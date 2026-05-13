@@ -69,12 +69,11 @@ let test_duplicate_table () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users" ~columns:[int_col "id"] in
-    let raised = ref false in
+    (* failwith is synchronous — raised before any Lwt.t is constructed *)
     (try
-       let _ = Lwt_main.run (C.create_table cat ~name:"users" ~columns:[int_col "id"]) in
-       ()
-     with Failure _ -> raised := true);
-    Alcotest.(check bool) "duplicate raises Failure" true !raised;
+       ignore (C.create_table cat ~name:"users" ~columns:[int_col "id"]);
+       Alcotest.fail "expected Failure for duplicate"
+     with Failure _ -> ());
     Lwt.return_unit
   )
 
@@ -247,12 +246,11 @@ let test_rowid_unknown_table () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let raised = ref false in
+    (* failwith is synchronous — raised before any Lwt.t is constructed *)
     (try
-       let _ = Lwt_main.run (C.next_rowid cat ~name:"nonexistent") in
-       ()
-     with Failure _ -> raised := true);
-    Alcotest.(check bool) "next_rowid unknown table raises Failure" true !raised;
+       ignore (C.next_rowid cat ~name:"nonexistent");
+       Alcotest.fail "expected Failure for unknown table"
+     with Failure _ -> ());
     Lwt.return_unit
   )
 
@@ -326,6 +324,27 @@ let test_tree_id_survives_reopen () =
     Lwt.return_unit
   )
 
+(* Targeted test: verify load_all does NOT skip the first alphabetical table.
+   "aardvark" sorts before "zebra" — after reopen, both must be found. *)
+let test_load_all_first_table_not_skipped () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let* _ = C.create_table cat1 ~name:"aardvark" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"zebra" ~columns:[int_col "id"] in
+    (* Open a fresh catalog — this calls load_all which walks the cursor *)
+    let* cat2 = C.open_ store in
+    let* r_a = C.find_table cat2 ~name:"aardvark" in
+    let* r_z = C.find_table cat2 ~name:"zebra" in
+    (match r_a with
+     | None -> Alcotest.fail "aardvark (first alphabetically) not found after reopen — load_all skipped it"
+     | Some _ -> ());
+    (match r_z with
+     | None -> Alcotest.fail "zebra not found after reopen"
+     | Some _ -> ());
+    Lwt.return_unit
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Group 5: Error conditions                                            *)
 (* ------------------------------------------------------------------ *)
@@ -392,6 +411,7 @@ let () =
       Alcotest.test_case "columns_survive_reopen"      `Quick test_columns_survive_reopen;
       Alcotest.test_case "rowid_survives_reopen"       `Quick test_rowid_survives_reopen;
       Alcotest.test_case "tree_id_survives_reopen"     `Quick test_tree_id_survives_reopen;
+      Alcotest.test_case "load_all_first_table_not_skipped" `Quick test_load_all_first_table_not_skipped;
     ];
     "error_conditions", [
       Alcotest.test_case "create_empty_name"           `Quick test_create_empty_name;
