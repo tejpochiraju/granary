@@ -34,11 +34,12 @@ let encode schema row =
   let bitmap_bytes = (n + 7) / 8 in
   let bitmap = Bytes.make bitmap_bytes '\x00' in
   Array.iteri (fun i v ->
-    if v = V_null then begin
+    match v with
+    | V_null ->
       let byte_idx = i / 8 and bit_idx = i mod 8 in
       let cur = Bytes.get_uint8 bitmap byte_idx in
       Bytes.set_uint8 bitmap byte_idx (cur lor (1 lsl bit_idx))
-    end
+    | _ -> ()
   ) row;
   Buffer.add_bytes buf bitmap;
   (* 3. non-null values in column order *)

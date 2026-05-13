@@ -129,6 +129,14 @@ let edge_tests = [
 
   "zero int64",
   (fun () -> test_roundtrip schema_single_int [| Row.V_int 0L |] ());
+
+  "zero-column roundtrip",
+  (fun () ->
+    let schema : Row.schema = [] in
+    let row : Row.t = [| |] in
+    let encoded = Row.encode schema row in
+    let decoded = Row.decode schema encoded in
+    Alcotest.(check bool) "zero-col roundtrip" true (Row.equal row decoded));
 ]
 
 (* ── Category 5: equal function ──────────────────────────────────────── *)
@@ -187,6 +195,24 @@ let error_tests = [
     try
       let _ = Row.decode schema_single_int encoded in
       Alcotest.fail "expected Invalid_argument"
+    with Invalid_argument _ -> ());
+
+  "type mismatch: int in text column",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Text }] in
+    let row = [| Row.V_int 42L |] in
+    try
+      let _ = Row.encode schema row in
+      Alcotest.fail "expected Invalid_argument for int in text column"
+    with Invalid_argument _ -> ());
+
+  "type mismatch: text in integer column",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Integer }] in
+    let row = [| Row.V_text "hello" |] in
+    try
+      let _ = Row.encode schema row in
+      Alcotest.fail "expected Invalid_argument for text in integer column"
     with Invalid_argument _ -> ());
 ]
 
