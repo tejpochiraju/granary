@@ -1,3 +1,5 @@
+(** Block I/O abstraction. Backends implement [S]. *)
+
 module type S = sig
   type t
   type error
