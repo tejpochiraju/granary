@@ -2,6 +2,16 @@ open Lwt.Syntax
 
 module Mem = Sqlocaml_block.Mem
 
+(* Helper: check if [needle] appears anywhere in [haystack] *)
+let string_contains haystack needle =
+  let hl = String.length haystack and nl = String.length needle in
+  let rec go i =
+    if i > hl - nl then false
+    else if String.sub haystack i nl = needle then true
+    else go (i + 1)
+  in
+  go 0
+
 let page_size = Mem.page_size
 
 (* Helper: create a fresh Cstruct buffer of page_size *)
@@ -90,11 +100,7 @@ let full_page_write_test () =
      | Error e -> Alcotest.failf "read error: %a" Mem.pp_error e
      | Ok () ->
        let got = Cstruct.to_bytes rbuf in
-       let mismatch = ref false in
-       for i = 0 to page_size - 1 do
-         if Bytes.get payload i <> Bytes.get got i then mismatch := true
-       done;
-       Alcotest.(check bool) "full page matches" false !mismatch);
+       Alcotest.(check bool) "full page matches" true (Bytes.equal payload got));
     Lwt.return_unit
   )
 
@@ -305,30 +311,26 @@ let resize_shrink_then_grow_test () =
     (* Write to all pages *)
     let wbuf = make_buf () in
     Cstruct.memset wbuf 0xFF;
-    for i = 0 to 7 do
-      Lwt_main.run (
-        let* _ = Mem.write_page m ~page_id:(Int64.of_int i) wbuf in
-        Lwt.return_unit
-      )
-    done;
+    let* () = Lwt_list.iter_s (fun i ->
+      let* _ = Mem.write_page m ~page_id:(Int64.of_int i) wbuf in
+      Lwt.return_unit
+    ) [0; 1; 2; 3; 4; 5; 6; 7] in
     let* _ = Mem.resize m ~n_pages:2L in
     let* _ = Mem.resize m ~n_pages:6L in
     Alcotest.(check int64) "n_pages" 6L (Mem.n_pages m);
     (* New pages 2..5 must be zero *)
-    let all_ok = ref true in
-    for i = 2 to 5 do
+    let* () = Lwt_list.iter_s (fun i ->
       let rbuf = make_buf () in
-      Lwt_main.run (
-        let* rr = Mem.read_page m ~page_id:(Int64.of_int i) rbuf in
-        (match rr with
-         | Error e -> Alcotest.failf "read page %d error: %a" i Mem.pp_error e
-         | Ok () ->
-           if not (Cstruct.for_all (fun c -> c = '\x00') rbuf) then
-             all_ok := false);
-        Lwt.return_unit
-      )
-    done;
-    Alcotest.(check bool) "new pages (2-5) are zero" true !all_ok;
+      let* rr = Mem.read_page m ~page_id:(Int64.of_int i) rbuf in
+      (match rr with
+       | Error e -> Alcotest.failf "read page %d error: %a" i Mem.pp_error e
+       | Ok () ->
+         Alcotest.(check bool)
+           (Printf.sprintf "page %d zero after regrow" i)
+           true
+           (Cstruct.for_all (fun c -> c = '\x00') rbuf));
+      Lwt.return_unit
+    ) [2; 3; 4; 5] in
     Lwt.return_unit
   )
 
@@ -413,13 +415,9 @@ let pp_error_format_test () =
   let err = Mem.Out_of_bounds { page_id = 42L; n_pages = 10L } in
   let s = Format.asprintf "%a" Mem.pp_error err in
   Alcotest.(check bool) "contains page_id"
-    true (let re = Str.regexp_string "42" in
-          try ignore (Str.search_forward re s 0); true
-          with Not_found -> false);
+    true (string_contains s "42");
   Alcotest.(check bool) "contains n_pages"
-    true (let re = Str.regexp_string "10" in
-          try ignore (Str.search_forward re s 0); true
-          with Not_found -> false)
+    true (string_contains s "10")
 
 (* ------------------------------------------------------------------ *)
 (* 6. QCHECK PROPERTY TESTS                                            *)
