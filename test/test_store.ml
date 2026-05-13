@@ -610,7 +610,7 @@ let prop_cursor_sorted =
          let* () = S.ro_end tx in
          let got = List.rev !collected in
          let expected = List.sort Bytes.compare unique_keys in
-         Lwt.return (got = expected)
+         Lwt.return (List.equal Bytes.equal got expected)
        ))
 
 (* ------------------------------------------------------------------ *)
