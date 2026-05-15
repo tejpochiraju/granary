@@ -258,8 +258,11 @@ let test_root_page_changes () =
   let (t, _) = empty_tree () in
   let t1 = ok_btree (run (Btree.put t (b "a") (b "1"))) in
   let r1 = Btree.root_page t1 in
+  (* The pager starts with pages 0 and 1 pre-allocated, so the first alloc
+     returns page 2 — i.e. root must not be 0L after a successful put. *)
   Alcotest.(check bool) "root_page non-zero after first put"
-    true (Int64.compare r1 0L > 0 || r1 = 0L (* page 0 is allowed *));
+    true (r1 <> 0L);
+  (* Each put on a distinct key creates a new CoW page, so the root changes. *)
   let t2 = ok_btree (run (Btree.put t1 (b "b") (b "2"))) in
   let r2 = Btree.root_page t2 in
   Alcotest.(check bool) "root_page changed after second put (CoW)"
@@ -423,12 +426,10 @@ let prop_root_nonzero_after_put =
        in
        if not any then Btree.root_page t = 0L
        else
-         (* root_page should be a real page-id; in our pager pages start at
-            0L and grow, so root could be 0L if only one entry was inserted.
-            The contract is "non-zero (if at least one put succeeded)" — but
-            with page 0 as a legal page-id, this is ambiguous.  Accept any
-            page id (root just needs to identify a real page, including 0). *)
-         let _ = t in true)
+         (* The test pager pre-allocates pages 0 and 1, so the btree's first
+            alloc returns page 2 or higher.  After any successful put the
+            root_page must therefore be > 0L. *)
+         Int64.compare (Btree.root_page t) 0L > 0)
 
 (* ------------------------------------------------------------------ *)
 (* Runner                                                              *)

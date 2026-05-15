@@ -108,13 +108,12 @@ let build_and_write_leaf pager ~page_id ~entries ~right_page :
   (unit, error) result Lwt.t =
   let buf = Cstruct.create Page.page_size in
   Cstruct.memset buf 0;
-  let final_offset =
+  let _final_offset =
     List.fold_left
       (fun off (k, v) ->
          Page.leaf_append_entry buf ~offset:off ~key:k ~value:v)
       Page.data_offset entries
   in
-  let _ = final_offset in
   let common : Page.common = {
     kind = Page.Leaf;
     flags = 0;
@@ -133,14 +132,13 @@ let build_and_write_branch pager ~page_id ~entries ~right_page :
   (unit, error) result Lwt.t =
   let buf = Cstruct.create Page.page_size in
   Cstruct.memset buf 0;
-  let final_offset =
+  let _final_offset =
     List.fold_left
       (fun off (k, lc) ->
          Page.branch_append_entry buf ~offset:off ~key:k
            ~left_child:(int32_of_page_id lc))
       Page.data_offset entries
   in
-  let _ = final_offset in
   let common : Page.common = {
     kind = Page.Branch;
     flags = 0;
@@ -511,9 +509,10 @@ let rec propagate_up pager (path : path_step list)
         split_branch_child step.branch_entries step.right_page
           step.child_idx left_new split_key right_new
     in
-    (* Free the old branch page first; alloc is allowed to return it back
-       only if txn ids match.  We use txn_id_free=0 / txn_id_alloc=1, so it
-       will not be returned for the immediate allocs below. *)
+    (* Free the old branch page first.  Both txn_id_free and txn_id_alloc are
+       1L; Pager reuses a freed page only when current_txn_id > freed_at, so
+       freed_at(1) < current(1) is false and the page will not be returned for
+       the immediate allocs below — safe within the same put/del operation. *)
     Pager.free pager ~page_id:step.page_id ~freed_at_txn_id:txn_id_free;
     let* w = write_branch_maybe_split pager new_entries
         ~right_page:new_right_page in
@@ -708,7 +707,6 @@ let leftmost_leaf_with_path pager page_id :
             | [] -> right_page
             | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
           in
-          let _ = pid in
           let frame = {
             cf_branch_entries = entries;
             cf_right_page = right_page;
@@ -815,7 +813,6 @@ let descend_with_path_for_key pager page_id key :
           let (entries, _) = decode_branch_entries buf common in
           let right_page = page_id_of_int32 common.right_page in
           let (idx, child) = pick_branch_child_with_idx entries common key in
-          let _ = pid in
           let frame = {
             cf_branch_entries = entries;
             cf_right_page = right_page;
