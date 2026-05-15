@@ -30,6 +30,12 @@ type bound_stmt =
       limit      : int option;
       offset     : int option;
     }
+  | BS_create_index of {
+      name       : string;
+      table_meta : Cat.table_meta;
+      col_idx    : int;
+      unique     : bool;
+    }
 
 type error =
   | Unknown_table  of string
@@ -212,6 +218,29 @@ let bind_select cat ~proj ~table ~where ~order ~limit ~offset =
                    })))))))
 
 (* ------------------------------------------------------------------ *)
+(* CREATE INDEX                                                         *)
+(* ------------------------------------------------------------------ *)
+
+let bind_create_index cat ~name ~table ~column ~unique =
+  let* meta_opt = Cat.find_table cat ~name:table in
+  match meta_opt with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some meta ->
+    (match col_index meta.columns column with
+     | None ->
+       Lwt.return (Error (Unknown_column { table; column }))
+     | Some i ->
+       (match Cat.find_index cat ~name with
+        | Some _ -> Lwt.return (Error (Already_exists name))
+        | None ->
+          Lwt.return (Ok (BS_create_index {
+            name;
+            table_meta = meta;
+            col_idx    = i;
+            unique;
+          }))))
+
+(* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -220,3 +249,5 @@ let bind cat = function
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
   | Ast.S_select { proj; table; where; order; limit; offset } ->
     bind_select cat ~proj ~table ~where ~order ~limit ~offset
+  | Ast.S_create_index { name; table; column; unique } ->
+    bind_create_index cat ~name ~table ~column ~unique

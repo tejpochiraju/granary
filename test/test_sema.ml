@@ -366,6 +366,63 @@ let bind_select_second_col_unknown () =
   | _ -> Alcotest.fail "expected Unknown_column for second proj column"
 
 (* ------------------------------------------------------------------ *)
+(* Group 3b: CREATE INDEX binding                                       *)
+(* ------------------------------------------------------------------ *)
+
+let bind_create_index_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_index {
+    name = "idx_id"; table = "users"; column = "id"; unique = false;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_create_index { name; col_idx; unique; _ }) ->
+    Alcotest.(check string) "name" "idx_id" name;
+    Alcotest.(check int) "col_idx" 0 col_idx;
+    Alcotest.(check bool) "not unique" false unique
+  | _ -> Alcotest.fail "expected BS_create_index"
+
+let bind_create_index_unique () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_index {
+    name = "uidx"; table = "users"; column = "name"; unique = true;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_create_index { col_idx = 1; unique = true; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_create_index unique with col_idx=1"
+
+let bind_create_index_unknown_table () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_index {
+    name = "idx"; table = "ghost"; column = "x"; unique = false;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost"
+
+let bind_create_index_unknown_column () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_index {
+    name = "idx"; table = "users"; column = "bogus"; unique = false;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus"
+
+let bind_create_index_duplicate () =
+  let cat = two_col_cat () in
+  (* First creation succeeds via catalog directly *)
+  let _ = Lwt_main.run (
+    Sqlocaml_catalog.Catalog.create_index cat ~name:"idx" ~table:"users"
+      ~column:"id" ~unique:false
+  ) in
+  let stmt = Ast.S_create_index {
+    name = "idx"; table = "users"; column = "id"; unique = false;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Already_exists "idx") -> ()
+  | _ -> Alcotest.fail "expected Already_exists idx"
+
+(* ------------------------------------------------------------------ *)
 (* Group 4: Error values                                                *)
 (* ------------------------------------------------------------------ *)
 
@@ -430,6 +487,13 @@ let () =
       Alcotest.test_case "bind_select_where_text_col"    `Quick bind_select_where_text_col;
       Alcotest.test_case "bind_select_where_right_unknown" `Quick bind_select_where_right_unknown;
       Alcotest.test_case "bind_select_second_col_unknown"  `Quick bind_select_second_col_unknown;
+    ];
+    "create-index", [
+      Alcotest.test_case "bind_create_index_basic"          `Quick bind_create_index_basic;
+      Alcotest.test_case "bind_create_index_unique"         `Quick bind_create_index_unique;
+      Alcotest.test_case "bind_create_index_unknown_table"  `Quick bind_create_index_unknown_table;
+      Alcotest.test_case "bind_create_index_unknown_column" `Quick bind_create_index_unknown_column;
+      Alcotest.test_case "bind_create_index_duplicate"      `Quick bind_create_index_duplicate;
     ];
     "error-values", [
       Alcotest.test_case "error_already_exists_message" `Quick error_already_exists_message;

@@ -12,6 +12,7 @@
 %token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
 %token NOT NULL PRIMARY KEY AND
 %token ORDER BY ASC DESC LIMIT OFFSET
+%token INDEX ON UNIQUE
 %token STAR LPAREN RPAREN COMMA SEMI EQ
 %token EOF
 
@@ -26,12 +27,19 @@ stmt_eof:
 
 stmt:
   | s = create_table { s }
+  | s = create_index { s }
   | s = insert       { s }
   | s = select       { s }
 
 create_table:
   | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN
     { S_create_table { name; columns = cols } }
+
+create_index:
+  | CREATE INDEX name = IDENT ON table = IDENT LPAREN col = IDENT RPAREN
+    { S_create_index { name; table; column = col; unique = false } }
+  | CREATE UNIQUE INDEX name = IDENT ON table = IDENT LPAREN col = IDENT RPAREN
+    { S_create_index { name; table; column = col; unique = true } }
 
 column_def:
   | name = IDENT ty = col_ty cs = column_constraint*

@@ -28,6 +28,12 @@ type bound_stmt =
       limit      : int option;
       offset     : int option;
     }
+  | BS_create_index of {
+      name       : string;
+      table_meta : Sqlocaml_catalog.Catalog.table_meta;
+      col_idx    : int;                 (** column ordinal in the table *)
+      unique     : bool;
+    }
 
 type error =
   | Unknown_table  of string

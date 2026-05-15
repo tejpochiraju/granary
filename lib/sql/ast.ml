@@ -52,3 +52,9 @@ type stmt =
       limit  : int option;
       offset : int option;
     }
+  | S_create_index of {
+      name   : string;
+      table  : string;
+      column : string;
+      unique : bool;
+    }

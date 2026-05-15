@@ -692,6 +692,229 @@ let qcheck_limit_count =
       ))
 
 (* ------------------------------------------------------------------ *)
+(* Group 15: CREATE INDEX + index lookup                                *)
+(* ------------------------------------------------------------------ *)
+
+let create_index_simple () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  exec db "INSERT INTO t (id, name) VALUES (3, 'carol')";
+  exec db "CREATE INDEX idx_t_id ON t (id)";
+  let rows = query_ok db "SELECT id, name FROM t WHERE id = 2" in
+  Alcotest.(check int) "1 row found via index" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "id=2"  (Db.V_int 2L)    row.(0);
+  Alcotest.check value_testable "name"  (Db.V_text "bob") row.(1)
+
+let create_index_on_text_column () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  exec db "INSERT INTO t (id, name) VALUES (3, 'carol')";
+  exec db "CREATE INDEX idx_name ON t (name)";
+  let rows = query_ok db "SELECT id FROM t WHERE name = 'bob'" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "id=2" (Db.V_int 2L) (List.hd rows).(0)
+
+let create_unique_index () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "CREATE UNIQUE INDEX idx_id ON t (id)";
+  let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
+  Alcotest.(check int) "1 row" 1 (List.length rows)
+
+let index_lookup_no_match () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  exec db "CREATE INDEX idx_id ON t (id)";
+  let rows = query_ok db "SELECT * FROM t WHERE id = 99" in
+  Alcotest.(check int) "0 rows for missing key" 0 (List.length rows)
+
+let index_lookup_returns_all_matches () =
+  (* Index lookup must return every row whose key matches, not just one. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (val INTEGER, name TEXT)";
+  exec db "INSERT INTO t (val, name) VALUES (5, 'a')";
+  exec db "INSERT INTO t (val, name) VALUES (5, 'b')";
+  exec db "INSERT INTO t (val, name) VALUES (5, 'c')";
+  exec db "INSERT INTO t (val, name) VALUES (7, 'd')";
+  exec db "CREATE INDEX idx_val ON t (val)";
+  let rows = query_ok db "SELECT name FROM t WHERE val = 5" in
+  Alcotest.(check int) "3 matches" 3 (List.length rows);
+  let names = List.map (fun r -> match r.(0) with
+    | Db.V_text s -> s | _ -> "") rows |> List.sort String.compare in
+  Alcotest.(check (list string)) "matched names" ["a"; "b"; "c"] names
+
+let index_lookup_matches_seq_scan () =
+  (* For each value we insert, verify the index lookup result equals
+     what a sequential scan with WHERE would return. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (val INTEGER, name TEXT)";
+  let data = [
+    (10, "alpha"); (20, "beta"); (10, "gamma"); (30, "delta"); (20, "epsilon")
+  ] in
+  List.iter (fun (n, s) ->
+    let sql = Printf.sprintf "INSERT INTO t (val, name) VALUES (%d, '%s')" n s in
+    exec db sql
+  ) data;
+  (* Snapshot pre-index results *)
+  let pre_10 = query_ok db "SELECT name FROM t WHERE val = 10" in
+  let pre_20 = query_ok db "SELECT name FROM t WHERE val = 20" in
+  let pre_30 = query_ok db "SELECT name FROM t WHERE val = 30" in
+  exec db "CREATE INDEX idx_val ON t (val)";
+  let post_10 = query_ok db "SELECT name FROM t WHERE val = 10" in
+  let post_20 = query_ok db "SELECT name FROM t WHERE val = 20" in
+  let post_30 = query_ok db "SELECT name FROM t WHERE val = 30" in
+  let names rows =
+    List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "") rows
+    |> List.sort String.compare
+  in
+  Alcotest.(check (list string)) "val=10 results" (names pre_10) (names post_10);
+  Alcotest.(check (list string)) "val=20 results" (names pre_20) (names post_20);
+  Alcotest.(check (list string)) "val=30 results" (names pre_30) (names post_30)
+
+let index_lookup_after_inserts () =
+  (* Inserts after CREATE INDEX must also be findable. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "CREATE INDEX idx_id ON t (id)";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  exec db "INSERT INTO t (id, name) VALUES (3, 'carol')";
+  let rows = query_ok db "SELECT name FROM t WHERE id = 3" in
+  Alcotest.(check int) "1 row found" 1 (List.length rows);
+  Alcotest.check value_testable "name=carol" (Db.V_text "carol") (List.hd rows).(0)
+
+let create_index_unknown_table () =
+  let db = fresh_db () in
+  let result = run (Db.execute db "CREATE INDEX idx ON ghost (x)") in
+  (match err_or_fail "create_index_unknown_table" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
+   | _ -> Alcotest.fail "expected Sema(Unknown_table)")
+
+let create_index_unknown_column () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  let result = run (Db.execute db "CREATE INDEX idx ON t (bogus)") in
+  (match err_or_fail "create_index_unknown_column" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+   | _ -> Alcotest.fail "expected Sema(Unknown_column)")
+
+let create_index_duplicate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "CREATE INDEX idx ON t (id)";
+  let result = run (Db.execute db "CREATE INDEX idx ON t (id)") in
+  (match err_or_fail "create_index_duplicate" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Already_exists _) -> ()
+   | _ -> Alcotest.fail "expected Sema(Already_exists)")
+
+let index_lookup_where_null_no_match () =
+  (* WHERE col = NULL must return 0 rows even when an index exists
+     and there are NULL-valued rows. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val TEXT)";
+  exec db "INSERT INTO t (id, val) VALUES (1, NULL)";
+  exec db "INSERT INTO t (id, val) VALUES (2, 'a')";
+  exec db "CREATE INDEX idx ON t (val)";
+  let rows = query_ok db "SELECT * FROM t WHERE val = NULL" in
+  Alcotest.(check int) "0 rows for col = NULL" 0 (List.length rows)
+
+(* QCheck: random integer inserts + CREATE INDEX; index lookup must
+   match sequential scan for every distinct value. *)
+let qcheck_index_lookup_matches_seq_scan =
+  QCheck.Test.make
+    ~name:"index_lookup: same rows as seq_scan for all values"
+    ~count:10_000
+    QCheck.(list_size Gen.(0 -- 20) (int_range (-100) 100))
+    (fun ns ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run (
+         let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+         let* () = Lwt_list.iter_s (fun n ->
+           let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+           let* _ = Db.execute db sql in
+           Lwt.return_unit
+         ) ns in
+         (* Snapshot results per distinct value, pre-index *)
+         let distinct = List.sort_uniq compare ns in
+         let* pre_counts = Lwt_list.map_s (fun v ->
+           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
+           match r with
+           | Error _ -> Lwt.return (v, -1)
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (v, List.length rows)
+         ) distinct in
+         let* _ = Db.execute db "CREATE INDEX idx_n ON t (n)" in
+         let* post_counts = Lwt_list.map_s (fun v ->
+           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
+           match r with
+           | Error _ -> Lwt.return (v, -1)
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (v, List.length rows)
+         ) distinct in
+         (* Also check a value that's not present (should give 0 in both) *)
+         let absent = 1000 in
+         let* r1 = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" absent) in
+         let* absent_post = match r1 with
+           | Error _ -> Lwt.return (-1)
+           | Ok s -> let* rs = Lwt_stream.to_list s in Lwt.return (List.length rs)
+         in
+         Lwt.return (pre_counts = post_counts && absent_post = 0)
+       ))
+
+(* QCheck: random text inserts + CREATE INDEX on the text column *)
+let qcheck_text_index_lookup =
+  QCheck.Test.make
+    ~name:"text_index_lookup: results match seq_scan for any value"
+    ~count:10_000
+    QCheck.(list_size Gen.(0 -- 15)
+              (string_size ~gen:Gen.(char_range 'a' 'd') Gen.(1 -- 4)))
+    (fun ss ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run (
+         let* _ = Db.execute db "CREATE TABLE t (s TEXT)" in
+         let* () = Lwt_list.iter_s (fun s ->
+           (* Escape single quotes by skipping inserts that contain them. *)
+           if String.contains s '\'' then Lwt.return_unit
+           else
+             let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
+             let* _ = Db.execute db sql in
+             Lwt.return_unit
+         ) ss in
+         let distinct =
+           List.filter (fun s -> not (String.contains s '\''))
+             (List.sort_uniq compare ss)
+         in
+         let* pre_counts = Lwt_list.map_s (fun v ->
+           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v) in
+           match r with
+           | Error _ -> Lwt.return (v, -1)
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (v, List.length rows)
+         ) distinct in
+         let* _ = Db.execute db "CREATE INDEX idx_s ON t (s)" in
+         let* post_counts = Lwt_list.map_s (fun v ->
+           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v) in
+           match r with
+           | Error _ -> Lwt.return (v, -1)
+           | Ok stream ->
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (v, List.length rows)
+         ) distinct in
+         Lwt.return (pre_counts = post_counts)
+       ))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -772,6 +995,25 @@ let () =
         qcheck_order_by_asc_sorted;
         qcheck_order_by_desc_sorted;
         qcheck_limit_count;
+      ]
+    );
+    "create_index", [
+      Alcotest.test_case "create_index_simple"              `Quick create_index_simple;
+      Alcotest.test_case "create_index_on_text_column"      `Quick create_index_on_text_column;
+      Alcotest.test_case "create_unique_index"              `Quick create_unique_index;
+      Alcotest.test_case "index_lookup_no_match"            `Quick index_lookup_no_match;
+      Alcotest.test_case "index_lookup_returns_all_matches" `Quick index_lookup_returns_all_matches;
+      Alcotest.test_case "index_lookup_matches_seq_scan"    `Quick index_lookup_matches_seq_scan;
+      Alcotest.test_case "index_lookup_after_inserts"       `Quick index_lookup_after_inserts;
+      Alcotest.test_case "create_index_unknown_table"       `Quick create_index_unknown_table;
+      Alcotest.test_case "create_index_unknown_column"      `Quick create_index_unknown_column;
+      Alcotest.test_case "create_index_duplicate"           `Quick create_index_duplicate;
+      Alcotest.test_case "index_lookup_where_null_no_match"  `Quick index_lookup_where_null_no_match;
+    ];
+    "qcheck_create_index", (
+      List.map QCheck_alcotest.to_alcotest [
+        qcheck_index_lookup_matches_seq_scan;
+        qcheck_text_index_lookup;
       ]
     );
   ]

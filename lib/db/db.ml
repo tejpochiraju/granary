@@ -46,7 +46,7 @@ let prepare t sql =
     let* bound = Sql.Sema.bind t.catalog ast in
     match bound with
     | Error e -> Lwt.return (Error (Sema e))
-    | Ok b    -> Lwt.return (Ok (Sql.Planner.plan b))
+    | Ok b    -> Lwt.return (Ok (Sql.Planner.plan ~cat:t.catalog b))
 
 let execute t sql =
   let* op = prepare t sql in

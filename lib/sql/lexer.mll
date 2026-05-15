@@ -32,6 +32,9 @@ rule token = parse
   | "DESC"     { DESC }
   | "LIMIT"    { LIMIT }
   | "OFFSET"   { OFFSET }
+  | "INDEX"    { INDEX }
+  | "ON"       { ON }
+  | "UNIQUE"   { UNIQUE }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

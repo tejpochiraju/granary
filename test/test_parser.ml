@@ -198,6 +198,33 @@ let select_cols_where () =
   | _ -> Alcotest.fail "expected col+where"
 
 (* ------------------------------------------------------------------ *)
+(* Group 4: CREATE INDEX                                                *)
+(* ------------------------------------------------------------------ *)
+
+let create_index_basic () =
+  match parse "CREATE INDEX idx_t_id ON t (id);" with
+  | Ast.S_create_index { name = "idx_t_id"; table = "t"; column = "id";
+                         unique = false } -> ()
+  | _ -> Alcotest.fail "expected S_create_index"
+
+let create_index_unique () =
+  match parse "CREATE UNIQUE INDEX uidx ON users (email);" with
+  | Ast.S_create_index { name = "uidx"; table = "users"; column = "email";
+                         unique = true } -> ()
+  | _ -> Alcotest.fail "expected S_create_index with unique=true"
+
+let create_index_no_semi () =
+  match parse "CREATE INDEX i ON t (x)" with
+  | Ast.S_create_index { name = "i"; table = "t"; column = "x"; unique = false } -> ()
+  | _ -> Alcotest.fail "expected S_create_index without semi"
+
+let create_index_missing_column_list () =
+  try
+    ignore (parse "CREATE INDEX i ON t;");
+    Alcotest.fail "expected syntax error for missing (col)"
+  with Parser.Error | Failure _ -> ()
+
+(* ------------------------------------------------------------------ *)
 (* Main                                                                 *)
 (* ------------------------------------------------------------------ *)
 
@@ -238,5 +265,11 @@ let () =
       Alcotest.test_case "where-reversed"     `Quick select_where_reversed;
       Alcotest.test_case "no-semi"            `Quick select_no_semi;
       Alcotest.test_case "cols-where"         `Quick select_cols_where;
+    ];
+    "create-index", [
+      Alcotest.test_case "basic"           `Quick create_index_basic;
+      Alcotest.test_case "unique"          `Quick create_index_unique;
+      Alcotest.test_case "no-semi"         `Quick create_index_no_semi;
+      Alcotest.test_case "missing-col-list" `Quick create_index_missing_column_list;
     ];
   ]

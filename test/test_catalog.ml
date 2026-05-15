@@ -410,6 +410,121 @@ let corrupt_column_type_tag () =
        true (String.length msg > 0))
 
 (* ------------------------------------------------------------------ *)
+(* Group 6: Indexes                                                     *)
+(* ------------------------------------------------------------------ *)
+
+let test_create_index_basic () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"users"
+      ~columns:[int_col "id"; txt_col "name"] in
+    let* result = C.create_index cat ~name:"idx_users_id"
+      ~table:"users" ~column:"id" ~unique:false in
+    (match result with
+     | Error msg -> Alcotest.failf "expected Ok, got Error %s" msg
+     | Ok info ->
+       Alcotest.(check string) "index name" "idx_users_id" info.C.idx_name;
+       Alcotest.(check string) "index table" "users" info.C.idx_table;
+       Alcotest.(check string) "index column" "id" info.C.idx_column;
+       Alcotest.(check bool) "not unique" false info.C.idx_unique;
+       (* Index gets a tree_id >= 16, separate from the table's *)
+       Alcotest.(check bool) "tree_id >= 16" true (info.C.idx_tree_id >= 16));
+    Lwt.return_unit
+  )
+
+let test_indexes_for_table () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"users"
+      ~columns:[int_col "id"; txt_col "name"] in
+    let before = C.indexes_for_table cat ~table:"users" in
+    Alcotest.(check int) "no indexes initially" 0 (List.length before);
+    let* _ = C.create_index cat ~name:"idx_id"
+      ~table:"users" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx_name"
+      ~table:"users" ~column:"name" ~unique:true in
+    let after = C.indexes_for_table cat ~table:"users" in
+    Alcotest.(check int) "two indexes" 2 (List.length after);
+    let names = List.map (fun i -> i.C.idx_name) after |> List.sort String.compare in
+    Alcotest.(check (list string)) "index names" ["idx_id"; "idx_name"] names;
+    Lwt.return_unit
+  )
+
+let test_create_index_unknown_table () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* r = C.create_index cat ~name:"idx" ~table:"ghost" ~column:"x" ~unique:false in
+    (match r with
+     | Error _ -> ()
+     | Ok _ -> Alcotest.fail "expected Error for unknown table");
+    Lwt.return_unit
+  )
+
+let test_create_index_unknown_column () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* r = C.create_index cat ~name:"idx" ~table:"t" ~column:"bogus" ~unique:false in
+    (match r with
+     | Error _ -> ()
+     | Ok _ -> Alcotest.fail "expected Error for unknown column");
+    Lwt.return_unit
+  )
+
+let test_create_index_duplicate () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* r = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    (match r with
+     | Error _ -> ()
+     | Ok _ -> Alcotest.fail "expected Error for duplicate index name");
+    Lwt.return_unit
+  )
+
+let test_index_persists_across_reopen () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let* _ = C.create_table cat1 ~name:"users"
+      ~columns:[int_col "id"; txt_col "name"] in
+    let* _ = C.create_index cat1 ~name:"idx_users_id"
+      ~table:"users" ~column:"id" ~unique:true in
+    (* Reopen *)
+    let* cat2 = C.open_ store in
+    let idxs = C.indexes_for_table cat2 ~table:"users" in
+    Alcotest.(check int) "1 index after reopen" 1 (List.length idxs);
+    let i = List.hd idxs in
+    Alcotest.(check string) "name preserved" "idx_users_id" i.C.idx_name;
+    Alcotest.(check string) "table preserved" "users" i.C.idx_table;
+    Alcotest.(check string) "column preserved" "id" i.C.idx_column;
+    Alcotest.(check bool) "unique preserved" true i.C.idx_unique;
+    Lwt.return_unit
+  )
+
+let test_find_index () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    Alcotest.(check bool) "missing index returns None"
+      true (C.find_index cat ~name:"idx" = None);
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    (match C.find_index cat ~name:"idx" with
+     | None -> Alcotest.fail "expected Some"
+     | Some i ->
+       Alcotest.(check string) "name" "idx" i.C.idx_name;
+       Alcotest.(check string) "column" "id" i.C.idx_column);
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -449,5 +564,14 @@ let () =
       Alcotest.test_case "create_empty_name"           `Quick test_create_empty_name;
       Alcotest.test_case "create_empty_columns"        `Quick test_create_empty_columns;
       Alcotest.test_case "corrupt_column_type_tag"     `Quick corrupt_column_type_tag;
+    ];
+    "indexes", [
+      Alcotest.test_case "create_index_basic"           `Quick test_create_index_basic;
+      Alcotest.test_case "indexes_for_table"            `Quick test_indexes_for_table;
+      Alcotest.test_case "create_index_unknown_table"   `Quick test_create_index_unknown_table;
+      Alcotest.test_case "create_index_unknown_column"  `Quick test_create_index_unknown_column;
+      Alcotest.test_case "create_index_duplicate"       `Quick test_create_index_duplicate;
+      Alcotest.test_case "index_persists_across_reopen" `Quick test_index_persists_across_reopen;
+      Alcotest.test_case "find_index"                   `Quick test_find_index;
     ];
   ]

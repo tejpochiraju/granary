@@ -53,6 +53,9 @@ let kw_tests = [
   check "kw_primary" [Parser.PRIMARY; Parser.EOF]          "PRIMARY";
   check "kw_key"     [Parser.KEY;     Parser.EOF]          "KEY";
   check "kw_and"     [Parser.AND;     Parser.EOF]          "AND";
+  check "kw_index"   [Parser.INDEX;   Parser.EOF]          "INDEX";
+  check "kw_on"      [Parser.ON;      Parser.EOF]          "ON";
+  check "kw_unique"  [Parser.UNIQUE;  Parser.EOF]          "UNIQUE";
 ]
 
 (* ------------------------------------------------------------------ *)

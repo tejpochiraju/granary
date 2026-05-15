@@ -40,3 +40,21 @@ type op =
       offset : int;
       child  : op;
     }
+  | Op_create_index of {
+      name     : string;
+      table    : string;
+      tree_id  : int;    (** table's tree_id *)
+      col_idx  : int;    (** column ordinal in table schema *)
+      unique   : bool;
+      columns  : Sqlocaml_encoding.Row.column list;
+        (** columns of the target table — needed for row decoding
+            during index population *)
+    }
+  | Op_index_lookup of {
+      table_tree : int;                 (** table's tree_id *)
+      idx_tree   : int;                 (** index tree_id *)
+      col_idx    : int;                 (** column ordinal for encoding *)
+      col_type   : Sqlocaml_encoding.Row.ty;
+      lookup_val : expr;                (** value to look up *)
+      table_meta : Cat.table_meta;      (** for row decoding *)
+    }

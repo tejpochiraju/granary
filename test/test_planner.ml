@@ -307,6 +307,76 @@ let plan_order_and_limit () =
   | _ -> Alcotest.fail "expected Op_limit(Op_sort(Op_project(Op_seq_scan)))"
 
 (* ------------------------------------------------------------------ *)
+(* Group 6: Index lookup planner rule                                   *)
+(* ------------------------------------------------------------------ *)
+
+let make_cat_with_index ~col_name =
+  Lwt_main.run (
+    let store = S.create () in
+    let* cat = Cat.open_ store in
+    let* _ = Cat.create_table cat ~name:"users" ~columns:[
+      { Row.name = "id";   ty = Row.Integer };
+      { Row.name = "name"; ty = Row.Text };
+    ] in
+    let* _ = Cat.create_index cat ~name:"idx" ~table:"users"
+      ~column:col_name ~unique:false in
+    Lwt.return cat
+  )
+
+let plan_index_lookup_col_eq_lit () =
+  let cat = make_cat_with_index ~col_name:"id" in
+  let stmt = Ast.S_select {
+    proj  = `All;
+    table = "users";
+    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_index_lookup _; _ } -> ()
+  | Plan.Op_project { child = Plan.Op_filter _; _ } ->
+    Alcotest.fail "expected Op_index_lookup, got Op_filter"
+  | _ -> Alcotest.fail "expected Op_project { child=Op_index_lookup _ }"
+
+let plan_index_lookup_lit_eq_col () =
+  let cat = make_cat_with_index ~col_name:"id" in
+  let stmt = Ast.S_select {
+    proj  = `All;
+    table = "users";
+    where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 1L), Ast.E_col "id"));
+    order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_index_lookup _; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_project { child=Op_index_lookup _ } (lit=col)"
+
+let plan_no_index_falls_back_to_filter () =
+  (* No index on "name" — equality on "name" should fall back to Op_filter. *)
+  let cat = make_cat_with_index ~col_name:"id" in
+  let stmt = Ast.S_select {
+    proj  = `All;
+    table = "users";
+    where = Some (Ast.E_eq (Ast.E_col "name", Ast.E_lit (Ast.L_text "x")));
+    order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_seq_scan _; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_project { child=Op_filter { child=Op_seq_scan _ } }"
+
+let plan_create_index () =
+  let cat = make_cat_with_index ~col_name:"id" in
+  let stmt = Ast.S_create_index {
+    name = "idx2"; table = "users"; column = "name"; unique = true;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_create_index { name = "idx2"; table = "users"; col_idx = 1;
+                           unique = true; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_create_index { name=idx2; ... }"
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -341,5 +411,11 @@ let () =
       Alcotest.test_case "plan_limit_only"        `Quick plan_limit_only;
       Alcotest.test_case "plan_limit_with_offset" `Quick plan_limit_with_offset;
       Alcotest.test_case "plan_order_and_limit"   `Quick plan_order_and_limit;
+    ];
+    "index-lookup", [
+      Alcotest.test_case "plan_index_lookup_col_eq_lit"      `Quick plan_index_lookup_col_eq_lit;
+      Alcotest.test_case "plan_index_lookup_lit_eq_col"      `Quick plan_index_lookup_lit_eq_col;
+      Alcotest.test_case "plan_no_index_falls_back_to_filter" `Quick plan_no_index_falls_back_to_filter;
+      Alcotest.test_case "plan_create_index"                  `Quick plan_create_index;
     ];
   ]
