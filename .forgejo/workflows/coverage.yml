@@ -1,0 +1,80 @@
+name: Coverage
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+
+env:
+  COVERAGE_THRESHOLD: "85"
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config libgmp-dev bc
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.1-cov-${{ hashFiles('sqlocaml.opam') }}
+          restore-keys: opam-5.1-cov-
+
+      - name: Install opam packages (including bisect_ppx)
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx bisect_ppx
+
+      - name: Build and run instrumented tests
+        run: |
+          opam exec -- dune runtest --instrument-with bisect_ppx
+
+      - name: Generate coverage summary
+        id: coverage
+        run: |
+          COVFILES=$(find _build -name '*.coverage' | tr '\n' ' ')
+          if [ -z "${COVFILES// }" ]; then
+            echo "ERROR: no coverage files found" >&2
+            exit 1
+          fi
+
+          # Per-file breakdown
+          opam exec -- bisect-ppx-report summary --per-file $COVFILES | tee /tmp/coverage-summary.txt
+
+          # Extract overall percentage
+          PCT=$(grep -oP '\d+\.\d+(?= %)' /tmp/coverage-summary.txt | tail -1)
+          echo "pct=${PCT}" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "Overall coverage: ${PCT}%"
+
+      - name: Generate HTML report
+        run: |
+          COVFILES=$(find _build -name '*.coverage' | tr '\n' ' ')
+          mkdir -p _coverage
+          opam exec -- bisect-ppx-report html -o _coverage $COVFILES
+
+      - name: Upload HTML report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: _coverage/
+          retention-days: 30
+
+      - name: Enforce threshold on tags
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PCT="${{ steps.coverage.outputs.pct }}"
+          echo "Coverage: ${PCT}%  threshold: ${COVERAGE_THRESHOLD}%"
+          if (( $(echo "$PCT < $COVERAGE_THRESHOLD" | bc -l) )); then
+            echo "FAIL: coverage ${PCT}% is below threshold ${COVERAGE_THRESHOLD}%"
+            exit 1
+          fi
+          echo "PASS: ${PCT}% >= ${COVERAGE_THRESHOLD}%"

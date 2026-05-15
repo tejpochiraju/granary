@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config libgmp-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.1-${{ hashFiles('sqlocaml.opam') }}
+          restore-keys: opam-5.1-
+
+      - name: Install opam packages
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Test
+        run: opam exec -- dune runtest
+
+      - name: Report test count
+        run: |
+          for exe in _build/default/test/test_*.exe; do
+            name=$(basename "$exe" .exe)
+            result=$("$exe" 2>&1 | tail -1)
+            echo "$name: $result"
+          done
