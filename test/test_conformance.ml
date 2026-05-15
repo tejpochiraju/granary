@@ -85,7 +85,7 @@ let fresh_temp_path () =
 (* Suite runner                                                          *)
 (* ------------------------------------------------------------------ *)
 
-let run_suite name open_db close_db tests =
+let run_suite open_db close_db tests =
   List.map (fun t ->
     Alcotest.test_case t.name `Quick (fun () ->
       Lwt_main.run (
@@ -98,9 +98,6 @@ let run_suite name open_db close_db tests =
       )
     )
   ) tests
-  |> fun cases ->
-    ignore name;
-    cases
 
 (* ------------------------------------------------------------------ *)
 (* Backend openers                                                       *)
@@ -320,13 +317,13 @@ let persistence_test path =
       (* Phase 2: reopen, query, verify *)
       let* db2 = open_unix_file path () in
       let* rows = query_rows db2 "SELECT * FROM t ORDER BY id ASC" in
+      let* () = Db.close db2 in
+      (try Unix.unlink path with Unix.Unix_error _ -> ());
       let expected = [
         [| Db.V_int 1L; Db.V_text "alice" |];
         [| Db.V_int 2L; Db.V_text "bob"   |];
       ] in
       check_rows expected rows;
-      let* () = Db.close db2 in
-      (try Unix.unlink path with Unix.Unix_error _ -> ());
       Lwt.return_unit
     )
   )
@@ -338,7 +335,7 @@ let persistence_test path =
 let mem_suite () =
   let open_db = open_mem in
   let close_db = Db.close in
-  run_suite "mem" open_db close_db tests
+  run_suite open_db close_db tests
   @ [ unique_index_duplicate_rejected_case "mem" open_db close_db ]
 
 let unix_file_suite () =
@@ -348,7 +345,7 @@ let unix_file_suite () =
       let path = fresh_temp_path () in
       let open_db = open_unix_file path in
       let close_db = close_and_delete_file path in
-      let cases = run_suite "unix_file" open_db close_db [t] in
+      let cases = run_suite open_db close_db [t] in
       List.hd cases
     ) tests
   in
