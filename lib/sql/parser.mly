@@ -18,6 +18,7 @@
 %token INDEX ON UNIQUE
 %token UPDATE SET
 %token DELETE
+%token DROP
 %token JOIN INNER LEFT OUTER
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
@@ -49,6 +50,14 @@ stmt:
   | s = select       { s }
   | s = update       { s }
   | s = delete       { s }
+  | s = drop_table   { s }
+  | s = drop_index   { s }
+
+drop_table:
+  | DROP TABLE name = IDENT { S_drop_table { name } }
+
+drop_index:
+  | DROP INDEX name = IDENT { S_drop_index { name } }
 
 create_table:
   | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN

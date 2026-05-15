@@ -409,3 +409,56 @@ let indexes_for_table t ~table =
 
 let find_index t ~name =
   Hashtbl.find_opt t.indexes name
+
+(** Scan _sys_indexes (using the given txn) to find the key for [name].
+    Returns [None] if not found. *)
+let find_index_key_in_txn tx name =
+  let%lwt cur = S.cursor_open tx sys_indexes_tid in
+  let _sr = S.cursor_first cur in
+  let result = ref None in
+  let rec walk () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (k, v) ->
+      let info = decode_index_value v in
+      if info.idx_name = name then
+        result := Some k
+      else
+        walk ()
+  in
+  walk ();
+  S.cursor_close cur;
+  Lwt.return !result
+
+let drop_index t tx ~name =
+  (* Remove from _sys_indexes on disk by scanning for the numeric key. *)
+  let%lwt key_opt = find_index_key_in_txn tx name in
+  let%lwt () =
+    match key_opt with
+    | None -> Lwt.return_unit
+    | Some key -> S.del tx sys_indexes_tid key
+  in
+  (* Update in-memory cache. *)
+  Hashtbl.remove t.indexes name;
+  Lwt.return_unit
+
+let drop_table t tx ~name =
+  (* 1. Remove table entry from _sys_tables. *)
+  let%lwt () = S.del tx sys_tables_tid (Bytes.of_string name) in
+  (* 2. Remove all column entries from _sys_columns. *)
+  let n_cols =
+    match Hashtbl.find_opt t.cache name with
+    | None -> 0
+    | Some m -> List.length m.columns
+  in
+  let%lwt () = Lwt_list.iter_s (fun i ->
+    S.del tx sys_columns_tid (column_key name i)
+  ) (List.init n_cols (fun i -> i)) in
+  (* 3. Remove all associated indexes. *)
+  let idx_list = indexes_for_table t ~table:name in
+  let%lwt () = Lwt_list.iter_s (fun (idx : index_info) ->
+    drop_index t tx ~name:idx.idx_name
+  ) idx_list in
+  (* 4. Update in-memory cache. *)
+  Hashtbl.remove t.cache name;
+  Lwt.return_unit

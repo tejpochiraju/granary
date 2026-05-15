@@ -310,3 +310,11 @@ let plan ?cat = function
       where   = Option.map plan_expr where;
       indexes;
     }
+  | Sema.BS_drop_table { table_meta; _ } ->
+    let indexes = match cat with
+      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
+      | None   -> []
+    in
+    Plan.Op_drop_table { table_meta; indexes }
+  | Sema.BS_drop_index { idx_info; _ } ->
+    Plan.Op_drop_index { idx_info }

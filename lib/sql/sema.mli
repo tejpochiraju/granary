@@ -95,6 +95,14 @@ type bound_stmt =
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       where      : bound_expr option;
     }
+  | BS_drop_table of {
+      name       : string;
+      table_meta : Sqlocaml_catalog.Catalog.table_meta;
+    }
+  | BS_drop_index of {
+      name     : string;
+      idx_info : Sqlocaml_catalog.Catalog.index_info;
+    }
 
 type error =
   | Unknown_table       of string
@@ -107,6 +115,7 @@ type error =
   | Invalid_limit       of string
   | Unsupported         of string
   | Not_null_violation  of string   (* column name *)
+  | Unknown_index       of string   (* index name *)
 
 val bind :
   Sqlocaml_catalog.Catalog.t ->

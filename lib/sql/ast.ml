@@ -101,3 +101,9 @@ type stmt =
       table : string;
       where : expr option;
     }
+  | S_drop_table of {
+      name : string;
+    }
+  | S_drop_index of {
+      name : string;
+    }

@@ -73,6 +73,14 @@ type bound_stmt =
       table_meta : Cat.table_meta;
       where      : bound_expr option;
     }
+  | BS_drop_table of {
+      name       : string;
+      table_meta : Cat.table_meta;
+    }
+  | BS_drop_index of {
+      name     : string;
+      idx_info : Cat.index_info;
+    }
 
 type error =
   | Unknown_table       of string
@@ -84,6 +92,7 @@ type error =
   | Invalid_limit       of string
   | Unsupported         of string
   | Not_null_violation  of string   (* column name *)
+  | Unknown_index       of string   (* index name *)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -928,6 +937,27 @@ let bind_delete cat ~table ~where =
        })))
 
 (* ------------------------------------------------------------------ *)
+(* DROP TABLE                                                           *)
+(* ------------------------------------------------------------------ *)
+
+let bind_drop_table cat ~name =
+  let* meta_opt = Cat.find_table cat ~name in
+  match meta_opt with
+  | None -> Lwt.return (Error (Unknown_table name))
+  | Some table_meta ->
+    Lwt.return (Ok (BS_drop_table { name; table_meta }))
+
+(* ------------------------------------------------------------------ *)
+(* DROP INDEX                                                           *)
+(* ------------------------------------------------------------------ *)
+
+let bind_drop_index cat ~name =
+  match Cat.find_index cat ~name with
+  | None -> Lwt.return (Error (Unknown_index name))
+  | Some idx_info ->
+    Lwt.return (Ok (BS_drop_index { name; idx_info }))
+
+(* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -942,3 +972,7 @@ let bind cat = function
     bind_update cat ~table ~assignments ~where
   | Ast.S_delete { table; where } ->
     bind_delete cat ~table ~where
+  | Ast.S_drop_table { name } ->
+    bind_drop_table cat ~name
+  | Ast.S_drop_index { name } ->
+    bind_drop_index cat ~name

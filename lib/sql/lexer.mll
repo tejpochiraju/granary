@@ -41,6 +41,7 @@ rule token = parse
   | "SET"      { SET }
   | "DEFAULT"  { DEFAULT }
   | "DELETE"   { DELETE }
+  | "DROP"     { DROP }
   | "JOIN"     { JOIN }
   | "INNER"    { INNER }
   | "LEFT"     { LEFT }

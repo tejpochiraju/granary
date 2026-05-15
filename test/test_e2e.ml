@@ -1045,6 +1045,119 @@ let qcheck_default_applied =
                | _ -> Lwt.return false))
 
 (* ------------------------------------------------------------------ *)
+(* Group 17: DROP TABLE and DROP INDEX (Task 7)                         *)
+(* ------------------------------------------------------------------ *)
+
+(** Helper: expect a Sema(Unknown_table) error. *)
+let expect_unknown_table label result =
+  match err_or_fail label result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
+  | _ -> Alcotest.failf "%s: expected Sema(Unknown_table)" label
+
+(** Helper: expect a Sema(Unknown_index) error. *)
+let expect_unknown_index label result =
+  match err_or_fail label result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_index _) -> ()
+  | _ -> Alcotest.failf "%s: expected Sema(Unknown_index)" label
+
+(** DROP TABLE then SELECT returns Unknown_table. *)
+let drop_table_then_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  exec db "DROP TABLE t";
+  let result = run (Db.query db "SELECT * FROM t") in
+  expect_unknown_table "drop_table_then_select" result
+
+(** DROP TABLE on a non-existent table → Unknown_table. *)
+let drop_table_nonexistent () =
+  let db = fresh_db () in
+  let result = run (Db.execute db "DROP TABLE ghost") in
+  expect_unknown_table "drop_table_nonexistent" result
+
+(** DROP TABLE removes all rows — old data not visible after recreate. *)
+let drop_table_data_gone () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (42)";
+  exec db "DROP TABLE t";
+  exec db "CREATE TABLE t (n INTEGER)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "no old rows after DROP+CREATE" 0 (List.length rows)
+
+(** DROP TABLE with associated index — indexes gone from catalog; subsequent
+    SELECT on recreated table works (no crash). *)
+let drop_table_with_index () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "CREATE INDEX idx ON t (id)";
+  exec db "DROP TABLE t";
+  (* Table is gone — index must be gone too *)
+  let result = run (Db.query db "SELECT * FROM t") in
+  expect_unknown_table "drop_table_with_index: table gone" result;
+  (* DROP INDEX on a now-deleted index should return Unknown_index *)
+  let result2 = run (Db.execute db "DROP INDEX idx") in
+  expect_unknown_index "drop_table_with_index: index gone" result2
+
+(** DROP TABLE then re-CREATE with same name succeeds and is empty. *)
+let drop_table_then_recreate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t (x) VALUES (100)";
+  exec db "DROP TABLE t";
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t (x) VALUES (200)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row in recreated table" 1 (List.length rows);
+  Alcotest.check value_testable "new row value" (Db.V_int 200L) (List.hd rows).(0)
+
+(** DROP INDEX then SELECT falls back to seq scan (no crash). *)
+let drop_index_then_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  exec db "CREATE INDEX idx ON t (id)";
+  exec db "DROP INDEX idx";
+  (* Query still returns correct rows via seq scan *)
+  let rows = query_ok db "SELECT name FROM t WHERE id = 2" in
+  Alcotest.(check int) "1 row via seq scan after DROP INDEX" 1 (List.length rows);
+  Alcotest.check value_testable "name=bob" (Db.V_text "bob") (List.hd rows).(0)
+
+(** DROP INDEX on non-existent index → Unknown_index. *)
+let drop_index_nonexistent () =
+  let db = fresh_db () in
+  let result = run (Db.execute db "DROP INDEX no_such_idx") in
+  expect_unknown_index "drop_index_nonexistent" result
+
+(** DROP INDEX then re-CREATE with same name succeeds. *)
+let drop_index_then_recreate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t (id) VALUES (1)";
+  exec db "CREATE INDEX idx ON t (id)";
+  exec db "DROP INDEX idx";
+  exec db "CREATE INDEX idx ON t (id)";
+  let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
+  Alcotest.(check int) "1 row via recreated index" 1 (List.length rows)
+
+(** After DROP TABLE and re-CREATE, only new rows are visible. *)
+let drop_table_recreate_old_data_invisible () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val TEXT)";
+  exec db "INSERT INTO t (id, val) VALUES (1, 'old1')";
+  exec db "INSERT INTO t (id, val) VALUES (2, 'old2')";
+  exec db "DROP TABLE t";
+  exec db "CREATE TABLE t (id INTEGER, val TEXT)";
+  exec db "INSERT INTO t (id, val) VALUES (10, 'new10')";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "only 1 new row visible" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "id=10"     (Db.V_int 10L)     row.(0);
+  Alcotest.check value_testable "val=new10" (Db.V_text "new10") row.(1)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1161,4 +1274,15 @@ let () =
         qcheck_default_applied;
       ]
     );
+    "drop_table_and_index", [
+      Alcotest.test_case "drop_table_then_select"             `Quick drop_table_then_select;
+      Alcotest.test_case "drop_table_nonexistent"             `Quick drop_table_nonexistent;
+      Alcotest.test_case "drop_table_data_gone"               `Quick drop_table_data_gone;
+      Alcotest.test_case "drop_table_with_index"              `Quick drop_table_with_index;
+      Alcotest.test_case "drop_table_then_recreate"           `Quick drop_table_then_recreate;
+      Alcotest.test_case "drop_index_then_select"             `Quick drop_index_then_select;
+      Alcotest.test_case "drop_index_nonexistent"             `Quick drop_index_nonexistent;
+      Alcotest.test_case "drop_index_then_recreate"           `Quick drop_index_then_recreate;
+      Alcotest.test_case "drop_table_recreate_old_data_invis" `Quick drop_table_recreate_old_data_invisible;
+    ];
   ]

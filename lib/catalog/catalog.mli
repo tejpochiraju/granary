@@ -65,3 +65,20 @@ val indexes_for_table : t -> table:string -> index_info list
 
 (** Look up an index by name. *)
 val find_index : t -> name:string -> index_info option
+
+(** Remove a table and all its indexes from the catalog.
+    Removes entries from _sys_tables, _sys_columns, and _sys_indexes.
+    The B+-tree pages for the table and its indexes are NOT reclaimed (Phase 3). *)
+val drop_table :
+  t ->
+  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+  name:string ->
+  unit Lwt.t
+
+(** Remove an index from _sys_indexes.
+    The B+-tree pages are NOT reclaimed (Phase 3). *)
+val drop_index :
+  t ->
+  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+  name:string ->
+  unit Lwt.t

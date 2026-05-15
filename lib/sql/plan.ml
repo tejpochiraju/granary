@@ -75,6 +75,13 @@ type op =
       where      : expr option;
       indexes    : Cat.index_info list;
     }
+  | Op_drop_table of {
+      table_meta : Cat.table_meta;
+      indexes    : Cat.index_info list;
+    }
+  | Op_drop_index of {
+      idx_info : Cat.index_info;
+    }
   | Op_nested_loop_join of {
       left             : op;                  (** left input (any op stream) *)
       right_meta       : Cat.table_meta;      (** right table for row decode *)

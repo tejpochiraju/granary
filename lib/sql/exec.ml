@@ -431,6 +431,23 @@ let execute_delete (store : S.t)
     Lwt.return n
   end
 
+(** Run [Op_drop_table]: remove catalog entries for the table and all
+    its indexes.  The B+-tree pages are NOT reclaimed in Phase 2. *)
+let execute_drop_table (store : S.t) (cat : Cat.t)
+    ~(table_meta : Cat.table_meta)
+    ~(_indexes : Cat.index_info list) : unit Lwt.t =
+  let* tx = S.rw_begin store in
+  let* () = Cat.drop_table cat tx ~name:table_meta.Cat.name in
+  S.commit tx
+
+(** Run [Op_drop_index]: remove catalog entry for the index.
+    The B+-tree pages are NOT reclaimed in Phase 2. *)
+let execute_drop_index (store : S.t) (cat : Cat.t)
+    ~(idx_info : Cat.index_info) : unit Lwt.t =
+  let* tx = S.rw_begin store in
+  let* () = Cat.drop_index cat tx ~name:idx_info.Cat.idx_name in
+  S.commit tx
+
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
@@ -451,6 +468,12 @@ let execute_with_count (store : S.t) (cat : Cat.t) (op : Plan.op)
     execute_update store ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes } ->
     execute_delete store ~table_meta ~where ~indexes
+  | Plan.Op_drop_table { table_meta; indexes } ->
+    let* () = execute_drop_table store cat ~table_meta ~_indexes:indexes in
+    Lwt.return 0
+  | Plan.Op_drop_index { idx_info } ->
+    let* () = execute_drop_index store cat ~idx_info in
+    Lwt.return 0
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _ ->
@@ -834,7 +857,8 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     in
     Lwt.return (Lwt_stream.of_list final_rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
-  | Plan.Op_update _ | Plan.Op_delete _ ->
+  | Plan.Op_update _ | Plan.Op_delete _
+  | Plan.Op_drop_table _ | Plan.Op_drop_index _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 
 (* ------------------------------------------------------------------ *)
