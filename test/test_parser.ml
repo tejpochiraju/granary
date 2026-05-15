@@ -99,14 +99,12 @@ let insert_multiple_rows_not_supported () =
     Alcotest.fail "expected syntax error for multi-row insert"
   with Parser.Error | Failure _ -> ()
 
-let insert_syntax_error () =
-  (* INSERT without column list — grammar requires column names in Phase 0 *)
+let insert_no_col_list () =
+  (* Phase 0 grammar requires an explicit column list; no-column-list INSERT is a syntax error *)
   try
     ignore (parse "INSERT INTO t VALUES (1);");
-    (* If it accepts, columns=[] is fine per spec *)
-    ()
+    Alcotest.fail "expected Parser.Error for INSERT without column list"
   with Parser.Error | Failure _ -> ()
-  (* Either outcome is acceptable — just no crash *)
 
 (* ------------------------------------------------------------------ *)
 (* Group 3: SELECT                                                      *)
@@ -181,7 +179,7 @@ let () =
       Alcotest.test_case "negative-int"       `Quick insert_negative_int;
       Alcotest.test_case "empty-string"       `Quick insert_empty_string;
       Alcotest.test_case "multi-row-error"    `Quick insert_multiple_rows_not_supported;
-      Alcotest.test_case "syntax-error"       `Quick insert_syntax_error;
+      Alcotest.test_case "no-col-list"        `Quick insert_no_col_list;
     ];
     "select", [
       Alcotest.test_case "star"               `Quick select_star;
