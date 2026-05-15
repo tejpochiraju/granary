@@ -56,16 +56,16 @@ some may be reconsidered in v2+.
 
 ### In v1
 - [x] `CREATE TABLE` with INTEGER / REAL / TEXT / BLOB / NULL types
-- [ ] Column constraints: NOT NULL, PRIMARY KEY (single + composite),
+- [x] Column constraints: NOT NULL, PRIMARY KEY (single + composite),
       UNIQUE (single col), DEFAULT (literal values)
-- [ ] `DROP TABLE`, `DROP INDEX`
+- [x] `DROP TABLE`, `DROP INDEX`
 - [x] `CREATE INDEX` (single col)
 - [x] `INSERT` with `WHERE`
-- [ ] `UPDATE`, `DELETE` with `WHERE`
+- [x] `UPDATE`, `DELETE` with `WHERE`
 - [x] `SELECT` with `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`
-- [ ] `GROUP BY`, `HAVING`
-- [ ] Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- [ ] Joins: `INNER JOIN`, `LEFT JOIN` (nested-loop + hash join physical
+- [x] `GROUP BY`, `HAVING`
+- [x] Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- [x] Joins: `INNER JOIN`, `LEFT JOIN` (nested-loop + hash join physical
       operators)
 - [ ] `BEGIN`, `COMMIT`, `ROLLBACK`
 - [ ] Prepared statements with `?` parameters
@@ -225,7 +225,7 @@ stretch them.
       INSERT, simple SELECT. End-to-end demo.
 - [x] **Phase 1 — disk storage (~6-8 wks):** Unix_file backend (CoW B+-tree);
       ORDER BY, LIMIT, single-col indexes.
-- [ ] **Phase 2 — query depth (~8-10 wks):** UPDATE, DELETE, joins,
+- [x] **Phase 2 — query depth (~8-10 wks):** UPDATE, DELETE, joins,
       GROUP BY, aggregates.
 - [ ] **Phase 3 — transactions (~6 wks):** RO snapshots, RW txn,
       BEGIN/COMMIT/ROLLBACK, MVCC correctness.

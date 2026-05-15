@@ -535,6 +535,527 @@ let error_arity_fields () =
   | _ -> Alcotest.fail "wrong variant"
 
 (* ------------------------------------------------------------------ *)
+(* Group 5: UPDATE binding                                              *)
+(* ------------------------------------------------------------------ *)
+
+let bind_update_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "carol"))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update { assignments = [(1, _)]; where = None; _ }) -> ()
+  | Ok _ -> Alcotest.fail "unexpected BS_update shape"
+  | Error _ -> Alcotest.fail "unexpected error"
+
+let bind_update_unknown_table () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "ghost"; assignments = [("x", Ast.E_lit (Ast.L_int 1L))]; where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost"
+
+let bind_update_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users"; assignments = [("bogus", Ast.E_lit (Ast.L_int 1L))]; where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus"
+
+let bind_update_type_mismatch () =
+  let cat = two_col_cat () in
+  (* SET id (INTEGER) = 'text' *)
+  let stmt = Ast.S_update {
+    table = "users"; assignments = [("id", Ast.E_lit (Ast.L_text "bad"))]; where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
+  | _ -> Alcotest.fail "expected Type_mismatch Integer/Text"
+
+let bind_update_not_null_violation () =
+  let cat = make_catalog [
+    { Row.name = "id"; ty = Row.Integer; not_null = true; primary_key = false; default = None };
+    { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None };
+  ] in
+  (* SET id = NULL on a NOT NULL column *)
+  let stmt = Ast.S_update {
+    table = "users"; assignments = [("id", Ast.E_lit Ast.L_null)]; where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Not_null_violation "id") -> ()
+  | _ -> Alcotest.fail "expected Not_null_violation for id"
+
+let bind_update_with_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update { where = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_update with where"
+
+let bind_update_where_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = Some (Ast.E_col "bogus");
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column for where"
+
+(* ------------------------------------------------------------------ *)
+(* Group 6: DELETE binding                                              *)
+(* ------------------------------------------------------------------ *)
+
+let bind_delete_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete { table = "users"; where = None } in
+  match bind cat stmt with
+  | Ok (Sema.BS_delete { where = None; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_delete with no where"
+
+let bind_delete_with_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete {
+    table = "users";
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_delete { where = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_delete with where"
+
+let bind_delete_unknown_table () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete { table = "ghost"; where = None } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost"
+
+let bind_delete_where_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete {
+    table = "users";
+    where = Some (Ast.E_col "bogus");
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus"
+
+(* ------------------------------------------------------------------ *)
+(* Group 7: DROP TABLE / DROP INDEX binding                             *)
+(* ------------------------------------------------------------------ *)
+
+let bind_drop_table_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_drop_table { name = "users" } in
+  match bind cat stmt with
+  | Ok (Sema.BS_drop_table { name; _ }) ->
+    Alcotest.(check string) "name" "users" name
+  | _ -> Alcotest.fail "expected BS_drop_table"
+
+let bind_drop_table_unknown () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_drop_table { name = "ghost" } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost"
+
+let bind_drop_index_basic () =
+  let cat = two_col_cat () in
+  let _ = Lwt_main.run (
+    Sqlocaml_catalog.Catalog.create_index cat ~name:"idx" ~table:"users"
+      ~column:"id" ~unique:false
+  ) in
+  let stmt = Ast.S_drop_index { name = "idx" } in
+  match bind cat stmt with
+  | Ok (Sema.BS_drop_index { name; _ }) ->
+    Alcotest.(check string) "index name" "idx" name
+  | _ -> Alcotest.fail "expected BS_drop_index"
+
+let bind_drop_index_unknown () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_drop_index { name = "no_such_idx" } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_index "no_such_idx") -> ()
+  | _ -> Alcotest.fail "expected Unknown_index"
+
+(* ------------------------------------------------------------------ *)
+(* Group 8: JOIN / bind_expr_join resolution                            *)
+(* ------------------------------------------------------------------ *)
+
+let make_join_cat () =
+  Lwt_main.run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"users" ~columns:[
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    ] in
+    let* _ = C.create_table cat ~name:"orders" ~columns:[
+      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    ] in
+    Lwt.return cat
+  )
+
+let bind_select_join_unknown_table () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "ghost"; alias = None;
+                on = Ast.E_lit (Ast.L_int 1L) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost for join"
+
+let bind_select_join_ambiguous_col () =
+  (* Both tables have a column named 'uid' to trigger Ambiguous_column. *)
+  let cat = Lwt_main.run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"a" ~columns:[
+      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    ] in
+    let* _ = C.create_table cat ~name:"b" ~columns:[
+      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    ] in
+    Lwt.return cat
+  ) in
+  let stmt = Ast.S_select {
+    proj = `Cols ["uid"]; table = "a";
+    joins = [ { Ast.kind = Ast.Inner; table = "b"; alias = None;
+                on = Ast.E_lit (Ast.L_int 1L) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Ambiguous_column "uid") -> ()
+  | _ -> Alcotest.fail "expected Ambiguous_column uid"
+
+let bind_select_join_unknown_proj_col () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `Cols ["bogus"]; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_lit (Ast.L_int 1L) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in join proj"
+
+let bind_select_join_qualified_col_ok () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_tbl_col ("orders", "uid")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok BS_select with join"
+
+let bind_select_join_qualified_unknown_table () =
+  (* E_tbl_col with a table name that matches neither left nor right *)
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_tbl_col ("ghost", "id") } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost in ON expr"
+
+let bind_select_join_unknown_col_unqual () =
+  (* An unqualified column name that doesn't exist in either table. *)
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_col "bogus" } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in ON"
+
+let bind_select_join_agg_in_on_rejected () =
+  (* E_agg in ON clause is an error. *)
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_agg (Ast.Agg_count, None) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for agg in ON"
+
+let bind_select_join_qualified_col_unknown_col () =
+  (* E_tbl_col ("users", "bogus") — table name matches but column doesn't. *)
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_tbl_col ("orders", "bogus") } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { table = "orders"; column = "bogus" }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus for orders in ON"
+
+let bind_select_join_where_unknown_col () =
+  (* WHERE references a column that exists in neither table in a JOIN query *)
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("users","id"),
+                  Ast.E_tbl_col ("orders","uid")) } ];
+    where = Some (Ast.E_col "bogus");
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in join WHERE"
+
+(* ------------------------------------------------------------------ *)
+(* Group 9: Aggregate / GROUP BY / HAVING binding                       *)
+(* ------------------------------------------------------------------ *)
+
+let bind_select_count_star () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { aggs = [{ func = Ast.Agg_count; col_ord = None }]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select with COUNT(*) agg"
+
+let bind_select_sum_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "id"))];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { aggs = [{ func = Ast.Agg_sum; col_ord = Some 0 }]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select with SUM(id)"
+
+let bind_select_sum_text_col_rejected () =
+  (* SUM on a TEXT column must be rejected as Type_mismatch. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "name"))];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Type_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Type_mismatch for SUM(name)"
+
+let bind_select_avg_text_col_rejected () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_avg, Some (Ast.E_col "name"))];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Type_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Type_mismatch for AVG(name)"
+
+let bind_select_group_by_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { group_by = Some 0; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select GROUP BY id"
+
+let bind_select_group_by_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["bogus"]; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in GROUP BY"
+
+let bind_select_group_by_multi_rejected () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"; "name"]; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for multi-col GROUP BY"
+
+let bind_select_having_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_binop (Ast.Gt,
+      Ast.E_agg (Ast.Agg_count, None), Ast.E_lit (Ast.L_int 0L)));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select with HAVING"
+
+let bind_select_having_no_group_by_rejected () =
+  (* HAVING without GROUP BY and without aggregates in projection → Unsupported *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Cols ["id"];
+    table = "users"; joins = [];
+    where = None; group_by = [];
+    having = Some (Ast.E_binop (Ast.Gt, Ast.E_col "id", Ast.E_lit (Ast.L_int 0L)));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for HAVING without GROUP BY"
+
+let bind_select_agg_star_non_count_rejected () =
+  (* COUNT-star is OK but SUM-star is not. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_sum, None)];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for SUM(*)"
+
+let bind_select_agg_complex_arg_rejected () =
+  (* Aggregate argument must be a column reference, not e.g. a binop. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_sum,
+      Some (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L))))];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for complex agg arg"
+
+let bind_select_col_not_in_group_by_rejected () =
+  (* A bare column reference in aggregated SELECT must be the GROUP BY col. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "name"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported: name not in GROUP BY"
+
+let bind_select_agg_star_in_select_rejected () =
+  (* SELECT * with aggregates is not allowed. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `All;
+    table = "users"; joins = [];
+    where = None; group_by = [];
+    having = Some (Ast.E_agg (Ast.Agg_count, None));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for SELECT * with aggregates"
+
+let bind_select_agg_unknown_col_arg () =
+  (* SUM(bogus) — column doesn't exist. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "bogus"))];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in SUM arg"
+
+let bind_select_agg_in_where_rejected () =
+  (* Aggregate in WHERE clause should be Unsupported. *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Cols ["id"];
+    table = "users"; joins = [];
+    where = Some (Ast.E_agg (Ast.Agg_count, None));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for agg in WHERE"
+
+let bind_select_more_than_one_join_rejected () =
+  let cat = make_join_cat () in
+  let join_clause tbl = { Ast.kind = Ast.Inner; table = tbl; alias = None;
+                          on = Ast.E_lit (Ast.L_int 1L) } in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ join_clause "orders"; join_clause "orders" ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for 2+ JOINs"
+
+(* ------------------------------------------------------------------ *)
+(* Group 10: NOT NULL violation in INSERT                               *)
+(* ------------------------------------------------------------------ *)
+
+let bind_insert_not_null_violation () =
+  let cat = make_catalog [
+    { Row.name = "id";   ty = Row.Integer; not_null = true;  primary_key = false; default = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+  ] in
+  (* Omit the NOT NULL column entirely; it fills with NULL → violation. *)
+  let stmt = Ast.S_insert {
+    table = "users";
+    columns = ["name"];
+    values = [Ast.L_text "alice"];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Not_null_violation "id") -> ()
+  | _ -> Alcotest.fail "expected Not_null_violation for id"
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -556,6 +1077,7 @@ let () =
       Alcotest.test_case "bind_insert_type_mismatch_text_col" `Quick bind_insert_type_mismatch_text_col;
       Alcotest.test_case "bind_insert_null_allowed"        `Quick bind_insert_null_allowed;
       Alcotest.test_case "bind_insert_second_col_unknown"  `Quick bind_insert_second_col_unknown;
+      Alcotest.test_case "bind_insert_not_null_violation"  `Quick bind_insert_not_null_violation;
     ];
     "select", [
       Alcotest.test_case "bind_select_star"              `Quick bind_select_star;
@@ -582,6 +1104,56 @@ let () =
       Alcotest.test_case "bind_create_index_unknown_table"  `Quick bind_create_index_unknown_table;
       Alcotest.test_case "bind_create_index_unknown_column" `Quick bind_create_index_unknown_column;
       Alcotest.test_case "bind_create_index_duplicate"      `Quick bind_create_index_duplicate;
+    ];
+    "update", [
+      Alcotest.test_case "bind_update_basic"              `Quick bind_update_basic;
+      Alcotest.test_case "bind_update_unknown_table"      `Quick bind_update_unknown_table;
+      Alcotest.test_case "bind_update_unknown_col"        `Quick bind_update_unknown_col;
+      Alcotest.test_case "bind_update_type_mismatch"      `Quick bind_update_type_mismatch;
+      Alcotest.test_case "bind_update_not_null_violation" `Quick bind_update_not_null_violation;
+      Alcotest.test_case "bind_update_with_where"         `Quick bind_update_with_where;
+      Alcotest.test_case "bind_update_where_unknown_col"  `Quick bind_update_where_unknown_col;
+    ];
+    "delete", [
+      Alcotest.test_case "bind_delete_basic"              `Quick bind_delete_basic;
+      Alcotest.test_case "bind_delete_with_where"         `Quick bind_delete_with_where;
+      Alcotest.test_case "bind_delete_unknown_table"      `Quick bind_delete_unknown_table;
+      Alcotest.test_case "bind_delete_where_unknown_col"  `Quick bind_delete_where_unknown_col;
+    ];
+    "drop", [
+      Alcotest.test_case "bind_drop_table_basic"   `Quick bind_drop_table_basic;
+      Alcotest.test_case "bind_drop_table_unknown" `Quick bind_drop_table_unknown;
+      Alcotest.test_case "bind_drop_index_basic"   `Quick bind_drop_index_basic;
+      Alcotest.test_case "bind_drop_index_unknown" `Quick bind_drop_index_unknown;
+    ];
+    "join", [
+      Alcotest.test_case "bind_select_join_unknown_table"       `Quick bind_select_join_unknown_table;
+      Alcotest.test_case "bind_select_join_ambiguous_col"       `Quick bind_select_join_ambiguous_col;
+      Alcotest.test_case "bind_select_join_unknown_proj_col"    `Quick bind_select_join_unknown_proj_col;
+      Alcotest.test_case "bind_select_join_qualified_col_ok"    `Quick bind_select_join_qualified_col_ok;
+      Alcotest.test_case "bind_select_join_qualified_unknown_table" `Quick bind_select_join_qualified_unknown_table;
+      Alcotest.test_case "bind_select_join_unknown_col_unqual"  `Quick bind_select_join_unknown_col_unqual;
+      Alcotest.test_case "bind_select_join_agg_in_on_rejected"  `Quick bind_select_join_agg_in_on_rejected;
+      Alcotest.test_case "bind_select_join_qualified_col_unknown_col" `Quick bind_select_join_qualified_col_unknown_col;
+      Alcotest.test_case "bind_select_join_where_unknown_col"   `Quick bind_select_join_where_unknown_col;
+      Alcotest.test_case "bind_select_more_than_one_join"       `Quick bind_select_more_than_one_join_rejected;
+    ];
+    "aggregate", [
+      Alcotest.test_case "bind_select_count_star"                  `Quick bind_select_count_star;
+      Alcotest.test_case "bind_select_sum_col"                     `Quick bind_select_sum_col;
+      Alcotest.test_case "bind_select_sum_text_col_rejected"       `Quick bind_select_sum_text_col_rejected;
+      Alcotest.test_case "bind_select_avg_text_col_rejected"       `Quick bind_select_avg_text_col_rejected;
+      Alcotest.test_case "bind_select_group_by_basic"              `Quick bind_select_group_by_basic;
+      Alcotest.test_case "bind_select_group_by_unknown_col"        `Quick bind_select_group_by_unknown_col;
+      Alcotest.test_case "bind_select_group_by_multi_rejected"     `Quick bind_select_group_by_multi_rejected;
+      Alcotest.test_case "bind_select_having_basic"                `Quick bind_select_having_basic;
+      Alcotest.test_case "bind_select_having_no_group_by_rejected" `Quick bind_select_having_no_group_by_rejected;
+      Alcotest.test_case "bind_select_agg_star_non_count_rejected" `Quick bind_select_agg_star_non_count_rejected;
+      Alcotest.test_case "bind_select_agg_complex_arg_rejected"    `Quick bind_select_agg_complex_arg_rejected;
+      Alcotest.test_case "bind_select_col_not_in_group_by_rejected" `Quick bind_select_col_not_in_group_by_rejected;
+      Alcotest.test_case "bind_select_agg_star_in_select_rejected" `Quick bind_select_agg_star_in_select_rejected;
+      Alcotest.test_case "bind_select_agg_unknown_col_arg"         `Quick bind_select_agg_unknown_col_arg;
+      Alcotest.test_case "bind_select_agg_in_where_rejected"       `Quick bind_select_agg_in_where_rejected;
     ];
     "error-values", [
       Alcotest.test_case "error_already_exists_message" `Quick error_already_exists_message;

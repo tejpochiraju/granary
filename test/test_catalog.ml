@@ -602,6 +602,150 @@ let test_find_index () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 7: drop_table and drop_index                                  *)
+(* ------------------------------------------------------------------ *)
+
+let test_drop_table_basic () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* tx = S.rw_begin store in
+    let* () = C.drop_table cat tx ~name:"t" in
+    let* () = S.commit tx in
+    (* Table should be gone from in-memory cache *)
+    let* result = C.find_table cat ~name:"t" in
+    Alcotest.(check bool) "table gone after drop" true (Option.is_none result);
+    Lwt.return_unit
+  )
+
+let test_drop_table_removes_from_disk () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* tx = S.rw_begin store in
+    let* () = C.drop_table cat1 tx ~name:"t" in
+    let* () = S.commit tx in
+    (* Re-open catalog from same store — table must not appear. *)
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    Alcotest.(check bool) "table gone from disk after drop" true (Option.is_none result);
+    Lwt.return_unit
+  )
+
+let test_drop_table_also_drops_indexes () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"; txt_col "name"] in
+    let* _ = C.create_index cat ~name:"idx_id" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx_name" ~table:"t" ~column:"name" ~unique:false in
+    (* Verify indexes exist before drop *)
+    Alcotest.(check int) "2 indexes before drop" 2
+      (List.length (C.indexes_for_table cat ~table:"t"));
+    let* tx = S.rw_begin store in
+    let* () = C.drop_table cat tx ~name:"t" in
+    let* () = S.commit tx in
+    (* Indexes should be gone *)
+    Alcotest.(check int) "0 indexes after table drop" 0
+      (List.length (C.indexes_for_table cat ~table:"t"));
+    Alcotest.(check bool) "idx_id gone" true (Option.is_none (C.find_index cat ~name:"idx_id"));
+    Alcotest.(check bool) "idx_name gone" true (Option.is_none (C.find_index cat ~name:"idx_name"));
+    Lwt.return_unit
+  )
+
+let test_drop_table_nonexistent_graceful () =
+  (* drop_table on a table not in cache: n_cols=0, so column-del loop is a no-op.
+     This exercises the None branch in Hashtbl.find_opt t.cache. *)
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* tx = S.rw_begin store in
+    (* Use a name that was never created — catalog just does nothing for columns *)
+    let* () = C.drop_table cat tx ~name:"phantom" in
+    S.commit tx
+  )
+
+let test_drop_index_basic () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* tx = S.rw_begin store in
+    let* () = C.drop_index cat tx ~name:"idx" in
+    let* () = S.commit tx in
+    Alcotest.(check bool) "index gone from cache" true
+      (Option.is_none (C.find_index cat ~name:"idx"));
+    Lwt.return_unit
+  )
+
+let test_drop_index_persists () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* tx = S.rw_begin store in
+    let* () = C.drop_index cat1 tx ~name:"idx" in
+    let* () = S.commit tx in
+    (* Re-open and verify gone from disk *)
+    let* cat2 = C.open_ store in
+    Alcotest.(check bool) "index gone from disk" true
+      (Option.is_none (C.find_index cat2 ~name:"idx"));
+    Lwt.return_unit
+  )
+
+let test_drop_index_empty_sys_indexes () =
+  (* drop_index when _sys_indexes tree is empty (key_opt = None).
+     Create an index, create a fresh catalog (which loads the index),
+     then manually clear _sys_indexes and call drop_index — exercises
+     the None arm of find_index_key_in_txn. *)
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    (* Delete all entries from sys_indexes_tid (tree_id=2) directly. *)
+    let sys_indexes_tid = 2 in
+    let* tx_ro = S.ro_begin store in
+    let* cur = S.cursor_open tx_ro sys_indexes_tid in
+    let _sr = S.cursor_first cur in
+    let keys = ref [] in
+    let rec collect () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, _) -> keys := k :: !keys; collect ()
+    in
+    collect ();
+    S.cursor_close cur;
+    let* () = S.ro_end tx_ro in
+    let* tx_rw = S.rw_begin store in
+    let* () = Lwt_list.iter_s (fun k -> S.del tx_rw sys_indexes_tid k) !keys in
+    let* () = S.commit tx_rw in
+    (* Open a fresh catalog — it will load no indexes from disk,
+       but we add one to the in-memory table via a separate create. *)
+    let* cat2 = C.open_ store in
+    (* The index "idx" is now only in cat1's cache, not on disk.
+       Call drop_index on cat2 which has idx in cache but not on disk.
+       (We put it back in cat2's cache via create_index but on the
+       already-cleared tree, so find_index_key_in_txn returns None.) *)
+    (* Simpler: create another index on cat2 without wiping disk this time,
+       then drop it — the standard path. Just verify drop on non-disk entry
+       for cat1 after the disk clear. *)
+    let* tx = S.rw_begin store in
+    (* drop_index on cat1 with name "idx": find_index_key_in_txn scans empty
+       _sys_indexes, returns None. The cache entry is still removed. *)
+    let* () = C.drop_index cat1 tx ~name:"idx" in
+    let* () = S.commit tx in
+    Alcotest.(check bool) "idx gone from cat1 cache after disk-empty drop"
+      true (Option.is_none (C.find_index cat1 ~name:"idx"));
+    ignore cat2;
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -653,5 +797,14 @@ let () =
       Alcotest.test_case "create_index_duplicate"       `Quick test_create_index_duplicate;
       Alcotest.test_case "index_persists_across_reopen" `Quick test_index_persists_across_reopen;
       Alcotest.test_case "find_index"                   `Quick test_find_index;
+    ];
+    "drop", [
+      Alcotest.test_case "drop_table_basic"                  `Quick test_drop_table_basic;
+      Alcotest.test_case "drop_table_removes_from_disk"      `Quick test_drop_table_removes_from_disk;
+      Alcotest.test_case "drop_table_also_drops_indexes"     `Quick test_drop_table_also_drops_indexes;
+      Alcotest.test_case "drop_table_nonexistent_graceful"   `Quick test_drop_table_nonexistent_graceful;
+      Alcotest.test_case "drop_index_basic"                  `Quick test_drop_index_basic;
+      Alcotest.test_case "drop_index_persists"               `Quick test_drop_index_persists;
+      Alcotest.test_case "drop_index_empty_sys_indexes"       `Quick test_drop_index_empty_sys_indexes;
     ];
   ]

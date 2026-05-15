@@ -1281,6 +1281,659 @@ let unique_index_first_insert_succeeds () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 11: Op_update (via execute_with_count)                         *)
+(* ------------------------------------------------------------------ *)
+
+let exec_update_no_match_returns_zero () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_update {
+           table_meta  = m;
+           assignments = [(1, Plan.P_lit (Ast.L_text "z"))];
+           where       = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
+           indexes     = [];
+         }) in
+    Alcotest.(check int) "no match → 0 rows affected" 0 n;
+    Lwt.return_unit
+  )
+
+let exec_update_match_returns_count () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_update {
+           table_meta  = m;
+           assignments = [(1, Plan.P_lit (Ast.L_text "updated"))];
+           where       = None;  (* update all *)
+           indexes     = [];
+         }) in
+    Alcotest.(check int) "all 2 rows affected" 2 n;
+    Lwt.return_unit
+  )
+
+let exec_update_raises_in_query () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_update {
+            table_meta = m;
+            assignments = [(1, Plan.P_lit (Ast.L_text "x"))];
+            where = None;
+            indexes = [];
+          }));
+       Alcotest.fail "expected Failure for Op_update in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 12: Op_delete (via execute_with_count)                         *)
+(* ------------------------------------------------------------------ *)
+
+let exec_delete_no_match_returns_zero () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_delete {
+           table_meta = m;
+           where = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
+           indexes = [];
+         }) in
+    Alcotest.(check int) "no match → 0 deleted" 0 n;
+    Lwt.return_unit
+  )
+
+let exec_delete_all_returns_count () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_delete { table_meta = m; where = None; indexes = [] }) in
+    Alcotest.(check int) "all 3 deleted" 3 n;
+    Lwt.return_unit
+  )
+
+let exec_delete_raises_in_query () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_delete { table_meta = m; where = None; indexes = [] }));
+       Alcotest.fail "expected Failure for Op_delete in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 13: Op_drop_table / Op_drop_index                              *)
+(* ------------------------------------------------------------------ *)
+
+let exec_drop_table_basic () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_drop_table { table_meta = m; indexes = [] }) in
+    let* result = Cat.find_table cat ~name:"t" in
+    Alcotest.(check bool) "table gone after drop" true (Option.is_none result);
+    Lwt.return_unit
+  )
+
+let exec_drop_table_returns_zero () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_drop_table { table_meta = m; indexes = [] }) in
+    Alcotest.(check int) "drop_table returns 0" 0 n;
+    Lwt.return_unit
+  )
+
+let exec_drop_table_raises_in_query () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_drop_table { table_meta = m; indexes = [] }));
+       Alcotest.fail "expected Failure for Op_drop_table in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let exec_drop_index_basic () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx"; table = "t";
+           tree_id = 16; col_idx = 0; unique = false;
+           columns = id_name_cols;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx" in
+    let idx = Option.get idx_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_drop_index { idx_info = idx }) in
+    Alcotest.(check bool) "index gone after drop"
+      true (Option.is_none (Cat.find_index cat ~name:"idx"));
+    Lwt.return_unit
+  )
+
+let exec_drop_index_returns_zero () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx2"; table = "t";
+           tree_id = 16; col_idx = 0; unique = false;
+           columns = id_name_cols;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx2" in
+    let idx = Option.get idx_opt in
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_drop_index { idx_info = idx }) in
+    Alcotest.(check int) "drop_index returns 0" 0 n;
+    Lwt.return_unit
+  )
+
+let exec_drop_index_raises_in_query () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx3"; table = "t";
+           tree_id = 16; col_idx = 0; unique = false;
+           columns = id_name_cols;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx3" in
+    let idx = Option.get idx_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_drop_index { idx_info = idx }));
+       Alcotest.fail "expected Failure for Op_drop_index in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 14: Op_hash_join and Op_nested_loop_join (direct plan tests)  *)
+(* ------------------------------------------------------------------ *)
+
+let query_hash_join_inner () =
+  let store, cat = setup () in
+  run (
+    (* Create two tables: users(id, name) and orders(uid, item) *)
+    let users_cols = [int_col "id"; txt_col "name"] in
+    let orders_cols = [int_col "uid"; txt_col "item"] in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "users"; columns = users_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "orders"; columns = orders_cols }) in
+    let* users_opt = Cat.find_table cat ~name:"users" in
+    let um = Option.get users_opt in
+    let* orders_opt = Cat.find_table cat ~name:"orders" in
+    let om = Option.get orders_opt in
+    insert store cat "users"  ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
+    insert store cat "users"  ([0; 1], [Ast.L_int 2L; Ast.L_text "bob"]);
+    insert store cat "orders" ([0; 1], [Ast.L_int 1L; Ast.L_text "book"]);
+    insert store cat "orders" ([0; 1], [Ast.L_int 2L; Ast.L_text "pen"]);
+    let n_left = List.length users_cols in
+    let n_right = List.length orders_cols in
+    (* Hash join: left.id (col 0) = right.uid (col 0 of right = offset 0) *)
+    let op = Plan.Op_project {
+      ordinals = [0; 1; 2; 3];
+      child = Plan.Op_hash_join {
+        left  = Plan.Op_seq_scan { table_meta = um };
+        right = Plan.Op_seq_scan { table_meta = om };
+        left_key  = 0;
+        right_key = 0;
+        join_kind = `Inner;
+        right_col_offset = n_left;
+        n_right_cols     = n_right;
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "2 rows from hash join" 2 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_hash_join_left () =
+  let store, cat = setup () in
+  run (
+    let users_cols = [int_col "id"; txt_col "name"] in
+    let orders_cols = [int_col "uid"; txt_col "item"] in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "users"; columns = users_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "orders"; columns = orders_cols }) in
+    let* users_opt = Cat.find_table cat ~name:"users" in
+    let um = Option.get users_opt in
+    let* orders_opt = Cat.find_table cat ~name:"orders" in
+    let om = Option.get orders_opt in
+    insert store cat "users"  ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
+    insert store cat "users"  ([0; 1], [Ast.L_int 2L; Ast.L_text "bob"]);
+    insert store cat "orders" ([0; 1], [Ast.L_int 1L; Ast.L_text "book"]);
+    (* bob has no matching order *)
+    let n_left = List.length users_cols in
+    let n_right = List.length orders_cols in
+    let op = Plan.Op_hash_join {
+      left  = Plan.Op_seq_scan { table_meta = um };
+      right = Plan.Op_seq_scan { table_meta = om };
+      left_key  = 0;
+      right_key = 0;
+      join_kind = `Left;
+      right_col_offset = n_left;
+      n_right_cols     = n_right;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "2 rows from left hash join" 2 (List.length rows);
+    (* Find the row for bob (id=2) — right cols should be NULL. *)
+    let bob = List.find (fun r ->
+      match r.(0) with Row.V_int 2L -> true | _ -> false) rows
+    in
+    (match bob.(2) with
+     | Row.V_null -> ()
+     | _ -> Alcotest.fail "expected NULL uid for bob (no matching order)");
+    Lwt.return_unit
+  )
+
+let query_hash_join_cartesian () =
+  (* left_key = -1, right_key = -1 → cartesian product path *)
+  let store, cat = setup () in
+  run (
+    let users_cols = [int_col "id"] in
+    let orders_cols = [int_col "uid"] in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "u2"; columns = users_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "o2"; columns = orders_cols }) in
+    let* um = Cat.find_table cat ~name:"u2" in
+    let um = Option.get um in
+    let* om = Cat.find_table cat ~name:"o2" in
+    let om = Option.get om in
+    insert store cat "u2" ([0], [Ast.L_int 1L]);
+    insert store cat "u2" ([0], [Ast.L_int 2L]);
+    insert store cat "o2" ([0], [Ast.L_int 10L]);
+    let n_right = 1 in
+    let n_left = 1 in
+    let op = Plan.Op_hash_join {
+      left  = Plan.Op_seq_scan { table_meta = um };
+      right = Plan.Op_seq_scan { table_meta = om };
+      left_key  = -1;
+      right_key = -1;
+      join_kind = `Inner;
+      right_col_offset = n_left;
+      n_right_cols     = n_right;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    (* 2 left × 1 right = 2 rows *)
+    Alcotest.(check int) "cartesian: 2*1=2 rows" 2 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_hash_join_null_key_excluded () =
+  (* A NULL join key on the right side must not match any left row. *)
+  let store, cat = setup () in
+  run (
+    let left_cols  = [int_col "id"] in
+    let right_cols = [int_col "uid"] in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "l3"; columns = left_cols }) in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "r3"; columns = right_cols }) in
+    let* lm = Cat.find_table cat ~name:"l3" in
+    let lm = Option.get lm in
+    let* rm = Cat.find_table cat ~name:"r3" in
+    let rm = Option.get rm in
+    insert store cat "l3" ([0], [Ast.L_int 1L]);
+    (* Insert a row with NULL uid on the right *)
+    insert store cat "r3" ([], []);  (* uid = NULL *)
+    let n_right = 1 in
+    let n_left = 1 in
+    let op = Plan.Op_hash_join {
+      left  = Plan.Op_seq_scan { table_meta = lm };
+      right = Plan.Op_seq_scan { table_meta = rm };
+      left_key  = 0;
+      right_key = 0;
+      join_kind = `Inner;
+      right_col_offset = n_left;
+      n_right_cols     = n_right;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "null right key → 0 joined rows" 0 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 15: Op_aggregate (direct plan tests)                           *)
+(* ------------------------------------------------------------------ *)
+
+let query_aggregate_count_star () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "one output row" 1 (List.length rows);
+    (match (List.hd rows).(0) with
+     | Row.V_int n -> Alcotest.(check int64) "count(*) = 3" 3L n
+     | _ -> Alcotest.fail "expected V_int");
+    Lwt.return_unit
+  )
+
+let query_aggregate_sum_int () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+    insert store cat "t" ([0], [Ast.L_int 10L]);
+    insert store cat "t" ([0], [Ast.L_int 20L]);
+    insert store cat "t" ([0], [Ast.L_int 30L]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match (List.hd rows).(0) with
+     | Row.V_int n -> Alcotest.(check int64) "sum = 60" 60L n
+     | _ -> Alcotest.fail "expected V_int sum");
+    Lwt.return_unit
+  )
+
+let query_aggregate_sum_real () =
+  let store, cat = setup () in
+  run (
+    let schema = [{ Row.name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = schema }) in
+    insert store cat "t" ([0], [Ast.L_real 1.5]);
+    insert store cat "t" ([0], [Ast.L_real 2.5]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    (match (List.hd rows).(0) with
+     | Row.V_real f -> Alcotest.(check bool) "sum_real = 4.0" true (abs_float (f -. 4.0) < 1e-9)
+     | _ -> Alcotest.fail "expected V_real sum");
+    Lwt.return_unit
+  )
+
+let query_aggregate_avg () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+    insert store cat "t" ([0], [Ast.L_int 10L]);
+    insert store cat "t" ([0], [Ast.L_int 20L]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_avg; col_ord = Some 0 } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    (match (List.hd rows).(0) with
+     | Row.V_real f -> Alcotest.(check bool) "avg = 15.0" true (abs_float (f -. 15.0) < 1e-9)
+     | _ -> Alcotest.fail "expected V_real avg");
+    Lwt.return_unit
+  )
+
+let query_aggregate_min_max () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+    insert store cat "t" ([0], [Ast.L_int 5L]);
+    insert store cat "t" ([0], [Ast.L_int 1L]);
+    insert store cat "t" ([0], [Ast.L_int 9L]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_min; col_ord = Some 0 };
+                    { Plan.func = Ast.Agg_max; col_ord = Some 0 } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0; Plan.PI_agg_slot 1 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "one agg row" 1 (List.length rows);
+    let r = List.hd rows in
+    (match r.(0) with
+     | Row.V_int n -> Alcotest.(check int64) "min=1" 1L n
+     | _ -> Alcotest.fail "expected V_int min");
+    (match r.(1) with
+     | Row.V_int n -> Alcotest.(check int64) "max=9" 9L n
+     | _ -> Alcotest.fail "expected V_int max");
+    Lwt.return_unit
+  )
+
+let query_aggregate_count_col_skips_null () =
+  (* COUNT(id) should not count NULL values. *)
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([1],   [Ast.L_text "b"]);  (* id = NULL *)
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = None;
+      aggs      = [ { Plan.func = Ast.Agg_count; col_ord = Some 0 } ];
+      having    = None;
+      proj      = [ Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    (match (List.hd rows).(0) with
+     | Row.V_int n -> Alcotest.(check int64) "count(id) = 2 (null skipped)" 2L n
+     | _ -> Alcotest.fail "expected V_int");
+    Lwt.return_unit
+  )
+
+let query_aggregate_with_group_by () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = Some 0;  (* GROUP BY id *)
+      aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
+      having    = None;
+      proj      = [ Plan.PI_group_col; Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "2 groups" 2 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_aggregate_with_having () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (* HAVING count-star > 1 → only group id=1 (count=2) passes *)
+    let op = Plan.Op_aggregate {
+      child     = Plan.Op_seq_scan { table_meta = m };
+      group_col = Some 0;
+      aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
+      having    = Some (Plan.P_binop (Plan.Gt, Plan.P_col 1, Plan.P_lit (Ast.L_int 1L)));
+      proj      = [ Plan.PI_group_col; Plan.PI_agg_slot 0 ];
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 group passes HAVING" 1 (List.length rows);
+    (match (List.hd rows).(0) with
+     | Row.V_int n -> Alcotest.(check int64) "group id=1" 1L n
+     | _ -> Alcotest.fail "expected V_int group key");
+    Lwt.return_unit
+  )
+
+let query_aggregate_raises_in_execute () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_aggregate {
+            child = Plan.Op_seq_scan { table_meta = m };
+            group_col = None;
+            aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
+            having = None;
+            proj = [ Plan.PI_agg_slot 0 ];
+          }));
+       Alcotest.fail "expected Failure for Op_aggregate in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let query_nlj_raises_in_execute () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_nested_loop_join {
+            left = Plan.Op_seq_scan { table_meta = m };
+            right_meta = m;
+            idx_tree = 99;
+            right_col_idx = 0;
+            left_col_idx = 0;
+            join_kind = `Inner;
+            right_col_offset = 2;
+            n_right_cols = 2;
+          }));
+       Alcotest.fail "expected Failure for Op_nested_loop_join in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let query_hash_join_raises_in_execute () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_hash_join {
+            left = Plan.Op_seq_scan { table_meta = m };
+            right = Plan.Op_seq_scan { table_meta = m };
+            left_key = 0; right_key = 0;
+            join_kind = `Inner;
+            right_col_offset = 2; n_right_cols = 2;
+          }));
+       Alcotest.fail "expected Failure for Op_hash_join in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1360,5 +2013,42 @@ let () =
       Alcotest.test_case "query_sort_multiple_nulls"         `Quick query_sort_multiple_nulls;
       Alcotest.test_case "exec_create_index_unknown_table"   `Quick exec_create_index_unknown_table;
       Alcotest.test_case "unique_first_insert_succeeds"      `Quick unique_index_first_insert_succeeds;
+    ];
+    "update", [
+      Alcotest.test_case "exec_update_no_match_returns_zero" `Quick exec_update_no_match_returns_zero;
+      Alcotest.test_case "exec_update_match_returns_count"   `Quick exec_update_match_returns_count;
+      Alcotest.test_case "exec_update_raises_in_query"       `Quick exec_update_raises_in_query;
+    ];
+    "delete", [
+      Alcotest.test_case "exec_delete_no_match_returns_zero" `Quick exec_delete_no_match_returns_zero;
+      Alcotest.test_case "exec_delete_all_returns_count"     `Quick exec_delete_all_returns_count;
+      Alcotest.test_case "exec_delete_raises_in_query"       `Quick exec_delete_raises_in_query;
+    ];
+    "drop", [
+      Alcotest.test_case "exec_drop_table_basic"            `Quick exec_drop_table_basic;
+      Alcotest.test_case "exec_drop_table_returns_zero"     `Quick exec_drop_table_returns_zero;
+      Alcotest.test_case "exec_drop_table_raises_in_query"  `Quick exec_drop_table_raises_in_query;
+      Alcotest.test_case "exec_drop_index_basic"            `Quick exec_drop_index_basic;
+      Alcotest.test_case "exec_drop_index_returns_zero"     `Quick exec_drop_index_returns_zero;
+      Alcotest.test_case "exec_drop_index_raises_in_query"  `Quick exec_drop_index_raises_in_query;
+    ];
+    "hash_join", [
+      Alcotest.test_case "query_hash_join_inner"           `Quick query_hash_join_inner;
+      Alcotest.test_case "query_hash_join_left"            `Quick query_hash_join_left;
+      Alcotest.test_case "query_hash_join_cartesian"       `Quick query_hash_join_cartesian;
+      Alcotest.test_case "query_hash_join_null_key"        `Quick query_hash_join_null_key_excluded;
+      Alcotest.test_case "query_nlj_raises_in_execute"     `Quick query_nlj_raises_in_execute;
+      Alcotest.test_case "query_hash_join_raises_in_execute" `Quick query_hash_join_raises_in_execute;
+    ];
+    "aggregate", [
+      Alcotest.test_case "query_aggregate_count_star"          `Quick query_aggregate_count_star;
+      Alcotest.test_case "query_aggregate_sum_int"             `Quick query_aggregate_sum_int;
+      Alcotest.test_case "query_aggregate_sum_real"            `Quick query_aggregate_sum_real;
+      Alcotest.test_case "query_aggregate_avg"                 `Quick query_aggregate_avg;
+      Alcotest.test_case "query_aggregate_min_max"             `Quick query_aggregate_min_max;
+      Alcotest.test_case "query_aggregate_count_col_skips_null" `Quick query_aggregate_count_col_skips_null;
+      Alcotest.test_case "query_aggregate_with_group_by"       `Quick query_aggregate_with_group_by;
+      Alcotest.test_case "query_aggregate_with_having"         `Quick query_aggregate_with_having;
+      Alcotest.test_case "query_aggregate_raises_in_execute"   `Quick query_aggregate_raises_in_execute;
     ];
   ]
