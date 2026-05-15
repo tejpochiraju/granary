@@ -580,47 +580,58 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     let* left_rows = Lwt_stream.to_list left_stream in
     let* tx = S.ro_begin store in
     let out = ref [] in
+    let is_left_join = (join_kind = `Left) in
     let* () =
       Lwt_list.iter_s (fun lrow ->
         let lkey = lrow.(left_col_idx) in
-        (* Encode the lookup value uniformly via row_value_to_index_value;
-           cross-type entries simply will not match. *)
-        let ik_value = row_value_to_index_value lkey in
-        let prefix = Index_key.encode_value ik_value in
-        let plen = Bytes.length prefix in
-        let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-        let* cur = S.cursor_open tx idx_tree in
-        let _sr = S.cursor_seek cur seek_key in
-        let found = ref false in
-        let rec scan () =
-          match S.cursor_next cur with
-          | None -> Lwt.return_unit
-          | Some (ikey, _) ->
-            if Bytes.length ikey >= plen + 8 &&
-               Bytes.equal (Bytes.sub ikey 0 plen) prefix
-            then begin
-              let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-              let rowid = Rowid.decode rowid_bytes in
-              let table_key = Rowid.encode rowid in
-              let* vrow = S.get tx right_meta.Cat.tree_id table_key in
-              (match vrow with
-               | None -> scan ()
-               | Some vbytes ->
-                 let rrow = Row.decode right_meta.Cat.columns vbytes in
-                 let combined = Array.append lrow rrow in
-                 out := combined :: !out;
-                 found := true;
-                 scan ())
-            end else Lwt.return_unit
-        in
-        let* () = scan () in
-        S.cursor_close cur;
-        (match join_kind with
-         | `Left when not !found ->
-           let null_right = Array.make n_right_cols Row.V_null in
-           out := Array.append lrow null_right :: !out
-         | _ -> ());
-        Lwt.return_unit
+        (* SQL NULL semantics: NULL = NULL is false, so a NULL join key
+           never matches any right row.  Skip the index probe entirely. *)
+        if lkey = Row.V_null then begin
+          if is_left_join then begin
+            let null_right = Array.make n_right_cols Row.V_null in
+            out := Array.append lrow null_right :: !out
+          end;
+          Lwt.return_unit
+        end else begin
+          (* Encode the lookup value uniformly via row_value_to_index_value;
+             cross-type entries simply will not match. *)
+          let ik_value = row_value_to_index_value lkey in
+          let prefix = Index_key.encode_value ik_value in
+          let plen = Bytes.length prefix in
+          let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+          let* cur = S.cursor_open tx idx_tree in
+          let _sr = S.cursor_seek cur seek_key in
+          let found = ref false in
+          let rec scan () =
+            match S.cursor_next cur with
+            | None -> Lwt.return_unit
+            | Some (ikey, _) ->
+              if Bytes.length ikey >= plen + 8 &&
+                 Bytes.equal (Bytes.sub ikey 0 plen) prefix
+              then begin
+                let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+                let rowid = Rowid.decode rowid_bytes in
+                let table_key = Rowid.encode rowid in
+                let* vrow = S.get tx right_meta.Cat.tree_id table_key in
+                (match vrow with
+                 | None -> scan ()
+                 | Some vbytes ->
+                   let rrow = Row.decode right_meta.Cat.columns vbytes in
+                   let combined = Array.append lrow rrow in
+                   out := combined :: !out;
+                   found := true;
+                   scan ())
+              end else Lwt.return_unit
+          in
+          let* () = scan () in
+          S.cursor_close cur;
+          (match join_kind with
+           | `Left when not !found ->
+             let null_right = Array.make n_right_cols Row.V_null in
+             out := Array.append lrow null_right :: !out
+           | _ -> ());
+          Lwt.return_unit
+        end
       ) left_rows
     in
     let* () = S.ro_end tx in
@@ -649,15 +660,20 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       ) left_rows;
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end else begin
-      (* Build phase: hash right rows by their join key. *)
+      (* Build phase: hash right rows by their join key.
+         NULL-keyed right rows are excluded: they can never match any probe
+         (probe phase already skips NULL left keys, so NULL = NULL never fires). *)
       let tbl : (bytes, Row.t list) Hashtbl.t = Hashtbl.create 64 in
       List.iter (fun rrow ->
         let key_v = rrow.(right_key) in
-        let key_bytes =
-          Index_key.encode_value (row_value_to_index_value key_v)
-        in
-        let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
-        Hashtbl.replace tbl key_bytes (rrow :: prev)
+        match key_v with
+        | Row.V_null -> ()   (* NULL join key: never matches, skip *)
+        | _ ->
+          let key_bytes =
+            Index_key.encode_value (row_value_to_index_value key_v)
+          in
+          let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
+          Hashtbl.replace tbl key_bytes (rrow :: prev)
       ) right_rows;
       let* left_rows = Lwt_stream.to_list left_stream in
       let out = ref [] in

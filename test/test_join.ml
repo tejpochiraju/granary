@@ -331,6 +331,63 @@ let select_star_columns () =
    | Row.V_int 7L, Row.V_text "gus", Row.V_int 7L, Row.V_text "pen" -> ()
    | _ -> Alcotest.fail "wrong combined-row content")
 
+(** NULL = NULL must not produce a join match (SQL 3-valued logic). *)
+let null_key_inner_join_empty_hash_join () =
+  (* No index on R.k — planner selects hash join. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE l (id INTEGER, k INTEGER)";
+  exec db "CREATE TABLE r (id INTEGER, k INTEGER)";
+  exec db "INSERT INTO l (id, k) VALUES (1, NULL)";
+  exec db "INSERT INTO r (id, k) VALUES (2, NULL)";
+  let rows = query_ok db
+    "SELECT * FROM l INNER JOIN r ON l.k = r.k" in
+  Alcotest.(check int) "NULL=NULL inner join (hash): empty result" 0 (List.length rows)
+
+let null_key_inner_join_empty_nlj () =
+  (* Index on r.k — planner selects nested-loop join. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE l (id INTEGER, k INTEGER)";
+  exec db "CREATE TABLE r (id INTEGER, k INTEGER)";
+  exec db "CREATE INDEX idx_r_k ON r (k)";
+  exec db "INSERT INTO l (id, k) VALUES (1, NULL)";
+  exec db "INSERT INTO r (id, k) VALUES (2, NULL)";
+  let rows = query_ok db
+    "SELECT * FROM l INNER JOIN r ON l.k = r.k" in
+  Alcotest.(check int) "NULL=NULL inner join (NLJ): empty result" 0 (List.length rows)
+
+let null_key_left_join_pads_hash_join () =
+  (* No index — hash join path.  The left row (NULL key) must appear with
+     NULL-padded right columns since no right row matches. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE l (id INTEGER, k INTEGER)";
+  exec db "CREATE TABLE r (id INTEGER, k INTEGER)";
+  exec db "INSERT INTO l (id, k) VALUES (1, NULL)";
+  exec db "INSERT INTO r (id, k) VALUES (2, NULL)";
+  let rows = query_ok db
+    "SELECT * FROM l LEFT JOIN r ON l.k = r.k" in
+  Alcotest.(check int) "NULL=NULL left join (hash): one padded row" 1 (List.length rows);
+  let row = List.hd rows in
+  (* r.id and r.k must be NULL in the result. *)
+  (match row.(2), row.(3) with
+   | Row.V_null, Row.V_null -> ()
+   | _ -> Alcotest.fail "expected NULL-padded right columns for unmatched left row")
+
+let null_key_left_join_pads_nlj () =
+  (* Index on r.k — NLJ path.  Same expectation as above. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE l (id INTEGER, k INTEGER)";
+  exec db "CREATE TABLE r (id INTEGER, k INTEGER)";
+  exec db "CREATE INDEX idx_r_k ON r (k)";
+  exec db "INSERT INTO l (id, k) VALUES (1, NULL)";
+  exec db "INSERT INTO r (id, k) VALUES (2, NULL)";
+  let rows = query_ok db
+    "SELECT * FROM l LEFT JOIN r ON l.k = r.k" in
+  Alcotest.(check int) "NULL=NULL left join (NLJ): one padded row" 1 (List.length rows);
+  let row = List.hd rows in
+  (match row.(2), row.(3) with
+   | Row.V_null, Row.V_null -> ()
+   | _ -> Alcotest.fail "expected NULL-padded right columns for unmatched left row")
+
 let nlj_with_index_returns_same_as_seqscan () =
   (* Same data with and without an index — INNER JOIN result must match. *)
   let mk_db ~with_index =
@@ -460,6 +517,10 @@ let () =
       Alcotest.test_case "JOIN with ORDER BY"         `Quick join_with_order_by;
       Alcotest.test_case "SELECT * yields all cols"   `Quick select_star_columns;
       Alcotest.test_case "NLJ with index = seq scan"  `Quick nlj_with_index_returns_same_as_seqscan;
+      Alcotest.test_case "NULL=NULL inner join empty (hash)"  `Quick null_key_inner_join_empty_hash_join;
+      Alcotest.test_case "NULL=NULL inner join empty (NLJ)"   `Quick null_key_inner_join_empty_nlj;
+      Alcotest.test_case "NULL=NULL left join pads (hash)"    `Quick null_key_left_join_pads_hash_join;
+      Alcotest.test_case "NULL=NULL left join pads (NLJ)"     `Quick null_key_left_join_pads_nlj;
     ];
     "qcheck", (
       List.map QCheck_alcotest.to_alcotest [
