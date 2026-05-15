@@ -1,6 +1,13 @@
 (** Ordered byte-keyed store.
     Phase 0: in-memory [BytesMap] per [tree_id].
-    Phase 1: replaced by CoW B+-tree on BLOCK behind the same interface. *)
+    Phase 1: CoW B+-tree on BLOCK behind the same interface.
+
+    Two backends are available:
+    - [create ()] — in-memory [BytesMap] (no size limits on keys/values).
+      This is the legacy Phase 0 backend, retained for tests and
+      ephemeral use cases that exceed B+-tree leaf-cell size limits.
+    - [open_file ~path] — CoW B+-tree over a Unix_file BLOCK device.
+      Persistent across reopen. Keys ≤ 512 bytes, values ≤ 1024 bytes. *)
 
 type t
 
@@ -15,8 +22,24 @@ type 'a txn
     System trees use IDs 0–15; user tables use 16+. *)
 type tree_id = int
 
+(** Errors from the persistent (B+-tree) backend.  The in-memory backend
+    never returns errors. *)
+type error =
+  | Block_error of string
+  | Corruption of string
+  | Key_too_large of int
+  | Value_too_large of int
+  | Header_error of string
+
+val pp_error : Format.formatter -> error -> unit
+
 (** Open a fresh in-memory store with no trees. *)
 val create : unit -> t
+
+(** Open a B+-tree backed store over a Unix file.  Creates the file if
+    absent.  If the file is non-empty it must be a valid sqlocaml database
+    written by a previous [open_file]/[commit] sequence. *)
+val open_file : path:string -> (t, error) result Lwt.t
 
 (** Close the store. After this, any use of the store or its txns is
     undefined. *)
