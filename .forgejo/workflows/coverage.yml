@@ -46,8 +46,11 @@ jobs:
             exit 1
           fi
 
-          # Per-file breakdown
-          opam exec -- bisect-ppx-report summary --per-file $COVFILES | tee /tmp/coverage-summary.txt
+          # Exclude generated files (parser.ml from Menhir, lexer.ml from ocamllex)
+          EXCLUDE="--exclude-files lib/sql/parser.ml --exclude-files lib/sql/lexer.ml"
+
+          # Per-file breakdown (handwritten code only)
+          opam exec -- bisect-ppx-report summary --per-file $EXCLUDE $COVFILES | tee /tmp/coverage-summary.txt
 
           # Extract overall percentage
           PCT=$(grep -oP '\d+\.\d+(?= %)' /tmp/coverage-summary.txt | tail -1)
@@ -58,8 +61,9 @@ jobs:
       - name: Generate HTML report
         run: |
           COVFILES=$(find _build -name '*.coverage' | tr '\n' ' ')
+          EXCLUDE="--exclude-files lib/sql/parser.ml --exclude-files lib/sql/lexer.ml"
           mkdir -p _coverage
-          opam exec -- bisect-ppx-report html -o _coverage $COVFILES
+          opam exec -- bisect-ppx-report html $EXCLUDE -o _coverage $COVFILES
 
       - name: Upload HTML report as artifact
         uses: actions/upload-artifact@v4
