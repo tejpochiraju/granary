@@ -28,6 +28,16 @@ let open_in_memory () =
   let* catalog = Cat.open_ store in
   Lwt.return { store; catalog }
 
+let open_file ~path =
+  let* result = S.open_file ~path in
+  match result with
+  | Error e ->
+    let msg = Format.asprintf "%a" S.pp_error e in
+    Lwt.return (Error (Runtime msg))
+  | Ok store ->
+    let* catalog = Cat.open_ store in
+    Lwt.return (Ok { store; catalog })
+
 let close t = S.close t.store
 
 let parse sql =

@@ -19,6 +19,10 @@ type error =
 
 val open_in_memory : unit -> t Lwt.t
 
+(** Open a persistent B+-tree-backed database at the given file path.
+    Creates the file if absent; reopens an existing database otherwise. *)
+val open_file : path:string -> (t, error) result Lwt.t
+
 val close : t -> unit Lwt.t
 
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT).
