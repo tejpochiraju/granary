@@ -1,6 +1,7 @@
 %{
-  (* open Ast -- omitted until grammar rules are added in Tasks 13-15 *)
-  let _unused = ()  (* suppress unused-open warning *)
+  open Ast
+
+  type col_constraint = Col_not_null | Col_primary_key
 %}
 
 %token <string> IDENT
@@ -12,9 +13,61 @@
 %token STAR LPAREN RPAREN COMMA SEMI EQ
 %token EOF
 
-%start <unit> stmt_eof
+%left EQ
+
+%start <Ast.stmt> stmt_eof
 
 %%
 
 stmt_eof:
-  | EOF { () }
+  | s = stmt SEMI? EOF { s }
+
+stmt:
+  | s = create_table { s }
+  | s = insert       { s }
+  | s = select       { s }
+
+create_table:
+  | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN
+    { S_create_table { name; columns = cols } }
+
+column_def:
+  | name = IDENT ty = col_ty cs = column_constraint*
+    { let not_null    = List.mem Col_not_null cs in
+      let primary_key = List.mem Col_primary_key cs in
+      { name; ty; not_null; primary_key } }
+
+col_ty:
+  | INTEGER_TY { Ty_int }
+  | TEXT_TY    { Ty_text }
+
+column_constraint:
+  | NOT NULL    { Col_not_null }
+  | PRIMARY KEY { Col_primary_key }
+
+insert:
+  | INSERT INTO table = IDENT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+      VALUES LPAREN vals = separated_nonempty_list(COMMA, literal) RPAREN
+    { S_insert { table; columns = cols; values = vals } }
+
+literal:
+  | n = INT_LIT    { L_int n }
+  | s = STRING_LIT { L_text s }
+  | NULL           { L_null }
+
+select:
+  | SELECT proj = projection FROM table = IDENT wh = where_opt
+    { S_select { proj; table; where = wh } }
+
+projection:
+  | STAR                                             { `All }
+  | cols = separated_nonempty_list(COMMA, IDENT)     { `Cols cols }
+
+where_opt:
+  |                { None }
+  | WHERE e = expr { Some e }
+
+expr:
+  | l = literal              { E_lit l }
+  | name = IDENT             { E_col name }
+  | a = expr EQ b = expr     { E_eq (a, b) }
