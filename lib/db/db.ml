@@ -74,6 +74,22 @@ let execute t sql =
           | Failure msg -> Lwt.return (Error (Runtime msg))
           | exn         -> Lwt.fail exn))
 
+let execute_change_count t sql =
+  let* op = prepare t sql in
+  match op with
+  | Error e -> Lwt.return (Error e)
+  | Ok op   ->
+    (match Sql.Exec.execute_with_count t.store t.catalog op with
+     | exception Failure msg -> Lwt.return (Error (Runtime msg))
+     | lwt_op ->
+       Lwt.catch
+         (fun () ->
+           let* n = lwt_op in
+           Lwt.return (Ok n))
+         (function
+          | Failure msg -> Lwt.return (Error (Runtime msg))
+          | exn         -> Lwt.fail exn))
+
 let query t sql =
   let* op = prepare t sql in
   match op with

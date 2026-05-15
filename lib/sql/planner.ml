@@ -131,3 +131,18 @@ let plan ?cat = function
       unique;
       columns  = table_meta.columns;
     }
+  | Sema.BS_update { table_meta; assignments; where } ->
+    let indexes = match cat with
+      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
+      | None   -> []
+    in
+    let plan_assignments =
+      List.map (fun (i, e) -> (i, plan_expr e)) assignments
+    in
+    let plan_where = Option.map plan_expr where in
+    Plan.Op_update {
+      table_meta;
+      assignments = plan_assignments;
+      where       = plan_where;
+      indexes;
+    }

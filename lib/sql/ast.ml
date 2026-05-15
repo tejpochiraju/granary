@@ -68,3 +68,8 @@ type stmt =
       column : string;
       unique : bool;
     }
+  | S_update of {
+      table       : string;
+      assignments : (string * expr) list;   (** [(col_name, new_value_expr)] *)
+      where       : expr option;
+    }

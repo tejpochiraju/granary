@@ -25,9 +25,14 @@ val open_file : path:string -> (t, error) result Lwt.t
 
 val close : t -> unit Lwt.t
 
-(** Execute a DDL or DML statement (CREATE TABLE, INSERT).
+(** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
     Returns [Ok ()] on success, [Error e] on failure. *)
 val execute : t -> string -> (unit, error) result Lwt.t
+
+(** Like [execute], but returns the rows-affected count.  For DDL the
+    count is [0]; for INSERT it is [1]; for UPDATE it is the number of
+    rows whose contents were modified. *)
+val execute_change_count : t -> string -> (int, error) result Lwt.t
 
 (** Execute a query (SELECT).
     Returns [Ok stream] on success, [Error e] on failure.

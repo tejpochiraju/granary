@@ -64,3 +64,9 @@ type op =
       lookup_val : expr;                (** value to look up *)
       table_meta : Cat.table_meta;      (** for row decoding *)
     }
+  | Op_update of {
+      table_meta  : Cat.table_meta;
+      assignments : (int * expr) list;  (** [(col_ordinal, new_value_expr)] *)
+      where       : expr option;
+      indexes     : Cat.index_info list;
+    }

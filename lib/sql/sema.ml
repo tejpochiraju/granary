@@ -42,6 +42,11 @@ type bound_stmt =
       col_idx    : int;
       unique     : bool;
     }
+  | BS_update of {
+      table_meta  : Cat.table_meta;
+      assignments : (int * bound_expr) list;
+      where       : bound_expr option;
+    }
 
 type error =
   | Unknown_table  of string
@@ -260,6 +265,33 @@ let bind_select cat ~proj ~table ~where ~order ~limit ~offset =
                    })))))))
 
 (* ------------------------------------------------------------------ *)
+(* Best-effort type inference for bound expressions.                    *)
+(* Returns [None] when the type is statically indeterminate (e.g. NULL  *)
+(* literal, or mixed-type arithmetic where coercion may apply).         *)
+(* ------------------------------------------------------------------ *)
+
+let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = function
+  | BE_lit l -> lit_ty l
+  | BE_col i ->
+    (* col_idx is already validated; safe to access. *)
+    Some (List.nth cols i).Row.ty
+  | BE_not _ | BE_is_null _ | BE_is_not_null _ ->
+    Some Row.Integer   (* boolean expressions encoded as INTEGER 0/1 *)
+  | BE_binop (op, a, b) ->
+    (match op with
+     | Eq | Ne | Lt | Le | Gt | Ge | And | Or ->
+       Some Row.Integer
+     | Add | Sub | Mul | Div ->
+       (match infer_type cols a, infer_type cols b with
+        | Some Row.Integer, Some Row.Integer -> Some Row.Integer
+        | Some Row.Real,    _
+        | _,                Some Row.Real    -> Some Row.Real
+        | Some Row.Integer, None
+        | None,             Some Row.Integer -> None
+        | _                                  -> None))
+  | BE_neg e -> infer_type cols e
+
+(* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
 (* ------------------------------------------------------------------ *)
 
@@ -283,6 +315,57 @@ let bind_create_index cat ~name ~table ~column ~unique =
           }))))
 
 (* ------------------------------------------------------------------ *)
+(* UPDATE                                                               *)
+(* ------------------------------------------------------------------ *)
+
+let bind_update cat ~table ~assignments ~where =
+  let* meta_opt = Cat.find_table cat ~name:table in
+  match meta_opt with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some meta ->
+    (* Bind each assignment: resolve column ordinal, bind the expression,
+       and check that the inferred expression type matches the column. *)
+    let assign_result =
+      List.fold_left (fun acc (col_name, expr_ast) ->
+        match acc with
+        | Error _ -> acc
+        | Ok bound_list ->
+          (match col_index meta.columns col_name with
+           | None ->
+             Error (Unknown_column { table; column = col_name })
+           | Some i ->
+             let col = List.nth meta.columns i in
+             (match bind_expr meta expr_ast with
+              | Error e -> Error e
+              | Ok bexpr ->
+                (match infer_type meta.columns bexpr with
+                 | None    -> Ok (bound_list @ [(i, bexpr)])
+                 | Some t  ->
+                   if ty_equal t col.ty then Ok (bound_list @ [(i, bexpr)])
+                   else Error (Type_mismatch { expected = col.ty; got = t }))))
+      ) (Ok []) assignments
+    in
+    (match assign_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_assigns ->
+       let where_result =
+         match where with
+         | None   -> Ok None
+         | Some e ->
+           (match bind_expr meta e with
+            | Ok be   -> Ok (Some be)
+            | Error e -> Error e)
+       in
+       (match where_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok bound_where ->
+          Lwt.return (Ok (BS_update {
+            table_meta  = meta;
+            assignments = bound_assigns;
+            where       = bound_where;
+          }))))
+
+(* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -293,3 +376,5 @@ let bind cat = function
     bind_select cat ~proj ~table ~where ~order ~limit ~offset
   | Ast.S_create_index { name; table; column; unique } ->
     bind_create_index cat ~name ~table ~column ~unique
+  | Ast.S_update { table; assignments; where } ->
+    bind_update cat ~table ~assignments ~where

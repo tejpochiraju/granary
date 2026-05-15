@@ -37,6 +37,8 @@ rule token = parse
   | "INDEX"    { INDEX }
   | "ON"       { ON }
   | "UNIQUE"   { UNIQUE }
+  | "UPDATE"   { UPDATE }
+  | "SET"      { SET }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

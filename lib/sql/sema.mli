@@ -40,6 +40,12 @@ type bound_stmt =
       col_idx    : int;                 (** column ordinal in the table *)
       unique     : bool;
     }
+  | BS_update of {
+      table_meta  : Sqlocaml_catalog.Catalog.table_meta;
+      assignments : (int * bound_expr) list;
+        (** [(col_ordinal, new_value_expr)] *)
+      where       : bound_expr option;
+    }
 
 type error =
   | Unknown_table  of string

@@ -5,6 +5,15 @@ val execute :
   Plan.op ->
   unit Lwt.t
 
+(** Like [execute], but returns the rows-affected count.  For DDL ops
+    (CREATE TABLE, CREATE INDEX) this is [0]; for INSERT it is [1]; for
+    UPDATE it is the number of rows whose contents were modified. *)
+val execute_with_count :
+  Sqlocaml_store.Store.t ->
+  Sqlocaml_catalog.Catalog.t ->
+  Plan.op ->
+  int Lwt.t
+
 (** Execute read operations; returns a lazy stream of result rows. *)
 val query :
   Sqlocaml_store.Store.t ->
