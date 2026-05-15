@@ -507,6 +507,38 @@ let execute_read_op_raises () =
     Lwt.return_unit
   )
 
+let execute_filter_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tf"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"tf" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_filter { pred = Plan.P_lit (Ast.L_int 1L);
+                           child = Plan.Op_seq_scan { table_meta = m } }));
+       Alcotest.fail "expected Failure for Op_filter in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let execute_project_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tp"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"tp" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_project { ordinals = [0];
+                            child = Plan.Op_seq_scan { table_meta = m } }));
+       Alcotest.fail "expected Failure for Op_project in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
 let query_write_op_raises () =
   let store, cat = setup () in
   run (
@@ -516,6 +548,59 @@ let query_write_op_raises () =
                  (Plan.Op_create_table { name = "t"; columns = id_name_cols }));
        Alcotest.fail "expected Failure"
      with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let query_insert_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "ti"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"ti" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_insert { table_meta = m; ordinals = [0];
+                           values = [Ast.L_int 1L] }));
+       Alcotest.fail "expected Failure for Op_insert in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let query_filter_nonnull_eq_null () =
+  (* Test the _, V_null arm: va is non-null, vb is V_null *)
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tn"; columns = id_name_cols }) in
+    insert store cat "tn" ([0; 1], [Ast.L_int 5L; Ast.L_text "ghost"]);
+    let* meta_opt = Cat.find_table cat ~name:"tn" in
+    let m = Option.get meta_opt in
+    (* Filter: name = NULL → va=V_text "ghost", vb=V_null → hits _, V_null arm *)
+    let pred = Plan.P_eq (Plan.P_col 1, Plan.P_lit Ast.L_null) in
+    let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "non-null = NULL → 0 rows" 0 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_filter_type_mismatch () =
+  (* Test the final catch-all _ arm in eval_expr P_eq match (L54):
+     va is V_int (non-null), vb is V_text (non-null), different types → hits _ -> false *)
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tm"; columns = id_name_cols }) in
+    insert store cat "tm" ([0; 1], [Ast.L_int 5L; Ast.L_text "hi"]);
+    let* meta_opt = Cat.find_table cat ~name:"tm" in
+    let m = Option.get meta_opt in
+    (* Filter: id (V_int 5L) = "text" (V_text) → type mismatch → catch-all _ -> false *)
+    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_text "text")) in
+    let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "int = text → type mismatch → 0 rows" 0 (List.length rows);
     Lwt.return_unit
   )
 
@@ -545,11 +630,13 @@ let () =
       Alcotest.test_case "query_seqscan_three_rows" `Quick query_seqscan_three_rows;
     ];
     "filter", [
-      Alcotest.test_case "query_filter_eq_int"    `Quick query_filter_eq_int;
-      Alcotest.test_case "query_filter_eq_string" `Quick query_filter_eq_string;
-      Alcotest.test_case "query_filter_no_match"  `Quick query_filter_no_match;
-      Alcotest.test_case "query_filter_all_match" `Quick query_filter_all_match;
-      Alcotest.test_case "query_filter_null_col"  `Quick query_filter_null_col;
+      Alcotest.test_case "query_filter_eq_int"          `Quick query_filter_eq_int;
+      Alcotest.test_case "query_filter_eq_string"       `Quick query_filter_eq_string;
+      Alcotest.test_case "query_filter_no_match"        `Quick query_filter_no_match;
+      Alcotest.test_case "query_filter_all_match"       `Quick query_filter_all_match;
+      Alcotest.test_case "query_filter_null_col"        `Quick query_filter_null_col;
+      Alcotest.test_case "query_filter_nonnull_eq_null" `Quick query_filter_nonnull_eq_null;
+      Alcotest.test_case "query_filter_type_mismatch"   `Quick query_filter_type_mismatch;
     ];
     "project", [
       Alcotest.test_case "query_project_all"        `Quick query_project_all;
@@ -558,7 +645,10 @@ let () =
       Alcotest.test_case "query_project_star_where" `Quick query_project_star_where;
     ];
     "error_conditions", [
-      Alcotest.test_case "execute_read_op_raises" `Quick execute_read_op_raises;
-      Alcotest.test_case "query_write_op_raises"  `Quick query_write_op_raises;
+      Alcotest.test_case "execute_read_op_raises"  `Quick execute_read_op_raises;
+      Alcotest.test_case "execute_filter_raises"   `Quick execute_filter_raises;
+      Alcotest.test_case "execute_project_raises"  `Quick execute_project_raises;
+      Alcotest.test_case "query_write_op_raises"   `Quick query_write_op_raises;
+      Alcotest.test_case "query_insert_raises"     `Quick query_insert_raises;
     ];
   ]

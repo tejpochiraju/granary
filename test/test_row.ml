@@ -173,6 +173,28 @@ let equal_tests = [
 
 (* ── Category 6: Error conditions ────────────────────────────────────── *)
 
+let encode_arity_too_many () =
+  let schema = [{ Row.name = "x"; ty = Row.Integer }] in
+  (* Row has 2 elements but schema expects 1 *)
+  let row = [| Row.V_int 1L; Row.V_int 2L |] in
+  try
+    ignore (Row.encode schema row);
+    Alcotest.fail "expected invalid_arg for too-many columns"
+  with Invalid_argument _ -> ()
+
+let decode_arity_too_few_encoded () =
+  (* Encode a 1-col row, then decode as 2-col schema *)
+  let schema1 = [{ Row.name = "x"; ty = Row.Integer }] in
+  let schema2 = [
+    { Row.name = "x"; ty = Row.Integer };
+    { Row.name = "y"; ty = Row.Integer };
+  ] in
+  let bytes = Row.encode schema1 [| Row.V_int 42L |] in
+  try
+    ignore (Row.decode schema2 bytes);
+    Alcotest.fail "expected invalid_arg: encoded 1 col, schema expects 2"
+  with Invalid_argument _ -> ()
+
 let error_tests = [
   "encode arity mismatch: too few cols",
   (fun () ->
@@ -196,6 +218,12 @@ let error_tests = [
       let _ = Row.decode schema_single_int encoded in
       Alcotest.fail "expected Invalid_argument"
     with Invalid_argument _ -> ());
+
+  "decode arity mismatch: encoded too few",
+  (fun () -> decode_arity_too_few_encoded ());
+
+  "encode arity mismatch: row too many for schema",
+  (fun () -> encode_arity_too_many ());
 
   "type mismatch: int in text column",
   (fun () ->

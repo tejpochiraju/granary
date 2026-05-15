@@ -326,6 +326,41 @@ let already_exists_error () =
      Alcotest.(check string) "table name is t" "t" name
    | _ -> Alcotest.fail "expected Sema(Already_exists \"t\")")
 
+let parse_failure_via_lexer () =
+  run (
+    let* db = Db.open_in_memory () in
+    (* '@' is an unknown character — lexer calls failwith, not Parser.Error *)
+    let* r = Db.execute db "@ invalid" in
+    (match r with
+     | Error (Db.Parse _) -> ()
+     | _ -> Alcotest.fail "expected Parse error from lexer Failure");
+    Db.close db
+  )
+
+let execute_with_select_is_runtime_error () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
+    (* execute with a SELECT — planner produces read op → Exec.execute raises → Runtime *)
+    let* r = Db.execute db "SELECT * FROM t;" in
+    (match r with
+     | Error (Db.Runtime _) -> ()
+     | _ -> Alcotest.fail "expected Runtime error for SELECT via execute");
+    Db.close db
+  )
+
+let query_with_insert_is_runtime_error () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
+    (* query with INSERT — planner produces write op → Exec.query raises → Runtime *)
+    let* r = Db.query db "INSERT INTO t (x) VALUES (1);" in
+    (match r with
+     | Error (Db.Runtime _) -> ()
+     | _ -> Alcotest.fail "expected Runtime error for INSERT via query");
+    Db.close db
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -345,12 +380,15 @@ let () =
       Alcotest.test_case "table_isolation" `Quick table_isolation;
     ];
     "error_propagation", [
-      Alcotest.test_case "parse_error"      `Quick parse_error;
-      Alcotest.test_case "unknown_table"    `Quick unknown_table;
-      Alcotest.test_case "unknown_column"   `Quick unknown_column;
-      Alcotest.test_case "type_mismatch"    `Quick type_mismatch;
-      Alcotest.test_case "arity_mismatch"   `Quick arity_mismatch;
-      Alcotest.test_case "already_exists"   `Quick already_exists_error;
+      Alcotest.test_case "parse_error"                       `Quick parse_error;
+      Alcotest.test_case "unknown_table"                     `Quick unknown_table;
+      Alcotest.test_case "unknown_column"                    `Quick unknown_column;
+      Alcotest.test_case "type_mismatch"                     `Quick type_mismatch;
+      Alcotest.test_case "arity_mismatch"                    `Quick arity_mismatch;
+      Alcotest.test_case "already_exists"                    `Quick already_exists_error;
+      Alcotest.test_case "parse_failure_via_lexer"           `Quick parse_failure_via_lexer;
+      Alcotest.test_case "execute_with_select_is_runtime"    `Quick execute_with_select_is_runtime_error;
+      Alcotest.test_case "query_with_insert_is_runtime"      `Quick query_with_insert_is_runtime_error;
     ];
     "null_handling", [
       Alcotest.test_case "insert_null"        `Quick insert_null;

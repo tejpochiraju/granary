@@ -445,6 +445,25 @@ let test_cursor_value_after_seek () =
     Lwt.return_unit
   )
 
+let cursor_value_after_next () =
+  run (
+    let s = S.create () in
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "a") (bs "1") in
+    let* () = S.put tx 0 (bs "b") (bs "2") in
+    let* () = S.commit tx in
+    let* tx = S.ro_begin s in
+    let* c = S.cursor_open tx 0 in
+    let _ = S.cursor_first c in
+    (* First cursor_next: returns "a", sets ready=false *)
+    let _ = S.cursor_next c in
+    (* Now remaining=["b"] but ready=false — cursor_value should return None *)
+    Alcotest.(check bool) "cursor_value None after next" true
+      (S.cursor_value c = None);
+    S.cursor_close c;
+    S.ro_end tx
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Group 6: Multiple trees + large data                                 *)
 (* ------------------------------------------------------------------ *)
@@ -657,6 +676,7 @@ let () =
       Alcotest.test_case "after_first"        `Quick test_cursor_value_after_first;
       Alcotest.test_case "exhausted"          `Quick test_cursor_value_exhausted;
       Alcotest.test_case "after_seek"         `Quick test_cursor_value_after_seek;
+      Alcotest.test_case "after_next"         `Quick cursor_value_after_next;
     ];
     "large_data", [
       Alcotest.test_case "many_trees"         `Quick test_many_trees;

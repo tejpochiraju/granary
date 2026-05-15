@@ -310,6 +310,56 @@ let bind_select_where_text_col () =
   | Error _ -> Alcotest.fail "unexpected error"
 
 (* ------------------------------------------------------------------ *)
+(* Gap-fill: right-side unknown col, second insert col unknown,         *)
+(* second select proj col unknown                                        *)
+(* ------------------------------------------------------------------ *)
+
+let bind_select_where_right_unknown () =
+  let cat = two_col_cat () in
+  (* WHERE id = bogus — left (id) resolves, right (bogus) fails *)
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_col "bogus"));
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column for right side"
+
+let bind_insert_second_col_unknown () =
+  (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
+     id resolves, bogus fails, name is never reached — the 3rd iteration hits L99. *)
+  let cat = make_catalog [
+    { Row.name = "id";   ty = Row.Integer };
+    { Row.name = "name"; ty = Row.Text    };
+    { Row.name = "age";  ty = Row.Integer };
+  ] in
+  let stmt = Ast.S_insert {
+    table = "users";
+    columns = ["id"; "bogus"; "age"];
+    values = [Ast.L_int 1L; Ast.L_int 2L; Ast.L_int 3L];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column for second column"
+
+let bind_select_second_col_unknown () =
+  (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
+     id resolves, bogus fails, age is never reached — the 3rd iteration hits L134. *)
+  let cat = make_catalog [
+    { Row.name = "id";   ty = Row.Integer };
+    { Row.name = "name"; ty = Row.Text    };
+    { Row.name = "age";  ty = Row.Integer };
+  ] in
+  let stmt = Ast.S_select {
+    proj = `Cols ["id"; "bogus"; "age"];
+    table = "users";
+    where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column for second proj column"
+
+(* ------------------------------------------------------------------ *)
 (* Group 4: Error values                                                *)
 (* ------------------------------------------------------------------ *)
 
@@ -358,6 +408,7 @@ let () =
       Alcotest.test_case "bind_insert_type_mismatch_int_col"  `Quick bind_insert_type_mismatch_int_col;
       Alcotest.test_case "bind_insert_type_mismatch_text_col" `Quick bind_insert_type_mismatch_text_col;
       Alcotest.test_case "bind_insert_null_allowed"        `Quick bind_insert_null_allowed;
+      Alcotest.test_case "bind_insert_second_col_unknown"  `Quick bind_insert_second_col_unknown;
     ];
     "select", [
       Alcotest.test_case "bind_select_star"              `Quick bind_select_star;
@@ -371,6 +422,8 @@ let () =
       Alcotest.test_case "bind_select_where_lit_eq_col"  `Quick bind_select_where_lit_eq_col;
       Alcotest.test_case "bind_select_where_unknown_col" `Quick bind_select_where_unknown_col;
       Alcotest.test_case "bind_select_where_text_col"    `Quick bind_select_where_text_col;
+      Alcotest.test_case "bind_select_where_right_unknown" `Quick bind_select_where_right_unknown;
+      Alcotest.test_case "bind_select_second_col_unknown"  `Quick bind_select_second_col_unknown;
     ];
     "error-values", [
       Alcotest.test_case "error_already_exists_message" `Quick error_already_exists_message;

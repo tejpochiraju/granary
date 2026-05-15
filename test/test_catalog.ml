@@ -377,6 +377,38 @@ let test_create_empty_columns () =
     Lwt.return_unit
   )
 
+let corrupt_column_type_tag () =
+  (* Setup: create a store with a real table, then corrupt the column type tag *)
+  let store = S.create () in
+  run (
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"users"
+      ~columns:[{ Row.name = "id"; ty = Row.Integer }] in
+    (* Overwrite the column entry with a corrupt type tag (0) *)
+    let col_key =
+      let tn = Bytes.of_string "users" in
+      let ord = Bytes.make 8 '\x00' in  (* ordinal 0, big-endian *)
+      Bytes.cat (Bytes.cat tn (Bytes.of_string "\x00")) ord
+    in
+    let bad_val =
+      let buf = Buffer.create 8 in
+      Sqlocaml_encoding.Varint.encode_uint64 buf 0L;  (* tag=0, invalid *)
+      Sqlocaml_encoding.Varint.encode_uint64 buf 2L;  (* name len *)
+      Buffer.add_string buf "id";
+      Buffer.to_bytes buf
+    in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 1 col_key bad_val in  (* sys_columns_tid = 1 *)
+    S.commit tx
+  );
+  (* Now open_ a fresh catalog — load_columns will hit type_of_tag with 0 → failwith *)
+  (try
+     let _ = Lwt_main.run (C.open_ store) in
+     Alcotest.fail "expected Failure for corrupt type tag"
+   with Failure msg ->
+     Alcotest.(check bool) "error message non-empty"
+       true (String.length msg > 0))
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -416,5 +448,6 @@ let () =
     "error_conditions", [
       Alcotest.test_case "create_empty_name"           `Quick test_create_empty_name;
       Alcotest.test_case "create_empty_columns"        `Quick test_create_empty_columns;
+      Alcotest.test_case "corrupt_column_type_tag"     `Quick corrupt_column_type_tag;
     ];
   ]
