@@ -5,6 +5,7 @@
  (preprocess (pps lwt_ppx)))
 
 (menhir
- (modules parser))
+ (modules parser)
+ (flags --unused-tokens))
 
 (ocamllex lexer)
