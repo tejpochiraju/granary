@@ -160,6 +160,83 @@ let test_text_column_type () =
     Lwt.return_unit
   )
 
+let test_real_column_type () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t"
+        ~columns:[mk_col "r" Row.Real] in
+    let* result = C.find_table cat ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "expected Some"
+     | Some m ->
+       let col = List.hd m.C.columns in
+       (match col.Row.ty with
+        | Row.Real -> ()
+        | _ -> Alcotest.fail "expected Real, got other"));
+    Lwt.return_unit
+  )
+
+let test_blob_column_type () =
+  run (
+    let store = S.create () in
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t"
+        ~columns:[mk_col "b" Row.Blob] in
+    let* result = C.find_table cat ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "expected Some"
+     | Some m ->
+       let col = List.hd m.C.columns in
+       (match col.Row.ty with
+        | Row.Blob -> ()
+        | _ -> Alcotest.fail "expected Blob, got other"));
+    Lwt.return_unit
+  )
+
+(* Exercise Real and Blob types in a round-trip including reopen so the
+   column types are run through encode/decode (hitting the Real/Blob arms
+   in type_of_tag). *)
+let test_mixed_column_types_roundtrip () =
+  let path = Printf.sprintf "/tmp/sqlocaml_test_catalog_mixed_%d.db" (Random.bits ()) in
+  (try Unix.unlink path with _ -> ());
+  Fun.protect
+    ~finally:(fun () -> try Unix.unlink path with _ -> ())
+    (fun () ->
+       run (
+         let* sr = S.open_file ~path in
+         let store = match sr with
+           | Ok s -> s
+           | Error e -> Alcotest.failf "open_file: %a" S.pp_error e
+         in
+         let* cat = C.open_ store in
+         let cols = [
+           mk_col "i" Row.Integer;
+           mk_col "t" Row.Text;
+           mk_col "r" Row.Real;
+           mk_col "b" Row.Blob;
+         ] in
+         let* _ = C.create_table cat ~name:"mixed" ~columns:cols in
+         let* () = S.close store in
+         (* Reopen and force the catalog to decode columns from disk *)
+         let* sr2 = S.open_file ~path in
+         let store2 = match sr2 with
+           | Ok s -> s
+           | Error e -> Alcotest.failf "reopen: %a" S.pp_error e
+         in
+         let* cat2 = C.open_ store2 in
+         let* result = C.find_table cat2 ~name:"mixed" in
+         (match result with
+          | None -> Alcotest.fail "expected Some"
+          | Some m ->
+            let tys = List.map (fun c -> c.Row.ty) m.C.columns in
+            Alcotest.(check bool) "Integer present" true (List.mem Row.Integer tys);
+            Alcotest.(check bool) "Text present"    true (List.mem Row.Text    tys);
+            Alcotest.(check bool) "Real present"    true (List.mem Row.Real    tys);
+            Alcotest.(check bool) "Blob present"    true (List.mem Row.Blob    tys));
+         S.close store2
+       ))
+
 let test_single_column () =
   run (
     let store = S.create () in
@@ -544,6 +621,9 @@ let () =
       Alcotest.test_case "columns_preserved"           `Quick test_columns_preserved;
       Alcotest.test_case "integer_column_type"         `Quick test_integer_column_type;
       Alcotest.test_case "text_column_type"            `Quick test_text_column_type;
+      Alcotest.test_case "real_column_type"            `Quick test_real_column_type;
+      Alcotest.test_case "blob_column_type"            `Quick test_blob_column_type;
+      Alcotest.test_case "mixed_column_types_roundtrip" `Quick test_mixed_column_types_roundtrip;
       Alcotest.test_case "single_column"               `Quick test_single_column;
       Alcotest.test_case "many_columns"                `Quick test_many_columns;
     ];

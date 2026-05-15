@@ -367,6 +367,154 @@ let test_empty_branch_cursor () =
    | Ok None -> Alcotest.fail "expected entry from leaf under empty branch"
    | Error e -> Alcotest.failf "cursor error: %a" Btree.pp_error e)
 
+let string_contains hay needle =
+  let hl = String.length hay and nl = String.length needle in
+  let rec go i =
+    if i > hl - nl then false
+    else if String.sub hay i nl = needle then true
+    else go (i + 1)
+  in
+  go 0
+
+(* Exercise every constructor of Btree.error in pp_error. *)
+let test_pp_error_all_variants () =
+  let pe1 = Btree.pp_error in
+  let s_pager_block = Format.asprintf "%a" pe1
+                        (Btree.Pager_error (Pager.Block_error "x")) in
+  let s_pager_corr  = Format.asprintf "%a" pe1
+                        (Btree.Pager_error (Pager.Corruption "c")) in
+  let s_keytl = Format.asprintf "%a" pe1 (Btree.Key_too_large 99) in
+  let s_valtl = Format.asprintf "%a" pe1 (Btree.Value_too_large 7) in
+  let s_corr  = Format.asprintf "%a" pe1 (Btree.Tree_corrupt "broken") in
+  Alcotest.(check bool) "Pager_error/Block" true
+    (string_contains s_pager_block "Block_error");
+  Alcotest.(check bool) "Pager_error/Corr" true
+    (string_contains s_pager_corr "Corruption");
+  Alcotest.(check bool) "Key_too_large" true (string_contains s_keytl "99");
+  Alcotest.(check bool) "Value_too_large" true (string_contains s_valtl "7");
+  Alcotest.(check bool) "Tree_corrupt" true (string_contains s_corr "broken")
+
+(* Force a BRANCH split by inserting enough keys that the root branch
+   itself exceeds Page.max_data_bytes.  With ~1000-byte values and ~10-byte
+   keys, each leaf holds 3-4 entries; an internal branch with 10-byte keys
+   (16 bytes each) holds ~250 entries before splitting, so ~800-1000 leaf
+   entries should overflow the root branch. *)
+let test_branch_split () =
+  let (t, _) = empty_tree () in
+  let value = Bytes.make 1000 'q' in
+  let n = 1200 in
+  let t = ref t in
+  for i = 0 to n - 1 do
+    let k = b (Printf.sprintf "k%05d" i) in
+    t := ok_btree (run (Btree.put !t k value))
+  done;
+  (* Spot-check retrieval at a few positions *)
+  let positions = [0; 1; 100; 500; n - 1] in
+  List.iter (fun i ->
+    let k = b (Printf.sprintf "k%05d" i) in
+    match run (Btree.get !t k) with
+    | Ok (Some v) -> Alcotest.(check int) (Printf.sprintf "len(v%d)" i)
+                       (Bytes.length value) (Bytes.length v)
+    | _ -> Alcotest.failf "missing key at position %d" i
+  ) positions;
+  (* Cursor should still visit all entries in sorted order *)
+  let c = ok_btree (run (Btree.cursor_open !t)) in
+  let rec collect acc =
+    match run (Btree.cursor_next c) with
+    | Ok None -> List.rev acc
+    | Ok (Some (k, _)) -> collect (Bytes.to_string k :: acc)
+    | Error e -> Alcotest.failf "cursor error: %a" Btree.pp_error e
+  in
+  let got = collect [] in
+  Alcotest.(check int) "cursor visits all entries" n (List.length got)
+
+(* Mock pager whose write_page can be set to fail on demand --- used to
+   exercise B-tree's error-propagation arms. *)
+type failable_mock = {
+  store : (int64, Bytes.t) Hashtbl.t;
+  mutable n_pages : int64; [@warning "-69"]
+  mutable fail_writes : bool;
+  mutable fail_reads  : bool;
+  mutable fail_resize : bool;
+}
+[@@warning "-69"]
+
+let make_failable_mock () =
+  { store = Hashtbl.create 64; n_pages = 0L;
+    fail_writes = false; fail_reads = false; fail_resize = false }
+
+let failable_pager mb =
+  let read_page ~page_id buf =
+    if mb.fail_reads then Lwt.return_error "injected read error"
+    else
+      (match Hashtbl.find_opt mb.store page_id with
+       | None ->
+         Cstruct.memset buf 0;
+         Lwt.return_ok ()
+       | Some bytes ->
+         Cstruct.blit_from_bytes bytes 0 buf 0 Page.page_size;
+         Lwt.return_ok ())
+  in
+  let write_page ~page_id buf =
+    if mb.fail_writes then Lwt.return_error "injected write error"
+    else begin
+      let bytes = Bytes.create Page.page_size in
+      Cstruct.blit_to_bytes buf 0 bytes 0 Page.page_size;
+      Hashtbl.replace mb.store page_id bytes;
+      Lwt.return_ok ()
+    end
+  in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages =
+    if mb.fail_resize then Lwt.return_error "injected resize error"
+    else begin mb.n_pages <- n_pages; Lwt.return_ok () end
+  in
+  Pager.create ~read_page ~write_page ~sync ~resize
+    ~n_pages:2L ~freelist:Freelist.empty
+
+(* Btree.put with a resize-failure pager -> Pager.alloc fails ->
+   Btree.put surfaces a Pager_error (Block_error _). *)
+let test_btree_put_alloc_error () =
+  let mb = make_failable_mock () in
+  let pager = failable_pager mb in
+  let t = Btree.create pager ~root_page:0L in
+  mb.fail_resize <- true;
+  match run (Btree.put t (b "k") (b "v")) with
+  | Error (Btree.Pager_error (Pager.Block_error _)) -> ()
+  | Error e -> Alcotest.failf "expected Pager_error Block_error, got: %a"
+                 Btree.pp_error e
+  | Ok _ -> Alcotest.fail "expected error from failing resize"
+
+(* Btree.get on a tree whose root page can't be read should surface a
+   Pager_error.  We construct a Btree with a non-zero root_page that
+   points to a page that doesn't exist in the mock's store, then make
+   reads fail. *)
+let test_btree_get_read_error () =
+  let mb = make_failable_mock () in
+  let pager = failable_pager mb in
+  let t = Btree.create pager ~root_page:0L in
+  (* Build a real tree first via a working pager. *)
+  let t = match run (Btree.put t (b "k") (b "v")) with
+    | Ok t -> t
+    | Error e -> Alcotest.failf "setup put: %a" Btree.pp_error e
+  in
+  (* Now flip read failure on the same mock and create a fresh Btree
+     against the same root page, but use a fresh pager (no cache).  *)
+  let pager2 =
+    let read_page ~page_id:_ _buf = Lwt.return_error "injected" in
+    let write_page ~page_id:_ _buf = Lwt.return_ok () in
+    let sync () = Lwt.return_ok () in
+    let resize ~n_pages:_ = Lwt.return_ok () in
+    Pager.create ~read_page ~write_page ~sync ~resize
+      ~n_pages:2L ~freelist:Freelist.empty
+  in
+  let t2 = Btree.create pager2 ~root_page:(Btree.root_page t) in
+  match run (Btree.get t2 (b "k")) with
+  | Error (Btree.Pager_error _) -> ()
+  | Error e -> Alcotest.failf "expected Pager_error, got: %a"
+                 Btree.pp_error e
+  | Ok _ -> Alcotest.fail "expected error from failing reads"
+
 (* ------------------------------------------------------------------ *)
 (* QCheck properties                                                   *)
 (* ------------------------------------------------------------------ *)
@@ -548,6 +696,10 @@ let () =
       Alcotest.test_case "tree_corrupt bad page kind"  `Quick test_tree_corrupt_bad_page_kind;
       Alcotest.test_case "del key too large no-op"     `Quick test_del_key_too_large;
       Alcotest.test_case "empty branch cursor"         `Quick test_empty_branch_cursor;
+      Alcotest.test_case "pp_error all variants"       `Quick test_pp_error_all_variants;
+      Alcotest.test_case "branch split"                `Slow  test_branch_split;
+      Alcotest.test_case "put alloc error"             `Quick test_btree_put_alloc_error;
+      Alcotest.test_case "get read error"              `Quick test_btree_get_read_error;
     ];
     "qcheck", qcheck_tests;
   ]

@@ -463,6 +463,109 @@ let page_isolation_test () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* 9b. Cross-process file-lock conflict (sub-process holding the lock) *)
+(* ------------------------------------------------------------------ *)
+
+(* Spawn a child that locks the file and stays alive; the parent then
+   tries to open the same path and must see an "already locked" error. *)
+let cross_process_lock_test () =
+  let path = fresh_path () in
+  (try Unix.unlink path with _ -> ());
+  (* Ensure the file exists with at least one page so it has bytes for lockf *)
+  Lwt_main.run (
+    let* r = UF.open_ ~path in
+    match r with
+    | Error e -> Alcotest.failf "prepare: %a" UF.pp_error e
+    | Ok t ->
+      let* _ = UF.resize t ~n_pages:1L in
+      let* _ = UF.close t in
+      Lwt.return_unit
+  );
+  let r_pipe, w_pipe = Unix.pipe () in
+  match Unix.fork () with
+  | 0 ->
+    (* Child: open the file, lock it, signal parent, sleep, exit. *)
+    Unix.close r_pipe;
+    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
+    Unix.lockf fd Unix.F_TLOCK 0;
+    let _ = Unix.write w_pipe (Bytes.of_string "x") 0 1 in
+    Unix.close w_pipe;
+    Unix.sleep 2;
+    Unix.close fd;
+    exit 0
+  | child_pid ->
+    Unix.close w_pipe;
+    (* Wait for child to signal it has the lock *)
+    let buf = Bytes.create 1 in
+    let _ = Unix.read r_pipe buf 0 1 in
+    Unix.close r_pipe;
+    let result =
+      Lwt_main.run (
+        let* r = UF.open_ ~path in
+        match r with
+        | Ok t ->
+          let* _ = UF.close t in
+          Lwt.return `Success
+        | Error _ -> Lwt.return `Locked
+      )
+    in
+    let _ = Unix.waitpid [] child_pid in
+    cleanup path;
+    (match result with
+     | `Locked -> ()
+     | `Success ->
+       Alcotest.fail "expected open to fail while child holds the lock")
+
+(* Trigger Unix errors on operations against a file whose fd is already
+   closed.  We do this by reaching into the public API: open, immediately
+   close (which releases the lock), then call read/write/sync/resize on
+   the closed handle.  These all hit the Unix.Unix_error / Failure arms. *)
+let ops_on_closed_fd_test () =
+  Lwt_main.run (
+    let path = fresh_path () in
+    let* r = UF.open_ ~path in
+    match r with
+    | Error e -> Alcotest.failf "open: %a" UF.pp_error e
+    | Ok t ->
+      let* _ = UF.resize t ~n_pages:1L in
+      let* _ = UF.close t in
+      (* All subsequent operations against [t] hit a closed fd → Unix errors *)
+      let buf = make_buf () in
+      let* r_read = UF.read_page t ~page_id:0L buf in
+      let read_io = match r_read with
+        | Error (UF.Io _) -> true
+        | _ -> false
+      in
+      let* r_write = UF.write_page t ~page_id:0L buf in
+      let write_io = match r_write with
+        | Error (UF.Io _) -> true
+        | _ -> false
+      in
+      let* r_sync = UF.sync t in
+      let sync_io = match r_sync with
+        | Error (UF.Io _) -> true
+        | _ -> false
+      in
+      let* r_resize = UF.resize t ~n_pages:2L in
+      let resize_io = match r_resize with
+        | Error (UF.Io _) -> true
+        | _ -> false
+      in
+      let* r_close2 = UF.close t in
+      let close_io = match r_close2 with
+        | Error (UF.Io _) -> true
+        | _ -> false
+      in
+      Alcotest.(check bool) "read on closed fd: Io"   true read_io;
+      Alcotest.(check bool) "write on closed fd: Io"  true write_io;
+      Alcotest.(check bool) "sync on closed fd: Io"   true sync_io;
+      Alcotest.(check bool) "resize on closed fd: Io" true resize_io;
+      Alcotest.(check bool) "close on closed fd: Io"  true close_io;
+      cleanup path;
+      Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* 10. QCHECK PROPERTY TESTS                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -655,6 +758,10 @@ let () =
     "flock", [
       Alcotest.test_case "flock_conflict"                  `Quick flock_conflict_test;
       Alcotest.test_case "close_releases_lock"             `Quick close_releases_lock_test;
+      Alcotest.test_case "cross_process_lock"              `Slow  cross_process_lock_test;
+    ];
+    "closed_fd", [
+      Alcotest.test_case "ops_on_closed_fd"                `Quick ops_on_closed_fd_test;
     ];
     "resize", [
       Alcotest.test_case "resize_grow"                     `Quick resize_grow_test;

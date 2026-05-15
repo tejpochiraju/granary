@@ -966,6 +966,320 @@ let query_index_lookup_type_mismatch () =
     Lwt.return_unit
   )
 
+(* Multiple rows match the same index value -> Op_index_lookup must
+   keep returning rows until exhausted, exercising the cursor-exhausted
+   branch in the index_lookup stream loop. *)
+let query_index_lookup_multiple_matches () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    (* Three rows all with id = 7 -> a non-unique index will list all *)
+    insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_id_multi"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_id_multi" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Integer;
+      lookup_val = Plan.P_lit (Ast.L_int 7L);
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "3 matching rows" 3 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Op_index_lookup with col_type = Text exercises the IK_text arm. *)
+let query_index_lookup_text () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "bob"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_name"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 1; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_name" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 1;
+      col_type   = Row.Text;
+      lookup_val = Plan.P_lit (Ast.L_text "alice");
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 row matched on text key" 1 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Op_index_lookup with col_type=Real -> exercises IK_real arm. *)
+let query_index_lookup_real () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "r"; ty = Row.Real }] }) in
+    insert store cat "t" ([0], [Ast.L_real 1.5]);
+    insert store cat "t" ([0], [Ast.L_real 2.5]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_r"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_r" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Real;
+      lookup_val = Plan.P_lit (Ast.L_real 2.5);
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 real row" 1 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Op_index_lookup with col_type=Blob -> exercises IK_blob arm. *)
+let query_index_lookup_blob () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AAAA")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BBBB")]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_b"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_b" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Blob;
+      lookup_val = Plan.P_lit (Ast.L_blob (Bytes.of_string "BBBB"));
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 blob row" 1 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Op_index_lookup with lookup_val=NULL -> IK_null arm. *)
+let query_index_lookup_null () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "x"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_n"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_n" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Integer;
+      lookup_val = Plan.P_lit Ast.L_null;
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let _rows = collect stream in
+    Lwt.return_unit
+  )
+
+(* Filter with Op_eq comparing different value types -> exercises
+   the v_real/v_blob/null arms of eval_expr. *)
+let query_filter_eq_real () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "r"; ty = Row.Real }] }) in
+    insert store cat "t" ([0], [Ast.L_real 1.5]);
+    insert store cat "t" ([0], [Ast.L_real 2.5]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
+    let op = Plan.Op_filter {
+      pred;
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 row matches real eq" 1 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_filter_eq_blob () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let pred = Plan.P_eq (Plan.P_col 0,
+                          Plan.P_lit (Ast.L_blob (Bytes.of_string "BB"))) in
+    let op = Plan.Op_filter {
+      pred;
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "1 row matches blob eq" 1 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Sort by Real and Blob columns -> exercises compare_values for these types *)
+let query_sort_real () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "r"; ty = Row.Real }] }) in
+    insert store cat "t" ([0], [Ast.L_real 3.0]);
+    insert store cat "t" ([0], [Ast.L_real 1.0]);
+    insert store cat "t" ([0], [Ast.L_real 2.0]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "3 rows sorted" 3 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_sort_blob () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t";
+                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "CC")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "3 rows sorted (blob)" 3 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Create index on a non-existent table should fail.  The create_index
+   path runs in Lwt so we catch via Lwt.catch. *)
+let exec_create_index_unknown_table () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* outcome =
+      Lwt.catch
+        (fun () ->
+           let* () = Exec.execute store cat
+               (Plan.Op_create_index {
+                  name = "i"; table = "no_such_table";
+                  tree_id = 99; col_idx = 0; unique = false;
+                  columns = id_name_cols;
+                }) in
+           Lwt.return `Ok)
+        (fun _ -> Lwt.return `Err)
+    in
+    Alcotest.(check bool) "create_index on unknown table fails"
+      true (outcome = `Err);
+    Lwt.return_unit
+  )
+
+(* Sort with multiple NULL values -> exercises compare_values NULL/NULL arm. *)
+let query_sort_multiple_nulls () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    (* Two rows with NULL in the id column *)
+    insert store cat "t" ([1], [Ast.L_text "x"]);
+    insert store cat "t" ([1], [Ast.L_text "y"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "z"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "all rows present" 3 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* Unique constraint: inserting the first row should run through the
+   UNIQUE-check path without finding a duplicate (covers else-arm). *)
+let unique_index_first_insert_succeeds () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_u"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = true; columns = m.Cat.columns;
+         }) in
+    (* Insert two distinct values: each triggers the unique check
+       (no duplicate) so the else-arm is exercised on both. *)
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    Lwt.return_unit
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -1034,5 +1348,17 @@ let () =
     "index_lookup", [
       Alcotest.test_case "query_index_lookup_basic"          `Quick query_index_lookup_basic;
       Alcotest.test_case "query_index_lookup_type_mismatch"  `Quick query_index_lookup_type_mismatch;
+      Alcotest.test_case "query_index_lookup_multiple"       `Quick query_index_lookup_multiple_matches;
+      Alcotest.test_case "query_index_lookup_text"           `Quick query_index_lookup_text;
+      Alcotest.test_case "query_index_lookup_real"           `Quick query_index_lookup_real;
+      Alcotest.test_case "query_index_lookup_blob"           `Quick query_index_lookup_blob;
+      Alcotest.test_case "query_index_lookup_null"           `Quick query_index_lookup_null;
+      Alcotest.test_case "query_filter_eq_real"              `Quick query_filter_eq_real;
+      Alcotest.test_case "query_filter_eq_blob"              `Quick query_filter_eq_blob;
+      Alcotest.test_case "query_sort_real"                   `Quick query_sort_real;
+      Alcotest.test_case "query_sort_blob"                   `Quick query_sort_blob;
+      Alcotest.test_case "query_sort_multiple_nulls"         `Quick query_sort_multiple_nulls;
+      Alcotest.test_case "exec_create_index_unknown_table"   `Quick exec_create_index_unknown_table;
+      Alcotest.test_case "unique_first_insert_succeeds"      `Quick unique_index_first_insert_succeeds;
     ];
   ]

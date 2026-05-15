@@ -259,6 +259,112 @@ let test_non_header_kind_treated_as_corrupt () =
            Alcotest.(check int64) "uses page 1 (txn_id=1)" 1L h.Header.txn_id)))
 
 (* ------------------------------------------------------------------ *)
+(* Error-path coverage                                                 *)
+(* ------------------------------------------------------------------ *)
+
+let string_contains hay needle =
+  let hl = String.length hay and nl = String.length needle in
+  let rec go i =
+    if i > hl - nl then false
+    else if String.sub hay i nl = needle then true
+    else go (i + 1)
+  in
+  go 0
+
+(* pp_error formats both variants distinctly. *)
+let test_pp_error_io () =
+  let s = Format.asprintf "%a" Header.pp_error (Header.Io "disk full") in
+  Alcotest.(check bool) "Io tag"  true (string_contains s "Io");
+  Alcotest.(check bool) "Io msg"  true (string_contains s "disk full")
+
+let test_pp_error_both_corrupt () =
+  let s = Format.asprintf "%a"
+            Header.pp_error Header.Both_headers_corrupt in
+  Alcotest.(check bool) "Both_headers_corrupt"
+    true (string_contains s "Both_headers_corrupt")
+
+(* init with a pager whose flush fails -> Header.init returns Io. *)
+let test_init_flush_error () =
+  let read_page ~page_id:_ buf = Cstruct.memset buf 0; Lwt.return_ok () in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync () = Lwt.return_error "sync failed" in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let pager = Pager.create ~read_page ~write_page ~sync ~resize
+                ~n_pages:2L ~freelist:Freelist.empty in
+  match run (Header.init pager) with
+  | Error (Header.Io _) -> ()
+  | Error _ -> Alcotest.fail "expected Io"
+  | Ok () -> Alcotest.fail "expected init to fail when sync fails"
+
+(* commit where pager.flush fails -> Header.commit returns Io. *)
+let test_commit_flush_error () =
+  let read_page ~page_id:_ buf = Cstruct.memset buf 0; Lwt.return_ok () in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync = ref (fun () -> Lwt.return_ok ()) in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let pager = Pager.create
+                ~read_page
+                ~write_page
+                ~sync:(fun () -> !sync ())
+                ~resize ~n_pages:2L ~freelist:Freelist.empty in
+  (* Initialise successfully first *)
+  (match run (Header.init pager) with
+   | Error e -> Alcotest.failf "init failed: %a" Header.pp_error e
+   | Ok () -> ());
+  (* Now break sync on next flush *)
+  sync := (fun () -> Lwt.return_error "sync failed");
+  let new_state =
+    Header.{ txn_id = 0L; root_page = 7L; freelist_page = 0L;
+             n_pages_total = 3L; schema_version = 0L } in
+  match run (Header.commit pager ~prev_header:zero_header ~new_state) with
+  | Error (Header.Io _) -> ()
+  | Error _ -> Alcotest.fail "expected Io"
+  | Ok () -> Alcotest.fail "expected commit to fail when flush fails"
+
+(* read_live when both pages fail to read -> Both_headers_corrupt. *)
+let test_read_live_both_read_errors () =
+  let read_page ~page_id:_ _buf = Lwt.return_error "read failed" in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let pager = Pager.create ~read_page ~write_page ~sync ~resize
+                ~n_pages:2L ~freelist:Freelist.empty in
+  match run (Header.read_live pager) with
+  | Error Header.Both_headers_corrupt -> ()
+  | _ -> Alcotest.fail "expected Both_headers_corrupt"
+
+(* read_live where ONE page is corrupt (read fails for page 0, succeeds
+   for page 1) - exercises the asymmetric arm. *)
+let test_read_live_one_read_error () =
+  let pages = Hashtbl.create 2 in
+  let read_page ~page_id buf =
+    if Int64.equal page_id 0L then Lwt.return_error "broken"
+    else match Hashtbl.find_opt pages page_id with
+      | Some b -> Cstruct.blit_from_bytes b 0 buf 0 Page.page_size;
+                  Lwt.return_ok ()
+      | None -> Cstruct.memset buf 0; Lwt.return_ok ()
+  in
+  let write_page ~page_id buf =
+    let b = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes buf 0 b 0 Page.page_size;
+    Hashtbl.replace pages page_id b;
+    Lwt.return_ok ()
+  in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let pager = Pager.create ~read_page ~write_page ~sync ~resize
+                ~n_pages:2L ~freelist:Freelist.empty in
+  (* Write a valid header to page 1 via build_page indirectly: do init,
+     which writes both, but only page 1 is queryable. *)
+  (match run (Header.init pager) with
+   | Error e -> Alcotest.failf "init failed: %a" Header.pp_error e
+   | Ok () -> ());
+  match run (Header.read_live pager) with
+  | Ok h -> Alcotest.(check int64) "uses page 1" 0L h.Header.txn_id
+  | Error e -> Alcotest.failf "expected Ok with page 1, got: %a"
+                 Header.pp_error e
+
+(* ------------------------------------------------------------------ *)
 (* QCheck property tests                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -319,6 +425,14 @@ let () =
       Alcotest.test_case "corrupt page 1 falls back to page 0"  `Quick test_corrupt_page1_fallback_to_page0;
       Alcotest.test_case "both pages corrupt"                   `Quick test_both_corrupt;
       Alcotest.test_case "non-Header kind treated as corrupt"   `Quick test_non_header_kind_treated_as_corrupt;
+    ];
+    "errors", [
+      Alcotest.test_case "pp_error Io"                          `Quick test_pp_error_io;
+      Alcotest.test_case "pp_error Both_headers_corrupt"        `Quick test_pp_error_both_corrupt;
+      Alcotest.test_case "init flush error"                     `Quick test_init_flush_error;
+      Alcotest.test_case "commit flush error"                   `Quick test_commit_flush_error;
+      Alcotest.test_case "read_live both read errors"           `Quick test_read_live_both_read_errors;
+      Alcotest.test_case "read_live one read error"             `Quick test_read_live_one_read_error;
     ];
     "qcheck", qcheck_tests;
   ]

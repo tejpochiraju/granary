@@ -346,6 +346,75 @@ let prop_flush_then_reread =
             last_written true))
 
 (* ------------------------------------------------------------------ *)
+(* pp_error formatting + flush error paths                              *)
+(* ------------------------------------------------------------------ *)
+
+let string_contains hay needle =
+  let hl = String.length hay and nl = String.length needle in
+  let rec go i =
+    if i > hl - nl then false
+    else if String.sub hay i nl = needle then true
+    else go (i + 1)
+  in
+  go 0
+
+let test_pp_error_block () =
+  let s = Format.asprintf "%a" Pager.pp_error (Pager.Block_error "msg") in
+  Alcotest.(check bool) "Block_error tag" true (string_contains s "Block_error");
+  Alcotest.(check bool) "Block_error msg" true (string_contains s "msg")
+
+let test_pp_error_corruption () =
+  let s = Format.asprintf "%a" Pager.pp_error (Pager.Corruption "bad") in
+  Alcotest.(check bool) "Corruption tag" true (string_contains s "Corruption");
+  Alcotest.(check bool) "Corruption msg" true (string_contains s "bad")
+
+(* flush where write_page returns Error -> pager surfaces Block_error *)
+let test_flush_write_error () =
+  let read_page ~page_id:_ buf =
+    Cstruct.memset buf 0; Lwt.return_ok ()
+  in
+  let write_page ~page_id:_ _buf = Lwt.return_error "injected write" in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let p = Pager.create ~read_page ~write_page ~sync ~resize
+            ~n_pages:1L ~freelist:Freelist.empty in
+  let buf = fill_page 0x11 in
+  Pager.write p 0L buf;
+  match run (Pager.flush p) with
+  | Ok () -> Alcotest.fail "expected error from flush"
+  | Error (Pager.Block_error _) -> ()
+  | Error _ -> Alcotest.fail "expected Block_error"
+
+(* flush where sync returns Error -> pager surfaces Block_error *)
+let test_flush_sync_error () =
+  let read_page ~page_id:_ buf =
+    Cstruct.memset buf 0; Lwt.return_ok ()
+  in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync () = Lwt.return_error "injected sync" in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let p = Pager.create ~read_page ~write_page ~sync ~resize
+            ~n_pages:1L ~freelist:Freelist.empty in
+  (* dirty list is empty - flush still calls sync at the end *)
+  match run (Pager.flush p) with
+  | Ok () -> Alcotest.fail "expected error from flush sync"
+  | Error (Pager.Block_error _) -> ()
+  | Error _ -> Alcotest.fail "expected Block_error"
+
+(* read where the underlying read_page fails -> Block_error *)
+let test_read_block_error () =
+  let read_page ~page_id:_ _buf = Lwt.return_error "injected read" in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  let p = Pager.create ~read_page ~write_page ~sync ~resize
+            ~n_pages:1L ~freelist:Freelist.empty in
+  match run (Pager.read p 0L) with
+  | Ok _ -> Alcotest.fail "expected Block_error"
+  | Error (Pager.Block_error _) -> ()
+  | Error _ -> Alcotest.fail "expected Block_error"
+
+(* ------------------------------------------------------------------ *)
 (* RUNNER                                                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -370,6 +439,13 @@ let () =
       Alcotest.test_case "flush clears dirty"                   `Quick test_flush_clears_dirty;
       Alcotest.test_case "n_pages after two allocs"             `Quick test_n_pages_after_two_allocs;
       Alcotest.test_case "cache eviction"                       `Quick test_cache_eviction;
+    ];
+    "errors", [
+      Alcotest.test_case "pp_error Block_error"                 `Quick test_pp_error_block;
+      Alcotest.test_case "pp_error Corruption"                  `Quick test_pp_error_corruption;
+      Alcotest.test_case "flush write error"                    `Quick test_flush_write_error;
+      Alcotest.test_case "flush sync error"                     `Quick test_flush_sync_error;
+      Alcotest.test_case "read block error"                     `Quick test_read_block_error;
     ];
     "qcheck", qcheck_tests;
   ]

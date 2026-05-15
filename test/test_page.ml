@@ -419,6 +419,35 @@ let test_leaf_append_overflow () =
   | _ -> Alcotest.fail "expected invalid_arg for leaf overflow"
   | exception Invalid_argument _ -> ()
 
+(* branch_append_entry: key longer than uint16 max (0xFFFF) raises *)
+let test_branch_append_key_too_long () =
+  let buf = fresh_page () in
+  let big_key = Bytes.make 0x10000 'k' in   (* > 65535 *)
+  match P.branch_append_entry buf ~offset:P.data_offset
+          ~key:big_key ~left_child:1l with
+  | _ -> Alcotest.fail "expected invalid_arg for oversized branch key"
+  | exception Invalid_argument _ -> ()
+
+(* leaf_append_entry: key longer than uint16 max raises *)
+let test_leaf_append_key_too_long () =
+  let buf = fresh_page () in
+  let big_key = Bytes.make 0x10000 'k' in
+  let value = Bytes.of_string "v" in
+  match P.leaf_append_entry buf ~offset:P.data_offset
+          ~key:big_key ~value with
+  | _ -> Alcotest.fail "expected invalid_arg for oversized leaf key"
+  | exception Invalid_argument _ -> ()
+
+(* leaf_append_entry: value longer than uint16 max raises *)
+let test_leaf_append_value_too_long () =
+  let buf = fresh_page () in
+  let key = Bytes.of_string "k" in
+  let big_val = Bytes.make 0x10000 'v' in
+  match P.leaf_append_entry buf ~offset:P.data_offset
+          ~key ~value:big_val with
+  | _ -> Alcotest.fail "expected invalid_arg for oversized leaf value"
+  | exception Invalid_argument _ -> ()
+
 (* branch_entry_at: key_len says the key would overflow the page *)
 let test_branch_entry_at_key_overflow () =
   let buf = fresh_page () in
@@ -643,6 +672,9 @@ let () =
     "overflow", [
       Alcotest.test_case "branch_append_entry overflow"     `Quick test_branch_append_overflow;
       Alcotest.test_case "leaf_append_entry overflow"       `Quick test_leaf_append_overflow;
+      Alcotest.test_case "branch_append key>0xFFFF raises"  `Quick test_branch_append_key_too_long;
+      Alcotest.test_case "leaf_append key>0xFFFF raises"    `Quick test_leaf_append_key_too_long;
+      Alcotest.test_case "leaf_append val>0xFFFF raises"    `Quick test_leaf_append_value_too_long;
       Alcotest.test_case "branch_entry_at key overflow"     `Quick test_branch_entry_at_key_overflow;
       Alcotest.test_case "leaf_entry_at key overflow"       `Quick test_leaf_entry_at_key_overflow;
       Alcotest.test_case "leaf_entry_at val overflow"       `Quick test_leaf_entry_at_val_overflow;
