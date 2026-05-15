@@ -1001,6 +1001,18 @@ let default_value_readable () =
   Alcotest.check value_testable "x=1 (explicit)"   (Db.V_int 1L)    row.(0);
   Alcotest.check value_testable "y=hi (default)"   (Db.V_text "hi") row.(1)
 
+(** INSERT omitting a NOT NULL column that has no DEFAULT → error. *)
+let not_null_omit_no_default () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER NOT NULL)" in
+    let* result = Db.execute db "INSERT INTO t (id) VALUES (1)" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected error when omitting NOT NULL column with no default");
+    Db.close db
+  )
+
 (** QCheck: for a table with n INTEGER NOT NULL DEFAULT 99, inserting without
     specifying n always produces n=99.  10,000 trials. *)
 let qcheck_default_applied =
@@ -1142,6 +1154,7 @@ let () =
       Alcotest.test_case "not_null_default_zero"            `Quick not_null_default_zero;
       Alcotest.test_case "not_null_update_to_null"          `Quick not_null_update_to_null;
       Alcotest.test_case "default_value_readable"           `Quick default_value_readable;
+      Alcotest.test_case "not_null_omit_no_default"         `Quick not_null_omit_no_default;
     ];
     "qcheck_not_null_default", (
       List.map QCheck_alcotest.to_alcotest [
