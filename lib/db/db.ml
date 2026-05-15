@@ -56,8 +56,13 @@ let execute t sql =
     (match Sql.Exec.execute t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
-       let* () = lwt_op in
-       Lwt.return (Ok ()))
+       Lwt.catch
+         (fun () ->
+           let* () = lwt_op in
+           Lwt.return (Ok ()))
+         (function
+          | Failure msg -> Lwt.return (Error (Runtime msg))
+          | exn         -> Lwt.fail exn))
 
 let query t sql =
   let* op = prepare t sql in

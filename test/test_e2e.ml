@@ -727,6 +727,27 @@ let create_unique_index () =
   let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
   Alcotest.(check int) "1 row" 1 (List.length rows)
 
+let unique_index_rejects_duplicate () =
+  (* Second INSERT with same indexed value must return an error. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "CREATE UNIQUE INDEX idx ON t (id)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  let result = run (Db.execute db "INSERT INTO t (id, name) VALUES (1, 'bob')") in
+  (match err_or_fail "unique_index_rejects_duplicate" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected Runtime error for UNIQUE constraint violation")
+
+let unique_index_allows_distinct_values () =
+  (* Two rows with different values on a UNIQUE index must both succeed. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "CREATE UNIQUE INDEX idx ON t (id)";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows)
+
 let index_lookup_no_match () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, name TEXT)";
@@ -1001,6 +1022,8 @@ let () =
       Alcotest.test_case "create_index_simple"              `Quick create_index_simple;
       Alcotest.test_case "create_index_on_text_column"      `Quick create_index_on_text_column;
       Alcotest.test_case "create_unique_index"              `Quick create_unique_index;
+      Alcotest.test_case "unique_index_rejects_duplicate"    `Quick unique_index_rejects_duplicate;
+      Alcotest.test_case "unique_index_allows_distinct"      `Quick unique_index_allows_distinct_values;
       Alcotest.test_case "index_lookup_no_match"            `Quick index_lookup_no_match;
       Alcotest.test_case "index_lookup_returns_all_matches" `Quick index_lookup_returns_all_matches;
       Alcotest.test_case "index_lookup_matches_seq_scan"    `Quick index_lookup_matches_seq_scan;

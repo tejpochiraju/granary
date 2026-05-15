@@ -59,6 +59,46 @@ let execute (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
      | [] -> Lwt.return_unit
      | _  ->
        let* tx = S.rw_begin store in
+       (* Check UNIQUE constraints before writing any index entry.
+          Open RO cursors on each unique index to test for duplicates. *)
+       let* unique_ok =
+         Lwt_list.fold_left_s (fun acc (idx : Cat.index_info) ->
+           if not acc || not idx.idx_unique then Lwt.return acc
+           else begin
+             let col_idx =
+               let rec find i = function
+                 | [] -> failwith "indexed column not found"
+                 | (c : Row.column) :: _ when c.name = idx.idx_column -> i
+                 | _ :: rest -> find (i + 1) rest
+               in
+               find 0 table_meta.columns
+             in
+             let v = row.(col_idx) in
+             let ik_value = row_value_to_index_value v in
+             let prefix = Index_key.encode_value ik_value in
+             let plen = Bytes.length prefix in
+             (* Seek to the smallest key >= prefix ++ min_rowid. *)
+             let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+             let* cur = S.cursor_open tx idx.idx_tree_id in
+             let _sr = S.cursor_seek cur seek_key in
+             let duplicate =
+               match S.cursor_next cur with
+               | None -> false
+               | Some (ikey, _) ->
+                 Bytes.length ikey >= plen &&
+                 Bytes.equal (Bytes.sub ikey 0 plen) prefix
+             in
+             S.cursor_close cur;
+             if duplicate then
+               Lwt.fail_with (Printf.sprintf
+                 "UNIQUE constraint violated: duplicate value in column '%s'"
+                 idx.idx_column)
+             else
+               Lwt.return true
+           end
+         ) true idxs
+       in
+       ignore unique_ok;
        let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
          (* Locate the indexed column's value in the row. *)
          let col_idx =
