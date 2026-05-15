@@ -42,6 +42,10 @@ val compute_crc : Cstruct.t -> int32
 val verify_crc  : Cstruct.t -> bool
 (** [true] if [compute_crc buf] equals the crc32 stored in the common header. *)
 
+val seal : Cstruct.t -> unit
+(** Compute CRC and write it into the page at bytes 8..11.
+    Call after all other fields are written. *)
+
 (** Header page fields (kind = [Header]; bytes 16–63). *)
 type header_fields = {
   txn_id         : int64;  (** int64 BE; higher = more recent *)
@@ -57,7 +61,9 @@ val read_header_fields  : Cstruct.t -> header_fields
 (** Read header-page fields from [buf] (reads bytes 16–63). *)
 
 val write_header_fields : Cstruct.t -> header_fields -> unit
-(** Write header-page fields into [buf] (writes bytes 16–63). *)
+(** Write header-page fields into [buf].  Zeros bytes 16–4095 first (including
+    the reserved area 64–4095) to prevent stale data from corrupting the CRC,
+    then writes the known fields into bytes 16–63. *)
 
 (** A decoded branch page entry. *)
 type branch_entry = {
@@ -77,7 +83,8 @@ val branch_entry_at : Cstruct.t -> offset:int ->
   [ `Entry of branch_entry | `End ]
 
 (** Append a branch entry at [offset].  Returns the next offset after the
-    appended entry.  The caller must ensure the entry fits in the page. *)
+    appended entry.  Raises [Invalid_argument] if the entry would overflow the
+    page or if [key] is longer than 65535 bytes. *)
 val branch_append_entry : Cstruct.t -> offset:int -> key:bytes -> left_child:int32 -> int
 
 (** A decoded leaf page entry. *)
@@ -96,8 +103,9 @@ type leaf_entry = {
 val leaf_entry_at : Cstruct.t -> offset:int ->
   [ `Entry of leaf_entry | `End ]
 
-(** Append a leaf entry at [offset].  Returns the next offset.  The caller
-    must ensure the entry fits in the page. *)
+(** Append a leaf entry at [offset].  Returns the next offset.  Raises
+    [Invalid_argument] if the entry would overflow the page or if [key] or
+    [value] is longer than 65535 bytes. *)
 val leaf_append_entry : Cstruct.t -> offset:int -> key:bytes -> value:bytes -> int
 
 val max_freelist_entries_per_page : int

@@ -113,6 +113,10 @@ let verify_crc buf =
   let computed = compute_crc buf in
   computed = stored
 
+let seal buf =
+  let crc = compute_crc buf in
+  Cstruct.BE.set_uint32 buf 8 crc
+
 (* ------------------------------------------------------------------ *)
 (* Header page fields (kind = Header, bytes 16–63)                    *)
 (* ------------------------------------------------------------------ *)
@@ -151,6 +155,9 @@ let read_header_fields buf =
     page_size; format_version }
 
 let write_header_fields buf hf =
+  (* Zero bytes 16..4095 first so the reserved area (64..4095) is clean.
+     write_common handles bytes 0..15 separately. *)
+  Cstruct.memset (Cstruct.sub buf 16 (page_size - 16)) 0;
   Cstruct.BE.set_uint64 buf 16 hf.txn_id;
   Cstruct.BE.set_uint64 buf 24 hf.root_page;
   Cstruct.BE.set_uint64 buf 32 hf.freelist_page;
@@ -192,6 +199,13 @@ let branch_entry_at buf ~offset =
 
 let branch_append_entry buf ~offset ~key ~left_child =
   let key_len = Bytes.length key in
+  if key_len > 0xFFFF then
+    invalid_arg "branch_append_entry: key too long (max 65535 bytes)";
+  let entry_size = 2 + key_len + 4 in
+  if offset + entry_size > page_size then
+    invalid_arg (Printf.sprintf
+      "branch_append_entry: entry size %d would overflow page at offset %d"
+      entry_size offset);
   Cstruct.BE.set_uint16 buf offset key_len;
   Cstruct.blit_from_bytes key 0 buf (offset + 2) key_len;
   Cstruct.BE.set_uint32 buf (offset + 2 + key_len) left_child;
@@ -236,6 +250,15 @@ let leaf_entry_at buf ~offset =
 let leaf_append_entry buf ~offset ~key ~value =
   let key_len = Bytes.length key in
   let val_len = Bytes.length value in
+  if key_len > 0xFFFF then
+    invalid_arg "leaf_append_entry: key too long (max 65535 bytes)";
+  if val_len > 0xFFFF then
+    invalid_arg "leaf_append_entry: value too long (max 65535 bytes)";
+  let entry_size = 2 + key_len + 2 + val_len in
+  if offset + entry_size > page_size then
+    invalid_arg (Printf.sprintf
+      "leaf_append_entry: entry size %d would overflow page at offset %d"
+      entry_size offset);
   Cstruct.BE.set_uint16 buf offset key_len;
   Cstruct.blit_from_bytes key 0 buf (offset + 2) key_len;
   Cstruct.BE.set_uint16 buf (offset + 2 + key_len) val_len;

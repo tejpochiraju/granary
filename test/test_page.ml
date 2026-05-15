@@ -167,6 +167,13 @@ let test_verify_crc_fails_flipped_crc_byte () =
   flip_byte buf 8;
   Alcotest.(check bool) "verify_crc fails after CRC field flip" false (P.verify_crc buf)
 
+let test_seal () =
+  let buf = fresh_page () in
+  let c = P.{ kind = P.Leaf; flags = 0; n_keys = 5; right_page = 0l; crc32 = 0l } in
+  P.write_common buf c;
+  P.seal buf;
+  Alcotest.(check bool) "verify after seal" true (P.verify_crc buf)
+
 (* ------------------------------------------------------------------ *)
 (* 5. Header page fields round-trip                                    *)
 (* ------------------------------------------------------------------ *)
@@ -557,6 +564,7 @@ let () =
       Alcotest.test_case "verify_crc passes on fresh page"  `Quick test_verify_crc_fresh_page;
       Alcotest.test_case "verify_crc fails: data byte flip" `Quick test_verify_crc_fails_flipped_data_byte;
       Alcotest.test_case "verify_crc fails: CRC byte flip"  `Quick test_verify_crc_fails_flipped_crc_byte;
+      Alcotest.test_case "seal then verify_crc passes"      `Quick test_seal;
     ];
     "header_fields", [
       Alcotest.test_case "header_fields round-trip"         `Quick test_header_fields_roundtrip;

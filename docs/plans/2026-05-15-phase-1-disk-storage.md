@@ -167,7 +167,7 @@ kind byte: 0=Header, 1=Branch, 2=Leaf, 3=Freelist
 +1  [1] flags (reserved, set to 0)
 +2  [2] n_keys (uint16, number of keys in this page)
 +4  [4] right_page (uint32, branch pages: rightmost child; leaf: next-leaf page-id for range scans; 0 = none)
-+8  [4] crc32 (uint32, CRC32 of bytes 0..4091; bytes 4088..4091 are the CRC field itself set to 0 during computation)
++8  [4] crc32 (uint32, CRC32 of bytes 0..4095 with bytes 8..11 zeroed during computation)
 +12 [4] reserved (set to 0)
 ```
 Total header: 16 bytes. Data area: bytes 16..4095 (4080 bytes).
@@ -222,7 +222,7 @@ type common = {
 val read_common  : Cstruct.t -> common
 val write_common : Cstruct.t -> common -> unit
 
-(** CRC32 of page contents (bytes 0..4091 with crc32 field zeroed) *)
+(** CRC32 of page contents (bytes 0..4095 with bytes 8..11 zeroed during computation) *)
 val compute_crc : Cstruct.t -> int32
 val verify_crc  : Cstruct.t -> bool
 
