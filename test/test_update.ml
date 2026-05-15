@@ -418,6 +418,39 @@ let qcheck_update_count_matches =
        ))
 
 (* ------------------------------------------------------------------ *)
+(* Group 8: Known limitations                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* sqlocaml checks UNIQUE constraints against committed (pre-update) index
+   state before applying any mutations.  This means a single UPDATE that
+   "swaps" two unique values across rows is rejected, even though the final
+   state would be valid: when the check runs for the first row being updated
+   (n=1 → n=-1), the committed index still contains -1 (owned by the second
+   row), so sqlocaml raises a UNIQUE violation.
+
+   This is a known Phase 2 limitation: a correct implementation would defer
+   the constraint check until all row mutations have been applied (or remove
+   old index entries before checking).  For now, callers must work around
+   this by updating through an intermediate value that doesn't collide. *)
+let update_unique_swap_rejected () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx ON t(n)" in
+    let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+    let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (2, -1)" in
+    (* Attempt to negate all n values: row 1: 1 -> -1, row 2: -1 -> 1.
+       Logically this is a pure swap and the final state would satisfy
+       UNIQUE(n), but sqlocaml rejects it because -1 already exists in the
+       committed index when the pre-update check runs for row 1. *)
+    let* result = Db.execute db "UPDATE t SET n = 0 - n" in
+    (* Expect a UNIQUE violation Runtime error — not Ok. *)
+    Alcotest.(check bool) "swap rejected due to committed-state UNIQUE check" true
+      (match result with Error (Db.Runtime _) -> true | _ -> false);
+    Db.close db
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -466,4 +499,12 @@ let () =
         qcheck_update_count_matches;
       ]
     );
+    "known_limitations", [
+      (* This test documents the committed-state UNIQUE check limitation:
+         a single UPDATE that swaps unique values across rows is incorrectly
+         rejected.  The test asserts the *current* (buggy) behaviour so that
+         any future fix will cause it to fail and prompt updating the test. *)
+      Alcotest.test_case "update_unique_swap_rejected"
+        `Quick update_unique_swap_rejected;
+    ];
   ]
