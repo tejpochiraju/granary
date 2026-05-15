@@ -460,7 +460,7 @@ let collect_via_cursor s =
   Lwt.return acc
 
 let prop_btree_matches_mem =
-  QCheck.Test.make ~count:200 ~name:"btree backend matches Mem backend"
+  QCheck.Test.make ~count:10_000 ~name:"btree backend matches Mem backend"
     arb_ops
     (fun ops ->
       Lwt_main.run (
@@ -486,7 +486,7 @@ let prop_btree_matches_mem =
       ))
 
 let prop_persist_roundtrip =
-  QCheck.Test.make ~count:100
+  QCheck.Test.make ~count:10_000
     ~name:"persistence: writes survive close/reopen"
     arb_ops
     (fun ops ->
