@@ -220,7 +220,7 @@ some may be reconsidered in v2+.
 These are solo-developer-feel estimates. Team size, depth, and rigor will
 stretch them.
 
-- [ ] **Phase 0 — walking skeleton (~4-6 wks):** Mem backend; CREATE TABLE,
+- [x] **Phase 0 — walking skeleton (~4-6 wks):** Mem backend; CREATE TABLE,
       INSERT, simple SELECT. End-to-end demo.
 - [ ] **Phase 1 — disk storage (~6-8 wks):** Unix_file backend (CoW B+-tree);
       ORDER BY, LIMIT, single-col indexes.
