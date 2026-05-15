@@ -1142,6 +1142,21 @@ let drop_index_then_recreate () =
   let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
   Alcotest.(check int) "1 row via recreated index" 1 (List.length rows)
 
+(** DROP the very first index ever created (id=0, first entry in _sys_indexes)
+    and verify re-creation succeeds, proving the on-disk record was deleted. *)
+let drop_first_index_then_recreate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  (* This is the first and only index created — it receives id=0,
+     stored at key varint(0) = the first entry in _sys_indexes. *)
+  exec db "CREATE INDEX idx ON t (id)";
+  exec db "DROP INDEX idx";
+  (* Re-creation must succeed: if the on-disk record was not deleted,
+     a re-open would see a ghost entry and fail to insert again. *)
+  exec db "CREATE INDEX idx ON t (id)";
+  let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
+  Alcotest.(check int) "0 rows (recreated index, empty table)" 0 (List.length rows)
+
 (** After DROP TABLE and re-CREATE, only new rows are visible. *)
 let drop_table_recreate_old_data_invisible () =
   let db = fresh_db () in
@@ -1284,5 +1299,6 @@ let () =
       Alcotest.test_case "drop_index_nonexistent"             `Quick drop_index_nonexistent;
       Alcotest.test_case "drop_index_then_recreate"           `Quick drop_index_then_recreate;
       Alcotest.test_case "drop_table_recreate_old_data_invis" `Quick drop_table_recreate_old_data_invisible;
+      Alcotest.test_case "drop_first_index_then_recreate"     `Quick drop_first_index_then_recreate;
     ];
   ]

@@ -411,11 +411,20 @@ let find_index t ~name =
   Hashtbl.find_opt t.indexes name
 
 (** Scan _sys_indexes (using the given txn) to find the key for [name].
-    Returns [None] if not found. *)
+    Returns [None] if not found.
+
+    [cursor_first] positions at the first entry (id=0 when it exists).
+    We inspect that entry immediately via [cursor_next] — which on a
+    pre-positioned cursor returns the current entry without advancing —
+    so no entry is ever skipped, including the very first one. *)
 let find_index_key_in_txn tx name =
   let%lwt cur = S.cursor_open tx sys_indexes_tid in
+  (* Position at the first entry; returns Not_found `End if the tree is
+     empty, in which case cursor_next will immediately return None. *)
   let _sr = S.cursor_first cur in
   let result = ref None in
+  (* cursor_next after cursor_first returns the positioned (first) entry on
+     its initial call, then advances on each subsequent call. *)
   let rec walk () =
     match S.cursor_next cur with
     | None -> ()
