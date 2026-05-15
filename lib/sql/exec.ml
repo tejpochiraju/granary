@@ -174,10 +174,12 @@ let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with
+  (* Phase 2 simplification: two-valued logic — NULL is falsy, not unknown (diverges from SQL 3VL). *)
   | Plan.And ->
     if value_truthy lv && value_truthy rv then Row.V_int 1L else Row.V_int 0L
   | Plan.Or ->
     if value_truthy lv || value_truthy rv then Row.V_int 1L else Row.V_int 0L
+  (* Cross-type comparisons (e.g. V_int vs V_real) return false — no implicit coercion is performed. *)
   | Plan.Eq ->
     (* NaN != NaN is intentional SQL semantics (IEEE 754). *)
     (match lv, rv with
