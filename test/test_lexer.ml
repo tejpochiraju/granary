@@ -46,6 +46,8 @@ let kw_tests = [
   check "kw_where"   [Parser.WHERE;   Parser.EOF]          "WHERE";
   check "kw_integer" [Parser.INTEGER_TY; Parser.EOF]       "INTEGER";
   check "kw_text"    [Parser.TEXT_TY; Parser.EOF]          "TEXT";
+  check "kw_real"    [Parser.REAL_TY; Parser.EOF]          "REAL";
+  check "kw_blob"    [Parser.BLOB_TY; Parser.EOF]          "BLOB";
   check "kw_not"     [Parser.NOT;     Parser.EOF]          "NOT";
   check "kw_null"    [Parser.NULL;    Parser.EOF]          "NULL";
   check "kw_primary" [Parser.PRIMARY; Parser.EOF]          "PRIMARY";
@@ -82,6 +84,11 @@ let lit_tests = [
   check "ident_users"     [Parser.IDENT "users";         Parser.EOF] "users";
   check "ident_underscore"[Parser.IDENT "_col";          Parser.EOF] "_col";
   check "ident_alphanum"  [Parser.IDENT "col123";        Parser.EOF] "col123";
+  check "float_3_14"      [Parser.FLOAT_LIT 3.14;        Parser.EOF] "3.14";
+  check "float_0_0"       [Parser.FLOAT_LIT 0.0;         Parser.EOF] "0.0";
+  check "float_neg"       [Parser.FLOAT_LIT (-1.5);      Parser.EOF] "-1.5";
+  check "float_no_frac"   [Parser.FLOAT_LIT 42.0;        Parser.EOF] "42.";
+  check "float_neg_no_fr" [Parser.FLOAT_LIT (-42.0);     Parser.EOF] "-42.";
 ]
 
 (* ------------------------------------------------------------------ *)

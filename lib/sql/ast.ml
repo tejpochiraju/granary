@@ -5,11 +5,15 @@
 type ty =
   | Ty_int   (** INTEGER column type *)
   | Ty_text  (** TEXT column type *)
+  | Ty_real  (** REAL (float64) column type *)
+  | Ty_blob  (** BLOB (bytes) column type *)
 
 type literal =
   | L_int  of int64
   | L_text of string
   | L_null
+  | L_real of float
+  | L_blob of bytes
 
 type expr =
   | E_lit of literal

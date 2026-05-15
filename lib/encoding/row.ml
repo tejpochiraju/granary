@@ -1,14 +1,18 @@
 type ty =
   | Integer
   | Text
+  | Real
+  | Blob
 
 type column = { name : string; ty : ty }
 type schema = column list
 
 type value =
-  | V_int of int64
+  | V_int  of int64
   | V_text of string
   | V_null
+  | V_real of float
+  | V_blob of bytes
 
 type t = value array
 
@@ -16,6 +20,8 @@ let value_equal a b = match a, b with
   | V_int x,  V_int y  -> Int64.equal x y
   | V_text x, V_text y -> String.equal x y
   | V_null,   V_null   -> true
+  | V_real x, V_real y -> Int64.equal (Int64.bits_of_float x) (Int64.bits_of_float y)
+  | V_blob x, V_blob y -> Bytes.equal x y
   | _                  -> false
 
 let equal a b =
@@ -49,17 +55,38 @@ let encode schema row =
     | V_int n ->
       (match col.ty with
        | Integer -> Varint.encode_int64 buf n
-       | Text    ->
+       | _ ->
          invalid_arg (Printf.sprintf
-           "Row.encode: integer value in text column '%s'" col.name))
+           "Row.encode: integer value in non-integer column '%s'" col.name))
     | V_text s ->
       (match col.ty with
        | Text ->
          Varint.encode_uint64 buf (Int64.of_int (String.length s));
          Buffer.add_string buf s
-       | Integer ->
+       | _ ->
          invalid_arg (Printf.sprintf
-           "Row.encode: text value in integer column '%s'" col.name))
+           "Row.encode: text value in non-text column '%s'" col.name))
+    | V_real f ->
+      (match col.ty with
+       | Real ->
+         (* 8-byte little-endian IEEE-754 float64 *)
+         let bits = Int64.bits_of_float f in
+         let tmp = Bytes.create 8 in
+         for k = 0 to 7 do
+           Bytes.set_uint8 tmp k (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (k * 8)) 0xFFL))
+         done;
+         Buffer.add_bytes buf tmp
+       | _ ->
+         invalid_arg (Printf.sprintf
+           "Row.encode: real value in non-real column '%s'" col.name))
+    | V_blob b ->
+      (match col.ty with
+       | Blob ->
+         Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+         Buffer.add_bytes buf b
+       | _ ->
+         invalid_arg (Printf.sprintf
+           "Row.encode: blob value in non-blob column '%s'" col.name))
   ) schema;
   Buffer.to_bytes buf
 
@@ -90,6 +117,21 @@ let decode schema encoded =
         let len = Int64.to_int len in
         let s = Bytes.sub_string encoded off' len in
         result.(i) <- V_text s;
+        off := off' + len
+      | Real ->
+        (* 8-byte little-endian IEEE-754 float64 *)
+        let bits = ref Int64.zero in
+        for k = 0 to 7 do
+          let byte = Int64.of_int (Bytes.get_uint8 encoded (!off + k)) in
+          bits := Int64.logor !bits (Int64.shift_left byte (k * 8))
+        done;
+        result.(i) <- V_real (Int64.float_of_bits !bits);
+        off := !off + 8
+      | Blob ->
+        let len, off' = Varint.decode_uint64 encoded !off in
+        let len = Int64.to_int len in
+        let b = Bytes.sub encoded off' len in
+        result.(i) <- V_blob b;
         off := off' + len
   ) schema;
   result

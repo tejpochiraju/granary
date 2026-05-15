@@ -140,7 +140,7 @@ let test_integer_column_type () =
        let col = List.hd m.C.columns in
        (match col.Row.ty with
         | Row.Integer -> ()
-        | Row.Text -> Alcotest.fail "expected Integer, got Text"));
+        | _ -> Alcotest.fail "expected Integer, got other"));
     Lwt.return_unit
   )
 
@@ -156,7 +156,7 @@ let test_text_column_type () =
        let col = List.hd m.C.columns in
        (match col.Row.ty with
         | Row.Text -> ()
-        | Row.Integer -> Alcotest.fail "expected Text, got Integer"));
+        | _ -> Alcotest.fail "expected Text, got other"));
     Lwt.return_unit
   )
 

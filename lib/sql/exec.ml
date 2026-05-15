@@ -12,6 +12,8 @@ let lit_to_value : Ast.literal -> Row.value = function
   | Ast.L_int  n -> Row.V_int n
   | Ast.L_text s -> Row.V_text s
   | Ast.L_null   -> Row.V_null
+  | Ast.L_real f -> Row.V_real f
+  | Ast.L_blob b -> Row.V_blob b
 
 (* ------------------------------------------------------------------ *)
 (* execute: write operations only                                       *)
@@ -49,6 +51,8 @@ let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
     let eq = match va, vb with
       | Row.V_int  x, Row.V_int  y -> Int64.equal x y
       | Row.V_text x, Row.V_text y -> String.equal x y
+      | Row.V_real x, Row.V_real y -> Float.equal x y
+      | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
       | Row.V_null,   _            -> false   (* NULL != anything *)
       | _,            Row.V_null   -> false
       | _                          -> false

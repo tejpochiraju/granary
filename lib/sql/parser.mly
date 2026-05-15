@@ -7,8 +7,9 @@
 %token <string> IDENT
 %token <int64>  INT_LIT
 %token <string> STRING_LIT
+%token <float>  FLOAT_LIT
 %token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE
-%token INTEGER_TY TEXT_TY
+%token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
 %token NOT NULL PRIMARY KEY AND
 %token STAR LPAREN RPAREN COMMA SEMI EQ
 %token EOF
@@ -40,6 +41,8 @@ column_def:
 col_ty:
   | INTEGER_TY { Ty_int }
   | TEXT_TY    { Ty_text }
+  | REAL_TY    { Ty_real }
+  | BLOB_TY    { Ty_blob }
 
 column_constraint:
   | NOT NULL    { Col_not_null }
@@ -54,6 +57,7 @@ literal:
   | n = INT_LIT    { L_int n }
   | s = STRING_LIT { L_text s }
   | NULL           { L_null }
+  | f = FLOAT_LIT  { L_real f }
 
 select:
   | SELECT proj = projection FROM table = IDENT wh = where_opt

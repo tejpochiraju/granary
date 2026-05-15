@@ -13,6 +13,8 @@ type value = Row.value =
   | V_int  of int64
   | V_text of string
   | V_null
+  | V_real of float
+  | V_blob of bytes
 
 type row = Row.t
 

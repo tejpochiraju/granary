@@ -49,11 +49,17 @@ let column_key table_name ordinal =
 let column_prefix table_name =
   Bytes.cat (Bytes.of_string table_name) (Bytes.of_string "\x00")
 
-let type_tag = function Row.Integer -> 1 | Row.Text -> 2
+let type_tag = function
+  | Row.Integer -> 1
+  | Row.Text    -> 2
+  | Row.Real    -> 3
+  | Row.Blob    -> 4
 
 let type_of_tag = function
   | 1 -> Row.Integer
   | 2 -> Row.Text
+  | 3 -> Row.Real
+  | 4 -> Row.Blob
   | n -> failwith (Printf.sprintf "unknown column type tag %d" n)
 
 let encode_column (col : Row.column) =

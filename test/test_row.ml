@@ -37,12 +37,27 @@ let schema_single_text : Row.schema = [
   { Row.name = "x"; ty = Text };
 ]
 
+let schema_single_real : Row.schema = [
+  { Row.name = "x"; ty = Real };
+]
+
+let schema_single_blob : Row.schema = [
+  { Row.name = "x"; ty = Blob };
+]
+
+let schema_real_blob : Row.schema = [
+  { Row.name = "f"; ty = Real };
+  { Row.name = "b"; ty = Blob };
+]
+
 (* ── Alcotest testable for Row.t ─────────────────────────────────────── *)
 
 let pp_value fmt v = match v with
   | Row.V_int n  -> Format.fprintf fmt "V_int %Ld" n
   | Row.V_text s -> Format.fprintf fmt "V_text %S" s
   | Row.V_null   -> Format.pp_print_string fmt "V_null"
+  | Row.V_real f -> Format.fprintf fmt "V_real %h" f
+  | Row.V_blob b -> Format.fprintf fmt "V_blob(%d bytes)" (Bytes.length b)
 
 let pp_row fmt arr =
   Format.fprintf fmt "[|";
@@ -254,7 +269,11 @@ let value_gen (col : Row.column) =
           | Row.Integer -> map (fun n -> Row.V_int n) int64
           | Row.Text ->
             map (fun s -> Row.V_text s)
-              (string_size ~gen:(char_range 'a' 'z') (int_range 0 100)))
+              (string_size ~gen:(char_range 'a' 'z') (int_range 0 100))
+          | Row.Real -> map (fun f -> Row.V_real f) float
+          | Row.Blob ->
+            map (fun s -> Row.V_blob (Bytes.of_string s))
+              (string_size ~gen:(char_range '\x00' '\xff') (int_range 0 100)))
     ])
 
 let row_gen schema =
@@ -279,6 +298,15 @@ let prop_roundtrip_ints =
 let prop_roundtrip_texts =
   prop_roundtrip schema_texts "prop_roundtrip_texts"
 
+let prop_roundtrip_real =
+  prop_roundtrip schema_single_real "prop_roundtrip_real"
+
+let prop_roundtrip_blob =
+  prop_roundtrip schema_single_blob "prop_roundtrip_blob"
+
+let prop_roundtrip_real_blob =
+  prop_roundtrip schema_real_blob "prop_roundtrip_real_blob"
+
 let prop_encode_deterministic =
   QCheck.Test.make ~count:5000 ~name:"prop_encode_deterministic"
     (QCheck.make (row_gen schema_mixed))
@@ -287,7 +315,183 @@ let prop_encode_deterministic =
       let b2 = Row.encode schema_mixed row in
       Bytes.equal b1 b2)
 
-(* ── Category 8: Bitmap correctness ─────────────────────────────────── *)
+let prop_encode_deterministic_real =
+  QCheck.Test.make ~count:10_000 ~name:"prop_encode_deterministic_real"
+    (QCheck.make (row_gen schema_real_blob))
+    (fun row ->
+      let b1 = Row.encode schema_real_blob row in
+      let b2 = Row.encode schema_real_blob row in
+      Bytes.equal b1 b2)
+
+(* ── Category 8: REAL roundtrip ─────────────────────────────────────── *)
+
+let real_roundtrip_tests = [
+  "real: pi",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real Float.pi |] ());
+
+  "real: zero",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real 0.0 |] ());
+
+  "real: negative",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real (-1.5) |] ());
+
+  "real: infinity",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real Float.infinity |] ());
+
+  "real: neg_infinity",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real Float.neg_infinity |] ());
+
+  "real: max_float",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real Float.max_float |] ());
+
+  "real: min_float",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_real Float.min_float |] ());
+
+  "real: null in real col",
+  (fun () -> test_roundtrip schema_single_real [| Row.V_null |] ());
+
+  "real: NaN (bitwise)",
+  (fun () ->
+    let nan_val = Float.nan in
+    let encoded = Row.encode schema_single_real [| Row.V_real nan_val |] in
+    let decoded  = Row.decode schema_single_real encoded in
+    (* NaN != NaN by Float.equal, compare via bits *)
+    match decoded.(0) with
+    | Row.V_real f ->
+      let orig_bits = Int64.bits_of_float nan_val in
+      let dec_bits  = Int64.bits_of_float f in
+      Alcotest.(check bool) "NaN bits preserved" true (Int64.equal orig_bits dec_bits)
+    | _ -> Alcotest.fail "expected V_real");
+]
+
+(* ── Category 9: BLOB roundtrip ─────────────────────────────────────── *)
+
+let blob_roundtrip_tests = [
+  "blob: empty",
+  (fun () -> test_roundtrip schema_single_blob [| Row.V_blob Bytes.empty |] ());
+
+  "blob: single byte",
+  (fun () -> test_roundtrip schema_single_blob [| Row.V_blob (Bytes.make 1 '\xff') |] ());
+
+  "blob: binary data",
+  (fun () -> test_roundtrip schema_single_blob
+    [| Row.V_blob (Bytes.of_string "\x00\x01\x02\xfe\xff") |] ());
+
+  "blob: 1000 bytes",
+  (fun () -> test_roundtrip schema_single_blob
+    [| Row.V_blob (Bytes.make 1000 '\xab') |] ());
+
+  "blob: null in blob col",
+  (fun () -> test_roundtrip schema_single_blob [| Row.V_null |] ());
+
+  "blob: all zero bytes",
+  (fun () -> test_roundtrip schema_single_blob
+    [| Row.V_blob (Bytes.make 16 '\x00') |] ());
+]
+
+(* ── Category 10: REAL + BLOB mixed schema ───────────────────────────── *)
+
+let real_blob_mixed_tests = [
+  "real+blob: both present",
+  (fun () -> test_roundtrip schema_real_blob
+    [| Row.V_real 3.14; Row.V_blob (Bytes.of_string "hello") |] ());
+
+  "real+blob: first null",
+  (fun () -> test_roundtrip schema_real_blob
+    [| Row.V_null; Row.V_blob (Bytes.of_string "x") |] ());
+
+  "real+blob: second null",
+  (fun () -> test_roundtrip schema_real_blob
+    [| Row.V_real (-0.0); Row.V_null |] ());
+
+  "real+blob: both null",
+  (fun () -> test_roundtrip schema_real_blob
+    [| Row.V_null; Row.V_null |] ());
+]
+
+(* ── Category 11: value_equal for new types ─────────────────────────── *)
+
+let value_equal_new_tests = [
+  "real equal same",
+  (fun () -> Alcotest.(check bool) "eq"
+    true (Row.equal [| Row.V_real 1.0 |] [| Row.V_real 1.0 |]));
+
+  "real equal different",
+  (fun () -> Alcotest.(check bool) "neq"
+    false (Row.equal [| Row.V_real 1.0 |] [| Row.V_real 2.0 |]));
+
+  "real vs null",
+  (fun () -> Alcotest.(check bool) "neq"
+    false (Row.equal [| Row.V_real 0.0 |] [| Row.V_null |]));
+
+  "blob equal same",
+  (fun () -> Alcotest.(check bool) "eq"
+    true (Row.equal [| Row.V_blob (Bytes.of_string "ab") |]
+                    [| Row.V_blob (Bytes.of_string "ab") |]));
+
+  "blob equal different",
+  (fun () -> Alcotest.(check bool) "neq"
+    false (Row.equal [| Row.V_blob (Bytes.of_string "ab") |]
+                     [| Row.V_blob (Bytes.of_string "ac") |]));
+
+  "blob vs null",
+  (fun () -> Alcotest.(check bool) "neq"
+    false (Row.equal [| Row.V_blob Bytes.empty |] [| Row.V_null |]));
+]
+
+(* ── Category 12: Type-mismatch errors for new types ────────────────── *)
+
+let type_mismatch_new_tests = [
+  "real in integer col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Integer }] in
+    let row = [| Row.V_real 1.5 |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+
+  "blob in integer col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Integer }] in
+    let row = [| Row.V_blob Bytes.empty |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+
+  "int in real col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Real }] in
+    let row = [| Row.V_int 1L |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+
+  "text in blob col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Blob }] in
+    let row = [| Row.V_text "hi" |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+
+  "real in blob col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Blob }] in
+    let row = [| Row.V_real 1.0 |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+
+  "blob in real col",
+  (fun () ->
+    let schema = [{ Row.name = "x"; ty = Row.Real }] in
+    let row = [| Row.V_blob Bytes.empty |] in
+    match Row.encode schema row with
+    | _ -> Alcotest.fail "expected Invalid_argument"
+    | exception Invalid_argument _ -> ());
+]
+
+(* ── Category 13: Bitmap correctness ────────────────────────────────── *)
 
 (* Helper: read the null bitmap from an encoded row.
    Wire format: varint(n_cols) ++ bitmap(ceil(n/8) bytes) ++ values *)
@@ -347,15 +551,24 @@ let () =
       [ prop_roundtrip_mixed
       ; prop_roundtrip_ints
       ; prop_roundtrip_texts
-      ; prop_encode_deterministic ]
+      ; prop_roundtrip_real
+      ; prop_roundtrip_blob
+      ; prop_roundtrip_real_blob
+      ; prop_encode_deterministic
+      ; prop_encode_deterministic_real ]
   in
   Alcotest.run "row" [
-    make_tests "basic roundtrip"    basic_roundtrip_tests;
-    make_tests "null handling"      null_tests;
-    make_tests "single column"      single_col_tests;
-    make_tests "edge cases"         edge_tests;
-    make_tests "equal"              equal_tests;
-    make_tests "error conditions"   error_tests;
-    make_tests "bitmap correctness" bitmap_tests;
+    make_tests "basic roundtrip"       basic_roundtrip_tests;
+    make_tests "null handling"         null_tests;
+    make_tests "single column"         single_col_tests;
+    make_tests "edge cases"            edge_tests;
+    make_tests "equal"                 equal_tests;
+    make_tests "error conditions"      error_tests;
+    make_tests "real roundtrip"        real_roundtrip_tests;
+    make_tests "blob roundtrip"        blob_roundtrip_tests;
+    make_tests "real+blob mixed"       real_blob_mixed_tests;
+    make_tests "value equal new types" value_equal_new_tests;
+    make_tests "type mismatch new"     type_mismatch_new_tests;
+    make_tests "bitmap correctness"    bitmap_tests;
     "qcheck", qcheck_tests;
   ]

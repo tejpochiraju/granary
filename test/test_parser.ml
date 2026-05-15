@@ -44,6 +44,29 @@ let create_both_constraints () =
     Alcotest.(check bool) "c2 not_null" true c2.not_null
   | _ -> Alcotest.fail "expected 2-col"
 
+let create_real_col () =
+  match parse "CREATE TABLE t (f REAL);" with
+  | Ast.S_create_table { name = "t"; columns = [c] } ->
+    Alcotest.(check string) "col name" "f" c.name;
+    Alcotest.(check bool) "col is real" true (c.ty = Ast.Ty_real)
+  | _ -> Alcotest.fail "expected S_create_table with REAL col"
+
+let create_blob_col () =
+  match parse "CREATE TABLE t (b BLOB);" with
+  | Ast.S_create_table { name = "t"; columns = [c] } ->
+    Alcotest.(check string) "col name" "b" c.name;
+    Alcotest.(check bool) "col is blob" true (c.ty = Ast.Ty_blob)
+  | _ -> Alcotest.fail "expected S_create_table with BLOB col"
+
+let create_all_types () =
+  match parse "CREATE TABLE t (i INTEGER, t2 TEXT, r REAL, b BLOB);" with
+  | Ast.S_create_table { columns = [c1; c2; c3; c4]; _ } ->
+    Alcotest.(check bool) "c1 int"  true (c1.ty = Ast.Ty_int);
+    Alcotest.(check bool) "c2 text" true (c2.ty = Ast.Ty_text);
+    Alcotest.(check bool) "c3 real" true (c3.ty = Ast.Ty_real);
+    Alcotest.(check bool) "c4 blob" true (c4.ty = Ast.Ty_blob)
+  | _ -> Alcotest.fail "expected 4-col table with all types"
+
 let create_many_cols () =
   match parse "CREATE TABLE t (a INTEGER, b TEXT, c INTEGER, d TEXT, e INTEGER);" with
   | Ast.S_create_table { columns; _ } ->
@@ -98,6 +121,24 @@ let insert_multiple_rows_not_supported () =
     ignore (parse "INSERT INTO t (n) VALUES (1), (2);");
     Alcotest.fail "expected syntax error for multi-row insert"
   with Parser.Error | Failure _ -> ()
+
+let insert_real_value () =
+  match parse "INSERT INTO t (f) VALUES (3.14);" with
+  | Ast.S_insert { columns = ["f"]; values = [Ast.L_real f]; _ } ->
+    Alcotest.(check bool) "f = 3.14" true (Float.equal f 3.14)
+  | _ -> Alcotest.fail "expected FLOAT_LIT 3.14"
+
+let insert_real_zero () =
+  match parse "INSERT INTO t (f) VALUES (0.0);" with
+  | Ast.S_insert { values = [Ast.L_real f]; _ } ->
+    Alcotest.(check bool) "f = 0.0" true (Float.equal f 0.0)
+  | _ -> Alcotest.fail "expected FLOAT_LIT 0.0"
+
+let insert_real_negative () =
+  match parse "INSERT INTO t (f) VALUES (-1.5);" with
+  | Ast.S_insert { values = [Ast.L_real f]; _ } ->
+    Alcotest.(check bool) "f = -1.5" true (Float.equal f (-1.5))
+  | _ -> Alcotest.fail "expected FLOAT_LIT -1.5"
 
 let insert_no_col_list () =
   (* Phase 0 grammar requires an explicit column list; no-column-list INSERT is a syntax error *)
@@ -171,6 +212,9 @@ let () =
       Alcotest.test_case "many-cols"          `Quick create_many_cols;
       Alcotest.test_case "no-semi"            `Quick create_no_semi;
       Alcotest.test_case "syntax-error"       `Quick create_syntax_error;
+      Alcotest.test_case "real-col"           `Quick create_real_col;
+      Alcotest.test_case "blob-col"           `Quick create_blob_col;
+      Alcotest.test_case "all-types"          `Quick create_all_types;
     ];
     "insert", [
       Alcotest.test_case "named-cols"         `Quick insert_named_cols;
@@ -180,6 +224,9 @@ let () =
       Alcotest.test_case "empty-string"       `Quick insert_empty_string;
       Alcotest.test_case "multi-row-error"    `Quick insert_multiple_rows_not_supported;
       Alcotest.test_case "no-col-list"        `Quick insert_no_col_list;
+      Alcotest.test_case "real-value"         `Quick insert_real_value;
+      Alcotest.test_case "real-zero"          `Quick insert_real_zero;
+      Alcotest.test_case "real-negative"      `Quick insert_real_negative;
     ];
     "select", [
       Alcotest.test_case "star"               `Quick select_star;

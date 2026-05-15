@@ -24,12 +24,18 @@ rule token = parse
   | "PRIMARY"  { PRIMARY }
   | "KEY"      { KEY }
   | "AND"      { AND }
+  | "REAL"     { REAL_TY }
+  | "BLOB"     { BLOB_TY }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }
   | ","        { COMMA }
   | ";"        { SEMI }
   | "="        { EQ }
+  | (digit+ as i) '.' (digit* as f)
+    { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }
+  | '-' (digit+ as i) '.' (digit* as f)
+    { FLOAT_LIT (-. float_of_string (i ^ "." ^ f)) }
   | digit+ as n             { INT_LIT (Int64.of_string n) }
   | "-" (digit+ as n)       { INT_LIT (Int64.neg (Int64.of_string n)) }
   | '\'' ([^ '\'']* as s) '\''  { STRING_LIT s }

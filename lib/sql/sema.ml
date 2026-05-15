@@ -46,10 +46,14 @@ let lit_ty = function
   | Ast.L_int _  -> Some Row.Integer
   | Ast.L_text _ -> Some Row.Text
   | Ast.L_null   -> None   (* NULL is compatible with any column *)
+  | Ast.L_real _ -> Some Row.Real
+  | Ast.L_blob _ -> Some Row.Blob
 
 let ty_equal (a : Row.ty) (b : Row.ty) = match a, b with
   | Row.Integer, Row.Integer -> true
   | Row.Text,    Row.Text    -> true
+  | Row.Real,    Row.Real    -> true
+  | Row.Blob,    Row.Blob    -> true
   | _,           _           -> false
 
 let rec bind_expr (meta : Cat.table_meta) = function
@@ -75,7 +79,11 @@ let bind_create cat ~name ~columns =
   | None ->
     let row_cols = List.map (fun (c : Ast.column_def) ->
       Row.{ name = c.name;
-            ty   = (match c.ty with Ast.Ty_int -> Row.Integer | Ast.Ty_text -> Row.Text) }
+            ty   = (match c.ty with
+                    | Ast.Ty_int  -> Row.Integer
+                    | Ast.Ty_text -> Row.Text
+                    | Ast.Ty_real -> Row.Real
+                    | Ast.Ty_blob -> Row.Blob) }
     ) columns in
     Lwt.return (Ok (BS_create_table { name; columns = row_cols }))
 

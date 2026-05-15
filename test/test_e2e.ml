@@ -45,11 +45,15 @@ let value_testable : Db.value Alcotest.testable =
     | Db.V_int  n -> Format.fprintf ppf "V_int(%Ld)" n
     | Db.V_text s -> Format.fprintf ppf "V_text(%S)" s
     | Db.V_null   -> Format.fprintf ppf "V_null"
+    | Db.V_real f -> Format.fprintf ppf "V_real(%h)" f
+    | Db.V_blob b -> Format.fprintf ppf "V_blob(%d bytes)" (Bytes.length b)
   in
   let eq a b = match a, b with
     | Db.V_int  x, Db.V_int  y -> Int64.equal x y
     | Db.V_text x, Db.V_text y -> String.equal x y
     | Db.V_null,   Db.V_null   -> true
+    | Db.V_real x, Db.V_real y -> Float.equal x y
+    | Db.V_blob x, Db.V_blob y -> Bytes.equal x y
     | _,           _           -> false
   in
   Alcotest.testable pp eq
@@ -362,6 +366,130 @@ let query_with_insert_is_runtime_error () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 10: REAL column type end-to-end                                *)
+(* ------------------------------------------------------------------ *)
+
+let real_create_insert_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val REAL)";
+  exec db "INSERT INTO t (id, val) VALUES (1, 3.14)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check int) "2 columns" 2 (Array.length row);
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "val=3.14" (Db.V_real 3.14) row.(1)
+
+let real_negative () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x REAL)";
+  exec db "INSERT INTO t (x) VALUES (-1.5)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "x=-1.5" (Db.V_real (-1.5)) (List.hd rows).(0)
+
+let real_zero () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x REAL)";
+  exec db "INSERT INTO t (x) VALUES (0.0)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "x=0.0" (Db.V_real 0.0) (List.hd rows).(0)
+
+let real_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x REAL)";
+  exec db "INSERT INTO t (x) VALUES (NULL)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "x=null" Db.V_null (List.hd rows).(0)
+
+let real_multiple_rows () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, x REAL)";
+  exec db "INSERT INTO t (id, x) VALUES (1, 1.0)";
+  exec db "INSERT INTO t (id, x) VALUES (2, 2.5)";
+  exec db "INSERT INTO t (id, x) VALUES (3, -3.14)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  Alcotest.check value_testable "row0.x" (Db.V_real 1.0)    (List.nth rows 0).(1);
+  Alcotest.check value_testable "row1.x" (Db.V_real 2.5)    (List.nth rows 1).(1);
+  Alcotest.check value_testable "row2.x" (Db.V_real (-3.14)) (List.nth rows 2).(1)
+
+let real_type_mismatch () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x REAL)";
+  (* Inserting an integer literal into a REAL column should fail type check *)
+  let result = run (Db.execute db "INSERT INTO t (x) VALUES ('text')") in
+  (match err_or_fail "real_type_mismatch" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+   | _ -> Alcotest.fail "expected Sema(Type_mismatch)")
+
+(* ------------------------------------------------------------------ *)
+(* Group 11: BLOB column type end-to-end                                *)
+(* Note: BLOB literals can't be expressed in SQL directly (no hex      *)
+(* literal syntax in Phase 0). We test NULL insertion and type errors.  *)
+(* ------------------------------------------------------------------ *)
+
+let blob_null_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, data BLOB)";
+  exec db "INSERT INTO t (id, data) VALUES (1, NULL)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "id=1"    (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "data=null" Db.V_null   row.(1)
+
+let blob_type_mismatch () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (data BLOB)";
+  let result = run (Db.execute db "INSERT INTO t (data) VALUES ('text')") in
+  (match err_or_fail "blob_type_mismatch" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+   | _ -> Alcotest.fail "expected Sema(Type_mismatch) for text into blob col")
+
+let blob_schema_preserved () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, data BLOB, name TEXT)";
+  exec db "INSERT INTO t (id, data, name) VALUES (42, NULL, 'hello')";
+  let rows = query_ok db "SELECT id, name FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check int) "2 cols projected" 2 (Array.length row);
+  Alcotest.check value_testable "id=42"      (Db.V_int 42L)       row.(0);
+  Alcotest.check value_testable "name=hello" (Db.V_text "hello")  row.(1)
+
+(* ------------------------------------------------------------------ *)
+(* Group 12: REAL and BLOB together                                     *)
+(* ------------------------------------------------------------------ *)
+
+let real_and_blob_together () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, score REAL, payload BLOB)";
+  exec db "INSERT INTO t (id, score, payload) VALUES (1, 99.5, NULL)";
+  exec db "INSERT INTO t (id, score, payload) VALUES (2, NULL, NULL)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  let r0 = List.nth rows 0 in
+  let r1 = List.nth rows 1 in
+  Alcotest.check value_testable "r0.id"      (Db.V_int 1L)    r0.(0);
+  Alcotest.check value_testable "r0.score"   (Db.V_real 99.5) r0.(1);
+  Alcotest.check value_testable "r0.payload" Db.V_null         r0.(2);
+  Alcotest.check value_testable "r1.id"      (Db.V_int 2L)    r1.(0);
+  Alcotest.check value_testable "r1.score"   Db.V_null         r1.(1);
+  Alcotest.check value_testable "r1.payload" Db.V_null         r1.(2)
+
+let already_exists_real_blob () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (f REAL, b BLOB)";
+  let result = run (Db.execute db "CREATE TABLE t (x INTEGER)") in
+  (match err_or_fail "already_exists" result with
+   | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
+     Alcotest.(check string) "table name is t" "t" name
+   | _ -> Alcotest.fail "expected Sema(Already_exists)")
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -406,5 +534,22 @@ let () =
       Alcotest.test_case "select_partial_projection"  `Quick select_partial_projection;
       Alcotest.test_case "empty_table_select"         `Quick empty_table_select;
       Alcotest.test_case "select_where_text"          `Quick select_where_text;
+    ];
+    "real_column", [
+      Alcotest.test_case "real_create_insert_select" `Quick real_create_insert_select;
+      Alcotest.test_case "real_negative"             `Quick real_negative;
+      Alcotest.test_case "real_zero"                 `Quick real_zero;
+      Alcotest.test_case "real_null"                 `Quick real_null;
+      Alcotest.test_case "real_multiple_rows"        `Quick real_multiple_rows;
+      Alcotest.test_case "real_type_mismatch"        `Quick real_type_mismatch;
+    ];
+    "blob_column", [
+      Alcotest.test_case "blob_null_insert"          `Quick blob_null_insert;
+      Alcotest.test_case "blob_type_mismatch"        `Quick blob_type_mismatch;
+      Alcotest.test_case "blob_schema_preserved"     `Quick blob_schema_preserved;
+    ];
+    "real_and_blob", [
+      Alcotest.test_case "real_and_blob_together"    `Quick real_and_blob_together;
+      Alcotest.test_case "already_exists_real_blob"  `Quick already_exists_real_blob;
     ];
   ]
