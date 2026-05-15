@@ -146,3 +146,13 @@ let plan ?cat = function
       where       = plan_where;
       indexes;
     }
+  | Sema.BS_delete { table_meta; where } ->
+    let indexes = match cat with
+      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
+      | None   -> []
+    in
+    Plan.Op_delete {
+      table_meta;
+      where   = Option.map plan_expr where;
+      indexes;
+    }

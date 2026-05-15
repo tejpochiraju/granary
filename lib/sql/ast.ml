@@ -73,3 +73,7 @@ type stmt =
       assignments : (string * expr) list;   (** [(col_name, new_value_expr)] *)
       where       : expr option;
     }
+  | S_delete of {
+      table : string;
+      where : expr option;
+    }

@@ -70,3 +70,8 @@ type op =
       where       : expr option;
       indexes     : Cat.index_info list;
     }
+  | Op_delete of {
+      table_meta : Cat.table_meta;
+      where      : expr option;
+      indexes    : Cat.index_info list;
+    }

@@ -46,6 +46,10 @@ type bound_stmt =
         (** [(col_ordinal, new_value_expr)] *)
       where       : bound_expr option;
     }
+  | BS_delete of {
+      table_meta : Sqlocaml_catalog.Catalog.table_meta;
+      where      : bound_expr option;
+    }
 
 type error =
   | Unknown_table  of string

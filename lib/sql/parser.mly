@@ -14,6 +14,7 @@
 %token ORDER BY ASC DESC LIMIT OFFSET
 %token INDEX ON UNIQUE
 %token UPDATE SET
+%token DELETE
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -41,6 +42,7 @@ stmt:
   | s = insert       { s }
   | s = select       { s }
   | s = update       { s }
+  | s = delete       { s }
 
 create_table:
   | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN
@@ -97,6 +99,10 @@ update:
       assignments = separated_nonempty_list(COMMA, assignment)
       wh = where_opt
     { S_update { table; assignments; where = wh } }
+
+delete:
+  | DELETE FROM table = IDENT wh = where_opt
+    { S_delete { table; where = wh } }
 
 assignment:
   | col = IDENT EQ value = expr { (col, value) }

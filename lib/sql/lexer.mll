@@ -39,6 +39,7 @@ rule token = parse
   | "UNIQUE"   { UNIQUE }
   | "UPDATE"   { UPDATE }
   | "SET"      { SET }
+  | "DELETE"   { DELETE }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

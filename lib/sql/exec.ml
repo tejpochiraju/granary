@@ -376,6 +376,61 @@ let execute_update (store : S.t)
     Lwt.return n
   end
 
+(** Run [Op_delete]: drain matching rows into a list (snapshot read),
+    then for each matching (rowid, row) remove index entries and the
+    row itself from the table tree.  Returns the number of rows deleted. *)
+let execute_delete (store : S.t)
+    ~(table_meta : Cat.table_meta)
+    ~(where : Plan.expr option)
+    ~(indexes : Cat.index_info list)
+  : int Lwt.t =
+  let schema = table_meta.Cat.columns in
+  (* Drain matching rows under an RO snapshot. *)
+  let* tx_ro = S.ro_begin store in
+  let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+  let _sr    = S.cursor_first cur in
+  let buf    = ref [] in
+  let rec drain () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (kbytes, vbytes) ->
+      let rowid = Rowid.decode kbytes in
+      let row   = Row.decode schema vbytes in
+      let keep  = match where with
+        | None      -> true
+        | Some pred -> value_truthy (eval_expr row pred)
+      in
+      if keep then buf := (rowid, row) :: !buf;
+      drain ()
+  in
+  drain ();
+  S.cursor_close cur;
+  let* () = S.ro_end tx_ro in
+  let matches = List.rev !buf in
+  let n = List.length matches in
+  if n = 0 then Lwt.return 0
+  else begin
+    let* tx = S.rw_begin store in
+    let* () =
+      Lwt_list.iter_s (fun (rowid, row) ->
+        let rowid_key = Rowid.encode rowid in
+        (* Remove index entries for this row. *)
+        let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+          let col_i = find_col_idx_by_name schema idx.idx_column in
+          let v = row.(col_i) in
+          let old_ikey =
+            Index_key.encode [row_value_to_index_value v] ~rowid
+          in
+          S.del tx idx.idx_tree_id old_ikey
+        ) indexes in
+        (* Remove the row from the table tree. *)
+        S.del tx table_meta.tree_id rowid_key
+      ) matches
+    in
+    let* () = S.commit tx in
+    Lwt.return n
+  end
+
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
@@ -394,6 +449,8 @@ let execute_with_count (store : S.t) (cat : Cat.t) (op : Plan.op)
     Lwt.return 0
   | Plan.Op_update { table_meta; assignments; where; indexes } ->
     execute_update store ~table_meta ~assignments ~where ~indexes
+  | Plan.Op_delete { table_meta; where; indexes } ->
+    execute_delete store ~table_meta ~where ~indexes
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _ ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -513,7 +570,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     ) in
     Lwt.return stream
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
-  | Plan.Op_update _ ->
+  | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 
 (* ------------------------------------------------------------------ *)

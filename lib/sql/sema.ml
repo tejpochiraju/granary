@@ -47,6 +47,10 @@ type bound_stmt =
       assignments : (int * bound_expr) list;
       where       : bound_expr option;
     }
+  | BS_delete of {
+      table_meta : Cat.table_meta;
+      where      : bound_expr option;
+    }
 
 type error =
   | Unknown_table  of string
@@ -366,6 +370,31 @@ let bind_update cat ~table ~assignments ~where =
           }))))
 
 (* ------------------------------------------------------------------ *)
+(* DELETE                                                               *)
+(* ------------------------------------------------------------------ *)
+
+let bind_delete cat ~table ~where =
+  let* meta_opt = Cat.find_table cat ~name:table in
+  match meta_opt with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some meta ->
+    let where_result =
+      match where with
+      | None   -> Ok None
+      | Some e ->
+        (match bind_expr meta e with
+         | Ok be   -> Ok (Some be)
+         | Error e -> Error e)
+    in
+    (match where_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_where ->
+       Lwt.return (Ok (BS_delete {
+         table_meta = meta;
+         where      = bound_where;
+       })))
+
+(* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -378,3 +407,5 @@ let bind cat = function
     bind_create_index cat ~name ~table ~column ~unique
   | Ast.S_update { table; assignments; where } ->
     bind_update cat ~table ~assignments ~where
+  | Ast.S_delete { table; where } ->
+    bind_delete cat ~table ~where
