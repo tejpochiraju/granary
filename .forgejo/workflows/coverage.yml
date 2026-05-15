@@ -46,14 +46,29 @@ jobs:
             exit 1
           fi
 
-          # Exclude generated files (parser.ml from Menhir, lexer.ml from ocamllex)
-          EXCLUDE="--exclude-files lib/sql/parser.ml --exclude-files lib/sql/lexer.ml"
-
-          # Per-file breakdown (handwritten code only)
-          opam exec -- bisect-ppx-report summary --per-file $EXCLUDE $COVFILES | tee /tmp/coverage-summary.txt
-
-          # Extract overall percentage
-          PCT=$(grep -oP '\d+\.\d+(?= %)' /tmp/coverage-summary.txt | tail -1)
+          # bisect-ppx-report has no --exclude-files flag; filter generated files via Python.
+          SUMMARY=$(opam exec -- bisect-ppx-report summary --per-file $COVFILES | python3 -c "
+          import sys, re
+          generated = {'lib/sql/parser.ml', 'lib/sql/lexer.ml'}
+          total_hit = 0
+          total_pts = 0
+          lines = []
+          for line in sys.stdin:
+              line = line.rstrip()
+              m = re.match(r'\s*(\d+\.\d+)\s*%\s+(\d+)/(\d+)\s+(.+)', line)
+              if m:
+                  pct, hit, pts, path = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4).strip()
+                  if path not in generated:
+                      total_hit += hit
+                      total_pts += pts
+                      lines.append(line)
+          for l in lines:
+              print(l)
+          overall = 100.0 * total_hit / total_pts if total_pts else 0.0
+          print(f'{overall:6.2f} %  {total_hit:4d}/{total_pts:4d}   Handwritten total (excl. generated parser+lexer)')
+          ")
+          echo "$SUMMARY"
+          PCT=$(echo "$SUMMARY" | tail -1 | python3 -c "import sys,re; m=re.search(r'(\d+\.\d+)\s*%', sys.stdin.read()); print(m.group(1)) if m else print(0)")
           echo "pct=${PCT}" >> "$GITHUB_OUTPUT"
           echo ""
           echo "Overall coverage: ${PCT}%"
@@ -61,9 +76,8 @@ jobs:
       - name: Generate HTML report
         run: |
           COVFILES=$(find _build -name '*.coverage' | tr '\n' ' ')
-          EXCLUDE="--exclude-files lib/sql/parser.ml --exclude-files lib/sql/lexer.ml"
           mkdir -p _coverage
-          opam exec -- bisect-ppx-report html $EXCLUDE -o _coverage $COVFILES
+          opam exec -- bisect-ppx-report html -o _coverage $COVFILES
 
       - name: Upload HTML report as artifact
         uses: actions/upload-artifact@v4
