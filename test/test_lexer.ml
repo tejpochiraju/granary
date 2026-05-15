@@ -79,8 +79,10 @@ let lit_tests = [
   check "int_42"          [Parser.INT_LIT 42L;           Parser.EOF] "42";
   check "int_0"           [Parser.INT_LIT 0L;            Parser.EOF] "0";
   check "int_big"         [Parser.INT_LIT 9999999999L;   Parser.EOF] "9999999999";
-  check "int_neg1"        [Parser.INT_LIT (-1L);         Parser.EOF] "-1";
-  check "int_neg_big"     [Parser.INT_LIT (-9999999999L);Parser.EOF] "-9999999999";
+  (* Phase 2: MINUS is now a standalone operator token; negation is handled
+     at parse time. The lexer therefore emits MINUS + INT_LIT. *)
+  check "int_neg1"        [Parser.MINUS; Parser.INT_LIT 1L;          Parser.EOF] "-1";
+  check "int_neg_big"     [Parser.MINUS; Parser.INT_LIT 9999999999L; Parser.EOF] "-9999999999";
   check "str_hello"       [Parser.STRING_LIT "hello";    Parser.EOF] "'hello'";
   check "str_empty"       [Parser.STRING_LIT "";         Parser.EOF] "''";
   check "str_with_space"  [Parser.STRING_LIT "hello world"; Parser.EOF] "'hello world'";
@@ -89,9 +91,9 @@ let lit_tests = [
   check "ident_alphanum"  [Parser.IDENT "col123";        Parser.EOF] "col123";
   check "float_3_14"      [Parser.FLOAT_LIT 3.14;        Parser.EOF] "3.14";
   check "float_0_0"       [Parser.FLOAT_LIT 0.0;         Parser.EOF] "0.0";
-  check "float_neg"       [Parser.FLOAT_LIT (-1.5);      Parser.EOF] "-1.5";
+  check "float_neg"       [Parser.MINUS; Parser.FLOAT_LIT 1.5;  Parser.EOF] "-1.5";
   check "float_no_frac"   [Parser.FLOAT_LIT 42.0;        Parser.EOF] "42.";
-  check "float_neg_no_fr" [Parser.FLOAT_LIT (-42.0);     Parser.EOF] "-42.";
+  check "float_neg_no_fr" [Parser.MINUS; Parser.FLOAT_LIT 42.0; Parser.EOF] "-42.";
 ]
 
 (* ------------------------------------------------------------------ *)

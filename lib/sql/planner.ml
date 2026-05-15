@@ -1,10 +1,22 @@
 module Cat = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 
+let plan_binop : Sema.binop -> Plan.binop = function
+  | Sema.Eq  -> Plan.Eq  | Sema.Ne  -> Plan.Ne
+  | Sema.Lt  -> Plan.Lt  | Sema.Le  -> Plan.Le
+  | Sema.Gt  -> Plan.Gt  | Sema.Ge  -> Plan.Ge
+  | Sema.Add -> Plan.Add | Sema.Sub -> Plan.Sub
+  | Sema.Mul -> Plan.Mul | Sema.Div -> Plan.Div
+  | Sema.And -> Plan.And | Sema.Or  -> Plan.Or
+
 let rec plan_expr = function
-  | Sema.BE_lit l     -> Plan.P_lit l
-  | Sema.BE_col i     -> Plan.P_col i
-  | Sema.BE_eq (a, b) -> Plan.P_eq (plan_expr a, plan_expr b)
+  | Sema.BE_lit l               -> Plan.P_lit l
+  | Sema.BE_col i               -> Plan.P_col i
+  | Sema.BE_binop (op, a, b)    -> Plan.P_binop (plan_binop op, plan_expr a, plan_expr b)
+  | Sema.BE_not e               -> Plan.P_not (plan_expr e)
+  | Sema.BE_is_null e           -> Plan.P_is_null (plan_expr e)
+  | Sema.BE_is_not_null e       -> Plan.P_is_not_null (plan_expr e)
+  | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -14,8 +26,8 @@ let rec plan_expr = function
     to [Op_filter] (which short-circuits on NULL) gives correct
     behaviour. *)
 let recognise_eq_col_lit = function
-  | Sema.BE_eq (Sema.BE_col i, (Sema.BE_lit l as e))
-  | Sema.BE_eq ((Sema.BE_lit l as e), Sema.BE_col i) ->
+  | Sema.BE_binop (Sema.Eq, Sema.BE_col i, (Sema.BE_lit l as e))
+  | Sema.BE_binop (Sema.Eq, (Sema.BE_lit l as e), Sema.BE_col i) ->
     (match l with
      | Ast.L_null -> None
      | _          -> Some (i, e))

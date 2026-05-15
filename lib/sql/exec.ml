@@ -145,31 +145,86 @@ let execute (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
 (* Expression evaluation                                                *)
 (* ------------------------------------------------------------------ *)
 
-let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
-  match e with
-  | Plan.P_lit l     -> lit_to_value l
-  | Plan.P_col i     -> row.(i)
-  | Plan.P_eq (a, b) ->
-    let va = eval_expr row a
-    and vb = eval_expr row b in
-    (* NaN != NaN is intentional SQL semantics (IEEE 754): a WHERE clause
-       comparing a REAL column to NaN must not match, matching SQLite and
-       standard SQL behaviour.  Row.value_equal uses bit-equality instead,
-       which is appropriate only for round-trip testing (encode/decode). *)
-    let eq = match va, vb with
-      | Row.V_int  x, Row.V_int  y -> Int64.equal x y
-      | Row.V_text x, Row.V_text y -> String.equal x y
-      | Row.V_real x, Row.V_real y -> Float.equal x y  (* NaN != NaN intentional *)
-      | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
-      | Row.V_null,   _            -> false   (* NULL != anything *)
-      | _,            Row.V_null   -> false
-      | _                          -> false
-    in
-    if eq then Row.V_int 1L else Row.V_int 0L
-
 let value_truthy : Row.value -> bool = function
   | Row.V_null | Row.V_int 0L -> false
   | _                          -> true
+
+let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
+  match e with
+  | Plan.P_lit l            -> lit_to_value l
+  | Plan.P_col i            -> row.(i)
+  | Plan.P_neg e ->
+    (match eval_expr row e with
+     | Row.V_int  n -> Row.V_int  (Int64.neg n)
+     | Row.V_real f -> Row.V_real (-. f)
+     | Row.V_null   -> Row.V_null
+     | _            -> failwith "unary minus requires numeric operand")
+  | Plan.P_is_null e ->
+    (match eval_expr row e with
+     | Row.V_null -> Row.V_int 1L
+     | _          -> Row.V_int 0L)
+  | Plan.P_is_not_null e ->
+    (match eval_expr row e with
+     | Row.V_null -> Row.V_int 0L
+     | _          -> Row.V_int 1L)
+  | Plan.P_not e ->
+    if value_truthy (eval_expr row e) then Row.V_int 0L else Row.V_int 1L
+  | Plan.P_binop (op, a, b) ->
+    eval_binop op (eval_expr row a) (eval_expr row b)
+
+and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
+  match op with
+  | Plan.And ->
+    if value_truthy lv && value_truthy rv then Row.V_int 1L else Row.V_int 0L
+  | Plan.Or ->
+    if value_truthy lv || value_truthy rv then Row.V_int 1L else Row.V_int 0L
+  | Plan.Eq ->
+    (* NaN != NaN is intentional SQL semantics (IEEE 754). *)
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+     | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_blob x, Row.V_blob y -> if Bytes.equal  x y then Row.V_int 1L else Row.V_int 0L
+     | _                          -> Row.V_int 0L)
+  | Plan.Ne ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+     | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_blob x, Row.V_blob y -> if Bytes.equal  x y then Row.V_int 0L else Row.V_int 1L
+     | _                          -> Row.V_int 0L)
+  | Plan.Lt -> cmp_result lv rv (fun c -> c <  0)
+  | Plan.Le -> cmp_result lv rv (fun c -> c <= 0)
+  | Plan.Gt -> cmp_result lv rv (fun c -> c >  0)
+  | Plan.Ge -> cmp_result lv rv (fun c -> c >= 0)
+  | Plan.Add -> arith_op lv rv Int64.add ( +. )
+  | Plan.Sub -> arith_op lv rv Int64.sub ( -. )
+  | Plan.Mul -> arith_op lv rv Int64.mul ( *. )
+  | Plan.Div ->
+    arith_op lv rv
+      (fun a b -> if Int64.equal b 0L then failwith "division by zero" else Int64.div a b)
+      ( /. )
+
+and cmp_result lv rv pred =
+  match lv, rv with
+  | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+  | Row.V_int _,  Row.V_int _
+  | Row.V_text _, Row.V_text _
+  | Row.V_real _, Row.V_real _
+  | Row.V_blob _, Row.V_blob _ ->
+    if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
+  | _ -> Row.V_int 0L  (* cross-type comparisons are false *)
+
+and arith_op lv rv int_f float_f =
+  match lv, rv with
+  | Row.V_null, _ | _, Row.V_null -> Row.V_null
+  | Row.V_int  a, Row.V_int  b -> Row.V_int  (int_f a b)
+  | Row.V_real a, Row.V_real b -> Row.V_real (float_f a b)
+  | Row.V_int  a, Row.V_real b -> Row.V_real (float_f (Int64.to_float a) b)
+  | Row.V_real a, Row.V_int  b -> Row.V_real (float_f a (Int64.to_float b))
+  | _ -> failwith "arithmetic on non-numeric operands"
 
 let project_row (ords : int list) (row : Row.t) : Row.t =
   Array.of_list (List.map (fun i -> row.(i)) ords)

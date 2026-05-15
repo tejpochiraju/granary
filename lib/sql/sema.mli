@@ -1,9 +1,15 @@
 (** Name resolution and light type checking for Phase 0 SQL. *)
 
+type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+
 type bound_expr =
-  | BE_lit of Ast.literal
-  | BE_col of int                       (** column ordinal in the table *)
-  | BE_eq  of bound_expr * bound_expr
+  | BE_lit         of Ast.literal
+  | BE_col         of int                  (** column ordinal in the table *)
+  | BE_binop       of binop * bound_expr * bound_expr
+  | BE_not         of bound_expr
+  | BE_is_null     of bound_expr
+  | BE_is_not_null of bound_expr
+  | BE_neg         of bound_expr
 
 type bound_order_key = {
   col_idx : int;

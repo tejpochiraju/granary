@@ -82,7 +82,7 @@ let plan_select_star_where () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -97,7 +97,7 @@ let plan_select_cols_where () =
   let stmt = Ast.S_select {
     proj  = `Cols ["id"];
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -118,17 +118,17 @@ let plan_expr_lit () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 99L), Ast.E_lit (Ast.L_int 99L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 99L), Ast.E_lit (Ast.L_int 99L)));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project {
       child = Plan.Op_filter {
-        pred = Plan.P_eq (Plan.P_lit (Ast.L_int 99L), Plan.P_lit (Ast.L_int 99L)); _ }; _ } -> ()
+        pred = Plan.P_binop (Plan.Eq, Plan.P_lit (Ast.L_int 99L), Plan.P_lit (Ast.L_int 99L)); _ }; _ } -> ()
   | Plan.Op_project { child = Plan.Op_filter { pred; _ }; _ } ->
     ignore pred;
-    Alcotest.fail "filter pred not P_eq(P_lit, P_lit)"
+    Alcotest.fail "filter pred not P_binop(Eq, P_lit, P_lit)"
   | _ -> Alcotest.fail "expected Op_project { child=Op_filter _ }"
 
 let plan_expr_col () =
@@ -136,17 +136,17 @@ let plan_expr_col () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_col "id"));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "id"));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project {
       child = Plan.Op_filter {
-        pred = Plan.P_eq (Plan.P_col 0, Plan.P_col 0); _ }; _ } -> ()
+        pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_col 0); _ }; _ } -> ()
   | Plan.Op_project { child = Plan.Op_filter { pred; _ }; _ } ->
     ignore pred;
-    Alcotest.fail "filter pred not P_eq(P_col 0, P_col 0)"
+    Alcotest.fail "filter pred not P_binop(Eq, P_col 0, P_col 0)"
   | _ -> Alcotest.fail "expected Op_project { child=Op_filter _ }"
 
 let plan_expr_eq () =
@@ -154,17 +154,17 @@ let plan_expr_eq () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project {
       child = Plan.Op_filter {
-        pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_int 42L)); _ }; _ } -> ()
+        pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 42L)); _ }; _ } -> ()
   | Plan.Op_project { child = Plan.Op_filter { pred; _ }; _ } ->
     ignore pred;
-    Alcotest.fail "filter pred not P_eq(P_col 0, P_lit(L_int 42L))"
+    Alcotest.fail "filter pred not P_binop(Eq, P_col 0, P_lit(L_int 42L))"
   | _ -> Alcotest.fail "expected Op_project { child=Op_filter _ }"
 
 let plan_expr_reversed_eq () =
@@ -172,17 +172,17 @@ let plan_expr_reversed_eq () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project {
       child = Plan.Op_filter {
-        pred = Plan.P_eq (Plan.P_lit (Ast.L_int 42L), Plan.P_col 0); _ }; _ } -> ()
+        pred = Plan.P_binop (Plan.Eq, Plan.P_lit (Ast.L_int 42L), Plan.P_col 0); _ }; _ } -> ()
   | Plan.Op_project { child = Plan.Op_filter { pred; _ }; _ } ->
     ignore pred;
-    Alcotest.fail "filter pred not P_eq(P_lit(L_int 42L), P_col 0)"
+    Alcotest.fail "filter pred not P_binop(Eq, P_lit(L_int 42L), P_col 0)"
   | _ -> Alcotest.fail "expected Op_project { child=Op_filter _ }"
 
 (* ------------------------------------------------------------------ *)
@@ -328,7 +328,7 @@ let plan_index_lookup_col_eq_lit () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -343,7 +343,7 @@ let plan_index_lookup_lit_eq_col () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 1L), Ast.E_col "id"));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 1L), Ast.E_col "id"));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -357,7 +357,7 @@ let plan_no_index_falls_back_to_filter () =
   let stmt = Ast.S_select {
     proj  = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "name", Ast.E_lit (Ast.L_text "x")));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", Ast.E_lit (Ast.L_text "x")));
     order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in

@@ -168,23 +168,23 @@ let select_single_col () =
 
 let select_where_eq_int () =
   match parse "SELECT * FROM users WHERE id = 42;" with
-  | Ast.S_select { where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 42L))); _ } -> ()
+  | Ast.S_select { where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 42L))); _ } -> ()
   | _ -> Alcotest.fail "expected WHERE id=42"
 
 let select_where_eq_string () =
   match parse "SELECT * FROM t WHERE name = 'bob';" with
-  | Ast.S_select { where = Some (Ast.E_eq (Ast.E_col "name", Ast.E_lit (Ast.L_text "bob"))); _ } -> ()
+  | Ast.S_select { where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", Ast.E_lit (Ast.L_text "bob"))); _ } -> ()
   | _ -> Alcotest.fail "expected WHERE name='bob'"
 
 let select_where_eq_null () =
   match parse "SELECT * FROM t WHERE x = NULL;" with
-  | Ast.S_select { where = Some (Ast.E_eq (Ast.E_col "x", Ast.E_lit Ast.L_null)); _ } -> ()
+  | Ast.S_select { where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "x", Ast.E_lit Ast.L_null)); _ } -> ()
   | _ -> Alcotest.fail "expected WHERE x=NULL"
 
 let select_where_reversed () =
   (* literal = col *)
   match parse "SELECT * FROM t WHERE 42 = id;" with
-  | Ast.S_select { where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 42L), Ast.E_col "id")); _ } -> ()
+  | Ast.S_select { where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 42L), Ast.E_col "id")); _ } -> ()
   | _ -> Alcotest.fail "expected reversed eq"
 
 let select_no_semi () =

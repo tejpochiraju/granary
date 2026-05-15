@@ -263,11 +263,11 @@ let bind_select_where_col_eq_lit () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
     order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { where = Some (Sema.BE_eq (Sema.BE_col 0, Sema.BE_lit (Ast.L_int 42L))); _ }) -> ()
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Eq, Sema.BE_col 0, Sema.BE_lit (Ast.L_int 42L))); _ }) -> ()
   | Ok (Sema.BS_select { where = Some _; _ }) -> Alcotest.fail "where bound incorrectly"
   | Ok _ -> Alcotest.fail "expected BS_select"
   | Error _ -> Alcotest.fail "unexpected error"
@@ -277,11 +277,11 @@ let bind_select_where_lit_eq_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
     order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { where = Some (Sema.BE_eq (Sema.BE_lit (Ast.L_int 42L), Sema.BE_col 0)); _ }) -> ()
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Eq, Sema.BE_lit (Ast.L_int 42L), Sema.BE_col 0)); _ }) -> ()
   | Ok (Sema.BS_select { where = Some _; _ }) -> Alcotest.fail "where bound incorrectly (reversed)"
   | Ok _ -> Alcotest.fail "expected BS_select"
   | Error _ -> Alcotest.fail "unexpected error"
@@ -291,7 +291,7 @@ let bind_select_where_unknown_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "bogus", Ast.E_lit (Ast.L_int 1L)));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "bogus", Ast.E_lit (Ast.L_int 1L)));
     order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
@@ -304,11 +304,11 @@ let bind_select_where_text_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "name", Ast.E_lit (Ast.L_text "alice")));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", Ast.E_lit (Ast.L_text "alice")));
     order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { where = Some (Sema.BE_eq (Sema.BE_col 1, Sema.BE_lit (Ast.L_text "alice"))); _ }) -> ()
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Eq, Sema.BE_col 1, Sema.BE_lit (Ast.L_text "alice"))); _ }) -> ()
   | Ok (Sema.BS_select { where = Some _; _ }) -> Alcotest.fail "where bound incorrectly (text col)"
   | Ok _ -> Alcotest.fail "expected BS_select"
   | Error _ -> Alcotest.fail "unexpected error"
@@ -323,7 +323,7 @@ let bind_select_where_right_unknown () =
   (* WHERE id = bogus — left (id) resolves, right (bogus) fails *)
   let stmt = Ast.S_select {
     proj = `All; table = "users";
-    where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_col "bogus"));
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "bogus"));
     order = []; limit = None; offset = None;
   } in
   match bind cat stmt with

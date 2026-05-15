@@ -4,10 +4,16 @@
 
 module Cat = Sqlocaml_catalog.Catalog
 
+type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+
 type expr =
-  | P_lit of Ast.literal
-  | P_col of int           (** column ordinal *)
-  | P_eq  of expr * expr
+  | P_lit         of Ast.literal
+  | P_col         of int                   (** column ordinal *)
+  | P_binop       of binop * expr * expr
+  | P_not         of expr
+  | P_is_null     of expr
+  | P_is_not_null of expr
+  | P_neg         of expr
 
 type op =
   | Op_create_table of {

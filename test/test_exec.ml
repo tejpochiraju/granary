@@ -293,7 +293,7 @@ let query_filter_eq_int () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Filter: id = 2 *)
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_int 2L)) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 2L)) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -315,7 +315,7 @@ let query_filter_eq_string () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Filter: name = 'b' *)
-    let pred = Plan.P_eq (Plan.P_col 1, Plan.P_lit (Ast.L_text "b")) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 1, Plan.P_lit (Ast.L_text "b")) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -336,7 +336,7 @@ let query_filter_no_match () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Filter: id = 99 → no match *)
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -355,7 +355,7 @@ let query_filter_all_match () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Filter: 1 = 1 → always true *)
-    let pred = Plan.P_eq (Plan.P_lit (Ast.L_int 1L), Plan.P_lit (Ast.L_int 1L)) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_lit (Ast.L_int 1L), Plan.P_lit (Ast.L_int 1L)) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -373,7 +373,7 @@ let query_filter_null_col () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Filter: id = NULL → NULL != NULL → no match *)
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit Ast.L_null) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit Ast.L_null) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -466,7 +466,7 @@ let query_project_star_where () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Full pipeline: Project(ordinals=[0,1], Filter(id=2, SeqScan)) *)
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_int 2L)) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 2L)) in
     let op = Plan.Op_project {
       ordinals = [0; 1];
       child    = Plan.Op_filter {
@@ -577,7 +577,7 @@ let query_filter_nonnull_eq_null () =
     let* meta_opt = Cat.find_table cat ~name:"tn" in
     let m = Option.get meta_opt in
     (* Filter: name = NULL → va=V_text "ghost", vb=V_null → hits _, V_null arm *)
-    let pred = Plan.P_eq (Plan.P_col 1, Plan.P_lit Ast.L_null) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 1, Plan.P_lit Ast.L_null) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -596,7 +596,7 @@ let query_filter_type_mismatch () =
     let* meta_opt = Cat.find_table cat ~name:"tm" in
     let m = Option.get meta_opt in
     (* Filter: id (V_int 5L) = "text" (V_text) → type mismatch → catch-all _ -> false *)
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_text "text")) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_text "text")) in
     let op = Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta = m } } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1137,7 +1137,7 @@ let query_filter_eq_real () =
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
-    let pred = Plan.P_eq (Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
     let op = Plan.Op_filter {
       pred;
       child = Plan.Op_seq_scan { table_meta = m };
@@ -1158,8 +1158,8 @@ let query_filter_eq_blob () =
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
-    let pred = Plan.P_eq (Plan.P_col 0,
-                          Plan.P_lit (Ast.L_blob (Bytes.of_string "BB"))) in
+    let pred = Plan.P_binop (Plan.Eq, Plan.P_col 0,
+                             Plan.P_lit (Ast.L_blob (Bytes.of_string "BB"))) in
     let op = Plan.Op_filter {
       pred;
       child = Plan.Op_seq_scan { table_meta = m };

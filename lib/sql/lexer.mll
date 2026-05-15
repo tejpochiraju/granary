@@ -24,6 +24,8 @@ rule token = parse
   | "PRIMARY"  { PRIMARY }
   | "KEY"      { KEY }
   | "AND"      { AND }
+  | "OR"       { OR }
+  | "IS"       { IS }
   | "REAL"     { REAL_TY }
   | "BLOB"     { BLOB_TY }
   | "ORDER"    { ORDER }
@@ -40,13 +42,20 @@ rule token = parse
   | ")"        { RPAREN }
   | ","        { COMMA }
   | ";"        { SEMI }
+  | "<>"       { NE }
+  | "!="       { NE }
+  | "<="       { LE }
+  | ">="       { GE }
+  | "<"        { LT }
+  | ">"        { GT }
   | "="        { EQ }
+  | "+"        { PLUS }
+  | "-"        { MINUS }
+  | "/"        { SLASH }
+  | "."        { DOT }
   | (digit+ as i) '.' (digit* as f)
     { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }
-  | '-' (digit+ as i) '.' (digit* as f)
-    { FLOAT_LIT (-. float_of_string (i ^ "." ^ f)) }
   | digit+ as n             { INT_LIT (Int64.of_string n) }
-  | "-" (digit+ as n)       { INT_LIT (Int64.neg (Int64.of_string n)) }
   | '\'' ([^ '\'']* as s) '\''  { STRING_LIT s }
   | '\'' [^ '\'']*          { failwith "unterminated string literal" }
   | ident as id             { IDENT id }

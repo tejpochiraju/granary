@@ -15,10 +15,20 @@ type literal =
   | L_real of float
   | L_blob of bytes
 
+type binop =
+  | Eq | Ne | Lt | Le | Gt | Ge   (** comparison *)
+  | Add | Sub | Mul | Div          (** arithmetic *)
+  | And | Or                       (** logical *)
+
 type expr =
-  | E_lit of literal
-  | E_col of string          (** unqualified column reference *)
-  | E_eq  of expr * expr     (** equality — only binary op in Phase 0 *)
+  | E_lit         of literal
+  | E_col         of string                (** unqualified column reference *)
+  | E_tbl_col     of string * string       (** qualified: table.col *)
+  | E_binop       of binop * expr * expr
+  | E_not         of expr
+  | E_is_null     of expr
+  | E_is_not_null of expr
+  | E_neg         of expr                  (** unary minus *)
 
 type column_def = {
   name        : string;

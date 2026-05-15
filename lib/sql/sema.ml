@@ -2,10 +2,16 @@ open Lwt.Syntax
 module Row = Sqlocaml_encoding.Row
 module Cat = Sqlocaml_catalog.Catalog
 
+type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+
 type bound_expr =
-  | BE_lit of Ast.literal
-  | BE_col of int
-  | BE_eq  of bound_expr * bound_expr
+  | BE_lit         of Ast.literal
+  | BE_col         of int
+  | BE_binop       of binop * bound_expr * bound_expr
+  | BE_not         of bound_expr
+  | BE_is_null     of bound_expr
+  | BE_is_not_null of bound_expr
+  | BE_neg         of bound_expr
 
 type bound_order_key = {
   col_idx : int;
@@ -72,17 +78,47 @@ let ty_equal (a : Row.ty) (b : Row.ty) = match a, b with
   | Row.Blob,    Row.Blob    -> true
   | _,           _           -> false
 
+let ast_binop_to_sema : Ast.binop -> binop = function
+  | Ast.Eq  -> Eq  | Ast.Ne  -> Ne
+  | Ast.Lt  -> Lt  | Ast.Le  -> Le
+  | Ast.Gt  -> Gt  | Ast.Ge  -> Ge
+  | Ast.Add -> Add | Ast.Sub -> Sub
+  | Ast.Mul -> Mul | Ast.Div -> Div
+  | Ast.And -> And | Ast.Or  -> Or
+
 let rec bind_expr (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
     (match col_index meta.columns name with
      | None   -> Error (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
-  | Ast.E_eq (a, b) ->
+  | Ast.E_tbl_col (_tbl, name) ->
+    (* Phase 2 Task 1: single-table queries — ignore table qualifier.
+       Multi-table resolution arrives with JOIN support. *)
+    (match col_index meta.columns name with
+     | None   -> Error (Unknown_column { table = meta.name; column = name })
+     | Some i -> Ok (BE_col i))
+  | Ast.E_binop (op, a, b) ->
     (match bind_expr meta a, bind_expr meta b with
-     | Ok ba, Ok bb  -> Ok (BE_eq (ba, bb))
+     | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
      | Error e, _    -> Error e
      | Ok _,  Error e -> Error e)
+  | Ast.E_not e ->
+    (match bind_expr meta e with
+     | Ok be   -> Ok (BE_not be)
+     | Error e -> Error e)
+  | Ast.E_is_null e ->
+    (match bind_expr meta e with
+     | Ok be   -> Ok (BE_is_null be)
+     | Error e -> Error e)
+  | Ast.E_is_not_null e ->
+    (match bind_expr meta e with
+     | Ok be   -> Ok (BE_is_not_null be)
+     | Error e -> Error e)
+  | Ast.E_neg e ->
+    (match bind_expr meta e with
+     | Ok be   -> Ok (BE_neg be)
+     | Error e -> Error e)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
