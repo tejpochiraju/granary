@@ -48,10 +48,14 @@ let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
   | Plan.P_eq (a, b) ->
     let va = eval_expr row a
     and vb = eval_expr row b in
+    (* NaN != NaN is intentional SQL semantics (IEEE 754): a WHERE clause
+       comparing a REAL column to NaN must not match, matching SQLite and
+       standard SQL behaviour.  Row.value_equal uses bit-equality instead,
+       which is appropriate only for round-trip testing (encode/decode). *)
     let eq = match va, vb with
       | Row.V_int  x, Row.V_int  y -> Int64.equal x y
       | Row.V_text x, Row.V_text y -> String.equal x y
-      | Row.V_real x, Row.V_real y -> Float.equal x y
+      | Row.V_real x, Row.V_real y -> Float.equal x y  (* NaN != NaN intentional *)
       | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
       | Row.V_null,   _            -> false   (* NULL != anything *)
       | _,            Row.V_null   -> false

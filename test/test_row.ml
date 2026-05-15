@@ -282,7 +282,7 @@ let row_gen schema =
     flatten_list gens |> map Array.of_list)
 
 let prop_roundtrip schema name =
-  QCheck.Test.make ~count:5000 ~name
+  QCheck.Test.make ~count:10_000 ~name
     (QCheck.make (row_gen schema))
     (fun row ->
       let encoded = Row.encode schema row in
