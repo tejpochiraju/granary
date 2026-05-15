@@ -2,7 +2,8 @@
  (name sqlocaml_sql)
  (public_name sqlocaml.sql)
  (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.catalog)
- (preprocess (pps lwt_ppx)))
+ (preprocess (pps lwt_ppx))
+ (instrumentation (backend bisect_ppx)))
 
 (menhir
  (modules parser)

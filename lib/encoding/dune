@@ -1,3 +1,4 @@
 (library
  (name sqlocaml_encoding)
- (public_name sqlocaml.encoding))
+ (public_name sqlocaml.encoding)
+ (instrumentation (backend bisect_ppx)))

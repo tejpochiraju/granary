@@ -1,4 +1,5 @@
 (library
  (name sqlocaml_block)
  (public_name sqlocaml.block)
- (libraries lwt cstruct))
+ (libraries lwt cstruct)
+ (instrumentation (backend bisect_ppx)))
