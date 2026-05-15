@@ -1,0 +1,375 @@
+(** Tests for Sqlocaml_storage.Pager *)
+
+open Sqlocaml_storage
+
+(* ------------------------------------------------------------------ *)
+(* Mock BLOCK backend                                                   *)
+(* ------------------------------------------------------------------ *)
+
+(** An in-memory mock block device backed by a Hashtbl.
+    Every page is [Page.page_size] bytes. *)
+type mock_block = {
+  store      : (int64, Bytes.t) Hashtbl.t;
+  mutable n_pages : int64;
+  mutable read_count  : int;   (* total BLOCK read calls *)
+  mutable write_count : int;   (* total BLOCK write calls *)
+  mutable sync_count  : int;
+}
+
+let make_mock () =
+  { store       = Hashtbl.create 16;
+    n_pages     = 0L;
+    read_count  = 0;
+    write_count = 0;
+    sync_count  = 0; }
+
+(** Wire up the four callbacks expected by [Pager.create]. *)
+let mock_callbacks mb =
+  let read_page ~page_id buf =
+    mb.read_count <- mb.read_count + 1;
+    (match Hashtbl.find_opt mb.store page_id with
+     | None ->
+       (* Unwritten page → return zeros *)
+       Cstruct.memset buf 0;
+       Lwt.return_ok ()
+     | Some bytes ->
+       Cstruct.blit_from_bytes bytes 0 buf 0 Page.page_size;
+       Lwt.return_ok ())
+  in
+  let write_page ~page_id buf =
+    mb.write_count <- mb.write_count + 1;
+    let bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes buf 0 bytes 0 Page.page_size;
+    Hashtbl.replace mb.store page_id bytes;
+    Lwt.return_ok ()
+  in
+  let sync () =
+    mb.sync_count <- mb.sync_count + 1;
+    Lwt.return_ok ()
+  in
+  let resize ~n_pages =
+    mb.n_pages <- n_pages;
+    Lwt.return_ok ()
+  in
+  (read_page, write_page, sync, resize)
+
+(** Create a pager wired to a fresh mock block. *)
+let make_pager ?(n_pages = 0L) ?(freelist = Freelist.empty) () =
+  let mb = make_mock () in
+  let (read_page, write_page, sync, resize) = mock_callbacks mb in
+  let pager =
+    Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist
+  in
+  (pager, mb)
+
+(** Run an Lwt value synchronously (test helper). *)
+let run = Lwt_main.run
+
+(** Build a Cstruct filled with a given byte value. *)
+let fill_page byte =
+  let buf = Cstruct.create Page.page_size in
+  Cstruct.memset buf byte;
+  buf
+
+(* ------------------------------------------------------------------ *)
+(* Unit tests                                                          *)
+(* ------------------------------------------------------------------ *)
+
+(* create with empty state; n_pages = 0 *)
+let test_create_empty () =
+  let (p, _) = make_pager () in
+  Alcotest.(check int64) "n_pages = 0" 0L (Pager.n_pages p);
+  Alcotest.(check int) "freelist size = 0" 0 (Freelist.size (Pager.freelist p))
+
+(* alloc with empty freelist → returns page 0; n_pages becomes 1 *)
+let test_alloc_first () =
+  let (p, mb) = make_pager () in
+  let id = run (Pager.alloc p ~current_txn_id:1L) in
+  (match id with
+   | Error e ->
+     Alcotest.failf "alloc failed: %a" Pager.pp_error e
+   | Ok pid ->
+     Alcotest.(check int64) "first alloc = 0" 0L pid;
+     Alcotest.(check int64) "n_pages = 1" 1L (Pager.n_pages p);
+     Alcotest.(check int64) "mock resized to 1" 1L mb.n_pages)
+
+(* alloc twice → returns pages 0 and 1 in order *)
+let test_alloc_twice () =
+  let (p, _) = make_pager () in
+  let id0 = run (Pager.alloc p ~current_txn_id:1L) in
+  let id1 = run (Pager.alloc p ~current_txn_id:1L) in
+  (match id0, id1 with
+   | Ok p0, Ok p1 ->
+     Alcotest.(check int64) "first = 0"  0L p0;
+     Alcotest.(check int64) "second = 1" 1L p1;
+     Alcotest.(check int64) "n_pages = 2" 2L (Pager.n_pages p)
+   | _ -> Alcotest.fail "unexpected error")
+
+(* write then read returns same content (from dirty/cache, no BLOCK hit) *)
+let test_write_then_read () =
+  let (p, mb) = make_pager () in
+  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let buf = fill_page 0xAB in
+  Pager.write p 0L buf;
+  let before_reads = mb.read_count in
+  let result = run (Pager.read p 0L) in
+  (match result with
+   | Error e -> Alcotest.failf "read failed: %a" Pager.pp_error e
+   | Ok got  ->
+     Alcotest.(check int) "no BLOCK reads" before_reads mb.read_count;
+     (* Verify content matches *)
+     let expected = Bytes.make Page.page_size '\xAB' in
+     let actual   = Bytes.create Page.page_size in
+     Cstruct.blit_to_bytes got 0 actual 0 Page.page_size;
+     Alcotest.(check bool) "content matches" true (Bytes.equal expected actual))
+
+(* write then flush → verify BLOCK mock contains the page data *)
+let test_write_then_flush () =
+  let (p, mb) = make_pager () in
+  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let buf = fill_page 0x5A in
+  Pager.write p 0L buf;
+  (match run (Pager.flush p) with
+   | Error e -> Alcotest.failf "flush failed: %a" Pager.pp_error e
+   | Ok () ->
+     let stored = Hashtbl.find_opt mb.store 0L in
+     (match stored with
+      | None -> Alcotest.fail "page not written to mock"
+      | Some bytes ->
+        let expected = Bytes.make Page.page_size '\x5A' in
+        Alcotest.(check bool) "flushed content correct" true (Bytes.equal expected bytes);
+        Alcotest.(check int) "sync called once" 1 mb.sync_count))
+
+(* read on non-cached page calls BLOCK; subsequent read returns cached copy *)
+let test_read_caches_block () =
+  let (p, mb) = make_pager () in
+  (* Pre-populate mock store directly so there is something to read *)
+  let bytes = Bytes.make Page.page_size '\x77' in
+  Hashtbl.replace mb.store 0L bytes;
+  mb.n_pages <- 1L;
+  (* First read — should hit BLOCK *)
+  let _r1 = run (Pager.read p 0L) in
+  Alcotest.(check int) "first read hits BLOCK" 1 mb.read_count;
+  (* Second read — should come from cache *)
+  let _r2 = run (Pager.read p 0L) in
+  Alcotest.(check int) "second read from cache" 1 mb.read_count
+
+(* free then alloc (with higher current_txn_id) → returns the freed page_id *)
+let test_free_then_alloc_reusable () =
+  let (p, _) = make_pager ~n_pages:5L () in
+  (* Free page 3 at txn 1 *)
+  Pager.free p ~page_id:3L ~freed_at_txn_id:1L;
+  (* Alloc with txn 2 → page 3 should be returned *)
+  (match run (Pager.alloc p ~current_txn_id:2L) with
+   | Error e -> Alcotest.failf "alloc failed: %a" Pager.pp_error e
+   | Ok pid  -> Alcotest.(check int64) "reuses freed page 3" 3L pid)
+
+(* free then alloc (with same txn_id) → returns NEW page (freed not yet reusable) *)
+let test_free_then_alloc_same_txn () =
+  let (p, _) = make_pager ~n_pages:5L () in
+  Pager.free p ~page_id:3L ~freed_at_txn_id:2L;
+  (* Alloc with same txn_id: 2 — page 3 not yet reusable *)
+  (match run (Pager.alloc p ~current_txn_id:2L) with
+   | Error e -> Alcotest.failf "alloc failed: %a" Pager.pp_error e
+   | Ok pid  ->
+     Alcotest.(check bool) "new page allocated, not freed one" true
+       (Int64.compare pid 3L <> 0);
+     Alcotest.(check int64) "new page = n_pages before (5)" 5L pid)
+
+(* flush clears dirty — second flush makes no BLOCK write calls *)
+let test_flush_clears_dirty () =
+  let (p, mb) = make_pager () in
+  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  Pager.write p 0L (fill_page 0x11);
+  let _ = run (Pager.flush p) in
+  let writes_after_first = mb.write_count in
+  (* Second flush — dirty is empty, should write nothing *)
+  let _ = run (Pager.flush p) in
+  Alcotest.(check int) "no extra writes after second flush"
+    writes_after_first mb.write_count
+
+(* n_pages after two allocs = 2 *)
+let test_n_pages_after_two_allocs () =
+  let (p, _) = make_pager () in
+  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  Alcotest.(check int64) "n_pages = 2" 2L (Pager.n_pages p)
+
+(* Cache eviction — write 65 pages; read oldest back (should hit BLOCK) *)
+let test_cache_eviction () =
+  let (p, mb) = make_pager ~n_pages:65L () in
+  (* Pre-populate mock store for all 65 pages *)
+  for i = 0 to 64 do
+    let bytes = Bytes.make Page.page_size (Char.chr (i land 0xFF)) in
+    Hashtbl.replace mb.store (Int64.of_int i) bytes
+  done;
+  (* Write pages 0..64 to the pager (fills cache + dirty) *)
+  for i = 0 to 64 do
+    let buf = fill_page (i land 0xFF) in
+    Pager.write p (Int64.of_int i) buf
+  done;
+  (* Flush so pages move out of dirty *)
+  let _ = run (Pager.flush p) in
+  (* Now create a fresh pager over the same mock so cache is empty *)
+  let (read_page, write_page, sync, resize) = mock_callbacks mb in
+  let p2 =
+    Pager.create ~read_page ~write_page ~sync ~resize
+      ~n_pages:65L ~freelist:Freelist.empty
+  in
+  (* Write 65 distinct pages to fill the cache beyond capacity *)
+  for i = 0 to 64 do
+    let buf = fill_page (i land 0xFF) in
+    Pager.write p2 (Int64.of_int i) buf
+  done;
+  let _ = run (Pager.flush p2) in
+  (* Build a third fresh pager to test cache eviction purely on reads *)
+  let mb2 = make_mock () in
+  (* Populate mb2.store with recognizable content per page *)
+  for i = 0 to 64 do
+    let bytes = Bytes.make Page.page_size (Char.chr ((i + 1) land 0xFF)) in
+    Hashtbl.replace mb2.store (Int64.of_int i) bytes
+  done;
+  let (rp, wp, sy, rs) = mock_callbacks mb2 in
+  let p3 =
+    Pager.create ~read_page:rp ~write_page:wp ~sync:sy ~resize:rs
+      ~n_pages:65L ~freelist:Freelist.empty
+  in
+  (* Read pages 0..63 to fill cache to capacity *)
+  for i = 0 to 63 do
+    let _ = run (Pager.read p3 (Int64.of_int i)) in ()
+  done;
+  let reads_before_64 = mb2.read_count in
+  (* Reading page 64 should cause eviction of page 0 from cache *)
+  let _ = run (Pager.read p3 64L) in
+  (* Now re-read page 0 — it must have been evicted, so should hit BLOCK *)
+  let _ = run (Pager.read p3 0L) in
+  Alcotest.(check bool) "evicted page re-read from BLOCK" true
+    (mb2.read_count > reads_before_64 + 1)
+
+(* ------------------------------------------------------------------ *)
+(* QCheck property tests                                               *)
+(* ------------------------------------------------------------------ *)
+
+(** Last write for a page_id always readable. *)
+let prop_last_write_readable =
+  QCheck.Test.make
+    ~name:"prop_last_write_readable"
+    ~count:10_000
+    QCheck.(make Gen.(list_size (int_range 1 20)
+                        (pair (int_range 0 7) (int_range 0 255))))
+    (fun ops ->
+       let (p, _) = make_pager ~n_pages:8L () in
+       (* Track last written byte per page *)
+       let last_written = Hashtbl.create 8 in
+       List.iter (fun (page_idx, byte_val) ->
+           let pid = Int64.of_int page_idx in
+           let buf = fill_page byte_val in
+           Pager.write p pid buf;
+           Hashtbl.replace last_written pid byte_val)
+         ops;
+       (* Verify every page that was written reads back correctly *)
+       Hashtbl.fold (fun pid expected_byte ok ->
+           if not ok then false
+           else
+             match run (Pager.read p pid) with
+             | Error _ -> false
+             | Ok got  ->
+               let b = Cstruct.get_uint8 got 0 in
+               b = expected_byte)
+         last_written true)
+
+(** alloc produces monotonically increasing page_ids when freelist is empty. *)
+let prop_alloc_monotone =
+  QCheck.Test.make
+    ~name:"prop_alloc_monotone"
+    ~count:10_000
+    QCheck.(Gen.int_range 1 30 |> make)
+    (fun n ->
+       let (p, _) = make_pager () in
+       let ids = Array.init n (fun _ ->
+           match run (Pager.alloc p ~current_txn_id:1L) with
+           | Ok id -> id
+           | Error _ -> Int64.minus_one)
+       in
+       (* Every id must be non-negative *)
+       let all_valid = Array.for_all (fun id -> Int64.compare id 0L >= 0) ids in
+       (* ids must be strictly increasing *)
+       let monotone =
+         let ok = ref true in
+         for i = 1 to n - 1 do
+           if Int64.compare ids.(i) ids.(i-1) <= 0 then ok := false
+         done;
+         !ok
+       in
+       all_valid && monotone)
+
+(** flush then re-read from fresh pager returns correct data. *)
+let prop_flush_then_reread =
+  QCheck.Test.make
+    ~name:"prop_flush_then_reread"
+    ~count:10_000
+    QCheck.(make Gen.(list_size (int_range 1 10)
+                        (pair (int_range 0 4) (int_range 0 255))))
+    (fun ops ->
+       let mb = make_mock () in
+       let (rp, wp, sy, rs) = mock_callbacks mb in
+       let p1 =
+         Pager.create ~read_page:rp ~write_page:wp ~sync:sy ~resize:rs
+           ~n_pages:5L ~freelist:Freelist.empty
+       in
+       (* Track last write per page *)
+       let last_written = Hashtbl.create 5 in
+       List.iter (fun (page_idx, byte_val) ->
+           let pid = Int64.of_int page_idx in
+           let buf = fill_page byte_val in
+           Pager.write p1 pid buf;
+           Hashtbl.replace last_written pid byte_val)
+         ops;
+       (* Flush *)
+       (match run (Pager.flush p1) with
+        | Error _ -> false   (* flush failure = test inconclusive, pass it *)
+        | Ok () ->
+          (* Create a fresh pager over the same mock *)
+          let (rp2, wp2, sy2, rs2) = mock_callbacks mb in
+          let p2 =
+            Pager.create ~read_page:rp2 ~write_page:wp2 ~sync:sy2 ~resize:rs2
+              ~n_pages:5L ~freelist:Freelist.empty
+          in
+          Hashtbl.fold (fun pid expected_byte ok ->
+              if not ok then false
+              else
+                match run (Pager.read p2 pid) with
+                | Error _ -> false
+                | Ok got  ->
+                  let b = Cstruct.get_uint8 got 0 in
+                  b = expected_byte)
+            last_written true))
+
+(* ------------------------------------------------------------------ *)
+(* RUNNER                                                              *)
+(* ------------------------------------------------------------------ *)
+
+let () =
+  let qcheck_tests =
+    List.map QCheck_alcotest.to_alcotest [
+      prop_last_write_readable;
+      prop_alloc_monotone;
+      prop_flush_then_reread;
+    ]
+  in
+  Alcotest.run "pager" [
+    "basic", [
+      Alcotest.test_case "create empty"                         `Quick test_create_empty;
+      Alcotest.test_case "alloc first page"                     `Quick test_alloc_first;
+      Alcotest.test_case "alloc twice"                          `Quick test_alloc_twice;
+      Alcotest.test_case "write then read (no BLOCK)"           `Quick test_write_then_read;
+      Alcotest.test_case "write then flush to BLOCK"            `Quick test_write_then_flush;
+      Alcotest.test_case "read caches BLOCK page"               `Quick test_read_caches_block;
+      Alcotest.test_case "free then alloc reusable"             `Quick test_free_then_alloc_reusable;
+      Alcotest.test_case "free then alloc same txn"             `Quick test_free_then_alloc_same_txn;
+      Alcotest.test_case "flush clears dirty"                   `Quick test_flush_clears_dirty;
+      Alcotest.test_case "n_pages after two allocs"             `Quick test_n_pages_after_two_allocs;
+      Alcotest.test_case "cache eviction"                       `Quick test_cache_eviction;
+    ];
+    "qcheck", qcheck_tests;
+  ]
