@@ -851,6 +851,122 @@ let execute_limit_raises () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 9: Op_create_index (via execute)                               *)
+(* ------------------------------------------------------------------ *)
+
+let exec_create_index_basic () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    (* Insert a row so the index-population path runs *)
+    insert store cat "t" ([0; 1], [Ast.L_int 42L; Ast.L_text "alice"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name     = "idx_id";
+           table    = "t";
+           tree_id  = m.Cat.tree_id;
+           col_idx  = 0;
+           unique   = false;
+           columns  = m.Cat.columns;
+         }) in
+    (* Index should now exist in the catalog *)
+    let idx = Cat.find_index cat ~name:"idx_id" in
+    Alcotest.(check bool) "index created" true (Option.is_some idx);
+    Lwt.return_unit
+  )
+
+let query_create_index_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tci"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"tci" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.query store cat
+         (Plan.Op_create_index {
+            name = "idx"; table = "tci"; tree_id = m.Cat.tree_id;
+            col_idx = 0; unique = false; columns = m.Cat.columns;
+          }));
+       Alcotest.fail "expected Failure for Op_create_index in query"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 10: Op_index_lookup (via query)                                *)
+(* ------------------------------------------------------------------ *)
+
+let query_index_lookup_basic () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_id"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_id" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Integer;
+      lookup_val = Plan.P_lit (Ast.L_int 2L);
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "index lookup finds 1 row" 1 (List.length rows);
+    (match (List.hd rows).(0) with
+     | Row.V_int n -> Alcotest.(check int64) "id=2" 2L n
+     | _ -> Alcotest.fail "expected V_int");
+    Lwt.return_unit
+  )
+
+(* Type mismatch in Op_index_lookup: col_type=Integer but lookup_val is TEXT.
+   The branch "| _, _ -> IK_null" is hit, resulting in zero matches. *)
+let query_index_lookup_type_mismatch () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let* () = Exec.execute store cat
+        (Plan.Op_create_index {
+           name = "idx_id2"; table = "t"; tree_id = m.Cat.tree_id;
+           col_idx = 0; unique = false; columns = m.Cat.columns;
+         }) in
+    let idx_opt = Cat.find_index cat ~name:"idx_id2" in
+    let (idx : Cat.index_info) = Option.get idx_opt in
+    (* col_type=Integer but lookup_val is TEXT — type mismatch → IK_null → no results *)
+    let op = Plan.Op_index_lookup {
+      table_tree = m.Cat.tree_id;
+      idx_tree   = idx.Cat.idx_tree_id;
+      col_idx    = 0;
+      col_type   = Row.Integer;
+      lookup_val = Plan.P_lit (Ast.L_text "not-an-int");
+      table_meta = m;
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "type mismatch → 0 rows" 0 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -910,5 +1026,13 @@ let () =
       Alcotest.test_case "query_limit_with_offset"    `Quick query_limit_with_offset;
       Alcotest.test_case "query_limit_exceeds_rows"   `Quick query_limit_exceeds_rows;
       Alcotest.test_case "query_limit_offset_exceeds" `Quick query_limit_offset_exceeds;
+    ];
+    "create_index", [
+      Alcotest.test_case "exec_create_index_basic"   `Quick exec_create_index_basic;
+      Alcotest.test_case "query_create_index_raises" `Quick query_create_index_raises;
+    ];
+    "index_lookup", [
+      Alcotest.test_case "query_index_lookup_basic"          `Quick query_index_lookup_basic;
+      Alcotest.test_case "query_index_lookup_type_mismatch"  `Quick query_index_lookup_type_mismatch;
     ];
   ]

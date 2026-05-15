@@ -396,6 +396,63 @@ let test_freelist_isolation () =
   Alcotest.(check int32) "entry 2 unchanged" 3l e2.page_id
 
 (* ------------------------------------------------------------------ *)
+(* 9b. Overflow / invalid-arg edge cases                               *)
+(* ------------------------------------------------------------------ *)
+
+(* branch_append_entry: key too long for the current page offset *)
+let test_branch_append_overflow () =
+  let buf = fresh_page () in
+  (* Place the offset near the end so the entry would overflow *)
+  let near_end = P.page_size - 4 in  (* only 4 bytes left: can't fit key + 4-byte child *)
+  let key = Bytes.of_string "k" in
+  match P.branch_append_entry buf ~offset:near_end ~key ~left_child:1l with
+  | _ -> Alcotest.fail "expected invalid_arg for branch overflow"
+  | exception Invalid_argument _ -> ()
+
+(* leaf_append_entry: entry would overflow page *)
+let test_leaf_append_overflow () =
+  let buf = fresh_page () in
+  let near_end = P.page_size - 2 in  (* only 2 bytes left: can't fit key+value entry *)
+  let key   = Bytes.of_string "k" in
+  let value = Bytes.of_string "v" in
+  match P.leaf_append_entry buf ~offset:near_end ~key ~value with
+  | _ -> Alcotest.fail "expected invalid_arg for leaf overflow"
+  | exception Invalid_argument _ -> ()
+
+(* branch_entry_at: key_len says the key would overflow the page *)
+let test_branch_entry_at_key_overflow () =
+  let buf = fresh_page () in
+  (* Write a branch entry manually with a large key_len that would go past page_size *)
+  let offset = P.page_size - 10 in
+  (* key_len = 0xFFFF → 2 + 65535 + 4 would far exceed page bounds *)
+  Cstruct.BE.set_uint16 buf offset 0xFFFF;
+  match P.branch_entry_at buf ~offset with
+  | `End -> ()  (* expected: key_len overflows page *)
+  | `Entry _ -> Alcotest.fail "expected End when key_len overflows page"
+
+(* leaf_entry_at: key_len or val_len overflow *)
+let test_leaf_entry_at_key_overflow () =
+  let buf = fresh_page () in
+  let offset = P.page_size - 10 in
+  (* key_len = 0xFFFF → overflows *)
+  Cstruct.BE.set_uint16 buf offset 0xFFFF;
+  match P.leaf_entry_at buf ~offset with
+  | `End -> ()  (* expected *)
+  | `Entry _ -> Alcotest.fail "expected End when leaf key_len overflows page"
+
+(* leaf_entry_at: key fits but val_len overflows *)
+let test_leaf_entry_at_val_overflow () =
+  let buf = fresh_page () in
+  (* Place at start of data, write key_len=1, key='a', then val_len=0xFFFF *)
+  let offset = P.data_offset in
+  Cstruct.BE.set_uint16 buf offset 1;          (* key_len = 1 *)
+  Cstruct.set_char buf (offset + 2) 'a';       (* key data *)
+  Cstruct.BE.set_uint16 buf (offset + 3) 0xFFFF; (* val_len = 65535 → overflows *)
+  match P.leaf_entry_at buf ~offset with
+  | `End -> ()  (* expected *)
+  | `Entry _ -> Alcotest.fail "expected End when leaf val_len overflows page"
+
+(* ------------------------------------------------------------------ *)
 (* 10. QCheck property tests                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -582,6 +639,13 @@ let () =
       Alcotest.test_case "leaf End at near-boundary"        `Quick test_leaf_end_at_offset_past_data;
       Alcotest.test_case "leaf End at page_size"            `Quick test_leaf_end_at_page_size;
       Alcotest.test_case "leaf zeroed page Entry"           `Quick test_leaf_zeroed_page_entry;
+    ];
+    "overflow", [
+      Alcotest.test_case "branch_append_entry overflow"     `Quick test_branch_append_overflow;
+      Alcotest.test_case "leaf_append_entry overflow"       `Quick test_leaf_append_overflow;
+      Alcotest.test_case "branch_entry_at key overflow"     `Quick test_branch_entry_at_key_overflow;
+      Alcotest.test_case "leaf_entry_at key overflow"       `Quick test_leaf_entry_at_key_overflow;
+      Alcotest.test_case "leaf_entry_at val overflow"       `Quick test_leaf_entry_at_val_overflow;
     ];
     "freelist", [
       Alcotest.test_case "freelist single entry"            `Quick test_freelist_single_entry;

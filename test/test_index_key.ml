@@ -178,6 +178,80 @@ let test_roundtrip_text_embedded_null () =
   | Ok _ -> Alcotest.fail "unexpected result"
 
 (* ------------------------------------------------------------------ *)
+(* Decode error paths                                                   *)
+(* ------------------------------------------------------------------ *)
+
+let test_decode_buffer_too_short () =
+  (* Buffer with fewer than 8 bytes cannot hold even a rowid *)
+  let buf = Bytes.of_string "short" in
+  match decode buf with
+  | Error msg ->
+    Alcotest.(check bool) "error mentions too short" true
+      (String.length msg > 0)
+  | Ok _ -> Alcotest.fail "expected Error for too-short buffer"
+
+let test_decode_truncated_integer () =
+  (* Tag 0x01 (INTEGER) followed by only 4 bytes (need 8) + 8 rowid bytes *)
+  let buf = Bytes.create 13 in  (* 1 tag + 4 partial + 8 would-be rowid *)
+  Bytes.set_uint8 buf 0 0x01;   (* INTEGER tag *)
+  (* only 4 bytes follow before the would-be rowid region: too short for 8-byte int *)
+  match decode buf with
+  | Error _ -> ()  (* expected: truncated INTEGER *)
+  | Ok _ -> Alcotest.fail "expected Error for truncated INTEGER field"
+
+let test_decode_truncated_real () =
+  (* Tag 0x02 (REAL) followed by only 4 bytes (need 8) + 8 rowid bytes *)
+  let buf = Bytes.create 13 in
+  Bytes.set_uint8 buf 0 0x02;
+  match decode buf with
+  | Error _ -> ()  (* expected: truncated REAL *)
+  | Ok _ -> Alcotest.fail "expected Error for truncated REAL field"
+
+let test_decode_missing_escape_terminator () =
+  (* Tag 0x03 (TEXT) followed by a byte sequence with no 0x00 0x00 terminator *)
+  (* Total: 1 tag + some bytes + 8 rowid = 1 + 5 + 8 = 14 bytes
+     But the 5 bytes are all non-zero so no terminator before rowid region *)
+  let buf = Bytes.create 14 in
+  Bytes.set_uint8 buf 0 0x03;   (* TEXT tag *)
+  Bytes.set_uint8 buf 1 0x41;   (* 'A' *)
+  Bytes.set_uint8 buf 2 0x42;   (* 'B' *)
+  Bytes.set_uint8 buf 3 0x43;   (* 'C' *)
+  Bytes.set_uint8 buf 4 0x44;   (* 'D' *)
+  Bytes.set_uint8 buf 5 0x45;   (* 'E' - no terminator, reaches rowid *)
+  (* bytes 6..13 = rowid region - but the parser will hit end-of-input without terminator *)
+  match decode buf with
+  | Error _ -> ()  (* expected: missing terminator *)
+  | Ok _ -> Alcotest.fail "expected Error for missing escape terminator"
+
+let test_decode_invalid_escape_byte () =
+  (* Tag 0x03 (TEXT) with 0x00 0x42 (invalid escape: second byte should be 0x00 or 0xFF) *)
+  let buf = Bytes.create 12 in  (* 1 tag + 2 escape bytes + 1 bogus + 8 rowid *)
+  Bytes.set_uint8 buf 0 0x03;   (* TEXT tag *)
+  Bytes.set_uint8 buf 1 0x00;   (* start of escape *)
+  Bytes.set_uint8 buf 2 0x42;   (* invalid: not 0x00 or 0xFF *)
+  match decode buf with
+  | Error _ -> ()  (* expected: invalid escape byte *)
+  | Ok _ -> Alcotest.fail "expected Error for invalid escape byte"
+
+let test_decode_unknown_tag () =
+  (* Tag 0x05 is not a valid type tag *)
+  let buf = Bytes.create 9 in  (* 1 unknown tag + 8 rowid bytes *)
+  Bytes.set_uint8 buf 0 0x05;
+  match decode buf with
+  | Error _ -> ()  (* expected: unknown tag *)
+  | Ok _ -> Alcotest.fail "expected Error for unknown tag byte"
+
+let test_decode_rowid_tail_wrong_length () =
+  (* A valid INTEGER value (9 bytes) + 4 leftover bytes (not 8) — wrong rowid tail *)
+  let buf = Bytes.create 13 in  (* 1 tag + 8 int + 4 partial rowid *)
+  Bytes.set_uint8 buf 0 0x01;   (* INTEGER tag *)
+  (* buf[1..8] = int data (zeros = 0L encoded with sign-bit flip) *)
+  (* 4 remaining bytes after the 9-byte integer — not exactly 8 *)
+  match decode buf with
+  | Error _ -> ()  (* expected: wrong rowid byte count *)
+  | Ok _ -> Alcotest.fail "expected Error for wrong rowid tail length"
+
+(* ------------------------------------------------------------------ *)
 (* QCheck property tests                                                *)
 (* ------------------------------------------------------------------ *)
 
@@ -298,6 +372,15 @@ let () =
       Alcotest.test_case "empty key rowid=42"            `Quick test_roundtrip_empty_key;
       Alcotest.test_case "multi-column [int; text]"      `Quick test_roundtrip_multi_column;
       Alcotest.test_case "text with embedded null"        `Quick test_roundtrip_text_embedded_null;
+    ];
+    "decode_errors", [
+      Alcotest.test_case "buffer too short"              `Quick test_decode_buffer_too_short;
+      Alcotest.test_case "truncated INTEGER field"       `Quick test_decode_truncated_integer;
+      Alcotest.test_case "truncated REAL field"          `Quick test_decode_truncated_real;
+      Alcotest.test_case "missing escape terminator"     `Quick test_decode_missing_escape_terminator;
+      Alcotest.test_case "invalid escape byte"           `Quick test_decode_invalid_escape_byte;
+      Alcotest.test_case "unknown tag byte"              `Quick test_decode_unknown_tag;
+      Alcotest.test_case "wrong rowid tail length"       `Quick test_decode_rowid_tail_wrong_length;
     ];
   ] in
   let qcheck_tests =

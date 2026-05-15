@@ -284,6 +284,89 @@ let test_value_too_large () =
   | Error e -> Alcotest.failf "wrong error: %a" Btree.pp_error e
   | Ok _ -> Alcotest.fail "expected Value_too_large"
 
+(* Inject a Header page (kind != Leaf/Branch) as the root, forcing Tree_corrupt *)
+let test_tree_corrupt_bad_page_kind () =
+  let mb = make_mock () in
+  let (read_page, write_page, sync, resize) = mock_callbacks mb in
+  let pager =
+    Pager.create ~read_page ~write_page ~sync ~resize
+      ~n_pages:3L ~freelist:Freelist.empty
+  in
+  (* Write a Header-kind page at page 2 (our designated root) *)
+  let buf = Cstruct.create Page.page_size in
+  Page.write_common buf Page.{
+    kind = Page.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l
+  };
+  Page.seal buf;
+  Pager.write pager 2L buf;
+  let t = Btree.create pager ~root_page:2L in
+  (* GET on a root that is a Header page should yield Tree_corrupt *)
+  (match run (Btree.get t (b "k")) with
+   | Error (Btree.Tree_corrupt _) -> ()
+   | Error e -> Alcotest.failf "expected Tree_corrupt, got: %a" Btree.pp_error e
+   | Ok _ -> Alcotest.fail "expected Tree_corrupt error");
+  (* PUT should also hit Tree_corrupt *)
+  let _ = Btree.create pager ~root_page:2L in
+  (match run (Btree.put t (b "k") (b "v")) with
+   | Error (Btree.Tree_corrupt _) -> ()
+   | Error e -> Alcotest.failf "expected Tree_corrupt on put, got: %a" Btree.pp_error e
+   | Ok _ -> Alcotest.fail "expected Tree_corrupt error on put");
+  (* DEL should also hit Tree_corrupt — but del starts by reading the leaf *)
+  (match run (Btree.del t (b "k")) with
+   | Error (Btree.Tree_corrupt _) -> ()
+   | Error e -> Alcotest.failf "expected Tree_corrupt on del, got: %a" Btree.pp_error e
+   | Ok _ -> Alcotest.fail "expected Tree_corrupt error on del")
+
+(* Test del on a key that's too large (>max_key_size): should return t unchanged *)
+let test_del_key_too_large () =
+  let (t, _) = empty_tree () in
+  let t = ok_btree (run (Btree.put t (b "k") (b "v"))) in
+  let big_key = Bytes.make 513 'k' in
+  (* del with oversized key is a no-op *)
+  let t' = ok_btree (run (Btree.del t big_key)) in
+  (* original key must still be present *)
+  let r = run (Btree.get t' (b "k")) in
+  Alcotest.(check bool) "key still present after no-op del" true (r = Ok (Some (b "v")))
+
+(* Inject a branch page with n_keys=0 (empty branch) as root.
+   This exercises the `entries = []` arm in leftmost_leaf_with_path
+   that uses right_page directly. *)
+let test_empty_branch_cursor () =
+  let mb = make_mock () in
+  let (read_page, write_page, sync, resize) = mock_callbacks mb in
+  let pager =
+    Pager.create ~read_page ~write_page ~sync ~resize
+      ~n_pages:4L ~freelist:Freelist.empty
+  in
+  (* page 2: empty branch (n_keys=0) pointing right_page → page 3 *)
+  let branch_buf = Cstruct.create Page.page_size in
+  Page.write_common branch_buf Page.{
+    kind = Page.Branch; flags = 0; n_keys = 0;
+    right_page = 3l;  (* right_page = page 3 *)
+    crc32 = 0l;
+  };
+  Page.seal branch_buf;
+  Pager.write pager 2L branch_buf;
+  (* page 3: leaf with one entry *)
+  let leaf_buf = Cstruct.create Page.page_size in
+  let _next = Page.leaf_append_entry leaf_buf
+    ~offset:Page.data_offset ~key:(b "mykey") ~value:(b "myval") in
+  Page.write_common leaf_buf Page.{
+    kind = Page.Leaf; flags = 0; n_keys = 1;
+    right_page = 0l; crc32 = 0l;
+  };
+  Page.seal leaf_buf;
+  Pager.write pager 3L leaf_buf;
+  let t = Btree.create pager ~root_page:2L in
+  (* Open cursor: should descend through the empty branch → leaf *)
+  let c = ok_btree (run (Btree.cursor_open t)) in
+  (match run (Btree.cursor_next c) with
+   | Ok (Some (k, v)) ->
+     Alcotest.(check bool) "key is mykey" true (Bytes.equal k (b "mykey"));
+     Alcotest.(check bool) "val is myval" true (Bytes.equal v (b "myval"))
+   | Ok None -> Alcotest.fail "expected entry from leaf under empty branch"
+   | Error e -> Alcotest.failf "cursor error: %a" Btree.pp_error e)
+
 (* ------------------------------------------------------------------ *)
 (* QCheck properties                                                   *)
 (* ------------------------------------------------------------------ *)
@@ -462,6 +545,9 @@ let () =
       Alcotest.test_case "root_page changes (CoW)"     `Quick test_root_page_changes;
       Alcotest.test_case "key too large"               `Quick test_key_too_large;
       Alcotest.test_case "value too large"             `Quick test_value_too_large;
+      Alcotest.test_case "tree_corrupt bad page kind"  `Quick test_tree_corrupt_bad_page_kind;
+      Alcotest.test_case "del key too large no-op"     `Quick test_del_key_too_large;
+      Alcotest.test_case "empty branch cursor"         `Quick test_empty_branch_cursor;
     ];
     "qcheck", qcheck_tests;
   ]

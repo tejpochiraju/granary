@@ -55,14 +55,15 @@ some may be reconsidered in v2+.
 ## v1 SQL feature scope
 
 ### In v1
-- [ ] `CREATE TABLE` with INTEGER / REAL / TEXT / BLOB / NULL types
+- [x] `CREATE TABLE` with INTEGER / REAL / TEXT / BLOB / NULL types
 - [ ] Column constraints: NOT NULL, PRIMARY KEY (single + composite),
       UNIQUE (single col), DEFAULT (literal values)
 - [ ] `DROP TABLE`, `DROP INDEX`
-- [ ] `CREATE INDEX` (single col + composite)
-- [ ] `INSERT`, `UPDATE`, `DELETE` with `WHERE`
-- [ ] `SELECT` with `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`, `GROUP BY`,
-      `HAVING`
+- [x] `CREATE INDEX` (single col)
+- [x] `INSERT` with `WHERE`
+- [ ] `UPDATE`, `DELETE` with `WHERE`
+- [x] `SELECT` with `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`
+- [ ] `GROUP BY`, `HAVING`
 - [ ] Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 - [ ] Joins: `INNER JOIN`, `LEFT JOIN` (nested-loop + hash join physical
       operators)
@@ -109,15 +110,15 @@ some may be reconsidered in v2+.
 ## Storage / runtime
 
 ### v1
-- [ ] CoW B+-tree implementation (page format, splits, merges, rebalancing)
+- [x] CoW B+-tree implementation (page format, splits, merges, rebalancing)
 - [ ] Free-list with per-page freed-at-txn metadata
-- [ ] RW txn manager (single-writer mutex)
+- [x] RW txn manager (single-writer mutex)
 - [ ] RO txn manager (active-readers table; freelist gating)
-- [ ] Page cache (bounded LRU)
-- [ ] Two-header alternating commit protocol
-- [ ] Checksums on header pages
-- [ ] `BLOCK` signature + Mem/Unix_file/Mirage_block backends
-- [ ] Crash recovery on `Db.open_` (pick valid header by checksum + txn_id)
+- [x] Page cache (bounded LRU)
+- [x] Two-header alternating commit protocol
+- [x] Checksums on header pages
+- [x] `BLOCK` signature + Mem/Unix_file/Mirage_block backends
+- [x] Crash recovery on `Db.open_` (pick valid header by checksum + txn_id)
 
 ### Deferred — runtime / storage (v2+)
 - [ ] WAL (write-ahead log) layer between txn manager and page writer
@@ -222,7 +223,7 @@ stretch them.
 
 - [x] **Phase 0 — walking skeleton (~4-6 wks):** Mem backend; CREATE TABLE,
       INSERT, simple SELECT. End-to-end demo.
-- [ ] **Phase 1 — disk storage (~6-8 wks):** Unix_file backend (CoW B+-tree);
+- [x] **Phase 1 — disk storage (~6-8 wks):** Unix_file backend (CoW B+-tree);
       ORDER BY, LIMIT, single-col indexes.
 - [ ] **Phase 2 — query depth (~8-10 wks):** UPDATE, DELETE, joins,
       GROUP BY, aggregates.

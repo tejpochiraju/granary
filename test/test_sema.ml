@@ -382,6 +382,39 @@ let bind_select_multi_order_by_rejected () =
   | Error _ -> Alcotest.fail "expected Unsupported error for multi-column ORDER BY"
   | Ok _ -> Alcotest.fail "expected error, got Ok"
 
+let bind_select_order_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `All;
+    table = "users";
+    where = None;
+    order = [Ast.{ col = "bogus"; dir = Ast.Asc }];
+    limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column for ORDER BY on non-existent col"
+
+let bind_select_negative_limit () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None; order = [];
+    limit = Some (-1); offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Invalid_limit _) -> ()
+  | _ -> Alcotest.fail "expected Invalid_limit for negative LIMIT"
+
+let bind_select_negative_offset () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None; order = [];
+    limit = None; offset = Some (-5);
+  } in
+  match bind cat stmt with
+  | Error (Sema.Invalid_limit _) -> ()
+  | _ -> Alcotest.fail "expected Invalid_limit for negative OFFSET"
+
 (* ------------------------------------------------------------------ *)
 (* Group 3b: CREATE INDEX binding                                       *)
 (* ------------------------------------------------------------------ *)
@@ -505,6 +538,9 @@ let () =
       Alcotest.test_case "bind_select_where_right_unknown"      `Quick bind_select_where_right_unknown;
       Alcotest.test_case "bind_select_second_col_unknown"        `Quick bind_select_second_col_unknown;
       Alcotest.test_case "bind_select_multi_order_by_rejected"   `Quick bind_select_multi_order_by_rejected;
+      Alcotest.test_case "bind_select_order_unknown_col"         `Quick bind_select_order_unknown_col;
+      Alcotest.test_case "bind_select_negative_limit"            `Quick bind_select_negative_limit;
+      Alcotest.test_case "bind_select_negative_offset"           `Quick bind_select_negative_offset;
     ];
     "create-index", [
       Alcotest.test_case "bind_create_index_basic"          `Quick bind_create_index_basic;
