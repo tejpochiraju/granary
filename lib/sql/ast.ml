@@ -35,6 +35,7 @@ type column_def = {
   ty          : ty;
   not_null    : bool;
   primary_key : bool;
+  default     : literal option;  (* None = no DEFAULT *)
 }
 
 type order_dir = Asc | Desc

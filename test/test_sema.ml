@@ -19,8 +19,8 @@ let make_catalog cols =
   )
 
 let two_col_cat () = make_catalog [
-  { Row.name = "id";   ty = Row.Integer };
-  { Row.name = "name"; ty = Row.Text };
+  { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+  { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
 ]
 
 let bind cat stmt = Lwt_main.run (Sema.bind cat stmt)
@@ -32,8 +32,8 @@ let bind cat stmt = Lwt_main.run (Sema.bind cat stmt)
 let bind_create_new () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false };
-    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false };
+    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None };
+    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols } in
   match bind cat stmt with
@@ -49,7 +49,7 @@ let bind_create_new () =
 let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
-  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false }] in
+  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None }] in
   let stmt = Ast.S_create_table { name = "users"; columns = cols } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
@@ -59,8 +59,8 @@ let bind_create_duplicate () =
 let bind_create_preserves_cols () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false };
-    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false };
+    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None };
+    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols } in
   match bind cat stmt with
@@ -92,6 +92,9 @@ let bind_insert_basic () =
   | Error _ -> Alcotest.fail "unexpected error"
 
 let bind_insert_reversed_cols () =
+  (* INSERT (name, id) VALUES ('bob', 2) — columns specified in user order.
+     After Task 4, bind_insert normalises to full-width table order:
+     ordinals = [0; 1] (id first, then name), values = [L_int 2; L_text "bob"]. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_insert {
     table = "users";
@@ -99,12 +102,23 @@ let bind_insert_reversed_cols () =
     values = [Ast.L_text "bob"; Ast.L_int 2L];
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_insert { ordinals; _ }) ->
-    Alcotest.(check (list int)) "ordinals reversed" [1; 0] ordinals
+  | Ok (Sema.BS_insert { ordinals; values; _ }) ->
+    Alcotest.(check (list int)) "ordinals full-width table-order" [0; 1] ordinals;
+    Alcotest.(check int) "values count full-width" 2 (List.length values);
+    (* id (ordinal 0) should be L_int 2L, name (ordinal 1) L_text "bob" *)
+    (match List.nth values 0 with
+     | Ast.L_int 2L -> ()
+     | _ -> Alcotest.fail "expected id=L_int 2L at position 0");
+    (match List.nth values 1 with
+     | Ast.L_text "bob" -> ()
+     | _ -> Alcotest.fail "expected name=L_text bob at position 1")
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error"
 
 let bind_insert_single_col () =
+  (* INSERT (id) VALUES (99) — omitted name column fills with NULL.
+     After Task 4, bind_insert normalises to full-width: ordinals = [0; 1],
+     values = [L_int 99; L_null]. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_insert {
     table = "users";
@@ -112,8 +126,15 @@ let bind_insert_single_col () =
     values = [Ast.L_int 99L];
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_insert { ordinals; _ }) ->
-    Alcotest.(check (list int)) "ordinals single" [0] ordinals
+  | Ok (Sema.BS_insert { ordinals; values; _ }) ->
+    Alcotest.(check (list int)) "ordinals full-width" [0; 1] ordinals;
+    Alcotest.(check int) "values count full-width" 2 (List.length values);
+    (match List.nth values 0 with
+     | Ast.L_int 99L -> ()
+     | _ -> Alcotest.fail "expected id=L_int 99L");
+    (match List.nth values 1 with
+     | Ast.L_null -> ()
+     | _ -> Alcotest.fail "expected name=L_null (omitted)")
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error"
 
@@ -181,7 +202,8 @@ let bind_insert_type_mismatch_text_col () =
 
 let bind_insert_null_allowed () =
   let cat = two_col_cat () in
-  (* NULL is allowed in any column — no type check *)
+  (* NULL is allowed in any nullable column — no type check.
+     After Task 4, full-width ordinals = [0; 1]. *)
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
@@ -189,7 +211,7 @@ let bind_insert_null_allowed () =
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; _ }) ->
-    Alcotest.(check (list int)) "null insert ordinals" [0] ordinals
+    Alcotest.(check (list int)) "null insert ordinals full-width" [0; 1] ordinals
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error: NULL should be allowed"
 
@@ -334,9 +356,9 @@ let bind_insert_second_col_unknown () =
   (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
      id resolves, bogus fails, name is never reached — the 3rd iteration hits L99. *)
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer };
-    { Row.name = "name"; ty = Row.Text    };
-    { Row.name = "age";  ty = Row.Integer };
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users";
@@ -351,9 +373,9 @@ let bind_select_second_col_unknown () =
   (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
      id resolves, bogus fails, age is never reached — the 3rd iteration hits L134. *)
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer };
-    { Row.name = "name"; ty = Row.Text    };
-    { Row.name = "age";  ty = Row.Integer };
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_select {
     proj = `Cols ["id"; "bogus"; "age"];

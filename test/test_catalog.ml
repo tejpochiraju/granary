@@ -10,7 +10,7 @@ module Row = Sqlocaml_encoding.Row
 
 let run = Lwt_main.run
 
-let mk_col name ty : Row.column = { name; ty }
+let mk_col name ty : Row.column = { name; ty; not_null = false; primary_key = false; default = None }
 
 let int_col name = mk_col name Row.Integer
 let txt_col name = mk_col name Row.Text
@@ -460,7 +460,7 @@ let corrupt_column_type_tag () =
   run (
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users"
-      ~columns:[{ Row.name = "id"; ty = Row.Integer }] in
+      ~columns:[{ Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false; default = None }] in
     (* Overwrite the column entry with a corrupt type tag (0) *)
     let col_key =
       let tn = Bytes.of_string "users" in

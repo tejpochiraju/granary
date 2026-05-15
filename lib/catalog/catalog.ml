@@ -76,18 +76,108 @@ let type_of_tag = function
   | 4 -> Row.Blob
   | n -> failwith (Printf.sprintf "unknown column type tag %d" n)
 
+let default_value_tag : Row.default_value -> int = function
+  | Row.DV_null   -> 0
+  | Row.DV_int  _ -> 1
+  | Row.DV_real _ -> 2
+  | Row.DV_text _ -> 3
+  | Row.DV_blob _ -> 4
+
+let encode_default_value buf (dv : Row.default_value) =
+  Varint.encode_uint64 buf (Int64.of_int (default_value_tag dv));
+  match dv with
+  | Row.DV_null   -> ()
+  | Row.DV_int  n ->
+    (* 8-byte LE int64 *)
+    let tmp = Bytes.create 8 in
+    for k = 0 to 7 do
+      Bytes.set_uint8 tmp k (Int64.to_int (Int64.logand
+        (Int64.shift_right_logical n (k * 8)) 0xFFL))
+    done;
+    Buffer.add_bytes buf tmp
+  | Row.DV_real f ->
+    let bits = Int64.bits_of_float f in
+    let tmp = Bytes.create 8 in
+    for k = 0 to 7 do
+      Bytes.set_uint8 tmp k (Int64.to_int (Int64.logand
+        (Int64.shift_right_logical bits (k * 8)) 0xFFL))
+    done;
+    Buffer.add_bytes buf tmp
+  | Row.DV_text s ->
+    Varint.encode_uint64 buf (Int64.of_int (String.length s));
+    Buffer.add_string buf s
+  | Row.DV_blob b ->
+    Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+    Buffer.add_bytes buf b
+
+let decode_default_value bytes off =
+  let tag, off = Varint.decode_uint64 bytes off in
+  match Int64.to_int tag with
+  | 0 -> (Row.DV_null, off)
+  | 1 ->
+    let n = ref Int64.zero in
+    for k = 0 to 7 do
+      let byte = Int64.of_int (Bytes.get_uint8 bytes (off + k)) in
+      n := Int64.logor !n (Int64.shift_left byte (k * 8))
+    done;
+    (Row.DV_int !n, off + 8)
+  | 2 ->
+    let bits = ref Int64.zero in
+    for k = 0 to 7 do
+      let byte = Int64.of_int (Bytes.get_uint8 bytes (off + k)) in
+      bits := Int64.logor !bits (Int64.shift_left byte (k * 8))
+    done;
+    (Row.DV_real (Int64.float_of_bits !bits), off + 8)
+  | 3 ->
+    let len, off = Varint.decode_uint64 bytes off in
+    let len = Int64.to_int len in
+    let s = Bytes.sub_string bytes off len in
+    (Row.DV_text s, off + len)
+  | 4 ->
+    let len, off = Varint.decode_uint64 bytes off in
+    let len = Int64.to_int len in
+    let b = Bytes.sub bytes off len in
+    (Row.DV_blob b, off + len)
+  | n -> failwith (Printf.sprintf "unknown default value tag %d" n)
+
 let encode_column (col : Row.column) =
   let buf = Buffer.create 16 in
   Varint.encode_uint64 buf (Int64.of_int (type_tag col.ty));
   Varint.encode_uint64 buf (Int64.of_int (String.length col.name));
   Buffer.add_string buf col.name;
+  Varint.encode_uint64 buf (if col.not_null    then 1L else 0L);
+  Varint.encode_uint64 buf (if col.primary_key then 1L else 0L);
+  (match col.default with
+   | None    -> Varint.encode_uint64 buf 0L
+   | Some dv ->
+     Varint.encode_uint64 buf 1L;
+     encode_default_value buf dv);
   Buffer.to_bytes buf
 
 let decode_column bytes =
   let tag, off = Varint.decode_uint64 bytes 0 in
   let len, off = Varint.decode_uint64 bytes off in
   let name = Bytes.sub_string bytes off (Int64.to_int len) in
-  Row.{ name; ty = type_of_tag (Int64.to_int tag) }
+  let off  = off + Int64.to_int len in
+  (* not_null and primary_key — present only in the new format.
+     If there are no more bytes, default to false (backward compat). *)
+  let bytes_left = Bytes.length bytes - off in
+  if bytes_left = 0 then
+    Row.{ name; ty = type_of_tag (Int64.to_int tag);
+          not_null = false; primary_key = false; default = None }
+  else begin
+    let nn, off  = Varint.decode_uint64 bytes off in
+    let pk, off  = Varint.decode_uint64 bytes off in
+    let has_def, off = Varint.decode_uint64 bytes off in
+    let default =
+      if Int64.to_int has_def = 0 then None
+      else let dv, _ = decode_default_value bytes off in Some dv
+    in
+    Row.{ name; ty = type_of_tag (Int64.to_int tag);
+          not_null    = (Int64.to_int nn <> 0);
+          primary_key = (Int64.to_int pk <> 0);
+          default }
+  end
 
 (* Index value encoding:
    varint(name_len) ++ name ++ varint(table_len) ++ table

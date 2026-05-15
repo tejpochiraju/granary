@@ -53,13 +53,14 @@ type bound_stmt =
     }
 
 type error =
-  | Unknown_table  of string
-  | Unknown_column of { table : string; column : string }
-  | Type_mismatch  of { expected : Row.ty; got : Row.ty }
-  | Arity_mismatch of { expected : int; got : int }
-  | Already_exists of string
-  | Invalid_limit  of string
-  | Unsupported    of string
+  | Unknown_table       of string
+  | Unknown_column      of { table : string; column : string }
+  | Type_mismatch       of { expected : Row.ty; got : Row.ty }
+  | Arity_mismatch      of { expected : int; got : int }
+  | Already_exists      of string
+  | Invalid_limit       of string
+  | Unsupported         of string
+  | Not_null_violation  of string   (* column name *)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -138,19 +139,37 @@ let bind_create cat ~name ~columns =
   match existing with
   | Some _ -> Lwt.return (Error (Already_exists name))
   | None ->
+    let ast_lit_to_dv : Ast.literal -> Row.default_value = function
+      | Ast.L_int  n -> Row.DV_int n
+      | Ast.L_text s -> Row.DV_text s
+      | Ast.L_null   -> Row.DV_null
+      | Ast.L_real f -> Row.DV_real f
+      | Ast.L_blob b -> Row.DV_blob b
+    in
     let row_cols = List.map (fun (c : Ast.column_def) ->
-      Row.{ name = c.name;
-            ty   = (match c.ty with
-                    | Ast.Ty_int  -> Row.Integer
-                    | Ast.Ty_text -> Row.Text
-                    | Ast.Ty_real -> Row.Real
-                    | Ast.Ty_blob -> Row.Blob) }
+      Row.{ name        = c.name;
+            ty          = (match c.ty with
+                           | Ast.Ty_int  -> Row.Integer
+                           | Ast.Ty_text -> Row.Text
+                           | Ast.Ty_real -> Row.Real
+                           | Ast.Ty_blob -> Row.Blob);
+            not_null    = c.not_null;
+            primary_key = c.primary_key;
+            default     = Option.map ast_lit_to_dv c.default }
     ) columns in
     Lwt.return (Ok (BS_create_table { name; columns = row_cols }))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
 (* ------------------------------------------------------------------ *)
+
+(** Convert a [Row.default_value] to an [Ast.literal]. *)
+let dv_to_lit : Row.default_value -> Ast.literal = function
+  | Row.DV_int  n -> Ast.L_int n
+  | Row.DV_text s -> Ast.L_text s
+  | Row.DV_null   -> Ast.L_null
+  | Row.DV_real f -> Ast.L_real f
+  | Row.DV_blob b -> Ast.L_blob b
 
 let bind_insert cat ~table ~columns ~values =
   let* meta_opt = Cat.find_table cat ~name:table in
@@ -162,27 +181,73 @@ let bind_insert cat ~table ~columns ~values =
     if n_cols <> n_vals then
       Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
     else
-      let result =
+      (* 1. Validate the explicitly-provided columns and build a map
+            from column ordinal -> supplied literal. *)
+      let explicit_result =
         List.fold_left2 (fun acc col_name lit ->
           match acc with
           | Error _ -> acc
-          | Ok ords ->
+          | Ok map ->
             (match col_index meta.columns col_name with
              | None ->
                Error (Unknown_column { table; column = col_name })
              | Some i ->
                let col = List.nth meta.columns i in
                (match lit_ty lit with
-                | None   -> Ok (ords @ [i])   (* NULL: skip type check *)
+                | None   -> Ok (map @ [(i, lit)])   (* NULL: skip type check *)
                 | Some t ->
-                  if ty_equal t col.ty then Ok (ords @ [i])
+                  if ty_equal t col.ty then Ok (map @ [(i, lit)])
                   else Error (Type_mismatch { expected = col.ty; got = t })))
         ) (Ok []) columns values
       in
-      (match result with
-       | Error e    -> Lwt.return (Error e)
-       | Ok ordinals ->
-         Lwt.return (Ok (BS_insert { table_meta = meta; ordinals; values })))
+      (match explicit_result with
+       | Error e -> Lwt.return (Error e)
+       | Ok explicit_map ->
+         (* 2. Build the full value list (one entry per table column),
+               applying DEFAULT for omitted columns. *)
+         let n_table_cols = List.length meta.columns in
+         let per_col_results =
+           List.init n_table_cols (fun i ->
+             let col = List.nth meta.columns i in
+             match List.assoc_opt i explicit_map with
+             | Some lit -> (i, lit)
+             | None ->
+               (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
+               let lit = match col.Row.default with
+                 | Some dv -> dv_to_lit dv
+                 | None    -> Ast.L_null
+               in
+               (i, lit))
+         in
+         let full_values_result : ((int * Ast.literal) list, error) result =
+           Ok per_col_results
+         in
+         (match full_values_result with
+          | Error e -> Lwt.return (Error e)
+          | Ok full_pairs ->
+            (* 3. NOT NULL enforcement: reject if any NOT NULL column has NULL. *)
+            let nn_result =
+              List.fold_left (fun acc (i, lit) ->
+                match acc with
+                | Error _ -> acc
+                | Ok () ->
+                  let col = List.nth meta.columns i in
+                  if col.Row.not_null && lit = Ast.L_null then
+                    Error (Not_null_violation col.Row.name)
+                  else
+                    Ok ()
+              ) (Ok ()) full_pairs
+            in
+            (match nn_result with
+             | Error e -> Lwt.return (Error e)
+             | Ok () ->
+               let ordinals = List.map fst full_pairs in
+               let full_vals = List.map snd full_pairs in
+               Lwt.return (Ok (BS_insert {
+                 table_meta = meta;
+                 ordinals;
+                 values     = full_vals;
+               }))))) (* closes Ok, Lwt.return, nn_result match, full_values_result match, explicit_result match *)
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)
@@ -328,7 +393,8 @@ let bind_update cat ~table ~assignments ~where =
   | None -> Lwt.return (Error (Unknown_table table))
   | Some meta ->
     (* Bind each assignment: resolve column ordinal, bind the expression,
-       and check that the inferred expression type matches the column. *)
+       and check that the inferred expression type matches the column.
+       Also reject SET col = NULL on a NOT NULL column (static check). *)
     let assign_result =
       List.fold_left (fun acc (col_name, expr_ast) ->
         match acc with
@@ -339,6 +405,10 @@ let bind_update cat ~table ~assignments ~where =
              Error (Unknown_column { table; column = col_name })
            | Some i ->
              let col = List.nth meta.columns i in
+             (* Static NOT NULL check for literal NULL assignments. *)
+             if col.Row.not_null && expr_ast = Ast.E_lit Ast.L_null then
+               Error (Not_null_violation col.Row.name)
+             else
              (match bind_expr meta expr_ast with
               | Error e -> Error e
               | Ok bexpr ->

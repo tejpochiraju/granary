@@ -13,8 +13,8 @@ module Exec = Sqlocaml_sql.Exec
 
 let run = Lwt_main.run
 
-let int_col name : Row.column = { name; ty = Row.Integer }
-let txt_col name : Row.column = { name; ty = Row.Text    }
+let int_col name : Row.column = { name; ty = Row.Integer; not_null = false; primary_key = false; default = None }
+let txt_col name : Row.column = { name; ty = Row.Text;    not_null = false; primary_key = false; default = None }
 
 (** Standard two-column schema: id INTEGER, name TEXT *)
 let id_name_cols = [int_col "id"; txt_col "name"]
@@ -1038,7 +1038,7 @@ let query_index_lookup_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1070,7 +1070,7 @@ let query_index_lookup_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AAAA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BBBB")]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1132,7 +1132,7 @@ let query_filter_eq_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1153,7 +1153,7 @@ let query_filter_eq_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1176,7 +1176,7 @@ let query_sort_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_real 3.0]);
     insert store cat "t" ([0], [Ast.L_real 1.0]);
     insert store cat "t" ([0], [Ast.L_real 2.0]);
@@ -1197,7 +1197,7 @@ let query_sort_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "CC")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);

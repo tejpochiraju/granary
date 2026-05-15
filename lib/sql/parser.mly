@@ -1,7 +1,10 @@
 %{
   open Ast
 
-  type col_constraint = Col_not_null | Col_primary_key
+  type col_constraint =
+    | Col_not_null
+    | Col_primary_key
+    | Col_default of literal
 %}
 
 %token <string> IDENT
@@ -10,7 +13,7 @@
 %token <float>  FLOAT_LIT
 %token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE
 %token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
-%token NOT NULL PRIMARY KEY AND OR IS
+%token NOT NULL PRIMARY KEY DEFAULT AND OR IS
 %token ORDER BY ASC DESC LIMIT OFFSET
 %token INDEX ON UNIQUE
 %token UPDATE SET
@@ -58,7 +61,9 @@ column_def:
   | name = IDENT ty = col_ty cs = column_constraint*
     { let not_null    = List.mem Col_not_null cs in
       let primary_key = List.mem Col_primary_key cs in
-      { name; ty; not_null; primary_key } }
+      let default     = List.fold_left (fun acc c ->
+          match c with Col_default l -> Some l | _ -> acc) None cs in
+      { name; ty; not_null; primary_key; default } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -67,8 +72,17 @@ col_ty:
   | BLOB_TY    { Ty_blob }
 
 column_constraint:
-  | NOT NULL    { Col_not_null }
-  | PRIMARY KEY { Col_primary_key }
+  | NOT NULL              { Col_not_null }
+  | PRIMARY KEY           { Col_primary_key }
+  | DEFAULT l = def_value { Col_default l }
+
+def_value:
+  | n = INT_LIT              { L_int n }
+  | s = STRING_LIT           { L_text s }
+  | NULL                     { L_null }
+  | f = FLOAT_LIT            { L_real f }
+  | MINUS n = INT_LIT        { L_int (Int64.neg n) }
+  | MINUS f = FLOAT_LIT      { L_real (-. f) }
 
 insert:
   | INSERT INTO table = IDENT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN

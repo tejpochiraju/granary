@@ -52,14 +52,15 @@ type bound_stmt =
     }
 
 type error =
-  | Unknown_table  of string
-  | Unknown_column of { table : string; column : string }
-  | Type_mismatch  of { expected : Sqlocaml_encoding.Row.ty;
-                        got      : Sqlocaml_encoding.Row.ty }
-  | Arity_mismatch of { expected : int; got : int }
-  | Already_exists of string
-  | Invalid_limit  of string
-  | Unsupported    of string
+  | Unknown_table       of string
+  | Unknown_column      of { table : string; column : string }
+  | Type_mismatch       of { expected : Sqlocaml_encoding.Row.ty;
+                             got      : Sqlocaml_encoding.Row.ty }
+  | Arity_mismatch      of { expected : int; got : int }
+  | Already_exists      of string
+  | Invalid_limit       of string
+  | Unsupported         of string
+  | Not_null_violation  of string   (* column name *)
 
 val bind :
   Sqlocaml_catalog.Catalog.t ->

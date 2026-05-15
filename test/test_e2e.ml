@@ -936,6 +936,103 @@ let qcheck_text_index_lookup =
        ))
 
 (* ------------------------------------------------------------------ *)
+(* Group 16: NOT NULL enforcement + DEFAULT constraints (Task 4)        *)
+(* ------------------------------------------------------------------ *)
+
+(** INSERT NULL into a NOT NULL column → Not_null_violation. *)
+let not_null_insert_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER NOT NULL)";
+  let result = run (Db.execute db "INSERT INTO t (n) VALUES (NULL)") in
+  match result with
+  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
+  | Error (Db.Runtime _) -> ()   (* also acceptable: runtime enforcement *)
+  | Error e ->
+    (match e with
+     | Db.Parse msg  -> Alcotest.failf "expected Not_null_violation, got Parse: %s" msg
+     | Db.Sema _     -> Alcotest.fail "expected Not_null_violation, got other Sema error"
+     | Db.Runtime msg -> Alcotest.failf "expected Not_null_violation, got Runtime: %s" msg)
+  | Ok () -> Alcotest.fail "expected Not_null_violation error, got Ok"
+
+(** INSERT omitting a NOT NULL column that has a DEFAULT → uses default. *)
+let not_null_default_used_when_omitted () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 42, s TEXT)";
+  exec db "INSERT INTO t (s) VALUES ('x')";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row inserted" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "n=42 (from default)" (Db.V_int 42L) row.(0);
+  Alcotest.check value_testable "s=x"                  (Db.V_text "x") row.(1)
+
+(** INSERT omitting a NOT NULL column with DEFAULT 0 → uses 0. *)
+let not_null_default_zero () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 0, s TEXT)";
+  exec db "INSERT INTO t (s) VALUES ('hello')";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "n=0 (default)" (Db.V_int 0L) (List.hd rows).(0)
+
+(** UPDATE SET col = NULL on a NOT NULL column → Not_null_violation. *)
+let not_null_update_to_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 1)";
+  exec db "INSERT INTO t (n) VALUES (5)";
+  let result = run (Db.execute db "UPDATE t SET n = NULL") in
+  match result with
+  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
+  | Error (Db.Runtime _) -> ()   (* also acceptable *)
+  | Ok ()   -> Alcotest.fail "expected Not_null_violation on UPDATE, got Ok"
+  | Error e ->
+    (match e with
+     | Db.Parse msg  -> Alcotest.failf "got Parse: %s" msg
+     | Db.Sema _     -> Alcotest.fail "got other Sema error"
+     | Db.Runtime msg -> Alcotest.failf "got Runtime: %s" msg)
+
+(** Explicit DEFAULT value is returned after SELECT. *)
+let default_value_readable () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER DEFAULT 99, y TEXT DEFAULT 'hi')";
+  exec db "INSERT INTO t (x) VALUES (1)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "x=1 (explicit)"   (Db.V_int 1L)    row.(0);
+  Alcotest.check value_testable "y=hi (default)"   (Db.V_text "hi") row.(1)
+
+(** QCheck: for a table with n INTEGER NOT NULL DEFAULT 99, inserting without
+    specifying n always produces n=99.  10,000 trials. *)
+let qcheck_default_applied =
+  QCheck.Test.make
+    ~name:"default_applied: omitted NOT NULL DEFAULT 99 col always returns 99"
+    ~count:10_000
+    QCheck.(string_size ~gen:Gen.(char_range 'a' 'z') Gen.(1 -- 8))
+    (fun s ->
+       if String.contains s '\'' then true  (* skip strings with quotes *)
+       else
+         let db = Lwt_main.run (Db.open_in_memory ()) in
+         Lwt_main.run (
+           let* _ = Db.execute db
+               "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 99, s TEXT)" in
+           let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
+           let* res = Db.execute db sql in
+           match res with
+           | Error _ -> Lwt.return false
+           | Ok () ->
+             let* qres = Db.query db "SELECT * FROM t" in
+             match qres with
+             | Error _ -> Lwt.return false
+             | Ok stream ->
+               let* rows = Lwt_stream.to_list stream in
+               match rows with
+               | [row] ->
+                 (match row.(0) with
+                  | Db.V_int 99L -> Lwt.return true
+                  | _             -> Lwt.return false)
+               | _ -> Lwt.return false))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1037,6 +1134,18 @@ let () =
       List.map QCheck_alcotest.to_alcotest [
         qcheck_index_lookup_matches_seq_scan;
         qcheck_text_index_lookup;
+      ]
+    );
+    "not_null_and_default", [
+      Alcotest.test_case "not_null_insert_null"             `Quick not_null_insert_null;
+      Alcotest.test_case "not_null_default_used_when_omitted" `Quick not_null_default_used_when_omitted;
+      Alcotest.test_case "not_null_default_zero"            `Quick not_null_default_zero;
+      Alcotest.test_case "not_null_update_to_null"          `Quick not_null_update_to_null;
+      Alcotest.test_case "default_value_readable"           `Quick default_value_readable;
+    ];
+    "qcheck_not_null_default", (
+      List.map QCheck_alcotest.to_alcotest [
+        qcheck_default_applied;
       ]
     );
   ]

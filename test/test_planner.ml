@@ -16,8 +16,8 @@ let make_cat () =
     let store = S.create () in
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"users" ~columns:[
-      { Row.name = "id";   ty = Row.Integer };
-      { Row.name = "name"; ty = Row.Text };
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None };
     ] in
     Lwt.return cat
   )
@@ -31,8 +31,8 @@ let bind cat stmt = Lwt_main.run (Sema.bind cat stmt) |> Result.get_ok
 let plan_create_table () =
   let cat = make_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false };
-    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false };
+    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None };
+    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols } in
   let bound = bind cat stmt in
@@ -315,8 +315,8 @@ let make_cat_with_index ~col_name =
     let store = S.create () in
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"users" ~columns:[
-      { Row.name = "id";   ty = Row.Integer };
-      { Row.name = "name"; ty = Row.Text };
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None };
     ] in
     let* _ = Cat.create_index cat ~name:"idx" ~table:"users"
       ~column:col_name ~unique:false in
