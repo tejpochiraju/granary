@@ -5,6 +5,11 @@ type bound_expr =
   | BE_col of int                       (** column ordinal in the table *)
   | BE_eq  of bound_expr * bound_expr
 
+type bound_order_key = {
+  col_idx : int;
+  dir     : Ast.order_dir;
+}
+
 type bound_stmt =
   | BS_create_table of {
       name    : string;
@@ -19,6 +24,9 @@ type bound_stmt =
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       proj       : int list;            (** column ordinals to project *)
       where      : bound_expr option;
+      order      : bound_order_key list;
+      limit      : int option;
+      offset     : int option;
     }
 
 type error =
@@ -28,6 +36,7 @@ type error =
                         got      : Sqlocaml_encoding.Row.ty }
   | Arity_mismatch of { expected : int; got : int }
   | Already_exists of string
+  | Invalid_limit  of string
 
 val bind :
   Sqlocaml_catalog.Catalog.t ->

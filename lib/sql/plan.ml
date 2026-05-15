@@ -30,3 +30,13 @@ type op =
       ordinals : int list;
       child    : op;
     }
+  | Op_sort of {
+      col_idx : int;
+      dir     : [`Asc | `Desc];
+      child   : op;
+    }
+  | Op_limit of {
+      limit  : int;
+      offset : int;
+      child  : op;
+    }

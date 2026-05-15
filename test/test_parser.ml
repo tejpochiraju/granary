@@ -153,12 +153,12 @@ let insert_no_col_list () =
 
 let select_star () =
   match parse "SELECT * FROM users;" with
-  | Ast.S_select { proj = `All; table = "users"; where = None } -> ()
+  | Ast.S_select { proj = `All; table = "users"; where = None; _ } -> ()
   | _ -> Alcotest.fail "expected SELECT *"
 
 let select_cols () =
   match parse "SELECT id, name FROM users;" with
-  | Ast.S_select { proj = `Cols ["id"; "name"]; table = "users"; where = None } -> ()
+  | Ast.S_select { proj = `Cols ["id"; "name"]; table = "users"; where = None; _ } -> ()
   | _ -> Alcotest.fail "expected col list"
 
 let select_single_col () =

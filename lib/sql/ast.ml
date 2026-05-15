@@ -27,6 +27,13 @@ type column_def = {
   primary_key : bool;
 }
 
+type order_dir = Asc | Desc
+
+type order_key = {
+  col : string;
+  dir : order_dir;
+}
+
 type stmt =
   | S_create_table of {
       name    : string;
@@ -38,7 +45,10 @@ type stmt =
       values  : literal list;
     }
   | S_select of {
-      proj  : [ `All | `Cols of string list ];
-      table : string;
-      where : expr option;
+      proj   : [ `All | `Cols of string list ];
+      table  : string;
+      where  : expr option;
+      order  : order_key list;   (** empty = no ORDER BY *)
+      limit  : int option;
+      offset : int option;
     }

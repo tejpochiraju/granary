@@ -490,6 +490,208 @@ let already_exists_real_blob () =
    | _ -> Alcotest.fail "expected Sema(Already_exists)")
 
 (* ------------------------------------------------------------------ *)
+(* Group 13: ORDER BY end-to-end                                        *)
+(* ------------------------------------------------------------------ *)
+
+let order_by_asc () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  let rows = query_ok db "SELECT * FROM t ORDER BY n ASC" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "ascending order" [10L; 20L; 30L] ns
+
+let order_by_desc () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  let rows = query_ok db "SELECT * FROM t ORDER BY n DESC" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "descending order" [30L; 20L; 10L] ns
+
+let order_by_default_asc () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (3)";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  exec db "INSERT INTO t (n) VALUES (2)";
+  let rows = query_ok db "SELECT * FROM t ORDER BY n" in
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "default asc" [1L; 2L; 3L] ns
+
+let limit_no_order () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (40)";
+  exec db "INSERT INTO t (n) VALUES (50)";
+  let rows = query_ok db "SELECT * FROM t LIMIT 3" in
+  Alcotest.(check int) "limit 3" 3 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "insertion order first 3" [10L; 20L; 30L] ns
+
+let limit_with_offset () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (40)";
+  exec db "INSERT INTO t (n) VALUES (50)";
+  let rows = query_ok db "SELECT * FROM t LIMIT 3 OFFSET 2" in
+  Alcotest.(check int) "limit 3 offset 2 → 3 rows" 3 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "rows at positions 2,3,4" [30L; 40L; 50L] ns
+
+let order_by_then_limit () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (40)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  let rows = query_ok db "SELECT * FROM t ORDER BY n ASC LIMIT 2" in
+  Alcotest.(check int) "limit 2 after sort" 2 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "smallest 2" [10L; 20L] ns
+
+let order_by_limit_offset () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (30)";
+  exec db "INSERT INTO t (n) VALUES (10)";
+  exec db "INSERT INTO t (n) VALUES (40)";
+  exec db "INSERT INTO t (n) VALUES (20)";
+  let rows = query_ok db "SELECT * FROM t ORDER BY n ASC LIMIT 2 OFFSET 1" in
+  Alcotest.(check int) "limit 2 offset 1 after sort" 2 (List.length rows);
+  let ns = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
+  Alcotest.(check (list int64)) "2nd and 3rd smallest" [20L; 30L] ns
+
+let order_by_null_last () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
+  exec db "INSERT INTO t (id, n) VALUES (1, 5)";
+  exec db "INSERT INTO t (id, n) VALUES (2, NULL)";
+  exec db "INSERT INTO t (id, n) VALUES (3, 2)";
+  let rows = query_ok db "SELECT id, n FROM t ORDER BY n ASC" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  (* 2 < 5 < NULL-last *)
+  (match (List.nth rows 0).(1) with
+   | Db.V_int 2L -> ()
+   | _ -> Alcotest.fail "expected 2 first");
+  (match (List.nth rows 1).(1) with
+   | Db.V_int 5L -> ()
+   | _ -> Alcotest.fail "expected 5 second");
+  (match (List.nth rows 2).(1) with
+   | Db.V_null -> ()
+   | _ -> Alcotest.fail "expected NULL last")
+
+let order_by_text () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (name TEXT)";
+  exec db "INSERT INTO t (name) VALUES ('charlie')";
+  exec db "INSERT INTO t (name) VALUES ('alice')";
+  exec db "INSERT INTO t (name) VALUES ('bob')";
+  let rows = query_ok db "SELECT * FROM t ORDER BY name ASC" in
+  let names = List.map (fun r -> match r.(0) with
+    | Db.V_text s -> s | _ -> "") rows in
+  Alcotest.(check (list string)) "alphabetical order" ["alice"; "bob"; "charlie"] names
+
+(* ------------------------------------------------------------------ *)
+(* Group 14: QCheck ORDER BY properties                                 *)
+(* ------------------------------------------------------------------ *)
+
+let qcheck_order_by_asc_sorted =
+  QCheck.Test.make
+    ~name:"order_by_asc: result is sorted ascending"
+    ~count:10_000
+    QCheck.(list_size Gen.(0 -- 20) nat_small)
+    (fun ns ->
+      let db = Lwt_main.run (Db.open_in_memory ()) in
+      Lwt_main.run (
+        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+        let* () = Lwt_list.iter_s (fun n ->
+          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+          let* _ = Db.execute db sql in
+          Lwt.return_unit
+        ) ns in
+        let* result = Db.query db "SELECT * FROM t ORDER BY n ASC" in
+        match result with
+        | Error _ -> Lwt.return false
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          let got = List.map (fun r -> match r.(0) with
+            | Db.V_int x -> Int64.to_int x | _ -> 0) rows in
+          let sorted = List.sort compare ns in
+          Lwt.return (got = sorted)
+      ))
+
+let qcheck_order_by_desc_sorted =
+  QCheck.Test.make
+    ~name:"order_by_desc: result is sorted descending"
+    ~count:10_000
+    QCheck.(list_size Gen.(0 -- 20) nat_small)
+    (fun ns ->
+      let db = Lwt_main.run (Db.open_in_memory ()) in
+      Lwt_main.run (
+        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+        let* () = Lwt_list.iter_s (fun n ->
+          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+          let* _ = Db.execute db sql in
+          Lwt.return_unit
+        ) ns in
+        let* result = Db.query db "SELECT * FROM t ORDER BY n DESC" in
+        match result with
+        | Error _ -> Lwt.return false
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          let got = List.map (fun r -> match r.(0) with
+            | Db.V_int x -> Int64.to_int x | _ -> 0) rows in
+          let sorted = List.sort (fun a b -> compare b a) ns in
+          Lwt.return (got = sorted)
+      ))
+
+let qcheck_limit_count =
+  QCheck.Test.make
+    ~name:"limit n: result has at most n rows"
+    ~count:10_000
+    QCheck.(pair (list_size Gen.(0 -- 20) nat_small) (1 -- 10))
+    (fun (ns, lim) ->
+      let db = Lwt_main.run (Db.open_in_memory ()) in
+      Lwt_main.run (
+        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+        let* () = Lwt_list.iter_s (fun n ->
+          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+          let* _ = Db.execute db sql in
+          Lwt.return_unit
+        ) ns in
+        let sql = Printf.sprintf "SELECT * FROM t LIMIT %d" lim in
+        let* result = Db.query db sql in
+        match result with
+        | Error _ -> Lwt.return false
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          let n_got = List.length rows in
+          let n_exp = min lim (List.length ns) in
+          Lwt.return (n_got = n_exp)
+      ))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -552,4 +754,24 @@ let () =
       Alcotest.test_case "real_and_blob_together"    `Quick real_and_blob_together;
       Alcotest.test_case "already_exists_real_blob"  `Quick already_exists_real_blob;
     ];
+    "order_by", [
+      Alcotest.test_case "order_by_asc"         `Quick order_by_asc;
+      Alcotest.test_case "order_by_desc"        `Quick order_by_desc;
+      Alcotest.test_case "order_by_default_asc" `Quick order_by_default_asc;
+      Alcotest.test_case "order_by_null_last"   `Quick order_by_null_last;
+      Alcotest.test_case "order_by_text"        `Quick order_by_text;
+    ];
+    "limit_offset", [
+      Alcotest.test_case "limit_no_order"       `Quick limit_no_order;
+      Alcotest.test_case "limit_with_offset"    `Quick limit_with_offset;
+      Alcotest.test_case "order_by_then_limit"  `Quick order_by_then_limit;
+      Alcotest.test_case "order_by_limit_offset" `Quick order_by_limit_offset;
+    ];
+    "qcheck_order_limit", (
+      List.map QCheck_alcotest.to_alcotest [
+        qcheck_order_by_asc_sorted;
+        qcheck_order_by_desc_sorted;
+        qcheck_limit_count;
+      ]
+    );
   ]

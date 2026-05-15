@@ -605,6 +605,252 @@ let query_filter_type_mismatch () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 7: Op_sort (via query)                                          *)
+(* ------------------------------------------------------------------ *)
+
+let query_sort_asc () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "three rows" 3 (List.length rows);
+    let ids = List.map (fun r -> match r.(0) with
+        | Row.V_int n -> n | _ -> failwith "expected V_int") rows in
+    Alcotest.(check (list int64)) "sorted ascending" [1L; 2L; 3L] ids;
+    Lwt.return_unit
+  )
+
+let query_sort_desc () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Desc;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "three rows" 3 (List.length rows);
+    let ids = List.map (fun r -> match r.(0) with
+        | Row.V_int n -> n | _ -> failwith "expected V_int") rows in
+    Alcotest.(check (list int64)) "sorted descending" [3L; 2L; 1L] ids;
+    Lwt.return_unit
+  )
+
+let query_sort_nulls_last () =
+  let schema = [int_col "n"] in
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = schema }) in
+    insert store cat "t" ([0], [Ast.L_int 5L]);
+    insert store cat "t" ([],  []);   (* all NULL *)
+    insert store cat "t" ([0], [Ast.L_int 2L]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_project {
+        ordinals = [0];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "three rows" 3 (List.length rows);
+    (* NULLs sort last *)
+    (match (List.nth rows 0).(0) with
+     | Row.V_int 2L -> ()
+     | _ -> Alcotest.fail "expected 2 first");
+    (match (List.nth rows 1).(0) with
+     | Row.V_int 5L -> ()
+     | _ -> Alcotest.fail "expected 5 second");
+    (match (List.nth rows 2).(0) with
+     | Row.V_null -> ()
+     | _ -> Alcotest.fail "expected NULL last");
+    Lwt.return_unit
+  )
+
+let query_sort_empty () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      col_idx = 0; dir = `Asc;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "sort of empty → 0 rows" 0 (List.length rows);
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
+(* Group 8: Op_limit (via query)                                         *)
+(* ------------------------------------------------------------------ *)
+
+let query_limit_basic () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 4L; Ast.L_text "d"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 5L; Ast.L_text "e"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_limit {
+      limit = 3; offset = 0;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "limit 3 → 3 rows" 3 (List.length rows);
+    let ids = List.map (fun r -> match r.(0) with
+        | Row.V_int n -> n | _ -> failwith "expected V_int") rows in
+    Alcotest.(check (list int64)) "first 3" [1L; 2L; 3L] ids;
+    Lwt.return_unit
+  )
+
+let query_limit_with_offset () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 4L; Ast.L_text "d"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 5L; Ast.L_text "e"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_limit {
+      limit = 2; offset = 2;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "limit 2 offset 2 → 2 rows" 2 (List.length rows);
+    let ids = List.map (fun r -> match r.(0) with
+        | Row.V_int n -> n | _ -> failwith "expected V_int") rows in
+    Alcotest.(check (list int64)) "rows 2,3 (0-indexed)" [3L; 4L] ids;
+    Lwt.return_unit
+  )
+
+let query_limit_exceeds_rows () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_limit {
+      limit = 100; offset = 0;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "limit larger than rows → 2 rows" 2 (List.length rows);
+    Lwt.return_unit
+  )
+
+let query_limit_offset_exceeds () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_limit {
+      limit = 3; offset = 10;
+      child = Plan.Op_project {
+        ordinals = [0; 1];
+        child = Plan.Op_seq_scan { table_meta = m };
+      };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "offset beyond rows → 0 rows" 0 (List.length rows);
+    Lwt.return_unit
+  )
+
+let execute_sort_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "ts"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"ts" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_sort { col_idx = 0; dir = `Asc;
+                         child = Plan.Op_seq_scan { table_meta = m } }));
+       Alcotest.fail "expected Failure for Op_sort in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+let execute_limit_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "tl"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"tl" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_limit { limit = 1; offset = 0;
+                          child = Plan.Op_seq_scan { table_meta = m } }));
+       Alcotest.fail "expected Failure for Op_limit in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -650,5 +896,19 @@ let () =
       Alcotest.test_case "execute_project_raises"  `Quick execute_project_raises;
       Alcotest.test_case "query_write_op_raises"   `Quick query_write_op_raises;
       Alcotest.test_case "query_insert_raises"     `Quick query_insert_raises;
+      Alcotest.test_case "execute_sort_raises"     `Quick execute_sort_raises;
+      Alcotest.test_case "execute_limit_raises"    `Quick execute_limit_raises;
+    ];
+    "sort", [
+      Alcotest.test_case "query_sort_asc"       `Quick query_sort_asc;
+      Alcotest.test_case "query_sort_desc"      `Quick query_sort_desc;
+      Alcotest.test_case "query_sort_nulls_last" `Quick query_sort_nulls_last;
+      Alcotest.test_case "query_sort_empty"     `Quick query_sort_empty;
+    ];
+    "limit", [
+      Alcotest.test_case "query_limit_basic"          `Quick query_limit_basic;
+      Alcotest.test_case "query_limit_with_offset"    `Quick query_limit_with_offset;
+      Alcotest.test_case "query_limit_exceeds_rows"   `Quick query_limit_exceeds_rows;
+      Alcotest.test_case "query_limit_offset_exceeds" `Quick query_limit_offset_exceeds;
     ];
   ]

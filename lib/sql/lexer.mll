@@ -26,6 +26,12 @@ rule token = parse
   | "AND"      { AND }
   | "REAL"     { REAL_TY }
   | "BLOB"     { BLOB_TY }
+  | "ORDER"    { ORDER }
+  | "BY"       { BY }
+  | "ASC"      { ASC }
+  | "DESC"     { DESC }
+  | "LIMIT"    { LIMIT }
+  | "OFFSET"   { OFFSET }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

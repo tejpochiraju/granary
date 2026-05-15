@@ -7,6 +7,11 @@ type bound_expr =
   | BE_col of int
   | BE_eq  of bound_expr * bound_expr
 
+type bound_order_key = {
+  col_idx : int;
+  dir     : Ast.order_dir;
+}
+
 type bound_stmt =
   | BS_create_table of {
       name    : string;
@@ -21,6 +26,9 @@ type bound_stmt =
       table_meta : Cat.table_meta;
       proj       : int list;
       where      : bound_expr option;
+      order      : bound_order_key list;
+      limit      : int option;
+      offset     : int option;
     }
 
 type error =
@@ -29,6 +37,7 @@ type error =
   | Type_mismatch  of { expected : Row.ty; got : Row.ty }
   | Arity_mismatch of { expected : int; got : int }
   | Already_exists of string
+  | Invalid_limit  of string
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -127,7 +136,7 @@ let bind_insert cat ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_select cat ~proj ~table ~where =
+let bind_select cat ~proj ~table ~where ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -160,17 +169,54 @@ let bind_select cat ~proj ~table ~where =
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
-          Lwt.return (Ok (BS_select {
-            table_meta = meta;
-            proj       = proj_ords;
-            where      = bound_where;
-          }))))
+          (* Validate and bind ORDER BY columns *)
+          let order_result =
+            List.fold_left (fun acc (ok : Ast.order_key) ->
+              match acc with
+              | Error _ -> acc
+              | Ok keys ->
+                (match col_index meta.columns ok.col with
+                 | None   -> Error (Unknown_column { table; column = ok.col })
+                 | Some i -> Ok (keys @ [{ col_idx = i; dir = ok.dir }]))
+            ) (Ok []) order
+          in
+          (match order_result with
+           | Error e -> Lwt.return (Error e)
+           | Ok bound_order ->
+             (* Validate LIMIT/OFFSET are non-negative *)
+             let limit_result =
+               match limit with
+               | Some n when n < 0 ->
+                 Error (Invalid_limit "LIMIT must be non-negative")
+               | _ -> Ok limit
+             in
+             (match limit_result with
+              | Error e -> Lwt.return (Error e)
+              | Ok valid_limit ->
+                let offset_result =
+                  match offset with
+                  | Some n when n < 0 ->
+                    Error (Invalid_limit "OFFSET must be non-negative")
+                  | _ -> Ok offset
+                in
+                (match offset_result with
+                 | Error e -> Lwt.return (Error e)
+                 | Ok valid_offset ->
+                   Lwt.return (Ok (BS_select {
+                     table_meta = meta;
+                     proj       = proj_ords;
+                     where      = bound_where;
+                     order      = bound_order;
+                     limit      = valid_limit;
+                     offset     = valid_offset;
+                   })))))))
 
 (* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
 let bind cat = function
-  | Ast.S_create_table { name; columns }         -> bind_create cat ~name ~columns
-  | Ast.S_insert { table; columns; values }       -> bind_insert cat ~table ~columns ~values
-  | Ast.S_select { proj; table; where }           -> bind_select cat ~proj ~table ~where
+  | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
+  | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
+  | Ast.S_select { proj; table; where; order; limit; offset } ->
+    bind_select cat ~proj ~table ~where ~order ~limit ~offset

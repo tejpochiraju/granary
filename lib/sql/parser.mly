@@ -11,6 +11,7 @@
 %token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE
 %token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
 %token NOT NULL PRIMARY KEY AND
+%token ORDER BY ASC DESC LIMIT OFFSET
 %token STAR LPAREN RPAREN COMMA SEMI EQ
 %token EOF
 
@@ -61,7 +62,9 @@ literal:
 
 select:
   | SELECT proj = projection FROM table = IDENT wh = where_opt
-    { S_select { proj; table; where = wh } }
+      ob = order_by_clause lim = limit_clause
+    { let (limit, offset) = lim in
+      S_select { proj; table; where = wh; order = ob; limit; offset } }
 
 projection:
   | STAR                                             { `All }
@@ -70,6 +73,20 @@ projection:
 where_opt:
   |                { None }
   | WHERE e = expr { Some e }
+
+order_by_clause:
+  |                                                                 { [] }
+  | ORDER BY keys = separated_nonempty_list(COMMA, order_key)      { keys }
+
+order_key:
+  | name = IDENT           { { col = name; dir = Asc } }
+  | name = IDENT ASC       { { col = name; dir = Asc } }
+  | name = IDENT DESC      { { col = name; dir = Desc } }
+
+limit_clause:
+  |                                         { (None, None) }
+  | LIMIT n = INT_LIT                       { (Some (Int64.to_int n), None) }
+  | LIMIT n = INT_LIT OFFSET m = INT_LIT   { (Some (Int64.to_int n), Some (Int64.to_int m)) }
 
 expr:
   | l = literal              { E_lit l }

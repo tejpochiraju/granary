@@ -15,6 +15,17 @@ let lit_to_value : Ast.literal -> Row.value = function
   | Ast.L_real f -> Row.V_real f
   | Ast.L_blob b -> Row.V_blob b
 
+let compare_values (a : Row.value) (b : Row.value) : int =
+  match a, b with
+  | Row.V_null, Row.V_null -> 0
+  | Row.V_null, _          -> 1   (* NULLs sort last *)
+  | _, Row.V_null          -> -1
+  | Row.V_int  x, Row.V_int  y -> Int64.compare x y
+  | Row.V_real x, Row.V_real y -> Float.compare x y
+  | Row.V_text x, Row.V_text y -> String.compare x y
+  | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
+  | _,            _            -> 0  (* cross-type: shouldn't happen *)
+
 (* ------------------------------------------------------------------ *)
 (* execute: write operations only                                       *)
 (* ------------------------------------------------------------------ *)
@@ -34,7 +45,8 @@ let execute (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
     let* tx    = S.rw_begin store in
     let* ()    = S.put tx table_meta.tree_id key bytes in
     S.commit tx
-  | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _ ->
+  | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
+  | Plan.Op_sort _ | Plan.Op_limit _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (* ------------------------------------------------------------------ *)
@@ -99,6 +111,21 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream store child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
+  | Plan.Op_sort { col_idx; dir; child } ->
+    let* inner = to_stream store child in
+    let* rows = Lwt_stream.to_list inner in
+    let cmp a b =
+      let va = a.(col_idx) and vb = b.(col_idx) in
+      let c = compare_values va vb in
+      if dir = `Asc then c else -c
+    in
+    let sorted = List.sort cmp rows in
+    Lwt.return (Lwt_stream.of_list sorted)
+  | Plan.Op_limit { limit; offset; child } ->
+    let* inner = to_stream store child in
+    let* rows = Lwt_stream.to_list inner in
+    let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
+    Lwt.return (Lwt_stream.of_list rows')
   | Plan.Op_create_table _ | Plan.Op_insert _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 

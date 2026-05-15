@@ -58,7 +58,7 @@ let plan_insert () =
 
 let plan_select_star_no_where () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan _; _ } -> ()
@@ -68,7 +68,7 @@ let plan_select_star_no_where () =
 
 let plan_select_cols_no_where () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals = [0]; child = Plan.Op_seq_scan _ } -> ()
@@ -83,6 +83,7 @@ let plan_select_star_where () =
     proj  = `All;
     table = "users";
     where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -97,6 +98,7 @@ let plan_select_cols_where () =
     proj  = `Cols ["id"];
     table = "users";
     where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -117,6 +119,7 @@ let plan_expr_lit () =
     proj  = `All;
     table = "users";
     where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 99L), Ast.E_lit (Ast.L_int 99L)));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -134,6 +137,7 @@ let plan_expr_col () =
     proj  = `All;
     table = "users";
     where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_col "id"));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -151,6 +155,7 @@ let plan_expr_eq () =
     proj  = `All;
     table = "users";
     where = Some (Ast.E_eq (Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -168,6 +173,7 @@ let plan_expr_reversed_eq () =
     proj  = `All;
     table = "users";
     where = Some (Ast.E_eq (Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
+    order = []; limit = None; offset = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -185,7 +191,7 @@ let plan_expr_reversed_eq () =
 
 let plan_project_all_ordinals () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -194,7 +200,7 @@ let plan_project_all_ordinals () =
 
 let plan_project_single () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"]; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `Cols ["name"]; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -203,7 +209,7 @@ let plan_project_single () =
 
 let plan_project_reversed () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -216,7 +222,7 @@ let plan_project_reversed () =
 
 let plan_seqscan_tree_id () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
@@ -226,7 +232,7 @@ let plan_seqscan_tree_id () =
 
 let plan_seqscan_columns () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
@@ -234,6 +240,71 @@ let plan_seqscan_columns () =
     Alcotest.(check string) "col 0 name" "id"   (List.nth table_meta.columns 0).Row.name;
     Alcotest.(check string) "col 1 name" "name" (List.nth table_meta.columns 1).Row.name
   | _ -> Alcotest.fail "expected Op_project { child=Op_seq_scan _ }"
+
+(* ------------------------------------------------------------------ *)
+(* Group 5: ORDER BY plan shapes                                         *)
+(* ------------------------------------------------------------------ *)
+
+let plan_order_by_asc () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None;
+    order = [{ Ast.col = "id"; dir = Ast.Asc }];
+    limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_sort { col_idx = 0; dir = `Asc;
+                   child = Plan.Op_project { child = Plan.Op_seq_scan _; _ } } -> ()
+  | _ -> Alcotest.fail "expected Op_sort { col_idx=0; dir=Asc; child=Op_project(Op_seq_scan) }"
+
+let plan_order_by_desc () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None;
+    order = [{ Ast.col = "name"; dir = Ast.Desc }];
+    limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_sort { col_idx = 1; dir = `Desc; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_sort { col_idx=1; dir=Desc }"
+
+let plan_limit_only () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None;
+    order = []; limit = Some 3; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_limit { limit = 3; offset = 0;
+                    child = Plan.Op_project { child = Plan.Op_seq_scan _; _ } } -> ()
+  | _ -> Alcotest.fail "expected Op_limit { limit=3; offset=0; child=Op_project(Op_seq_scan) }"
+
+let plan_limit_with_offset () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None;
+    order = []; limit = Some 5; offset = Some 2;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_limit { limit = 5; offset = 2; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_limit { limit=5; offset=2 }"
+
+let plan_order_and_limit () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users"; where = None;
+    order = [{ Ast.col = "id"; dir = Ast.Asc }];
+    limit = Some 2; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_limit { limit = 2; offset = 0;
+                    child = Plan.Op_sort { col_idx = 0; dir = `Asc; _ } } -> ()
+  | _ -> Alcotest.fail "expected Op_limit(Op_sort(Op_project(Op_seq_scan)))"
 
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
@@ -263,5 +334,12 @@ let () =
     "seqscan-meta", [
       Alcotest.test_case "plan_seqscan_tree_id"  `Quick plan_seqscan_tree_id;
       Alcotest.test_case "plan_seqscan_columns"  `Quick plan_seqscan_columns;
+    ];
+    "order-limit-shapes", [
+      Alcotest.test_case "plan_order_by_asc"      `Quick plan_order_by_asc;
+      Alcotest.test_case "plan_order_by_desc"     `Quick plan_order_by_desc;
+      Alcotest.test_case "plan_limit_only"        `Quick plan_limit_only;
+      Alcotest.test_case "plan_limit_with_offset" `Quick plan_limit_with_offset;
+      Alcotest.test_case "plan_order_and_limit"   `Quick plan_order_and_limit;
     ];
   ]
