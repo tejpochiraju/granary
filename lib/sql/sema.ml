@@ -18,6 +18,14 @@ type bound_order_key = {
   dir     : Ast.order_dir;
 }
 
+(** A bound JOIN clause.  See sema.mli for layout details. *)
+type bound_join = {
+  kind             : Ast.join_kind;
+  right_meta       : Cat.table_meta;
+  on               : bound_expr;
+  right_col_offset : int;
+}
+
 type bound_stmt =
   | BS_create_table of {
       name    : string;
@@ -35,6 +43,7 @@ type bound_stmt =
       order      : bound_order_key list;
       limit      : int option;
       offset     : int option;
+      join       : bound_join option;
     }
   | BS_create_index of {
       name       : string;
@@ -55,6 +64,7 @@ type bound_stmt =
 type error =
   | Unknown_table       of string
   | Unknown_column      of { table : string; column : string }
+  | Ambiguous_column    of string
   | Type_mismatch       of { expected : Row.ty; got : Row.ty }
   | Arity_mismatch      of { expected : int; got : int }
   | Already_exists      of string
@@ -129,6 +139,58 @@ let rec bind_expr (meta : Cat.table_meta) = function
     (match bind_expr meta e with
      | Ok be   -> Ok (BE_neg be)
      | Error e -> Error e)
+
+(* ------------------------------------------------------------------ *)
+(* Two-table column resolution used when a JOIN is present.            *)
+(* The combined row layout is [left_cols ... right_cols].              *)
+(* Right table ordinal i becomes absolute ordinal [right_offset + i].  *)
+(* ------------------------------------------------------------------ *)
+
+let rec bind_expr_join
+    ~(left_meta : Cat.table_meta)
+    ~(right_meta : Cat.table_meta)
+    ~(right_offset : int)
+  = function
+  | Ast.E_lit l -> Ok (BE_lit l)
+  | Ast.E_col name ->
+    let in_left  = col_index left_meta.columns  name in
+    let in_right = col_index right_meta.columns name in
+    (match in_left, in_right with
+     | Some _, Some _ -> Error (Ambiguous_column name)
+     | Some i, None   -> Ok (BE_col i)
+     | None,   Some i -> Ok (BE_col (right_offset + i))
+     | None,   None   ->
+       (* Report unknown_column against the left table for consistency. *)
+       Error (Unknown_column { table = left_meta.name; column = name }))
+  | Ast.E_tbl_col (tbl, name) ->
+    if String.equal tbl left_meta.name then
+      (match col_index left_meta.columns name with
+       | Some i -> Ok (BE_col i)
+       | None   -> Error (Unknown_column { table = tbl; column = name }))
+    else if String.equal tbl right_meta.name then
+      (match col_index right_meta.columns name with
+       | Some i -> Ok (BE_col (right_offset + i))
+       | None   -> Error (Unknown_column { table = tbl; column = name }))
+    else
+      Error (Unknown_table tbl)
+  | Ast.E_binop (op, a, b) ->
+    (match bind_expr_join ~left_meta ~right_meta ~right_offset a,
+           bind_expr_join ~left_meta ~right_meta ~right_offset b with
+     | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
+     | Error e, _    -> Error e
+     | Ok _,  Error e -> Error e)
+  | Ast.E_not e ->
+    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+     | Ok be -> Ok (BE_not be) | Error e -> Error e)
+  | Ast.E_is_null e ->
+    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+     | Ok be -> Ok (BE_is_null be) | Error e -> Error e)
+  | Ast.E_is_not_null e ->
+    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+     | Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
+  | Ast.E_neg e ->
+    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+     | Ok be -> Ok (BE_neg be) | Error e -> Error e)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -253,85 +315,154 @@ let bind_insert cat ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_select cat ~proj ~table ~where ~order ~limit ~offset =
+let bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some meta ->
-    let proj_result =
-      match proj with
-      | `All ->
-        Ok (List.mapi (fun i _ -> i) meta.columns)
-      | `Cols names ->
-        List.fold_left (fun acc name ->
-          match acc with
-          | Error _ -> acc
-          | Ok ords ->
-            (match col_index meta.columns name with
-             | None   -> Error (Unknown_column { table; column = name })
-             | Some i -> Ok (ords @ [i]))
-        ) (Ok []) names
+    (* Phase 2: support a single JOIN clause. *)
+    if List.length joins > 1 then
+      Lwt.return (Error (Unsupported
+        "more than one JOIN clause is not supported in Phase 2"))
+    else
+    let* join_meta_result =
+      match joins with
+      | [] -> Lwt.return (Ok None)
+      | [ (jc : Ast.join_clause) ] ->
+        let* rm_opt = Cat.find_table cat ~name:jc.table in
+        (match rm_opt with
+         | None -> Lwt.return (Error (Unknown_table jc.table))
+         | Some rm -> Lwt.return (Ok (Some (jc, rm))))
+      | _ -> Lwt.return (Ok None)   (* unreachable due to length check *)
     in
-    (match proj_result with
+    (match join_meta_result with
      | Error e -> Lwt.return (Error e)
-     | Ok proj_ords ->
-       let where_result =
-         match where with
-         | None   -> Ok None
-         | Some e ->
-           (match bind_expr meta e with
-            | Ok be   -> Ok (Some be)
-            | Error e -> Error e)
+     | Ok join_info ->
+       let n_left = List.length meta.columns in
+       let right_offset = n_left in
+       (* Combined-row column lookup with full error reporting (Ambiguous,
+          Unknown).  Used for proj and ORDER BY name resolution. *)
+       let proj_lookup name : (int, error) result =
+         match join_info with
+         | None ->
+           (match col_index meta.columns name with
+            | None   -> Error (Unknown_column { table; column = name })
+            | Some i -> Ok i)
+         | Some (_jc, rm) ->
+           let in_left  = col_index meta.columns name in
+           let in_right = col_index rm.columns    name in
+           (match in_left, in_right with
+            | Some _, Some _ -> Error (Ambiguous_column name)
+            | Some i, None   -> Ok i
+            | None,   Some i -> Ok (right_offset + i)
+            | None,   None   -> Error (Unknown_column { table; column = name }))
        in
-       (match where_result with
+       let proj_result =
+         match proj with
+         | `All ->
+           (* All columns from both tables, left ++ right. *)
+           let left_ords = List.mapi (fun i _ -> i) meta.columns in
+           (match join_info with
+            | None -> Ok left_ords
+            | Some (_jc, rm) ->
+              let n_right = List.length rm.columns in
+              let right_ords =
+                List.init n_right (fun i -> right_offset + i)
+              in
+              Ok (left_ords @ right_ords))
+         | `Cols names ->
+           List.fold_left (fun acc name ->
+             match acc with
+             | Error _ -> acc
+             | Ok ords ->
+               (match proj_lookup name with
+                | Error e -> Error e
+                | Ok i    -> Ok (ords @ [i]))
+           ) (Ok []) names
+       in
+       (match proj_result with
         | Error e -> Lwt.return (Error e)
-        | Ok bound_where ->
-          (* Phase 1: single-column ORDER BY only *)
-          if List.length order > 1 then
-            Lwt.return (Error (Unsupported
-              "ORDER BY with more than one key is not supported in Phase 1"))
-          else
-          (* Validate and bind ORDER BY columns *)
-          let order_result =
-            List.fold_left (fun acc (ok : Ast.order_key) ->
-              match acc with
-              | Error _ -> acc
-              | Ok keys ->
-                (match col_index meta.columns ok.col with
-                 | None   -> Error (Unknown_column { table; column = ok.col })
-                 | Some i -> Ok (keys @ [{ col_idx = i; dir = ok.dir }]))
-            ) (Ok []) order
+        | Ok proj_ords ->
+          (* Bind the JOIN ON predicate (must use two-table resolution). *)
+          let bound_join_result : (bound_join option, error) result =
+            match join_info with
+            | None -> Ok None
+            | Some (jc, rm) ->
+              (match bind_expr_join
+                       ~left_meta:meta
+                       ~right_meta:rm
+                       ~right_offset jc.Ast.on with
+               | Error e -> Error e
+               | Ok be ->
+                 Ok (Some { kind = jc.Ast.kind;
+                            right_meta = rm;
+                            on = be;
+                            right_col_offset = right_offset }))
           in
-          (match order_result with
+          (match bound_join_result with
            | Error e -> Lwt.return (Error e)
-           | Ok bound_order ->
-             (* Validate LIMIT/OFFSET are non-negative *)
-             let limit_result =
-               match limit with
-               | Some n when n < 0 ->
-                 Error (Invalid_limit "LIMIT must be non-negative")
-               | _ -> Ok limit
+           | Ok bound_join ->
+             let bind_combined e =
+               match join_info with
+               | None -> bind_expr meta e
+               | Some (_jc, rm) ->
+                 bind_expr_join ~left_meta:meta ~right_meta:rm ~right_offset e
              in
-             (match limit_result with
+             let where_result =
+               match where with
+               | None   -> Ok None
+               | Some e ->
+                 (match bind_combined e with
+                  | Ok be   -> Ok (Some be)
+                  | Error e -> Error e)
+             in
+             (match where_result with
               | Error e -> Lwt.return (Error e)
-              | Ok valid_limit ->
-                let offset_result =
-                  match offset with
-                  | Some n when n < 0 ->
-                    Error (Invalid_limit "OFFSET must be non-negative")
-                  | _ -> Ok offset
+              | Ok bound_where ->
+                if List.length order > 1 then
+                  Lwt.return (Error (Unsupported
+                    "ORDER BY with more than one key is not supported in Phase 1"))
+                else
+                let order_result =
+                  List.fold_left (fun acc (ok : Ast.order_key) ->
+                    match acc with
+                    | Error _ -> acc
+                    | Ok keys ->
+                      (match proj_lookup ok.col with
+                       | Error e -> Error e
+                       | Ok i    -> Ok (keys @ [{ col_idx = i; dir = ok.dir }]))
+                  ) (Ok []) order
                 in
-                (match offset_result with
+                (match order_result with
                  | Error e -> Lwt.return (Error e)
-                 | Ok valid_offset ->
-                   Lwt.return (Ok (BS_select {
-                     table_meta = meta;
-                     proj       = proj_ords;
-                     where      = bound_where;
-                     order      = bound_order;
-                     limit      = valid_limit;
-                     offset     = valid_offset;
-                   })))))))
+                 | Ok bound_order ->
+                   let limit_result =
+                     match limit with
+                     | Some n when n < 0 ->
+                       Error (Invalid_limit "LIMIT must be non-negative")
+                     | _ -> Ok limit
+                   in
+                   (match limit_result with
+                    | Error e -> Lwt.return (Error e)
+                    | Ok valid_limit ->
+                      let offset_result =
+                        match offset with
+                        | Some n when n < 0 ->
+                          Error (Invalid_limit "OFFSET must be non-negative")
+                        | _ -> Ok offset
+                      in
+                      (match offset_result with
+                       | Error e -> Lwt.return (Error e)
+                       | Ok valid_offset ->
+                         Lwt.return (Ok (BS_select {
+                           table_meta = meta;
+                           proj       = proj_ords;
+                           where      = bound_where;
+                           order      = bound_order;
+                           limit      = valid_limit;
+                           offset     = valid_offset;
+                           join       = bound_join;
+                         })))))))))
 
 (* ------------------------------------------------------------------ *)
 (* Best-effort type inference for bound expressions.                    *)
@@ -471,8 +602,8 @@ let bind_delete cat ~table ~where =
 let bind cat = function
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
-  | Ast.S_select { proj; table; where; order; limit; offset } ->
-    bind_select cat ~proj ~table ~where ~order ~limit ~offset
+  | Ast.S_select { proj; table; joins; where; order; limit; offset } ->
+    bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset
   | Ast.S_create_index { name; table; column; unique } ->
     bind_create_index cat ~name ~table ~column ~unique
   | Ast.S_update { table; assignments; where } ->

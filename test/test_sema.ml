@@ -221,7 +221,7 @@ let bind_insert_null_allowed () =
 
 let bind_select_star () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj all" [0; 1] proj
@@ -230,7 +230,7 @@ let bind_select_star () =
 
 let bind_select_cols () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"; "name"]; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `Cols ["id"; "name"]; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj cols in order" [0; 1] proj
@@ -239,7 +239,7 @@ let bind_select_cols () =
 
 let bind_select_reversed () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj reversed" [1; 0] proj
@@ -248,7 +248,7 @@ let bind_select_reversed () =
 
 let bind_select_single () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj single" [0] proj
@@ -257,7 +257,7 @@ let bind_select_single () =
 
 let bind_select_unknown_table () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "ghost"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `All; table = "ghost"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
   | Error _ -> Alcotest.fail "expected Unknown_table \"ghost\""
@@ -265,7 +265,7 @@ let bind_select_unknown_table () =
 
 let bind_select_unknown_col () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["bogus"]; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `Cols ["bogus"]; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
   | Error _ -> Alcotest.fail "expected Unknown_column {table=users; column=bogus}"
@@ -273,7 +273,7 @@ let bind_select_unknown_col () =
 
 let bind_select_no_where () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; where = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { where = None; _ }) -> ()
   | Ok (Sema.BS_select { where = Some _; _ }) -> Alcotest.fail "expected where = None"
@@ -285,6 +285,7 @@ let bind_select_where_col_eq_lit () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 42L)));
     order = []; limit = None; offset = None;
   } in
@@ -299,6 +300,7 @@ let bind_select_where_lit_eq_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_lit (Ast.L_int 42L), Ast.E_col "id"));
     order = []; limit = None; offset = None;
   } in
@@ -313,6 +315,7 @@ let bind_select_where_unknown_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "bogus", Ast.E_lit (Ast.L_int 1L)));
     order = []; limit = None; offset = None;
   } in
@@ -326,6 +329,7 @@ let bind_select_where_text_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", Ast.E_lit (Ast.L_text "alice")));
     order = []; limit = None; offset = None;
   } in
@@ -345,6 +349,7 @@ let bind_select_where_right_unknown () =
   (* WHERE id = bogus — left (id) resolves, right (bogus) fails *)
   let stmt = Ast.S_select {
     proj = `All; table = "users";
+    joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "bogus"));
     order = []; limit = None; offset = None;
   } in
@@ -380,6 +385,7 @@ let bind_select_second_col_unknown () =
   let stmt = Ast.S_select {
     proj = `Cols ["id"; "bogus"; "age"];
     table = "users";
+    joins = [];
     where = None;
     order = []; limit = None; offset = None;
   } in
@@ -392,6 +398,7 @@ let bind_select_multi_order_by_rejected () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = None;
     order = [
       Ast.{ col = "id";   dir = Ast.Asc };
@@ -409,6 +416,7 @@ let bind_select_order_unknown_col () =
   let stmt = Ast.S_select {
     proj = `All;
     table = "users";
+    joins = [];
     where = None;
     order = [Ast.{ col = "bogus"; dir = Ast.Asc }];
     limit = None; offset = None;
@@ -421,6 +429,7 @@ let bind_select_negative_limit () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
     proj = `All; table = "users"; where = None; order = [];
+    joins = [];
     limit = Some (-1); offset = None;
   } in
   match bind cat stmt with
@@ -431,6 +440,7 @@ let bind_select_negative_offset () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
     proj = `All; table = "users"; where = None; order = [];
+    joins = [];
     limit = None; offset = Some (-5);
   } in
   match bind cat stmt with

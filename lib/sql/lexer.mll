@@ -41,6 +41,10 @@ rule token = parse
   | "SET"      { SET }
   | "DEFAULT"  { DEFAULT }
   | "DELETE"   { DELETE }
+  | "JOIN"     { JOIN }
+  | "INNER"    { INNER }
+  | "LEFT"     { LEFT }
+  | "OUTER"    { OUTER }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

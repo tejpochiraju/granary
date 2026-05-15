@@ -452,7 +452,8 @@ let execute_with_count (store : S.t) (cat : Cat.t) (op : Plan.op)
   | Plan.Op_delete { table_meta; where; indexes } ->
     execute_delete store ~table_meta ~where ~indexes
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
-  | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _ ->
+  | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
+  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -569,6 +570,122 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       end
     ) in
     Lwt.return stream
+  | Plan.Op_nested_loop_join {
+      left; right_meta; idx_tree;
+      right_col_idx = _; left_col_idx; join_kind;
+      right_col_offset = _; n_right_cols } ->
+    (* Indexed nested-loop join: for each left row, seek the right
+       index tree for the join key and collect matching right rows. *)
+    let* left_stream = to_stream store left in
+    let* left_rows = Lwt_stream.to_list left_stream in
+    let* tx = S.ro_begin store in
+    let out = ref [] in
+    let* () =
+      Lwt_list.iter_s (fun lrow ->
+        let lkey = lrow.(left_col_idx) in
+        (* Encode the lookup value uniformly via row_value_to_index_value;
+           cross-type entries simply will not match. *)
+        let ik_value = row_value_to_index_value lkey in
+        let prefix = Index_key.encode_value ik_value in
+        let plen = Bytes.length prefix in
+        let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+        let* cur = S.cursor_open tx idx_tree in
+        let _sr = S.cursor_seek cur seek_key in
+        let found = ref false in
+        let rec scan () =
+          match S.cursor_next cur with
+          | None -> Lwt.return_unit
+          | Some (ikey, _) ->
+            if Bytes.length ikey >= plen + 8 &&
+               Bytes.equal (Bytes.sub ikey 0 plen) prefix
+            then begin
+              let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+              let rowid = Rowid.decode rowid_bytes in
+              let table_key = Rowid.encode rowid in
+              let* vrow = S.get tx right_meta.Cat.tree_id table_key in
+              (match vrow with
+               | None -> scan ()
+               | Some vbytes ->
+                 let rrow = Row.decode right_meta.Cat.columns vbytes in
+                 let combined = Array.append lrow rrow in
+                 out := combined :: !out;
+                 found := true;
+                 scan ())
+            end else Lwt.return_unit
+        in
+        let* () = scan () in
+        S.cursor_close cur;
+        (match join_kind with
+         | `Left when not !found ->
+           let null_right = Array.make n_right_cols Row.V_null in
+           out := Array.append lrow null_right :: !out
+         | _ -> ());
+        Lwt.return_unit
+      ) left_rows
+    in
+    let* () = S.ro_end tx in
+    Lwt.return (Lwt_stream.of_list (List.rev !out))
+  | Plan.Op_hash_join {
+      left; right; left_key; right_key; join_kind;
+      right_col_offset = _; n_right_cols } ->
+    let* left_stream  = to_stream store left in
+    let* right_stream = to_stream store right in
+    let* right_rows = Lwt_stream.to_list right_stream in
+    if left_key < 0 || right_key < 0 then begin
+      (* Cartesian product fallback (general ON predicate). *)
+      let* left_rows = Lwt_stream.to_list left_stream in
+      let out = ref [] in
+      List.iter (fun lrow ->
+        let any = ref false in
+        List.iter (fun rrow ->
+          out := Array.append lrow rrow :: !out;
+          any := true
+        ) right_rows;
+        (match join_kind with
+         | `Left when not !any ->
+           let null_right = Array.make n_right_cols Row.V_null in
+           out := Array.append lrow null_right :: !out
+         | _ -> ())
+      ) left_rows;
+      Lwt.return (Lwt_stream.of_list (List.rev !out))
+    end else begin
+      (* Build phase: hash right rows by their join key. *)
+      let tbl : (bytes, Row.t list) Hashtbl.t = Hashtbl.create 64 in
+      List.iter (fun rrow ->
+        let key_v = rrow.(right_key) in
+        let key_bytes =
+          Index_key.encode_value (row_value_to_index_value key_v)
+        in
+        let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
+        Hashtbl.replace tbl key_bytes (rrow :: prev)
+      ) right_rows;
+      let* left_rows = Lwt_stream.to_list left_stream in
+      let out = ref [] in
+      List.iter (fun lrow ->
+        let key_v = lrow.(left_key) in
+        let any = ref false in
+        (match key_v with
+         | Row.V_null -> ()                (* NULL never joins in equi-join *)
+         | _ ->
+           let key_bytes =
+             Index_key.encode_value (row_value_to_index_value key_v)
+           in
+           (match Hashtbl.find_opt tbl key_bytes with
+            | None -> ()
+            | Some rrows ->
+              (* Preserve build-order: rrows is reversed-insertion. *)
+              List.iter (fun rrow ->
+                out := Array.append lrow rrow :: !out;
+                any := true
+              ) (List.rev rrows)));
+        (match join_kind with
+         | `Left when not !any ->
+           let null_right = Array.make n_right_cols Row.V_null in
+           out := Array.append lrow null_right :: !out
+         | _ -> ())
+      ) left_rows;
+      Lwt.return (Lwt_stream.of_list (List.rev !out))
+    end
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

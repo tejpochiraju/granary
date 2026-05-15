@@ -75,3 +75,22 @@ type op =
       where      : expr option;
       indexes    : Cat.index_info list;
     }
+  | Op_nested_loop_join of {
+      left             : op;                  (** left input (any op stream) *)
+      right_meta       : Cat.table_meta;      (** right table for row decode *)
+      idx_tree         : int;                 (** right-side index tree id *)
+      right_col_idx    : int;                 (** join col ordinal IN RIGHT TABLE *)
+      left_col_idx     : int;                 (** join col ordinal in the LEFT row *)
+      join_kind        : [ `Inner | `Left ];
+      right_col_offset : int;                 (** = n_left_cols *)
+      n_right_cols     : int;
+    }
+  | Op_hash_join of {
+      left             : op;
+      right            : op;
+      left_key         : int;                 (** col ordinal in the left row *)
+      right_key        : int;                 (** col ordinal in the right row *)
+      join_kind        : [ `Inner | `Left ];
+      right_col_offset : int;
+      n_right_cols     : int;
+    }

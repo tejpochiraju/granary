@@ -18,6 +18,7 @@
 %token INDEX ON UNIQUE
 %token UPDATE SET
 %token DELETE
+%token JOIN INNER LEFT OUTER
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -103,10 +104,24 @@ insert_value:
   | MINUS f = FLOAT_LIT    { L_real (-. f) }
 
 select:
-  | SELECT proj = projection FROM table = IDENT wh = where_opt
+  | SELECT proj = projection FROM table = IDENT js = join_clauses wh = where_opt
       ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      S_select { proj; table; where = wh; order = ob; limit; offset } }
+      S_select { proj; table; joins = js; where = wh; order = ob; limit; offset } }
+
+join_clauses:
+  |                                  { [] }
+  | j = join_clause rest = join_clauses { j :: rest }
+
+join_clause:
+  | INNER JOIN t = IDENT ON e = expr
+    { { kind = Inner; table = t; alias = None; on = e } }
+  | LEFT JOIN t = IDENT ON e = expr
+    { { kind = Left;  table = t; alias = None; on = e } }
+  | LEFT OUTER JOIN t = IDENT ON e = expr
+    { { kind = Left;  table = t; alias = None; on = e } }
+  | JOIN t = IDENT ON e = expr
+    { { kind = Inner; table = t; alias = None; on = e } }
 
 update:
   | UPDATE table = IDENT SET

@@ -45,6 +45,18 @@ type order_key = {
   dir : order_dir;
 }
 
+type join_kind = Inner | Left
+
+(** A single JOIN clause attached to a SELECT.
+    Phase 2 supports a single right-hand table (no nested joins beyond
+    a flat list) and an ON predicate. *)
+type join_clause = {
+  kind  : join_kind;
+  table : string;                (** right-side table name *)
+  alias : string option;         (** optional alias — stored but unused in Phase 2 *)
+  on    : expr;                  (** join condition (predicate over both tables) *)
+}
+
 type stmt =
   | S_create_table of {
       name    : string;
@@ -58,6 +70,7 @@ type stmt =
   | S_select of {
       proj   : [ `All | `Cols of string list ];
       table  : string;
+      joins  : join_clause list;  (** empty list = no joins *)
       where  : expr option;
       order  : order_key list;   (** empty = no ORDER BY *)
       limit  : int option;

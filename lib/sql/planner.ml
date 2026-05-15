@@ -40,40 +40,123 @@ let find_index_on_col cat (meta : Cat.table_meta) col_idx =
   let candidates = Cat.indexes_for_table cat ~table:meta.name in
   List.find_opt (fun (i : Cat.index_info) -> i.idx_column = col_name) candidates
 
+(** Detect [BE_col a = BE_col b] equality at the top level. *)
+let recognise_eq_col_col = function
+  | Sema.BE_binop (Sema.Eq, Sema.BE_col a, Sema.BE_col b) -> Some (a, b)
+  | _ -> None
+
+(** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
+    either Op_nested_loop_join (when the right join column has an index)
+    or Op_hash_join (otherwise).  If the ON predicate is not a simple
+    equality between a left and a right column, fall back to a hash
+    cartesian product wrapped in an Op_filter. *)
+let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Plan.op =
+  let join_kind = match bj.kind with
+    | Ast.Inner -> `Inner
+    | Ast.Left  -> `Left
+  in
+  let right_offset = bj.right_col_offset in
+  let n_right_cols = List.length bj.right_meta.Cat.columns in
+  let mk_with_left_col_right_col left_col right_col : Plan.op =
+    let idx_opt = find_index_on_col cat bj.right_meta right_col in
+    match idx_opt with
+    | Some idx ->
+      Plan.Op_nested_loop_join {
+        left = left_op;
+        right_meta = bj.right_meta;
+        idx_tree = idx.Cat.idx_tree_id;
+        right_col_idx = right_col;
+        left_col_idx = left_col;
+        join_kind;
+        right_col_offset = right_offset;
+        n_right_cols;
+      }
+    | None ->
+      Plan.Op_hash_join {
+        left = left_op;
+        right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+        left_key  = left_col;
+        right_key = right_col;
+        join_kind;
+        right_col_offset = right_offset;
+        n_right_cols;
+      }
+  in
+  match recognise_eq_col_col bj.on with
+  | Some (a, b) when (a < n_left) && (b >= right_offset) ->
+    mk_with_left_col_right_col a (b - right_offset)
+  | Some (a, b) when (b < n_left) && (a >= right_offset) ->
+    mk_with_left_col_right_col b (a - right_offset)
+  | _ ->
+    (* General ON predicate: cartesian hash-join + post-filter. *)
+    let cart =
+      Plan.Op_hash_join {
+        left = left_op;
+        right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+        left_key  = -1;
+        right_key = -1;
+        join_kind;
+        right_col_offset = right_offset;
+        n_right_cols;
+      }
+    in
+    Plan.Op_filter { pred = plan_expr bj.on; child = cart }
+
 let plan_select cat
-    ~table_meta ~proj ~where ~order ~limit ~offset =
-  (* Try to use an index lookup if possible. *)
+    ~table_meta ~proj ~where ~order ~limit ~offset ~join =
+  (* Try to use an index lookup if possible (single-table path). *)
   let base =
-    match where with
-    | None -> Plan.Op_seq_scan { table_meta }
-    | Some e ->
-      (match recognise_eq_col_lit e with
-       | Some (col_idx, lit_expr) ->
-         (match find_index_on_col cat table_meta col_idx with
-          | Some idx ->
-            let col_type =
-              (List.nth table_meta.columns col_idx).Row.ty
-            in
-            Plan.Op_index_lookup {
-              table_tree = table_meta.tree_id;
-              idx_tree   = idx.idx_tree_id;
-              col_idx;
-              col_type;
-              lookup_val = plan_expr lit_expr;
-              table_meta;
-            }
+    match join with
+    | Some _ ->
+      (* With a JOIN, we always start from a seq scan of the left table
+         and let plan_join wrap it.  WHERE applies to the combined row
+         (handled below). *)
+      Plan.Op_seq_scan { table_meta }
+    | None ->
+      (match where with
+       | None -> Plan.Op_seq_scan { table_meta }
+       | Some e ->
+         (match recognise_eq_col_lit e with
+          | Some (col_idx, lit_expr) ->
+            (match find_index_on_col cat table_meta col_idx with
+             | Some idx ->
+               let col_type =
+                 (List.nth table_meta.columns col_idx).Row.ty
+               in
+               Plan.Op_index_lookup {
+                 table_tree = table_meta.tree_id;
+                 idx_tree   = idx.idx_tree_id;
+                 col_idx;
+                 col_type;
+                 lookup_val = plan_expr lit_expr;
+                 table_meta;
+               }
+             | None ->
+               Plan.Op_filter {
+                 pred = plan_expr e;
+                 child = Plan.Op_seq_scan { table_meta };
+               })
           | None ->
             Plan.Op_filter {
               pred = plan_expr e;
               child = Plan.Op_seq_scan { table_meta };
-            })
-       | None ->
-         Plan.Op_filter {
-           pred = plan_expr e;
-           child = Plan.Op_seq_scan { table_meta };
-         })
+            }))
   in
-  let projected = Plan.Op_project { ordinals = proj; child = base } in
+  (* Apply JOIN (if any), then WHERE (post-join). *)
+  let after_join =
+    match join with
+    | None -> base
+    | Some bj ->
+      let n_left = List.length table_meta.columns in
+      plan_join cat bj base n_left
+  in
+  let after_where =
+    match join, where with
+    | Some _, Some e ->
+      Plan.Op_filter { pred = plan_expr e; child = after_join }
+    | _ -> after_join
+  in
+  let projected = Plan.Op_project { ordinals = proj; child = after_where } in
   (* Wrap with Op_sort for the first ORDER BY key *)
   let sorted = match order with
     | [] -> projected
@@ -96,16 +179,53 @@ let plan ?cat = function
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
     Plan.Op_insert { table_meta; ordinals; values }
-  | Sema.BS_select { table_meta; proj; where; order; limit; offset } ->
+  | Sema.BS_select { table_meta; proj; where; order; limit; offset; join } ->
     (match cat with
-     | Some cat -> plan_select cat ~table_meta ~proj ~where ~order ~limit ~offset
+     | Some cat ->
+       plan_select cat ~table_meta ~proj ~where ~order ~limit ~offset ~join
      | None ->
-       (* Backwards-compatible path: no catalog, no index lookup.
-          Build a plan with Op_seq_scan + optional Op_filter. *)
-       let scan = Plan.Op_seq_scan { table_meta } in
+       (* Backwards-compatible path: no catalog → no index lookup, and
+          (for JOIN) no index-based NLJ.  Build a hash-join + filter
+          chain manually. *)
+       let base = Plan.Op_seq_scan { table_meta } in
+       let after_join : Plan.op = match join with
+         | None -> base
+         | Some bj ->
+           let n_left = List.length table_meta.columns in
+           let n_right_cols = List.length bj.Sema.right_meta.Cat.columns in
+           let right_offset = bj.right_col_offset in
+           let join_kind = match bj.kind with
+             | Ast.Inner -> `Inner | Ast.Left -> `Left
+           in
+           (match recognise_eq_col_col bj.on with
+            | Some (a, b) when (a < n_left) && (b >= right_offset) ->
+              Plan.Op_hash_join {
+                left = base;
+                right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                left_key = a; right_key = b - right_offset;
+                join_kind; right_col_offset = right_offset; n_right_cols;
+              }
+            | Some (a, b) when (b < n_left) && (a >= right_offset) ->
+              Plan.Op_hash_join {
+                left = base;
+                right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                left_key = b; right_key = a - right_offset;
+                join_kind; right_col_offset = right_offset; n_right_cols;
+              }
+            | _ ->
+              let cart =
+                Plan.Op_hash_join {
+                  left = base;
+                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  left_key = -1; right_key = -1;
+                  join_kind; right_col_offset = right_offset; n_right_cols;
+                }
+              in
+              Plan.Op_filter { pred = plan_expr bj.on; child = cart })
+       in
        let filtered = match where with
-         | None   -> scan
-         | Some e -> Plan.Op_filter { pred = plan_expr e; child = scan }
+         | None   -> after_join
+         | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_join }
        in
        let projected = Plan.Op_project { ordinals = proj; child = filtered } in
        let sorted = match order with
