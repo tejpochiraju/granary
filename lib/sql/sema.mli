@@ -16,6 +16,24 @@ type bound_order_key = {
   dir     : Ast.order_dir;
 }
 
+(** Specification of a single aggregate computation.
+    [col_ord] is [None] for COUNT-star and [Some i] for [COUNT(col)],
+    [SUM(col)], [AVG(col)], [MIN(col)], [MAX(col)] where [i] is the
+    column ordinal in the (combined) input row. *)
+type agg_spec = {
+  func    : Ast.agg_func;
+  col_ord : int option;
+}
+
+(** Projection item in an aggregated SELECT.  The output row of
+    [Op_aggregate] has shape [[group_col_value; agg1; agg2; ...]] when
+    [GROUP BY] is present, and [[agg1; agg2; ...]] otherwise.
+    Projection items below describe how to compute each projected
+    column FROM that aggregate output row. *)
+type agg_proj_item =
+  | AP_group_col              (** project the GROUP BY column (only valid if group_by present) *)
+  | AP_agg_slot of int        (** project the [i]-th aggregate result from the aggregate output *)
+
 (** A bound JOIN clause.
     Column ordinals in [on] are absolute within the combined
     [left ++ right] row: left table columns occupy [0 .. n_left-1] and
@@ -40,12 +58,26 @@ type bound_stmt =
   | BS_select of {
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       proj       : int list;            (** column ordinals to project
-                                            (refer to the combined row when [join] is set) *)
+                                            (refer to the combined row when [join] is set)
+                                            — used when this is NOT an aggregated query *)
       where      : bound_expr option;
       order      : bound_order_key list;
       limit      : int option;
       offset     : int option;
       join       : bound_join option;   (** Phase 2: single optional JOIN *)
+      group_by   : int option;
+        (** [Some i] = GROUP BY column at ordinal [i] (in combined row).
+            [None] with non-empty [aggs] = one big group over all rows.
+            [None] with empty [aggs] = no aggregation (ordinary SELECT). *)
+      aggs       : agg_spec list;       (** ordered list of aggregates to compute *)
+      having     : bound_expr option;
+        (** HAVING predicate.  Column references inside resolve against
+            the OUTPUT row of [Op_aggregate]:
+              - ordinal 0 = group column value (if [group_by] is [Some]);
+              - ordinals 1..N (or 0..N-1 if no group_by) = aggregate slots. *)
+      agg_proj   : agg_proj_item list;
+        (** When [aggs] is non-empty, this is the projection list over
+            the aggregate output row (ignore [proj]).  Empty otherwise. *)
     }
   | BS_create_index of {
       name       : string;

@@ -20,6 +20,9 @@ type binop =
   | Add | Sub | Mul | Div          (** arithmetic *)
   | And | Or                       (** logical *)
 
+(** Aggregate functions supported in Phase 2 Task 6. *)
+type agg_func = Agg_count | Agg_sum | Agg_avg | Agg_min | Agg_max
+
 type expr =
   | E_lit         of literal
   | E_col         of string                (** unqualified column reference *)
@@ -29,6 +32,8 @@ type expr =
   | E_is_null     of expr
   | E_is_not_null of expr
   | E_neg         of expr                  (** unary minus *)
+  | E_agg         of agg_func * expr option
+    (** Aggregate call; [None] argument means [COUNT( * )]. *)
 
 type column_def = {
   name        : string;
@@ -68,13 +73,18 @@ type stmt =
       values  : literal list;
     }
   | S_select of {
-      proj   : [ `All | `Cols of string list ];
-      table  : string;
-      joins  : join_clause list;  (** empty list = no joins *)
-      where  : expr option;
-      order  : order_key list;   (** empty = no ORDER BY *)
-      limit  : int option;
-      offset : int option;
+      proj     : [ `All | `Cols of string list | `Exprs of expr list ];
+        (** [`Exprs] supports arbitrary projection expressions (used for
+            aggregates).  Plain column projection still parses to
+            [`Cols]. *)
+      table    : string;
+      joins    : join_clause list;  (** empty list = no joins *)
+      where    : expr option;
+      group_by : string list;       (** column names; empty = no GROUP BY *)
+      having   : expr option;       (** HAVING predicate (may reference aggregates) *)
+      order    : order_key list;    (** empty = no ORDER BY *)
+      limit    : int option;
+      offset   : int option;
     }
   | S_create_index of {
       name   : string;

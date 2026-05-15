@@ -453,7 +453,7 @@ let execute_with_count (store : S.t) (cat : Cat.t) (op : Plan.op)
     execute_delete store ~table_meta ~where ~indexes
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
-  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ ->
+  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -702,6 +702,137 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       ) left_rows;
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
+  | Plan.Op_aggregate { child; group_col; aggs; having; proj } ->
+    let* inner = to_stream store child in
+    let* rows = Lwt_stream.to_list inner in
+    let groups : (Row.value * Row.t list) list =
+      match group_col with
+      | None ->
+        [ (Row.V_null, rows) ]
+      | Some gc ->
+        (* Stable-sort by group column, then split runs of equal keys. *)
+        let sorted =
+          List.stable_sort (fun a b ->
+            compare_values a.(gc) b.(gc)
+          ) rows
+        in
+        let rec group_runs acc cur_key cur_rows = function
+          | [] ->
+            (match cur_rows with
+             | [] -> List.rev acc
+             | _  -> List.rev ((cur_key, List.rev cur_rows) :: acc))
+          | r :: rest ->
+            let k = r.(gc) in
+            if compare_values k cur_key = 0 && cur_rows <> [] then
+              group_runs acc cur_key (r :: cur_rows) rest
+            else
+              let acc' =
+                if cur_rows = [] then acc
+                else (cur_key, List.rev cur_rows) :: acc
+              in
+              group_runs acc' k [r] rest
+        in
+        group_runs [] Row.V_null [] sorted
+    in
+    let compute_agg (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
+      match spec.func, spec.col_ord with
+      | Ast.Agg_count, None ->
+        Row.V_int (Int64.of_int (List.length group_rows))
+      | Ast.Agg_count, Some i ->
+        let n = List.fold_left (fun acc r ->
+          match r.(i) with
+          | Row.V_null -> acc
+          | _ -> acc + 1
+        ) 0 group_rows in
+        Row.V_int (Int64.of_int n)
+      | Ast.Agg_sum, Some i ->
+        (* Sum non-null numeric values; preserve INT vs REAL like SQLite-lite. *)
+        let any_real = List.exists (fun r ->
+          match r.(i) with Row.V_real _ -> true | _ -> false
+        ) group_rows in
+        let any_non_null = List.exists (fun r ->
+          match r.(i) with Row.V_null -> false | _ -> true
+        ) group_rows in
+        if not any_non_null then Row.V_null
+        else if any_real then
+          let s = List.fold_left (fun acc r ->
+            match r.(i) with
+            | Row.V_null -> acc
+            | Row.V_int n -> acc +. Int64.to_float n
+            | Row.V_real f -> acc +. f
+            | _ -> failwith "SUM on non-numeric value"
+          ) 0.0 group_rows in
+          Row.V_real s
+        else
+          let s = List.fold_left (fun acc r ->
+            match r.(i) with
+            | Row.V_null -> acc
+            | Row.V_int n -> Int64.add acc n
+            | _ -> failwith "SUM on non-numeric value"
+          ) 0L group_rows in
+          Row.V_int s
+      | Ast.Agg_avg, Some i ->
+        let sum, n = List.fold_left (fun (s, n) r ->
+          match r.(i) with
+          | Row.V_null -> (s, n)
+          | Row.V_int x -> (s +. Int64.to_float x, n + 1)
+          | Row.V_real f -> (s +. f, n + 1)
+          | _ -> failwith "AVG on non-numeric value"
+        ) (0.0, 0) group_rows in
+        if n = 0 then Row.V_null
+        else Row.V_real (sum /. float_of_int n)
+      | Ast.Agg_min, Some i ->
+        List.fold_left (fun acc r ->
+          match r.(i), acc with
+          | Row.V_null, _ -> acc
+          | v, Row.V_null -> v
+          | v, cur ->
+            if compare_values v cur < 0 then v else cur
+        ) Row.V_null group_rows
+      | Ast.Agg_max, Some i ->
+        List.fold_left (fun acc r ->
+          match r.(i), acc with
+          | Row.V_null, _ -> acc
+          | v, Row.V_null -> v
+          | v, cur ->
+            if compare_values v cur > 0 then v else cur
+        ) Row.V_null group_rows
+      | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
+        failwith "non-COUNT aggregate must have a column argument"
+    in
+    let agg_output_rows =
+      List.map (fun (group_key, group_rows) ->
+        let agg_vals = List.map (fun spec -> compute_agg spec group_rows) aggs in
+        let out =
+          match group_col with
+          | None   -> Array.of_list agg_vals
+          | Some _ -> Array.of_list (group_key :: agg_vals)
+        in
+        out
+      ) groups
+    in
+    (* Apply HAVING on the aggregate output row. *)
+    let after_having =
+      match having with
+      | None -> agg_output_rows
+      | Some pred ->
+        List.filter (fun r -> value_truthy (eval_expr r pred)) agg_output_rows
+    in
+    (* Project to final output row. *)
+    let final_rows =
+      List.map (fun agg_row ->
+        Array.of_list (List.map (function
+          | Plan.PI_group_col ->
+            (match group_col with
+             | Some _ -> agg_row.(0)
+             | None   -> failwith "PI_group_col without group_col")
+          | Plan.PI_agg_slot k ->
+            let off = match group_col with Some _ -> 1 | None -> 0 in
+            agg_row.(off + k)
+        ) proj)
+      ) after_having
+    in
+    Lwt.return (Lwt_stream.of_list final_rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

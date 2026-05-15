@@ -146,7 +146,7 @@ let sema_unknown_join_table () =
     proj = `All; table = "users";
     joins = [ { kind = Ast.Inner; table = "ghost"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "uid") } ];
-    where = None; order = []; limit = None; offset = None;
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -169,7 +169,7 @@ let sema_ambiguous_column () =
     proj = `Cols ["x"]; table = "a";
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
-    where = None; order = []; limit = None; offset = None;
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
   | Error (Sema.Ambiguous_column "x") -> ()
@@ -191,7 +191,7 @@ let sema_qualified_column_resolves () =
     proj = `All; table = "a";
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("a","x"), Ast.E_tbl_col ("b","x")) } ];
-    where = None; order = []; limit = None; offset = None;
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_select { join = Some _; proj; _ }) ->
@@ -210,7 +210,7 @@ let planner_picks_hash_join_no_index () =
                 on = Ast.E_binop (Ast.Eq,
                   Ast.E_tbl_col ("users","id"),
                   Ast.E_tbl_col ("orders","uid")) } ];
-    where = None; order = []; limit = None; offset = None;
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   let bound = bind_ok cat stmt in
   match Planner.plan ~cat bound with
@@ -225,7 +225,7 @@ let planner_picks_nlj_with_index () =
                 on = Ast.E_binop (Ast.Eq,
                   Ast.E_tbl_col ("users","id"),
                   Ast.E_tbl_col ("orders","uid")) } ];
-    where = None; order = []; limit = None; offset = None;
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   let bound = bind_ok cat stmt in
   match Planner.plan ~cat bound with

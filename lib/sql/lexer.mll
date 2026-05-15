@@ -45,6 +45,13 @@ rule token = parse
   | "INNER"    { INNER }
   | "LEFT"     { LEFT }
   | "OUTER"    { OUTER }
+  | "GROUP"    { GROUP }
+  | "HAVING"   { HAVING }
+  | "COUNT"    { COUNT }
+  | "SUM"      { SUM }
+  | "AVG"      { AVG }
+  | "MIN"      { MIN }
+  | "MAX"      { MAX }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

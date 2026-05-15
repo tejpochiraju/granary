@@ -18,6 +18,15 @@ type bound_order_key = {
   dir     : Ast.order_dir;
 }
 
+type agg_spec = {
+  func    : Ast.agg_func;
+  col_ord : int option;
+}
+
+type agg_proj_item =
+  | AP_group_col
+  | AP_agg_slot of int
+
 (** A bound JOIN clause.  See sema.mli for layout details. *)
 type bound_join = {
   kind             : Ast.join_kind;
@@ -44,6 +53,10 @@ type bound_stmt =
       limit      : int option;
       offset     : int option;
       join       : bound_join option;
+      group_by   : int option;
+      aggs       : agg_spec list;
+      having     : bound_expr option;
+      agg_proj   : agg_proj_item list;
     }
   | BS_create_index of {
       name       : string;
@@ -139,6 +152,8 @@ let rec bind_expr (meta : Cat.table_meta) = function
     (match bind_expr meta e with
      | Ok be   -> Ok (BE_neg be)
      | Error e -> Error e)
+  | Ast.E_agg _ ->
+    Error (Unsupported "aggregate in WHERE")
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -191,6 +206,101 @@ let rec bind_expr_join
   | Ast.E_neg e ->
     (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
+  | Ast.E_agg _ ->
+    Error (Unsupported "aggregate in WHERE")
+
+(* ------------------------------------------------------------------ *)
+(* Aggregate-aware binding.                                             *)
+(* Walks an [expr], using a name-resolver for plain column references,  *)
+(* and collects aggregate calls into an accumulator.  Aggregates in the *)
+(* returned [bound_expr] become [BE_col k] where [k] is the column      *)
+(* ordinal in the AGGREGATE OUTPUT ROW (NOT the input row), with the    *)
+(* offset [group_col_present_offset] applied.                            *)
+(*                                                                       *)
+(* Returns (bound_expr, list_of_agg_specs_in_traversal_order).           *)
+(* ------------------------------------------------------------------ *)
+
+(** Resolve a column reference into a [BE_col i] using a resolver
+    function.  Used by [bind_expr_agg]. *)
+type col_resolver = {
+  resolve_unqual : string -> (int, error) result;
+  resolve_qual   : string -> string -> (int, error) result;
+}
+
+(** Bind expression, collecting aggregates.  Aggregates become
+    [BE_col (offset + slot)] referring to the aggregate output row.
+    [offset] is 1 when GROUP BY is present (slot 0 holds the group key)
+    and 0 otherwise. *)
+let bind_expr_agg
+    ~(resolver : col_resolver)
+    ~(offset : int)
+    (e : Ast.expr)
+  : (bound_expr * agg_spec list, error) result =
+  let aggs = ref [] in
+  let add_agg spec =
+    let idx = List.length !aggs in
+    aggs := !aggs @ [spec];
+    idx
+  in
+  let rec go = function
+    | Ast.E_lit l -> Ok (BE_lit l)
+    | Ast.E_col name ->
+      (match resolver.resolve_unqual name with
+       | Error e -> Error e
+       | Ok i -> Ok (BE_col i))
+    | Ast.E_tbl_col (t, c) ->
+      (match resolver.resolve_qual t c with
+       | Error e -> Error e
+       | Ok i -> Ok (BE_col i))
+    | Ast.E_binop (op, a, b) ->
+      (match go a, go b with
+       | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
+       | Error e, _    -> Error e
+       | Ok _,  Error e -> Error e)
+    | Ast.E_not e ->
+      (match go e with Ok be -> Ok (BE_not be) | Error e -> Error e)
+    | Ast.E_is_null e ->
+      (match go e with Ok be -> Ok (BE_is_null be) | Error e -> Error e)
+    | Ast.E_is_not_null e ->
+      (match go e with Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
+    | Ast.E_neg e ->
+      (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
+    | Ast.E_agg (func, arg_opt) ->
+      let col_ord_result : (int option, error) result =
+        match arg_opt with
+        | None ->
+          (* COUNT-star — only legal here for Agg_count *)
+          (match func with
+           | Ast.Agg_count -> Ok None
+           | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+        | Some (Ast.E_col name) ->
+          (match resolver.resolve_unqual name with
+           | Error e -> Error e
+           | Ok i    -> Ok (Some i))
+        | Some (Ast.E_tbl_col (t, c)) ->
+          (match resolver.resolve_qual t c with
+           | Error e -> Error e
+           | Ok i    -> Ok (Some i))
+        | Some _ ->
+          Error (Unsupported "aggregate argument must be a column reference")
+      in
+      (match col_ord_result with
+       | Error e -> Error e
+       | Ok col_ord ->
+         let slot = add_agg { func; col_ord } in
+         Ok (BE_col (offset + slot)))
+  in
+  match go e with
+  | Error e -> Error e
+  | Ok be   -> Ok (be, !aggs)
+
+(** Check if any [E_agg] appears anywhere in an [expr]. *)
+let rec expr_has_agg = function
+  | Ast.E_agg _ -> true
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
+  | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e ->
+    expr_has_agg e
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -315,7 +425,7 @@ let bind_insert cat ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset =
+let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -357,32 +467,199 @@ let bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset =
             | None,   Some i -> Ok (right_offset + i)
             | None,   None   -> Error (Unknown_column { table; column = name }))
        in
-       let proj_result =
+       let qual_lookup t c : (int, error) result =
+         match join_info with
+         | None ->
+           if String.equal t meta.name then
+             (match col_index meta.columns c with
+              | Some i -> Ok i
+              | None -> Error (Unknown_column { table = t; column = c }))
+           else Error (Unknown_table t)
+         | Some (_jc, rm) ->
+           if String.equal t meta.name then
+             (match col_index meta.columns c with
+              | Some i -> Ok i
+              | None -> Error (Unknown_column { table = t; column = c }))
+           else if String.equal t rm.Cat.name then
+             (match col_index rm.columns c with
+              | Some i -> Ok (right_offset + i)
+              | None -> Error (Unknown_column { table = t; column = c }))
+           else Error (Unknown_table t)
+       in
+       (* Detect whether this is an aggregated query: any aggregate in
+          projection or HAVING, or GROUP BY present. *)
+       let proj_has_agg =
          match proj with
-         | `All ->
-           (* All columns from both tables, left ++ right. *)
-           let left_ords = List.mapi (fun i _ -> i) meta.columns in
-           (match join_info with
-            | None -> Ok left_ords
-            | Some (_jc, rm) ->
-              let n_right = List.length rm.columns in
-              let right_ords =
-                List.init n_right (fun i -> right_offset + i)
-              in
-              Ok (left_ords @ right_ords))
-         | `Cols names ->
-           List.fold_left (fun acc name ->
-             match acc with
-             | Error _ -> acc
-             | Ok ords ->
+         | `All | `Cols _ -> false
+         | `Exprs es -> List.exists expr_has_agg es
+       in
+       let having_has_agg =
+         match having with
+         | None -> false
+         | Some e -> expr_has_agg e
+       in
+       let group_by_present = group_by <> [] in
+       let is_aggregated =
+         proj_has_agg || having_has_agg || group_by_present
+       in
+       (* Bind GROUP BY column (only first column supported in Phase 2). *)
+       let group_col_result : (int option, error) result =
+         match group_by with
+         | [] -> Ok None
+         | [name] ->
+           (match proj_lookup name with
+            | Error e -> Error e
+            | Ok i -> Ok (Some i))
+         | _ -> Error (Unsupported "GROUP BY with more than one column is not supported in Phase 2")
+       in
+       (match group_col_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok group_col ->
+       let offset_for_aggs = match group_col with Some _ -> 1 | None -> 0 in
+       (* Build proj/agg_proj. *)
+       let proj_result : (int list * agg_proj_item list * agg_spec list, error) result =
+         if not is_aggregated then
+           (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
+           let ords_result =
+             match proj with
+             | `All ->
+               let left_ords = List.mapi (fun i _ -> i) meta.columns in
+               (match join_info with
+                | None -> Ok left_ords
+                | Some (_jc, rm) ->
+                  let n_right = List.length rm.columns in
+                  let right_ords = List.init n_right (fun i -> right_offset + i) in
+                  Ok (left_ords @ right_ords))
+             | `Cols names ->
+               List.fold_left (fun acc name ->
+                 match acc with
+                 | Error _ -> acc
+                 | Ok ords ->
+                   (match proj_lookup name with
+                    | Error e -> Error e
+                    | Ok i    -> Ok (ords @ [i]))
+               ) (Ok []) names
+             | `Exprs _ ->
+               (* No aggregate in proj_has_agg=false case — Exprs without
+                  aggregates is unusual in this engine (only aggregates
+                  produce Exprs in the parser).  Reject for now. *)
+               Error (Unsupported "non-aggregate expression projection not supported")
+           in
+           (match ords_result with
+            | Error e -> Error e
+            | Ok o -> Ok (o, [], []))
+         else begin
+           (* Aggregated SELECT — build agg_proj and aggs list. *)
+           (* Helper: walk an expression that is an explicit projection
+              item.  For a bare column reference, produce a non-agg slot;
+              for an aggregate, produce an AP_agg_slot. *)
+           let acc_aggs = ref [] in
+           let add_agg spec =
+             let idx = List.length !acc_aggs in
+             acc_aggs := !acc_aggs @ [spec];
+             idx
+           in
+           let project_one (e : Ast.expr) : (agg_proj_item, error) result =
+             match e with
+             | Ast.E_col name ->
                (match proj_lookup name with
                 | Error e -> Error e
-                | Ok i    -> Ok (ords @ [i]))
-           ) (Ok []) names
+                | Ok i ->
+                  (* Must match the GROUP BY column. *)
+                  (match group_col with
+                   | Some gc when gc = i -> Ok AP_group_col
+                   | _ -> Error (Unsupported (Printf.sprintf
+                                  "column '%s' must appear in GROUP BY clause" name))))
+             | Ast.E_tbl_col (t, c) ->
+               (match qual_lookup t c with
+                | Error e -> Error e
+                | Ok i ->
+                  (match group_col with
+                   | Some gc when gc = i -> Ok AP_group_col
+                   | _ -> Error (Unsupported (Printf.sprintf
+                                  "column '%s.%s' must appear in GROUP BY clause" t c))))
+             | Ast.E_agg (func, arg_opt) ->
+               (* SUM/AVG type check. *)
+               let validate_numeric col_ord =
+                 let cols =
+                   match join_info with
+                   | None -> meta.columns
+                   | Some (_jc, rm) -> meta.columns @ rm.Cat.columns
+                 in
+                 let col = List.nth cols col_ord in
+                 match col.Row.ty with
+                 | Row.Integer | Row.Real -> Ok ()
+                 | _ -> Error (Type_mismatch { expected = Row.Real; got = col.ty })
+               in
+               let col_ord_result : (int option, error) result =
+                 match arg_opt with
+                 | None ->
+                   (match func with
+                    | Ast.Agg_count -> Ok None
+                    | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+                 | Some (Ast.E_col name) ->
+                   (match proj_lookup name with
+                    | Error e -> Error e
+                    | Ok i -> Ok (Some i))
+                 | Some (Ast.E_tbl_col (t, c)) ->
+                   (match qual_lookup t c with
+                    | Error e -> Error e
+                    | Ok i -> Ok (Some i))
+                 | Some _ ->
+                   Error (Unsupported "aggregate argument must be a column reference")
+               in
+               (match col_ord_result with
+                | Error e -> Error e
+                | Ok co ->
+                  let type_check =
+                    match func, co with
+                    | (Ast.Agg_sum | Ast.Agg_avg), Some i -> validate_numeric i
+                    | _ -> Ok ()
+                  in
+                  (match type_check with
+                   | Error e -> Error e
+                   | Ok () ->
+                     let slot = add_agg { func; col_ord = co } in
+                     Ok (AP_agg_slot slot)))
+             | _ ->
+               Error (Unsupported "complex expression in aggregated projection not supported")
+           in
+           let exprs_to_project : Ast.expr list =
+             match proj with
+             | `All ->
+               (* In aggregated context, `*` is interpreted as either:
+                  - the group column alone (if GROUP BY present and no
+                    aggregates in HAVING — rare), or
+                  - error if there are no aggregates.
+                  This is non-standard SQL behaviour but for Phase 2 we
+                  only accept aggregated `*` if there's a GROUP BY. *)
+               (match group_col with
+                | Some _ -> [] (* unused — won't reach here *)
+                | None -> [])
+             | `Cols names -> List.map (fun n -> Ast.E_col n) names
+             | `Exprs es -> es
+           in
+           if exprs_to_project = [] && proj = `All && is_aggregated then
+             Error (Unsupported "SELECT * with aggregates requires explicit columns")
+           else
+             let agg_proj_result =
+               List.fold_left (fun acc e ->
+                 match acc with
+                 | Error _ -> acc
+                 | Ok items ->
+                   (match project_one e with
+                    | Error e -> Error e
+                    | Ok item -> Ok (items @ [item]))
+               ) (Ok []) exprs_to_project
+             in
+             (match agg_proj_result with
+              | Error e -> Error e
+              | Ok items -> Ok ([], items, !acc_aggs))
+         end
        in
        (match proj_result with
         | Error e -> Lwt.return (Error e)
-        | Ok proj_ords ->
+        | Ok (proj_ords, agg_proj_items, proj_aggs) ->
           (* Bind the JOIN ON predicate (must use two-table resolution). *)
           let bound_join_result : (bound_join option, error) result =
             match join_info with
@@ -419,6 +696,57 @@ let bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset =
              (match where_result with
               | Error e -> Lwt.return (Error e)
               | Ok bound_where ->
+                (* HAVING is bound in the agg-output context.  Aggregates
+                   inside HAVING collect into [having_aggs] which are
+                   appended after [proj_aggs]. *)
+                let having_result : (bound_expr option * agg_spec list, error) result =
+                  match having with
+                  | None -> Ok (None, [])
+                  | Some e ->
+                    if not is_aggregated then
+                      Error (Unsupported "HAVING requires GROUP BY or aggregate")
+                    else begin
+                      (* Use a resolver that, for plain column refs,
+                         requires the column to be the GROUP BY column
+                         (resolves to slot 0 = group col), else error. *)
+                      let having_resolver_unqual name =
+                        match proj_lookup name with
+                        | Error e -> Error e
+                        | Ok i ->
+                          (match group_col with
+                           | Some gc when gc = i -> Ok 0
+                           | _ -> Error (Unsupported (Printf.sprintf
+                                          "HAVING references non-grouped column '%s'" name)))
+                      in
+                      let having_resolver_qual t c =
+                        match qual_lookup t c with
+                        | Error e -> Error e
+                        | Ok i ->
+                          (match group_col with
+                           | Some gc when gc = i -> Ok 0
+                           | _ -> Error (Unsupported (Printf.sprintf
+                                          "HAVING references non-grouped column '%s.%s'" t c)))
+                      in
+                      let having_resolver = {
+                        resolve_unqual = having_resolver_unqual;
+                        resolve_qual = having_resolver_qual;
+                      } in
+                      (* Append HAVING aggregates AFTER the projection
+                         aggregates: in BE_col offset = offset_for_aggs +
+                         (List.length proj_aggs). *)
+                      let having_offset =
+                        offset_for_aggs + List.length proj_aggs
+                      in
+                      match bind_expr_agg ~resolver:having_resolver
+                              ~offset:having_offset e with
+                      | Error e -> Error e
+                      | Ok (be, hagg) -> Ok (Some be, hagg)
+                    end
+                in
+                (match having_result with
+                 | Error e -> Lwt.return (Error e)
+                 | Ok (bound_having, having_aggs) ->
+                let all_aggs = proj_aggs @ having_aggs in
                 if List.length order > 1 then
                   Lwt.return (Error (Unsupported
                     "ORDER BY with more than one key is not supported in Phase 1"))
@@ -462,7 +790,11 @@ let bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset =
                            limit      = valid_limit;
                            offset     = valid_offset;
                            join       = bound_join;
-                         })))))))))
+                           group_by   = group_col;
+                           aggs       = all_aggs;
+                           having     = bound_having;
+                           agg_proj   = agg_proj_items;
+                         })))))))))))
 
 (* ------------------------------------------------------------------ *)
 (* Best-effort type inference for bound expressions.                    *)
@@ -602,8 +934,8 @@ let bind_delete cat ~table ~where =
 let bind cat = function
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
-  | Ast.S_select { proj; table; joins; where; order; limit; offset } ->
-    bind_select cat ~proj ~table ~joins ~where ~order ~limit ~offset
+  | Ast.S_select { proj; table; joins; where; group_by; having; order; limit; offset } ->
+    bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; column; unique } ->
     bind_create_index cat ~name ~table ~column ~unique
   | Ast.S_update { table; assignments; where } ->

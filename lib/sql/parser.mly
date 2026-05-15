@@ -19,6 +19,8 @@
 %token UPDATE SET
 %token DELETE
 %token JOIN INNER LEFT OUTER
+%token GROUP HAVING
+%token COUNT SUM AVG MIN MAX
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -105,9 +107,11 @@ insert_value:
 
 select:
   | SELECT proj = projection FROM table = IDENT js = join_clauses wh = where_opt
-      ob = order_by_clause lim = limit_clause
+      gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      S_select { proj; table; joins = js; where = wh; order = ob; limit; offset } }
+      S_select { proj; table; joins = js; where = wh;
+                 group_by = gb; having = hv;
+                 order = ob; limit; offset } }
 
 join_clauses:
   |                                  { [] }
@@ -138,11 +142,33 @@ assignment:
 
 projection:
   | STAR                                             { `All }
-  | cols = separated_nonempty_list(COMMA, IDENT)     { `Cols cols }
+  | items = separated_nonempty_list(COMMA, proj_item)
+    { (* If every item is a plain column reference, produce `Cols
+         (preserves existing AST shape).  Otherwise produce `Exprs. *)
+      let all_cols = List.for_all (function `Col _ -> true | _ -> false) items in
+      if all_cols then
+        `Cols (List.map (function `Col c -> c | _ -> assert false) items)
+      else
+        `Exprs (List.map (function
+          | `Col c -> E_col c
+          | `Expr e -> e) items) }
+
+proj_item:
+  | name = IDENT                       { `Col name }
+  | t = IDENT DOT c = IDENT            { `Expr (E_tbl_col (t, c)) }
+  | e = agg_expr                       { `Expr e }
 
 where_opt:
   |                { None }
   | WHERE e = expr { Some e }
+
+group_by_clause:
+  |                                                                 { [] }
+  | GROUP BY cs = separated_nonempty_list(COMMA, IDENT)            { cs }
+
+having_clause:
+  |                                                                 { None }
+  | HAVING e = expr                                                 { Some e }
 
 order_by_clause:
   |                                                                 { [] }
@@ -158,10 +184,19 @@ limit_clause:
   | LIMIT n = INT_LIT                       { (Some (Int64.to_int n), None) }
   | LIMIT n = INT_LIT OFFSET m = INT_LIT   { (Some (Int64.to_int n), Some (Int64.to_int m)) }
 
+agg_expr:
+  | COUNT LPAREN STAR RPAREN          { E_agg (Agg_count, None) }
+  | COUNT LPAREN e = expr RPAREN      { E_agg (Agg_count, Some e) }
+  | SUM   LPAREN e = expr RPAREN      { E_agg (Agg_sum,   Some e) }
+  | AVG   LPAREN e = expr RPAREN      { E_agg (Agg_avg,   Some e) }
+  | MIN   LPAREN e = expr RPAREN      { E_agg (Agg_min,   Some e) }
+  | MAX   LPAREN e = expr RPAREN      { E_agg (Agg_max,   Some e) }
+
 expr:
   | l = literal                       { E_lit l }
   | name = IDENT                      { E_col name }
   | t = IDENT DOT c = IDENT           { E_tbl_col (t, c) }
+  | e = agg_expr                      { e }
   | a = expr AND b = expr             { E_binop (And, a, b) }
   | a = expr OR  b = expr             { E_binop (Or,  a, b) }
   | NOT e = expr                      { E_not e }

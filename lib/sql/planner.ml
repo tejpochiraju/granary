@@ -102,8 +102,16 @@ let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Pl
     in
     Plan.Op_filter { pred = plan_expr bj.on; child = cart }
 
+let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
+  { Plan.func = a.func; col_ord = a.col_ord }
+
+let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
+  | Sema.AP_group_col   -> Plan.PI_group_col
+  | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
+
 let plan_select cat
-    ~table_meta ~proj ~where ~order ~limit ~offset ~join =
+    ~table_meta ~proj ~where ~order ~limit ~offset ~join
+    ~group_by ~aggs ~having ~agg_proj =
   (* Try to use an index lookup if possible (single-table path). *)
   let base =
     match join with
@@ -156,7 +164,19 @@ let plan_select cat
       Plan.Op_filter { pred = plan_expr e; child = after_join }
     | _ -> after_join
   in
-  let projected = Plan.Op_project { ordinals = proj; child = after_where } in
+  let is_aggregated = aggs <> [] || group_by <> None in
+  let projected =
+    if is_aggregated then
+      Plan.Op_aggregate {
+        child = after_where;
+        group_col = group_by;
+        aggs = List.map sema_agg_to_plan aggs;
+        having = Option.map plan_expr having;
+        proj = List.map sema_agg_proj_to_plan agg_proj;
+      }
+    else
+      Plan.Op_project { ordinals = proj; child = after_where }
+  in
   (* Wrap with Op_sort for the first ORDER BY key *)
   let sorted = match order with
     | [] -> projected
@@ -179,10 +199,12 @@ let plan ?cat = function
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
     Plan.Op_insert { table_meta; ordinals; values }
-  | Sema.BS_select { table_meta; proj; where; order; limit; offset; join } ->
+  | Sema.BS_select { table_meta; proj; where; order; limit; offset; join;
+                     group_by; aggs; having; agg_proj } ->
     (match cat with
      | Some cat ->
        plan_select cat ~table_meta ~proj ~where ~order ~limit ~offset ~join
+         ~group_by ~aggs ~having ~agg_proj
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
@@ -227,7 +249,19 @@ let plan ?cat = function
          | None   -> after_join
          | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_join }
        in
-       let projected = Plan.Op_project { ordinals = proj; child = filtered } in
+       let is_aggregated = aggs <> [] || group_by <> None in
+       let projected =
+         if is_aggregated then
+           Plan.Op_aggregate {
+             child = filtered;
+             group_col = group_by;
+             aggs = List.map sema_agg_to_plan aggs;
+             having = Option.map plan_expr having;
+             proj = List.map sema_agg_proj_to_plan agg_proj;
+           }
+         else
+           Plan.Op_project { ordinals = proj; child = filtered }
+       in
        let sorted = match order with
          | [] -> projected
          | (key :: _) ->
