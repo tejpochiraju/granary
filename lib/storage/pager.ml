@@ -120,12 +120,14 @@ let alloc t ~current_txn_id =
   | None ->
     (* Extend the file by one page *)
     let new_id = t.n_pages in
-    t.n_pages <- Int64.add t.n_pages 1L;
+    let new_pages = Int64.add t.n_pages 1L in
     let open Lwt.Syntax in
-    let* result = t.resize ~n_pages:t.n_pages in
+    let* result = t.resize ~n_pages:new_pages in
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
-     | Ok ()     -> Lwt.return_ok new_id)
+     | Ok ()     ->
+       t.n_pages <- new_pages;
+       Lwt.return_ok new_id)
 
 let free t ~page_id ~freed_at_txn_id =
   t.freelist <-
