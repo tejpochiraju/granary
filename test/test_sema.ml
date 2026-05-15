@@ -365,6 +365,23 @@ let bind_select_second_col_unknown () =
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
   | _ -> Alcotest.fail "expected Unknown_column for second proj column"
 
+let bind_select_multi_order_by_rejected () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `All;
+    table = "users";
+    where = None;
+    order = [
+      Ast.{ col = "id";   dir = Ast.Asc };
+      Ast.{ col = "name"; dir = Ast.Asc };
+    ];
+    limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Error _ -> Alcotest.fail "expected Unsupported error for multi-column ORDER BY"
+  | Ok _ -> Alcotest.fail "expected error, got Ok"
+
 (* ------------------------------------------------------------------ *)
 (* Group 3b: CREATE INDEX binding                                       *)
 (* ------------------------------------------------------------------ *)
@@ -485,8 +502,9 @@ let () =
       Alcotest.test_case "bind_select_where_lit_eq_col"  `Quick bind_select_where_lit_eq_col;
       Alcotest.test_case "bind_select_where_unknown_col" `Quick bind_select_where_unknown_col;
       Alcotest.test_case "bind_select_where_text_col"    `Quick bind_select_where_text_col;
-      Alcotest.test_case "bind_select_where_right_unknown" `Quick bind_select_where_right_unknown;
-      Alcotest.test_case "bind_select_second_col_unknown"  `Quick bind_select_second_col_unknown;
+      Alcotest.test_case "bind_select_where_right_unknown"      `Quick bind_select_where_right_unknown;
+      Alcotest.test_case "bind_select_second_col_unknown"        `Quick bind_select_second_col_unknown;
+      Alcotest.test_case "bind_select_multi_order_by_rejected"   `Quick bind_select_multi_order_by_rejected;
     ];
     "create-index", [
       Alcotest.test_case "bind_create_index_basic"          `Quick bind_create_index_basic;

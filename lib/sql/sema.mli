@@ -43,6 +43,7 @@ type error =
   | Arity_mismatch of { expected : int; got : int }
   | Already_exists of string
   | Invalid_limit  of string
+  | Unsupported    of string
 
 val bind :
   Sqlocaml_catalog.Catalog.t ->

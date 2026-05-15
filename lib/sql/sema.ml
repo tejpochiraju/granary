@@ -44,6 +44,7 @@ type error =
   | Arity_mismatch of { expected : int; got : int }
   | Already_exists of string
   | Invalid_limit  of string
+  | Unsupported    of string
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -175,6 +176,11 @@ let bind_select cat ~proj ~table ~where ~order ~limit ~offset =
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
+          (* Phase 1: single-column ORDER BY only *)
+          if List.length order > 1 then
+            Lwt.return (Error (Unsupported
+              "ORDER BY with more than one key is not supported in Phase 1"))
+          else
           (* Validate and bind ORDER BY columns *)
           let order_result =
             List.fold_left (fun acc (ok : Ast.order_key) ->
