@@ -391,6 +391,75 @@ let plan_create_index () =
   | _ -> Alcotest.fail "expected Op_create_index { name=idx2; ... }"
 
 (* ------------------------------------------------------------------ *)
+(* Group 7: Gap-fill — JOIN swapped/general ON, no-cat fallbacks         *)
+(* ------------------------------------------------------------------ *)
+
+let make_join_cat () =
+  Lwt_main.run (
+    let store = S.create () in
+    let* cat = Cat.open_ store in
+    let* _ = Cat.create_table cat ~name:"users" ~columns:[
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    ] in
+    let* _ = Cat.create_table cat ~name:"orders" ~columns:[
+      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    ] in
+    Lwt.return cat
+  )
+
+(** Swapped ON predicate: ON orders.uid = users.id (right.col = left.col).
+    Exercises plan_join lines 88-89 — the second guarded match arm. *)
+let plan_join_swapped_on () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("orders", "uid"),
+                  Ast.E_tbl_col ("users", "id")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_hash_join _; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_hash_join with swapped ON"
+
+(** General ON predicate (not col=col).  Exercises plan_join lines 90-103
+    — the cartesian + post-filter fallback. *)
+let plan_join_general_on () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                (* ON users.id > orders.uid — not equality, falls through *)
+                on = Ast.E_binop (Ast.Gt,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_tbl_col ("orders", "uid")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_filter wrapping Op_hash_join cartesian"
+
+(** recognise_eq_col_col fallback (line 46): inputs that are NOT BE_col = BE_col
+    return None. We verify by giving plan_join an ON that is a literal. *)
+let plan_join_on_literal () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_lit (Ast.L_int 1L) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan ~cat bound with
+  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_filter wrapping Op_hash_join for literal ON"
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -431,5 +500,10 @@ let () =
       Alcotest.test_case "plan_index_lookup_lit_eq_col"      `Quick plan_index_lookup_lit_eq_col;
       Alcotest.test_case "plan_no_index_falls_back_to_filter" `Quick plan_no_index_falls_back_to_filter;
       Alcotest.test_case "plan_create_index"                  `Quick plan_create_index;
+    ];
+    "gap-fill", [
+      Alcotest.test_case "plan_join_swapped_on"  `Quick plan_join_swapped_on;
+      Alcotest.test_case "plan_join_general_on"  `Quick plan_join_general_on;
+      Alcotest.test_case "plan_join_on_literal"  `Quick plan_join_on_literal;
     ];
   ]

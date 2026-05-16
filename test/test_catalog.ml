@@ -401,6 +401,157 @@ let test_tree_id_survives_reopen () =
     Lwt.return_unit
   )
 
+(* Gap-fill: DV_blob / DV_null DEFAULT values round-trip through reopen.
+   Exercises encode_default_value and decode_default_value branches. *)
+let test_default_blob_roundtrip () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let cols : Row.column list = [
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "b"; ty = Row.Blob;    not_null = false; primary_key = false;
+        default = Some (Row.DV_blob (Bytes.of_string "binary")) };
+    ] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "table not found after reopen"
+     | Some m ->
+       let col_b = List.nth m.C.columns 1 in
+       (match col_b.Row.default with
+        | Some (Row.DV_blob b) when Bytes.equal b (Bytes.of_string "binary") -> ()
+        | Some _ -> Alcotest.fail "wrong default value variant"
+        | None   -> Alcotest.fail "default lost"));
+    Lwt.return_unit
+  )
+
+let test_default_real_roundtrip () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let cols : Row.column list = [
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "f"; ty = Row.Real;    not_null = false; primary_key = false;
+        default = Some (Row.DV_real 3.14159) };
+    ] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "table not found after reopen"
+     | Some m ->
+       let col_f = List.nth m.C.columns 1 in
+       (match col_f.Row.default with
+        | Some (Row.DV_real x) when Float.equal x 3.14159 -> ()
+        | Some _ -> Alcotest.fail "wrong default value variant"
+        | None   -> Alcotest.fail "default lost"));
+    Lwt.return_unit
+  )
+
+let test_default_text_roundtrip () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let cols : Row.column list = [
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "s"; ty = Row.Text;    not_null = false; primary_key = false;
+        default = Some (Row.DV_text "hello") };
+    ] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "table not found after reopen"
+     | Some m ->
+       let col_s = List.nth m.C.columns 1 in
+       (match col_s.Row.default with
+        | Some (Row.DV_text "hello") -> ()
+        | Some _ -> Alcotest.fail "wrong default value variant"
+        | None   -> Alcotest.fail "default lost"));
+    Lwt.return_unit
+  )
+
+let test_default_null_roundtrip () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let cols : Row.column list = [
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
+        default = Some Row.DV_null };
+    ] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "table not found after reopen"
+     | Some m ->
+       let col = List.nth m.C.columns 0 in
+       (match col.Row.default with
+        | Some Row.DV_null -> ()
+        | Some _ -> Alcotest.fail "wrong default value variant"
+        | None   -> Alcotest.fail "default lost"));
+    Lwt.return_unit
+  )
+
+(* Gap-fill: decode_default_value with corrupt tag (line 141).
+   Inject a column entry with has_default=1 but tag=99 (unknown), so
+   load_columns hits the failwith branch. *)
+let corrupt_default_tag () =
+  let store = S.create () in
+  run (
+    let* cat = C.open_ store in
+    let* _ = C.create_table cat ~name:"t"
+      ~columns:[{ Row.name = "x"; ty = Row.Integer; not_null = false;
+                  primary_key = false; default = None }] in
+    let col_key =
+      let tn = Bytes.of_string "t" in
+      let ord = Bytes.make 8 '\x00' in
+      Bytes.cat (Bytes.cat tn (Bytes.of_string "\x00")) ord
+    in
+    let bad_val =
+      let buf = Buffer.create 16 in
+      let v = Sqlocaml_encoding.Varint.encode_uint64 in
+      v buf 1L;       (* type tag = INTEGER *)
+      v buf 1L;       (* name len = 1 *)
+      Buffer.add_string buf "x";
+      v buf 0L;       (* not_null = 0 *)
+      v buf 0L;       (* primary_key = 0 *)
+      v buf 1L;       (* has_default = 1 *)
+      v buf 99L;      (* default tag = 99 (invalid) *)
+      Buffer.to_bytes buf
+    in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 1 col_key bad_val in  (* sys_columns_tid = 1 *)
+    S.commit tx
+  );
+  (try
+     let _ = Lwt_main.run (C.open_ store) in
+     Alcotest.fail "expected Failure for corrupt default tag"
+   with Failure _ -> ())
+
+let test_default_int_roundtrip () =
+  run (
+    let store = S.create () in
+    let* cat1 = C.open_ store in
+    let cols : Row.column list = [
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
+        default = Some (Row.DV_int 12345L) };
+    ] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* cat2 = C.open_ store in
+    let* result = C.find_table cat2 ~name:"t" in
+    (match result with
+     | None -> Alcotest.fail "table not found after reopen"
+     | Some m ->
+       let col = List.nth m.C.columns 0 in
+       (match col.Row.default with
+        | Some (Row.DV_int 12345L) -> ()
+        | Some _ -> Alcotest.fail "wrong default value variant"
+        | None   -> Alcotest.fail "default lost"));
+    Lwt.return_unit
+  )
+
 (* Targeted test: verify load_all does NOT skip the first alphabetical table.
    "aardvark" sorts before "zebra" — after reopen, both must be found. *)
 let test_load_all_first_table_not_skipped () =
@@ -783,11 +934,17 @@ let () =
       Alcotest.test_case "rowid_survives_reopen"       `Quick test_rowid_survives_reopen;
       Alcotest.test_case "tree_id_survives_reopen"     `Quick test_tree_id_survives_reopen;
       Alcotest.test_case "load_all_first_table_not_skipped" `Quick test_load_all_first_table_not_skipped;
+      Alcotest.test_case "default_blob_roundtrip"      `Quick test_default_blob_roundtrip;
+      Alcotest.test_case "default_real_roundtrip"      `Quick test_default_real_roundtrip;
+      Alcotest.test_case "default_text_roundtrip"      `Quick test_default_text_roundtrip;
+      Alcotest.test_case "default_null_roundtrip"      `Quick test_default_null_roundtrip;
+      Alcotest.test_case "default_int_roundtrip"       `Quick test_default_int_roundtrip;
     ];
     "error_conditions", [
       Alcotest.test_case "create_empty_name"           `Quick test_create_empty_name;
       Alcotest.test_case "create_empty_columns"        `Quick test_create_empty_columns;
       Alcotest.test_case "corrupt_column_type_tag"     `Quick corrupt_column_type_tag;
+      Alcotest.test_case "corrupt_default_tag"         `Quick corrupt_default_tag;
     ];
     "indexes", [
       Alcotest.test_case "create_index_basic"           `Quick test_create_index_basic;

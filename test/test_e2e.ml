@@ -1173,6 +1173,125 @@ let drop_table_recreate_old_data_invisible () =
   Alcotest.check value_testable "val=new10" (Db.V_text "new10") row.(1)
 
 (* ------------------------------------------------------------------ *)
+(* Group 17: Gap-fill — Db.open_file error path, REAL DEFAULT roundtrip *)
+(* ------------------------------------------------------------------ *)
+
+(** Db.open_file with a path that points to an existing directory triggers
+    an OS-level error (e.g., EISDIR) — covers db.ml lines 34-36 and
+    store.ml line 219. *)
+let open_file_invalid_path () =
+  run (
+    (* "/" is always a directory; openfile with O_RDWR on it fails. *)
+    let* result = Db.open_file ~path:"/" in
+    (match result with
+     | Ok _ -> Alcotest.fail "expected Error opening '/'"
+     | Error (Db.Runtime _) -> ()
+     | Error _ -> Alcotest.fail "expected Runtime error variant");
+    Lwt.return_unit
+  )
+
+(** Tempfile helper that survives a single test. *)
+let with_tempfile f =
+  let path = Filename.temp_file "sqlocaml_gap_" ".db" in
+  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  let result = f path in
+  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  result
+
+(** REAL DEFAULT round-trips through close+reopen, exercising
+    encode/decode_default_value DV_real (catalog.ml lines 98-103 / 124-130)
+    and the Some-default decode branch (catalog.ml line 174). *)
+let default_real_persists () =
+  with_tempfile (fun path ->
+    run (
+      let* db_res = Db.open_file ~path in
+      let db = match db_res with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "open_file failed"
+      in
+      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, f REAL DEFAULT 2.5)" in
+      let* () = Db.close db in
+      (* Reopen and check schema *)
+      let* db_res2 = Db.open_file ~path in
+      let db2 = match db_res2 with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "reopen failed"
+      in
+      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+      let* rq = Db.query db2 "SELECT * FROM t" in
+      let* rows = match rq with
+        | Ok stream -> Lwt_stream.to_list stream
+        | Error _ -> Alcotest.fail "query failed after reopen"
+      in
+      Alcotest.(check int) "1 row" 1 (List.length rows);
+      let r = List.hd rows in
+      Alcotest.check value_testable "n=1" (Db.V_int 1L) r.(0);
+      Alcotest.check value_testable "f=2.5 (default)" (Db.V_real 2.5) r.(1);
+      Db.close db2
+    )
+  )
+
+(** TEXT DEFAULT round-trips through close+reopen.
+    Exercises catalog DV_text encode/decode_default_value branches. *)
+let default_text_persists () =
+  with_tempfile (fun path ->
+    run (
+      let* db_res = Db.open_file ~path in
+      let db = match db_res with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "open_file failed"
+      in
+      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, s TEXT DEFAULT 'hello')" in
+      let* () = Db.close db in
+      let* db_res2 = Db.open_file ~path in
+      let db2 = match db_res2 with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "reopen failed"
+      in
+      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+      let* rq = Db.query db2 "SELECT * FROM t" in
+      let* rows = match rq with
+        | Ok stream -> Lwt_stream.to_list stream
+        | Error _ -> Alcotest.fail "query failed after reopen"
+      in
+      Alcotest.(check int) "1 row" 1 (List.length rows);
+      let r = List.hd rows in
+      Alcotest.check value_testable "s=hello (default)" (Db.V_text "hello") r.(1);
+      Db.close db2
+    )
+  )
+
+(** INTEGER DEFAULT round-trips through close+reopen. Exercises DV_int
+    encode/decode branches in catalog.ml. *)
+let default_int_persists () =
+  with_tempfile (fun path ->
+    run (
+      let* db_res = Db.open_file ~path in
+      let db = match db_res with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "open_file failed"
+      in
+      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, k INTEGER DEFAULT 42)" in
+      let* () = Db.close db in
+      let* db_res2 = Db.open_file ~path in
+      let db2 = match db_res2 with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "reopen failed"
+      in
+      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+      let* rq = Db.query db2 "SELECT * FROM t" in
+      let* rows = match rq with
+        | Ok stream -> Lwt_stream.to_list stream
+        | Error _ -> Alcotest.fail "query failed after reopen"
+      in
+      Alcotest.(check int) "1 row" 1 (List.length rows);
+      let r = List.hd rows in
+      Alcotest.check value_testable "k=42 (default)" (Db.V_int 42L) r.(1);
+      Db.close db2
+    )
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1300,5 +1419,11 @@ let () =
       Alcotest.test_case "drop_index_then_recreate"           `Quick drop_index_then_recreate;
       Alcotest.test_case "drop_table_recreate_old_data_invis" `Quick drop_table_recreate_old_data_invisible;
       Alcotest.test_case "drop_first_index_then_recreate"     `Quick drop_first_index_then_recreate;
+    ];
+    "gap_fill", [
+      Alcotest.test_case "open_file_invalid_path"  `Quick open_file_invalid_path;
+      Alcotest.test_case "default_real_persists"   `Quick default_real_persists;
+      Alcotest.test_case "default_text_persists"   `Quick default_text_persists;
+      Alcotest.test_case "default_int_persists"    `Quick default_int_persists;
     ];
   ]
