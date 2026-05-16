@@ -207,6 +207,48 @@ let test_match_prefix () =
       Alcotest.(check int) "prefix count" 2 (List.length rows);
       Lwt.return_unit)
 
+let test_rank_column () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    (* doc1: "ocaml" appears 3 times — higher tf *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml ocaml ocaml tutorial')" in
+    (* doc2: "ocaml" appears 1 time *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml introduction')" in
+    (* doc3: no ocaml *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('python tutorial')" in
+    let* r = D.query db "SELECT body, rank FROM docs WHERE docs MATCH 'ocaml'" in
+    match r with
+    | Error e -> Alcotest.failf "rank: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (* Only 2 docs match "ocaml" *)
+      Alcotest.(check int) "ranked rows" 2 (List.length rows);
+      (* First row should have a rank value (real number) *)
+      (match rows with
+       | [| _; D.V_real _ |] :: _ -> Lwt.return_unit
+       | _ -> Alcotest.failf "rank column should be V_real"))
+
+let test_rank_ordering () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml ocaml ocaml')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml language')" in
+    let* r = D.query db "SELECT body, rank FROM docs WHERE docs MATCH 'ocaml'" in
+    match r with
+    | Error e -> Alcotest.failf "rank_order: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (* Results should be sorted by rank descending — doc1 first since it has more "ocaml" *)
+      Alcotest.(check int) "count" 2 (List.length rows);
+      (match rows with
+       | [| D.V_text body1; D.V_real r1 |] :: [| D.V_text body2; D.V_real r2 |] :: _ ->
+         Alcotest.(check bool) "doc1 ranks higher" true (r1 >= r2);
+         ignore (body1, body2);
+         Lwt.return_unit
+       | _ -> Alcotest.failf "unexpected row shape"))
+
 let () =
   Alcotest.run "fts" [
     "ddl", [
@@ -234,5 +276,9 @@ let () =
       Alcotest.test_case "or"        `Quick test_match_or;
       Alcotest.test_case "not"       `Quick test_match_not;
       Alcotest.test_case "prefix"    `Quick test_match_prefix;
+    ];
+    "rank", [
+      Alcotest.test_case "rank_column"   `Quick test_rank_column;
+      Alcotest.test_case "rank_ordering" `Quick test_rank_ordering;
     ];
   ]

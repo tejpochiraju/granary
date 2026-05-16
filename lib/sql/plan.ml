@@ -140,9 +140,10 @@ type op =
       where    : expr option;
     }
   | Op_fts_match_scan of {
-      fts_meta : Cat.fts_table_meta;
-      query    : Fts_query.fts_query;
-      proj     : int list;
+      fts_meta     : Cat.fts_table_meta;
+      query        : Fts_query.fts_query;
+      proj         : int list;
+      include_rank : bool;  (** if true, append BM25 score as last projected column *)
     }
 
 and proj_item =

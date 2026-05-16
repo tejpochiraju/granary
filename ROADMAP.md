@@ -68,8 +68,8 @@ some may be reconsidered in v2+.
 - [x] Joins: `INNER JOIN`, `LEFT JOIN` (nested-loop + hash join physical
       operators)
 - [x] `BEGIN`, `COMMIT`, `ROLLBACK`
-- [ ] Prepared statements with `?` parameters
-- [ ] Scalar functions: `LENGTH`, `LOWER`, `UPPER`, `COALESCE`, `IFNULL`,
+- [x] Prepared statements with `?` parameters
+- [x] Scalar functions: `LENGTH`, `LOWER`, `UPPER`, `COALESCE`, `IFNULL`,
       `ABS`, basic arithmetic & comparison
 
 ### Deferred — SQL features (v2+)
@@ -98,10 +98,10 @@ some may be reconsidered in v2+.
 - [ ] `ATTACH DATABASE` (multi-file)
 
 ### Deferred — Full-text search (v2)
-- [ ] FTS index type (separate from regular indexes)
-- [ ] Tokenizer (Unicode-aware, configurable)
-- [ ] `MATCH` operator + query syntax (AND/OR/NOT, phrases, prefixes)
-- [ ] BM25 ranking
+- [x] FTS index type (separate from regular indexes)
+- [x] Tokenizer (ASCII/UTF-8-aware word boundary split)
+- [x] `MATCH` operator + query syntax (AND/OR/NOT, prefix, phrase)
+- [x] BM25 ranking
 - [ ] Snippets / highlights
 - [ ] Decision: aim for SQLite FTS5 syntax compat or our own surface
 
@@ -230,7 +230,7 @@ stretch them.
 - [x] **Phase 3 — transactions (~6 wks):** RO snapshots, RW txn,
       BEGIN/COMMIT/ROLLBACK, MVCC correctness.
 - [x] **Phase 4 — Mirage_block (~4 wks):** unikernel deployment.
-- [ ] **Phase 5 (later) — FTS:** v2.
+- [x] **Phase 5 (later) — FTS:** basic FTS (CREATE VIRTUAL TABLE fts5, tokenizer, MATCH operator with AND/OR/NOT/prefix, BM25 ranking), scalar functions, prepared statements.
 
 ---
 

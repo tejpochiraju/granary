@@ -135,9 +135,10 @@ type bound_stmt =
       where    : bound_expr option;
     }
   | BS_fts_match_scan of {
-      fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta;
-      query    : Fts_query.fts_query;
-      proj     : int list;
+      fts_meta     : Sqlocaml_catalog.Catalog.fts_table_meta;
+      query        : Fts_query.fts_query;
+      proj         : int list;
+      include_rank : bool;
     }
 
 type error =

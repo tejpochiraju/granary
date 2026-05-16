@@ -354,5 +354,5 @@ let plan ?cat = function
     Plan.Op_fts_delete { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_seq_scan { fts_meta; where } ->
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
-  | Sema.BS_fts_match_scan { fts_meta; query; proj } ->
-    Plan.Op_fts_match_scan { fts_meta; query; proj }
+  | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank } ->
+    Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank }

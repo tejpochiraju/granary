@@ -903,6 +903,33 @@ let execute ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Pl
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
+(* BM25 scoring helpers                                                 *)
+(* ------------------------------------------------------------------ *)
+
+let bm25_score ~k1 ~b ~total_docs ~total_tokens
+               ~n_docs_with_term ~term_freq ~doc_length =
+  if total_docs = 0 || n_docs_with_term = 0 then 0.0
+  else
+    let n      = Float.of_int total_docs in
+    let n_t    = Float.of_int n_docs_with_term in
+    let tf     = Float.of_int term_freq in
+    let dl     = Float.of_int doc_length in
+    let avgdl  = Float.of_int total_tokens /. n in
+    let idf    = Float.log ((n -. n_t +. 0.5) /. (n_t +. 0.5) +. 1.0) in
+    idf *. (tf *. (k1 +. 1.0)) /. (tf +. k1 *. (1.0 -. b +. b *. dl /. avgdl))
+
+(** Collect all positive (non-negated) terms from a query for BM25. *)
+let fts_query_terms query =
+  let rec collect = function
+    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [t]
+    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [t]
+    | Fts_query.FQ_term (Fts_query.FT_phrase ts) -> ts
+    | Fts_query.FQ_and qs | Fts_query.FQ_or qs   -> List.concat_map collect qs
+    | Fts_query.FQ_not _                          -> []
+  in
+  List.sort_uniq String.compare (collect query)
+
+(* ------------------------------------------------------------------ *)
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* ------------------------------------------------------------------ *)
 
@@ -1305,10 +1332,42 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
           else read_next ()
     in
     Lwt.return (Lwt_stream.from read_next)
-  | Plan.Op_fts_match_scan { fts_meta; query; proj } ->
+  | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank } ->
     let* tx = S.ro_begin store in
     let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
-    let* rows = Lwt_list.filter_map_s (fun (rowid, _positions) ->
+    (* Compute BM25 scores when rank is requested *)
+    let* scored_matches =
+      if not include_rank then
+        Lwt.return (List.map (fun (rowid, positions) -> (rowid, positions, 0.0)) matches)
+      else begin
+        let* (total_docs, total_tokens) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+        let query_terms = fts_query_terms query in
+        let* term_doc_counts = Lwt_list.map_s (fun term ->
+          let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
+          Lwt.return (term, List.length pl)) query_terms in
+        let* doc_lengths = Lwt_list.map_s (fun (rowid, positions) ->
+          let dlen_key = fts_doclen_key rowid in
+          let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
+          let dl = match v with
+            | None -> 1
+            | Some b -> let (n, _) = Varint.decode_uint64 b 0 in Int64.to_int n
+          in
+          Lwt.return (rowid, positions, dl)) matches in
+        let scored = List.map (fun (rowid, positions, dl) ->
+          let tf = List.length positions in
+          let score = List.fold_left (fun acc (_, n_docs) ->
+            acc +. bm25_score ~k1:1.2 ~b:0.75 ~total_docs ~total_tokens
+                               ~n_docs_with_term:n_docs ~term_freq:tf ~doc_length:dl)
+            0.0 term_doc_counts in
+          (rowid, positions, score)) doc_lengths in
+        Lwt.return scored
+      end
+    in
+    (* Sort by BM25 score descending when rank is included *)
+    let sorted = if include_rank then
+      List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
+    else scored_matches in
+    let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
       let key = Rowid.encode rowid in
       let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
       match val_opt with
@@ -1316,10 +1375,10 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       | Some bytes ->
         let texts = fts_decode_content bytes in
         let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        let projected = if proj = [] then full_row
-                        else Array.of_list (List.map (fun i -> full_row.(i)) proj)
-        in
-        Lwt.return (Some projected)) matches in
+        let projected = if proj = [] then Array.to_list full_row
+                        else List.map (fun i -> full_row.(i)) proj in
+        let row_values = projected @ (if include_rank then [Row.V_real score] else []) in
+        Lwt.return (Some (Array.of_list row_values))) sorted in
     let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _

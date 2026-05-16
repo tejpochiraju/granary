@@ -109,9 +109,10 @@ type bound_stmt =
       where    : bound_expr option;
     }
   | BS_fts_match_scan of {
-      fts_meta : Cat.fts_table_meta;
-      query    : Fts_query.fts_query;
-      proj     : int list;
+      fts_meta     : Cat.fts_table_meta;
+      query        : Fts_query.fts_query;
+      proj         : int list;
+      include_rank : bool;
     }
 
 type error =
@@ -613,26 +614,36 @@ let bind_fts_seq_scan cat ~param_counter:_ ~table ~where ~proj =
          (match Fts_query.parse query_str with
           | Error msg -> Lwt.return (Error (Unsupported ("FTS query parse error: " ^ msg)))
           | Ok q ->
-            (* Compute column ordinals from the projection *)
-            let col_ords = match proj with
+            (* Compute column ordinals and detect the virtual `rank` column.
+               `rank` is not a real column — it triggers include_rank=true and
+               is NOT added to proj (the executor appends it as the last value). *)
+            let all_real_ords = List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns in
+            let (col_ords, include_rank) = match proj with
               | `All ->
-                List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns
+                (* SELECT * from FTS: no explicit rank requested *)
+                (all_real_ords, false)
               | `Cols names ->
-                List.filter_map (fun name ->
-                  let rec find i = function
-                    | [] -> None
-                    | c :: _ when String.equal c name -> Some i
-                    | _ :: rest -> find (i+1) rest
-                  in
-                  find 0 fts_meta.Cat.fts_columns
-                ) names
+                let has_rank = List.exists (String.equal "rank") names in
+                let real_ords = List.filter_map (fun name ->
+                  if String.equal name "rank" then None
+                  else
+                    let rec find i = function
+                      | [] -> None
+                      | c :: _ when String.equal c name -> Some i
+                      | _ :: rest -> find (i+1) rest
+                    in
+                    find 0 fts_meta.Cat.fts_columns
+                ) names in
+                (real_ords, has_rank)
               | `Exprs _ ->
-                List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns
+                (* Expression projections: treat as SELECT * with no rank *)
+                (all_real_ords, false)
             in
             Lwt.return (Ok (BS_fts_match_scan {
               fts_meta;
               query = q;
               proj  = col_ords;
+              include_rank;
             })))
      | _ ->
        let synth_meta = fts_as_table_meta fts_meta in
