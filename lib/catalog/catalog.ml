@@ -369,6 +369,20 @@ let next_rowid t ~name =
     let%lwt () = S.commit tx in
     Lwt.return id
 
+(** Like [next_rowid] but uses an already-acquired RW transaction.
+    The txn is NOT committed; the caller is responsible for the commit.
+    Use this when an explicit transaction is already held to avoid
+    deadlocking on the store's RW mutex. *)
+let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
+  match Hashtbl.find_opt t.cache name with
+  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | Some m ->
+    let id = m.next_rowid in
+    let m' = { m with next_rowid = Int64.add id 1L } in
+    Hashtbl.replace t.cache name m';
+    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
+    Lwt.return id
+
 let create_index t ~name ~table ~column ~unique =
   if Hashtbl.mem t.indexes name then
     Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))

@@ -81,6 +81,9 @@ type bound_stmt =
       name     : string;
       idx_info : Cat.index_info;
     }
+  | BS_begin
+  | BS_commit
+  | BS_rollback
 
 type error =
   | Unknown_table       of string
@@ -976,3 +979,6 @@ let bind cat = function
     bind_drop_table cat ~name
   | Ast.S_drop_index { name } ->
     bind_drop_index cat ~name
+  | Ast.S_begin    -> Lwt.return (Ok BS_begin)
+  | Ast.S_commit   -> Lwt.return (Ok BS_commit)
+  | Ast.S_rollback -> Lwt.return (Ok BS_rollback)

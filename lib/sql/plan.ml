@@ -113,6 +113,9 @@ type op =
         (** projection over the aggregate output row.  Maps to the final
             row emitted to downstream operators. *)
     }
+  | Op_begin
+  | Op_commit
+  | Op_rollback
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

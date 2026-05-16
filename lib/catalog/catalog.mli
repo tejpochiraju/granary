@@ -41,6 +41,12 @@ val list_tables : t -> table_meta list Lwt.t
     Raises [Failure] if the table does not exist. *)
 val next_rowid : t -> name:string -> int64 Lwt.t
 
+(** Like [next_rowid] but operates within an already-held RW transaction.
+    Does NOT commit; the caller owns the commit.  Use within explicit
+    transactions to avoid deadlocking on the store's writer mutex. *)
+val next_rowid_in_txn :
+  t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t
+
 (** Create a new index on a single column of an existing table.
     The new index gets its own [tree_id] (separate from the table tree).
     The index metadata is persisted in the [_sys_indexes] tree.

@@ -19,6 +19,7 @@
 %token UPDATE SET
 %token DELETE
 %token DROP
+%token BEGIN COMMIT ROLLBACK
 %token JOIN INNER LEFT OUTER
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
@@ -44,20 +45,32 @@ stmt_eof:
   | s = stmt SEMI? EOF { s }
 
 stmt:
-  | s = create_table { s }
-  | s = create_index { s }
-  | s = insert       { s }
-  | s = select       { s }
-  | s = update       { s }
-  | s = delete       { s }
-  | s = drop_table   { s }
-  | s = drop_index   { s }
+  | s = create_table  { s }
+  | s = create_index  { s }
+  | s = insert        { s }
+  | s = select        { s }
+  | s = update        { s }
+  | s = delete        { s }
+  | s = drop_table    { s }
+  | s = drop_index    { s }
+  | s = begin_stmt    { s }
+  | s = commit_stmt   { s }
+  | s = rollback_stmt { s }
 
 drop_table:
   | DROP TABLE name = IDENT { S_drop_table { name } }
 
 drop_index:
   | DROP INDEX name = IDENT { S_drop_index { name } }
+
+begin_stmt:
+  | BEGIN    { S_begin }
+
+commit_stmt:
+  | COMMIT   { S_commit }
+
+rollback_stmt:
+  | ROLLBACK { S_rollback }
 
 create_table:
   | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN

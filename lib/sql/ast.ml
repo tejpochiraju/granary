@@ -107,3 +107,6 @@ type stmt =
   | S_drop_index of {
       name : string;
     }
+  | S_begin
+  | S_commit
+  | S_rollback

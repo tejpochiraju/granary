@@ -136,77 +136,91 @@ let project_row (ords : int list) (row : Row.t) : Row.t =
   Array.of_list (List.map (fun i -> row.(i)) ords)
 
 (* ------------------------------------------------------------------ *)
+(* Transaction mode                                                     *)
+(* ------------------------------------------------------------------ *)
+
+type txn_mode =
+  | Auto        (** Each DML op starts and commits its own RW txn. *)
+  | In_txn of S.rw S.txn  (** Use this txn; skip auto begin/commit. *)
+
+let acquire_txn store mode =
+  match mode with
+  | Auto -> let* tx = S.rw_begin store in Lwt.return (tx, true)
+  | In_txn tx -> Lwt.return (tx, false)
+
+let release_txn tx owned =
+  if owned then S.commit tx else Lwt.return_unit
+
+(* ------------------------------------------------------------------ *)
 (* execute: write operations only                                       *)
 (* ------------------------------------------------------------------ *)
 
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
-    corresponding index entries (checking UNIQUE constraints first). *)
-let execute_insert (store : S.t) (cat : Cat.t)
+    corresponding index entries (checking UNIQUE constraints first).
+    Uses a SINGLE RW txn for both the row write and index writes. *)
+let execute_insert ?(mode = Auto) (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~values : unit Lwt.t =
   let n   = List.length table_meta.columns in
   let row = Array.make n Row.V_null in
   List.iter2 (fun ord v -> row.(ord) <- lit_to_value v) ordinals values;
-  let* rowid = Cat.next_rowid cat ~name:table_meta.name in
+  (* When an explicit transaction is already held, we must NOT call
+     Cat.next_rowid (which opens its own RW txn and deadlocks on the
+     mutex).  Instead acquire/reuse the txn first, then update the
+     rowid counter within that same txn. *)
+  let* (tx, owned) = acquire_txn store mode in
+  let* rowid = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
   let key    = Rowid.encode rowid in
   let bytes  = Row.encode table_meta.columns row in
-  let* tx    = S.rw_begin store in
-  let* ()    = S.put tx table_meta.tree_id key bytes in
-  let* ()    = S.commit tx in
-  (* If any indexes exist on this table, write index entries too. *)
+  let* () = S.put tx table_meta.tree_id key bytes in
   let idxs = Cat.indexes_for_table cat ~table:table_meta.name in
-  (match idxs with
-   | [] -> Lwt.return_unit
-   | _  ->
-     let* tx = S.rw_begin store in
-     (* Check UNIQUE constraints before writing any index entry.
-        Open RO cursors on each unique index to test for duplicates. *)
-     let* unique_ok =
-       Lwt_list.fold_left_s (fun acc (idx : Cat.index_info) ->
-         if not acc || not idx.idx_unique then Lwt.return acc
-         else begin
-           let col_idx =
-             find_col_idx_by_name table_meta.columns idx.idx_column
-           in
-           let v = row.(col_idx) in
-           let ik_value = row_value_to_index_value v in
-           let prefix = Index_key.encode_value ik_value in
-           let plen = Bytes.length prefix in
-           (* Seek to the smallest key >= prefix ++ min_rowid. *)
-           let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-           let* cur = S.cursor_open tx idx.idx_tree_id in
-           let _sr = S.cursor_seek cur seek_key in
-           let duplicate =
-             match S.cursor_next cur with
-             | None -> false
-             | Some (ikey, _) ->
-               Bytes.length ikey >= plen &&
-               Bytes.equal (Bytes.sub ikey 0 plen) prefix
-           in
-           S.cursor_close cur;
-           if duplicate then
-             Lwt.fail_with (Printf.sprintf
-               "UNIQUE constraint violated: duplicate value in column '%s'"
-               idx.idx_column)
-           else
-             Lwt.return true
-         end
-       ) true idxs
-     in
-     ignore unique_ok;
-     let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-       let col_idx =
-         find_col_idx_by_name table_meta.columns idx.idx_column
-       in
-       let v = row.(col_idx) in
-       let ikey = Index_key.encode [row_value_to_index_value v] ~rowid in
-       S.put tx idx.idx_tree_id ikey Bytes.empty
-     ) idxs in
-     S.commit tx)
+  (* Check UNIQUE constraints and write index entries in the same txn. *)
+  let* unique_ok =
+    Lwt_list.fold_left_s (fun acc (idx : Cat.index_info) ->
+      if not acc || not idx.idx_unique then Lwt.return acc
+      else begin
+        let col_idx =
+          find_col_idx_by_name table_meta.columns idx.idx_column
+        in
+        let v = row.(col_idx) in
+        let ik_value = row_value_to_index_value v in
+        let prefix = Index_key.encode_value ik_value in
+        let plen = Bytes.length prefix in
+        (* Seek to the smallest key >= prefix ++ min_rowid. *)
+        let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+        let* cur = S.cursor_open tx idx.idx_tree_id in
+        let _sr = S.cursor_seek cur seek_key in
+        let duplicate =
+          match S.cursor_next cur with
+          | None -> false
+          | Some (ikey, _) ->
+            Bytes.length ikey >= plen &&
+            Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        in
+        S.cursor_close cur;
+        if duplicate then
+          Lwt.fail_with (Printf.sprintf
+            "UNIQUE constraint violated: duplicate value in column '%s'"
+            idx.idx_column)
+        else
+          Lwt.return true
+      end
+    ) true idxs
+  in
+  ignore unique_ok;
+  let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    let col_idx =
+      find_col_idx_by_name table_meta.columns idx.idx_column
+    in
+    let v = row.(col_idx) in
+    let ikey = Index_key.encode [row_value_to_index_value v] ~rowid in
+    S.put tx idx.idx_tree_id ikey Bytes.empty
+  ) idxs in
+  release_txn tx owned
 
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
-let execute_create_index (store : S.t) (cat : Cat.t)
+let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
     ~name ~table ~tree_id ~col_idx ~unique
     ~(columns : Row.column list) : unit Lwt.t =
   let* res = Cat.create_index cat ~name ~table
@@ -214,7 +228,7 @@ let execute_create_index (store : S.t) (cat : Cat.t)
   match res with
   | Error msg -> failwith msg
   | Ok info ->
-    let* tx = S.rw_begin store in
+    let* (tx, owned) = acquire_txn store mode in
     let* cur = S.cursor_open tx tree_id in
     let _sr = S.cursor_first cur in
     let rec walk () =
@@ -230,7 +244,7 @@ let execute_create_index (store : S.t) (cat : Cat.t)
     in
     let* () = walk () in
     S.cursor_close cur;
-    S.commit tx
+    release_txn tx owned
 
 (** Check whether inserting a new index entry for [new_value] with
     [rowid] into [idx] would violate a UNIQUE constraint.  Returns
@@ -270,7 +284,7 @@ let unique_violation_on_update
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
     number of rows whose contents were modified. *)
-let execute_update (store : S.t)
+let execute_update ?(mode = Auto) (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(assignments : (int * Plan.expr) list)
     ~(where : Plan.expr option)
@@ -303,7 +317,7 @@ let execute_update (store : S.t)
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
-    let* tx = S.rw_begin store in
+    let* (tx, owned) = acquire_txn store mode in
     (* First pass: validate UNIQUE constraints for every target row,
        considering the FULL set of new values (each updated row may
        conflict with another updated row). *)
@@ -372,14 +386,14 @@ let execute_update (store : S.t)
         S.put tx table_meta.tree_id key new_bytes
       ) matches
     in
-    let* () = S.commit tx in
+    let* () = release_txn tx owned in
     Lwt.return n
   end
 
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
     then for each matching (rowid, row) remove index entries and the
     row itself from the table tree.  Returns the number of rows deleted. *)
-let execute_delete (store : S.t)
+let execute_delete ?(mode = Auto) (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(where : Plan.expr option)
     ~(indexes : Cat.index_info list)
@@ -410,7 +424,7 @@ let execute_delete (store : S.t)
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
-    let* tx = S.rw_begin store in
+    let* (tx, owned) = acquire_txn store mode in
     let* () =
       Lwt_list.iter_s (fun (rowid, row) ->
         let rowid_key = Rowid.encode rowid in
@@ -427,61 +441,63 @@ let execute_delete (store : S.t)
         S.del tx table_meta.tree_id rowid_key
       ) matches
     in
-    let* () = S.commit tx in
+    let* () = release_txn tx owned in
     Lwt.return n
   end
 
 (** Run [Op_drop_table]: remove catalog entries for the table and all
     its indexes.  The B+-tree pages are NOT reclaimed in Phase 2. *)
-let execute_drop_table (store : S.t) (cat : Cat.t)
+let execute_drop_table ?(mode = Auto) (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
     ~(_indexes : Cat.index_info list) : unit Lwt.t =
-  let* tx = S.rw_begin store in
+  let* (tx, owned) = acquire_txn store mode in
   let* () = Cat.drop_table cat tx ~name:table_meta.Cat.name in
-  S.commit tx
+  release_txn tx owned
 
 (** Run [Op_drop_index]: remove catalog entry for the index.
     The B+-tree pages are NOT reclaimed in Phase 2. *)
-let execute_drop_index (store : S.t) (cat : Cat.t)
+let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
     ~(idx_info : Cat.index_info) : unit Lwt.t =
-  let* tx = S.rw_begin store in
+  let* (tx, owned) = acquire_txn store mode in
   let* () = Cat.drop_index cat tx ~name:idx_info.Cat.idx_name in
-  S.commit tx
+  release_txn tx owned
 
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
-let execute_with_count (store : S.t) (cat : Cat.t) (op : Plan.op)
+let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
   | Plan.Op_create_table { name; columns } ->
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values } ->
-    let* () = execute_insert store cat ~table_meta ~ordinals ~values in
+    let* () = execute_insert ~mode store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
   | Plan.Op_create_index { name; table; tree_id; col_idx; unique; columns } ->
-    let* () = execute_create_index store cat ~name ~table ~tree_id
+    let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
                 ~col_idx ~unique ~columns in
     Lwt.return 0
   | Plan.Op_update { table_meta; assignments; where; indexes } ->
-    execute_update store ~table_meta ~assignments ~where ~indexes
+    execute_update ~mode store ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes } ->
-    execute_delete store ~table_meta ~where ~indexes
+    execute_delete ~mode store ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
-    let* () = execute_drop_table store cat ~table_meta ~_indexes:indexes in
+    let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     Lwt.return 0
   | Plan.Op_drop_index { idx_info } ->
-    let* () = execute_drop_index store cat ~idx_info in
+    let* () = execute_drop_index ~mode store cat ~idx_info in
     Lwt.return 0
+  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
+    failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
-let execute (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count store cat op in
+let execute ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
+  let* _n = execute_with_count ~mode store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
@@ -858,7 +874,8 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     Lwt.return (Lwt_stream.of_list final_rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _
-  | Plan.Op_drop_table _ | Plan.Op_drop_index _ ->
+  | Plan.Op_drop_table _ | Plan.Op_drop_index _
+  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.query: use Exec.execute for write operations"
 
 (* ------------------------------------------------------------------ *)

@@ -42,6 +42,9 @@ rule token = parse
   | "DEFAULT"  { DEFAULT }
   | "DELETE"   { DELETE }
   | "DROP"     { DROP }
+  | "BEGIN"    { BEGIN }
+  | "COMMIT"   { COMMIT }
+  | "ROLLBACK" { ROLLBACK }
   | "JOIN"     { JOIN }
   | "INNER"    { INNER }
   | "LEFT"     { LEFT }

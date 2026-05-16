@@ -69,6 +69,10 @@ type backend =
 type t = {
   backend  : backend;
   rw_mutex : Lwt_mutex.t;
+  (* Snapshot of Mem backend tree contents taken at rw_begin.
+     Used to implement rollback for the in-memory backend.
+     None when no RW transaction is active. *)
+  mutable mem_rw_snapshot : (tree_id * Bytes.t BytesMap.t) list option;
 }
 
 type ro_snapshot = {
@@ -242,7 +246,8 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 (* ------------------------------------------------------------------ *)
 
 let create () : t =
-  { backend = Mem (Hashtbl.create 16); rw_mutex = Lwt_mutex.create () }
+  { backend = Mem (Hashtbl.create 16); rw_mutex = Lwt_mutex.create ();
+    mem_rw_snapshot = None }
 
 let map_unix_err (e : Unix_file.error) : error =
   match e with
@@ -323,7 +328,8 @@ let open_file ~path : (t, error) result Lwt.t =
               active_readers = Hashtbl.create 4 }
           in
           Lwt.return_ok
-            { backend = Btree st; rw_mutex = Lwt_mutex.create () }
+            { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+              mem_rw_snapshot = None }
     end else begin
       let pager = pager_of_unix_file file ~freelist:Freelist.empty in
       let%lwt hr = Header.read_live pager in
@@ -342,7 +348,8 @@ let open_file ~path : (t, error) result Lwt.t =
             active_readers = Hashtbl.create 4 }
         in
         Lwt.return_ok
-          { backend = Btree st; rw_mutex = Lwt_mutex.create () }
+          { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+            mem_rw_snapshot = None }
     end
 
 let close (t : t) : unit Lwt.t =
@@ -377,7 +384,10 @@ let ro_begin t =
 let rw_begin t =
   let* () = Lwt_mutex.lock t.rw_mutex in
   (match t.backend with
-   | Mem _ -> ()
+   | Mem trees ->
+     (* Snapshot all currently-existing trees so rollback can restore them. *)
+     let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+     t.mem_rw_snapshot <- Some snap
    | Btree st ->
      let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
      Pager.set_txn_id st.pager current_rw_txn_id;
@@ -502,7 +512,9 @@ let write_freelist_pages pager : int64 Lwt.t =
    the header alternating-pages protocol). *)
 let commit (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
-   | Mem _ -> Lwt.return_unit
+   | Mem _ ->
+     t.mem_rw_snapshot <- None;
+     Lwt.return_unit
    | Btree st ->
      (* 1. Free old freelist pages from the previous commit *)
      let* () = free_old_freelist_pages st.pager
@@ -553,8 +565,9 @@ let commit (Rw t : rw txn) : unit Lwt.t =
   Lwt.return_unit
 
 (* rollback:
-   - Phase 1 Mem: mutations are applied immediately; nothing to undo.
-   - Phase 1 Btree: drop cached tree handles so subsequent reads pick up
+   - Mem: restore the snapshot of tree contents taken at rw_begin, so that
+     mutations made during this txn are undone.
+   - Btree: drop cached tree handles so subsequent reads pick up
      last-committed roots from the meta-tree, then restore the freelist
      snapshot taken at rw_begin and clear dirty pages.
      Discard dirty pages from the aborted txn: clear_dirty removes them from
@@ -563,7 +576,24 @@ let commit (Rw t : rw txn) : unit Lwt.t =
      corrupt future allocations. *)
 let rollback (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
-   | Mem _ -> ()
+   | Mem trees ->
+     (* Restore tree contents to the snapshot taken at rw_begin. *)
+     (match t.mem_rw_snapshot with
+      | None -> ()   (* no snapshot (shouldn't happen) *)
+      | Some snap ->
+        (* Restore each tree that existed at snapshot time. *)
+        List.iter (fun (tid, map) ->
+          match Hashtbl.find_opt trees tid with
+          | None -> ()   (* tree was added after snapshot; skip *)
+          | Some r -> r := map
+        ) snap;
+        (* Remove trees that were created during this txn (tid not in snap). *)
+        let snap_tids = List.map fst snap in
+        Hashtbl.iter (fun tid _ ->
+          if not (List.mem tid snap_tids) then
+            Hashtbl.remove trees tid
+        ) (Hashtbl.copy trees);
+        t.mem_rw_snapshot <- None)
    | Btree st ->
      (* Drop the per-tree cache so subsequent reads pick up the
         last-committed roots from the meta-tree.  Note: the meta-tree

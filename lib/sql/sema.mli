@@ -103,6 +103,9 @@ type bound_stmt =
       name     : string;
       idx_info : Sqlocaml_catalog.Catalog.index_info;
     }
+  | BS_begin
+  | BS_commit
+  | BS_rollback
 
 type error =
   | Unknown_table       of string
