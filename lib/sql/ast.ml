@@ -123,3 +123,7 @@ type stmt =
   | S_begin
   | S_commit
   | S_rollback
+  | S_create_fts_table of {
+      name    : string;
+      columns : string list;
+    }

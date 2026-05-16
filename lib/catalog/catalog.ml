@@ -7,6 +7,10 @@ let sys_tables_tid  : S.tree_id = 0
 let sys_columns_tid : S.tree_id = 1
 let sys_indexes_tid : S.tree_id = 2
 let sys_meta_tid    : S.tree_id = 3
+let sys_fts_tid     : S.tree_id = 4
+
+(* Rowid counter key suffix for FTS tables: name ++ "\x00rowid" *)
+let sys_fts_rowid_suffix = Bytes.of_string "\x00rowid"
 
 let next_user_tid_key = Bytes.of_string "next_user_tid"
 let next_user_tid_init = 16
@@ -29,11 +33,20 @@ type index_info = {
   idx_tree_id : S.tree_id;
 }
 
+type fts_table_meta = {
+  fts_name         : string;
+  fts_content_tree : S.tree_id;
+  fts_index_tree   : S.tree_id;
+  fts_columns      : string list;
+}
+
 type t = {
   store : S.t;
   cache : (string, table_meta) Hashtbl.t;
   (* index_name -> index_info *)
   indexes : (string, index_info) Hashtbl.t;
+  (* fts_name -> fts_table_meta *)
+  fts : (string, fts_table_meta) Hashtbl.t;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -218,6 +231,38 @@ let decode_index_value bytes =
     idx_tree_id = Int64.to_int tree_id;
   }
 
+(* FTS value encoding:
+   varint(content_tree) ++ varint(index_tree) ++ varint(n_cols)
+   ++ (varint(col_len) ++ col_bytes)* *)
+let encode_fts_value (m : fts_table_meta) =
+  let buf = Buffer.create 32 in
+  Varint.encode_uint64 buf (Int64.of_int m.fts_content_tree);
+  Varint.encode_uint64 buf (Int64.of_int m.fts_index_tree);
+  Varint.encode_uint64 buf (Int64.of_int (List.length m.fts_columns));
+  List.iter (fun col ->
+    let b = Bytes.of_string col in
+    Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+    Buffer.add_bytes buf b) m.fts_columns;
+  Buffer.to_bytes buf
+
+let decode_fts_value fts_name bytes =
+  let ct,  off0 = Varint.decode_uint64 bytes 0 in
+  let it,  off1 = Varint.decode_uint64 bytes off0 in
+  let nc,  off2 = Varint.decode_uint64 bytes off1 in
+  let n = Int64.to_int nc in
+  let cols = ref [] in
+  let pos = ref off2 in
+  for _ = 1 to n do
+    let len, off = Varint.decode_uint64 bytes !pos in
+    let col = Bytes.sub_string bytes off (Int64.to_int len) in
+    cols := col :: !cols;
+    pos := off + Int64.to_int len
+  done;
+  { fts_name;
+    fts_content_tree = Int64.to_int ct;
+    fts_index_tree   = Int64.to_int it;
+    fts_columns      = List.rev !cols }
+
 (* ------------------------------------------------------------------ *)
 (* next_user_tid / next_index_id management                              *)
 (* ------------------------------------------------------------------ *)
@@ -325,6 +370,30 @@ let load_all_indexes store =
   let%lwt () = S.ro_end tx in
   Lwt.return tbl
 
+let load_all_fts store =
+  let tbl = Hashtbl.create 4 in
+  let%lwt tx = S.ro_begin store in
+  let%lwt cur = S.cursor_open tx sys_fts_tid in
+  let _sr = S.cursor_first cur in
+  let rec walk () =
+    match S.cursor_next cur with
+    | None -> Lwt.return_unit
+    | Some (k, v) ->
+      (* Skip rowid counter keys: they start with \x00 *)
+      if Bytes.length k > 0 && Bytes.get_uint8 k 0 = 0 then
+        walk ()
+      else begin
+        let name = Bytes.to_string k in
+        let meta = decode_fts_value name v in
+        Hashtbl.replace tbl name meta;
+        walk ()
+      end
+  in
+  let%lwt () = walk () in
+  S.cursor_close cur;
+  let%lwt () = S.ro_end tx in
+  Lwt.return tbl
+
 (* ------------------------------------------------------------------ *)
 (* Public API                                                           *)
 (* ------------------------------------------------------------------ *)
@@ -332,13 +401,19 @@ let load_all_indexes store =
 let open_ store =
   let%lwt cache = load_all_tables store in
   let%lwt indexes = load_all_indexes store in
-  Lwt.return { store; cache; indexes }
+  let%lwt fts = load_all_fts store in
+  Lwt.return { store; cache; indexes; fts }
+
+(** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
+let next_user_tid t =
+  let%lwt tid = read_next_user_tid t.store in
+  let%lwt () = write_next_user_tid t.store (tid + 1) in
+  Lwt.return tid
 
 let create_table t ~name ~columns =
   if Hashtbl.mem t.cache name then
     failwith (Printf.sprintf "table '%s' already exists" name);
-  let%lwt tid = read_next_user_tid t.store in
-  let%lwt () = write_next_user_tid t.store (tid + 1) in
+  let%lwt tid = next_user_tid t in
   let m = { name; tree_id = tid; columns; next_rowid = 1L } in
   let%lwt tx = S.rw_begin t.store in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
@@ -397,8 +472,7 @@ let create_index t ~name ~table ~column ~unique =
         Lwt.return (Error (Printf.sprintf
                              "no column '%s' on table '%s'" column table))
       else
-        let%lwt tid = read_next_user_tid t.store in
-        let%lwt () = write_next_user_tid t.store (tid + 1) in
+        let%lwt tid = next_user_tid t in
         let%lwt id = read_next_index_id t.store in
         let%lwt () = write_next_index_id t.store (id + 1) in
         let info = {
@@ -485,3 +559,41 @@ let drop_table t tx ~name =
   (* 4. Update in-memory cache. *)
   Hashtbl.remove t.cache name;
   Lwt.return_unit
+
+(* ------------------------------------------------------------------ *)
+(* FTS public API                                                       *)
+(* ------------------------------------------------------------------ *)
+
+let find_fts (t : t) name = Hashtbl.find_opt t.fts name
+
+let create_fts_table (t : t) ~name ~columns : fts_table_meta Lwt.t =
+  (* Allocate two new tree IDs: one for content, one for the inverted index *)
+  let%lwt content_tree = next_user_tid t in
+  let%lwt index_tree   = next_user_tid t in
+  let meta = { fts_name = name;
+               fts_content_tree = content_tree;
+               fts_index_tree   = index_tree;
+               fts_columns      = columns } in
+  (* Write to sys_fts_tid *)
+  let%lwt tx = S.rw_begin t.store in
+  let key   = Bytes.of_string name in
+  let value = encode_fts_value meta in
+  let%lwt () = S.put tx sys_fts_tid key value in
+  let%lwt () = S.commit tx in
+  Hashtbl.replace t.fts name meta;
+  Lwt.return meta
+
+(** Rowid counter for FTS tables stored as a separate key in sys_fts_tid.
+    Key format: name ++ "\x00rowid" (the \x00 prefix sorts before printable ASCII). *)
+let next_fts_rowid_in_txn (_t : t) ~name (tx : S.rw S.txn) : int64 Lwt.t =
+  let rowid_key = Bytes.cat (Bytes.of_string name) sys_fts_rowid_suffix in
+  let%lwt cur_opt = S.get tx sys_fts_tid rowid_key in
+  let cur = match cur_opt with
+    | None -> 1L
+    | Some b -> let (n, _) = Varint.decode_int64 b 0 in n
+  in
+  let next = Int64.add cur 1L in
+  let nbuf = Buffer.create 8 in
+  Varint.encode_int64 nbuf next;
+  let%lwt () = S.put tx sys_fts_tid rowid_key (Buffer.to_bytes nbuf) in
+  Lwt.return cur

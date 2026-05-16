@@ -557,6 +557,9 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_drop_index { idx_info } ->
     let* () = execute_drop_index ~mode store cat ~idx_info in
     Lwt.return 0
+  | Plan.Op_create_fts_table { name; columns } ->
+    let* _ = Cat.create_fts_table cat ~name ~columns in
+    Lwt.return 0
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
@@ -951,6 +954,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
+  | Plan.Op_create_fts_table _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.query: use Exec.execute for write operations"
 

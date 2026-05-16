@@ -1,6 +1,6 @@
 (** In-memory catalog backed by system trees in the Store.
     System tree allocation: 0=_sys_tables, 1=_sys_columns, 2=_sys_indexes,
-    3=_sys_meta.  User tables and indexes use tree_ids >= 16. *)
+    3=_sys_meta, 4=_sys_fts_tables.  User tables and indexes use tree_ids >= 16. *)
 
 type t
 
@@ -17,6 +17,13 @@ type index_info = {
   idx_column  : string;
   idx_unique  : bool;
   idx_tree_id : Sqlocaml_store.Store.tree_id;
+}
+
+type fts_table_meta = {
+  fts_name         : string;
+  fts_content_tree : Sqlocaml_store.Store.tree_id;
+  fts_index_tree   : Sqlocaml_store.Store.tree_id;
+  fts_columns      : string list;
 }
 
 (** Open (or initialise) a catalog on the given store.
@@ -88,3 +95,16 @@ val drop_index :
   Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
   name:string ->
   unit Lwt.t
+
+(** Find an FTS table by name. Returns [None] if not found. *)
+val find_fts : t -> string -> fts_table_meta option
+
+(** Create a new FTS virtual table.  Allocates two new tree IDs (content tree
+    and inverted-index tree) and persists the entry in the [_sys_fts_tables]
+    system tree.  Raises [Failure] if a table with that name already exists. *)
+val create_fts_table : t -> name:string -> columns:string list -> fts_table_meta Lwt.t
+
+(** Allocate and return the next rowid for an FTS table within an already-held
+    RW transaction.  Does NOT commit; the caller owns the commit. *)
+val next_fts_rowid_in_txn :
+  t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t

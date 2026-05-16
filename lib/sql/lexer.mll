@@ -62,6 +62,9 @@ rule token = parse
   | "ABS"      { ABS }
   | "COALESCE" { COALESCE }
   | "IFNULL"   { IFNULL }
+  | "VIRTUAL"  { VIRTUAL }
+  | "USING"    { USING }
+  | "FTS5"     { FTS5 }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

@@ -115,6 +115,10 @@ type bound_stmt =
   | BS_begin
   | BS_commit
   | BS_rollback
+  | BS_create_fts_table of {
+      name    : string;
+      columns : string list;
+    }
 
 type error =
   | Unknown_table       of string

@@ -122,6 +122,10 @@ type op =
   | Op_begin
   | Op_commit
   | Op_rollback
+  | Op_create_fts_table of {
+      name    : string;
+      columns : string list;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

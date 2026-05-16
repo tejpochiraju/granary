@@ -24,6 +24,7 @@
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
+%token VIRTUAL USING FTS5
 %token QUESTION
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
@@ -47,17 +48,18 @@ stmt_eof:
   | s = stmt SEMI? EOF { s }
 
 stmt:
-  | s = create_table  { s }
-  | s = create_index  { s }
-  | s = insert        { s }
-  | s = select        { s }
-  | s = update        { s }
-  | s = delete        { s }
-  | s = drop_table    { s }
-  | s = drop_index    { s }
-  | s = begin_stmt    { s }
-  | s = commit_stmt   { s }
-  | s = rollback_stmt { s }
+  | s = create_table      { s }
+  | s = create_fts_table  { s }
+  | s = create_index      { s }
+  | s = insert            { s }
+  | s = select            { s }
+  | s = update            { s }
+  | s = delete            { s }
+  | s = drop_table        { s }
+  | s = drop_index        { s }
+  | s = begin_stmt        { s }
+  | s = commit_stmt       { s }
+  | s = rollback_stmt     { s }
 
 drop_table:
   | DROP TABLE name = IDENT { S_drop_table { name } }
@@ -77,6 +79,11 @@ rollback_stmt:
 create_table:
   | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN
     { S_create_table { name; columns = cols } }
+
+create_fts_table:
+  | CREATE VIRTUAL TABLE name = IDENT USING FTS5
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { S_create_fts_table { name; columns = cols } }
 
 create_index:
   | CREATE INDEX name = IDENT ON table = IDENT LPAREN col = IDENT RPAREN

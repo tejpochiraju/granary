@@ -343,3 +343,5 @@ let plan ?cat = function
   | Sema.BS_begin    -> Plan.Op_begin
   | Sema.BS_commit   -> Plan.Op_commit
   | Sema.BS_rollback -> Plan.Op_rollback
+  | Sema.BS_create_fts_table { name; columns } ->
+    Plan.Op_create_fts_table { name; columns }

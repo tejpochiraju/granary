@@ -90,6 +90,10 @@ type bound_stmt =
   | BS_begin
   | BS_commit
   | BS_rollback
+  | BS_create_fts_table of {
+      name    : string;
+      columns : string list;
+    }
 
 type error =
   | Unknown_table       of string
@@ -1123,3 +1127,10 @@ let bind cat stmt =
   | Ast.S_begin    -> Lwt.return (Ok BS_begin)
   | Ast.S_commit   -> Lwt.return (Ok BS_commit)
   | Ast.S_rollback -> Lwt.return (Ok BS_rollback)
+  | Ast.S_create_fts_table { name; columns } ->
+    let* tbl = Cat.find_table cat ~name in
+    let fts_existing = Cat.find_fts cat name in
+    (match tbl, fts_existing with
+     | Some _, _ | _, Some _ -> Lwt.return (Error (Already_exists name))
+     | None, None ->
+       Lwt.return (Ok (BS_create_fts_table { name; columns })))
