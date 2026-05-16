@@ -370,6 +370,12 @@ let load_all_indexes store =
   let%lwt () = S.ro_end tx in
   Lwt.return tbl
 
+let is_fts_rowid_key k =
+  let suffix = sys_fts_rowid_suffix in
+  let slen = Bytes.length suffix in
+  Bytes.length k > slen &&
+  Bytes.equal (Bytes.sub k (Bytes.length k - slen) slen) suffix
+
 let load_all_fts store =
   let tbl = Hashtbl.create 4 in
   let%lwt tx = S.ro_begin store in
@@ -379,8 +385,8 @@ let load_all_fts store =
     match S.cursor_next cur with
     | None -> Lwt.return_unit
     | Some (k, v) ->
-      (* Skip rowid counter keys: they start with \x00 *)
-      if Bytes.length k > 0 && Bytes.get_uint8 k 0 = 0 then
+      (* Skip rowid counter keys: they end with "\x00rowid" *)
+      if is_fts_rowid_key k then
         walk ()
       else begin
         let name = Bytes.to_string k in
