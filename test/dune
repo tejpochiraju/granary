@@ -5,3 +5,7 @@
 (test
  (name test_txn)
  (libraries sqlocaml sqlocaml.sql sqlocaml.encoding alcotest lwt.unix))
+
+(test
+ (name test_mirage_backend)
+ (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))

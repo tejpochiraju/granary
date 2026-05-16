@@ -1,5 +1,13 @@
 (library
  (name sqlocaml_block)
  (public_name sqlocaml.block)
+ (modules block mem unix_file)
  (libraries lwt lwt.unix unix cstruct)
+ (instrumentation (backend bisect_ppx)))
+
+(library
+ (name sqlocaml_mirage_block)
+ (public_name sqlocaml.mirage_block)
+ (modules mirage_backend)
+ (libraries mirage-block lwt cstruct)
  (instrumentation (backend bisect_ppx)))

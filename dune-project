@@ -15,4 +15,6 @@
   (cstruct (>= 6.2))
   (menhir (>= 20240715))
   (alcotest :with-test)
-  (qcheck-alcotest :with-test)))
+  (qcheck-alcotest :with-test)
+  (mirage-block (>= "3.0.0"))
+  (mirage-block-unix (>= "2.14.0"))))
