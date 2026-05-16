@@ -73,8 +73,9 @@ let compile t sql =
 
 (* Prepared statement: holds a compiled plan for repeated execution. *)
 type stmt = {
-  db_ref : t;
-  plan   : Sql.Plan.op;
+  db_ref             : t;
+  plan               : Sql.Plan.op;
+  mutable finalized  : bool;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -187,9 +188,11 @@ let prepare t sql =
   let* result = compile t sql in
   match result with
   | Error e -> Lwt.return (Error e)
-  | Ok plan -> Lwt.return (Ok { db_ref = t; plan })
+  | Ok plan -> Lwt.return (Ok { db_ref = t; plan; finalized = false })
 
 let run st ~params =
+  if st.finalized then Lwt.return (Error (Runtime "statement already finalized"))
+  else
   let params_arr = Array.of_list params in
   let t = st.db_ref in
   let mode = match t.explicit_txn with
@@ -205,6 +208,8 @@ let run st ~params =
      | exn         -> Lwt.fail exn)
 
 let iter st ~params =
+  if st.finalized then Lwt.return (Error (Runtime "statement already finalized"))
+  else
   let params_arr = Array.of_list params in
   let t = st.db_ref in
   Lwt.catch
@@ -215,7 +220,9 @@ let iter st ~params =
      | Failure msg -> Lwt.return (Error (Runtime msg))
      | exn         -> Lwt.fail exn)
 
-let finalize _st = Lwt.return_unit
+let finalize st =
+  st.finalized <- true;
+  Lwt.return_unit
 
 let pp_error fmt = function
   | Parse msg -> Format.fprintf fmt "parse error: %s" msg

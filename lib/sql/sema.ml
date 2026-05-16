@@ -137,15 +137,7 @@ let ast_binop_to_sema : Ast.binop -> binop = function
   | Ast.Mul -> Mul | Ast.Div -> Div
   | Ast.And -> And | Ast.Or  -> Or
 
-(* ------------------------------------------------------------------ *)
-(* Parameter counter — reset at the start of each [bind] call.         *)
-(* Not thread-safe, but fine for single-threaded Lwt.                  *)
-(* ------------------------------------------------------------------ *)
-
-let param_counter = ref 0
-let reset_params () = param_counter := 0
-
-let rec bind_expr (meta : Cat.table_meta) = function
+let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
     (match col_index meta.columns name with
@@ -158,24 +150,24 @@ let rec bind_expr (meta : Cat.table_meta) = function
      | None   -> Error (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
   | Ast.E_binop (op, a, b) ->
-    (match bind_expr meta a, bind_expr meta b with
+    (match bind_expr ~param_counter meta a, bind_expr ~param_counter meta b with
      | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
      | Error e, _    -> Error e
      | Ok _,  Error e -> Error e)
   | Ast.E_not e ->
-    (match bind_expr meta e with
+    (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_not be)
      | Error e -> Error e)
   | Ast.E_is_null e ->
-    (match bind_expr meta e with
+    (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_is_null be)
      | Error e -> Error e)
   | Ast.E_is_not_null e ->
-    (match bind_expr meta e with
+    (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_is_not_null be)
      | Error e -> Error e)
   | Ast.E_neg e ->
-    (match bind_expr meta e with
+    (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_neg be)
      | Error e -> Error e)
   | Ast.E_param _ ->
@@ -185,7 +177,7 @@ let rec bind_expr (meta : Cat.table_meta) = function
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    let bound = List.map (bind_expr meta) args in
+    let bound = List.map (bind_expr ~param_counter meta) args in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
     (match errors with
      | e :: _ -> Error e
@@ -209,6 +201,7 @@ let rec bind_expr (meta : Cat.table_meta) = function
 (* ------------------------------------------------------------------ *)
 
 let rec bind_expr_join
+    ~param_counter
     ~(left_meta : Cat.table_meta)
     ~(right_meta : Cat.table_meta)
     ~(right_offset : int)
@@ -236,22 +229,22 @@ let rec bind_expr_join
     else
       Error (Unknown_table tbl)
   | Ast.E_binop (op, a, b) ->
-    (match bind_expr_join ~left_meta ~right_meta ~right_offset a,
-           bind_expr_join ~left_meta ~right_meta ~right_offset b with
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset a,
+           bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset b with
      | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
      | Error e, _    -> Error e
      | Ok _,  Error e -> Error e)
   | Ast.E_not e ->
-    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_not be) | Error e -> Error e)
   | Ast.E_is_null e ->
-    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_is_null be) | Error e -> Error e)
   | Ast.E_is_not_null e ->
-    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
   | Ast.E_neg e ->
-    (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
   | Ast.E_param _ ->
     let i = !param_counter in
@@ -260,7 +253,7 @@ let rec bind_expr_join
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    let bound = List.map (bind_expr_join ~left_meta ~right_meta ~right_offset) args in
+    let bound = List.map (bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset) args in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
     (match errors with
      | e :: _ -> Error e
@@ -300,6 +293,7 @@ type col_resolver = {
     [offset] is 1 when GROUP BY is present (slot 0 holds the group key)
     and 0 otherwise. *)
 let bind_expr_agg
+    ~param_counter
     ~(resolver : col_resolver)
     ~(offset : int)
     (e : Ast.expr)
@@ -433,7 +427,7 @@ let dv_to_lit : Row.default_value -> Ast.literal = function
   | Row.DV_real f -> Ast.L_real f
   | Row.DV_blob b -> Ast.L_blob b
 
-let bind_insert cat ~table ~columns ~values =
+let bind_insert cat ~param_counter ~table ~columns ~values =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -448,7 +442,7 @@ let bind_insert cat ~table ~columns ~values =
         match e with
         | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
           (* Literals, negated literals, and params: bind without column context. *)
-          bind_expr meta e
+          bind_expr ~param_counter meta e
         | _ ->
           (* Column references in VALUES make no sense — reject. *)
           Error (Unsupported "complex expression in INSERT VALUES")
@@ -527,7 +521,7 @@ let bind_insert cat ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
+let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -629,9 +623,9 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
            let bind_one e =
              match join_info with
-             | None -> bind_expr meta e
+             | None -> bind_expr ~param_counter meta e
              | Some (_jc, rm) ->
-               bind_expr_join ~left_meta:meta ~right_meta:rm ~right_offset e
+               bind_expr_join ~param_counter ~left_meta:meta ~right_meta:rm ~right_offset e
            in
            let ords_result =
              match proj with
@@ -787,6 +781,7 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
             | None -> Ok None
             | Some (jc, rm) ->
               (match bind_expr_join
+                       ~param_counter
                        ~left_meta:meta
                        ~right_meta:rm
                        ~right_offset jc.Ast.on with
@@ -802,9 +797,9 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
            | Ok bound_join ->
              let bind_combined e =
                match join_info with
-               | None -> bind_expr meta e
+               | None -> bind_expr ~param_counter meta e
                | Some (_jc, rm) ->
-                 bind_expr_join ~left_meta:meta ~right_meta:rm ~right_offset e
+                 bind_expr_join ~param_counter ~left_meta:meta ~right_meta:rm ~right_offset e
              in
              let where_result =
                match where with
@@ -858,7 +853,7 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
                       let having_offset =
                         offset_for_aggs + List.length proj_aggs
                       in
-                      match bind_expr_agg ~resolver:having_resolver
+                      match bind_expr_agg ~param_counter ~resolver:having_resolver
                               ~offset:having_offset e with
                       | Error e -> Error e
                       | Ok (be, hagg) -> Ok (Some be, hagg)
@@ -974,7 +969,7 @@ let bind_create_index cat ~name ~table ~column ~unique =
 (* UPDATE                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_update cat ~table ~assignments ~where =
+let bind_update cat ~param_counter ~table ~assignments ~where =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -996,7 +991,7 @@ let bind_update cat ~table ~assignments ~where =
              if col.Row.not_null && expr_ast = Ast.E_lit Ast.L_null then
                Error (Not_null_violation col.Row.name)
              else
-             (match bind_expr meta expr_ast with
+             (match bind_expr ~param_counter meta expr_ast with
               | Error e -> Error e
               | Ok bexpr ->
                 (match infer_type meta.columns bexpr with
@@ -1013,7 +1008,7 @@ let bind_update cat ~table ~assignments ~where =
          match where with
          | None   -> Ok None
          | Some e ->
-           (match bind_expr meta e with
+           (match bind_expr ~param_counter meta e with
             | Ok be   -> Ok (Some be)
             | Error e -> Error e)
        in
@@ -1030,7 +1025,7 @@ let bind_update cat ~table ~assignments ~where =
 (* DELETE                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_delete cat ~table ~where =
+let bind_delete cat ~param_counter ~table ~where =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -1039,7 +1034,7 @@ let bind_delete cat ~table ~where =
       match where with
       | None   -> Ok None
       | Some e ->
-        (match bind_expr meta e with
+        (match bind_expr ~param_counter meta e with
          | Ok be   -> Ok (Some be)
          | Error e -> Error e)
     in
@@ -1109,18 +1104,18 @@ let pp_error fmt = function
 (* ------------------------------------------------------------------ *)
 
 let bind cat stmt =
-  reset_params ();
+  let param_counter = ref 0 in
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
-  | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
+  | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~param_counter ~table ~columns ~values
   | Ast.S_select { proj; table; joins; where; group_by; having; order; limit; offset } ->
-    bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
+    bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; column; unique } ->
     bind_create_index cat ~name ~table ~column ~unique
   | Ast.S_update { table; assignments; where } ->
-    bind_update cat ~table ~assignments ~where
+    bind_update cat ~param_counter ~table ~assignments ~where
   | Ast.S_delete { table; where } ->
-    bind_delete cat ~table ~where
+    bind_delete cat ~param_counter ~table ~where
   | Ast.S_drop_table { name } ->
     bind_drop_table cat ~name
   | Ast.S_drop_index { name } ->
