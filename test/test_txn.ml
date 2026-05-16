@@ -135,6 +135,20 @@ let test_create_table_in_txn_not_rolled_back () =
   Alcotest.(check bool) "table created in auto-commit is immediately visible"
     true (Result.is_ok r)
 
+let test_create_index_in_txn_limitation () =
+  (* Known Phase 3 limitation: CREATE INDEX (like CREATE TABLE) acquires its own
+     internal RW txn via the catalog. Calling BEGIN + CREATE INDEX would deadlock
+     because the catalog's S.rw_begin would try to re-acquire the already-held mutex.
+     Only run CREATE INDEX outside explicit transactions for now. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  exec db "INSERT INTO t (n) VALUES (2)";
+  (* CREATE INDEX outside explicit txn works fine *)
+  exec db "CREATE INDEX idx_n ON t (n)";
+  let ns = query_ints db "SELECT n FROM t ORDER BY n ASC" in
+  Alcotest.(check (list int)) "indexed query works after create index" [1; 2] ns
+
 let test_parse_begin () =
   let db = fresh_db () in
   let r = run (Db.execute db "BEGIN") in
@@ -313,6 +327,7 @@ let () =
         Alcotest.test_case "update_delete_commit"              `Quick test_txn_with_update_delete;
         Alcotest.test_case "rollback_with_update"              `Quick test_txn_rollback_with_update;
         Alcotest.test_case "create_table_in_txn_not_rolled_back" `Quick test_create_table_in_txn_not_rolled_back;
+        Alcotest.test_case "create_index_in_txn_limitation"   `Quick test_create_index_in_txn_limitation;
       ];
       "parse", [
         Alcotest.test_case "parse_begin" `Quick test_parse_begin;

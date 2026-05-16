@@ -75,16 +75,16 @@ let commit_txn t =
   match t.explicit_txn with
   | None -> Lwt.return (Error (Runtime "no active transaction"))
   | Some tx ->
-    t.explicit_txn <- None;
     let* () = S.commit tx in
+    t.explicit_txn <- None;
     Lwt.return (Ok ())
 
 let rollback_txn t =
   match t.explicit_txn with
   | None -> Lwt.return (Error (Runtime "no active transaction"))
   | Some tx ->
-    t.explicit_txn <- None;
     let* () = S.rollback tx in
+    t.explicit_txn <- None;
     Lwt.return (Ok ())
 
 (* ------------------------------------------------------------------ *)

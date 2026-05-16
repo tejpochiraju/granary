@@ -514,6 +514,9 @@ let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
     let* () = execute_insert ~mode store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
   | Plan.Op_create_index { name; table; tree_id; col_idx; unique; columns } ->
+    (* Note: create_index calls catalog functions that acquire their own RW txn.
+       Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
+       block — it commits immediately. Phase 4 work to fix. *)
     let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
                 ~col_idx ~unique ~columns in
     Lwt.return 0

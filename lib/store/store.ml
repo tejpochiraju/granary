@@ -560,9 +560,9 @@ let commit (Rw t : rw txn) : unit Lwt.t =
        Lwt.fail_with
          (Format.asprintf "Store.commit: %a" pp_error (map_header_err e)))
   |> fun work ->
-  let* () = work in
-  Lwt_mutex.unlock t.rw_mutex;
-  Lwt.return_unit
+  Lwt.finalize
+    (fun () -> work)
+    (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit)
 
 (* rollback:
    - Mem: restore the snapshot of tree contents taken at rw_begin, so that
