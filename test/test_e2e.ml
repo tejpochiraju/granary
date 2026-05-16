@@ -582,7 +582,7 @@ let order_by_limit_offset () =
     | Db.V_int n -> n | _ -> Int64.minus_one) rows in
   Alcotest.(check (list int64)) "2nd and 3rd smallest" [20L; 30L] ns
 
-let order_by_null_last () =
+let order_by_null_first () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
   exec db "INSERT INTO t (id, n) VALUES (1, 5)";
@@ -590,16 +590,16 @@ let order_by_null_last () =
   exec db "INSERT INTO t (id, n) VALUES (3, 2)";
   let rows = query_ok db "SELECT id, n FROM t ORDER BY n ASC" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  (* 2 < 5 < NULL-last *)
+  (* NULL < 2 < 5 in ASC (matches SQLite: NULLs are less than any value) *)
   (match (List.nth rows 0).(1) with
-   | Db.V_int 2L -> ()
-   | _ -> Alcotest.fail "expected 2 first");
-  (match (List.nth rows 1).(1) with
-   | Db.V_int 5L -> ()
-   | _ -> Alcotest.fail "expected 5 second");
-  (match (List.nth rows 2).(1) with
    | Db.V_null -> ()
-   | _ -> Alcotest.fail "expected NULL last")
+   | _ -> Alcotest.fail "expected NULL first");
+  (match (List.nth rows 1).(1) with
+   | Db.V_int 2L -> ()
+   | _ -> Alcotest.fail "expected 2 second");
+  (match (List.nth rows 2).(1) with
+   | Db.V_int 5L -> ()
+   | _ -> Alcotest.fail "expected 5 last")
 
 let order_by_text () =
   let db = fresh_db () in
@@ -1358,7 +1358,7 @@ let () =
       Alcotest.test_case "order_by_asc"         `Quick order_by_asc;
       Alcotest.test_case "order_by_desc"        `Quick order_by_desc;
       Alcotest.test_case "order_by_default_asc" `Quick order_by_default_asc;
-      Alcotest.test_case "order_by_null_last"   `Quick order_by_null_last;
+      Alcotest.test_case "order_by_null_first"  `Quick order_by_null_first;
       Alcotest.test_case "order_by_text"        `Quick order_by_text;
     ];
     "limit_offset", [

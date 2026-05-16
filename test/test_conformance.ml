@@ -227,7 +227,7 @@ let tests = [
       [| Db.V_int 42L |];
     ] };
 
-  { name = "null_order_by_last";
+  { name = "null_sorts_first_asc";
     setup = [
       "CREATE TABLE t (n INTEGER)";
       "INSERT INTO t (n) VALUES (NULL)";
@@ -236,9 +236,9 @@ let tests = [
     ];
     query = "SELECT * FROM t ORDER BY n ASC";
     expected = [
+      [| Db.V_null   |];
       [| Db.V_int 1L |];
       [| Db.V_int 2L |];
-      [| Db.V_null   |];
     ] };
 
   { name = "index_lookup";

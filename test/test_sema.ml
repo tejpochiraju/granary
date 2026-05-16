@@ -402,8 +402,8 @@ let bind_select_multi_order_by_rejected () =
     where = None;
     group_by = []; having = None;
     order = [
-      Ast.{ col = "id";   dir = Ast.Asc };
-      Ast.{ col = "name"; dir = Ast.Asc };
+      Ast.{ col = "id";   table_opt = None; dir = Ast.Asc };
+      Ast.{ col = "name"; table_opt = None; dir = Ast.Asc };
     ];
     limit = None; offset = None;
   } in
@@ -420,7 +420,7 @@ let bind_select_order_unknown_col () =
     joins = [];
     where = None;
     group_by = []; having = None;
-    order = [Ast.{ col = "bogus"; dir = Ast.Asc }];
+    order = [Ast.{ col = "bogus"; table_opt = None; dir = Ast.Asc }];
     limit = None; offset = None;
   } in
   match bind cat stmt with

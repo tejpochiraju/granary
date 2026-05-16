@@ -27,8 +27,8 @@ let row_value_to_index_value : Row.value -> Index_key.value = function
 let compare_values (a : Row.value) (b : Row.value) : int =
   match a, b with
   | Row.V_null, Row.V_null -> 0
-  | Row.V_null, _          -> 1   (* NULLs sort last *)
-  | _, Row.V_null          -> -1
+  | Row.V_null, _          -> -1  (* NULLs sort first — less than any non-null value, matches SQLite *)
+  | _, Row.V_null          -> 1
   | Row.V_int  x, Row.V_int  y -> Int64.compare x y
   | Row.V_real x, Row.V_real y -> Float.compare x y
   | Row.V_text x, Row.V_text y -> String.compare x y
@@ -75,7 +75,9 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
      | Row.V_null -> Row.V_int 0L
      | _          -> Row.V_int 1L)
   | Plan.P_not e ->
-    if value_truthy (eval_expr params row e) then Row.V_int 0L else Row.V_int 1L
+    (match eval_expr params row e with
+     | Row.V_null -> Row.V_null
+     | v -> if value_truthy v then Row.V_int 0L else Row.V_int 1L)
   | Plan.P_binop (op, a, b) ->
     eval_binop op (eval_expr params row a) (eval_expr params row b)
   | Plan.P_func (func, args) ->
@@ -106,16 +108,22 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with
-  (* Phase 2 simplification: two-valued logic — NULL is falsy, not unknown (diverges from SQL 3VL). *)
   | Plan.And ->
-    if value_truthy lv && value_truthy rv then Row.V_int 1L else Row.V_int 0L
+    let lt = value_truthy lv and rt = value_truthy rv in
+    let ln = lv = Row.V_null  and rn = rv = Row.V_null in
+    if lt && rt then Row.V_int 1L
+    else if (not ln && not lt) || (not rn && not rt) then Row.V_int 0L
+    else Row.V_null
   | Plan.Or ->
-    if value_truthy lv || value_truthy rv then Row.V_int 1L else Row.V_int 0L
-  (* Cross-type comparisons (e.g. V_int vs V_real) return false — no implicit coercion is performed. *)
+    let lt = value_truthy lv and rt = value_truthy rv in
+    let ln = lv = Row.V_null  and rn = rv = Row.V_null in
+    if lt || rt then Row.V_int 1L
+    else if not ln && not rn then Row.V_int 0L
+    else Row.V_null
+  (* NULL compared with anything yields NULL (3-valued logic). Cross-type → false. *)
   | Plan.Eq ->
-    (* NaN != NaN is intentional SQL semantics (IEEE 754). *)
     (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
      | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
      | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 1L else Row.V_int 0L
      | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 1L else Row.V_int 0L
@@ -123,7 +131,7 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
      | _                          -> Row.V_int 0L)
   | Plan.Ne ->
     (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
      | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
      | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 0L else Row.V_int 1L
      | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 0L else Row.V_int 1L
@@ -143,7 +151,7 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
 
 and cmp_result lv rv pred =
   match lv, rv with
-  | Row.V_null, _ | _, Row.V_null -> Row.V_int 0L
+  | Row.V_null, _ | _, Row.V_null -> Row.V_null
   | Row.V_int _,  Row.V_int _
   | Row.V_text _, Row.V_text _
   | Row.V_real _, Row.V_real _

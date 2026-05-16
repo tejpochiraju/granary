@@ -324,8 +324,12 @@ let rec bind_expr_join
 (** Resolve a column reference into a [BE_col i] using a resolver
     function.  Used by [bind_expr_agg]. *)
 type col_resolver = {
-  resolve_unqual : string -> (int, error) result;
-  resolve_qual   : string -> string -> (int, error) result;
+  resolve_unqual  : string -> (int, error) result;
+  resolve_qual    : string -> string -> (int, error) result;
+  (* Resolver used for column refs inside aggregate-function arguments —
+     may differ from resolve_unqual in HAVING contexts. *)
+  resolve_agg_arg       : string -> (int, error) result;
+  resolve_agg_arg_qual  : string -> string -> (int, error) result;
 }
 
 (** Bind expression, collecting aggregates.  Aggregates become
@@ -380,11 +384,11 @@ let bind_expr_agg
            | Ast.Agg_count -> Ok None
            | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
         | Some (Ast.E_col name) ->
-          (match resolver.resolve_unqual name with
+          (match resolver.resolve_agg_arg name with
            | Error e -> Error e
            | Ok i    -> Ok (Some i))
         | Some (Ast.E_tbl_col (t, c)) ->
-          (match resolver.resolve_qual t c with
+          (match resolver.resolve_agg_arg_qual t c with
            | Error e -> Error e
            | Ok i    -> Ok (Some i))
         | Some _ ->
@@ -512,6 +516,10 @@ let bind_insert cat ~param_counter ~table ~columns ~values =
     (* Not a regular table — check if it's an FTS table *)
     bind_fts_insert cat ~param_counter ~table ~columns ~values
   | Some meta ->
+    let columns =
+      if columns = [] then List.map (fun c -> c.Row.name) meta.columns
+      else columns
+    in
     let n_cols = List.length columns in
     let n_vals = List.length values in
     if n_cols <> n_vals then
@@ -998,6 +1006,9 @@ let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having 
                       let having_resolver = {
                         resolve_unqual = having_resolver_unqual;
                         resolve_qual = having_resolver_qual;
+                        (* Inside aggregate args in HAVING, any table column is allowed *)
+                        resolve_agg_arg      = proj_lookup;
+                        resolve_agg_arg_qual = qual_lookup;
                       } in
                       (* Append HAVING aggregates AFTER the projection
                          aggregates: in BE_col offset = offset_for_aggs +
@@ -1024,7 +1035,11 @@ let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having 
                     match acc with
                     | Error _ -> acc
                     | Ok keys ->
-                      (match proj_lookup ok.col with
+                      let result = match ok.table_opt with
+                        | None   -> proj_lookup ok.col
+                        | Some t -> qual_lookup t ok.col
+                      in
+                      (match result with
                        | Error e -> Error e
                        | Ok i    -> Ok (keys @ [{ col_idx = i; dir = ok.dir }]))
                   ) (Ok []) order

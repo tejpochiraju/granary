@@ -61,8 +61,9 @@ type column_def = {
 type order_dir = Asc | Desc
 
 type order_key = {
-  col : string;
-  dir : order_dir;
+  col       : string;
+  table_opt : string option;  (* Some "t" for ORDER BY t.col *)
+  dir       : order_dir;
 }
 
 type join_kind = Inner | Left

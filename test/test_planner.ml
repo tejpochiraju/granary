@@ -256,7 +256,7 @@ let plan_order_by_asc () =
   let stmt = Ast.S_select {
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
-    order = [{ Ast.col = "id"; dir = Ast.Asc }];
+    order = [{ Ast.col = "id"; table_opt = None; dir = Ast.Asc }];
     limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -270,7 +270,7 @@ let plan_order_by_desc () =
   let stmt = Ast.S_select {
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
-    order = [{ Ast.col = "name"; dir = Ast.Desc }];
+    order = [{ Ast.col = "name"; table_opt = None; dir = Ast.Desc }];
     limit = None; offset = None;
   } in
   let bound = bind cat stmt in
@@ -308,7 +308,7 @@ let plan_order_and_limit () =
   let stmt = Ast.S_select {
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
-    order = [{ Ast.col = "id"; dir = Ast.Asc }];
+    order = [{ Ast.col = "id"; table_opt = None; dir = Ast.Asc }];
     limit = Some 2; offset = None;
   } in
   let bound = bind cat stmt in

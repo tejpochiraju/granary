@@ -123,6 +123,9 @@ insert:
   | INSERT INTO table = IDENT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
       VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
     { S_insert { table; columns = cols; values = vals } }
+  | INSERT INTO table = IDENT
+      VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
+    { S_insert { table; columns = []; values = vals } }
 
 literal:
   | n = INT_LIT    { L_int n }
@@ -195,10 +198,7 @@ scalar_expr:
   | COALESCE LPAREN es = separated_nonempty_list(COMMA, expr) RPAREN  { E_func (Fn_coalesce, es) }
 
 proj_item:
-  | name = IDENT                       { `Col name }
-  | t = IDENT DOT c = IDENT            { `Expr (E_tbl_col (t, c)) }
-  | e = agg_expr                       { `Expr e }
-  | e = scalar_expr                    { `Expr e }
+  | e = expr { match e with E_col name -> `Col name | _ -> `Expr e }
 
 where_opt:
   |                { None }
@@ -217,9 +217,12 @@ order_by_clause:
   | ORDER BY keys = separated_nonempty_list(COMMA, order_key)      { keys }
 
 order_key:
-  | name = IDENT           { { col = name; dir = Asc } }
-  | name = IDENT ASC       { { col = name; dir = Asc } }
-  | name = IDENT DESC      { { col = name; dir = Desc } }
+  | name = IDENT                      { { col = name; table_opt = None; dir = Asc } }
+  | name = IDENT ASC                  { { col = name; table_opt = None; dir = Asc } }
+  | name = IDENT DESC                 { { col = name; table_opt = None; dir = Desc } }
+  | t = IDENT DOT c = IDENT          { { col = c; table_opt = Some t; dir = Asc } }
+  | t = IDENT DOT c = IDENT ASC      { { col = c; table_opt = Some t; dir = Asc } }
+  | t = IDENT DOT c = IDENT DESC     { { col = c; table_opt = Some t; dir = Desc } }
 
 limit_clause:
   |                                         { (None, None) }
