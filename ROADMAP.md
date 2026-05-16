@@ -229,7 +229,7 @@ stretch them.
       GROUP BY, aggregates.
 - [x] **Phase 3 — transactions (~6 wks):** RO snapshots, RW txn,
       BEGIN/COMMIT/ROLLBACK, MVCC correctness.
-- [ ] **Phase 4 — Mirage_block (~4 wks):** unikernel deployment.
+- [x] **Phase 4 — Mirage_block (~4 wks):** unikernel deployment.
 - [ ] **Phase 5 (later) — FTS:** v2.
 
 ---

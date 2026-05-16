@@ -29,7 +29,8 @@ jobs:
 
       - name: Install opam packages
         run: |
-          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix
 
       - name: Build
         run: opam exec -- dune build
