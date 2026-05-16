@@ -169,10 +169,23 @@ let plan_select cat
     | _ -> after_join
   in
   let is_aggregated = aggs <> [] || group_by <> None in
+  (* For non-aggregate queries: sort BEFORE projection so col_idx correctly
+     addresses the original table schema (pre-projection row layout).
+     For aggregate queries: sort AFTER aggregation because ORDER BY refers
+     to the aggregated output row layout. *)
+  let sort_key = match order with [] -> None | k :: _ -> Some k in
+  let make_sort child key =
+    let dir = match key.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+    Plan.Op_sort { col_idx = key.col_idx; dir; child }
+  in
+  let after_sort =
+    if is_aggregated then after_where
+    else match sort_key with None -> after_where | Some k -> make_sort after_where k
+  in
   let projected =
     if is_aggregated then
       Plan.Op_aggregate {
-        child = after_where;
+        child = after_sort;
         group_col = group_by;
         aggs = List.map sema_agg_to_plan aggs;
         having = Option.map plan_expr having;
@@ -181,30 +194,17 @@ let plan_select cat
     else if expr_proj <> [] then
       Plan.Op_expr_project {
         exprs = List.map plan_expr expr_proj;
-        child = after_where;
+        child = after_sort;
       }
     else
-      Plan.Op_project { ordinals = proj; child = after_where }
+      Plan.Op_project { ordinals = proj; child = after_sort }
   in
-  (* Wrap with Op_sort for the first ORDER BY key.
-     NOTE: when [projected] is [Op_expr_project], [Op_sort] is applied
-     AFTER the projection.  [key.col_idx] was resolved by sema against
-     the original table columns, not the projected output columns.  If
-     the ORDER BY column is not also present (at the same ordinal) in the
-     projected row, sort results will be incorrect.  A proper fix would
-     require either (a) sorting before projection, or (b) re-resolving
-     ORDER BY ordinals against the post-projection row layout.
-     Fixing this correctly is deferred beyond Task 1 scope. *)
-  let sorted = match order with
-    | [] -> projected
-    | (key :: _) ->
-      let dir = match key.Sema.dir with
-        | Ast.Asc  -> `Asc
-        | Ast.Desc -> `Desc
-      in
-      Plan.Op_sort { col_idx = key.col_idx; dir; child = projected }
+  (* Post-aggregation sort (only for aggregated queries). *)
+  let sorted =
+    if is_aggregated then
+      match sort_key with None -> projected | Some k -> make_sort projected k
+    else projected
   in
-  (* Wrap with Op_limit if LIMIT present *)
   match limit with
   | None   -> sorted
   | Some n ->
@@ -267,10 +267,19 @@ let plan ?cat = function
          | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_join }
        in
        let is_aggregated = aggs <> [] || group_by <> None in
+       let sort_key = match order with [] -> None | k :: _ -> Some k in
+       let make_sort child key =
+         let dir = match key.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+         Plan.Op_sort { col_idx = key.col_idx; dir; child }
+       in
+       let after_sort =
+         if is_aggregated then filtered
+         else match sort_key with None -> filtered | Some k -> make_sort filtered k
+       in
        let projected =
          if is_aggregated then
            Plan.Op_aggregate {
-             child = filtered;
+             child = after_sort;
              group_col = group_by;
              aggs = List.map sema_agg_to_plan aggs;
              having = Option.map plan_expr having;
@@ -279,21 +288,15 @@ let plan ?cat = function
          else if expr_proj <> [] then
            Plan.Op_expr_project {
              exprs = List.map plan_expr expr_proj;
-             child = filtered;
+             child = after_sort;
            }
          else
-           Plan.Op_project { ordinals = proj; child = filtered }
+           Plan.Op_project { ordinals = proj; child = after_sort }
        in
-       (* NOTE: same ORDER BY + Op_expr_project limitation as in plan_select
-          above applies here too. *)
-       let sorted = match order with
-         | [] -> projected
-         | (key :: _) ->
-           let dir = match key.Sema.dir with
-             | Ast.Asc  -> `Asc
-             | Ast.Desc -> `Desc
-           in
-           Plan.Op_sort { col_idx = key.col_idx; dir; child = projected }
+       let sorted =
+         if is_aggregated then
+           match sort_key with None -> projected | Some k -> make_sort projected k
+         else projected
        in
        match limit with
        | None   -> sorted

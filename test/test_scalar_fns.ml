@@ -77,6 +77,30 @@ let test_ifnull () =
         Lwt.return_unit
       | _ -> Alcotest.failf "ifnull: unexpected result")
 
+(* Regression test for issue #116: ORDER BY with scalar expression projection.
+   Previously, Op_sort was applied after Op_expr_project using col_idx from the
+   original schema, causing out-of-bounds access or wrong sort order.
+   Fix: sort before projection so col_idx correctly addresses original schema. *)
+let test_order_by_after_expr_proj () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE words (id INTEGER, w TEXT)" in
+    let* _ = D.execute d "INSERT INTO words (id, w) VALUES (1, 'banana')" in
+    let* _ = D.execute d "INSERT INTO words (id, w) VALUES (2, 'apple')" in
+    let* _ = D.execute d "INSERT INTO words (id, w) VALUES (3, 'cherry')" in
+    (* SELECT UPPER(w) ORDER BY w — w is col 1 in original schema.
+       After projection only 1 column exists; old code sorted by col 1 of
+       projected row (out of bounds / wrong column). *)
+    let* r = D.query d "SELECT UPPER(w) FROM words ORDER BY w" in
+    match r with
+    | Error e -> Alcotest.failf "order_expr_proj: query error: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      let got = List.map (fun row -> match row.(0) with D.V_text s -> s | _ -> "?") rows in
+      Alcotest.(check (list string)) "sorted_by_w"
+        ["APPLE"; "BANANA"; "CHERRY"] got;
+      Lwt.return_unit)
+
 let () =
   Alcotest.run "scalar_fns" [
     "length",   [ Alcotest.test_case "length"   `Quick test_length   ];
@@ -85,4 +109,5 @@ let () =
     "abs",      [ Alcotest.test_case "abs"      `Quick test_abs      ];
     "coalesce", [ Alcotest.test_case "coalesce" `Quick test_coalesce ];
     "ifnull",   [ Alcotest.test_case "ifnull"   `Quick test_ifnull   ];
+    "order_by_expr_proj", [ Alcotest.test_case "order_by_after_expr_proj" `Quick test_order_by_after_expr_proj ];
   ]
