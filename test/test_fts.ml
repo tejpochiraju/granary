@@ -207,6 +207,44 @@ let test_match_prefix () =
       Alcotest.(check int) "prefix count" 2 (List.length rows);
       Lwt.return_unit)
 
+(* Regression tests for issue #117: phrase queries must verify adjacency.
+   Previously the phrase intersector only checked that all words existed in
+   the doc — a doc with "quick" at pos 0 and "brown" at pos 5 would match
+   the phrase "quick brown" even though they are not adjacent. *)
+let test_phrase_adjacent () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    (* "quick brown fox" — phrase "quick brown" is adjacent (pos 0,1) *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick brown fox')" in
+    (* "quick lazy brown" — "quick" at pos 0, "brown" at pos 2; NOT adjacent *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick lazy brown')" in
+    let* r = D.query db {|SELECT body FROM docs WHERE docs MATCH '"quick brown"'|} in
+    match r with
+    | Error e -> Alcotest.failf "phrase_adjacent: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "only adjacent doc matches" 1 (List.length rows);
+      (match rows with
+       | [| D.V_text body |] :: _ ->
+         Alcotest.(check string) "correct doc" "quick brown fox" body;
+         Lwt.return_unit
+       | _ -> Alcotest.failf "unexpected rows"))
+
+let test_phrase_non_adjacent_no_match () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    (* "hello world" appears but separated by another word *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('hello cruel world')" in
+    let* r = D.query db {|SELECT body FROM docs WHERE docs MATCH '"hello world"'|} in
+    match r with
+    | Error e -> Alcotest.failf "phrase_no_match: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "non-adjacent phrase: no match" 0 (List.length rows);
+      Lwt.return_unit)
+
 let test_rank_column () =
   run (fun () ->
     let* db = D.open_in_memory () in
@@ -276,6 +314,8 @@ let () =
       Alcotest.test_case "or"        `Quick test_match_or;
       Alcotest.test_case "not"       `Quick test_match_not;
       Alcotest.test_case "prefix"    `Quick test_match_prefix;
+      Alcotest.test_case "phrase_adjacent"     `Quick test_phrase_adjacent;
+      Alcotest.test_case "phrase_non_adjacent" `Quick test_phrase_non_adjacent_no_match;
     ];
     "rank", [
       Alcotest.test_case "rank_column"   `Quick test_rank_column;

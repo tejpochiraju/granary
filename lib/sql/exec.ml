@@ -372,17 +372,39 @@ let rec fts_execute_query tx ~index_tree query =
   | Fts_query.FQ_term (Fts_query.FT_prefix prefix) ->
     fts_prefix_posting_list tx ~index_tree prefix
   | Fts_query.FQ_term (Fts_query.FT_phrase words) ->
-    (* Phrase: find docs where all words are present (simplified — no position check). *)
+    (* Phrase: all words must appear consecutively in the same column.
+       For each candidate document, check that there exists a starting position p
+       and column c such that word[i] occurs at (col=c, pos=p+i) for all i. *)
     (match words with
      | [] -> Lwt.return []
      | first :: rest ->
        let* first_pl = fts_posting_list tx ~index_tree first in
        let* rest_pls = Lwt_list.map_s (fts_posting_list tx ~index_tree) rest in
-       let intersect acc pl =
-         let row_ids = List.map fst pl in
-         List.filter (fun (r, _) -> List.mem r row_ids) acc
+       (* Keep only docs present in every posting list. *)
+       let intersect_ids acc pl =
+         let ids = List.map fst pl in
+         List.filter (fun (r, _) -> List.mem r ids) acc
        in
-       Lwt.return (List.fold_left intersect first_pl rest_pls))
+       let candidates = List.fold_left intersect_ids first_pl rest_pls in
+       (* Build an array of per-term posting lists for position checking. *)
+       let all_pls = Array.of_list (first_pl :: rest_pls) in
+       let n = Array.length all_pls in
+       (* Check whether doc with [rowid] contains the phrase. *)
+       let phrase_matches rowid =
+         (* Collect positions for each word in this doc. *)
+         let term_positions = Array.map (fun pl ->
+           match List.assoc_opt rowid pl with
+           | None -> []
+           | Some pos -> pos) all_pls in
+         (* For each (col, pos) of the first word, test adjacency of the rest. *)
+         List.exists (fun (c0, p0) ->
+           let rec check i =
+             if i >= n then true
+             else List.mem (c0, p0 + i) term_positions.(i) && check (i + 1)
+           in check 1) term_positions.(0)
+       in
+       let matched = List.filter (fun (r, _) -> phrase_matches r) candidates in
+       Lwt.return matched)
   | Fts_query.FQ_and qs ->
     let positive = List.filter (function Fts_query.FQ_not _ -> false | _ -> true) qs in
     let negated  = List.filter_map (function Fts_query.FQ_not q -> Some q | _ -> None) qs in
