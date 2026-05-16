@@ -289,6 +289,77 @@ let update_with_unique_index_new_value_ok () =
   Alcotest.(check int) "0 match for n=10 (old value gone)"
     0 (List.length lookup_old)
 
+(* Update TEXT/REAL/BLOB unique-indexed column to same value — exercises
+   the unchanged check in execute_update (exec.ml lines 354-359). *)
+let update_text_unique_same_value () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, s TEXT)";
+  exec db "INSERT INTO t (id, s) VALUES (1, 'hello')";
+  exec db "INSERT INTO t (id, s) VALUES (2, 'world')";
+  exec db "CREATE UNIQUE INDEX idx ON t (s)";
+  (* Update s to the same value — unchanged check hits V_text arm *)
+  exec db "UPDATE t SET s = 'hello' WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t WHERE s = 'hello'" in
+  Alcotest.(check int) "still 1 row for s='hello'" 1 (List.length rows)
+
+let update_real_unique_same_value () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, f REAL)";
+  exec db "INSERT INTO t (id, f) VALUES (1, 3.14)";
+  exec db "CREATE UNIQUE INDEX idx ON t (f)";
+  (* Update f to the same value — unchanged check hits V_real arm *)
+  exec db "UPDATE t SET f = 3.14 WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "row still present" 1 (List.length rows)
+
+let update_real_unique_new_value () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, f REAL)";
+  exec db "INSERT INTO t (id, f) VALUES (1, 1.0)";
+  exec db "INSERT INTO t (id, f) VALUES (2, 2.0)";
+  exec db "CREATE UNIQUE INDEX idx ON t (f)";
+  (* Update to a different real value — not unchanged *)
+  exec db "UPDATE t SET f = 9.9 WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "both rows still present" 2 (List.length rows)
+
+let update_null_unchanged () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
+  exec db "INSERT INTO t (id, n) VALUES (1, 5)";
+  exec db "CREATE UNIQUE INDEX idx ON t (n)";
+  (* Set n to NULL then update to same NULL — hits V_null/V_null arm *)
+  exec db "UPDATE t SET n = NULL WHERE id = 1";
+  exec db "UPDATE t SET n = NULL WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "row still present after null→null" 1 (List.length rows)
+
+let update_text_unique_new_value () =
+  (* Update to a different TEXT value in a unique index — not unchanged, checks no violation *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, s TEXT)";
+  exec db "INSERT INTO t (id, s) VALUES (1, 'hello')";
+  exec db "INSERT INTO t (id, s) VALUES (2, 'world')";
+  exec db "CREATE UNIQUE INDEX idx ON t (s)";
+  exec db "UPDATE t SET s = 'newval' WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t WHERE s = 'newval'" in
+  Alcotest.(check int) "updated row found by new text value" 1 (List.length rows)
+
+let update_cross_type_unchanged () =
+  (* Test where old_v and new_v have different types (the `_` arm) *)
+  (* This can happen if a column value somehow has a different type than expected *)
+  (* In practice, the `_` arm in unchanged check is hit when old_v is e.g. null
+     and new_v is a non-null value of different type *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
+  exec db "INSERT INTO t (id, n) VALUES (1, 5)";
+  exec db "CREATE UNIQUE INDEX idx ON t (n)";
+  (* NULL to non-null: old_v = V_null, new_v = V_int 10 — hits `_` arm *)
+  exec db "UPDATE t SET n = NULL WHERE id = 1";
+  exec db "UPDATE t SET n = 10 WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "row present after null→int update" 1 (List.length rows)
+
 let update_with_non_unique_index_lookup () =
   (* Verify that index entries are correctly updated for non-unique
      indexes — the new value should be findable, the old value should
@@ -484,6 +555,12 @@ let () =
       Alcotest.test_case "unique_index_same_value_ok"    `Quick update_with_unique_index_to_same_value_ok;
       Alcotest.test_case "unique_index_new_value_ok"     `Quick update_with_unique_index_new_value_ok;
       Alcotest.test_case "non_unique_index_lookup"       `Quick update_with_non_unique_index_lookup;
+      Alcotest.test_case "text_unique_same_value"        `Quick update_text_unique_same_value;
+      Alcotest.test_case "real_unique_same_value"        `Quick update_real_unique_same_value;
+      Alcotest.test_case "real_unique_new_value"         `Quick update_real_unique_new_value;
+      Alcotest.test_case "null_unchanged"                `Quick update_null_unchanged;
+      Alcotest.test_case "text_unique_new_value"          `Quick update_text_unique_new_value;
+      Alcotest.test_case "cross_type_unchanged"          `Quick update_cross_type_unchanged;
     ];
     "row_count", [
       Alcotest.test_case "update_returns_count"             `Quick update_returns_count;

@@ -444,6 +444,129 @@ let plan_join_general_on () =
   | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
   | _ -> Alcotest.fail "expected Op_filter wrapping Op_hash_join cartesian"
 
+(** Plan join without ~cat: exercises the None path in plan for BS_select.
+    Same join structure as plan_join_swapped_on but without ~cat, so it
+    uses the hash-join based fallback instead of NLJ. *)
+let plan_join_no_cat () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_tbl_col ("orders", "uid")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  (* Call Planner.plan WITHOUT ~cat — hits the None branch *)
+  match Planner.plan bound with
+  | Plan.Op_project { child = Plan.Op_hash_join _; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_hash_join for join without ~cat"
+
+(** Plan join without ~cat with swapped ON (b < n_left, a >= right_offset). *)
+let plan_join_no_cat_swapped () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("orders", "uid"),
+                  Ast.E_tbl_col ("users", "id")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_project { child = Plan.Op_hash_join _; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_hash_join for swapped join without ~cat"
+
+(** Plan join without ~cat with general ON (not col=col) — cartesian hash-join + filter. *)
+let plan_join_no_cat_general_on () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Gt,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_tbl_col ("orders", "uid")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_filter(Op_hash_join) for general ON without ~cat"
+
+(** Plan join without ~cat with WHERE clause — exercises the filtered path. *)
+let plan_join_no_cat_with_where () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_tbl_col ("orders", "uid")) } ];
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("users", "id"), Ast.E_lit (Ast.L_int 1L)));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_project { child = Plan.Op_filter { child = Plan.Op_hash_join _; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_filter(Op_hash_join) for join+where without ~cat"
+
+(** Plan BS_update without ~cat → indexes = [] (None arm). *)
+let plan_update_no_cat () =
+  let cat = make_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_update { indexes = []; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_update with empty indexes"
+
+(** Plan BS_delete without ~cat → indexes = [] (None arm). *)
+let plan_delete_no_cat () =
+  let cat = make_cat () in
+  let stmt = Ast.S_delete { table = "users"; where = None } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_delete { indexes = []; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_delete with empty indexes"
+
+(** Plan BS_drop_table without ~cat → indexes = [] (None arm). *)
+let plan_drop_table_no_cat () =
+  let cat = make_cat () in
+  let stmt = Ast.S_drop_table { name = "users" } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_drop_table { indexes = []; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_drop_table with empty indexes"
+
+(** Plan BS_begin → Op_begin. *)
+let plan_begin () =
+  let cat = make_cat () in
+  let bound = bind cat Ast.S_begin in
+  match Planner.plan bound with
+  | Plan.Op_begin -> ()
+  | _ -> Alcotest.fail "expected Op_begin"
+
+(** Plan BS_commit → Op_commit. *)
+let plan_commit () =
+  let cat = make_cat () in
+  let bound = bind cat Ast.S_commit in
+  match Planner.plan bound with
+  | Plan.Op_commit -> ()
+  | _ -> Alcotest.fail "expected Op_commit"
+
+(** Plan BS_rollback → Op_rollback. *)
+let plan_rollback () =
+  let cat = make_cat () in
+  let bound = bind cat Ast.S_rollback in
+  match Planner.plan bound with
+  | Plan.Op_rollback -> ()
+  | _ -> Alcotest.fail "expected Op_rollback"
+
 (** recognise_eq_col_col fallback (line 46): inputs that are NOT BE_col = BE_col
     return None. We verify by giving plan_join an ON that is a literal. *)
 let plan_join_on_literal () =
@@ -505,5 +628,19 @@ let () =
       Alcotest.test_case "plan_join_swapped_on"  `Quick plan_join_swapped_on;
       Alcotest.test_case "plan_join_general_on"  `Quick plan_join_general_on;
       Alcotest.test_case "plan_join_on_literal"  `Quick plan_join_on_literal;
+    ];
+    "no-cat", [
+      Alcotest.test_case "plan_join_no_cat"            `Quick plan_join_no_cat;
+      Alcotest.test_case "plan_join_no_cat_swapped"    `Quick plan_join_no_cat_swapped;
+      Alcotest.test_case "plan_join_no_cat_general_on" `Quick plan_join_no_cat_general_on;
+      Alcotest.test_case "plan_join_no_cat_with_where" `Quick plan_join_no_cat_with_where;
+      Alcotest.test_case "plan_update_no_cat"          `Quick plan_update_no_cat;
+      Alcotest.test_case "plan_delete_no_cat"          `Quick plan_delete_no_cat;
+      Alcotest.test_case "plan_drop_table_no_cat"      `Quick plan_drop_table_no_cat;
+    ];
+    "txn-ops", [
+      Alcotest.test_case "plan_begin"    `Quick plan_begin;
+      Alcotest.test_case "plan_commit"   `Quick plan_commit;
+      Alcotest.test_case "plan_rollback" `Quick plan_rollback;
     ];
   ]

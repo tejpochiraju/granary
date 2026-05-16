@@ -67,7 +67,7 @@ some may be reconsidered in v2+.
 - [x] Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 - [x] Joins: `INNER JOIN`, `LEFT JOIN` (nested-loop + hash join physical
       operators)
-- [ ] `BEGIN`, `COMMIT`, `ROLLBACK`
+- [x] `BEGIN`, `COMMIT`, `ROLLBACK`
 - [ ] Prepared statements with `?` parameters
 - [ ] Scalar functions: `LENGTH`, `LOWER`, `UPPER`, `COALESCE`, `IFNULL`,
       `ABS`, basic arithmetic & comparison
@@ -111,9 +111,9 @@ some may be reconsidered in v2+.
 
 ### v1
 - [x] CoW B+-tree implementation (page format, splits, merges, rebalancing)
-- [ ] Free-list with per-page freed-at-txn metadata
+- [x] Free-list with per-page freed-at-txn metadata
 - [x] RW txn manager (single-writer mutex)
-- [ ] RO txn manager (active-readers table; freelist gating)
+- [x] RO txn manager (active-readers table; freelist gating)
 - [x] Page cache (bounded LRU)
 - [x] Two-header alternating commit protocol
 - [x] Checksums on header pages
@@ -227,7 +227,7 @@ stretch them.
       ORDER BY, LIMIT, single-col indexes.
 - [x] **Phase 2 — query depth (~8-10 wks):** UPDATE, DELETE, joins,
       GROUP BY, aggregates.
-- [ ] **Phase 3 — transactions (~6 wks):** RO snapshots, RW txn,
+- [x] **Phase 3 — transactions (~6 wks):** RO snapshots, RW txn,
       BEGIN/COMMIT/ROLLBACK, MVCC correctness.
 - [ ] **Phase 4 — Mirage_block (~4 wks):** unikernel deployment.
 - [ ] **Phase 5 (later) — FTS:** v2.

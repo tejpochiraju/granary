@@ -1831,6 +1831,89 @@ let bind_select_join_qual_left_unknown_col_proj () =
   | _ -> Alcotest.fail "expected Unknown_column bogus for users.bogus"
 
 (* ------------------------------------------------------------------ *)
+(* Group 11b: bind_expr_agg_proj error paths inside E_not/E_is_null/  *)
+(*            E_is_not_null/E_neg (lines 273, 275, 277, 279 in sema.ml) *)
+(* ------------------------------------------------------------------ *)
+
+(** E_not with an unknown column inside HAVING (Error arm of line 273). *)
+let bind_select_having_not_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_not (Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_not in HAVING agg proj"
+
+(** E_is_null with an unknown column inside HAVING (Error arm of line 275). *)
+let bind_select_having_is_null_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_is_null (Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_is_null in HAVING agg proj"
+
+(** E_is_not_null with an unknown column inside HAVING (Error arm of line 277). *)
+let bind_select_having_is_not_null_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_is_not_null (Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_is_not_null in HAVING agg proj"
+
+(** E_neg with an unknown column inside HAVING (Error arm of line 279). *)
+let bind_select_having_neg_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_neg (Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_neg in HAVING agg proj"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12: BS_begin / BS_commit / BS_rollback binding                 *)
+(* ------------------------------------------------------------------ *)
+
+let bind_begin () =
+  let cat = two_col_cat () in
+  match bind cat Ast.S_begin with
+  | Ok Sema.BS_begin -> ()
+  | _ -> Alcotest.fail "expected BS_begin"
+
+let bind_commit () =
+  let cat = two_col_cat () in
+  match bind cat Ast.S_commit with
+  | Ok Sema.BS_commit -> ()
+  | _ -> Alcotest.fail "expected BS_commit"
+
+let bind_rollback () =
+  let cat = two_col_cat () in
+  match bind cat Ast.S_rollback with
+  | Ok Sema.BS_rollback -> ()
+  | _ -> Alcotest.fail "expected BS_rollback"
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1990,5 +2073,16 @@ let () =
       Alcotest.test_case "bind_select_having_agg_with_qual_arg_error" `Quick bind_select_having_agg_with_qual_arg_error;
       Alcotest.test_case "bind_select_having_agg_complex_arg" `Quick bind_select_having_agg_complex_arg;
       Alcotest.test_case "bind_select_having_sum_star_rejected" `Quick bind_select_having_sum_star_rejected;
+    ];
+    "agg-proj-errors", [
+      Alcotest.test_case "having_not_unknown_col"         `Quick bind_select_having_not_unknown_col;
+      Alcotest.test_case "having_is_null_unknown_col"     `Quick bind_select_having_is_null_unknown_col;
+      Alcotest.test_case "having_is_not_null_unknown_col" `Quick bind_select_having_is_not_null_unknown_col;
+      Alcotest.test_case "having_neg_unknown_col"         `Quick bind_select_having_neg_unknown_col;
+    ];
+    "txn-stmts", [
+      Alcotest.test_case "bind_begin"    `Quick bind_begin;
+      Alcotest.test_case "bind_commit"   `Quick bind_commit;
+      Alcotest.test_case "bind_rollback" `Quick bind_rollback;
     ];
   ]

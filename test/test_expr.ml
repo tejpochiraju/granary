@@ -263,6 +263,90 @@ let eval_eq () =
   Alcotest.(check bool) "5 = 5 → V_int 1"
     true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
 
+(* Ne text, real, blob — covers exec.ml lines 100-103 *)
+let eval_ne_text () =
+  let row = [| Row.V_text "abc" |] in
+  let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_text "xyz")) in
+  Alcotest.(check bool) "abc != xyz → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+let eval_ne_text_equal () =
+  let row = [| Row.V_text "same" |] in
+  let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_text "same")) in
+  Alcotest.(check bool) "same != same → V_int 0"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 0L))
+
+let eval_ne_real () =
+  let row = [| Row.V_real 1.0 |] in
+  let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.0)) in
+  Alcotest.(check bool) "1.0 != 2.0 → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+let eval_ne_blob () =
+  let row = [| Row.V_blob (Bytes.of_string "a") |] in
+  let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_blob (Bytes.of_string "b"))) in
+  Alcotest.(check bool) "a != b → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+(* cmp_result for text/real/blob — covers exec.ml lines 120-124 *)
+let eval_lt_text () =
+  let row = [| Row.V_text "apple" |] in
+  let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_text "banana")) in
+  Alcotest.(check bool) "apple < banana → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+let eval_lt_real () =
+  let row = [| Row.V_real 1.5 |] in
+  let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
+  Alcotest.(check bool) "1.5 < 2.5 → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+let eval_lt_blob () =
+  let row = [| Row.V_blob (Bytes.of_string "a") |] in
+  let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_blob (Bytes.of_string "b"))) in
+  Alcotest.(check bool) "a-blob < b-blob → V_int 1"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 1L))
+
+let eval_cmp_cross_type () =
+  (* Cross-type comparison: int vs text — returns false (0) *)
+  let row = [| Row.V_int 5L; Row.V_text "abc" |] in
+  let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "int < text (cross-type) → 0"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 0L))
+
+(* arith_op real + int — covers exec.ml lines 131-133 *)
+let eval_arith_real_int () =
+  let row = [| Row.V_real 2.5 |] in
+  let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_int 1L)) in
+  Alcotest.(check bool) "2.5 + 1 → V_real 3.5"
+    true (value_eq (Exec.eval_expr row e) (Row.V_real 3.5))
+
+let eval_compare_values_cross_type () =
+  (* compare_values cross-type (non-null): int vs text → 0 (line 35 of exec.ml) *)
+  (* We can test this via Eq which uses compare_values internally, or via a sort *)
+  (* Actually compare_values is also called in sort — use a direct approach via eval_binop *)
+  (* For cross-type cmp_result: text vs int → 0 *)
+  let row = [| Row.V_text "x"; Row.V_int 5L |] in
+  let e = Plan.P_binop (Plan.Gt, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "text > int (cross-type) → 0"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 0L))
+
+let eval_arith_text_error () =
+  (* arith_op: text + int → failwith (line 133 of exec.ml) *)
+  let row = [| Row.V_text "a"; Row.V_int 5L |] in
+  let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_col 1) in
+  (try
+     let _ = Exec.eval_expr row e in
+     Alcotest.fail "expected arithmetic error on text + int"
+   with Failure _ -> ())
+
+let eval_ne_null_left () =
+  (* V_null on left of Ne → Row.V_int 0L *)
+  let row = [| Row.V_null |] in
+  let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_int 5L)) in
+  Alcotest.(check bool) "null != 5 → V_int 0"
+    true (value_eq (Exec.eval_expr row e) (Row.V_int 0L))
+
 let eval_neq () =
   let row = [| Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_int 6L)) in
@@ -551,6 +635,18 @@ let () =
       Alcotest.test_case "eval_and"                `Quick eval_and;
       Alcotest.test_case "eval_or"                 `Quick eval_or;
       Alcotest.test_case "eval_cmp_null"           `Quick eval_cmp_null;
+      Alcotest.test_case "eval_ne_text"             `Quick eval_ne_text;
+      Alcotest.test_case "eval_ne_text_equal"       `Quick eval_ne_text_equal;
+      Alcotest.test_case "eval_ne_real"             `Quick eval_ne_real;
+      Alcotest.test_case "eval_ne_blob"             `Quick eval_ne_blob;
+      Alcotest.test_case "eval_lt_text"             `Quick eval_lt_text;
+      Alcotest.test_case "eval_lt_real"             `Quick eval_lt_real;
+      Alcotest.test_case "eval_lt_blob"             `Quick eval_lt_blob;
+      Alcotest.test_case "eval_cmp_cross_type"      `Quick eval_cmp_cross_type;
+      Alcotest.test_case "eval_arith_real_int"      `Quick eval_arith_real_int;
+      Alcotest.test_case "eval_compare_values_cross_type" `Quick eval_compare_values_cross_type;
+      Alcotest.test_case "eval_arith_text_error"          `Quick eval_arith_text_error;
+      Alcotest.test_case "eval_ne_null_left"              `Quick eval_ne_null_left;
     ];
     "qcheck", qcheck_tests;
   ]

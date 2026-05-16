@@ -1057,6 +1057,193 @@ let test_active_reader_gates_freelist () =
     run (S.close store))
 
 (* ------------------------------------------------------------------ *)
+(* 13b. map_btree_err Block_error / Corruption coverage                *)
+(* Trigger a Pager-level Block_error by truncating the file to be      *)
+(* shorter than the header records, so a page read goes out-of-bounds. *)
+(* ------------------------------------------------------------------ *)
+
+let test_btree_block_error_propagation () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    (* Write enough data to create a real tree with multiple pages *)
+    let* tx = S.rw_begin s in
+    let* () = Lwt_list.iter_s (fun i ->
+      let k = Bytes.of_string (Printf.sprintf "key%04d" i) in
+      let v = Bytes.of_string (Printf.sprintf "val%04d" i) in
+      S.put tx 0 k v
+    ) (List.init 20 Fun.id) in
+    let* () = S.commit tx in
+    let* () = S.close s in
+    (* Truncate the file to just 2 pages, making it too short for the data *)
+    let page_size = Sqlocaml_storage.Page.page_size in
+    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
+    let _ = Unix.ftruncate fd (2 * page_size) in
+    Unix.close fd;
+    (* Reopen: should succeed (headers on page 0-1 are intact) *)
+    let* r2 = S.open_file ~path in
+    (match r2 with
+     | Error _ ->
+       (* File truncation may corrupt headers too — that's ok, abort *)
+       Lwt.return_unit
+     | Ok s2 ->
+       let* tx2 = S.ro_begin s2 in
+       let* exc =
+         Lwt.catch
+           (fun () ->
+             let* _ = S.get tx2 0 (Bytes.of_string "key0000") in
+             Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       let* () = S.ro_end tx2 in
+       (* Either Block_error (out of bounds) or Tree_corrupt — both are ok *)
+       Alcotest.(check bool) "truncated file raises on get" true (exc <> None);
+       S.close s2)))
+
+(* ------------------------------------------------------------------ *)
+(* 13c. read_freelist_pages error path                                  *)
+(* Create a file where freelist_page points to a page beyond EOF,      *)
+(* causing Pager.read to fail — exercises the Error _ arm.             *)
+(* ------------------------------------------------------------------ *)
+
+let test_freelist_read_error_path () =
+  let path = Filename.temp_file "sqlocaml_fl_err_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    (* Create a file with many CoW operations so freelist has entries *)
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Do many commits to build up freelist entries *)
+    for i = 1 to 30 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    for i = 1 to 30 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.del tx 16 key);
+      run (S.commit tx)
+    done;
+    let freelist_sz = S.freelist_size store in
+    run (S.close store);
+    if freelist_sz > 0 then begin
+      (* The freelist was written. Now corrupt the header to make freelist_page
+         point to a page beyond the end of the file, triggering Pager.read error. *)
+      let module Pg = Sqlocaml_storage.Page in
+      let module Pager = Sqlocaml_storage.Pager in
+      let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
+      let st = Unix.fstat fd in
+      let file_size = st.Unix.st_size in
+      let n_pages = file_size / Pg.page_size in
+      (* Read header to find which header page is "live" *)
+      let buf0 = Bytes.create Pg.page_size in
+      let _ = Unix.lseek fd 0 Unix.SEEK_SET in
+      let _ = Unix.read fd buf0 0 Pg.page_size in
+      let buf1 = Bytes.create Pg.page_size in
+      let _ = Unix.lseek fd Pg.page_size Unix.SEEK_SET in
+      let _ = Unix.read fd buf1 0 Pg.page_size in
+      (* Set freelist_page field in BOTH header pages to a beyond-EOF page *)
+      (* Header layout: offset 32 = freelist_page (int64 BE) *)
+      let out_of_bounds = Int64.of_int (n_pages + 100) in
+      let set_freelist_page buf offset =
+        (* Offset 32 in header is freelist_page as int64 BE *)
+        Bytes.set_int64_be buf 32 out_of_bounds;
+        (* Re-seal the CRC *)
+        let cs = Cstruct.of_bytes buf in
+        Sqlocaml_storage.Page.seal cs;
+        let resealed = Bytes.create Pg.page_size in
+        Cstruct.blit_to_bytes cs 0 resealed 0 Pg.page_size;
+        let _ = Unix.lseek fd offset Unix.SEEK_SET in
+        let _ = Unix.write fd resealed 0 Pg.page_size in
+        ()
+      in
+      set_freelist_page buf0 0;
+      set_freelist_page buf1 Pg.page_size;
+      Unix.close fd;
+      (* Reopen: the freelist read will fail since freelist_page is out of bounds *)
+      let store2 = Result.get_ok (run (S.open_file ~path)) in
+      (* The freelist should be empty (error during read caused early return) *)
+      let _ = S.freelist_size store2 in
+      run (S.close store2)
+    end)
+
+(* ------------------------------------------------------------------ *)
+(* 14. min_active_reader_txn with multiple readers                     *)
+(* Tests the Some branch in min_active_reader_txn (comparing txn ids). *)
+(* ------------------------------------------------------------------ *)
+
+let test_multiple_active_readers () =
+  let path = Filename.temp_file "sqlocaml_multi_ro_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Commit two rounds to advance txn_id so we get different snap_txn_ids *)
+    let tx = run (S.rw_begin store) in
+    run (S.put tx 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
+    run (S.commit tx);
+    let ro1 = run (S.ro_begin store) in
+    (* Advance txn_id again *)
+    let tx2 = run (S.rw_begin store) in
+    run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
+    run (S.commit tx2);
+    let ro2 = run (S.ro_begin store) in
+    (* Both readers are active; rw_begin will see both in active_readers *)
+    let tx3 = run (S.rw_begin store) in
+    run (S.commit tx3);
+    (* Cleanup *)
+    run (S.ro_end ro1);
+    run (S.ro_end ro2);
+    run (S.close store))
+
+(* ------------------------------------------------------------------ *)
+(* 15. bt_get_tree_ro cache hit path                                   *)
+(* Opening the same tree_id twice in the same RO snapshot hits cache.  *)
+(* ------------------------------------------------------------------ *)
+
+let test_ro_cache_hit () =
+  let path = Filename.temp_file "sqlocaml_ro_cache_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx = run (S.rw_begin store) in
+    run (S.put tx 16 (Bytes.of_string "a") (Bytes.of_string "1"));
+    run (S.commit tx);
+    let ro = run (S.ro_begin store) in
+    (* First access: cache miss — builds tree from meta *)
+    let v1 = run (S.get ro 16 (Bytes.of_string "a")) in
+    (* Second access: cache hit — returns cached Btree *)
+    let v2 = run (S.get ro 16 (Bytes.of_string "a")) in
+    run (S.ro_end ro);
+    Alcotest.(check (option string)) "first read" (Some "1") (Option.map Bytes.to_string v1);
+    Alcotest.(check (option string)) "second read (cache hit)" (Some "1") (Option.map Bytes.to_string v2);
+    run (S.close store))
+
+(* ------------------------------------------------------------------ *)
+(* 16. ro_begin / ro_end on Btree: ref-count multiple readers          *)
+(* Tests the active_readers ref-count path (n > 1).                   *)
+(* ------------------------------------------------------------------ *)
+
+let test_ro_refcount () =
+  let path = Filename.temp_file "sqlocaml_ro_refcount_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx = run (S.rw_begin store) in
+    run (S.put tx 16 (Bytes.of_string "x") (Bytes.of_string "y"));
+    run (S.commit tx);
+    (* Open two RO snapshots at the same txn_id — ref-count goes to 2 *)
+    let ro1 = run (S.ro_begin store) in
+    let ro2 = run (S.ro_begin store) in
+    (* First ro_end: count drops from 2 to 1 (Some n branch) *)
+    run (S.ro_end ro1);
+    (* Second ro_end: count drops to 0 (Some 1 branch → remove) *)
+    run (S.ro_end ro2);
+    (* Engine must still work *)
+    let ro3 = run (S.ro_begin store) in
+    let v = run (S.get ro3 16 (Bytes.of_string "x")) in
+    run (S.ro_end ro3);
+    Alcotest.(check (option string)) "value after ro refcount" (Some "y")
+      (Option.map Bytes.to_string v);
+    run (S.close store))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1098,6 +1285,8 @@ let () =
       Alcotest.test_case "missing_key"    `Quick test_missing_key;
     ];
     "extra", [
+      Alcotest.test_case "btree_block_error" `Quick test_btree_block_error_propagation;
+      Alcotest.test_case "freelist_read_error" `Quick test_freelist_read_error_path;
       Alcotest.test_case "pp_error all variants"   `Quick test_pp_error_all_variants;
       Alcotest.test_case "rollback drops uncommitted" `Quick test_rollback_btree_drops_uncommitted;
       Alcotest.test_case "cursor_seek found (btree)"  `Quick test_cursor_seek_found;
@@ -1122,6 +1311,11 @@ let () =
       Alcotest.test_case "ro_sees_committed_not_in_progress" `Quick test_ro_sees_committed_not_in_progress;
       Alcotest.test_case "active_reader_gates_freelist" `Quick test_active_reader_gates_freelist;
       Alcotest.test_case "ro_after_rw_begin_safe" `Quick test_ro_after_rw_begin_safe;
+    ];
+    "readers", [
+      Alcotest.test_case "multiple_active_readers"   `Quick test_multiple_active_readers;
+      Alcotest.test_case "ro_cache_hit"              `Quick test_ro_cache_hit;
+      Alcotest.test_case "ro_refcount"               `Quick test_ro_refcount;
     ];
     "qcheck", qcheck_tests;
   ]

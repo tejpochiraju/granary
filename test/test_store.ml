@@ -579,6 +579,23 @@ let test_binary_order () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group 7b: Mem backend freelist / n_pages accessors return 0/[]/0L  *)
+(* ------------------------------------------------------------------ *)
+
+let test_mem_freelist_size () =
+  let s = S.create () in
+  Alcotest.(check int) "Mem freelist_size = 0" 0 (S.freelist_size s)
+
+let test_mem_freelist_entries () =
+  let s = S.create () in
+  Alcotest.(check int) "Mem freelist_entries = []" 0
+    (List.length (S.freelist_entries s))
+
+let test_mem_n_pages () =
+  let s = S.create () in
+  Alcotest.(check int64) "Mem n_pages = 0L" 0L (S.n_pages s)
+
+(* ------------------------------------------------------------------ *)
 (* Group 8: QCheck property tests                                       *)
 (* ------------------------------------------------------------------ *)
 
@@ -687,6 +704,11 @@ let () =
     "ordering", [
       Alcotest.test_case "lexicographic_order" `Quick test_lexicographic_order;
       Alcotest.test_case "binary_order"        `Quick test_binary_order;
+    ];
+    "mem_accessors", [
+      Alcotest.test_case "freelist_size"    `Quick test_mem_freelist_size;
+      Alcotest.test_case "freelist_entries" `Quick test_mem_freelist_entries;
+      Alcotest.test_case "n_pages"          `Quick test_mem_n_pages;
     ];
     "qcheck", qcheck_tests;
   ]
