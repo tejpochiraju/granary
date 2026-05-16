@@ -15,6 +15,7 @@ module Btree    = Sqlocaml_storage.Btree
 module Pager    = Sqlocaml_storage.Pager
 module Header   = Sqlocaml_storage.Header
 module Freelist = Sqlocaml_storage.Freelist
+module Page     = Sqlocaml_storage.Page
 module Unix_file = Sqlocaml_block.Unix_file
 module Varint   = Sqlocaml_encoding.Varint
 
@@ -165,6 +166,38 @@ let unwrap_error r =
   | Error e -> Lwt.fail_with (Format.asprintf "Store: %a" pp_error e)
 
 (* ------------------------------------------------------------------ *)
+(* Freelist page I/O helpers (forward-declared here; used by open_file  *)
+(* and commit below)                                                    *)
+(* ------------------------------------------------------------------ *)
+
+(* Walk the freelist page chain starting at [first_page], collect all
+   entries, and return a reconstructed [Freelist.t]. *)
+let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
+  if Int64.equal first_page 0L then Lwt.return Freelist.empty
+  else begin
+    let rec loop pid acc =
+      if Int64.equal pid 0L then Lwt.return (Freelist.of_list (List.rev acc))
+      else begin
+        let* r = Pager.read pager pid in
+        match r with
+        | Error _ -> Lwt.return (Freelist.of_list (List.rev acc))
+        | Ok buf ->
+          let common = Page.read_common buf in
+          let n = common.Page.n_keys in
+          let next_pid = Int64.logand 0xFFFFFFFFL
+                           (Int64.of_int32 common.Page.right_page) in
+          let entries =
+            List.init n (fun i ->
+              let e = Page.freelist_entry_at buf ~index:i in
+              (e.Page.page_id, e.Page.freed_at_txn_id))
+          in
+          loop next_pid (List.rev_append entries acc)
+      end
+    in
+    loop first_page []
+  end
+
+(* ------------------------------------------------------------------ *)
 (* create / open_file / close                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -255,6 +288,8 @@ let open_file ~path : (t, error) result Lwt.t =
       match hr with
       | Error e -> Lwt.return_error (map_header_err e)
       | Ok h ->
+        let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+        Pager.set_freelist pager fl;
         let meta = Btree.create pager ~root_page:h.root_page in
         let st =
           { file; pager; meta;
@@ -291,6 +326,89 @@ let rw_begin t =
 
 let ro_end (Ro _ : ro txn) = Lwt.return_unit
 
+(* Free the previous freelist page chain back into the pager's in-memory
+   freelist (stamped with the current txn_id). *)
+let free_old_freelist_pages pager ~first_page =
+  let rec loop pid =
+    if Int64.equal pid 0L then Lwt.return_unit
+    else begin
+      let* r = Pager.read pager pid in
+      let next_pid =
+        match r with
+        | Error _ -> 0L
+        | Ok buf ->
+          let c = Page.read_common buf in
+          Int64.logand 0xFFFFFFFFL (Int64.of_int32 c.Page.right_page)
+      in
+      Pager.free pager ~page_id:pid
+        ~freed_at_txn_id:(Pager.get_txn_id pager);
+      loop next_pid
+    end
+  in
+  loop first_page
+
+(* Serialize the current pager freelist to a new page chain.
+   Returns the first page id (0L if the freelist is empty). *)
+let write_freelist_pages pager : int64 Lwt.t =
+  let entries_before = Freelist.to_list (Pager.freelist pager) in
+  let n_entries = List.length entries_before in
+  let max_per = Page.max_freelist_entries_per_page in
+  let n_fl_pages = (n_entries + max_per - 1) / max_per in
+  if n_fl_pages = 0 then Lwt.return 0L
+  else begin
+    (* Allocate all needed pages *)
+    let* page_ids =
+      Lwt_list.map_s (fun () ->
+        let* r = Pager.alloc pager in
+        match r with
+        | Ok pid -> Lwt.return pid
+        | Error e ->
+          Lwt.fail_with
+            (Format.asprintf "write_freelist_pages: %a" Pager.pp_error e)
+      ) (List.init n_fl_pages (fun _ -> ()))
+    in
+    (* Get FINAL freelist state after allocations *)
+    let final_entries = Freelist.to_list (Pager.freelist pager) in
+    (* Split into chunks of max_per *)
+    let rec chunkify = function
+      | [] -> []
+      | lst ->
+        let chunk = List.filteri (fun i _ -> i < max_per) lst in
+        let rest  = List.filteri (fun i _ -> i >= max_per) lst in
+        chunk :: chunkify rest
+    in
+    let chunks = chunkify final_entries in
+    let n_chunks = List.length chunks in
+    let pid_arr = Array.of_list page_ids in
+    (* Write each chunk to a freelist page *)
+    List.iteri (fun i chunk ->
+      let pid  = pid_arr.(i) in
+      let next = if i + 1 < Array.length pid_arr then pid_arr.(i+1) else 0L in
+      let buf  = Cstruct.create Page.page_size in
+      Cstruct.memset buf 0;
+      Page.write_common buf
+        { Page.kind = Page.Freelist; flags = 0;
+          n_keys = List.length chunk;
+          right_page = Int64.to_int32 next; crc32 = 0l };
+      List.iteri (fun j (page_id, freed_at_txn_id) ->
+        Page.freelist_set_entry buf ~index:j ~page_id ~freed_at_txn_id
+      ) chunk;
+      Pager.write pager pid buf
+    ) chunks;
+    (* Any extra allocated pages (n_fl_pages > n_chunks) get empty freelist pages *)
+    for i = n_chunks to n_fl_pages - 1 do
+      let pid  = pid_arr.(i) in
+      let next = if i + 1 < Array.length pid_arr then pid_arr.(i+1) else 0L in
+      let buf  = Cstruct.create Page.page_size in
+      Cstruct.memset buf 0;
+      Page.write_common buf
+        { Page.kind = Page.Freelist; flags = 0; n_keys = 0;
+          right_page = Int64.to_int32 next; crc32 = 0l };
+      Pager.write pager pid buf
+    done;
+    Lwt.return pid_arr.(0)
+  end
+
 (* commit:
    - Mem backend: no I/O, just release the writer lock.
    - Btree backend: flush all currently-open trees' root_pages into the
@@ -305,6 +423,10 @@ let commit (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
    | Mem _ -> Lwt.return_unit
    | Btree st ->
+     (* 1. Free old freelist pages from the previous commit *)
+     let* () = free_old_freelist_pages st.pager
+                 ~first_page:st.current_header.freelist_page
+     in
      (* Persist every cached tree's root_page into the meta-tree.  We
         iterate over a snapshot of the bindings to avoid mutation during
         iteration. *)
@@ -322,10 +444,12 @@ let commit (Rw t : rw txn) : unit Lwt.t =
            (Format.asprintf "Store.commit: %a" pp_error (map_btree_err e))
        ) bindings
      in
+     (* Write updated freelist to new pages *)
+     let* freelist_first_page = write_freelist_pages st.pager in
      let new_state : Header.t =
        { txn_id         = 0L;  (* overwritten by Header.commit *)
          root_page      = Btree.root_page st.meta;
-         freelist_page  = 0L;  (* Phase 1: no freelist persistence *)
+         freelist_page  = freelist_first_page;
          n_pages_total  = Pager.n_pages st.pager;
          schema_version = st.schema_version }
      in
@@ -516,3 +640,13 @@ let cursor_value c =
   match c.remaining with
   | (_, v) :: _ when c.ready -> Some v
   | _ -> None
+
+let freelist_size t =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> Freelist.size (Pager.freelist st.pager)
+
+let n_pages t =
+  match t.backend with
+  | Mem _ -> 0L
+  | Btree st -> Pager.n_pages st.pager

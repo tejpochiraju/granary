@@ -52,3 +52,6 @@ val get_txn_id : t -> int64
 (** Set the minimum txn_id threshold for freelist reuse.
     A freed page is reusable iff freed_at_txn_id < alloc_min_safe. *)
 val set_alloc_min_safe : t -> int64 -> unit
+
+(** Replace the in-memory freelist (used after deserializing from disk). *)
+val set_freelist : t -> Freelist.t -> unit

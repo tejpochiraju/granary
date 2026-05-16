@@ -168,3 +168,5 @@ let set_txn_id t id = t.current_txn_id <- id
 let get_txn_id t = t.current_txn_id
 
 let set_alloc_min_safe t v = t.alloc_min_safe <- v
+
+let set_freelist t fl = t.freelist <- fl

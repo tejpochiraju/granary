@@ -773,6 +773,76 @@ let test_open_corrupt_headers_both () =
   Alcotest.(check bool) "got expected error" true !finished
 
 (* ------------------------------------------------------------------ *)
+(* 11. Freelist persistence                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_freelist_survives_reopen () =
+  let path = Filename.temp_file "sqlocaml_fl_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Insert 50 rows to force some B+-tree page allocations *)
+    for i = 1 to 50 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      let value = Bytes.of_string "value" in
+      run (S.put tx 16 key value);
+      run (S.commit tx)
+    done;
+    (* Delete half to free pages via CoW *)
+    for i = 1 to 25 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.del tx 16 key);
+      run (S.commit tx)
+    done;
+    let fl_before = S.freelist_size store in
+    run (S.close store);
+    (* Reopen and verify freelist recovered *)
+    let store2 = Result.get_ok (run (S.open_file ~path)) in
+    let fl_after = S.freelist_size store2 in
+    Alcotest.(check bool) "freelist non-empty after reopen"
+      true (fl_after > 0);
+    Alcotest.(check int) "freelist size matches" fl_before fl_after;
+    run (S.close store2))
+
+let test_freed_pages_reused_after_reopen () =
+  let path = Filename.temp_file "sqlocaml_reuse_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Build initial state *)
+    for i = 1 to 30 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    (* Delete all to free pages *)
+    for i = 1 to 30 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.del tx 16 key);
+      run (S.commit tx)
+    done;
+    let n_pages_after_delete = S.n_pages store in
+    run (S.close store);
+    (* Reopen: freelist should be loaded *)
+    let store2 = Result.get_ok (run (S.open_file ~path)) in
+    Alcotest.(check bool) "freelist loaded on reopen"
+      true (S.freelist_size store2 > 0);
+    (* Reinsert: should reuse freed pages, file should not grow significantly *)
+    for i = 1 to 30 do
+      let tx = run (S.rw_begin store2) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    let n_pages_after_reinsert = S.n_pages store2 in
+    (* Allow some growth for freelist pages themselves, but it should be bounded *)
+    Alcotest.(check bool) "pages reused — file doesn't grow much"
+      true (n_pages_after_reinsert <= Int64.add n_pages_after_delete 10L);
+    run (S.close store2))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -823,6 +893,10 @@ let () =
       Alcotest.test_case "put value too large"       `Quick test_put_value_too_large_btree;
       Alcotest.test_case "open corrupt headers"      `Quick test_open_corrupt_headers_both;
       Alcotest.test_case "btree corruption surfaces" `Quick test_btree_corrupt_propagation;
+    ];
+    "freelist", [
+      Alcotest.test_case "survives reopen"          `Quick test_freelist_survives_reopen;
+      Alcotest.test_case "freed pages reused"       `Quick test_freed_pages_reused_after_reopen;
     ];
     "qcheck", qcheck_tests;
   ]

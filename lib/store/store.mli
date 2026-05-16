@@ -112,3 +112,9 @@ val cursor_next : cursor -> (bytes * bytes) option
 (** Return the value at the current cursor position without advancing,
     or [None] if the cursor is not positioned (exhausted or before first). *)
 val cursor_value : cursor -> bytes option
+
+(** Number of entries in the in-memory freelist (diagnostics / testing). *)
+val freelist_size : t -> int
+
+(** Current total file page count (diagnostics / testing). *)
+val n_pages : t -> int64
