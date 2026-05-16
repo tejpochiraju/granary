@@ -323,7 +323,7 @@ let unique_violation_on_update
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
     number of rows whose contents were modified. *)
-let execute_update ?(mode = Auto) (store : S.t)
+let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(assignments : (int * Plan.expr) list)
     ~(where : Plan.expr option)
@@ -344,7 +344,7 @@ let execute_update ?(mode = Auto) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr [||] row pred)
+        | Some pred -> value_truthy (eval_expr params row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -366,7 +366,7 @@ let execute_update ?(mode = Auto) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr [||] old_row expr
+              new_row.(i) <- eval_expr params old_row expr
             ) assignments;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
@@ -402,7 +402,7 @@ let execute_update ?(mode = Auto) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr [||] old_row expr
+              new_row.(i) <- eval_expr params old_row expr
             ) assignments;
             let key = Rowid.encode rowid in
             (* Update index entries: delete old, insert new. *)
@@ -438,7 +438,7 @@ let execute_update ?(mode = Auto) (store : S.t)
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
     then for each matching (rowid, row) remove index entries and the
     row itself from the table tree.  Returns the number of rows deleted. *)
-let execute_delete ?(mode = Auto) (store : S.t)
+let execute_delete ?(mode = Auto) ?(params = [||]) (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(where : Plan.expr option)
     ~(indexes : Cat.index_info list)
@@ -457,7 +457,7 @@ let execute_delete ?(mode = Auto) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr [||] row pred)
+        | Some pred -> value_truthy (eval_expr params row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -548,9 +548,9 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
                 ~col_idx ~unique ~columns in
     Lwt.return 0
   | Plan.Op_update { table_meta; assignments; where; indexes } ->
-    execute_update ~mode store ~table_meta ~assignments ~where ~indexes
+    execute_update ~mode ~params store ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes } ->
-    execute_delete ~mode store ~table_meta ~where ~indexes
+    execute_delete ~mode ~params store ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     Lwt.return 0
