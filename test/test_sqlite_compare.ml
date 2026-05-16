@@ -481,6 +481,53 @@ let cases = [
     query = "SELECT * FROM t WHERE a > 0 AND b > 0 ORDER BY a ASC";
     unordered = false };
 
+  (* HAVING with qualified table.col inside aggregate function *)
+  { name = "having_qualified_agg_col";
+    setup = [
+      "CREATE TABLE t (cat TEXT, val INTEGER)";
+      "INSERT INTO t VALUES ('a', 1)";
+      "INSERT INTO t VALUES ('a', 2)";
+      "INSERT INTO t VALUES ('b', 10)";
+      "INSERT INTO t VALUES ('b', 20)";
+      "INSERT INTO t VALUES ('c', 1)";
+    ];
+    query = "SELECT cat, SUM(val) FROM t GROUP BY cat HAVING SUM(t.val) > 5 ORDER BY cat ASC";
+    unordered = false };
+
+  (* ORDER BY with qualified column in JOIN query *)
+  { name = "order_by_qualified_col";
+    setup = [
+      "CREATE TABLE a (id INTEGER, name TEXT)";
+      "CREATE TABLE b (aid INTEGER, val INTEGER)";
+      "INSERT INTO a VALUES (1, 'x')";
+      "INSERT INTO a VALUES (2, 'y')";
+      "INSERT INTO b VALUES (1, 100)";
+      "INSERT INTO b VALUES (2, 200)";
+    ];
+    query = "SELECT a.name, b.val FROM a INNER JOIN b ON a.id = b.aid ORDER BY a.name DESC";
+    unordered = false };
+
+  (* SELECT * with WHERE clause using OR *)
+  { name = "select_star_where_or";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT, score INTEGER)";
+      "INSERT INTO t VALUES (1, 'alice', 90)";
+      "INSERT INTO t VALUES (2, 'bob', 50)";
+      "INSERT INTO t VALUES (3, 'charlie', 80)";
+    ];
+    query = "SELECT * FROM t WHERE score > 85 OR name = 'bob' ORDER BY id ASC";
+    unordered = false };
+
+  (* Negative integer division *)
+  { name = "negative_division";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b INTEGER)";
+      "INSERT INTO t VALUES (-7, 2)";
+      "INSERT INTO t VALUES (7, -2)";
+    ];
+    query = "SELECT a / b FROM t ORDER BY a ASC";
+    unordered = false };
+
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
