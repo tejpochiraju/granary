@@ -14,6 +14,8 @@ type bound_expr =
     (** Scalar function call (Phase 5). *)
   | BE_param       of int
     (** 0-indexed positional parameter (?). *)
+  | BE_match       of Sqlocaml_catalog.Catalog.fts_table_meta * Fts_query.fts_query
+    (** FTS MATCH expression: [table MATCH 'query']. *)
 
 type bound_order_key = {
   col_idx : int;
@@ -131,6 +133,11 @@ type bound_stmt =
   | BS_fts_seq_scan of {
       fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta;
       where    : bound_expr option;
+    }
+  | BS_fts_match_scan of {
+      fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta;
+      query    : Fts_query.fts_query;
+      proj     : int list;
     }
 
 type error =

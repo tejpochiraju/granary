@@ -19,6 +19,8 @@ let rec plan_expr = function
   | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
   | Sema.BE_func (func, args)   -> Plan.P_func (func, List.map plan_expr args)
   | Sema.BE_param i             -> Plan.P_param i
+  | Sema.BE_match _             ->
+    failwith "plan_expr: BE_match should be handled at statement level, not as an expr"
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -352,3 +354,5 @@ let plan ?cat = function
     Plan.Op_fts_delete { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_seq_scan { fts_meta; where } ->
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
+  | Sema.BS_fts_match_scan { fts_meta; query; proj } ->
+    Plan.Op_fts_match_scan { fts_meta; query; proj }

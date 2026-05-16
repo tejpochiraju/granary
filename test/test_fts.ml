@@ -128,6 +128,85 @@ let test_fts_seq_scan () =
       Alcotest.(check int) "row count" 2 (List.length rows);
       Lwt.return_unit)
 
+let test_match_basic () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(title, body)" in
+    let* _ = D.execute db "INSERT INTO docs (title, body) VALUES ('OCaml intro', 'Functional language')" in
+    let* _ = D.execute db "INSERT INTO docs (title, body) VALUES ('Python guide', 'Dynamic language')" in
+    let* _ = D.execute db "INSERT INTO docs (title, body) VALUES ('OCaml advanced', 'Type systems')" in
+    let* r = D.query db "SELECT title FROM docs WHERE docs MATCH 'ocaml'" in
+    match r with
+    | Error e -> Alcotest.failf "match: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "match ocaml count" 2 (List.length rows);
+      Lwt.return_unit)
+
+let test_match_multiterm () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick brown fox')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick lazy dog')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('slow brown cat')" in
+    (* AND query: only doc 1 has both "quick" AND "brown" *)
+    let* r = D.query db "SELECT body FROM docs WHERE docs MATCH 'quick brown'" in
+    match r with
+    | Error e -> Alcotest.failf "multiterm: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "and count" 1 (List.length rows);
+      Lwt.return_unit)
+
+let test_match_or () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick brown fox')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('lazy dog')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('hello world')" in
+    (* OR query: docs 1 and 2 match *)
+    let* r = D.query db "SELECT body FROM docs WHERE docs MATCH 'fox OR dog'" in
+    match r with
+    | Error e -> Alcotest.failf "or: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "or count" 2 (List.length rows);
+      Lwt.return_unit)
+
+let test_match_not () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick brown fox')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('quick lazy dog')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('slow brown cat')" in
+    (* quick AND NOT dog: doc 1 has "quick" without "dog" *)
+    let* r = D.query db "SELECT body FROM docs WHERE docs MATCH 'quick -dog'" in
+    match r with
+    | Error e -> Alcotest.failf "not: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "not count" 1 (List.length rows);
+      Lwt.return_unit)
+
+let test_match_prefix () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('programming is fun')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('programs are useful')" in
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('hello world')" in
+    (* prefix "prog*" matches docs 1 and 2 *)
+    let* r = D.query db "SELECT body FROM docs WHERE docs MATCH 'prog*'" in
+    match r with
+    | Error e -> Alcotest.failf "prefix: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "prefix count" 2 (List.length rows);
+      Lwt.return_unit)
+
 let () =
   Alcotest.run "fts" [
     "ddl", [
@@ -148,5 +227,12 @@ let () =
       Alcotest.test_case "insert"   `Quick test_fts_insert;
       Alcotest.test_case "delete"   `Quick test_fts_delete;
       Alcotest.test_case "seq_scan" `Quick test_fts_seq_scan;
+    ];
+    "match", [
+      Alcotest.test_case "basic"     `Quick test_match_basic;
+      Alcotest.test_case "multiterm" `Quick test_match_multiterm;
+      Alcotest.test_case "or"        `Quick test_match_or;
+      Alcotest.test_case "not"       `Quick test_match_not;
+      Alcotest.test_case "prefix"    `Quick test_match_prefix;
     ];
   ]

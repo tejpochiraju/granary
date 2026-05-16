@@ -139,6 +139,11 @@ type op =
       fts_meta : Cat.fts_table_meta;
       where    : expr option;
     }
+  | Op_fts_match_scan of {
+      fts_meta : Cat.fts_table_meta;
+      query    : Fts_query.fts_query;
+      proj     : int list;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

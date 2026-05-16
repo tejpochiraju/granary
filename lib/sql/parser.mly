@@ -25,6 +25,7 @@
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
 %token VIRTUAL USING FTS5
+%token MATCH
 %token QUESTION
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
@@ -255,5 +256,6 @@ expr:
   | MINUS e = expr %prec UMINUS       { E_neg e }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
+  | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }
   | LPAREN e = expr RPAREN            { e }
   | QUESTION                          { E_param 0 }

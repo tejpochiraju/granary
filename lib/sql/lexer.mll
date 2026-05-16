@@ -65,6 +65,7 @@ rule token = parse
   | "VIRTUAL"  { VIRTUAL }
   | "USING"    { USING }
   | "FTS5"     { FTS5 }
+  | "MATCH"    { MATCH }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

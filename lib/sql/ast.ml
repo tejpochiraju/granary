@@ -47,6 +47,8 @@ type expr =
     (** Scalar function call. *)
   | E_param       of int
     (** 0-indexed positional parameter: ? *)
+  | E_match       of string * string
+    (** [E_match (table_name, query_string)]: [WHERE table MATCH 'query'] *)
 
 type column_def = {
   name        : string;

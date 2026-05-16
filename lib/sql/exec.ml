@@ -207,6 +207,18 @@ let fts_encode_content (texts : string list) : bytes =
     Buffer.add_bytes buf b) texts;
   Buffer.to_bytes buf
 
+let decode_positions value =
+  let len = Bytes.length value in
+  let pos = ref 0 in
+  let result = ref [] in
+  while !pos < len do
+    let col, off1 = Varint.decode_uint64 value !pos in
+    let p, off2   = Varint.decode_uint64 value off1 in
+    result := (Int64.to_int col, Int64.to_int p) :: !result;
+    pos := off2
+  done;
+  List.rev !result
+
 let fts_decode_content bytes =
   let n, off0 = Varint.decode_uint64 bytes 0 in
   let nc = Int64.to_int n in
@@ -272,6 +284,131 @@ let fts_deindex_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
   let* (docs, toks) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
   write_fts_stats tx fts_meta.Cat.fts_index_tree
     (max 0 (docs - 1)) (max 0 (toks - dlen))
+
+(* ------------------------------------------------------------------ *)
+(* FTS query execution                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(** Fetch the posting list for an exact term: [(rowid, positions)] *)
+let fts_posting_list tx ~index_tree term =
+  (* Scan keys from term\x00 onwards (sorted order) *)
+  let prefix = Bytes.cat (Bytes.of_string term) (Bytes.of_string "\x00") in
+  let* cur = S.cursor_open tx index_tree in
+  let _sr = S.cursor_seek cur prefix in
+  let entries = ref [] in
+  let rec gather () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (key, value) ->
+      if Bytes.length key >= Bytes.length prefix &&
+         Bytes.equal (Bytes.sub key 0 (Bytes.length prefix)) prefix then begin
+        (* Extract rowid from last 8 bytes (sign-bit-flipped) *)
+        let rowid_off = Bytes.length key - 8 in
+        let v = ref 0L in
+        for i = 0 to 7 do
+          v := Int64.logor (Int64.shift_left !v 8)
+                 (Int64.of_int (Bytes.get_uint8 key (rowid_off + i)))
+        done;
+        let rowid = Int64.logxor !v Int64.min_int in
+        let positions = decode_positions value in
+        entries := (rowid, positions) :: !entries;
+        gather ()
+      end
+  in
+  gather ();
+  S.cursor_close cur;
+  Lwt.return (List.rev !entries)
+
+(** Fetch posting lists for a prefix: merge all (rowid, positions) for terms matching prefix* *)
+let fts_prefix_posting_list tx ~index_tree prefix_str =
+  let prefix_bytes = Bytes.of_string prefix_str in
+  let plen = Bytes.length prefix_bytes in
+  let* cur = S.cursor_open tx index_tree in
+  let _sr = S.cursor_seek cur prefix_bytes in
+  let by_rowid : (int64, (int * int) list) Hashtbl.t = Hashtbl.create 16 in
+  let rec gather () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (key, value) ->
+      (* Find the null byte separating term from rowid *)
+      let null_pos = ref (-1) in
+      let klen = Bytes.length key in
+      let i = ref 0 in
+      while !i < klen - 8 && !null_pos = -1 do
+        if Bytes.get_uint8 key !i = 0 then null_pos := !i;
+        incr i
+      done;
+      if !null_pos > 0 then begin
+        let term_len = !null_pos in
+        (* Check term has our prefix *)
+        if term_len >= plen &&
+           Bytes.equal (Bytes.sub key 0 plen) prefix_bytes then begin
+          let rowid_off = !null_pos + 1 in
+          if rowid_off + 8 <= klen then begin
+            let v = ref 0L in
+            for j = 0 to 7 do
+              v := Int64.logor (Int64.shift_left !v 8)
+                     (Int64.of_int (Bytes.get_uint8 key (rowid_off + j)))
+            done;
+            let rowid = Int64.logxor !v Int64.min_int in
+            let positions = decode_positions value in
+            let existing = Option.value ~default:[] (Hashtbl.find_opt by_rowid rowid) in
+            Hashtbl.replace by_rowid rowid (existing @ positions);
+            gather ()
+          end
+        end
+        (* if term no longer has the prefix, stop — keys are sorted *)
+      end
+  in
+  gather ();
+  S.cursor_close cur;
+  Lwt.return (Hashtbl.fold (fun rowid positions acc -> (rowid, positions) :: acc) by_rowid [])
+
+(** Execute an FTS query, returning [(rowid, positions)] for matching documents. *)
+let rec fts_execute_query tx ~index_tree query =
+  match query with
+  | Fts_query.FQ_term (Fts_query.FT_exact term) ->
+    fts_posting_list tx ~index_tree term
+  | Fts_query.FQ_term (Fts_query.FT_prefix prefix) ->
+    fts_prefix_posting_list tx ~index_tree prefix
+  | Fts_query.FQ_term (Fts_query.FT_phrase words) ->
+    (* Phrase: find docs where all words are present (simplified — no position check). *)
+    (match words with
+     | [] -> Lwt.return []
+     | first :: rest ->
+       let* first_pl = fts_posting_list tx ~index_tree first in
+       let* rest_pls = Lwt_list.map_s (fts_posting_list tx ~index_tree) rest in
+       let intersect acc pl =
+         let row_ids = List.map fst pl in
+         List.filter (fun (r, _) -> List.mem r row_ids) acc
+       in
+       Lwt.return (List.fold_left intersect first_pl rest_pls))
+  | Fts_query.FQ_and qs ->
+    let positive = List.filter (function Fts_query.FQ_not _ -> false | _ -> true) qs in
+    let negated  = List.filter_map (function Fts_query.FQ_not q -> Some q | _ -> None) qs in
+    let* pos_results = Lwt_list.map_s (fts_execute_query tx ~index_tree) positive in
+    let* neg_results = Lwt_list.map_s (fts_execute_query tx ~index_tree) negated in
+    let neg_ids = List.concat_map (List.map fst) neg_results in
+    let intersected = match pos_results with
+      | [] -> []
+      | first :: rest ->
+        List.fold_left (fun acc pl ->
+          let ids = List.map fst pl in
+          List.filter (fun (r, _) -> List.mem r ids) acc) first rest
+    in
+    Lwt.return (List.filter (fun (r, _) -> not (List.mem r neg_ids)) intersected)
+  | Fts_query.FQ_or qs ->
+    let* results = Lwt_list.map_s (fts_execute_query tx ~index_tree) qs in
+    let seen : (int64, unit) Hashtbl.t = Hashtbl.create 16 in
+    let union = List.concat_map (fun pl ->
+      List.filter (fun (r, _) ->
+        if Hashtbl.mem seen r then false
+        else begin Hashtbl.replace seen r (); true end) pl) results in
+    Lwt.return union
+  | Fts_query.FQ_not _ ->
+    (* Standalone NOT is meaningless; returns empty set.
+       NOT inside AND is handled in the FQ_and case above. *)
+    Lwt.return []
 
 (** Helper: find the first index [i] such that [pred lst[i]] holds. *)
 let list_find_index pred lst =
@@ -757,7 +894,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _
-  | Plan.Op_fts_seq_scan _ ->
+  | Plan.Op_fts_seq_scan _ | Plan.Op_fts_match_scan _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -1168,6 +1305,23 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
           else read_next ()
     in
     Lwt.return (Lwt_stream.from read_next)
+  | Plan.Op_fts_match_scan { fts_meta; query; proj } ->
+    let* tx = S.ro_begin store in
+    let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
+    let* rows = Lwt_list.filter_map_s (fun (rowid, _positions) ->
+      let key = Rowid.encode rowid in
+      let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
+      match val_opt with
+      | None -> Lwt.return None
+      | Some bytes ->
+        let texts = fts_decode_content bytes in
+        let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+        let projected = if proj = [] then full_row
+                        else Array.of_list (List.map (fun i -> full_row.(i)) proj)
+        in
+        Lwt.return (Some projected)) matches in
+    let* () = S.ro_end tx in
+    Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _

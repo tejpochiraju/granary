@@ -14,6 +14,7 @@ type bound_expr =
   | BE_neg         of bound_expr
   | BE_func        of Ast.scalar_func * bound_expr list
   | BE_param       of int
+  | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
 
 type bound_order_key = {
   col_idx : int;
@@ -106,6 +107,11 @@ type bound_stmt =
   | BS_fts_seq_scan of {
       fts_meta : Cat.fts_table_meta;
       where    : bound_expr option;
+    }
+  | BS_fts_match_scan of {
+      fts_meta : Cat.fts_table_meta;
+      query    : Fts_query.fts_query;
+      proj     : int list;
     }
 
 type error =
@@ -222,6 +228,8 @@ let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
        else
          Ok (BE_func (func, ok_args)))
+  | Ast.E_match _ ->
+    Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -298,6 +306,8 @@ let rec bind_expr_join
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
        else
          Ok (BE_func (func, ok_args)))
+  | Ast.E_match _ ->
+    Error (Unsupported "MATCH in JOIN context")
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -401,6 +411,8 @@ let bind_expr_agg
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
          else
            Ok (BE_func (func, ok_args)))
+    | Ast.E_match _ ->
+      Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
   in
   match go e with
   | Error e -> Error e
@@ -409,7 +421,7 @@ let bind_expr_agg
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
   | Ast.E_agg _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ -> false
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e ->
     expr_has_agg e
@@ -588,26 +600,58 @@ let bind_insert cat ~param_counter ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_fts_seq_scan cat ~param_counter ~table ~where =
+let bind_fts_seq_scan cat ~param_counter:_ ~table ~where ~proj =
   match Cat.find_fts cat table with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some fts_meta ->
-    let synth_meta = fts_as_table_meta fts_meta in
-    let where_result =
-      match where with
-      | None   -> Ok None
-      | Some e ->
-        (match bind_expr ~param_counter synth_meta e with
-         | Ok be   -> Ok (Some be)
-         | Error e -> Error e)
-    in
-    (match where_result with
-     | Error e -> Lwt.return (Error e)
-     | Ok bound_where ->
-       Lwt.return (Ok (BS_fts_seq_scan {
-         fts_meta;
-         where = bound_where;
-       })))
+    (match where with
+     | Some (Ast.E_match (match_table, query_str)) ->
+       (* Validate the table name matches *)
+       if not (String.equal match_table fts_meta.Cat.fts_name) then
+         Lwt.return (Error (Unknown_table match_table))
+       else
+         (match Fts_query.parse query_str with
+          | Error msg -> Lwt.return (Error (Unsupported ("FTS query parse error: " ^ msg)))
+          | Ok q ->
+            (* Compute column ordinals from the projection *)
+            let col_ords = match proj with
+              | `All ->
+                List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns
+              | `Cols names ->
+                List.filter_map (fun name ->
+                  let rec find i = function
+                    | [] -> None
+                    | c :: _ when String.equal c name -> Some i
+                    | _ :: rest -> find (i+1) rest
+                  in
+                  find 0 fts_meta.Cat.fts_columns
+                ) names
+              | `Exprs _ ->
+                List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns
+            in
+            Lwt.return (Ok (BS_fts_match_scan {
+              fts_meta;
+              query = q;
+              proj  = col_ords;
+            })))
+     | _ ->
+       let synth_meta = fts_as_table_meta fts_meta in
+       let param_counter = ref 0 in
+       let where_result =
+         match where with
+         | None   -> Ok None
+         | Some e ->
+           (match bind_expr ~param_counter synth_meta e with
+            | Ok be   -> Ok (Some be)
+            | Error e -> Error e)
+       in
+       (match where_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok bound_where ->
+          Lwt.return (Ok (BS_fts_seq_scan {
+            fts_meta;
+            where = bound_where;
+          }))))
 
 let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
@@ -616,7 +660,7 @@ let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having 
     (* Not a regular table — check if it's an FTS table (only plain SELECT supported) *)
     (match joins, group_by, having, order, limit, offset with
      | [], [], None, [], None, None ->
-       bind_fts_seq_scan cat ~param_counter ~table ~where
+       bind_fts_seq_scan cat ~param_counter ~table ~where ~proj
      | _ ->
        (* FTS does not yet support JOINs, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET *)
        (match Cat.find_fts cat table with
@@ -1038,6 +1082,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
   | BE_neg e -> infer_type cols e
   | BE_func _ -> None   (* scalar functions return dynamic types *)
   | BE_param _ -> None  (* parameter type unknown at compile time *)
+  | BE_match _ -> Some Row.Integer  (* MATCH returns boolean (0/1) *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
