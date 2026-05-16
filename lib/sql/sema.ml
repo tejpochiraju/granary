@@ -178,7 +178,16 @@ let rec bind_expr (meta : Cat.table_meta) = function
      | e :: _ -> Error e
      | [] ->
        let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-       Ok (BE_func (func, ok_args)))
+       let n = List.length ok_args in
+       let arity_ok = match func with
+         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
+         | Ast.Fn_ifnull -> n = 2
+         | Ast.Fn_coalesce -> n >= 1
+       in
+       if not arity_ok then
+         Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
+       else
+         Ok (BE_func (func, ok_args)))
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -240,7 +249,16 @@ let rec bind_expr_join
      | e :: _ -> Error e
      | [] ->
        let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-       Ok (BE_func (func, ok_args)))
+       let n = List.length ok_args in
+       let arity_ok = match func with
+         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
+         | Ast.Fn_ifnull -> n = 2
+         | Ast.Fn_coalesce -> n >= 1
+       in
+       if not arity_ok then
+         Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
+       else
+         Ok (BE_func (func, ok_args)))
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -329,7 +347,16 @@ let bind_expr_agg
        | e :: _ -> Error e
        | [] ->
          let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-         Ok (BE_func (func, ok_args)))
+         let n = List.length ok_args in
+         let arity_ok = match func with
+           | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
+           | Ast.Fn_ifnull -> n = 2
+           | Ast.Fn_coalesce -> n >= 1
+         in
+         if not arity_ok then
+           Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
+         else
+           Ok (BE_func (func, ok_args)))
   in
   match go e with
   | Error e -> Error e

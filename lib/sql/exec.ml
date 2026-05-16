@@ -83,18 +83,23 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   | Ast.Fn_length, [Row.V_text s] -> Row.V_int (Int64.of_int (String.length s))
   | Ast.Fn_length, [Row.V_blob b] -> Row.V_int (Int64.of_int (Bytes.length b))
   | Ast.Fn_length, [Row.V_null]   -> Row.V_null
+  | Ast.Fn_length, [_]            -> Row.V_null  (* non-text/blob: return null like SQLite *)
   | Ast.Fn_lower,  [Row.V_text s] -> Row.V_text (String.lowercase_ascii s)
   | Ast.Fn_lower,  [Row.V_null]   -> Row.V_null
+  | Ast.Fn_lower,  [_]            -> Row.V_null
   | Ast.Fn_upper,  [Row.V_text s] -> Row.V_text (String.uppercase_ascii s)
   | Ast.Fn_upper,  [Row.V_null]   -> Row.V_null
+  | Ast.Fn_upper,  [_]            -> Row.V_null
   | Ast.Fn_abs,    [Row.V_int  n] -> Row.V_int  (Int64.abs n)
   | Ast.Fn_abs,    [Row.V_real f] -> Row.V_real (Float.abs f)
   | Ast.Fn_abs,    [Row.V_null]   -> Row.V_null
+  | Ast.Fn_abs,    [_]            -> Row.V_null
   | Ast.Fn_coalesce, vs           ->
     (match List.find_opt (fun v -> v <> Row.V_null) vs with
      | Some v -> v | None -> Row.V_null)
   | Ast.Fn_ifnull, [a; b]         -> (match a with Row.V_null -> b | v -> v)
-  | _ -> failwith (Printf.sprintf "scalar_func: wrong arity or type")
+  | _ ->
+    failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with

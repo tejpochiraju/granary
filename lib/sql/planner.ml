@@ -183,7 +183,15 @@ let plan_select cat
     else
       Plan.Op_project { ordinals = proj; child = after_where }
   in
-  (* Wrap with Op_sort for the first ORDER BY key *)
+  (* Wrap with Op_sort for the first ORDER BY key.
+     NOTE: when [projected] is [Op_expr_project], [Op_sort] is applied
+     AFTER the projection.  [key.col_idx] was resolved by sema against
+     the original table columns, not the projected output columns.  If
+     the ORDER BY column is not also present (at the same ordinal) in the
+     projected row, sort results will be incorrect.  A proper fix would
+     require either (a) sorting before projection, or (b) re-resolving
+     ORDER BY ordinals against the post-projection row layout.
+     Fixing this correctly is deferred beyond Task 1 scope. *)
   let sorted = match order with
     | [] -> projected
     | (key :: _) ->
@@ -273,6 +281,8 @@ let plan ?cat = function
          else
            Plan.Op_project { ordinals = proj; child = filtered }
        in
+       (* NOTE: same ORDER BY + Op_expr_project limitation as in plan_select
+          above applies here too. *)
        let sorted = match order with
          | [] -> projected
          | (key :: _) ->
