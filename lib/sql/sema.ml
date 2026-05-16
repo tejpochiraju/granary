@@ -12,6 +12,7 @@ type bound_expr =
   | BE_is_null     of bound_expr
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
+  | BE_func        of Ast.scalar_func * bound_expr list
 
 type bound_order_key = {
   col_idx : int;
@@ -48,6 +49,10 @@ type bound_stmt =
   | BS_select of {
       table_meta : Cat.table_meta;
       proj       : int list;
+      expr_proj  : bound_expr list;
+        (** Non-empty when projection contains scalar functions (Phase 5).
+            When non-empty, [proj] is empty and [expr_proj] governs the
+            output columns. *)
       where      : bound_expr option;
       order      : bound_order_key list;
       limit      : int option;
@@ -166,6 +171,14 @@ let rec bind_expr (meta : Cat.table_meta) = function
      | Error e -> Error e)
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
+  | Ast.E_func (func, args) ->
+    let bound = List.map (bind_expr meta) args in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+    (match errors with
+     | e :: _ -> Error e
+     | [] ->
+       let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+       Ok (BE_func (func, ok_args)))
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -220,6 +233,14 @@ let rec bind_expr_join
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
+  | Ast.E_func (func, args) ->
+    let bound = List.map (bind_expr_join ~left_meta ~right_meta ~right_offset) args in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+    (match errors with
+     | e :: _ -> Error e
+     | [] ->
+       let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+       Ok (BE_func (func, ok_args)))
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -301,6 +322,14 @@ let bind_expr_agg
        | Ok col_ord ->
          let slot = add_agg { func; col_ord } in
          Ok (BE_col (offset + slot)))
+    | Ast.E_func (func, args) ->
+      let bound = List.map go args in
+      let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+      (match errors with
+       | e :: _ -> Error e
+       | [] ->
+         let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+         Ok (BE_func (func, ok_args)))
   in
   match go e with
   | Error e -> Error e
@@ -313,6 +342,7 @@ let rec expr_has_agg = function
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e ->
     expr_has_agg e
+  | Ast.E_func (_, args) -> List.exists expr_has_agg args
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -528,38 +558,57 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
         | Error e -> Lwt.return (Error e)
         | Ok group_col ->
        let offset_for_aggs = match group_col with Some _ -> 1 | None -> 0 in
-       (* Build proj/agg_proj. *)
-       let proj_result : (int list * agg_proj_item list * agg_spec list, error) result =
+       (* Build proj/agg_proj.
+          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj).
+          [expr_proj] is non-empty only for scalar-function projections
+          (Phase 5); [col_ordinals] is empty in that case. *)
+       let proj_result :
+           (int list * agg_proj_item list * agg_spec list * bound_expr list,
+            error) result =
          if not is_aggregated then
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
+           let bind_one e =
+             match join_info with
+             | None -> bind_expr meta e
+             | Some (_jc, rm) ->
+               bind_expr_join ~left_meta:meta ~right_meta:rm ~right_offset e
+           in
            let ords_result =
              match proj with
              | `All ->
                let left_ords = List.mapi (fun i _ -> i) meta.columns in
                (match join_info with
-                | None -> Ok left_ords
+                | None -> Ok (`Ords left_ords)
                 | Some (_jc, rm) ->
                   let n_right = List.length rm.columns in
                   let right_ords = List.init n_right (fun i -> right_offset + i) in
-                  Ok (left_ords @ right_ords))
+                  Ok (`Ords (left_ords @ right_ords)))
              | `Cols names ->
                List.fold_left (fun acc name ->
                  match acc with
                  | Error _ -> acc
-                 | Ok ords ->
+                 | Ok (`Exprs _) -> acc  (* shouldn't reach here *)
+                 | Ok (`Ords ords) ->
                    (match proj_lookup name with
                     | Error e -> Error e
-                    | Ok i    -> Ok (ords @ [i]))
-               ) (Ok []) names
-             | `Exprs _ ->
-               (* No aggregate in proj_has_agg=false case — Exprs without
-                  aggregates is unusual in this engine (only aggregates
-                  produce Exprs in the parser).  Reject for now. *)
-               Error (Unsupported "non-aggregate expression projection not supported")
+                    | Ok i    -> Ok (`Ords (ords @ [i])))
+               ) (Ok (`Ords [])) names
+             | `Exprs es ->
+               (* Phase 5: scalar function (or general expr) projection.
+                  Bind each expression; return as BE list. *)
+               let bound_list = List.map bind_one es in
+               let errors = List.filter_map
+                 (function Error e -> Some e | Ok _ -> None) bound_list in
+               (match errors with
+                | e :: _ -> Error e
+                | [] ->
+                  Ok (`Exprs (List.filter_map
+                    (function Ok e -> Some e | Error _ -> None) bound_list)))
            in
            (match ords_result with
             | Error e -> Error e
-            | Ok o -> Ok (o, [], []))
+            | Ok (`Ords o)    -> Ok (o, [], [], [])
+            | Ok (`Exprs bes) -> Ok ([], [], [], bes))
          else begin
            (* Aggregated SELECT — build agg_proj and aggs list. *)
            (* Helper: walk an expression that is an explicit projection
@@ -666,12 +715,12 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
              in
              (match agg_proj_result with
               | Error e -> Error e
-              | Ok items -> Ok ([], items, !acc_aggs))
+              | Ok items -> Ok ([], items, !acc_aggs, []))
          end
        in
        (match proj_result with
         | Error e -> Lwt.return (Error e)
-        | Ok (proj_ords, agg_proj_items, proj_aggs) ->
+        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs) ->
           (* Bind the JOIN ON predicate (must use two-table resolution). *)
           let bound_join_result : (bound_join option, error) result =
             match join_info with
@@ -797,6 +846,7 @@ let bind_select cat ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~
                          Lwt.return (Ok (BS_select {
                            table_meta = meta;
                            proj       = proj_ords;
+                           expr_proj  = proj_exprs;
                            where      = bound_where;
                            order      = bound_order;
                            limit      = valid_limit;
@@ -834,6 +884,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
         | None,             Some Row.Integer -> None
         | _                                  -> None))
   | BE_neg e -> infer_type cols e
+  | BE_func _ -> None   (* scalar functions return dynamic types *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)

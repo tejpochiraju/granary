@@ -3,6 +3,10 @@
  (libraries alcotest qcheck-alcotest sqlocaml sqlocaml.block sqlocaml.encoding sqlocaml.store sqlocaml.catalog sqlocaml.sql sqlocaml.storage lwt.unix unix))
 
 (test
+ (name test_scalar_fns)
+ (libraries sqlocaml sqlocaml.sql alcotest lwt.unix))
+
+(test
  (name test_txn)
  (libraries sqlocaml sqlocaml.sql sqlocaml.encoding alcotest lwt.unix))
 

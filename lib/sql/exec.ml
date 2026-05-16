@@ -75,6 +75,26 @@ let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
     if value_truthy (eval_expr row e) then Row.V_int 0L else Row.V_int 1L
   | Plan.P_binop (op, a, b) ->
     eval_binop op (eval_expr row a) (eval_expr row b)
+  | Plan.P_func (func, args) ->
+    eval_func func (List.map (eval_expr row) args)
+
+and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
+  match func, args with
+  | Ast.Fn_length, [Row.V_text s] -> Row.V_int (Int64.of_int (String.length s))
+  | Ast.Fn_length, [Row.V_blob b] -> Row.V_int (Int64.of_int (Bytes.length b))
+  | Ast.Fn_length, [Row.V_null]   -> Row.V_null
+  | Ast.Fn_lower,  [Row.V_text s] -> Row.V_text (String.lowercase_ascii s)
+  | Ast.Fn_lower,  [Row.V_null]   -> Row.V_null
+  | Ast.Fn_upper,  [Row.V_text s] -> Row.V_text (String.uppercase_ascii s)
+  | Ast.Fn_upper,  [Row.V_null]   -> Row.V_null
+  | Ast.Fn_abs,    [Row.V_int  n] -> Row.V_int  (Int64.abs n)
+  | Ast.Fn_abs,    [Row.V_real f] -> Row.V_real (Float.abs f)
+  | Ast.Fn_abs,    [Row.V_null]   -> Row.V_null
+  | Ast.Fn_coalesce, vs           ->
+    (match List.find_opt (fun v -> v <> Row.V_null) vs with
+     | Some v -> v | None -> Row.V_null)
+  | Ast.Fn_ifnull, [a; b]         -> (match a with Row.V_null -> b | v -> v)
+  | _ -> failwith (Printf.sprintf "scalar_func: wrong arity or type")
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with
@@ -533,6 +553,7 @@ let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
+  | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _ ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -571,6 +592,12 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream store child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
+  | Plan.Op_expr_project { exprs; child } ->
+    let* inner = to_stream store child in
+    let eval_exprs row =
+      Array.of_list (List.map (eval_expr row) exprs)
+    in
+    Lwt.return (Lwt_stream.map eval_exprs inner)
   | Plan.Op_sort { col_idx; dir; child } ->
     let* inner = to_stream store child in
     let* rows = Lwt_stream.to_list inner in

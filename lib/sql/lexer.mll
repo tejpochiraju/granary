@@ -56,6 +56,12 @@ rule token = parse
   | "AVG"      { AVG }
   | "MIN"      { MIN }
   | "MAX"      { MAX }
+  | "LENGTH"   { LENGTH }
+  | "LOWER"    { LOWER }
+  | "UPPER"    { UPPER }
+  | "ABS"      { ABS }
+  | "COALESCE" { COALESCE }
+  | "IFNULL"   { IFNULL }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

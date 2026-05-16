@@ -10,6 +10,8 @@ type bound_expr =
   | BE_is_null     of bound_expr
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
+  | BE_func        of Ast.scalar_func * bound_expr list
+    (** Scalar function call (Phase 5). *)
 
 type bound_order_key = {
   col_idx : int;
@@ -59,7 +61,12 @@ type bound_stmt =
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       proj       : int list;            (** column ordinals to project
                                             (refer to the combined row when [join] is set)
-                                            — used when this is NOT an aggregated query *)
+                                            — used when this is NOT an aggregated query
+                                            and [expr_proj] is empty *)
+      expr_proj  : bound_expr list;
+        (** Phase 5: non-empty when projection contains scalar functions
+            or other arbitrary expressions.  When non-empty, [proj] is
+            empty and [expr_proj] governs the output columns. *)
       where      : bound_expr option;
       order      : bound_order_key list;
       limit      : int option;

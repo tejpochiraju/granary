@@ -17,6 +17,7 @@ let rec plan_expr = function
   | Sema.BE_is_null e           -> Plan.P_is_null (plan_expr e)
   | Sema.BE_is_not_null e       -> Plan.P_is_not_null (plan_expr e)
   | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
+  | Sema.BE_func (func, args)   -> Plan.P_func (func, List.map plan_expr args)
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -110,7 +111,7 @@ let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
   | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
 
 let plan_select cat
-    ~table_meta ~proj ~where ~order ~limit ~offset ~join
+    ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~join
     ~group_by ~aggs ~having ~agg_proj =
   (* Try to use an index lookup if possible (single-table path). *)
   let base =
@@ -174,6 +175,11 @@ let plan_select cat
         having = Option.map plan_expr having;
         proj = List.map sema_agg_proj_to_plan agg_proj;
       }
+    else if expr_proj <> [] then
+      Plan.Op_expr_project {
+        exprs = List.map plan_expr expr_proj;
+        child = after_where;
+      }
     else
       Plan.Op_project { ordinals = proj; child = after_where }
   in
@@ -199,12 +205,12 @@ let plan ?cat = function
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
     Plan.Op_insert { table_meta; ordinals; values }
-  | Sema.BS_select { table_meta; proj; where; order; limit; offset; join;
-                     group_by; aggs; having; agg_proj } ->
+  | Sema.BS_select { table_meta; proj; expr_proj; where; order; limit; offset;
+                     join; group_by; aggs; having; agg_proj } ->
     (match cat with
      | Some cat ->
-       plan_select cat ~table_meta ~proj ~where ~order ~limit ~offset ~join
-         ~group_by ~aggs ~having ~agg_proj
+       plan_select cat ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset
+         ~join ~group_by ~aggs ~having ~agg_proj
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
@@ -258,6 +264,11 @@ let plan ?cat = function
              aggs = List.map sema_agg_to_plan aggs;
              having = Option.map plan_expr having;
              proj = List.map sema_agg_proj_to_plan agg_proj;
+           }
+         else if expr_proj <> [] then
+           Plan.Op_expr_project {
+             exprs = List.map plan_expr expr_proj;
+             child = filtered;
            }
          else
            Plan.Op_project { ordinals = proj; child = filtered }

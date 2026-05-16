@@ -23,6 +23,7 @@
 %token JOIN INNER LEFT OUTER
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
+%token LENGTH LOWER UPPER ABS COALESCE IFNULL
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -175,10 +176,19 @@ projection:
           | `Col c -> E_col c
           | `Expr e -> e) items) }
 
+scalar_expr:
+  | LENGTH   LPAREN e = expr RPAREN                                   { E_func (Fn_length,   [e]) }
+  | LOWER    LPAREN e = expr RPAREN                                   { E_func (Fn_lower,    [e]) }
+  | UPPER    LPAREN e = expr RPAREN                                   { E_func (Fn_upper,    [e]) }
+  | ABS      LPAREN e = expr RPAREN                                   { E_func (Fn_abs,      [e]) }
+  | IFNULL   LPAREN a = expr COMMA b = expr RPAREN                    { E_func (Fn_ifnull,   [a; b]) }
+  | COALESCE LPAREN es = separated_nonempty_list(COMMA, expr) RPAREN  { E_func (Fn_coalesce, es) }
+
 proj_item:
   | name = IDENT                       { `Col name }
   | t = IDENT DOT c = IDENT            { `Expr (E_tbl_col (t, c)) }
   | e = agg_expr                       { `Expr e }
+  | e = scalar_expr                    { `Expr e }
 
 where_opt:
   |                { None }
@@ -219,6 +229,7 @@ expr:
   | name = IDENT                      { E_col name }
   | t = IDENT DOT c = IDENT           { E_tbl_col (t, c) }
   | e = agg_expr                      { e }
+  | e = scalar_expr                   { e }
   | a = expr AND b = expr             { E_binop (And, a, b) }
   | a = expr OR  b = expr             { E_binop (Or,  a, b) }
   | NOT e = expr                      { E_not e }

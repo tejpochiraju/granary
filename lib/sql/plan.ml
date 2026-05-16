@@ -14,6 +14,7 @@ type expr =
   | P_is_null     of expr
   | P_is_not_null of expr
   | P_neg         of expr
+  | P_func        of Ast.scalar_func * expr list
 
 type op =
   | Op_create_table of {
@@ -35,6 +36,10 @@ type op =
   | Op_project of {
       ordinals : int list;
       child    : op;
+    }
+  | Op_expr_project of {
+      exprs : expr list;
+      child : op;
     }
   | Op_sort of {
       col_idx : int;

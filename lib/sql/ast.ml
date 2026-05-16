@@ -23,6 +23,15 @@ type binop =
 (** Aggregate functions supported in Phase 2 Task 6. *)
 type agg_func = Agg_count | Agg_sum | Agg_avg | Agg_min | Agg_max
 
+(** Scalar functions supported in Phase 5 Task 1. *)
+type scalar_func =
+  | Fn_length
+  | Fn_lower
+  | Fn_upper
+  | Fn_abs
+  | Fn_coalesce
+  | Fn_ifnull
+
 type expr =
   | E_lit         of literal
   | E_col         of string                (** unqualified column reference *)
@@ -34,6 +43,8 @@ type expr =
   | E_neg         of expr                  (** unary minus *)
   | E_agg         of agg_func * expr option
     (** Aggregate call; [None] argument means [COUNT( * )]. *)
+  | E_func        of scalar_func * expr list
+    (** Scalar function call. *)
 
 type column_def = {
   name        : string;
