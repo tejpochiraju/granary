@@ -53,30 +53,32 @@ let value_truthy : Row.value -> bool = function
   | Row.V_null | Row.V_int 0L -> false
   | _                          -> true
 
-let rec eval_expr (row : Row.t) (e : Plan.expr) : Row.value =
+let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
   | Plan.P_col i            -> row.(i)
+  | Plan.P_param i          ->
+    if i < Array.length params then params.(i) else Row.V_null
   | Plan.P_neg e ->
-    (match eval_expr row e with
+    (match eval_expr params row e with
      | Row.V_int  n -> Row.V_int  (Int64.neg n)
      | Row.V_real f -> Row.V_real (-. f)
      | Row.V_null   -> Row.V_null
      | _            -> failwith "unary minus requires numeric operand")
   | Plan.P_is_null e ->
-    (match eval_expr row e with
+    (match eval_expr params row e with
      | Row.V_null -> Row.V_int 1L
      | _          -> Row.V_int 0L)
   | Plan.P_is_not_null e ->
-    (match eval_expr row e with
+    (match eval_expr params row e with
      | Row.V_null -> Row.V_int 0L
      | _          -> Row.V_int 1L)
   | Plan.P_not e ->
-    if value_truthy (eval_expr row e) then Row.V_int 0L else Row.V_int 1L
+    if value_truthy (eval_expr params row e) then Row.V_int 0L else Row.V_int 1L
   | Plan.P_binop (op, a, b) ->
-    eval_binop op (eval_expr row a) (eval_expr row b)
+    eval_binop op (eval_expr params row a) (eval_expr params row b)
   | Plan.P_func (func, args) ->
-    eval_func func (List.map (eval_expr row) args)
+    eval_func func (List.map (eval_expr params row) args)
 
 and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -184,11 +186,11 @@ let release_txn tx owned =
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
     Uses a SINGLE RW txn for both the row write and index writes. *)
-let execute_insert ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~(table_meta : Cat.table_meta) ~ordinals ~values : unit Lwt.t =
+let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
+    ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : unit Lwt.t =
   let n   = List.length table_meta.columns in
   let row = Array.make n Row.V_null in
-  List.iter2 (fun ord v -> row.(ord) <- lit_to_value v) ordinals values;
+  List.iter2 (fun ord expr -> row.(ord) <- eval_expr params [||] expr) ordinals values;
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -342,7 +344,7 @@ let execute_update ?(mode = Auto) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr row pred)
+        | Some pred -> value_truthy (eval_expr [||] row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -364,7 +366,7 @@ let execute_update ?(mode = Auto) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr old_row expr
+              new_row.(i) <- eval_expr [||] old_row expr
             ) assignments;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
@@ -400,7 +402,7 @@ let execute_update ?(mode = Auto) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr old_row expr
+              new_row.(i) <- eval_expr [||] old_row expr
             ) assignments;
             let key = Rowid.encode rowid in
             (* Update index entries: delete old, insert new. *)
@@ -455,7 +457,7 @@ let execute_delete ?(mode = Auto) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr row pred)
+        | Some pred -> value_truthy (eval_expr [||] row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -526,7 +528,7 @@ let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
-let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
+let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
   | Plan.Op_create_table { name; columns } ->
@@ -536,7 +538,7 @@ let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values } ->
-    let* () = execute_insert ~mode store cat ~table_meta ~ordinals ~values in
+    let* () = execute_insert ~mode ~params store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
   | Plan.Op_create_index { name; table; tree_id; col_idx; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
@@ -564,15 +566,15 @@ let execute_with_count ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op)
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
-let execute ?(mode = Auto) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count ~mode store cat op in
+let execute ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
+  let* _n = execute_with_count ~mode ~params store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* ------------------------------------------------------------------ *)
 
-let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
     let* tx  = S.ro_begin store in
@@ -592,19 +594,19 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     ) in
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
-    let* inner = to_stream store child in
-    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr row pred)) inner)
+    let* inner = to_stream params store child in
+    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr params row pred)) inner)
   | Plan.Op_project { ordinals; child } ->
-    let* inner = to_stream store child in
+    let* inner = to_stream params store child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
-    let* inner = to_stream store child in
+    let* inner = to_stream params store child in
     let eval_exprs row =
-      Array.of_list (List.map (eval_expr row) exprs)
+      Array.of_list (List.map (eval_expr params row) exprs)
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
   | Plan.Op_sort { col_idx; dir; child } ->
-    let* inner = to_stream store child in
+    let* inner = to_stream params store child in
     let* rows = Lwt_stream.to_list inner in
     let cmp a b =
       let va = a.(col_idx) and vb = b.(col_idx) in
@@ -614,7 +616,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
     let sorted = List.sort cmp rows in
     Lwt.return (Lwt_stream.of_list sorted)
   | Plan.Op_limit { limit; offset; child } ->
-    let* inner = to_stream store child in
+    let* inner = to_stream params store child in
     let* rows = Lwt_stream.to_list inner in
     let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
     Lwt.return (Lwt_stream.of_list rows')
@@ -622,7 +624,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
                            col_type; lookup_val; table_meta } ->
     (* Encode the lookup value as an IndexKey.value matching the column type. *)
     let lookup_v =
-      let v = eval_expr [||] lookup_val in
+      let v = eval_expr params [||] lookup_val in
       match v, col_type with
       | Row.V_null, _ -> Index_key.IK_null
       | Row.V_int  n, Row.Integer -> Index_key.IK_int n
@@ -689,7 +691,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       right_col_offset = _; n_right_cols } ->
     (* Indexed nested-loop join: for each left row, seek the right
        index tree for the join key and collect matching right rows. *)
-    let* left_stream = to_stream store left in
+    let* left_stream = to_stream params store left in
     let* left_rows = Lwt_stream.to_list left_stream in
     let* tx = S.ro_begin store in
     let out = ref [] in
@@ -752,8 +754,8 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   | Plan.Op_hash_join {
       left; right; left_key; right_key; join_kind;
       right_col_offset = _; n_right_cols } ->
-    let* left_stream  = to_stream store left in
-    let* right_stream = to_stream store right in
+    let* left_stream  = to_stream params store left in
+    let* right_stream = to_stream params store right in
     let* right_rows = Lwt_stream.to_list right_stream in
     if left_key < 0 || right_key < 0 then begin
       (* Cartesian product fallback (general ON predicate). *)
@@ -816,7 +818,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
   | Plan.Op_aggregate { child; group_col; aggs; having; proj } ->
-    let* inner = to_stream store child in
+    let* inner = to_stream params store child in
     let* rows = Lwt_stream.to_list inner in
     let groups : (Row.value * Row.t list) list =
       match group_col with
@@ -929,7 +931,7 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
       match having with
       | None -> agg_output_rows
       | Some pred ->
-        List.filter (fun r -> value_truthy (eval_expr r pred)) agg_output_rows
+        List.filter (fun r -> value_truthy (eval_expr params r pred)) agg_output_rows
     in
     (* Project to final output row. *)
     let final_rows =
@@ -956,6 +958,6 @@ let rec to_stream (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
-let query (store : S.t) (_cat : Cat.t) (op : Plan.op) :
+let query ?(params = [||]) (store : S.t) (_cat : Cat.t) (op : Plan.op) :
     Row.t Lwt_stream.t Lwt.t =
-  to_stream store op
+  to_stream params store op

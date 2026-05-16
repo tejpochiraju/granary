@@ -52,3 +52,26 @@ val execute_change_count : t -> string -> (int, error) result Lwt.t
     Returns [Ok stream] on success, [Error e] on failure.
     The stream is lazy — rows are produced on demand. *)
 val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
+
+(** Format an [error] value for human-readable output. *)
+val pp_error : Format.formatter -> error -> unit
+
+(** A compiled prepared statement.  Can be reused with different
+    parameter bindings via [run] and [iter]. *)
+type stmt
+
+(** Compile [sql] into a prepared statement.  Returns [Error] if the
+    SQL cannot be parsed or the schema check fails. *)
+val prepare  : t -> string -> (stmt, error) result Lwt.t
+
+(** Execute a write statement (INSERT, UPDATE, DELETE) with the given
+    positional parameter values.  Returns the rows-affected count. *)
+val run      : stmt -> params:value list -> (int, error) result Lwt.t
+
+(** Execute a read statement (SELECT) with the given positional
+    parameter values.  Returns a stream of result rows. *)
+val iter     : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
+
+(** Release resources held by a prepared statement.  No-op in this
+    implementation, but should be called for forward compatibility. *)
+val finalize : stmt -> unit Lwt.t

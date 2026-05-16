@@ -15,6 +15,10 @@
  (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))
 
 (test
+ (name test_prepared)
+ (libraries sqlocaml alcotest lwt.unix))
+
+(test
  (name test_store_btree)
  (libraries alcotest qcheck-alcotest sqlocaml sqlocaml.block sqlocaml.encoding
             sqlocaml.store sqlocaml.catalog sqlocaml.sql sqlocaml.storage

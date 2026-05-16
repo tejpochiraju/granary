@@ -47,7 +47,7 @@ let plan_insert () =
   let stmt = Ast.S_insert {
     table   = "users";
     columns = ["id"; "name"];
-    values  = [Ast.L_int 1L; Ast.L_text "alice"];
+    values  = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with

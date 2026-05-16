@@ -12,6 +12,8 @@ type bound_expr =
   | BE_neg         of bound_expr
   | BE_func        of Ast.scalar_func * bound_expr list
     (** Scalar function call (Phase 5). *)
+  | BE_param       of int
+    (** 0-indexed positional parameter (?). *)
 
 type bound_order_key = {
   col_idx : int;
@@ -55,7 +57,7 @@ type bound_stmt =
   | BS_insert of {
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       ordinals   : int list;            (** column ordinals for the named cols *)
-      values     : Ast.literal list;
+      values     : bound_expr list;
     }
   | BS_select of {
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
@@ -126,6 +128,8 @@ type error =
   | Unsupported         of string
   | Not_null_violation  of string   (* column name *)
   | Unknown_index       of string   (* index name *)
+
+val pp_error : Format.formatter -> error -> unit
 
 val bind :
   Sqlocaml_catalog.Catalog.t ->

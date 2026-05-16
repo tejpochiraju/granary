@@ -62,7 +62,7 @@ let parse sql =
   | exception Sql.Parser.Error -> Error (Parse "syntax error")
   | exception Failure msg      -> Error (Parse msg)
 
-let prepare t sql =
+let compile t sql =
   match parse sql with
   | Error e -> Lwt.return (Error e)
   | Ok ast  ->
@@ -70,6 +70,12 @@ let prepare t sql =
     match bound with
     | Error e -> Lwt.return (Error (Sema e))
     | Ok b    -> Lwt.return (Ok (Sql.Planner.plan ~cat:t.catalog b))
+
+(* Prepared statement: holds a compiled plan for repeated execution. *)
+type stmt = {
+  db_ref : t;
+  plan   : Sql.Plan.op;
+}
 
 (* ------------------------------------------------------------------ *)
 (* Explicit transaction management                                      *)
@@ -104,7 +110,7 @@ let rollback_txn t =
 (* ------------------------------------------------------------------ *)
 
 let execute t sql =
-  let* op = prepare t sql in
+  let* op = compile t sql in
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_begin    -> begin_txn t
@@ -134,7 +140,7 @@ let execute t sql =
           | exn         -> Lwt.fail exn))
 
 let execute_change_count t sql =
-  let* op = prepare t sql in
+  let* op = compile t sql in
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_begin    ->
@@ -163,7 +169,7 @@ let execute_change_count t sql =
           | exn         -> Lwt.fail exn))
 
 let query t sql =
-  let* op = prepare t sql in
+  let* op = compile t sql in
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok op   ->
@@ -172,3 +178,46 @@ let query t sql =
      | lwt_stream ->
        let* stream = lwt_stream in
        Lwt.return (Ok stream))
+
+(* ------------------------------------------------------------------ *)
+(* Prepared statement API                                               *)
+(* ------------------------------------------------------------------ *)
+
+let prepare t sql =
+  let* result = compile t sql in
+  match result with
+  | Error e -> Lwt.return (Error e)
+  | Ok plan -> Lwt.return (Ok { db_ref = t; plan })
+
+let run st ~params =
+  let params_arr = Array.of_list params in
+  let t = st.db_ref in
+  let mode = match t.explicit_txn with
+    | None    -> Sql.Exec.Auto
+    | Some tx -> Sql.Exec.In_txn tx
+  in
+  Lwt.catch
+    (fun () ->
+      let* n = Sql.Exec.execute_with_count ~mode ~params:params_arr t.store t.catalog st.plan in
+      Lwt.return (Ok n))
+    (function
+     | Failure msg -> Lwt.return (Error (Runtime msg))
+     | exn         -> Lwt.fail exn)
+
+let iter st ~params =
+  let params_arr = Array.of_list params in
+  let t = st.db_ref in
+  Lwt.catch
+    (fun () ->
+      let* stream = Sql.Exec.query ~params:params_arr t.store t.catalog st.plan in
+      Lwt.return (Ok stream))
+    (function
+     | Failure msg -> Lwt.return (Error (Runtime msg))
+     | exn         -> Lwt.fail exn)
+
+let finalize _st = Lwt.return_unit
+
+let pp_error fmt = function
+  | Parse msg -> Format.fprintf fmt "parse error: %s" msg
+  | Sema  e   -> Format.fprintf fmt "sema error: %a" Sql.Sema.pp_error e
+  | Runtime m -> Format.fprintf fmt "runtime error: %s" m

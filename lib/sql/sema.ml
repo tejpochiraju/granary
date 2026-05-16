@@ -13,6 +13,7 @@ type bound_expr =
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
   | BE_func        of Ast.scalar_func * bound_expr list
+  | BE_param       of int
 
 type bound_order_key = {
   col_idx : int;
@@ -44,7 +45,7 @@ type bound_stmt =
   | BS_insert of {
       table_meta : Cat.table_meta;
       ordinals   : int list;
-      values     : Ast.literal list;
+      values     : bound_expr list;
     }
   | BS_select of {
       table_meta : Cat.table_meta;
@@ -136,6 +137,14 @@ let ast_binop_to_sema : Ast.binop -> binop = function
   | Ast.Mul -> Mul | Ast.Div -> Div
   | Ast.And -> And | Ast.Or  -> Or
 
+(* ------------------------------------------------------------------ *)
+(* Parameter counter — reset at the start of each [bind] call.         *)
+(* Not thread-safe, but fine for single-threaded Lwt.                  *)
+(* ------------------------------------------------------------------ *)
+
+let param_counter = ref 0
+let reset_params () = param_counter := 0
+
 let rec bind_expr (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
@@ -169,6 +178,10 @@ let rec bind_expr (meta : Cat.table_meta) = function
     (match bind_expr meta e with
      | Ok be   -> Ok (BE_neg be)
      | Error e -> Error e)
+  | Ast.E_param _ ->
+    let i = !param_counter in
+    incr param_counter;
+    Ok (BE_param i)
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
@@ -240,6 +253,10 @@ let rec bind_expr_join
   | Ast.E_neg e ->
     (match bind_expr_join ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
+  | Ast.E_param _ ->
+    let i = !param_counter in
+    incr param_counter;
+    Ok (BE_param i)
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
@@ -316,6 +333,10 @@ let bind_expr_agg
       (match go e with Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
     | Ast.E_neg e ->
       (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
+    | Ast.E_param _ ->
+      let i = !param_counter in
+      incr param_counter;
+      Ok (BE_param i)
     | Ast.E_agg (func, arg_opt) ->
       let col_ord_result : (int option, error) result =
         match arg_opt with
@@ -365,7 +386,7 @@ let bind_expr_agg
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
   | Ast.E_agg _ -> true
-  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ -> false
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e ->
     expr_has_agg e
@@ -422,10 +443,18 @@ let bind_insert cat ~table ~columns ~values =
     if n_cols <> n_vals then
       Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
     else
-      (* 1. Validate the explicitly-provided columns and build a map
-            from column ordinal -> supplied literal. *)
+      (* 1. Bind each expr and build a map from column ordinal -> bound_expr. *)
+      let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
+        match e with
+        | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
+          (* Literals, negated literals, and params: bind without column context. *)
+          bind_expr meta e
+        | _ ->
+          (* Column references in VALUES make no sense — reject. *)
+          Error (Unsupported "complex expression in INSERT VALUES")
+      in
       let explicit_result =
-        List.fold_left2 (fun acc col_name lit ->
+        List.fold_left2 (fun acc col_name expr_ast ->
           match acc with
           | Error _ -> acc
           | Ok map ->
@@ -433,12 +462,20 @@ let bind_insert cat ~table ~columns ~values =
              | None ->
                Error (Unknown_column { table; column = col_name })
              | Some i ->
-               let col = List.nth meta.columns i in
-               (match lit_ty lit with
-                | None   -> Ok (map @ [(i, lit)])   (* NULL: skip type check *)
-                | Some t ->
-                  if ty_equal t col.ty then Ok (map @ [(i, lit)])
-                  else Error (Type_mismatch { expected = col.ty; got = t })))
+               (match bind_value_expr expr_ast with
+                | Error e -> Error e
+                | Ok bexpr ->
+                  (* Skip type check for params (unknown at bind time). *)
+                  (match bexpr with
+                   | BE_param _ -> Ok (map @ [(i, bexpr)])
+                   | BE_lit lit ->
+                     let col = List.nth meta.columns i in
+                     (match lit_ty lit with
+                      | None   -> Ok (map @ [(i, bexpr)])   (* NULL: skip type check *)
+                      | Some t ->
+                        if ty_equal t col.ty then Ok (map @ [(i, bexpr)])
+                        else Error (Type_mismatch { expected = col.ty; got = t }))
+                   | _ -> Ok (map @ [(i, bexpr)]))))
         ) (Ok []) columns values
       in
       (match explicit_result with
@@ -451,44 +488,40 @@ let bind_insert cat ~table ~columns ~values =
            List.init n_table_cols (fun i ->
              let col = List.nth meta.columns i in
              match List.assoc_opt i explicit_map with
-             | Some lit -> (i, lit)
+             | Some bexpr -> (i, bexpr)
              | None ->
                (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
                let lit = match col.Row.default with
                  | Some dv -> dv_to_lit dv
                  | None    -> Ast.L_null
                in
-               (i, lit))
+               (i, BE_lit lit))
          in
-         let full_values_result : ((int * Ast.literal) list, error) result =
-           Ok per_col_results
-         in
-         (match full_values_result with
-          | Error e -> Lwt.return (Error e)
-          | Ok full_pairs ->
-            (* 3. NOT NULL enforcement: reject if any NOT NULL column has NULL. *)
-            let nn_result =
-              List.fold_left (fun acc (i, lit) ->
-                match acc with
-                | Error _ -> acc
-                | Ok () ->
-                  let col = List.nth meta.columns i in
-                  if col.Row.not_null && lit = Ast.L_null then
-                    Error (Not_null_violation col.Row.name)
-                  else
-                    Ok ()
-              ) (Ok ()) full_pairs
-            in
-            (match nn_result with
-             | Error e -> Lwt.return (Error e)
+         let full_pairs = per_col_results in
+         (* 3. NOT NULL enforcement: reject if any NOT NULL column has a NULL literal.
+               Params are unchecked at bind time (checked at runtime). *)
+         let nn_result =
+           List.fold_left (fun acc (i, bexpr) ->
+             match acc with
+             | Error _ -> acc
              | Ok () ->
-               let ordinals = List.map fst full_pairs in
-               let full_vals = List.map snd full_pairs in
-               Lwt.return (Ok (BS_insert {
-                 table_meta = meta;
-                 ordinals;
-                 values     = full_vals;
-               }))))) (* closes Ok, Lwt.return, nn_result match, full_values_result match, explicit_result match *)
+               let col = List.nth meta.columns i in
+               (match bexpr with
+                | BE_lit Ast.L_null when col.Row.not_null ->
+                  Error (Not_null_violation col.Row.name)
+                | _ -> Ok ())
+           ) (Ok ()) full_pairs
+         in
+         (match nn_result with
+          | Error e -> Lwt.return (Error e)
+          | Ok () ->
+            let ordinals = List.map fst full_pairs in
+            let full_vals = List.map snd full_pairs in
+            Lwt.return (Ok (BS_insert {
+              table_meta = meta;
+              ordinals;
+              values     = full_vals;
+            }))))
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)
@@ -912,6 +945,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
         | _                                  -> None))
   | BE_neg e -> infer_type cols e
   | BE_func _ -> None   (* scalar functions return dynamic types *)
+  | BE_param _ -> None  (* parameter type unknown at compile time *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
@@ -1039,10 +1073,44 @@ let bind_drop_index cat ~name =
     Lwt.return (Ok (BS_drop_index { name; idx_info }))
 
 (* ------------------------------------------------------------------ *)
+(* Error pretty-printer                                                 *)
+(* ------------------------------------------------------------------ *)
+
+let pp_error fmt = function
+  | Unknown_table t ->
+    Format.fprintf fmt "unknown table: %s" t
+  | Unknown_column { table; column } ->
+    Format.fprintf fmt "unknown column: %s.%s" table column
+  | Ambiguous_column col ->
+    Format.fprintf fmt "ambiguous column: %s" col
+  | Type_mismatch { expected; got } ->
+    let ty_str = function
+      | Sqlocaml_encoding.Row.Integer -> "INTEGER"
+      | Sqlocaml_encoding.Row.Text    -> "TEXT"
+      | Sqlocaml_encoding.Row.Real    -> "REAL"
+      | Sqlocaml_encoding.Row.Blob    -> "BLOB"
+    in
+    Format.fprintf fmt "type mismatch: expected %s, got %s" (ty_str expected) (ty_str got)
+  | Arity_mismatch { expected; got } ->
+    Format.fprintf fmt "arity mismatch: expected %d, got %d" expected got
+  | Already_exists name ->
+    Format.fprintf fmt "already exists: %s" name
+  | Invalid_limit msg ->
+    Format.fprintf fmt "invalid limit: %s" msg
+  | Unsupported msg ->
+    Format.fprintf fmt "unsupported: %s" msg
+  | Not_null_violation col ->
+    Format.fprintf fmt "NOT NULL violation: %s" col
+  | Unknown_index name ->
+    Format.fprintf fmt "unknown index: %s" name
+
+(* ------------------------------------------------------------------ *)
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
-let bind cat = function
+let bind cat stmt =
+  reset_params ();
+  match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~table ~columns ~values
   | Ast.S_select { proj; table; joins; where; group_by; having; order; limit; offset } ->

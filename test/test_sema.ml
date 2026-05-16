@@ -82,7 +82,7 @@ let bind_insert_basic () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "name"];
-    values = [Ast.L_int 1L; Ast.L_text "alice"];
+    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -94,47 +94,47 @@ let bind_insert_basic () =
 let bind_insert_reversed_cols () =
   (* INSERT (name, id) VALUES ('bob', 2) — columns specified in user order.
      After Task 4, bind_insert normalises to full-width table order:
-     ordinals = [0; 1] (id first, then name), values = [L_int 2; L_text "bob"]. *)
+     ordinals = [0; 1] (id first, then name), values = [BE_lit (L_int 2); BE_lit (L_text "bob")]. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"; "id"];
-    values = [Ast.L_text "bob"; Ast.L_int 2L];
+    values = [Ast.E_lit (Ast.L_text "bob"); Ast.E_lit (Ast.L_int 2L)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
     Alcotest.(check (list int)) "ordinals full-width table-order" [0; 1] ordinals;
     Alcotest.(check int) "values count full-width" 2 (List.length values);
-    (* id (ordinal 0) should be L_int 2L, name (ordinal 1) L_text "bob" *)
+    (* id (ordinal 0) should be BE_lit (L_int 2L), name (ordinal 1) BE_lit (L_text "bob") *)
     (match List.nth values 0 with
-     | Ast.L_int 2L -> ()
-     | _ -> Alcotest.fail "expected id=L_int 2L at position 0");
+     | Sema.BE_lit (Ast.L_int 2L) -> ()
+     | _ -> Alcotest.fail "expected id=BE_lit(L_int 2L) at position 0");
     (match List.nth values 1 with
-     | Ast.L_text "bob" -> ()
-     | _ -> Alcotest.fail "expected name=L_text bob at position 1")
+     | Sema.BE_lit (Ast.L_text "bob") -> ()
+     | _ -> Alcotest.fail "expected name=BE_lit(L_text bob) at position 1")
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error"
 
 let bind_insert_single_col () =
   (* INSERT (id) VALUES (99) — omitted name column fills with NULL.
      After Task 4, bind_insert normalises to full-width: ordinals = [0; 1],
-     values = [L_int 99; L_null]. *)
+     values = [BE_lit (L_int 99); BE_lit L_null]. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.L_int 99L];
+    values = [Ast.E_lit (Ast.L_int 99L)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
     Alcotest.(check (list int)) "ordinals full-width" [0; 1] ordinals;
     Alcotest.(check int) "values count full-width" 2 (List.length values);
     (match List.nth values 0 with
-     | Ast.L_int 99L -> ()
-     | _ -> Alcotest.fail "expected id=L_int 99L");
+     | Sema.BE_lit (Ast.L_int 99L) -> ()
+     | _ -> Alcotest.fail "expected id=BE_lit(L_int 99L)");
     (match List.nth values 1 with
-     | Ast.L_null -> ()
-     | _ -> Alcotest.fail "expected name=L_null (omitted)")
+     | Sema.BE_lit Ast.L_null -> ()
+     | _ -> Alcotest.fail "expected name=BE_lit(L_null) (omitted)")
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error"
 
@@ -143,7 +143,7 @@ let bind_insert_unknown_table () =
   let stmt = Ast.S_insert {
     table = "ghost";
     columns = ["id"];
-    values = [Ast.L_int 1L];
+    values = [Ast.E_lit (Ast.L_int 1L)];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -155,7 +155,7 @@ let bind_insert_unknown_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["bogus"];
-    values = [Ast.L_int 1L];
+    values = [Ast.E_lit (Ast.L_int 1L)];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
@@ -167,7 +167,7 @@ let bind_insert_arity_mismatch () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "name"];
-    values = [Ast.L_int 1L];       (* 2 cols, 1 value *)
+    values = [Ast.E_lit (Ast.L_int 1L)];       (* 2 cols, 1 value *)
   } in
   match bind cat stmt with
   | Error (Sema.Arity_mismatch { expected = 2; got = 1 }) -> ()
@@ -180,7 +180,7 @@ let bind_insert_type_mismatch_int_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.L_text "text"];
+    values = [Ast.E_lit (Ast.L_text "text")];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
@@ -193,7 +193,7 @@ let bind_insert_type_mismatch_text_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"];
-    values = [Ast.L_int 42L];
+    values = [Ast.E_lit (Ast.L_int 42L)];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Text; got = Row.Integer }) -> ()
@@ -207,7 +207,7 @@ let bind_insert_null_allowed () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.L_null];
+    values = [Ast.E_lit Ast.L_null];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; _ }) ->
@@ -368,7 +368,7 @@ let bind_insert_second_col_unknown () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "bogus"; "age"];
-    values = [Ast.L_int 1L; Ast.L_int 2L; Ast.L_int 3L];
+    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L); Ast.E_lit (Ast.L_int 3L)];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -1049,7 +1049,7 @@ let bind_insert_not_null_violation () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"];
-    values = [Ast.L_text "alice"];
+    values = [Ast.E_lit (Ast.L_text "alice")];
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation "id") -> ()
@@ -1068,7 +1068,7 @@ let bind_insert_real_lit_type_mismatch () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.L_real 1.5];
+    values = [Ast.E_lit (Ast.L_real 1.5)];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Real }) -> ()
@@ -1083,7 +1083,7 @@ let bind_insert_blob_lit_ok () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["b"];
-    values = [Ast.L_blob (Bytes.of_string "hello")];
+    values = [Ast.E_lit (Ast.L_blob (Bytes.of_string "hello"))];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1097,7 +1097,7 @@ let bind_insert_real_lit_ok () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["f"];
-    values = [Ast.L_real 3.14];
+    values = [Ast.E_lit (Ast.L_real 3.14)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1507,15 +1507,15 @@ let bind_insert_default_null () =
     { Row.name = "n";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.L_int 7L];
+    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
-    (* id should be L_null from default; values are in ordinal order: [id; n]. *)
+    (* id should be BE_lit L_null from default; values are in ordinal order: [id; n]. *)
     Alcotest.(check int) "values" 2 (List.length values);
     (match List.nth values 0 with
-     | Ast.L_null -> ()
-     | _ -> Alcotest.fail "expected id=L_null from DV_null default")
+     | Sema.BE_lit Ast.L_null -> ()
+     | _ -> Alcotest.fail "expected id=BE_lit(L_null) from DV_null default")
   | _ -> Alcotest.fail "expected BS_insert"
 
 (** dv_to_lit DV_real in INSERT default-application (line 352). *)
@@ -1526,13 +1526,13 @@ let bind_insert_default_real () =
     { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.L_int 7L];
+    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
     (match List.nth values 0 with
-     | Ast.L_real 2.5 -> ()
-     | _ -> Alcotest.fail "expected f=L_real 2.5 from DV_real default")
+     | Sema.BE_lit (Ast.L_real 2.5) -> ()
+     | _ -> Alcotest.fail "expected f=BE_lit(L_real 2.5) from DV_real default")
   | _ -> Alcotest.fail "expected BS_insert"
 
 (** dv_to_lit DV_blob in INSERT default-application (line 353). *)
@@ -1543,13 +1543,13 @@ let bind_insert_default_blob () =
     { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.L_int 7L];
+    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
     (match List.nth values 0 with
-     | Ast.L_blob b when Bytes.equal b (Bytes.of_string "x") -> ()
-     | _ -> Alcotest.fail "expected b=L_blob 'x' from DV_blob default")
+     | Sema.BE_lit (Ast.L_blob b) when Bytes.equal b (Bytes.of_string "x") -> ()
+     | _ -> Alcotest.fail "expected b=BE_lit(L_blob 'x') from DV_blob default")
   | _ -> Alcotest.fail "expected BS_insert"
 
 (** Insert with multiple NOT NULL columns where the first column is fine
@@ -1562,7 +1562,7 @@ let bind_insert_not_null_late () =
     { Row.name = "c"; ty = Row.Integer; not_null = true;  primary_key = false; default = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["a"]; values = [Ast.L_int 1L];
+    table = "users"; columns = ["a"]; values = [Ast.E_lit (Ast.L_int 1L)];
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation _) -> ()

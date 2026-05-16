@@ -24,6 +24,7 @@
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
+%token QUESTION
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -112,7 +113,7 @@ def_value:
 
 insert:
   | INSERT INTO table = IDENT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-      VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_value) RPAREN
+      VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
     { S_insert { table; columns = cols; values = vals } }
 
 literal:
@@ -121,12 +122,13 @@ literal:
   | NULL           { L_null }
   | f = FLOAT_LIT  { L_real f }
 
-(* INSERT VALUES allows a leading unary minus on numeric literals so that
-   queries like `INSERT INTO t (n) VALUES (-99)` produce L_int (-99L). *)
-insert_value:
-  | l = literal            { l }
-  | MINUS n = INT_LIT      { L_int (Int64.neg n) }
-  | MINUS f = FLOAT_LIT    { L_real (-. f) }
+(* INSERT VALUES allows a leading unary minus on numeric literals and
+   positional parameters (?). *)
+insert_expr:
+  | l = literal            { E_lit l }
+  | MINUS n = INT_LIT      { E_lit (L_int (Int64.neg n)) }
+  | MINUS f = FLOAT_LIT    { E_lit (L_real (-. f)) }
+  | QUESTION               { E_param 0 }
 
 select:
   | SELECT proj = projection FROM table = IDENT js = join_clauses wh = where_opt
@@ -247,3 +249,4 @@ expr:
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
   | LPAREN e = expr RPAREN            { e }
+  | QUESTION                          { E_param 0 }

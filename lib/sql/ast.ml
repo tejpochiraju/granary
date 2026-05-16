@@ -45,6 +45,8 @@ type expr =
     (** Aggregate call; [None] argument means [COUNT( * )]. *)
   | E_func        of scalar_func * expr list
     (** Scalar function call. *)
+  | E_param       of int
+    (** 0-indexed positional parameter: ? *)
 
 type column_def = {
   name        : string;
@@ -81,7 +83,7 @@ type stmt =
   | S_insert of {
       table   : string;
       columns : string list;   (** named columns; empty = "all in order" *)
-      values  : literal list;
+      values  : expr list;
     }
   | S_select of {
       proj     : [ `All | `Cols of string list | `Exprs of expr list ];

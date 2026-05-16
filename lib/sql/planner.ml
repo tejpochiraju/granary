@@ -18,6 +18,7 @@ let rec plan_expr = function
   | Sema.BE_is_not_null e       -> Plan.P_is_not_null (plan_expr e)
   | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
   | Sema.BE_func (func, args)   -> Plan.P_func (func, List.map plan_expr args)
+  | Sema.BE_param i             -> Plan.P_param i
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -212,7 +213,7 @@ let plan ?cat = function
   | Sema.BS_create_table { name; columns } ->
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
-    Plan.Op_insert { table_meta; ordinals; values }
+    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values }
   | Sema.BS_select { table_meta; proj; expr_proj; where; order; limit; offset;
                      join; group_by; aggs; having; agg_proj } ->
     (match cat with

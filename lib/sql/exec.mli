@@ -10,6 +10,7 @@ type txn_mode =
 
 val execute :
   ?mode:txn_mode ->
+  ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
@@ -22,13 +23,16 @@ val execute :
     they raise [Failure] if passed; the [Db] layer intercepts them. *)
 val execute_with_count :
   ?mode:txn_mode ->
+  ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
   int Lwt.t
 
-(** Execute read operations; returns a lazy stream of result rows. *)
+(** Execute read operations; returns a lazy stream of result rows.
+    [params] are the positional parameter values for [?] placeholders. *)
 val query :
+  ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
@@ -39,6 +43,7 @@ val query :
     SQL.  Failures (e.g. division by zero, type-mismatched arithmetic)
     raise [Failure]. *)
 val eval_expr :
+  Sqlocaml_encoding.Row.value array ->
   Sqlocaml_encoding.Row.t ->
   Plan.expr ->
   Sqlocaml_encoding.Row.value

@@ -15,6 +15,7 @@ type expr =
   | P_is_not_null of expr
   | P_neg         of expr
   | P_func        of Ast.scalar_func * expr list
+  | P_param       of int                   (** 0-indexed positional parameter *)
 
 type op =
   | Op_create_table of {
@@ -24,7 +25,7 @@ type op =
   | Op_insert of {
       table_meta : Cat.table_meta;
       ordinals   : int list;
-      values     : Ast.literal list;
+      values     : expr list;
     }
   | Op_seq_scan of {
       table_meta : Cat.table_meta;
