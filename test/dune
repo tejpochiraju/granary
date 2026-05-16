@@ -15,3 +15,10 @@
  (libraries alcotest qcheck-alcotest sqlocaml sqlocaml.block sqlocaml.encoding
             sqlocaml.store sqlocaml.catalog sqlocaml.sql sqlocaml.storage
             sqlocaml.mirage_block mirage-block-unix lwt.unix unix))
+
+(test
+ (name test_all_backends)
+ (libraries sqlocaml sqlocaml.block sqlocaml.encoding sqlocaml.store
+            sqlocaml.catalog sqlocaml.sql sqlocaml.storage
+            sqlocaml.mirage_block mirage-block-unix
+            alcotest lwt lwt.unix unix))
