@@ -13,14 +13,14 @@ let test_empty_size () =
 (* pop on empty returns None *)
 let test_pop_empty () =
   Alcotest.(check bool) "pop empty = None" true
-    (FL.pop FL.empty ~current_txn_id:1L = None)
+    (FL.pop FL.empty ~min_safe_txn_id:1L = None)
 
 (* add then pop with current_txn_id = freed_at_txn_id + 1 returns the page *)
 let test_add_pop_reusable () =
   let freed_at = 5L in
   let current  = 6L in
   let t = FL.add FL.empty ~page_id:42l ~freed_at_txn_id:freed_at in
-  match FL.pop t ~current_txn_id:current with
+  match FL.pop t ~min_safe_txn_id:current with
   | None -> Alcotest.fail "expected Some"
   | Some (pid, t') ->
     Alcotest.(check int32) "page_id" 42l pid;
@@ -31,13 +31,13 @@ let test_pop_equal_not_reusable () =
   let txn = 5L in
   let t = FL.add FL.empty ~page_id:10l ~freed_at_txn_id:txn in
   Alcotest.(check bool) "pop with equal txn = None" true
-    (FL.pop t ~current_txn_id:txn = None)
+    (FL.pop t ~min_safe_txn_id:txn = None)
 
 (* pop with current_txn_id < freed_at_txn_id returns None *)
 let test_pop_too_early () =
   let t = FL.add FL.empty ~page_id:7l ~freed_at_txn_id:10L in
   Alcotest.(check bool) "pop with current < freed = None" true
-    (FL.pop t ~current_txn_id:9L = None)
+    (FL.pop t ~min_safe_txn_id:9L = None)
 
 (* add 3 pages; pop 3 times succeeds; 4th pop returns None *)
 let test_pop_three_pages () =
@@ -49,34 +49,34 @@ let test_pop_three_pages () =
       ~page_id:3l ~freed_at_txn_id:3L
   in
   let current = 100L in
-  (match FL.pop t ~current_txn_id:current with
+  (match FL.pop t ~min_safe_txn_id:current with
    | None -> Alcotest.fail "pop 1: expected Some"
    | Some (_, t1) ->
-     (match FL.pop t1 ~current_txn_id:current with
+     (match FL.pop t1 ~min_safe_txn_id:current with
       | None -> Alcotest.fail "pop 2: expected Some"
       | Some (_, t2) ->
-        (match FL.pop t2 ~current_txn_id:current with
+        (match FL.pop t2 ~min_safe_txn_id:current with
          | None -> Alcotest.fail "pop 3: expected Some"
          | Some (_, t3) ->
            Alcotest.(check bool) "pop 4: None" true
-             (FL.pop t3 ~current_txn_id:current = None))))
+             (FL.pop t3 ~min_safe_txn_id:current = None))))
 
 (* oldest-first: add page freed at txn 5 and page freed at txn 2;
-   pop ~current_txn_id:3 returns the page freed at txn 2, not txn 5 *)
+   pop ~min_safe_txn_id:3 returns the page freed at txn 2, not txn 5 *)
 let test_pop_oldest_first () =
   let t =
     FL.add
       (FL.add FL.empty ~page_id:100l ~freed_at_txn_id:5L)
       ~page_id:200l ~freed_at_txn_id:2L
   in
-  match FL.pop t ~current_txn_id:3L with
+  match FL.pop t ~min_safe_txn_id:3L with
   | None -> Alcotest.fail "expected Some"
   | Some (pid, t') ->
     Alcotest.(check int32) "oldest page (freed at 2) returned" 200l pid;
     (* the page freed at txn 5 is not yet reusable at current_txn_id=3 *)
     Alcotest.(check int) "remaining size = 1" 1 (FL.size t');
     Alcotest.(check bool) "page freed at 5 not reusable yet" true
-      (FL.pop t' ~current_txn_id:3L = None)
+      (FL.pop t' ~min_safe_txn_id:3L = None)
 
 (* size after N adds equals N; decreases by 1 after each pop *)
 let test_size_tracking () =
@@ -88,11 +88,11 @@ let test_size_tracking () =
   Alcotest.(check int) "size 2" 2 (FL.size t2);
   let t3 = FL.add t2 ~page_id:3l ~freed_at_txn_id:3L in
   Alcotest.(check int) "size 3" 3 (FL.size t3);
-  (match FL.pop t3 ~current_txn_id:100L with
+  (match FL.pop t3 ~min_safe_txn_id:100L with
    | None -> Alcotest.fail "pop 1"
    | Some (_, t3') ->
      Alcotest.(check int) "size after pop 1" 2 (FL.size t3');
-     (match FL.pop t3' ~current_txn_id:100L with
+     (match FL.pop t3' ~min_safe_txn_id:100L with
       | None -> Alcotest.fail "pop 2"
       | Some (_, t3'') ->
         Alcotest.(check int) "size after pop 2" 1 (FL.size t3'')))
@@ -109,7 +109,7 @@ let test_to_of_list_idempotent () =
   let t' = FL.of_list (FL.to_list t) in
   Alcotest.(check int) "same size" (FL.size t) (FL.size t');
   (* pop behavior should be identical *)
-  (match FL.pop t ~current_txn_id:100L, FL.pop t' ~current_txn_id:100L with
+  (match FL.pop t ~min_safe_txn_id:100L, FL.pop t' ~min_safe_txn_id:100L with
    | None, None -> ()
    | Some (pid1, _), Some (pid2, _) ->
      Alcotest.(check int32) "same first pop page_id" pid1 pid2
@@ -118,9 +118,9 @@ let test_to_of_list_idempotent () =
 (* reusable_count on empty = 0 *)
 let test_reusable_count_empty () =
   Alcotest.(check int) "reusable_count empty = 0" 0
-    (FL.reusable_count FL.empty ~current_txn_id:99L)
+    (FL.reusable_count FL.empty ~min_safe_txn_id:99L)
 
-(* add 3 entries freed at txns 1, 2, 3; reusable_count ~current_txn_id:3 = 2 *)
+(* add 3 entries freed at txns 1, 2, 3; reusable_count ~min_safe_txn_id:3 = 2 *)
 let test_reusable_count_partial () =
   let t =
     FL.add
@@ -131,12 +131,12 @@ let test_reusable_count_partial () =
   in
   (* txns 1 and 2 < 3; txn 3 is not < 3 *)
   Alcotest.(check int) "reusable_count = 2" 2
-    (FL.reusable_count t ~current_txn_id:3L)
+    (FL.reusable_count t ~min_safe_txn_id:3L)
 
 (* add then pop returns that exact page_id *)
 let test_pop_returns_correct_page () =
   let t = FL.add FL.empty ~page_id:0xDEADBEEFl ~freed_at_txn_id:1L in
-  match FL.pop t ~current_txn_id:2L with
+  match FL.pop t ~min_safe_txn_id:2L with
   | None -> Alcotest.fail "expected Some"
   | Some (pid, _) ->
     Alcotest.(check int32) "exact page_id" 0xDEADBEEFl pid
@@ -168,13 +168,13 @@ let prop_pop_all_distinct =
        let n = List.length entries in
        (* Pop all with max_int *)
        let rec pop_all acc t_cur count =
-         match FL.pop t_cur ~current_txn_id:Int64.max_int with
+         match FL.pop t_cur ~min_safe_txn_id:Int64.max_int with
          | None -> (List.length acc = count, t_cur)
          | Some (pid, t') -> pop_all (pid :: acc) t' count
        in
        let (all_popped, t_final) = pop_all [] t n in
        (* final pop must return None *)
-       let final_none = FL.pop t_final ~current_txn_id:Int64.max_int = None in
+       let final_none = FL.pop t_final ~min_safe_txn_id:Int64.max_int = None in
        all_popped && final_none)
 
 (* of_list (to_list t) produces identical pop results *)
@@ -192,8 +192,8 @@ let prop_roundtrip_pop_identical =
        let t' = FL.of_list (FL.to_list t) in
        (* Compare pop sequences *)
        let rec compare_pops t1 t2 =
-         match FL.pop t1 ~current_txn_id:Int64.max_int,
-               FL.pop t2 ~current_txn_id:Int64.max_int with
+         match FL.pop t1 ~min_safe_txn_id:Int64.max_int,
+               FL.pop t2 ~min_safe_txn_id:Int64.max_int with
          | None, None -> true
          | Some (p1, t1'), Some (p2, t2') ->
            p1 = p2 && compare_pops t1' t2'
@@ -216,7 +216,7 @@ let prop_pop_only_added_ids =
        in
        (* Pop all and verify each is in the original set *)
        let rec check t_cur =
-         match FL.pop t_cur ~current_txn_id:Int64.max_int with
+         match FL.pop t_cur ~min_safe_txn_id:Int64.max_int with
          | None -> true
          | Some (pid, t') ->
            List.mem pid page_ids && check t'
@@ -224,8 +224,8 @@ let prop_pop_only_added_ids =
        check t)
 
 (* after add page freed_at T:
-   pop ~current_txn_id:T returns None;
-   pop ~current_txn_id:(T+1L) returns Some *)
+   pop ~min_safe_txn_id:T returns None;
+   pop ~min_safe_txn_id:(T+1L) returns Some *)
 let prop_txn_gating =
   (* Use non-negative txn_ids that won't overflow when +1 is applied *)
   let gen = QCheck.Gen.(
@@ -240,8 +240,8 @@ let prop_txn_gating =
     (QCheck.make gen)
     (fun (pid, txn) ->
        let t = FL.add FL.empty ~page_id:pid ~freed_at_txn_id:txn in
-       let at_equal = FL.pop t ~current_txn_id:txn = None in
-       let at_plus1 = FL.pop t ~current_txn_id:(Int64.add txn 1L) <> None in
+       let at_equal = FL.pop t ~min_safe_txn_id:txn = None in
+       let at_plus1 = FL.pop t ~min_safe_txn_id:(Int64.add txn 1L) <> None in
        at_equal && at_plus1)
 
 (* ------------------------------------------------------------------ *)

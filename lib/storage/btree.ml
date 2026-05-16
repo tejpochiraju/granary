@@ -7,19 +7,11 @@
 let max_key_size   = 512
 let max_value_size = 1024
 
-(* Transaction id used internally for [Pager.alloc]/[Pager.free].
-   The B+-tree itself does not track txn_ids; higher-level commit logic
-   (header module) is responsible for sequencing.  CoW requires that
-   freed-in-this-transaction pages are NOT reused within the same
-   transaction (otherwise we would clobber data we still depend on for
-   crash safety).  Pager honours this if [current_txn_id <= freed_at_txn_id].
-
-   We therefore stamp frees with the SAME txn id as allocs.  Per Pager
-   semantics, a page freed at txn N is only reusable when alloc has
-   current_txn_id > N, so freed pages stay unique within the current put/
-   del operation. *)
-let txn_id_alloc = 1L
-let txn_id_free  = 1L
+(* Transaction ids are now managed by the Pager itself.  The B+-tree
+   uses [Pager.get_txn_id] to stamp freed pages and [Pager.alloc] reads
+   [alloc_min_safe] internally.  Higher-level commit logic (store.ml /
+   header module) is responsible for sequencing via [Pager.set_txn_id]
+   and [Pager.set_alloc_min_safe]. *)
 
 (* ------------------------------------------------------------------ *)
 (* Types                                                               *)
@@ -419,7 +411,7 @@ let write_leaf_maybe_split pager (entries : (bytes * bytes) list) ~right_page :
   (write_result, error) result Lwt.t =
   let total = leaf_entries_total_size entries in
   if total <= Page.max_data_bytes then begin
-    let* alloc_r = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+    let* alloc_r = Pager.alloc pager in
     bind_pager alloc_r (fun new_pid ->
         let* w = build_and_write_leaf pager ~page_id:new_pid ~entries ~right_page in
         match w with
@@ -432,9 +424,9 @@ let write_leaf_maybe_split pager (entries : (bytes * bytes) list) ~right_page :
     match right_entries with
     | [] -> return_error (Tree_corrupt "leaf split with empty right half")
     | (split_key, _) :: _ ->
-      let* alloc_r1 = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+      let* alloc_r1 = Pager.alloc pager in
       bind_pager alloc_r1 (fun right_pid ->
-          let* alloc_r2 = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+          let* alloc_r2 = Pager.alloc pager in
           bind_pager alloc_r2 (fun left_pid ->
               (* Build right first (next-leaf = original right_page). *)
               let* w1 = build_and_write_leaf pager ~page_id:right_pid
@@ -458,7 +450,7 @@ let write_branch_maybe_split pager
   (* Branches need at least an 8-byte head (right_page already in common) so
      [max_data_bytes] suffices. *)
   if total <= Page.max_data_bytes then begin
-    let* alloc_r = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+    let* alloc_r = Pager.alloc pager in
     bind_pager alloc_r (fun new_pid ->
         let* w = build_and_write_branch pager ~page_id:new_pid ~entries ~right_page in
         match w with
@@ -475,9 +467,9 @@ let write_branch_maybe_split pager
          becomes the rightmost child of the LEFT branch.  mid_key is promoted
          to the parent.  right_entries plus right_page form the right
          branch (with right_page = right_page). *)
-      let* alloc_r1 = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+      let* alloc_r1 = Pager.alloc pager in
       bind_pager alloc_r1 (fun right_pid ->
-          let* alloc_r2 = Pager.alloc pager ~current_txn_id:txn_id_alloc in
+          let* alloc_r2 = Pager.alloc pager in
           bind_pager alloc_r2 (fun left_pid ->
               let* w1 = build_and_write_branch pager ~page_id:right_pid
                   ~entries:right_entries ~right_page in
@@ -509,11 +501,10 @@ let rec propagate_up pager (path : path_step list)
         split_branch_child step.branch_entries step.right_page
           step.child_idx left_new split_key right_new
     in
-    (* Free the old branch page first.  Both txn_id_free and txn_id_alloc are
-       1L; Pager reuses a freed page only when current_txn_id > freed_at, so
-       freed_at(1) < current(1) is false and the page will not be returned for
-       the immediate allocs below — safe within the same put/del operation. *)
-    Pager.free pager ~page_id:step.page_id ~freed_at_txn_id:txn_id_free;
+    (* Free the old branch page.  Stamp it with the pager's current_txn_id.
+       Pager reuses a freed page only when alloc_min_safe > freed_at, so a page
+       freed within this transaction will not be immediately recycled — safe. *)
+    Pager.free pager ~page_id:step.page_id ~freed_at_txn_id:(Pager.get_txn_id pager);
     let* w = write_branch_maybe_split pager new_entries
         ~right_page:new_right_page in
     match w with
@@ -531,7 +522,7 @@ let put t key value : (t, error) result Lwt.t =
   else if val_len > max_value_size then return_error (Value_too_large val_len)
   else if Int64.compare t.root_page 0L = 0 then begin
     (* Empty tree → create a single leaf page with one entry, set as root. *)
-    let* alloc_r = Pager.alloc t.pager ~current_txn_id:txn_id_alloc in
+    let* alloc_r = Pager.alloc t.pager in
     bind_pager alloc_r (fun new_pid ->
         let* w = build_and_write_leaf t.pager ~page_id:new_pid
             ~entries:[(key, value)] ~right_page:0L in
@@ -553,7 +544,7 @@ let put t key value : (t, error) result Lwt.t =
           in
           let new_entries = leaf_insert_or_replace plain_entries key value in
           (* Free the old leaf page first. *)
-          Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:txn_id_free;
+          Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
           let* w = write_leaf_maybe_split t.pager new_entries
               ~right_page:leaf_right in
           match w with
@@ -566,7 +557,7 @@ let put t key value : (t, error) result Lwt.t =
               return_ok { t with root_page = new_root }
             | Ok (Split (left_pid, split_key, right_pid)) ->
               (* Root split — create a new branch root with one entry. *)
-              let* alloc_r = Pager.alloc t.pager ~current_txn_id:txn_id_alloc in
+              let* alloc_r = Pager.alloc t.pager in
               bind_pager alloc_r (fun new_root_pid ->
                   let* w2 = build_and_write_branch t.pager
                       ~page_id:new_root_pid
@@ -617,10 +608,10 @@ let del t key : (t, error) result Lwt.t =
           else begin
             (* Special case: root is a single empty leaf → set root to 0L. *)
             if path = [] && new_entries = [] then begin
-              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:txn_id_free;
+              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
               return_ok { t with root_page = 0L }
             end else begin
-              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:txn_id_free;
+              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
               let* w = write_leaf_maybe_split t.pager new_entries
                   ~right_page:leaf_right in
               match w with
@@ -634,7 +625,7 @@ let del t key : (t, error) result Lwt.t =
                 | Ok (Split (left_pid, split_key, right_pid)) ->
                   (* Extremely unlikely: deletion caused a split (entries
                      decreased so no split — but defensive case). *)
-                  let* alloc_r = Pager.alloc t.pager ~current_txn_id:txn_id_alloc in
+                  let* alloc_r = Pager.alloc t.pager in
                   bind_pager alloc_r (fun new_root_pid ->
                       let* w2 = build_and_write_branch t.pager
                           ~page_id:new_root_pid

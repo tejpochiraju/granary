@@ -14,13 +14,13 @@ let add (t : t) ~page_id ~freed_at_txn_id : t =
   (page_id, freed_at_txn_id) :: t
 
 (** Find the entry with the lowest freed_at_txn_id among those where
-    freed_at_txn_id < current_txn_id.  Returns [(best_entry, rest)] or [None]. *)
-let pop (t : t) ~current_txn_id : (int32 * t) option =
+    freed_at_txn_id < min_safe_txn_id.  Returns [(best_entry, rest)] or [None]. *)
+let pop (t : t) ~min_safe_txn_id : (int32 * t) option =
   (* Scan for the reusable entry with the minimum freed_at_txn_id *)
   let best =
     List.fold_left
       (fun acc (pid, txn) ->
-         if Int64.compare txn current_txn_id < 0 then
+         if Int64.compare txn min_safe_txn_id < 0 then
            match acc with
            | None -> Some (pid, txn)
            | Some (_, best_txn) ->
@@ -48,10 +48,10 @@ let of_list (l : (int32 * int64) list) : t = l
 
 let size (t : t) : int = List.length t
 
-let reusable_count (t : t) ~current_txn_id : int =
+let reusable_count (t : t) ~min_safe_txn_id : int =
   List.fold_left
     (fun acc (_, txn) ->
-       if Int64.compare txn current_txn_id < 0 then acc + 1
+       if Int64.compare txn min_safe_txn_id < 0 then acc + 1
        else acc)
     0
     t

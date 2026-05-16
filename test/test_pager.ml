@@ -84,7 +84,7 @@ let test_create_empty () =
 (* alloc with empty freelist → returns page 0; n_pages becomes 1 *)
 let test_alloc_first () =
   let (p, mb) = make_pager () in
-  let id = run (Pager.alloc p ~current_txn_id:1L) in
+  let id = run (Pager.alloc p) in
   (match id with
    | Error e ->
      Alcotest.failf "alloc failed: %a" Pager.pp_error e
@@ -96,8 +96,8 @@ let test_alloc_first () =
 (* alloc twice → returns pages 0 and 1 in order *)
 let test_alloc_twice () =
   let (p, _) = make_pager () in
-  let id0 = run (Pager.alloc p ~current_txn_id:1L) in
-  let id1 = run (Pager.alloc p ~current_txn_id:1L) in
+  let id0 = run (Pager.alloc p) in
+  let id1 = run (Pager.alloc p) in
   (match id0, id1 with
    | Ok p0, Ok p1 ->
      Alcotest.(check int64) "first = 0"  0L p0;
@@ -108,7 +108,7 @@ let test_alloc_twice () =
 (* write then read returns same content (from dirty/cache, no BLOCK hit) *)
 let test_write_then_read () =
   let (p, mb) = make_pager () in
-  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let _ = run (Pager.alloc p) in
   let buf = fill_page 0xAB in
   Pager.write p 0L buf;
   let before_reads = mb.read_count in
@@ -126,7 +126,7 @@ let test_write_then_read () =
 (* write then flush → verify BLOCK mock contains the page data *)
 let test_write_then_flush () =
   let (p, mb) = make_pager () in
-  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let _ = run (Pager.alloc p) in
   let buf = fill_page 0x5A in
   Pager.write p 0L buf;
   (match run (Pager.flush p) with
@@ -154,22 +154,23 @@ let test_read_caches_block () =
   let _r2 = run (Pager.read p 0L) in
   Alcotest.(check int) "second read from cache" 1 mb.read_count
 
-(* free then alloc (with higher current_txn_id) → returns the freed page_id *)
+(* free then alloc (with alloc_min_safe > freed_at_txn_id) → returns the freed page_id *)
 let test_free_then_alloc_reusable () =
   let (p, _) = make_pager ~n_pages:5L () in
-  (* Free page 3 at txn 1 *)
+  (* Free page 3 at txn 1; set alloc_min_safe=2 so freed_at(1) < min_safe(2) *)
   Pager.free p ~page_id:3L ~freed_at_txn_id:1L;
-  (* Alloc with txn 2 → page 3 should be returned *)
-  (match run (Pager.alloc p ~current_txn_id:2L) with
+  Pager.set_alloc_min_safe p 2L;
+  (match run (Pager.alloc p) with
    | Error e -> Alcotest.failf "alloc failed: %a" Pager.pp_error e
    | Ok pid  -> Alcotest.(check int64) "reuses freed page 3" 3L pid)
 
-(* free then alloc (with same txn_id) → returns NEW page (freed not yet reusable) *)
+(* free then alloc (with alloc_min_safe = freed_at_txn_id) → returns NEW page (freed not yet reusable) *)
 let test_free_then_alloc_same_txn () =
   let (p, _) = make_pager ~n_pages:5L () in
   Pager.free p ~page_id:3L ~freed_at_txn_id:2L;
-  (* Alloc with same txn_id: 2 — page 3 not yet reusable *)
-  (match run (Pager.alloc p ~current_txn_id:2L) with
+  (* alloc_min_safe=2: freed_at(2) < 2 is false — page 3 not yet reusable *)
+  Pager.set_alloc_min_safe p 2L;
+  (match run (Pager.alloc p) with
    | Error e -> Alcotest.failf "alloc failed: %a" Pager.pp_error e
    | Ok pid  ->
      Alcotest.(check bool) "new page allocated, not freed one" true
@@ -179,7 +180,7 @@ let test_free_then_alloc_same_txn () =
 (* flush clears dirty — second flush makes no BLOCK write calls *)
 let test_flush_clears_dirty () =
   let (p, mb) = make_pager () in
-  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let _ = run (Pager.alloc p) in
   Pager.write p 0L (fill_page 0x11);
   let _ = run (Pager.flush p) in
   let writes_after_first = mb.write_count in
@@ -191,8 +192,8 @@ let test_flush_clears_dirty () =
 (* n_pages after two allocs = 2 *)
 let test_n_pages_after_two_allocs () =
   let (p, _) = make_pager () in
-  let _ = run (Pager.alloc p ~current_txn_id:1L) in
-  let _ = run (Pager.alloc p ~current_txn_id:1L) in
+  let _ = run (Pager.alloc p) in
+  let _ = run (Pager.alloc p) in
   Alcotest.(check int64) "n_pages = 2" 2L (Pager.n_pages p)
 
 (* Cache eviction — write 65 pages; read oldest back (should hit BLOCK) *)
@@ -287,7 +288,7 @@ let prop_alloc_monotone =
     (fun n ->
        let (p, _) = make_pager () in
        let ids = Array.init n (fun _ ->
-           match run (Pager.alloc p ~current_txn_id:1L) with
+           match run (Pager.alloc p) with
            | Ok id -> id
            | Error _ -> Int64.minus_one)
        in
@@ -401,6 +402,27 @@ let test_flush_sync_error () =
   | Error (Pager.Block_error _) -> ()
   | Error _ -> Alcotest.fail "expected Block_error"
 
+let test_alloc_no_arg () =
+  let (p, _) = make_pager () in
+  (match Lwt_main.run (Pager.alloc p) with
+   | Ok _ -> ()
+   | Error _ -> Alcotest.fail "alloc failed")
+
+let test_set_get_txn_id () =
+  let (p, _) = make_pager () in
+  Pager.set_txn_id p 5L;
+  Alcotest.(check int64) "get_txn_id" 5L (Pager.get_txn_id p)
+
+let test_freelist_recycled_after_txn () =
+  (* Free page with freed_at=2; alloc_min_safe=3 means it should be recycled *)
+  let (p, _) = make_pager () in
+  ignore (Lwt_main.run (Pager.alloc p));  (* alloc page 2 *)
+  Pager.free p ~page_id:2L ~freed_at_txn_id:2L;
+  Pager.set_alloc_min_safe p 3L;
+  (match Lwt_main.run (Pager.alloc p) with
+   | Ok pid -> Alcotest.(check int64) "page recycled" 2L pid
+   | Error _ -> Alcotest.fail "expected recycled page")
+
 (* read where the underlying read_page fails -> Block_error *)
 let test_read_block_error () =
   let read_page ~page_id:_ _buf = Lwt.return_error "injected read" in
@@ -446,6 +468,11 @@ let () =
       Alcotest.test_case "flush write error"                    `Quick test_flush_write_error;
       Alcotest.test_case "flush sync error"                     `Quick test_flush_sync_error;
       Alcotest.test_case "read block error"                     `Quick test_read_block_error;
+    ];
+    "txn_id", [
+      Alcotest.test_case "alloc no arg"                         `Quick test_alloc_no_arg;
+      Alcotest.test_case "set/get txn_id"                       `Quick test_set_get_txn_id;
+      Alcotest.test_case "freelist recycled after txn"          `Quick test_freelist_recycled_after_txn;
     ];
     "qcheck", qcheck_tests;
   ]

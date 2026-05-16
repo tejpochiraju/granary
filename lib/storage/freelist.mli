@@ -10,10 +10,10 @@ val empty : t
     [freed_at_txn_id]: the txn_id of the transaction that freed the page. *)
 val add : t -> page_id:int32 -> freed_at_txn_id:int64 -> t
 
-(** Pop a reusable page. A page is reusable if freed_at_txn_id < current_txn_id.
+(** Pop a reusable page. A page is reusable if freed_at_txn_id < min_safe_txn_id.
     Returns (page_id, updated_t) or None if no reusable page is available.
     Picks the page with the lowest freed_at_txn_id first (oldest freed first). *)
-val pop : t -> current_txn_id:int64 -> (int32 * t) option
+val pop : t -> min_safe_txn_id:int64 -> (int32 * t) option
 
 (** All entries in the freelist — for serialisation to Freelist pages. *)
 val to_list : t -> (int32 * int64) list   (* (page_id, freed_at_txn_id) *)
@@ -24,5 +24,5 @@ val of_list : (int32 * int64) list -> t
 (** Number of entries in the freelist. *)
 val size : t -> int
 
-(** Reusable count: number of entries with freed_at_txn_id < current_txn_id. *)
-val reusable_count : t -> current_txn_id:int64 -> int
+(** Reusable count: number of entries with freed_at_txn_id < min_safe_txn_id. *)
+val reusable_count : t -> min_safe_txn_id:int64 -> int

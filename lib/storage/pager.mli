@@ -26,9 +26,9 @@ val read : t -> int64 -> (Cstruct.t, error) result Lwt.t
     Does not write to BLOCK immediately. The Cstruct.t is copied internally. *)
 val write : t -> int64 -> Cstruct.t -> unit
 
-(** Allocate a new page ID. Tries freelist first; extends file if empty.
-    Does not write to BLOCK — caller must [write] the allocated page contents. *)
-val alloc : t -> current_txn_id:int64 -> (int64, error) result Lwt.t
+(** Allocate a new page ID. Tries freelist first (reusing pages where
+    freed_at_txn_id < alloc_min_safe); extends file if none available. *)
+val alloc : t -> (int64, error) result Lwt.t
 
 (** Free a page (add to in-memory freelist with [freed_at_txn_id]). *)
 val free : t -> page_id:int64 -> freed_at_txn_id:int64 -> unit
@@ -42,3 +42,13 @@ val n_pages : t -> int64
 
 (** Current freelist state (for serialisation into header). *)
 val freelist : t -> Freelist.t
+
+(** Set the current RW transaction ID. B+-tree uses get_txn_id for freed_at stamps. *)
+val set_txn_id : t -> int64 -> unit
+
+(** Get the current RW transaction ID (used by btree.ml for freed_at stamps). *)
+val get_txn_id : t -> int64
+
+(** Set the minimum txn_id threshold for freelist reuse.
+    A freed page is reusable iff freed_at_txn_id < alloc_min_safe. *)
+val set_alloc_min_safe : t -> int64 -> unit

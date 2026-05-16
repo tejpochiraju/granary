@@ -281,6 +281,12 @@ let ro_begin t = Lwt.return (Ro t)
 
 let rw_begin t =
   let* () = Lwt_mutex.lock t.rw_mutex in
+  (match t.backend with
+   | Mem _ -> ()
+   | Btree st ->
+     let next_txn_id = Int64.add st.current_header.txn_id 1L in
+     Pager.set_txn_id st.pager next_txn_id;
+     Pager.set_alloc_min_safe st.pager next_txn_id);
   Lwt.return (Rw t)
 
 let ro_end (Ro _ : ro txn) = Lwt.return_unit

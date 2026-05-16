@@ -18,8 +18,10 @@ type t = {
   cache      : (int64, Cstruct.t) Hashtbl.t;
   dirty      : (int64, Cstruct.t) Hashtbl.t;
   fifo       : int64 Queue.t;   (* insertion order for FIFO eviction *)
-  mutable n_pages  : int64;
-  mutable freelist : Freelist.t;
+  mutable n_pages       : int64;
+  mutable freelist      : Freelist.t;
+  mutable current_txn_id  : int64;
+  mutable alloc_min_safe  : int64;
 }
 
 type error = Block_error of string | Corruption of string
@@ -33,11 +35,13 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
     write_page;
     sync;
     resize;
-    cache    = Hashtbl.create 64;
-    dirty    = Hashtbl.create 16;
-    fifo     = Queue.create ();
+    cache           = Hashtbl.create 64;
+    dirty           = Hashtbl.create 16;
+    fifo            = Queue.create ();
     n_pages;
     freelist;
+    current_txn_id  = 0L;
+    alloc_min_safe  = 0L;
   }
 
 (** Evict the oldest cache entry if the cache is at capacity.
@@ -112,8 +116,8 @@ let write t page_id buf =
   let cache_copy = cstruct_dup buf in
   cache_add t page_id cache_copy
 
-let alloc t ~current_txn_id =
-  match Freelist.pop t.freelist ~current_txn_id with
+let alloc t =
+  match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
   | Some (pid32, fl') ->
     t.freelist <- fl';
     Lwt.return_ok (Int64.of_int32 pid32)
@@ -158,3 +162,9 @@ let flush t =
 let n_pages t = t.n_pages
 
 let freelist t = t.freelist
+
+let set_txn_id t id = t.current_txn_id <- id
+
+let get_txn_id t = t.current_txn_id
+
+let set_alloc_min_safe t v = t.alloc_min_safe <- v
