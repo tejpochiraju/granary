@@ -416,11 +416,18 @@ let test_set_get_txn_id () =
 let test_freelist_recycled_after_txn () =
   (* Free page with freed_at=2; alloc_min_safe=3 means it should be recycled *)
   let (p, _) = make_pager () in
-  ignore (Lwt_main.run (Pager.alloc p));  (* alloc page 2 *)
-  Pager.free p ~page_id:2L ~freed_at_txn_id:2L;
+  (* Allocate 3 pages to get a known page_id to free *)
+  let pid1 = Result.get_ok (Lwt_main.run (Pager.alloc p)) in
+  let pid2 = Result.get_ok (Lwt_main.run (Pager.alloc p)) in
+  let pid3 = Result.get_ok (Lwt_main.run (Pager.alloc p)) in
+  ignore (pid1, pid2);
+  (* Free pid3 with freed_at=2 *)
+  Pager.free p ~page_id:pid3 ~freed_at_txn_id:2L;
+  (* Set min_safe=3 so freed_at=2 < 3, making pid3 reusable *)
   Pager.set_alloc_min_safe p 3L;
+  (* Next alloc should return pid3 (recycled) *)
   (match Lwt_main.run (Pager.alloc p) with
-   | Ok pid -> Alcotest.(check int64) "page recycled" 2L pid
+   | Ok pid -> Alcotest.(check int64) "page recycled" pid3 pid
    | Error _ -> Alcotest.fail "expected recycled page")
 
 (* read where the underlying read_page fails -> Block_error *)

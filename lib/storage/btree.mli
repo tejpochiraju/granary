@@ -28,8 +28,9 @@ val root_page : t -> int64
 val get : t -> bytes -> (bytes option, error) result Lwt.t
 
 (** Insert or replace.  Returns an updated [t] whose [root_page] reflects the
-    new root.  Mutations always run with [current_txn_id = 1L] internally
-    (the caller is responsible for higher-level transaction sequencing).
+    new root.  Mutations stamp freed pages via {!Pager.get_txn_id}; the pager
+    manages the transaction ID internally — the caller is responsible only for
+    calling [Store.rw_begin] which sets the correct txn_id.
 
     @return [Error (Key_too_large n)] if the key is more than 512 bytes.
     @return [Error (Value_too_large n)] if the value is more than 1024 bytes. *)

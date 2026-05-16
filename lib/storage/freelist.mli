@@ -1,5 +1,6 @@
 (** In-memory freelist. Tracks freed pages and when they can be reused.
-    A page freed at txn_id T becomes reusable when current_txn_id > T.
+    A page freed at txn_id T becomes reusable when min_safe_txn_id > T
+    (i.e. freed_at_txn_id < min_safe_txn_id).
     Pure — no I/O, no Lwt. *)
 
 type t
