@@ -843,6 +843,60 @@ let test_freed_pages_reused_after_reopen () =
     run (S.close store2))
 
 (* ------------------------------------------------------------------ *)
+(* 12. Rollback correctness                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_rollback_restores_data () =
+  let path = Filename.temp_file "sqlocaml_rb_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx1 = run (S.rw_begin store) in
+    run (S.put tx1 16 (Bytes.of_string "key") (Bytes.of_string "original"));
+    run (S.commit tx1);
+    let tx2 = run (S.rw_begin store) in
+    run (S.put tx2 16 (Bytes.of_string "key") (Bytes.of_string "changed"));
+    run (S.rollback tx2);
+    let tx3 = run (S.ro_begin store) in
+    let v = run (S.get tx3 16 (Bytes.of_string "key")) in
+    run (S.ro_end tx3);
+    Alcotest.(check (option string)) "rolled back to original"
+      (Some "original") (Option.map Bytes.to_string v);
+    run (S.close store))
+
+let test_rollback_freelist_not_corrupted () =
+  let path = Filename.temp_file "sqlocaml_rb2_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx1 = run (S.rw_begin store) in
+    run (S.put tx1 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
+    run (S.commit tx1);
+    let fl_size_after_commit = S.freelist_size store in
+    let tx2 = run (S.rw_begin store) in
+    run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
+    run (S.rollback tx2);
+    let fl_size_after_rollback = S.freelist_size store in
+    Alcotest.(check int) "freelist unchanged after rollback"
+      fl_size_after_commit fl_size_after_rollback;
+    run (S.close store))
+
+let test_rollback_then_commit_works () =
+  let path = Filename.temp_file "sqlocaml_rb3_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx1 = run (S.rw_begin store) in
+    run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "first"));
+    run (S.rollback tx1);
+    let tx2 = run (S.rw_begin store) in
+    run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "second"));
+    run (S.commit tx2);
+    let tx3 = run (S.ro_begin store) in
+    let v = run (S.get tx3 16 (Bytes.of_string "k")) in
+    run (S.ro_end tx3);
+    Alcotest.(check (option string)) "second write committed"
+      (Some "second") (Option.map Bytes.to_string v);
+    run (S.close store))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -897,6 +951,11 @@ let () =
     "freelist", [
       Alcotest.test_case "survives reopen"          `Quick test_freelist_survives_reopen;
       Alcotest.test_case "freed pages reused"       `Quick test_freed_pages_reused_after_reopen;
+    ];
+    "rollback", [
+      Alcotest.test_case "restores_data"            `Quick test_rollback_restores_data;
+      Alcotest.test_case "freelist_not_corrupted"   `Quick test_rollback_freelist_not_corrupted;
+      Alcotest.test_case "then_commit_works"        `Quick test_rollback_then_commit_works;
     ];
     "qcheck", qcheck_tests;
   ]

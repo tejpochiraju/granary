@@ -55,3 +55,8 @@ val set_alloc_min_safe : t -> int64 -> unit
 
 (** Replace the in-memory freelist (used after deserializing from disk). *)
 val set_freelist : t -> Freelist.t -> unit
+
+(** Discard all dirty pages (and remove them from the read cache) without
+    writing them to disk. Used on rollback to prevent aborted writes from
+    being visible. *)
+val clear_dirty : t -> unit

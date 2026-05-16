@@ -170,3 +170,18 @@ let get_txn_id t = t.current_txn_id
 let set_alloc_min_safe t v = t.alloc_min_safe <- v
 
 let set_freelist t fl = t.freelist <- fl
+
+let clear_dirty t =
+  let dirty_pids = Hashtbl.fold (fun pid _ acc -> pid :: acc) t.dirty [] in
+  List.iter (fun pid ->
+    Hashtbl.remove t.dirty pid;
+    Hashtbl.remove t.cache pid
+  ) dirty_pids;
+  (* Rebuild FIFO queue without the removed page ids *)
+  let pids_set = Hashtbl.create (List.length dirty_pids) in
+  List.iter (fun pid -> Hashtbl.replace pids_set pid ()) dirty_pids;
+  let old_fifo = Queue.copy t.fifo in
+  Queue.clear t.fifo;
+  Queue.iter (fun pid ->
+    if not (Hashtbl.mem pids_set pid) then Queue.push pid t.fifo
+  ) old_fifo

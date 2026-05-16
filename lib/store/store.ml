@@ -56,6 +56,8 @@ type bt_state = {
   trees                : (tree_id, Btree.t) Hashtbl.t;
   mutable current_header : Header.t;
   schema_version : int64;
+  mutable txn_freelist_snapshot : Freelist.t option;
+  (* Snapshot of freelist taken at rw_begin; restored on rollback. None when no RW txn is active. *)
 }
 
 type backend =
@@ -278,7 +280,8 @@ let open_file ~path : (t, error) result Lwt.t =
             { file; pager; meta;
               trees = Hashtbl.create 16;
               current_header = h;
-              schema_version = h.schema_version }
+              schema_version = h.schema_version;
+              txn_freelist_snapshot = None }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create () }
@@ -295,7 +298,8 @@ let open_file ~path : (t, error) result Lwt.t =
           { file; pager; meta;
             trees = Hashtbl.create 16;
             current_header = h;
-            schema_version = h.schema_version }
+            schema_version = h.schema_version;
+            txn_freelist_snapshot = None }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create () }
@@ -321,7 +325,8 @@ let rw_begin t =
    | Btree st ->
      let next_txn_id = Int64.add st.current_header.txn_id 1L in
      Pager.set_txn_id st.pager next_txn_id;
-     Pager.set_alloc_min_safe st.pager next_txn_id);
+     Pager.set_alloc_min_safe st.pager next_txn_id;
+     st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
   Lwt.return (Rw t)
 
 let ro_end (Ro _ : ro txn) = Lwt.return_unit
@@ -464,6 +469,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
        st.current_header <-
          { new_state with
            txn_id = Int64.add st.current_header.txn_id 1L };
+       st.txn_freelist_snapshot <- None;
        Lwt.return_unit
      | Error e ->
        Lwt.fail_with
@@ -493,7 +499,13 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         to it); we revert it to the last-committed root from the
         header. *)
      Hashtbl.clear st.trees;
-     st.meta <- Btree.create st.pager ~root_page:st.current_header.root_page);
+     st.meta <- Btree.create st.pager ~root_page:st.current_header.root_page;
+     (match st.txn_freelist_snapshot with
+      | Some fl ->
+        Pager.set_freelist st.pager fl;
+        Pager.clear_dirty st.pager;
+        st.txn_freelist_snapshot <- None
+      | None -> ()));
   Lwt_mutex.unlock t.rw_mutex;
   Lwt.return_unit
 
