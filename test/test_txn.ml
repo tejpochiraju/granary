@@ -25,6 +25,8 @@ let query_ints db sql =
       | _ -> -1
     ) (rows_of stream)
 
+let execute db sql = run (Db.execute db sql)
+
 let test_begin_commit_visible () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
@@ -93,6 +95,32 @@ let test_txn_rollback_with_update () =
   let ns = query_ints db "SELECT n FROM t" in
   Alcotest.(check (list int)) "update rolled back" [1] ns
 
+let test_unique_violation_survives () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "CREATE UNIQUE INDEX t_n ON t (n)";
+  exec db "INSERT INTO t (n) VALUES (1)";
+  (* This should fail with UNIQUE constraint — but NOT hang the engine *)
+  let r = execute db "INSERT INTO t (n) VALUES (1)" in
+  Alcotest.(check bool) "unique violation returns error" true (Result.is_error r);
+  (* Engine must still work after the failed insert *)
+  exec db "INSERT INTO t (n) VALUES (2)";
+  let ns = query_ints db "SELECT n FROM t ORDER BY n ASC" in
+  Alcotest.(check (list int)) "engine still works after unique violation" [1; 2] ns
+
+let test_create_table_in_txn_not_rolled_back () =
+  (* Known Phase 3 limitation: CREATE TABLE acquires its own RW txn internally
+     and commits immediately — it cannot participate in an explicit BEGIN/ROLLBACK
+     block. Attempting BEGIN + CREATE TABLE deadlocks (catalog re-acquires the
+     held mutex). We document that CREATE TABLE in auto-commit mode is always
+     immediately committed and visible. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  (* Table is committed immediately and visible in a new auto-commit txn *)
+  let r = execute db "INSERT INTO t (n) VALUES (1)" in
+  Alcotest.(check bool) "table created in auto-commit is immediately visible"
+    true (Result.is_ok r)
+
 let test_parse_begin () =
   let db = fresh_db () in
   let r = run (Db.execute db "BEGIN") in
@@ -107,13 +135,15 @@ let () =
         Alcotest.test_case "autocommit_still_works" `Quick test_autocommit_still_works;
       ];
       "error_cases", [
-        Alcotest.test_case "double_begin"           `Quick test_double_begin_errors;
-        Alcotest.test_case "commit_without_begin"   `Quick test_commit_without_begin_errors;
-        Alcotest.test_case "rollback_without_begin" `Quick test_rollback_without_begin_errors;
+        Alcotest.test_case "double_begin"              `Quick test_double_begin_errors;
+        Alcotest.test_case "commit_without_begin"      `Quick test_commit_without_begin_errors;
+        Alcotest.test_case "rollback_without_begin"    `Quick test_rollback_without_begin_errors;
+        Alcotest.test_case "unique_violation_survives" `Quick test_unique_violation_survives;
       ];
       "multi_stmt", [
-        Alcotest.test_case "update_delete_commit"   `Quick test_txn_with_update_delete;
-        Alcotest.test_case "rollback_with_update"   `Quick test_txn_rollback_with_update;
+        Alcotest.test_case "update_delete_commit"              `Quick test_txn_with_update_delete;
+        Alcotest.test_case "rollback_with_update"              `Quick test_txn_rollback_with_update;
+        Alcotest.test_case "create_table_in_txn_not_rolled_back" `Quick test_create_table_in_txn_not_rolled_back;
       ];
       "parse", [
         Alcotest.test_case "parse_begin" `Quick test_parse_begin;

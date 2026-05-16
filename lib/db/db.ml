@@ -102,7 +102,10 @@ let execute t sql =
     (* SELECT always uses snapshot reads inside exec.ml (ro_begin/ro_end),
        so it reads committed state regardless of an active explicit txn.
        For DML, pass In_txn when an explicit transaction is open so all
-       writes join the same atomic context. *)
+       writes join the same atomic context.
+       Note on SELECT within explicit txn: SELECTs always read the last committed
+       state (snapshot isolation), not in-progress writes from the current txn.
+       This is a known Phase 3 limitation — read-your-own-writes deferred to Phase 4. *)
     let mode = match t.explicit_txn with
       | None    -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
