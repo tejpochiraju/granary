@@ -4,6 +4,7 @@ module Cat       = Sqlocaml_catalog.Catalog
 module Row       = Sqlocaml_encoding.Row
 module Rowid     = Sqlocaml_encoding.Rowid
 module Index_key = Sqlocaml_encoding.Index_key
+module Varint    = Sqlocaml_encoding.Varint
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -161,6 +162,124 @@ and arith_op lv rv int_f float_f =
 
 let project_row (ords : int list) (row : Row.t) : Row.t =
   Array.of_list (List.map (fun i -> row.(i)) ords)
+
+(* ------------------------------------------------------------------ *)
+(* FTS inverted-index helpers                                           *)
+(* ------------------------------------------------------------------ *)
+
+(** Key format: term_bytes ++ "\x00" ++ rowid_be8
+    Rowid stored with sign bit flipped so unsigned byte order = signed int64 order. *)
+let fts_term_key term rowid =
+  let rb = Bytes.create 8 in
+  let v  = Int64.logxor rowid Int64.min_int in
+  for i = 0 to 7 do
+    Bytes.set_uint8 rb i
+      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7-i)*8)) 0xFFL))
+  done;
+  Bytes.concat Bytes.empty [Bytes.of_string term; Bytes.of_string "\x00"; rb]
+
+let fts_stats_key = Bytes.of_string "\x00\x00"
+
+let fts_doclen_key rowid =
+  let rb = Bytes.create 8 in
+  let v  = Int64.logxor rowid Int64.min_int in
+  for i = 0 to 7 do
+    Bytes.set_uint8 rb i
+      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7-i)*8)) 0xFFL))
+  done;
+  Bytes.cat (Bytes.of_string "\x00\x01") rb
+
+(** Value: varint pairs (col, pos)* — all positions for one (term, rowid). *)
+let encode_positions positions =
+  let buf = Buffer.create (List.length positions * 2) in
+  List.iter (fun (col, pos) ->
+    Varint.encode_uint64 buf (Int64.of_int col);
+    Varint.encode_uint64 buf (Int64.of_int pos)) positions;
+  Buffer.to_bytes buf
+
+(** FTS content row: n_cols_varint ++ (col_len_varint ++ col_bytes)* *)
+let fts_encode_content (texts : string list) : bytes =
+  let buf = Buffer.create 64 in
+  Varint.encode_uint64 buf (Int64.of_int (List.length texts));
+  List.iter (fun s ->
+    let b = Bytes.of_string s in
+    Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+    Buffer.add_bytes buf b) texts;
+  Buffer.to_bytes buf
+
+let fts_decode_content bytes =
+  let n, off0 = Varint.decode_uint64 bytes 0 in
+  let nc = Int64.to_int n in
+  let texts = ref [] in
+  let pos = ref off0 in
+  for _ = 1 to nc do
+    let len, off = Varint.decode_uint64 bytes !pos in
+    let s = Bytes.sub_string bytes off (Int64.to_int len) in
+    texts := s :: !texts;
+    pos := off + Int64.to_int len
+  done;
+  List.rev !texts
+
+(** Read global FTS stats from index tree: (total_docs, total_tokens). *)
+let read_fts_stats tx index_tree =
+  let+ bytes_opt = S.get tx index_tree fts_stats_key in
+  match bytes_opt with
+  | None -> (0, 0)
+  | Some b ->
+    let docs, off = Varint.decode_uint64 b 0 in
+    let toks, _   = Varint.decode_uint64 b off in
+    (Int64.to_int docs, Int64.to_int toks)
+
+let write_fts_stats tx index_tree docs tokens =
+  let buf = Buffer.create 16 in
+  Varint.encode_uint64 buf (Int64.of_int docs);
+  Varint.encode_uint64 buf (Int64.of_int tokens);
+  S.put tx index_tree fts_stats_key (Buffer.to_bytes buf)
+
+(** Write inverted index entries for a newly inserted document. *)
+let fts_index_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
+  let tokens = Fts_tokenizer.tokenize col_texts in
+  (* Group by term *)
+  let by_term : (string, (int * int) list) Hashtbl.t = Hashtbl.create 8 in
+  List.iter (fun (tok : Fts_tokenizer.token) ->
+    let lst = Option.value ~default:[] (Hashtbl.find_opt by_term tok.term) in
+    Hashtbl.replace by_term tok.term ((tok.col, tok.pos) :: lst)) tokens;
+  (* Write one entry per unique term *)
+  let* () = Hashtbl.fold (fun term positions acc ->
+    let* () = acc in
+    let key   = fts_term_key term rowid in
+    let value = encode_positions (List.rev positions) in
+    S.put tx fts_meta.Cat.fts_index_tree key value) by_term (Lwt.return_unit) in
+  (* Write doc length *)
+  let dlen = List.length tokens in
+  let dlen_buf = Buffer.create 4 in
+  Varint.encode_uint64 dlen_buf (Int64.of_int dlen);
+  let* () = S.put tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid)
+                  (Buffer.to_bytes dlen_buf) in
+  (* Update global stats *)
+  let* (docs, toks) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+  write_fts_stats tx fts_meta.Cat.fts_index_tree (docs + 1) (toks + dlen)
+
+(** Remove inverted index entries for a deleted document. *)
+let fts_deindex_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
+  let tokens = Fts_tokenizer.tokenize col_texts in
+  let terms = List.sort_uniq String.compare
+    (List.map (fun (t : Fts_tokenizer.token) -> t.term) tokens) in
+  let* () = Lwt_list.iter_s (fun term ->
+    S.del tx fts_meta.Cat.fts_index_tree (fts_term_key term rowid)) terms in
+  let dlen = List.length tokens in
+  let* () = S.del tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid) in
+  let* (docs, toks) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+  write_fts_stats tx fts_meta.Cat.fts_index_tree
+    (max 0 (docs - 1)) (max 0 (toks - dlen))
+
+(** Helper: find the first index [i] such that [pred lst[i]] holds. *)
+let list_find_index pred lst =
+  let rec go i = function
+    | [] -> None
+    | x :: _ when pred x -> Some (i, x)
+    | _ :: rest -> go (i+1) rest
+  in go 0 lst
 
 (* ------------------------------------------------------------------ *)
 (* Transaction mode                                                     *)
@@ -560,12 +679,85 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_create_fts_table { name; columns } ->
     let* _ = Cat.create_fts_table cat ~name ~columns in
     Lwt.return 0
+  | Plan.Op_fts_insert { fts_meta; col_names; col_values } ->
+    let* (tx, owned) = acquire_txn store mode in
+    Lwt.catch
+      (fun () ->
+        let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
+        let key = Rowid.encode rowid in
+        (* Evaluate expressions to get text values *)
+        let vals = List.map (fun e -> eval_expr params [||] e) col_values in
+        (* Map to FTS column order *)
+        let n_cols = List.length fts_meta.Cat.fts_columns in
+        let texts = Array.make n_cols "" in
+        List.iter2 (fun col_name v ->
+          match list_find_index (String.equal col_name) fts_meta.Cat.fts_columns with
+          | None -> ()
+          | Some (i, _) ->
+            texts.(i) <- (match v with Row.V_text s -> s | _ -> "")
+        ) col_names vals;
+        let text_list = Array.to_list texts in
+        (* Store content row *)
+        let* () = S.put tx fts_meta.Cat.fts_content_tree key
+                    (fts_encode_content text_list) in
+        (* Index *)
+        let col_texts = List.mapi (fun i t -> (i, t)) text_list in
+        let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
+        let* () = release_txn tx owned in
+        Lwt.return 1)
+      (fun exn ->
+        let* () = if owned then S.rollback tx else Lwt.return_unit in
+        Lwt.fail exn)
+  | Plan.Op_fts_delete { fts_meta; where } ->
+    (* Drain matching rows under an RO snapshot *)
+    let* tx_ro = S.ro_begin store in
+    let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
+    let _sr = S.cursor_first cur in
+    let buf = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let texts = fts_decode_content vbytes in
+        let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+        let keep = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr params row pred)
+        in
+        if keep then buf := (rowid, kbytes, texts) :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    let* () = S.ro_end tx_ro in
+    let matches = List.rev !buf in
+    let n = List.length matches in
+    if n = 0 then Lwt.return 0
+    else begin
+      let* (tx, owned) = acquire_txn store mode in
+      Lwt.catch
+        (fun () ->
+          let* () =
+            Lwt_list.iter_s (fun (rowid, key, texts) ->
+              let col_texts = List.mapi (fun i t -> (i, t)) texts in
+              let* () = S.del tx fts_meta.Cat.fts_content_tree key in
+              fts_deindex_document tx ~fts_meta ~rowid ~col_texts
+            ) matches
+          in
+          let* () = release_txn tx owned in
+          Lwt.return n)
+        (fun exn ->
+          let* () = if owned then S.rollback tx else Lwt.return_unit in
+          Lwt.fail exn)
+    end
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
-  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _ ->
+  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _
+  | Plan.Op_fts_seq_scan _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -951,10 +1143,36 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       ) after_having
     in
     Lwt.return (Lwt_stream.of_list final_rows)
+  | Plan.Op_fts_seq_scan { fts_meta; where } ->
+    let* tx = S.ro_begin store in
+    let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
+    let _sr = S.cursor_first cur in
+    let exhausted = ref false in
+    let rec read_next () =
+      if !exhausted then Lwt.return_none
+      else
+        match S.cursor_next cur with
+        | None ->
+          exhausted := true;
+          S.cursor_close cur;
+          let%lwt () = S.ro_end tx in
+          Lwt.return_none
+        | Some (_key, val_bytes) ->
+          let texts = fts_decode_content val_bytes in
+          let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+          let emit = match where with
+            | None      -> true
+            | Some pred -> value_truthy (eval_expr params row pred)
+          in
+          if emit then Lwt.return_some row
+          else read_next ()
+    in
+    Lwt.return (Lwt_stream.from read_next)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
+  | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.query: use Exec.execute for write operations"
 

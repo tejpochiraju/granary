@@ -94,6 +94,19 @@ type bound_stmt =
       name    : string;
       columns : string list;
     }
+  | BS_fts_insert of {
+      fts_meta   : Cat.fts_table_meta;
+      col_names  : string list;
+      col_values : bound_expr list;
+    }
+  | BS_fts_delete of {
+      fts_meta : Cat.fts_table_meta;
+      where    : bound_expr option;
+    }
+  | BS_fts_seq_scan of {
+      fts_meta : Cat.fts_table_meta;
+      where    : bound_expr option;
+    }
 
 type error =
   | Unknown_table       of string
@@ -118,6 +131,18 @@ let col_index (cols : Row.column list) name =
     | _ :: rest -> go (i + 1) rest
   in
   go 0 cols
+
+(** Convert an FTS table meta to a synthetic [Cat.table_meta] for use
+    with [bind_expr] (column resolution in WHERE/VALUES expressions). *)
+let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
+  let columns = List.map (fun name ->
+    Row.{ name; ty = Row.Text; not_null = true;
+          primary_key = false; default = None }
+  ) m.Cat.fts_columns in
+  { Cat.name       = m.Cat.fts_name;
+    Cat.tree_id    = m.Cat.fts_content_tree;
+    Cat.columns;
+    Cat.next_rowid = 0L }
 
 let lit_ty = function
   | Ast.L_int _  -> Some Row.Integer
@@ -431,10 +456,48 @@ let dv_to_lit : Row.default_value -> Ast.literal = function
   | Row.DV_real f -> Ast.L_real f
   | Row.DV_blob b -> Ast.L_blob b
 
+let bind_fts_insert cat ~param_counter ~table ~columns ~values =
+  match Cat.find_fts cat table with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some fts_meta ->
+    let fts_cols = fts_meta.Cat.fts_columns in
+    (* Validate that all specified columns exist in fts_meta.fts_columns *)
+    let bad = List.find_opt (fun c -> not (List.mem c fts_cols)) columns in
+    (match bad with
+     | Some col -> Lwt.return (Error (Unknown_column { table; column = col }))
+     | None ->
+       (* Bind the value expressions using a synthetic table meta *)
+       let synth_meta = fts_as_table_meta fts_meta in
+       let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
+         match e with
+         | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
+           bind_expr ~param_counter synth_meta e
+         | _ ->
+           Error (Unsupported "complex expression in INSERT VALUES")
+       in
+       let results = List.map bind_value_expr values in
+       let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) results in
+       (match errors with
+        | e :: _ -> Lwt.return (Error e)
+        | [] ->
+          let col_values = List.filter_map (function Ok e -> Some e | Error _ -> None) results in
+          let n_cols = List.length columns in
+          let n_vals = List.length values in
+          if n_cols <> n_vals then
+            Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
+          else
+            Lwt.return (Ok (BS_fts_insert {
+              fts_meta;
+              col_names  = columns;
+              col_values;
+            }))))
+
 let bind_insert cat ~param_counter ~table ~columns ~values =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
-  | None -> Lwt.return (Error (Unknown_table table))
+  | None ->
+    (* Not a regular table — check if it's an FTS table *)
+    bind_fts_insert cat ~param_counter ~table ~columns ~values
   | Some meta ->
     let n_cols = List.length columns in
     let n_vals = List.length values in
@@ -525,10 +588,40 @@ let bind_insert cat ~param_counter ~table ~columns ~values =
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
+let bind_fts_seq_scan cat ~param_counter ~table ~where =
+  match Cat.find_fts cat table with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some fts_meta ->
+    let synth_meta = fts_as_table_meta fts_meta in
+    let where_result =
+      match where with
+      | None   -> Ok None
+      | Some e ->
+        (match bind_expr ~param_counter synth_meta e with
+         | Ok be   -> Ok (Some be)
+         | Error e -> Error e)
+    in
+    (match where_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_where ->
+       Lwt.return (Ok (BS_fts_seq_scan {
+         fts_meta;
+         where = bound_where;
+       })))
+
 let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
-  | None -> Lwt.return (Error (Unknown_table table))
+  | None ->
+    (* Not a regular table — check if it's an FTS table (only plain SELECT supported) *)
+    (match joins, group_by, having, order, limit, offset with
+     | [], [], None, [], None, None ->
+       bind_fts_seq_scan cat ~param_counter ~table ~where
+     | _ ->
+       (* FTS does not yet support JOINs, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET *)
+       (match Cat.find_fts cat table with
+        | None -> Lwt.return (Error (Unknown_table table))
+        | Some _ -> Lwt.return (Error (Unsupported "FTS tables do not support this query form"))))
   | Some meta ->
     (* Phase 2: support a single JOIN clause. *)
     if List.length joins > 1 then
@@ -1029,10 +1122,33 @@ let bind_update cat ~param_counter ~table ~assignments ~where =
 (* DELETE                                                               *)
 (* ------------------------------------------------------------------ *)
 
+let bind_fts_delete cat ~param_counter ~table ~where =
+  match Cat.find_fts cat table with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some fts_meta ->
+    let synth_meta = fts_as_table_meta fts_meta in
+    let where_result =
+      match where with
+      | None   -> Ok None
+      | Some e ->
+        (match bind_expr ~param_counter synth_meta e with
+         | Ok be   -> Ok (Some be)
+         | Error e -> Error e)
+    in
+    (match where_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_where ->
+       Lwt.return (Ok (BS_fts_delete {
+         fts_meta;
+         where = bound_where;
+       })))
+
 let bind_delete cat ~param_counter ~table ~where =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
-  | None -> Lwt.return (Error (Unknown_table table))
+  | None ->
+    (* Not a regular table — check if it's an FTS table *)
+    bind_fts_delete cat ~param_counter ~table ~where
   | Some meta ->
     let where_result =
       match where with

@@ -126,6 +126,19 @@ type op =
       name    : string;
       columns : string list;
     }
+  | Op_fts_insert of {
+      fts_meta   : Cat.fts_table_meta;
+      col_names  : string list;
+      col_values : expr list;
+    }
+  | Op_fts_delete of {
+      fts_meta : Cat.fts_table_meta;
+      where    : expr option;
+    }
+  | Op_fts_seq_scan of {
+      fts_meta : Cat.fts_table_meta;
+      where    : expr option;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

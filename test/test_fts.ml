@@ -92,6 +92,42 @@ let test_tokenizer_numbers () =
   Alcotest.(check string) "first" "abc123" (List.nth tokens 0).Tok.term;
   Alcotest.(check string) "second" "456def" (List.nth tokens 1).Tok.term
 
+let test_fts_insert () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(title, body)" in
+    let* r1 = D.execute db "INSERT INTO docs (title, body) VALUES ('Hello World', 'The quick brown fox')" in
+    let* r2 = D.execute db "INSERT INTO docs (title, body) VALUES ('OCaml intro', 'Functional programming')" in
+    match r1, r2 with
+    | Ok (), Ok () -> Lwt.return_unit
+    | Error e, _ | _, Error e ->
+      Alcotest.failf "fts_insert: %s" (Format.asprintf "%a" D.pp_error e))
+
+let test_fts_delete () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(title)" in
+    let* _ = D.execute db "INSERT INTO docs (title) VALUES ('Hello')" in
+    let* _ = D.execute db "INSERT INTO docs (title) VALUES ('World')" in
+    let* r = D.execute db "DELETE FROM docs WHERE title = 'Hello'" in
+    match r with
+    | Error e -> Alcotest.failf "fts_delete: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok () -> Lwt.return_unit)
+
+let test_fts_seq_scan () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(title)" in
+    let* _ = D.execute db "INSERT INTO docs (title) VALUES ('First')" in
+    let* _ = D.execute db "INSERT INTO docs (title) VALUES ('Second')" in
+    let* r = D.query db "SELECT title FROM docs" in
+    match r with
+    | Error e -> Alcotest.failf "fts_seq_scan: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "row count" 2 (List.length rows);
+      Lwt.return_unit)
+
 let () =
   Alcotest.run "fts" [
     "ddl", [
@@ -107,5 +143,10 @@ let () =
       Alcotest.test_case "empty"       `Quick test_tokenizer_empty;
       Alcotest.test_case "punct_only"  `Quick test_tokenizer_only_punct;
       Alcotest.test_case "numbers"     `Quick test_tokenizer_numbers;
+    ];
+    "write", [
+      Alcotest.test_case "insert"   `Quick test_fts_insert;
+      Alcotest.test_case "delete"   `Quick test_fts_delete;
+      Alcotest.test_case "seq_scan" `Quick test_fts_seq_scan;
     ];
   ]

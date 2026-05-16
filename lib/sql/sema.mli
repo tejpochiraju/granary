@@ -119,6 +119,19 @@ type bound_stmt =
       name    : string;
       columns : string list;
     }
+  | BS_fts_insert of {
+      fts_meta   : Sqlocaml_catalog.Catalog.fts_table_meta;
+      col_names  : string list;
+      col_values : bound_expr list;
+    }
+  | BS_fts_delete of {
+      fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta;
+      where    : bound_expr option;
+    }
+  | BS_fts_seq_scan of {
+      fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta;
+      where    : bound_expr option;
+    }
 
 type error =
   | Unknown_table       of string
