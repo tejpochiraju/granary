@@ -371,10 +371,9 @@ let load_all_indexes store =
   Lwt.return tbl
 
 let is_fts_rowid_key k =
-  let suffix = sys_fts_rowid_suffix in
-  let slen = Bytes.length suffix in
-  Bytes.length k > slen &&
-  Bytes.equal (Bytes.sub k (Bytes.length k - slen) slen) suffix
+  let slen = Bytes.length sys_fts_rowid_suffix in
+  Bytes.length k >= slen &&
+  Bytes.equal (Bytes.sub k (Bytes.length k - slen) slen) sys_fts_rowid_suffix
 
 let load_all_fts store =
   let tbl = Hashtbl.create 4 in
@@ -386,12 +385,17 @@ let load_all_fts store =
     | None -> Lwt.return_unit
     | Some (k, v) ->
       (* Skip rowid counter keys: they end with "\x00rowid" *)
-      if is_fts_rowid_key k then
-        walk ()
+      if is_fts_rowid_key k then walk ()
       else begin
-        let name = Bytes.to_string k in
-        let meta = decode_fts_value name v in
-        Hashtbl.replace tbl name meta;
+        (try
+          let name = Bytes.to_string k in
+          let meta = decode_fts_value name v in
+          Hashtbl.replace tbl name meta
+        with Invalid_argument msg ->
+          (* Corrupt FTS catalog entry for key; skip and continue.
+             A corrupt entry will simply be absent from the cache;
+             queries against that table will fail with "table not found". *)
+          Printf.eprintf "warning: skipping corrupt FTS catalog entry (%s)\n%!" msg);
         walk ()
       end
   in
@@ -573,6 +577,11 @@ let drop_table t tx ~name =
 let find_fts (t : t) name = Hashtbl.find_opt t.fts name
 
 let create_fts_table (t : t) ~name ~columns : fts_table_meta Lwt.t =
+  (* NOTE: tree-ID allocation and metadata write span multiple transactions.
+     A crash between the two next_user_tid calls leaks a tree-ID slot (non-fatal;
+     the next create will allocate the next available slot). A crash after both
+     allocations but before the sys_fts_tid write leaves the name unregistered and
+     the two tree IDs permanently unused. Same pattern as create_table. *)
   (* Allocate two new tree IDs: one for content, one for the inverted index *)
   let%lwt content_tree = next_user_tid t in
   let%lwt index_tree   = next_user_tid t in

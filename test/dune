@@ -20,7 +20,7 @@
 
 (test
  (name test_fts)
- (libraries sqlocaml alcotest lwt.unix))
+ (libraries sqlocaml alcotest lwt.unix unix))
 
 (test
  (name test_store_btree)
