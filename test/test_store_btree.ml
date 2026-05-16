@@ -70,8 +70,7 @@ let with_block_store path f =
     match result with
     | Error e -> Alcotest.failf "open_block failed: %a" S.pp_error e
     | Ok store ->
-      let* () = f store in
-      S.close store
+      Lwt.finalize (fun () -> f store) (fun () -> S.close store)
   )
 
 (* ------------------------------------------------------------------ *)
