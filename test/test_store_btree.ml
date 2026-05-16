@@ -950,6 +950,47 @@ let test_ro_sees_committed_not_in_progress () =
       (Some "uncommitted") (Option.map Bytes.to_string v3);
     run (S.close store))
 
+let test_ro_after_rw_begin_safe () =
+  (* Verify: opening an RO snapshot AFTER rw_begin does not corrupt reader's data.
+     The critical ordering: rw_begin → ro_begin → put/commit → verify reader sees original. *)
+  let path = Filename.temp_file "sqlocaml_ro_after_rw_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Commit initial state *)
+    let tx0 = run (S.rw_begin store) in
+    run (S.put tx0 16 (Bytes.of_string "key") (Bytes.of_string "original"));
+    run (S.commit tx0);
+    (* Start RW txn FIRST — then open RO snapshot *)
+    let tx_rw = run (S.rw_begin store) in
+    let ro = run (S.ro_begin store) in    (* ro_begin AFTER rw_begin *)
+    (* RO sees committed state before this RW txn *)
+    let v0 = run (S.get ro 16 (Bytes.of_string "key")) in
+    Alcotest.(check (option string)) "ro sees committed before rw"
+      (Some "original") (Option.map Bytes.to_string v0);
+    (* Do mutations in the RW txn and commit *)
+    run (S.put tx_rw 16 (Bytes.of_string "key") (Bytes.of_string "modified"));
+    run (S.commit tx_rw);
+    (* RO snapshot still sees original (snapshot isolation) *)
+    let v1 = run (S.get ro 16 (Bytes.of_string "key")) in
+    Alcotest.(check (option string)) "ro still sees original after commit"
+      (Some "original") (Option.map Bytes.to_string v1);
+    (* Start another RW txn — should be safe even with reader active *)
+    let tx_rw2 = run (S.rw_begin store) in
+    run (S.put tx_rw2 16 (Bytes.of_string "key") (Bytes.of_string "final"));
+    run (S.commit tx_rw2);
+    (* RO snapshot still sees original *)
+    let v2 = run (S.get ro 16 (Bytes.of_string "key")) in
+    Alcotest.(check (option string)) "ro sees original after second commit"
+      (Some "original") (Option.map Bytes.to_string v2);
+    run (S.ro_end ro);
+    (* New reader sees final value *)
+    let ro2 = run (S.ro_begin store) in
+    let v3 = run (S.get ro2 16 (Bytes.of_string "key")) in
+    run (S.ro_end ro2);
+    Alcotest.(check (option string)) "new ro sees final" (Some "final")
+      (Option.map Bytes.to_string v3);
+    run (S.close store))
+
 let test_active_reader_gates_freelist () =
   let path = Filename.temp_file "sqlocaml_gate_" ".db" in
   Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
@@ -978,6 +1019,19 @@ let test_active_reader_gates_freelist () =
       run (S.put tx 16 key (Bytes.of_string "v"));
       run (S.commit tx)
     done;
+    (* Verify RO reader still sees all 20 original keys via snapshot *)
+    let cur = run (S.cursor_open ro 16) in
+    let _sr = S.cursor_first cur in
+    let count = ref 0 in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some _ -> incr count; drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Alcotest.(check bool) "ro snapshot sees all 20 original keys"
+      true (!count = 20);
     let n_with_reader = S.n_pages store in
     (* Close reader — freed pages now ungated *)
     run (S.ro_end ro);
@@ -1067,6 +1121,7 @@ let () =
     "snapshot", [
       Alcotest.test_case "ro_sees_committed_not_in_progress" `Quick test_ro_sees_committed_not_in_progress;
       Alcotest.test_case "active_reader_gates_freelist" `Quick test_active_reader_gates_freelist;
+      Alcotest.test_case "ro_after_rw_begin_safe" `Quick test_ro_after_rw_begin_safe;
     ];
     "qcheck", qcheck_tests;
   ]

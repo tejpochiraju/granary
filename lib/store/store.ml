@@ -381,6 +381,10 @@ let rw_begin t =
    | Btree st ->
      let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
      Pager.set_txn_id st.pager current_rw_txn_id;
+     (* Safety: readers registered via ro_begin AFTER this rw_begin are visible at the
+        NEXT rw_begin (active_readers is checked at every rw_begin). Pages freed in
+        the current txn (freed_at = current_rw_txn_id) cannot be reused within this
+        txn because freed_at < alloc_min_safe = current_rw_txn_id is false. *)
      let min_safe =
        match min_active_reader_txn st with
        | None   -> current_rw_txn_id
