@@ -183,7 +183,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
         | Error _ -> Lwt.return (Freelist.of_list (List.rev acc))
         | Ok buf ->
           let common = Page.read_common buf in
-          let n = common.Page.n_keys in
+          let n = min common.Page.n_keys Page.max_freelist_entries_per_page in
           let next_pid = Int64.logand 0xFFFFFFFFL
                            (Int64.of_int32 common.Page.right_page) in
           let entries =
@@ -340,6 +340,9 @@ let free_old_freelist_pages pager ~first_page =
           let c = Page.read_common buf in
           Int64.logand 0xFFFFFFFFL (Int64.of_int32 c.Page.right_page)
       in
+      (* Note: if read fails mid-chain, remaining pages beyond this point are
+         orphaned (leaked). This is acceptable only because a corrupt freelist
+         page implies a deeper storage invariant violation. *)
       Pager.free pager ~page_id:pid
         ~freed_at_txn_id:(Pager.get_txn_id pager);
       loop next_pid
