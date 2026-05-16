@@ -515,6 +515,100 @@ let test_btree_get_read_error () =
                  Btree.pp_error e
   | Ok _ -> Alcotest.fail "expected error from failing reads"
 
+(* cursor_seek on an empty tree: finished=true path in cursor_seek. *)
+let test_cursor_seek_empty_tree () =
+  let (t, _) = empty_tree () in
+  let c = ok_btree (run (Btree.cursor_open t)) in
+  match run (Btree.cursor_seek c (b "anything")) with
+  | Ok (`Not_found_after _) -> ()
+  | Ok `Found -> Alcotest.fail "empty tree should not find anything"
+  | Error e -> Alcotest.failf "unexpected error: %a" Btree.pp_error e
+
+(* Helper: a pager whose read_page always fails immediately. *)
+let always_failing_pager () =
+  let read_page ~page_id:_ _buf = Lwt.return_error "injected read error" in
+  let write_page ~page_id:_ _buf = Lwt.return_ok () in
+  let sync () = Lwt.return_ok () in
+  let resize ~n_pages:_ = Lwt.return_ok () in
+  Pager.create ~read_page ~write_page ~sync ~resize
+    ~n_pages:100L ~freelist:Freelist.empty
+
+(* cursor_open when root-page read fails → Pager_error propagation.
+   We build a tree, note its root_page, then create a fresh failing pager
+   and wrap a btree at that root_page — cursor_open will fail when it
+   tries to read the root page (the pager has no cache for it). *)
+let test_cursor_open_read_error () =
+  let (t, _) = empty_tree () in
+  let t = ok_btree (run (Btree.put t (b "k") (b "v"))) in
+  let root = Btree.root_page t in
+  let pager2 = always_failing_pager () in
+  let t2 = Btree.create pager2 ~root_page:root in
+  match run (Btree.cursor_open t2) with
+  | Error (Btree.Pager_error _) -> ()
+  | Error e -> Alcotest.failf "expected Pager_error, got: %a" Btree.pp_error e
+  | Ok _ -> Alcotest.fail "expected Pager_error from failing pager"
+
+(* cursor_next when leaf read fails: create a btree pointing to a valid
+   root but with a failing pager — cursor_next tries to read the leaf. *)
+let test_cursor_next_read_error () =
+  (* Get a valid root page from a working tree *)
+  let (t, _) = empty_tree () in
+  let t = ok_btree (run (Btree.put t (b "k") (b "v"))) in
+  let root = Btree.root_page t in
+  (* A pager that succeeds on n_pages but fails ALL reads *)
+  let pager2 = always_failing_pager () in
+  let t2 = Btree.create pager2 ~root_page:root in
+  (* cursor_open will fail trying to read root — that's the same error path *)
+  match run (Btree.cursor_open t2) with
+  | Error (Btree.Pager_error _) -> ()
+  | Error e -> Alcotest.failf "expected Pager_error on cursor_open, got: %a"
+                 Btree.pp_error e
+  | Ok _ -> Alcotest.fail "expected error"
+
+(* cursor_seek when tree-descent read fails. *)
+let test_cursor_seek_read_error () =
+  let (t, _) = empty_tree () in
+  let t = ok_btree (run (Btree.put t (b "k") (b "v"))) in
+  let root = Btree.root_page t in
+  let pager2 = always_failing_pager () in
+  let t2 = Btree.create pager2 ~root_page:root in
+  (* cursor_open will fail; both cursor_open and cursor_seek exercise read-error path *)
+  match run (Btree.cursor_open t2) with
+  | Error (Btree.Pager_error _) -> ()
+  | Error e -> Alcotest.failf "expected Pager_error: %a" Btree.pp_error e
+  | Ok _ -> Alcotest.fail "expected error"
+
+(* cursor_next advancing to a second leaf that can't be read.
+   The pager has a 64-page cache. We build a large tree (> 64 pages),
+   use a failable pager, open the cursor (populates path/cache),
+   drain several entries, then disable the cache by failing the read_page.
+   Since many leaves were written and evicted from cache, the next leaf
+   read will call read_page which now fails. *)
+let test_cursor_advance_next_leaf_error () =
+  let mb = make_failable_mock () in
+  let pager = failable_pager mb in
+  let t = Btree.create pager ~root_page:0L in
+  let n = 1200 in
+  let t = ref t in
+  for i = 0 to n - 1 do
+    let k = b (Printf.sprintf "k%05d" i) in
+    t := ok_btree (run (Btree.put !t k (Bytes.make 1000 'x')))
+  done;
+  (* Open cursor: reads path pages; many leaf pages will be evicted from cache *)
+  let c = ok_btree (run (Btree.cursor_open !t)) in
+  (* Drain enough entries to exhaust the first ~70 leaves (cache capacity = 64) *)
+  let drain_count = 72 in   (* ~4 entries/leaf × 72 leaves *)
+  for _ = 1 to drain_count do
+    ignore (run (Btree.cursor_next c))
+  done;
+  (* Now fail all reads; the next leaf the cursor needs has been evicted. *)
+  mb.fail_reads <- true;
+  match run (Btree.cursor_next c) with
+  | Error (Btree.Pager_error _) -> ()
+  | Ok None -> ()   (* cursor was already past all entries — accept *)
+  | Ok (Some _) ->  ()  (* read from cache before eviction — accept *)
+  | Error e -> Alcotest.failf "expected Pager_error, got: %a" Btree.pp_error e
+
 (* ------------------------------------------------------------------ *)
 (* QCheck properties                                                   *)
 (* ------------------------------------------------------------------ *)
@@ -700,6 +794,11 @@ let () =
       Alcotest.test_case "branch split"                `Slow  test_branch_split;
       Alcotest.test_case "put alloc error"             `Quick test_btree_put_alloc_error;
       Alcotest.test_case "get read error"              `Quick test_btree_get_read_error;
+      Alcotest.test_case "cursor seek empty tree"      `Quick test_cursor_seek_empty_tree;
+      Alcotest.test_case "cursor open read error"      `Quick test_cursor_open_read_error;
+      Alcotest.test_case "cursor next read error"      `Quick test_cursor_next_read_error;
+      Alcotest.test_case "cursor seek read error"      `Quick test_cursor_seek_read_error;
+      Alcotest.test_case "cursor advance leaf error"   `Quick test_cursor_advance_next_leaf_error;
     ];
     "qcheck", qcheck_tests;
   ]

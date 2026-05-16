@@ -141,11 +141,10 @@ let insert_real_negative () =
   | _ -> Alcotest.fail "expected FLOAT_LIT -1.5"
 
 let insert_no_col_list () =
-  (* Phase 0 grammar requires an explicit column list; no-column-list INSERT is a syntax error *)
-  try
-    ignore (parse "INSERT INTO t VALUES (1);");
-    Alcotest.fail "expected Parser.Error for INSERT without column list"
-  with Parser.Error | Failure _ -> ()
+  (* INSERT without explicit column list is now supported; maps values positionally *)
+  match parse "INSERT INTO t VALUES (1, 'hello');" with
+  | Ast.S_insert { table = "t"; columns = []; values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "hello")] } -> ()
+  | _ -> Alcotest.fail "expected S_insert with empty columns and two values"
 
 (* ------------------------------------------------------------------ *)
 (* Group 3: SELECT                                                      *)

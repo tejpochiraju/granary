@@ -341,11 +341,11 @@ let eval_arith_text_error () =
    with Failure _ -> ())
 
 let eval_ne_null_left () =
-  (* V_null on left of Ne → Row.V_int 0L *)
+  (* V_null on left of Ne → Row.V_null (3VL: comparisons with NULL return NULL) *)
   let row = [| Row.V_null |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_int 5L)) in
-  Alcotest.(check bool) "null != 5 → V_int 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+  Alcotest.(check bool) "null != 5 → V_null"
+    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
 
 let eval_neq () =
   let row = [| Row.V_int 5L |] in
@@ -433,11 +433,12 @@ let eval_not_true () =
   Alcotest.(check bool) "NOT 0 → V_int 1"
     true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
 
-let eval_not_falsy_null () =
+let eval_not_null () =
+  (* NOT NULL → V_null (3VL: NOT of unknown is unknown) *)
   let row = [| Row.V_null |] in
   let e = Plan.P_not (Plan.P_col 0) in
-  Alcotest.(check bool) "NOT NULL → V_int 1 (NULL is falsy)"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+  Alcotest.(check bool) "NOT NULL → V_null"
+    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
 
 let eval_div_zero_raises () =
   let row = [| Row.V_int 5L |] in
@@ -460,10 +461,11 @@ let eval_or () =
     true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
 
 let eval_cmp_null () =
+  (* NULL < 1 → V_null (3VL: comparisons with NULL return NULL) *)
   let row = [| Row.V_null |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_int 1L)) in
-  Alcotest.(check bool) "NULL < 1 → V_int 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+  Alcotest.(check bool) "NULL < 1 → V_null"
+    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
 
 (* ------------------------------------------------------------------ *)
 (* Group 8: QCheck property-based tests                                 *)
@@ -630,7 +632,7 @@ let () =
       Alcotest.test_case "eval_is_null_false"      `Quick eval_is_null_false;
       Alcotest.test_case "eval_is_not_null_true"   `Quick eval_is_not_null_true;
       Alcotest.test_case "eval_not_true"           `Quick eval_not_true;
-      Alcotest.test_case "eval_not_falsy_null"     `Quick eval_not_falsy_null;
+      Alcotest.test_case "eval_not_null"            `Quick eval_not_null;
       Alcotest.test_case "eval_div_zero_raises"    `Quick eval_div_zero_raises;
       Alcotest.test_case "eval_and"                `Quick eval_and;
       Alcotest.test_case "eval_or"                 `Quick eval_or;

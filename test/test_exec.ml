@@ -660,7 +660,7 @@ let query_sort_desc () =
     Lwt.return_unit
   )
 
-let query_sort_nulls_last () =
+let query_sort_nulls_first () =
   let schema = [int_col "n"] in
   let store, cat = setup () in
   run (
@@ -681,16 +681,16 @@ let query_sort_nulls_last () =
     let* stream = Exec.query store cat op in
     let rows = collect stream in
     Alcotest.(check int) "three rows" 3 (List.length rows);
-    (* NULLs sort last *)
+    (* NULLs sort first in ASC — NULL < any non-null value (matches SQLite) *)
     (match (List.nth rows 0).(0) with
-     | Row.V_int 2L -> ()
-     | _ -> Alcotest.fail "expected 2 first");
-    (match (List.nth rows 1).(0) with
-     | Row.V_int 5L -> ()
-     | _ -> Alcotest.fail "expected 5 second");
-    (match (List.nth rows 2).(0) with
      | Row.V_null -> ()
-     | _ -> Alcotest.fail "expected NULL last");
+     | _ -> Alcotest.fail "expected NULL first");
+    (match (List.nth rows 1).(0) with
+     | Row.V_int 2L -> ()
+     | _ -> Alcotest.fail "expected 2 second");
+    (match (List.nth rows 2).(0) with
+     | Row.V_int 5L -> ()
+     | _ -> Alcotest.fail "expected 5 last");
     Lwt.return_unit
   )
 
@@ -1985,7 +1985,7 @@ let () =
     "sort", [
       Alcotest.test_case "query_sort_asc"       `Quick query_sort_asc;
       Alcotest.test_case "query_sort_desc"      `Quick query_sort_desc;
-      Alcotest.test_case "query_sort_nulls_last" `Quick query_sort_nulls_last;
+      Alcotest.test_case "query_sort_nulls_first" `Quick query_sort_nulls_first;
       Alcotest.test_case "query_sort_empty"     `Quick query_sort_empty;
     ];
     "limit", [
