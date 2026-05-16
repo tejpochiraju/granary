@@ -917,6 +917,92 @@ let test_rollback_new_key_absent () =
     run (S.close store))
 
 (* ------------------------------------------------------------------ *)
+(* 13. Snapshot isolation                                               *)
+(* ------------------------------------------------------------------ *)
+
+let test_ro_sees_committed_not_in_progress () =
+  let path = Filename.temp_file "sqlocaml_snap_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    let tx1 = run (S.rw_begin store) in
+    run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "committed"));
+    run (S.commit tx1);
+    (* Open RO snapshot at txn_id=1 *)
+    let ro = run (S.ro_begin store) in
+    (* Start a concurrent RW txn that modifies the same key *)
+    let tx2 = run (S.rw_begin store) in
+    run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "uncommitted"));
+    (* RO snapshot should NOT see the uncommitted write *)
+    let v = run (S.get ro 16 (Bytes.of_string "k")) in
+    Alcotest.(check (option string)) "RO sees committed value"
+      (Some "committed") (Option.map Bytes.to_string v);
+    run (S.commit tx2);
+    (* RO snapshot still sees OLD committed value even after commit *)
+    let v2 = run (S.get ro 16 (Bytes.of_string "k")) in
+    Alcotest.(check (option string)) "RO still sees snapshot value"
+      (Some "committed") (Option.map Bytes.to_string v2);
+    run (S.ro_end ro);
+    (* New RO txn sees latest committed value *)
+    let ro3 = run (S.ro_begin store) in
+    let v3 = run (S.get ro3 16 (Bytes.of_string "k")) in
+    run (S.ro_end ro3);
+    Alcotest.(check (option string)) "new RO sees latest commit"
+      (Some "uncommitted") (Option.map Bytes.to_string v3);
+    run (S.close store))
+
+let test_active_reader_gates_freelist () =
+  let path = Filename.temp_file "sqlocaml_gate_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Build some tree structure *)
+    for i = 1 to 20 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    (* Open RO snapshot — active reader pins current pages *)
+    let ro = run (S.ro_begin store) in
+    let n_pages_before_delete = S.n_pages store in
+    (* Delete all rows — CoW frees pages, but reader is active so they can't be reused *)
+    for i = 1 to 20 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.del tx 16 key);
+      run (S.commit tx)
+    done;
+    (* Reinsert — with active reader, freed pages are gated; file may grow *)
+    for i = 1 to 20 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    let n_with_reader = S.n_pages store in
+    (* Close reader — freed pages now ungated *)
+    run (S.ro_end ro);
+    (* Verify reader saw consistent snapshot throughout *)
+    Alcotest.(check bool) "file grew while reader was active"
+      true (n_with_reader > n_pages_before_delete);
+    (* Second delete+reinsert cycle without reader — pages reused, file doesn't grow *)
+    for i = 1 to 20 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.del tx 16 key);
+      run (S.commit tx)
+    done;
+    for i = 1 to 20 do
+      let tx = run (S.rw_begin store) in
+      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+      run (S.put tx 16 key (Bytes.of_string "v"));
+      run (S.commit tx)
+    done;
+    let n_no_reader = S.n_pages store in
+    Alcotest.(check bool) "file doesn't grow after reader closes"
+      true (n_no_reader <= n_with_reader);
+    run (S.close store))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -977,6 +1063,10 @@ let () =
       Alcotest.test_case "freelist_not_corrupted"   `Quick test_rollback_freelist_not_corrupted;
       Alcotest.test_case "then_commit_works"        `Quick test_rollback_then_commit_works;
       Alcotest.test_case "new_key_absent"           `Quick test_rollback_new_key_absent;
+    ];
+    "snapshot", [
+      Alcotest.test_case "ro_sees_committed_not_in_progress" `Quick test_ro_sees_committed_not_in_progress;
+      Alcotest.test_case "active_reader_gates_freelist" `Quick test_active_reader_gates_freelist;
     ];
     "qcheck", qcheck_tests;
   ]

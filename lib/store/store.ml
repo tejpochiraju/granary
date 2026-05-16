@@ -58,6 +58,8 @@ type bt_state = {
   schema_version : int64;
   mutable txn_freelist_snapshot : Freelist.t option;
   (* Snapshot of freelist taken at rw_begin; restored on rollback. None when no RW txn is active. *)
+  active_readers : (int64, int) Hashtbl.t;
+  (* Maps snap_txn_id -> reference count of active RO txns at that snapshot *)
 }
 
 type backend =
@@ -69,8 +71,15 @@ type t = {
   rw_mutex : Lwt_mutex.t;
 }
 
+type ro_snapshot = {
+  rs_store          : t;
+  rs_snap_txn_id    : int64;
+  rs_snap_meta_root : int64;
+  rs_snap_trees     : (tree_id, Btree.t) Hashtbl.t;
+}
+
 type 'a txn =
-  | Ro : t -> ro txn
+  | Ro : ro_snapshot -> ro txn
   | Rw : t -> rw txn
 
 type seek_result =
@@ -166,6 +175,35 @@ let unwrap_error r =
   match r with
   | Ok v -> Lwt.return v
   | Error e -> Lwt.fail_with (Format.asprintf "Store: %a" pp_error e)
+
+let min_active_reader_txn st =
+  Hashtbl.fold (fun txn_id _ acc ->
+    match acc with
+    | None -> Some txn_id
+    | Some m -> Some (Int64.min m txn_id)
+  ) st.active_readers None
+
+(* Lookup-or-build the Btree handle for a tree_id using a snapshot's
+   pinned meta root page rather than the live meta tree. *)
+let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
+    : (Btree.t, error) result Lwt.t =
+  match Hashtbl.find_opt snap.rs_snap_trees tid with
+  | Some bt -> Lwt.return_ok bt
+  | None ->
+    let snap_meta = Btree.create st.pager ~root_page:snap.rs_snap_meta_root in
+    let key = encode_tree_id tid in
+    let* r = Btree.get snap_meta key in
+    match r with
+    | Error e -> Lwt.return_error (map_btree_err e)
+    | Ok None ->
+      let bt = Btree.create st.pager ~root_page:0L in
+      Hashtbl.replace snap.rs_snap_trees tid bt;
+      Lwt.return_ok bt
+    | Ok (Some v) ->
+      let root_page = decode_root_page v in
+      let bt = Btree.create st.pager ~root_page in
+      Hashtbl.replace snap.rs_snap_trees tid bt;
+      Lwt.return_ok bt
 
 (* ------------------------------------------------------------------ *)
 (* Freelist page I/O helpers (forward-declared here; used by open_file  *)
@@ -281,7 +319,8 @@ let open_file ~path : (t, error) result Lwt.t =
               trees = Hashtbl.create 16;
               current_header = h;
               schema_version = h.schema_version;
-              txn_freelist_snapshot = None }
+              txn_freelist_snapshot = None;
+              active_readers = Hashtbl.create 4 }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create () }
@@ -299,7 +338,8 @@ let open_file ~path : (t, error) result Lwt.t =
             trees = Hashtbl.create 16;
             current_header = h;
             schema_version = h.schema_version;
-            txn_freelist_snapshot = None }
+            txn_freelist_snapshot = None;
+            active_readers = Hashtbl.create 4 }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create () }
@@ -316,20 +356,49 @@ let close (t : t) : unit Lwt.t =
 (* Transactions                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let ro_begin t = Lwt.return (Ro t)
+let ro_begin t =
+  match t.backend with
+  | Mem _ ->
+    Lwt.return
+      (Ro { rs_store = t; rs_snap_txn_id = 0L;
+            rs_snap_meta_root = 0L;
+            rs_snap_trees = Hashtbl.create 1 })
+  | Btree st ->
+    let snap_txn_id    = st.current_header.txn_id in
+    let snap_meta_root = st.current_header.root_page in
+    let count = Option.value ~default:0
+                  (Hashtbl.find_opt st.active_readers snap_txn_id) in
+    Hashtbl.replace st.active_readers snap_txn_id (count + 1);
+    Lwt.return
+      (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
+            rs_snap_meta_root = snap_meta_root;
+            rs_snap_trees = Hashtbl.create 4 })
 
 let rw_begin t =
   let* () = Lwt_mutex.lock t.rw_mutex in
   (match t.backend with
    | Mem _ -> ()
    | Btree st ->
-     let next_txn_id = Int64.add st.current_header.txn_id 1L in
-     Pager.set_txn_id st.pager next_txn_id;
-     Pager.set_alloc_min_safe st.pager next_txn_id;
+     let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+     Pager.set_txn_id st.pager current_rw_txn_id;
+     let min_safe =
+       match min_active_reader_txn st with
+       | None   -> current_rw_txn_id
+       | Some m -> Int64.min current_rw_txn_id m
+     in
+     Pager.set_alloc_min_safe st.pager min_safe;
      st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
   Lwt.return (Rw t)
 
-let ro_end (Ro _ : ro txn) = Lwt.return_unit
+let ro_end (Ro snap : ro txn) =
+  (match snap.rs_store.backend with
+   | Mem _ -> ()
+   | Btree st ->
+     let tid = snap.rs_snap_txn_id in
+     (match Hashtbl.find_opt st.active_readers tid with
+      | None | Some 1 -> Hashtbl.remove st.active_readers tid
+      | Some n -> Hashtbl.replace st.active_readers tid (n - 1)));
+  Lwt.return_unit
 
 (* Free the previous freelist page chain back into the pager's in-memory
    freelist (stamped with the current txn_id). *)
@@ -513,24 +582,38 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
 (* ------------------------------------------------------------------ *)
 
 let store_of : type a. a txn -> t = function
-  | Ro s -> s
-  | Rw s -> s
+  | Ro snap -> snap.rs_store
+  | Rw s    -> s
 
 let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
   fun tx tid key ->
-    let t = store_of tx in
-    match t.backend with
-    | Mem trees ->
-      Lwt.return (BytesMap.find_opt key !(mem_tree trees tid))
-    | Btree st ->
-      let* r = bt_get_tree st tid in
-      let* bt = unwrap_error r in
-      let* g = Btree.get bt key in
-      (match g with
-       | Ok v -> Lwt.return v
-       | Error e ->
-         Lwt.fail_with
-           (Format.asprintf "Store.get: %a" pp_error (map_btree_err e)))
+    match tx with
+    | Ro snap ->
+      (match snap.rs_store.backend with
+       | Mem trees ->
+         Lwt.return (BytesMap.find_opt key !(mem_tree trees tid))
+       | Btree st ->
+         let* r = bt_get_tree_ro snap st tid in
+         let* bt = unwrap_error r in
+         let* g = Btree.get bt key in
+         (match g with
+          | Ok v -> Lwt.return v
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.get(ro): %a" pp_error (map_btree_err e))))
+    | Rw t ->
+      (match t.backend with
+       | Mem trees ->
+         Lwt.return (BytesMap.find_opt key !(mem_tree trees tid))
+       | Btree st ->
+         let* r = bt_get_tree st tid in
+         let* bt = unwrap_error r in
+         let* g = Btree.get bt key in
+         (match g with
+          | Ok v -> Lwt.return v
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.get(rw): %a" pp_error (map_btree_err e))))
 
 let put (Rw t : rw txn) tid key value : unit Lwt.t =
   match t.backend with
@@ -588,24 +671,43 @@ let drain_btree_cursor (c : Btree.cursor) : (bytes * bytes) list Lwt.t =
 
 let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
   fun tx tid ->
-    let t = store_of tx in
-    match t.backend with
-    | Mem trees ->
-      let entries = BytesMap.bindings !(mem_tree trees tid) in
-      Lwt.return { all = entries; remaining = []; ready = false }
-    | Btree st ->
-      let* r = bt_get_tree st tid in
-      let* bt = unwrap_error r in
-      let* co = Btree.cursor_open bt in
-      (match co with
-       | Error e ->
-         Lwt.fail_with
-           (Format.asprintf "Store.cursor_open: %a"
-              pp_error (map_btree_err e))
-       | Ok c ->
-         let* entries = drain_btree_cursor c in
-         Btree.cursor_close c;
-         Lwt.return { all = entries; remaining = []; ready = false })
+    match tx with
+    | Ro snap ->
+      (match snap.rs_store.backend with
+       | Mem trees ->
+         let entries = BytesMap.bindings !(mem_tree trees tid) in
+         Lwt.return { all = entries; remaining = []; ready = false }
+       | Btree st ->
+         let* r = bt_get_tree_ro snap st tid in
+         let* bt = unwrap_error r in
+         let* co = Btree.cursor_open bt in
+         (match co with
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.cursor_open(ro): %a"
+                 pp_error (map_btree_err e))
+          | Ok c ->
+            let* entries = drain_btree_cursor c in
+            Btree.cursor_close c;
+            Lwt.return { all = entries; remaining = []; ready = false }))
+    | Rw _ ->
+      let t = store_of tx in
+      (match t.backend with
+       | Mem trees ->
+         let entries = BytesMap.bindings !(mem_tree trees tid) in
+         Lwt.return { all = entries; remaining = []; ready = false }
+       | Btree st ->
+         let* r = bt_get_tree st tid in
+         let* bt = unwrap_error r in
+         let* co = Btree.cursor_open bt in
+         (match co with
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.cursor_open: %a" pp_error (map_btree_err e))
+          | Ok c ->
+            let* entries = drain_btree_cursor c in
+            Btree.cursor_close c;
+            Lwt.return { all = entries; remaining = []; ready = false }))
 
 let cursor_close _ = ()
 
