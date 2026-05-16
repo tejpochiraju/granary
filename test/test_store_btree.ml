@@ -870,13 +870,18 @@ let test_rollback_freelist_not_corrupted () =
     let tx1 = run (S.rw_begin store) in
     run (S.put tx1 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
     run (S.commit tx1);
-    let fl_size_after_commit = S.freelist_size store in
+    (* Capture exact freelist entries after commit *)
+    let fl_entries_after_commit = S.freelist_entries store in
+    (* Start a txn that modifies the tree (causes CoW frees) *)
     let tx2 = run (S.rw_begin store) in
     run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
     run (S.rollback tx2);
-    let fl_size_after_rollback = S.freelist_size store in
-    Alcotest.(check int) "freelist unchanged after rollback"
-      fl_size_after_commit fl_size_after_rollback;
+    (* Freelist must be identical (same entries, same order) after rollback *)
+    let fl_entries_after_rollback = S.freelist_entries store in
+    Alcotest.(check int) "freelist size unchanged after rollback"
+      (List.length fl_entries_after_commit) (List.length fl_entries_after_rollback);
+    Alcotest.(check bool) "freelist contents identical after rollback"
+      true (fl_entries_after_commit = fl_entries_after_rollback);
     run (S.close store))
 
 let test_rollback_then_commit_works () =
@@ -894,6 +899,21 @@ let test_rollback_then_commit_works () =
     run (S.ro_end tx3);
     Alcotest.(check (option string)) "second write committed"
       (Some "second") (Option.map Bytes.to_string v);
+    run (S.close store))
+
+let test_rollback_new_key_absent () =
+  let path = Filename.temp_file "sqlocaml_rb4_" ".db" in
+  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
+    let store = Result.get_ok (run (S.open_file ~path)) in
+    (* Insert a brand-new key then rollback — key must not exist after *)
+    let tx1 = run (S.rw_begin store) in
+    run (S.put tx1 16 (Bytes.of_string "new_key") (Bytes.of_string "val"));
+    run (S.rollback tx1);
+    let tx2 = run (S.ro_begin store) in
+    let v = run (S.get tx2 16 (Bytes.of_string "new_key")) in
+    run (S.ro_end tx2);
+    Alcotest.(check (option string)) "new key absent after rollback"
+      None (Option.map Bytes.to_string v);
     run (S.close store))
 
 (* ------------------------------------------------------------------ *)
@@ -956,6 +976,7 @@ let () =
       Alcotest.test_case "restores_data"            `Quick test_rollback_restores_data;
       Alcotest.test_case "freelist_not_corrupted"   `Quick test_rollback_freelist_not_corrupted;
       Alcotest.test_case "then_commit_works"        `Quick test_rollback_then_commit_works;
+      Alcotest.test_case "new_key_absent"           `Quick test_rollback_new_key_absent;
     ];
     "qcheck", qcheck_tests;
   ]

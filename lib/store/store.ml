@@ -481,14 +481,13 @@ let commit (Rw t : rw txn) : unit Lwt.t =
 
 (* rollback:
    - Phase 1 Mem: mutations are applied immediately; nothing to undo.
-   - Phase 1 Btree: mutations are likewise applied immediately to the
-     pager's dirty set.  True rollback would need a separate dirty-page
-     stash; for Phase 1 we just drop the cached tree handles (forcing
-     the next access to re-read from the meta-tree's committed state)
-     and skip the header commit.  Any pages dirtied during this
-     transaction remain in the pager cache but will be overwritten /
-     ignored on the next commit's header swap.  This is a simplification
-     — full MVCC arrives in Phase 3. *)
+   - Phase 1 Btree: drop cached tree handles so subsequent reads pick up
+     last-committed roots from the meta-tree, then restore the freelist
+     snapshot taken at rw_begin and clear dirty pages.
+     Discard dirty pages from the aborted txn: clear_dirty removes them from
+     both the dirty set and the read cache, so subsequent reads see committed
+     data from disk. The freelist snapshot ensures no aborted CoW frees
+     corrupt future allocations. *)
 let rollback (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
    | Mem _ -> ()
@@ -660,6 +659,11 @@ let freelist_size t =
   match t.backend with
   | Mem _ -> 0
   | Btree st -> Freelist.size (Pager.freelist st.pager)
+
+let freelist_entries t =
+  match t.backend with
+  | Mem _ -> []
+  | Btree st -> Freelist.to_list (Pager.freelist st.pager)
 
 let n_pages t =
   match t.backend with

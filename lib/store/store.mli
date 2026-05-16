@@ -116,5 +116,8 @@ val cursor_value : cursor -> bytes option
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int
 
+(** Raw freelist entries for testing — (page_id, freed_at_txn_id) pairs. *)
+val freelist_entries : t -> (int32 * int64) list
+
 (** Current total file page count (diagnostics / testing). *)
 val n_pages : t -> int64
