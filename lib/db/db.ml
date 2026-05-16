@@ -39,6 +39,18 @@ let open_file ~path =
     let* catalog = Cat.open_ store in
     Lwt.return (Ok { store; catalog; explicit_txn = None })
 
+let open_block
+    ~read_page ~write_page ~sync ~resize ~n_pages ~close
+    : (t, error) result Lwt.t =
+  let* result = S.open_block ~read_page ~write_page ~sync ~resize ~n_pages ~close in
+  match result with
+  | Error e ->
+    let msg = Format.asprintf "%a" S.pp_error e in
+    Lwt.return (Error (Runtime msg))
+  | Ok store ->
+    let* catalog = Cat.open_ store in
+    Lwt.return (Ok { store; catalog; explicit_txn = None })
+
 let close t = S.close t.store
 
 let parse sql =

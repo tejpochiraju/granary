@@ -23,6 +23,20 @@ val open_in_memory : unit -> t Lwt.t
     Creates the file if absent; reopens an existing database otherwise. *)
 val open_file : path:string -> (t, error) result Lwt.t
 
+(** Open a SQL engine on any block device given as I/O callbacks.
+    Use with [Sqlocaml_mirage_block.Mirage_backend.Make(B)] to build
+    the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]
+    for Mirage adapters; the adapter handles device-capacity bounds
+    internally.  [~close] is called by [Db.close]. *)
+val open_block :
+  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  sync       : (unit -> (unit, string) result Lwt.t) ->
+  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
+  n_pages    : int64 ->
+  close      : (unit -> unit Lwt.t) ->
+  (t, error) result Lwt.t
+
 val close : t -> unit Lwt.t
 
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
