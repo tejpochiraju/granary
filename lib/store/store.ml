@@ -50,7 +50,7 @@ let pp_error fmt = function
    the header. *)
 
 type bt_state = {
-  file                 : Unix_file.t;
+  close_fn             : unit -> unit Lwt.t;
   pager                : Pager.t;
   mutable meta         : Btree.t;
   trees                : (tree_id, Btree.t) Hashtbl.t;
@@ -319,8 +319,9 @@ let open_file ~path : (t, error) result Lwt.t =
         | Error e -> Lwt.return_error (map_header_err e)
         | Ok h ->
           let meta = Btree.create pager ~root_page:0L in
+          let close_fn () = let%lwt _ = Unix_file.close file in Lwt.return_unit in
           let st =
-            { file; pager; meta;
+            { close_fn; pager; meta;
               trees = Hashtbl.create 16;
               current_header = h;
               schema_version = h.schema_version;
@@ -339,8 +340,9 @@ let open_file ~path : (t, error) result Lwt.t =
         let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
         Pager.set_freelist pager fl;
         let meta = Btree.create pager ~root_page:h.root_page in
+        let close_fn () = let%lwt _ = Unix_file.close file in Lwt.return_unit in
         let st =
-          { file; pager; meta;
+          { close_fn; pager; meta;
             trees = Hashtbl.create 16;
             current_header = h;
             schema_version = h.schema_version;
@@ -355,9 +357,61 @@ let open_file ~path : (t, error) result Lwt.t =
 let close (t : t) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
-  | Btree st ->
-    let%lwt _ = Unix_file.close st.file in
-    Lwt.return_unit
+  | Btree st -> st.close_fn ()
+
+let open_block
+    ~(read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(sync       : unit -> (unit, string) result Lwt.t)
+    ~(resize     : n_pages:int64 -> (unit, string) result Lwt.t)
+    ~(n_pages    : int64)
+    ~(close      : unit -> unit Lwt.t)
+    : (t, error) result Lwt.t =
+  let pager =
+    Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
+  in
+  let%lwt hr = Header.read_live pager in
+  match hr with
+  | Error Header.Both_headers_corrupt ->
+    (* Fresh device — initialise headers *)
+    let%lwt ir = Header.init pager in
+    (match ir with
+    | Error e -> Lwt.return_error (map_header_err e)
+    | Ok () ->
+      Pager.set_n_pages pager 2L;
+      let%lwt hr2 = Header.read_live pager in
+      (match hr2 with
+      | Error e -> Lwt.return_error (map_header_err e)
+      | Ok h ->
+        let meta = Btree.create pager ~root_page:0L in
+        let st =
+          { close_fn = close; pager; meta;
+            trees = Hashtbl.create 16;
+            current_header = h;
+            schema_version = h.schema_version;
+            txn_freelist_snapshot = None;
+            active_readers = Hashtbl.create 4 }
+        in
+        Lwt.return_ok
+          { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+            mem_rw_snapshot = None }))
+  | Error e -> Lwt.return_error (map_header_err e)
+  | Ok h ->
+    Pager.set_n_pages pager h.n_pages_total;
+    let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+    Pager.set_freelist pager fl;
+    let meta = Btree.create pager ~root_page:h.root_page in
+    let st =
+      { close_fn = close; pager; meta;
+        trees = Hashtbl.create 16;
+        current_header = h;
+        schema_version = h.schema_version;
+        txn_freelist_snapshot = None;
+        active_readers = Hashtbl.create 4 }
+    in
+    Lwt.return_ok
+      { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+        mem_rw_snapshot = None }
 
 (* ------------------------------------------------------------------ *)
 (* Transactions                                                         *)

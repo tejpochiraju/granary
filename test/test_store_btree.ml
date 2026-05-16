@@ -8,6 +8,7 @@
 open Lwt.Syntax
 
 module S = Sqlocaml_store.Store
+module MB = Sqlocaml_mirage_block.Mirage_backend.Make(Block)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -46,6 +47,32 @@ let with_fresh_db ~f =
   Lwt.finalize
     (fun () -> f path)
     (fun () -> cleanup path; Lwt.return_unit)
+
+let tmp_block_file size_mb =
+  let path = Filename.temp_file "sqlocaml_ob_test" ".raw" in
+  let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT] 0o644 in
+  Unix.ftruncate fd (size_mb * 1024 * 1024);
+  Unix.close fd;
+  path
+
+let with_block_store path f =
+  run (
+    let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+    let* adapter = MB.connect dev in
+    let* result = S.open_block
+      ~read_page:(MB.read_page adapter)
+      ~write_page:(MB.write_page adapter)
+      ~sync:(MB.sync adapter)
+      ~resize:(MB.resize adapter)
+      ~n_pages:(MB.n_pages adapter)
+      ~close:(fun () -> MB.close adapter)
+    in
+    match result with
+    | Error e -> Alcotest.failf "open_block failed: %a" S.pp_error e
+    | Ok store ->
+      let* () = f store in
+      S.close store
+  )
 
 (* ------------------------------------------------------------------ *)
 (* 1. open_file basics                                                  *)
@@ -1244,6 +1271,37 @@ let test_ro_refcount () =
     run (S.close store))
 
 (* ------------------------------------------------------------------ *)
+(* open_block tests                                                     *)
+(* ------------------------------------------------------------------ *)
+
+let test_open_block_fresh () =
+  let path = tmp_block_file 4 in
+  Fun.protect ~finally:(fun () -> (try Unix.unlink path with _ -> ())) (fun () ->
+    with_block_store path (fun store ->
+      let* tx = S.rw_begin store in
+      let* () = S.put tx 0 (bs "hello") (bs "world") in
+      S.commit tx
+    )
+  )
+
+let test_open_block_reopen_persists () =
+  let path = tmp_block_file 4 in
+  Fun.protect ~finally:(fun () -> (try Unix.unlink path with _ -> ())) (fun () ->
+    with_block_store path (fun store ->
+      let* tx = S.rw_begin store in
+      let* () = S.put tx 0 (bs "k1") (bs "v1") in
+      S.commit tx
+    );
+    with_block_store path (fun store ->
+      let* tx = S.ro_begin store in
+      let* v = S.get tx 0 (bs "k1") in
+      let* () = S.ro_end tx in
+      Alcotest.(check (option bytes)) "value persisted" (Some (bs "v1")) v;
+      Lwt.return_unit
+    )
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1318,4 +1376,8 @@ let () =
       Alcotest.test_case "ro_refcount"               `Quick test_ro_refcount;
     ];
     "qcheck", qcheck_tests;
+    "open_block", [
+      Alcotest.test_case "fresh_init"       `Quick test_open_block_fresh;
+      Alcotest.test_case "reopen_persists"  `Quick test_open_block_reopen_persists;
+    ];
   ]

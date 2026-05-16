@@ -1,5 +1,5 @@
 (tests
- (names test_dummy test_mem test_varint test_rowid test_row test_store test_store_btree test_catalog test_lexer test_parser test_sema test_planner test_exec test_e2e test_unix_file test_page test_freelist test_pager test_header test_btree test_index_key test_conformance test_expr test_update test_delete test_join test_aggregate)
+ (names test_dummy test_mem test_varint test_rowid test_row test_store test_catalog test_lexer test_parser test_sema test_planner test_exec test_e2e test_unix_file test_page test_freelist test_pager test_header test_btree test_index_key test_conformance test_expr test_update test_delete test_join test_aggregate)
  (libraries alcotest qcheck-alcotest sqlocaml sqlocaml.block sqlocaml.encoding sqlocaml.store sqlocaml.catalog sqlocaml.sql sqlocaml.storage lwt.unix unix))
 
 (test
@@ -9,3 +9,9 @@
 (test
  (name test_mirage_backend)
  (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))
+
+(test
+ (name test_store_btree)
+ (libraries alcotest qcheck-alcotest sqlocaml sqlocaml.block sqlocaml.encoding
+            sqlocaml.store sqlocaml.catalog sqlocaml.sql sqlocaml.storage
+            sqlocaml.mirage_block mirage-block-unix lwt.unix unix))

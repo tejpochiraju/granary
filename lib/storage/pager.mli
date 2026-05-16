@@ -56,6 +56,11 @@ val set_alloc_min_safe : t -> int64 -> unit
 (** Replace the in-memory freelist (used after deserializing from disk). *)
 val set_freelist : t -> Freelist.t -> unit
 
+val set_n_pages : t -> int64 -> unit
+(** Override the pager's current page count.  Used by [Store.open_block]
+    after probing headers to set the authoritative logical page count
+    without going through the resize callback. *)
+
 (** Discard all dirty pages (and remove them from the read cache) without
     writing them to disk. Used on rollback to prevent aborted writes from
     being visible. *)

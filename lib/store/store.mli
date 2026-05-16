@@ -41,6 +41,20 @@ val create : unit -> t
     written by a previous [open_file]/[commit] sequence. *)
 val open_file : path:string -> (t, error) result Lwt.t
 
+(** Open a B+-tree backed store from any block device, given as I/O callbacks.
+    Probes pages 0 and 1 for valid headers; if both are corrupt, treats the
+    device as fresh and initialises it.  Pass [~n_pages:0L] for Mirage adapters
+    (which bound-check internally against device capacity).
+    [~close] is called by [Store.close]. *)
+val open_block :
+  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  sync       : (unit -> (unit, string) result Lwt.t) ->
+  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
+  n_pages    : int64 ->
+  close      : (unit -> unit Lwt.t) ->
+  (t, error) result Lwt.t
+
 (** Close the store. After this, any use of the store or its txns is
     undefined. *)
 val close : t -> unit Lwt.t

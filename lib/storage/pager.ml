@@ -171,6 +171,8 @@ let set_alloc_min_safe t v = t.alloc_min_safe <- v
 
 let set_freelist t fl = t.freelist <- fl
 
+let set_n_pages t n = t.n_pages <- n
+
 let clear_dirty t =
   let dirty_pids = Hashtbl.fold (fun pid _ acc -> pid :: acc) t.dirty [] in
   List.iter (fun pid ->
