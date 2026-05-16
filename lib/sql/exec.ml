@@ -1364,9 +1364,11 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       else begin
         let* (total_docs, total_tokens) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
         let query_terms = fts_query_terms query in
-        let* term_doc_counts = Lwt_list.map_s (fun term ->
+        (* Fetch per-term posting lists: (n_docs_with_term, posting_list).
+           Keeping the posting list lets us look up each term's tf per document. *)
+        let* term_data = Lwt_list.map_s (fun term ->
           let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
-          Lwt.return (term, List.length pl)) query_terms in
+          Lwt.return (List.length pl, pl)) query_terms in
         let* doc_lengths = Lwt_list.map_s (fun (rowid, positions) ->
           let dlen_key = fts_doclen_key rowid in
           let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
@@ -1376,11 +1378,16 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
           in
           Lwt.return (rowid, positions, dl)) matches in
         let scored = List.map (fun (rowid, positions, dl) ->
-          let tf = List.length positions in
-          let score = List.fold_left (fun acc (_, n_docs) ->
+          (* Use each term's own tf (occurrences in this doc) rather than
+             a single shared tf from the combined query result. *)
+          let score = List.fold_left (fun acc (n_docs, term_pl) ->
+            let tf = match List.assoc_opt rowid term_pl with
+              | None -> 0
+              | Some pos -> List.length pos
+            in
             acc +. bm25_score ~k1:1.2 ~b:0.75 ~total_docs ~total_tokens
                                ~n_docs_with_term:n_docs ~term_freq:tf ~doc_length:dl)
-            0.0 term_doc_counts in
+            0.0 term_data in
           (rowid, positions, score)) doc_lengths in
         Lwt.return scored
       end

@@ -261,9 +261,9 @@ let plan_order_by_asc () =
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_sort { col_idx = 0; dir = `Asc;
-                   child = Plan.Op_project { child = Plan.Op_seq_scan _; _ } } -> ()
-  | _ -> Alcotest.fail "expected Op_sort { col_idx=0; dir=Asc; child=Op_project(Op_seq_scan) }"
+  | Plan.Op_project { child = Plan.Op_sort { col_idx = 0; dir = `Asc;
+                                             child = Plan.Op_seq_scan _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_project(Op_sort { col_idx=0; dir=Asc }(Op_seq_scan))"
 
 let plan_order_by_desc () =
   let cat = make_cat () in
@@ -275,8 +275,8 @@ let plan_order_by_desc () =
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_sort { col_idx = 1; dir = `Desc; _ } -> ()
-  | _ -> Alcotest.fail "expected Op_sort { col_idx=1; dir=Desc }"
+  | Plan.Op_project { child = Plan.Op_sort { col_idx = 1; dir = `Desc; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_project(Op_sort { col_idx=1; dir=Desc })"
 
 let plan_limit_only () =
   let cat = make_cat () in
@@ -314,8 +314,8 @@ let plan_order_and_limit () =
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_limit { limit = 2; offset = 0;
-                    child = Plan.Op_sort { col_idx = 0; dir = `Asc; _ } } -> ()
-  | _ -> Alcotest.fail "expected Op_limit(Op_sort(Op_project(Op_seq_scan)))"
+                    child = Plan.Op_project { child = Plan.Op_sort { col_idx = 0; dir = `Asc; _ }; _ } } -> ()
+  | _ -> Alcotest.fail "expected Op_limit(Op_project(Op_sort(Op_seq_scan)))"
 
 (* ------------------------------------------------------------------ *)
 (* Group 6: Index lookup planner rule                                   *)

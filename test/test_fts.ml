@@ -287,6 +287,31 @@ let test_rank_ordering () =
          Lwt.return_unit
        | _ -> Alcotest.failf "unexpected row shape"))
 
+(* Regression test for issue #118: multi-term BM25 must use per-term tf.
+   Previously all terms used the tf from the first posting list result.
+   We verify that a document where term A appears many times scores higher
+   than one where term A appears once, in a two-term AND query. *)
+let test_bm25_per_term_tf () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE VIRTUAL TABLE docs USING FTS5(body)" in
+    (* doc1: "ocaml" appears 4x, "tutorial" 1x *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml ocaml ocaml ocaml tutorial')" in
+    (* doc2: "ocaml" appears 1x, "tutorial" 1x *)
+    let* _ = D.execute db "INSERT INTO docs (body) VALUES ('ocaml tutorial guide')" in
+    let* r = D.query db "SELECT body, rank FROM docs WHERE docs MATCH 'ocaml tutorial'" in
+    match r with
+    | Error e -> Alcotest.failf "bm25_per_term: %s" (Format.asprintf "%a" D.pp_error e)
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      Alcotest.(check int) "both docs match" 2 (List.length rows);
+      (* doc1 has higher ocaml tf so should rank first *)
+      (match rows with
+       | [| D.V_text _; D.V_real r1 |] :: [| D.V_text _; D.V_real r2 |] :: _ ->
+         Alcotest.(check bool) "doc1 scores higher" true (r1 > r2);
+         Lwt.return_unit
+       | _ -> Alcotest.failf "unexpected row shape"))
+
 let () =
   Alcotest.run "fts" [
     "ddl", [
@@ -318,7 +343,8 @@ let () =
       Alcotest.test_case "phrase_non_adjacent" `Quick test_phrase_non_adjacent_no_match;
     ];
     "rank", [
-      Alcotest.test_case "rank_column"   `Quick test_rank_column;
-      Alcotest.test_case "rank_ordering" `Quick test_rank_ordering;
+      Alcotest.test_case "rank_column"      `Quick test_rank_column;
+      Alcotest.test_case "rank_ordering"    `Quick test_rank_ordering;
+      Alcotest.test_case "bm25_per_term_tf" `Quick test_bm25_per_term_tf;
     ];
   ]
