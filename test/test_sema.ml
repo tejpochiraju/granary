@@ -1975,6 +1975,191 @@ let bind_select_having_neg_unknown_col () =
   | _ -> Alcotest.fail "expected Unknown_column bogus in E_neg in HAVING agg proj"
 
 (* ------------------------------------------------------------------ *)
+(* Group 12a: infer_type branches reachable via bind_update assignments  *)
+(* ------------------------------------------------------------------ *)
+
+(** infer_type BE_neg: SET id = -id → inferred Integer, ok. *)
+let bind_update_neg_col_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_neg (Ast.E_col "id"))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = -id"
+
+(** infer_type BE_bitnot: SET id = ~id → inferred Integer, ok. *)
+let bind_update_bitnot_col_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_bitnot (Ast.E_col "id"))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = ~id"
+
+(** infer_type BE_between: SET id = (id BETWEEN 1 AND 10) → inferred Integer, ok. *)
+let bind_update_between_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_between (
+      Ast.E_col "id",
+      Ast.E_lit (Ast.L_int 1L),
+      Ast.E_lit (Ast.L_int 10L)))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = (id BETWEEN 1 AND 10)"
+
+(** infer_type BE_in: SET id = (id IN (1, 2)) → inferred Integer, ok. *)
+let bind_update_in_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_in (
+      Ast.E_col "id",
+      [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = (id IN (1, 2))"
+
+(** infer_type arithmetic with Real: SET id = id + 1.5 → inferred Real,
+    but col is INTEGER → Type_mismatch. *)
+let bind_update_arith_real_mismatch () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_binop (
+      Ast.Add,
+      Ast.E_col "id",
+      Ast.E_lit (Ast.L_real 1.5)))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Real }) -> ()
+  | _ -> Alcotest.fail "expected Type_mismatch Integer/Real for id + 1.5"
+
+(** infer_type Concat: SET name = name || ' x' → inferred Text, ok.
+    Also tests infer_type Concat branch. *)
+let bind_update_concat_type_mismatch () =
+  let cat = two_col_cat () in
+  (* SET id = name || 'x' → Concat returns Text but id is INTEGER *)
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_binop (
+      Ast.Concat,
+      Ast.E_col "name",
+      Ast.E_lit (Ast.L_text "x")))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
+  | _ -> Alcotest.fail "expected Type_mismatch Integer/Text for Concat on id col"
+
+(** infer_type BE_func → None: function result has unknown type, so no
+    type-check is done. SET id = LENGTH(name) → Ok (no type check). *)
+let bind_update_func_no_type_check () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_func (Ast.Fn_length, [Ast.E_col "name"]))];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = LENGTH(name) (no type check)"
+
+(** infer_type BE_param → None: param type unknown, so no type check.
+    SET id = ? → Ok. *)
+let bind_update_param_no_type_check () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_param Ast.Param_anon)];
+    where = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_update _) -> ()
+  | _ -> Alcotest.fail "expected Ok for SET id = ? (no type check)"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12aa: compound_col_count extra branches                        *)
+(* ------------------------------------------------------------------ *)
+
+(** compound_col_count for BS_compound { left; _ } branch (nested compound). *)
+let bind_compound_nested () =
+  let cat = two_col_cat () in
+  let sel = Ast.S_select { distinct = false; proj = `All; table = "users";
+                            joins = []; where = None; group_by = []; having = None;
+                            order = []; limit = None; offset = None } in
+  (* ((sel UNION sel) UNION sel) — nested compound *)
+  let inner = Ast.S_compound { op = Ast.Union; left = sel; right = sel } in
+  let stmt  = Ast.S_compound { op = Ast.Union_all; left = inner; right = sel } in
+  match bind cat stmt with
+  | Ok (Sema.BS_compound { op = Ast.Union_all; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok nested BS_compound"
+
+(** compound_col_count for BS_select with aggs (aggs <> []) branch. *)
+let bind_compound_agg_select () =
+  let cat = two_col_cat () in
+  let agg_sel = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  (* Two agg selects with 1 col each — should compound OK *)
+  let stmt = Ast.S_compound { op = Ast.Intersect; left = agg_sel; right = agg_sel } in
+  match bind cat stmt with
+  | Ok (Sema.BS_compound { op = Ast.Intersect; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok for compound of agg selects"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12ab: bind_returning_params                                    *)
+(* ------------------------------------------------------------------ *)
+
+let bind_returning_params_basic () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users";
+                             joins = []; where = Some (Ast.E_binop (Ast.Eq,
+                               Ast.E_col "id", Ast.E_param Ast.Param_anon));
+                             group_by = []; having = None; order = []; limit = None; offset = None } in
+  match Lwt_main.run (Sema.bind_returning_params cat stmt) with
+  | Ok (Sema.BS_select _, pairs) ->
+    (* Anonymous param: no named params returned *)
+    Alcotest.(check int) "no named params" 0 (List.length pairs)
+  | _ -> Alcotest.fail "expected Ok from bind_returning_params"
+
+let bind_returning_params_named () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users";
+                             joins = []; where = Some (Ast.E_binop (Ast.Eq,
+                               Ast.E_col "id", Ast.E_param (Ast.Param_name "myval")));
+                             group_by = []; having = None; order = []; limit = None; offset = None } in
+  match Lwt_main.run (Sema.bind_returning_params cat stmt) with
+  | Ok (Sema.BS_select _, pairs) ->
+    Alcotest.(check int) "one named param" 1 (List.length pairs);
+    Alcotest.(check string) "param name" "myval" (fst (List.hd pairs))
+  | _ -> Alcotest.fail "expected Ok with named param from bind_returning_params"
+
+let bind_returning_params_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "ghost";
+                             joins = []; where = None;
+                             group_by = []; having = None; order = []; limit = None; offset = None } in
+  match Lwt_main.run (Sema.bind_returning_params cat stmt) with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table from bind_returning_params"
+
+(* ------------------------------------------------------------------ *)
 (* Group 12b: bind_expr E_bitnot / E_between / E_in / E_param / E_func *)
 (*             / E_match branches                                        *)
 (* ------------------------------------------------------------------ *)
@@ -2814,5 +2999,24 @@ let () =
     "pragma", [
       Alcotest.test_case "table_info"  `Quick bind_pragma_table_info;
       Alcotest.test_case "index_list"  `Quick bind_pragma_index_list;
+    ];
+    "infer-type", [
+      Alcotest.test_case "update_neg_col_ok"         `Quick bind_update_neg_col_ok;
+      Alcotest.test_case "update_bitnot_col_ok"      `Quick bind_update_bitnot_col_ok;
+      Alcotest.test_case "update_between_ok"         `Quick bind_update_between_ok;
+      Alcotest.test_case "update_in_ok"              `Quick bind_update_in_ok;
+      Alcotest.test_case "update_arith_real_mismatch" `Quick bind_update_arith_real_mismatch;
+      Alcotest.test_case "update_concat_type_mismatch" `Quick bind_update_concat_type_mismatch;
+      Alcotest.test_case "update_func_no_type_check"  `Quick bind_update_func_no_type_check;
+      Alcotest.test_case "update_param_no_type_check" `Quick bind_update_param_no_type_check;
+    ];
+    "compound-extra", [
+      Alcotest.test_case "nested_compound"       `Quick bind_compound_nested;
+      Alcotest.test_case "compound_agg_select"   `Quick bind_compound_agg_select;
+    ];
+    "bind-returning-params", [
+      Alcotest.test_case "basic"        `Quick bind_returning_params_basic;
+      Alcotest.test_case "named_param"  `Quick bind_returning_params_named;
+      Alcotest.test_case "error"        `Quick bind_returning_params_error;
     ];
   ]
