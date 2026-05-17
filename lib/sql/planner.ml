@@ -23,6 +23,8 @@ let rec plan_expr = function
   | Sema.BE_is_not_null e       -> Plan.P_is_not_null (plan_expr e)
   | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
   | Sema.BE_bitnot e            -> Plan.P_bitnot (plan_expr e)
+  | Sema.BE_between (x, lo, hi) -> Plan.P_between (plan_expr x, plan_expr lo, plan_expr hi)
+  | Sema.BE_in (x, vals)        -> Plan.P_in (plan_expr x, List.map plan_expr vals)
   | Sema.BE_func (func, args)   -> Plan.P_func (func, List.map plan_expr args)
   | Sema.BE_param i             -> Plan.P_param i
   | Sema.BE_match _             ->

@@ -1292,6 +1292,54 @@ let default_int_persists () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group: BETWEEN and IN operators                                      *)
+(* ------------------------------------------------------------------ *)
+
+let test_between_query () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (5)";
+  exec db "INSERT INTO t VALUES (10)";
+  let rows = query_ok db "SELECT n FROM t WHERE n BETWEEN 3 AND 7" in
+  let vals = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> -1L) rows in
+  Alcotest.(check (list int64)) "between" [5L] vals
+
+let test_not_between_query () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (5)";
+  exec db "INSERT INTO t VALUES (10)";
+  let rows = query_ok db "SELECT n FROM t WHERE n NOT BETWEEN 3 AND 7" in
+  let vals = List.sort Int64.compare (List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> -1L) rows) in
+  Alcotest.(check (list int64)) "not between" [1L; 10L] vals
+
+let test_in_query () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db "SELECT n FROM t WHERE n IN (1, 3)" in
+  let vals = List.sort Int64.compare (List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> -1L) rows) in
+  Alcotest.(check (list int64)) "in" [1L; 3L] vals
+
+let test_not_in_query () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db "SELECT n FROM t WHERE n NOT IN (1, 3)" in
+  let vals = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> -1L) rows in
+  Alcotest.(check (list int64)) "not in" [2L] vals
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1425,5 +1473,11 @@ let () =
       Alcotest.test_case "default_real_persists"   `Quick default_real_persists;
       Alcotest.test_case "default_text_persists"   `Quick default_text_persists;
       Alcotest.test_case "default_int_persists"    `Quick default_int_persists;
+    ];
+    "between_in", [
+      Alcotest.test_case "between"     `Quick test_between_query;
+      Alcotest.test_case "not_between" `Quick test_not_between_query;
+      Alcotest.test_case "in"          `Quick test_in_query;
+      Alcotest.test_case "not_in"      `Quick test_not_in_query;
     ];
   ]

@@ -94,6 +94,25 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
      | Row.V_int n -> Row.V_int (Int64.lognot n)
      | Row.V_null  -> Row.V_null
      | _           -> Row.V_null)
+  | Plan.P_between (x, lo, hi) ->
+    let vx  = eval_expr params row x  in
+    let vlo = eval_expr params row lo in
+    let vhi = eval_expr params row hi in
+    (match vx, vlo, vhi with
+     | Row.V_null, _, _ | _, Row.V_null, _ | _, _, Row.V_null -> Row.V_null
+     | _ ->
+       let ge_lo = compare_values vx vlo >= 0 in
+       let le_hi = compare_values vx vhi <= 0 in
+       Row.V_int (if ge_lo && le_hi then 1L else 0L))
+  | Plan.P_in (x, vals) ->
+    let vx = eval_expr params row x in
+    if vx = Row.V_null then Row.V_null
+    else
+      let found = List.exists (fun ve ->
+        let v = eval_expr params row ve in
+        v <> Row.V_null && compare_values vx v = 0
+      ) vals in
+      Row.V_int (if found then 1L else 0L)
   | Plan.P_is_null e ->
     (match eval_expr params row e with
      | Row.V_null -> Row.V_int 1L

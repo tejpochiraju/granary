@@ -68,6 +68,8 @@ rule token = parse
   | "MATCH"    { MATCH }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }
+  | "BETWEEN"  { BETWEEN }
+  | "IN"       { IN }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

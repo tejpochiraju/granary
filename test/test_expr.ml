@@ -650,6 +650,40 @@ let test_glob_match () =
   Alcotest.(check int64) "glob case"  0L (match glob "Hello" "hello*" with Row.V_int n -> n | _ -> -1L)
 
 (* ------------------------------------------------------------------ *)
+(* Group 11: BETWEEN and IN operators                                   *)
+(* ------------------------------------------------------------------ *)
+
+let test_between () =
+  let row = [||] in
+  let between x lo hi =
+    Exec.eval_expr [||] row
+      (Plan.P_between (Plan.P_lit (Ast.L_int x),
+                       Plan.P_lit (Ast.L_int lo),
+                       Plan.P_lit (Ast.L_int hi)))
+  in
+  Alcotest.(check int64) "between in"   1L (match between 5L 1L 10L  with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "between lo"   1L (match between 1L 1L 10L  with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "between hi"   1L (match between 10L 1L 10L with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "between out"  0L (match between 0L 1L 10L  with Row.V_int n -> n | _ -> -1L)
+
+let test_in () =
+  let row = [||] in
+  let in_list x vs =
+    Exec.eval_expr [||] row
+      (Plan.P_in (Plan.P_lit (Ast.L_int x),
+                  List.map (fun v -> Plan.P_lit (Ast.L_int v)) vs))
+  in
+  Alcotest.(check int64) "in found"     1L (match in_list 3L [1L; 2L; 3L] with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "in not found" 0L (match in_list 4L [1L; 2L; 3L] with Row.V_int n -> n | _ -> -1L)
+
+let test_in_null () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row
+      (Plan.P_in (Plan.P_lit Ast.L_null,
+                  [Plan.P_lit (Ast.L_int 1L)])) in
+  Alcotest.(check bool) "in null subject" true (v = Row.V_null)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -747,5 +781,10 @@ let () =
       Alcotest.test_case "like_null"  `Quick test_like_null;
       Alcotest.test_case "glob_null"  `Quick test_glob_null;
       Alcotest.test_case "glob_match" `Quick test_glob_match;
+    ];
+    "between_in", [
+      Alcotest.test_case "between"  `Quick test_between;
+      Alcotest.test_case "in"       `Quick test_in;
+      Alcotest.test_case "in_null"  `Quick test_in_null;
     ];
   ]

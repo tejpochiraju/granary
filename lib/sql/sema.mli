@@ -13,6 +13,10 @@ type bound_expr =
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
   | BE_bitnot      of bound_expr
+  | BE_between     of bound_expr * bound_expr * bound_expr
+    (** BETWEEN predicate. *)
+  | BE_in          of bound_expr * bound_expr list
+    (** IN value list predicate. *)
   | BE_func        of Ast.scalar_func * bound_expr list
     (** Scalar function call (Phase 5). *)
   | BE_param       of int

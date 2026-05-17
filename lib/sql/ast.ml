@@ -47,6 +47,8 @@ type expr =
   | E_is_not_null of expr
   | E_neg         of expr                  (** unary minus *)
   | E_bitnot      of expr                  (** bitwise NOT ~ *)
+  | E_between     of expr * expr * expr   (** subject BETWEEN lo AND hi *)
+  | E_in          of expr * expr list     (** subject IN (val1, val2, ...) *)
   | E_agg         of agg_func * expr option
     (** Aggregate call; [None] argument means [COUNT( * )]. *)
   | E_func        of scalar_func * expr list

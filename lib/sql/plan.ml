@@ -17,6 +17,8 @@ type expr =
   | P_is_not_null of expr
   | P_neg         of expr
   | P_bitnot      of expr
+  | P_between     of expr * expr * expr
+  | P_in          of expr * expr list
   | P_func        of Ast.scalar_func * expr list
   | P_param       of int                   (** 0-indexed positional parameter *)
 

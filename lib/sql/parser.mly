@@ -27,6 +27,7 @@
 %token VIRTUAL USING FTS5
 %token MATCH
 %token LIKE GLOB
+%token BETWEEN IN
 %token QUESTION
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
@@ -39,6 +40,7 @@
 %right NOT
 %nonassoc IS
 %nonassoc LIKE GLOB
+%nonassoc BETWEEN_PREC
 %left EQ NE LT LE GT GE
 %left PIPE
 %left AMPERSAND
@@ -275,6 +277,14 @@ expr:
   | a = expr NOT LIKE b = expr %prec LIKE { E_not (E_binop (Like, a, b)) }
   | a = expr GLOB b = expr             { E_binop (Glob, a, b) }
   | a = expr NOT GLOB b = expr %prec GLOB { E_not (E_binop (Glob, a, b)) }
+  | a = expr BETWEEN lo = expr AND hi = expr %prec BETWEEN_PREC
+    { E_between (a, lo, hi) }
+  | a = expr NOT BETWEEN lo = expr AND hi = expr %prec BETWEEN_PREC
+    { E_not (E_between (a, lo, hi)) }
+  | a = expr IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_in (a, vals) }
+  | a = expr NOT IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN %prec BETWEEN_PREC
+    { E_not (E_in (a, vals)) }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
   | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }

@@ -15,6 +15,8 @@ type bound_expr =
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
   | BE_bitnot      of bound_expr
+  | BE_between     of bound_expr * bound_expr * bound_expr
+  | BE_in          of bound_expr * bound_expr list
   | BE_func        of Ast.scalar_func * bound_expr list
   | BE_param       of int
   | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
@@ -218,6 +220,22 @@ let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
     (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_bitnot be)
      | Error e -> Error e)
+  | Ast.E_between (x, lo, hi) ->
+    (match bind_expr ~param_counter meta x,
+           bind_expr ~param_counter meta lo,
+           bind_expr ~param_counter meta hi with
+     | Ok bx, Ok blo, Ok bhi -> Ok (BE_between (bx, blo, bhi))
+     | Error e, _, _ | _, Error e, _ | _, _, Error e -> Error e)
+  | Ast.E_in (x, vals) ->
+    let bx = bind_expr ~param_counter meta x in
+    let bvals = List.map (bind_expr ~param_counter meta) vals in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bvals in
+    (match bx, errors with
+     | Error e, _ -> Error e
+     | _, e :: _  -> Error e
+     | Ok bx', [] ->
+       let ok_vals = List.filter_map (function Ok v -> Some v | Error _ -> None) bvals in
+       Ok (BE_in (bx', ok_vals)))
   | Ast.E_param _ ->
     let i = !param_counter in
     incr param_counter;
@@ -299,6 +317,22 @@ let rec bind_expr_join
   | Ast.E_bitnot e ->
     (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_bitnot be) | Error e -> Error e)
+  | Ast.E_between (x, lo, hi) ->
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset x,
+           bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset lo,
+           bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset hi with
+     | Ok bx, Ok blo, Ok bhi -> Ok (BE_between (bx, blo, bhi))
+     | Error e, _, _ | _, Error e, _ | _, _, Error e -> Error e)
+  | Ast.E_in (x, vals) ->
+    let bx = bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset x in
+    let bvals = List.map (bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset) vals in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bvals in
+    (match bx, errors with
+     | Error e, _ -> Error e
+     | _, e :: _  -> Error e
+     | Ok bx', [] ->
+       let ok_vals = List.filter_map (function Ok v -> Some v | Error _ -> None) bvals in
+       Ok (BE_in (bx', ok_vals)))
   | Ast.E_param _ ->
     let i = !param_counter in
     incr param_counter;
@@ -388,6 +422,20 @@ let bind_expr_agg
       (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
     | Ast.E_bitnot e ->
       (match go e with Ok be -> Ok (BE_bitnot be) | Error e -> Error e)
+    | Ast.E_between (x, lo, hi) ->
+      (match go x, go lo, go hi with
+       | Ok bx, Ok blo, Ok bhi -> Ok (BE_between (bx, blo, bhi))
+       | Error e, _, _ | _, Error e, _ | _, _, Error e -> Error e)
+    | Ast.E_in (x, vals) ->
+      let bx = go x in
+      let bvals = List.map go vals in
+      let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bvals in
+      (match bx, errors with
+       | Error e, _ -> Error e
+       | _, e :: _  -> Error e
+       | Ok bx', [] ->
+         let ok_vals = List.filter_map (function Ok v -> Some v | Error _ -> None) bvals in
+         Ok (BE_in (bx', ok_vals)))
     | Ast.E_param _ ->
       let i = !param_counter in
       incr param_counter;
@@ -447,6 +495,8 @@ let rec expr_has_agg = function
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
     expr_has_agg e
+  | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
+  | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
   | Ast.E_func (_, args) -> List.exists expr_has_agg args
 
 (* ------------------------------------------------------------------ *)
@@ -1129,6 +1179,8 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
         | _                                  -> None))
   | BE_neg e -> infer_type cols e
   | BE_bitnot _ -> Some Row.Integer
+  | BE_between _ -> Some Row.Integer  (* BETWEEN returns boolean 0/1 *)
+  | BE_in _ -> Some Row.Integer       (* IN returns boolean 0/1 *)
   | BE_func _ -> None   (* scalar functions return dynamic types *)
   | BE_param _ -> None  (* parameter type unknown at compile time *)
   | BE_match _ -> Some Row.Integer  (* MATCH returns boolean (0/1) *)
