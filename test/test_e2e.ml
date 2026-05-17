@@ -2333,6 +2333,83 @@ let test_table_primary_key_constraint () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* Phase 8 edge-case / error-path tests                                *)
+(* ------------------------------------------------------------------ *)
+
+let test_insert_or_abort_error () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
+    let r = Lwt_main.run (Db.execute db "INSERT OR ABORT INTO t VALUES (1, 'b')") in
+    Alcotest.(check bool) "abort raises on conflict" true
+      (match r with Error (Db.Runtime _) -> true | _ -> false);
+    Lwt.return_unit)
+
+let test_insert_returning_ignored () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'orig')" in
+    let* r = Db.query db "INSERT OR IGNORE INTO t VALUES (1, 'new') RETURNING id, v" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "empty stream when ignored" 0 (List.length rows);
+       Lwt.return_unit))
+
+let test_alter_rename_nonexistent () =
+  Lwt_main.run (
+    let r = Lwt_main.run (
+      let* db = Db.open_in_memory () in
+      Db.execute db "ALTER TABLE nonexistent RENAME TO new_name"
+    ) in
+    Alcotest.(check bool) "error on nonexistent table" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
+let test_alter_rename_column_nonexistent () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+    let r = Lwt_main.run (Db.execute db "ALTER TABLE t RENAME COLUMN nonexistent TO x") in
+    Alcotest.(check bool) "error on nonexistent column" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
+let test_alter_add_column_duplicate () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN v TEXT") in
+    Alcotest.(check bool) "error on duplicate column name" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
+let test_alter_rename_table_to_existing () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE a (id INTEGER)" in
+    let* _ = Db.execute db "CREATE TABLE b (id INTEGER)" in
+    let r = Lwt_main.run (Db.execute db "ALTER TABLE a RENAME TO b") in
+    Alcotest.(check bool) "error renaming to existing table name" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
+let test_alter_add_column_nonexistent_table () =
+  Lwt_main.run (
+    let r = Lwt_main.run (
+      let* db = Db.open_in_memory () in
+      Db.execute db "ALTER TABLE nonexistent ADD COLUMN x TEXT"
+    ) in
+    Alcotest.(check bool) "error on nonexistent table" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2558,6 +2635,7 @@ let () =
       Alcotest.test_case "insert_or_ignore_unique"      `Quick test_insert_or_ignore_unique;
       Alcotest.test_case "insert_or_replace_no_conflict" `Quick test_insert_or_replace_no_conflict;
       Alcotest.test_case "insert_or_replace_multi_unique" `Quick test_insert_or_replace_multi_unique;
+      Alcotest.test_case "insert_or_abort_error"        `Quick test_insert_or_abort_error;
     ];
     "returning", [
       Alcotest.test_case "insert_returning"        `Quick test_insert_returning;
@@ -2565,6 +2643,7 @@ let () =
       Alcotest.test_case "delete_returning"        `Quick test_delete_returning;
       Alcotest.test_case "update_returning_multi"  `Quick test_update_returning_multi;
       Alcotest.test_case "delete_returning_multi"  `Quick test_delete_returning_multi;
+      Alcotest.test_case "insert_returning_ignored" `Quick test_insert_returning_ignored;
     ];
     "alter_table", [
       Alcotest.test_case "add_column"                    `Quick test_alter_add_column;
@@ -2573,6 +2652,11 @@ let () =
       Alcotest.test_case "rename_table"                  `Quick test_rename_table;
       Alcotest.test_case "rename_column"                 `Quick test_rename_column;
       Alcotest.test_case "rename_column_no_keyword"      `Quick test_rename_column_no_keyword;
+      Alcotest.test_case "rename_nonexistent"            `Quick test_alter_rename_nonexistent;
+      Alcotest.test_case "rename_column_nonexistent"     `Quick test_alter_rename_column_nonexistent;
+      Alcotest.test_case "add_column_duplicate"          `Quick test_alter_add_column_duplicate;
+      Alcotest.test_case "rename_table_to_existing"      `Quick test_alter_rename_table_to_existing;
+      Alcotest.test_case "add_column_nonexistent_table"  `Quick test_alter_add_column_nonexistent_table;
     ];
     "table_constraints", [
       Alcotest.test_case "table_unique_constraint"      `Quick test_table_unique_constraint;

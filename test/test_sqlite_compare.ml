@@ -1291,6 +1291,313 @@ let cases = [
     query = "SELECT DATE(NULL) FROM _d";
     unordered = false };
 
+  (* ── ON CONFLICT tests ─────────────────────────────────────────── *)
+
+  { name = "insert_or_ignore_basic";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'original')";
+      "INSERT OR IGNORE INTO t VALUES (1, 'ignored')";
+    ];
+    query = "SELECT id, v FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "insert_or_ignore_unique_idx";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT)";
+      "CREATE UNIQUE INDEX idx_name ON t (name)";
+      "INSERT INTO t VALUES (1, 'alice')";
+      "INSERT OR IGNORE INTO t VALUES (2, 'alice')";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "insert_or_replace_basic";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'old')";
+      "INSERT OR REPLACE INTO t VALUES (1, 'new')";
+    ];
+    query = "SELECT v FROM t WHERE id = 1";
+    unordered = false };
+
+  { name = "insert_or_replace_count";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'first')";
+      "INSERT OR REPLACE INTO t VALUES (1, 'second')";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "insert_or_replace_no_conflict";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT OR REPLACE INTO t VALUES (42, 'inserted')";
+    ];
+    query = "SELECT id, v FROM t";
+    unordered = false };
+
+  { name = "insert_or_ignore_no_conflict";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT OR IGNORE INTO t VALUES (7, 'hello')";
+    ];
+    query = "SELECT id, v FROM t";
+    unordered = false };
+
+  { name = "insert_or_replace_multi_unique";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b INTEGER)";
+      "CREATE UNIQUE INDEX idx_a ON t (a)";
+      "CREATE UNIQUE INDEX idx_b ON t (b)";
+      "INSERT INTO t VALUES (1, 100)";
+      "INSERT INTO t VALUES (2, 200)";
+      "INSERT OR REPLACE INTO t VALUES (1, 200)";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "insert_or_ignore_multiple_rows";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'a')";
+      "INSERT INTO t VALUES (2, 'b')";
+      "INSERT OR IGNORE INTO t VALUES (1, 'conflict')";
+      "INSERT OR IGNORE INTO t VALUES (3, 'new')";
+    ];
+    query = "SELECT id, v FROM t ORDER BY id";
+    unordered = false };
+
+  (* ── RETURNING tests ───────────────────────────────────────────── *)
+
+  { name = "insert_returning_cols";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+    ];
+    query = "INSERT INTO t VALUES (5, 'hello') RETURNING id, v";
+    unordered = false };
+
+  { name = "insert_returning_expr";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+    ];
+    query = "INSERT INTO t VALUES (3, 'x') RETURNING id * 2";
+    unordered = false };
+
+  { name = "update_returning_single";
+    setup = [
+      "CREATE TABLE t (id INTEGER, val TEXT)";
+      "INSERT INTO t VALUES (1, 'old')";
+      "INSERT INTO t VALUES (2, 'keep')";
+    ];
+    query = "UPDATE t SET val = 'new' WHERE id = 1 RETURNING id, val";
+    unordered = false };
+
+  { name = "update_returning_multi";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v INTEGER)";
+      "INSERT INTO t VALUES (1, 10)";
+      "INSERT INTO t VALUES (2, 20)";
+      "INSERT INTO t VALUES (3, 30)";
+    ];
+    query = "UPDATE t SET v = v + 1 RETURNING id, v";
+    unordered = true };
+
+  { name = "delete_returning_single";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "INSERT INTO t VALUES (1, 'gone')";
+      "INSERT INTO t VALUES (2, 'stays')";
+    ];
+    query = "DELETE FROM t WHERE id = 1 RETURNING id, v";
+    unordered = false };
+
+  { name = "delete_returning_all";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "INSERT INTO t VALUES (3)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "DELETE FROM t RETURNING id";
+    unordered = true };
+
+  { name = "insert_or_ignore_returning_empty";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX idx_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'orig')";
+    ];
+    query = "INSERT OR IGNORE INTO t VALUES (1, 'new') RETURNING id, v";
+    unordered = false };
+
+  { name = "update_returning_new_values";
+    setup = [
+      "CREATE TABLE t (id INTEGER, score INTEGER)";
+      "INSERT INTO t VALUES (1, 100)";
+    ];
+    query = "UPDATE t SET score = score * 2 WHERE id = 1 RETURNING id, score";
+    unordered = false };
+
+  (* ── ALTER TABLE tests ─────────────────────────────────────────── *)
+
+  { name = "alter_add_column_default";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT)";
+      "INSERT INTO t VALUES (1, 'alice')";
+      "INSERT INTO t VALUES (2, 'bob')";
+      "ALTER TABLE t ADD COLUMN tag TEXT DEFAULT 'unknown'";
+    ];
+    query = "SELECT id, name, tag FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "alter_add_column_null";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "ALTER TABLE t ADD COLUMN extra TEXT";
+    ];
+    query = "SELECT id, extra FROM t";
+    unordered = false };
+
+  { name = "alter_add_then_insert";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT)";
+      "INSERT INTO t VALUES (1, 'first')";
+      "ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 0";
+      "INSERT INTO t VALUES (2, 'second', 99)";
+    ];
+    query = "SELECT id, name, score FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "alter_add_multiple";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "INSERT INTO t VALUES (42)";
+      "ALTER TABLE t ADD COLUMN a TEXT DEFAULT 'foo'";
+      "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 7";
+    ];
+    query = "SELECT id, a, b FROM t";
+    unordered = false };
+
+  { name = "alter_rename_table";
+    setup = [
+      "CREATE TABLE old_name (id INTEGER, v TEXT)";
+      "INSERT INTO old_name VALUES (1, 'hello')";
+      "ALTER TABLE old_name RENAME TO new_name";
+    ];
+    query = "SELECT id, v FROM new_name ORDER BY id";
+    unordered = false };
+
+  { name = "alter_rename_column";
+    setup = [
+      "CREATE TABLE t (id INTEGER, old_col TEXT)";
+      "INSERT INTO t VALUES (1, 'data')";
+      "ALTER TABLE t RENAME COLUMN old_col TO new_col";
+    ];
+    query = "SELECT id, new_col FROM t";
+    unordered = false };
+
+  { name = "alter_rename_column_no_keyword";
+    setup = [
+      "CREATE TABLE t (x INTEGER, y TEXT)";
+      "INSERT INTO t VALUES (5, 'abc')";
+      "ALTER TABLE t RENAME y TO z";
+    ];
+    query = "SELECT x, z FROM t";
+    unordered = false };
+
+  { name = "alter_add_select_star";
+    setup = [
+      "CREATE TABLE t (a INTEGER)";
+      "INSERT INTO t VALUES (10)";
+      "ALTER TABLE t ADD COLUMN b TEXT DEFAULT 'yes'";
+    ];
+    query = "SELECT * FROM t";
+    unordered = false };
+
+  (* ── Table-level constraints tests ────────────────────────────── *)
+
+  { name = "table_unique_single";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b TEXT, UNIQUE(a))";
+      "INSERT INTO t VALUES (1, 'x')";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "table_unique_multi";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b INTEGER, UNIQUE(a, b))";
+      "INSERT INTO t VALUES (1, 1)";
+      "INSERT INTO t VALUES (1, 2)";
+      "INSERT INTO t VALUES (2, 1)";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "table_unique_allows_different_values";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b TEXT, UNIQUE(a))";
+      "INSERT INTO t VALUES (1, 'first')";
+      "INSERT INTO t VALUES (2, 'second')";
+      "INSERT INTO t VALUES (3, 'third')";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "table_pk_constraint";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT, PRIMARY KEY(id))";
+      "INSERT INTO t VALUES (1, 'alice')";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "table_unique_replace";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b TEXT, UNIQUE(a))";
+      "INSERT INTO t VALUES (1, 'old')";
+      "INSERT OR REPLACE INTO t VALUES (1, 'new')";
+    ];
+    query = "SELECT a, b FROM t";
+    unordered = false };
+
+  { name = "table_unique_ignore";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b TEXT, UNIQUE(a))";
+      "INSERT INTO t VALUES (1, 'first')";
+      "INSERT OR IGNORE INTO t VALUES (1, 'second')";
+    ];
+    query = "SELECT a, b FROM t";
+    unordered = false };
+
+  { name = "table_multi_constraint";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b INTEGER, UNIQUE(a), UNIQUE(b))";
+      "INSERT INTO t VALUES (1, 10)";
+      "INSERT INTO t VALUES (2, 20)";
+    ];
+    query = "SELECT COUNT(*) FROM t";
+    unordered = false };
+
+  { name = "table_unique_then_index";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b TEXT, UNIQUE(a))";
+      "CREATE INDEX idx_b ON t (b)";
+      "INSERT INTO t VALUES (1, 'hello')";
+      "INSERT INTO t VALUES (2, 'world')";
+    ];
+    query = "SELECT a, b FROM t ORDER BY a";
+    unordered = false };
+
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
