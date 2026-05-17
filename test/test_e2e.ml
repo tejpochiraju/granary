@@ -2590,6 +2590,16 @@ let test_check_cache_invalidation () =
      | Ok ()   -> Alcotest.fail "old values should fail new CHECK");
     Lwt.return_unit)
 
+let test_check_agg_rejected () =
+  run (
+    let* db = Db.open_in_memory () in
+    Lwt.catch
+      (fun () ->
+        let* _ = Db.execute db
+          "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (count(v) > 0))" in
+        Alcotest.fail "expected aggregate in CHECK to be rejected")
+      (fun _exn -> Lwt.return_unit))
+
 let test_check_persisted () =
   run (
     let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
@@ -3270,6 +3280,7 @@ let () =
       Alcotest.test_case "null_allowed"        `Quick test_check_null_allowed;
       Alcotest.test_case "persisted"           `Quick test_check_persisted;
       Alcotest.test_case "cache_invalidation"  `Quick test_check_cache_invalidation;
+      Alcotest.test_case "agg_in_check_rejected" `Quick test_check_agg_rejected;
     ];
     "phase9_edge", [
       Alcotest.test_case "const_select"          `Quick test_const_select;

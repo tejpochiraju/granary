@@ -599,38 +599,66 @@ let bind_create cat ~name ~columns ~constraints =
   match existing with
   | Some _ -> Lwt.return (Error (Already_exists name))
   | None ->
-    let ast_lit_to_dv : Ast.literal -> Row.default_value = function
-      | Ast.L_int  n -> Row.DV_int n
-      | Ast.L_text s -> Row.DV_text s
-      | Ast.L_null   -> Row.DV_null
-      | Ast.L_real f -> Row.DV_real f
-      | Ast.L_blob b -> Row.DV_blob b
+    (* Validate CHECK expressions — reject forms that can't be serialized *)
+    let rec check_expr_unsupported = function
+      | Ast.E_agg _
+      | Ast.E_match _
+      | Ast.E_subquery _
+      | Ast.E_exists _
+      | Ast.E_in_select _
+      | Ast.E_param _   -> true
+      | Ast.E_binop (_, a, b) -> check_expr_unsupported a || check_expr_unsupported b
+      | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e
+      | Ast.E_neg e | Ast.E_bitnot e -> check_expr_unsupported e
+      | Ast.E_between (x, lo, hi) ->
+        check_expr_unsupported x || check_expr_unsupported lo || check_expr_unsupported hi
+      | Ast.E_in (x, vals) ->
+        check_expr_unsupported x || List.exists check_expr_unsupported vals
+      | Ast.E_func (_, args) -> List.exists check_expr_unsupported args
+      | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
     in
-    let row_cols = List.map (fun (c : Ast.column_def) ->
-      Row.{ name        = c.name;
-            ty          = (match c.ty with
-                           | Ast.Ty_int  -> Row.Integer
-                           | Ast.Ty_text -> Row.Text
-                           | Ast.Ty_real -> Row.Real
-                           | Ast.Ty_blob -> Row.Blob);
-            not_null    = c.not_null;
-            primary_key = c.primary_key;
-            default     = Option.map ast_lit_to_dv c.default;
-            check_sql   = Option.map Ast.expr_to_sql c.check }
+    let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
+      match c.check with
+      | None -> false
+      | Some e -> check_expr_unsupported e
     ) columns in
-    (* Generate auto-UNIQUE index specs for table-level constraints *)
-    let uniq_idxs = List.mapi (fun i tc ->
-      match tc with
-      | Ast.TC_unique cols ->
-        let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
-            name (String.concat "_" cols) i in
-        (idx_name, cols)
-      | Ast.TC_primary_key cols ->
-        let idx_name = Printf.sprintf "__pk_%s_%s_%d"
-            name (String.concat "_" cols) i in
-        (idx_name, cols)
-    ) constraints in
-    Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs }))
+    match unsupported_check with
+    | Some col ->
+      Lwt.return (Error (Unsupported
+        (Printf.sprintf "CHECK constraint on column '%s' contains unsupported expression form (aggregates, subqueries, and parameters are not allowed)" col.name)))
+    | None ->
+      let ast_lit_to_dv : Ast.literal -> Row.default_value = function
+        | Ast.L_int  n -> Row.DV_int n
+        | Ast.L_text s -> Row.DV_text s
+        | Ast.L_null   -> Row.DV_null
+        | Ast.L_real f -> Row.DV_real f
+        | Ast.L_blob b -> Row.DV_blob b
+      in
+      let row_cols = List.map (fun (c : Ast.column_def) ->
+        Row.{ name        = c.name;
+              ty          = (match c.ty with
+                             | Ast.Ty_int  -> Row.Integer
+                             | Ast.Ty_text -> Row.Text
+                             | Ast.Ty_real -> Row.Real
+                             | Ast.Ty_blob -> Row.Blob);
+              not_null    = c.not_null;
+              primary_key = c.primary_key;
+              default     = Option.map ast_lit_to_dv c.default;
+              check_sql   = Option.map Ast.expr_to_sql c.check }
+      ) columns in
+      (* Generate auto-UNIQUE index specs for table-level constraints *)
+      let uniq_idxs = List.mapi (fun i tc ->
+        match tc with
+        | Ast.TC_unique cols ->
+          let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
+              name (String.concat "_" cols) i in
+          (idx_name, cols)
+        | Ast.TC_primary_key cols ->
+          let idx_name = Printf.sprintf "__pk_%s_%s_%d"
+              name (String.concat "_" cols) i in
+          (idx_name, cols)
+      ) constraints in
+      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs }))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
