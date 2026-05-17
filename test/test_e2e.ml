@@ -2164,6 +2164,36 @@ let test_delete_returning () =
        Alcotest.(check int) "id=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
        Lwt.return_unit))
 
+let test_update_returning_multi () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+    let* r = Db.query db "UPDATE t SET v = v + 1 RETURNING id, v" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "3 rows returned" 3 (List.length rows);
+       Lwt.return_unit))
+
+let test_delete_returning_multi () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (3)" in
+    let* r = Db.query db "DELETE FROM t RETURNING id" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "all 3 rows returned" 3 (List.length rows);
+       Lwt.return_unit))
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -2392,8 +2422,10 @@ let () =
       Alcotest.test_case "insert_or_replace_multi_unique" `Quick test_insert_or_replace_multi_unique;
     ];
     "returning", [
-      Alcotest.test_case "insert_returning" `Quick test_insert_returning;
-      Alcotest.test_case "update_returning" `Quick test_update_returning;
-      Alcotest.test_case "delete_returning" `Quick test_delete_returning;
+      Alcotest.test_case "insert_returning"        `Quick test_insert_returning;
+      Alcotest.test_case "update_returning"        `Quick test_update_returning;
+      Alcotest.test_case "delete_returning"        `Quick test_delete_returning;
+      Alcotest.test_case "update_returning_multi"  `Quick test_update_returning_multi;
+      Alcotest.test_case "delete_returning_multi"  `Quick test_delete_returning_multi;
     ];
   ]

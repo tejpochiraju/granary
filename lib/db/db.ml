@@ -176,7 +176,11 @@ let query t sql =
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok op   ->
-    (match Sql.Exec.query ~clock:t.clock t.store t.catalog op with
+    let mode = match t.explicit_txn with
+      | None    -> Sql.Exec.Auto
+      | Some tx -> Sql.Exec.In_txn tx
+    in
+    (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_stream ->
        let* stream = lwt_stream in

@@ -36,6 +36,7 @@ val execute_with_count :
     [clock] supplies the current Unix timestamp for SQL date/time
     functions invoked with the literal ['now']. *)
 val query :
+  ?mode:txn_mode ->
   ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->

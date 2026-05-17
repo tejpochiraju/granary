@@ -779,11 +779,17 @@ let release_txn tx owned =
 let execute_insert ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
     ?(on_conflict : Ast.conflict_action option = None)
+    ?(prebuilt_row : Row.t option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
   let n   = List.length table_meta.columns in
-  let row = Array.make n Row.V_null in
-  List.iter2 (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr) ordinals values;
+  let row = match prebuilt_row with
+    | Some r -> r
+    | None ->
+      let r = Array.make n Row.V_null in
+      List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
+      r
+  in
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -1330,7 +1336,7 @@ let fts_query_terms query =
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* ------------------------------------------------------------------ *)
 
-let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
     let* tx  = S.ro_begin store in
@@ -1350,19 +1356,19 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     ) in
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr clock params row pred)) inner)
   | Plan.Op_project { ordinals; child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     let eval_exprs row =
       Array.of_list (List.map (eval_expr clock params row) exprs)
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
   | Plan.Op_sort { keys; child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
     let cmp a b =
       List.fold_left (fun acc (key, dir) ->
@@ -1377,12 +1383,12 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     let sorted = List.sort cmp rows in
     Lwt.return (Lwt_stream.of_list sorted)
   | Plan.Op_limit { limit; offset; child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
     let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
     Lwt.return (Lwt_stream.of_list rows')
   | Plan.Op_distinct { child } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     let seen = Hashtbl.create 64 in
     Lwt.return (Lwt_stream.filter (fun row ->
       let k = row_key row in
@@ -1460,7 +1466,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       right_col_offset = _; n_right_cols } ->
     (* Indexed nested-loop join: for each left row, seek the right
        index tree for the join key and collect matching right rows. *)
-    let* left_stream = to_stream clock params store left in
+    let* left_stream = to_stream clock params store ~mode ~cat left in
     let* left_rows = Lwt_stream.to_list left_stream in
     let* tx = S.ro_begin store in
     let out = ref [] in
@@ -1523,8 +1529,8 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
   | Plan.Op_hash_join {
       left; right; left_key; right_key; join_kind;
       right_col_offset = _; n_right_cols } ->
-    let* left_stream  = to_stream clock params store left in
-    let* right_stream = to_stream clock params store right in
+    let* left_stream  = to_stream clock params store ~mode ~cat left in
+    let* right_stream = to_stream clock params store ~mode ~cat right in
     let* right_rows = Lwt_stream.to_list right_stream in
     if left_key < 0 || right_key < 0 then begin
       (* Cartesian product fallback (general ON predicate). *)
@@ -1587,7 +1593,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
   | Plan.Op_aggregate { child; group_col; aggs; having; proj } ->
-    let* inner = to_stream clock params store child in
+    let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
     let groups : (Row.value * Row.t list) list =
       match group_col with
@@ -1801,8 +1807,8 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_union { all; left; right } ->
-    let* ls = to_stream clock params store left  in
-    let* rs = to_stream clock params store right in
+    let* ls = to_stream clock params store ~mode ~cat left  in
+    let* rs = to_stream clock params store ~mode ~cat right in
     let combined = Lwt_stream.append ls rs in
     if all then Lwt.return combined
     else begin
@@ -1816,8 +1822,8 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       Lwt.return (Lwt_stream.of_list deduped)
     end
   | Plan.Op_intersect { left; right } ->
-    let* ls = to_stream clock params store left  in
-    let* rs = to_stream clock params store right in
+    let* ls = to_stream clock params store ~mode ~cat left  in
+    let* rs = to_stream clock params store ~mode ~cat right in
     let* right_list = Lwt_stream.to_list rs in
     let right_set = Hashtbl.create (max 1 (List.length right_list)) in
     List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
@@ -1831,8 +1837,8 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     ) left_list in
     Lwt.return (Lwt_stream.of_list result)
   | Plan.Op_except { left; right } ->
-    let* ls = to_stream clock params store left  in
-    let* rs = to_stream clock params store right in
+    let* ls = to_stream clock params store ~mode ~cat left  in
+    let* rs = to_stream clock params store ~mode ~cat right in
     let* right_list = Lwt_stream.to_list rs in
     let right_set = Hashtbl.create (max 1 (List.length right_list)) in
     List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
@@ -1850,13 +1856,18 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     (match cat with
      | None -> failwith "Exec.query: RETURNING requires catalog context"
      | Some c ->
-       (* Evaluate the row values locally (for RETURNING projection after insert). *)
+       (* Evaluate the row values locally first (for RETURNING projection),
+          then pass the pre-built row to execute_insert so it is NOT
+          evaluated a second time inside (fixes C1 double-eval). *)
        let n = List.length table_meta.columns in
        let inserted_row = Array.make n Row.V_null in
        List.iter2 (fun ord e ->
          inserted_row.(ord) <- eval_expr clock params [||] e
        ) ordinals values;
-       let* inserted = execute_insert ~on_conflict store c ~table_meta ~ordinals ~values in
+       let* inserted =
+         execute_insert ~mode ~clock ~on_conflict ~prebuilt_row:(Some inserted_row)
+           store c ~table_meta ~ordinals ~values
+       in
        if not inserted then Lwt.return (Lwt_stream.of_list [])
        else
          let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
@@ -1894,7 +1905,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       Array.of_list (List.map (eval_expr clock params new_row) returning)
     ) matched in
     (* Execute the actual update. *)
-    let* _ = execute_update ~params ~clock store ~table_meta ~assignments ~where ~indexes in
+    let* _ = execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_delete { table_meta; where; indexes; returning }
     when returning <> [] ->
@@ -1923,7 +1934,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     let result_rows = List.map (fun old_row ->
       Array.of_list (List.map (eval_expr clock params old_row) returning)
     ) matched in
-    let* _ = execute_delete ~params ~clock store ~table_meta ~where ~indexes in
+    let* _ = execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
@@ -1938,6 +1949,6 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
-let query ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) :
+let query ?(mode = Auto) ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) :
     Row.t Lwt_stream.t Lwt.t =
-  to_stream clock params store ~cat:(Some cat) op
+  to_stream clock params store ~mode ~cat:(Some cat) op
