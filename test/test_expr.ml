@@ -683,6 +683,19 @@ let test_in_null () =
                   [Plan.P_lit (Ast.L_int 1L)])) in
   Alcotest.(check bool) "in null subject" true (v = Row.V_null)
 
+let test_in_null_in_list () =
+  let row = [||] in
+  (* x NOT IN (NULL, 2) when x=5: should be NULL because list has NULL *)
+  let v_in = Exec.eval_expr [||] row
+      (Plan.P_in (Plan.P_lit (Ast.L_int 5L),
+                  [Plan.P_lit Ast.L_null; Plan.P_lit (Ast.L_int 2L)])) in
+  Alcotest.(check bool) "in with null in list" true (v_in = Row.V_null);
+  (* x IN (NULL, 5) when x=5: found → 1 (NULL doesn't block a definite match) *)
+  let v_in2 = Exec.eval_expr [||] row
+      (Plan.P_in (Plan.P_lit (Ast.L_int 5L),
+                  [Plan.P_lit Ast.L_null; Plan.P_lit (Ast.L_int 5L)])) in
+  Alcotest.(check int64) "in with null and match" 1L (match v_in2 with Row.V_int n -> n | _ -> -1L)
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -783,8 +796,9 @@ let () =
       Alcotest.test_case "glob_match" `Quick test_glob_match;
     ];
     "between_in", [
-      Alcotest.test_case "between"  `Quick test_between;
-      Alcotest.test_case "in"       `Quick test_in;
-      Alcotest.test_case "in_null"  `Quick test_in_null;
+      Alcotest.test_case "between"          `Quick test_between;
+      Alcotest.test_case "in"               `Quick test_in;
+      Alcotest.test_case "in_null"          `Quick test_in_null;
+      Alcotest.test_case "in_null_in_list"  `Quick test_in_null_in_list;
     ];
   ]

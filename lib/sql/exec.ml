@@ -108,11 +108,18 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
     let vx = eval_expr params row x in
     if vx = Row.V_null then Row.V_null
     else
-      let found = List.exists (fun ve ->
+      let result = List.fold_left (fun acc ve ->
         let v = eval_expr params row ve in
-        v <> Row.V_null && compare_values vx v = 0
-      ) vals in
-      Row.V_int (if found then 1L else 0L)
+        match acc with
+        | `Found -> `Found
+        | _ when v = Row.V_null -> `Maybe
+        | _ when compare_values vx v = 0 -> `Found
+        | acc -> acc
+      ) `Not_found vals in
+      (match result with
+       | `Found     -> Row.V_int 1L
+       | `Maybe     -> Row.V_null
+       | `Not_found -> Row.V_int 0L)
   | Plan.P_is_null e ->
     (match eval_expr params row e with
      | Row.V_null -> Row.V_int 1L
