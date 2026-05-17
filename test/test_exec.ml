@@ -850,6 +850,60 @@ let execute_limit_raises () =
     Lwt.return_unit
   )
 
+(** Op_union passed to execute raises — hits line 1252 of execute_with_count. *)
+let execute_union_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let child = Plan.Op_seq_scan { table_meta = m } in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_union { all = false; left = child; right = child }));
+       Alcotest.fail "expected Failure for Op_union in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(** Op_distinct passed to execute raises — hits line 1259 of execute_with_count. *)
+let execute_distinct_raises () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [int_col "x"] }) in
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    (try
+       ignore (Exec.execute store cat
+         (Plan.Op_distinct { child = Plan.Op_seq_scan { table_meta = m } }));
+       Alcotest.fail "expected Failure for Op_distinct in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(** Op_begin passed to execute raises in the query path — hits line 1249. *)
+let query_begin_raises () =
+  let store, cat = setup () in
+  run (
+    (try
+       ignore (Exec.execute store cat Plan.Op_begin);
+       Alcotest.fail "expected Failure for Op_begin in execute"
+     with Failure _ -> ());
+    Lwt.return_unit
+  )
+
+(** Op_pragma_rows passed to execute_with_count → returns 0 (line 1251). *)
+let execute_with_count_pragma_returns_zero () =
+  let store, cat = setup () in
+  run (
+    let* n = Exec.execute_with_count store cat
+        (Plan.Op_pragma_rows { rows = [ [| Row.V_text "foo" |] ] }) in
+    Alcotest.(check int) "pragma execute_with_count is 0" 0 n;
+    Lwt.return_unit
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Group 9: Op_create_index (via execute)                               *)
 (* ------------------------------------------------------------------ *)
@@ -1934,6 +1988,67 @@ let query_hash_join_raises_in_execute () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Group N: Op_distinct with V_blob — exercises row_key V_blob arm      *)
+(* ------------------------------------------------------------------ *)
+
+let query_distinct_blob () =
+  let blob_col name : Row.column =
+    { name; ty = Row.Blob; not_null = false; primary_key = false; default = None }
+  in
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = [blob_col "b"] }) in
+    (* Two identical blob values and one distinct one. *)
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
+    insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_distinct {
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    (* DISTINCT should collapse two "AA" blobs into one. *)
+    Alcotest.(check int) "distinct blob: 2 rows" 2 (List.length rows);
+    Lwt.return_unit
+  )
+
+(** Multi-key Op_sort — exercises the fold_left second-key path. *)
+let query_multikey_sort () =
+  let store, cat = setup () in
+  run (
+    let* () = Exec.execute store cat
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+    (* Four rows with id=1 or id=2; name used as tiebreaker. *)
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "c"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
+    insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "b"]);
+    let* meta_opt = Cat.find_table cat ~name:"t" in
+    let m = Option.get meta_opt in
+    let op = Plan.Op_sort {
+      keys = [(Plan.P_col 0, `Asc); (Plan.P_col 1, `Asc)];
+      child = Plan.Op_seq_scan { table_meta = m };
+    } in
+    let* stream = Exec.query store cat op in
+    let rows = collect stream in
+    Alcotest.(check int) "multikey sort: 4 rows" 4 (List.length rows);
+    (* First three rows should all have id=1 (sorted a,b,c), last is id=2. *)
+    (match (List.nth rows 0).(1) with
+     | Row.V_text "a" -> ()
+     | _ -> Alcotest.fail "expected 'a' first after multikey sort");
+    (match (List.nth rows 1).(1) with
+     | Row.V_text "b" -> ()
+     | _ -> Alcotest.fail "expected 'b' second after multikey sort");
+    (match (List.nth rows 2).(1) with
+     | Row.V_text "c" -> ()
+     | _ -> Alcotest.fail "expected 'c' third after multikey sort");
+    Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1981,6 +2096,10 @@ let () =
       Alcotest.test_case "query_insert_raises"     `Quick query_insert_raises;
       Alcotest.test_case "execute_sort_raises"     `Quick execute_sort_raises;
       Alcotest.test_case "execute_limit_raises"    `Quick execute_limit_raises;
+      Alcotest.test_case "execute_union_raises"    `Quick execute_union_raises;
+      Alcotest.test_case "execute_distinct_raises" `Quick execute_distinct_raises;
+      Alcotest.test_case "query_begin_raises"      `Quick query_begin_raises;
+      Alcotest.test_case "execute_with_count_pragma_zero" `Quick execute_with_count_pragma_returns_zero;
     ];
     "sort", [
       Alcotest.test_case "query_sort_asc"       `Quick query_sort_asc;
@@ -2039,6 +2158,10 @@ let () =
       Alcotest.test_case "query_hash_join_null_key"        `Quick query_hash_join_null_key_excluded;
       Alcotest.test_case "query_nlj_raises_in_execute"     `Quick query_nlj_raises_in_execute;
       Alcotest.test_case "query_hash_join_raises_in_execute" `Quick query_hash_join_raises_in_execute;
+    ];
+    "distinct_and_multikey_sort", [
+      Alcotest.test_case "query_distinct_blob"   `Quick query_distinct_blob;
+      Alcotest.test_case "query_multikey_sort"   `Quick query_multikey_sort;
     ];
     "aggregate", [
       Alcotest.test_case "query_aggregate_count_star"          `Quick query_aggregate_count_star;

@@ -697,6 +697,129 @@ let test_in_null_in_list () =
   Alcotest.(check int64) "in with null and match" 1L (match v_in2 with Row.V_int n -> n | _ -> -1L)
 
 (* ------------------------------------------------------------------ *)
+(* Group N: Additional binop coverage for uncovered exec.ml branches    *)
+(* ------------------------------------------------------------------ *)
+
+(** AND with null — one side is null, other is true → V_null (exec.ml line 364). *)
+let eval_and_null_true () =
+  let row = [| Row.V_null; Row.V_int 1L |] in
+  let e = Plan.P_binop (Plan.And, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL AND 1 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** OR with null — one side is null, other is false → V_null (exec.ml line 370). *)
+let eval_or_null_false () =
+  let row = [| Row.V_null; Row.V_int 0L |] in
+  let e = Plan.P_binop (Plan.Or, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL OR 0 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Concat text || int (exec.ml line 403). *)
+let eval_concat_text_int () =
+  let row = [| Row.V_text "x"; Row.V_int 5L |] in
+  let e = Plan.P_binop (Plan.Concat, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "'x' || 5 → V_text 'x5'"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_text "x5"))
+
+(** Concat int || text (exec.ml line 404). *)
+let eval_concat_int_text () =
+  let row = [| Row.V_int 5L; Row.V_text "x" |] in
+  let e = Plan.P_binop (Plan.Concat, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "5 || 'x' → V_text '5x'"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_text "5x"))
+
+(** Concat int || int (exec.ml line 405). *)
+let eval_concat_int_int () =
+  let row = [| Row.V_int 1L; Row.V_int 2L |] in
+  let e = Plan.P_binop (Plan.Concat, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "1 || 2 → V_text '12'"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_text "12"))
+
+(** Mod with real/real — exec.ml line 412-413. *)
+let eval_mod_real_real () =
+  let row = [| Row.V_real 5.5; Row.V_real 2.0 |] in
+  let e = Plan.P_binop (Plan.Mod, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "5.5 % 2.0 → V_real 1.5"
+    true (match Exec.eval_expr None [||] row e with Row.V_real f -> abs_float (f -. 1.5) < 1e-9 | _ -> false)
+
+(** Mod with int/real — exec.ml line 414-415. *)
+let eval_mod_int_real () =
+  let row = [| Row.V_int 7L; Row.V_real 3.0 |] in
+  let e = Plan.P_binop (Plan.Mod, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "7 % 3.0 → V_real 1.0"
+    true (match Exec.eval_expr None [||] row e with Row.V_real f -> abs_float (f -. 1.0) < 1e-9 | _ -> false)
+
+(** Mod with real/int — exec.ml line 416-417. *)
+let eval_mod_real_int () =
+  let row = [| Row.V_real 7.0; Row.V_int 3L |] in
+  let e = Plan.P_binop (Plan.Mod, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "7.0 % 3 → V_real 1.0"
+    true (match Exec.eval_expr None [||] row e with Row.V_real f -> abs_float (f -. 1.0) < 1e-9 | _ -> false)
+
+(** Bit_and with null (exec.ml line 421). *)
+let eval_bit_and_null () =
+  let row = [| Row.V_null; Row.V_int 5L |] in
+  let e = Plan.P_binop (Plan.Bit_and, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL & 5 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Bit_or with null (exec.ml line 426). *)
+let eval_bit_or_null () =
+  let row = [| Row.V_null; Row.V_int 5L |] in
+  let e = Plan.P_binop (Plan.Bit_or, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL | 5 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Lshift with null (exec.ml line 431). *)
+let eval_lshift_null () =
+  let row = [| Row.V_null; Row.V_int 2L |] in
+  let e = Plan.P_binop (Plan.Lshift, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL << 2 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Lshift with large shift (>= 64) → 0 (exec.ml line 434). *)
+let eval_lshift_overflow () =
+  let row = [| Row.V_int 1L; Row.V_int 64L |] in
+  let e = Plan.P_binop (Plan.Lshift, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "1 << 64 → 0"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
+
+(** Rshift with null (exec.ml line 438). *)
+let eval_rshift_null () =
+  let row = [| Row.V_null; Row.V_int 2L |] in
+  let e = Plan.P_binop (Plan.Rshift, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "NULL >> 2 → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Rshift with large shift (>= 64) → 0 (exec.ml line 441). *)
+let eval_rshift_overflow () =
+  let row = [| Row.V_int 1L; Row.V_int 65L |] in
+  let e = Plan.P_binop (Plan.Rshift, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "1 >> 65 → 0"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
+
+(** LIKE with non-text args → V_null (exec.ml line 448). *)
+let eval_like_non_text () =
+  let row = [| Row.V_int 5L; Row.V_text "%" |] in
+  let e = Plan.P_binop (Plan.Like, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "5 LIKE '%' → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** GLOB with non-text args → V_null (exec.ml line 454). *)
+let eval_glob_non_text () =
+  let row = [| Row.V_int 5L; Row.V_text "*" |] in
+  let e = Plan.P_binop (Plan.Glob, Plan.P_col 0, Plan.P_col 1) in
+  Alcotest.(check bool) "5 GLOB '*' → V_null"
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
+
+(** Abs with int literal — exercises exec.ml line 237. *)
+let eval_abs_int () =
+  let row = [||] in
+  let e = Plan.P_func (Ast.Fn_abs, [Plan.P_lit (Ast.L_int (-5L))]) in
+  Alcotest.(check bool) "ABS(-5) → V_int 5"
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 5L))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -788,6 +911,23 @@ let () =
       Alcotest.test_case "rshift"          `Quick test_rshift;
       Alcotest.test_case "rshift_negative" `Quick test_rshift_negative;
       Alcotest.test_case "bitnot"          `Quick test_bitnot;
+      Alcotest.test_case "and_null_true"   `Quick eval_and_null_true;
+      Alcotest.test_case "or_null_false"   `Quick eval_or_null_false;
+      Alcotest.test_case "concat_text_int" `Quick eval_concat_text_int;
+      Alcotest.test_case "concat_int_text" `Quick eval_concat_int_text;
+      Alcotest.test_case "concat_int_int"  `Quick eval_concat_int_int;
+      Alcotest.test_case "mod_real_real"   `Quick eval_mod_real_real;
+      Alcotest.test_case "mod_int_real"    `Quick eval_mod_int_real;
+      Alcotest.test_case "mod_real_int"    `Quick eval_mod_real_int;
+      Alcotest.test_case "bit_and_null"    `Quick eval_bit_and_null;
+      Alcotest.test_case "bit_or_null"     `Quick eval_bit_or_null;
+      Alcotest.test_case "lshift_null"     `Quick eval_lshift_null;
+      Alcotest.test_case "lshift_overflow" `Quick eval_lshift_overflow;
+      Alcotest.test_case "rshift_null"     `Quick eval_rshift_null;
+      Alcotest.test_case "rshift_overflow" `Quick eval_rshift_overflow;
+      Alcotest.test_case "like_non_text"   `Quick eval_like_non_text;
+      Alcotest.test_case "glob_non_text"   `Quick eval_glob_non_text;
+      Alcotest.test_case "abs_int"         `Quick eval_abs_int;
     ];
     "like_glob", [
       Alcotest.test_case "like_match" `Quick test_like_match;

@@ -1681,6 +1681,349 @@ let test_date_now () =
        Lwt.return_unit))
 
 (* ------------------------------------------------------------------ *)
+(* Phase 7: multi-key ORDER BY                                          *)
+(* ------------------------------------------------------------------ *)
+
+(** First key equal, second key (ASC) breaks the tie. *)
+let test_multikey_order_by () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER, y INTEGER)";
+  exec db "INSERT INTO t VALUES (1, 3)";
+  exec db "INSERT INTO t VALUES (1, 1)";
+  exec db "INSERT INTO t VALUES (2, 2)";
+  exec db "INSERT INTO t VALUES (1, 2)";
+  let rows = query_ok db "SELECT x, y FROM t ORDER BY x ASC, y ASC" in
+  Alcotest.(check int) "multikey: 4 rows" 4 (List.length rows);
+  let pairs = List.map (fun r -> r.(0), r.(1)) rows in
+  Alcotest.check (Alcotest.list (Alcotest.pair value_testable value_testable))
+    "multikey order asc asc"
+    [ Db.V_int 1L, Db.V_int 1L
+    ; Db.V_int 1L, Db.V_int 2L
+    ; Db.V_int 1L, Db.V_int 3L
+    ; Db.V_int 2L, Db.V_int 2L ] pairs
+
+(** First key equal, second key DESC breaks the tie. *)
+let test_multikey_order_by_mixed () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER, y INTEGER)";
+  exec db "INSERT INTO t VALUES (1, 1)";
+  exec db "INSERT INTO t VALUES (1, 3)";
+  exec db "INSERT INTO t VALUES (1, 2)";
+  let rows = query_ok db "SELECT x, y FROM t ORDER BY x ASC, y DESC" in
+  Alcotest.(check int) "multikey mixed: 3 rows" 3 (List.length rows);
+  let ys = List.map (fun r -> r.(1)) rows in
+  Alcotest.check (Alcotest.list value_testable) "multikey asc desc"
+    [Db.V_int 3L; Db.V_int 2L; Db.V_int 1L] ys
+
+(* ------------------------------------------------------------------ *)
+(* Phase 7: DISTINCT with V_real and V_blob (row_key coverage)          *)
+(* ------------------------------------------------------------------ *)
+
+(** DISTINCT on REAL column — exercises V_real arm in row_key. *)
+let test_distinct_real () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x REAL)";
+  exec db "INSERT INTO t VALUES (1.5)";
+  exec db "INSERT INTO t VALUES (1.5)";
+  exec db "INSERT INTO t VALUES (2.5)";
+  let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
+  Alcotest.(check int) "distinct real: 2 rows" 2 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "distinct real values"
+    [Db.V_real 1.5; Db.V_real 2.5] xs
+
+(* ------------------------------------------------------------------ *)
+(* Phase 7: INTERSECT / EXCEPT edge cases                               *)
+(* ------------------------------------------------------------------ *)
+
+(** INTERSECT where right side is empty → empty result. *)
+let test_intersect_empty_right () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  (* b is empty *)
+  let rows = query_ok db "SELECT x FROM a INTERSECT SELECT x FROM b" in
+  Alcotest.(check int) "intersect empty right: 0 rows" 0 (List.length rows)
+
+(** EXCEPT deduplication: left has duplicate 1s not in right → only one appears. *)
+let test_except_dedup_left () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (3)";
+  (* EXCEPT: both 1s from a are NOT in b, but DISTINCT → only one 1; 2 is also kept *)
+  let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
+  Alcotest.(check int) "except dedup: 2 rows" 2 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "except dedup values"
+    [Db.V_int 1L; Db.V_int 2L] xs
+
+(** EXCEPT where right side is empty → all left rows retained. *)
+let test_except_empty_right () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  (* b is empty: all a rows should appear *)
+  let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
+  Alcotest.(check int) "except empty right: 2 rows" 2 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "except empty right values"
+    [Db.V_int 1L; Db.V_int 2L] xs
+
+(* ------------------------------------------------------------------ *)
+(* Phase 7: datetime eval_func error / fallback branches                *)
+(* ------------------------------------------------------------------ *)
+
+(** DATE with invalid time string → NULL (Error _ branch). *)
+let test_date_invalid_input () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE('not-a-date') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for invalid date string")
+
+(** DATE with a non-text arg (integer literal) → NULL (_ -> V_null branch). *)
+let test_date_nontext_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE(42) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for integer DATE arg")
+
+(** DATE with a modifier (rest <> [] branch) → NULL. *)
+let test_date_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE('2024-01-15', '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when modifier present")
+
+(** TIME with invalid string → NULL (Error _ branch). *)
+let test_time_invalid_input () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME('bad-time') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for invalid time string")
+
+(** TIME with non-text arg → NULL. *)
+let test_time_nontext_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME(0) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for integer TIME arg")
+
+(** TIME with modifier → NULL. *)
+let test_time_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME('12:00:00', '+1 hour') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when TIME modifier present")
+
+(** DATETIME with invalid string → NULL (Error _ branch). *)
+let test_datetime_invalid_input () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME('bogus') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for invalid datetime string")
+
+(** DATETIME with non-text arg → NULL. *)
+let test_datetime_nontext_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME(1) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for integer DATETIME arg")
+
+(** DATETIME with modifier → NULL. *)
+let test_datetime_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME('2024-01-15', '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when DATETIME modifier present")
+
+(** JULIANDAY with invalid string → NULL (Error _ branch). *)
+let test_julianday_invalid () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY('bad') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for invalid julianday string")
+
+(** JULIANDAY with non-text arg → NULL. *)
+let test_julianday_nontext_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY(42) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for integer JULIANDAY arg")
+
+(** JULIANDAY with modifier → NULL. *)
+let test_julianday_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY('2000-01-01', 'start of month') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when JULIANDAY modifier present")
+
+(** UNIXEPOCH with invalid string → NULL (Error _ branch). *)
+let test_unixepoch_invalid () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH('bad') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for invalid unixepoch string")
+
+(** UNIXEPOCH with non-text arg → NULL. *)
+let test_unixepoch_nontext_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH(0) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for integer UNIXEPOCH arg")
+
+(** UNIXEPOCH with modifier → NULL. *)
+let test_unixepoch_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH('1970-01-01', '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when UNIXEPOCH modifier present")
+
+(** STRFTIME where fmt is not text (NULL) → NULL (_ -> V_null fallthrough). *)
+let test_strftime_null_fmt () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT STRFTIME(NULL, '2024-01-15') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when STRFTIME fmt is NULL")
+
+(** STRFTIME with invalid datetime string → NULL (Error _ branch). *)
+let test_strftime_invalid_ts () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT STRFTIME('%Y', 'bad-date') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when STRFTIME ts is invalid")
+
+(** STRFTIME with modifier → NULL (rest <> [] branch). *)
+let test_strftime_with_modifier () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT STRFTIME('%Y', '2024-01-15', '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL when STRFTIME has modifier")
+
+(* ------------------------------------------------------------------ *)
+(* Phase 7: datetime NULL-arg branches ([V_null] and V_null :: _)       *)
+(* ------------------------------------------------------------------ *)
+
+(** DATE(NULL) → NULL via the [V_null] single-arg branch. *)
+let test_date_null_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE(NULL) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for DATE(NULL)")
+
+(** DATE(NULL, 'x') → NULL via the V_null :: _ branch. *)
+let test_date_null_with_rest () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE(NULL, '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for DATE(NULL, modifier)")
+
+(** TIME(NULL) → NULL via the [V_null] single-arg branch. *)
+let test_time_null_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME(NULL) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for TIME(NULL)")
+
+(** TIME(NULL, 'x') → NULL via the V_null :: _ branch. *)
+let test_time_null_with_rest () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME(NULL, '+1 hour') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for TIME(NULL, modifier)")
+
+(** DATETIME(NULL) → NULL via the [V_null] single-arg branch. *)
+let test_datetime_null_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME(NULL) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for DATETIME(NULL)")
+
+(** DATETIME(NULL, 'x') → NULL via the V_null :: _ branch. *)
+let test_datetime_null_with_rest () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME(NULL, '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for DATETIME(NULL, modifier)")
+
+(** JULIANDAY(NULL) → NULL via the [V_null] single-arg branch. *)
+let test_julianday_null_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY(NULL) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL)")
+
+(** JULIANDAY(NULL, 'x') → NULL via the V_null :: _ branch. *)
+let test_julianday_null_with_rest () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY(NULL, 'start of month') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL, modifier)")
+
+(** UNIXEPOCH(NULL) → NULL via the [V_null] single-arg branch. *)
+let test_unixepoch_null_arg () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH(NULL) FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL)")
+
+(** UNIXEPOCH(NULL, 'x') → NULL via the V_null :: _ branch. *)
+let test_unixepoch_null_with_rest () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH(NULL, '+1 day') FROM _d" in
+  (match rows with
+   | [[| Db.V_null |]] -> ()
+   | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL, modifier)")
+
+(* ------------------------------------------------------------------ *)
+(* Phase 7: row_key V_blob coverage via DISTINCT on BLOB column         *)
+(* ------------------------------------------------------------------ *)
+
+(** DISTINCT on BLOB column with NULL values — exercises V_blob and V_null
+    arms in row_key via two NULL blobs (deduplicated to one). *)
+let test_distinct_blob_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x BLOB)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  let rows = query_ok db "SELECT DISTINCT x FROM t" in
+  Alcotest.(check int) "distinct blob null: 1 row" 1 (List.length rows)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1852,5 +2195,52 @@ let () =
       Alcotest.test_case "unixepoch_fn" `Quick test_unixepoch_fn;
       Alcotest.test_case "strftime_fn"  `Quick test_strftime_fn;
       Alcotest.test_case "date_now"     `Quick test_date_now;
+    ];
+    "multikey_order_by", [
+      Alcotest.test_case "multikey_asc_asc"   `Quick test_multikey_order_by;
+      Alcotest.test_case "multikey_asc_desc"  `Quick test_multikey_order_by_mixed;
+    ];
+    "distinct_types", [
+      Alcotest.test_case "distinct_real"  `Quick test_distinct_real;
+    ];
+    "set_op_edge_cases", [
+      Alcotest.test_case "intersect_empty_right"  `Quick test_intersect_empty_right;
+      Alcotest.test_case "except_dedup_left"      `Quick test_except_dedup_left;
+      Alcotest.test_case "except_empty_right"     `Quick test_except_empty_right;
+    ];
+    "datetime_null_branches", [
+      Alcotest.test_case "date_invalid_input"      `Quick test_date_invalid_input;
+      Alcotest.test_case "date_nontext_arg"        `Quick test_date_nontext_arg;
+      Alcotest.test_case "date_with_modifier"      `Quick test_date_with_modifier;
+      Alcotest.test_case "time_invalid_input"      `Quick test_time_invalid_input;
+      Alcotest.test_case "time_nontext_arg"        `Quick test_time_nontext_arg;
+      Alcotest.test_case "time_with_modifier"      `Quick test_time_with_modifier;
+      Alcotest.test_case "datetime_invalid_input"  `Quick test_datetime_invalid_input;
+      Alcotest.test_case "datetime_nontext_arg"    `Quick test_datetime_nontext_arg;
+      Alcotest.test_case "datetime_with_modifier"  `Quick test_datetime_with_modifier;
+      Alcotest.test_case "julianday_invalid"       `Quick test_julianday_invalid;
+      Alcotest.test_case "julianday_nontext_arg"   `Quick test_julianday_nontext_arg;
+      Alcotest.test_case "julianday_with_modifier" `Quick test_julianday_with_modifier;
+      Alcotest.test_case "unixepoch_invalid"       `Quick test_unixepoch_invalid;
+      Alcotest.test_case "unixepoch_nontext_arg"   `Quick test_unixepoch_nontext_arg;
+      Alcotest.test_case "unixepoch_with_modifier" `Quick test_unixepoch_with_modifier;
+      Alcotest.test_case "strftime_null_fmt"       `Quick test_strftime_null_fmt;
+      Alcotest.test_case "strftime_invalid_ts"     `Quick test_strftime_invalid_ts;
+      Alcotest.test_case "strftime_with_modifier"  `Quick test_strftime_with_modifier;
+    ];
+    "datetime_null_arg_branches", [
+      Alcotest.test_case "date_null_arg"           `Quick test_date_null_arg;
+      Alcotest.test_case "date_null_with_rest"     `Quick test_date_null_with_rest;
+      Alcotest.test_case "time_null_arg"           `Quick test_time_null_arg;
+      Alcotest.test_case "time_null_with_rest"     `Quick test_time_null_with_rest;
+      Alcotest.test_case "datetime_null_arg"       `Quick test_datetime_null_arg;
+      Alcotest.test_case "datetime_null_with_rest" `Quick test_datetime_null_with_rest;
+      Alcotest.test_case "julianday_null_arg"      `Quick test_julianday_null_arg;
+      Alcotest.test_case "julianday_null_with_rest" `Quick test_julianday_null_with_rest;
+      Alcotest.test_case "unixepoch_null_arg"      `Quick test_unixepoch_null_arg;
+      Alcotest.test_case "unixepoch_null_with_rest" `Quick test_unixepoch_null_with_rest;
+    ];
+    "distinct_blob", [
+      Alcotest.test_case "distinct_blob_null"  `Quick test_distinct_blob_null;
     ];
   ]
