@@ -29,6 +29,7 @@
 %token VIRTUAL USING FTS5
 %token MATCH
 %token PRAGMA
+%token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
 %token BETWEEN IN
 %token QUESTION
@@ -65,7 +66,7 @@ stmt:
   | s = create_fts_table  { s }
   | s = create_index      { s }
   | s = insert            { s }
-  | s = select            { s }
+  | s = compound_select   { s }
   | s = update            { s }
   | s = delete            { s }
   | s = drop_table        { s }
@@ -162,6 +163,17 @@ insert_expr:
   | MINUS n = INT_LIT      { E_lit (L_int (Int64.neg n)) }
   | MINUS f = FLOAT_LIT    { E_lit (L_real (-. f)) }
   | QUESTION               { E_param 0 }
+
+compound_select:
+  | s = select  { s }
+  | left = compound_select UNION ALL right = select
+    { S_compound { op = Union_all; left; right } }
+  | left = compound_select UNION right = select
+    { S_compound { op = Union; left; right } }
+  | left = compound_select INTERSECT right = select
+    { S_compound { op = Intersect; left; right } }
+  | left = compound_select EXCEPT right = select
+    { S_compound { op = Except; left; right } }
 
 select:
   | SELECT distinct = boption(DISTINCT) proj = projection FROM table = IDENT

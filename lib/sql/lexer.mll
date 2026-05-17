@@ -23,7 +23,11 @@ rule token = parse
   | "NULL"     { NULL }
   | "PRIMARY"  { PRIMARY }
   | "KEY"      { KEY }
+  | "ALL"       { ALL }
   | "AND"      { AND }
+  | "EXCEPT"    { EXCEPT }
+  | "INTERSECT" { INTERSECT }
+  | "UNION"     { UNION }
   | "OR"       { OR }
   | "IS"       { IS }
   | "REAL"     { REAL_TY }

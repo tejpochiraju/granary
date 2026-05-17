@@ -1473,6 +1473,87 @@ let test_distinct_null () =
     [Db.V_null; Db.V_int 1L] xs
 
 (* ------------------------------------------------------------------ *)
+(* UNION / INTERSECT / EXCEPT                                           *)
+(* ------------------------------------------------------------------ *)
+
+let sort_rows rows =
+  List.sort (fun a b ->
+    let cmp_val x y = match x, y with
+      | Db.V_int  x, Db.V_int  y -> Int64.compare x y
+      | Db.V_text x, Db.V_text y -> String.compare x y
+      | Db.V_null,   Db.V_null   -> 0
+      | Db.V_null,   _           -> -1
+      | _,           Db.V_null   -> 1
+      | Db.V_real x, Db.V_real y -> Float.compare x y
+      | _,           _           -> 0
+    in
+    let len = min (Array.length a) (Array.length b) in
+    let rec go i =
+      if i >= len then 0
+      else let c = cmp_val a.(i) b.(i) in
+           if c <> 0 then c else go (i+1)
+    in
+    go 0
+  ) rows
+
+let test_union () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (2)";
+  exec db "INSERT INTO b VALUES (3)";
+  let rows = sort_rows (query_ok db "SELECT x FROM a UNION SELECT x FROM b") in
+  Alcotest.(check int) "union deduplicates: 3 rows" 3 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "union values"
+    [Db.V_int 1L; Db.V_int 2L; Db.V_int 3L] xs
+
+let test_union_all () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (2)";
+  exec db "INSERT INTO b VALUES (3)";
+  let rows = sort_rows (query_ok db "SELECT x FROM a UNION ALL SELECT x FROM b") in
+  Alcotest.(check int) "union all keeps duplicates: 4 rows" 4 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "union all values"
+    [Db.V_int 1L; Db.V_int 2L; Db.V_int 2L; Db.V_int 3L] xs
+
+let test_intersect () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (2)";
+  exec db "INSERT INTO b VALUES (3)";
+  let rows = sort_rows (query_ok db "SELECT x FROM a INTERSECT SELECT x FROM b") in
+  Alcotest.(check int) "intersect: 1 row" 1 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "intersect values"
+    [Db.V_int 2L] xs
+
+let test_except () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (x INTEGER)";
+  exec db "CREATE TABLE b (x INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (2)";
+  let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
+  Alcotest.(check int) "except: 1 row" 1 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "except values"
+    [Db.V_int 1L] xs
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1625,5 +1706,11 @@ let () =
       Alcotest.test_case "distinct_single_col"   `Quick test_distinct;
       Alcotest.test_case "distinct_multicolumn"  `Quick test_distinct_multicolumn;
       Alcotest.test_case "distinct_null"         `Quick test_distinct_null;
+    ];
+    "set_operations", [
+      Alcotest.test_case "union"      `Quick test_union;
+      Alcotest.test_case "union_all"  `Quick test_union_all;
+      Alcotest.test_case "intersect"  `Quick test_intersect;
+      Alcotest.test_case "except"     `Quick test_except;
     ];
   ]

@@ -123,6 +123,11 @@ type bound_stmt =
   | BS_pragma of {
       kind : Ast.pragma_kind;
     }
+  | BS_compound of {
+      op    : Ast.set_op;
+      left  : bound_stmt;
+      right : bound_stmt;
+    }
 
 type error =
   | Unknown_table       of string
@@ -1399,7 +1404,7 @@ let pp_error fmt = function
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
-let bind cat stmt =
+let rec bind cat stmt =
   let param_counter = ref 0 in
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
@@ -1427,3 +1432,10 @@ let bind cat stmt =
      | None, None ->
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
+  | Ast.S_compound { op; left; right } ->
+    let* left_r  = bind cat left  in
+    let* right_r = bind cat right in
+    (match left_r, right_r with
+     | Ok l, Ok r   -> Lwt.return (Ok (BS_compound { op; left = l; right = r }))
+     | Error e, _
+     | _, Error e   -> Lwt.return (Error e))

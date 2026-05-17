@@ -1183,6 +1183,8 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
+  | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _ ->
+    failwith "set operations are read-only"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
@@ -1692,6 +1694,51 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
+  | Plan.Op_union { all; left; right } ->
+    let* ls = to_stream params store left  in
+    let* rs = to_stream params store right in
+    let combined = Lwt_stream.append ls rs in
+    if all then Lwt.return combined
+    else begin
+      let* rows = Lwt_stream.to_list combined in
+      let seen = Hashtbl.create 64 in
+      let deduped = List.filter (fun row ->
+        let k = row_key row in
+        if Hashtbl.mem seen k then false
+        else (Hashtbl.replace seen k (); true)
+      ) rows in
+      Lwt.return (Lwt_stream.of_list deduped)
+    end
+  | Plan.Op_intersect { left; right } ->
+    let* ls = to_stream params store left  in
+    let* rs = to_stream params store right in
+    let* right_list = Lwt_stream.to_list rs in
+    let right_set = Hashtbl.create (max 1 (List.length right_list)) in
+    List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+    let* left_list = Lwt_stream.to_list ls in
+    (* INTERSECT deduplicates: each distinct left row that also appears in right *)
+    let seen = Hashtbl.create 64 in
+    let result = List.filter (fun row ->
+      let k = row_key row in
+      if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k then false
+      else (Hashtbl.replace seen k (); true)
+    ) left_list in
+    Lwt.return (Lwt_stream.of_list result)
+  | Plan.Op_except { left; right } ->
+    let* ls = to_stream params store left  in
+    let* rs = to_stream params store right in
+    let* right_list = Lwt_stream.to_list rs in
+    let right_set = Hashtbl.create (max 1 (List.length right_list)) in
+    List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+    let* left_list = Lwt_stream.to_list ls in
+    (* EXCEPT deduplicates: each distinct left row not in right *)
+    let seen = Hashtbl.create 64 in
+    let result = List.filter (fun row ->
+      let k = row_key row in
+      if Hashtbl.mem right_set k || Hashtbl.mem seen k then false
+      else (Hashtbl.replace seen k (); true)
+    ) left_list in
+    Lwt.return (Lwt_stream.of_list result)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _

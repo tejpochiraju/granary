@@ -228,7 +228,7 @@ let plan_select cat
     let off = Option.value ~default:0 offset in
     Plan.Op_limit { limit = n; offset = off; child = after_distinct }
 
-let plan ?cat = function
+let rec plan ?cat = function
   | Sema.BS_create_table { name; columns } ->
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
@@ -380,6 +380,14 @@ let plan ?cat = function
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank } ->
     Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank }
+  | Sema.BS_compound { op; left; right } ->
+    let l = plan ?cat left in
+    let r = plan ?cat right in
+    (match op with
+     | Ast.Union     -> Plan.Op_union     { all = false; left = l; right = r }
+     | Ast.Union_all -> Plan.Op_union     { all = true;  left = l; right = r }
+     | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
+     | Ast.Except    -> Plan.Op_except    { left = l; right = r })
   | Sema.BS_pragma { kind } ->
     let rows = match kind with
       | Ast.Pragma_table_info table_name ->

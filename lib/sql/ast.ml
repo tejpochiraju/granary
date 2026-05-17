@@ -64,6 +64,8 @@ type expr =
   | E_match       of string * string
     (** [E_match (table_name, query_string)]: [WHERE table MATCH 'query'] *)
 
+type set_op = Union | Union_all | Intersect | Except
+
 type column_def = {
   name        : string;
   ty          : ty;
@@ -140,6 +142,11 @@ type stmt =
   | S_begin
   | S_commit
   | S_rollback
+  | S_compound of {
+      op    : set_op;
+      left  : stmt;
+      right : stmt;
+    }
   | S_create_fts_table of {
       name    : string;
       columns : string list;

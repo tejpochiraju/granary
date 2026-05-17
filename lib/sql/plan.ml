@@ -156,6 +156,19 @@ type op =
   | Op_distinct of {
       child : op;
     }
+  | Op_union of {
+      all   : bool;
+      left  : op;
+      right : op;
+    }
+  | Op_intersect of {
+      left  : op;
+      right : op;
+    }
+  | Op_except of {
+      left  : op;
+      right : op;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

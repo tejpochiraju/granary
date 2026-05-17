@@ -151,6 +151,11 @@ type bound_stmt =
   | BS_pragma of {
       kind : Ast.pragma_kind;
     }
+  | BS_compound of {
+      op    : Ast.set_op;
+      left  : bound_stmt;
+      right : bound_stmt;
+    }
 
 type error =
   | Unknown_table       of string
