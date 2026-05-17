@@ -30,6 +30,7 @@
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
+%token CONCAT PERCENT AMPERSAND PIPE TILDE LSHIFT RSHIFT
 %token EOF
 
 %left OR
@@ -37,9 +38,13 @@
 %right NOT
 %nonassoc IS
 %left EQ NE LT LE GT GE
+%left CONCAT
+%left PIPE
+%left AMPERSAND
+%left LSHIFT RSHIFT
 %left PLUS MINUS
-%left STAR SLASH
-%nonassoc UMINUS
+%left STAR SLASH PERCENT
+%nonassoc TILDE UMINUS
 
 %start <Ast.stmt> stmt_eof
 
@@ -256,6 +261,13 @@ expr:
   | a = expr MINUS b = expr           { E_binop (Sub, a, b) }
   | a = expr STAR  b = expr           { E_binop (Mul, a, b) }
   | a = expr SLASH b = expr           { E_binop (Div, a, b) }
+  | a = expr CONCAT    b = expr       { E_binop (Concat, a, b) }
+  | a = expr PERCENT   b = expr       { E_binop (Mod, a, b) }
+  | a = expr AMPERSAND b = expr       { E_binop (Bit_and, a, b) }
+  | a = expr PIPE      b = expr       { E_binop (Bit_or, a, b) }
+  | a = expr LSHIFT    b = expr       { E_binop (Lshift, a, b) }
+  | a = expr RSHIFT    b = expr       { E_binop (Rshift, a, b) }
+  | TILDE e = expr %prec TILDE        { E_bitnot e }
   | MINUS e = expr %prec UMINUS       { E_neg e }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }

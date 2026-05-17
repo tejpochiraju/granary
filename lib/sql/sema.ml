@@ -3,6 +3,7 @@ module Row = Sqlocaml_encoding.Row
 module Cat = Sqlocaml_catalog.Catalog
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+           | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
 
 type bound_expr =
   | BE_lit         of Ast.literal
@@ -12,6 +13,7 @@ type bound_expr =
   | BE_is_null     of bound_expr
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
+  | BE_bitnot      of bound_expr
   | BE_func        of Ast.scalar_func * bound_expr list
   | BE_param       of int
   | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
@@ -172,6 +174,10 @@ let ast_binop_to_sema : Ast.binop -> binop = function
   | Ast.Add -> Add | Ast.Sub -> Sub
   | Ast.Mul -> Mul | Ast.Div -> Div
   | Ast.And -> And | Ast.Or  -> Or
+  | Ast.Concat  -> Concat
+  | Ast.Mod     -> Mod
+  | Ast.Bit_and -> Bit_and | Ast.Bit_or -> Bit_or
+  | Ast.Lshift  -> Lshift  | Ast.Rshift -> Rshift
 
 let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
@@ -205,6 +211,10 @@ let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
   | Ast.E_neg e ->
     (match bind_expr ~param_counter meta e with
      | Ok be   -> Ok (BE_neg be)
+     | Error e -> Error e)
+  | Ast.E_bitnot e ->
+    (match bind_expr ~param_counter meta e with
+     | Ok be   -> Ok (BE_bitnot be)
      | Error e -> Error e)
   | Ast.E_param _ ->
     let i = !param_counter in
@@ -284,6 +294,9 @@ let rec bind_expr_join
   | Ast.E_neg e ->
     (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
+  | Ast.E_bitnot e ->
+    (match bind_expr_join ~param_counter ~left_meta ~right_meta ~right_offset e with
+     | Ok be -> Ok (BE_bitnot be) | Error e -> Error e)
   | Ast.E_param _ ->
     let i = !param_counter in
     incr param_counter;
@@ -371,6 +384,8 @@ let bind_expr_agg
       (match go e with Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
     | Ast.E_neg e ->
       (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
+    | Ast.E_bitnot e ->
+      (match go e with Ok be -> Ok (BE_bitnot be) | Error e -> Error e)
     | Ast.E_param _ ->
       let i = !param_counter in
       incr param_counter;
@@ -428,7 +443,7 @@ let rec expr_has_agg = function
   | Ast.E_agg _ -> true
   | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e ->
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
     expr_has_agg e
   | Ast.E_func (_, args) -> List.exists expr_has_agg args
 
@@ -1097,6 +1112,9 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
     (match op with
      | Eq | Ne | Lt | Le | Gt | Ge | And | Or ->
        Some Row.Integer
+     | Bit_and | Bit_or | Lshift | Rshift | Mod ->
+       Some Row.Integer
+     | Concat -> Some Row.Text
      | Add | Sub | Mul | Div ->
        (match infer_type cols a, infer_type cols b with
         | Some Row.Integer, Some Row.Integer -> Some Row.Integer
@@ -1106,6 +1124,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
         | None,             Some Row.Integer -> None
         | _                                  -> None))
   | BE_neg e -> infer_type cols e
+  | BE_bitnot _ -> Some Row.Integer
   | BE_func _ -> None   (* scalar functions return dynamic types *)
   | BE_param _ -> None  (* parameter type unknown at compile time *)
   | BE_match _ -> Some Row.Integer  (* MATCH returns boolean (0/1) *)

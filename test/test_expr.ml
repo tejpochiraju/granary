@@ -569,6 +569,45 @@ let prop_arith_add =
       got = [start])
 
 (* ------------------------------------------------------------------ *)
+(* Group 9: Extended binary operators                                    *)
+(* ------------------------------------------------------------------ *)
+
+let test_concat () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Concat, Plan.P_lit (Ast.L_text "foo"), Plan.P_lit (Ast.L_text "bar"))) in
+  Alcotest.(check string) "concat" "foobar" (match v with Row.V_text s -> s | _ -> "?")
+
+let test_mod () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Mod, Plan.P_lit (Ast.L_int 7L), Plan.P_lit (Ast.L_int 3L))) in
+  Alcotest.(check int64) "mod" 1L (match v with Row.V_int n -> n | _ -> -1L)
+
+let test_bit_and () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Bit_and, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 3L))) in
+  Alcotest.(check int64) "bit_and" 1L (match v with Row.V_int n -> n | _ -> -1L)
+
+let test_bit_or () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Bit_or, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 2L))) in
+  Alcotest.(check int64) "bit_or" 7L (match v with Row.V_int n -> n | _ -> -1L)
+
+let test_lshift () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Lshift, Plan.P_lit (Ast.L_int 2L), Plan.P_lit (Ast.L_int 3L))) in
+  Alcotest.(check int64) "lshift" 16L (match v with Row.V_int n -> n | _ -> -1L)
+
+let test_rshift () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int 16L), Plan.P_lit (Ast.L_int 2L))) in
+  Alcotest.(check int64) "rshift" 4L (match v with Row.V_int n -> n | _ -> -1L)
+
+let test_bitnot () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_bitnot (Plan.P_lit (Ast.L_int 5L))) in
+  Alcotest.(check int64) "bitnot" (-6L) (match v with Row.V_int n -> n | _ -> 0L)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -651,4 +690,13 @@ let () =
       Alcotest.test_case "eval_ne_null_left"              `Quick eval_ne_null_left;
     ];
     "qcheck", qcheck_tests;
+    "binary_operators", [
+      Alcotest.test_case "concat"  `Quick test_concat;
+      Alcotest.test_case "mod"     `Quick test_mod;
+      Alcotest.test_case "bit_and" `Quick test_bit_and;
+      Alcotest.test_case "bit_or"  `Quick test_bit_or;
+      Alcotest.test_case "lshift"  `Quick test_lshift;
+      Alcotest.test_case "rshift"  `Quick test_rshift;
+      Alcotest.test_case "bitnot"  `Quick test_bitnot;
+    ];
   ]

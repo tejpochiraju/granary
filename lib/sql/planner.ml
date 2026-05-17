@@ -8,6 +8,10 @@ let plan_binop : Sema.binop -> Plan.binop = function
   | Sema.Add -> Plan.Add | Sema.Sub -> Plan.Sub
   | Sema.Mul -> Plan.Mul | Sema.Div -> Plan.Div
   | Sema.And -> Plan.And | Sema.Or  -> Plan.Or
+  | Sema.Concat  -> Plan.Concat
+  | Sema.Mod     -> Plan.Mod
+  | Sema.Bit_and -> Plan.Bit_and | Sema.Bit_or -> Plan.Bit_or
+  | Sema.Lshift  -> Plan.Lshift  | Sema.Rshift -> Plan.Rshift
 
 let rec plan_expr = function
   | Sema.BE_lit l               -> Plan.P_lit l
@@ -17,6 +21,7 @@ let rec plan_expr = function
   | Sema.BE_is_null e           -> Plan.P_is_null (plan_expr e)
   | Sema.BE_is_not_null e       -> Plan.P_is_not_null (plan_expr e)
   | Sema.BE_neg e               -> Plan.P_neg (plan_expr e)
+  | Sema.BE_bitnot e            -> Plan.P_bitnot (plan_expr e)
   | Sema.BE_func (func, args)   -> Plan.P_func (func, List.map plan_expr args)
   | Sema.BE_param i             -> Plan.P_param i
   | Sema.BE_match _             ->

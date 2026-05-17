@@ -19,6 +19,10 @@ type binop =
   | Eq | Ne | Lt | Le | Gt | Ge   (** comparison *)
   | Add | Sub | Mul | Div          (** arithmetic *)
   | And | Or                       (** logical *)
+  | Concat                         (** string concatenation || *)
+  | Mod                            (** modulo % *)
+  | Bit_and | Bit_or               (** bitwise & | *)
+  | Lshift | Rshift                (** shift << >> *)
 
 (** Aggregate functions supported in Phase 2 Task 6. *)
 type agg_func = Agg_count | Agg_sum | Agg_avg | Agg_min | Agg_max
@@ -41,6 +45,7 @@ type expr =
   | E_is_null     of expr
   | E_is_not_null of expr
   | E_neg         of expr                  (** unary minus *)
+  | E_bitnot      of expr                  (** bitwise NOT ~ *)
   | E_agg         of agg_func * expr option
     (** Aggregate call; [None] argument means [COUNT( * )]. *)
   | E_func        of scalar_func * expr list

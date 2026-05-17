@@ -224,6 +224,28 @@ let create_index_missing_column_list () =
   with Parser.Error | Failure _ -> ()
 
 (* ------------------------------------------------------------------ *)
+(* Group 5: Bitwise / extended operators                                *)
+(* ------------------------------------------------------------------ *)
+
+let parse_concat () =
+  let s = parse "SELECT a || b FROM t" in
+  match s with
+  | Ast.S_select { proj = `Exprs [Ast.E_binop (Ast.Concat, Ast.E_col "a", Ast.E_col "b")]; _ } -> ()
+  | _ -> Alcotest.fail "expected concat binop"
+
+let parse_mod () =
+  let s = parse "SELECT 7 % 3 FROM t" in
+  match s with
+  | Ast.S_select { proj = `Exprs [Ast.E_binop (Ast.Mod, Ast.E_lit (Ast.L_int 7L), Ast.E_lit (Ast.L_int 3L))]; _ } -> ()
+  | _ -> Alcotest.fail "expected mod binop"
+
+let parse_bitnot () =
+  let s = parse "SELECT ~5 FROM t" in
+  match s with
+  | Ast.S_select { proj = `Exprs [Ast.E_bitnot (Ast.E_lit (Ast.L_int 5L))]; _ } -> ()
+  | _ -> Alcotest.fail "expected bitnot"
+
+(* ------------------------------------------------------------------ *)
 (* Main                                                                 *)
 (* ------------------------------------------------------------------ *)
 
@@ -270,5 +292,10 @@ let () =
       Alcotest.test_case "unique"          `Quick create_index_unique;
       Alcotest.test_case "no-semi"         `Quick create_index_no_semi;
       Alcotest.test_case "missing-col-list" `Quick create_index_missing_column_list;
+    ];
+    "bitwise", [
+      Alcotest.test_case "concat"  `Quick parse_concat;
+      Alcotest.test_case "mod"     `Quick parse_mod;
+      Alcotest.test_case "bitnot"  `Quick parse_bitnot;
     ];
   ]

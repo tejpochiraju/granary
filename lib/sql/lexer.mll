@@ -75,12 +75,19 @@ rule token = parse
   | "!="       { NE }
   | "<="       { LE }
   | ">="       { GE }
+  | "<<"       { LSHIFT }
+  | ">>"       { RSHIFT }
   | "<"        { LT }
   | ">"        { GT }
   | "="        { EQ }
+  | "||"       { CONCAT }
+  | "|"        { PIPE }
   | "+"        { PLUS }
   | "-"        { MINUS }
   | "/"        { SLASH }
+  | "%"        { PERCENT }
+  | "&"        { AMPERSAND }
+  | "~"        { TILDE }
   | "."        { DOT }
   | (digit+ as i) '.' (digit* as f)
     { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }

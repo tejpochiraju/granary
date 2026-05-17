@@ -1,6 +1,7 @@
 (** Name resolution and light type checking for Phase 0 SQL. *)
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+           | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
 
 type bound_expr =
   | BE_lit         of Ast.literal
@@ -10,6 +11,7 @@ type bound_expr =
   | BE_is_null     of bound_expr
   | BE_is_not_null of bound_expr
   | BE_neg         of bound_expr
+  | BE_bitnot      of bound_expr
   | BE_func        of Ast.scalar_func * bound_expr list
     (** Scalar function call (Phase 5). *)
   | BE_param       of int

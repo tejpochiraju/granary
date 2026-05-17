@@ -5,6 +5,7 @@
 module Cat = Sqlocaml_catalog.Catalog
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
+           | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
 
 type expr =
   | P_lit         of Ast.literal
@@ -14,6 +15,7 @@ type expr =
   | P_is_null     of expr
   | P_is_not_null of expr
   | P_neg         of expr
+  | P_bitnot      of expr
   | P_func        of Ast.scalar_func * expr list
   | P_param       of int                   (** 0-indexed positional parameter *)
 

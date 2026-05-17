@@ -66,6 +66,11 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
      | Row.V_real f -> Row.V_real (-. f)
      | Row.V_null   -> Row.V_null
      | _            -> failwith "unary minus requires numeric operand")
+  | Plan.P_bitnot e ->
+    (match eval_expr params row e with
+     | Row.V_int n -> Row.V_int (Int64.lognot n)
+     | Row.V_null  -> Row.V_null
+     | _           -> Row.V_null)
   | Plan.P_is_null e ->
     (match eval_expr params row e with
      | Row.V_null -> Row.V_int 1L
@@ -148,6 +153,50 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
     arith_op lv rv
       (fun a b -> if Int64.equal b 0L then failwith "division by zero" else Int64.div a b)
       ( /. )
+  | Plan.Concat ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_text a, Row.V_text b -> Row.V_text (a ^ b)
+     | Row.V_text a, Row.V_int  n -> Row.V_text (a ^ Int64.to_string n)
+     | Row.V_int  n, Row.V_text b -> Row.V_text (Int64.to_string n ^ b)
+     | Row.V_int  a, Row.V_int  b -> Row.V_text (Int64.to_string a ^ Int64.to_string b)
+     | _ -> Row.V_null)
+  | Plan.Mod ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_int a, Row.V_int b ->
+       if b = 0L then Row.V_null else Row.V_int (Int64.rem a b)
+     | Row.V_real a, Row.V_real b ->
+       if b = 0.0 then Row.V_null else Row.V_real (mod_float a b)
+     | Row.V_int a, Row.V_real b ->
+       if b = 0.0 then Row.V_null else Row.V_real (mod_float (Int64.to_float a) b)
+     | Row.V_real a, Row.V_int b ->
+       if b = 0L then Row.V_null else Row.V_real (mod_float a (Int64.to_float b))
+     | _ -> Row.V_null)
+  | Plan.Bit_and ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_int a, Row.V_int b -> Row.V_int (Int64.logand a b)
+     | _ -> Row.V_null)
+  | Plan.Bit_or ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_int a, Row.V_int b -> Row.V_int (Int64.logor a b)
+     | _ -> Row.V_null)
+  | Plan.Lshift ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_int a, Row.V_int b ->
+       let n = Int64.to_int b in
+       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_left a n)
+     | _ -> Row.V_null)
+  | Plan.Rshift ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_int a, Row.V_int b ->
+       let n = Int64.to_int b in
+       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_right_logical a n)
+     | _ -> Row.V_null)
 
 and cmp_result lv rv pred =
   match lv, rv with
