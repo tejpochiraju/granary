@@ -36,6 +36,12 @@ type scalar_func =
   | Fn_abs
   | Fn_coalesce
   | Fn_ifnull
+  | Fn_substr                        (** SUBSTR(s, start[, len]) — 1-indexed *)
+  | Fn_trim    | Fn_ltrim  | Fn_rtrim (** TRIM, LTRIM, RTRIM — optional 2nd arg for chars *)
+  | Fn_replace                       (** REPLACE(s, old, new) *)
+  | Fn_instr                         (** INSTR(s, sub) → 1-indexed position or 0 *)
+  | Fn_round                         (** ROUND(n[, digits]) *)
+  | Fn_typeof                        (** TYPEOF(x) → 'integer'|'real'|'text'|'blob'|'null' *)
 
 type expr =
   | E_lit         of literal

@@ -251,9 +251,14 @@ let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
        let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        let n = List.length ok_args in
        let arity_ok = match func with
-         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
-         | Ast.Fn_ifnull -> n = 2
+         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
+         | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
+         | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
          | Ast.Fn_coalesce -> n >= 1
+         | Ast.Fn_substr -> n = 2 || n = 3
+         | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
+         | Ast.Fn_replace -> n = 3
+         | Ast.Fn_round -> n = 1 || n = 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -348,9 +353,14 @@ let rec bind_expr_join
        let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        let n = List.length ok_args in
        let arity_ok = match func with
-         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
-         | Ast.Fn_ifnull -> n = 2
+         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
+         | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
+         | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
          | Ast.Fn_coalesce -> n >= 1
+         | Ast.Fn_substr -> n = 2 || n = 3
+         | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
+         | Ast.Fn_replace -> n = 3
+         | Ast.Fn_round -> n = 1 || n = 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -473,9 +483,14 @@ let bind_expr_agg
          let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
          let n = List.length ok_args in
          let arity_ok = match func with
-           | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper | Ast.Fn_abs -> n = 1
-           | Ast.Fn_ifnull -> n = 2
+           | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
+           | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
+           | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
            | Ast.Fn_coalesce -> n >= 1
+           | Ast.Fn_substr -> n = 2 || n = 3
+           | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
+           | Ast.Fn_replace -> n = 3
+           | Ast.Fn_round -> n = 1 || n = 2
          in
          if not arity_ok then
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })

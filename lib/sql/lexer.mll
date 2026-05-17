@@ -62,6 +62,14 @@ rule token = parse
   | "ABS"      { ABS }
   | "COALESCE" { COALESCE }
   | "IFNULL"   { IFNULL }
+  | "SUBSTR"   { SUBSTR }
+  | "TRIM"     { TRIM }
+  | "LTRIM"    { LTRIM }
+  | "RTRIM"    { RTRIM }
+  | "REPLACE"  { REPLACE }
+  | "INSTR"    { INSTR }
+  | "ROUND"    { ROUND }
+  | "TYPEOF"   { TYPEOF }
   | "VIRTUAL"  { VIRTUAL }
   | "USING"    { USING }
   | "FTS5"     { FTS5 }

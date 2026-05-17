@@ -77,6 +77,68 @@ let rec glob_match pat pi str si =
   | '?' -> si < slen && glob_match pat (pi+1) str (si+1)
   | c   -> si < slen && c = str.[si] && glob_match pat (pi+1) str (si+1)
 
+let str_trim_spaces s =
+  let n = String.length s in
+  let l = ref 0 and r = ref (n - 1) in
+  while !l <= !r && (let c = s.[!l] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do incr l done;
+  while !r >= !l && (let c = s.[!r] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do decr r done;
+  if !l > !r then "" else String.sub s !l (!r - !l + 1)
+
+let str_trim_chars s chars =
+  let n = String.length s in
+  let l = ref 0 and r = ref (n - 1) in
+  while !l <= !r && String.contains chars s.[!l] do incr l done;
+  while !r >= !l && String.contains chars s.[!r] do decr r done;
+  if !l > !r then "" else String.sub s !l (!r - !l + 1)
+
+let str_ltrim_spaces s =
+  let n = String.length s in
+  let l = ref 0 in
+  while !l < n && (let c = s.[!l] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do incr l done;
+  String.sub s !l (n - !l)
+
+let str_ltrim_chars s chars =
+  let n = String.length s in
+  let l = ref 0 in
+  while !l < n && String.contains chars s.[!l] do incr l done;
+  String.sub s !l (n - !l)
+
+let str_rtrim_spaces s =
+  let n = String.length s in
+  let r = ref (n - 1) in
+  while !r >= 0 && (let c = s.[!r] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do decr r done;
+  if !r < 0 then "" else String.sub s 0 (!r + 1)
+
+let str_rtrim_chars s chars =
+  let r = ref (String.length s - 1) in
+  while !r >= 0 && String.contains chars s.[!r] do decr r done;
+  if !r < 0 then "" else String.sub s 0 (!r + 1)
+
+let str_replace s old rep =
+  if String.length old = 0 then s
+  else
+    let buf = Buffer.create (String.length s) in
+    let n = String.length s and m = String.length old in
+    let i = ref 0 in
+    while !i <= n - m do
+      if String.sub s !i m = old then (Buffer.add_string buf rep; i := !i + m)
+      else (Buffer.add_char buf s.[!i]; incr i)
+    done;
+    while !i < n do Buffer.add_char buf s.[!i]; incr i done;
+    Buffer.contents buf
+
+let str_instr s sub =
+  let n = String.length s and m = String.length sub in
+  if m = 0 then 1
+  else
+    let found = ref 0 in
+    let i = ref 0 in
+    while !found = 0 && !i <= n - m do
+      if String.sub s !i m = sub then found := !i + 1  (* 1-indexed *)
+      else incr i
+    done;
+    !found
+
 let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
@@ -157,6 +219,51 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
     (match List.find_opt (fun v -> v <> Row.V_null) vs with
      | Some v -> v | None -> Row.V_null)
   | Ast.Fn_ifnull, [a; b]         -> (match a with Row.V_null -> b | v -> v)
+  | Ast.Fn_substr, (Row.V_text s :: rest) ->
+    (match rest with
+     | [Row.V_int start] ->
+       let i = max 0 (Int64.to_int start - 1) in
+       if i >= String.length s then Row.V_text ""
+       else Row.V_text (String.sub s i (String.length s - i))
+     | [Row.V_int start; Row.V_int len] ->
+       let i = max 0 (Int64.to_int start - 1) in
+       let l = Int64.to_int len in
+       if i >= String.length s || l <= 0 then Row.V_text ""
+       else Row.V_text (String.sub s i (min l (String.length s - i)))
+     | _ -> Row.V_null)
+  | Ast.Fn_substr, (Row.V_null :: _) -> Row.V_null
+  | Ast.Fn_trim,  [Row.V_text s]                        -> Row.V_text (str_trim_spaces s)
+  | Ast.Fn_trim,  [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_trim_chars s chars)
+  | Ast.Fn_trim,  (Row.V_null :: _)                     -> Row.V_null
+  | Ast.Fn_ltrim, [Row.V_text s]                        -> Row.V_text (str_ltrim_spaces s)
+  | Ast.Fn_ltrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_ltrim_chars s chars)
+  | Ast.Fn_ltrim, (Row.V_null :: _)                     -> Row.V_null
+  | Ast.Fn_rtrim, [Row.V_text s]                        -> Row.V_text (str_rtrim_spaces s)
+  | Ast.Fn_rtrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_rtrim_chars s chars)
+  | Ast.Fn_rtrim, (Row.V_null :: _)                     -> Row.V_null
+  | Ast.Fn_replace, [Row.V_text s; Row.V_text old; Row.V_text rep] ->
+    Row.V_text (str_replace s old rep)
+  | Ast.Fn_replace, (Row.V_null :: _) -> Row.V_null
+  | Ast.Fn_instr, [Row.V_text s; Row.V_text sub] ->
+    Row.V_int (Int64.of_int (str_instr s sub))
+  | Ast.Fn_instr, (Row.V_null :: _) | Ast.Fn_instr, [_; Row.V_null] -> Row.V_null
+  | Ast.Fn_round, [Row.V_real f] ->
+    Row.V_real (Float.round f)
+  | Ast.Fn_round, [Row.V_int n] ->
+    Row.V_real (Int64.to_float n)
+  | Ast.Fn_round, [Row.V_real f; Row.V_int d] ->
+    let factor = 10. ** Int64.to_float d in
+    Row.V_real (Float.round (f *. factor) /. factor)
+  | Ast.Fn_round, [Row.V_int n; Row.V_int _] ->
+    Row.V_real (Int64.to_float n)
+  | Ast.Fn_round, (Row.V_null :: _) -> Row.V_null
+  | Ast.Fn_typeof, [v] ->
+    Row.V_text (match v with
+      | Row.V_int  _ -> "integer"
+      | Row.V_real _ -> "real"
+      | Row.V_text _ -> "text"
+      | Row.V_blob _ -> "blob"
+      | Row.V_null   -> "null")
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 

@@ -24,6 +24,7 @@
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
+%token SUBSTR TRIM LTRIM RTRIM REPLACE INSTR ROUND TYPEOF
 %token VIRTUAL USING FTS5
 %token MATCH
 %token LIKE GLOB
@@ -205,6 +206,32 @@ scalar_expr:
   | ABS      LPAREN e = expr RPAREN                                   { E_func (Fn_abs,      [e]) }
   | IFNULL   LPAREN a = expr COMMA b = expr RPAREN                    { E_func (Fn_ifnull,   [a; b]) }
   | COALESCE LPAREN es = separated_nonempty_list(COMMA, expr) RPAREN  { E_func (Fn_coalesce, es) }
+  | SUBSTR   LPAREN s = expr COMMA start = expr RPAREN
+    { E_func (Fn_substr, [s; start]) }
+  | SUBSTR   LPAREN s = expr COMMA start = expr COMMA len = expr RPAREN
+    { E_func (Fn_substr, [s; start; len]) }
+  | TRIM     LPAREN s = expr RPAREN
+    { E_func (Fn_trim, [s]) }
+  | TRIM     LPAREN s = expr COMMA chars = expr RPAREN
+    { E_func (Fn_trim, [s; chars]) }
+  | LTRIM    LPAREN s = expr RPAREN
+    { E_func (Fn_ltrim, [s]) }
+  | LTRIM    LPAREN s = expr COMMA chars = expr RPAREN
+    { E_func (Fn_ltrim, [s; chars]) }
+  | RTRIM    LPAREN s = expr RPAREN
+    { E_func (Fn_rtrim, [s]) }
+  | RTRIM    LPAREN s = expr COMMA chars = expr RPAREN
+    { E_func (Fn_rtrim, [s; chars]) }
+  | REPLACE  LPAREN s = expr COMMA old_s = expr COMMA rep = expr RPAREN
+    { E_func (Fn_replace, [s; old_s; rep]) }
+  | INSTR    LPAREN s = expr COMMA sub = expr RPAREN
+    { E_func (Fn_instr, [s; sub]) }
+  | ROUND    LPAREN n = expr RPAREN
+    { E_func (Fn_round, [n]) }
+  | ROUND    LPAREN n = expr COMMA d = expr RPAREN
+    { E_func (Fn_round, [n; d]) }
+  | TYPEOF   LPAREN e = expr RPAREN
+    { E_func (Fn_typeof, [e]) }
 
 proj_item:
   | e = expr { match e with E_col name -> `Col name | _ -> `Expr e }

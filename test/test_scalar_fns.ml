@@ -77,6 +77,96 @@ let test_ifnull () =
         Lwt.return_unit
       | _ -> Alcotest.failf "ifnull: unexpected result")
 
+let test_substr () =
+  check_single_value "substr_from"     "SELECT SUBSTR(name, 2) FROM t WHERE id = 1"    "ello";
+  check_single_value "substr_from_len" "SELECT SUBSTR(name, 2, 3) FROM t WHERE id = 1" "ell"
+
+let test_trim () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('  hello  ')" in
+    let* r = D.query d "SELECT TRIM(v) FROM s" in
+    match r with
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | row :: _ -> Alcotest.(check string) "trim" "hello" (match row.(0) with D.V_text s -> s | _ -> "?")
+       | [] -> Alcotest.fail "no rows");
+      Lwt.return_unit)
+
+let test_ltrim () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('  hello  ')" in
+    let* r = D.query d "SELECT LTRIM(v) FROM s" in
+    match r with
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | row :: _ -> Alcotest.(check string) "ltrim" "hello  " (match row.(0) with D.V_text s -> s | _ -> "?")
+       | [] -> Alcotest.fail "no rows");
+      Lwt.return_unit)
+
+let test_rtrim () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('  hello  ')" in
+    let* r = D.query d "SELECT RTRIM(v) FROM s" in
+    match r with
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | row :: _ -> Alcotest.(check string) "rtrim" "  hello" (match row.(0) with D.V_text s -> s | _ -> "?")
+       | [] -> Alcotest.fail "no rows");
+      Lwt.return_unit)
+
+let test_replace () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('hello world')" in
+    let* r = D.query d "SELECT REPLACE(v, 'world', 'there') FROM s" in
+    match r with
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | row :: _ -> Alcotest.(check string) "replace" "hello there" (match row.(0) with D.V_text s -> s | _ -> "?")
+       | [] -> Alcotest.fail "no rows");
+      Lwt.return_unit)
+
+let test_instr () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('hello')" in
+    let* r = D.query d "SELECT INSTR(v, 'ell') FROM s" in
+    match r with
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | row :: _ -> Alcotest.(check int64) "instr" 2L (match row.(0) with D.V_int n -> n | _ -> -1L)
+       | [] -> Alcotest.fail "no rows");
+      Lwt.return_unit)
+
+let test_round () =
+  (* check_single_value formats reals as "%.2f": ROUND(3.14) = 3.0 -> "3.00", ROUND(3.14,1) = 3.1 -> "3.10" *)
+  check_single_value "round_0"  "SELECT ROUND(val) FROM t WHERE id = 1"    "3.00";
+  check_single_value "round_1"  "SELECT ROUND(val, 1) FROM t WHERE id = 1" "3.10"
+
+let test_typeof () =
+  check_single_value "typeof_int"  "SELECT TYPEOF(id) FROM t WHERE id = 1"   "integer";
+  check_single_value "typeof_text" "SELECT TYPEOF(name) FROM t WHERE id = 1" "text";
+  check_single_value "typeof_real" "SELECT TYPEOF(val) FROM t WHERE id = 1"  "real";
+  check_single_value "typeof_null" "SELECT TYPEOF(NULL) FROM t WHERE id = 1" "null"
+
 (* Regression test for issue #116: ORDER BY with scalar expression projection.
    Previously, Op_sort was applied after Op_expr_project using col_idx from the
    original schema, causing out-of-bounds access or wrong sort order.
@@ -110,4 +200,14 @@ let () =
     "coalesce", [ Alcotest.test_case "coalesce" `Quick test_coalesce ];
     "ifnull",   [ Alcotest.test_case "ifnull"   `Quick test_ifnull   ];
     "order_by_expr_proj", [ Alcotest.test_case "order_by_after_expr_proj" `Quick test_order_by_after_expr_proj ];
+    "new_scalar_fns", [
+      Alcotest.test_case "substr"  `Quick test_substr;
+      Alcotest.test_case "trim"    `Quick test_trim;
+      Alcotest.test_case "ltrim"   `Quick test_ltrim;
+      Alcotest.test_case "rtrim"   `Quick test_rtrim;
+      Alcotest.test_case "replace" `Quick test_replace;
+      Alcotest.test_case "instr"   `Quick test_instr;
+      Alcotest.test_case "round"   `Quick test_round;
+      Alcotest.test_case "typeof"  `Quick test_typeof;
+    ];
   ]
