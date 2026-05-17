@@ -1433,8 +1433,7 @@ let rec compound_col_count = function
   | BS_compound { left; _ } -> compound_col_count left
   | _ -> 0  (* non-select stmts in compound: don't validate *)
 
-let rec bind_internal ~named_params cat stmt =
-  let param_counter = ref 0 in
+let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values
@@ -1462,8 +1461,8 @@ let rec bind_internal ~named_params cat stmt =
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
   | Ast.S_compound { op; left; right } ->
-    let* left_r  = bind_internal ~named_params cat left  in
-    let* right_r = bind_internal ~named_params cat right in
+    let* left_r  = bind_internal ~named_params ~param_counter cat left  in
+    let* right_r = bind_internal ~named_params ~param_counter cat right in
     (match left_r, right_r with
      | Ok l, Ok r   ->
        let n_left  = compound_col_count l in
@@ -1477,11 +1476,13 @@ let rec bind_internal ~named_params cat stmt =
 
 let bind cat ast =
   let named_params : (string, int) Hashtbl.t = Hashtbl.create 4 in
-  bind_internal ~named_params cat ast
+  let param_counter = ref 0 in
+  bind_internal ~named_params ~param_counter cat ast
 
 let bind_returning_params cat ast =
   let named_params : (string, int) Hashtbl.t = Hashtbl.create 4 in
-  let* result = bind_internal ~named_params cat ast in
+  let param_counter = ref 0 in
+  let* result = bind_internal ~named_params ~param_counter cat ast in
   match result with
   | Error e -> Lwt.return (Error e)
   | Ok bs   ->
