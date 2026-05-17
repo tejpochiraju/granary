@@ -97,6 +97,10 @@ rule token = parse
   | "PRAGMA"   { PRAGMA }
   | "CHECK"    { CHECK }
   | "check"    { CHECK }
+  | "REFERENCES" { REFERENCES }
+  | "references" { REFERENCES }
+  | "FOREIGN"  { FOREIGN }
+  | "foreign"  { FOREIGN }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }
   | "BETWEEN"  { BETWEEN }

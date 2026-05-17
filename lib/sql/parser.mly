@@ -6,6 +6,7 @@
     | Col_primary_key
     | Col_default of literal
     | Col_check   of expr
+    | Col_fk_ref             (* parse-only FK reference — no semantic meaning *)
 
   type table_item =
     | TI_col of column_def
@@ -42,6 +43,7 @@
 %token LIKE GLOB
 %token BETWEEN IN EXISTS
 %token CHECK
+%token REFERENCES FOREIGN
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -175,6 +177,8 @@ column_constraint:
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
+  | REFERENCES t = IDENT                                { ignore t; Col_fk_ref }
+  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN       { ignore t; ignore c; Col_fk_ref }
 
 def_value:
   | n = INT_LIT              { L_int n }

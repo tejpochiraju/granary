@@ -2501,6 +2501,33 @@ let test_not_in_select_subquery () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* FOREIGN KEY parse-only                                                *)
+(* ------------------------------------------------------------------ *)
+
+let test_fk_parse_create () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+    (* FK syntax must be accepted without error *)
+    let* _ = Db.execute db
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))" in
+    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+    Alcotest.(check bool) "insert into FK table works (no enforcement)" true (n = Ok ());
+    Lwt.return_unit)
+
+let test_fk_parse_no_col () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+    (* REFERENCES without explicit column is also valid SQL syntax *)
+    let* _ = Db.execute db
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
+    let* n = Db.execute db "INSERT INTO orders VALUES (1, 999)" in
+    (* No FK enforcement — 999 doesn't exist in users but insert succeeds *)
+    Alcotest.(check bool) "insert without FK enforcement" true (n = Ok ());
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* CHECK constraints                                                     *)
 (* ------------------------------------------------------------------ *)
 
@@ -2842,6 +2869,10 @@ let () =
       Alcotest.test_case "exists_false"            `Quick test_exists_subquery_false;
       Alcotest.test_case "in_select"               `Quick test_in_select_subquery;
       Alcotest.test_case "not_in_select"           `Quick test_not_in_select_subquery;
+    ];
+    "fk_parse", [
+      Alcotest.test_case "fk_references_col"     `Quick test_fk_parse_create;
+      Alcotest.test_case "fk_references_no_col"  `Quick test_fk_parse_no_col;
     ];
     "check_constraints", [
       Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
