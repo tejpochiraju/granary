@@ -692,6 +692,135 @@ let bind_delete_where_unknown_col () =
   | _ -> Alcotest.fail "expected Unknown_column bogus"
 
 (* ------------------------------------------------------------------ *)
+(* Group 6b: Subquery-in-DML rejection tests (Phase 9)                 *)
+(* ------------------------------------------------------------------ *)
+
+(* A minimal SELECT AST used as a subquery in tests below. *)
+let dummy_subquery =
+  Ast.S_select {
+    distinct  = false;
+    proj      = `All;
+    table     = "users";
+    joins     = [];
+    where     = None;
+    group_by  = [];
+    having    = None;
+    order     = [];
+    limit     = None;
+    offset    = None;
+  }
+
+let bind_update_set_subquery_rejected () =
+  (* UPDATE users SET id = (SELECT MAX(id) FROM users) — must fail at sema *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("id", Ast.E_subquery dummy_subquery)];
+    where = None;
+    returning = [];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in UPDATE SET"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_update_where_subquery_rejected () =
+  (* UPDATE users SET name = 'x' WHERE id IN (SELECT id FROM users) — must fail *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = Some (Ast.E_in_select (Ast.E_col "id", dummy_subquery));
+    returning = [];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in UPDATE WHERE"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_update_where_exists_rejected () =
+  (* UPDATE users SET name = 'x' WHERE EXISTS (SELECT 1 FROM users) *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = Some (Ast.E_exists dummy_subquery);
+    returning = [];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for EXISTS in UPDATE WHERE"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_delete_where_subquery_rejected () =
+  (* DELETE FROM users WHERE id IN (SELECT id FROM users) — must fail *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete {
+    table = "users";
+    where = Some (Ast.E_in_select (Ast.E_col "id", dummy_subquery));
+    returning = [];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in DELETE WHERE"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_delete_where_exists_rejected () =
+  (* DELETE FROM users WHERE EXISTS (SELECT 1 FROM users) *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete {
+    table = "users";
+    where = Some (Ast.E_exists dummy_subquery);
+    returning = [];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for EXISTS in DELETE WHERE"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_insert_returning_subquery_rejected () =
+  (* INSERT ... RETURNING (SELECT ...) — must fail *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_insert {
+    table = "users";
+    columns = ["id"; "name"];
+    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    on_conflict = None;
+    returning = [Ast.E_subquery dummy_subquery];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in INSERT RETURNING"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_update_returning_subquery_rejected () =
+  (* UPDATE users SET name = 'x' RETURNING (SELECT ...) — must fail *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_update {
+    table = "users";
+    assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
+    where = None;
+    returning = [Ast.E_subquery dummy_subquery];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in UPDATE RETURNING"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+let bind_delete_returning_subquery_rejected () =
+  (* DELETE FROM users RETURNING (SELECT ...) — must fail *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_delete {
+    table = "users";
+    where = None;
+    returning = [Ast.E_subquery dummy_subquery];
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | Ok _ -> Alcotest.fail "expected Unsupported for subquery in DELETE RETURNING"
+  | Error _ -> Alcotest.fail "expected Unsupported, got different error"
+
+(* ------------------------------------------------------------------ *)
 (* Group 7: DROP TABLE / DROP INDEX binding                             *)
 (* ------------------------------------------------------------------ *)
 
@@ -2893,6 +3022,16 @@ let () =
       Alcotest.test_case "bind_delete_with_where"         `Quick bind_delete_with_where;
       Alcotest.test_case "bind_delete_unknown_table"      `Quick bind_delete_unknown_table;
       Alcotest.test_case "bind_delete_where_unknown_col"  `Quick bind_delete_where_unknown_col;
+    ];
+    "subquery-in-dml", [
+      Alcotest.test_case "update_set_subquery_rejected"       `Quick bind_update_set_subquery_rejected;
+      Alcotest.test_case "update_where_subquery_rejected"     `Quick bind_update_where_subquery_rejected;
+      Alcotest.test_case "update_where_exists_rejected"       `Quick bind_update_where_exists_rejected;
+      Alcotest.test_case "delete_where_subquery_rejected"     `Quick bind_delete_where_subquery_rejected;
+      Alcotest.test_case "delete_where_exists_rejected"       `Quick bind_delete_where_exists_rejected;
+      Alcotest.test_case "insert_returning_subquery_rejected" `Quick bind_insert_returning_subquery_rejected;
+      Alcotest.test_case "update_returning_subquery_rejected" `Quick bind_update_returning_subquery_rejected;
+      Alcotest.test_case "delete_returning_subquery_rejected" `Quick bind_delete_returning_subquery_rejected;
     ];
     "drop", [
       Alcotest.test_case "bind_drop_table_basic"   `Quick bind_drop_table_basic;

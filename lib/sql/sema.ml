@@ -563,6 +563,20 @@ let bind_expr_agg
   | Error e -> Error e
   | Ok be   -> Ok (be, !aggs)
 
+(** Check if any subquery node appears anywhere in a [bound_expr]. *)
+let rec expr_has_subquery = function
+  | BE_subquery _ | BE_exists _ -> true
+  | BE_in_select _ -> true
+  | BE_binop (_, a, b) -> expr_has_subquery a || expr_has_subquery b
+  | BE_not e | BE_is_null e | BE_is_not_null e | BE_neg e | BE_bitnot e ->
+    expr_has_subquery e
+  | BE_between (x, lo, hi) ->
+    expr_has_subquery x || expr_has_subquery lo || expr_has_subquery hi
+  | BE_in (x, vals) ->
+    expr_has_subquery x || List.exists expr_has_subquery vals
+  | BE_func (_, args) -> List.exists expr_has_subquery args
+  | BE_lit _ | BE_col _ | BE_param _ | BE_match _ -> false
+
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
   | Ast.E_agg _ -> true
@@ -672,7 +686,11 @@ let bind_returning_exprs ~param_counter ~named_params (meta : Cat.table_meta) (e
     | Ok bexprs ->
       (match bind_expr ~param_counter ~named_params meta re with
        | Error e -> Error e
-       | Ok be   -> Ok (bexprs @ [be]))
+       | Ok be   ->
+         if expr_has_subquery be then
+           Error (Unsupported "subqueries in RETURNING are not supported")
+         else
+           Ok (bexprs @ [be]))
   ) (Ok []) exprs
 
 let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning =
@@ -1372,6 +1390,17 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~ret
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
+          (* Block subqueries in UPDATE WHERE/SET — not supported in Phase 9. *)
+          let has_subquery_in_where = match bound_where with
+            | Some e -> expr_has_subquery e
+            | None   -> false
+          in
+          let has_subquery_in_assign =
+            List.exists (fun (_, e) -> expr_has_subquery e) bound_assigns
+          in
+          if has_subquery_in_where || has_subquery_in_assign then
+            Lwt.return (Error (Unsupported "subqueries in UPDATE WHERE/SET are not supported"))
+          else
           (match bind_returning_exprs ~param_counter ~named_params meta returning with
            | Error e -> Lwt.return (Error e)
            | Ok ret_bound ->
@@ -1425,6 +1454,14 @@ let bind_delete cat ~param_counter ~named_params ~table ~where ~returning =
     (match where_result with
      | Error e -> Lwt.return (Error e)
      | Ok bound_where ->
+       (* Block subqueries in DELETE WHERE — not supported in Phase 9. *)
+       let has_subquery_in_where = match bound_where with
+         | Some e -> expr_has_subquery e
+         | None   -> false
+       in
+       if has_subquery_in_where then
+         Lwt.return (Error (Unsupported "subqueries in DELETE WHERE are not supported"))
+       else
        (match bind_returning_exprs ~param_counter ~named_params meta returning with
         | Error e -> Lwt.return (Error e)
         | Ok ret_bound ->
