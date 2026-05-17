@@ -31,6 +31,7 @@
 %token VIRTUAL USING FTS5
 %token MATCH
 %token PRAGMA
+%token RETURNING
 %token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
 %token BETWEEN IN
@@ -158,10 +159,16 @@ insert:
   | INSERT oc = opt_conflict INTO table = IDENT
       LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
       VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
-    { Ast.S_insert { table; columns = cols; values = vals; on_conflict = oc } }
+      ret = opt_returning
+    { Ast.S_insert { table; columns = cols; values = vals; on_conflict = oc; returning = ret } }
   | INSERT oc = opt_conflict INTO table = IDENT
       VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
-    { Ast.S_insert { table; columns = []; values = vals; on_conflict = oc } }
+      ret = opt_returning
+    { Ast.S_insert { table; columns = []; values = vals; on_conflict = oc; returning = ret } }
+
+opt_returning:
+  | RETURNING exprs = separated_nonempty_list(COMMA, expr) { exprs }
+  |                                                         { [] }
 
 literal:
   | n = INT_LIT    { L_int n }
@@ -217,11 +224,12 @@ update:
   | UPDATE table = IDENT SET
       assignments = separated_nonempty_list(COMMA, assignment)
       wh = where_opt
-    { S_update { table; assignments; where = wh } }
+      ret = opt_returning
+    { S_update { table; assignments; where = wh; returning = ret } }
 
 delete:
-  | DELETE FROM table = IDENT wh = where_opt
-    { S_delete { table; where = wh } }
+  | DELETE FROM table = IDENT wh = where_opt ret = opt_returning
+    { S_delete { table; where = wh; returning = ret } }
 
 assignment:
   | col = IDENT EQ value = expr { (col, value) }

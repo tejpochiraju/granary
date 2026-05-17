@@ -116,6 +116,7 @@ type stmt =
       columns     : string list;   (** named columns; empty = "all in order" *)
       values      : expr list;
       on_conflict : conflict_action option;
+      returning   : expr list;   (** empty = no RETURNING *)
     }
   | S_select of {
       distinct : bool;
@@ -142,10 +143,12 @@ type stmt =
       table       : string;
       assignments : (string * expr) list;   (** [(col_name, new_value_expr)] *)
       where       : expr option;
+      returning   : expr list;
     }
   | S_delete of {
-      table : string;
-      where : expr option;
+      table     : string;
+      where     : expr option;
+      returning : expr list;
     }
   | S_drop_table of {
       name : string;

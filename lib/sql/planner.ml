@@ -236,8 +236,9 @@ let plan_select cat
 let rec plan ?cat = function
   | Sema.BS_create_table { name; columns } ->
     Plan.Op_create_table { name; columns }
-  | Sema.BS_insert { table_meta; ordinals; values; on_conflict } ->
-    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict }
+  | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning } ->
+    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict;
+                     returning = List.map plan_expr returning }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      join; group_by; aggs; having; agg_proj } ->
     (match cat with
@@ -343,7 +344,7 @@ let rec plan ?cat = function
       unique;
       columns  = table_meta.columns;
     }
-  | Sema.BS_update { table_meta; assignments; where } ->
+  | Sema.BS_update { table_meta; assignments; where; returning } ->
     let indexes = match cat with
       | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
       | None   -> []
@@ -357,16 +358,18 @@ let rec plan ?cat = function
       assignments = plan_assignments;
       where       = plan_where;
       indexes;
+      returning   = List.map plan_expr returning;
     }
-  | Sema.BS_delete { table_meta; where } ->
+  | Sema.BS_delete { table_meta; where; returning } ->
     let indexes = match cat with
       | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
       | None   -> []
     in
     Plan.Op_delete {
       table_meta;
-      where   = Option.map plan_expr where;
+      where     = Option.map plan_expr where;
       indexes;
+      returning = List.map plan_expr returning;
     }
   | Sema.BS_drop_table { table_meta; _ } ->
     let indexes = match cat with

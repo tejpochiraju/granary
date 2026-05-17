@@ -84,6 +84,7 @@ let bind_insert_basic () =
     columns     = ["id"; "name"];
     values      = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -102,6 +103,7 @@ let bind_insert_reversed_cols () =
     columns = ["name"; "id"];
     values = [Ast.E_lit (Ast.L_text "bob"); Ast.E_lit (Ast.L_int 2L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -127,6 +129,7 @@ let bind_insert_single_col () =
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_int 99L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -148,6 +151,7 @@ let bind_insert_unknown_table () =
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_int 1L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -161,6 +165,7 @@ let bind_insert_unknown_col () =
     columns = ["bogus"];
     values = [Ast.E_lit (Ast.L_int 1L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
@@ -174,6 +179,7 @@ let bind_insert_arity_mismatch () =
     columns = ["id"; "name"];
     values = [Ast.E_lit (Ast.L_int 1L)];       (* 2 cols, 1 value *)
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Arity_mismatch { expected = 2; got = 1 }) -> ()
@@ -188,6 +194,7 @@ let bind_insert_type_mismatch_int_col () =
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_text "text")];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
@@ -202,6 +209,7 @@ let bind_insert_type_mismatch_text_col () =
     columns = ["name"];
     values = [Ast.E_lit (Ast.L_int 42L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Text; got = Row.Integer }) -> ()
@@ -217,6 +225,7 @@ let bind_insert_null_allowed () =
     columns = ["id"];
     values = [Ast.E_lit Ast.L_null];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; _ }) ->
@@ -384,6 +393,7 @@ let bind_insert_second_col_unknown () =
     columns = ["id"; "bogus"; "age"];
     values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L); Ast.E_lit (Ast.L_int 3L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -565,6 +575,7 @@ let bind_update_basic () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "carol"))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update { assignments = [(1, _)]; where = None; _ }) -> ()
@@ -575,6 +586,7 @@ let bind_update_unknown_table () =
   let cat = two_col_cat () in
   let stmt = Ast.S_update {
     table = "ghost"; assignments = [("x", Ast.E_lit (Ast.L_int 1L))]; where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -584,6 +596,7 @@ let bind_update_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_update {
     table = "users"; assignments = [("bogus", Ast.E_lit (Ast.L_int 1L))]; where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -594,6 +607,7 @@ let bind_update_type_mismatch () =
   (* SET id (INTEGER) = 'text' *)
   let stmt = Ast.S_update {
     table = "users"; assignments = [("id", Ast.E_lit (Ast.L_text "bad"))]; where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
@@ -607,6 +621,7 @@ let bind_update_not_null_violation () =
   (* SET id = NULL on a NOT NULL column *)
   let stmt = Ast.S_update {
     table = "users"; assignments = [("id", Ast.E_lit Ast.L_null)]; where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation "id") -> ()
@@ -618,6 +633,7 @@ let bind_update_with_where () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update { where = Some _; _ }) -> ()
@@ -629,6 +645,7 @@ let bind_update_where_unknown_col () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_col "bogus");
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -640,7 +657,7 @@ let bind_update_where_unknown_col () =
 
 let bind_delete_basic () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_delete { table = "users"; where = None } in
+  let stmt = Ast.S_delete { table = "users"; where = None; returning = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_delete { where = None; _ }) -> ()
   | _ -> Alcotest.fail "expected BS_delete with no where"
@@ -650,6 +667,7 @@ let bind_delete_with_where () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_delete { where = Some _; _ }) -> ()
@@ -657,7 +675,7 @@ let bind_delete_with_where () =
 
 let bind_delete_unknown_table () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_delete { table = "ghost"; where = None } in
+  let stmt = Ast.S_delete { table = "ghost"; where = None; returning = [] } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
   | _ -> Alcotest.fail "expected Unknown_table ghost"
@@ -667,6 +685,7 @@ let bind_delete_where_unknown_col () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_col "bogus");
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -1097,6 +1116,7 @@ let bind_insert_not_null_violation () =
     columns = ["name"];
     values = [Ast.E_lit (Ast.L_text "alice")];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation "id") -> ()
@@ -1117,6 +1137,7 @@ let bind_insert_real_lit_type_mismatch () =
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_real 1.5)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Real }) -> ()
@@ -1133,6 +1154,7 @@ let bind_insert_blob_lit_ok () =
     columns = ["b"];
     values = [Ast.E_lit (Ast.L_blob (Bytes.of_string "hello"))];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1148,6 +1170,7 @@ let bind_insert_real_lit_ok () =
     columns = ["f"];
     values = [Ast.E_lit (Ast.L_real 3.14)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1585,6 +1608,7 @@ let bind_insert_default_null () =
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1605,6 +1629,7 @@ let bind_insert_default_real () =
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1623,6 +1648,7 @@ let bind_insert_default_blob () =
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1643,6 +1669,7 @@ let bind_insert_not_null_late () =
   let stmt = Ast.S_insert {
     table = "users"; columns = ["a"]; values = [Ast.E_lit (Ast.L_int 1L)];
     on_conflict = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation _) -> ()
@@ -2003,6 +2030,7 @@ let bind_update_neg_col_ok () =
     table = "users";
     assignments = [("id", Ast.E_neg (Ast.E_col "id"))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()
@@ -2015,6 +2043,7 @@ let bind_update_bitnot_col_ok () =
     table = "users";
     assignments = [("id", Ast.E_bitnot (Ast.E_col "id"))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()
@@ -2030,6 +2059,7 @@ let bind_update_between_ok () =
       Ast.E_lit (Ast.L_int 1L),
       Ast.E_lit (Ast.L_int 10L)))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()
@@ -2044,6 +2074,7 @@ let bind_update_in_ok () =
       Ast.E_col "id",
       [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()
@@ -2060,6 +2091,7 @@ let bind_update_arith_real_mismatch () =
       Ast.E_col "id",
       Ast.E_lit (Ast.L_real 1.5)))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Real }) -> ()
@@ -2077,6 +2109,7 @@ let bind_update_concat_type_mismatch () =
       Ast.E_col "name",
       Ast.E_lit (Ast.L_text "x")))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
@@ -2090,6 +2123,7 @@ let bind_update_func_no_type_check () =
     table = "users";
     assignments = [("id", Ast.E_func (Ast.Fn_length, [Ast.E_col "name"]))];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()
@@ -2103,6 +2137,7 @@ let bind_update_param_no_type_check () =
     table = "users";
     assignments = [("id", Ast.E_param Ast.Param_anon)];
     where = None;
+    returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_update _) -> ()

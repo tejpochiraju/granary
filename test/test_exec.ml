@@ -39,7 +39,7 @@ let insert store cat table_name (ordinals, values) =
     in
     Exec.execute store cat
       (Plan.Op_insert { table_meta; ordinals; values = List.map (fun l -> Plan.P_lit l) values;
-                        on_conflict = None })
+                        on_conflict = None; returning = [] })
   )
 
 (** Open a cursor on a tree and collect all (key, value) pairs. *)
@@ -563,7 +563,7 @@ let query_insert_raises () =
        ignore (Exec.query store cat
          (Plan.Op_insert { table_meta = m; ordinals = [0];
                            values = [Plan.P_lit (Ast.L_int 1L)];
-                           on_conflict = None }));
+                           on_conflict = None; returning = [] }));
        Alcotest.fail "expected Failure for Op_insert in query"
      with Failure _ -> ());
     Lwt.return_unit
@@ -1354,7 +1354,8 @@ let exec_update_no_match_returns_zero () =
            assignments = [(1, Plan.P_lit (Ast.L_text "z"))];
            where       = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
            indexes     = [];
-         }) in
+         
+          returning     = [] }) in
     Alcotest.(check int) "no match → 0 rows affected" 0 n;
     Lwt.return_unit
   )
@@ -1374,7 +1375,8 @@ let exec_update_match_returns_count () =
            assignments = [(1, Plan.P_lit (Ast.L_text "updated"))];
            where       = None;  (* update all *)
            indexes     = [];
-         }) in
+         
+          returning     = [] }) in
     Alcotest.(check int) "all 2 rows affected" 2 n;
     Lwt.return_unit
   )
@@ -1393,7 +1395,8 @@ let exec_update_raises_in_query () =
             assignments = [(1, Plan.P_lit (Ast.L_text "x"))];
             where = None;
             indexes = [];
-          }));
+          
+          returning     = [] }));
        Alcotest.fail "expected Failure for Op_update in query"
      with Failure _ -> ());
     Lwt.return_unit
@@ -1416,7 +1419,8 @@ let exec_delete_no_match_returns_zero () =
            table_meta = m;
            where = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
            indexes = [];
-         }) in
+         
+          returning     = [] }) in
     Alcotest.(check int) "no match → 0 deleted" 0 n;
     Lwt.return_unit
   )
@@ -1432,7 +1436,8 @@ let exec_delete_all_returns_count () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* n = Exec.execute_with_count store cat
-        (Plan.Op_delete { table_meta = m; where = None; indexes = [] }) in
+        (Plan.Op_delete { table_meta = m; where = None; indexes = [];
+          returning     = [] }) in
     Alcotest.(check int) "all 3 deleted" 3 n;
     Lwt.return_unit
   )
@@ -1446,7 +1451,8 @@ let exec_delete_raises_in_query () =
     let m = Option.get meta_opt in
     (try
        ignore (Exec.query store cat
-         (Plan.Op_delete { table_meta = m; where = None; indexes = [] }));
+         (Plan.Op_delete { table_meta = m; where = None; indexes = [];
+          returning     = [] }));
        Alcotest.fail "expected Failure for Op_delete in query"
      with Failure _ -> ());
     Lwt.return_unit

@@ -2114,6 +2114,57 @@ let test_insert_or_replace_multi_unique () =
        Lwt.return_unit))
 
 (* ------------------------------------------------------------------ *)
+(* RETURNING clause tests                                               *)
+(* ------------------------------------------------------------------ *)
+
+let test_insert_returning () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* r = Db.query db "INSERT INTO t VALUES (1, 'hello') RETURNING id, v" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "one returned row" 1 (List.length rows);
+       let row = List.hd rows in
+       Alcotest.(check int) "id=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
+       Alcotest.(check string) "v=hello" "hello" (match row.(1) with Db.V_text s -> s | _ -> "X");
+       Lwt.return_unit))
+
+let test_update_returning () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'old')" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'keep')" in
+    let* r = Db.query db "UPDATE t SET v = 'new' WHERE id = 1 RETURNING id, v" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "one updated row returned" 1 (List.length rows);
+       let row = List.hd rows in
+       Alcotest.(check string) "v=new" "new" (match row.(1) with Db.V_text s -> s | _ -> "X");
+       Lwt.return_unit))
+
+let test_delete_returning () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'b')" in
+    let* r = Db.query db "DELETE FROM t WHERE id = 1 RETURNING id, v" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "one deleted row returned" 1 (List.length rows);
+       let row = List.hd rows in
+       Alcotest.(check int) "id=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
+       Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2339,5 +2390,10 @@ let () =
       Alcotest.test_case "insert_or_ignore_unique"      `Quick test_insert_or_ignore_unique;
       Alcotest.test_case "insert_or_replace_no_conflict" `Quick test_insert_or_replace_no_conflict;
       Alcotest.test_case "insert_or_replace_multi_unique" `Quick test_insert_or_replace_multi_unique;
+    ];
+    "returning", [
+      Alcotest.test_case "insert_returning" `Quick test_insert_returning;
+      Alcotest.test_case "update_returning" `Quick test_update_returning;
+      Alcotest.test_case "delete_returning" `Quick test_delete_returning;
     ];
   ]

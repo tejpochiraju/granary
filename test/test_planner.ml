@@ -49,6 +49,7 @@ let plan_insert () =
     columns     = ["id"; "name"];
     values      = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
     on_conflict = None;
+    returning   = [];
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -574,6 +575,7 @@ let plan_update_no_cat () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = None;
+    returning = [];
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
@@ -583,7 +585,7 @@ let plan_update_no_cat () =
 (** Plan BS_delete without ~cat → indexes = [] (None arm). *)
 let plan_delete_no_cat () =
   let cat = make_cat () in
-  let stmt = Ast.S_delete { table = "users"; where = None } in
+  let stmt = Ast.S_delete { table = "users"; where = None; returning = [] } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_delete { indexes = []; _ } -> ()

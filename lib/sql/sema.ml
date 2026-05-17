@@ -53,6 +53,7 @@ type bound_stmt =
       ordinals    : int list;
       values      : bound_expr list;
       on_conflict : Ast.conflict_action option;
+      returning   : bound_expr list;
     }
   | BS_select of {
       distinct   : bool;
@@ -82,10 +83,12 @@ type bound_stmt =
       table_meta  : Cat.table_meta;
       assignments : (int * bound_expr) list;
       where       : bound_expr option;
+      returning   : bound_expr list;
     }
   | BS_delete of {
       table_meta : Cat.table_meta;
       where      : bound_expr option;
+      returning  : bound_expr list;
     }
   | BS_drop_table of {
       name       : string;
@@ -625,7 +628,17 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
               col_values;
             }))))
 
-let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict =
+let bind_returning_exprs ~param_counter ~named_params (meta : Cat.table_meta) (exprs : Ast.expr list) =
+  List.fold_left (fun acc re ->
+    match acc with
+    | Error _ -> acc
+    | Ok bexprs ->
+      (match bind_expr ~param_counter ~named_params meta re with
+       | Error e -> Error e
+       | Ok be   -> Ok (bexprs @ [be]))
+  ) (Ok []) exprs
+
+let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -715,12 +728,16 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
           | Ok () ->
             let ordinals = List.map fst full_pairs in
             let full_vals = List.map snd full_pairs in
-            Lwt.return (Ok (BS_insert {
-              table_meta = meta;
-              ordinals;
-              values     = full_vals;
-              on_conflict;
-            }))))
+            (match bind_returning_exprs ~param_counter ~named_params meta returning with
+             | Error e -> Lwt.return (Error e)
+             | Ok ret_bound ->
+               Lwt.return (Ok (BS_insert {
+                 table_meta = meta;
+                 ordinals;
+                 values     = full_vals;
+                 on_conflict;
+                 returning  = ret_bound;
+               })))))
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)
@@ -1269,7 +1286,7 @@ let bind_create_index cat ~name ~table ~columns ~unique =
 (* UPDATE                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_update cat ~param_counter ~named_params ~table ~assignments ~where =
+let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -1315,11 +1332,15 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where =
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
-          Lwt.return (Ok (BS_update {
-            table_meta  = meta;
-            assignments = bound_assigns;
-            where       = bound_where;
-          }))))
+          (match bind_returning_exprs ~param_counter ~named_params meta returning with
+           | Error e -> Lwt.return (Error e)
+           | Ok ret_bound ->
+             Lwt.return (Ok (BS_update {
+               table_meta  = meta;
+               assignments = bound_assigns;
+               where       = bound_where;
+               returning   = ret_bound;
+             })))))
 
 (* ------------------------------------------------------------------ *)
 (* DELETE                                                               *)
@@ -1346,7 +1367,7 @@ let bind_fts_delete cat ~param_counter ~named_params ~table ~where =
          where = bound_where;
        })))
 
-let bind_delete cat ~param_counter ~named_params ~table ~where =
+let bind_delete cat ~param_counter ~named_params ~table ~where ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -1364,10 +1385,14 @@ let bind_delete cat ~param_counter ~named_params ~table ~where =
     (match where_result with
      | Error e -> Lwt.return (Error e)
      | Ok bound_where ->
-       Lwt.return (Ok (BS_delete {
-         table_meta = meta;
-         where      = bound_where;
-       })))
+       (match bind_returning_exprs ~param_counter ~named_params meta returning with
+        | Error e -> Lwt.return (Error e)
+        | Ok ret_bound ->
+          Lwt.return (Ok (BS_delete {
+            table_meta = meta;
+            where      = bound_where;
+            returning  = ret_bound;
+          }))))
 
 (* ------------------------------------------------------------------ *)
 (* DROP TABLE                                                           *)
@@ -1438,15 +1463,15 @@ let rec compound_col_count = function
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
-  | Ast.S_insert { table; columns; values; on_conflict }     -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict
+  | Ast.S_insert { table; columns; values; on_conflict; returning } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
   | Ast.S_select { distinct; proj; table; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->
     bind_create_index cat ~name ~table ~columns ~unique
-  | Ast.S_update { table; assignments; where } ->
-    bind_update cat ~param_counter ~named_params ~table ~assignments ~where
-  | Ast.S_delete { table; where } ->
-    bind_delete cat ~param_counter ~named_params ~table ~where
+  | Ast.S_update { table; assignments; where; returning } ->
+    bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~returning
+  | Ast.S_delete { table; where; returning } ->
+    bind_delete cat ~param_counter ~named_params ~table ~where ~returning
   | Ast.S_drop_table { name } ->
     bind_drop_table cat ~name
   | Ast.S_drop_index { name } ->

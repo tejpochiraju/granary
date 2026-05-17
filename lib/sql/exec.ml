@@ -1184,7 +1184,7 @@ let execute_with_count ?(mode = Auto)
        it commits immediately regardless of mode. Phase 4 work to fix. *)
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict } ->
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _ } ->
     let* inserted = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in
     Lwt.return (if inserted then 1 else 0)
   | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
@@ -1194,9 +1194,9 @@ let execute_with_count ?(mode = Auto)
     let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
                 ~col_idxs ~unique ~columns in
     Lwt.return 0
-  | Plan.Op_update { table_meta; assignments; where; indexes } ->
+  | Plan.Op_update { table_meta; assignments; where; indexes; returning = _ } ->
     execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes
-  | Plan.Op_delete { table_meta; where; indexes } ->
+  | Plan.Op_delete { table_meta; where; indexes; returning = _ } ->
     execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
@@ -1330,7 +1330,7 @@ let fts_query_terms query =
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* ------------------------------------------------------------------ *)
 
-let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
     let* tx  = S.ro_begin store in
@@ -1845,18 +1845,99 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       else (Hashtbl.replace seen k (); true)
     ) left_list in
     Lwt.return (Lwt_stream.of_list result)
-  | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
-  | Plan.Op_update _ | Plan.Op_delete _
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning }
+    when returning <> [] ->
+    (match cat with
+     | None -> failwith "Exec.query: RETURNING requires catalog context"
+     | Some c ->
+       (* Evaluate the row values locally (for RETURNING projection after insert). *)
+       let n = List.length table_meta.columns in
+       let inserted_row = Array.make n Row.V_null in
+       List.iter2 (fun ord e ->
+         inserted_row.(ord) <- eval_expr clock params [||] e
+       ) ordinals values;
+       let* inserted = execute_insert ~on_conflict store c ~table_meta ~ordinals ~values in
+       if not inserted then Lwt.return (Lwt_stream.of_list [])
+       else
+         let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
+         Lwt.return (Lwt_stream.of_list [result]))
+  | Plan.Op_update { table_meta; assignments; where; indexes; returning }
+    when returning <> [] ->
+    let schema = table_meta.Cat.columns in
+    (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
+    let* tx_ro = S.ro_begin store in
+    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (_kbytes, vbytes) ->
+        let row = Row.decode schema vbytes in
+        let keep = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if keep then buf := row :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    let* () = S.ro_end tx_ro in
+    let matched = List.rev !buf in
+    (* Compute new values for each matched row, project RETURNING from new row. *)
+    let result_rows = List.map (fun old_row ->
+      let new_row = Array.copy old_row in
+      List.iter (fun (i, expr) ->
+        new_row.(i) <- eval_expr clock params old_row expr
+      ) assignments;
+      Array.of_list (List.map (eval_expr clock params new_row) returning)
+    ) matched in
+    (* Execute the actual update. *)
+    let* _ = execute_update ~params ~clock store ~table_meta ~assignments ~where ~indexes in
+    Lwt.return (Lwt_stream.of_list result_rows)
+  | Plan.Op_delete { table_meta; where; indexes; returning }
+    when returning <> [] ->
+    let schema = table_meta.Cat.columns in
+    (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)
+    let* tx_ro = S.ro_begin store in
+    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (_kbytes, vbytes) ->
+        let row = Row.decode schema vbytes in
+        let keep = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if keep then buf := row :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    let* () = S.ro_end tx_ro in
+    let matched = List.rev !buf in
+    let result_rows = List.map (fun old_row ->
+      Array.of_list (List.map (eval_expr clock params old_row) returning)
+    ) matched in
+    let* _ = execute_delete ~params ~clock store ~table_meta ~where ~indexes in
+    Lwt.return (Lwt_stream.of_list result_rows)
+  | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
   | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
+    failwith "Exec.query: use Exec.execute for write operations"
+  | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 
 (* ------------------------------------------------------------------ *)
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
-let query ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (_cat : Cat.t) (op : Plan.op) :
+let query ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) :
     Row.t Lwt_stream.t Lwt.t =
-  to_stream clock params store op
+  to_stream clock params store ~cat:(Some cat) op

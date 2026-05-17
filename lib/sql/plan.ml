@@ -32,6 +32,7 @@ type op =
       ordinals    : int list;
       values      : expr list;
       on_conflict : Ast.conflict_action option;
+      returning   : expr list;
     }
   | Op_seq_scan of {
       table_meta : Cat.table_meta;
@@ -80,11 +81,13 @@ type op =
       assignments : (int * expr) list;  (** [(col_ordinal, new_value_expr)] *)
       where       : expr option;
       indexes     : Cat.index_info list;
+      returning   : expr list;
     }
   | Op_delete of {
       table_meta : Cat.table_meta;
       where      : expr option;
       indexes    : Cat.index_info list;
+      returning  : expr list;
     }
   | Op_drop_table of {
       table_meta : Cat.table_meta;

@@ -68,6 +68,7 @@ type bound_stmt =
       ordinals    : int list;            (** column ordinals for the named cols *)
       values      : bound_expr list;
       on_conflict : Ast.conflict_action option;
+      returning   : bound_expr list;
     }
   | BS_select of {
       distinct   : bool;
@@ -110,10 +111,12 @@ type bound_stmt =
       assignments : (int * bound_expr) list;
         (** [(col_ordinal, new_value_expr)] *)
       where       : bound_expr option;
+      returning   : bound_expr list;
     }
   | BS_delete of {
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       where      : bound_expr option;
+      returning  : bound_expr list;
     }
   | BS_drop_table of {
       name       : string;
