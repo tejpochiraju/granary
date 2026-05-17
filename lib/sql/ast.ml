@@ -116,10 +116,10 @@ type stmt =
       offset   : int option;
     }
   | S_create_index of {
-      name   : string;
-      table  : string;
-      column : string;
-      unique : bool;
+      name    : string;
+      table   : string;
+      columns : string list;
+      unique  : bool;
     }
   | S_update of {
       table       : string;

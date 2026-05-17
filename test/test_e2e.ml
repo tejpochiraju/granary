@@ -876,6 +876,21 @@ let index_lookup_where_null_no_match () =
   let rows = query_ok db "SELECT * FROM t WHERE val = NULL" in
   Alcotest.(check int) "0 rows for col = NULL" 0 (List.length rows)
 
+(* ------------------------------------------------------------------ *)
+(* Multi-column index test                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_multi_col_index () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)";
+  exec db "CREATE INDEX idx_ab ON t (a, b)";
+  exec db "INSERT INTO t VALUES (1, 2, 'x')";
+  exec db "INSERT INTO t VALUES (3, 4, 'y')";
+  (* multi-column index was built; seq scan with WHERE a=1 still works *)
+  let rows = query_ok db "SELECT c FROM t WHERE a = 1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.check value_testable "value" (Db.V_text "x") (List.hd rows).(0)
+
 (* QCheck: random integer inserts + CREATE INDEX; index lookup must
    match sequential scan for every distinct value. *)
 let qcheck_index_lookup_matches_seq_scan =
@@ -1500,6 +1515,7 @@ let () =
       Alcotest.test_case "create_index_unknown_column"      `Quick create_index_unknown_column;
       Alcotest.test_case "create_index_duplicate"           `Quick create_index_duplicate;
       Alcotest.test_case "index_lookup_where_null_no_match"  `Quick index_lookup_where_null_no_match;
+      Alcotest.test_case "multi_col_index"                   `Quick test_multi_col_index;
     ];
     "qcheck_create_index", (
       List.map QCheck_alcotest.to_alcotest [

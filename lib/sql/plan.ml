@@ -60,8 +60,8 @@ type op =
   | Op_create_index of {
       name     : string;
       table    : string;
-      tree_id  : int;    (** table's tree_id *)
-      col_idx  : int;    (** column ordinal in table schema *)
+      tree_id  : int;          (** table's tree_id *)
+      col_idxs : int list;     (** column ordinals in table schema *)
       unique   : bool;
       columns  : Sqlocaml_encoding.Row.column list;
         (** columns of the target table — needed for row decoding

@@ -330,7 +330,7 @@ let make_cat_with_index ~col_name =
       { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None };
     ] in
     let* _ = Cat.create_index cat ~name:"idx" ~table:"users"
-      ~column:col_name ~unique:false in
+      ~columns:[col_name] ~unique:false in
     Lwt.return cat
   )
 
@@ -382,11 +382,11 @@ let plan_no_index_falls_back_to_filter () =
 let plan_create_index () =
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_create_index {
-    name = "idx2"; table = "users"; column = "name"; unique = true;
+    name = "idx2"; table = "users"; columns = ["name"]; unique = true;
   } in
   let bound = bind cat stmt in
   match Planner.plan ~cat bound with
-  | Plan.Op_create_index { name = "idx2"; table = "users"; col_idx = 1;
+  | Plan.Op_create_index { name = "idx2"; table = "users"; col_idxs = [1];
                            unique = true; _ } -> ()
   | _ -> Alcotest.fail "expected Op_create_index { name=idx2; ... }"
 

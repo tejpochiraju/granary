@@ -28,7 +28,7 @@ type table_meta = {
 type index_info = {
   idx_name    : string;
   idx_table   : string;
-  idx_column  : string;
+  idx_columns : string list;
   idx_unique  : bool;
   idx_tree_id : S.tree_id;
 }
@@ -194,15 +194,19 @@ let decode_column bytes =
 
 (* Index value encoding:
    varint(name_len) ++ name ++ varint(table_len) ++ table
-   ++ varint(col_len) ++ col ++ [unique: 1 byte] ++ varint(tree_id) *)
+   ++ varint(n_cols) ++ (varint(col_len) ++ col)*n_cols
+   ++ [unique: 1 byte] ++ varint(tree_id) *)
 let encode_index_value (idx : index_info) =
   let buf = Buffer.create 32 in
   Varint.encode_uint64 buf (Int64.of_int (String.length idx.idx_name));
   Buffer.add_string buf idx.idx_name;
   Varint.encode_uint64 buf (Int64.of_int (String.length idx.idx_table));
   Buffer.add_string buf idx.idx_table;
-  Varint.encode_uint64 buf (Int64.of_int (String.length idx.idx_column));
-  Buffer.add_string buf idx.idx_column;
+  Varint.encode_uint64 buf (Int64.of_int (List.length idx.idx_columns));
+  List.iter (fun col ->
+    Varint.encode_uint64 buf (Int64.of_int (String.length col));
+    Buffer.add_string buf col
+  ) idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
   Buffer.to_bytes buf
@@ -216,17 +220,21 @@ let decode_index_value bytes =
   let tbl_len = Int64.to_int tbl_len in
   let tbl = Bytes.sub_string bytes off tbl_len in
   let off = off + tbl_len in
-  let col_len, off = Varint.decode_uint64 bytes off in
-  let col_len = Int64.to_int col_len in
-  let col = Bytes.sub_string bytes off col_len in
-  let off = off + col_len in
-  let unique_byte = Bytes.get_uint8 bytes off in
-  let off = off + 1 in
-  let tree_id, _ = Varint.decode_uint64 bytes off in
+  let n_cols, off = Varint.decode_uint64 bytes off in
+  let n_cols = Int64.to_int n_cols in
+  let off = ref off in
+  let cols = List.init n_cols (fun _ ->
+    let col_len, next_off = Varint.decode_uint64 bytes !off in
+    let col = Bytes.sub_string bytes next_off (Int64.to_int col_len) in
+    off := next_off + Int64.to_int col_len;
+    col
+  ) in
+  let unique_byte = Bytes.get_uint8 bytes !off in
+  let tree_id, _ = Varint.decode_uint64 bytes (!off + 1) in
   {
     idx_name    = name;
     idx_table   = tbl;
-    idx_column  = col;
+    idx_columns = cols;
     idx_unique  = (unique_byte <> 0);
     idx_tree_id = Int64.to_int tree_id;
   }
@@ -470,37 +478,38 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 
-let create_index t ~name ~table ~column ~unique =
+let create_index t ~name ~table ~columns ~unique =
   if Hashtbl.mem t.indexes name then
     Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))
   else match Hashtbl.find_opt t.cache table with
     | None ->
       Lwt.return (Error (Printf.sprintf "no table '%s'" table))
     | Some tm ->
-      let has_col =
-        List.exists (fun (c : Row.column) -> c.name = column) tm.columns
-      in
-      if not has_col then
-        Lwt.return (Error (Printf.sprintf
-                             "no column '%s' on table '%s'" column table))
-      else
-        let%lwt tid = next_user_tid t in
-        let%lwt id = read_next_index_id t.store in
-        let%lwt () = write_next_index_id t.store (id + 1) in
-        let info = {
-          idx_name    = name;
-          idx_table   = table;
-          idx_column  = column;
-          idx_unique  = unique;
-          idx_tree_id = tid;
-        } in
-        let%lwt tx = S.rw_begin t.store in
-        let%lwt () =
-          S.put tx sys_indexes_tid (index_key id) (encode_index_value info)
-        in
-        let%lwt () = S.commit tx in
-        Hashtbl.replace t.indexes name info;
-        Lwt.return (Ok info)
+      let missing = List.find_opt (fun col ->
+        not (List.exists (fun (c : Row.column) -> c.name = col) tm.columns)
+      ) columns in
+      (match missing with
+       | Some col ->
+         Lwt.return (Error (Printf.sprintf
+                               "no column '%s' on table '%s'" col table))
+       | None ->
+         let%lwt tid = next_user_tid t in
+         let%lwt id = read_next_index_id t.store in
+         let%lwt () = write_next_index_id t.store (id + 1) in
+         let info = {
+           idx_name    = name;
+           idx_table   = table;
+           idx_columns = columns;
+           idx_unique  = unique;
+           idx_tree_id = tid;
+         } in
+         let%lwt tx = S.rw_begin t.store in
+         let%lwt () =
+           S.put tx sys_indexes_tid (index_key id) (encode_index_value info)
+         in
+         let%lwt () = S.commit tx in
+         Hashtbl.replace t.indexes name info;
+         Lwt.return (Ok info))
 
 let indexes_for_table t ~table =
   Hashtbl.fold (fun _ info acc ->

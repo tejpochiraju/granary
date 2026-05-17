@@ -73,7 +73,7 @@ type bound_stmt =
   | BS_create_index of {
       name       : string;
       table_meta : Cat.table_meta;
-      col_idx    : int;
+      col_idxs   : int list;
       unique     : bool;
     }
   | BS_update of {
@@ -1211,22 +1211,28 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
 (* CREATE INDEX                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let bind_create_index cat ~name ~table ~column ~unique =
+let bind_create_index cat ~name ~table ~columns ~unique =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some meta ->
-    (match col_index meta.columns column with
-     | None ->
-       Lwt.return (Error (Unknown_column { table; column }))
-     | Some i ->
+    let col_idxs_r = List.map (fun col ->
+      match col_index meta.columns col with
+      | None -> Error (Unknown_column { table; column = col })
+      | Some i -> Ok i
+    ) columns in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) col_idxs_r in
+    (match errors with
+     | e :: _ -> Lwt.return (Error e)
+     | [] ->
+       let col_idxs = List.filter_map (function Ok i -> Some i | Error _ -> None) col_idxs_r in
        (match Cat.find_index cat ~name with
         | Some _ -> Lwt.return (Error (Already_exists name))
         | None ->
           Lwt.return (Ok (BS_create_index {
             name;
             table_meta = meta;
-            col_idx    = i;
+            col_idxs;
             unique;
           }))))
 
@@ -1398,8 +1404,8 @@ let bind cat stmt =
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~param_counter ~table ~columns ~values
   | Ast.S_select { proj; table; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
-  | Ast.S_create_index { name; table; column; unique } ->
-    bind_create_index cat ~name ~table ~column ~unique
+  | Ast.S_create_index { name; table; columns; unique } ->
+    bind_create_index cat ~name ~table ~columns ~unique
   | Ast.S_update { table; assignments; where } ->
     bind_update cat ~param_counter ~table ~assignments ~where
   | Ast.S_delete { table; where } ->

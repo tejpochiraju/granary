@@ -100,7 +100,7 @@ type bound_stmt =
   | BS_create_index of {
       name       : string;
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
-      col_idx    : int;                 (** column ordinal in the table *)
+      col_idxs   : int list;            (** column ordinals in the table *)
       unique     : bool;
     }
   | BS_update of {

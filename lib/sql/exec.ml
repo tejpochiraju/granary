@@ -717,12 +717,13 @@ let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
         Lwt_list.fold_left_s (fun acc (idx : Cat.index_info) ->
           if not acc || not idx.idx_unique then Lwt.return acc
           else begin
-            let col_idx =
-              find_col_idx_by_name table_meta.columns idx.idx_column
+            let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+            let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+            (* For UNIQUE check on multi-col index, encode first col value as prefix *)
+            let prefix = match iks with
+              | [] -> Bytes.empty
+              | ik :: _ -> Index_key.encode_value ik
             in
-            let v = row.(col_idx) in
-            let ik_value = row_value_to_index_value v in
-            let prefix = Index_key.encode_value ik_value in
             let plen = Bytes.length prefix in
             (* Seek to the smallest key >= prefix ++ min_rowid. *)
             let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
@@ -738,8 +739,8 @@ let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
             S.cursor_close cur;
             if duplicate then
               Lwt.fail_with (Printf.sprintf
-                "UNIQUE constraint violated: duplicate value in column '%s'"
-                idx.idx_column)
+                "UNIQUE constraint violated: duplicate value in columns (%s)"
+                (String.concat ", " idx.idx_columns))
             else
               Lwt.return true
           end
@@ -747,11 +748,9 @@ let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
       in
       ignore unique_ok;
       let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-        let col_idx =
-          find_col_idx_by_name table_meta.columns idx.idx_column
-        in
-        let v = row.(col_idx) in
-        let ikey = Index_key.encode [row_value_to_index_value v] ~rowid in
+        let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+        let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+        let ikey = Index_key.encode iks ~rowid in
         S.put tx idx.idx_tree_id ikey Bytes.empty
       ) idxs in
       release_txn tx owned)
@@ -763,10 +762,10 @@ let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
 let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~name ~table ~tree_id ~col_idx ~unique
+    ~name ~table ~tree_id ~col_idxs ~unique
     ~(columns : Row.column list) : unit Lwt.t =
-  let* res = Cat.create_index cat ~name ~table
-               ~column:(List.nth columns col_idx).Row.name ~unique in
+  let col_names = List.map (fun ci -> (List.nth columns ci).Row.name) col_idxs in
+  let* res = Cat.create_index cat ~name ~table ~columns:col_names ~unique in
   match res with
   | Error msg -> failwith msg
   | Ok info ->
@@ -781,8 +780,8 @@ let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
           | Some (kbytes, vbytes) ->
             let rowid = Rowid.decode kbytes in
             let row = Row.decode columns vbytes in
-            let v = row.(col_idx) in
-            let ikey = Index_key.encode [row_value_to_index_value v] ~rowid in
+            let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_idxs in
+            let ikey = Index_key.encode iks ~rowid in
             let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
             walk ()
         in
@@ -800,16 +799,31 @@ let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
 let unique_violation_on_update
     (tx : S.rw S.txn)
     (idx : Cat.index_info)
-    (new_value : Row.value)
+    (new_values : Row.value list)
     ~(rowid : int64) : bool Lwt.t =
-  let ik_value = row_value_to_index_value new_value in
-  let prefix   = Index_key.encode_value ik_value in
+  (* For UNIQUE check we use the first value as the seek prefix.
+     This is a conservative approach: we seek to the first key with the
+     matching first-column value, then compare the entire encoded key. *)
+  let ik_values = List.map row_value_to_index_value new_values in
+  let full_key_no_rowid =
+    (* Encode all values without rowid to use as a prefix for exact match *)
+    let buf = Buffer.create 32 in
+    List.iter (fun ikv ->
+      Buffer.add_bytes buf (Index_key.encode_value ikv)
+    ) ik_values;
+    Buffer.to_bytes buf
+  in
+  let prefix = match ik_values with
+    | [] -> Bytes.empty
+    | ik :: _ -> Index_key.encode_value ik
+  in
   let plen     = Bytes.length prefix in
   let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
   let* cur = S.cursor_open tx idx.idx_tree_id in
   let _sr = S.cursor_seek cur seek_key in
   (* Scan entries while the value prefix matches.  A different rowid
-     with the same value is a UNIQUE violation. *)
+     with the same full value sequence is a UNIQUE violation. *)
+  let full_klen = Bytes.length full_key_no_rowid in
   let rec scan () =
     match S.cursor_next cur with
     | None -> Lwt.return false
@@ -817,10 +831,16 @@ let unique_violation_on_update
       if Bytes.length ikey >= plen + 8 &&
          Bytes.equal (Bytes.sub ikey 0 plen) prefix
       then begin
-        let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-        let other = Rowid.decode rowid_bytes in
-        if Int64.equal other rowid then scan ()
-        else Lwt.return true
+        (* Check that the full value prefix (all columns) also matches *)
+        if Bytes.length ikey >= full_klen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 full_klen) full_key_no_rowid
+        then begin
+          let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+          let other = Rowid.decode rowid_bytes in
+          if Int64.equal other rowid then scan ()
+          else Lwt.return true
+        end else
+          scan ()
       end else
         Lwt.return false
   in
@@ -880,27 +900,28 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
               else begin
-                let col_i = find_col_idx_by_name schema idx.idx_column in
-                (* Only check if the value actually changed (otherwise the
-                   existing entry has the same rowid and won't conflict). *)
-                let old_v = old_row.(col_i) in
-                let new_v = new_row.(col_i) in
-                let unchanged =
-                  match old_v, new_v with
+                let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
+                (* Only check if any of the indexed values actually changed *)
+                let old_vs = List.map (fun ci -> old_row.(ci)) col_is in
+                let new_vs = List.map (fun ci -> new_row.(ci)) col_is in
+                let values_equal a b = match a, b with
                   | Row.V_null, Row.V_null     -> true
-                  | Row.V_int  a, Row.V_int  b -> Int64.equal a b
-                  | Row.V_text a, Row.V_text b -> String.equal a b
-                  | Row.V_real a, Row.V_real b -> Float.equal a b
-                  | Row.V_blob a, Row.V_blob b -> Bytes.equal a b
+                  | Row.V_int  x, Row.V_int  y -> Int64.equal x y
+                  | Row.V_text x, Row.V_text y -> String.equal x y
+                  | Row.V_real x, Row.V_real y -> Float.equal x y
+                  | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
                   | _                           -> false
+                in
+                let unchanged =
+                  List.for_all2 values_equal old_vs new_vs
                 in
                 if unchanged then Lwt.return_unit
                 else
-                  let* dup = unique_violation_on_update tx idx new_v ~rowid in
+                  let* dup = unique_violation_on_update tx idx new_vs ~rowid in
                   if dup then
                     Lwt.fail_with (Printf.sprintf
-                      "UNIQUE constraint violated: duplicate value in column '%s'"
-                      idx.idx_column)
+                      "UNIQUE constraint violated: duplicate value in columns (%s)"
+                      (String.concat ", " idx.idx_columns))
                   else Lwt.return_unit
               end
             ) indexes
@@ -916,15 +937,11 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
             let key = Rowid.encode rowid in
             (* Update index entries: delete old, insert new. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              let col_i = find_col_idx_by_name schema idx.idx_column in
-              let old_v = old_row.(col_i) in
-              let new_v = new_row.(col_i) in
-              let old_ikey =
-                Index_key.encode [row_value_to_index_value old_v] ~rowid
-              in
-              let new_ikey =
-                Index_key.encode [row_value_to_index_value new_v] ~rowid
-              in
+              let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
+              let old_iks = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is in
+              let new_iks = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
+              let old_ikey = Index_key.encode old_iks ~rowid in
+              let new_ikey = Index_key.encode new_iks ~rowid in
               let* () = S.del tx idx.idx_tree_id old_ikey in
               S.put tx idx.idx_tree_id new_ikey Bytes.empty
             ) indexes in
@@ -986,11 +1003,9 @@ let execute_delete ?(mode = Auto) ?(params = [||]) (store : S.t)
             let rowid_key = Rowid.encode rowid in
             (* Remove index entries for this row. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              let col_i = find_col_idx_by_name schema idx.idx_column in
-              let v = row.(col_i) in
-              let old_ikey =
-                Index_key.encode [row_value_to_index_value v] ~rowid
-              in
+              let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
+              let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+              let old_ikey = Index_key.encode iks ~rowid in
               S.del tx idx.idx_tree_id old_ikey
             ) indexes in
             (* Remove the row from the table tree. *)
@@ -1049,12 +1064,12 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_insert { table_meta; ordinals; values } ->
     let* () = execute_insert ~mode ~params store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
-  | Plan.Op_create_index { name; table; tree_id; col_idx; unique; columns } ->
+  | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
        block — it commits immediately. Phase 4 work to fix. *)
     let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                ~col_idx ~unique ~columns in
+                ~col_idxs ~unique ~columns in
     Lwt.return 0
   | Plan.Op_update { table_meta; assignments; where; indexes } ->
     execute_update ~mode ~params store ~table_meta ~assignments ~where ~indexes

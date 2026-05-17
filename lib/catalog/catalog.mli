@@ -14,7 +14,7 @@ type table_meta = {
 type index_info = {
   idx_name    : string;
   idx_table   : string;
-  idx_column  : string;
+  idx_columns : string list;
   idx_unique  : bool;
   idx_tree_id : Sqlocaml_store.Store.tree_id;
 }
@@ -68,12 +68,12 @@ val next_rowid_in_txn :
     Errors:
     - [`Error msg] if a table with [table] does not exist.
     - [`Error msg] if an index named [name] already exists.
-    - [`Error msg] if [column] is not a column of [table]. *)
+    - [`Error msg] if any column in [columns] is not a column of [table]. *)
 val create_index :
   t ->
   name:string ->
   table:string ->
-  column:string ->
+  columns:string list ->
   unique:bool ->
   (index_info, string) result Lwt.t
 

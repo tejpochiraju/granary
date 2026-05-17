@@ -648,13 +648,13 @@ let test_create_index_basic () =
     let* _ = C.create_table cat ~name:"users"
       ~columns:[int_col "id"; txt_col "name"] in
     let* result = C.create_index cat ~name:"idx_users_id"
-      ~table:"users" ~column:"id" ~unique:false in
+      ~table:"users" ~columns:["id"] ~unique:false in
     (match result with
      | Error msg -> Alcotest.failf "expected Ok, got Error %s" msg
      | Ok info ->
        Alcotest.(check string) "index name" "idx_users_id" info.C.idx_name;
        Alcotest.(check string) "index table" "users" info.C.idx_table;
-       Alcotest.(check string) "index column" "id" info.C.idx_column;
+       Alcotest.(check (list string)) "index columns" ["id"] info.C.idx_columns;
        Alcotest.(check bool) "not unique" false info.C.idx_unique;
        (* Index gets a tree_id >= 16, separate from the table's *)
        Alcotest.(check bool) "tree_id >= 16" true (info.C.idx_tree_id >= 16));
@@ -670,9 +670,9 @@ let test_indexes_for_table () =
     let before = C.indexes_for_table cat ~table:"users" in
     Alcotest.(check int) "no indexes initially" 0 (List.length before);
     let* _ = C.create_index cat ~name:"idx_id"
-      ~table:"users" ~column:"id" ~unique:false in
+      ~table:"users" ~columns:["id"] ~unique:false in
     let* _ = C.create_index cat ~name:"idx_name"
-      ~table:"users" ~column:"name" ~unique:true in
+      ~table:"users" ~columns:["name"] ~unique:true in
     let after = C.indexes_for_table cat ~table:"users" in
     Alcotest.(check int) "two indexes" 2 (List.length after);
     let names = List.map (fun i -> i.C.idx_name) after |> List.sort String.compare in
@@ -684,7 +684,7 @@ let test_create_index_unknown_table () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* r = C.create_index cat ~name:"idx" ~table:"ghost" ~column:"x" ~unique:false in
+    let* r = C.create_index cat ~name:"idx" ~table:"ghost" ~columns:["x"] ~unique:false in
     (match r with
      | Error _ -> ()
      | Ok _ -> Alcotest.fail "expected Error for unknown table");
@@ -696,7 +696,7 @@ let test_create_index_unknown_column () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
-    let* r = C.create_index cat ~name:"idx" ~table:"t" ~column:"bogus" ~unique:false in
+    let* r = C.create_index cat ~name:"idx" ~table:"t" ~columns:["bogus"] ~unique:false in
     (match r with
      | Error _ -> ()
      | Ok _ -> Alcotest.fail "expected Error for unknown column");
@@ -708,8 +708,8 @@ let test_create_index_duplicate () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
-    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
-    let* r = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
+    let* r = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
     (match r with
      | Error _ -> ()
      | Ok _ -> Alcotest.fail "expected Error for duplicate index name");
@@ -723,7 +723,7 @@ let test_index_persists_across_reopen () =
     let* _ = C.create_table cat1 ~name:"users"
       ~columns:[int_col "id"; txt_col "name"] in
     let* _ = C.create_index cat1 ~name:"idx_users_id"
-      ~table:"users" ~column:"id" ~unique:true in
+      ~table:"users" ~columns:["id"] ~unique:true in
     (* Reopen *)
     let* cat2 = C.open_ store in
     let idxs = C.indexes_for_table cat2 ~table:"users" in
@@ -731,7 +731,7 @@ let test_index_persists_across_reopen () =
     let i = List.hd idxs in
     Alcotest.(check string) "name preserved" "idx_users_id" i.C.idx_name;
     Alcotest.(check string) "table preserved" "users" i.C.idx_table;
-    Alcotest.(check string) "column preserved" "id" i.C.idx_column;
+    Alcotest.(check (list string)) "columns preserved" ["id"] i.C.idx_columns;
     Alcotest.(check bool) "unique preserved" true i.C.idx_unique;
     Lwt.return_unit
   )
@@ -743,12 +743,12 @@ let test_find_index () =
     let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
     Alcotest.(check bool) "missing index returns None"
       true (C.find_index cat ~name:"idx" = None);
-    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
     (match C.find_index cat ~name:"idx" with
      | None -> Alcotest.fail "expected Some"
      | Some i ->
        Alcotest.(check string) "name" "idx" i.C.idx_name;
-       Alcotest.(check string) "column" "id" i.C.idx_column);
+       Alcotest.(check (list string)) "columns" ["id"] i.C.idx_columns);
     Lwt.return_unit
   )
 
@@ -790,8 +790,8 @@ let test_drop_table_also_drops_indexes () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"; txt_col "name"] in
-    let* _ = C.create_index cat ~name:"idx_id" ~table:"t" ~column:"id" ~unique:false in
-    let* _ = C.create_index cat ~name:"idx_name" ~table:"t" ~column:"name" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx_id" ~table:"t" ~columns:["id"] ~unique:false in
+    let* _ = C.create_index cat ~name:"idx_name" ~table:"t" ~columns:["name"] ~unique:false in
     (* Verify indexes exist before drop *)
     Alcotest.(check int) "2 indexes before drop" 2
       (List.length (C.indexes_for_table cat ~table:"t"));
@@ -823,7 +823,7 @@ let test_drop_index_basic () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
-    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
     let* tx = S.rw_begin store in
     let* () = C.drop_index cat tx ~name:"idx" in
     let* () = S.commit tx in
@@ -837,7 +837,7 @@ let test_drop_index_persists () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
-    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
     let* tx = S.rw_begin store in
     let* () = C.drop_index cat1 tx ~name:"idx" in
     let* () = S.commit tx in
@@ -857,7 +857,7 @@ let test_drop_index_empty_sys_indexes () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
-    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~column:"id" ~unique:false in
+    let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false in
     (* Delete all entries from sys_indexes_tid (tree_id=2) directly. *)
     let sys_indexes_tid = 2 in
     let* tx_ro = S.ro_begin store in

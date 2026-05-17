@@ -106,10 +106,12 @@ create_fts_table:
     { S_create_fts_table { name; columns = cols } }
 
 create_index:
-  | CREATE INDEX name = IDENT ON table = IDENT LPAREN col = IDENT RPAREN
-    { S_create_index { name; table; column = col; unique = false } }
-  | CREATE UNIQUE INDEX name = IDENT ON table = IDENT LPAREN col = IDENT RPAREN
-    { S_create_index { name; table; column = col; unique = true } }
+  | CREATE INDEX name = IDENT ON table = IDENT
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { S_create_index { name; table; columns = cols; unique = false } }
+  | CREATE UNIQUE INDEX name = IDENT ON table = IDENT
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { S_create_index { name; table; columns = cols; unique = true } }
 
 column_def:
   | name = IDENT ty = col_ty cs = column_constraint*

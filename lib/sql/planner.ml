@@ -45,12 +45,17 @@ let recognise_eq_col_lit = function
      | _          -> Some (i, e))
   | _ -> None
 
-(** If the catalog has an index on [(table, col_idx)], return the
-    matching [index_info].  Otherwise [None]. *)
+(** If the catalog has a single-column index on [(table, col_idx)], return the
+    matching [index_info].  Multi-column indexes are not used for lookup
+    optimization (deferred).  Otherwise [None]. *)
 let find_index_on_col cat (meta : Cat.table_meta) col_idx =
   let col_name = (List.nth meta.columns col_idx).Row.name in
   let candidates = Cat.indexes_for_table cat ~table:meta.name in
-  List.find_opt (fun (i : Cat.index_info) -> i.idx_column = col_name) candidates
+  List.find_opt (fun (i : Cat.index_info) ->
+    match i.idx_columns with
+    | [col] -> col = col_name
+    | _ -> false  (* multi-column indexes not used for lookup optimization *)
+  ) candidates
 
 (** Detect [BE_col a = BE_col b] equality at the top level. *)
 let recognise_eq_col_col = function
@@ -311,12 +316,12 @@ let plan ?cat = function
        | Some n ->
          let off = Option.value ~default:0 offset in
          Plan.Op_limit { limit = n; offset = off; child = sorted })
-  | Sema.BS_create_index { name; table_meta; col_idx; unique } ->
+  | Sema.BS_create_index { name; table_meta; col_idxs; unique } ->
     Plan.Op_create_index {
       name;
       table    = table_meta.name;
       tree_id  = table_meta.tree_id;
-      col_idx;
+      col_idxs;
       unique;
       columns  = table_meta.columns;
     }
