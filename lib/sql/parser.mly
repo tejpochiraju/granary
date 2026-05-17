@@ -33,6 +33,8 @@
 %token LIKE GLOB
 %token BETWEEN IN
 %token QUESTION
+%token <int>    IPARAM
+%token <string> NAMED_PARAM
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
 %token PLUS MINUS SLASH DOT
@@ -162,7 +164,9 @@ insert_expr:
   | l = literal            { E_lit l }
   | MINUS n = INT_LIT      { E_lit (L_int (Int64.neg n)) }
   | MINUS f = FLOAT_LIT    { E_lit (L_real (-. f)) }
-  | QUESTION               { E_param 0 }
+  | QUESTION        { E_param Param_anon }
+  | i = IPARAM      { E_param (Param_index i) }
+  | n = NAMED_PARAM { E_param (Param_name n) }
 
 compound_select:
   | s = select  { s }
@@ -327,7 +331,9 @@ between_bound:
   | a = between_bound LIKE b = between_bound { E_binop (Like, a, b) }
   | a = between_bound GLOB b = between_bound { E_binop (Glob, a, b) }
   | LPAREN e = expr RPAREN                 { e }
-  | QUESTION                               { E_param 0 }
+  | QUESTION        { E_param Param_anon }
+  | i = IPARAM      { E_param (Param_index i) }
+  | n = NAMED_PARAM { E_param (Param_name n) }
 
 expr:
   | l = literal                       { E_lit l }
@@ -372,4 +378,6 @@ expr:
   | e = expr IS NOT NULL              { E_is_not_null e }
   | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }
   | LPAREN e = expr RPAREN            { e }
-  | QUESTION                          { E_param 0 }
+  | QUESTION        { E_param Param_anon }
+  | i = IPARAM      { E_param (Param_index i) }
+  | n = NAMED_PARAM { E_param (Param_name n) }

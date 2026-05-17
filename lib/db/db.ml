@@ -75,6 +75,7 @@ let compile t sql =
 type stmt = {
   db_ref             : t;
   plan               : Sql.Plan.op;
+  param_names        : (string * int) list;
   mutable finalized  : bool;
 }
 
@@ -185,10 +186,27 @@ let query t sql =
 (* ------------------------------------------------------------------ *)
 
 let prepare t sql =
-  let* result = compile t sql in
-  match result with
+  match parse sql with
   | Error e -> Lwt.return (Error e)
-  | Ok plan -> Lwt.return (Ok { db_ref = t; plan; finalized = false })
+  | Ok ast  ->
+    let* bound = Sql.Sema.bind_returning_params t.catalog ast in
+    (match bound with
+     | Error e         -> Lwt.return (Error (Sema e))
+     | Ok (b, names)  ->
+       let plan = Sql.Planner.plan ~cat:t.catalog b in
+       Lwt.return (Ok { db_ref = t; plan; param_names = names; finalized = false }))
+
+let param_slot st name = List.assoc_opt name st.param_names
+
+let params_of_named st named =
+  let n = List.fold_left (fun acc (_, i) -> max acc (i + 1)) 0 st.param_names in
+  let arr = Array.make n Row.V_null in
+  List.iter (fun (name, v) ->
+    match List.assoc_opt name st.param_names with
+    | Some i -> arr.(i) <- v
+    | None   -> ()
+  ) named;
+  arr
 
 let run st ~params =
   if st.finalized then Lwt.return (Error (Runtime "statement already finalized"))

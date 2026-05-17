@@ -15,6 +15,11 @@ type literal =
   | L_real of float
   | L_blob of bytes
 
+type param =
+  | Param_anon            (** ? — assigned next slot in encounter order *)
+  | Param_index of int    (** ?1, ?2 ... — explicit 1-based slot *)
+  | Param_name  of string (** :name  @name  $name *)
+
 type binop =
   | Eq | Ne | Lt | Le | Gt | Ge   (** comparison *)
   | Add | Sub | Mul | Div          (** arithmetic *)
@@ -59,8 +64,8 @@ type expr =
     (** Aggregate call; [None] argument means [COUNT( * )]. *)
   | E_func        of scalar_func * expr list
     (** Scalar function call. *)
-  | E_param       of int
-    (** 0-indexed positional parameter: ? *)
+  | E_param       of param
+    (** parameter: ?, ?1, :name, @name, $name *)
   | E_match       of string * string
     (** [E_match (table_name, query_string)]: [WHERE table MATCH 'query'] *)
 

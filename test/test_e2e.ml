@@ -1554,6 +1554,54 @@ let test_except () =
     [Db.V_int 1L] xs
 
 (* ------------------------------------------------------------------ *)
+(* Named and indexed parameters                                         *)
+(* ------------------------------------------------------------------ *)
+
+let test_indexed_params () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (10, 20)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (30, 40)" in
+    (* ?1 reuses slot 0 twice — both conditions use the same value *)
+    let* stmt_r = Db.prepare db "SELECT x FROM t WHERE x = ?1 OR y = ?1" in
+    (match stmt_r with
+     | Error e -> Alcotest.failf "prepare: %s" (Format.asprintf "%a" Db.pp_error e)
+     | Ok st ->
+       let* r = Db.iter st ~params:[Db.V_int 10L] in
+       (match r with
+        | Error e -> Alcotest.failf "iter: %s" (Format.asprintf "%a" Db.pp_error e)
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          Alcotest.(check int) "indexed param rows" 1 (List.length rows);
+          let* () = Db.finalize st in
+          Lwt.return_unit)))
+
+let test_named_params_colon () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'world')" in
+    let* stmt_r = Db.prepare db "SELECT y FROM t WHERE x = :id" in
+    (match stmt_r with
+     | Error e -> Alcotest.failf "prepare: %s" (Format.asprintf "%a" Db.pp_error e)
+     | Ok st ->
+       let params = Array.to_list (Db.params_of_named st ["id", Db.V_int 1L]) in
+       let* r = Db.iter st ~params in
+       (match r with
+        | Error e -> Alcotest.failf "iter: %s" (Format.asprintf "%a" Db.pp_error e)
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          Alcotest.(check int) "named colon rows" 1 (List.length rows);
+          (match rows with
+           | [| Db.V_text s |] :: _ ->
+             Alcotest.(check string) "named colon value" "hello" s
+           | _ -> Alcotest.fail "unexpected rows");
+          let* () = Db.finalize st in
+          Lwt.return_unit)))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1712,5 +1760,9 @@ let () =
       Alcotest.test_case "union_all"  `Quick test_union_all;
       Alcotest.test_case "intersect"  `Quick test_intersect;
       Alcotest.test_case "except"     `Quick test_except;
+    ];
+    "named_indexed_params", [
+      Alcotest.test_case "indexed_params"       `Quick test_indexed_params;
+      Alcotest.test_case "named_params_colon"   `Quick test_named_params_colon;
     ];
   ]

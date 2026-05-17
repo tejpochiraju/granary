@@ -112,7 +112,11 @@ rule token = parse
   | digit+ as n             { INT_LIT (Int64.of_string n) }
   | '\'' ([^ '\'']* as s) '\''  { STRING_LIT s }
   | '\'' [^ '\'']*          { failwith "unterminated string literal" }
-  | '?'                      { QUESTION }
+  | '?' (digit+ as n) { IPARAM (int_of_string n) }
+  | '?'               { QUESTION }
+  | ':' (ident as id) { NAMED_PARAM id }
+  | '@' (ident as id) { NAMED_PARAM id }
+  | '$' (ident as id) { NAMED_PARAM id }
   | ident as id             { IDENT id }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }

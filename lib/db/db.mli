@@ -75,3 +75,11 @@ val iter     : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt
 (** Release resources held by a prepared statement.  No-op in this
     implementation, but should be called for forward compatibility. *)
 val finalize : stmt -> unit Lwt.t
+
+(** Look up the 0-based slot index for a named parameter.
+    Returns [None] if the name was not found in the prepared statement. *)
+val param_slot : stmt -> string -> int option
+
+(** Build a parameter array from a named association list.
+    Unnamed or unknown parameters are left as [V_null]. *)
+val params_of_named : stmt -> (string * value) list -> value array
