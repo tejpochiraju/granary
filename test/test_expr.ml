@@ -633,6 +633,12 @@ let test_like_null () =
       (Plan.P_binop (Plan.Like, Plan.P_lit Ast.L_null, Plan.P_lit (Ast.L_text "%"))) in
   Alcotest.(check bool) "like null" true (v = Row.V_null)
 
+let test_glob_null () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row
+      (Plan.P_binop (Plan.Glob, Plan.P_lit Ast.L_null, Plan.P_lit (Ast.L_text "*"))) in
+  Alcotest.(check bool) "glob null" true (v = Row.V_null)
+
 let test_glob_match () =
   let row = [||] in
   let glob s p =
@@ -739,6 +745,7 @@ let () =
     "like_glob", [
       Alcotest.test_case "like_match" `Quick test_like_match;
       Alcotest.test_case "like_null"  `Quick test_like_null;
+      Alcotest.test_case "glob_null"  `Quick test_glob_null;
       Alcotest.test_case "glob_match" `Quick test_glob_match;
     ];
   ]

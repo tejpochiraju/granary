@@ -54,6 +54,10 @@ let value_truthy : Row.value -> bool = function
   | Row.V_null | Row.V_int 0L -> false
   | _                          -> true
 
+(* Pattern matching helpers for LIKE and GLOB.
+   Uses naive recursive backtracking: worst case is O(2^k) for k '%'/'*'
+   metacharacters against an adversarial string.  Acceptable for typical
+   SQL workloads; replace with NFA/DP if adversarial patterns are a concern. *)
 let rec like_match pat pi str si =
   let plen = String.length pat and slen = String.length str in
   if pi = plen then si = slen
