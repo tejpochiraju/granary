@@ -1184,7 +1184,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _ ->
-    failwith "set operations are read-only"
+    failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _

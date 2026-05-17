@@ -1404,6 +1404,14 @@ let pp_error fmt = function
 (* Public entry point                                                   *)
 (* ------------------------------------------------------------------ *)
 
+(* Count output columns of a bound statement for compound-select validation. *)
+let compound_col_count = function
+  | BS_select { proj; expr_proj; aggs; _ } ->
+    if aggs <> [] then List.length aggs
+    else if expr_proj <> [] then List.length expr_proj
+    else List.length proj
+  | _ -> 0  (* non-select stmts in compound: don't validate *)
+
 let rec bind cat stmt =
   let param_counter = ref 0 in
   match stmt with
@@ -1436,6 +1444,12 @@ let rec bind cat stmt =
     let* left_r  = bind cat left  in
     let* right_r = bind cat right in
     (match left_r, right_r with
-     | Ok l, Ok r   -> Lwt.return (Ok (BS_compound { op; left = l; right = r }))
+     | Ok l, Ok r   ->
+       let n_left  = compound_col_count l in
+       let n_right = compound_col_count r in
+       if n_left <> n_right then
+         Lwt.return (Error (Arity_mismatch { expected = n_left; got = n_right }))
+       else
+         Lwt.return (Ok (BS_compound { op; left = l; right = r }))
      | Error e, _
      | _, Error e   -> Lwt.return (Error e))
