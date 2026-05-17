@@ -528,6 +528,566 @@ let cases = [
     query = "SELECT a / b FROM t ORDER BY a ASC";
     unordered = false };
 
+  (* Phase 6: || concat operator *)
+  { name = "concat_strings";
+    setup = [
+      "CREATE TABLE t (a TEXT, b TEXT)";
+      "INSERT INTO t VALUES ('foo', 'bar')";
+    ];
+    query = "SELECT a || ' ' || b FROM t";
+    unordered = false };
+
+  { name = "concat_null_propagates";
+    setup = [
+      "CREATE TABLE t (a TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT a || 'x' FROM t";
+    unordered = false };
+
+  { name = "concat_int_text";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (42)";
+    ];
+    query = "SELECT n || ' items' FROM t";
+    unordered = false };
+
+  (* Phase 6: % modulo *)
+  { name = "modulo_basic";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (7)";
+      "INSERT INTO t VALUES (10)";
+      "INSERT INTO t VALUES (6)";
+    ];
+    query = "SELECT n % 3 FROM t ORDER BY n";
+    unordered = false };
+
+  { name = "modulo_null";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT n % 3 FROM t";
+    unordered = false };
+
+  { name = "modulo_div_by_zero";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (7)";
+    ];
+    query = "SELECT n % 0 FROM t";
+    unordered = false };
+
+  (* Phase 6: bitwise operators *)
+  { name = "bitwise_and";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (12)";
+    ];
+    query = "SELECT n & 3 FROM t ORDER BY n";
+    unordered = false };
+
+  { name = "bitwise_or";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT n | 8 FROM t ORDER BY n";
+    unordered = false };
+
+  { name = "lshift";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT n << 3 FROM t ORDER BY n";
+    unordered = false };
+
+  { name = "rshift";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (16)";
+      "INSERT INTO t VALUES (8)";
+    ];
+    query = "SELECT n >> 2 FROM t ORDER BY n";
+    unordered = false };
+
+  { name = "rshift_negative";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (-4)";
+    ];
+    query = "SELECT n >> 1 FROM t";
+    unordered = false };
+
+  { name = "bitnot";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (5)";
+    ];
+    query = "SELECT ~n FROM t";
+    unordered = false };
+
+  (* Phase 6: LIKE *)
+  { name = "like_percent_suffix";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('world')";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE 'hel%'";
+    unordered = false };
+
+  { name = "like_percent_prefix";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('world')";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE '%llo'";
+    unordered = false };
+
+  { name = "like_underscore";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('hallo')";
+      "INSERT INTO t VALUES ('hxllo')";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE 'h_llo' ORDER BY s";
+    unordered = false };
+
+  { name = "like_case_insensitive";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('Hello')";
+      "INSERT INTO t VALUES ('WORLD')";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE 'hello'";
+    unordered = false };
+
+  { name = "like_no_match";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE 'xyz%'";
+    unordered = false };
+
+  { name = "like_null_subject";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT s FROM t WHERE s LIKE '%'";
+    unordered = false };
+
+  { name = "not_like";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('world')";
+    ];
+    query = "SELECT s FROM t WHERE NOT (s LIKE 'hel%') ORDER BY s";
+    unordered = false };
+
+  (* Phase 6: GLOB *)
+  { name = "glob_star";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('world')";
+    ];
+    query = "SELECT s FROM t WHERE s GLOB 'hel*'";
+    unordered = false };
+
+  { name = "glob_question";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+      "INSERT INTO t VALUES ('hallo')";
+    ];
+    query = "SELECT s FROM t WHERE s GLOB 'h?llo' ORDER BY s";
+    unordered = false };
+
+  { name = "glob_case_sensitive";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('Hello')";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT s FROM t WHERE s GLOB 'hello'";
+    unordered = false };
+
+  (* Phase 6: BETWEEN *)
+  { name = "between_basic";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (10)";
+    ];
+    query = "SELECT n FROM t WHERE n BETWEEN 3 AND 7";
+    unordered = false };
+
+  { name = "between_inclusive_bounds";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (10)";
+    ];
+    query = "SELECT n FROM t WHERE n BETWEEN 1 AND 10 ORDER BY n";
+    unordered = false };
+
+  { name = "not_between";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (10)";
+    ];
+    query = "SELECT n FROM t WHERE NOT (n BETWEEN 3 AND 7) ORDER BY n";
+    unordered = false };
+
+  { name = "between_null_subject";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+      "INSERT INTO t VALUES (5)";
+    ];
+    query = "SELECT n FROM t WHERE n BETWEEN 1 AND 10";
+    unordered = false };
+
+  { name = "between_real";
+    setup = [
+      "CREATE TABLE t (r REAL)";
+      "INSERT INTO t VALUES (1.5)";
+      "INSERT INTO t VALUES (3.0)";
+      "INSERT INTO t VALUES (5.5)";
+    ];
+    query = "SELECT r FROM t WHERE r BETWEEN 2.0 AND 4.0";
+    unordered = false };
+
+  { name = "between_text";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('apple')";
+      "INSERT INTO t VALUES ('mango')";
+      "INSERT INTO t VALUES ('zebra')";
+    ];
+    query = "SELECT s FROM t WHERE s BETWEEN 'banana' AND 'orange'";
+    unordered = false };
+
+  (* Phase 6: IN *)
+  { name = "in_list_found";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+    ];
+    query = "SELECT n FROM t WHERE n IN (1, 3) ORDER BY n";
+    unordered = false };
+
+  { name = "in_list_not_found";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT n FROM t WHERE n IN (5, 6)";
+    unordered = false };
+
+  { name = "not_in_list";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+    ];
+    query = "SELECT n FROM t WHERE NOT (n IN (1, 3)) ORDER BY n";
+    unordered = false };
+
+  { name = "in_null_subject";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+      "INSERT INTO t VALUES (1)";
+    ];
+    query = "SELECT n FROM t WHERE n IN (1, 2)";
+    unordered = false };
+
+  { name = "in_text_values";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('a')";
+      "INSERT INTO t VALUES ('b')";
+      "INSERT INTO t VALUES ('c')";
+    ];
+    query = "SELECT s FROM t WHERE s IN ('a', 'c') ORDER BY s";
+    unordered = false };
+
+  (* Phase 6: SUBSTR *)
+  { name = "substr_from";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT SUBSTR(s, 2) FROM t";
+    unordered = false };
+
+  { name = "substr_from_len";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT SUBSTR(s, 2, 3) FROM t";
+    unordered = false };
+
+  { name = "substr_first";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT SUBSTR(s, 1, 1) FROM t";
+    unordered = false };
+
+  { name = "substr_beyond_end";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT SUBSTR(s, 4, 100) FROM t";
+    unordered = false };
+
+  { name = "substr_null";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT SUBSTR(s, 1) FROM t";
+    unordered = false };
+
+  (* Phase 6: TRIM / LTRIM / RTRIM *)
+  { name = "trim_spaces";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('  hello  ')";
+    ];
+    query = "SELECT TRIM(s) FROM t";
+    unordered = false };
+
+  { name = "ltrim_spaces";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('  hello  ')";
+    ];
+    query = "SELECT LTRIM(s) FROM t";
+    unordered = false };
+
+  { name = "rtrim_spaces";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('  hello  ')";
+    ];
+    query = "SELECT RTRIM(s) FROM t";
+    unordered = false };
+
+  { name = "trim_null";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT TRIM(s) FROM t";
+    unordered = false };
+
+  (* Phase 6: REPLACE *)
+  { name = "replace_basic";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello world')";
+    ];
+    query = "SELECT REPLACE(s, 'world', 'there') FROM t";
+    unordered = false };
+
+  { name = "replace_multiple";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('aaa')";
+    ];
+    query = "SELECT REPLACE(s, 'a', 'b') FROM t";
+    unordered = false };
+
+  { name = "replace_not_found";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT REPLACE(s, 'xyz', 'abc') FROM t";
+    unordered = false };
+
+  { name = "replace_null";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT REPLACE(s, 'a', 'b') FROM t";
+    unordered = false };
+
+  (* Phase 6: INSTR *)
+  { name = "instr_found";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT INSTR(s, 'ell') FROM t";
+    unordered = false };
+
+  { name = "instr_not_found";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT INSTR(s, 'xyz') FROM t";
+    unordered = false };
+
+  { name = "instr_first_char";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT INSTR(s, 'h') FROM t";
+    unordered = false };
+
+  { name = "instr_null";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT INSTR(s, 'x') FROM t";
+    unordered = false };
+
+  (* Phase 6: ROUND *)
+  { name = "round_no_digits";
+    setup = [
+      "CREATE TABLE t (r REAL)";
+      "INSERT INTO t VALUES (3.7)";
+      "INSERT INTO t VALUES (3.2)";
+    ];
+    query = "SELECT ROUND(r) FROM t ORDER BY r";
+    unordered = false };
+
+  { name = "round_2_digits";
+    setup = [
+      "CREATE TABLE t (r REAL)";
+      "INSERT INTO t VALUES (3.14159)";
+    ];
+    query = "SELECT ROUND(r, 2) FROM t";
+    unordered = false };
+
+  { name = "round_integer";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (5)";
+    ];
+    query = "SELECT ROUND(n) FROM t";
+    unordered = false };
+
+  { name = "round_null";
+    setup = [
+      "CREATE TABLE t (r REAL)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT ROUND(r) FROM t";
+    unordered = false };
+
+  (* Phase 6: TYPEOF *)
+  { name = "typeof_integer";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+    ];
+    query = "SELECT TYPEOF(n) FROM t";
+    unordered = false };
+
+  { name = "typeof_text";
+    setup = [
+      "CREATE TABLE t (s TEXT)";
+      "INSERT INTO t VALUES ('hello')";
+    ];
+    query = "SELECT TYPEOF(s) FROM t";
+    unordered = false };
+
+  { name = "typeof_real";
+    setup = [
+      "CREATE TABLE t (r REAL)";
+      "INSERT INTO t VALUES (3.14)";
+    ];
+    query = "SELECT TYPEOF(r) FROM t";
+    unordered = false };
+
+  { name = "typeof_null";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT TYPEOF(n) FROM t";
+    unordered = false };
+
+  { name = "typeof_literal_null";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (1)";
+    ];
+    query = "SELECT TYPEOF(NULL) FROM t";
+    unordered = false };
+
+  (* Phase 6: ORDER BY arbitrary expressions *)
+  { name = "order_by_arith";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (3)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT n FROM t ORDER BY n * -1";
+    unordered = false };
+
+  { name = "order_by_abs_fn";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (-3)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (-2)";
+    ];
+    query = "SELECT n FROM t ORDER BY ABS(n)";
+    unordered = false };
+
+  { name = "order_by_concat";
+    setup = [
+      "CREATE TABLE t (a TEXT, b TEXT)";
+      "INSERT INTO t VALUES ('b', 'z')";
+      "INSERT INTO t VALUES ('a', 'y')";
+    ];
+    query = "SELECT a FROM t ORDER BY a || b";
+    unordered = false };
+
+  { name = "order_by_ifnull";
+    setup = [
+      "CREATE TABLE t (n INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+      "INSERT INTO t VALUES (5)";
+      "INSERT INTO t VALUES (NULL)";
+    ];
+    query = "SELECT IFNULL(n, 0) FROM t ORDER BY IFNULL(n, 99)";
+    unordered = false };
+
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
