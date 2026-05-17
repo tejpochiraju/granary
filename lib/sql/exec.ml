@@ -544,7 +544,12 @@ let compile_check_expr (table_name : string) (col_idx : int)
   | Some e -> e
   | None ->
     let lexbuf = Lexing.from_string check_sql in
-    let ast_expr = Parser.expr_only Lexer.token lexbuf in
+    let ast_expr =
+      try Parser.expr_only Lexer.token lexbuf
+      with _ ->
+        failwith (Printf.sprintf "CHECK constraint parse error for %s.col%d: %s"
+          table_name col_idx check_sql)
+    in
     let plan_expr = ast_expr_to_plan_check columns ast_expr in
     Hashtbl.add check_expr_cache key plan_expr;
     plan_expr
@@ -1307,6 +1312,10 @@ let execute_with_count ?(mode = Auto)
     execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
+    (* Invalidate cached CHECK expressions for the dropped table *)
+    Hashtbl.filter_map_inplace (fun (tbl, _) v ->
+      if String.equal tbl table_meta.name then None else Some v
+    ) check_expr_cache;
     Lwt.return 0
   | Plan.Op_drop_index { idx_info } ->
     let* () = execute_drop_index ~mode store cat ~idx_info in
@@ -1416,7 +1425,16 @@ let execute_with_count ?(mode = Auto)
            ~old_name:table_meta.Cat.name ~new_name in
        (match result with
         | Error msg -> Lwt.fail_with msg
-        | Ok ()     -> Lwt.return 0)
+        | Ok ()     ->
+          (* Remap cached CHECK entries from old_name to new_name *)
+          let to_add = Hashtbl.fold (fun (tbl, idx) v acc ->
+            if String.equal tbl table_meta.Cat.name then (new_name, idx, v) :: acc
+            else acc) check_expr_cache [] in
+          List.iter (fun (_, idx, _) ->
+            Hashtbl.remove check_expr_cache (table_meta.Cat.name, idx)) to_add;
+          List.iter (fun (new_t, idx, v) ->
+            Hashtbl.add check_expr_cache (new_t, idx) v) to_add;
+          Lwt.return 0)
      | Ast.AA_rename_column (old_col, new_col) ->
        let* result = Cat.rename_column cat
            ~table_name:table_meta.Cat.name ~old_col ~new_col in

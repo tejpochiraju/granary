@@ -220,8 +220,8 @@ let rec expr_to_sql = function
   | E_lit (L_text s) ->
     Printf.sprintf "'%s'" (String.concat "''" (String.split_on_char '\'' s))
   | E_lit L_null     -> "NULL"
-  | E_lit (L_real f) -> Printf.sprintf "%g" f
-  | E_lit (L_blob _) -> "X''"
+  | E_lit (L_real f) -> Printf.sprintf "%.17g" f
+  | E_lit (L_blob _) -> failwith "expr_to_sql: BLOB literals not supported in CHECK constraints"
   | E_col name       -> name
   | E_tbl_col (t, c) -> Printf.sprintf "%s.%s" t c
   | E_param Param_anon -> "?"

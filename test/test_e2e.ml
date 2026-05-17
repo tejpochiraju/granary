@@ -2546,6 +2546,23 @@ let test_check_null_allowed () =
     Alcotest.(check bool) "null passes CHECK" true (res = Ok ());
     Lwt.return_unit)
 
+let test_check_cache_invalidation () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v > 100))" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (150)" in
+    let* _ = Db.execute db "DROP TABLE t" in
+    let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v < 5))" in
+    (* This should pass new CHECK (v < 5), NOT be blocked by old cache *)
+    let* res = Db.execute db "INSERT INTO t VALUES (3)" in
+    Alcotest.(check bool) "insert passes new CHECK after DROP+CREATE" true (res = Ok ());
+    (* This should be blocked by new CHECK (v < 5) *)
+    let* res2 = Db.execute db "INSERT INTO t VALUES (200)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "old values should fail new CHECK");
+    Lwt.return_unit)
+
 let test_check_persisted () =
   run (
     let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
@@ -2832,5 +2849,6 @@ let () =
       Alcotest.test_case "update_violation"    `Quick test_check_update_violation;
       Alcotest.test_case "null_allowed"        `Quick test_check_null_allowed;
       Alcotest.test_case "persisted"           `Quick test_check_persisted;
+      Alcotest.test_case "cache_invalidation"  `Quick test_check_cache_invalidation;
     ];
   ]
