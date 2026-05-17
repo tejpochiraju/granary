@@ -5,6 +5,10 @@
     | Col_not_null
     | Col_primary_key
     | Col_default of literal
+
+  type table_item =
+    | TI_col of column_def
+    | TI_constraint of table_constraint
 %}
 
 %token <string> IDENT
@@ -117,9 +121,19 @@ commit_stmt:
 rollback_stmt:
   | ROLLBACK { S_rollback }
 
+table_item:
+  | col = column_def
+    { TI_col col }
+  | UNIQUE LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { TI_constraint (Ast.TC_unique cols) }
+  | PRIMARY KEY LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { TI_constraint (Ast.TC_primary_key cols) }
+
 create_table:
-  | CREATE TABLE name = IDENT LPAREN cols = separated_nonempty_list(COMMA, column_def) RPAREN
-    { S_create_table { name; columns = cols } }
+  | CREATE TABLE name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+    { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
+      let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
+      S_create_table { name; columns = cols; constraints = cons } }
 
 create_fts_table:
   | CREATE VIRTUAL TABLE name = IDENT USING FTS5

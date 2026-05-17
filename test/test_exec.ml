@@ -67,7 +67,7 @@ let exec_create_table () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "items"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "items"; columns = id_name_cols; uniq_idxs = [] }) in
     let* result = Cat.find_table cat ~name:"items" in
     (match result with
      | None   -> Alcotest.fail "expected Some, got None"
@@ -79,7 +79,7 @@ let exec_create_table_tree_id () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "first"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "first"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* result = Cat.find_table cat ~name:"first" in
     (match result with
      | None   -> Alcotest.fail "expected Some, got None"
@@ -91,7 +91,7 @@ let exec_create_table_columns () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "items"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "items"; columns = id_name_cols; uniq_idxs = [] }) in
     let* result = Cat.find_table cat ~name:"items" in
     (match result with
      | None   -> Alcotest.fail "expected Some"
@@ -105,11 +105,11 @@ let exec_create_duplicate () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "items"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "items"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Second create should raise Failure *)
     (try
        ignore (Exec.execute store cat
-                 (Plan.Op_create_table { name = "items"; columns = id_name_cols }));
+                 (Plan.Op_create_table { name = "items"; columns = id_name_cols; uniq_idxs = [] }));
        Alcotest.fail "expected Failure for duplicate table"
      with Failure _ -> ());
     Lwt.return_unit
@@ -123,7 +123,7 @@ let exec_insert_one_row () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"t" in
     let m = Option.get meta in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
@@ -136,7 +136,7 @@ let exec_insert_two_rows () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"t" in
     let m = Option.get meta in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
@@ -150,7 +150,7 @@ let exec_insert_row_content () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"t" in
     let m = Option.get meta in
     insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "hat"]);
@@ -173,7 +173,7 @@ let exec_insert_null () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"t" in
     let m = Option.get meta in
     (* Insert with NULL in the name column (ordinal 0 = id, ordinal 1 = name) *)
@@ -194,7 +194,7 @@ let exec_insert_increments_rowid () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"t" in
     let m = Option.get meta in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
@@ -213,7 +213,7 @@ let exec_insert_text_only () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "words"; columns = schema }) in
+        (Plan.Op_create_table { name = "words"; columns = schema; uniq_idxs = [] }) in
     let* meta = Cat.find_table cat ~name:"words" in
     let m = Option.get meta in
     insert store cat "words" ([0], [Ast.L_text "hello"]);
@@ -236,7 +236,7 @@ let query_seqscan_empty () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* stream = Exec.query store cat (Plan.Op_seq_scan { table_meta = m }) in
@@ -249,7 +249,7 @@ let query_seqscan_one_row () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -263,7 +263,7 @@ let query_seqscan_three_rows () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -287,7 +287,7 @@ let query_filter_eq_int () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -309,7 +309,7 @@ let query_filter_eq_string () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -331,7 +331,7 @@ let query_filter_no_match () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -349,7 +349,7 @@ let query_filter_all_match () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -368,7 +368,7 @@ let query_filter_null_col () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Insert a row with only name set; id stays NULL *)
     insert store cat "t" ([1], [Ast.L_text "ghost"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -390,7 +390,7 @@ let query_project_all () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -409,7 +409,7 @@ let query_project_single_col () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 42L; Ast.L_text "alice"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -433,7 +433,7 @@ let query_project_reversed () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "hat"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -460,7 +460,7 @@ let query_project_star_where () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -497,7 +497,7 @@ let execute_read_op_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (* Calling execute with a read op should raise Failure *)
@@ -512,7 +512,7 @@ let execute_filter_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tf"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "tf"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"tf" in
     let m = Option.get meta_opt in
     (try
@@ -528,7 +528,7 @@ let execute_project_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tp"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "tp"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"tp" in
     let m = Option.get meta_opt in
     (try
@@ -546,7 +546,7 @@ let query_write_op_raises () =
     (* Calling query with a write op should raise Failure *)
     (try
        ignore (Exec.query store cat
-                 (Plan.Op_create_table { name = "t"; columns = id_name_cols }));
+                 (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }));
        Alcotest.fail "expected Failure"
      with Failure _ -> ());
     Lwt.return_unit
@@ -556,7 +556,7 @@ let query_insert_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "ti"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "ti"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"ti" in
     let m = Option.get meta_opt in
     (try
@@ -574,7 +574,7 @@ let query_filter_nonnull_eq_null () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tn"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "tn"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "tn" ([0; 1], [Ast.L_int 5L; Ast.L_text "ghost"]);
     let* meta_opt = Cat.find_table cat ~name:"tn" in
     let m = Option.get meta_opt in
@@ -593,7 +593,7 @@ let query_filter_type_mismatch () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tm"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "tm"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "tm" ([0; 1], [Ast.L_int 5L; Ast.L_text "hi"]);
     let* meta_opt = Cat.find_table cat ~name:"tm" in
     let m = Option.get meta_opt in
@@ -614,7 +614,7 @@ let query_sort_asc () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
@@ -640,7 +640,7 @@ let query_sort_desc () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
@@ -667,7 +667,7 @@ let query_sort_nulls_first () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = schema }) in
+        (Plan.Op_create_table { name = "t"; columns = schema; uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_int 5L]);
     insert store cat "t" ([],  []);   (* all NULL *)
     insert store cat "t" ([0], [Ast.L_int 2L]);
@@ -700,7 +700,7 @@ let query_sort_empty () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
@@ -724,7 +724,7 @@ let query_limit_basic () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -752,7 +752,7 @@ let query_limit_with_offset () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -780,7 +780,7 @@ let query_limit_exceeds_rows () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -802,7 +802,7 @@ let query_limit_offset_exceeds () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -824,7 +824,7 @@ let execute_sort_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "ts"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "ts"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"ts" in
     let m = Option.get meta_opt in
     (try
@@ -840,7 +840,7 @@ let execute_limit_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tl"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "tl"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"tl" in
     let m = Option.get meta_opt in
     (try
@@ -857,7 +857,7 @@ let execute_union_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let child = Plan.Op_seq_scan { table_meta = m } in
@@ -874,7 +874,7 @@ let execute_distinct_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -914,7 +914,7 @@ let exec_create_index_basic () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Insert a row so the index-population path runs *)
     insert store cat "t" ([0; 1], [Ast.L_int 42L; Ast.L_text "alice"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -938,7 +938,7 @@ let query_create_index_raises () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "tci"; columns = [int_col "x"] }) in
+        (Plan.Op_create_table { name = "tci"; columns = [int_col "x"]; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"tci" in
     let m = Option.get meta_opt in
     (try
@@ -960,7 +960,7 @@ let query_index_lookup_basic () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -996,7 +996,7 @@ let query_index_lookup_type_mismatch () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -1029,7 +1029,7 @@ let query_index_lookup_multiple_matches () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Three rows all with id = 7 -> a non-unique index will list all *)
     insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 7L; Ast.L_text "b"]);
@@ -1062,7 +1062,7 @@ let query_index_lookup_text () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "alice"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "bob"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1094,7 +1094,8 @@ let query_index_lookup_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1126,7 +1127,8 @@ let query_index_lookup_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AAAA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BBBB")]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1157,7 +1159,7 @@ let query_index_lookup_null () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "x"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -1188,7 +1190,8 @@ let query_filter_eq_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1209,7 +1212,8 @@ let query_filter_eq_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1232,7 +1236,8 @@ let query_sort_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_real 3.0]);
     insert store cat "t" ([0], [Ast.L_real 1.0]);
     insert store cat "t" ([0], [Ast.L_real 2.0]);
@@ -1253,7 +1258,8 @@ let query_sort_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }] }) in
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None }];
+                                uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "CC")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
@@ -1275,7 +1281,7 @@ let exec_create_index_unknown_table () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* outcome =
       Lwt.catch
         (fun () ->
@@ -1298,7 +1304,7 @@ let query_sort_multiple_nulls () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Two rows with NULL in the id column *)
     insert store cat "t" ([1], [Ast.L_text "x"]);
     insert store cat "t" ([1], [Ast.L_text "y"]);
@@ -1321,7 +1327,7 @@ let unique_index_first_insert_succeeds () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* () = Exec.execute store cat
@@ -1344,7 +1350,7 @@ let exec_update_no_match_returns_zero () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -1364,7 +1370,7 @@ let exec_update_match_returns_count () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1385,7 +1391,7 @@ let exec_update_raises_in_query () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -1410,7 +1416,7 @@ let exec_delete_no_match_returns_zero () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
@@ -1429,7 +1435,7 @@ let exec_delete_all_returns_count () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -1446,7 +1452,7 @@ let exec_delete_raises_in_query () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -1466,7 +1472,7 @@ let exec_drop_table_basic () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* () = Exec.execute store cat
@@ -1480,7 +1486,7 @@ let exec_drop_table_returns_zero () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* n = Exec.execute_with_count store cat
@@ -1493,7 +1499,7 @@ let exec_drop_table_raises_in_query () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -1508,7 +1514,7 @@ let exec_drop_index_basic () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx"; table = "t";
@@ -1528,7 +1534,7 @@ let exec_drop_index_returns_zero () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx2"; table = "t";
@@ -1547,7 +1553,7 @@ let exec_drop_index_raises_in_query () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx3"; table = "t";
@@ -1575,9 +1581,9 @@ let query_hash_join_inner () =
     let users_cols = [int_col "id"; txt_col "name"] in
     let orders_cols = [int_col "uid"; txt_col "item"] in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "users"; columns = users_cols }) in
+        (Plan.Op_create_table { name = "users"; columns = users_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "orders"; columns = orders_cols }) in
+        (Plan.Op_create_table { name = "orders"; columns = orders_cols; uniq_idxs = [] }) in
     let* users_opt = Cat.find_table cat ~name:"users" in
     let um = Option.get users_opt in
     let* orders_opt = Cat.find_table cat ~name:"orders" in
@@ -1613,9 +1619,9 @@ let query_hash_join_left () =
     let users_cols = [int_col "id"; txt_col "name"] in
     let orders_cols = [int_col "uid"; txt_col "item"] in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "users"; columns = users_cols }) in
+        (Plan.Op_create_table { name = "users"; columns = users_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "orders"; columns = orders_cols }) in
+        (Plan.Op_create_table { name = "orders"; columns = orders_cols; uniq_idxs = [] }) in
     let* users_opt = Cat.find_table cat ~name:"users" in
     let um = Option.get users_opt in
     let* orders_opt = Cat.find_table cat ~name:"orders" in
@@ -1655,9 +1661,9 @@ let query_hash_join_cartesian () =
     let users_cols = [int_col "id"] in
     let orders_cols = [int_col "uid"] in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "u2"; columns = users_cols }) in
+        (Plan.Op_create_table { name = "u2"; columns = users_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "o2"; columns = orders_cols }) in
+        (Plan.Op_create_table { name = "o2"; columns = orders_cols; uniq_idxs = [] }) in
     let* um = Cat.find_table cat ~name:"u2" in
     let um = Option.get um in
     let* om = Cat.find_table cat ~name:"o2" in
@@ -1690,9 +1696,9 @@ let query_hash_join_null_key_excluded () =
     let left_cols  = [int_col "id"] in
     let right_cols = [int_col "uid"] in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "l3"; columns = left_cols }) in
+        (Plan.Op_create_table { name = "l3"; columns = left_cols; uniq_idxs = [] }) in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "r3"; columns = right_cols }) in
+        (Plan.Op_create_table { name = "r3"; columns = right_cols; uniq_idxs = [] }) in
     let* lm = Cat.find_table cat ~name:"l3" in
     let lm = Option.get lm in
     let* rm = Cat.find_table cat ~name:"r3" in
@@ -1725,7 +1731,7 @@ let query_aggregate_count_star () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -1751,7 +1757,7 @@ let query_aggregate_sum_int () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"]; uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_int 10L]);
     insert store cat "t" ([0], [Ast.L_int 20L]);
     insert store cat "t" ([0], [Ast.L_int 30L]);
@@ -1778,7 +1784,7 @@ let query_aggregate_sum_real () =
   run (
     let schema = [{ Row.name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None }] in
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = schema }) in
+        (Plan.Op_create_table { name = "t"; columns = schema; uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1802,7 +1808,7 @@ let query_aggregate_avg () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"]; uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_int 10L]);
     insert store cat "t" ([0], [Ast.L_int 20L]);
     let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1826,7 +1832,7 @@ let query_aggregate_min_max () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [int_col "n"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [int_col "n"]; uniq_idxs = [] }) in
     insert store cat "t" ([0], [Ast.L_int 5L]);
     insert store cat "t" ([0], [Ast.L_int 1L]);
     insert store cat "t" ([0], [Ast.L_int 9L]);
@@ -1858,7 +1864,7 @@ let query_aggregate_count_col_skips_null () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([1],   [Ast.L_text "b"]);  (* id = NULL *)
     insert store cat "t" ([0; 1], [Ast.L_int 3L; Ast.L_text "c"]);
@@ -1883,7 +1889,7 @@ let query_aggregate_with_group_by () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "c"]);
@@ -1906,7 +1912,7 @@ let query_aggregate_with_having () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "b"]);
     insert store cat "t" ([0; 1], [Ast.L_int 2L; Ast.L_text "c"]);
@@ -1933,7 +1939,7 @@ let query_aggregate_raises_in_execute () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -1954,7 +1960,7 @@ let query_nlj_raises_in_execute () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -1978,7 +1984,7 @@ let query_hash_join_raises_in_execute () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     (try
@@ -2006,7 +2012,7 @@ let query_distinct_blob () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = [blob_col "b"] }) in
+        (Plan.Op_create_table { name = "t"; columns = [blob_col "b"]; uniq_idxs = [] }) in
     (* Two identical blob values and one distinct one. *)
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
@@ -2028,7 +2034,7 @@ let query_multikey_sort () =
   let store, cat = setup () in
   run (
     let* () = Exec.execute store cat
-        (Plan.Op_create_table { name = "t"; columns = id_name_cols }) in
+        (Plan.Op_create_table { name = "t"; columns = id_name_cols; uniq_idxs = [] }) in
     (* Four rows with id=1 or id=2; name used as tiebreaker. *)
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "c"]);
     insert store cat "t" ([0; 1], [Ast.L_int 1L; Ast.L_text "a"]);

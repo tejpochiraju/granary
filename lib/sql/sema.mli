@@ -60,8 +60,11 @@ type bound_join = {
 
 type bound_stmt =
   | BS_create_table of {
-      name    : string;
-      columns : Sqlocaml_encoding.Row.column list;
+      name      : string;
+      columns   : Sqlocaml_encoding.Row.column list;
+      uniq_idxs : (string * string list) list;
+        (** Auto-generated UNIQUE index specs: (index_name, [col_name; ...]).
+            Planner creates Op_create_index for each. *)
     }
   | BS_insert of {
       table_meta  : Sqlocaml_catalog.Catalog.table_meta;

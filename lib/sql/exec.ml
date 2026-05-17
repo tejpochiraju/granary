@@ -1184,11 +1184,18 @@ let execute_with_count ?(mode = Auto)
     ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
-  | Plan.Op_create_table { name; columns } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs } ->
     (* Note: create_table acquires its own RW txn internally via catalog.
        This means CREATE TABLE is NOT atomic within an explicit BEGIN/COMMIT block —
        it commits immediately regardless of mode. Phase 4 work to fix. *)
     let* _tid = Cat.create_table cat ~name ~columns in
+    let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
+      let* result = Cat.create_index cat ~name:idx_name ~table:name
+          ~columns:col_names ~unique:true in
+      match result with
+      | Error msg -> Lwt.fail_with msg
+      | Ok _      -> Lwt.return_unit
+    ) uniq_idxs in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _ } ->
     let* inserted = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in

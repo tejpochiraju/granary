@@ -111,10 +111,15 @@ type join_clause = {
   on    : expr;                  (** join condition (predicate over both tables) *)
 }
 
+type table_constraint =
+  | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
+  | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
+
 type stmt =
   | S_create_table of {
-      name    : string;
-      columns : column_def list;
+      name        : string;
+      columns     : column_def list;
+      constraints : table_constraint list;
     }
   | S_insert of {
       table       : string;

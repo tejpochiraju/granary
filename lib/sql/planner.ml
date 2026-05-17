@@ -234,8 +234,8 @@ let plan_select cat
     Plan.Op_limit { limit = n; offset = off; child = after_distinct }
 
 let rec plan ?cat = function
-  | Sema.BS_create_table { name; columns } ->
-    Plan.Op_create_table { name; columns }
+  | Sema.BS_create_table { name; columns; uniq_idxs } ->
+    Plan.Op_create_table { name; columns; uniq_idxs }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning } ->
     Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict;
                      returning = List.map plan_expr returning }

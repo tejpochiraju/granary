@@ -2297,6 +2297,42 @@ let test_rename_column_no_keyword () =
        Lwt.return_unit))
 
 (* ------------------------------------------------------------------ *)
+(* Group: Table-level UNIQUE and PRIMARY KEY constraints               *)
+(* ------------------------------------------------------------------ *)
+
+let test_table_unique_constraint () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE t (a TEXT, b INTEGER, UNIQUE(a, b))" in
+    let* _ = Db.execute db "INSERT INTO t VALUES ('x', 1)" in
+    let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES ('x', 1)") in
+    Alcotest.(check bool) "unique violation raises" true
+      (match r with Error (Db.Runtime _) -> true | _ -> false);
+    (* Different combinations are fine *)
+    let* _ = Db.execute db "INSERT INTO t VALUES ('x', 2)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES ('y', 1)" in
+    let* r2 = Db.query db "SELECT COUNT(*) FROM t" in
+    (match r2 with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "3 unique rows" 3
+         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
+       Lwt.return_unit))
+
+let test_table_primary_key_constraint () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE t (id INTEGER, name TEXT, PRIMARY KEY(id))" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+    let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") in
+    Alcotest.(check bool) "pk violation raises" true
+      (match r with Error (Db.Runtime _) -> true | _ -> false);
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2537,5 +2573,9 @@ let () =
       Alcotest.test_case "rename_table"                  `Quick test_rename_table;
       Alcotest.test_case "rename_column"                 `Quick test_rename_column;
       Alcotest.test_case "rename_column_no_keyword"      `Quick test_rename_column_no_keyword;
+    ];
+    "table_constraints", [
+      Alcotest.test_case "table_unique_constraint"      `Quick test_table_unique_constraint;
+      Alcotest.test_case "table_primary_key_constraint" `Quick test_table_primary_key_constraint;
     ];
   ]

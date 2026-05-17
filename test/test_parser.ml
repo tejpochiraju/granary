@@ -10,14 +10,14 @@ let parse s =
 
 let create_simple () =
   match parse "CREATE TABLE t (id INTEGER);" with
-  | Ast.S_create_table { name = "t"; columns = [c] } ->
+  | Ast.S_create_table { name = "t"; columns = [c]; _ } ->
     Alcotest.(check string) "col name" "id" c.name;
     Alcotest.(check bool) "col is int" true (c.ty = Ast.Ty_int)
   | _ -> Alcotest.fail "expected S_create_table"
 
 let create_two_cols () =
   match parse "CREATE TABLE users (id INTEGER, name TEXT);" with
-  | Ast.S_create_table { name = "users"; columns = [c1; c2] } ->
+  | Ast.S_create_table { name = "users"; columns = [c1; c2]; _ } ->
     Alcotest.(check string) "c1" "id" c1.name;
     Alcotest.(check string) "c2" "name" c2.name;
     Alcotest.(check bool) "c2 text" true (c2.ty = Ast.Ty_text)
@@ -39,21 +39,21 @@ let create_not_null () =
 
 let create_both_constraints () =
   match parse "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL);" with
-  | Ast.S_create_table { name = "t"; columns = [c1; c2] } ->
+  | Ast.S_create_table { name = "t"; columns = [c1; c2]; _ } ->
     Alcotest.(check bool) "c1 pk" true c1.primary_key;
     Alcotest.(check bool) "c2 not_null" true c2.not_null
   | _ -> Alcotest.fail "expected 2-col"
 
 let create_real_col () =
   match parse "CREATE TABLE t (f REAL);" with
-  | Ast.S_create_table { name = "t"; columns = [c] } ->
+  | Ast.S_create_table { name = "t"; columns = [c]; _ } ->
     Alcotest.(check string) "col name" "f" c.name;
     Alcotest.(check bool) "col is real" true (c.ty = Ast.Ty_real)
   | _ -> Alcotest.fail "expected S_create_table with REAL col"
 
 let create_blob_col () =
   match parse "CREATE TABLE t (b BLOB);" with
-  | Ast.S_create_table { name = "t"; columns = [c] } ->
+  | Ast.S_create_table { name = "t"; columns = [c]; _ } ->
     Alcotest.(check string) "col name" "b" c.name;
     Alcotest.(check bool) "col is blob" true (c.ty = Ast.Ty_blob)
   | _ -> Alcotest.fail "expected S_create_table with BLOB col"

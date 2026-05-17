@@ -34,10 +34,10 @@ let plan_create_table () =
     Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None };
     Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_create_table { name; columns } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs = _ } ->
     Alcotest.(check string) "table name" "items" name;
     Alcotest.(check int) "column count" 2 (List.length columns)
   | _ -> Alcotest.fail "expected Op_create_table"

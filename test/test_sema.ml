@@ -35,7 +35,7 @@ let bind_create_new () =
     Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None };
     Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { name; _ }) ->
     Alcotest.(check string) "table name" "items" name
@@ -50,7 +50,7 @@ let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
   let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None }] in
-  let stmt = Ast.S_create_table { name = "users"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
   | Error _ -> Alcotest.fail "expected Already_exists \"users\""
@@ -62,7 +62,7 @@ let bind_create_preserves_cols () =
     Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None };
     Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     Alcotest.(check int) "two columns" 2 (List.length columns);
@@ -1560,7 +1560,7 @@ let bind_create_default_null () =
     Ast.{ name = "x"; ty = Ty_int; not_null = false; primary_key = false;
           default = Some Ast.L_null };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1575,7 +1575,7 @@ let bind_create_default_real () =
     Ast.{ name = "x"; ty = Ty_real; not_null = false; primary_key = false;
           default = Some (Ast.L_real 3.14) };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1590,7 +1590,7 @@ let bind_create_default_blob () =
     Ast.{ name = "x"; ty = Ty_blob; not_null = false; primary_key = false;
           default = Some (Ast.L_blob (Bytes.of_string "hi")) };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with

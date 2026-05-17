@@ -45,8 +45,9 @@ type bound_join = {
 
 type bound_stmt =
   | BS_create_table of {
-      name    : string;
-      columns : Row.column list;
+      name      : string;
+      columns   : Row.column list;
+      uniq_idxs : (string * string list) list;
     }
   | BS_insert of {
       table_meta  : Cat.table_meta;
@@ -559,7 +560,7 @@ let rec expr_has_agg = function
 (* CREATE TABLE                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let bind_create cat ~name ~columns =
+let bind_create cat ~name ~columns ~constraints =
   let* existing = Cat.find_table cat ~name in
   match existing with
   | Some _ -> Lwt.return (Error (Already_exists name))
@@ -582,7 +583,19 @@ let bind_create cat ~name ~columns =
             primary_key = c.primary_key;
             default     = Option.map ast_lit_to_dv c.default }
     ) columns in
-    Lwt.return (Ok (BS_create_table { name; columns = row_cols }))
+    (* Generate auto-UNIQUE index specs for table-level constraints *)
+    let uniq_idxs = List.mapi (fun i tc ->
+      match tc with
+      | Ast.TC_unique cols ->
+        let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
+            name (String.concat "_" cols) i in
+        (idx_name, cols)
+      | Ast.TC_primary_key cols ->
+        let idx_name = Printf.sprintf "__pk_%s_%s_%d"
+            name (String.concat "_" cols) i in
+        (idx_name, cols)
+    ) constraints in
+    Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs }))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
@@ -1492,7 +1505,7 @@ let rec compound_col_count = function
 
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
-  | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
+  | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
   | Ast.S_insert { table; columns; values; on_conflict; returning } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
   | Ast.S_select { distinct; proj; table; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset

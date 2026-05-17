@@ -24,8 +24,9 @@ type expr =
 
 type op =
   | Op_create_table of {
-      name    : string;
-      columns : Sqlocaml_encoding.Row.column list;
+      name      : string;
+      columns   : Sqlocaml_encoding.Row.column list;
+      uniq_idxs : (string * string list) list;
     }
   | Op_insert of {
       table_meta  : Cat.table_meta;
