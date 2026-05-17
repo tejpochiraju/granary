@@ -892,22 +892,20 @@ let test_multi_col_index () =
   Alcotest.check value_testable "value" (Db.V_text "x") (List.hd rows).(0)
 
 let test_multi_col_unique_index () =
-  run (fun () ->
-    let* db = D.open_in_memory () in
-    let* _ = D.execute db "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)" in
-    let* _ = D.execute db "CREATE UNIQUE INDEX idx_ab ON t (a, b)" in
-    let* _ = D.execute db "INSERT INTO t VALUES (1, 2, 'x')" in
-    (* Same a=1 but different b=3 — must NOT violate unique constraint *)
-    let* r1 = D.execute db "INSERT INTO t VALUES (1, 3, 'y')" in
-    (match r1 with
-     | Error e -> Alcotest.failf "should allow (1,3): %a" D.pp_error e
-     | Ok () -> ());
-    (* Same (a=1, b=2) — MUST violate unique constraint *)
-    let* r2 = D.execute db "INSERT INTO t VALUES (1, 2, 'z')" in
-    (match r2 with
-     | Ok () -> Alcotest.fail "should have rejected duplicate (1,2)"
-     | Error _ -> ());
-    Lwt.return_unit)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)";
+  exec db "CREATE UNIQUE INDEX idx_ab ON t (a, b)";
+  exec db "INSERT INTO t VALUES (1, 2, 'x')";
+  (* Same a=1 but different b=3 — must NOT violate unique constraint *)
+  let r1 = run (Db.execute db "INSERT INTO t VALUES (1, 3, 'y')") in
+  (match r1 with
+   | Error _ -> Alcotest.fail "should allow (1,3): different b column"
+   | Ok () -> ());
+  (* Same (a=1, b=2) — MUST violate unique constraint *)
+  let r2 = run (Db.execute db "INSERT INTO t VALUES (1, 2, 'z')") in
+  (match r2 with
+   | Ok () -> Alcotest.fail "should have rejected duplicate (1,2)"
+   | Error _ -> ())
 
 (* QCheck: random integer inserts + CREATE INDEX; index lookup must
    match sequential scan for every distinct value. *)
