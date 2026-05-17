@@ -328,6 +328,40 @@ let plan_order_and_limit () =
                     child = Plan.Op_project { child = Plan.Op_sort { key = Plan.P_col 0; dir = `Asc; _ }; _ } } -> ()
   | _ -> Alcotest.fail "expected Op_limit(Op_project(Op_sort(Op_seq_scan)))"
 
+(** SELECT DISTINCT id FROM users → planner should wrap with Op_distinct. *)
+let plan_distinct () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    distinct = true;
+    proj = `Cols ["id"]; table = "users"; where = None;
+    joins = []; group_by = []; having = None;
+    order = []; limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_distinct { child = Plan.Op_project _ } -> ()
+  | Plan.Op_project _ ->
+    Alcotest.fail "expected Op_distinct wrapping Op_project, got Op_project alone"
+  | _ -> Alcotest.fail "expected Op_distinct { child = Op_project _ }"
+
+(** SELECT DISTINCT id FROM users ORDER BY id → Op_distinct wraps Op_project(Op_sort). *)
+let plan_distinct_with_order () =
+  let cat = make_cat () in
+  let stmt = Ast.S_select {
+    distinct = true;
+    proj = `Cols ["id"]; table = "users"; where = None;
+    joins = []; group_by = []; having = None;
+    order = [{ Ast.expr = Ast.E_col "id"; dir = Ast.Asc }];
+    limit = None; offset = None;
+  } in
+  let bound = bind cat stmt in
+  match Planner.plan bound with
+  | Plan.Op_distinct { child = Plan.Op_project { child = Plan.Op_sort _; _ } }
+  | Plan.Op_distinct { child = Plan.Op_project _ } -> ()
+  | Plan.Op_project _ ->
+    Alcotest.fail "expected Op_distinct wrapping Op_project, got Op_project alone"
+  | _ -> Alcotest.fail "expected Op_distinct { child = Op_project _ }"
+
 (* ------------------------------------------------------------------ *)
 (* Group 6: Index lookup planner rule                                   *)
 (* ------------------------------------------------------------------ *)
@@ -638,6 +672,10 @@ let () =
       Alcotest.test_case "plan_limit_only"        `Quick plan_limit_only;
       Alcotest.test_case "plan_limit_with_offset" `Quick plan_limit_with_offset;
       Alcotest.test_case "plan_order_and_limit"   `Quick plan_order_and_limit;
+    ];
+    "distinct", [
+      Alcotest.test_case "plan_distinct"            `Quick plan_distinct;
+      Alcotest.test_case "plan_distinct_with_order" `Quick plan_distinct_with_order;
     ];
     "index-lookup", [
       Alcotest.test_case "plan_index_lookup_col_eq_lit"      `Quick plan_index_lookup_col_eq_lit;

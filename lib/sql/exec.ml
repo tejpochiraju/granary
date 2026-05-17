@@ -157,7 +157,7 @@ let row_key (row : Row.t) : string =
     | Row.V_blob b -> Buffer.add_char buf 'B';
                       Buffer.add_string buf (string_of_int (Bytes.length b));
                       Buffer.add_char buf ':';
-                      Buffer.add_string buf (Bytes.to_string b);
+                      Buffer.add_bytes buf b;
                       Buffer.add_char buf '|'
   ) row;
   Buffer.contents buf
