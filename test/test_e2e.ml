@@ -2410,6 +2410,97 @@ let test_alter_add_column_nonexistent_table () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* Subqueries                                                           *)
+(* ------------------------------------------------------------------ *)
+
+let test_scalar_subquery () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+    let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "scalar subquery returns max" (Db.V_int 20L) row.(0)
+     | _ -> Alcotest.fail "expected exactly one row");
+    Lwt.return_unit)
+
+let test_scalar_subquery_null () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "scalar subquery on empty table returns null" Db.V_null row.(0)
+     | _ -> Alcotest.fail "expected exactly one row");
+    Lwt.return_unit)
+
+let test_exists_subquery () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY, ref_id INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO r VALUES (1, 1)" in
+    let* _ = Db.execute db "INSERT INTO r VALUES (2, 99)" in
+    let* res = Db.query db
+      "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t WHERE t.id = 1)" in
+    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "exists matches two rows" 2 (List.length rows);
+    Lwt.return_unit)
+
+let test_exists_subquery_false () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY)" in
+    let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY)" in
+    let* _ = Db.execute db "INSERT INTO r VALUES (1)" in
+    let* res = Db.query db
+      "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t)" in
+    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "exists on empty inner table returns 0 rows" 0 (List.length rows);
+    Lwt.return_unit)
+
+let test_in_select_subquery () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+    let* _ = Db.execute db "CREATE TABLE allowed (v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO allowed VALUES (10)" in
+    let* _ = Db.execute db "INSERT INTO allowed VALUES (30)" in
+    let* res = Db.query db "SELECT id FROM t WHERE v IN (SELECT v FROM allowed)" in
+    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    let ids = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "in-select returns matching rows"
+      [Db.V_int 1L; Db.V_int 3L] ids;
+    Lwt.return_unit)
+
+let test_not_in_select_subquery () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+    let* _ = Db.execute db "CREATE TABLE excluded (v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO excluded VALUES (20)" in
+    let* res = Db.query db "SELECT id FROM t WHERE v NOT IN (SELECT v FROM excluded)" in
+    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    let ids = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "not-in-select excludes row 2"
+      [Db.V_int 1L; Db.V_int 3L] ids;
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2661,5 +2752,13 @@ let () =
     "table_constraints", [
       Alcotest.test_case "table_unique_constraint"      `Quick test_table_unique_constraint;
       Alcotest.test_case "table_primary_key_constraint" `Quick test_table_primary_key_constraint;
+    ];
+    "subqueries", [
+      Alcotest.test_case "scalar_subquery"         `Quick test_scalar_subquery;
+      Alcotest.test_case "scalar_subquery_null"    `Quick test_scalar_subquery_null;
+      Alcotest.test_case "exists_true"             `Quick test_exists_subquery;
+      Alcotest.test_case "exists_false"            `Quick test_exists_subquery_false;
+      Alcotest.test_case "in_select"               `Quick test_in_select_subquery;
+      Alcotest.test_case "not_in_select"           `Quick test_not_in_select_subquery;
     ];
   ]

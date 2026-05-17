@@ -56,6 +56,31 @@ type scalar_func =
   | Fn_julianday                         (** JULIANDAY(ts[, mod...]) → float *)
   | Fn_unixepoch                         (** UNIXEPOCH(ts[, mod...]) → integer *)
 
+type set_op = Union | Union_all | Intersect | Except
+
+type column_def = {
+  name        : string;
+  ty          : ty;
+  not_null    : bool;
+  primary_key : bool;
+  default     : literal option;  (* None = no DEFAULT *)
+}
+
+type alter_action =
+  | AA_add_column    of column_def
+  | AA_rename_table  of string              (* new table name *)
+  | AA_rename_column of string * string     (* old_col_name * new_col_name *)
+
+type order_dir = Asc | Desc
+
+type join_kind = Inner | Left
+
+type table_constraint =
+  | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
+  | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
+
+(** Expressions and statements are mutually recursive because subquery
+    expressions embed a [stmt] directly. *)
 type expr =
   | E_lit         of literal
   | E_col         of string                (** unqualified column reference *)
@@ -76,46 +101,23 @@ type expr =
     (** parameter: ?, ?1, :name, @name, $name *)
   | E_match       of string * string
     (** [E_match (table_name, query_string)]: [WHERE table MATCH 'query'] *)
+  | E_subquery  of stmt               (** scalar subquery: (SELECT ...) in expr position *)
+  | E_exists    of stmt               (** EXISTS (SELECT ...) *)
+  | E_in_select of expr * stmt        (** x IN (SELECT ...) *)
 
-type set_op = Union | Union_all | Intersect | Except
-
-type column_def = {
-  name        : string;
-  ty          : ty;
-  not_null    : bool;
-  primary_key : bool;
-  default     : literal option;  (* None = no DEFAULT *)
-}
-
-type alter_action =
-  | AA_add_column    of column_def
-  | AA_rename_table  of string              (* new table name *)
-  | AA_rename_column of string * string     (* old_col_name * new_col_name *)
-
-type order_dir = Asc | Desc
-
-type order_key = {
+and order_key = {
   expr : expr;
   dir  : order_dir;
 }
 
-type join_kind = Inner | Left
-
-(** A single JOIN clause attached to a SELECT.
-    Phase 2 supports a single right-hand table (no nested joins beyond
-    a flat list) and an ON predicate. *)
-type join_clause = {
+and join_clause = {
   kind  : join_kind;
   table : string;                (** right-side table name *)
   alias : string option;         (** optional alias — stored but unused in Phase 2 *)
   on    : expr;                  (** join condition (predicate over both tables) *)
 }
 
-type table_constraint =
-  | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
-  | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
-
-type stmt =
+and stmt =
   | S_create_table of {
       name        : string;
       columns     : column_def list;
@@ -183,6 +185,13 @@ type stmt =
       columns : string list;
     }
   | S_pragma of pragma_kind
+
+  | S_const_select of {
+      (** FROM-less SELECT that evaluates constant expressions — returns one row.
+          Used when a scalar subquery appears in projection position at the
+          outermost query level (e.g. [SELECT (SELECT max(v) FROM t)]). *)
+      exprs : expr list;
+    }
 
 and pragma_kind =
   | Pragma_table_info of string

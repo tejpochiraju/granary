@@ -99,6 +99,8 @@ rule token = parse
   | "GLOB"     { GLOB }
   | "BETWEEN"  { BETWEEN }
   | "IN"       { IN }
+  | "EXISTS"   { EXISTS }
+  | "exists"   { EXISTS }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }

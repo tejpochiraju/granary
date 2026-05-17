@@ -20,6 +20,9 @@ type bound_expr =
   | BE_func        of Ast.scalar_func * bound_expr list
   | BE_param       of int
   | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
+  | BE_subquery  of Ast.stmt
+  | BE_exists    of Ast.stmt
+  | BE_in_select of bound_expr * Ast.stmt
 
 type bound_order_key = {
   key : bound_expr;
@@ -136,6 +139,9 @@ type bound_stmt =
       op    : Ast.set_op;
       left  : bound_stmt;
       right : bound_stmt;
+    }
+  | BS_const_select of {
+      exprs : bound_expr list;
     }
 
 type error =
@@ -304,6 +310,14 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
          Ok (BE_func (func, ok_args)))
   | Ast.E_match _ ->
     Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
+  | Ast.E_subquery inner ->
+    Ok (BE_subquery inner)
+  | Ast.E_exists inner ->
+    Ok (BE_exists inner)
+  | Ast.E_in_select (x, inner) ->
+    (match bind_expr ~param_counter ~named_params meta x with
+     | Error e -> Error e
+     | Ok bx   -> Ok (BE_in_select (bx, inner)))
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -408,6 +422,8 @@ let rec bind_expr_join
          Ok (BE_func (func, ok_args)))
   | Ast.E_match _ ->
     Error (Unsupported "MATCH in JOIN context")
+  | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
+    Error (Unsupported "subqueries are not supported in JOIN ON conditions")
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -540,6 +556,8 @@ let bind_expr_agg
            Ok (BE_func (func, ok_args)))
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
+    | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
+      Error (Unsupported "subqueries are not supported in aggregate expressions")
   in
   match go e with
   | Error e -> Error e
@@ -549,6 +567,8 @@ let bind_expr_agg
 let rec expr_has_agg = function
   | Ast.E_agg _ -> true
   | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ | Ast.E_param _ | Ast.E_match _ -> false
+  | Ast.E_subquery _ | Ast.E_exists _ -> false
+  | Ast.E_in_select (x, _) -> expr_has_agg x
   | Ast.E_binop (_, a, b) -> expr_has_agg a || expr_has_agg b
   | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e | Ast.E_neg e | Ast.E_bitnot e ->
     expr_has_agg e
@@ -1269,6 +1289,9 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
   | BE_func _ -> None   (* scalar functions return dynamic types *)
   | BE_param _ -> None  (* parameter type unknown at compile time *)
   | BE_match _ -> Some Row.Integer  (* MATCH returns boolean (0/1) *)
+  | BE_subquery _ -> None           (* subquery type unknown at bind time *)
+  | BE_exists _ -> Some Row.Integer (* EXISTS returns boolean 0/1 *)
+  | BE_in_select _ -> Some Row.Integer (* IN (SELECT) returns boolean 0/1 *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
@@ -1501,6 +1524,7 @@ let rec compound_col_count = function
     else if expr_proj <> [] then List.length expr_proj
     else List.length proj
   | BS_compound { left; _ } -> compound_col_count left
+  | BS_const_select { exprs } -> List.length exprs
   | _ -> 0  (* non-select stmts in compound: don't validate *)
 
 let rec bind_internal ~named_params ~param_counter cat stmt =
@@ -1532,6 +1556,22 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
      | None, None ->
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
+  | Ast.S_const_select { exprs } ->
+    (* FROM-less SELECT: bind each expression without any table context.
+       We use a dummy empty table_meta for the resolver. *)
+    let dummy_meta : Cat.table_meta = {
+      Cat.name    = "__const__";
+      Cat.tree_id = 0;
+      Cat.columns = [];
+      Cat.next_rowid = 0L;
+    } in
+    let bound = List.map (bind_expr ~param_counter ~named_params dummy_meta) exprs in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+    (match errors with
+     | e :: _ -> Lwt.return (Error e)
+     | [] ->
+       let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+       Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~named_params ~param_counter cat right in

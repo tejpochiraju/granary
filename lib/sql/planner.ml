@@ -29,6 +29,9 @@ let rec plan_expr = function
   | Sema.BE_param i             -> Plan.P_param i
   | Sema.BE_match _             ->
     failwith "plan_expr: BE_match should be handled at statement level, not as an expr"
+  | Sema.BE_subquery inner      -> Plan.P_subquery inner
+  | Sema.BE_exists inner        -> Plan.P_exists inner
+  | Sema.BE_in_select (bx, inner) -> Plan.P_in_select (plan_expr bx, inner)
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -403,6 +406,8 @@ let rec plan ?cat = function
      | Ast.Union_all -> Plan.Op_union     { all = true;  left = l; right = r }
      | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
      | Ast.Except    -> Plan.Op_except    { left = l; right = r })
+  | Sema.BS_const_select { exprs } ->
+    Plan.Op_const_select { exprs = List.map plan_expr exprs }
   | Sema.BS_pragma { kind } ->
     let rows = match kind with
       | Ast.Pragma_table_info table_name ->

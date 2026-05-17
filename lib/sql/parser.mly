@@ -39,7 +39,7 @@
 %token RETURNING
 %token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
-%token BETWEEN IN
+%token BETWEEN IN EXISTS
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -226,13 +226,27 @@ compound_select:
     { S_compound { op = Except; left; right } }
 
 select:
-  | SELECT distinct = boption(DISTINCT) proj = projection FROM table = IDENT
+  | SELECT distinct = boption(DISTINCT) proj = projection ft = from_tail
+    { match ft with
+      | Some (table, js, wh, gb, hv, ob, limit, offset) ->
+        S_select { distinct; proj; table; joins = js; where = wh;
+                   group_by = gb; having = hv;
+                   order = ob; limit; offset }
+      | None ->
+        let exprs = match proj with
+          | `Exprs es -> es
+          | `Cols names -> List.map (fun n -> E_col n) names
+          | `All -> []
+        in
+        S_const_select { exprs } }
+
+from_tail:
+  | FROM table = IDENT
       js = join_clauses wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      S_select { distinct; proj; table; joins = js; where = wh;
-                 group_by = gb; having = hv;
-                 order = ob; limit; offset } }
+      Some (table, js, wh, gb, hv, ob, limit, offset) }
+  |   { None }
 
 join_clauses:
   |                                  { [] }
@@ -429,13 +443,20 @@ expr:
     { E_between (a, lo, hi) }
   | a = expr NOT BETWEEN lo = between_bound AND hi = between_bound %prec BETWEEN_PREC
     { E_not (E_between (a, lo, hi)) }
+  | a = expr IN LPAREN s = compound_select RPAREN
+    { E_in_select (a, s) }
+  | a = expr NOT IN LPAREN s = compound_select RPAREN
+    { E_not (E_in_select (a, s)) }
   | a = expr IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN
     { E_in (a, vals) }
   | a = expr NOT IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN
     { E_not (E_in (a, vals)) }
+  | EXISTS LPAREN s = compound_select RPAREN
+    { E_exists s }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
   | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }
+  | LPAREN s = compound_select RPAREN { E_subquery s }
   | LPAREN e = expr RPAREN            { e }
   | QUESTION        { E_param Param_anon }
   | i = IPARAM      { E_param (Param_index i) }

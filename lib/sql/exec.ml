@@ -17,6 +17,13 @@ let lit_to_value : Ast.literal -> Row.value = function
   | Ast.L_real f -> Row.V_real f
   | Ast.L_blob b -> Row.V_blob b
 
+let value_to_literal : Row.value -> Ast.literal = function
+  | Row.V_int n  -> Ast.L_int n
+  | Row.V_text s -> Ast.L_text s
+  | Row.V_real f -> Ast.L_real f
+  | Row.V_blob b -> Ast.L_blob b
+  | Row.V_null   -> Ast.L_null
+
 let row_value_to_index_value : Row.value -> Index_key.value = function
   | Row.V_int  n -> Index_key.IK_int n
   | Row.V_text s -> Index_key.IK_text s
@@ -221,6 +228,9 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     eval_binop op (eval_expr clock params row a) (eval_expr clock params row b)
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
+  | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ ->
+    (* These are replaced by pre_eval_subquery before row evaluation. *)
+    Row.V_null
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -1331,7 +1341,8 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
-  | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _ ->
+  | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
+  | Plan.Op_const_select _ ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -1377,9 +1388,95 @@ let fts_query_terms query =
 
 (* ------------------------------------------------------------------ *)
 (* to_stream: convert a read op tree into a Row stream                  *)
+(* pre_eval_subquery: resolve subquery Plan.expr nodes before row scan  *)
 (* ------------------------------------------------------------------ *)
 
-let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+let rec pre_eval_subquery
+    (clock : (unit -> float) option)
+    (store : S.t)
+    (params : Row.value array)
+    (cat_opt : Cat.t option)
+    (e : Plan.expr) : Plan.expr Lwt.t =
+  match e with
+  | Plan.P_subquery inner_ast ->
+    (match cat_opt with
+     | None -> Lwt.return (Plan.P_lit Ast.L_null)
+     | Some cat ->
+       let* bound_r = Sema.bind cat inner_ast in
+       (match bound_r with
+        | Error _ -> Lwt.return (Plan.P_lit Ast.L_null)
+        | Ok bound ->
+          let op = Planner.plan ~cat bound in
+          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+          let* rows = Lwt_stream.to_list stream in
+          let v = match rows with
+            | [] -> Ast.L_null
+            | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
+            | _ -> Ast.L_null
+          in
+          Lwt.return (Plan.P_lit v)))
+  | Plan.P_exists inner_ast ->
+    (match cat_opt with
+     | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
+     | Some cat ->
+       let* bound_r = Sema.bind cat inner_ast in
+       (match bound_r with
+        | Error _ -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
+        | Ok bound ->
+          let op = Planner.plan ~cat bound in
+          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+          let* first = Lwt_stream.get stream in
+          Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L)))))
+  | Plan.P_in_select (x, inner_ast) ->
+    (match cat_opt with
+     | None -> Lwt.return (Plan.P_in (x, []))
+     | Some cat ->
+       let* bound_r = Sema.bind cat inner_ast in
+       (match bound_r with
+        | Error _ -> Lwt.return (Plan.P_in (x, []))
+        | Ok bound ->
+          let op = Planner.plan ~cat bound in
+          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+          let* rows = Lwt_stream.to_list stream in
+          let vals = List.filter_map (fun row ->
+            if Array.length row >= 1 then Some (Plan.P_lit (value_to_literal row.(0)))
+            else None) rows in
+          let* x' = pre_eval_subquery clock store params cat_opt x in
+          Lwt.return (Plan.P_in (x', vals))))
+  | Plan.P_binop (op, a, b) ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    let* b' = pre_eval_subquery clock store params cat_opt b in
+    Lwt.return (Plan.P_binop (op, a', b'))
+  | Plan.P_not a ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    Lwt.return (Plan.P_not a')
+  | Plan.P_is_null a ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    Lwt.return (Plan.P_is_null a')
+  | Plan.P_is_not_null a ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    Lwt.return (Plan.P_is_not_null a')
+  | Plan.P_neg a ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    Lwt.return (Plan.P_neg a')
+  | Plan.P_bitnot a ->
+    let* a' = pre_eval_subquery clock store params cat_opt a in
+    Lwt.return (Plan.P_bitnot a')
+  | Plan.P_between (x, lo, hi) ->
+    let* x'  = pre_eval_subquery clock store params cat_opt x in
+    let* lo' = pre_eval_subquery clock store params cat_opt lo in
+    let* hi' = pre_eval_subquery clock store params cat_opt hi in
+    Lwt.return (Plan.P_between (x', lo', hi'))
+  | Plan.P_in (x, vals) ->
+    let* x'    = pre_eval_subquery clock store params cat_opt x in
+    let* vals' = Lwt_list.map_s (pre_eval_subquery clock store params cat_opt) vals in
+    Lwt.return (Plan.P_in (x', vals'))
+  | Plan.P_func (f, args) ->
+    let* args' = Lwt_list.map_s (pre_eval_subquery clock store params cat_opt) args in
+    Lwt.return (Plan.P_func (f, args'))
+  | _ -> Lwt.return e
+
+and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
     let* tx  = S.ro_begin store in
@@ -1400,19 +1497,24 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
-    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr clock params row pred)) inner)
+    let* pred' = pre_eval_subquery clock store params cat pred in
+    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr clock params row pred')) inner)
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
+    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
     let eval_exprs row =
-      Array.of_list (List.map (eval_expr clock params row) exprs)
+      Array.of_list (List.map (eval_expr clock params row) exprs')
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
   | Plan.Op_sort { keys; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
+    let* keys' = Lwt_list.map_s (fun (e, dir) ->
+        let* e' = pre_eval_subquery clock store params cat e in
+        Lwt.return (e', dir)) keys in
     let cmp a b =
       List.fold_left (fun acc (key, dir) ->
         if acc <> 0 then acc
@@ -1421,7 +1523,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
           and vb = eval_expr clock params b key in
           let c = compare_values va vb in
           if dir = `Asc then c else -c
-      ) 0 keys
+      ) 0 keys'
     in
     let sorted = List.sort cmp rows in
     Lwt.return (Lwt_stream.of_list sorted)
@@ -1979,6 +2081,12 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
     ) matched in
     let* _ = execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
+  | Plan.Op_const_select { exprs } ->
+    (* FROM-less SELECT: evaluate each expression with an empty row and
+       return a single result row. *)
+    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
+    let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
+    Lwt.return (Lwt_stream.of_list [row])
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _

@@ -23,6 +23,12 @@ type bound_expr =
     (** 0-indexed positional parameter (?). *)
   | BE_match       of Sqlocaml_catalog.Catalog.fts_table_meta * Fts_query.fts_query
     (** FTS MATCH expression: [table MATCH 'query']. *)
+  | BE_subquery  of Ast.stmt
+    (** Scalar subquery: [(SELECT ...)] in expression position. *)
+  | BE_exists    of Ast.stmt
+    (** EXISTS predicate: [EXISTS (SELECT ...)]. *)
+  | BE_in_select of bound_expr * Ast.stmt
+    (** IN subquery: [x IN (SELECT ...)]. *)
 
 type bound_order_key = {
   key : bound_expr;
@@ -166,6 +172,9 @@ type bound_stmt =
       op    : Ast.set_op;
       left  : bound_stmt;
       right : bound_stmt;
+    }
+  | BS_const_select of {
+      exprs : bound_expr list;
     }
 
 type error =

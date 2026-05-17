@@ -21,6 +21,9 @@ type expr =
   | P_in          of expr * expr list
   | P_func        of Ast.scalar_func * expr list
   | P_param       of int                   (** 0-indexed positional parameter *)
+  | P_subquery  of Ast.stmt
+  | P_exists    of Ast.stmt
+  | P_in_select of expr * Ast.stmt
 
 type op =
   | Op_create_table of {
@@ -176,6 +179,9 @@ type op =
   | Op_except of {
       left  : op;
       right : op;
+    }
+  | Op_const_select of {
+      exprs : expr list;
     }
 
 and proj_item =
