@@ -162,27 +162,27 @@ let row_key (row : Row.t) : string =
   ) row;
   Buffer.contents buf
 
-let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
+let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
   | Plan.P_col i            -> row.(i)
   | Plan.P_param i          ->
     if i < Array.length params then params.(i) else Row.V_null
   | Plan.P_neg e ->
-    (match eval_expr params row e with
+    (match eval_expr clock params row e with
      | Row.V_int  n -> Row.V_int  (Int64.neg n)
      | Row.V_real f -> Row.V_real (-. f)
      | Row.V_null   -> Row.V_null
      | _            -> failwith "unary minus requires numeric operand")
   | Plan.P_bitnot e ->
-    (match eval_expr params row e with
+    (match eval_expr clock params row e with
      | Row.V_int n -> Row.V_int (Int64.lognot n)
      | Row.V_null  -> Row.V_null
      | _           -> Row.V_null)
   | Plan.P_between (x, lo, hi) ->
-    let vx  = eval_expr params row x  in
-    let vlo = eval_expr params row lo in
-    let vhi = eval_expr params row hi in
+    let vx  = eval_expr clock params row x  in
+    let vlo = eval_expr clock params row lo in
+    let vhi = eval_expr clock params row hi in
     (match vx, vlo, vhi with
      | Row.V_null, _, _ | _, Row.V_null, _ | _, _, Row.V_null -> Row.V_null
      | _ ->
@@ -190,11 +190,11 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
        let le_hi = compare_values vx vhi <= 0 in
        Row.V_int (if ge_lo && le_hi then 1L else 0L))
   | Plan.P_in (x, vals) ->
-    let vx = eval_expr params row x in
+    let vx = eval_expr clock params row x in
     if vx = Row.V_null then Row.V_null
     else
       let result = List.fold_left (fun acc ve ->
-        let v = eval_expr params row ve in
+        let v = eval_expr clock params row ve in
         match acc with
         | `Found -> `Found
         | _ when v = Row.V_null -> `Maybe
@@ -206,23 +206,23 @@ let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row
        | `Maybe     -> Row.V_null
        | `Not_found -> Row.V_int 0L)
   | Plan.P_is_null e ->
-    (match eval_expr params row e with
+    (match eval_expr clock params row e with
      | Row.V_null -> Row.V_int 1L
      | _          -> Row.V_int 0L)
   | Plan.P_is_not_null e ->
-    (match eval_expr params row e with
+    (match eval_expr clock params row e with
      | Row.V_null -> Row.V_int 0L
      | _          -> Row.V_int 1L)
   | Plan.P_not e ->
-    (match eval_expr params row e with
+    (match eval_expr clock params row e with
      | Row.V_null -> Row.V_null
      | v -> if value_truthy v then Row.V_int 0L else Row.V_int 1L)
   | Plan.P_binop (op, a, b) ->
-    eval_binop op (eval_expr params row a) (eval_expr params row b)
+    eval_binop op (eval_expr clock params row a) (eval_expr clock params row b)
   | Plan.P_func (func, args) ->
-    eval_func func (List.map (eval_expr params row) args)
+    eval_func clock func (List.map (eval_expr clock params row) args)
 
-and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
+and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
   | Ast.Fn_length, [Row.V_text s] -> Row.V_int (Int64.of_int (String.length s))
   | Ast.Fn_length, [Row.V_blob b] -> Row.V_int (Int64.of_int (Bytes.length b))
@@ -293,6 +293,64 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
       | Row.V_text _ -> "text"
       | Row.V_blob _ -> "blob"
       | Row.V_null   -> "null")
+  | Ast.Fn_date, args ->
+    (match args with
+     | [] | [Row.V_null] -> Row.V_null
+     | Row.V_null :: _ -> Row.V_null
+     | Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_text (Datetime.to_date dt))
+     | _ -> Row.V_null)
+  | Ast.Fn_time, args ->
+    (match args with
+     | [] | [Row.V_null] -> Row.V_null
+     | Row.V_null :: _ -> Row.V_null
+     | Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_text (Datetime.to_time dt))
+     | _ -> Row.V_null)
+  | Ast.Fn_datetime, args ->
+    (match args with
+     | [] | [Row.V_null] -> Row.V_null
+     | Row.V_null :: _ -> Row.V_null
+     | Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_text (Datetime.to_datetime dt))
+     | _ -> Row.V_null)
+  | Ast.Fn_julianday, args ->
+    (match args with
+     | [] | [Row.V_null] -> Row.V_null
+     | Row.V_null :: _ -> Row.V_null
+     | Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_real (Datetime.to_julianday dt))
+     | _ -> Row.V_null)
+  | Ast.Fn_unixepoch, args ->
+    (match args with
+     | [] | [Row.V_null] -> Row.V_null
+     | Row.V_null :: _ -> Row.V_null
+     | Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_int (Datetime.to_unixepoch dt))
+     | _ -> Row.V_null)
+  | Ast.Fn_strftime, args ->
+    (match args with
+     | Row.V_text fmt :: Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_text (Datetime.strftime fmt dt))
+     | _ -> Row.V_null)
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
@@ -718,11 +776,13 @@ let release_txn tx owned =
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
     Uses a SINGLE RW txn for both the row write and index writes. *)
-let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
+let execute_insert ?(mode = Auto) ?(params = [||])
+    ?(clock : (unit -> float) option = None)
+    (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : unit Lwt.t =
   let n   = List.length table_meta.columns in
   let row = Array.make n Row.V_null in
-  List.iter2 (fun ord expr -> row.(ord) <- eval_expr params [||] expr) ordinals values;
+  List.iter2 (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr) ordinals values;
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -876,7 +936,9 @@ let unique_violation_on_update
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
     number of rows whose contents were modified. *)
-let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
+let execute_update ?(mode = Auto) ?(params = [||])
+    ?(clock : (unit -> float) option = None)
+    (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(assignments : (int * Plan.expr) list)
     ~(where : Plan.expr option)
@@ -897,7 +959,7 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr params row pred)
+        | Some pred -> value_truthy (eval_expr clock params row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -919,7 +981,7 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr params old_row expr
+              new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
@@ -956,7 +1018,7 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
           Lwt_list.iter_s (fun (rowid, old_row) ->
             let new_row = Array.copy old_row in
             List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr params old_row expr
+              new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
             let key = Rowid.encode rowid in
             (* Update index entries: delete old, insert new. *)
@@ -988,7 +1050,9 @@ let execute_update ?(mode = Auto) ?(params = [||]) (store : S.t)
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
     then for each matching (rowid, row) remove index entries and the
     row itself from the table tree.  Returns the number of rows deleted. *)
-let execute_delete ?(mode = Auto) ?(params = [||]) (store : S.t)
+let execute_delete ?(mode = Auto) ?(params = [||])
+    ?(clock : (unit -> float) option = None)
+    (store : S.t)
     ~(table_meta : Cat.table_meta)
     ~(where : Plan.expr option)
     ~(indexes : Cat.index_info list)
@@ -1007,7 +1071,7 @@ let execute_delete ?(mode = Auto) ?(params = [||]) (store : S.t)
       let row   = Row.decode schema vbytes in
       let keep  = match where with
         | None      -> true
-        | Some pred -> value_truthy (eval_expr params row pred)
+        | Some pred -> value_truthy (eval_expr clock params row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
       drain ()
@@ -1076,7 +1140,9 @@ let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
-let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
+let execute_with_count ?(mode = Auto)
+    ?(clock : (unit -> float) option = None)
+    ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
   | Plan.Op_create_table { name; columns } ->
@@ -1086,7 +1152,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values } ->
-    let* () = execute_insert ~mode ~params store cat ~table_meta ~ordinals ~values in
+    let* () = execute_insert ~mode ~params ~clock store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
   | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
@@ -1096,9 +1162,9 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
                 ~col_idxs ~unique ~columns in
     Lwt.return 0
   | Plan.Op_update { table_meta; assignments; where; indexes } ->
-    execute_update ~mode ~params store ~table_meta ~assignments ~where ~indexes
+    execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes } ->
-    execute_delete ~mode ~params store ~table_meta ~where ~indexes
+    execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     Lwt.return 0
@@ -1115,7 +1181,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
         let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
         let key = Rowid.encode rowid in
         (* Evaluate expressions to get text values *)
-        let vals = List.map (fun e -> eval_expr params [||] e) col_values in
+        let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
         (* Map to FTS column order *)
         let n_cols = List.length fts_meta.Cat.fts_columns in
         let texts = Array.make n_cols "" in
@@ -1152,7 +1218,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
         let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
         let keep = match where with
           | None      -> true
-          | Some pred -> value_truthy (eval_expr params row pred)
+          | Some pred -> value_truthy (eval_expr clock params row pred)
         in
         if keep then buf := (rowid, kbytes, texts) :: !buf;
         drain ()
@@ -1194,8 +1260,10 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
-let execute ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count ~mode ~params store cat op in
+let execute ?(mode = Auto)
+    ?(clock : (unit -> float) option = None)
+    ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
+  let* _n = execute_with_count ~mode ~clock ~params store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
@@ -1229,7 +1297,7 @@ let fts_query_terms query =
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* ------------------------------------------------------------------ *)
 
-let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
     let* tx  = S.ro_begin store in
@@ -1249,34 +1317,34 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
     ) in
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
-    let* inner = to_stream params store child in
-    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr params row pred)) inner)
+    let* inner = to_stream clock params store child in
+    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr clock params row pred)) inner)
   | Plan.Op_project { ordinals; child } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     let eval_exprs row =
-      Array.of_list (List.map (eval_expr params row) exprs)
+      Array.of_list (List.map (eval_expr clock params row) exprs)
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
   | Plan.Op_sort { key; dir; child } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     let* rows = Lwt_stream.to_list inner in
     let cmp a b =
-      let va = eval_expr params a key and vb = eval_expr params b key in
+      let va = eval_expr clock params a key and vb = eval_expr clock params b key in
       let c = compare_values va vb in
       if dir = `Asc then c else -c
     in
     let sorted = List.sort cmp rows in
     Lwt.return (Lwt_stream.of_list sorted)
   | Plan.Op_limit { limit; offset; child } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     let* rows = Lwt_stream.to_list inner in
     let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
     Lwt.return (Lwt_stream.of_list rows')
   | Plan.Op_distinct { child } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     let seen = Hashtbl.create 64 in
     Lwt.return (Lwt_stream.filter (fun row ->
       let k = row_key row in
@@ -1287,7 +1355,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
                            col_type; lookup_val; table_meta } ->
     (* Encode the lookup value as an IndexKey.value matching the column type. *)
     let lookup_v =
-      let v = eval_expr params [||] lookup_val in
+      let v = eval_expr clock params [||] lookup_val in
       match v, col_type with
       | Row.V_null, _ -> Index_key.IK_null
       | Row.V_int  n, Row.Integer -> Index_key.IK_int n
@@ -1354,7 +1422,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       right_col_offset = _; n_right_cols } ->
     (* Indexed nested-loop join: for each left row, seek the right
        index tree for the join key and collect matching right rows. *)
-    let* left_stream = to_stream params store left in
+    let* left_stream = to_stream clock params store left in
     let* left_rows = Lwt_stream.to_list left_stream in
     let* tx = S.ro_begin store in
     let out = ref [] in
@@ -1417,8 +1485,8 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
   | Plan.Op_hash_join {
       left; right; left_key; right_key; join_kind;
       right_col_offset = _; n_right_cols } ->
-    let* left_stream  = to_stream params store left in
-    let* right_stream = to_stream params store right in
+    let* left_stream  = to_stream clock params store left in
+    let* right_stream = to_stream clock params store right in
     let* right_rows = Lwt_stream.to_list right_stream in
     if left_key < 0 || right_key < 0 then begin
       (* Cartesian product fallback (general ON predicate). *)
@@ -1481,7 +1549,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
   | Plan.Op_aggregate { child; group_col; aggs; having; proj } ->
-    let* inner = to_stream params store child in
+    let* inner = to_stream clock params store child in
     let* rows = Lwt_stream.to_list inner in
     let groups : (Row.value * Row.t list) list =
       match group_col with
@@ -1594,7 +1662,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       match having with
       | None -> agg_output_rows
       | Some pred ->
-        List.filter (fun r -> value_truthy (eval_expr params r pred)) agg_output_rows
+        List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
     in
     (* Project to final output row. *)
     let final_rows =
@@ -1630,7 +1698,7 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
           let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
           let emit = match where with
             | None      -> true
-            | Some pred -> value_truthy (eval_expr params row pred)
+            | Some pred -> value_truthy (eval_expr clock params row pred)
           in
           if emit then Lwt.return_some row
           else read_next ()
@@ -1695,8 +1763,8 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_union { all; left; right } ->
-    let* ls = to_stream params store left  in
-    let* rs = to_stream params store right in
+    let* ls = to_stream clock params store left  in
+    let* rs = to_stream clock params store right in
     let combined = Lwt_stream.append ls rs in
     if all then Lwt.return combined
     else begin
@@ -1710,8 +1778,8 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       Lwt.return (Lwt_stream.of_list deduped)
     end
   | Plan.Op_intersect { left; right } ->
-    let* ls = to_stream params store left  in
-    let* rs = to_stream params store right in
+    let* ls = to_stream clock params store left  in
+    let* rs = to_stream clock params store right in
     let* right_list = Lwt_stream.to_list rs in
     let right_set = Hashtbl.create (max 1 (List.length right_list)) in
     List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
@@ -1725,8 +1793,8 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
     ) left_list in
     Lwt.return (Lwt_stream.of_list result)
   | Plan.Op_except { left; right } ->
-    let* ls = to_stream params store left  in
-    let* rs = to_stream params store right in
+    let* ls = to_stream clock params store left  in
+    let* rs = to_stream clock params store right in
     let* right_list = Lwt_stream.to_list rs in
     let right_set = Hashtbl.create (max 1 (List.length right_list)) in
     List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
@@ -1751,6 +1819,6 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
-let query ?(params = [||]) (store : S.t) (_cat : Cat.t) (op : Plan.op) :
+let query ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (_cat : Cat.t) (op : Plan.op) :
     Row.t Lwt_stream.t Lwt.t =
-  to_stream params store op
+  to_stream clock params store op

@@ -26,6 +26,7 @@
 %token COUNT SUM AVG MIN MAX
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
 %token SUBSTR TRIM LTRIM RTRIM REPLACE INSTR ROUND TYPEOF
+%token DATE DATETIME JULIANDAY STRFTIME TIME UNIXEPOCH
 %token VIRTUAL USING FTS5
 %token MATCH
 %token PRAGMA
@@ -261,6 +262,18 @@ scalar_expr:
     { E_func (Fn_round, [n; d]) }
   | TYPEOF   LPAREN e = expr RPAREN
     { E_func (Fn_typeof, [e]) }
+  | DATE      LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_date,      args) }
+  | DATETIME  LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_datetime,  args) }
+  | JULIANDAY LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_julianday, args) }
+  | STRFTIME  LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_strftime,  args) }
+  | TIME      LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_time,      args) }
+  | UNIXEPOCH LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_unixepoch, args) }
 
 proj_item:
   | e = expr { match e with E_col name -> `Col name | _ -> `Expr e }

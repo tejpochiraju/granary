@@ -1602,6 +1602,85 @@ let test_named_params_colon () =
           Lwt.return_unit)))
 
 (* ------------------------------------------------------------------ *)
+(* Date/time functions                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(** Helper: create a single-row "dummy" table for SELECT-expression tests.
+    The parser requires FROM <table>, so we use a 1-row table as a probe. *)
+let dummy_db () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE _d (n INTEGER)";
+  exec db "INSERT INTO _d (n) VALUES (1)";
+  db
+
+let test_date_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATE('2024-01-15') FROM _d" in
+  (match rows with
+   | [[| Db.V_text d |]] ->
+     Alcotest.(check string) "date fn" "2024-01-15" d
+   | _ -> Alcotest.fail "expected one row with text")
+
+let test_time_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT TIME('12:30:45') FROM _d" in
+  (match rows with
+   | [[| Db.V_text t |]] ->
+     Alcotest.(check string) "time fn" "12:30:45" t
+   | _ -> Alcotest.fail "expected one row with text")
+
+let test_datetime_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT DATETIME('2024-01-15 12:30:45') FROM _d" in
+  (match rows with
+   | [[| Db.V_text dt |]] ->
+     Alcotest.(check string) "datetime fn" "2024-01-15 12:30:45" dt
+   | _ -> Alcotest.fail "expected one row with text")
+
+let test_julianday_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT JULIANDAY('2000-01-01') FROM _d" in
+  (match rows with
+   | [[| Db.V_real jd |]] ->
+     Alcotest.(check bool) "julianday 2000-01-01"
+       true (abs_float (jd -. 2451544.5) < 0.001)
+   | _ -> Alcotest.fail "expected one row with real")
+
+let test_unixepoch_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT UNIXEPOCH('1970-01-01') FROM _d" in
+  (match rows with
+   | [[| Db.V_int n |]] ->
+     Alcotest.(check int64) "unixepoch 1970" 0L n
+   | _ -> Alcotest.fail "expected one row with int")
+
+let test_strftime_fn () =
+  let db = dummy_db () in
+  let rows = query_ok db "SELECT STRFTIME('%Y-%m-%d', '2024-06-15') FROM _d" in
+  (match rows with
+   | [[| Db.V_text s |]] ->
+     Alcotest.(check string) "strftime" "2024-06-15" s
+   | _ -> Alcotest.fail "expected one row with text")
+
+let test_date_now () =
+  Lwt_main.run (
+    (* 2024-01-15 00:00:00 UTC as unix timestamp *)
+    let fixed_ts = 1705276800.0 in
+    let* db = Db.open_in_memory ~clock:(fun () -> fixed_ts) () in
+    let* _ = Db.execute db "CREATE TABLE _d (n INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO _d (n) VALUES (1)" in
+    let* result = Db.query db "SELECT DATE('now') FROM _d" in
+    (match result with
+     | Error e -> Alcotest.failf "%a" Db.pp_error e
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       (match rows with
+        | [[| Db.V_text d |]] ->
+          Alcotest.(check string) "date now" "2024-01-15" d
+        | _ -> Alcotest.fail "expected date string");
+       Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1764,5 +1843,14 @@ let () =
     "named_indexed_params", [
       Alcotest.test_case "indexed_params"       `Quick test_indexed_params;
       Alcotest.test_case "named_params_colon"   `Quick test_named_params_colon;
+    ];
+    "datetime_functions", [
+      Alcotest.test_case "date_fn"      `Quick test_date_fn;
+      Alcotest.test_case "time_fn"      `Quick test_time_fn;
+      Alcotest.test_case "datetime_fn"  `Quick test_datetime_fn;
+      Alcotest.test_case "julianday_fn" `Quick test_julianday_fn;
+      Alcotest.test_case "unixepoch_fn" `Quick test_unixepoch_fn;
+      Alcotest.test_case "strftime_fn"  `Quick test_strftime_fn;
+      Alcotest.test_case "date_now"     `Quick test_date_now;
     ];
   ]

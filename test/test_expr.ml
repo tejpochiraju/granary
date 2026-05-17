@@ -261,65 +261,65 @@ let eval_eq () =
   let row = [| Row.V_int 5L; Row.V_text "hi" |] in
   let e = Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 5L)) in
   Alcotest.(check bool) "5 = 5 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 (* Ne text, real, blob — covers exec.ml lines 100-103 *)
 let eval_ne_text () =
   let row = [| Row.V_text "abc" |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_text "xyz")) in
   Alcotest.(check bool) "abc != xyz → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_ne_text_equal () =
   let row = [| Row.V_text "same" |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_text "same")) in
   Alcotest.(check bool) "same != same → V_int 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
 
 let eval_ne_real () =
   let row = [| Row.V_real 1.0 |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.0)) in
   Alcotest.(check bool) "1.0 != 2.0 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_ne_blob () =
   let row = [| Row.V_blob (Bytes.of_string "a") |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_blob (Bytes.of_string "b"))) in
   Alcotest.(check bool) "a != b → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 (* cmp_result for text/real/blob — covers exec.ml lines 120-124 *)
 let eval_lt_text () =
   let row = [| Row.V_text "apple" |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_text "banana")) in
   Alcotest.(check bool) "apple < banana → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_lt_real () =
   let row = [| Row.V_real 1.5 |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
   Alcotest.(check bool) "1.5 < 2.5 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_lt_blob () =
   let row = [| Row.V_blob (Bytes.of_string "a") |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_blob (Bytes.of_string "b"))) in
   Alcotest.(check bool) "a-blob < b-blob → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_cmp_cross_type () =
   (* Cross-type comparison: int vs text — returns false (0) *)
   let row = [| Row.V_int 5L; Row.V_text "abc" |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool) "int < text (cross-type) → 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
 
 (* arith_op real + int — covers exec.ml lines 131-133 *)
 let eval_arith_real_int () =
   let row = [| Row.V_real 2.5 |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_int 1L)) in
   Alcotest.(check bool) "2.5 + 1 → V_real 3.5"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_real 3.5))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_real 3.5))
 
 let eval_compare_values_cross_type () =
   (* compare_values cross-type (non-null): int vs text → 0 (line 35 of exec.ml) *)
@@ -329,14 +329,14 @@ let eval_compare_values_cross_type () =
   let row = [| Row.V_text "x"; Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Gt, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool) "text > int (cross-type) → 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
 
 let eval_arith_text_error () =
   (* arith_op: text + int → failwith (line 133 of exec.ml) *)
   let row = [| Row.V_text "a"; Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_col 1) in
   (try
-     let _ = Exec.eval_expr [||] row e in
+     let _ = Exec.eval_expr None [||] row e in
      Alcotest.fail "expected arithmetic error on text + int"
    with Failure _ -> ())
 
@@ -345,67 +345,67 @@ let eval_ne_null_left () =
   let row = [| Row.V_null |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_int 5L)) in
   Alcotest.(check bool) "null != 5 → V_null"
-    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
 
 let eval_neq () =
   let row = [| Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Ne, Plan.P_col 0, Plan.P_lit (Ast.L_int 6L)) in
   Alcotest.(check bool) "5 != 6 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_lt () =
   let row = [| Row.V_int 3L |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_int 5L)) in
   Alcotest.(check bool) "3 < 5 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_arith_add () =
   let row = [| Row.V_int 3L |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_int 4L)) in
   Alcotest.(check bool) "3 + 4 → V_int 7"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 7L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 7L))
 
 let eval_arith_add_real () =
   let row = [| Row.V_real 1.5 |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_real 2.5)) in
   Alcotest.(check bool) "1.5 + 2.5 → V_real 4.0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_real 4.0))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_real 4.0))
 
 let eval_arith_mixed_int_real () =
   let row = [| Row.V_int 3L |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_real 0.5)) in
   Alcotest.(check bool) "3 + 0.5 → V_real 3.5"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_real 3.5))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_real 3.5))
 
 let eval_arith_null () =
   let row = [| Row.V_null |] in
   let e = Plan.P_binop (Plan.Add, Plan.P_col 0, Plan.P_lit (Ast.L_int 1L)) in
   Alcotest.(check bool) "NULL + 1 → V_null"
-    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
 
 let eval_neg_int () =
   let row = [| Row.V_int 7L |] in
   let e = Plan.P_neg (Plan.P_col 0) in
   Alcotest.(check bool) "-7 → V_int -7"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int (-7L)))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int (-7L)))
 
 let eval_neg_real () =
   let row = [| Row.V_real 2.0 |] in
   let e = Plan.P_neg (Plan.P_col 0) in
   Alcotest.(check bool) "-2.0 → V_real -2.0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_real (-2.0)))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_real (-2.0)))
 
 let eval_neg_null () =
   let row = [| Row.V_null |] in
   let e = Plan.P_neg (Plan.P_col 0) in
   Alcotest.(check bool) "-NULL → V_null"
-    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
 
 let eval_neg_text_raises () =
   let row = [| Row.V_text "x" |] in
   let e = Plan.P_neg (Plan.P_col 0) in
   (try
-     let _ = Exec.eval_expr [||] row e in
+     let _ = Exec.eval_expr None [||] row e in
      Alcotest.fail "expected failure on negating TEXT"
    with Failure _ -> ())
 
@@ -413,38 +413,38 @@ let eval_is_null_true () =
   let row = [| Row.V_null |] in
   let e = Plan.P_is_null (Plan.P_col 0) in
   Alcotest.(check bool) "NULL IS NULL → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_is_null_false () =
   let row = [| Row.V_int 1L |] in
   let e = Plan.P_is_null (Plan.P_col 0) in
   Alcotest.(check bool) "1 IS NULL → V_int 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
 
 let eval_is_not_null_true () =
   let row = [| Row.V_int 1L |] in
   let e = Plan.P_is_not_null (Plan.P_col 0) in
   Alcotest.(check bool) "1 IS NOT NULL → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_not_true () =
   let row = [| Row.V_int 0L |] in
   let e = Plan.P_not (Plan.P_col 0) in
   Alcotest.(check bool) "NOT 0 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_not_null () =
   (* NOT NULL → V_null (3VL: NOT of unknown is unknown) *)
   let row = [| Row.V_null |] in
   let e = Plan.P_not (Plan.P_col 0) in
   Alcotest.(check bool) "NOT NULL → V_null"
-    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
 
 let eval_div_zero_raises () =
   let row = [| Row.V_int 5L |] in
   let e = Plan.P_binop (Plan.Div, Plan.P_col 0, Plan.P_lit (Ast.L_int 0L)) in
   (try
-     let _ = Exec.eval_expr [||] row e in
+     let _ = Exec.eval_expr None [||] row e in
      Alcotest.fail "expected division-by-zero failure"
    with Failure _ -> ())
 
@@ -452,20 +452,20 @@ let eval_and () =
   let row = [| Row.V_int 1L; Row.V_int 0L |] in
   let e = Plan.P_binop (Plan.And, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool) "1 AND 0 → V_int 0"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 0L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 0L))
 
 let eval_or () =
   let row = [| Row.V_int 1L; Row.V_int 0L |] in
   let e = Plan.P_binop (Plan.Or, Plan.P_col 0, Plan.P_col 1) in
   Alcotest.(check bool) "1 OR 0 → V_int 1"
-    true (value_eq (Exec.eval_expr [||] row e) (Row.V_int 1L))
+    true (value_eq (Exec.eval_expr None [||] row e) (Row.V_int 1L))
 
 let eval_cmp_null () =
   (* NULL < 1 → V_null (3VL: comparisons with NULL return NULL) *)
   let row = [| Row.V_null |] in
   let e = Plan.P_binop (Plan.Lt, Plan.P_col 0, Plan.P_lit (Ast.L_int 1L)) in
   Alcotest.(check bool) "NULL < 1 → V_null"
-    true (value_eq (Exec.eval_expr [||] row e) Row.V_null)
+    true (value_eq (Exec.eval_expr None [||] row e) Row.V_null)
 
 (* ------------------------------------------------------------------ *)
 (* Group 8: QCheck property-based tests                                 *)
@@ -574,42 +574,42 @@ let prop_arith_add =
 
 let test_concat () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Concat, Plan.P_lit (Ast.L_text "foo"), Plan.P_lit (Ast.L_text "bar"))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Concat, Plan.P_lit (Ast.L_text "foo"), Plan.P_lit (Ast.L_text "bar"))) in
   Alcotest.(check string) "concat" "foobar" (match v with Row.V_text s -> s | _ -> "?")
 
 let test_mod () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Mod, Plan.P_lit (Ast.L_int 7L), Plan.P_lit (Ast.L_int 3L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Mod, Plan.P_lit (Ast.L_int 7L), Plan.P_lit (Ast.L_int 3L))) in
   Alcotest.(check int64) "mod" 1L (match v with Row.V_int n -> n | _ -> -1L)
 
 let test_bit_and () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Bit_and, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 3L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Bit_and, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 3L))) in
   Alcotest.(check int64) "bit_and" 1L (match v with Row.V_int n -> n | _ -> -1L)
 
 let test_bit_or () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Bit_or, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 2L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Bit_or, Plan.P_lit (Ast.L_int 5L), Plan.P_lit (Ast.L_int 2L))) in
   Alcotest.(check int64) "bit_or" 7L (match v with Row.V_int n -> n | _ -> -1L)
 
 let test_lshift () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Lshift, Plan.P_lit (Ast.L_int 2L), Plan.P_lit (Ast.L_int 3L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Lshift, Plan.P_lit (Ast.L_int 2L), Plan.P_lit (Ast.L_int 3L))) in
   Alcotest.(check int64) "lshift" 16L (match v with Row.V_int n -> n | _ -> -1L)
 
 let test_rshift () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int 16L), Plan.P_lit (Ast.L_int 2L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int 16L), Plan.P_lit (Ast.L_int 2L))) in
   Alcotest.(check int64) "rshift" 4L (match v with Row.V_int n -> n | _ -> -1L)
 
 let test_bitnot () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_bitnot (Plan.P_lit (Ast.L_int 5L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_bitnot (Plan.P_lit (Ast.L_int 5L))) in
   Alcotest.(check int64) "bitnot" (-6L) (match v with Row.V_int n -> n | _ -> 0L)
 
 let test_rshift_negative () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int (-4L)), Plan.P_lit (Ast.L_int 1L))) in
+  let v = Exec.eval_expr None [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int (-4L)), Plan.P_lit (Ast.L_int 1L))) in
   Alcotest.(check int64) "rshift_neg" (-2L) (match v with Row.V_int n -> n | _ -> 0L)
 
 (* ------------------------------------------------------------------ *)
@@ -619,7 +619,7 @@ let test_rshift_negative () =
 let test_like_match () =
   let row = [||] in
   let like a p =
-    Exec.eval_expr [||] row
+    Exec.eval_expr None [||] row
       (Plan.P_binop (Plan.Like, Plan.P_lit (Ast.L_text a), Plan.P_lit (Ast.L_text p)))
   in
   Alcotest.(check int64) "like percent"    1L (match like "hello" "hel%"   with Row.V_int n -> n | _ -> -1L);
@@ -629,20 +629,20 @@ let test_like_match () =
 
 let test_like_null () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row
+  let v = Exec.eval_expr None [||] row
       (Plan.P_binop (Plan.Like, Plan.P_lit Ast.L_null, Plan.P_lit (Ast.L_text "%"))) in
   Alcotest.(check bool) "like null" true (v = Row.V_null)
 
 let test_glob_null () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row
+  let v = Exec.eval_expr None [||] row
       (Plan.P_binop (Plan.Glob, Plan.P_lit Ast.L_null, Plan.P_lit (Ast.L_text "*"))) in
   Alcotest.(check bool) "glob null" true (v = Row.V_null)
 
 let test_glob_match () =
   let row = [||] in
   let glob s p =
-    Exec.eval_expr [||] row
+    Exec.eval_expr None [||] row
       (Plan.P_binop (Plan.Glob, Plan.P_lit (Ast.L_text s), Plan.P_lit (Ast.L_text p)))
   in
   Alcotest.(check int64) "glob star"  1L (match glob "hello" "hel*"  with Row.V_int n -> n | _ -> -1L);
@@ -656,7 +656,7 @@ let test_glob_match () =
 let test_between () =
   let row = [||] in
   let between x lo hi =
-    Exec.eval_expr [||] row
+    Exec.eval_expr None [||] row
       (Plan.P_between (Plan.P_lit (Ast.L_int x),
                        Plan.P_lit (Ast.L_int lo),
                        Plan.P_lit (Ast.L_int hi)))
@@ -669,7 +669,7 @@ let test_between () =
 let test_in () =
   let row = [||] in
   let in_list x vs =
-    Exec.eval_expr [||] row
+    Exec.eval_expr None [||] row
       (Plan.P_in (Plan.P_lit (Ast.L_int x),
                   List.map (fun v -> Plan.P_lit (Ast.L_int v)) vs))
   in
@@ -678,7 +678,7 @@ let test_in () =
 
 let test_in_null () =
   let row = [||] in
-  let v = Exec.eval_expr [||] row
+  let v = Exec.eval_expr None [||] row
       (Plan.P_in (Plan.P_lit Ast.L_null,
                   [Plan.P_lit (Ast.L_int 1L)])) in
   Alcotest.(check bool) "in null subject" true (v = Row.V_null)
@@ -686,12 +686,12 @@ let test_in_null () =
 let test_in_null_in_list () =
   let row = [||] in
   (* x NOT IN (NULL, 2) when x=5: should be NULL because list has NULL *)
-  let v_in = Exec.eval_expr [||] row
+  let v_in = Exec.eval_expr None [||] row
       (Plan.P_in (Plan.P_lit (Ast.L_int 5L),
                   [Plan.P_lit Ast.L_null; Plan.P_lit (Ast.L_int 2L)])) in
   Alcotest.(check bool) "in with null in list" true (v_in = Row.V_null);
   (* x IN (NULL, 5) when x=5: found → 1 (NULL doesn't block a definite match) *)
-  let v_in2 = Exec.eval_expr [||] row
+  let v_in2 = Exec.eval_expr None [||] row
       (Plan.P_in (Plan.P_lit (Ast.L_int 5L),
                   [Plan.P_lit Ast.L_null; Plan.P_lit (Ast.L_int 5L)])) in
   Alcotest.(check int64) "in with null and match" 1L (match v_in2 with Row.V_int n -> n | _ -> -1L)

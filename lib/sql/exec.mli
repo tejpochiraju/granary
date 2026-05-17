@@ -10,6 +10,7 @@ type txn_mode =
 
 val execute :
   ?mode:txn_mode ->
+  ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
@@ -23,6 +24,7 @@ val execute :
     they raise [Failure] if passed; the [Db] layer intercepts them. *)
 val execute_with_count :
   ?mode:txn_mode ->
+  ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
@@ -30,8 +32,11 @@ val execute_with_count :
   int Lwt.t
 
 (** Execute read operations; returns a lazy stream of result rows.
-    [params] are the positional parameter values for [?] placeholders. *)
+    [params] are the positional parameter values for [?] placeholders.
+    [clock] supplies the current Unix timestamp for SQL date/time
+    functions invoked with the literal ['now']. *)
 val query :
+  ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
@@ -43,6 +48,7 @@ val query :
     SQL.  Failures (e.g. division by zero, type-mismatched arithmetic)
     raise [Failure]. *)
 val eval_expr :
+  (unit -> float) option ->
   Sqlocaml_encoding.Row.value array ->
   Sqlocaml_encoding.Row.t ->
   Plan.expr ->

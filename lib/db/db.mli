@@ -17,7 +17,10 @@ type error =
   | Sema    of Sqlocaml_sql.Sema.error  (** name/type error *)
   | Runtime of string                (** unexpected internal error *)
 
-val open_in_memory : unit -> t Lwt.t
+(** Open a fresh in-memory database.  [clock] is an optional Unix-timestamp
+    provider used by SQL date/time functions when invoked with the literal
+    ['now'].  Omit for MirageOS-friendly cores that have no Unix dependency. *)
+val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
 
 (** Open a persistent B+-tree-backed database at the given file path.
     Creates the file if absent; reopens an existing database otherwise. *)

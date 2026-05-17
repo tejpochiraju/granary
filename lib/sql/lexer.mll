@@ -75,6 +75,12 @@ rule token = parse
   | "INSTR"    { INSTR }
   | "ROUND"    { ROUND }
   | "TYPEOF"   { TYPEOF }
+  | "DATETIME"  { DATETIME }
+  | "DATE"      { DATE }
+  | "JULIANDAY" { JULIANDAY }
+  | "STRFTIME"  { STRFTIME }
+  | "TIME"      { TIME }
+  | "UNIXEPOCH" { UNIXEPOCH }
   | "VIRTUAL"  { VIRTUAL }
   | "USING"    { USING }
   | "FTS5"     { FTS5 }

@@ -285,6 +285,9 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
          | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
          | Ast.Fn_replace -> n = 3
          | Ast.Fn_round -> n = 1 || n = 2
+         | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
+         | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
+         | Ast.Fn_strftime -> n >= 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -386,6 +389,9 @@ let rec bind_expr_join
          | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
          | Ast.Fn_replace -> n = 3
          | Ast.Fn_round -> n = 1 || n = 2
+         | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
+         | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
+         | Ast.Fn_strftime -> n >= 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -515,6 +521,9 @@ let bind_expr_agg
            | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
            | Ast.Fn_replace -> n = 3
            | Ast.Fn_round -> n = 1 || n = 2
+           | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
+           | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
+           | Ast.Fn_strftime -> n >= 2
          in
          if not arity_ok then
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })

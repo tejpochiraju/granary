@@ -47,6 +47,12 @@ type scalar_func =
   | Fn_instr                         (** INSTR(s, sub) → 1-indexed position or 0 *)
   | Fn_round                         (** ROUND(n[, digits]) *)
   | Fn_typeof                        (** TYPEOF(x) → 'integer'|'real'|'text'|'blob'|'null' *)
+  | Fn_date                              (** DATE(ts[, mod...]) → 'YYYY-MM-DD' *)
+  | Fn_time                              (** TIME(ts[, mod...]) → 'HH:MM:SS' *)
+  | Fn_datetime                          (** DATETIME(ts[, mod...]) → 'YYYY-MM-DD HH:MM:SS' *)
+  | Fn_strftime                          (** STRFTIME(fmt, ts[, mod...]) → formatted string *)
+  | Fn_julianday                         (** JULIANDAY(ts[, mod...]) → float *)
+  | Fn_unixepoch                         (** UNIXEPOCH(ts[, mod...]) → integer *)
 
 type expr =
   | E_lit         of literal

@@ -7,6 +7,7 @@ module Row    = Sqlocaml_encoding.Row
 type t = {
   store            : S.t;
   catalog          : Cat.t;
+  clock            : (unit -> float) option;
   mutable explicit_txn : S.rw S.txn option;
 }
 
@@ -24,10 +25,10 @@ type error =
   | Sema    of Sql.Sema.error
   | Runtime of string
 
-let open_in_memory () =
+let open_in_memory ?clock () =
   let store = S.create () in
   let* catalog = Cat.open_ store in
-  Lwt.return { store; catalog; explicit_txn = None }
+  Lwt.return { store; catalog; clock; explicit_txn = None }
 
 let open_file ~path =
   let* result = S.open_file ~path in
@@ -37,7 +38,7 @@ let open_file ~path =
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; explicit_txn = None })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -49,7 +50,7 @@ let open_block
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; explicit_txn = None })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None })
 
 let close t = S.close t.store
 
@@ -130,7 +131,7 @@ let execute t sql =
       | None    -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
     in
-    (match Sql.Exec.execute ~mode t.store t.catalog op with
+    (match Sql.Exec.execute ~mode ~clock:t.clock t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
        Lwt.catch
@@ -159,7 +160,7 @@ let execute_change_count t sql =
       | None    -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
     in
-    (match Sql.Exec.execute_with_count ~mode t.store t.catalog op with
+    (match Sql.Exec.execute_with_count ~mode ~clock:t.clock t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
        Lwt.catch
@@ -175,7 +176,7 @@ let query t sql =
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok op   ->
-    (match Sql.Exec.query t.store t.catalog op with
+    (match Sql.Exec.query ~clock:t.clock t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_stream ->
        let* stream = lwt_stream in
@@ -219,7 +220,7 @@ let run st ~params =
   in
   Lwt.catch
     (fun () ->
-      let* n = Sql.Exec.execute_with_count ~mode ~params:params_arr t.store t.catalog st.plan in
+      let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr t.store t.catalog st.plan in
       Lwt.return (Ok n))
     (function
      | Failure msg -> Lwt.return (Error (Runtime msg))
@@ -232,7 +233,7 @@ let iter st ~params =
   let t = st.db_ref in
   Lwt.catch
     (fun () ->
-      let* stream = Sql.Exec.query ~params:params_arr t.store t.catalog st.plan in
+      let* stream = Sql.Exec.query ~clock:t.clock ~params:params_arr t.store t.catalog st.plan in
       Lwt.return (Ok stream))
     (function
      | Failure msg -> Lwt.return (Error (Runtime msg))
