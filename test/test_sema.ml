@@ -1975,6 +1975,601 @@ let bind_select_having_neg_unknown_col () =
   | _ -> Alcotest.fail "expected Unknown_column bogus in E_neg in HAVING agg proj"
 
 (* ------------------------------------------------------------------ *)
+(* Group 12b: bind_expr E_bitnot / E_between / E_in / E_param / E_func *)
+(*             / E_match branches                                        *)
+(* ------------------------------------------------------------------ *)
+
+(** bind_expr E_bitnot OK path. *)
+let bind_select_bitnot_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_bitnot (Ast.E_col "id"));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_bitnot (Sema.BE_col 0)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_bitnot(BE_col 0) in where"
+
+(** bind_expr E_bitnot error path. *)
+let bind_select_bitnot_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_bitnot (Ast.E_col "bogus"));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_bitnot"
+
+(** bind_expr E_between OK path. *)
+let bind_select_between_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_between (
+      Ast.E_col "id",
+      Ast.E_lit (Ast.L_int 1L),
+      Ast.E_lit (Ast.L_int 10L)));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_between _); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_between in where"
+
+(** bind_expr E_between hi-error path. *)
+let bind_select_between_hi_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_between (
+      Ast.E_col "id",
+      Ast.E_lit (Ast.L_int 1L),
+      Ast.E_col "bogus"));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_between hi"
+
+(** bind_expr E_in OK path. *)
+let bind_select_in_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_in (
+      Ast.E_col "id",
+      [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_in _); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_in in where"
+
+(** bind_expr E_in error path — the subject col is unknown. *)
+let bind_select_in_subject_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_in (
+      Ast.E_col "bogus",
+      [Ast.E_lit (Ast.L_int 1L)]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_in subject"
+
+(** bind_expr E_in error path — a value is unknown col. *)
+let bind_select_in_value_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_in (
+      Ast.E_col "id",
+      [Ast.E_col "bogus"]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_in value"
+
+(** bind_expr E_param OK path — anonymous param in WHERE. *)
+let bind_select_param_in_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_param Ast.Param_anon));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_param in WHERE"
+
+(** bind_expr E_func arity mismatch in WHERE (LENGTH with 0 args). *)
+let bind_select_func_arity_error_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_func (Ast.Fn_length, []));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Arity_mismatch { got = 0; _ }) -> ()
+  | _ -> Alcotest.fail "expected Arity_mismatch for LENGTH() in WHERE"
+
+(** bind_expr E_func arity OK in WHERE (LENGTH with 1 arg). *)
+let bind_select_func_ok_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_func (Ast.Fn_length, [Ast.E_col "name"]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_func _); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_func in WHERE"
+
+(** bind_expr E_func with arg error propagates correctly. *)
+let bind_select_func_arg_error_where () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_func (Ast.Fn_length, [Ast.E_col "bogus"]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in func arg"
+
+(** bind_expr E_func with IFNULL arity: 2 arg path → sets expected=2. *)
+let bind_select_ifnull_arity_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_func (Ast.Fn_ifnull, [Ast.E_col "id"]));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Arity_mismatch { expected = 2; got = 1 }) -> ()
+  | _ -> Alcotest.fail "expected Arity_mismatch expected=2 for IFNULL with 1 arg"
+
+(** bind_expr E_match in a regular (non-FTS) table: Unsupported. *)
+let bind_select_match_non_fts () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_match ("users", "hello"));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for MATCH on regular table"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12c: bind_expr_join additional branches                        *)
+(* ------------------------------------------------------------------ *)
+
+(** bind_expr_join E_bitnot OK. *)
+let bind_select_join_bitnot_ok () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_bitnot (Ast.E_tbl_col ("users", "id")) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_bitnot in ON"
+
+(** bind_expr_join E_bitnot error. *)
+let bind_select_join_bitnot_error () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_bitnot (Ast.E_col "bogus") } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_bitnot in ON"
+
+(** bind_expr_join E_between OK. *)
+let bind_select_join_between_ok () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_between (
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_lit (Ast.L_int 1L),
+                  Ast.E_lit (Ast.L_int 10L)) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_between in ON"
+
+(** bind_expr_join E_between error (hi unknown col). *)
+let bind_select_join_between_error () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_between (
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_lit (Ast.L_int 1L),
+                  Ast.E_col "bogus") } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_between hi in ON"
+
+(** bind_expr_join E_in OK. *)
+let bind_select_join_in_ok () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_in (
+                  Ast.E_tbl_col ("users", "id"),
+                  [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_in in ON"
+
+(** bind_expr_join E_in error (value unknown col). *)
+let bind_select_join_in_error () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_in (
+                  Ast.E_tbl_col ("users", "id"),
+                  [Ast.E_col "bogus"]) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_in value in ON"
+
+(** bind_expr_join E_param. *)
+let bind_select_join_param () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_binop (Ast.Eq,
+                  Ast.E_tbl_col ("users", "id"),
+                  Ast.E_param Ast.Param_anon) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_param in ON"
+
+(** bind_expr_join E_func arity mismatch. *)
+let bind_select_join_func_arity_error () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_func (Ast.Fn_length, []) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Arity_mismatch { got = 0; _ }) -> ()
+  | _ -> Alcotest.fail "expected Arity_mismatch for LENGTH() in ON"
+
+(** bind_expr_join E_func arg error propagates. *)
+let bind_select_join_func_arg_error () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_func (Ast.Fn_length, [Ast.E_col "bogus"]) } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_func arg in ON"
+
+(** bind_expr_join E_match. *)
+let bind_select_join_match_rejected () =
+  let cat = make_join_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users";
+    joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
+                on = Ast.E_match ("users", "hello") } ];
+    where = None; group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for MATCH in ON"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12d: bind_expr_agg additional branches                         *)
+(* ------------------------------------------------------------------ *)
+
+(** bind_expr_agg E_bitnot in HAVING. *)
+let bind_select_having_bitnot () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_bitnot (Ast.E_agg (Ast.Agg_count, None)));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_bitnot(agg) in HAVING"
+
+(** bind_expr_agg E_bitnot error path (unknown col inside bitnot). *)
+let bind_select_having_bitnot_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_bitnot (Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_bitnot in HAVING"
+
+(** bind_expr_agg E_between in HAVING OK. *)
+let bind_select_having_between () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_between (
+      Ast.E_agg (Ast.Agg_count, None),
+      Ast.E_lit (Ast.L_int 1L),
+      Ast.E_lit (Ast.L_int 100L)));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_between in HAVING"
+
+(** bind_expr_agg E_between error path. *)
+let bind_select_having_between_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_between (
+      Ast.E_agg (Ast.Agg_count, None),
+      Ast.E_lit (Ast.L_int 1L),
+      Ast.E_col "bogus"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_between hi in HAVING"
+
+(** bind_expr_agg E_in OK path. *)
+let bind_select_having_in_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_in (
+      Ast.E_agg (Ast.Agg_count, None),
+      [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_in in HAVING"
+
+(** bind_expr_agg E_in error (subject unknown). *)
+let bind_select_having_in_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_in (
+      Ast.E_col "bogus",
+      [Ast.E_lit (Ast.L_int 1L)]));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_in subject in HAVING"
+
+(** bind_expr_agg E_param. *)
+let bind_select_having_param () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_binop (Ast.Gt,
+      Ast.E_agg (Ast.Agg_count, None),
+      Ast.E_param Ast.Param_anon));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { having = Some _; _ }) -> ()
+  | _ -> Alcotest.fail "expected Ok with E_param in HAVING"
+
+(** bind_expr_agg E_func arity mismatch. *)
+let bind_select_having_func_arity_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_func (Ast.Fn_length, []));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Arity_mismatch { got = 0; _ }) -> ()
+  | _ -> Alcotest.fail "expected Arity_mismatch for LENGTH() in HAVING"
+
+(** bind_expr_agg E_func arg error. *)
+let bind_select_having_func_arg_error () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_func (Ast.Fn_length, [Ast.E_col "bogus"]));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in E_func arg in HAVING"
+
+(** bind_expr_agg E_match. *)
+let bind_select_having_match_rejected () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
+    table = "users"; joins = [];
+    where = None; group_by = ["id"];
+    having = Some (Ast.E_match ("users", "hello"));
+    order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Error (Sema.Unsupported _) -> ()
+  | _ -> Alcotest.fail "expected Unsupported for MATCH in HAVING"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12e: S_compound binding                                        *)
+(* ------------------------------------------------------------------ *)
+
+let bind_compound_union_ok () =
+  let cat = two_col_cat () in
+  let left  = Ast.S_select { distinct = false; proj = `All; table = "users";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let right = Ast.S_select { distinct = false; proj = `All; table = "users";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  match bind cat stmt with
+  | Ok (Sema.BS_compound { op = Ast.Union; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_compound Union"
+
+let bind_compound_col_mismatch () =
+  (* left has 2 cols, right has 1 col — arity mismatch *)
+  let cat = make_catalog [
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+  ] in
+  let left  = Ast.S_select { distinct = false; proj = `Cols ["id"; "name"]; table = "users";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let right = Ast.S_select { distinct = false; proj = `Cols ["age"]; table = "users";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  match bind cat stmt with
+  | Error (Sema.Arity_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Arity_mismatch for compound column mismatch"
+
+let bind_compound_left_error () =
+  let cat = two_col_cat () in
+  let left  = Ast.S_select { distinct = false; proj = `All; table = "ghost";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let right = Ast.S_select { distinct = false; proj = `All; table = "users";
+                              joins = []; where = None; group_by = []; having = None;
+                              order = []; limit = None; offset = None } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table _) -> ()
+  | _ -> Alcotest.fail "expected Unknown_table for left side error in compound"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12f: S_create_fts_table Already_exists                        *)
+(* ------------------------------------------------------------------ *)
+
+let bind_create_fts_table_ok () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_fts_table { name = "docs"; columns = ["body"; "title"] } in
+  match bind cat stmt with
+  | Ok (Sema.BS_create_fts_table { name; columns }) ->
+    Alcotest.(check string) "fts name" "docs" name;
+    Alcotest.(check int) "fts columns" 2 (List.length columns)
+  | _ -> Alcotest.fail "expected BS_create_fts_table"
+
+let bind_create_fts_table_dup_regular () =
+  (* "users" is a regular table — creating an FTS table with same name → Already_exists *)
+  let cat = two_col_cat () in
+  let stmt = Ast.S_create_fts_table { name = "users"; columns = ["body"] } in
+  match bind cat stmt with
+  | Error (Sema.Already_exists "users") -> ()
+  | _ -> Alcotest.fail "expected Already_exists users for FTS duplicate"
+
+(* ------------------------------------------------------------------ *)
+(* Group 12g: S_pragma binding                                          *)
+(* ------------------------------------------------------------------ *)
+
+let bind_pragma_table_info () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_pragma (Ast.Pragma_table_info "users") in
+  match bind cat stmt with
+  | Ok (Sema.BS_pragma { kind = Ast.Pragma_table_info "users" }) -> ()
+  | _ -> Alcotest.fail "expected BS_pragma table_info"
+
+let bind_pragma_index_list () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_pragma (Ast.Pragma_index_list "users") in
+  match bind cat stmt with
+  | Ok (Sema.BS_pragma { kind = Ast.Pragma_index_list "users" }) -> ()
+  | _ -> Alcotest.fail "expected BS_pragma index_list"
+
+(* ------------------------------------------------------------------ *)
 (* Group 12: BS_begin / BS_commit / BS_rollback binding                 *)
 (* ------------------------------------------------------------------ *)
 
@@ -2167,5 +2762,57 @@ let () =
       Alcotest.test_case "bind_begin"    `Quick bind_begin;
       Alcotest.test_case "bind_commit"   `Quick bind_commit;
       Alcotest.test_case "bind_rollback" `Quick bind_rollback;
+    ];
+    "bind-expr-extra", [
+      Alcotest.test_case "bitnot_ok"                `Quick bind_select_bitnot_ok;
+      Alcotest.test_case "bitnot_unknown_col"       `Quick bind_select_bitnot_unknown_col;
+      Alcotest.test_case "between_ok"               `Quick bind_select_between_ok;
+      Alcotest.test_case "between_hi_error"         `Quick bind_select_between_hi_error;
+      Alcotest.test_case "in_ok"                    `Quick bind_select_in_ok;
+      Alcotest.test_case "in_subject_error"         `Quick bind_select_in_subject_error;
+      Alcotest.test_case "in_value_error"           `Quick bind_select_in_value_error;
+      Alcotest.test_case "param_in_where"           `Quick bind_select_param_in_where;
+      Alcotest.test_case "func_arity_error_where"   `Quick bind_select_func_arity_error_where;
+      Alcotest.test_case "func_ok_where"            `Quick bind_select_func_ok_where;
+      Alcotest.test_case "func_arg_error_where"     `Quick bind_select_func_arg_error_where;
+      Alcotest.test_case "ifnull_arity_error"       `Quick bind_select_ifnull_arity_error;
+      Alcotest.test_case "match_non_fts"            `Quick bind_select_match_non_fts;
+    ];
+    "bind-expr-join-extra", [
+      Alcotest.test_case "bitnot_ok"       `Quick bind_select_join_bitnot_ok;
+      Alcotest.test_case "bitnot_error"    `Quick bind_select_join_bitnot_error;
+      Alcotest.test_case "between_ok"      `Quick bind_select_join_between_ok;
+      Alcotest.test_case "between_error"   `Quick bind_select_join_between_error;
+      Alcotest.test_case "in_ok"           `Quick bind_select_join_in_ok;
+      Alcotest.test_case "in_error"        `Quick bind_select_join_in_error;
+      Alcotest.test_case "param"           `Quick bind_select_join_param;
+      Alcotest.test_case "func_arity"      `Quick bind_select_join_func_arity_error;
+      Alcotest.test_case "func_arg_error"  `Quick bind_select_join_func_arg_error;
+      Alcotest.test_case "match_rejected"  `Quick bind_select_join_match_rejected;
+    ];
+    "bind-expr-agg-extra", [
+      Alcotest.test_case "bitnot_ok"         `Quick bind_select_having_bitnot;
+      Alcotest.test_case "bitnot_error"      `Quick bind_select_having_bitnot_error;
+      Alcotest.test_case "between_ok"        `Quick bind_select_having_between;
+      Alcotest.test_case "between_error"     `Quick bind_select_having_between_error;
+      Alcotest.test_case "in_ok"             `Quick bind_select_having_in_ok;
+      Alcotest.test_case "in_error"          `Quick bind_select_having_in_error;
+      Alcotest.test_case "param"             `Quick bind_select_having_param;
+      Alcotest.test_case "func_arity_error"  `Quick bind_select_having_func_arity_error;
+      Alcotest.test_case "func_arg_error"    `Quick bind_select_having_func_arg_error;
+      Alcotest.test_case "match_rejected"    `Quick bind_select_having_match_rejected;
+    ];
+    "compound", [
+      Alcotest.test_case "union_ok"           `Quick bind_compound_union_ok;
+      Alcotest.test_case "col_mismatch"       `Quick bind_compound_col_mismatch;
+      Alcotest.test_case "left_error"         `Quick bind_compound_left_error;
+    ];
+    "fts-table", [
+      Alcotest.test_case "create_fts_ok"          `Quick bind_create_fts_table_ok;
+      Alcotest.test_case "create_fts_dup_regular" `Quick bind_create_fts_table_dup_regular;
+    ];
+    "pragma", [
+      Alcotest.test_case "table_info"  `Quick bind_pragma_table_info;
+      Alcotest.test_case "index_list"  `Quick bind_pragma_index_list;
     ];
   ]
