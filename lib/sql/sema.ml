@@ -22,8 +22,8 @@ type bound_expr =
   | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
 
 type bound_order_key = {
-  col_idx : int;
-  dir     : Ast.order_dir;
+  key : bound_expr;
+  dir : Ast.order_dir;
 }
 
 type agg_spec = {
@@ -1117,13 +1117,17 @@ let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having 
                     match acc with
                     | Error _ -> acc
                     | Ok keys ->
-                      let result = match ok.table_opt with
-                        | None   -> proj_lookup ok.col
-                        | Some t -> qual_lookup t ok.col
+                      let bound_e =
+                        match join_info with
+                        | None ->
+                          bind_expr ~param_counter meta ok.Ast.expr
+                        | Some (_jc, rm) ->
+                          bind_expr_join ~param_counter ~left_meta:meta
+                            ~right_meta:rm ~right_offset ok.Ast.expr
                       in
-                      (match result with
+                      (match bound_e with
                        | Error e -> Error e
-                       | Ok i    -> Ok (keys @ [{ col_idx = i; dir = ok.dir }]))
+                       | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir }]))
                   ) (Ok []) order
                 in
                 (match order_result with

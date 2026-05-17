@@ -48,9 +48,9 @@ type op =
       child : op;
     }
   | Op_sort of {
-      col_idx : int;
-      dir     : [`Asc | `Desc];
-      child   : op;
+      key   : expr;
+      dir   : [`Asc | `Desc];
+      child : op;
     }
   | Op_limit of {
       limit  : int;

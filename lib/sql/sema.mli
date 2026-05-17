@@ -25,8 +25,8 @@ type bound_expr =
     (** FTS MATCH expression: [table MATCH 'query']. *)
 
 type bound_order_key = {
-  col_idx : int;
-  dir     : Ast.order_dir;
+  key : bound_expr;
+  dir : Ast.order_dir;
 }
 
 (** Specification of a single aggregate computation.

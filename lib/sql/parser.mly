@@ -253,12 +253,9 @@ order_by_clause:
   | ORDER BY keys = separated_nonempty_list(COMMA, order_key)      { keys }
 
 order_key:
-  | name = IDENT                      { { col = name; table_opt = None; dir = Asc } }
-  | name = IDENT ASC                  { { col = name; table_opt = None; dir = Asc } }
-  | name = IDENT DESC                 { { col = name; table_opt = None; dir = Desc } }
-  | t = IDENT DOT c = IDENT          { { col = c; table_opt = Some t; dir = Asc } }
-  | t = IDENT DOT c = IDENT ASC      { { col = c; table_opt = Some t; dir = Asc } }
-  | t = IDENT DOT c = IDENT DESC     { { col = c; table_opt = Some t; dir = Desc } }
+  | e = expr      { { expr = e; dir = Asc } }
+  | e = expr ASC  { { expr = e; dir = Asc } }
+  | e = expr DESC { { expr = e; dir = Desc } }
 
 limit_clause:
   |                                         { (None, None) }

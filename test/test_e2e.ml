@@ -612,6 +612,17 @@ let order_by_text () =
     | Db.V_text s -> s | _ -> "") rows in
   Alcotest.(check (list string)) "alphabetical order" ["alice"; "bob"; "charlie"] names
 
+let order_by_expr () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  let rows = query_ok db "SELECT n FROM t ORDER BY n * -1" in
+  let vals = List.map (fun r -> match r.(0) with
+    | Db.V_int n -> n | _ -> -1L) rows in
+  Alcotest.(check (list int64)) "order_by_expr" [3L; 2L; 1L] vals
+
 (* ------------------------------------------------------------------ *)
 (* Group 14: QCheck ORDER BY properties                                 *)
 (* ------------------------------------------------------------------ *)
@@ -1408,6 +1419,7 @@ let () =
       Alcotest.test_case "order_by_default_asc" `Quick order_by_default_asc;
       Alcotest.test_case "order_by_null_first"  `Quick order_by_null_first;
       Alcotest.test_case "order_by_text"        `Quick order_by_text;
+      Alcotest.test_case "order_by_expr"        `Quick order_by_expr;
     ];
     "limit_offset", [
       Alcotest.test_case "limit_no_order"       `Quick limit_no_order;

@@ -182,9 +182,9 @@ let plan_select cat
      For aggregate queries: sort AFTER aggregation because ORDER BY refers
      to the aggregated output row layout. *)
   let sort_key = match order with [] -> None | k :: _ -> Some k in
-  let make_sort child key =
-    let dir = match key.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-    Plan.Op_sort { col_idx = key.col_idx; dir; child }
+  let make_sort child (bkey : Sema.bound_order_key) =
+    let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+    Plan.Op_sort { key = plan_expr bkey.key; dir; child }
   in
   let after_sort =
     if is_aggregated then after_where
@@ -276,9 +276,9 @@ let plan ?cat = function
        in
        let is_aggregated = aggs <> [] || group_by <> None in
        let sort_key = match order with [] -> None | k :: _ -> Some k in
-       let make_sort child key =
-         let dir = match key.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-         Plan.Op_sort { col_idx = key.col_idx; dir; child }
+       let make_sort child (bkey : Sema.bound_order_key) =
+         let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+         Plan.Op_sort { key = plan_expr bkey.key; dir; child }
        in
        let after_sort =
          if is_aggregated then filtered

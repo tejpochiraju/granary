@@ -1217,11 +1217,11 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
       Array.of_list (List.map (eval_expr params row) exprs)
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
-  | Plan.Op_sort { col_idx; dir; child } ->
+  | Plan.Op_sort { key; dir; child } ->
     let* inner = to_stream params store child in
     let* rows = Lwt_stream.to_list inner in
     let cmp a b =
-      let va = a.(col_idx) and vb = b.(col_idx) in
+      let va = eval_expr params a key and vb = eval_expr params b key in
       let c = compare_values va vb in
       if dir = `Asc then c else -c
     in
