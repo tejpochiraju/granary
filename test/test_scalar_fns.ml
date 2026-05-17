@@ -191,6 +191,29 @@ let test_order_by_after_expr_proj () =
         ["APPLE"; "BANANA"; "CHERRY"] got;
       Lwt.return_unit)
 
+let test_null_args () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
+    let* _ = D.execute d "INSERT INTO s VALUES ('hello')" in
+    let check_null sql =
+      match%lwt D.query d sql with
+      | Error e -> Alcotest.failf "query: %a" D.pp_error e
+      | Ok stream ->
+        let* rows = Lwt_stream.to_list stream in
+        (match rows with
+         | row :: _ -> Alcotest.(check bool) sql true (row.(0) = D.V_null)
+         | [] -> Alcotest.fail "no rows");
+        Lwt.return_unit
+    in
+    let* () = check_null "SELECT TRIM(v, NULL) FROM s" in
+    let* () = check_null "SELECT LTRIM(v, NULL) FROM s" in
+    let* () = check_null "SELECT RTRIM(v, NULL) FROM s" in
+    let* () = check_null "SELECT REPLACE(v, NULL, 'x') FROM s" in
+    let* () = check_null "SELECT REPLACE(v, 'l', NULL) FROM s" in
+    let* () = check_null "SELECT ROUND(3.14, NULL) FROM s" in
+    Lwt.return_unit)
+
 let () =
   Alcotest.run "scalar_fns" [
     "length",   [ Alcotest.test_case "length"   `Quick test_length   ];
@@ -201,13 +224,14 @@ let () =
     "ifnull",   [ Alcotest.test_case "ifnull"   `Quick test_ifnull   ];
     "order_by_expr_proj", [ Alcotest.test_case "order_by_after_expr_proj" `Quick test_order_by_after_expr_proj ];
     "new_scalar_fns", [
-      Alcotest.test_case "substr"  `Quick test_substr;
-      Alcotest.test_case "trim"    `Quick test_trim;
-      Alcotest.test_case "ltrim"   `Quick test_ltrim;
-      Alcotest.test_case "rtrim"   `Quick test_rtrim;
-      Alcotest.test_case "replace" `Quick test_replace;
-      Alcotest.test_case "instr"   `Quick test_instr;
-      Alcotest.test_case "round"   `Quick test_round;
-      Alcotest.test_case "typeof"  `Quick test_typeof;
+      Alcotest.test_case "substr"     `Quick test_substr;
+      Alcotest.test_case "trim"       `Quick test_trim;
+      Alcotest.test_case "ltrim"      `Quick test_ltrim;
+      Alcotest.test_case "rtrim"      `Quick test_rtrim;
+      Alcotest.test_case "replace"    `Quick test_replace;
+      Alcotest.test_case "instr"      `Quick test_instr;
+      Alcotest.test_case "round"      `Quick test_round;
+      Alcotest.test_case "typeof"     `Quick test_typeof;
+      Alcotest.test_case "null_args"  `Quick test_null_args;
     ];
   ]

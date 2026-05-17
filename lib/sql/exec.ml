@@ -234,15 +234,20 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   | Ast.Fn_substr, (Row.V_null :: _) -> Row.V_null
   | Ast.Fn_trim,  [Row.V_text s]                        -> Row.V_text (str_trim_spaces s)
   | Ast.Fn_trim,  [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_trim_chars s chars)
+  | Ast.Fn_trim,  [_; Row.V_null]                       -> Row.V_null
   | Ast.Fn_trim,  (Row.V_null :: _)                     -> Row.V_null
   | Ast.Fn_ltrim, [Row.V_text s]                        -> Row.V_text (str_ltrim_spaces s)
   | Ast.Fn_ltrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_ltrim_chars s chars)
+  | Ast.Fn_ltrim, [_; Row.V_null]                       -> Row.V_null
   | Ast.Fn_ltrim, (Row.V_null :: _)                     -> Row.V_null
   | Ast.Fn_rtrim, [Row.V_text s]                        -> Row.V_text (str_rtrim_spaces s)
   | Ast.Fn_rtrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_rtrim_chars s chars)
+  | Ast.Fn_rtrim, [_; Row.V_null]                       -> Row.V_null
   | Ast.Fn_rtrim, (Row.V_null :: _)                     -> Row.V_null
   | Ast.Fn_replace, [Row.V_text s; Row.V_text old; Row.V_text rep] ->
     Row.V_text (str_replace s old rep)
+  | Ast.Fn_replace, [_; Row.V_null; _] -> Row.V_null
+  | Ast.Fn_replace, [_; _; Row.V_null] -> Row.V_null
   | Ast.Fn_replace, (Row.V_null :: _) -> Row.V_null
   | Ast.Fn_instr, [Row.V_text s; Row.V_text sub] ->
     Row.V_int (Int64.of_int (str_instr s sub))
@@ -256,6 +261,7 @@ and eval_func (func : Ast.scalar_func) (args : Row.value list) : Row.value =
     Row.V_real (Float.round (f *. factor) /. factor)
   | Ast.Fn_round, [Row.V_int n; Row.V_int _] ->
     Row.V_real (Int64.to_float n)
+  | Ast.Fn_round, [_; Row.V_null] -> Row.V_null
   | Ast.Fn_round, (Row.V_null :: _) -> Row.V_null
   | Ast.Fn_typeof, [v] ->
     Row.V_text (match v with
