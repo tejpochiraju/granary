@@ -17,6 +17,7 @@ type column = {
   not_null    : bool;
   primary_key : bool;
   default     : default_value option;  (* None = no DEFAULT *)
+  check_sql   : string option;         (* None = no CHECK constraint *)
 }
 type schema = column list
 

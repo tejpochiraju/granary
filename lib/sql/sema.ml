@@ -173,7 +173,7 @@ let col_index (cols : Row.column list) name =
 let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
   let columns = List.map (fun name ->
     Row.{ name; ty = Row.Text; not_null = true;
-          primary_key = false; default = None }
+          primary_key = false; default = None; check_sql = None }
   ) m.Cat.fts_columns in
   { Cat.name       = m.Cat.fts_name;
     Cat.tree_id    = m.Cat.fts_content_tree;
@@ -615,7 +615,8 @@ let bind_create cat ~name ~columns ~constraints =
                            | Ast.Ty_blob -> Row.Blob);
             not_null    = c.not_null;
             primary_key = c.primary_key;
-            default     = Option.map ast_lit_to_dv c.default }
+            default     = Option.map ast_lit_to_dv c.default;
+            check_sql   = Option.map Ast.expr_to_sql c.check }
     ) columns in
     (* Generate auto-UNIQUE index specs for table-level constraints *)
     let uniq_idxs = List.mapi (fun i tc ->

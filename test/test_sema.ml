@@ -19,8 +19,8 @@ let make_catalog cols =
   )
 
 let two_col_cat () = make_catalog [
-  { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
-  { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+  { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
 ]
 
 let bind cat stmt = Lwt_main.run (Sema.bind cat stmt)
@@ -32,8 +32,8 @@ let bind cat stmt = Lwt_main.run (Sema.bind cat stmt)
 let bind_create_new () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None };
-    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None };
+    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None; check = None };
+    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None; check = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
@@ -49,7 +49,7 @@ let bind_create_new () =
 let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
-  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None }] in
+  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None; check = None }] in
   let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = [] } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
@@ -59,8 +59,8 @@ let bind_create_duplicate () =
 let bind_create_preserves_cols () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None };
-    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None };
+    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None };
+    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
@@ -384,9 +384,9 @@ let bind_insert_second_col_unknown () =
   (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
      id resolves, bogus fails, name is never reached — the 3rd iteration hits L99. *)
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
-    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
-    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users";
@@ -403,9 +403,9 @@ let bind_select_second_col_unknown () =
   (* Use 3 columns so the fold's short-circuit arm (| Error _ -> acc) is exercised.
      id resolves, bogus fails, age is never reached — the 3rd iteration hits L134. *)
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
-    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
-    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_select {
     distinct = false;
@@ -615,8 +615,8 @@ let bind_update_type_mismatch () =
 
 let bind_update_not_null_violation () =
   let cat = make_catalog [
-    { Row.name = "id"; ty = Row.Integer; not_null = true; primary_key = false; default = None };
-    { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None };
+    { Row.name = "id"; ty = Row.Integer; not_null = true; primary_key = false; default = None; check_sql = None };
+    { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   (* SET id = NULL on a NOT NULL column *)
   let stmt = Ast.S_update {
@@ -867,12 +867,12 @@ let make_join_cat () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users" ~columns:[
-      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
-      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     let* _ = C.create_table cat ~name:"orders" ~columns:[
-      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
-      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     Lwt.return cat
   )
@@ -896,10 +896,10 @@ let bind_select_join_ambiguous_col () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"a" ~columns:[
-      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     let* _ = C.create_table cat ~name:"b" ~columns:[
-      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     Lwt.return cat
   ) in
@@ -1236,8 +1236,8 @@ let bind_select_more_than_one_join_rejected () =
 
 let bind_insert_not_null_violation () =
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer; not_null = true;  primary_key = false; default = None };
-    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
+    { Row.name = "id";   ty = Row.Integer; not_null = true;  primary_key = false; default = None; check_sql = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   (* Omit the NOT NULL column entirely; it fills with NULL → violation. *)
   let stmt = Ast.S_insert {
@@ -1276,7 +1276,7 @@ let bind_insert_real_lit_type_mismatch () =
     BLOB type accepts a blob literal. *)
 let bind_insert_blob_lit_ok () =
   let cat = make_catalog [
-    { Row.name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None };
+    { Row.name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users";
@@ -1292,7 +1292,7 @@ let bind_insert_blob_lit_ok () =
 (** ty_equal Row.Real (line 119) — Real-typed col accepts Real lit. *)
 let bind_insert_real_lit_ok () =
   let cat = make_catalog [
-    { Row.name = "f"; ty = Row.Real; not_null = false; primary_key = false; default = None };
+    { Row.name = "f"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users";
@@ -1687,7 +1687,7 @@ let bind_create_default_null () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_int; not_null = false; primary_key = false;
-          default = Some Ast.L_null };
+          default = Some Ast.L_null; check = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
@@ -1702,7 +1702,7 @@ let bind_create_default_real () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_real; not_null = false; primary_key = false;
-          default = Some (Ast.L_real 3.14) };
+          default = Some (Ast.L_real 3.14); check = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
@@ -1717,7 +1717,7 @@ let bind_create_default_blob () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_blob; not_null = false; primary_key = false;
-          default = Some (Ast.L_blob (Bytes.of_string "hi")) };
+          default = Some (Ast.L_blob (Bytes.of_string "hi")); check = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
   match bind cat stmt with
@@ -1731,8 +1731,8 @@ let bind_create_default_blob () =
 let bind_insert_default_null () =
   let cat = make_catalog [
     { Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false;
-      default = Some Row.DV_null };
-    { Row.name = "n";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      default = Some Row.DV_null; check_sql = None };
+    { Row.name = "n";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
@@ -1752,8 +1752,8 @@ let bind_insert_default_null () =
 let bind_insert_default_real () =
   let cat = make_catalog [
     { Row.name = "f"; ty = Row.Real; not_null = false; primary_key = false;
-      default = Some (Row.DV_real 2.5) };
-    { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      default = Some (Row.DV_real 2.5); check_sql = None };
+    { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
@@ -1771,8 +1771,8 @@ let bind_insert_default_real () =
 let bind_insert_default_blob () =
   let cat = make_catalog [
     { Row.name = "b"; ty = Row.Blob; not_null = false; primary_key = false;
-      default = Some (Row.DV_blob (Bytes.of_string "x")) };
-    { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      default = Some (Row.DV_blob (Bytes.of_string "x")); check_sql = None };
+    { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
@@ -1791,9 +1791,9 @@ let bind_insert_default_blob () =
     `| Error _ -> acc` branch (line 413). *)
 let bind_insert_not_null_late () =
   let cat = make_catalog [
-    { Row.name = "a"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
-    { Row.name = "b"; ty = Row.Integer; not_null = true;  primary_key = false; default = None };
-    { Row.name = "c"; ty = Row.Integer; not_null = true;  primary_key = false; default = None };
+    { Row.name = "a"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "b"; ty = Row.Integer; not_null = true;  primary_key = false; default = None; check_sql = None };
+    { Row.name = "c"; ty = Row.Integer; not_null = true;  primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["a"]; values = [Ast.E_lit (Ast.L_int 1L)];
@@ -1887,10 +1887,10 @@ let bind_select_join_on_ambiguous () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"a" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     let* _ = C.create_table cat ~name:"b" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     Lwt.return cat
   ) in
@@ -2869,9 +2869,9 @@ let bind_compound_union_ok () =
 let bind_compound_col_mismatch () =
   (* left has 2 cols, right has 1 col — arity mismatch *)
   let cat = make_catalog [
-    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None };
-    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
-    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let left  = Ast.S_select { distinct = false; proj = `Cols ["id"; "name"]; table = "users";
                               joins = []; where = None; group_by = []; having = None;

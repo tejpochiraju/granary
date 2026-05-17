@@ -5,6 +5,7 @@
     | Col_not_null
     | Col_primary_key
     | Col_default of literal
+    | Col_check   of expr
 
   type table_item =
     | TI_col of column_def
@@ -40,6 +41,7 @@
 %token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
 %token BETWEEN IN EXISTS
+%token CHECK
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -65,8 +67,12 @@
 %nonassoc TILDE UMINUS
 
 %start <Ast.stmt> stmt_eof
+%start <Ast.expr> expr_only
 
 %%
+
+expr_only:
+  | e = expr EOF { e }
 
 stmt_eof:
   | s = stmt SEMI? EOF { s }
@@ -154,7 +160,9 @@ column_def:
       let primary_key = List.mem Col_primary_key cs in
       let default     = List.fold_left (fun acc c ->
           match c with Col_default l -> Some l | _ -> acc) None cs in
-      { name; ty; not_null; primary_key; default } }
+      let check       = List.fold_left (fun acc c ->
+          match c with Col_check e -> Some e | _ -> acc) None cs in
+      { name; ty; not_null; primary_key; default; check } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -166,6 +174,7 @@ column_constraint:
   | NOT NULL              { Col_not_null }
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
+  | CHECK LPAREN e = expr RPAREN { Col_check e }
 
 def_value:
   | n = INT_LIT              { L_int n }

@@ -2501,6 +2501,71 @@ let test_not_in_select_subquery () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* CHECK constraints                                                     *)
+(* ------------------------------------------------------------------ *)
+
+let test_check_insert_ok () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))" in
+    let* res = Db.execute db "INSERT INTO prices VALUES (1, 9.99)" in
+    Alcotest.(check bool) "valid row inserted" true (res = Ok ());
+    Lwt.return_unit)
+
+let test_check_insert_violation () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))" in
+    let* res = Db.execute db "INSERT INTO prices VALUES (1, -5.0)" in
+    (match res with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "expected CHECK violation but insert succeeded");
+    Lwt.return_unit)
+
+let test_check_update_violation () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 5)" in
+    let* res = Db.execute db "UPDATE t SET v = -1 WHERE id = 1" in
+    (match res with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "expected CHECK violation on update");
+    Lwt.return_unit)
+
+let test_check_null_allowed () =
+  run (
+    (* SQLite CHECK: NULL in CHECK expr -> passes (not a violation) *)
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))" in
+    let* res = Db.execute db "INSERT INTO t VALUES (1, NULL)" in
+    Alcotest.(check bool) "null passes CHECK" true (res = Ok ());
+    Lwt.return_unit)
+
+let test_check_persisted () =
+  run (
+    let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
+    Fun.protect ~finally:(fun () -> try Unix.unlink tmpfile with _ -> ()) (fun () ->
+      let* db_res = Db.open_file ~path:tmpfile in
+      let db = match db_res with Ok d -> d | Error _ -> failwith "open_file failed" in
+      let* _ = Db.execute db
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))" in
+      let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+      let* () = Db.close db in
+      let* db2_res = Db.open_file ~path:tmpfile in
+      let db2 = match db2_res with Ok d -> d | Error _ -> failwith "open_file2 failed" in
+      let* res = Db.execute db2 "INSERT INTO t VALUES (2, -1)" in
+      let* () = Db.close db2 in
+      (match res with
+       | Error _ -> ()
+       | Ok ()   -> Alcotest.fail "expected CHECK to persist after reopen");
+      Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2760,5 +2825,12 @@ let () =
       Alcotest.test_case "exists_false"            `Quick test_exists_subquery_false;
       Alcotest.test_case "in_select"               `Quick test_in_select_subquery;
       Alcotest.test_case "not_in_select"           `Quick test_not_in_select_subquery;
+    ];
+    "check_constraints", [
+      Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
+      Alcotest.test_case "insert_violation"    `Quick test_check_insert_violation;
+      Alcotest.test_case "update_violation"    `Quick test_check_update_violation;
+      Alcotest.test_case "null_allowed"        `Quick test_check_null_allowed;
+      Alcotest.test_case "persisted"           `Quick test_check_persisted;
     ];
   ]

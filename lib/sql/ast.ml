@@ -58,19 +58,6 @@ type scalar_func =
 
 type set_op = Union | Union_all | Intersect | Except
 
-type column_def = {
-  name        : string;
-  ty          : ty;
-  not_null    : bool;
-  primary_key : bool;
-  default     : literal option;  (* None = no DEFAULT *)
-}
-
-type alter_action =
-  | AA_add_column    of column_def
-  | AA_rename_table  of string              (* new table name *)
-  | AA_rename_column of string * string     (* old_col_name * new_col_name *)
-
 type order_dir = Asc | Desc
 
 type join_kind = Inner | Left
@@ -79,8 +66,8 @@ type table_constraint =
   | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
   | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
 
-(** Expressions and statements are mutually recursive because subquery
-    expressions embed a [stmt] directly. *)
+(** Expressions, statements, and column_def are mutually recursive because
+    column_def.check embeds an [expr], and subquery expressions embed a [stmt]. *)
 type expr =
   | E_lit         of literal
   | E_col         of string                (** unqualified column reference *)
@@ -196,3 +183,65 @@ and stmt =
 and pragma_kind =
   | Pragma_table_info of string
   | Pragma_index_list of string
+
+and column_def = {
+  name        : string;
+  ty          : ty;
+  not_null    : bool;
+  primary_key : bool;
+  default     : literal option;  (* None = no DEFAULT *)
+  check       : expr option;     (* None = no CHECK constraint *)
+}
+
+and alter_action =
+  | AA_add_column    of column_def
+  | AA_rename_table  of string              (* new table name *)
+  | AA_rename_column of string * string     (* old_col_name * new_col_name *)
+
+let binop_to_sql = function
+  | Eq -> "=" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="
+  | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
+  | And -> "AND" | Or -> "OR" | Concat -> "||"
+  | Bit_and -> "&" | Bit_or -> "|" | Lshift -> "<<" | Rshift -> ">>"
+  | Like -> "LIKE" | Glob -> "GLOB"
+
+let func_to_sql = function
+  | Fn_length -> "LENGTH" | Fn_lower -> "LOWER" | Fn_upper -> "UPPER"
+  | Fn_abs -> "ABS" | Fn_coalesce -> "COALESCE" | Fn_ifnull -> "IFNULL"
+  | Fn_substr -> "SUBSTR" | Fn_trim -> "TRIM" | Fn_ltrim -> "LTRIM"
+  | Fn_rtrim -> "RTRIM" | Fn_replace -> "REPLACE" | Fn_instr -> "INSTR"
+  | Fn_round -> "ROUND" | Fn_typeof -> "TYPEOF"
+  | Fn_date -> "DATE" | Fn_time -> "TIME" | Fn_datetime -> "DATETIME"
+  | Fn_strftime -> "STRFTIME" | Fn_julianday -> "JULIANDAY"
+  | Fn_unixepoch -> "UNIXEPOCH"
+
+let rec expr_to_sql = function
+  | E_lit (L_int n)  -> Int64.to_string n
+  | E_lit (L_text s) ->
+    Printf.sprintf "'%s'" (String.concat "''" (String.split_on_char '\'' s))
+  | E_lit L_null     -> "NULL"
+  | E_lit (L_real f) -> Printf.sprintf "%g" f
+  | E_lit (L_blob _) -> "X''"
+  | E_col name       -> name
+  | E_tbl_col (t, c) -> Printf.sprintf "%s.%s" t c
+  | E_param Param_anon -> "?"
+  | E_param (Param_index i) -> Printf.sprintf "?%d" i
+  | E_param (Param_name n)  -> Printf.sprintf ":%s" n
+  | E_binop (op, a, b) ->
+    Printf.sprintf "(%s %s %s)" (expr_to_sql a) (binop_to_sql op) (expr_to_sql b)
+  | E_not e          -> Printf.sprintf "NOT (%s)" (expr_to_sql e)
+  | E_is_null e      -> Printf.sprintf "(%s) IS NULL" (expr_to_sql e)
+  | E_is_not_null e  -> Printf.sprintf "(%s) IS NOT NULL" (expr_to_sql e)
+  | E_neg e          -> Printf.sprintf "(-(%s))" (expr_to_sql e)
+  | E_bitnot e       -> Printf.sprintf "(~(%s))" (expr_to_sql e)
+  | E_between (x, lo, hi) ->
+    Printf.sprintf "(%s) BETWEEN (%s) AND (%s)"
+      (expr_to_sql x) (expr_to_sql lo) (expr_to_sql hi)
+  | E_in (x, vals) ->
+    Printf.sprintf "(%s) IN (%s)" (expr_to_sql x)
+      (String.concat ", " (List.map expr_to_sql vals))
+  | E_func (f, args) ->
+    Printf.sprintf "%s(%s)" (func_to_sql f)
+      (String.concat ", " (List.map expr_to_sql args))
+  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ ->
+    failwith "expr_to_sql: unsupported expression form"

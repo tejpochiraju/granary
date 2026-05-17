@@ -95,6 +95,8 @@ rule token = parse
   | "TO"       { TO }
   | "COLUMN"   { COLUMN }
   | "PRAGMA"   { PRAGMA }
+  | "CHECK"    { CHECK }
+  | "check"    { CHECK }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }
   | "BETWEEN"  { BETWEEN }

@@ -165,6 +165,13 @@ let encode_column (col : Row.column) =
    | Some dv ->
      Varint.encode_uint64 buf 1L;
      encode_default_value buf dv);
+  (* Phase 9: check_sql field — appended at end for backward compat *)
+  (match col.check_sql with
+   | None     -> Varint.encode_uint64 buf 0L
+   | Some sql ->
+     Varint.encode_uint64 buf 1L;
+     Varint.encode_uint64 buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
   Buffer.to_bytes buf
 
 let decode_column bytes =
@@ -177,19 +184,32 @@ let decode_column bytes =
   let bytes_left = Bytes.length bytes - off in
   if bytes_left = 0 then
     Row.{ name; ty = type_of_tag (Int64.to_int tag);
-          not_null = false; primary_key = false; default = None }
+          not_null = false; primary_key = false; default = None; check_sql = None }
   else begin
     let nn, off  = Varint.decode_uint64 bytes off in
     let pk, off  = Varint.decode_uint64 bytes off in
     let has_def, off = Varint.decode_uint64 bytes off in
-    let default =
-      if Int64.to_int has_def = 0 then None
-      else let dv, _ = decode_default_value bytes off in Some dv
+    let default, off =
+      if Int64.to_int has_def = 0 then (None, off)
+      else let dv, off' = decode_default_value bytes off in (Some dv, off')
+    in
+    let bytes_left2 = Bytes.length bytes - off in
+    let check_sql =
+      if bytes_left2 <= 0 then None
+      else
+        let has_check, off = Varint.decode_uint64 bytes off in
+        if Int64.to_int has_check = 0 then None
+        else
+          let sql_len, off = Varint.decode_uint64 bytes off in
+          let sql = Bytes.sub_string bytes off (Int64.to_int sql_len) in
+          ignore off;
+          Some sql
     in
     Row.{ name; ty = type_of_tag (Int64.to_int tag);
           not_null    = (Int64.to_int nn <> 0);
           primary_key = (Int64.to_int pk <> 0);
-          default }
+          default;
+          check_sql }
   end
 
 (* Index value encoding:

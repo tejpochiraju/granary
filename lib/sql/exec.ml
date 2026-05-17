@@ -51,6 +51,11 @@ let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
   in
   find 0 cols
 
+(* Module-level cache for compiled CHECK expressions.
+   Key: (table_name, column_ordinal) → compiled Plan.expr.
+   Per-process only; cleared on restart. *)
+let check_expr_cache : (string * int, Plan.expr) Hashtbl.t = Hashtbl.create 16
+
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
 (* (Defined before [execute] so that [Op_update] can evaluate WHERE     *)
@@ -471,6 +476,13 @@ and cmp_result lv rv pred =
   | Row.V_real _, Row.V_real _
   | Row.V_blob _, Row.V_blob _ ->
     if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
+  (* Cross-type numeric comparisons: promote int to float *)
+  | Row.V_real a, Row.V_int  b ->
+    let c = Float.compare a (Int64.to_float b) in
+    if pred c then Row.V_int 1L else Row.V_int 0L
+  | Row.V_int  a, Row.V_real b ->
+    let c = Float.compare (Int64.to_float a) b in
+    if pred c then Row.V_int 1L else Row.V_int 0L
   | _ -> Row.V_int 0L  (* cross-type comparisons are false *)
 
 and arith_op lv rv int_f float_f =
@@ -484,6 +496,74 @@ and arith_op lv rv int_f float_f =
 
 let project_row (ords : int list) (row : Row.t) : Row.t =
   Array.of_list (List.map (fun i -> row.(i)) ords)
+
+(* ------------------------------------------------------------------ *)
+(* CHECK constraint evaluation                                          *)
+(* ------------------------------------------------------------------ *)
+
+let ast_binop_to_plan : Ast.binop -> Plan.binop = function
+  | Ast.Eq -> Plan.Eq | Ast.Ne -> Plan.Ne | Ast.Lt -> Plan.Lt | Ast.Le -> Plan.Le
+  | Ast.Gt -> Plan.Gt | Ast.Ge -> Plan.Ge
+  | Ast.Add -> Plan.Add | Ast.Sub -> Plan.Sub
+  | Ast.Mul -> Plan.Mul | Ast.Div -> Plan.Div
+  | Ast.And -> Plan.And | Ast.Or  -> Plan.Or
+  | Ast.Concat -> Plan.Concat | Ast.Mod -> Plan.Mod
+  | Ast.Bit_and -> Plan.Bit_and | Ast.Bit_or -> Plan.Bit_or
+  | Ast.Lshift  -> Plan.Lshift  | Ast.Rshift -> Plan.Rshift
+  | Ast.Like -> Plan.Like | Ast.Glob -> Plan.Glob
+
+let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan.expr =
+  match e with
+  | Ast.E_lit l       -> Plan.P_lit l
+  | Ast.E_col name    -> Plan.P_col (find_col_idx_by_name columns name)
+  | Ast.E_tbl_col (_, name) -> Plan.P_col (find_col_idx_by_name columns name)
+  | Ast.E_binop (op, a, b) ->
+    Plan.P_binop (ast_binop_to_plan op,
+                  ast_expr_to_plan_check columns a,
+                  ast_expr_to_plan_check columns b)
+  | Ast.E_not e      -> Plan.P_not (ast_expr_to_plan_check columns e)
+  | Ast.E_is_null e  -> Plan.P_is_null (ast_expr_to_plan_check columns e)
+  | Ast.E_is_not_null e -> Plan.P_is_not_null (ast_expr_to_plan_check columns e)
+  | Ast.E_neg e      -> Plan.P_neg (ast_expr_to_plan_check columns e)
+  | Ast.E_bitnot e   -> Plan.P_bitnot (ast_expr_to_plan_check columns e)
+  | Ast.E_between (x, lo, hi) ->
+    Plan.P_between (ast_expr_to_plan_check columns x,
+                    ast_expr_to_plan_check columns lo,
+                    ast_expr_to_plan_check columns hi)
+  | Ast.E_in (x, vals) ->
+    Plan.P_in (ast_expr_to_plan_check columns x,
+               List.map (ast_expr_to_plan_check columns) vals)
+  | Ast.E_func (f, args) ->
+    Plan.P_func (f, List.map (ast_expr_to_plan_check columns) args)
+  | _ -> failwith "ast_expr_to_plan_check: unsupported expression in CHECK"
+
+let compile_check_expr (table_name : string) (col_idx : int)
+    (columns : Row.column list) (check_sql : string) : Plan.expr =
+  let key = (table_name, col_idx) in
+  match Hashtbl.find_opt check_expr_cache key with
+  | Some e -> e
+  | None ->
+    let lexbuf = Lexing.from_string check_sql in
+    let ast_expr = Parser.expr_only Lexer.token lexbuf in
+    let plan_expr = ast_expr_to_plan_check columns ast_expr in
+    Hashtbl.add check_expr_cache key plan_expr;
+    plan_expr
+
+let eval_check_constraints
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (table_meta : Cat.table_meta)
+    (row : Row.t) : unit =
+  List.iteri (fun i (col : Row.column) ->
+    match col.check_sql with
+    | None -> ()
+    | Some check_sql ->
+      let check_plan = compile_check_expr table_meta.name i table_meta.columns check_sql in
+      let result = eval_expr clock params row check_plan in
+      (* SQLite: NULL result -> passes (not a violation) *)
+      if result <> Row.V_null && not (value_truthy result) then
+        failwith (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name)
+  ) table_meta.columns
 
 (* ------------------------------------------------------------------ *)
 (* FTS inverted-index helpers                                           *)
@@ -800,6 +880,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
       r
   in
+  (* Evaluate CHECK constraints before any writes. *)
+  eval_check_constraints clock params table_meta row;
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -1032,6 +1114,8 @@ let execute_update ?(mode = Auto) ?(params = [||])
             List.iter (fun (i, expr) ->
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
+            (* Evaluate CHECK constraints on the new row before writes. *)
+            eval_check_constraints clock params table_meta new_row;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
               else begin
@@ -1321,6 +1405,7 @@ let execute_with_count ?(mode = Auto)
                             | Some (Ast.L_text s) -> Some (Row.DV_text s)
                             | Some (Ast.L_real f) -> Some (Row.DV_real f)
                             | Some (Ast.L_blob b) -> Some (Row.DV_blob b));
+         Row.check_sql   = Option.map Ast.expr_to_sql col_def.Ast.check;
        } in
        let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
        (match result with
