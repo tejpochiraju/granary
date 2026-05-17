@@ -3,6 +3,7 @@ open Lwt.Syntax
 module S = Sqlocaml_store.Store
 module C = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
+module Varint = Sqlocaml_encoding.Varint
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -897,6 +898,103 @@ let test_drop_index_empty_sys_indexes () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Backward compatibility: old-format column encoding                    *)
+(* ------------------------------------------------------------------ *)
+
+(* Construct old-format column bytes with no not_null/pk/default fields
+   (the very oldest format: just type_tag + name_len + name) *)
+let make_old_format_col_bytes ty_tag name =
+  let buf = Buffer.create 16 in
+  Varint.encode_uint64 buf (Int64.of_int ty_tag);
+  Varint.encode_uint64 buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  Buffer.to_bytes buf
+
+(* Construct intermediate-format column bytes with not_null/pk/default but
+   no check_sql field (the pre-Phase-9 format) *)
+let make_intermediate_format_col_bytes ty_tag name =
+  let buf = Buffer.create 16 in
+  Varint.encode_uint64 buf (Int64.of_int ty_tag);
+  Varint.encode_uint64 buf (Int64.of_int (String.length name));
+  Buffer.add_string buf name;
+  Varint.encode_uint64 buf 0L;  (* not_null = false *)
+  Varint.encode_uint64 buf 0L;  (* primary_key = false *)
+  Varint.encode_uint64 buf 0L;  (* has_default = false *)
+  Buffer.to_bytes buf
+
+(* Column key: table_name ++ NUL ++ ordinal_be8 *)
+let make_column_key table_name ordinal =
+  let tn = Bytes.of_string table_name in
+  let ord = Bytes.create 8 in
+  for i = 0 to 7 do
+    Bytes.set_uint8 ord i ((ordinal lsr ((7 - i) * 8)) land 0xFF)
+  done;
+  Bytes.cat (Bytes.cat tn (Bytes.of_string "\x00")) ord
+
+(* Table value: varint(tree_id) ++ zigzag(next_rowid) *)
+let make_table_value tree_id =
+  let buf = Buffer.create 8 in
+  Varint.encode_uint64 buf (Int64.of_int tree_id);
+  Varint.encode_int64 buf 1L;  (* next_rowid = 1 *)
+  Buffer.to_bytes buf
+
+let sys_tables_tid  = 0
+let sys_columns_tid = 1
+
+(** Test that a catalog stored with old-format column bytes (no not_null/pk/default)
+    is read correctly with backward-compat code (bytes_left = 0 path). *)
+let test_decode_column_old_format () =
+  run (
+    let store = S.create () in
+    let* tx = S.rw_begin store in
+    (* Write a table entry for "compat_t" with tree_id=16 *)
+    let* () = S.put tx sys_tables_tid
+        (Bytes.of_string "compat_t") (make_table_value 16) in
+    (* Write one column in old-format (no not_null/pk/default/check) *)
+    let col_bytes = make_old_format_col_bytes 1 (* INTEGER *) "id" in
+    let* () = S.put tx sys_columns_tid
+        (make_column_key "compat_t" 0) col_bytes in
+    let* () = S.commit tx in
+    (* Open catalog — should load with backward-compat path *)
+    let* cat = C.open_ store in
+    let* result = C.find_table cat ~name:"compat_t" in
+    (match result with
+     | None -> Alcotest.fail "expected table compat_t to be found"
+     | Some m ->
+       Alcotest.(check int) "one column" 1 (List.length m.columns);
+       let col = List.hd m.columns in
+       Alcotest.(check string) "col name" "id" col.Row.name;
+       Alcotest.(check bool) "col ty integer" true (col.Row.ty = Row.Integer);
+       Alcotest.(check bool) "not_null false" false col.Row.not_null;
+       Alcotest.(check bool) "check_sql none" true (col.Row.check_sql = None));
+    Lwt.return_unit)
+
+(** Test that a catalog stored with intermediate-format column bytes
+    (not_null/pk/default but no check_sql) is read correctly
+    (bytes_left2 = 0 path). *)
+let test_decode_column_no_check_sql () =
+  run (
+    let store = S.create () in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx sys_tables_tid
+        (Bytes.of_string "inter_t") (make_table_value 16) in
+    let col_bytes = make_intermediate_format_col_bytes 2 (* TEXT *) "name" in
+    let* () = S.put tx sys_columns_tid
+        (make_column_key "inter_t" 0) col_bytes in
+    let* () = S.commit tx in
+    let* cat = C.open_ store in
+    let* result = C.find_table cat ~name:"inter_t" in
+    (match result with
+     | None -> Alcotest.fail "expected table inter_t to be found"
+     | Some m ->
+       Alcotest.(check int) "one column" 1 (List.length m.columns);
+       let col = List.hd m.columns in
+       Alcotest.(check string) "col name" "name" col.Row.name;
+       Alcotest.(check bool) "col ty text" true (col.Row.ty = Row.Text);
+       Alcotest.(check bool) "check_sql none" true (col.Row.check_sql = None));
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -945,6 +1043,10 @@ let () =
       Alcotest.test_case "create_empty_columns"        `Quick test_create_empty_columns;
       Alcotest.test_case "corrupt_column_type_tag"     `Quick corrupt_column_type_tag;
       Alcotest.test_case "corrupt_default_tag"         `Quick corrupt_default_tag;
+    ];
+    "backward_compat", [
+      Alcotest.test_case "decode_column_old_format"    `Quick test_decode_column_old_format;
+      Alcotest.test_case "decode_column_no_check_sql"  `Quick test_decode_column_no_check_sql;
     ];
     "indexes", [
       Alcotest.test_case "create_index_basic"           `Quick test_create_index_basic;

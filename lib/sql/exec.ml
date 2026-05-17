@@ -52,9 +52,10 @@ let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
   find 0 cols
 
 (* Module-level cache for compiled CHECK expressions.
-   Key: (table_name, column_ordinal) → compiled Plan.expr.
-   Per-process only; cleared on restart. *)
-let check_expr_cache : (string * int, Plan.expr) Hashtbl.t = Hashtbl.create 16
+   Key: (table_name, column_ordinal, check_sql) → compiled Plan.expr.
+   Including check_sql avoids stale hits when different tables share the same
+   name and column index across DB instances (e.g. test isolation). *)
+let check_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.create 16
 
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
@@ -539,7 +540,7 @@ let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan
 
 let compile_check_expr (table_name : string) (col_idx : int)
     (columns : Row.column list) (check_sql : string) : Plan.expr =
-  let key = (table_name, col_idx) in
+  let key = (table_name, col_idx, check_sql) in
   match Hashtbl.find_opt check_expr_cache key with
   | Some e -> e
   | None ->
@@ -1313,7 +1314,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     (* Invalidate cached CHECK expressions for the dropped table *)
-    Hashtbl.filter_map_inplace (fun (tbl, _) v ->
+    Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
       if String.equal tbl table_meta.name then None else Some v
     ) check_expr_cache;
     Lwt.return 0
@@ -1427,13 +1428,13 @@ let execute_with_count ?(mode = Auto)
         | Error msg -> Lwt.fail_with msg
         | Ok ()     ->
           (* Remap cached CHECK entries from old_name to new_name *)
-          let to_add = Hashtbl.fold (fun (tbl, idx) v acc ->
-            if String.equal tbl table_meta.Cat.name then (new_name, idx, v) :: acc
+          let to_add = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
+            if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
             else acc) check_expr_cache [] in
-          List.iter (fun (_, idx, _) ->
-            Hashtbl.remove check_expr_cache (table_meta.Cat.name, idx)) to_add;
-          List.iter (fun (new_t, idx, v) ->
-            Hashtbl.add check_expr_cache (new_t, idx) v) to_add;
+          List.iter (fun (_, idx, sql, _) ->
+            Hashtbl.remove check_expr_cache (table_meta.Cat.name, idx, sql)) to_add;
+          List.iter (fun (new_t, idx, sql, v) ->
+            Hashtbl.add check_expr_cache (new_t, idx, sql) v) to_add;
           Lwt.return 0)
      | Ast.AA_rename_column (old_col, new_col) ->
        let* result = Cat.rename_column cat

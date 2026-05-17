@@ -285,6 +285,29 @@ let test_round_int () =
 let test_round_int_int () =
   check_single_value "round_int_int" "SELECT ROUND(3, 1) FROM t WHERE id = 1" "3.00"
 
+(* Additional coverage tests for exec.ml Fn_typeof blob branch.
+   Blob literals cannot be expressed in SQL directly, so we use prepared stmts. *)
+let test_typeof_blob () =
+  run (fun () ->
+    let* d = D.open_in_memory () in
+    let* _ = D.execute d "CREATE TABLE b (id INTEGER, data BLOB)" in
+    (* Insert a blob value via prepared statement with blob param *)
+    let* stmt_r = D.prepare d "INSERT INTO b VALUES (1, ?)" in
+    let stmt = match stmt_r with
+      | Ok s -> s | Error _ -> Alcotest.fail "typeof_blob: prepare failed" in
+    let* _ = D.run stmt ~params:[D.V_blob (Bytes.of_string "\xDE\xAD\xBE\xEF")] in
+    let* r = D.query d "SELECT TYPEOF(data) FROM b WHERE id = 1" in
+    match r with
+    | Error _ -> Alcotest.fail "typeof_blob: query error"
+    | Ok stream ->
+      let* rows = Lwt_stream.to_list stream in
+      (match rows with
+       | [row] ->
+         let got = match row.(0) with D.V_text s -> s | _ -> "?" in
+         Alcotest.(check string) "typeof blob" "blob" got
+       | _ -> Alcotest.fail "typeof_blob: expected 1 row");
+      Lwt.return_unit)
+
 let () =
   Alcotest.run "scalar_fns" [
     "length",   [ Alcotest.test_case "length"   `Quick test_length   ];
@@ -310,5 +333,6 @@ let () =
       Alcotest.test_case "ltrim_rtrim_chars" `Quick test_ltrim_rtrim_chars;
       Alcotest.test_case "round_int"        `Quick test_round_int;
       Alcotest.test_case "round_int_int"    `Quick test_round_int_int;
+      Alcotest.test_case "typeof_blob"      `Quick test_typeof_blob;
     ];
   ]

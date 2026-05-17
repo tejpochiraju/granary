@@ -2959,6 +2959,137 @@ let bind_rollback () =
   | _ -> Alcotest.fail "expected BS_rollback"
 
 (* ------------------------------------------------------------------ *)
+(* ast_binop_to_sema coverage: Like/Glob/Mod/Bit operators             *)
+(* ------------------------------------------------------------------ *)
+
+(** Bind a WHERE with LIKE operator to cover ast_binop_to_sema Like. *)
+let bind_select_like_op () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Like,
+      Ast.E_col "name", Ast.E_lit (Ast.L_text "a%")));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Like, _, _)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_binop(Like) in where"
+
+(** Bind a WHERE with GLOB operator to cover ast_binop_to_sema Glob. *)
+let bind_select_glob_op () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Glob,
+      Ast.E_col "name", Ast.E_lit (Ast.L_text "a*")));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Glob, _, _)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_binop(Glob) in where"
+
+(** Bind a WHERE with MOD to cover ast_binop_to_sema Mod. *)
+let bind_select_mod_op () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Mod,
+      Ast.E_col "id", Ast.E_lit (Ast.L_int 2L)));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Mod, _, _)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_binop(Mod) in where"
+
+(** Bind a WHERE with Bit_and to cover ast_binop_to_sema Bit_and. *)
+let bind_select_bit_and_op () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Bit_and,
+      Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Bit_and, _, _)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_binop(Bit_and) in where"
+
+(** Bind a WHERE with Lshift to cover ast_binop_to_sema Lshift. *)
+let bind_select_lshift_op () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.Lshift,
+      Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { where = Some (Sema.BE_binop (Sema.Lshift, _, _)); _ }) -> ()
+  | _ -> Alcotest.fail "expected BE_binop(Lshift) in where"
+
+(** Bind a WHERE with named param used twice — exercises resolve_param cache hit. *)
+let bind_select_named_param_reuse () =
+  let cat = two_col_cat () in
+  let stmt = Ast.S_select {
+    distinct = false;
+    proj = `All; table = "users"; joins = [];
+    where = Some (Ast.E_binop (Ast.And,
+      Ast.E_binop (Ast.Eq, Ast.E_col "id",   Ast.E_param (Ast.Param_name "v")),
+      Ast.E_binop (Ast.Ne, Ast.E_col "name",  Ast.E_param (Ast.Param_name "v"))));
+    group_by = []; having = None; order = []; limit = None; offset = None;
+  } in
+  match bind cat stmt with
+  | Ok (Sema.BS_select _) -> ()
+  | Ok _ -> Alcotest.fail "unexpected non-select result"
+  | Error e -> Alcotest.failf "unexpected error: %a" Sema.pp_error e
+
+(* ------------------------------------------------------------------ *)
+(* pp_error coverage: exercise every error variant                      *)
+(* ------------------------------------------------------------------ *)
+
+let pp e = Format.asprintf "%a" Sema.pp_error e
+
+let test_pp_error_all_variants () =
+  (* Unknown_table *)
+  let s = pp (Sema.Unknown_table "tbl") in
+  Alcotest.(check bool) "unknown table msg" true (String.length s > 0);
+  (* Unknown_column *)
+  let s = pp (Sema.Unknown_column { table = "t"; column = "c" }) in
+  Alcotest.(check bool) "unknown column msg" true (String.length s > 0);
+  (* Ambiguous_column *)
+  let s = pp (Sema.Ambiguous_column "col") in
+  Alcotest.(check bool) "ambiguous column msg" true (String.length s > 0);
+  (* Type_mismatch — Real and Blob *)
+  let s = pp (Sema.Type_mismatch { expected = Row.Real; got = Row.Blob }) in
+  Alcotest.(check bool) "type mismatch Real/Blob msg" true (String.length s > 0);
+  (* Type_mismatch — Text *)
+  let s = pp (Sema.Type_mismatch { expected = Row.Text; got = Row.Integer }) in
+  Alcotest.(check bool) "type mismatch Text msg" true (String.length s > 0);
+  (* Arity_mismatch *)
+  let s = pp (Sema.Arity_mismatch { expected = 2; got = 3 }) in
+  Alcotest.(check bool) "arity mismatch msg" true (String.length s > 0);
+  (* Already_exists *)
+  let s = pp (Sema.Already_exists "t") in
+  Alcotest.(check bool) "already exists msg" true (String.length s > 0);
+  (* Invalid_limit *)
+  let s = pp (Sema.Invalid_limit "bad limit") in
+  Alcotest.(check bool) "invalid limit msg" true (String.length s > 0);
+  (* Unsupported *)
+  let s = pp (Sema.Unsupported "feature X") in
+  Alcotest.(check bool) "unsupported msg" true (String.length s > 0);
+  (* Not_null_violation *)
+  let s = pp (Sema.Not_null_violation "colname") in
+  Alcotest.(check bool) "not null violation msg" true (String.length s > 0);
+  (* Unknown_index *)
+  let s = pp (Sema.Unknown_index "idx") in
+  Alcotest.(check bool) "unknown index msg" true (String.length s > 0)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3210,5 +3341,16 @@ let () =
       Alcotest.test_case "basic"        `Quick bind_returning_params_basic;
       Alcotest.test_case "named_param"  `Quick bind_returning_params_named;
       Alcotest.test_case "error"        `Quick bind_returning_params_error;
+    ];
+    "pp-error-coverage", [
+      Alcotest.test_case "pp_all_variants" `Quick test_pp_error_all_variants;
+    ];
+    "binop-operator-coverage", [
+      Alcotest.test_case "like_op"             `Quick bind_select_like_op;
+      Alcotest.test_case "glob_op"             `Quick bind_select_glob_op;
+      Alcotest.test_case "mod_op"              `Quick bind_select_mod_op;
+      Alcotest.test_case "bit_and_op"          `Quick bind_select_bit_and_op;
+      Alcotest.test_case "lshift_op"           `Quick bind_select_lshift_op;
+      Alcotest.test_case "named_param_reuse"   `Quick bind_select_named_param_reuse;
     ];
   ]

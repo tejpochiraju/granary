@@ -1600,9 +1600,284 @@ let cases = [
 
 ]
 
+(* ── phase9_subqueries test cases ─────────────────────────────── *)
+
+let phase9_subquery_cases = [
+
+  { name = "scalar_max";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+    ];
+    query = "SELECT (SELECT max(id) FROM t) FROM t LIMIT 1";
+    unordered = false };
+
+  { name = "scalar_min_where";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+    ];
+    query = "SELECT id FROM t WHERE id = (SELECT min(id) FROM t)";
+    unordered = false };
+
+  { name = "exists_true";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM t WHERE id = 1)";
+    unordered = false };
+
+  { name = "exists_false";
+    setup = [
+      "CREATE TABLE empty (id INTEGER PRIMARY KEY)";
+    ];
+    query = "SELECT count(*) FROM empty WHERE EXISTS (SELECT 1 FROM empty)";
+    unordered = false };
+
+  { name = "in_select";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+      "CREATE TABLE ids (id INTEGER)";
+      "INSERT INTO ids VALUES (1)";
+      "INSERT INTO ids VALUES (3)";
+    ];
+    query = "SELECT id FROM t WHERE id IN (SELECT id FROM ids) ORDER BY id ASC";
+    unordered = false };
+
+  { name = "not_in_select";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "INSERT INTO t VALUES (3)";
+      "CREATE TABLE excluded (id INTEGER)";
+      "INSERT INTO excluded VALUES (2)";
+    ];
+    query = "SELECT id FROM t WHERE id NOT IN (SELECT id FROM excluded) ORDER BY id ASC";
+    unordered = false };
+
+  { name = "in_select_empty";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+      "CREATE TABLE empty (id INTEGER)";
+    ];
+    query = "SELECT id FROM t WHERE id IN (SELECT id FROM empty)";
+    unordered = false };
+
+  { name = "from_less_select";
+    setup = [];
+    query = "SELECT 1 + 1";
+    unordered = false };
+
+]
+
+(* ── phase9_fk test cases ──────────────────────────────────────── *)
+
+let phase9_fk_cases = [
+
+  { name = "fk_accepted";
+    setup = [
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+      "INSERT INTO users VALUES (1, 'alice')";
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+    ];
+    query = "SELECT count(*) FROM orders";
+    unordered = false };
+
+  { name = "fk_no_col";
+    setup = [
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+      "INSERT INTO users VALUES (1, 'alice')";
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)";
+    ];
+    query = "SELECT count(*) FROM orders";
+    unordered = false };
+
+  { name = "fk_no_enforcement";
+    setup = [
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+      "INSERT INTO orders VALUES (1, 999)";
+    ];
+    query = "SELECT id, user_id FROM orders";
+    unordered = false };
+
+  { name = "fk_with_not_null";
+    setup = [
+      "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+      "INSERT INTO users VALUES (1, 'bob')";
+      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id))";
+      "INSERT INTO orders VALUES (1, 1)";
+    ];
+    query = "SELECT id, user_id FROM orders";
+    unordered = false };
+
+]
+
+(* ── phase9_check error-comparison infrastructure ─────────────── *)
+(* These tests verify that BOTH sqlocaml and SQLite raise an error.  *)
+(* We do not compare exact error messages.                           *)
+
+(** Run [setup] statements in sqlocaml; return true if the last one raises an
+    error (all preceding ones must succeed). *)
+let sqlocaml_last_setup_fails setup =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let n = List.length setup in
+    let prefix = List.filteri (fun i _ -> i < n - 1) setup in
+    let last   = List.nth setup (n - 1) in
+    let* () = Lwt_list.iter_s (fun sql ->
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "sqlocaml unexpected setup error for %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    ) prefix in
+    let* r = Db.execute db last in
+    Lwt.return (match r with Error _ -> true | Ok () -> false)
+  )
+
+(** Run [setup] statements via sqlite3 up to the last; return true if the
+    last one produces non-empty output (i.e. an error line). *)
+let sqlite3_last_setup_fails ~db_path setup =
+  let n = List.length setup in
+  let prefix = List.filteri (fun i _ -> i < n - 1) setup in
+  let last   = List.nth setup (n - 1) in
+  sqlite3_run_setup ~db_path prefix;
+  (* Run last statement and capture stderr/stdout *)
+  let cmd = Printf.sprintf
+    "sqlite3 %s %s 2>&1"
+    (Filename.quote db_path) (Filename.quote last) in
+  let ic = Unix.open_process_in cmd in
+  let output = ref [] in
+  (try while true do output := input_line ic :: !output done
+   with End_of_file -> ());
+  ignore (Unix.close_process_in ic);
+  (* If sqlite3 printed anything, it was an error *)
+  !output <> []
+
+type check_error_case = {
+  ce_name  : string;
+  ce_setup : string list;  (* last statement must fail *)
+}
+
+let run_check_error_case ce =
+  let db_path = fresh_db_path () in
+  Fun.protect
+    ~finally:(fun () -> try Unix.unlink db_path with _ -> ())
+    (fun () ->
+      let sq_fails = sqlocaml_last_setup_fails ce.ce_setup in
+      let sl_fails = sqlite3_last_setup_fails ~db_path ce.ce_setup in
+      if not sq_fails then
+        Alcotest.failf "%s: sqlocaml did not raise an error (expected CHECK violation)"
+          ce.ce_name;
+      if not sl_fails then
+        Alcotest.failf "%s: sqlite3 did not raise an error (expected CHECK violation)"
+          ce.ce_name)
+
+let make_check_error_test ce =
+  Alcotest.test_case ce.ce_name `Quick (fun () ->
+    if sqlite3_available () then run_check_error_case ce
+    else begin
+      (* Without sqlite3, at least verify sqlocaml raises an error *)
+      let sq_fails = sqlocaml_last_setup_fails ce.ce_setup in
+      if not sq_fails then
+        Alcotest.failf "%s: sqlocaml did not raise an error (expected CHECK violation)"
+          ce.ce_name
+    end
+  )
+
+(* ── phase9_check test cases ───────────────────────────────────── *)
+
+let phase9_check_cases = [
+
+  { name = "check_valid_insert";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0))";
+      "INSERT INTO t VALUES (1, 9.99)";
+    ];
+    query = "SELECT count(*) FROM t";
+    unordered = false };
+
+  { name = "check_null_passes";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))";
+      "INSERT INTO t VALUES (1, NULL)";
+    ];
+    query = "SELECT count(*) FROM t";
+    unordered = false };
+
+  { name = "check_valid_update";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))";
+      "INSERT INTO t VALUES (1, 5)";
+      "UPDATE t SET v = 10 WHERE id = 1";
+    ];
+    query = "SELECT v FROM t WHERE id = 1";
+    unordered = false };
+
+  { name = "check_compound_expr";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0 AND price < 10000))";
+      "INSERT INTO t VALUES (1, 99.0)";
+      "INSERT INTO t VALUES (2, 5000.0)";
+    ];
+    query = "SELECT count(*) FROM t";
+    unordered = false };
+
+  { name = "check_between";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v BETWEEN 0 AND 100))";
+      "INSERT INTO t VALUES (1, 50)";
+      "INSERT INTO t VALUES (2, 0)";
+      "INSERT INTO t VALUES (3, 100)";
+    ];
+    query = "SELECT count(*) FROM t";
+    unordered = false };
+
+]
+
+let phase9_check_error_cases = [
+
+  { ce_name  = "check_violation_insert";
+    ce_setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0))";
+      "INSERT INTO t VALUES (1, -5.0)";
+    ] };
+
+  { ce_name  = "check_violation_update";
+    ce_setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))";
+      "INSERT INTO t VALUES (1, 5)";
+      "UPDATE t SET v = -1 WHERE id = 1";
+    ] };
+
+  { ce_name  = "check_function_expr";
+    ce_setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT CHECK (LENGTH(name) > 0))";
+      "INSERT INTO t VALUES (1, '')";
+    ] };
+
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
   Alcotest.run "sqlite_compare" [
-    "correctness", List.map make_test cases;
+    "correctness",       List.map make_test cases;
+    "phase9_subqueries", List.map make_test phase9_subquery_cases;
+    "phase9_check",      (List.map make_test phase9_check_cases
+                          @ List.map make_check_error_test phase9_check_error_cases);
+    "phase9_fk",         List.map make_test phase9_fk_cases;
   ]

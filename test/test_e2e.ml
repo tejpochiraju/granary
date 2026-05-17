@@ -2610,6 +2610,395 @@ let test_check_persisted () =
       Lwt.return_unit))
 
 (* ------------------------------------------------------------------ *)
+(* Phase 9 edge cases                                                   *)
+(* ------------------------------------------------------------------ *)
+
+let test_const_select () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* r = Db.query db "SELECT 1 + 1" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "const select error: %a" Db.pp_error e) in
+    Alcotest.(check int) "const select returns one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "1+1 = V_int 2" (Db.V_int 2L) row.(0)
+     | _ -> Alcotest.fail "expected exactly one row");
+    Lwt.return_unit)
+
+let test_subquery_and_predicate () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+    let* res = Db.query db
+      "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE id = 1) AND v > 15" in
+    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "subquery_and_pred error: %a" Db.pp_error e) in
+    let ids = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "exists AND predicate"
+      [Db.V_int 2L] ids;
+    Lwt.return_unit)
+
+let test_check_complex_expr () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE prices_t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0 AND price < 1000))" in
+    let* res = Db.execute db "INSERT INTO prices_t VALUES (1, 99.9)" in
+    Alcotest.(check bool) "complex check passes" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO prices_t VALUES (2, 1500.0)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "expected CHECK violation for price > 1000");
+    Lwt.return_unit)
+
+let test_check_function_in_expr () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE names_t (id INTEGER PRIMARY KEY, name TEXT CHECK (LENGTH(name) > 0))" in
+    let* res = Db.execute db "INSERT INTO names_t VALUES (1, 'Alice')" in
+    (match res with
+     | Error e -> Alcotest.failf "INSERT error: %a" Db.pp_error e
+     | Ok () -> ());
+    Alcotest.(check bool) "check with function passes" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO names_t VALUES (2, '')" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "expected CHECK violation for empty name");
+    Lwt.return_unit)
+
+let test_text_scalar_subquery () =
+  (* Covers exec.ml value_to_literal V_text branch *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE words (id INTEGER, w TEXT)" in
+    let* _ = Db.execute db "INSERT INTO words VALUES (1, 'apple')" in
+    let* _ = Db.execute db "INSERT INTO words VALUES (2, 'banana')" in
+    let* r = Db.query db "SELECT (SELECT MAX(w) FROM words)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "text scalar subquery error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "max text" (Db.V_text "banana") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_real_scalar_subquery () =
+  (* Covers exec.ml value_to_literal V_real branch *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE prices (id INTEGER, price REAL)" in
+    let* _ = Db.execute db "INSERT INTO prices VALUES (1, 1.5)" in
+    let* _ = Db.execute db "INSERT INTO prices VALUES (2, 9.99)" in
+    let* r = Db.query db "SELECT (SELECT MAX(price) FROM prices)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "real scalar subquery error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "max real" (Db.V_real 9.99) row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_like_in_where () =
+  (* Covers sema.ml Like/Glob in ast_binop_to_sema and exec.ml like_match *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE names (id INTEGER, name TEXT)" in
+    let* _ = Db.execute db "INSERT INTO names VALUES (1, 'alice')" in
+    let* _ = Db.execute db "INSERT INTO names VALUES (2, 'bob')" in
+    let* _ = Db.execute db "INSERT INTO names VALUES (3, 'alicia')" in
+    let* r = Db.query db "SELECT id FROM names WHERE name LIKE 'ali%' ORDER BY id" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "LIKE query error: %a" Db.pp_error e) in
+    let ids = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "LIKE 'ali%' matches alice and alicia"
+      [Db.V_int 1L; Db.V_int 3L] ids;
+    Lwt.return_unit)
+
+let test_modulo_operator () =
+  (* Covers sema.ml Mod in ast_binop_to_sema and exec.ml Mod evaluation *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE nums (n INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO nums VALUES (7)" in
+    let* _ = Db.execute db "INSERT INTO nums VALUES (10)" in
+    let* r = Db.query db "SELECT n % 3 FROM nums ORDER BY n" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "modulo query error: %a" Db.pp_error e) in
+    let vals = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "7%3=1, 10%3=1"
+      [Db.V_int 1L; Db.V_int 1L] vals;
+    Lwt.return_unit)
+
+let test_sum_real_with_nulls () =
+  (* Covers exec.ml SUM REAL path with NULLs (lines 1896-1904) *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE prices2 (id INTEGER, price REAL)" in
+    let* _ = Db.execute db "INSERT INTO prices2 VALUES (1, 1.5)" in
+    let* _ = Db.execute db "INSERT INTO prices2 VALUES (2, NULL)" in
+    let* _ = Db.execute db "INSERT INTO prices2 VALUES (3, 2.5)" in
+    let* r = Db.query db "SELECT SUM(price) FROM prices2" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "SUM REAL query error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "SUM(1.5 + NULL + 2.5) = 4.0" (Db.V_real 4.0) row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_avg_real_column () =
+  (* Covers exec.ml AVG with REAL values (lines 1913-1922) *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE real_vals (v REAL)" in
+    let* _ = Db.execute db "INSERT INTO real_vals VALUES (2.0)" in
+    let* _ = Db.execute db "INSERT INTO real_vals VALUES (NULL)" in
+    let* _ = Db.execute db "INSERT INTO real_vals VALUES (4.0)" in
+    let* r = Db.query db "SELECT AVG(v) FROM real_vals" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "AVG REAL query error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "AVG(2.0, null, 4.0) = 3.0" (Db.V_real 3.0) row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_check_add_binop () =
+  (* Covers exec.ml ast_binop_to_plan for Add/Mod operators via CHECK *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE even_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (n % 2 = 0))" in
+    let* res = Db.execute db "INSERT INTO even_t VALUES (1, 4)" in
+    Alcotest.(check bool) "even passes CHECK" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO even_t VALUES (2, 3)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "odd should fail CHECK");
+    Lwt.return_unit)
+
+let test_check_concat_binop () =
+  (* Covers exec.ml ast_binop_to_plan for Concat/Ne via CHECK *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE prefix_t (id INTEGER PRIMARY KEY, name TEXT CHECK (name || '' != ''))" in
+    let* res = Db.execute db "INSERT INTO prefix_t VALUES (1, 'Alice')" in
+    Alcotest.(check bool) "non-empty name passes" true (res = Ok ());
+    Lwt.return_unit)
+
+let test_check_like_in_constraint () =
+  (* Covers exec.ml ast_binop_to_plan for Like via CHECK *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE upper_t (id INTEGER PRIMARY KEY, code TEXT CHECK (code LIKE 'A%'))" in
+    let* res = Db.execute db "INSERT INTO upper_t VALUES (1, 'ABC')" in
+    Alcotest.(check bool) "A-prefix passes CHECK LIKE" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO upper_t VALUES (2, 'xyz')" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "non-A prefix should fail CHECK LIKE");
+    Lwt.return_unit)
+
+let test_check_not_operator () =
+  (* Covers exec.ml ast_expr_to_plan_check E_not/E_neg/E_bitnot paths *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE not_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (NOT (n = 0)))" in
+    let* res = Db.execute db "INSERT INTO not_t VALUES (1, 5)" in
+    Alcotest.(check bool) "NOT(n=0) with n=5 passes" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO not_t VALUES (2, 0)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "NOT(n=0) with n=0 should fail");
+    Lwt.return_unit)
+
+let test_check_between_in_check () =
+  (* Covers exec.ml ast_expr_to_plan_check E_between path *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE range_t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v BETWEEN 1 AND 10))" in
+    let* res = Db.execute db "INSERT INTO range_t VALUES (1, 5)" in
+    Alcotest.(check bool) "v BETWEEN 1 AND 10 with v=5 passes" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO range_t VALUES (2, 15)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "v=15 should fail BETWEEN 1 AND 10");
+    Lwt.return_unit)
+
+let test_check_is_not_null_in_check () =
+  (* Covers exec.ml ast_expr_to_plan_check E_is_not_null/E_is_null path *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db
+      "CREATE TABLE notnull_t (id INTEGER PRIMARY KEY, v TEXT CHECK (v IS NOT NULL))" in
+    let* res = Db.execute db "INSERT INTO notnull_t VALUES (1, 'hello')" in
+    Alcotest.(check bool) "IS NOT NULL with 'hello' passes" true (res = Ok ());
+    let* res2 = Db.execute db "INSERT INTO notnull_t VALUES (2, NULL)" in
+    (match res2 with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "NULL should fail IS NOT NULL check");
+    Lwt.return_unit)
+
+let test_real_mod_int () =
+  (* Covers exec.ml V_real,V_int Mod path (line 432-433) *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE rmod (v REAL)" in
+    let* _ = Db.execute db "INSERT INTO rmod VALUES (7.5)" in
+    (* 7.5 % 2 → should be 1.5 (real % int) *)
+    let* r = Db.query db "SELECT v % 2 FROM rmod" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "real_mod_int error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "7.5 % 2 = 1.5" (Db.V_real 1.5) row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_real_ne_comparison () =
+  (* Covers exec.ml eval_binop Ne with V_real,V_real (line 401) and null (line 398) *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE reals (id INTEGER, v REAL)" in
+    let* _ = Db.execute db "INSERT INTO reals VALUES (1, 1.5)" in
+    let* _ = Db.execute db "INSERT INTO reals VALUES (2, 2.5)" in
+    let* _ = Db.execute db "INSERT INTO reals VALUES (3, NULL)" in
+    (* REAL != REAL: v != 1.5 should return rows 2 (2.5 != 1.5) but not 1 or 3 *)
+    let* r = Db.query db "SELECT id FROM reals WHERE v != 1.5 ORDER BY id" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "real_ne_comparison error: %a" Db.pp_error e) in
+    let ids = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "only id=2 has v != 1.5"
+      [Db.V_int 2L] ids;
+    Lwt.return_unit)
+
+let test_alter_add_text_default () =
+  (* Covers exec.ml lines 1415-1416: ALTER TABLE ADD COLUMN with TEXT/REAL default *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE alter_t (id INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO alter_t VALUES (1)" in
+    (* Add TEXT column with default — covers L_text branch in execute_with_count *)
+    let* res = Db.execute db "ALTER TABLE alter_t ADD COLUMN status TEXT DEFAULT 'active'" in
+    Alcotest.(check bool) "ALTER ADD TEXT default ok" true (res = Ok ());
+    (* Add REAL column with default — covers L_real branch *)
+    let* res2 = Db.execute db "ALTER TABLE alter_t ADD COLUMN score REAL DEFAULT 0.0" in
+    Alcotest.(check bool) "ALTER ADD REAL default ok" true (res2 = Ok ());
+    let* r = Db.query db "SELECT id, status, score FROM alter_t" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "alter_add_text_default query error: %a" Db.pp_error e) in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [row] ->
+       Alcotest.check value_testable "status='active'" (Db.V_text "active") row.(1);
+       Alcotest.check value_testable "score=0.0" (Db.V_real 0.0) row.(2)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_int_real_comparison () =
+  (* Covers exec.ml cmp_result V_int,V_real and V_real,V_int cross-type paths *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE mixed (n INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO mixed VALUES (1)" in
+    let* _ = Db.execute db "INSERT INTO mixed VALUES (2)" in
+    let* _ = Db.execute db "INSERT INTO mixed VALUES (3)" in
+    (* WHERE n > 2.5 → integer vs real comparison, covering V_int,V_real path *)
+    let* r = Db.query db "SELECT n FROM mixed WHERE n > 2.5 ORDER BY n" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "int_real_cmp error: %a" Db.pp_error e) in
+    let vals = List.map (fun r -> r.(0)) rows in
+    Alcotest.(check (list value_testable)) "only 3 > 2.5"
+      [Db.V_int 3L] vals;
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
+(* Phase 9 string-function coverage                                     *)
+(* These tests target specific uncovered branches in exec.ml:          *)
+(*  - str_trim_spaces / str_rtrim_spaces empty-result branch            *)
+(*  - str_trim_chars / str_rtrim_chars empty-result branch              *)
+(*  - str_replace with empty old-string branch                          *)
+(*  - tab/newline/cr whitespace in TRIM functions                       *)
+(* ------------------------------------------------------------------ *)
+
+let test_trim_all_whitespace () =
+  (* TRIM of strings with tabs/newlines → hits \t, \n, \r branches in trim helpers *)
+  run (
+    let* db = Db.open_in_memory () in
+    (* All spaces → str_trim_spaces empty-result branch *)
+    let* r = Db.query db "SELECT TRIM('   ')" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "TRIM all-space error: %a" Db.pp_error e) in
+    (match rows with
+     | [row] -> Alcotest.check value_testable "TRIM of spaces = empty" (Db.V_text "") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    (* TRIM with tab chars on both sides — covers '\t' in str_trim_spaces *)
+    let* r2 = Db.query db "SELECT TRIM('\thello\t')" in
+    let* rows2 = (match r2 with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "TRIM tab error: %a" Db.pp_error e) in
+    (match rows2 with
+     | [row] -> Alcotest.check value_testable "TRIM tabs from both sides" (Db.V_text "hello") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    (* LTRIM with tab — covers '\t' in str_ltrim_spaces *)
+    let* r3 = Db.query db "SELECT LTRIM('\thello')" in
+    let* rows3 = (match r3 with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "LTRIM tab error: %a" Db.pp_error e) in
+    (match rows3 with
+     | [row] -> Alcotest.check value_testable "LTRIM tab" (Db.V_text "hello") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    (* RTRIM with tabs only → str_rtrim_spaces empty-result branch *)
+    let* r4 = Db.query db "SELECT RTRIM('\t\t\t')" in
+    let* rows4 = (match r4 with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "RTRIM all-tabs error: %a" Db.pp_error e) in
+    (match rows4 with
+     | [row] -> Alcotest.check value_testable "RTRIM of tabs = empty" (Db.V_text "") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_trim_chars_all_removed () =
+  (* TRIM(s, chars) where all chars are in the trim-set → "" *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* r = Db.query db "SELECT TRIM('xxxxx', 'x')" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "TRIM chars all-removed error: %a" Db.pp_error e) in
+    (match rows with
+     | [row] -> Alcotest.check value_testable "TRIM('xxxxx','x') = empty" (Db.V_text "") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    let* r2 = Db.query db "SELECT RTRIM('aaa', 'a')" in
+    let* rows2 = (match r2 with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "RTRIM chars all-removed error: %a" Db.pp_error e) in
+    (match rows2 with
+     | [row] -> Alcotest.check value_testable "RTRIM('aaa','a') = empty" (Db.V_text "") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_replace_empty_old () =
+  (* REPLACE(s, '', rep) → s unchanged (covers str_replace empty-old branch) *)
+  run (
+    let* db = Db.open_in_memory () in
+    let* r = Db.query db "SELECT REPLACE('hello', '', 'X')" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
+      Alcotest.failf "REPLACE empty-old error: %a" Db.pp_error e) in
+    (match rows with
+     | [row] -> Alcotest.check value_testable "REPLACE with empty old = original" (Db.V_text "hello") row.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2881,5 +3270,32 @@ let () =
       Alcotest.test_case "null_allowed"        `Quick test_check_null_allowed;
       Alcotest.test_case "persisted"           `Quick test_check_persisted;
       Alcotest.test_case "cache_invalidation"  `Quick test_check_cache_invalidation;
+    ];
+    "phase9_edge", [
+      Alcotest.test_case "const_select"          `Quick test_const_select;
+      Alcotest.test_case "subquery_and_pred"     `Quick test_subquery_and_predicate;
+      Alcotest.test_case "check_complex_expr"    `Quick test_check_complex_expr;
+      Alcotest.test_case "check_function_expr"   `Quick test_check_function_in_expr;
+      Alcotest.test_case "text_scalar_subquery"  `Quick test_text_scalar_subquery;
+      Alcotest.test_case "real_scalar_subquery"  `Quick test_real_scalar_subquery;
+      Alcotest.test_case "like_in_where"         `Quick test_like_in_where;
+      Alcotest.test_case "modulo_operator"       `Quick test_modulo_operator;
+      Alcotest.test_case "sum_real_with_nulls"   `Quick test_sum_real_with_nulls;
+      Alcotest.test_case "avg_real_column"       `Quick test_avg_real_column;
+      Alcotest.test_case "check_add_binop"       `Quick test_check_add_binop;
+      Alcotest.test_case "check_concat_binop"    `Quick test_check_concat_binop;
+      Alcotest.test_case "check_like_constraint" `Quick test_check_like_in_constraint;
+      Alcotest.test_case "int_real_comparison"   `Quick test_int_real_comparison;
+      Alcotest.test_case "real_ne_comparison"    `Quick test_real_ne_comparison;
+      Alcotest.test_case "real_mod_int"          `Quick test_real_mod_int;
+      Alcotest.test_case "alter_add_text_default"   `Quick test_alter_add_text_default;
+      Alcotest.test_case "check_not_operator"        `Quick test_check_not_operator;
+      Alcotest.test_case "check_between_in_check"    `Quick test_check_between_in_check;
+      Alcotest.test_case "check_is_not_null_in_check" `Quick test_check_is_not_null_in_check;
+    ];
+    "string_coverage", [
+      Alcotest.test_case "trim_all_whitespace"    `Quick test_trim_all_whitespace;
+      Alcotest.test_case "trim_chars_all_removed" `Quick test_trim_chars_all_removed;
+      Alcotest.test_case "replace_empty_old"      `Quick test_replace_empty_old;
     ];
   ]
