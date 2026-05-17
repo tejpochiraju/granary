@@ -891,6 +891,24 @@ let test_multi_col_index () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check value_testable "value" (Db.V_text "x") (List.hd rows).(0)
 
+let test_multi_col_unique_index () =
+  run (fun () ->
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT)" in
+    let* _ = D.execute db "CREATE UNIQUE INDEX idx_ab ON t (a, b)" in
+    let* _ = D.execute db "INSERT INTO t VALUES (1, 2, 'x')" in
+    (* Same a=1 but different b=3 — must NOT violate unique constraint *)
+    let* r1 = D.execute db "INSERT INTO t VALUES (1, 3, 'y')" in
+    (match r1 with
+     | Error e -> Alcotest.failf "should allow (1,3): %a" D.pp_error e
+     | Ok () -> ());
+    (* Same (a=1, b=2) — MUST violate unique constraint *)
+    let* r2 = D.execute db "INSERT INTO t VALUES (1, 2, 'z')" in
+    (match r2 with
+     | Ok () -> Alcotest.fail "should have rejected duplicate (1,2)"
+     | Error _ -> ());
+    Lwt.return_unit)
+
 (* QCheck: random integer inserts + CREATE INDEX; index lookup must
    match sequential scan for every distinct value. *)
 let qcheck_index_lookup_matches_seq_scan =
@@ -1516,6 +1534,7 @@ let () =
       Alcotest.test_case "create_index_duplicate"           `Quick create_index_duplicate;
       Alcotest.test_case "index_lookup_where_null_no_match"  `Quick index_lookup_where_null_no_match;
       Alcotest.test_case "multi_col_index"                   `Quick test_multi_col_index;
+      Alcotest.test_case "multi_col_unique_index"             `Quick test_multi_col_unique_index;
     ];
     "qcheck_create_index", (
       List.map QCheck_alcotest.to_alcotest [

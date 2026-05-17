@@ -719,10 +719,11 @@ let execute_insert ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.t)
           else begin
             let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
             let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-            (* For UNIQUE check on multi-col index, encode first col value as prefix *)
-            let prefix = match iks with
-              | [] -> Bytes.empty
-              | ik :: _ -> Index_key.encode_value ik
+            (* For UNIQUE check on multi-col index, encode all column values as prefix *)
+            let prefix =
+              let buf = Buffer.create 32 in
+              List.iter (fun ikv -> Buffer.add_bytes buf (Index_key.encode_value ikv)) iks;
+              Buffer.to_bytes buf
             in
             let plen = Bytes.length prefix in
             (* Seek to the smallest key >= prefix ++ min_rowid. *)
