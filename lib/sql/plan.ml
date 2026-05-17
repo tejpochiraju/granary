@@ -28,9 +28,10 @@ type op =
       columns : Sqlocaml_encoding.Row.column list;
     }
   | Op_insert of {
-      table_meta : Cat.table_meta;
-      ordinals   : int list;
-      values     : expr list;
+      table_meta  : Cat.table_meta;
+      ordinals    : int list;
+      values      : expr list;
+      on_conflict : Ast.conflict_action option;
     }
   | Op_seq_scan of {
       table_meta : Cat.table_meta;

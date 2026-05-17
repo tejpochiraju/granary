@@ -778,6 +778,7 @@ let release_txn tx owned =
     Uses a SINGLE RW txn for both the row write and index writes. *)
 let execute_insert ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
+    ?(on_conflict : Ast.conflict_action option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : unit Lwt.t =
   let n   = List.length table_meta.columns in
@@ -791,53 +792,91 @@ let execute_insert ?(mode = Auto) ?(params = [||])
   Lwt.catch
     (fun () ->
       let* rowid = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
-      let key    = Rowid.encode rowid in
-      let bytes  = Row.encode table_meta.columns row in
-      let* () = S.put tx table_meta.tree_id key bytes in
-      let idxs = Cat.indexes_for_table cat ~table:table_meta.name in
-      (* Check UNIQUE constraints and write index entries in the same txn. *)
-      let* unique_ok =
-        Lwt_list.fold_left_s (fun acc (idx : Cat.index_info) ->
-          if not acc || not idx.idx_unique then Lwt.return acc
+      let idxs   = Cat.indexes_for_table cat ~table:table_meta.name in
+      (* Phase 1: check UNIQUE constraints BEFORE writing the row.
+         Collect skip flag and list of conflicting rowids to delete. *)
+      let* (skip, to_delete) =
+        Lwt_list.fold_left_s (fun (skip, dels) (idx : Cat.index_info) ->
+          if skip || not idx.idx_unique then Lwt.return (skip, dels)
           else begin
             let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
-            let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-            (* For UNIQUE check on multi-col index, encode all column values as prefix *)
+            let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
             let prefix =
               let buf = Buffer.create 32 in
               List.iter (fun ikv -> Buffer.add_bytes buf (Index_key.encode_value ikv)) iks;
               Buffer.to_bytes buf
             in
-            let plen = Bytes.length prefix in
-            (* Seek to the smallest key >= prefix ++ min_rowid. *)
+            let plen     = Bytes.length prefix in
             let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-            let* cur = S.cursor_open tx idx.idx_tree_id in
-            let _sr = S.cursor_seek cur seek_key in
-            let duplicate =
+            let* cur     = S.cursor_open tx idx.idx_tree_id in
+            let _        = S.cursor_seek cur seek_key in
+            let conflict_rowid_opt =
               match S.cursor_next cur with
-              | None -> false
+              | None -> None
               | Some (ikey, _) ->
-                Bytes.length ikey >= plen &&
-                Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                if Bytes.length ikey >= plen &&
+                   Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                then
+                  let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+                  Some (Rowid.decode rid_bytes)
+                else None
             in
             S.cursor_close cur;
-            if duplicate then
-              Lwt.fail_with (Printf.sprintf
-                "UNIQUE constraint violated: duplicate value in columns (%s)"
-                (String.concat ", " idx.idx_columns))
-            else
-              Lwt.return true
+            match conflict_rowid_opt with
+            | None -> Lwt.return (false, dels)
+            | Some old_rowid ->
+              (match on_conflict with
+               | Some Ast.CA_ignore ->
+                 Lwt.return (true, dels)  (* skip=true, stop checking *)
+               | Some Ast.CA_replace ->
+                 Lwt.return (false, old_rowid :: dels)
+               | _ ->
+                 Lwt.fail_with (Printf.sprintf
+                   "UNIQUE constraint violated: duplicate value in columns (%s)"
+                   (String.concat ", " idx.idx_columns)))
           end
-        ) true idxs
+        ) (false, []) idxs
       in
-      ignore unique_ok;
-      let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-        let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
-        let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-        let ikey = Index_key.encode iks ~rowid in
-        S.put tx idx.idx_tree_id ikey Bytes.empty
-      ) idxs in
-      release_txn tx owned)
+      if skip then begin
+        (* IGNORE: rollback if we own the txn (undo rowid allocation), return normally *)
+        let* () = if owned then S.rollback tx else Lwt.return_unit in
+        Lwt.return_unit
+      end else begin
+        (* REPLACE: delete all conflicting rows first *)
+        let* () = Lwt_list.iter_s (fun old_rowid ->
+          let old_key = Rowid.encode old_rowid in
+          (* Read the old row via cursor seek *)
+          let* cur = S.cursor_open tx table_meta.tree_id in
+          let _    = S.cursor_seek cur old_key in
+          let old_bytes_opt = match S.cursor_next cur with
+            | Some (k, v) when Bytes.equal k old_key -> Some v
+            | _ -> None
+          in
+          S.cursor_close cur;
+          match old_bytes_opt with
+          | None -> Lwt.return_unit
+          | Some old_bytes ->
+            let old_row = Row.decode table_meta.columns old_bytes in
+            let* () = S.del tx table_meta.tree_id old_key in
+            Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
+              let col_is2 = List.map (find_col_idx_by_name table_meta.columns) idx2.idx_columns in
+              let iks2    = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is2 in
+              let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
+              S.del tx idx2.idx_tree_id old_ikey
+            ) idxs
+        ) (List.sort_uniq compare to_delete) in
+        (* Phase 2: write new row and index entries *)
+        let key   = Rowid.encode rowid in
+        let bytes = Row.encode table_meta.columns row in
+        let* () = S.put tx table_meta.tree_id key bytes in
+        let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+          let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+          let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+          let ikey   = Index_key.encode iks ~rowid in
+          S.put tx idx.idx_tree_id ikey Bytes.empty
+        ) idxs in
+        release_txn tx owned
+      end)
     (fun exn ->
       (* On any exception: rollback if we own the txn, then re-raise. *)
       let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -1151,8 +1190,8 @@ let execute_with_count ?(mode = Auto)
        it commits immediately regardless of mode. Phase 4 work to fix. *)
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
-  | Plan.Op_insert { table_meta; ordinals; values } ->
-    let* () = execute_insert ~mode ~params ~clock store cat ~table_meta ~ordinals ~values in
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict } ->
+    let* () = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in
     Lwt.return 1
   | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.

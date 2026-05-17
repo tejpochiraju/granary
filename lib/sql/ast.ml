@@ -20,6 +20,8 @@ type param =
   | Param_index of int    (** ?1, ?2 ... — explicit 1-based slot *)
   | Param_name  of string (** :name  @name  $name *)
 
+type conflict_action = CA_rollback | CA_abort | CA_fail | CA_ignore | CA_replace
+
 type binop =
   | Eq | Ne | Lt | Le | Gt | Ge   (** comparison *)
   | Add | Sub | Mul | Div          (** arithmetic *)
@@ -110,9 +112,10 @@ type stmt =
       columns : column_def list;
     }
   | S_insert of {
-      table   : string;
-      columns : string list;   (** named columns; empty = "all in order" *)
-      values  : expr list;
+      table       : string;
+      columns     : string list;   (** named columns; empty = "all in order" *)
+      values      : expr list;
+      on_conflict : conflict_action option;
     }
   | S_select of {
       distinct : bool;

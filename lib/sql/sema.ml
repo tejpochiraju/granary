@@ -49,9 +49,10 @@ type bound_stmt =
       columns : Row.column list;
     }
   | BS_insert of {
-      table_meta : Cat.table_meta;
-      ordinals   : int list;
-      values     : bound_expr list;
+      table_meta  : Cat.table_meta;
+      ordinals    : int list;
+      values      : bound_expr list;
+      on_conflict : Ast.conflict_action option;
     }
   | BS_select of {
       distinct   : bool;
@@ -624,7 +625,7 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
               col_values;
             }))))
 
-let bind_insert cat ~param_counter ~named_params ~table ~columns ~values =
+let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -718,6 +719,7 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values =
               table_meta = meta;
               ordinals;
               values     = full_vals;
+              on_conflict;
             }))))
 
 (* ------------------------------------------------------------------ *)
@@ -1436,7 +1438,7 @@ let rec compound_col_count = function
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
-  | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values
+  | Ast.S_insert { table; columns; values; on_conflict }     -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict
   | Ast.S_select { distinct; proj; table; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->

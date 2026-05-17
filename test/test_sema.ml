@@ -80,9 +80,10 @@ let bind_create_preserves_cols () =
 let bind_insert_basic () =
   let cat = two_col_cat () in
   let stmt = Ast.S_insert {
-    table = "users";
-    columns = ["id"; "name"];
-    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    table       = "users";
+    columns     = ["id"; "name"];
+    values      = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -100,6 +101,7 @@ let bind_insert_reversed_cols () =
     table = "users";
     columns = ["name"; "id"];
     values = [Ast.E_lit (Ast.L_text "bob"); Ast.E_lit (Ast.L_int 2L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -124,6 +126,7 @@ let bind_insert_single_col () =
     table = "users";
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_int 99L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
@@ -144,6 +147,7 @@ let bind_insert_unknown_table () =
     table = "ghost";
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_int 1L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -156,6 +160,7 @@ let bind_insert_unknown_col () =
     table = "users";
     columns = ["bogus"];
     values = [Ast.E_lit (Ast.L_int 1L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
@@ -168,6 +173,7 @@ let bind_insert_arity_mismatch () =
     table = "users";
     columns = ["id"; "name"];
     values = [Ast.E_lit (Ast.L_int 1L)];       (* 2 cols, 1 value *)
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Arity_mismatch { expected = 2; got = 1 }) -> ()
@@ -181,6 +187,7 @@ let bind_insert_type_mismatch_int_col () =
     table = "users";
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_text "text")];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Text }) -> ()
@@ -194,6 +201,7 @@ let bind_insert_type_mismatch_text_col () =
     table = "users";
     columns = ["name"];
     values = [Ast.E_lit (Ast.L_int 42L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Text; got = Row.Integer }) -> ()
@@ -208,6 +216,7 @@ let bind_insert_null_allowed () =
     table = "users";
     columns = ["id"];
     values = [Ast.E_lit Ast.L_null];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; _ }) ->
@@ -374,6 +383,7 @@ let bind_insert_second_col_unknown () =
     table = "users";
     columns = ["id"; "bogus"; "age"];
     values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L); Ast.E_lit (Ast.L_int 3L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
@@ -1086,6 +1096,7 @@ let bind_insert_not_null_violation () =
     table = "users";
     columns = ["name"];
     values = [Ast.E_lit (Ast.L_text "alice")];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation "id") -> ()
@@ -1105,6 +1116,7 @@ let bind_insert_real_lit_type_mismatch () =
     table = "users";
     columns = ["id"];
     values = [Ast.E_lit (Ast.L_real 1.5)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Type_mismatch { expected = Row.Integer; got = Row.Real }) -> ()
@@ -1120,6 +1132,7 @@ let bind_insert_blob_lit_ok () =
     table = "users";
     columns = ["b"];
     values = [Ast.E_lit (Ast.L_blob (Bytes.of_string "hello"))];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1134,6 +1147,7 @@ let bind_insert_real_lit_ok () =
     table = "users";
     columns = ["f"];
     values = [Ast.E_lit (Ast.L_real 3.14)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert _) -> ()
@@ -1570,6 +1584,7 @@ let bind_insert_default_null () =
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1589,6 +1604,7 @@ let bind_insert_default_real () =
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1606,6 +1622,7 @@ let bind_insert_default_blob () =
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
@@ -1625,6 +1642,7 @@ let bind_insert_not_null_late () =
   ] in
   let stmt = Ast.S_insert {
     table = "users"; columns = ["a"]; values = [Ast.E_lit (Ast.L_int 1L)];
+    on_conflict = None;
   } in
   match bind cat stmt with
   | Error (Sema.Not_null_violation _) -> ()

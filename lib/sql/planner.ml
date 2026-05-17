@@ -236,8 +236,8 @@ let plan_select cat
 let rec plan ?cat = function
   | Sema.BS_create_table { name; columns } ->
     Plan.Op_create_table { name; columns }
-  | Sema.BS_insert { table_meta; ordinals; values } ->
-    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values }
+  | Sema.BS_insert { table_meta; ordinals; values; on_conflict } ->
+    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      join; group_by; aggs; having; agg_proj } ->
     (match cat with

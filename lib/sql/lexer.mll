@@ -50,6 +50,9 @@ rule token = parse
   | "BEGIN"    { BEGIN }
   | "COMMIT"   { COMMIT }
   | "ROLLBACK" { ROLLBACK }
+  | "ABORT"    { ABORT }
+  | "IGNORE"   { IGNORE }
+  | "FAIL"     { FAIL }
   | "JOIN"     { JOIN }
   | "INNER"    { INNER }
   | "LEFT"     { LEFT }

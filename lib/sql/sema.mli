@@ -64,9 +64,10 @@ type bound_stmt =
       columns : Sqlocaml_encoding.Row.column list;
     }
   | BS_insert of {
-      table_meta : Sqlocaml_catalog.Catalog.table_meta;
-      ordinals   : int list;            (** column ordinals for the named cols *)
-      values     : bound_expr list;
+      table_meta  : Sqlocaml_catalog.Catalog.table_meta;
+      ordinals    : int list;            (** column ordinals for the named cols *)
+      values      : bound_expr list;
+      on_conflict : Ast.conflict_action option;
     }
   | BS_select of {
       distinct   : bool;

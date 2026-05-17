@@ -92,7 +92,7 @@ let create_syntax_error () =
 let insert_named_cols () =
   match parse "INSERT INTO users (id, name) VALUES (1, 'alice');" with
   | Ast.S_insert { table = "users"; columns = ["id"; "name"];
-                   values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")] } -> ()
+                   values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]; _ } -> ()
   | _ -> Alcotest.fail "expected S_insert"
 
 let insert_int_only () =
@@ -143,7 +143,7 @@ let insert_real_negative () =
 let insert_no_col_list () =
   (* INSERT without explicit column list is now supported; maps values positionally *)
   match parse "INSERT INTO t VALUES (1, 'hello');" with
-  | Ast.S_insert { table = "t"; columns = []; values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "hello")] } -> ()
+  | Ast.S_insert { table = "t"; columns = []; values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "hello")]; _ } -> ()
   | _ -> Alcotest.fail "expected S_insert with empty columns and two values"
 
 (* ------------------------------------------------------------------ *)

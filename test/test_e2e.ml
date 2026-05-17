@@ -13,6 +13,9 @@ let err_or_fail label = function
   | Error e -> e
   | Ok _    -> Alcotest.failf "%s: expected Error, got Ok" label
 
+let fmt_err e =
+  Format.asprintf "%a" Db.pp_error e
+
 (** Fresh in-memory database. *)
 let fresh_db () = run (Db.open_in_memory ())
 
@@ -2024,6 +2027,60 @@ let test_distinct_blob_null () =
   Alcotest.(check int) "distinct blob null: 1 row" 1 (List.length rows)
 
 (* ------------------------------------------------------------------ *)
+(* Group: ON CONFLICT (INSERT OR REPLACE / INSERT OR IGNORE)           *)
+(* ------------------------------------------------------------------ *)
+
+let test_insert_or_ignore () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
+    let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (1, 'second')" in
+    let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "row count" 1 (List.length rows);
+       Alcotest.(check string) "value unchanged" "first"
+         (match rows with [[| Db.V_text s |]] -> s | _ -> "WRONG");
+       Lwt.return_unit))
+
+let test_insert_or_replace () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
+    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 'second')" in
+    let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "row count" 1 (List.length rows);
+       Alcotest.(check string) "value replaced" "second"
+         (match rows with [[| Db.V_text s |]] -> s | _ -> "WRONG");
+       Lwt.return_unit))
+
+let test_insert_or_ignore_unique () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_name ON t (name)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+    let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (2, 'alice')" in
+    let* r = Db.query db "SELECT COUNT(*) FROM t" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "only original row" 1
+         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
+       Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2242,5 +2299,10 @@ let () =
     ];
     "distinct_blob", [
       Alcotest.test_case "distinct_blob_null"  `Quick test_distinct_blob_null;
+    ];
+    "on_conflict", [
+      Alcotest.test_case "insert_or_ignore"        `Quick test_insert_or_ignore;
+      Alcotest.test_case "insert_or_replace"       `Quick test_insert_or_replace;
+      Alcotest.test_case "insert_or_ignore_unique" `Quick test_insert_or_ignore_unique;
     ];
   ]

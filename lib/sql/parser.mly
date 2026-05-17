@@ -21,6 +21,7 @@
 %token DISTINCT
 %token DROP
 %token BEGIN COMMIT ROLLBACK
+%token ABORT IGNORE FAIL
 %token JOIN INNER LEFT OUTER
 %token GROUP HAVING
 %token COUNT SUM AVG MIN MAX
@@ -145,13 +146,22 @@ def_value:
   | MINUS n = INT_LIT        { L_int (Int64.neg n) }
   | MINUS f = FLOAT_LIT      { L_real (-. f) }
 
+opt_conflict:
+  | OR REPLACE  { Some Ast.CA_replace  }
+  | OR IGNORE   { Some Ast.CA_ignore   }
+  | OR ABORT    { Some Ast.CA_abort    }
+  | OR FAIL     { Some Ast.CA_fail     }
+  | OR ROLLBACK { Some Ast.CA_rollback }
+  |             { None }
+
 insert:
-  | INSERT INTO table = IDENT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | INSERT oc = opt_conflict INTO table = IDENT
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
       VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
-    { S_insert { table; columns = cols; values = vals } }
-  | INSERT INTO table = IDENT
+    { Ast.S_insert { table; columns = cols; values = vals; on_conflict = oc } }
+  | INSERT oc = opt_conflict INTO table = IDENT
       VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
-    { S_insert { table; columns = []; values = vals } }
+    { Ast.S_insert { table; columns = []; values = vals; on_conflict = oc } }
 
 literal:
   | n = INT_LIT    { L_int n }
