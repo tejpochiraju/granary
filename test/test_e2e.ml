@@ -2274,6 +2274,10 @@ let test_rename_column () =
        let row = List.hd rows in
        Alcotest.(check string) "value preserved" "hello"
          (match row.(1) with Db.V_text s -> s | _ -> "X");
+       (* Old column name should fail *)
+       let* r_old = Db.query db "SELECT old_col FROM t" in
+       Alcotest.(check bool) "old col name gone" true
+         (match r_old with Error _ -> true | Ok _ -> false);
        Lwt.return_unit))
 
 let test_rename_column_no_keyword () =

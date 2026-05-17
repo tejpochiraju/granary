@@ -614,36 +614,61 @@ let rename_table t ~old_name ~new_name =
       let%lwt () = S.put tx sys_tables_tid
           (Bytes.of_string new_name)
           (encode_table_value meta) in
-      (* Re-key all column entries *)
+      (* Re-key all column entries; return Error if any entry is missing *)
       let n_cols = List.length meta.columns in
-      let%lwt () =
-        let rec loop i =
-          if i >= n_cols then Lwt.return_unit
-          else
-            let old_k = column_key old_name i in
-            let new_k = column_key new_name i in
-            let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
-            (match bytes_opt with
-             | None -> loop (i + 1)
-             | Some bytes ->
-               let%lwt () = S.del tx sys_columns_tid old_k in
-               let%lwt () = S.put tx sys_columns_tid new_k bytes in
-               loop (i + 1))
-        in
-        loop 0
+      let rec loop i =
+        if i >= n_cols then Lwt.return (Ok ())
+        else
+          let old_k = column_key old_name i in
+          let new_k = column_key new_name i in
+          let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
+          (match bytes_opt with
+           | None ->
+             let%lwt () = S.rollback tx in
+             Lwt.return (Error (Printf.sprintf
+               "catalog corrupt: column %d missing for table %s" i old_name))
+           | Some bytes ->
+             let%lwt () = S.del tx sys_columns_tid old_k in
+             let%lwt () = S.put tx sys_columns_tid new_k bytes in
+             loop (i + 1))
       in
-      let%lwt () = S.commit tx in
-      (* Update in-memory cache *)
-      Hashtbl.remove  t.cache old_name;
-      Hashtbl.replace t.cache new_name { meta with name = new_name };
-      (* Update index entries that reference old table name *)
-      let to_update = Hashtbl.fold (fun k v acc ->
-        if String.equal v.idx_table old_name then (k, v) :: acc else acc
-      ) t.indexes [] in
-      List.iter (fun (k, v) ->
-        Hashtbl.replace t.indexes k { v with idx_table = new_name }
-      ) to_update;
-      Lwt.return (Ok ())
+      let%lwt col_result = loop 0 in
+      (match col_result with
+       | Error msg -> Lwt.return (Error msg)
+       | Ok () ->
+         (* Re-write sys_indexes entries that reference old_name *)
+         let%lwt tx_ro_idx = S.ro_begin t.store in
+         let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
+         let _sr = S.cursor_first cur in
+         let idx_updates = ref [] in
+         let rec scan_idxs () =
+           match S.cursor_next cur with
+           | None -> ()
+           | Some (k, v) ->
+             let info = decode_index_value v in
+             if String.equal info.idx_table old_name then
+               idx_updates := (k, info) :: !idx_updates;
+             scan_idxs ()
+         in
+         scan_idxs ();
+         S.cursor_close cur;
+         let%lwt () = S.ro_end tx_ro_idx in
+         let%lwt () = Lwt_list.iter_s (fun (k, info) ->
+           let new_info = { info with idx_table = new_name } in
+           S.put tx sys_indexes_tid k (encode_index_value new_info)
+         ) !idx_updates in
+         let%lwt () = S.commit tx in
+         (* Update in-memory cache *)
+         Hashtbl.remove  t.cache old_name;
+         Hashtbl.replace t.cache new_name { meta with name = new_name };
+         (* Update in-memory index entries that reference old table name *)
+         let to_update = Hashtbl.fold (fun k v acc ->
+           if String.equal v.idx_table old_name then (k, v) :: acc else acc
+         ) t.indexes [] in
+         List.iter (fun (k, v) ->
+           Hashtbl.replace t.indexes k { v with idx_table = new_name }
+         ) to_update;
+         Lwt.return (Ok ()))
     end
 
 let rename_column t ~table_name ~old_col ~new_col =
