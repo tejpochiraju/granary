@@ -2080,6 +2080,39 @@ let test_insert_or_ignore_unique () =
          (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
        Lwt.return_unit))
 
+let test_insert_or_replace_no_conflict () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)" in
+    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (99, 'new')" in
+    let* r = Db.query db "SELECT v FROM t WHERE id = 99" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "row inserted" 1 (List.length rows);
+       Lwt.return_unit))
+
+let test_insert_or_replace_multi_unique () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (a INTEGER, b INTEGER)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_a ON t (a)" in
+    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_b ON t (b)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 100)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 200)" in
+    (* New row (a=1, b=200) conflicts with row 1 via idx_a AND row 2 via idx_b
+       REPLACE must delete BOTH old rows and insert the new one *)
+    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 200)" in
+    let* r = Db.query db "SELECT COUNT(*) FROM t" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "only new row remains" 1
+         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
+       Lwt.return_unit))
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -2301,8 +2334,10 @@ let () =
       Alcotest.test_case "distinct_blob_null"  `Quick test_distinct_blob_null;
     ];
     "on_conflict", [
-      Alcotest.test_case "insert_or_ignore"        `Quick test_insert_or_ignore;
-      Alcotest.test_case "insert_or_replace"       `Quick test_insert_or_replace;
-      Alcotest.test_case "insert_or_ignore_unique" `Quick test_insert_or_ignore_unique;
+      Alcotest.test_case "insert_or_ignore"             `Quick test_insert_or_ignore;
+      Alcotest.test_case "insert_or_replace"            `Quick test_insert_or_replace;
+      Alcotest.test_case "insert_or_ignore_unique"      `Quick test_insert_or_ignore_unique;
+      Alcotest.test_case "insert_or_replace_no_conflict" `Quick test_insert_or_replace_no_conflict;
+      Alcotest.test_case "insert_or_replace_multi_unique" `Quick test_insert_or_replace_multi_unique;
     ];
   ]

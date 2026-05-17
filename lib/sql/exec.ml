@@ -780,7 +780,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
     ?(on_conflict : Ast.conflict_action option = None)
     (store : S.t) (cat : Cat.t)
-    ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : unit Lwt.t =
+    ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
   let n   = List.length table_meta.columns in
   let row = Array.make n Row.V_null in
   List.iter2 (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr) ordinals values;
@@ -838,21 +838,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
         ) (false, []) idxs
       in
       if skip then begin
-        (* IGNORE: rollback if we own the txn (undo rowid allocation), return normally *)
+        (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
         let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.return_unit
+        Lwt.return false
       end else begin
         (* REPLACE: delete all conflicting rows first *)
         let* () = Lwt_list.iter_s (fun old_rowid ->
           let old_key = Rowid.encode old_rowid in
-          (* Read the old row via cursor seek *)
-          let* cur = S.cursor_open tx table_meta.tree_id in
-          let _    = S.cursor_seek cur old_key in
-          let old_bytes_opt = match S.cursor_next cur with
-            | Some (k, v) when Bytes.equal k old_key -> Some v
-            | _ -> None
-          in
-          S.cursor_close cur;
+          let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
           match old_bytes_opt with
           | None -> Lwt.return_unit
           | Some old_bytes ->
@@ -875,7 +868,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
           let ikey   = Index_key.encode iks ~rowid in
           S.put tx idx.idx_tree_id ikey Bytes.empty
         ) idxs in
-        release_txn tx owned
+        let* () = release_txn tx owned in
+        Lwt.return true
       end)
     (fun exn ->
       (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -1191,8 +1185,8 @@ let execute_with_count ?(mode = Auto)
     let* _tid = Cat.create_table cat ~name ~columns in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict } ->
-    let* () = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in
-    Lwt.return 1
+    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in
+    Lwt.return (if inserted then 1 else 0)
   | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
