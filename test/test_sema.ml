@@ -400,6 +400,7 @@ let bind_select_second_col_unknown () =
   | _ -> Alcotest.fail "expected Unknown_column for second proj column"
 
 let bind_select_multi_order_by_rejected () =
+  (* Multi-key ORDER BY is now supported; verify it binds without error. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
     distinct = false;
@@ -415,9 +416,9 @@ let bind_select_multi_order_by_rejected () =
     limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Error (Sema.Unsupported _) -> ()
-  | Error _ -> Alcotest.fail "expected Unsupported error for multi-column ORDER BY"
-  | Ok _ -> Alcotest.fail "expected error, got Ok"
+  | Ok _ -> ()
+  | Error e -> Alcotest.failf "unexpected error for multi-column ORDER BY: %a"
+                 Sema.pp_error e
 
 let bind_select_order_unknown_col () =
   let cat = two_col_cat () in

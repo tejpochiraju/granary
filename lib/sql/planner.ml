@@ -186,14 +186,20 @@ let plan_select cat
      addresses the original table schema (pre-projection row layout).
      For aggregate queries: sort AFTER aggregation because ORDER BY refers
      to the aggregated output row layout. *)
-  let sort_key = match order with [] -> None | k :: _ -> Some k in
-  let make_sort child (bkey : Sema.bound_order_key) =
-    let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-    Plan.Op_sort { key = plan_expr bkey.key; dir; child }
+  let make_sort_keys () =
+    List.map (fun (bkey : Sema.bound_order_key) ->
+      let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+      (plan_expr bkey.key, dir)
+    ) order
+  in
+  let make_sort child =
+    let keys = make_sort_keys () in
+    if keys = [] then child
+    else Plan.Op_sort { keys; child }
   in
   let after_sort =
     if is_aggregated then after_where
-    else match sort_key with None -> after_where | Some k -> make_sort after_where k
+    else make_sort after_where
   in
   let projected =
     if is_aggregated then
@@ -214,8 +220,7 @@ let plan_select cat
   in
   (* Post-aggregation sort (only for aggregated queries). *)
   let sorted =
-    if is_aggregated then
-      match sort_key with None -> projected | Some k -> make_sort projected k
+    if is_aggregated then make_sort projected
     else projected
   in
   let after_distinct =
@@ -284,14 +289,20 @@ let rec plan ?cat = function
          | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_join }
        in
        let is_aggregated = aggs <> [] || group_by <> None in
-       let sort_key = match order with [] -> None | k :: _ -> Some k in
-       let make_sort child (bkey : Sema.bound_order_key) =
-         let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-         Plan.Op_sort { key = plan_expr bkey.key; dir; child }
+       let make_sort_keys () =
+         List.map (fun (bkey : Sema.bound_order_key) ->
+           let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+           (plan_expr bkey.key, dir)
+         ) order
+       in
+       let make_sort child =
+         let keys = make_sort_keys () in
+         if keys = [] then child
+         else Plan.Op_sort { keys; child }
        in
        let after_sort =
          if is_aggregated then filtered
-         else match sort_key with None -> filtered | Some k -> make_sort filtered k
+         else make_sort filtered
        in
        let projected =
          if is_aggregated then
@@ -311,8 +322,7 @@ let rec plan ?cat = function
            Plan.Op_project { ordinals = proj; child = after_sort }
        in
        let sorted =
-         if is_aggregated then
-           match sort_key with None -> projected | Some k -> make_sort projected k
+         if is_aggregated then make_sort projected
          else projected
        in
        let after_distinct =

@@ -1328,13 +1328,18 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
       Array.of_list (List.map (eval_expr clock params row) exprs)
     in
     Lwt.return (Lwt_stream.map eval_exprs inner)
-  | Plan.Op_sort { key; dir; child } ->
+  | Plan.Op_sort { keys; child } ->
     let* inner = to_stream clock params store child in
     let* rows = Lwt_stream.to_list inner in
     let cmp a b =
-      let va = eval_expr clock params a key and vb = eval_expr clock params b key in
-      let c = compare_values va vb in
-      if dir = `Asc then c else -c
+      List.fold_left (fun acc (key, dir) ->
+        if acc <> 0 then acc
+        else
+          let va = eval_expr clock params a key
+          and vb = eval_expr clock params b key in
+          let c = compare_values va vb in
+          if dir = `Asc then c else -c
+      ) 0 keys
     in
     let sorted = List.sort cmp rows in
     Lwt.return (Lwt_stream.of_list sorted)

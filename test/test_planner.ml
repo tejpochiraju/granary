@@ -268,9 +268,9 @@ let plan_order_by_asc () =
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_project { child = Plan.Op_sort { key = Plan.P_col 0; dir = `Asc;
+  | Plan.Op_project { child = Plan.Op_sort { keys = [(Plan.P_col 0, `Asc)];
                                              child = Plan.Op_seq_scan _ }; _ } -> ()
-  | _ -> Alcotest.fail "expected Op_project(Op_sort { key=P_col 0; dir=Asc }(Op_seq_scan))"
+  | _ -> Alcotest.fail "expected Op_project(Op_sort { keys=[(P_col 0,Asc)] }(Op_seq_scan))"
 
 let plan_order_by_desc () =
   let cat = make_cat () in
@@ -283,8 +283,8 @@ let plan_order_by_desc () =
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_project { child = Plan.Op_sort { key = Plan.P_col 1; dir = `Desc; _ }; _ } -> ()
-  | _ -> Alcotest.fail "expected Op_project(Op_sort { key=P_col 1; dir=Desc })"
+  | Plan.Op_project { child = Plan.Op_sort { keys = [(Plan.P_col 1, `Desc)]; _ }; _ } -> ()
+  | _ -> Alcotest.fail "expected Op_project(Op_sort { keys=[(P_col 1,Desc)] })"
 
 let plan_limit_only () =
   let cat = make_cat () in
@@ -325,7 +325,7 @@ let plan_order_and_limit () =
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_limit { limit = 2; offset = 0;
-                    child = Plan.Op_project { child = Plan.Op_sort { key = Plan.P_col 0; dir = `Asc; _ }; _ } } -> ()
+                    child = Plan.Op_project { child = Plan.Op_sort { keys = [(Plan.P_col 0, `Asc)]; _ }; _ } } -> ()
   | _ -> Alcotest.fail "expected Op_limit(Op_project(Op_sort(Op_seq_scan)))"
 
 (** SELECT DISTINCT id FROM users → planner should wrap with Op_distinct. *)

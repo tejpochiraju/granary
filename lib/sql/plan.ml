@@ -48,8 +48,7 @@ type op =
       child : op;
     }
   | Op_sort of {
-      key   : expr;
-      dir   : [`Asc | `Desc];
+      keys  : (expr * [`Asc | `Desc]) list;
       child : op;
     }
   | Op_limit of {

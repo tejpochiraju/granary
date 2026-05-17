@@ -55,8 +55,9 @@ let fmt_val = function
   | Db.V_int  n -> Int64.to_string n
   | Db.V_text s -> s
   | Db.V_real f ->
-    (* SQLite always includes a decimal point for real output *)
-    let s = Printf.sprintf "%g" f in
+    (* SQLite uses up to 15 significant digits, removing trailing zeros.
+       Use %.15g to match SQLite's output format for large and small floats. *)
+    let s = Printf.sprintf "%.15g" f in
     if String.contains s '.' || String.contains s 'e' || String.contains s 'E'
        || String.contains s 'n' (* nan/inf *)
     then s
@@ -1086,6 +1087,208 @@ let cases = [
       "INSERT INTO t VALUES (NULL)";
     ];
     query = "SELECT IFNULL(n, 0) FROM t ORDER BY IFNULL(n, 99)";
+    unordered = false };
+
+  (* Phase 7: SELECT DISTINCT *)
+  { name = "distinct_basic";
+    setup = [
+      "CREATE TABLE t (x INTEGER, y TEXT)";
+      "INSERT INTO t VALUES (1, 'a')";
+      "INSERT INTO t VALUES (1, 'b')";
+      "INSERT INTO t VALUES (2, 'a')";
+      "INSERT INTO t VALUES (1, 'a')";
+    ];
+    query = "SELECT DISTINCT x FROM t ORDER BY x";
+    unordered = false };
+
+  { name = "distinct_multi_col";
+    setup = [
+      "CREATE TABLE t (x INTEGER, y TEXT)";
+      "INSERT INTO t VALUES (1, 'a')";
+      "INSERT INTO t VALUES (1, 'a')";
+      "INSERT INTO t VALUES (1, 'b')";
+      "INSERT INTO t VALUES (2, 'a')";
+    ];
+    query = "SELECT DISTINCT x, y FROM t ORDER BY x, y";
+    unordered = false };
+
+  { name = "distinct_with_null";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (NULL)";
+      "INSERT INTO t VALUES (NULL)";
+      "INSERT INTO t VALUES (1)";
+    ];
+    query = "SELECT DISTINCT x FROM t ORDER BY x";
+    unordered = false };
+
+  (* Phase 7: UNION *)
+  { name = "union_basic";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO b VALUES (2)";
+      "INSERT INTO b VALUES (3)";
+    ];
+    query = "SELECT x FROM a UNION SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  { name = "union_all";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO b VALUES (2)";
+      "INSERT INTO b VALUES (3)";
+    ];
+    query = "SELECT x FROM a UNION ALL SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  { name = "union_with_nulls";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (NULL)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (NULL)";
+      "INSERT INTO b VALUES (2)";
+    ];
+    query = "SELECT x FROM a UNION SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  { name = "union_chained_three_way";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "CREATE TABLE c (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (2)";
+      "INSERT INTO c VALUES (3)";
+    ];
+    query = "SELECT x FROM a UNION SELECT x FROM b UNION SELECT x FROM c ORDER BY x";
+    unordered = false };
+
+  (* Phase 7: INTERSECT *)
+  { name = "intersect_basic";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO b VALUES (2)";
+      "INSERT INTO b VALUES (3)";
+    ];
+    query = "SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  { name = "intersect_empty_result";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (2)";
+    ];
+    query = "SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  (* Phase 7: EXCEPT *)
+  { name = "except_basic";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO a VALUES (2)";
+      "INSERT INTO b VALUES (2)";
+    ];
+    query = "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  { name = "except_removes_all";
+    setup = [
+      "CREATE TABLE a (x INTEGER)";
+      "CREATE TABLE b (x INTEGER)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (1)";
+    ];
+    query = "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x";
+    unordered = false };
+
+  (* Phase 7: date/time functions *)
+  { name = "date_round_trip";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT DATE('2024-01-15') FROM _d";
+    unordered = false };
+
+  { name = "time_round_trip";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT TIME('14:30:45') FROM _d";
+    unordered = false };
+
+  { name = "datetime_round_trip";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT DATETIME('2024-03-22 08:45:00') FROM _d";
+    unordered = false };
+
+  { name = "julianday_2000_01_01";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT JULIANDAY('2000-01-01') FROM _d";
+    unordered = false };
+
+  { name = "unixepoch_1970_01_01";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT UNIXEPOCH('1970-01-01') FROM _d";
+    unordered = false };
+
+  { name = "strftime_year";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT STRFTIME('%Y', '2024-06-15') FROM _d";
+    unordered = false };
+
+  { name = "strftime_full_date";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT STRFTIME('%Y-%m-%d', '2024-06-15 12:30:45') FROM _d";
+    unordered = false };
+
+  { name = "strftime_time";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT STRFTIME('%H:%M:%S', '2024-06-15 09:05:03') FROM _d";
+    unordered = false };
+
+  { name = "date_null_propagation";
+    setup = [
+      "CREATE TABLE _d (x INTEGER)";
+      "INSERT INTO _d VALUES (1)";
+    ];
+    query = "SELECT DATE(NULL) FROM _d";
     unordered = false };
 
 ]

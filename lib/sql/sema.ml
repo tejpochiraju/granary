@@ -1141,10 +1141,6 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                  | Error e -> Lwt.return (Error e)
                  | Ok (bound_having, having_aggs) ->
                 let all_aggs = proj_aggs @ having_aggs in
-                if List.length order > 1 then
-                  Lwt.return (Error (Unsupported
-                    "ORDER BY with more than one key is not supported in Phase 1"))
-                else
                 let order_result =
                   List.fold_left (fun acc (ok : Ast.order_key) ->
                     match acc with
@@ -1429,11 +1425,12 @@ let pp_error fmt = function
 (* ------------------------------------------------------------------ *)
 
 (* Count output columns of a bound statement for compound-select validation. *)
-let compound_col_count = function
+let rec compound_col_count = function
   | BS_select { proj; expr_proj; aggs; _ } ->
     if aggs <> [] then List.length aggs
     else if expr_proj <> [] then List.length expr_proj
     else List.length proj
+  | BS_compound { left; _ } -> compound_col_count left
   | _ -> 0  (* non-select stmts in compound: don't validate *)
 
 let rec bind_internal ~named_params cat stmt =
