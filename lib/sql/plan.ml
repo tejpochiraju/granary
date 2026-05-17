@@ -150,6 +150,9 @@ type op =
       proj         : int list;
       include_rank : bool;  (** if true, append BM25 score as last projected column *)
     }
+  | Op_pragma_rows of {
+      rows : Sqlocaml_encoding.Row.t list;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

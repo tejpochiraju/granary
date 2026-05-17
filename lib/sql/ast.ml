@@ -143,3 +143,8 @@ type stmt =
       name    : string;
       columns : string list;
     }
+  | S_pragma of pragma_kind
+
+and pragma_kind =
+  | Pragma_table_info of string
+  | Pragma_index_list of string

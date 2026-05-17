@@ -119,6 +119,9 @@ type bound_stmt =
       proj         : int list;
       include_rank : bool;
     }
+  | BS_pragma of {
+      kind : Ast.pragma_kind;
+    }
 
 type error =
   | Unknown_table       of string
@@ -1415,3 +1418,4 @@ let bind cat stmt =
      | Some _, _ | _, Some _ -> Lwt.return (Error (Already_exists name))
      | None, None ->
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
+  | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))

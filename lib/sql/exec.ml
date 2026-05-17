@@ -1143,6 +1143,7 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
     end
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
+  | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
@@ -1640,6 +1641,8 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
         let row_values = projected @ (if include_rank then [Row.V_real score] else []) in
         Lwt.return (Some (Array.of_list row_values))) sorted in
     let* () = S.ro_end tx in
+    Lwt.return (Lwt_stream.of_list rows)
+  | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_create_table _ | Plan.Op_insert _ | Plan.Op_create_index _
   | Plan.Op_update _ | Plan.Op_delete _

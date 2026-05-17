@@ -74,6 +74,7 @@ rule token = parse
   | "USING"    { USING }
   | "FTS5"     { FTS5 }
   | "MATCH"    { MATCH }
+  | "PRAGMA"   { PRAGMA }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }
   | "BETWEEN"  { BETWEEN }

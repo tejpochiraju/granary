@@ -439,6 +439,8 @@ let create_table t ~name ~columns =
 let find_table t ~name =
   Lwt.return (Hashtbl.find_opt t.cache name)
 
+let find_table_cached t ~name = Hashtbl.find_opt t.cache name
+
 let list_tables t =
   Lwt.return (Hashtbl.fold (fun _ v acc -> v :: acc) t.cache [])
 

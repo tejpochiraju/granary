@@ -41,6 +41,10 @@ val create_table :
 (** Find a table by name. Returns [None] if not found. *)
 val find_table : t -> name:string -> table_meta option Lwt.t
 
+(** Synchronous in-memory lookup (no Lwt). Always up to date since the cache
+    is updated on every DDL operation. *)
+val find_table_cached : t -> name:string -> table_meta option
+
 (** List all known tables. Order is unspecified. *)
 val list_tables : t -> table_meta list Lwt.t
 

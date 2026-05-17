@@ -1369,6 +1369,39 @@ let test_not_in_query () =
   Alcotest.(check (list int64)) "not in" [2L] vals
 
 (* ------------------------------------------------------------------ *)
+(* PRAGMA tests                                                         *)
+(* ------------------------------------------------------------------ *)
+
+module D = Db
+
+let test_pragma_table_info () =
+  run (
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT)" in
+    let* r = D.query db "PRAGMA table_info(t)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "pragma rows" 2 (List.length rows);
+    let col0 = List.nth rows 0 in
+    Alcotest.(check string) "col0 name" "id"      (match col0.(1) with D.V_text s -> s | _ -> "?");
+    Alcotest.(check string) "col0 type" "INTEGER"  (match col0.(2) with D.V_text s -> s | _ -> "?");
+    Alcotest.(check int64)  "col0 nn"   1L         (match col0.(3) with D.V_int n -> n | _ -> -1L);
+    Alcotest.(check int64)  "col0 pk"   1L         (match col0.(5) with D.V_int n -> n | _ -> -1L);
+    Lwt.return_unit)
+
+let test_pragma_index_list () =
+  run (
+    let* db = D.open_in_memory () in
+    let* _ = D.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+    let* _ = D.execute db "CREATE INDEX idx_name ON t (name)" in
+    let* r = D.query db "PRAGMA index_list(t)" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    Alcotest.(check int) "idx rows" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.(check string) "idx name" "idx_name" (match row.(1) with D.V_text s -> s | _ -> "?");
+    Alcotest.(check int64)  "idx uniq" 0L         (match row.(2) with D.V_int n -> n | _ -> -1L);
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1510,5 +1543,9 @@ let () =
       Alcotest.test_case "not_between" `Quick test_not_between_query;
       Alcotest.test_case "in"          `Quick test_in_query;
       Alcotest.test_case "not_in"      `Quick test_not_in_query;
+    ];
+    "pragma", [
+      Alcotest.test_case "table_info"  `Quick test_pragma_table_info;
+      Alcotest.test_case "index_list"  `Quick test_pragma_index_list;
     ];
   ]

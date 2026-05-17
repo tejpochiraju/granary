@@ -27,6 +27,7 @@
 %token SUBSTR TRIM LTRIM RTRIM REPLACE INSTR ROUND TYPEOF
 %token VIRTUAL USING FTS5
 %token MATCH
+%token PRAGMA
 %token LIKE GLOB
 %token BETWEEN IN
 %token QUESTION
@@ -71,6 +72,14 @@ stmt:
   | s = begin_stmt        { s }
   | s = commit_stmt       { s }
   | s = rollback_stmt     { s }
+  | s = pragma_stmt       { s }
+
+pragma_stmt:
+  | PRAGMA name = IDENT LPAREN arg = IDENT RPAREN
+    { match String.lowercase_ascii name with
+      | "table_info" -> S_pragma (Pragma_table_info arg)
+      | "index_list" -> S_pragma (Pragma_index_list arg)
+      | _ -> failwith (Printf.sprintf "unknown pragma: %s" name) }
 
 drop_table:
   | DROP TABLE name = IDENT { S_drop_table { name } }

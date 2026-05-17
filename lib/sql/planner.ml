@@ -367,3 +367,34 @@ let plan ?cat = function
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank } ->
     Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank }
+  | Sema.BS_pragma { kind } ->
+    let rows = match kind with
+      | Ast.Pragma_table_info table_name ->
+        (match cat with
+         | None -> []
+         | Some c ->
+           (match Cat.find_table_cached c ~name:table_name with
+            | None -> []
+            | Some meta ->
+              List.mapi (fun i (col : Row.column) ->
+                [| Row.V_int (Int64.of_int i);
+                   Row.V_text col.name;
+                   Row.V_text (match col.ty with
+                     | Row.Integer -> "INTEGER" | Row.Text -> "TEXT"
+                     | Row.Real    -> "REAL"    | Row.Blob -> "BLOB");
+                   Row.V_int (if col.not_null then 1L else 0L);
+                   Row.V_null;  (* dflt_value — simplified *)
+                   Row.V_int (if col.primary_key then 1L else 0L) |]
+              ) meta.columns))
+      | Ast.Pragma_index_list table_name ->
+        let idxs = match cat with
+          | None -> []
+          | Some c -> Cat.indexes_for_table c ~table:table_name
+        in
+        List.mapi (fun i (idx : Cat.index_info) ->
+          [| Row.V_int (Int64.of_int i);
+             Row.V_text idx.idx_name;
+             Row.V_int (if idx.idx_unique then 1L else 0L) |]
+        ) idxs
+    in
+    Plan.Op_pragma_rows { rows }

@@ -147,6 +147,9 @@ type bound_stmt =
       proj         : int list;
       include_rank : bool;
     }
+  | BS_pragma of {
+      kind : Ast.pragma_kind;
+    }
 
 type error =
   | Unknown_table       of string
