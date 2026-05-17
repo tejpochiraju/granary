@@ -143,6 +143,7 @@ let parse_no_join () =
 let sema_unknown_join_table () =
   let cat = make_two_table_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { kind = Ast.Inner; table = "ghost"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "uid") } ];
@@ -166,6 +167,7 @@ let sema_ambiguous_column () =
   ) in
   (* SELECT x FROM a JOIN b ON ...  — "x" appears in both *)
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["x"]; table = "a";
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
@@ -188,6 +190,7 @@ let sema_qualified_column_resolves () =
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "a";
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("a","x"), Ast.E_tbl_col ("b","x")) } ];
@@ -205,6 +208,7 @@ let sema_qualified_column_resolves () =
 let planner_picks_hash_join_no_index () =
   let cat = make_two_table_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -220,6 +224,7 @@ let planner_picks_hash_join_no_index () =
 let planner_picks_nlj_with_index () =
   let cat = make_two_table_cat ~orders_idx:true () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,

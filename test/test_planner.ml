@@ -58,7 +58,7 @@ let plan_insert () =
 
 let plan_select_star_no_where () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan _; _ } -> ()
@@ -68,7 +68,7 @@ let plan_select_star_no_where () =
 
 let plan_select_cols_no_where () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals = [0]; child = Plan.Op_seq_scan _ } -> ()
@@ -80,6 +80,7 @@ let plan_select_cols_no_where () =
 let plan_select_star_where () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -96,6 +97,7 @@ let plan_select_star_where () =
 let plan_select_cols_where () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `Cols ["id"];
     table = "users";
     joins = [];
@@ -118,6 +120,7 @@ let plan_select_cols_where () =
 let plan_expr_lit () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -137,6 +140,7 @@ let plan_expr_lit () =
 let plan_expr_col () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -156,6 +160,7 @@ let plan_expr_col () =
 let plan_expr_eq () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -175,6 +180,7 @@ let plan_expr_eq () =
 let plan_expr_reversed_eq () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -197,7 +203,7 @@ let plan_expr_reversed_eq () =
 
 let plan_project_all_ordinals () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -206,7 +212,7 @@ let plan_project_all_ordinals () =
 
 let plan_project_single () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["name"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -215,7 +221,7 @@ let plan_project_single () =
 
 let plan_project_reversed () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["name"; "id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { ordinals; _ } ->
@@ -228,7 +234,7 @@ let plan_project_reversed () =
 
 let plan_seqscan_tree_id () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
@@ -238,7 +244,7 @@ let plan_seqscan_tree_id () =
 
 let plan_seqscan_columns () =
   let cat = make_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
@@ -254,6 +260,7 @@ let plan_seqscan_columns () =
 let plan_order_by_asc () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
     order = [{ Ast.expr = Ast.E_col "id"; dir = Ast.Asc }];
@@ -268,6 +275,7 @@ let plan_order_by_asc () =
 let plan_order_by_desc () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
     order = [{ Ast.expr = Ast.E_col "name"; dir = Ast.Desc }];
@@ -281,6 +289,7 @@ let plan_order_by_desc () =
 let plan_limit_only () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
     order = []; limit = Some 3; offset = None;
@@ -294,6 +303,7 @@ let plan_limit_only () =
 let plan_limit_with_offset () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
     order = []; limit = Some 5; offset = Some 2;
@@ -306,6 +316,7 @@ let plan_limit_with_offset () =
 let plan_order_and_limit () =
   let cat = make_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None;
     joins = []; group_by = []; having = None;
     order = [{ Ast.expr = Ast.E_col "id"; dir = Ast.Asc }];
@@ -337,6 +348,7 @@ let make_cat_with_index ~col_name =
 let plan_index_lookup_col_eq_lit () =
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -353,6 +365,7 @@ let plan_index_lookup_col_eq_lit () =
 let plan_index_lookup_lit_eq_col () =
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -368,6 +381,7 @@ let plan_no_index_falls_back_to_filter () =
   (* No index on "name" — equality on "name" should fall back to Op_filter. *)
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_select {
+    distinct = false;
     proj  = `All;
     table = "users";
     joins = [];
@@ -414,6 +428,7 @@ let make_join_cat () =
 let plan_join_swapped_on () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -431,6 +446,7 @@ let plan_join_swapped_on () =
 let plan_join_general_on () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 (* ON users.id > orders.uid — not equality, falls through *)
@@ -450,6 +466,7 @@ let plan_join_general_on () =
 let plan_join_no_cat () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -467,6 +484,7 @@ let plan_join_no_cat () =
 let plan_join_no_cat_swapped () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -483,6 +501,7 @@ let plan_join_no_cat_swapped () =
 let plan_join_no_cat_general_on () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Gt,
@@ -499,6 +518,7 @@ let plan_join_no_cat_general_on () =
 let plan_join_no_cat_with_where () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -572,6 +592,7 @@ let plan_rollback () =
 let plan_join_on_literal () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];

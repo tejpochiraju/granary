@@ -54,6 +54,7 @@ type bound_stmt =
       values     : bound_expr list;
     }
   | BS_select of {
+      distinct   : bool;
       table_meta : Cat.table_meta;
       proj       : int list;
       expr_proj  : bound_expr list;
@@ -757,7 +758,7 @@ let bind_fts_seq_scan cat ~param_counter:_ ~table ~where ~proj =
             where = bound_where;
           }))))
 
-let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
+let bind_select cat ~param_counter ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -1155,6 +1156,7 @@ let bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having 
                        | Error e -> Lwt.return (Error e)
                        | Ok valid_offset ->
                          Lwt.return (Ok (BS_select {
+                           distinct;
                            table_meta = meta;
                            proj       = proj_ords;
                            expr_proj  = proj_exprs;
@@ -1402,8 +1404,8 @@ let bind cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns }                     -> bind_create cat ~name ~columns
   | Ast.S_insert { table; columns; values }                  -> bind_insert cat ~param_counter ~table ~columns ~values
-  | Ast.S_select { proj; table; joins; where; group_by; having; order; limit; offset } ->
-    bind_select cat ~param_counter ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
+  | Ast.S_select { distinct; proj; table; joins; where; group_by; having; order; limit; offset } ->
+    bind_select cat ~param_counter ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->
     bind_create_index cat ~name ~table ~columns ~unique
   | Ast.S_update { table; assignments; where } ->

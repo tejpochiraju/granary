@@ -128,7 +128,7 @@ let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
 
 let plan_select cat
     ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~join
-    ~group_by ~aggs ~having ~agg_proj =
+    ~group_by ~aggs ~having ~agg_proj ~distinct =
   (* Try to use an index lookup if possible (single-table path). *)
   let base =
     match join with
@@ -218,23 +218,27 @@ let plan_select cat
       match sort_key with None -> projected | Some k -> make_sort projected k
     else projected
   in
+  let after_distinct =
+    if distinct then Plan.Op_distinct { child = sorted }
+    else sorted
+  in
   match limit with
-  | None   -> sorted
+  | None   -> after_distinct
   | Some n ->
     let off = Option.value ~default:0 offset in
-    Plan.Op_limit { limit = n; offset = off; child = sorted }
+    Plan.Op_limit { limit = n; offset = off; child = after_distinct }
 
 let plan ?cat = function
   | Sema.BS_create_table { name; columns } ->
     Plan.Op_create_table { name; columns }
   | Sema.BS_insert { table_meta; ordinals; values } ->
     Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values }
-  | Sema.BS_select { table_meta; proj; expr_proj; where; order; limit; offset;
+  | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      join; group_by; aggs; having; agg_proj } ->
     (match cat with
      | Some cat ->
        plan_select cat ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset
-         ~join ~group_by ~aggs ~having ~agg_proj
+         ~join ~group_by ~aggs ~having ~agg_proj ~distinct
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
@@ -311,11 +315,15 @@ let plan ?cat = function
            match sort_key with None -> projected | Some k -> make_sort projected k
          else projected
        in
+       let after_distinct =
+         if distinct then Plan.Op_distinct { child = sorted }
+         else sorted
+       in
        match limit with
-       | None   -> sorted
+       | None   -> after_distinct
        | Some n ->
          let off = Option.value ~default:0 offset in
-         Plan.Op_limit { limit = n; offset = off; child = sorted })
+         Plan.Op_limit { limit = n; offset = off; child = after_distinct })
   | Sema.BS_create_index { name; table_meta; col_idxs; unique } ->
     Plan.Op_create_index {
       name;

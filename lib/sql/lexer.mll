@@ -41,6 +41,7 @@ rule token = parse
   | "SET"      { SET }
   | "DEFAULT"  { DEFAULT }
   | "DELETE"   { DELETE }
+  | "DISTINCT" { DISTINCT }
   | "DROP"     { DROP }
   | "BEGIN"    { BEGIN }
   | "COMMIT"   { COMMIT }

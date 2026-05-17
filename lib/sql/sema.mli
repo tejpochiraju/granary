@@ -69,6 +69,7 @@ type bound_stmt =
       values     : bound_expr list;
     }
   | BS_select of {
+      distinct   : bool;
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       proj       : int list;            (** column ordinals to project
                                             (refer to the combined row when [join] is set)

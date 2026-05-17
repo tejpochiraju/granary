@@ -139,6 +139,29 @@ let str_instr s sub =
     done;
     !found
 
+let row_key (row : Row.t) : string =
+  let buf = Buffer.create 64 in
+  Array.iter (function
+    | Row.V_null   -> Buffer.add_string buf "N|"
+    | Row.V_int n  -> Buffer.add_char buf 'I';
+                      Buffer.add_string buf (Int64.to_string n);
+                      Buffer.add_char buf '|'
+    | Row.V_real f -> Buffer.add_char buf 'R';
+                      Buffer.add_string buf (Printf.sprintf "%h" f);
+                      Buffer.add_char buf '|'
+    | Row.V_text s -> Buffer.add_char buf 'T';
+                      Buffer.add_string buf (string_of_int (String.length s));
+                      Buffer.add_char buf ':';
+                      Buffer.add_string buf s;
+                      Buffer.add_char buf '|'
+    | Row.V_blob b -> Buffer.add_char buf 'B';
+                      Buffer.add_string buf (string_of_int (Bytes.length b));
+                      Buffer.add_char buf ':';
+                      Buffer.add_string buf (Bytes.to_string b);
+                      Buffer.add_char buf '|'
+  ) row;
+  Buffer.contents buf
+
 let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
@@ -1164,7 +1187,8 @@ let execute_with_count ?(mode = Auto) ?(params = [||]) (store : S.t) (cat : Cat.
   | Plan.Op_expr_project _
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _
-  | Plan.Op_fts_seq_scan _ | Plan.Op_fts_match_scan _ ->
+  | Plan.Op_fts_seq_scan _ | Plan.Op_fts_match_scan _
+  | Plan.Op_distinct _ ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -1249,6 +1273,14 @@ let rec to_stream (params : Row.value array) (store : S.t) (op : Plan.op) : Row.
     let* rows = Lwt_stream.to_list inner in
     let rows' = List.filteri (fun i _ -> i >= offset && i < offset + limit) rows in
     Lwt.return (Lwt_stream.of_list rows')
+  | Plan.Op_distinct { child } ->
+    let* inner = to_stream params store child in
+    let seen = Hashtbl.create 64 in
+    Lwt.return (Lwt_stream.filter (fun row ->
+      let k = row_key row in
+      if Hashtbl.mem seen k then false
+      else (Hashtbl.replace seen k (); true)
+    ) inner)
   | Plan.Op_index_lookup { table_tree; idx_tree; col_idx = _;
                            col_type; lookup_val; table_meta } ->
     (* Encode the lookup value as an IndexKey.value matching the column type. *)

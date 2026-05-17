@@ -1433,6 +1433,46 @@ let test_pragma_index_list () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* SELECT DISTINCT                                                      *)
+(* ------------------------------------------------------------------ *)
+
+let test_distinct () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER, y TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  exec db "INSERT INTO t VALUES (1, 'b')";
+  exec db "INSERT INTO t VALUES (2, 'a')";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
+  Alcotest.(check int) "2 distinct x rows" 2 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "distinct x values"
+    [Db.V_int 1L; Db.V_int 2L] xs
+
+let test_distinct_multicolumn () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER, y TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  exec db "INSERT INTO t VALUES (1, 'b')";
+  exec db "INSERT INTO t VALUES (2, 'a')";
+  (* Use ORDER BY x only (multi-key ORDER BY is not yet supported). *)
+  let rows = query_ok db "SELECT DISTINCT x, y FROM t ORDER BY x" in
+  Alcotest.(check int) "3 distinct (x,y) rows" 3 (List.length rows)
+
+let test_distinct_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES (1)";
+  let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
+  Alcotest.(check int) "2 distinct x rows (with null)" 2 (List.length rows);
+  let xs = List.map (fun r -> r.(0)) rows in
+  Alcotest.check (Alcotest.list value_testable) "distinct x with null"
+    [Db.V_null; Db.V_int 1L] xs
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1580,5 +1620,10 @@ let () =
     "pragma", [
       Alcotest.test_case "table_info"  `Quick test_pragma_table_info;
       Alcotest.test_case "index_list"  `Quick test_pragma_index_list;
+    ];
+    "select_distinct", [
+      Alcotest.test_case "distinct_single_col"   `Quick test_distinct;
+      Alcotest.test_case "distinct_multicolumn"  `Quick test_distinct_multicolumn;
+      Alcotest.test_case "distinct_null"         `Quick test_distinct_null;
     ];
   ]

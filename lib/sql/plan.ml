@@ -153,6 +153,9 @@ type op =
   | Op_pragma_rows of {
       rows : Sqlocaml_encoding.Row.t list;
     }
+  | Op_distinct of {
+      child : op;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

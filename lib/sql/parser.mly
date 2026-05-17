@@ -18,6 +18,7 @@
 %token INDEX ON UNIQUE
 %token UPDATE SET
 %token DELETE
+%token DISTINCT
 %token DROP
 %token BEGIN COMMIT ROLLBACK
 %token JOIN INNER LEFT OUTER
@@ -163,10 +164,11 @@ insert_expr:
   | QUESTION               { E_param 0 }
 
 select:
-  | SELECT proj = projection FROM table = IDENT js = join_clauses wh = where_opt
+  | SELECT distinct = boption(DISTINCT) proj = projection FROM table = IDENT
+      js = join_clauses wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      S_select { proj; table; joins = js; where = wh;
+      S_select { distinct; proj; table; joins = js; where = wh;
                  group_by = gb; having = hv;
                  order = ob; limit; offset } }
 

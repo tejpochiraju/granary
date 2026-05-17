@@ -221,7 +221,7 @@ let bind_insert_null_allowed () =
 
 let bind_select_star () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj all" [0; 1] proj
@@ -230,7 +230,7 @@ let bind_select_star () =
 
 let bind_select_cols () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"; "name"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["id"; "name"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj cols in order" [0; 1] proj
@@ -239,7 +239,7 @@ let bind_select_cols () =
 
 let bind_select_reversed () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["name"; "id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["name"; "id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj reversed" [1; 0] proj
@@ -248,7 +248,7 @@ let bind_select_reversed () =
 
 let bind_select_single () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["id"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { proj; _ }) ->
     Alcotest.(check (list int)) "proj single" [0] proj
@@ -257,7 +257,7 @@ let bind_select_single () =
 
 let bind_select_unknown_table () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "ghost"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "ghost"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
   | Error _ -> Alcotest.fail "expected Unknown_table \"ghost\""
@@ -265,7 +265,7 @@ let bind_select_unknown_table () =
 
 let bind_select_unknown_col () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `Cols ["bogus"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `Cols ["bogus"]; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
   | Error _ -> Alcotest.fail "expected Unknown_column {table=users; column=bogus}"
@@ -273,7 +273,7 @@ let bind_select_unknown_col () =
 
 let bind_select_no_where () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_select { proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
+  let stmt = Ast.S_select { distinct = false; proj = `All; table = "users"; joins = []; where = None; group_by = []; having = None; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_select { where = None; _ }) -> ()
   | Ok (Sema.BS_select { where = Some _; _ }) -> Alcotest.fail "expected where = None"
@@ -283,6 +283,7 @@ let bind_select_no_where () =
 let bind_select_where_col_eq_lit () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -298,6 +299,7 @@ let bind_select_where_col_eq_lit () =
 let bind_select_where_lit_eq_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -313,6 +315,7 @@ let bind_select_where_lit_eq_col () =
 let bind_select_where_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -327,6 +330,7 @@ let bind_select_where_unknown_col () =
 let bind_select_where_text_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -348,6 +352,7 @@ let bind_select_where_right_unknown () =
   let cat = two_col_cat () in
   (* WHERE id = bogus — left (id) resolves, right (bogus) fails *)
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "bogus"));
@@ -383,6 +388,7 @@ let bind_select_second_col_unknown () =
     { Row.name = "age";  ty = Row.Integer; not_null = false; primary_key = false; default = None };
   ] in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["id"; "bogus"; "age"];
     table = "users";
     joins = [];
@@ -396,6 +402,7 @@ let bind_select_second_col_unknown () =
 let bind_select_multi_order_by_rejected () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -415,6 +422,7 @@ let bind_select_multi_order_by_rejected () =
 let bind_select_order_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users";
     joins = [];
@@ -430,6 +438,7 @@ let bind_select_order_unknown_col () =
 let bind_select_negative_limit () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None; order = [];
     joins = []; group_by = []; having = None;
     limit = Some (-1); offset = None;
@@ -441,6 +450,7 @@ let bind_select_negative_limit () =
 let bind_select_negative_offset () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; where = None; order = [];
     joins = []; group_by = []; having = None;
     limit = None; offset = Some (-5);
@@ -711,6 +721,7 @@ let make_join_cat () =
 let bind_select_join_unknown_table () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "ghost"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
@@ -734,6 +745,7 @@ let bind_select_join_ambiguous_col () =
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["uid"]; table = "a";
     joins = [ { Ast.kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
@@ -746,6 +758,7 @@ let bind_select_join_ambiguous_col () =
 let bind_select_join_unknown_proj_col () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["bogus"]; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
@@ -758,6 +771,7 @@ let bind_select_join_unknown_proj_col () =
 let bind_select_join_qualified_col_ok () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -773,6 +787,7 @@ let bind_select_join_qualified_unknown_table () =
   (* E_tbl_col with a table name that matches neither left nor right *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_tbl_col ("ghost", "id") } ];
@@ -786,6 +801,7 @@ let bind_select_join_unknown_col_unqual () =
   (* An unqualified column name that doesn't exist in either table. *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_col "bogus" } ];
@@ -799,6 +815,7 @@ let bind_select_join_agg_in_on_rejected () =
   (* E_agg in ON clause is an error. *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_agg (Ast.Agg_count, None) } ];
@@ -812,6 +829,7 @@ let bind_select_join_qualified_col_unknown_col () =
   (* E_tbl_col ("users", "bogus") — table name matches but column doesn't. *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_tbl_col ("orders", "bogus") } ];
@@ -825,6 +843,7 @@ let bind_select_join_where_unknown_col () =
   (* WHERE references a column that exists in neither table in a JOIN query *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -844,6 +863,7 @@ let bind_select_join_where_unknown_col () =
 let bind_select_count_star () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -855,6 +875,7 @@ let bind_select_count_star () =
 let bind_select_sum_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "id"))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -867,6 +888,7 @@ let bind_select_sum_text_col_rejected () =
   (* SUM on a TEXT column must be rejected as Type_mismatch. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "name"))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -878,6 +900,7 @@ let bind_select_sum_text_col_rejected () =
 let bind_select_avg_text_col_rejected () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_avg, Some (Ast.E_col "name"))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -889,6 +912,7 @@ let bind_select_avg_text_col_rejected () =
 let bind_select_group_by_basic () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
@@ -900,6 +924,7 @@ let bind_select_group_by_basic () =
 let bind_select_group_by_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["bogus"]; having = None; order = []; limit = None; offset = None;
@@ -911,6 +936,7 @@ let bind_select_group_by_unknown_col () =
 let bind_select_group_by_multi_rejected () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"; "name"]; having = None; order = []; limit = None; offset = None;
@@ -922,6 +948,7 @@ let bind_select_group_by_multi_rejected () =
 let bind_select_having_basic () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -937,6 +964,7 @@ let bind_select_having_no_group_by_rejected () =
   (* HAVING without GROUP BY and without aggregates in projection → Unsupported *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["id"];
     table = "users"; joins = [];
     where = None; group_by = [];
@@ -951,6 +979,7 @@ let bind_select_agg_star_non_count_rejected () =
   (* COUNT-star is OK but SUM-star is not. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, None)];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -963,6 +992,7 @@ let bind_select_agg_complex_arg_rejected () =
   (* Aggregate argument must be a column reference, not e.g. a binop. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum,
       Some (Ast.E_binop (Ast.Add, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L))))];
     table = "users"; joins = [];
@@ -976,6 +1006,7 @@ let bind_select_col_not_in_group_by_rejected () =
   (* A bare column reference in aggregated SELECT must be the GROUP BY col. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "name"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
@@ -988,6 +1019,7 @@ let bind_select_agg_star_in_select_rejected () =
   (* SELECT * with aggregates is not allowed. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All;
     table = "users"; joins = [];
     where = None; group_by = [];
@@ -1002,6 +1034,7 @@ let bind_select_agg_unknown_col_arg () =
   (* SUM(bogus) — column doesn't exist. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "bogus"))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1014,6 +1047,7 @@ let bind_select_agg_in_where_rejected () =
   (* Aggregate in WHERE clause should be Unsupported. *)
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["id"];
     table = "users"; joins = [];
     where = Some (Ast.E_agg (Ast.Agg_count, None));
@@ -1028,6 +1062,7 @@ let bind_select_more_than_one_join_rejected () =
   let join_clause tbl = { Ast.kind = Ast.Inner; table = tbl; alias = None;
                           on = Ast.E_lit (Ast.L_int 1L) } in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ join_clause "orders"; join_clause "orders" ];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1108,6 +1143,7 @@ let bind_insert_real_lit_ok () =
 let bind_select_tbl_col_unknown_no_join () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; joins = [];
     where = Some (Ast.E_tbl_col ("users", "bogus"));
     group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1120,6 +1156,7 @@ let bind_select_tbl_col_unknown_no_join () =
 let bind_select_not_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; joins = [];
     where = Some (Ast.E_not (Ast.E_col "bogus"));
     group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1132,6 +1169,7 @@ let bind_select_not_unknown_col () =
 let bind_select_is_null_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; joins = [];
     where = Some (Ast.E_is_null (Ast.E_col "bogus"));
     group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1144,6 +1182,7 @@ let bind_select_is_null_unknown_col () =
 let bind_select_is_not_null_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; joins = [];
     where = Some (Ast.E_is_not_null (Ast.E_col "bogus"));
     group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1156,6 +1195,7 @@ let bind_select_is_not_null_unknown_col () =
 let bind_select_neg_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users"; joins = [];
     where = Some (Ast.E_neg (Ast.E_col "bogus"));
     group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1169,6 +1209,7 @@ let bind_select_neg_unknown_col () =
 let bind_select_join_unqual_right_only () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_col "item", Ast.E_lit (Ast.L_text "x")) } ];
@@ -1182,6 +1223,7 @@ let bind_select_join_unqual_right_only () =
 let bind_select_join_qual_right_col () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -1197,6 +1239,7 @@ let bind_select_join_qual_right_col () =
 let bind_select_join_binop_right_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -1212,6 +1255,7 @@ let bind_select_join_binop_right_error () =
 let bind_select_join_on_not () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_not (Ast.E_tbl_col ("users", "id")) } ];
@@ -1225,6 +1269,7 @@ let bind_select_join_on_not () =
 let bind_select_join_on_not_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_not (Ast.E_col "bogus") } ];
@@ -1238,6 +1283,7 @@ let bind_select_join_on_not_error () =
 let bind_select_join_on_is_null () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_is_null (Ast.E_tbl_col ("users", "id")) } ];
@@ -1251,6 +1297,7 @@ let bind_select_join_on_is_null () =
 let bind_select_join_on_is_null_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_is_null (Ast.E_col "bogus") } ];
@@ -1264,6 +1311,7 @@ let bind_select_join_on_is_null_error () =
 let bind_select_join_on_is_not_null () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_is_not_null (Ast.E_tbl_col ("users", "id")) } ];
@@ -1277,6 +1325,7 @@ let bind_select_join_on_is_not_null () =
 let bind_select_join_on_is_not_null_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_is_not_null (Ast.E_col "bogus") } ];
@@ -1290,6 +1339,7 @@ let bind_select_join_on_is_not_null_error () =
 let bind_select_join_on_neg () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_neg (Ast.E_tbl_col ("users", "id")) } ];
@@ -1303,6 +1353,7 @@ let bind_select_join_on_neg () =
 let bind_select_join_on_neg_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_neg (Ast.E_col "bogus") } ];
@@ -1317,6 +1368,7 @@ let bind_select_join_on_neg_error () =
 let bind_select_having_with_plain_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1331,6 +1383,7 @@ let bind_select_having_with_plain_col () =
 let bind_select_having_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1345,6 +1398,7 @@ let bind_select_having_unknown_col () =
 let bind_select_having_qual_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1360,6 +1414,7 @@ let bind_select_having_qual_col () =
 let bind_select_having_qual_col_error () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1377,6 +1432,7 @@ let bind_select_having_qual_col_error () =
 let bind_select_having_with_not_agg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1391,6 +1447,7 @@ let bind_select_having_with_not_agg () =
 let bind_select_having_with_neg_agg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1407,6 +1464,7 @@ let bind_select_having_with_neg_agg () =
 let bind_select_having_with_is_null_agg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1420,6 +1478,7 @@ let bind_select_having_with_is_null_agg () =
 let bind_select_having_with_is_not_null_agg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1434,6 +1493,7 @@ let bind_select_having_with_is_not_null_agg () =
 let bind_select_agg_qual_col_arg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_tbl_col ("users", "id")))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1446,6 +1506,7 @@ let bind_select_agg_qual_col_arg () =
 let bind_select_agg_qual_col_arg_error () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_agg (Ast.Agg_sum, Some (Ast.E_tbl_col ("ghost", "id")))];
     table = "users"; joins = [];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -1572,6 +1633,7 @@ let bind_insert_not_null_late () =
 let bind_select_multi_join_explicit_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [
       { Ast.kind = Ast.Inner; table = "orders"; alias = None;
@@ -1591,6 +1653,7 @@ let bind_select_multi_join_explicit_error () =
 let bind_select_join_right_only_col_proj () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Cols ["item"]; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -1607,6 +1670,7 @@ let bind_select_join_right_only_col_proj () =
 let bind_select_qual_no_join () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_tbl_col ("users", "id"); Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
@@ -1619,6 +1683,7 @@ let bind_select_qual_no_join () =
 let bind_select_qual_no_join_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_tbl_col ("users", "bogus"); Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
@@ -1631,6 +1696,7 @@ let bind_select_qual_no_join_unknown_col () =
 let bind_select_qual_no_join_unknown_table () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_tbl_col ("ghost", "id"); Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
@@ -1654,6 +1720,7 @@ let bind_select_join_on_ambiguous () =
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "a";
     joins = [ { Ast.kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_col "x" } ];
@@ -1667,6 +1734,7 @@ let bind_select_join_on_ambiguous () =
 let bind_select_join_on_unqual_left_only () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 (* "name" is only in users *)
@@ -1681,6 +1749,7 @@ let bind_select_join_on_unqual_left_only () =
 let bind_select_join_on_qual_left_unknown () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_tbl_col ("users", "bogus") } ];
@@ -1694,6 +1763,7 @@ let bind_select_join_on_qual_left_unknown () =
 let bind_select_join_binop_left_error () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `All; table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
@@ -1710,6 +1780,7 @@ let bind_select_join_binop_left_error () =
 let bind_select_having_binop_right_error () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1726,6 +1797,7 @@ let bind_select_having_binop_right_error () =
 let bind_select_having_agg_unknown_arg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1740,6 +1812,7 @@ let bind_select_having_agg_unknown_arg () =
 let bind_select_having_agg_with_col_arg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1756,6 +1829,7 @@ let bind_select_having_agg_with_col_arg () =
 let bind_select_having_agg_with_qual_arg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1773,6 +1847,7 @@ let bind_select_having_agg_with_qual_arg () =
 let bind_select_having_agg_with_qual_arg_error () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1788,6 +1863,7 @@ let bind_select_having_agg_with_qual_arg_error () =
 let bind_select_having_agg_complex_arg () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1803,6 +1879,7 @@ let bind_select_having_agg_complex_arg () =
 let bind_select_having_sum_star_rejected () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1818,6 +1895,7 @@ let bind_select_having_sum_star_rejected () =
 let bind_select_join_qual_left_unknown_col_proj () =
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_tbl_col ("users", "bogus"); Ast.E_agg (Ast.Agg_count, None)];
     table = "users";
     joins = [ { Ast.kind = Ast.Inner; table = "orders"; alias = None;
@@ -1839,6 +1917,7 @@ let bind_select_join_qual_left_unknown_col_proj () =
 let bind_select_having_not_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1853,6 +1932,7 @@ let bind_select_having_not_unknown_col () =
 let bind_select_having_is_null_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1867,6 +1947,7 @@ let bind_select_having_is_null_unknown_col () =
 let bind_select_having_is_not_null_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];
@@ -1881,6 +1962,7 @@ let bind_select_having_is_not_null_unknown_col () =
 let bind_select_having_neg_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
+    distinct = false;
     proj = `Exprs [Ast.E_col "id"; Ast.E_agg (Ast.Agg_count, None)];
     table = "users"; joins = [];
     where = None; group_by = ["id"];

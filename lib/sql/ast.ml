@@ -102,6 +102,7 @@ type stmt =
       values  : expr list;
     }
   | S_select of {
+      distinct : bool;
       proj     : [ `All | `Cols of string list | `Exprs of expr list ];
         (** [`Exprs] supports arbitrary projection expressions (used for
             aggregates).  Plain column projection still parses to
