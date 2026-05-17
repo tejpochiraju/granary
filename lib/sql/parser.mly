@@ -41,7 +41,7 @@
 %left AND
 %right NOT
 %nonassoc IS
-%nonassoc LIKE GLOB
+%nonassoc IN BETWEEN LIKE GLOB
 %nonassoc BETWEEN_PREC
 %left EQ NE LT LE GT GE
 %left PIPE
@@ -281,6 +281,40 @@ agg_expr:
   | MIN   LPAREN e = expr RPAREN      { E_agg (Agg_min,   Some e) }
   | MAX   LPAREN e = expr RPAREN      { E_agg (Agg_max,   Some e) }
 
+(* between_bound is an expression that may not contain a bare AND binary
+   operator at the top level.  This prevents the reduce/reduce conflict that
+   arises in  "expr BETWEEN expr AND expr"  where the AND token is ambiguous
+   between the BETWEEN separator and the binary AND operator. *)
+between_bound:
+  | l = literal                            { E_lit l }
+  | name = IDENT                           { E_col name }
+  | t = IDENT DOT c = IDENT               { E_tbl_col (t, c) }
+  | e = agg_expr                           { e }
+  | e = scalar_expr                        { e }
+  | NOT e = between_bound                  { E_not e }
+  | a = between_bound EQ  b = between_bound { E_binop (Eq,  a, b) }
+  | a = between_bound NE  b = between_bound { E_binop (Ne,  a, b) }
+  | a = between_bound LT  b = between_bound { E_binop (Lt,  a, b) }
+  | a = between_bound LE  b = between_bound { E_binop (Le,  a, b) }
+  | a = between_bound GT  b = between_bound { E_binop (Gt,  a, b) }
+  | a = between_bound GE  b = between_bound { E_binop (Ge,  a, b) }
+  | a = between_bound PLUS  b = between_bound { E_binop (Add, a, b) }
+  | a = between_bound MINUS b = between_bound { E_binop (Sub, a, b) }
+  | a = between_bound STAR  b = between_bound { E_binop (Mul, a, b) }
+  | a = between_bound SLASH b = between_bound { E_binop (Div, a, b) }
+  | a = between_bound CONCAT    b = between_bound { E_binop (Concat, a, b) }
+  | a = between_bound PERCENT   b = between_bound { E_binop (Mod, a, b) }
+  | a = between_bound AMPERSAND b = between_bound { E_binop (Bit_and, a, b) }
+  | a = between_bound PIPE      b = between_bound { E_binop (Bit_or, a, b) }
+  | a = between_bound LSHIFT    b = between_bound { E_binop (Lshift, a, b) }
+  | a = between_bound RSHIFT    b = between_bound { E_binop (Rshift, a, b) }
+  | TILDE e = between_bound %prec TILDE    { E_bitnot e }
+  | MINUS e = between_bound %prec UMINUS   { E_neg e }
+  | a = between_bound LIKE b = between_bound { E_binop (Like, a, b) }
+  | a = between_bound GLOB b = between_bound { E_binop (Glob, a, b) }
+  | LPAREN e = expr RPAREN                 { e }
+  | QUESTION                               { E_param 0 }
+
 expr:
   | l = literal                       { E_lit l }
   | name = IDENT                      { E_col name }
@@ -312,13 +346,13 @@ expr:
   | a = expr NOT LIKE b = expr %prec LIKE { E_not (E_binop (Like, a, b)) }
   | a = expr GLOB b = expr             { E_binop (Glob, a, b) }
   | a = expr NOT GLOB b = expr %prec GLOB { E_not (E_binop (Glob, a, b)) }
-  | a = expr BETWEEN lo = expr AND hi = expr %prec BETWEEN_PREC
+  | a = expr BETWEEN lo = between_bound AND hi = between_bound %prec BETWEEN_PREC
     { E_between (a, lo, hi) }
-  | a = expr NOT BETWEEN lo = expr AND hi = expr %prec BETWEEN_PREC
+  | a = expr NOT BETWEEN lo = between_bound AND hi = between_bound %prec BETWEEN_PREC
     { E_not (E_between (a, lo, hi)) }
   | a = expr IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN
     { E_in (a, vals) }
-  | a = expr NOT IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN %prec BETWEEN_PREC
+  | a = expr NOT IN LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN
     { E_not (E_in (a, vals)) }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
