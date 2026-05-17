@@ -623,6 +623,24 @@ let order_by_expr () =
     | Db.V_int n -> n | _ -> -1L) rows in
   Alcotest.(check (list int64)) "order_by_expr" [3L; 2L; 1L] vals
 
+let test_order_by_expr_join () =
+  run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
+    let* _ = Db.execute db "CREATE TABLE u (tid INTEGER, v TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 30)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 10)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (3, 20)" in
+    let* _ = Db.execute db "INSERT INTO u VALUES (1, 'a')" in
+    let* _ = Db.execute db "INSERT INTO u VALUES (2, 'b')" in
+    let* _ = Db.execute db "INSERT INTO u VALUES (3, 'c')" in
+    let* r = Db.query db "SELECT u.v FROM t JOIN u ON t.id = u.tid ORDER BY t.n" in
+    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
+    let vals = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
+    Alcotest.(check (list string)) "join_order_by" ["b"; "c"; "a"] vals;
+    Db.close db
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Group 14: QCheck ORDER BY properties                                 *)
 (* ------------------------------------------------------------------ *)
@@ -1420,6 +1438,7 @@ let () =
       Alcotest.test_case "order_by_null_first"  `Quick order_by_null_first;
       Alcotest.test_case "order_by_text"        `Quick order_by_text;
       Alcotest.test_case "order_by_expr"        `Quick order_by_expr;
+      Alcotest.test_case "join_order_by"        `Quick test_order_by_expr_join;
     ];
     "limit_offset", [
       Alcotest.test_case "limit_no_order"       `Quick limit_no_order;
