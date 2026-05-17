@@ -38,12 +38,12 @@
 %right NOT
 %nonassoc IS
 %left EQ NE LT LE GT GE
-%left CONCAT
 %left PIPE
 %left AMPERSAND
 %left LSHIFT RSHIFT
 %left PLUS MINUS
 %left STAR SLASH PERCENT
+%left CONCAT
 %nonassoc TILDE UMINUS
 
 %start <Ast.stmt> stmt_eof

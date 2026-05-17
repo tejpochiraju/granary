@@ -607,6 +607,11 @@ let test_bitnot () =
   let v = Exec.eval_expr [||] row (Plan.P_bitnot (Plan.P_lit (Ast.L_int 5L))) in
   Alcotest.(check int64) "bitnot" (-6L) (match v with Row.V_int n -> n | _ -> 0L)
 
+let test_rshift_negative () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row (Plan.P_binop (Plan.Rshift, Plan.P_lit (Ast.L_int (-4L)), Plan.P_lit (Ast.L_int 1L))) in
+  Alcotest.(check int64) "rshift_neg" (-2L) (match v with Row.V_int n -> n | _ -> 0L)
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -696,7 +701,8 @@ let () =
       Alcotest.test_case "bit_and" `Quick test_bit_and;
       Alcotest.test_case "bit_or"  `Quick test_bit_or;
       Alcotest.test_case "lshift"  `Quick test_lshift;
-      Alcotest.test_case "rshift"  `Quick test_rshift;
-      Alcotest.test_case "bitnot"  `Quick test_bitnot;
+      Alcotest.test_case "rshift"          `Quick test_rshift;
+      Alcotest.test_case "rshift_negative" `Quick test_rshift_negative;
+      Alcotest.test_case "bitnot"          `Quick test_bitnot;
     ];
   ]

@@ -195,7 +195,7 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
      | Row.V_int a, Row.V_int b ->
        let n = Int64.to_int b in
-       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_right_logical a n)
+       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_right a n)
      | _ -> Row.V_null)
 
 and cmp_result lv rv pred =
