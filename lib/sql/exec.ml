@@ -1285,6 +1285,33 @@ let execute_with_count ?(mode = Auto)
           let* () = if owned then S.rollback tx else Lwt.return_unit in
           Lwt.fail exn)
     end
+  | Plan.Op_alter_table { table_meta; action } ->
+    (match action with
+     | Ast.AA_add_column col_def ->
+       let col : Row.column = {
+         Row.name        = col_def.Ast.name;
+         Row.ty          = (match col_def.Ast.ty with
+                            | Ast.Ty_int  -> Row.Integer
+                            | Ast.Ty_text -> Row.Text
+                            | Ast.Ty_real -> Row.Real
+                            | Ast.Ty_blob -> Row.Blob);
+         Row.not_null    = col_def.Ast.not_null;
+         Row.primary_key = col_def.Ast.primary_key;
+         Row.default     = (match col_def.Ast.default with
+                            | None              -> None
+                            | Some Ast.L_null   -> Some Row.DV_null
+                            | Some (Ast.L_int  n) -> Some (Row.DV_int  n)
+                            | Some (Ast.L_text s) -> Some (Row.DV_text s)
+                            | Some (Ast.L_real f) -> Some (Row.DV_real f)
+                            | Some (Ast.L_blob b) -> Some (Row.DV_blob b));
+       } in
+       let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
+       (match result with
+        | Error msg -> Lwt.fail_with msg
+        | Ok ()     -> Lwt.return 0)
+     | Ast.AA_rename_table _ | Ast.AA_rename_column _ ->
+       (* Implemented in Task 4 *)
+       Lwt.return 0)
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
@@ -1940,6 +1967,7 @@ let rec to_stream (clock : (unit -> float) option) (params : Row.value array) (s
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
   | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
+  | Plan.Op_alter_table _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->

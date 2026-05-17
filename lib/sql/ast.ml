@@ -87,6 +87,11 @@ type column_def = {
   default     : literal option;  (* None = no DEFAULT *)
 }
 
+type alter_action =
+  | AA_add_column    of column_def
+  | AA_rename_table  of string              (* new table name *)
+  | AA_rename_column of string * string     (* old_col_name * new_col_name *)
+
 type order_dir = Asc | Desc
 
 type order_key = {
@@ -155,6 +160,10 @@ type stmt =
     }
   | S_drop_index of {
       name : string;
+    }
+  | S_alter_table of {
+      table  : string;
+      action : alter_action;
     }
   | S_begin
   | S_commit

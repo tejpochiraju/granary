@@ -2195,6 +2195,45 @@ let test_delete_returning_multi () =
        Lwt.return_unit))
 
 (* ------------------------------------------------------------------ *)
+(* alter_table                                                          *)
+(* ------------------------------------------------------------------ *)
+
+let test_alter_add_column () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
+    let* _ = Db.execute db "ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 0" in
+    let* r = Db.query db "SELECT id, name, score FROM t ORDER BY id" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "2 rows" 2 (List.length rows);
+       (match rows with
+        | [r1; r2] ->
+          Alcotest.(check int) "score1=0" 0 (match r1.(2) with Db.V_int n -> Int64.to_int n | _ -> -1);
+          Alcotest.(check int) "score2=0" 0 (match r2.(2) with Db.V_int n -> Int64.to_int n | _ -> -1)
+        | _ -> Alcotest.fail "wrong row count");
+       Lwt.return_unit))
+
+let test_alter_add_column_null_default () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (42)" in
+    let* _ = Db.execute db "ALTER TABLE t ADD COLUMN extra TEXT" in
+    let* r = Db.query db "SELECT id, extra FROM t" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       let row = List.hd rows in
+       Alcotest.(check bool) "extra is null" true (row.(1) = Db.V_null);
+       Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -2427,5 +2466,9 @@ let () =
       Alcotest.test_case "delete_returning"        `Quick test_delete_returning;
       Alcotest.test_case "update_returning_multi"  `Quick test_update_returning_multi;
       Alcotest.test_case "delete_returning_multi"  `Quick test_delete_returning_multi;
+    ];
+    "alter_table", [
+      Alcotest.test_case "add_column"             `Quick test_alter_add_column;
+      Alcotest.test_case "add_column_null_default" `Quick test_alter_add_column_null_default;
     ];
   ]

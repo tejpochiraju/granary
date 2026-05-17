@@ -511,6 +511,25 @@ let create_index t ~name ~table ~columns ~unique =
          Hashtbl.replace t.indexes name info;
          Lwt.return (Ok info))
 
+let add_column t ~table_name ~(column : Row.column) =
+  match Hashtbl.find_opt t.cache table_name with
+  | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
+  | Some meta ->
+    let exists = List.exists (fun c -> String.equal c.Row.name column.Row.name) meta.columns in
+    if exists then
+      Lwt.return (Error (Printf.sprintf "column already exists: %s" column.Row.name))
+    else begin
+      let new_cols = meta.columns @ [column] in
+      let ordinal  = List.length meta.columns in
+      let col_k    = column_key table_name ordinal in
+      let col_v    = encode_column column in
+      let%lwt tx   = S.rw_begin t.store in
+      let%lwt ()   = S.put tx sys_columns_tid col_k col_v in
+      let%lwt ()   = S.commit tx in
+      Hashtbl.replace t.cache table_name { meta with columns = new_cols };
+      Lwt.return (Ok ())
+    end
+
 let indexes_for_table t ~table =
   Hashtbl.fold (fun _ info acc ->
     if info.idx_table = table then info :: acc else acc

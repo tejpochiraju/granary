@@ -89,6 +89,11 @@ rule token = parse
   | "FTS5"     { FTS5 }
   | "MATCH"    { MATCH }
   | "RETURNING" { RETURNING }
+  | "ALTER"    { ALTER }
+  | "ADD"      { ADD }
+  | "RENAME"   { RENAME }
+  | "TO"       { TO }
+  | "COLUMN"   { COLUMN }
   | "PRAGMA"   { PRAGMA }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }

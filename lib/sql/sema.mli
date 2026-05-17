@@ -155,6 +155,10 @@ type bound_stmt =
   | BS_pragma of {
       kind : Ast.pragma_kind;
     }
+  | BS_alter_table of {
+      table_meta : Sqlocaml_catalog.Catalog.table_meta;
+      action     : Ast.alter_action;
+    }
   | BS_compound of {
       op    : Ast.set_op;
       left  : bound_stmt;

@@ -30,6 +30,7 @@
 %token DATE DATETIME JULIANDAY STRFTIME TIME UNIXEPOCH
 %token VIRTUAL USING FTS5
 %token MATCH
+%token ALTER ADD RENAME TO COLUMN
 %token PRAGMA
 %token RETURNING
 %token UNION INTERSECT EXCEPT ALL
@@ -80,6 +81,7 @@ stmt:
   | s = commit_stmt       { s }
   | s = rollback_stmt     { s }
   | s = pragma_stmt       { s }
+  | s = alter_table       { s }
 
 pragma_stmt:
   | PRAGMA name = IDENT LPAREN arg = IDENT RPAREN
@@ -93,6 +95,18 @@ drop_table:
 
 drop_index:
   | DROP INDEX name = IDENT { S_drop_index { name } }
+
+alter_table:
+  | ALTER TABLE table = IDENT ADD COLUMN col = column_def
+    { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
+  | ALTER TABLE table = IDENT ADD col = column_def
+    { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
+  | ALTER TABLE table = IDENT RENAME TO new_name = IDENT
+    { Ast.S_alter_table { table; action = Ast.AA_rename_table new_name } }
+  | ALTER TABLE table = IDENT RENAME COLUMN old_col = IDENT TO new_col = IDENT
+    { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
+  | ALTER TABLE table = IDENT RENAME old_col = IDENT TO new_col = IDENT
+    { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
 
 begin_stmt:
   | BEGIN    { S_begin }

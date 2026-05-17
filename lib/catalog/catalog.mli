@@ -100,6 +100,15 @@ val drop_index :
   name:string ->
   unit Lwt.t
 
+(** Add a new column to an existing table.
+    Updates the catalog's persistent storage and in-memory cache.
+    Returns [Error msg] if the table does not exist or the column already exists. *)
+val add_column :
+  t ->
+  table_name:string ->
+  column:Sqlocaml_encoding.Row.column ->
+  (unit, string) result Lwt.t
+
 (** Find an FTS table by name. Returns [None] if not found. *)
 val find_fts : t -> string -> fts_table_meta option
 

@@ -127,6 +127,10 @@ type bound_stmt =
   | BS_pragma of {
       kind : Ast.pragma_kind;
     }
+  | BS_alter_table of {
+      table_meta : Cat.table_meta;
+      action     : Ast.alter_action;
+    }
   | BS_compound of {
       op    : Ast.set_op;
       left  : bound_stmt;
@@ -1395,6 +1399,28 @@ let bind_delete cat ~param_counter ~named_params ~table ~where ~returning =
           }))))
 
 (* ------------------------------------------------------------------ *)
+(* ALTER TABLE                                                          *)
+(* ------------------------------------------------------------------ *)
+
+let bind_alter_table cat ~table ~action =
+  let* meta_opt = Cat.find_table cat ~name:table in
+  match meta_opt with
+  | None -> Lwt.return (Error (Unknown_table table))
+  | Some table_meta ->
+    (match action with
+     | Ast.AA_add_column col_def ->
+       let col_name = col_def.Ast.name in
+       let exists = List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns in
+       if exists then Lwt.return (Error (Already_exists col_name))
+       else Lwt.return (Ok (BS_alter_table { table_meta; action }))
+     | Ast.AA_rename_table _ ->
+       Lwt.return (Ok (BS_alter_table { table_meta; action }))
+     | Ast.AA_rename_column (old_col, _new_col) ->
+       let exists = List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns in
+       if not exists then Lwt.return (Error (Unknown_column { table; column = old_col }))
+       else Lwt.return (Ok (BS_alter_table { table_meta; action })))
+
+(* ------------------------------------------------------------------ *)
 (* DROP TABLE                                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -1476,6 +1502,8 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
     bind_drop_table cat ~name
   | Ast.S_drop_index { name } ->
     bind_drop_index cat ~name
+  | Ast.S_alter_table { table; action } ->
+    bind_alter_table cat ~table ~action
   | Ast.S_begin    -> Lwt.return (Ok BS_begin)
   | Ast.S_commit   -> Lwt.return (Ok BS_commit)
   | Ast.S_rollback -> Lwt.return (Ok BS_rollback)

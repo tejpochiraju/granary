@@ -127,6 +127,10 @@ type op =
         (** projection over the aggregate output row.  Maps to the final
             row emitted to downstream operators. *)
     }
+  | Op_alter_table of {
+      table_meta : Cat.table_meta;
+      action     : Ast.alter_action;
+    }
   | Op_begin
   | Op_commit
   | Op_rollback

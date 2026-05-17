@@ -379,6 +379,8 @@ let rec plan ?cat = function
     Plan.Op_drop_table { table_meta; indexes }
   | Sema.BS_drop_index { idx_info; _ } ->
     Plan.Op_drop_index { idx_info }
+  | Sema.BS_alter_table { table_meta; action } ->
+    Plan.Op_alter_table { table_meta; action }
   | Sema.BS_begin    -> Plan.Op_begin
   | Sema.BS_commit   -> Plan.Op_commit
   | Sema.BS_rollback -> Plan.Op_rollback
