@@ -197,7 +197,8 @@ let test_null_args () =
     let* _ = D.execute d "CREATE TABLE s (v TEXT)" in
     let* _ = D.execute d "INSERT INTO s VALUES ('hello')" in
     let check_null sql =
-      match%lwt D.query d sql with
+      let* r = D.query d sql in
+      match r with
       | Error e -> Alcotest.failf "query: %a" D.pp_error e
       | Ok stream ->
         let* rows = Lwt_stream.to_list stream in
