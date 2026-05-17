@@ -1412,6 +1412,10 @@ let bind_alter_table cat ~table ~action =
        let col_name = col_def.Ast.name in
        let exists = List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns in
        if exists then Lwt.return (Error (Already_exists col_name))
+       else if col_def.Ast.not_null && (col_def.Ast.default = None ||
+                                         col_def.Ast.default = Some Ast.L_null) then
+         Lwt.return (Error (Unsupported
+           "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))
        else Lwt.return (Ok (BS_alter_table { table_meta; action }))
      | Ast.AA_rename_table _ ->
        Lwt.return (Ok (BS_alter_table { table_meta; action }))

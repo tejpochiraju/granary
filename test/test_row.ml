@@ -198,17 +198,18 @@ let encode_arity_too_many () =
   with Invalid_argument _ -> ()
 
 let decode_arity_too_few_encoded () =
-  (* Encode a 1-col row, then decode as 2-col schema *)
+  (* Encode a 1-column row, decode against a 2-column schema.
+     Row.decode now fills missing columns with NULL instead of raising. *)
   let schema1 = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None }] in
   let schema2 = [
     { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
-    { Row.name = "y"; ty = Row.Integer; not_null = false; primary_key = false; default = None };
+    { Row.name = "y"; ty = Row.Text;    not_null = false; primary_key = false; default = None };
   ] in
-  let bytes = Row.encode schema1 [| Row.V_int 42L |] in
-  try
-    ignore (Row.decode schema2 bytes);
-    Alcotest.fail "expected invalid_arg: encoded 1 col, schema expects 2"
-  with Invalid_argument _ -> ()
+  let encoded = Row.encode schema1 [| Row.V_int 42L |] in
+  let decoded  = Row.decode schema2 encoded in
+  Alcotest.(check int)  "2 columns"  2 (Array.length decoded);
+  Alcotest.(check bool) "col0=42"   true (decoded.(0) = Row.V_int 42L);
+  Alcotest.(check bool) "col1=null" true (decoded.(1) = Row.V_null)
 
 let error_tests = [
   "encode arity mismatch: too few cols",
@@ -234,7 +235,7 @@ let error_tests = [
       Alcotest.fail "expected Invalid_argument"
     with Invalid_argument _ -> ());
 
-  "decode arity mismatch: encoded too few",
+  "decode short row: extra columns become NULL",
   (fun () -> decode_arity_too_few_encoded ());
 
   "encode arity mismatch: row too many for schema",

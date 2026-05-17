@@ -2233,6 +2233,15 @@ let test_alter_add_column_null_default () =
        Alcotest.(check bool) "extra is null" true (row.(1) = Db.V_null);
        Lwt.return_unit))
 
+let test_alter_add_not_null_no_default_error () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+    let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN x TEXT NOT NULL") in
+    Alcotest.(check bool) "error for NOT NULL without DEFAULT" true
+      (match r with Error _ -> true | Ok _ -> false);
+    Lwt.return_unit)
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -2468,7 +2477,8 @@ let () =
       Alcotest.test_case "delete_returning_multi"  `Quick test_delete_returning_multi;
     ];
     "alter_table", [
-      Alcotest.test_case "add_column"             `Quick test_alter_add_column;
-      Alcotest.test_case "add_column_null_default" `Quick test_alter_add_column_null_default;
+      Alcotest.test_case "add_column"                    `Quick test_alter_add_column;
+      Alcotest.test_case "add_column_null_default"       `Quick test_alter_add_column_null_default;
+      Alcotest.test_case "add_not_null_no_default_error" `Quick test_alter_add_not_null_no_default_error;
     ];
   ]
