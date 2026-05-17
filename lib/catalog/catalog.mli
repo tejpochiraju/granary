@@ -109,6 +109,19 @@ val add_column :
   column:Sqlocaml_encoding.Row.column ->
   (unit, string) result Lwt.t
 
+(** Rename a table.
+    Updates _sys_tables, re-keys all _sys_columns entries, and refreshes the
+    in-memory cache and any index entries that reference the old table name.
+    Returns [Error msg] if [old_name] does not exist or [new_name] already exists. *)
+val rename_table :
+  t -> old_name:string -> new_name:string -> (unit, string) result Lwt.t
+
+(** Rename a column within a table.
+    Updates the _sys_columns entry and refreshes the in-memory cache.
+    Returns [Error msg] if the table or column does not exist. *)
+val rename_column :
+  t -> table_name:string -> old_col:string -> new_col:string -> (unit, string) result Lwt.t
+
 (** Find an FTS table by name. Returns [None] if not found. *)
 val find_fts : t -> string -> fts_table_meta option
 

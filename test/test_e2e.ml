@@ -2242,6 +2242,56 @@ let test_alter_add_not_null_no_default_error () =
       (match r with Error _ -> true | Ok _ -> false);
     Lwt.return_unit)
 
+let test_rename_table () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE old_name (id INTEGER, v TEXT)" in
+    let* _ = Db.execute db "INSERT INTO old_name VALUES (1, 'x')" in
+    let* _ = Db.execute db "ALTER TABLE old_name RENAME TO new_name" in
+    (* Old name is gone *)
+    let r_old = Lwt_main.run (Db.query db "SELECT * FROM old_name") in
+    Alcotest.(check bool) "old name gone" true (match r_old with Error _ -> true | Ok _ -> false);
+    (* New name works *)
+    let* r = Db.query db "SELECT id, v FROM new_name" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check int) "row still there" 1 (List.length rows);
+       Lwt.return_unit))
+
+let test_rename_column () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, old_col TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
+    let* _ = Db.execute db "ALTER TABLE t RENAME COLUMN old_col TO new_col" in
+    let* r = Db.query db "SELECT id, new_col FROM t" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       let row = List.hd rows in
+       Alcotest.(check string) "value preserved" "hello"
+         (match row.(1) with Db.V_text s -> s | _ -> "X");
+       Lwt.return_unit))
+
+let test_rename_column_no_keyword () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
+    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'abc')" in
+    let* _ = Db.execute db "ALTER TABLE t RENAME y TO z" in
+    let* r = Db.query db "SELECT x, z FROM t" in
+    (match r with
+     | Error e -> Alcotest.fail (fmt_err e)
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       let row = List.hd rows in
+       Alcotest.(check string) "value preserved" "abc"
+         (match row.(1) with Db.V_text s -> s | _ -> "X");
+       Lwt.return_unit))
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
@@ -2480,5 +2530,8 @@ let () =
       Alcotest.test_case "add_column"                    `Quick test_alter_add_column;
       Alcotest.test_case "add_column_null_default"       `Quick test_alter_add_column_null_default;
       Alcotest.test_case "add_not_null_no_default_error" `Quick test_alter_add_not_null_no_default_error;
+      Alcotest.test_case "rename_table"                  `Quick test_rename_table;
+      Alcotest.test_case "rename_column"                 `Quick test_rename_column;
+      Alcotest.test_case "rename_column_no_keyword"      `Quick test_rename_column_no_keyword;
     ];
   ]

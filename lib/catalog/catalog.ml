@@ -600,6 +600,77 @@ let drop_table t tx ~name =
   Hashtbl.remove t.cache name;
   Lwt.return_unit
 
+let rename_table t ~old_name ~new_name =
+  match Hashtbl.find_opt t.cache old_name with
+  | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
+  | Some meta ->
+    if Hashtbl.mem t.cache new_name then
+      Lwt.return (Error (Printf.sprintf "table already exists: %s" new_name))
+    else begin
+      let%lwt tx = S.rw_begin t.store in
+      (* Remove old sys_tables entry *)
+      let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
+      (* Insert new sys_tables entry *)
+      let%lwt () = S.put tx sys_tables_tid
+          (Bytes.of_string new_name)
+          (encode_table_value meta) in
+      (* Re-key all column entries *)
+      let n_cols = List.length meta.columns in
+      let%lwt () =
+        let rec loop i =
+          if i >= n_cols then Lwt.return_unit
+          else
+            let old_k = column_key old_name i in
+            let new_k = column_key new_name i in
+            let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
+            (match bytes_opt with
+             | None -> loop (i + 1)
+             | Some bytes ->
+               let%lwt () = S.del tx sys_columns_tid old_k in
+               let%lwt () = S.put tx sys_columns_tid new_k bytes in
+               loop (i + 1))
+        in
+        loop 0
+      in
+      let%lwt () = S.commit tx in
+      (* Update in-memory cache *)
+      Hashtbl.remove  t.cache old_name;
+      Hashtbl.replace t.cache new_name { meta with name = new_name };
+      (* Update index entries that reference old table name *)
+      let to_update = Hashtbl.fold (fun k v acc ->
+        if String.equal v.idx_table old_name then (k, v) :: acc else acc
+      ) t.indexes [] in
+      List.iter (fun (k, v) ->
+        Hashtbl.replace t.indexes k { v with idx_table = new_name }
+      ) to_update;
+      Lwt.return (Ok ())
+    end
+
+let rename_column t ~table_name ~old_col ~new_col =
+  match Hashtbl.find_opt t.cache table_name with
+  | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
+  | Some meta ->
+    match List.find_index (fun c -> String.equal c.Row.name old_col) meta.columns with
+    | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" old_col))
+    | Some i ->
+      let%lwt tx = S.rw_begin t.store in
+      let col_k = column_key table_name i in
+      let%lwt bytes_opt = S.get tx sys_columns_tid col_k in
+      (match bytes_opt with
+       | None ->
+         let%lwt () = S.rollback tx in
+         Lwt.return (Error "column entry missing from catalog")
+       | Some old_bytes ->
+         let old_col_rec = decode_column old_bytes in
+         let new_col_rec = { old_col_rec with Row.name = new_col } in
+         let%lwt () = S.put tx sys_columns_tid col_k (encode_column new_col_rec) in
+         let%lwt () = S.commit tx in
+         let new_columns = List.mapi (fun j c ->
+           if j = i then { c with Row.name = new_col } else c
+         ) meta.columns in
+         Hashtbl.replace t.cache table_name { meta with columns = new_columns };
+         Lwt.return (Ok ()))
+
 (* ------------------------------------------------------------------ *)
 (* FTS public API                                                       *)
 (* ------------------------------------------------------------------ *)

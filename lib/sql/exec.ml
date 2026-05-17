@@ -1309,9 +1309,18 @@ let execute_with_count ?(mode = Auto)
        (match result with
         | Error msg -> Lwt.fail_with msg
         | Ok ()     -> Lwt.return 0)
-     | Ast.AA_rename_table _ | Ast.AA_rename_column _ ->
-       (* Implemented in Task 4 *)
-       Lwt.return 0)
+     | Ast.AA_rename_table new_name ->
+       let* result = Cat.rename_table cat
+           ~old_name:table_meta.Cat.name ~new_name in
+       (match result with
+        | Error msg -> Lwt.fail_with msg
+        | Ok ()     -> Lwt.return 0)
+     | Ast.AA_rename_column (old_col, new_col) ->
+       let* result = Cat.rename_column cat
+           ~table_name:table_meta.Cat.name ~old_col ~new_col in
+       (match result with
+        | Error msg -> Lwt.fail_with msg
+        | Ok ()     -> Lwt.return 0))
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
