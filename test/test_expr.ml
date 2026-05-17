@@ -613,6 +613,37 @@ let test_rshift_negative () =
   Alcotest.(check int64) "rshift_neg" (-2L) (match v with Row.V_int n -> n | _ -> 0L)
 
 (* ------------------------------------------------------------------ *)
+(* Group 10: LIKE and GLOB pattern matching                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_like_match () =
+  let row = [||] in
+  let like a p =
+    Exec.eval_expr [||] row
+      (Plan.P_binop (Plan.Like, Plan.P_lit (Ast.L_text a), Plan.P_lit (Ast.L_text p)))
+  in
+  Alcotest.(check int64) "like percent"    1L (match like "hello" "hel%"   with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "like underscore" 1L (match like "hello" "h_llo"  with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "like case"       1L (match like "Hello" "hello%"  with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "like no match"   0L (match like "hello" "world%"  with Row.V_int n -> n | _ -> -1L)
+
+let test_like_null () =
+  let row = [||] in
+  let v = Exec.eval_expr [||] row
+      (Plan.P_binop (Plan.Like, Plan.P_lit Ast.L_null, Plan.P_lit (Ast.L_text "%"))) in
+  Alcotest.(check bool) "like null" true (v = Row.V_null)
+
+let test_glob_match () =
+  let row = [||] in
+  let glob s p =
+    Exec.eval_expr [||] row
+      (Plan.P_binop (Plan.Glob, Plan.P_lit (Ast.L_text s), Plan.P_lit (Ast.L_text p)))
+  in
+  Alcotest.(check int64) "glob star"  1L (match glob "hello" "hel*"  with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "glob q"     1L (match glob "hello" "h?llo" with Row.V_int n -> n | _ -> -1L);
+  Alcotest.(check int64) "glob case"  0L (match glob "Hello" "hello*" with Row.V_int n -> n | _ -> -1L)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -704,5 +735,10 @@ let () =
       Alcotest.test_case "rshift"          `Quick test_rshift;
       Alcotest.test_case "rshift_negative" `Quick test_rshift_negative;
       Alcotest.test_case "bitnot"          `Quick test_bitnot;
+    ];
+    "like_glob", [
+      Alcotest.test_case "like_match" `Quick test_like_match;
+      Alcotest.test_case "like_null"  `Quick test_like_null;
+      Alcotest.test_case "glob_match" `Quick test_glob_match;
     ];
   ]

@@ -26,6 +26,7 @@
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
 %token VIRTUAL USING FTS5
 %token MATCH
+%token LIKE GLOB
 %token QUESTION
 %token STAR LPAREN RPAREN COMMA SEMI
 %token EQ NE LT LE GT GE
@@ -37,6 +38,7 @@
 %left AND
 %right NOT
 %nonassoc IS
+%nonassoc LIKE GLOB
 %left EQ NE LT LE GT GE
 %left PIPE
 %left AMPERSAND
@@ -269,6 +271,10 @@ expr:
   | a = expr RSHIFT    b = expr       { E_binop (Rshift, a, b) }
   | TILDE e = expr %prec TILDE        { E_bitnot e }
   | MINUS e = expr %prec UMINUS       { E_neg e }
+  | a = expr LIKE b = expr             { E_binop (Like, a, b) }
+  | a = expr NOT LIKE b = expr %prec LIKE { E_not (E_binop (Like, a, b)) }
+  | a = expr GLOB b = expr             { E_binop (Glob, a, b) }
+  | a = expr NOT GLOB b = expr %prec GLOB { E_not (E_binop (Glob, a, b)) }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
   | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }

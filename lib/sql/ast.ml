@@ -23,6 +23,7 @@ type binop =
   | Mod                            (** modulo % *)
   | Bit_and | Bit_or               (** bitwise & | *)
   | Lshift | Rshift                (** shift << >> *)
+  | Like | Glob                    (** pattern matching *)
 
 (** Aggregate functions supported in Phase 2 Task 6. *)
 type agg_func = Agg_count | Agg_sum | Agg_avg | Agg_min | Agg_max

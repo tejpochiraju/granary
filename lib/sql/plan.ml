@@ -6,6 +6,7 @@ module Cat = Sqlocaml_catalog.Catalog
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
            | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
+           | Like | Glob
 
 type expr =
   | P_lit         of Ast.literal

@@ -12,6 +12,7 @@ let plan_binop : Sema.binop -> Plan.binop = function
   | Sema.Mod     -> Plan.Mod
   | Sema.Bit_and -> Plan.Bit_and | Sema.Bit_or -> Plan.Bit_or
   | Sema.Lshift  -> Plan.Lshift  | Sema.Rshift -> Plan.Rshift
+  | Sema.Like -> Plan.Like | Sema.Glob -> Plan.Glob
 
 let rec plan_expr = function
   | Sema.BE_lit l               -> Plan.P_lit l

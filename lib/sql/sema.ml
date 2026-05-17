@@ -4,6 +4,7 @@ module Cat = Sqlocaml_catalog.Catalog
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
            | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
+           | Like | Glob
 
 type bound_expr =
   | BE_lit         of Ast.literal
@@ -178,6 +179,7 @@ let ast_binop_to_sema : Ast.binop -> binop = function
   | Ast.Mod     -> Mod
   | Ast.Bit_and -> Bit_and | Ast.Bit_or -> Bit_or
   | Ast.Lshift  -> Lshift  | Ast.Rshift -> Rshift
+  | Ast.Like -> Like | Ast.Glob -> Glob
 
 let rec bind_expr ~param_counter (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
@@ -1113,6 +1115,8 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
      | Eq | Ne | Lt | Le | Gt | Ge | And | Or ->
        Some Row.Integer
      | Bit_and | Bit_or | Lshift | Rshift | Mod ->
+       Some Row.Integer
+     | Like | Glob ->
        Some Row.Integer
      | Concat -> Some Row.Text
      | Add | Sub | Mul | Div ->

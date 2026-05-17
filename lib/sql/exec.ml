@@ -54,6 +54,25 @@ let value_truthy : Row.value -> bool = function
   | Row.V_null | Row.V_int 0L -> false
   | _                          -> true
 
+let rec like_match pat pi str si =
+  let plen = String.length pat and slen = String.length str in
+  if pi = plen then si = slen
+  else match pat.[pi] with
+  | '%' -> like_match pat (pi+1) str si ||
+            (si < slen && like_match pat pi str (si+1))
+  | '_' -> si < slen && like_match pat (pi+1) str (si+1)
+  | c   -> si < slen && Char.lowercase_ascii c = Char.lowercase_ascii str.[si] &&
+            like_match pat (pi+1) str (si+1)
+
+let rec glob_match pat pi str si =
+  let plen = String.length pat and slen = String.length str in
+  if pi = plen then si = slen
+  else match pat.[pi] with
+  | '*' -> glob_match pat (pi+1) str si ||
+            (si < slen && glob_match pat pi str (si+1))
+  | '?' -> si < slen && glob_match pat (pi+1) str (si+1)
+  | c   -> si < slen && c = str.[si] && glob_match pat (pi+1) str (si+1)
+
 let rec eval_expr (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
@@ -196,6 +215,18 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
      | Row.V_int a, Row.V_int b ->
        let n = Int64.to_int b in
        Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_right a n)
+     | _ -> Row.V_null)
+  | Plan.Like ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_text str, Row.V_text pat ->
+       Row.V_int (if like_match (String.lowercase_ascii pat) 0 (String.lowercase_ascii str) 0 then 1L else 0L)
+     | _ -> Row.V_null)
+  | Plan.Glob ->
+    (match lv, rv with
+     | Row.V_null, _ | _, Row.V_null -> Row.V_null
+     | Row.V_text str, Row.V_text pat ->
+       Row.V_int (if glob_match pat 0 str 0 then 1L else 0L)
      | _ -> Row.V_null)
 
 and cmp_result lv rv pred =
