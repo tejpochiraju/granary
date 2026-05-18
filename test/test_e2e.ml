@@ -3161,6 +3161,82 @@ let test_multi_join_regression_one () =
   let rows = query_ok db "SELECT a.v, b.w FROM a JOIN b ON a.id = b.aid" in
   Alcotest.(check int) "one row" 1 (List.length rows)
 
+(* ── Phase 10 edge cases ─────────────────────────────────────────── *)
+
+let test_case_in_order_by () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db
+    "SELECT v FROM t ORDER BY CASE v WHEN 1 THEN 3 WHEN 2 THEN 1 ELSE 2 END" in
+  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
+  Alcotest.(check (list int)) "case_order" [2; 3; 1] vals
+
+let test_case_with_func () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT)";
+  exec db "INSERT INTO t VALUES ('hello')";
+  let rows = query_ok db
+    "SELECT CASE WHEN LENGTH(s) > 3 THEN UPPER(s) ELSE s END FROM t" in
+  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
+  Alcotest.(check (list string)) "case_func" ["HELLO"] labels
+
+let test_case_in_update () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, v INTEGER)";
+  exec db "INSERT INTO t VALUES (1, 5)";
+  exec db "INSERT INTO t VALUES (2, -3)";
+  exec db "UPDATE t SET v = CASE WHEN v > 0 THEN v * 10 ELSE 0 END";
+  let rows = query_ok db "SELECT v FROM t ORDER BY id" in
+  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
+  Alcotest.(check (list int)) "update_case" [50; 0] vals
+
+let test_case_in_join () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER)";
+  exec db "CREATE TABLE b (aid INTEGER, v INTEGER)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (1, 10)";
+  exec db "INSERT INTO b VALUES (2, 20)";
+  let rows = query_ok db
+    "SELECT a.id, CASE WHEN b.v > 15 THEN 'big' ELSE 'small' END FROM a JOIN b ON a.id = b.aid ORDER BY a.id" in
+  Alcotest.(check int) "two rows" 2 (List.length rows);
+  let labels = List.map (fun r -> match r.(1) with Db.V_text s -> s | _ -> "?") rows in
+  Alcotest.(check (list string)) "labels" ["small"; "big"] labels
+
+let test_four_table_join () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER)";
+  exec db "CREATE TABLE b (aid INTEGER, bid INTEGER)";
+  exec db "CREATE TABLE c (bid INTEGER, cid INTEGER)";
+  exec db "CREATE TABLE d (cid INTEGER, v TEXT)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO b VALUES (1, 2)";
+  exec db "INSERT INTO c VALUES (2, 3)";
+  exec db "INSERT INTO d VALUES (3, 'found')";
+  let rows = query_ok db
+    "SELECT d.v FROM a JOIN b ON a.id = b.aid JOIN c ON b.bid = c.bid JOIN d ON c.cid = d.cid" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check string) "v" "found" (match (List.hd rows).(0) with Db.V_text s -> s | _ -> "?")
+
+let test_multi_join_middle_col () =
+  (* Tests qual_lookup resolving column on the MIDDLE table of a 3-way join *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER)";
+  exec db "CREATE TABLE b (aid INTEGER, val INTEGER)";
+  exec db "CREATE TABLE c (bid INTEGER, extra TEXT)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO b VALUES (1, 42)";
+  exec db "INSERT INTO c VALUES (42, 'x')";
+  let rows = query_ok db
+    "SELECT b.val FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check int) "b.val" 42
+    (match (List.hd rows).(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3476,5 +3552,13 @@ let () =
       Alcotest.test_case "two_left_joins"      `Quick test_two_left_joins;
       Alcotest.test_case "star_three_tables"   `Quick test_star_three_tables;
       Alcotest.test_case "regression_one_join" `Quick test_multi_join_regression_one;
+    ];
+    "phase10_edge", [
+      Alcotest.test_case "case_in_order_by"   `Quick test_case_in_order_by;
+      Alcotest.test_case "case_with_func"     `Quick test_case_with_func;
+      Alcotest.test_case "case_in_update"     `Quick test_case_in_update;
+      Alcotest.test_case "case_in_join"       `Quick test_case_in_join;
+      Alcotest.test_case "four_table_join"    `Quick test_four_table_join;
+      Alcotest.test_case "multi_join_mid_col" `Quick test_multi_join_middle_col;
     ];
   ]

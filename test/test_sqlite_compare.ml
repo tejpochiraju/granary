@@ -1871,6 +1871,113 @@ let phase9_check_error_cases = [
 
 ]
 
+(* ── phase10_case_when comparison cases ───────────────────────── *)
+
+let phase10_case_when_cases = [
+  { name    = "searched_basic";
+    setup   = ["CREATE TABLE t (v INTEGER)";
+               "INSERT INTO t VALUES (3)";
+               "INSERT INTO t VALUES (-1)";
+               "INSERT INTO t VALUES (0)"];
+    query   = "SELECT CASE WHEN v > 0 THEN 'pos' WHEN v < 0 THEN 'neg' ELSE 'zero' END FROM t ORDER BY v";
+    unordered = false };
+
+  { name    = "simple_basic";
+    setup   = ["CREATE TABLE t (v INTEGER)";
+               "INSERT INTO t VALUES (1)";
+               "INSERT INTO t VALUES (2)";
+               "INSERT INTO t VALUES (99)"];
+    query   = "SELECT CASE v WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t ORDER BY v";
+    unordered = false };
+
+  { name    = "no_else_no_match";
+    setup   = ["CREATE TABLE t (v INTEGER)"; "INSERT INTO t VALUES (5)"];
+    query   = "SELECT CASE WHEN v = 0 THEN 'zero' END FROM t";
+    unordered = false };
+
+  { name    = "case_in_where";
+    setup   = ["CREATE TABLE t (v INTEGER)";
+               "INSERT INTO t VALUES (1)";
+               "INSERT INTO t VALUES (2)";
+               "INSERT INTO t VALUES (3)"];
+    query   = "SELECT v FROM t WHERE CASE WHEN v > 1 THEN 1 ELSE 0 END = 1 ORDER BY v";
+    unordered = false };
+
+  { name    = "case_arithmetic_result";
+    setup   = ["CREATE TABLE t (v INTEGER)"; "INSERT INTO t VALUES (4)"];
+    query   = "SELECT CASE WHEN v > 2 THEN v * 10 ELSE v END FROM t";
+    unordered = false };
+
+  { name    = "case_with_null";
+    setup   = ["CREATE TABLE t (v INTEGER)"; "INSERT INTO t VALUES (NULL)"];
+    query   = "SELECT CASE WHEN v IS NULL THEN 'is_null' ELSE 'not_null' END FROM t";
+    unordered = false };
+
+  { name    = "case_simple_null_eq_semantics";
+    setup   = ["CREATE TABLE t (v INTEGER)"; "INSERT INTO t VALUES (NULL)"];
+    query   = "SELECT CASE v WHEN NULL THEN 1 ELSE 0 END FROM t";
+    unordered = false };
+
+  { name    = "case_in_select_and_where";
+    setup   = ["CREATE TABLE t (n INTEGER, s TEXT)";
+               "INSERT INTO t VALUES (1, 'a')";
+               "INSERT INTO t VALUES (2, 'b')"];
+    query   = "SELECT CASE n WHEN 1 THEN 'first' ELSE 'rest' END, s FROM t ORDER BY n";
+    unordered = false };
+]
+
+(* ── phase10_multi_join comparison cases ─────────────────────── *)
+
+let phase10_multi_join_cases = [
+  { name    = "three_table_join";
+    setup   = ["CREATE TABLE a (id INTEGER, name TEXT)";
+               "CREATE TABLE b (aid INTEGER, val INTEGER)";
+               "CREATE TABLE c (bid INTEGER, extra TEXT)";
+               "INSERT INTO a VALUES (1, 'alice')";
+               "INSERT INTO b VALUES (1, 42)";
+               "INSERT INTO c VALUES (42, 'extra')"];
+    query   = "SELECT a.name, b.val, c.extra FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid";
+    unordered = false };
+
+  { name    = "two_joins_filtered";
+    setup   = ["CREATE TABLE u (id INTEGER, name TEXT)";
+               "CREATE TABLE o (uid INTEGER, item TEXT)";
+               "CREATE TABLE p (item TEXT, price INTEGER)";
+               "INSERT INTO u VALUES (1, 'alice'), (2, 'bob')";
+               "INSERT INTO o VALUES (1, 'hat'), (2, 'book')";
+               "INSERT INTO p VALUES ('hat', 10), ('book', 5)"];
+    query   = "SELECT u.name, p.price FROM u JOIN o ON u.id = o.uid JOIN p ON o.item = p.item ORDER BY u.name";
+    unordered = false };
+
+  { name    = "two_left_joins";
+    setup   = ["CREATE TABLE a (id INTEGER)";
+               "CREATE TABLE b (aid INTEGER, v TEXT)";
+               "CREATE TABLE c (aid INTEGER, w TEXT)";
+               "INSERT INTO a VALUES (1), (2)";
+               "INSERT INTO b VALUES (1, 'B1')";
+               "INSERT INTO c VALUES (2, 'C2')"];
+    query   = "SELECT a.id, b.v, c.w FROM a LEFT JOIN b ON a.id = b.aid LEFT JOIN c ON a.id = c.aid ORDER BY a.id";
+    unordered = false };
+
+  { name    = "three_join_aggregate";
+    setup   = ["CREATE TABLE dept (id INTEGER, name TEXT)";
+               "CREATE TABLE emp (id INTEGER, dept_id INTEGER, name TEXT)";
+               "CREATE TABLE sal (emp_id INTEGER, amount INTEGER)";
+               "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
+               "INSERT INTO emp VALUES (1, 1, 'alice'), (2, 1, 'bob'), (3, 2, 'carol')";
+               "INSERT INTO sal VALUES (1, 100), (2, 90), (3, 80)"];
+    query   = "SELECT dept.name, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id JOIN sal ON emp.id = sal.emp_id GROUP BY dept.name ORDER BY dept.name";
+    unordered = false };
+
+  { name    = "case_in_multi_join";
+    setup   = ["CREATE TABLE a (id INTEGER)";
+               "CREATE TABLE b (aid INTEGER, v INTEGER)";
+               "INSERT INTO a VALUES (1), (2)";
+               "INSERT INTO b VALUES (1, 10), (2, 20)"];
+    query   = "SELECT a.id, CASE WHEN b.v > 15 THEN 'big' ELSE 'small' END FROM a JOIN b ON a.id = b.aid ORDER BY a.id";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -1880,4 +1987,6 @@ let () =
     "phase9_check",      (List.map make_test phase9_check_cases
                           @ List.map make_check_error_test phase9_check_error_cases);
     "phase9_fk",         List.map make_test phase9_fk_cases;
+    "phase10_case_when", List.map make_test phase10_case_when_cases;
+    "phase10_multi_join", List.map make_test phase10_multi_join_cases;
   ]
