@@ -2243,6 +2243,109 @@ let phase12_correlated_cases = [
     unordered = false };
 ]
 
+(* ── Phase 13: UPSERT comparison tests ─────────────────────────── *)
+
+let phase13_upsert_cases = [
+  { name = "upsert_basic";
+    setup = [
+      "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL)";
+      "CREATE UNIQUE INDEX kv_k ON kv (k)";
+      "INSERT INTO kv VALUES (1, 'old')";
+      "INSERT INTO kv VALUES (1, 'new') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    ];
+    query = "SELECT k, v FROM kv";
+    unordered = false };
+
+  { name = "upsert_no_conflict";
+    setup = [
+      "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL)";
+      "CREATE UNIQUE INDEX kv_k ON kv (k)";
+      "INSERT INTO kv VALUES (1, 'first')";
+      "INSERT INTO kv VALUES (2, 'second') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    ];
+    query = "SELECT k, v FROM kv ORDER BY k";
+    unordered = false };
+
+  { name = "upsert_increment";
+    setup = [
+      "CREATE TABLE counters (name TEXT NOT NULL, cnt INTEGER NOT NULL)";
+      "CREATE UNIQUE INDEX cnt_name ON counters (name)";
+      "INSERT INTO counters VALUES ('hits', 1)";
+      "INSERT INTO counters VALUES ('hits', 0) ON CONFLICT(name) DO UPDATE SET cnt = cnt + 1";
+    ];
+    query = "SELECT name, cnt FROM counters";
+    unordered = false };
+
+  { name = "upsert_multi_assign";
+    setup = [
+      "CREATE TABLE t (id INTEGER, a TEXT, b TEXT)";
+      "CREATE UNIQUE INDEX t_id ON t (id)";
+      "INSERT INTO t VALUES (1, 'a1', 'b1')";
+      "INSERT INTO t VALUES (1, 'a2', 'b2') ON CONFLICT(id) DO UPDATE SET a = excluded.a, b = excluded.b";
+    ];
+    query = "SELECT a, b FROM t WHERE id = 1";
+    unordered = false };
+
+  { name = "upsert_preserves_others";
+    setup = [
+      "CREATE TABLE kv (k INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX kv_k2 ON kv (k)";
+      "INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+      "INSERT INTO kv VALUES (2, 'B') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    ];
+    query = "SELECT k, v FROM kv ORDER BY k";
+    unordered = false };
+]
+
+(* ── Phase 13: Views comparison tests ──────────────────────────── *)
+
+let phase13_view_cases = [
+  { name = "view_basic";
+    setup = [
+      "CREATE TABLE users (id INTEGER, name TEXT, active INTEGER)";
+      "INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)";
+      "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1";
+    ];
+    query = "SELECT name FROM active_users ORDER BY id";
+    unordered = false };
+
+  { name = "view_filter";
+    setup = [
+      "CREATE TABLE products (id INTEGER, name TEXT, price INTEGER)";
+      "INSERT INTO products VALUES (1, 'A', 10), (2, 'B', 20), (3, 'C', 5)";
+      "CREATE VIEW cheap AS SELECT id, name, price FROM products WHERE price < 15";
+    ];
+    query = "SELECT name FROM cheap ORDER BY price";
+    unordered = false };
+
+  { name = "view_aggregation";
+    setup = [
+      "CREATE TABLE orders (customer TEXT, amount INTEGER)";
+      "INSERT INTO orders VALUES ('Alice', 100), ('Alice', 200), ('Bob', 50)";
+      "CREATE VIEW order_counts AS SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer";
+    ];
+    query = "SELECT customer, cnt FROM order_counts ORDER BY customer";
+    unordered = false };
+
+  { name = "view_count";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (1), (2), (3), (4), (5)";
+      "CREATE VIEW big AS SELECT x FROM t WHERE x > 2";
+    ];
+    query = "SELECT COUNT(*) FROM big";
+    unordered = false };
+
+  { name = "view_sum";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (10), (20), (30)";
+      "CREATE VIEW all_t AS SELECT x FROM t";
+    ];
+    query = "SELECT SUM(x) FROM all_t";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2259,4 +2362,6 @@ let () =
     "phase12_cte",        List.map make_test phase12_cte_cases;
     "phase12_multirow",   List.map make_test phase12_multirow_cases;
     "phase12_correlated", List.map make_test phase12_correlated_cases;
+    "phase13_upsert",     List.map make_test phase13_upsert_cases;
+    "phase13_view",       List.map make_test phase13_view_cases;
   ]
