@@ -2126,44 +2126,53 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
      done
 
    | Ast.WF_percent_rank ->
-     (* PERCENT_RANK = (rank - 1) / (n - 1), where rank = 1 + #{rows with strictly smaller ORDER BY key} *)
-     let peer_vals pos =
-       List.map (fun (e, _) -> eval_expr clock params sorted_rows.(pos) e) wplan.Plan.order_by
-     in
-     for pos = 0 to n - 1 do
-       let rank =
-         if wplan.Plan.order_by = [] then 1
-         else
-           let cur_vals = peer_vals pos in
-           let strictly_before i =
-             List.fold_left2 (fun acc a b ->
-               if acc <> 0 then acc else compare_values a b
-             ) 0 (peer_vals i) cur_vals < 0
-           in
-           1 + List.length (List.filter strictly_before (List.init pos (fun i -> i)))
-       in
-       let pct = if n <= 1 then 0.0
-                 else Float.of_int (rank - 1) /. Float.of_int (n - 1) in
-       results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
-     done
+     (* PERCENT_RANK = peer_group_start / (n - 1).
+        Use positional adjacency in the already-direction-sorted array so that
+        DESC order works correctly without needing to know the sort direction. *)
+     if n = 0 then ()
+     else begin
+       let peer_start = ref 0 in
+       for pos = 0 to n - 1 do
+         if pos > 0 then begin
+           let order_changed = List.exists (fun (e, _) ->
+             compare_values
+               (eval_expr clock params sorted_rows.(pos)   e)
+               (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+           ) wplan.Plan.order_by in
+           if order_changed then peer_start := pos
+         end;
+         let pct = if n <= 1 then 0.0
+                   else Float.of_int !peer_start /. Float.of_int (n - 1) in
+         results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
+       done
+     end
 
    | Ast.WF_cume_dist ->
-     (* CUME_DIST = count(rows with ORDER BY key <= current) / n *)
-     let peer_vals pos =
-       List.map (fun (e, _) -> eval_expr clock params sorted_rows.(pos) e) wplan.Plan.order_by
-     in
-     for pos = 0 to n - 1 do
-       let cur_vals = peer_vals pos in
-       let at_or_before i =
-         if wplan.Plan.order_by = [] then true
-         else
-           List.fold_left2 (fun acc a b ->
-             if acc <> 0 then acc else compare_values a b
-           ) 0 (peer_vals i) cur_vals <= 0
-       in
-       let count = List.length (List.filter at_or_before (List.init n (fun i -> i))) in
-       results.(sorted_orig_idxs.(pos)) <- Row.V_real (Float.of_int count /. Float.of_int n)
-     done
+     (* CUME_DIST = (last position in peer group + 1) / n.
+        Use positional adjacency in the already-direction-sorted array so that
+        DESC order works correctly without needing to know the sort direction. *)
+     if n = 0 then ()
+     else begin
+       let pos = ref 0 in
+       while !pos < n do
+         (* Find the end of the current peer group *)
+         let peer_end = ref !pos in
+         while !peer_end + 1 < n &&
+               List.for_all (fun (e, _) ->
+                 compare_values
+                   (eval_expr clock params sorted_rows.(!peer_end + 1) e)
+                   (eval_expr clock params sorted_rows.(!peer_end)     e) = 0
+               ) wplan.Plan.order_by
+         do
+           incr peer_end
+         done;
+         let cd = Float.of_int (!peer_end + 1) /. Float.of_int n in
+         for i = !pos to !peer_end do
+           results.(sorted_orig_idxs.(i)) <- Row.V_real cd
+         done;
+         pos := !peer_end + 1
+       done
+     end
 
    | Ast.WF_agg agg_func ->
      let has_order = wplan.Plan.order_by <> [] in

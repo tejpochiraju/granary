@@ -4013,6 +4013,62 @@ let test_window_cume_dist () =
       "cume_dist" [(10, 0.25); (20, 0.75); (20, 0.75); (30, 1.0)] pairs;
     Lwt.return_unit)
 
+let test_window_percent_rank_desc () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE pr_desc (s INTEGER)" in
+    let* () = exec "INSERT INTO pr_desc VALUES (10)" in
+    let* () = exec "INSERT INTO pr_desc VALUES (20)" in
+    let* () = exec "INSERT INTO pr_desc VALUES (20)" in
+    let* () = exec "INSERT INTO pr_desc VALUES (30)" in
+    let* rows_r = Db.query db
+      "SELECT s, PERCENT_RANK() OVER (ORDER BY s DESC) FROM pr_desc ORDER BY s DESC" in
+    let rows = match rows_r with
+      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    (* DESC order: [30, 20, 20, 10]; rank(30)=1->0/3=0.0; rank(20)=2->1/3≈0.333; rank(10)=4->3/3=1.0 *)
+    let pairs = List.map (function
+      | [|Db.V_int s; Db.V_real pr|] ->
+        (Int64.to_int s, Float.round (pr *. 1000.0) /. 1000.0)
+      | _ -> (-1, -1.0)) rows in
+    Alcotest.(check (list (pair int (float 0.001))))
+      "percent_rank_desc" [(30, 0.0); (20, 0.333); (20, 0.333); (10, 1.0)] pairs;
+    Lwt.return_unit)
+
+let test_window_cume_dist_desc () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE cd_desc (s INTEGER)" in
+    let* () = exec "INSERT INTO cd_desc VALUES (10)" in
+    let* () = exec "INSERT INTO cd_desc VALUES (20)" in
+    let* () = exec "INSERT INTO cd_desc VALUES (20)" in
+    let* () = exec "INSERT INTO cd_desc VALUES (30)" in
+    let* rows_r = Db.query db
+      "SELECT s, CUME_DIST() OVER (ORDER BY s DESC) FROM cd_desc ORDER BY s DESC" in
+    let rows = match rows_r with
+      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    (* DESC order: [30, 20, 20, 10]; <=30(desc): 1->0.25; <=20(desc): 3->0.75; <=10(desc): 4->1.0 *)
+    let pairs = List.map (function
+      | [|Db.V_int s; Db.V_real cd|] ->
+        (Int64.to_int s, Float.round (cd *. 100.0) /. 100.0)
+      | _ -> (-1, -1.0)) rows in
+    Alcotest.(check (list (pair int (float 0.01))))
+      "cume_dist_desc" [(30, 0.25); (20, 0.75); (20, 0.75); (10, 1.0)] pairs;
+    Lwt.return_unit)
+
 let test_collate_nocase_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
@@ -4471,8 +4527,10 @@ let () =
       Alcotest.test_case "orderby_alias"    `Quick test_window_orderby_alias;
       Alcotest.test_case "rows_frame"       `Quick test_window_rows_frame;
       Alcotest.test_case "rows_unbounded"   `Quick test_window_rows_unbounded;
-      Alcotest.test_case "percent_rank"     `Quick test_window_percent_rank;
-      Alcotest.test_case "cume_dist"        `Quick test_window_cume_dist;
+      Alcotest.test_case "percent_rank"      `Quick test_window_percent_rank;
+      Alcotest.test_case "cume_dist"         `Quick test_window_cume_dist;
+      Alcotest.test_case "percent_rank_desc" `Quick test_window_percent_rank_desc;
+      Alcotest.test_case "cume_dist_desc"    `Quick test_window_cume_dist_desc;
     ];
     "recursive_cte", [
       Alcotest.test_case "series"                  `Quick test_recursive_cte_series;
