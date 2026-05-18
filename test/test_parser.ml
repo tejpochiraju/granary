@@ -230,19 +230,19 @@ let create_index_missing_column_list () =
 let parse_concat () =
   let s = parse "SELECT a || b FROM t" in
   match s with
-  | Ast.S_select { proj = `Exprs [Ast.E_binop (Ast.Concat, Ast.E_col "a", Ast.E_col "b")]; _ } -> ()
+  | Ast.S_select { proj = `Exprs [(Ast.E_binop (Ast.Concat, Ast.E_col "a", Ast.E_col "b"), _)]; _ } -> ()
   | _ -> Alcotest.fail "expected concat binop"
 
 let parse_mod () =
   let s = parse "SELECT 7 % 3 FROM t" in
   match s with
-  | Ast.S_select { proj = `Exprs [Ast.E_binop (Ast.Mod, Ast.E_lit (Ast.L_int 7L), Ast.E_lit (Ast.L_int 3L))]; _ } -> ()
+  | Ast.S_select { proj = `Exprs [(Ast.E_binop (Ast.Mod, Ast.E_lit (Ast.L_int 7L), Ast.E_lit (Ast.L_int 3L)), _)]; _ } -> ()
   | _ -> Alcotest.fail "expected mod binop"
 
 let parse_bitnot () =
   let s = parse "SELECT ~5 FROM t" in
   match s with
-  | Ast.S_select { proj = `Exprs [Ast.E_bitnot (Ast.E_lit (Ast.L_int 5L))]; _ } -> ()
+  | Ast.S_select { proj = `Exprs [(Ast.E_bitnot (Ast.E_lit (Ast.L_int 5L)), _)]; _ } -> ()
   | _ -> Alcotest.fail "expected bitnot"
 
 (* ------------------------------------------------------------------ *)

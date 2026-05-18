@@ -56,7 +56,7 @@ type op =
       child    : op;
     }
   | Op_expr_project of {
-      exprs : expr list;
+      exprs : (expr * string option) list;
       child : op;
     }
   | Op_sort of {

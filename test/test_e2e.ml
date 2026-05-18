@@ -3339,6 +3339,55 @@ let test_iif_false () =
   Alcotest.(check row_testable) "iif false branch"
     [| Db.V_text "small" |] (List.nth rows 0)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 11: Column aliases                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_col_alias_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db "SELECT n * 2 AS doubled FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "expr with alias"
+    [| Db.V_int 6L |] (List.nth rows 0)
+
+let test_col_alias_order_by () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  let rows = query_ok db "SELECT n * 10 AS big FROM t ORDER BY big" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_int 10L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "row 1" [| Db.V_int 20L |] (List.nth rows 1);
+  Alcotest.(check row_testable) "row 2" [| Db.V_int 30L |] (List.nth rows 2)
+
+let test_col_alias_multiple () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
+  exec db "INSERT INTO t VALUES (2, 3)";
+  let rows = query_ok db "SELECT a + b AS sum, a * b AS product FROM t" in
+  Alcotest.(check row_testable) "two aliased cols"
+    [| Db.V_int 5L; Db.V_int 6L |] (List.nth rows 0)
+
+let test_col_alias_mixed () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (4)";
+  let rows = query_ok db "SELECT n, n * 2 AS doubled FROM t" in
+  Alcotest.(check row_testable) "mixed proj"
+    [| Db.V_int 4L; Db.V_int 8L |] (List.nth rows 0)
+
+let test_col_alias_cast () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (7)";
+  let rows = query_ok db "SELECT CAST(n AS TEXT) AS s FROM t" in
+  Alcotest.(check row_testable) "cast with alias"
+    [| Db.V_text "7" |] (List.nth rows 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3678,5 +3727,12 @@ let () =
       Alcotest.test_case "nullif_unequal" `Quick test_nullif_unequal;
       Alcotest.test_case "iif_true"       `Quick test_iif_true;
       Alcotest.test_case "iif_false"      `Quick test_iif_false;
+    ];
+    "col_alias", [
+      Alcotest.test_case "basic"     `Quick test_col_alias_basic;
+      Alcotest.test_case "order_by"  `Quick test_col_alias_order_by;
+      Alcotest.test_case "multiple"  `Quick test_col_alias_multiple;
+      Alcotest.test_case "mixed"     `Quick test_col_alias_mixed;
+      Alcotest.test_case "cast"      `Quick test_col_alias_cast;
     ];
   ]

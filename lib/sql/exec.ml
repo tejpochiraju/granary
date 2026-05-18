@@ -1741,7 +1741,10 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
-    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
+    let* exprs' = Lwt_list.map_s
+      (fun (e, _alias) -> pre_eval_subquery clock store params cat e)
+      exprs
+    in
     let eval_exprs row =
       Array.of_list (List.map (eval_expr clock params row) exprs')
     in

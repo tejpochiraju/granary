@@ -126,7 +126,7 @@ and stmt =
     }
   | S_select of {
       distinct : bool;
-      proj     : [ `All | `Cols of string list | `Exprs of expr list ];
+      proj     : [ `All | `Cols of string list | `Exprs of (expr * string option) list ];
         (** [`Exprs] supports arbitrary projection expressions (used for
             aggregates).  Plain column projection still parses to
             [`Cols]. *)

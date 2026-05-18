@@ -69,8 +69,9 @@ type bound_stmt =
       distinct   : bool;
       table_meta : Cat.table_meta;
       proj       : int list;
-      expr_proj  : bound_expr list;
-        (** Non-empty when projection contains scalar functions (Phase 5).
+      expr_proj  : (bound_expr * string option) list;
+        (** Non-empty when projection contains scalar functions (Phase 5)
+            or aliased expressions (Phase 11).
             When non-empty, [proj] is empty and [expr_proj] governs the
             output columns. *)
       where      : bound_expr option;
@@ -1092,7 +1093,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
        let proj_has_agg =
          match proj with
          | `All | `Cols _ -> false
-         | `Exprs es -> List.exists expr_has_agg es
+         | `Exprs es -> List.exists (fun (e, _) -> expr_has_agg e) es
        in
        let having_has_agg =
          match having with
@@ -1122,7 +1123,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
           [expr_proj] is non-empty only for scalar-function projections
           (Phase 5); [col_ordinals] is empty in that case. *)
        let proj_result :
-           (int list * agg_proj_item list * agg_spec list * bound_expr list,
+           (int list * agg_proj_item list * agg_spec list * (bound_expr * string option) list,
             error) result =
          if not is_aggregated then
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
@@ -1150,16 +1151,18 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                     | Ok i    -> Ok (`Ords (ords @ [i])))
                ) (Ok (`Ords [])) names
              | `Exprs es ->
-               (* Phase 5: scalar function (or general expr) projection.
-                  Bind each expression; return as BE list. *)
-               let bound_list = List.map bind_one es in
-               let errors = List.filter_map
-                 (function Error e -> Some e | Ok _ -> None) bound_list in
+               (* Phase 5 / Phase 11: arbitrary expr projection with optional alias. *)
+               let bound_list = List.map (fun (e, alias) ->
+                 match bind_one e with
+                 | Ok be   -> Ok (be, alias)
+                 | Error e -> Error e
+               ) es in
+               let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound_list in
                (match errors with
                 | e :: _ -> Error e
                 | [] ->
                   Ok (`Exprs (List.filter_map
-                    (function Ok e -> Some e | Error _ -> None) bound_list)))
+                    (function Ok p -> Some p | Error _ -> None) bound_list)))
            in
            (match ords_result with
             | Error e -> Error e
@@ -1250,7 +1253,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                 | Some _ -> [] (* unused — won't reach here *)
                 | None -> [])
              | `Cols names -> List.map (fun n -> Ast.E_col n) names
-             | `Exprs es -> es
+             | `Exprs es -> List.map fst es
            in
            if exprs_to_project = [] && proj = `All && is_aggregated then
              Error (Unsupported "SELECT * with aggregates requires explicit columns")
@@ -1363,18 +1366,35 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                  | Error e -> Lwt.return (Error e)
                  | Ok (bound_having, having_aggs) ->
                 let all_aggs = proj_aggs @ having_aggs in
+                (* alias_map: name → bound_expr for ORDER BY alias resolution *)
+                let alias_map : (string * bound_expr) list =
+                  List.filter_map (fun (be, alias_opt) ->
+                    Option.map (fun a -> (a, be)) alias_opt
+                  ) proj_exprs
+                in
+                let bind_order_expr e =
+                  let base_result =
+                    if joined_pairs = [] then
+                      bind_expr ~param_counter ~named_params meta e
+                    else
+                      bind_expr_join ~param_counter ~named_params ~tables e
+                  in
+                  match base_result with
+                  | Ok _ -> base_result
+                  | Error _ ->
+                    (match e with
+                     | Ast.E_col name ->
+                       (match List.assoc_opt name alias_map with
+                        | Some be -> Ok be
+                        | None    -> base_result)
+                     | _ -> base_result)
+                in
                 let order_result =
                   List.fold_left (fun acc (ok : Ast.order_key) ->
                     match acc with
                     | Error _ -> acc
                     | Ok keys ->
-                      let bound_e =
-                        if joined_pairs = [] then
-                          bind_expr ~param_counter ~named_params meta ok.Ast.expr
-                        else
-                          bind_expr_join ~param_counter ~named_params ~tables ok.Ast.expr
-                      in
-                      (match bound_e with
+                      (match bind_order_expr ok.Ast.expr with
                        | Error e -> Error e
                        | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir }]))
                   ) (Ok []) order

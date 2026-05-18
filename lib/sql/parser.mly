@@ -249,7 +249,7 @@ select:
                    order = ob; limit; offset }
       | None ->
         let exprs = match proj with
-          | `Exprs es -> es
+          | `Exprs es -> List.map fst es
           | `Cols names -> List.map (fun n -> E_col n) names
           | `All -> []
         in
@@ -296,13 +296,13 @@ projection:
   | items = separated_nonempty_list(COMMA, proj_item)
     { (* If every item is a plain column reference, produce `Cols
          (preserves existing AST shape).  Otherwise produce `Exprs. *)
-      let all_cols = List.for_all (function `Col _ -> true | _ -> false) items in
-      if all_cols then
+      let all_plain_cols = List.for_all (function `Col _ -> true | _ -> false) items in
+      if all_plain_cols then
         `Cols (List.map (function `Col c -> c | _ -> assert false) items)
       else
         `Exprs (List.map (function
-          | `Col c -> E_col c
-          | `Expr e -> e) items) }
+          | `Col c         -> (Ast.E_col c, None)
+          | `ExprA (e, a)  -> (e, a)) items) }
 
 scalar_expr:
   | LENGTH   LPAREN e = expr RPAREN                                   { E_func (Fn_length,   [e]) }
@@ -361,7 +361,8 @@ scalar_expr:
                else_     = Some f } }
 
 proj_item:
-  | e = expr { match e with E_col name -> `Col name | _ -> `Expr e }
+  | e = expr AS alias = IDENT { `ExprA (e, Some alias) }
+  | e = expr { match e with E_col name -> `Col name | _ -> `ExprA (e, None) }
 
 where_opt:
   |                { None }

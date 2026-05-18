@@ -93,7 +93,7 @@ type bound_stmt =
                                             (refer to the combined row when [join] is set)
                                             — used when this is NOT an aggregated query
                                             and [expr_proj] is empty *)
-      expr_proj  : bound_expr list;
+      expr_proj  : (bound_expr * string option) list;
         (** Phase 5: non-empty when projection contains scalar functions
             or other arbitrary expressions.  When non-empty, [proj] is
             empty and [expr_proj] governs the output columns. *)

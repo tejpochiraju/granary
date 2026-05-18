@@ -224,7 +224,7 @@ let plan_select cat
       }
     else if expr_proj <> [] then
       Plan.Op_expr_project {
-        exprs = List.map plan_expr expr_proj;
+        exprs = List.map (fun (be, alias) -> (plan_expr be, alias)) expr_proj;
         child = after_sort;
       }
     else
@@ -328,7 +328,7 @@ let rec plan ?cat = function
            }
          else if expr_proj <> [] then
            Plan.Op_expr_project {
-             exprs = List.map plan_expr expr_proj;
+             exprs = List.map (fun (be, alias) -> (plan_expr be, alias)) expr_proj;
              child = after_sort;
            }
          else
