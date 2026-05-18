@@ -380,6 +380,8 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
     (match bind_expr ~param_counter ~named_params meta e with
      | Ok be   -> Ok (BE_cast (be, ty))
      | Error e -> Error e)
+  | Ast.E_window _ ->
+    Error (Unsupported "window functions not yet supported in single-table context")
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -530,6 +532,8 @@ let rec bind_expr_join
     (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be   -> Ok (BE_cast (be, ty))
      | Error e -> Error e)
+  | Ast.E_window _ ->
+    Error (Unsupported "window functions not yet supported in join context")
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -700,6 +704,8 @@ let bind_expr_agg
                Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
     | Ast.E_cast (e, ty) ->
       (match go e with Ok be -> Ok (BE_cast (be, ty)) | Error e -> Error e)
+    | Ast.E_window _ ->
+      Error (Unsupported "window functions not yet supported in aggregate context")
   in
   match go e with
   | Error e -> Error e
@@ -742,6 +748,7 @@ let rec expr_has_agg = function
     || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
     || (match else_ with Some e -> expr_has_agg e | None -> false)
   | Ast.E_cast (e, _) -> expr_has_agg e
+  | Ast.E_window _ -> false
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -774,6 +781,7 @@ let bind_create cat ~name ~columns ~constraints =
         || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
         || (match else_ with Some e -> check_expr_unsupported e | None -> false)
       | Ast.E_cast _ -> false
+      | Ast.E_window _ -> true
     in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
       match c.check with
@@ -1869,7 +1877,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        (match Hashtbl.find_opt views table with
         | Some view_def ->
           bind_internal ~views ~named_params ~param_counter cat
-            (Ast.S_with_cte { name = table; def = view_def; query = sel })
+            (Ast.S_with_cte { name = table; def = view_def; query = sel; recursive = false })
         | None ->
           bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias
             ~joins ~where ~group_by ~having ~order ~limit ~offset))
@@ -1912,7 +1920,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
      | [] ->
        let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
-  | Ast.S_with_cte { name; def; query } ->
+  | Ast.S_with_cte { name; def; query; recursive = _ } ->
     let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
     (match def_r with
      | Error e -> Lwt.return (Error e)

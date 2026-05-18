@@ -45,6 +45,7 @@
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
+%token OVER PARTITION RECURSIVE
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -103,7 +104,9 @@ stmt:
 
 with_cte:
   | WITH name = IDENT AS LPAREN def = compound_select RPAREN query = compound_select
-    { Ast.S_with_cte { name; def; query } }
+    { Ast.S_with_cte { name; def; query; recursive = false } }
+  | WITH RECURSIVE name = IDENT AS LPAREN def = compound_select RPAREN query = compound_select
+    { Ast.S_with_cte { name; def; query; recursive = true } }
 
 pragma_stmt:
   | PRAGMA name = IDENT LPAREN arg = IDENT RPAREN
@@ -419,13 +422,57 @@ limit_clause:
   | LIMIT n = INT_LIT                       { (Some (Int64.to_int n), None) }
   | LIMIT n = INT_LIT OFFSET m = INT_LIT   { (Some (Int64.to_int n), Some (Int64.to_int m)) }
 
-agg_expr:
-  | COUNT LPAREN STAR RPAREN          { E_agg (Agg_count, None) }
-  | COUNT LPAREN e = expr RPAREN      { E_agg (Agg_count, Some e) }
-  | SUM   LPAREN e = expr RPAREN      { E_agg (Agg_sum,   Some e) }
-  | AVG   LPAREN e = expr RPAREN      { E_agg (Agg_avg,   Some e) }
-  | MIN   LPAREN e = expr RPAREN      { E_agg (Agg_min,   Some e) }
-  | MAX   LPAREN e = expr RPAREN      { E_agg (Agg_max,   Some e) }
+agg_or_window_expr:
+  | COUNT LPAREN STAR RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_count, None)
+      | Some w -> E_window { func = WF_agg Agg_count; args = []; window = w } }
+  | COUNT LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_count, Some e)
+      | Some w -> E_window { func = WF_agg Agg_count; args = [e]; window = w } }
+  | SUM LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_sum, Some e)
+      | Some w -> E_window { func = WF_agg Agg_sum; args = [e]; window = w } }
+  | AVG LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_avg, Some e)
+      | Some w -> E_window { func = WF_agg Agg_avg; args = [e]; window = w } }
+  | MIN LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_min, Some e)
+      | Some w -> E_window { func = WF_agg Agg_min; args = [e]; window = w } }
+  | MAX LPAREN e = expr RPAREN ow = option(preceded(OVER, window_spec))
+    { match ow with
+      | None   -> E_agg (Agg_max, Some e)
+      | Some w -> E_window { func = WF_agg Agg_max; args = [e]; window = w } }
+
+window_spec:
+  | LPAREN pb = partition_clause ob = order_by_clause RPAREN
+    { Ast.{ partition_by = pb; order_by = ob } }
+
+partition_clause:
+  |                                                                   { [] }
+  | PARTITION BY es = separated_nonempty_list(COMMA, expr)           { es }
+
+window_func_args:
+  |                                                                   { [] }
+  | es = separated_nonempty_list(COMMA, expr)                        { es }
+
+window_func_name:
+  | id = IDENT
+    { match String.uppercase_ascii id with
+      | "ROW_NUMBER"  -> Ast.WF_row_number
+      | "RANK"        -> Ast.WF_rank
+      | "DENSE_RANK"  -> Ast.WF_dense_rank
+      | "NTILE"       -> Ast.WF_ntile
+      | "LAG"         -> Ast.WF_lag
+      | "LEAD"        -> Ast.WF_lead
+      | "FIRST_VALUE" -> Ast.WF_first_value
+      | "LAST_VALUE"  -> Ast.WF_last_value
+      | "NTH_VALUE"   -> Ast.WF_nth_value
+      | other         -> failwith (Printf.sprintf "Unknown window function: %s" other) }
 
 when_clause:
   | WHEN cond = expr THEN result = expr { (cond, result) }
@@ -447,7 +494,7 @@ between_bound:
   | l = literal                            { E_lit l }
   | name = IDENT                           { E_col name }
   | t = IDENT DOT c = IDENT               { E_tbl_col (t, c) }
-  | e = agg_expr                           { e }
+  | e = agg_or_window_expr                 { e }
   | e = scalar_expr                        { e }
   | NOT e = between_bound                  { E_not e }
   | a = between_bound EQ  b = between_bound { E_binop (Eq,  a, b) }
@@ -480,8 +527,10 @@ expr:
   | l = literal                       { E_lit l }
   | name = IDENT                      { E_col name }
   | t = IDENT DOT c = IDENT           { E_tbl_col (t, c) }
-  | e = agg_expr                      { e }
+  | e = agg_or_window_expr            { e }
   | e = scalar_expr                   { e }
+  | func = window_func_name LPAREN args = window_func_args RPAREN OVER ws = window_spec
+    { E_window { func; args; window = ws } }
   | a = expr AND b = expr             { E_binop (And, a, b) }
   | a = expr OR  b = expr             { E_binop (Or,  a, b) }
   | NOT e = expr                      { E_not e }

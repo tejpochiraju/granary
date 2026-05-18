@@ -98,6 +98,29 @@ type expr =
     }
   | E_cast of expr * ty
     (** CAST(expr AS type) — SQLite type coercion *)
+  | E_window of {
+      func   : window_func;
+      args   : expr list;
+      window : window_spec;
+    }
+    (** Window function call: FUNC(...) OVER (PARTITION BY ... ORDER BY ...) *)
+
+and window_func =
+  | WF_row_number
+  | WF_rank
+  | WF_dense_rank
+  | WF_ntile
+  | WF_lag
+  | WF_lead
+  | WF_first_value
+  | WF_last_value
+  | WF_nth_value
+  | WF_agg of agg_func
+
+and window_spec = {
+  partition_by : expr list;
+  order_by     : order_key list;
+}
 
 and order_key = {
   expr : expr;
@@ -194,9 +217,10 @@ and stmt =
       exprs : expr list;
     }
   | S_with_cte of {
-      name  : string;
-      def   : stmt;
-      query : stmt;
+      name      : string;
+      def       : stmt;
+      query     : stmt;
+      recursive : bool;
     }
   | S_create_view of {
       name  : string;
@@ -288,5 +312,5 @@ let rec expr_to_sql = function
       | Ty_real -> "REAL"    | Ty_blob -> "BLOB"
     in
     Printf.sprintf "CAST(%s AS %s)" (expr_to_sql e) tn
-  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ ->
+  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
     failwith "expr_to_sql: unsupported expression form"

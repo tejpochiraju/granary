@@ -1747,8 +1747,8 @@ let rec substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.
     }
   | Ast.S_compound { op; left; right } ->
     Ast.S_compound { op; left = go_s left; right = go_s right }
-  | Ast.S_with_cte { name; def; query } ->
-    Ast.S_with_cte { name; def = go_s def; query = go_s query }
+  | Ast.S_with_cte { name; def; query; recursive } ->
+    Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
   | _ -> s
 
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
