@@ -255,7 +255,9 @@ let rec plan ?cat = function
   | Sema.BS_create_table { name; columns; uniq_idxs } ->
     Plan.Op_create_table { name; columns; uniq_idxs }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning } ->
-    Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict;
+    Plan.Op_insert { table_meta; ordinals;
+                     values = List.map (List.map plan_expr) values;
+                     on_conflict;
                      returning = List.map plan_expr returning }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      joins; group_by; aggs; having; agg_proj } ->

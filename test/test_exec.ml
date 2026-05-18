@@ -38,7 +38,7 @@ let insert store cat table_name (ordinals, values) =
       | None   -> failwith ("insert helper: table not found: " ^ table_name)
     in
     Exec.execute store cat
-      (Plan.Op_insert { table_meta; ordinals; values = List.map (fun l -> Plan.P_lit l) values;
+      (Plan.Op_insert { table_meta; ordinals; values = [List.map (fun l -> Plan.P_lit l) values];
                         on_conflict = None; returning = [] })
   )
 
@@ -562,7 +562,7 @@ let query_insert_raises () =
     (try
        ignore (Exec.query store cat
          (Plan.Op_insert { table_meta = m; ordinals = [0];
-                           values = [Plan.P_lit (Ast.L_int 1L)];
+                           values = [[Plan.P_lit (Ast.L_int 1L)]];
                            on_conflict = None; returning = [] }));
        Alcotest.fail "expected Failure for Op_insert in query"
      with Failure _ -> ());

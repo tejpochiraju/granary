@@ -203,16 +203,19 @@ opt_conflict:
   | OR ROLLBACK { Some Ast.CA_rollback }
   |             { None }
 
+value_row:
+  | LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN { vals }
+
 insert:
   | INSERT oc = opt_conflict INTO table = IDENT
       LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-      VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
+      VALUES rows = separated_nonempty_list(COMMA, value_row)
       ret = opt_returning
-    { Ast.S_insert { table; columns = cols; values = vals; on_conflict = oc; returning = ret } }
+    { Ast.S_insert { table; columns = cols; values = rows; on_conflict = oc; returning = ret } }
   | INSERT oc = opt_conflict INTO table = IDENT
-      VALUES LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN
+      VALUES rows = separated_nonempty_list(COMMA, value_row)
       ret = opt_returning
-    { Ast.S_insert { table; columns = []; values = vals; on_conflict = oc; returning = ret } }
+    { Ast.S_insert { table; columns = []; values = rows; on_conflict = oc; returning = ret } }
 
 opt_returning:
   | RETURNING exprs = separated_nonempty_list(COMMA, expr) { exprs }

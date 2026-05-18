@@ -3499,6 +3499,38 @@ let test_tbl_alias_three_join () =
   Alcotest.(check row_testable) "three alias join"
     [| Db.V_text "eng"; Db.V_int 500L |] (List.nth rows 0)
 
+(* ------------------------------------------------------------------ *)
+(* Multi-row INSERT tests                                               *)
+(* ------------------------------------------------------------------ *)
+
+let test_multirow_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')";
+  let rows = query_ok db "SELECT * FROM t ORDER BY id" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  Alcotest.check row_testable "row 1" [| Db.V_int 1L; Db.V_text "alice" |] (List.nth rows 0);
+  Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "bob"   |] (List.nth rows 1);
+  Alcotest.check row_testable "row 3" [| Db.V_int 3L; Db.V_text "carol" |] (List.nth rows 2)
+
+let test_multirow_single_still_works () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t VALUES (42)";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check row_testable "row" [| Db.V_int 42L |] (List.nth rows 0)
+
+let test_multirow_on_conflict () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, v TEXT)";
+  exec db "CREATE UNIQUE INDEX idx ON t (id)";
+  exec db "INSERT OR IGNORE INTO t VALUES (1, 'a'), (1, 'b'), (2, 'c')";
+  let rows = query_ok db "SELECT * FROM t ORDER BY id" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check row_testable "row 1" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0);
+  Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "c" |] (List.nth rows 1)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3859,5 +3891,10 @@ let () =
       Alcotest.test_case "agg"      `Quick test_cte_agg;
       Alcotest.test_case "col_name" `Quick test_cte_col_name;
       Alcotest.test_case "order"    `Quick test_cte_order;
+    ];
+    "multi_insert", [
+      Alcotest.test_case "basic"         `Quick test_multirow_basic;
+      Alcotest.test_case "single_works"  `Quick test_multirow_single_still_works;
+      Alcotest.test_case "on_conflict"   `Quick test_multirow_on_conflict;
     ];
   ]

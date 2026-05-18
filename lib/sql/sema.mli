@@ -82,7 +82,7 @@ type bound_stmt =
   | BS_insert of {
       table_meta  : Sqlocaml_catalog.Catalog.table_meta;
       ordinals    : int list;            (** column ordinals for the named cols *)
-      values      : bound_expr list;
+      values      : bound_expr list list;   (* one sublist per VALUES row *)
       on_conflict : Ast.conflict_action option;
       returning   : bound_expr list;
     }

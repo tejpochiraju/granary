@@ -82,14 +82,14 @@ let bind_insert_basic () =
   let stmt = Ast.S_insert {
     table       = "users";
     columns     = ["id"; "name"];
-    values      = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    values      = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
     Alcotest.(check (list int)) "ordinals" [0; 1] ordinals;
-    Alcotest.(check int) "values count" 2 (List.length values)
+    Alcotest.(check int) "values count" 2 (List.length (List.hd values))
   | Ok _ -> Alcotest.fail "expected BS_insert"
   | Error _ -> Alcotest.fail "unexpected error"
 
@@ -101,19 +101,19 @@ let bind_insert_reversed_cols () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"; "id"];
-    values = [Ast.E_lit (Ast.L_text "bob"); Ast.E_lit (Ast.L_int 2L)];
+    values = [[Ast.E_lit (Ast.L_text "bob"); Ast.E_lit (Ast.L_int 2L)]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
     Alcotest.(check (list int)) "ordinals full-width table-order" [0; 1] ordinals;
-    Alcotest.(check int) "values count full-width" 2 (List.length values);
+    Alcotest.(check int) "values count full-width" 2 (List.length (List.hd values));
     (* id (ordinal 0) should be BE_lit (L_int 2L), name (ordinal 1) BE_lit (L_text "bob") *)
-    (match List.nth values 0 with
+    (match List.nth (List.hd values) 0 with
      | Sema.BE_lit (Ast.L_int 2L) -> ()
      | _ -> Alcotest.fail "expected id=BE_lit(L_int 2L) at position 0");
-    (match List.nth values 1 with
+    (match List.nth (List.hd values) 1 with
      | Sema.BE_lit (Ast.L_text "bob") -> ()
      | _ -> Alcotest.fail "expected name=BE_lit(L_text bob) at position 1")
   | Ok _ -> Alcotest.fail "expected BS_insert"
@@ -127,18 +127,18 @@ let bind_insert_single_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.E_lit (Ast.L_int 99L)];
+    values = [[Ast.E_lit (Ast.L_int 99L)]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { ordinals; values; _ }) ->
     Alcotest.(check (list int)) "ordinals full-width" [0; 1] ordinals;
-    Alcotest.(check int) "values count full-width" 2 (List.length values);
-    (match List.nth values 0 with
+    Alcotest.(check int) "values count full-width" 2 (List.length (List.hd values));
+    (match List.nth (List.hd values) 0 with
      | Sema.BE_lit (Ast.L_int 99L) -> ()
      | _ -> Alcotest.fail "expected id=BE_lit(L_int 99L)");
-    (match List.nth values 1 with
+    (match List.nth (List.hd values) 1 with
      | Sema.BE_lit Ast.L_null -> ()
      | _ -> Alcotest.fail "expected name=BE_lit(L_null) (omitted)")
   | Ok _ -> Alcotest.fail "expected BS_insert"
@@ -149,7 +149,7 @@ let bind_insert_unknown_table () =
   let stmt = Ast.S_insert {
     table = "ghost";
     columns = ["id"];
-    values = [Ast.E_lit (Ast.L_int 1L)];
+    values = [[Ast.E_lit (Ast.L_int 1L)]];
     on_conflict = None;
     returning = [];
   } in
@@ -163,7 +163,7 @@ let bind_insert_unknown_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["bogus"];
-    values = [Ast.E_lit (Ast.L_int 1L)];
+    values = [[Ast.E_lit (Ast.L_int 1L)]];
     on_conflict = None;
     returning = [];
   } in
@@ -177,7 +177,7 @@ let bind_insert_arity_mismatch () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "name"];
-    values = [Ast.E_lit (Ast.L_int 1L)];       (* 2 cols, 1 value *)
+    values = [[Ast.E_lit (Ast.L_int 1L)]];       (* 2 cols, 1 value *)
     on_conflict = None;
     returning = [];
   } in
@@ -192,7 +192,7 @@ let bind_insert_type_mismatch_int_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.E_lit (Ast.L_text "text")];
+    values = [[Ast.E_lit (Ast.L_text "text")]];
     on_conflict = None;
     returning = [];
   } in
@@ -207,7 +207,7 @@ let bind_insert_type_mismatch_text_col () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"];
-    values = [Ast.E_lit (Ast.L_int 42L)];
+    values = [[Ast.E_lit (Ast.L_int 42L)]];
     on_conflict = None;
     returning = [];
   } in
@@ -223,7 +223,7 @@ let bind_insert_null_allowed () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.E_lit Ast.L_null];
+    values = [[Ast.E_lit Ast.L_null]];
     on_conflict = None;
     returning = [];
   } in
@@ -396,7 +396,7 @@ let bind_insert_second_col_unknown () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "bogus"; "age"];
-    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L); Ast.E_lit (Ast.L_int 3L)];
+    values = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L); Ast.E_lit (Ast.L_int 3L)]];
     on_conflict = None;
     returning = [];
   } in
@@ -793,7 +793,7 @@ let bind_insert_returning_subquery_rejected () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"; "name"];
-    values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    values = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]];
     on_conflict = None;
     returning = [Ast.E_subquery dummy_subquery];
   } in
@@ -1264,7 +1264,7 @@ let bind_insert_not_null_violation () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["name"];
-    values = [Ast.E_lit (Ast.L_text "alice")];
+    values = [[Ast.E_lit (Ast.L_text "alice")]];
     on_conflict = None;
     returning = [];
   } in
@@ -1285,7 +1285,7 @@ let bind_insert_real_lit_type_mismatch () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["id"];
-    values = [Ast.E_lit (Ast.L_real 1.5)];
+    values = [[Ast.E_lit (Ast.L_real 1.5)]];
     on_conflict = None;
     returning = [];
   } in
@@ -1302,7 +1302,7 @@ let bind_insert_blob_lit_ok () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["b"];
-    values = [Ast.E_lit (Ast.L_blob (Bytes.of_string "hello"))];
+    values = [[Ast.E_lit (Ast.L_blob (Bytes.of_string "hello"))]];
     on_conflict = None;
     returning = [];
   } in
@@ -1318,7 +1318,7 @@ let bind_insert_real_lit_ok () =
   let stmt = Ast.S_insert {
     table = "users";
     columns = ["f"];
-    values = [Ast.E_lit (Ast.L_real 3.14)];
+    values = [[Ast.E_lit (Ast.L_real 3.14)]];
     on_conflict = None;
     returning = [];
   } in
@@ -1767,15 +1767,15 @@ let bind_insert_default_null () =
     { Row.name = "n";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    table = "users"; columns = ["n"]; values = [[Ast.E_lit (Ast.L_int 7L)]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
     (* id should be BE_lit L_null from default; values are in ordinal order: [id; n]. *)
-    Alcotest.(check int) "values" 2 (List.length values);
-    (match List.nth values 0 with
+    Alcotest.(check int) "values" 2 (List.length (List.hd values));
+    (match List.nth (List.hd values) 0 with
      | Sema.BE_lit Ast.L_null -> ()
      | _ -> Alcotest.fail "expected id=BE_lit(L_null) from DV_null default")
   | _ -> Alcotest.fail "expected BS_insert"
@@ -1788,13 +1788,13 @@ let bind_insert_default_real () =
     { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    table = "users"; columns = ["n"]; values = [[Ast.E_lit (Ast.L_int 7L)]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
-    (match List.nth values 0 with
+    (match List.nth (List.hd values) 0 with
      | Sema.BE_lit (Ast.L_real 2.5) -> ()
      | _ -> Alcotest.fail "expected f=BE_lit(L_real 2.5) from DV_real default")
   | _ -> Alcotest.fail "expected BS_insert"
@@ -1807,13 +1807,13 @@ let bind_insert_default_blob () =
     { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["n"]; values = [Ast.E_lit (Ast.L_int 7L)];
+    table = "users"; columns = ["n"]; values = [[Ast.E_lit (Ast.L_int 7L)]];
     on_conflict = None;
     returning = [];
   } in
   match bind cat stmt with
   | Ok (Sema.BS_insert { values; _ }) ->
-    (match List.nth values 0 with
+    (match List.nth (List.hd values) 0 with
      | Sema.BE_lit (Ast.L_blob b) when Bytes.equal b (Bytes.of_string "x") -> ()
      | _ -> Alcotest.fail "expected b=BE_lit(L_blob 'x') from DV_blob default")
   | _ -> Alcotest.fail "expected BS_insert"
@@ -1828,7 +1828,7 @@ let bind_insert_not_null_late () =
     { Row.name = "c"; ty = Row.Integer; not_null = true;  primary_key = false; default = None; check_sql = None };
   ] in
   let stmt = Ast.S_insert {
-    table = "users"; columns = ["a"]; values = [Ast.E_lit (Ast.L_int 1L)];
+    table = "users"; columns = ["a"]; values = [[Ast.E_lit (Ast.L_int 1L)]];
     on_conflict = None;
     returning = [];
   } in

@@ -40,7 +40,7 @@ type op =
   | Op_insert of {
       table_meta  : Cat.table_meta;
       ordinals    : int list;
-      values      : expr list;
+      values      : expr list list;   (* one sublist per VALUES row *)
       on_conflict : Ast.conflict_action option;
       returning   : expr list;
     }

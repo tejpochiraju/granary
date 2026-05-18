@@ -1407,8 +1407,11 @@ let execute_with_count ?(mode = Auto)
     ) uniq_idxs in
     Lwt.return 0
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _ } ->
-    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict store cat ~table_meta ~ordinals ~values in
-    Lwt.return (if inserted then 1 else 0)
+    Lwt_list.fold_left_s (fun count row_vals ->
+      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
+                        store cat ~table_meta ~ordinals ~values:row_vals in
+      Lwt.return (count + if inserted then 1 else 0)
+    ) 0 values
   | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
@@ -2263,22 +2266,22 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     (match cat with
      | None -> failwith "Exec.query: RETURNING requires catalog context"
      | Some c ->
-       (* Evaluate the row values locally first (for RETURNING projection),
-          then pass the pre-built row to execute_insert so it is NOT
-          evaluated a second time inside (fixes C1 double-eval). *)
-       let n = List.length table_meta.columns in
-       let inserted_row = Array.make n Row.V_null in
-       List.iter2 (fun ord e ->
-         inserted_row.(ord) <- eval_expr clock params [||] e
-       ) ordinals values;
-       let* inserted =
-         execute_insert ~mode ~clock ~on_conflict ~prebuilt_row:(Some inserted_row)
-           store c ~table_meta ~ordinals ~values
-       in
-       if not inserted then Lwt.return (Lwt_stream.of_list [])
-       else
-         let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
-         Lwt.return (Lwt_stream.of_list [result]))
+       let* result_lists = Lwt_list.map_s (fun row_vals ->
+         let n = List.length table_meta.columns in
+         let inserted_row = Array.make n Row.V_null in
+         List.iter2 (fun ord e ->
+           inserted_row.(ord) <- eval_expr clock params [||] e
+         ) ordinals row_vals;
+         let* inserted =
+           execute_insert ~mode ~clock ~on_conflict ~prebuilt_row:(Some inserted_row)
+             store c ~table_meta ~ordinals ~values:row_vals
+         in
+         if not inserted then Lwt.return []
+         else
+           let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
+           Lwt.return [result]
+       ) values in
+       Lwt.return (Lwt_stream.of_list (List.concat result_lists)))
   | Plan.Op_update { table_meta; assignments; where; indexes; returning }
     when returning <> [] ->
     let schema = table_meta.Cat.columns in

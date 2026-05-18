@@ -120,7 +120,7 @@ and stmt =
   | S_insert of {
       table       : string;
       columns     : string list;   (** named columns; empty = "all in order" *)
-      values      : expr list;
+      values      : expr list list;   (** one inner list per VALUES row *)
       on_conflict : conflict_action option;
       returning   : expr list;   (** empty = no RETURNING *)
     }

@@ -92,58 +92,57 @@ let create_syntax_error () =
 let insert_named_cols () =
   match parse "INSERT INTO users (id, name) VALUES (1, 'alice');" with
   | Ast.S_insert { table = "users"; columns = ["id"; "name"];
-                   values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]; _ } -> ()
+                   values = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]]; _ } -> ()
   | _ -> Alcotest.fail "expected S_insert"
 
 let insert_int_only () =
   match parse "INSERT INTO t (n) VALUES (42);" with
-  | Ast.S_insert { columns = ["n"]; values = [Ast.E_lit (Ast.L_int 42L)]; _ } -> ()
+  | Ast.S_insert { columns = ["n"]; values = [[Ast.E_lit (Ast.L_int 42L)]]; _ } -> ()
   | _ -> Alcotest.fail "expected int insert"
 
 let insert_null_value () =
   match parse "INSERT INTO t (n) VALUES (NULL);" with
-  | Ast.S_insert { values = [Ast.E_lit Ast.L_null]; _ } -> ()
+  | Ast.S_insert { values = [[Ast.E_lit Ast.L_null]]; _ } -> ()
   | _ -> Alcotest.fail "expected null value"
 
 let insert_negative_int () =
   match parse "INSERT INTO t (n) VALUES (-99);" with
-  | Ast.S_insert { values = [Ast.E_lit (Ast.L_int (-99L))]; _ } -> ()
+  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_int (-99L))]]; _ } -> ()
   | _ -> Alcotest.fail "expected negative int"
 
 let insert_empty_string () =
   match parse "INSERT INTO t (s) VALUES ('');" with
-  | Ast.S_insert { values = [Ast.E_lit (Ast.L_text "")]; _ } -> ()
+  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_text "")]]; _ } -> ()
   | _ -> Alcotest.fail "expected empty string"
 
-let insert_multiple_rows_not_supported () =
-  (* Phase 0: one VALUES list only *)
-  try
-    ignore (parse "INSERT INTO t (n) VALUES (1), (2);");
-    Alcotest.fail "expected syntax error for multi-row insert"
-  with Parser.Error | Failure _ -> ()
+let insert_multiple_rows_supported () =
+  (* Phase 12 Task 2: multi-row INSERT is now supported *)
+  match parse "INSERT INTO t (n) VALUES (1), (2);" with
+  | Ast.S_insert { columns = ["n"]; values = [[Ast.E_lit (Ast.L_int 1L)]; [Ast.E_lit (Ast.L_int 2L)]]; _ } -> ()
+  | _ -> Alcotest.fail "expected S_insert with two value rows"
 
 let insert_real_value () =
   match parse "INSERT INTO t (f) VALUES (3.14);" with
-  | Ast.S_insert { columns = ["f"]; values = [Ast.E_lit (Ast.L_real f)]; _ } ->
+  | Ast.S_insert { columns = ["f"]; values = [[Ast.E_lit (Ast.L_real f)]]; _ } ->
     Alcotest.(check bool) "f = 3.14" true (Float.equal f 3.14)
   | _ -> Alcotest.fail "expected FLOAT_LIT 3.14"
 
 let insert_real_zero () =
   match parse "INSERT INTO t (f) VALUES (0.0);" with
-  | Ast.S_insert { values = [Ast.E_lit (Ast.L_real f)]; _ } ->
+  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_real f)]]; _ } ->
     Alcotest.(check bool) "f = 0.0" true (Float.equal f 0.0)
   | _ -> Alcotest.fail "expected FLOAT_LIT 0.0"
 
 let insert_real_negative () =
   match parse "INSERT INTO t (f) VALUES (-1.5);" with
-  | Ast.S_insert { values = [Ast.E_lit (Ast.L_real f)]; _ } ->
+  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_real f)]]; _ } ->
     Alcotest.(check bool) "f = -1.5" true (Float.equal f (-1.5))
   | _ -> Alcotest.fail "expected FLOAT_LIT -1.5"
 
 let insert_no_col_list () =
   (* INSERT without explicit column list is now supported; maps values positionally *)
   match parse "INSERT INTO t VALUES (1, 'hello');" with
-  | Ast.S_insert { table = "t"; columns = []; values = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "hello")]; _ } -> ()
+  | Ast.S_insert { table = "t"; columns = []; values = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "hello")]]; _ } -> ()
   | _ -> Alcotest.fail "expected S_insert with empty columns and two values"
 
 (* ------------------------------------------------------------------ *)
@@ -270,7 +269,7 @@ let () =
       Alcotest.test_case "null-value"         `Quick insert_null_value;
       Alcotest.test_case "negative-int"       `Quick insert_negative_int;
       Alcotest.test_case "empty-string"       `Quick insert_empty_string;
-      Alcotest.test_case "multi-row-error"    `Quick insert_multiple_rows_not_supported;
+      Alcotest.test_case "multi-row-supported" `Quick insert_multiple_rows_supported;
       Alcotest.test_case "no-col-list"        `Quick insert_no_col_list;
       Alcotest.test_case "real-value"         `Quick insert_real_value;
       Alcotest.test_case "real-zero"          `Quick insert_real_zero;

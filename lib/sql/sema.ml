@@ -61,7 +61,7 @@ type bound_stmt =
   | BS_insert of {
       table_meta  : Cat.table_meta;
       ordinals    : int list;
-      values      : bound_expr list;
+      values      : bound_expr list list;   (* one sublist per VALUES row *)
       on_conflict : Ast.conflict_action option;
       returning   : bound_expr list;
     }
@@ -878,102 +878,122 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
-    (* Not a regular table — check if it's an FTS table *)
-    bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values
+    (* Not a regular table — check if it's an FTS table.
+       For multi-row FTS INSERT (not tested), flatten all rows. *)
+    bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values:(List.concat values)
   | Some meta ->
     let columns =
       if columns = [] then List.map (fun c -> c.Row.name) meta.columns
       else columns
     in
-    let n_cols = List.length columns in
-    let n_vals = List.length values in
-    if n_cols <> n_vals then
-      Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
-    else
-      (* 1. Bind each expr and build a map from column ordinal -> bound_expr. *)
-      let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
-        match e with
-        | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
-          (* Literals, negated literals, and params: bind without column context. *)
-          bind_expr ~param_counter ~named_params meta e
-        | _ ->
-          (* Column references in VALUES make no sense — reject. *)
-          Error (Unsupported "complex expression in INSERT VALUES")
-      in
-      let explicit_result =
-        List.fold_left2 (fun acc col_name expr_ast ->
-          match acc with
-          | Error _ -> acc
-          | Ok map ->
-            (match col_index meta.columns col_name with
-             | None ->
-               Error (Unknown_column { table; column = col_name })
-             | Some i ->
-               (match bind_value_expr expr_ast with
-                | Error e -> Error e
-                | Ok bexpr ->
-                  (* Skip type check for params (unknown at bind time). *)
-                  (match bexpr with
-                   | BE_param _ -> Ok (map @ [(i, bexpr)])
-                   | BE_lit lit ->
-                     let col = List.nth meta.columns i in
-                     (match lit_ty lit with
-                      | None   -> Ok (map @ [(i, bexpr)])   (* NULL: skip type check *)
-                      | Some t ->
-                        if ty_equal t col.ty then Ok (map @ [(i, bexpr)])
-                        else Error (Type_mismatch { expected = col.ty; got = t }))
-                   | _ -> Ok (map @ [(i, bexpr)]))))
-        ) (Ok []) columns values
-      in
-      (match explicit_result with
-       | Error e -> Lwt.return (Error e)
-       | Ok explicit_map ->
-         (* 2. Build the full value list (one entry per table column),
-               applying DEFAULT for omitted columns. *)
-         let n_table_cols = List.length meta.columns in
-         let per_col_results =
-           List.init n_table_cols (fun i ->
-             let col = List.nth meta.columns i in
-             match List.assoc_opt i explicit_map with
-             | Some bexpr -> (i, bexpr)
-             | None ->
-               (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
-               let lit = match col.Row.default with
-                 | Some dv -> dv_to_lit dv
-                 | None    -> Ast.L_null
-               in
-               (i, BE_lit lit))
-         in
-         let full_pairs = per_col_results in
-         (* 3. NOT NULL enforcement: reject if any NOT NULL column has a NULL literal.
-               Params are unchecked at bind time (checked at runtime). *)
-         let nn_result =
-           List.fold_left (fun acc (i, bexpr) ->
-             match acc with
-             | Error _ -> acc
-             | Ok () ->
+    (* bind_one_row: bind a single row of VALUES exprs.
+       Returns Ok (ordinals, full_vals) or Error. *)
+    let bind_one_row row_vals =
+      let n_cols = List.length columns in
+      let n_vals = List.length row_vals in
+      if n_cols <> n_vals then
+        Error (Arity_mismatch { expected = n_cols; got = n_vals })
+      else
+        (* 1. Bind each expr and build a map from column ordinal -> bound_expr. *)
+        let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
+          match e with
+          | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
+            (* Literals, negated literals, and params: bind without column context. *)
+            bind_expr ~param_counter ~named_params meta e
+          | _ ->
+            (* Column references in VALUES make no sense — reject. *)
+            Error (Unsupported "complex expression in INSERT VALUES")
+        in
+        let explicit_result =
+          List.fold_left2 (fun acc col_name expr_ast ->
+            match acc with
+            | Error _ -> acc
+            | Ok map ->
+              (match col_index meta.columns col_name with
+               | None ->
+                 Error (Unknown_column { table; column = col_name })
+               | Some i ->
+                 (match bind_value_expr expr_ast with
+                  | Error e -> Error e
+                  | Ok bexpr ->
+                    (* Skip type check for params (unknown at bind time). *)
+                    (match bexpr with
+                     | BE_param _ -> Ok (map @ [(i, bexpr)])
+                     | BE_lit lit ->
+                       let col = List.nth meta.columns i in
+                       (match lit_ty lit with
+                        | None   -> Ok (map @ [(i, bexpr)])   (* NULL: skip type check *)
+                        | Some t ->
+                          if ty_equal t col.ty then Ok (map @ [(i, bexpr)])
+                          else Error (Type_mismatch { expected = col.ty; got = t }))
+                     | _ -> Ok (map @ [(i, bexpr)]))))
+          ) (Ok []) columns row_vals
+        in
+        (match explicit_result with
+         | Error e -> Error e
+         | Ok explicit_map ->
+           (* 2. Build the full value list (one entry per table column),
+                 applying DEFAULT for omitted columns. *)
+           let n_table_cols = List.length meta.columns in
+           let per_col_results =
+             List.init n_table_cols (fun i ->
                let col = List.nth meta.columns i in
-               (match bexpr with
-                | BE_lit Ast.L_null when col.Row.not_null ->
-                  Error (Not_null_violation col.Row.name)
-                | _ -> Ok ())
-           ) (Ok ()) full_pairs
-         in
-         (match nn_result with
-          | Error e -> Lwt.return (Error e)
-          | Ok () ->
-            let ordinals = List.map fst full_pairs in
-            let full_vals = List.map snd full_pairs in
-            (match bind_returning_exprs ~param_counter ~named_params meta returning with
-             | Error e -> Lwt.return (Error e)
-             | Ok ret_bound ->
-               Lwt.return (Ok (BS_insert {
-                 table_meta = meta;
-                 ordinals;
-                 values     = full_vals;
-                 on_conflict;
-                 returning  = ret_bound;
-               })))))
+               match List.assoc_opt i explicit_map with
+               | Some bexpr -> (i, bexpr)
+               | None ->
+                 (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
+                 let lit = match col.Row.default with
+                   | Some dv -> dv_to_lit dv
+                   | None    -> Ast.L_null
+                 in
+                 (i, BE_lit lit))
+           in
+           let full_pairs = per_col_results in
+           (* 3. NOT NULL enforcement: reject if any NOT NULL column has a NULL literal.
+                 Params are unchecked at bind time (checked at runtime). *)
+           let nn_result =
+             List.fold_left (fun acc (i, bexpr) ->
+               match acc with
+               | Error _ -> acc
+               | Ok () ->
+                 let col = List.nth meta.columns i in
+                 (match bexpr with
+                  | BE_lit Ast.L_null when col.Row.not_null ->
+                    Error (Not_null_violation col.Row.name)
+                  | _ -> Ok ())
+             ) (Ok ()) full_pairs
+           in
+           (match nn_result with
+            | Error e -> Error e
+            | Ok () ->
+              let ordinals = List.map fst full_pairs in
+              let full_vals = List.map snd full_pairs in
+              Ok (ordinals, full_vals)))
+    in
+    (* Bind every row *)
+    let rows_result = List.fold_left (fun acc row ->
+      match acc with
+      | Error e -> Error e
+      | Ok bound_rows ->
+        (match bind_one_row row with
+         | Error e -> Error e
+         | Ok (ords, vals) -> Ok (bound_rows @ [(ords, vals)]))
+    ) (Ok []) values in
+    (match rows_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok [] -> Lwt.return (Error (Arity_mismatch { expected = 1; got = 0 }))
+     | Ok ((ordinals, _) :: _ as bound_rows) ->
+       let all_vals = List.map snd bound_rows in
+       (match bind_returning_exprs ~param_counter ~named_params meta returning with
+        | Error e -> Lwt.return (Error e)
+        | Ok ret_bound ->
+          Lwt.return (Ok (BS_insert {
+            table_meta = meta;
+            ordinals;
+            values     = all_vals;
+            on_conflict;
+            returning  = ret_bound;
+          }))))
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)

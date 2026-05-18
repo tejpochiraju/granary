@@ -47,7 +47,7 @@ let plan_insert () =
   let stmt = Ast.S_insert {
     table       = "users";
     columns     = ["id"; "name"];
-    values      = [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")];
+    values      = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]];
     on_conflict = None;
     returning   = [];
   } in
@@ -55,7 +55,7 @@ let plan_insert () =
   match Planner.plan bound with
   | Plan.Op_insert { ordinals; values; _ } ->
     Alcotest.(check (list int)) "ordinals" [0; 1] ordinals;
-    Alcotest.(check int) "value count" 2 (List.length values)
+    Alcotest.(check int) "value count" 2 (List.length (List.hd values))
   | _ -> Alcotest.fail "expected Op_insert"
 
 let plan_select_star_no_where () =
