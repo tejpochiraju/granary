@@ -281,8 +281,8 @@ select:
                    order = ob; limit; offset }
       | None ->
         let exprs = match proj with
-          | `Exprs es -> List.map fst es
-          | `Cols names -> List.map (fun n -> E_col n) names
+          | `Exprs es -> es
+          | `Cols names -> List.map (fun n -> (E_col n, None)) names
           | `All -> []
         in
         S_const_select { exprs } }

@@ -199,7 +199,7 @@ type op =
       right : op;
     }
   | Op_const_select of {
-      exprs : expr list;
+      exprs : (expr * string option) list;
     }
   | Op_window of {
       child        : op;

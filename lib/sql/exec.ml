@@ -2776,15 +2776,40 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_const_select { exprs } ->
     (* FROM-less SELECT: evaluate each expression with an empty row and
-       return a single result row. *)
-    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
+       return a single result row. Aliases are stored in the plan for
+       column-name purposes but are not needed during execution. *)
+    let raw_exprs = List.map fst exprs in
+    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) raw_exprs in
     let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
     Lwt.return (Lwt_stream.of_list [row])
-  | Plan.Op_with_cte { cte_name; def; query; recursive = _ } ->
+  | Plan.Op_with_cte { cte_name; def; query; recursive = false } ->
     let* def_stream = to_stream clock params store ~mode ~cat def in
     let* cte_rows = Lwt_stream.to_list def_stream in
     let patched = substitute_cte ~cte_name ~rows:cte_rows query in
     to_stream clock params store ~mode ~cat patched
+
+  | Plan.Op_with_cte { cte_name; def; query; recursive = true } ->
+    (* Recursive CTE: def must be Op_union { all=true; left=base_case; right=recursive_arm }.
+       Execute base case once, then iteratively execute recursive_arm substituting
+       the CTE scan with current working rows, until no new rows are produced. *)
+    let (base_op, recursive_arm) = match def with
+      | Plan.Op_union { all = true; left; right } -> (left, right)
+      | _ ->
+        failwith "Exec: recursive CTE def must be UNION ALL — non-UNION-ALL recursive CTEs are not supported"
+    in
+    let* base_stream = to_stream clock params store ~mode ~cat base_op in
+    let* seed_rows = Lwt_stream.to_list base_stream in
+    let rec iterate acc working =
+      if working = [] then Lwt.return acc
+      else
+        let patched_arm = substitute_cte ~cte_name ~rows:working recursive_arm in
+        let* new_stream = to_stream clock params store ~mode ~cat patched_arm in
+        let* new_rows = Lwt_stream.to_list new_stream in
+        iterate (acc @ new_rows) new_rows
+    in
+    let* all_rows = iterate seed_rows seed_rows in
+    let patched_query = substitute_cte ~cte_name ~rows:all_rows query in
+    to_stream clock params store ~mode ~cat patched_query
   | Plan.Op_cte_scan { cte_name; _ } ->
     failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
   | Plan.Op_window { child; windows; n_input_cols = _ } ->

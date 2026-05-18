@@ -212,9 +212,9 @@ and stmt =
 
   | S_const_select of {
       (** FROM-less SELECT that evaluates constant expressions — returns one row.
-          Used when a scalar subquery appears in projection position at the
-          outermost query level (e.g. [SELECT (SELECT max(v) FROM t)]). *)
-      exprs : expr list;
+          Used when a SELECT has no FROM clause.
+          Each entry pairs the expression with an optional column alias. *)
+      exprs : (expr * string option) list;
     }
   | S_with_cte of {
       name      : string;

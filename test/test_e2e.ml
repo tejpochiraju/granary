@@ -3446,6 +3446,61 @@ let test_cte_order () =
   Alcotest.(check row_testable) "row 1" [| Db.V_int 2L |] (List.nth rows 1);
   Alcotest.(check row_testable) "row 2" [| Db.V_int 3L |] (List.nth rows 2)
 
+let test_recursive_cte_series () =
+  (* Generate integers 1..5 via recursive CTE *)
+  let db = fresh_db () in
+  let rows = query_ok db
+    "WITH RECURSIVE cnt AS (
+       SELECT 1 AS n
+       UNION ALL
+       SELECT n + 1 FROM cnt WHERE n < 5
+     )
+     SELECT n FROM cnt ORDER BY n" in
+  Alcotest.(check int) "5 rows" 5 (List.length rows);
+  Alcotest.(check row_testable) "n=1" [| Db.V_int 1L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "n=5" [| Db.V_int 5L |] (List.nth rows 4)
+
+let test_recursive_cte_sum () =
+  (* Compute cumulative sum: row where i=4 has s=1+2+3+4=10 *)
+  let db = fresh_db () in
+  let rows = query_ok db
+    "WITH RECURSIVE nums AS (
+       SELECT 1 AS i, 1 AS s
+       UNION ALL
+       SELECT i + 1, s + (i + 1) FROM nums WHERE i < 4
+     )
+     SELECT s FROM nums WHERE i = 4" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.(check row_testable) "sum=10" [| Db.V_int 10L |] (List.nth rows 0)
+
+let test_recursive_cte_tree () =
+  (* Hierarchical: find all descendants of node with parent=1 *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE tree (id INTEGER, parent INTEGER)";
+  exec db "INSERT INTO tree VALUES (1, 0), (2, 1), (3, 1), (4, 2)";
+  let rows = query_ok db
+    "WITH RECURSIVE desc AS (
+       SELECT id FROM tree WHERE parent = 1
+       UNION ALL
+       SELECT t.id FROM tree AS t INNER JOIN desc AS d ON t.parent = d.id
+     )
+     SELECT id FROM desc ORDER BY id" in
+  Alcotest.(check int) "3 descendants" 3 (List.length rows);
+  Alcotest.(check row_testable) "id=2" [| Db.V_int 2L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "id=3" [| Db.V_int 3L |] (List.nth rows 1);
+  Alcotest.(check row_testable) "id=4" [| Db.V_int 4L |] (List.nth rows 2)
+
+let test_recursive_cte_non_recursive_unchanged () =
+  (* Non-recursive WITH still works after this change *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t VALUES (1), (2), (3)";
+  let rows = query_ok db
+    "WITH sq AS (SELECT x FROM t WHERE x > 1) SELECT x FROM sq ORDER BY x" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.(check row_testable) "x=2" [| Db.V_int 2L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "x=3" [| Db.V_int 3L |] (List.nth rows 1)
+
 let test_tbl_alias_from () =
   let db = fresh_db () in
   exec db "CREATE TABLE products (id INTEGER, name TEXT)";
@@ -4224,5 +4279,11 @@ let () =
       Alcotest.test_case "sum_over"         `Quick test_window_sum_over;
       Alcotest.test_case "no_partition"     `Quick test_window_no_partition;
       Alcotest.test_case "first_last_value" `Quick test_window_first_last_value;
+    ];
+    "recursive_cte", [
+      Alcotest.test_case "series"                  `Quick test_recursive_cte_series;
+      Alcotest.test_case "sum"                     `Quick test_recursive_cte_sum;
+      Alcotest.test_case "tree"                    `Quick test_recursive_cte_tree;
+      Alcotest.test_case "non_recursive_unchanged" `Quick test_recursive_cte_non_recursive_unchanged;
     ];
   ]

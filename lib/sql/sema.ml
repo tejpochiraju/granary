@@ -162,7 +162,7 @@ type bound_stmt =
       right : bound_stmt;
     }
   | BS_const_select of {
-      exprs : bound_expr list;
+      exprs : (bound_expr * string option) list;
     }
   | BS_with_cte of {
       name      : string;
@@ -1996,6 +1996,10 @@ let rec col_names_of_bound_stmt bs =
       ) proj
   | BS_compound { left; _ } -> col_names_of_bound_stmt left
   | BS_with_cte { query; recursive = _; _ } -> col_names_of_bound_stmt query
+  | BS_const_select { exprs } ->
+    List.mapi (fun i (_, alias_opt) ->
+      Option.value alias_opt ~default:(Printf.sprintf "col_%d" (i + 1))
+    ) exprs
   | _ -> List.init n (fun i -> Printf.sprintf "col_%d" (i + 1))
 
 (** Extract output column names from an AST SELECT stmt (best-effort; used for CTEs). *)
@@ -2015,6 +2019,16 @@ let rec col_names_of_ast_stmt = function
             | _ -> Printf.sprintf "col_%d" (i + 1))
        ) items)
   | Ast.S_compound { left; _ } -> col_names_of_ast_stmt left
+  | Ast.S_const_select { exprs } ->
+    List.mapi (fun i (expr, alias_opt) ->
+      match alias_opt with
+      | Some a -> a
+      | None ->
+        (match expr with
+         | Ast.E_col name -> name
+         | Ast.E_tbl_col (_, name) -> name
+         | _ -> Printf.sprintf "col_%d" (i + 1))
+    ) exprs
   | _ -> []
 
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
@@ -2067,7 +2081,11 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
       Cat.columns = [];
       Cat.next_rowid = 0L;
     } in
-    let bound = List.map (bind_expr ~param_counter ~named_params dummy_meta) exprs in
+    let bound = List.map (fun (expr, alias) ->
+      match bind_expr ~param_counter ~named_params dummy_meta expr with
+      | Error e -> Error e
+      | Ok be   -> Ok (be, alias)
+    ) exprs in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
     (match errors with
      | e :: _ -> Lwt.return (Error e)
@@ -2075,14 +2093,27 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
   | Ast.S_with_cte { name; def; query; recursive } ->
-    let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
-    (match def_r with
+    (* For recursive CTEs the def is UNION ALL [base; recursive_arm].
+       The recursive arm references the CTE by name, which must be in the
+       catalog before we can bind the recursive arm.  Strategy:
+         1. Bind just the base (left branch) to derive column names.
+         2. Register the CTE as an ephemeral table.
+         3. Bind the full def (now the recursive arm can resolve the name).
+       For non-recursive CTEs the base-only pre-pass is not needed; we bind
+       the full def in one shot as before. *)
+    let base_ast = match recursive, def with
+      | true, Ast.S_compound { left; _ } -> Some left
+      | _ -> None
+    in
+    let col_source_ast = match base_ast with Some b -> b | None -> def in
+    let* col_source_r = bind_internal ~views ~named_params ~param_counter cat col_source_ast in
+    (match col_source_r with
      | Error e -> Lwt.return (Error e)
-     | Ok bound_def ->
+     | Ok col_source ->
        (* Derive column names: prefer AST-level names (which preserve aliases
           for aggregated projections) and fall back to bound-stmt names. *)
-       let ast_names = col_names_of_ast_stmt def in
-       let bound_names = col_names_of_bound_stmt bound_def in
+       let ast_names = col_names_of_ast_stmt col_source_ast in
+       let bound_names = col_names_of_bound_stmt col_source in
        (* Use AST names when available (non-empty), filling gaps from bound names. *)
        let n_cols = List.length bound_names in
        let col_names = List.init n_cols (fun i ->
@@ -2104,12 +2135,20 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
          Cat.next_rowid = 0L;
        } in
        Cat.register_ephemeral cat cte_meta;
-       let* query_r = bind_internal ~views ~named_params ~param_counter cat query in
-       Cat.unregister_ephemeral cat ~name;
-       (match query_r with
-        | Error e -> Lwt.return (Error e)
-        | Ok bound_query ->
-          Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query; recursive }))))
+       (* Now bind the full def (for recursive CTEs the CTE name is now in
+          scope, so the recursive arm can resolve it). *)
+       let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
+       (match def_r with
+        | Error e ->
+          Cat.unregister_ephemeral cat ~name;
+          Lwt.return (Error e)
+        | Ok bound_def ->
+          let* query_r = bind_internal ~views ~named_params ~param_counter cat query in
+          Cat.unregister_ephemeral cat ~name;
+          (match query_r with
+           | Error e -> Lwt.return (Error e)
+           | Ok bound_query ->
+             Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query; recursive })))))
   | Ast.S_create_view { name; query } ->
     let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
     (match bound_r with

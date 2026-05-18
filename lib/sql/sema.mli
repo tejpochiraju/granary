@@ -194,7 +194,7 @@ type bound_stmt =
       right : bound_stmt;
     }
   | BS_const_select of {
-      exprs : bound_expr list;
+      exprs : (bound_expr * string option) list;
     }
   | BS_with_cte of {
       name      : string;
