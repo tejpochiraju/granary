@@ -71,7 +71,7 @@ type agg_spec = {
     Projection items below describe how to compute each projected
     column FROM that aggregate output row. *)
 type agg_proj_item =
-  | AP_group_col              (** project the GROUP BY column (only valid if group_by present) *)
+  | AP_group_col of int       (** project the i-th GROUP BY column (index into group_cols list) *)
   | AP_agg_slot of int        (** project the [i]-th aggregate result from the aggregate output *)
 
 (** A bound JOIN clause.
@@ -118,16 +118,17 @@ type bound_stmt =
       limit      : int option;
       offset     : int option;
       joins      : bound_join list;     (** Phase 10: zero or more JOINs *)
-      group_by   : int option;
-        (** [Some i] = GROUP BY column at ordinal [i] (in combined row).
-            [None] with non-empty [aggs] = one big group over all rows.
-            [None] with empty [aggs] = no aggregation (ordinary SELECT). *)
+      group_by   : int list;
+        (** List of GROUP BY column ordinals (in combined row).
+            Non-empty = GROUP BY present.
+            Empty with non-empty [aggs] = one big group over all rows.
+            Empty with empty [aggs] = no aggregation (ordinary SELECT). *)
       aggs       : agg_spec list;       (** ordered list of aggregates to compute *)
       having     : bound_expr option;
         (** HAVING predicate.  Column references inside resolve against
             the OUTPUT row of [Op_aggregate]:
-              - ordinal 0 = group column value (if [group_by] is [Some]);
-              - ordinals 1..N (or 0..N-1 if no group_by) = aggregate slots. *)
+              - ordinals 0..k-1 = group column values (if group_by non-empty);
+              - ordinals k..k+N-1 = aggregate slots. *)
       agg_proj   : agg_proj_item list;
         (** When [aggs] is non-empty, this is the projection list over
             the aggregate output row (ignore [proj]).  Empty otherwise. *)

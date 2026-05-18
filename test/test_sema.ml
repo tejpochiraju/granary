@@ -1106,7 +1106,7 @@ let bind_select_group_by_basic () =
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { group_by = Some 0; _ }) -> ()
+  | Ok (Sema.BS_select { group_by = [0]; _ }) -> ()
   | _ -> Alcotest.fail "expected BS_select GROUP BY id"
 
 let bind_select_group_by_unknown_col () =
@@ -1121,17 +1121,17 @@ let bind_select_group_by_unknown_col () =
   | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
   | _ -> Alcotest.fail "expected Unknown_column bogus in GROUP BY"
 
-let bind_select_group_by_multi_rejected () =
+let bind_select_group_by_multi_accepted () =
   let cat = two_col_cat () in
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `Exprs [(Ast.E_agg (Ast.Agg_count, None), None)];
+    proj = `Exprs [(Ast.E_col "id", None); (Ast.E_col "name", None); (Ast.E_agg (Ast.Agg_count, None), None)];
     table = "users"; table_alias = None; joins = [];
     where = None; group_by = ["id"; "name"]; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for multi-col GROUP BY"
+  | Ok (Sema.BS_select { group_by = [0; 1]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select with two-column GROUP BY [0;1]"
 
 let bind_select_having_basic () =
   let cat = two_col_cat () in
@@ -1906,7 +1906,7 @@ let bind_select_qual_no_join () =
     where = None; group_by = ["id"]; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { group_by = Some 0; _ }) -> ()
+  | Ok (Sema.BS_select { group_by = [0]; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok with qual col, no join"
 
 (** qual_lookup no-join, unknown column on the table (line 485). *)
@@ -3269,7 +3269,7 @@ let () =
       Alcotest.test_case "bind_select_avg_text_col_rejected"       `Quick bind_select_avg_text_col_rejected;
       Alcotest.test_case "bind_select_group_by_basic"              `Quick bind_select_group_by_basic;
       Alcotest.test_case "bind_select_group_by_unknown_col"        `Quick bind_select_group_by_unknown_col;
-      Alcotest.test_case "bind_select_group_by_multi_rejected"     `Quick bind_select_group_by_multi_rejected;
+      Alcotest.test_case "bind_select_group_by_multi_accepted"     `Quick bind_select_group_by_multi_accepted;
       Alcotest.test_case "bind_select_having_basic"                `Quick bind_select_having_basic;
       Alcotest.test_case "bind_select_having_no_group_by_rejected" `Quick bind_select_having_no_group_by_rejected;
       Alcotest.test_case "bind_select_agg_star_non_count_rejected" `Quick bind_select_agg_star_non_count_rejected;

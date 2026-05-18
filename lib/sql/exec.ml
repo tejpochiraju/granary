@@ -2585,18 +2585,24 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       ) left_rows;
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
-  | Plan.Op_aggregate { child; group_col; aggs; having; proj } ->
+  | Plan.Op_aggregate { child; group_cols; aggs; having; proj } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
-    let groups : (Row.value * Row.t list) list =
-      match group_col with
-      | None ->
-        [ (Row.V_null, rows) ]
-      | Some gc ->
-        (* Stable-sort by group column, then split runs of equal keys. *)
+    let n_group_cols = List.length group_cols in
+    let group_keys_of_row row = List.map (fun i -> row.(i)) group_cols in
+    let compare_group_keys ka kb =
+      List.fold_left2 (fun acc a b ->
+        if acc <> 0 then acc else compare_values a b
+      ) 0 ka kb
+    in
+    let groups : (Row.value list * Row.t list) list =
+      if group_cols = [] then
+        [ ([], rows) ]
+      else begin
+        (* Stable-sort by group key tuple, then split runs of equal keys. *)
         let sorted =
           List.stable_sort (fun a b ->
-            compare_values a.(gc) b.(gc)
+            compare_group_keys (group_keys_of_row a) (group_keys_of_row b)
           ) rows
         in
         let rec group_runs acc cur_key cur_rows = function
@@ -2605,8 +2611,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
              | [] -> List.rev acc
              | _  -> List.rev ((cur_key, List.rev cur_rows) :: acc))
           | r :: rest ->
-            let k = r.(gc) in
-            if compare_values k cur_key = 0 && cur_rows <> [] then
+            let k = group_keys_of_row r in
+            if cur_rows <> [] && compare_group_keys k cur_key = 0 then
               group_runs acc cur_key (r :: cur_rows) rest
             else
               let acc' =
@@ -2615,7 +2621,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
               in
               group_runs acc' k [r] rest
         in
-        group_runs [] Row.V_null [] sorted
+        group_runs [] [] [] sorted
+      end
     in
     let compute_agg (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
       match spec.func, spec.col_ord with
@@ -2686,12 +2693,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let agg_output_rows =
       List.map (fun (group_key, group_rows) ->
         let agg_vals = List.map (fun spec -> compute_agg spec group_rows) aggs in
-        let out =
-          match group_col with
-          | None   -> Array.of_list agg_vals
-          | Some _ -> Array.of_list (group_key :: agg_vals)
-        in
-        out
+        (* Output row: [key0; key1; ...; agg0; agg1; ...] *)
+        Array.of_list (group_key @ agg_vals)
       ) groups
     in
     (* Apply HAVING on the aggregate output row. *)
@@ -2705,13 +2708,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let final_rows =
       List.map (fun agg_row ->
         Array.of_list (List.map (function
-          | Plan.PI_group_col ->
-            (match group_col with
-             | Some _ -> agg_row.(0)
-             | None   -> failwith "PI_group_col without group_col")
-          | Plan.PI_agg_slot k ->
-            let off = match group_col with Some _ -> 1 | None -> 0 in
-            agg_row.(off + k)
+          | Plan.PI_group_col i -> agg_row.(i)
+          | Plan.PI_agg_slot k  -> agg_row.(n_group_cols + k)
         ) proj)
       ) after_having
     in

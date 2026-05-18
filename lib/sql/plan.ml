@@ -142,14 +142,14 @@ type op =
       n_right_cols     : int;
     }
   | Op_aggregate of {
-      child     : op;
-      group_col : int option;
-        (** column ordinal in the CHILD row.  [None] = one big group. *)
-      aggs      : agg_spec list;
-      having    : expr option;
+      child      : op;
+      group_cols : int list;
+        (** column ordinals in the CHILD row.  [[]] = one big group. *)
+      aggs       : agg_spec list;
+      having     : expr option;
         (** evaluated on the OUTPUT row of [Op_aggregate];
-            output row = [group_col_value?; agg1; agg2; ...]. *)
-      proj      : proj_item list;
+            output row = [group_col0; group_col1; ...; agg1; agg2; ...]. *)
+      proj       : proj_item list;
         (** projection over the aggregate output row.  Maps to the final
             row emitted to downstream operators. *)
     }
@@ -229,7 +229,7 @@ type op =
     }
 
 and proj_item =
-  | PI_group_col            (** project the group column (must have [group_col = Some _]) *)
+  | PI_group_col of int     (** project the i-th GROUP BY column (index into group_cols) *)
   | PI_agg_slot of int      (** project the k-th aggregate result *)
 
 and agg_spec = {

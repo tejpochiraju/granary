@@ -4199,6 +4199,58 @@ let test_create_table_no_ine_fails () =
      | Ok () -> Alcotest.fail "expected error for duplicate table without IF NOT EXISTS");
     Lwt.return_unit)
 
+(* ------------------------------------------------------------------ *)
+(* Multi-column GROUP BY tests                                          *)
+(* ------------------------------------------------------------------ *)
+
+let test_group_by_two_cols () =
+  let db = fresh_db () in
+  run (
+    let* r = Db.execute db "CREATE TABLE emp (dept TEXT, role TEXT, salary INTEGER)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 100)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 120)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'mgr', 200)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp VALUES ('hr',  'dev', 80)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* rows_r = Db.query db
+      "SELECT dept, role, COUNT(*) FROM emp GROUP BY dept, role ORDER BY dept, role" in
+    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    let triples = List.map (fun row ->
+      match row.(0), row.(1), row.(2) with
+      | Db.V_text d, Db.V_text r, Db.V_int c -> (d, r, Int64.to_int c)
+      | _ -> ("?","?",0)) rows in
+    Alcotest.(check (list (triple string string int)))
+      "two-col group" [("eng","dev",2);("eng","mgr",1);("hr","dev",1)] triples;
+    Lwt.return_unit)
+
+let test_group_by_two_cols_sum () =
+  let db = fresh_db () in
+  run (
+    let* r = Db.execute db "CREATE TABLE emp2 (dept TEXT, role TEXT, salary INTEGER)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 100)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 120)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'mgr', 200)" in
+    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+    let* rows_r = Db.query db
+      "SELECT dept, role, SUM(salary) FROM emp2 GROUP BY dept, role ORDER BY dept, role" in
+    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    let triples = List.map (fun row ->
+      match row.(0), row.(1), row.(2) with
+      | Db.V_text d, Db.V_text r, Db.V_int s -> (d, r, Int64.to_int s)
+      | _ -> ("?","?",0)) rows in
+    Alcotest.(check (list (triple string string int)))
+      "two-col sum" [("eng","dev",220);("eng","mgr",200)] triples;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4626,5 +4678,9 @@ let () =
       Alcotest.test_case "create_table_ine"     `Quick test_create_table_if_not_exists;
       Alcotest.test_case "create_index_ine"     `Quick test_create_index_if_not_exists;
       Alcotest.test_case "create_table_no_ine"  `Quick test_create_table_no_ine_fails;
+    ];
+    "group_by_multi", [
+      Alcotest.test_case "two_cols_count" `Quick test_group_by_two_cols;
+      Alcotest.test_case "two_cols_sum"   `Quick test_group_by_two_cols_sum;
     ];
   ]

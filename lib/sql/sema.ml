@@ -56,7 +56,7 @@ type agg_spec = {
 }
 
 type agg_proj_item =
-  | AP_group_col
+  | AP_group_col of int     (** index into group_cols list *)
   | AP_agg_slot of int
 
 (** A bound JOIN clause.  See sema.mli for layout details. *)
@@ -96,7 +96,7 @@ type bound_stmt =
       limit      : int option;
       offset     : int option;
       joins      : bound_join list;
-      group_by   : int option;
+      group_by   : int list;
       aggs       : agg_spec list;
       having     : bound_expr option;
       agg_proj   : agg_proj_item list;
@@ -1236,20 +1236,37 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
        let is_aggregated =
          proj_has_agg || having_has_agg || group_by_present
        in
-       (* Bind GROUP BY column (only first column supported in Phase 2). *)
-       let group_col_result : (int option, error) result =
-         match group_by with
-         | [] -> Ok None
-         | [name] ->
-           (match proj_lookup name with
-            | Error e -> Error e
-            | Ok i -> Ok (Some i))
-         | _ -> Error (Unsupported "GROUP BY with more than one column is not supported in Phase 2")
+       (* Bind GROUP BY columns — any number supported. *)
+       let find_pos lst v =
+         let rec go i = function
+           | [] -> None
+           | x :: _ when x = v -> Some i
+           | _ :: rest -> go (i + 1) rest
+         in go 0 lst
        in
-       (match group_col_result with
+       let group_cols_result : (int list, error) result =
+         List.fold_left (fun acc col_name ->
+           match acc with
+           | Error _ as e -> e
+           | Ok indices ->
+             (match proj_lookup col_name with
+              | Ok i -> Ok (indices @ [i])
+              | Error _ ->
+                (* try qualified lookup across all tables *)
+                let found = List.find_map (fun (tm, _, _) ->
+                  match qual_lookup tm.Cat.name col_name with
+                  | Ok i -> Some i
+                  | Error _ -> None
+                ) tables in
+                (match found with
+                 | Some i -> Ok (indices @ [i])
+                 | None -> Error (Unknown_column { table = ""; column = col_name })))
+         ) (Ok []) group_by
+       in
+       (match group_cols_result with
         | Error e -> Lwt.return (Error e)
-        | Ok group_col ->
-       let offset_for_aggs = match group_col with Some _ -> 1 | None -> 0 in
+        | Ok group_cols ->
+       let offset_for_aggs = List.length group_cols in
        (* Build proj/agg_proj.
           The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj, windows).
           [expr_proj] is non-empty only for scalar-function projections
@@ -1449,18 +1466,18 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                (match proj_lookup name with
                 | Error e -> Error e
                 | Ok i ->
-                  (* Must match the GROUP BY column. *)
-                  (match group_col with
-                   | Some gc when gc = i -> Ok AP_group_col
-                   | _ -> Error (Unsupported (Printf.sprintf
+                  (* Must appear in GROUP BY. *)
+                  (match find_pos group_cols i with
+                   | Some pos -> Ok (AP_group_col pos)
+                   | None -> Error (Unsupported (Printf.sprintf
                                   "column '%s' must appear in GROUP BY clause" name))))
              | Ast.E_tbl_col (t, c) ->
                (match qual_lookup t c with
                 | Error e -> Error e
                 | Ok i ->
-                  (match group_col with
-                   | Some gc when gc = i -> Ok AP_group_col
-                   | _ -> Error (Unsupported (Printf.sprintf
+                  (match find_pos group_cols i with
+                   | Some pos -> Ok (AP_group_col pos)
+                   | None -> Error (Unsupported (Printf.sprintf
                                   "column '%s.%s' must appear in GROUP BY clause" t c))))
              | Ast.E_agg (func, arg_opt) ->
                (* SUM/AVG type check. *)
@@ -1513,9 +1530,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                   - error if there are no aggregates.
                   This is non-standard SQL behaviour but for Phase 2 we
                   only accept aggregated `*` if there's a GROUP BY. *)
-               (match group_col with
-                | Some _ -> [] (* unused — won't reach here *)
-                | None -> [])
+               (match group_cols with
+                | _ :: _ -> [] (* unused — won't reach here *)
+                | [] -> [])
              | `Cols names -> List.map (fun n -> Ast.E_col n) names
              | `Exprs es -> List.map fst es
            in
@@ -1587,24 +1604,24 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                       Error (Unsupported "HAVING requires GROUP BY or aggregate")
                     else begin
                       (* Use a resolver that, for plain column refs,
-                         requires the column to be the GROUP BY column
-                         (resolves to slot 0 = group col), else error. *)
+                         requires the column to appear in GROUP BY
+                         (resolves to its position in group_cols), else error. *)
                       let having_resolver_unqual name =
                         match proj_lookup name with
                         | Error e -> Error e
                         | Ok i ->
-                          (match group_col with
-                           | Some gc when gc = i -> Ok 0
-                           | _ -> Error (Unsupported (Printf.sprintf
+                          (match find_pos group_cols i with
+                           | Some pos -> Ok pos
+                           | None -> Error (Unsupported (Printf.sprintf
                                           "HAVING references non-grouped column '%s'" name)))
                       in
                       let having_resolver_qual t c =
                         match qual_lookup t c with
                         | Error e -> Error e
                         | Ok i ->
-                          (match group_col with
-                           | Some gc when gc = i -> Ok 0
-                           | _ -> Error (Unsupported (Printf.sprintf
+                          (match find_pos group_cols i with
+                           | Some pos -> Ok pos
+                           | None -> Error (Unsupported (Printf.sprintf
                                           "HAVING references non-grouped column '%s.%s'" t c)))
                       in
                       let having_resolver = {
@@ -1694,7 +1711,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                            limit      = valid_limit;
                            offset     = valid_offset;
                            joins      = bound_joins;
-                           group_by   = group_col;
+                           group_by   = group_cols;
                            aggs       = all_aggs;
                            having     = bound_having;
                            agg_proj   = agg_proj_items;

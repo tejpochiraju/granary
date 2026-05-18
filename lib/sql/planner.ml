@@ -142,7 +142,7 @@ let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
   { Plan.func = a.func; col_ord = a.col_ord }
 
 let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
-  | Sema.AP_group_col   -> Plan.PI_group_col
+  | Sema.AP_group_col i -> Plan.PI_group_col i
   | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
 
 let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
@@ -240,7 +240,7 @@ let plan_select cat
     else
       after_joins
   in
-  let is_aggregated = aggs <> [] || group_by <> None in
+  let is_aggregated = aggs <> [] || group_by <> [] in
   (* Insert Op_window after scan+filter+joins when windows are present. *)
   let after_window =
     if windows = [] then after_where
@@ -277,7 +277,7 @@ let plan_select cat
     if is_aggregated then
       Plan.Op_aggregate {
         child = after_sort;
-        group_col = group_by;
+        group_cols = group_by;
         aggs = List.map sema_agg_to_plan aggs;
         having = Option.map plan_expr having;
         proj = List.map sema_agg_proj_to_plan agg_proj;
@@ -389,7 +389,7 @@ let rec plan ?cat = function
              n_input_cols = n_input_cols_no_cat;
            }
        in
-       let is_aggregated = aggs <> [] || group_by <> None in
+       let is_aggregated = aggs <> [] || group_by <> [] in
        let make_sort_keys () =
          List.map (fun (bkey : Sema.bound_order_key) ->
            let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
@@ -409,7 +409,7 @@ let rec plan ?cat = function
          if is_aggregated then
            Plan.Op_aggregate {
              child = after_sort;
-             group_col = group_by;
+             group_cols = group_by;
              aggs = List.map sema_agg_to_plan aggs;
              having = Option.map plan_expr having;
              proj = List.map sema_agg_proj_to_plan agg_proj;
