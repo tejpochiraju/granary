@@ -3591,6 +3591,75 @@ let test_corr_not_in_select () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "bob" [| Db.V_text "bob" |] (List.nth rows 0)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 13: UPSERT                                                    *)
+(* ------------------------------------------------------------------ *)
+
+let test_upsert_basic () =
+  run (
+    let* db = Db.open_in_memory () in
+    exec db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))";
+    exec db "INSERT INTO kv (k, v) VALUES (1, 'old')";
+    exec db "INSERT INTO kv (k, v) VALUES (1, 'new') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    let rows = query_ok db "SELECT k, v FROM kv" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (match rows with
+     | [r] ->
+       Alcotest.check value_testable "k=1" (Db.V_int 1L) r.(0);
+       Alcotest.check value_testable "v=new" (Db.V_text "new") r.(1)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_upsert_no_conflict () =
+  run (
+    let* db = Db.open_in_memory () in
+    exec db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))";
+    exec db "INSERT INTO kv (k, v) VALUES (1, 'first')";
+    exec db "INSERT INTO kv (k, v) VALUES (2, 'second') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    let rows = query_ok db "SELECT k, v FROM kv ORDER BY k" in
+    Alcotest.(check int) "two rows" 2 (List.length rows);
+    Lwt.return_unit)
+
+let test_upsert_expression () =
+  run (
+    let* db = Db.open_in_memory () in
+    exec db "CREATE TABLE counters (name TEXT NOT NULL, cnt INTEGER NOT NULL, UNIQUE(name))";
+    exec db "INSERT INTO counters (name, cnt) VALUES ('hits', 1)";
+    exec db "INSERT INTO counters (name, cnt) VALUES ('hits', 0) ON CONFLICT(name) DO UPDATE SET cnt = cnt + 1";
+    let rows = query_ok db "SELECT cnt FROM counters WHERE name = 'hits'" in
+    (match rows with
+     | [r] -> Alcotest.check value_testable "cnt=2" (Db.V_int 2L) r.(0)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_upsert_multiple_assignments () =
+  run (
+    let* db = Db.open_in_memory () in
+    exec db "CREATE TABLE t (id INTEGER, a TEXT, b TEXT, UNIQUE(id))";
+    exec db "INSERT INTO t (id, a, b) VALUES (1, 'a1', 'b1')";
+    exec db "INSERT INTO t (id, a, b) VALUES (1, 'a2', 'b2') ON CONFLICT(id) DO UPDATE SET a = excluded.a, b = excluded.b";
+    let rows = query_ok db "SELECT a, b FROM t WHERE id = 1" in
+    (match rows with
+     | [r] ->
+       Alcotest.check value_testable "a=a2" (Db.V_text "a2") r.(0);
+       Alcotest.check value_testable "b=b2" (Db.V_text "b2") r.(1)
+     | _ -> Alcotest.fail "expected one row");
+    Lwt.return_unit)
+
+let test_upsert_preserves_non_conflict_rows () =
+  run (
+    let* db = Db.open_in_memory () in
+    exec db "CREATE TABLE kv (k INTEGER, v TEXT, UNIQUE(k))";
+    exec db "INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+    exec db "INSERT INTO kv VALUES (2, 'B') ON CONFLICT(k) DO UPDATE SET v = excluded.v";
+    let rows = query_ok db "SELECT k, v FROM kv ORDER BY k" in
+    Alcotest.(check int) "still 3 rows" 3 (List.length rows);
+    (match rows with
+     | [_; r2; _] ->
+       Alcotest.check value_testable "row2 v=B" (Db.V_text "B") r2.(1)
+     | _ -> Alcotest.fail "expected 3 rows");
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3963,5 +4032,12 @@ let () =
       Alcotest.test_case "not_exists" `Quick test_corr_not_exists;
       Alcotest.test_case "in_select"  `Quick test_corr_in_select;
       Alcotest.test_case "not_in"     `Quick test_corr_not_in_select;
+    ];
+    "upsert", [
+      Alcotest.test_case "basic"                `Quick test_upsert_basic;
+      Alcotest.test_case "no_conflict"          `Quick test_upsert_no_conflict;
+      Alcotest.test_case "expression"           `Quick test_upsert_expression;
+      Alcotest.test_case "multiple_assignments" `Quick test_upsert_multiple_assignments;
+      Alcotest.test_case "preserves_others"     `Quick test_upsert_preserves_non_conflict_rows;
     ];
   ]
