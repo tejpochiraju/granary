@@ -1986,6 +1986,129 @@ let phase10_multi_join_cases = [
     unordered = false };
 ]
 
+(* ── Phase 11: CAST, NULLIF, IIF ──────────────────────────────── *)
+
+let phase11_cast_cases = [
+  { name    = "cast_int_to_text";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (42)"];
+    query   = "SELECT CAST(n AS TEXT) FROM t";
+    unordered = false };
+
+  { name    = "cast_text_to_int";
+    setup   = ["CREATE TABLE t (s TEXT)"; "INSERT INTO t VALUES ('99')"];
+    query   = "SELECT CAST(s AS INTEGER) FROM t";
+    unordered = false };
+
+  { name    = "cast_float_prefix_to_int";
+    setup   = ["CREATE TABLE t (s TEXT)"; "INSERT INTO t VALUES ('3.7')"];
+    query   = "SELECT CAST(s AS INTEGER) FROM t";
+    unordered = false };
+
+  { name    = "cast_real_to_int";
+    setup   = ["CREATE TABLE t (r REAL)"; "INSERT INTO t VALUES (7.9)"];
+    query   = "SELECT CAST(r AS INTEGER) FROM t";
+    unordered = false };
+
+  { name    = "cast_int_to_real";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (3)"];
+    query   = "SELECT CAST(n AS REAL) FROM t";
+    unordered = false };
+
+  { name    = "cast_null_is_null";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (NULL)"];
+    query   = "SELECT CAST(n AS TEXT) FROM t";
+    unordered = false };
+
+  { name    = "cast_in_where";
+    setup   = ["CREATE TABLE t (s TEXT)";
+               "INSERT INTO t VALUES ('10')";
+               "INSERT INTO t VALUES ('3')"];
+    query   = "SELECT s FROM t WHERE CAST(s AS INTEGER) > 5 ORDER BY s";
+    unordered = false };
+
+  { name    = "nullif_equal";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (5)"];
+    query   = "SELECT NULLIF(n, 5) FROM t";
+    unordered = false };
+
+  { name    = "nullif_unequal";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (5)"];
+    query   = "SELECT NULLIF(n, 3) FROM t";
+    unordered = false };
+
+  { name    = "iif_true";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (10)"];
+    query   = "SELECT IIF(n > 5, 'big', 'small') FROM t";
+    unordered = false };
+
+  { name    = "iif_false";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (2)"];
+    query   = "SELECT IIF(n > 5, 'big', 'small') FROM t";
+    unordered = false };
+
+  { name    = "cast_text_invalid_to_int";
+    setup   = ["CREATE TABLE t (s TEXT)"; "INSERT INTO t VALUES ('abc')"];
+    query   = "SELECT CAST(s AS INTEGER) FROM t";
+    unordered = false };
+]
+
+(* ── Phase 11: aliases ─────────────────────────────────────────── *)
+
+let phase11_alias_cases = [
+  { name    = "col_alias_basic";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (4)"];
+    query   = "SELECT n * 2 AS doubled FROM t";
+    unordered = false };
+
+  { name    = "col_alias_order_by";
+    setup   = ["CREATE TABLE t (n INTEGER)";
+               "INSERT INTO t VALUES (3)";
+               "INSERT INTO t VALUES (1)";
+               "INSERT INTO t VALUES (2)"];
+    query   = "SELECT n * 10 AS big FROM t ORDER BY big";
+    unordered = false };
+
+  { name    = "col_alias_multiple";
+    setup   = ["CREATE TABLE t (a INTEGER, b INTEGER)";
+               "INSERT INTO t VALUES (2, 3)"];
+    query   = "SELECT a + b AS total, a * b AS product FROM t";
+    unordered = false };
+
+  { name    = "tbl_alias_from";
+    setup   = ["CREATE TABLE products (id INTEGER, name TEXT)";
+               "INSERT INTO products VALUES (1, 'apple')"];
+    query   = "SELECT p.id, p.name FROM products AS p";
+    unordered = false };
+
+  { name    = "tbl_alias_join";
+    setup   = ["CREATE TABLE a (id INTEGER, val TEXT)";
+               "CREATE TABLE b (aid INTEGER, extra TEXT)";
+               "INSERT INTO a VALUES (1, 'x')";
+               "INSERT INTO b VALUES (1, 'y')"];
+    query   = "SELECT x.val, y.extra FROM a AS x JOIN b AS y ON x.id = y.aid";
+    unordered = false };
+
+  { name    = "tbl_alias_where";
+    setup   = ["CREATE TABLE t (n INTEGER)";
+               "INSERT INTO t VALUES (1)";
+               "INSERT INTO t VALUES (2)"];
+    query   = "SELECT r.n FROM t AS r WHERE r.n > 1 ORDER BY r.n";
+    unordered = false };
+
+  { name    = "nullif_null_arg";
+    setup   = ["CREATE TABLE t (n INTEGER)"; "INSERT INTO t VALUES (NULL)"];
+    query   = "SELECT NULLIF(n, 0) FROM t";
+    unordered = false };
+
+  { name    = "cast_in_join_on";
+    setup   = ["CREATE TABLE t (id INTEGER)";
+               "CREATE TABLE u (sid TEXT)";
+               "INSERT INTO t VALUES (1)";
+               "INSERT INTO u VALUES ('1')"];
+    query   = "SELECT t.id FROM t JOIN u ON t.id = CAST(u.sid AS INTEGER)";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -1997,4 +2120,6 @@ let () =
     "phase9_fk",         List.map make_test phase9_fk_cases;
     "phase10_case_when", List.map make_test phase10_case_when_cases;
     "phase10_multi_join", List.map make_test phase10_multi_join_cases;
+    "phase11_cast",      List.map make_test phase11_cast_cases;
+    "phase11_alias",     List.map make_test phase11_alias_cases;
   ]
