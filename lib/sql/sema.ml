@@ -29,6 +29,8 @@ type bound_expr =
       else_     : bound_expr option;
     }
   | BE_cast of bound_expr * Ast.ty
+  | BE_excluded_col of int
+    (** Reference to the i-th column of the proposed INSERT row (the 'excluded' pseudo-table). *)
 
 type bound_order_key = {
   key : bound_expr;
@@ -59,11 +61,12 @@ type bound_stmt =
       uniq_idxs : (string * string list) list;
     }
   | BS_insert of {
-      table_meta  : Cat.table_meta;
-      ordinals    : int list;
-      values      : bound_expr list list;   (* one sublist per VALUES row *)
-      on_conflict : Ast.conflict_action option;
-      returning   : bound_expr list;
+      table_meta    : Cat.table_meta;
+      ordinals      : int list;
+      values        : bound_expr list list;   (* one sublist per VALUES row *)
+      on_conflict   : Ast.conflict_action option;
+      returning     : bound_expr list;
+      upsert_update : (string list * (int * bound_expr) list) option;
     }
   | BS_select of {
       distinct   : bool;
@@ -155,6 +158,8 @@ type bound_stmt =
       def   : bound_stmt;
       query : bound_stmt;
     }
+  | BS_create_view of { name: string; query: Ast.stmt }
+  | BS_drop_view   of { name: string }
 
 type error =
   | Unknown_table       of string
@@ -718,6 +723,7 @@ let rec expr_has_subquery = function
     || List.exists (fun (c, r) -> expr_has_subquery c || expr_has_subquery r) branches
     || (match else_ with Some e -> expr_has_subquery e | None -> false)
   | BE_cast (e, _) -> expr_has_subquery e
+  | BE_excluded_col _ -> false
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
@@ -874,7 +880,30 @@ let bind_returning_exprs ~param_counter ~named_params (meta : Cat.table_meta) (e
            Ok (bexprs @ [be]))
   ) (Ok []) exprs
 
-let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning =
+let bind_upsert_rhs_expr ~param_counter ~named_params (meta : Cat.table_meta) (e : Ast.expr) =
+  match e with
+  | Ast.E_tbl_col (tbl, col) when
+      String.equal (String.uppercase_ascii tbl) "EXCLUDED" ->
+    (match col_index meta.columns col with
+     | None   -> Error (Unknown_column { table = "excluded"; column = col })
+     | Some i -> Ok (BE_excluded_col i))
+  | other -> bind_expr ~param_counter ~named_params meta other
+
+let bind_upsert_assignments ~param_counter ~named_params (meta : Cat.table_meta)
+    (assigns : (string * Ast.expr) list) =
+  List.fold_left (fun acc (col_name, rhs_expr) ->
+    match acc with
+    | Error _ -> acc
+    | Ok bound_list ->
+      (match col_index meta.columns col_name with
+       | None   -> Error (Unknown_column { table = meta.name; column = col_name })
+       | Some i ->
+         (match bind_upsert_rhs_expr ~param_counter ~named_params meta rhs_expr with
+          | Error e -> Error e
+          | Ok be   -> Ok (bound_list @ [(i, be)])))
+  ) (Ok []) assigns
+
+let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -987,13 +1016,25 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
        (match bind_returning_exprs ~param_counter ~named_params meta returning with
         | Error e -> Lwt.return (Error e)
         | Ok ret_bound ->
-          Lwt.return (Ok (BS_insert {
-            table_meta = meta;
-            ordinals;
-            values     = all_vals;
-            on_conflict;
-            returning  = ret_bound;
-          }))))
+          let upsert_result =
+            match upsert_update with
+            | None -> Ok None
+            | Some Ast.{ conflict_cols; assignments } ->
+              (match bind_upsert_assignments ~param_counter ~named_params meta assignments with
+               | Error e -> Error e
+               | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
+          in
+          (match upsert_result with
+           | Error e -> Lwt.return (Error e)
+           | Ok bound_upsert ->
+             Lwt.return (Ok (BS_insert {
+               table_meta    = meta;
+               ordinals;
+               values        = all_vals;
+               on_conflict;
+               returning     = ret_bound;
+               upsert_update = bound_upsert;
+             })))))
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)
@@ -1516,6 +1557,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
       | Ast.Ty_text -> Row.Text
       | Ast.Ty_real -> Row.Real
       | Ast.Ty_blob -> Row.Blob)
+  | BE_excluded_col _ -> None      (* type of excluded col unknown at bind time *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
@@ -1816,7 +1858,7 @@ let rec col_names_of_ast_stmt = function
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
-  | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update = _ } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
+  | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->
@@ -1894,10 +1936,13 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
         | Error e -> Lwt.return (Error e)
         | Ok bound_query ->
           Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query }))))
-  | Ast.S_create_view _ ->
-    Lwt.return (Error (Unsupported "CREATE VIEW not yet implemented"))
-  | Ast.S_drop_view _ ->
-    Lwt.return (Error (Unsupported "DROP VIEW not yet implemented"))
+  | Ast.S_create_view { name; query } ->
+    let* bound_r = bind_internal ~named_params ~param_counter cat query in
+    (match bound_r with
+     | Error e -> Lwt.return (Error e)
+     | Ok _ -> Lwt.return (Ok (BS_create_view { name; query })))
+  | Ast.S_drop_view { name } ->
+    Lwt.return (Ok (BS_drop_view { name }))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~named_params ~param_counter cat right in

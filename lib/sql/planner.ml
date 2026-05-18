@@ -39,6 +39,7 @@ let rec plan_expr = function
       else_     = Option.map plan_expr else_;
     }
   | Sema.BE_cast (e, ty) -> Plan.P_cast (plan_expr e, ty)
+  | Sema.BE_excluded_col i -> Plan.P_excluded_col i
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -254,11 +255,17 @@ let plan_select cat
 let rec plan ?cat = function
   | Sema.BS_create_table { name; columns; uniq_idxs } ->
     Plan.Op_create_table { name; columns; uniq_idxs }
-  | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning } ->
+  | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update } ->
+    let plan_upsert = match upsert_update with
+      | None -> None
+      | Some (cols, assigns) ->
+        Some (cols, List.map (fun (i, e) -> (i, plan_expr e)) assigns)
+    in
     Plan.Op_insert { table_meta; ordinals;
                      values = List.map (List.map plan_expr) values;
                      on_conflict;
-                     returning = List.map plan_expr returning }
+                     returning = List.map plan_expr returning;
+                     upsert_update = plan_upsert }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      joins; group_by; aggs; having; agg_proj } ->
     (match cat with
@@ -462,3 +469,7 @@ let rec plan ?cat = function
       def      = plan ?cat def;
       query    = plan ?cat query;
     }
+  | Sema.BS_create_view { name; query } ->
+    Plan.Op_create_view { name; query }
+  | Sema.BS_drop_view { name } ->
+    Plan.Op_drop_view { name }

@@ -39,7 +39,7 @@ let insert store cat table_name (ordinals, values) =
     in
     Exec.execute store cat
       (Plan.Op_insert { table_meta; ordinals; values = [List.map (fun l -> Plan.P_lit l) values];
-                        on_conflict = None; returning = [] })
+                        on_conflict = None; returning = []; upsert_update = None })
   )
 
 (** Open a cursor on a tree and collect all (key, value) pairs. *)
@@ -563,7 +563,7 @@ let query_insert_raises () =
        ignore (Exec.query store cat
          (Plan.Op_insert { table_meta = m; ordinals = [0];
                            values = [[Plan.P_lit (Ast.L_int 1L)]];
-                           on_conflict = None; returning = [] }));
+                           on_conflict = None; returning = []; upsert_update = None }));
        Alcotest.fail "expected Failure for Op_insert in query"
      with Failure _ -> ());
     Lwt.return_unit

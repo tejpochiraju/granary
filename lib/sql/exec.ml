@@ -338,6 +338,9 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
   | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ ->
     (* These are replaced by pre_eval_subquery before row evaluation. *)
     Row.V_null
+  | Plan.P_excluded_col _ ->
+    (* Excluded-column references are evaluated by the UPSERT executor — not reachable here. *)
+    Row.V_null
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -1406,7 +1409,7 @@ let execute_with_count ?(mode = Auto)
       | Ok _      -> Lwt.return_unit
     ) uniq_idxs in
     Lwt.return 0
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _ } ->
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update = _ } ->
     Lwt_list.fold_left_s (fun count row_vals ->
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
                         store cat ~table_meta ~ordinals ~values:row_vals in
@@ -1557,6 +1560,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
+  | Plan.Op_create_view _ | Plan.Op_drop_view _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _ ->
     failwith "Exec.execute: use Exec.query for read operations"
@@ -2382,7 +2386,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       else (Hashtbl.replace seen k (); true)
     ) left_list in
     Lwt.return (Lwt_stream.of_list result)
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning }
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update = _ }
     when returning <> [] ->
     (match cat with
      | None -> failwith "Exec.query: RETURNING requires catalog context"
@@ -2485,6 +2489,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_create_fts_table _
   | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
   | Plan.Op_alter_table _
+  | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->

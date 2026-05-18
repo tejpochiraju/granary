@@ -30,6 +30,8 @@ type expr =
       else_     : expr option;
     }
   | P_cast of expr * Ast.ty
+  | P_excluded_col of int
+    (** Column reference into the proposed INSERT excluded row. *)
 
 type op =
   | Op_create_table of {
@@ -38,11 +40,12 @@ type op =
       uniq_idxs : (string * string list) list;
     }
   | Op_insert of {
-      table_meta  : Cat.table_meta;
-      ordinals    : int list;
-      values      : expr list list;   (* one sublist per VALUES row *)
-      on_conflict : Ast.conflict_action option;
-      returning   : expr list;
+      table_meta    : Cat.table_meta;
+      ordinals      : int list;
+      values        : expr list list;   (* one sublist per VALUES row *)
+      on_conflict   : Ast.conflict_action option;
+      returning     : expr list;
+      upsert_update : (string list * (int * expr) list) option;
     }
   | Op_seq_scan of {
       table_meta : Cat.table_meta;
@@ -197,6 +200,13 @@ type op =
   | Op_cte_scan of {
       cte_name : string;
       n_cols   : int;
+    }
+  | Op_create_view of {
+      name  : string;
+      query : Ast.stmt;
+    }
+  | Op_drop_view of {
+      name : string;
     }
 
 and proj_item =

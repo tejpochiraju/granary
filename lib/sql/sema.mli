@@ -36,6 +36,8 @@ type bound_expr =
     }
     (** CASE [scrutinee] WHEN ... THEN ... [ELSE ...] END *)
   | BE_cast of bound_expr * Ast.ty
+  | BE_excluded_col of int
+    (** Reference to the i-th column of the proposed INSERT row (the 'excluded' pseudo-table). *)
 
 type bound_order_key = {
   key : bound_expr;
@@ -80,11 +82,12 @@ type bound_stmt =
             Planner creates Op_create_index for each. *)
     }
   | BS_insert of {
-      table_meta  : Sqlocaml_catalog.Catalog.table_meta;
-      ordinals    : int list;            (** column ordinals for the named cols *)
-      values      : bound_expr list list;   (* one sublist per VALUES row *)
-      on_conflict : Ast.conflict_action option;
-      returning   : bound_expr list;
+      table_meta    : Sqlocaml_catalog.Catalog.table_meta;
+      ordinals      : int list;            (** column ordinals for the named cols *)
+      values        : bound_expr list list;   (* one sublist per VALUES row *)
+      on_conflict   : Ast.conflict_action option;
+      returning     : bound_expr list;
+      upsert_update : (string list * (int * bound_expr) list) option;
     }
   | BS_select of {
       distinct   : bool;
@@ -188,6 +191,8 @@ type bound_stmt =
       def   : bound_stmt;
       query : bound_stmt;
     }
+  | BS_create_view of { name: string; query: Ast.stmt }
+  | BS_drop_view   of { name: string }
 
 type error =
   | Unknown_table       of string
