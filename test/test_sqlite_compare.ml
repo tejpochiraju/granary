@@ -2346,6 +2346,97 @@ let phase13_view_cases = [
     unordered = false };
 ]
 
+let phase14_window_cases = [
+  { name = "window_row_number";
+    setup = [
+      "CREATE TABLE emp (dept TEXT, name TEXT, salary INTEGER)";
+      "INSERT INTO emp VALUES ('eng','Alice',90000),('eng','Bob',80000),('hr','Carol',70000),('hr','Dave',60000)";
+    ];
+    query = "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp ORDER BY dept, salary DESC";
+    unordered = false };
+
+  { name = "window_rank";
+    setup = [
+      "CREATE TABLE scores (name TEXT, score INTEGER)";
+      "INSERT INTO scores VALUES ('A',100),('B',100),('C',90),('D',80)";
+    ];
+    query = "SELECT name, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY name";
+    unordered = false };
+
+  { name = "window_dense_rank";
+    setup = [
+      "CREATE TABLE scores (name TEXT, score INTEGER)";
+      "INSERT INTO scores VALUES ('A',100),('B',100),('C',90),('D',80)";
+    ];
+    query = "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY name";
+    unordered = false };
+
+  { name = "window_lag";
+    setup = [
+      "CREATE TABLE vals (id INTEGER, v INTEGER)";
+      "INSERT INTO vals VALUES (1,10),(2,20),(3,30)";
+    ];
+    query = "SELECT id, v, LAG(v, 1, 0) OVER (ORDER BY id) AS prev FROM vals ORDER BY id";
+    unordered = false };
+
+  { name = "window_lead";
+    setup = [
+      "CREATE TABLE vals (id INTEGER, v INTEGER)";
+      "INSERT INTO vals VALUES (1,10),(2,20),(3,30)";
+    ];
+    query = "SELECT id, v, LEAD(v, 1, 0) OVER (ORDER BY id) AS nxt FROM vals ORDER BY id";
+    unordered = false };
+
+  { name = "window_sum_running";
+    setup = [
+      "CREATE TABLE sales (id INTEGER, amount INTEGER)";
+      "INSERT INTO sales VALUES (1,100),(2,200),(3,300)";
+    ];
+    query = "SELECT id, SUM(amount) OVER (ORDER BY id) AS running FROM sales ORDER BY id";
+    unordered = false };
+
+  { name = "window_partition_sum";
+    setup = [
+      "CREATE TABLE t (dept TEXT, v INTEGER)";
+      "INSERT INTO t VALUES ('a',1),('a',2),('b',10),('b',20)";
+    ];
+    query = "SELECT dept, v, SUM(v) OVER (PARTITION BY dept) AS dept_total FROM t ORDER BY dept, v";
+    unordered = false };
+
+  { name = "window_count_star";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (3),(1),(2)";
+    ];
+    query = "SELECT x, COUNT(*) OVER () AS total FROM t ORDER BY x";
+    unordered = false };
+]
+
+let phase14_recursive_cte_cases = [
+  { name = "recursive_series";
+    setup = [];
+    query = "WITH RECURSIVE cnt AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM cnt WHERE n < 5) SELECT n FROM cnt ORDER BY n";
+    unordered = false };
+
+  { name = "recursive_sum";
+    setup = [];
+    query = "WITH RECURSIVE nums AS (SELECT 1 AS i, 1 AS s UNION ALL SELECT i + 1, s + (i + 1) FROM nums WHERE i < 4) SELECT s FROM nums WHERE i = 4";
+    unordered = false };
+
+  { name = "recursive_tree";
+    setup = [
+      "CREATE TABLE tree (id INTEGER, parent INTEGER)";
+      "INSERT INTO tree VALUES (1,0),(2,1),(3,1),(4,2)";
+    ];
+    query = "WITH RECURSIVE anc AS (SELECT id FROM tree WHERE parent = 1 UNION ALL SELECT t.id FROM tree AS t INNER JOIN anc AS a ON t.parent = a.id) SELECT id FROM anc ORDER BY id";
+    unordered = false };
+
+  { name = "recursive_fibonacci";
+    setup = [];
+    query = "WITH RECURSIVE fib AS (SELECT 0 AS a, 1 AS b UNION ALL SELECT b, a + b FROM fib WHERE a < 10) SELECT a FROM fib ORDER BY a";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2364,4 +2455,6 @@ let () =
     "phase12_correlated", List.map make_test phase12_correlated_cases;
     "phase13_upsert",     List.map make_test phase13_upsert_cases;
     "phase13_view",       List.map make_test phase13_view_cases;
+    "phase14_window",          List.map make_test phase14_window_cases;
+    "phase14_recursive_cte",   List.map make_test phase14_recursive_cte_cases;
   ]
