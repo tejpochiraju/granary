@@ -2109,6 +2109,140 @@ let phase11_alias_cases = [
     unordered = false };
 ]
 
+(* ── Phase 12: CTEs ────────────────────────────────────────────── *)
+
+let phase12_cte_cases = [
+  { name = "cte_basic";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "INSERT INTO t VALUES (1, 'a')";
+      "INSERT INTO t VALUES (2, 'b')";
+    ];
+    query = "WITH cte AS (SELECT id, v FROM t) SELECT * FROM cte ORDER BY id";
+    unordered = false };
+
+  { name = "cte_filter";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v INTEGER)";
+      "INSERT INTO t VALUES (1, 10)";
+      "INSERT INTO t VALUES (2, 20)";
+      "INSERT INTO t VALUES (3, 30)";
+    ];
+    query = "WITH cte AS (SELECT id, v FROM t) SELECT * FROM cte WHERE v > 10 ORDER BY id";
+    unordered = false };
+
+  { name = "cte_agg";
+    setup = [
+      "CREATE TABLE orders (uid INTEGER, amt INTEGER)";
+      "INSERT INTO orders VALUES (1, 100)";
+      "INSERT INTO orders VALUES (1, 50)";
+      "INSERT INTO orders VALUES (2, 200)";
+    ];
+    query = "WITH totals AS (SELECT uid, SUM(amt) AS total FROM orders GROUP BY uid) SELECT * FROM totals ORDER BY uid";
+    unordered = false };
+
+  { name = "cte_order";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (3)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "WITH cte AS (SELECT x FROM t) SELECT * FROM cte ORDER BY x";
+    unordered = false };
+
+  { name = "cte_limit";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (3)";
+      "INSERT INTO t VALUES (1)";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "WITH cte AS (SELECT x FROM t ORDER BY x) SELECT * FROM cte LIMIT 2";
+    unordered = false };
+]
+
+(* ── Phase 12: multi-row INSERT ────────────────────────────────── *)
+
+let phase12_multirow_cases = [
+  { name = "multirow_basic";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')";
+    ];
+    query = "SELECT * FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "multirow_single";
+    setup = [
+      "CREATE TABLE t (x INTEGER)";
+      "INSERT INTO t VALUES (42)";
+    ];
+    query = "SELECT * FROM t";
+    unordered = false };
+
+  { name = "multirow_count";
+    setup = [
+      "CREATE TABLE t (a INTEGER, b INTEGER)";
+      "INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40),(5,50)";
+    ];
+    query = "SELECT COUNT(*), SUM(a), SUM(b) FROM t";
+    unordered = false };
+
+  { name = "multirow_on_conflict_ignore";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE UNIQUE INDEX u ON t (id)";
+      "INSERT OR IGNORE INTO t VALUES (1,'a'),(1,'b'),(2,'c')";
+    ];
+    query = "SELECT * FROM t ORDER BY id";
+    unordered = false };
+]
+
+(* ── Phase 12: correlated subqueries ───────────────────────────── *)
+
+let phase12_correlated_cases = [
+  { name = "corr_exists";
+    setup = [
+      "CREATE TABLE u (id INTEGER, name TEXT)";
+      "CREATE TABLE o (uid INTEGER)";
+      "INSERT INTO u VALUES (1,'alice'),(2,'bob')";
+      "INSERT INTO o VALUES (1)";
+    ];
+    query = "SELECT name FROM u WHERE EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) ORDER BY name";
+    unordered = false };
+
+  { name = "corr_not_exists";
+    setup = [
+      "CREATE TABLE u (id INTEGER, name TEXT)";
+      "CREATE TABLE o (uid INTEGER)";
+      "INSERT INTO u VALUES (1,'alice'),(2,'bob')";
+      "INSERT INTO o VALUES (1)";
+    ];
+    query = "SELECT name FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) ORDER BY name";
+    unordered = false };
+
+  { name = "corr_in_select";
+    setup = [
+      "CREATE TABLE u (id INTEGER, name TEXT)";
+      "CREATE TABLE o (uid INTEGER)";
+      "INSERT INTO u VALUES (1,'alice'),(2,'bob')";
+      "INSERT INTO o VALUES (1)";
+    ];
+    query = "SELECT name FROM u WHERE u.id IN (SELECT uid FROM o WHERE o.uid = u.id) ORDER BY name";
+    unordered = false };
+
+  { name = "corr_not_in";
+    setup = [
+      "CREATE TABLE u (id INTEGER, name TEXT)";
+      "CREATE TABLE blocked (uid INTEGER)";
+      "INSERT INTO u VALUES (1,'alice'),(2,'bob')";
+      "INSERT INTO blocked VALUES (1)";
+    ];
+    query = "SELECT name FROM u WHERE u.id NOT IN (SELECT uid FROM blocked WHERE blocked.uid = u.id) ORDER BY name";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2122,4 +2256,7 @@ let () =
     "phase10_multi_join", List.map make_test phase10_multi_join_cases;
     "phase11_cast",      List.map make_test phase11_cast_cases;
     "phase11_alias",     List.map make_test phase11_alias_cases;
+    "phase12_cte",        List.map make_test phase12_cte_cases;
+    "phase12_multirow",   List.map make_test phase12_multirow_cases;
+    "phase12_correlated", List.map make_test phase12_correlated_cases;
   ]
