@@ -125,19 +125,20 @@ and stmt =
       returning   : expr list;   (** empty = no RETURNING *)
     }
   | S_select of {
-      distinct : bool;
-      proj     : [ `All | `Cols of string list | `Exprs of (expr * string option) list ];
+      distinct    : bool;
+      proj        : [ `All | `Cols of string list | `Exprs of (expr * string option) list ];
         (** [`Exprs] supports arbitrary projection expressions (used for
             aggregates).  Plain column projection still parses to
             [`Cols]. *)
-      table    : string;
-      joins    : join_clause list;  (** empty list = no joins *)
-      where    : expr option;
-      group_by : string list;       (** column names; empty = no GROUP BY *)
-      having   : expr option;       (** HAVING predicate (may reference aggregates) *)
-      order    : order_key list;    (** empty = no ORDER BY *)
-      limit    : int option;
-      offset   : int option;
+      table       : string;
+      table_alias : string option;     (** optional AS alias for the FROM table *)
+      joins       : join_clause list;  (** empty list = no joins *)
+      where       : expr option;
+      group_by    : string list;       (** column names; empty = no GROUP BY *)
+      having      : expr option;       (** HAVING predicate (may reference aggregates) *)
+      order       : order_key list;    (** empty = no ORDER BY *)
+      limit       : int option;
+      offset      : int option;
     }
   | S_create_index of {
       name    : string;

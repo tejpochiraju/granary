@@ -243,8 +243,8 @@ compound_select:
 select:
   | SELECT distinct = boption(DISTINCT) proj = projection ft = from_tail
     { match ft with
-      | Some (table, js, wh, gb, hv, ob, limit, offset) ->
-        S_select { distinct; proj; table; joins = js; where = wh;
+      | Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset) ->
+        S_select { distinct; proj; table; table_alias = tbl_alias; joins = js; where = wh;
                    group_by = gb; having = hv;
                    order = ob; limit; offset }
       | None ->
@@ -256,11 +256,11 @@ select:
         S_const_select { exprs } }
 
 from_tail:
-  | FROM table = IDENT
+  | FROM table = IDENT tbl_alias = option(preceded(AS, IDENT))
       js = join_clauses wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
-      Some (table, js, wh, gb, hv, ob, limit, offset) }
+      Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset) }
   |   { None }
 
 join_clauses:
@@ -268,14 +268,14 @@ join_clauses:
   | j = join_clause rest = join_clauses { j :: rest }
 
 join_clause:
-  | INNER JOIN t = IDENT ON e = expr
-    { { kind = Inner; table = t; alias = None; on = e } }
-  | LEFT JOIN t = IDENT ON e = expr
-    { { kind = Left;  table = t; alias = None; on = e } }
-  | LEFT OUTER JOIN t = IDENT ON e = expr
-    { { kind = Left;  table = t; alias = None; on = e } }
-  | JOIN t = IDENT ON e = expr
-    { { kind = Inner; table = t; alias = None; on = e } }
+  | INNER JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+    { { kind = Inner; table = t; alias; on = e } }
+  | LEFT JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+    { { kind = Left;  table = t; alias; on = e } }
+  | LEFT OUTER JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+    { { kind = Left;  table = t; alias; on = e } }
+  | JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+    { { kind = Inner; table = t; alias; on = e } }
 
 update:
   | UPDATE table = IDENT SET

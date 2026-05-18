@@ -3388,6 +3388,63 @@ let test_col_alias_cast () =
   Alcotest.(check row_testable) "cast with alias"
     [| Db.V_text "7" |] (List.nth rows 0)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 11: Table aliases                                              *)
+(* ------------------------------------------------------------------ *)
+
+let test_tbl_alias_from () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE products (id INTEGER, name TEXT)";
+  exec db "INSERT INTO products VALUES (1, 'apple')";
+  let rows = query_ok db "SELECT p.id, p.name FROM products AS p" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "aliased table col refs"
+    [| Db.V_int 1L; Db.V_text "apple" |] (List.nth rows 0)
+
+let test_tbl_alias_join () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER, val TEXT)";
+  exec db "CREATE TABLE b (aid INTEGER, extra TEXT)";
+  exec db "INSERT INTO a VALUES (1, 'x')";
+  exec db "INSERT INTO b VALUES (1, 'y')";
+  let rows = query_ok db
+    "SELECT x.val, y.extra FROM a AS x JOIN b AS y ON x.id = y.aid" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "two aliased joined tables"
+    [| Db.V_text "x"; Db.V_text "y" |] (List.nth rows 0)
+
+let test_tbl_alias_where () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  let rows = query_ok db "SELECT r.n FROM t AS r WHERE r.n > 1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "aliased where" [| Db.V_int 2L |] (List.nth rows 0)
+
+let test_tbl_alias_order_by () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "INSERT INTO t VALUES (1)";
+  let rows = query_ok db "SELECT r.n FROM t AS r ORDER BY r.n" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.(check row_testable) "first row" [| Db.V_int 1L |] (List.nth rows 0)
+
+let test_tbl_alias_three_join () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE d (id INTEGER, name TEXT)";
+  exec db "CREATE TABLE e (id INTEGER, dept_id INTEGER)";
+  exec db "CREATE TABLE s (eid INTEGER, pay INTEGER)";
+  exec db "INSERT INTO d VALUES (1, 'eng')";
+  exec db "INSERT INTO e VALUES (10, 1)";
+  exec db "INSERT INTO s VALUES (10, 500)";
+  let rows = query_ok db
+    "SELECT d.name, s.pay FROM d AS d JOIN e AS e ON d.id = e.dept_id JOIN s AS s ON e.id = s.eid" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "three alias join"
+    [| Db.V_text "eng"; Db.V_int 500L |] (List.nth rows 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3734,5 +3791,12 @@ let () =
       Alcotest.test_case "multiple"  `Quick test_col_alias_multiple;
       Alcotest.test_case "mixed"     `Quick test_col_alias_mixed;
       Alcotest.test_case "cast"      `Quick test_col_alias_cast;
+    ];
+    "tbl_alias", [
+      Alcotest.test_case "from"       `Quick test_tbl_alias_from;
+      Alcotest.test_case "join"       `Quick test_tbl_alias_join;
+      Alcotest.test_case "where"      `Quick test_tbl_alias_where;
+      Alcotest.test_case "order_by"   `Quick test_tbl_alias_order_by;
+      Alcotest.test_case "three_join" `Quick test_tbl_alias_three_join;
     ];
   ]

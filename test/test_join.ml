@@ -144,7 +144,7 @@ let sema_unknown_join_table () =
   let cat = make_two_table_cat () in
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `All; table = "users";
+    proj = `All; table = "users"; table_alias = None;
     joins = [ { kind = Ast.Inner; table = "ghost"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "uid") } ];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -168,7 +168,7 @@ let sema_ambiguous_column () =
   (* SELECT x FROM a JOIN b ON ...  — "x" appears in both *)
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `Cols ["x"]; table = "a";
+    proj = `Cols ["x"]; table = "a"; table_alias = None;
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_lit (Ast.L_int 1L) } ];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -191,7 +191,7 @@ let sema_qualified_column_resolves () =
   ) in
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `All; table = "a";
+    proj = `All; table = "a"; table_alias = None;
     joins = [ { kind = Ast.Inner; table = "b"; alias = None;
                 on = Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("a","x"), Ast.E_tbl_col ("b","x")) } ];
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
@@ -209,7 +209,7 @@ let planner_picks_hash_join_no_index () =
   let cat = make_two_table_cat () in
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `All; table = "users";
+    proj = `All; table = "users"; table_alias = None;
     joins = [ { kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
                   Ast.E_tbl_col ("users","id"),
@@ -225,7 +225,7 @@ let planner_picks_nlj_with_index () =
   let cat = make_two_table_cat ~orders_idx:true () in
   let stmt = Ast.S_select {
     distinct = false;
-    proj = `All; table = "users";
+    proj = `All; table = "users"; table_alias = None;
     joins = [ { kind = Ast.Inner; table = "orders"; alias = None;
                 on = Ast.E_binop (Ast.Eq,
                   Ast.E_tbl_col ("users","id"),

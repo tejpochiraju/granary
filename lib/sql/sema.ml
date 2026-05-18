@@ -380,23 +380,28 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
 let rec bind_expr_join
     ~param_counter
     ~named_params
-    ~(tables : (Cat.table_meta * int) list)
+    ~(tables : (Cat.table_meta * int * string option) list)
   = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
-    let matches = List.filter_map (fun (tm, base) ->
+    let matches = List.filter_map (fun (tm, base, _alias) ->
       match col_index tm.Cat.columns name with
       | Some i -> Some (BE_col (base + i))
       | None   -> None
     ) tables in
     (match matches with
      | [be]   -> Ok be
-     | []     -> Error (Unknown_column { table = (fst (List.hd tables)).Cat.name; column = name })
+     | []     ->
+       let (tm0, _, _) = List.hd tables in
+       Error (Unknown_column { table = tm0.Cat.name; column = name })
      | _ :: _ -> Error (Ambiguous_column name))
   | Ast.E_tbl_col (tbl, name) ->
-    (match List.find_opt (fun (tm, _) -> String.equal tm.Cat.name tbl) tables with
-     | None            -> Error (Unknown_table tbl)
-     | Some (tm, base) ->
+    (match List.find_opt (fun (tm, _, alias_opt) ->
+       String.equal tm.Cat.name tbl ||
+       (match alias_opt with Some a -> String.equal tbl a | None -> false)
+     ) tables with
+     | None -> Error (Unknown_table tbl)
+     | Some (tm, base, _) ->
        (match col_index tm.Cat.columns name with
         | Some i -> Ok (BE_col (base + i))
         | None   -> Error (Unknown_column { table = tbl; column = name })))
@@ -1031,7 +1036,7 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
             where = bound_where;
           }))))
 
-let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset =
+let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -1061,17 +1066,17 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
      | Error e -> Lwt.return (Error e)
      | Ok joined_pairs ->
        let n_left = List.length meta.columns in
-       (* tables: [(primary_meta, 0); (rm0, n_left); (rm1, n_left+n_rm0); ...] *)
+       (* tables: [(primary_meta, 0, alias); (rm0, n_left, alias0); ...] *)
        let (tables, _) =
-         List.fold_left (fun (acc, off) (_, rm) ->
+         List.fold_left (fun (acc, off) ((jc : Ast.join_clause), rm) ->
            let n = List.length rm.Cat.columns in
-           (acc @ [(rm, off)], off + n)
-         ) ([(meta, 0)], n_left) joined_pairs
+           (acc @ [(rm, off, jc.Ast.alias)], off + n)
+         ) ([(meta, 0, table_alias)], n_left) joined_pairs
        in
        (* Combined-row column lookup with full error reporting (Ambiguous,
           Unknown).  Used for proj and ORDER BY name resolution. *)
        let proj_lookup name : (int, error) result =
-         let hits = List.filter_map (fun (tm, base) ->
+         let hits = List.filter_map (fun (tm, base, _alias) ->
            match col_index tm.Cat.columns name with
            | Some i -> Some (base + i) | None -> None
          ) tables in
@@ -1081,9 +1086,12 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
           | _ :: _ -> Error (Ambiguous_column name))
        in
        let qual_lookup t c : (int, error) result =
-         match List.find_opt (fun (tm, _) -> String.equal tm.Cat.name t) tables with
-         | None            -> Error (Unknown_table t)
-         | Some (tm, base) ->
+         match List.find_opt (fun (tm, _, alias_opt) ->
+           String.equal tm.Cat.name t ||
+           (match alias_opt with Some a -> String.equal t a | None -> false)
+         ) tables with
+         | None -> Error (Unknown_table t)
+         | Some (tm, base, _) ->
            (match col_index tm.Cat.columns c with
             | Some i -> Ok (base + i)
             | None   -> Error (Unknown_column { table = t; column = c }))
@@ -1136,7 +1144,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
            let ords_result =
              match proj with
              | `All ->
-               let all_ords = List.concat_map (fun (tm, base) ->
+               let all_ords = List.concat_map (fun (tm, base, _alias) ->
                  List.mapi (fun i _ -> base + i) tm.Cat.columns
                ) tables in
                Ok (`Ords all_ords)
@@ -1201,7 +1209,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
              | Ast.E_agg (func, arg_opt) ->
                (* SUM/AVG type check. *)
                let validate_numeric col_ord =
-                 let cols = List.concat_map (fun (tm, _) -> tm.Cat.columns) tables in
+                 let cols = List.concat_map (fun (tm, _, _) -> tm.Cat.columns) tables in
                  let col = List.nth cols col_ord in
                  match col.Row.ty with
                  | Row.Integer | Row.Real -> Ok ()
@@ -1281,7 +1289,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
             let rec go acc tbl_acc offset = function
               | [] -> Ok (List.rev acc)
               | ((jc : Ast.join_clause), rm) :: rest ->
-                let tables_so_far = tbl_acc @ [(rm, offset)] in
+                let tables_so_far = tbl_acc @ [(rm, offset, jc.Ast.alias)] in
                 (match bind_expr_join ~param_counter ~named_params
                          ~tables:tables_so_far jc.Ast.on with
                  | Error e -> Error e
@@ -1290,7 +1298,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                               on = be; right_col_offset = offset } in
                    go (bj :: acc) tables_so_far (offset + List.length rm.Cat.columns) rest)
             in
-            go [] [(meta, 0)] n_left joined_pairs
+            go [] [(meta, 0, table_alias)] n_left joined_pairs
           in
           (match bind_joins_result with
            | Error e -> Lwt.return (Error e)
@@ -1741,8 +1749,8 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
   | Ast.S_insert { table; columns; values; on_conflict; returning } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
-  | Ast.S_select { distinct; proj; table; joins; where; group_by; having; order; limit; offset } ->
-    bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~where ~group_by ~having ~order ~limit ~offset
+  | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } ->
+    bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->
     bind_create_index cat ~name ~table ~columns ~unique
   | Ast.S_update { table; assignments; where; returning } ->
