@@ -32,9 +32,19 @@ type bound_expr =
   | BE_excluded_col of int
     (** Reference to the i-th column of the proposed INSERT row (the 'excluded' pseudo-table). *)
 
+  | BE_window_slot of int
+    (** Reference to the i-th window function result appended after input columns by Op_window. *)
+
 type bound_order_key = {
   key : bound_expr;
   dir : Ast.order_dir;
+}
+
+type window_sema = {
+  func         : Ast.window_func;
+  args         : bound_expr list;
+  partition_by : bound_expr list;
+  order_by     : bound_order_key list;
 }
 
 type agg_spec = {
@@ -86,6 +96,7 @@ type bound_stmt =
       aggs       : agg_spec list;
       having     : bound_expr option;
       agg_proj   : agg_proj_item list;
+      windows    : window_sema list;
     }
   | BS_create_index of {
       name       : string;
@@ -154,9 +165,10 @@ type bound_stmt =
       exprs : bound_expr list;
     }
   | BS_with_cte of {
-      name  : string;
-      def   : bound_stmt;
-      query : bound_stmt;
+      name      : string;
+      def       : bound_stmt;
+      query     : bound_stmt;
+      recursive : bool;
     }
   | BS_create_view of { name: string; query: Ast.stmt }
   | BS_drop_view   of { name: string }
@@ -730,6 +742,7 @@ let rec expr_has_subquery = function
     || (match else_ with Some e -> expr_has_subquery e | None -> false)
   | BE_cast (e, _) -> expr_has_subquery e
   | BE_excluded_col _ -> false
+  | BE_window_slot _ -> false
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
@@ -749,6 +762,21 @@ let rec expr_has_agg = function
     || (match else_ with Some e -> expr_has_agg e | None -> false)
   | Ast.E_cast (e, _) -> expr_has_agg e
   | Ast.E_window _ -> false
+
+let rec expr_has_window = function
+  | Ast.E_window _ -> true
+  | Ast.E_binop (_, a, b) -> expr_has_window a || expr_has_window b
+  | Ast.E_not e | Ast.E_neg e | Ast.E_is_null e | Ast.E_is_not_null e
+  | Ast.E_bitnot e -> expr_has_window e
+  | Ast.E_between (x, lo, hi) ->
+    expr_has_window x || expr_has_window lo || expr_has_window hi
+  | Ast.E_in (x, vals) -> expr_has_window x || List.exists expr_has_window vals
+  | Ast.E_func (_, args) -> List.exists expr_has_window args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    (match scrutinee with Some e -> expr_has_window e | None -> false)
+    || List.exists (fun (c, r) -> expr_has_window c || expr_has_window r) branches
+    || (match else_ with Some e -> expr_has_window e | None -> false)
+  | _ -> false
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -1201,55 +1229,175 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
         | Ok group_col ->
        let offset_for_aggs = match group_col with Some _ -> 1 | None -> 0 in
        (* Build proj/agg_proj.
-          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj).
+          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj, windows).
           [expr_proj] is non-empty only for scalar-function projections
-          (Phase 5); [col_ordinals] is empty in that case. *)
-       let proj_result :
-           (int list * agg_proj_item list * agg_spec list * (bound_expr * string option) list,
+          (Phase 5); [col_ordinals] is empty in that case.
+          [windows] is non-empty only for window-function projections (Phase 14). *)
+       let* proj_result :
+           (int list * agg_proj_item list * agg_spec list * (bound_expr * string option) list
+            * window_sema list,
             error) result =
          if not is_aggregated then
-           (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
+           (* Ordinary SELECT — keep behaviour identical to pre-Task-6,
+              but also handle E_window via bind_ww. *)
            let bind_one e =
              if joined_pairs = [] then
                bind_expr ~param_counter ~named_params meta e
              else
                bind_expr_join ~param_counter ~named_params ~tables e
            in
-           let ords_result =
+           let windows_queue : window_sema Queue.t = Queue.create () in
+           let rec bind_ww e =
+             if not (expr_has_window e) then Lwt.return (bind_one e)
+             else match e with
+               | Ast.E_window { func; args; window } ->
+                 let slot = Queue.length windows_queue in
+                 let bind_list es =
+                   List.fold_left (fun acc_r ex ->
+                     match acc_r with
+                     | Error _ as err -> err
+                     | Ok acc ->
+                       match bind_one ex with
+                       | Error er -> Error er
+                       | Ok be    -> Ok (acc @ [be])
+                   ) (Ok []) es
+                 in
+                 let bind_ok_list es =
+                   List.fold_left (fun acc_r (ok : Ast.order_key) ->
+                     match acc_r with
+                     | Error _ as err -> err
+                     | Ok acc ->
+                       match bind_one ok.Ast.expr with
+                       | Error er -> Error er
+                       | Ok be    -> Ok (acc @ [{ key = be; dir = ok.Ast.dir }])
+                   ) (Ok []) es
+                 in
+                 (match bind_list args with
+                  | Error er -> Lwt.return (Error er)
+                  | Ok bound_args ->
+                    match bind_list window.Ast.partition_by with
+                    | Error er -> Lwt.return (Error er)
+                    | Ok bound_pb ->
+                      match bind_ok_list window.Ast.order_by with
+                      | Error er -> Lwt.return (Error er)
+                      | Ok bound_ob ->
+                        let ws = { func; args = bound_args;
+                                   partition_by = bound_pb;
+                                   order_by = bound_ob } in
+                        Queue.push ws windows_queue;
+                        Lwt.return (Ok (BE_window_slot slot)))
+               | Ast.E_binop (op, a, b) ->
+                 let* ba = bind_ww a in
+                 let* bb = bind_ww b in
+                 (match ba, bb with
+                  | Ok ba', Ok bb' ->
+                    Lwt.return (Ok (BE_binop (ast_binop_to_sema op, ba', bb')))
+                  | Error er, _ | _, Error er -> Lwt.return (Error er))
+               | Ast.E_not a ->
+                 let* ba = bind_ww a in
+                 Lwt.return (Result.map (fun x -> BE_not x) ba)
+               | Ast.E_neg a ->
+                 let* ba = bind_ww a in
+                 Lwt.return (Result.map (fun x -> BE_neg x) ba)
+               | Ast.E_is_null a ->
+                 let* ba = bind_ww a in
+                 Lwt.return (Result.map (fun x -> BE_is_null x) ba)
+               | Ast.E_is_not_null a ->
+                 let* ba = bind_ww a in
+                 Lwt.return (Result.map (fun x -> BE_is_not_null x) ba)
+               | Ast.E_bitnot a ->
+                 let* ba = bind_ww a in
+                 Lwt.return (Result.map (fun x -> BE_bitnot x) ba)
+               | Ast.E_between (x, lo, hi) ->
+                 let* bx  = bind_ww x  in
+                 let* blo = bind_ww lo in
+                 let* bhi = bind_ww hi in
+                 (match bx, blo, bhi with
+                  | Ok x', Ok lo', Ok hi' ->
+                    Lwt.return (Ok (BE_between (x', lo', hi')))
+                  | Error er, _, _ | _, Error er, _ | _, _, Error er ->
+                    Lwt.return (Error er))
+               | Ast.E_case { scrutinee; branches; else_ } ->
+                 let* bscr = (match scrutinee with
+                   | None   -> Lwt.return (Ok None)
+                   | Some e ->
+                     let* r = bind_ww e in
+                     Lwt.return (Result.map Option.some r)) in
+                 let* bbranches = Lwt_list.fold_left_s (fun acc (c, r) ->
+                     match acc with
+                     | Error er -> Lwt.return (Error er)
+                     | Ok bs ->
+                       let* bc = bind_ww c in
+                       let* br = bind_ww r in
+                       (match bc, br with
+                        | Ok c', Ok r' -> Lwt.return (Ok (bs @ [(c', r')]))
+                        | Error er, _ | _, Error er -> Lwt.return (Error er))
+                   ) (Ok []) branches in
+                 let* belse_ = (match else_ with
+                   | None   -> Lwt.return (Ok None)
+                   | Some e ->
+                     let* r = bind_ww e in
+                     Lwt.return (Result.map Option.some r)) in
+                 (match bscr, bbranches, belse_ with
+                  | Ok scr, Ok brs, Ok el ->
+                    Lwt.return (Ok (BE_case { scrutinee = scr;
+                                              branches = brs;
+                                              else_ = el }))
+                  | Error er, _, _ | _, Error er, _ | _, _, Error er ->
+                    Lwt.return (Error er))
+               | Ast.E_func (f, fargs) ->
+                 let* bargs = Lwt_list.fold_left_s (fun acc a ->
+                     match acc with
+                     | Error er -> Lwt.return (Error er)
+                     | Ok bs ->
+                       let* r = bind_ww a in
+                       Lwt.return (Result.map (fun b -> bs @ [b]) r)
+                   ) (Ok []) fargs in
+                 Lwt.return (Result.map (fun ba -> BE_func (f, ba)) bargs)
+               | _ -> Lwt.return (bind_one e)
+           in
+           let ords_result_lwt =
              match proj with
              | `All ->
                let all_ords = List.concat_map (fun (tm, base, _alias) ->
                  List.mapi (fun i _ -> base + i) tm.Cat.columns
                ) tables in
-               Ok (`Ords all_ords)
+               Lwt.return (Ok (`Ords all_ords))
              | `Cols names ->
-               List.fold_left (fun acc name ->
+               Lwt.return (List.fold_left (fun acc name ->
                  match acc with
                  | Error _ -> acc
-                 | Ok (`Exprs _) -> acc  (* shouldn't reach here *)
+                 | Ok (`Exprs _) -> acc
                  | Ok (`Ords ords) ->
                    (match proj_lookup name with
                     | Error e -> Error e
                     | Ok i    -> Ok (`Ords (ords @ [i])))
-               ) (Ok (`Ords [])) names
+               ) (Ok (`Ords [])) names)
              | `Exprs es ->
-               (* Phase 5 / Phase 11: arbitrary expr projection with optional alias. *)
-               let bound_list = List.map (fun (e, alias) ->
-                 match bind_one e with
-                 | Ok be   -> Ok (be, alias)
-                 | Error e -> Error e
-               ) es in
-               let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound_list in
+               (* Phase 5 / Phase 11 / Phase 14: arbitrary expr projection.
+                  Use bind_ww so that E_window nodes are handled. *)
+               let* bound_list =
+                 Lwt_list.map_s (fun (e, alias) ->
+                   let* r = bind_ww e in
+                   Lwt.return (match r with
+                     | Ok be   -> Ok (be, alias)
+                     | Error e -> Error e)
+                 ) es
+               in
+               let errors = List.filter_map
+                 (function Error e -> Some e | Ok _ -> None) bound_list in
                (match errors with
-                | e :: _ -> Error e
+                | e :: _ -> Lwt.return (Error e)
                 | [] ->
-                  Ok (`Exprs (List.filter_map
-                    (function Ok p -> Some p | Error _ -> None) bound_list)))
+                  Lwt.return (Ok (`Exprs (List.filter_map
+                    (function Ok p -> Some p | Error _ -> None) bound_list))))
            in
+           let* ords_result = ords_result_lwt in
+           let windows_list = Queue.fold (fun acc w -> acc @ [w]) [] windows_queue in
            (match ords_result with
-            | Error e -> Error e
-            | Ok (`Ords o)    -> Ok (o, [], [], [])
-            | Ok (`Exprs bes) -> Ok ([], [], [], bes))
+            | Error e -> Lwt.return (Error e)
+            | Ok (`Ords o)    -> Lwt.return (Ok (o, [], [], [], windows_list))
+            | Ok (`Exprs bes) -> Lwt.return (Ok ([], [], [], bes, windows_list)))
          else begin
            (* Aggregated SELECT — build agg_proj and aggs list. *)
            (* Helper: walk an expression that is an explicit projection
@@ -1338,7 +1486,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
              | `Exprs es -> List.map fst es
            in
            if exprs_to_project = [] && proj = `All && is_aggregated then
-             Error (Unsupported "SELECT * with aggregates requires explicit columns")
+             Lwt.return (Error (Unsupported "SELECT * with aggregates requires explicit columns"))
            else
              let agg_proj_result =
                List.fold_left (fun acc e ->
@@ -1350,14 +1498,14 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                     | Ok item -> Ok (items @ [item]))
                ) (Ok []) exprs_to_project
              in
-             (match agg_proj_result with
+             Lwt.return (match agg_proj_result with
               | Error e -> Error e
-              | Ok items -> Ok ([], items, !acc_aggs, []))
+              | Ok items -> Ok ([], items, !acc_aggs, [], []))
          end
        in
        (match proj_result with
         | Error e -> Lwt.return (Error e)
-        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs) ->
+        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows) ->
           (* Bind each join ON predicate against tables visible so far *)
           let bind_joins_result : (bound_join list, error) result =
             let rec go acc tbl_acc offset = function
@@ -1516,6 +1664,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                            aggs       = all_aggs;
                            having     = bound_having;
                            agg_proj   = agg_proj_items;
+                           windows    = proj_windows;
                          })))))))))))
 
 (* ------------------------------------------------------------------ *)
@@ -1566,6 +1715,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
       | Ast.Ty_real -> Row.Real
       | Ast.Ty_blob -> Row.Blob)
   | BE_excluded_col _ -> None      (* type of excluded col unknown at bind time *)
+  | BE_window_slot _ -> None       (* type of window func result unknown at bind time *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
@@ -1818,7 +1968,7 @@ let rec compound_col_count = function
     else List.length proj
   | BS_compound { left; _ } -> compound_col_count left
   | BS_const_select { exprs } -> List.length exprs
-  | BS_with_cte { query; _ } -> compound_col_count query
+  | BS_with_cte { query; recursive = _; _ } -> compound_col_count query
   | _ -> 0  (* non-select stmts in compound: don't validate *)
 
 let rec col_names_of_bound_stmt bs =
@@ -1841,7 +1991,7 @@ let rec col_names_of_bound_stmt bs =
         else None
       ) proj
   | BS_compound { left; _ } -> col_names_of_bound_stmt left
-  | BS_with_cte { query; _ } -> col_names_of_bound_stmt query
+  | BS_with_cte { query; recursive = _; _ } -> col_names_of_bound_stmt query
   | _ -> List.init n (fun i -> Printf.sprintf "col_%d" (i + 1))
 
 (** Extract output column names from an AST SELECT stmt (best-effort; used for CTEs). *)
@@ -1920,7 +2070,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
      | [] ->
        let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
-  | Ast.S_with_cte { name; def; query; recursive = _ } ->
+  | Ast.S_with_cte { name; def; query; recursive } ->
     let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
     (match def_r with
      | Error e -> Lwt.return (Error e)
@@ -1955,7 +2105,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        (match query_r with
         | Error e -> Lwt.return (Error e)
         | Ok bound_query ->
-          Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query }))))
+          Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query; recursive }))))
   | Ast.S_create_view { name; query } ->
     let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
     (match bound_r with

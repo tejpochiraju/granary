@@ -38,10 +38,19 @@ type bound_expr =
   | BE_cast of bound_expr * Ast.ty
   | BE_excluded_col of int
     (** Reference to the i-th column of the proposed INSERT row (the 'excluded' pseudo-table). *)
+  | BE_window_slot of int
+    (** Reference to the i-th window function result appended after input columns by Op_window. *)
 
 type bound_order_key = {
   key : bound_expr;
   dir : Ast.order_dir;
+}
+
+type window_sema = {
+  func         : Ast.window_func;
+  args         : bound_expr list;
+  partition_by : bound_expr list;
+  order_by     : bound_order_key list;
 }
 
 (** Specification of a single aggregate computation.
@@ -118,6 +127,7 @@ type bound_stmt =
       agg_proj   : agg_proj_item list;
         (** When [aggs] is non-empty, this is the projection list over
             the aggregate output row (ignore [proj]).  Empty otherwise. *)
+      windows    : window_sema list;
     }
   | BS_create_index of {
       name       : string;
@@ -187,9 +197,10 @@ type bound_stmt =
       exprs : bound_expr list;
     }
   | BS_with_cte of {
-      name  : string;
-      def   : bound_stmt;
-      query : bound_stmt;
+      name      : string;
+      def       : bound_stmt;
+      query     : bound_stmt;
+      recursive : bool;
     }
   | BS_create_view of { name: string; query: Ast.stmt }
   | BS_drop_view   of { name: string }

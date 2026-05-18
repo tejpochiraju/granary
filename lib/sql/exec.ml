@@ -340,6 +340,8 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     Row.V_null
   | Plan.P_excluded_col _ ->
     failwith "Exec: P_excluded_col in eval_expr — must be substituted before evaluation"
+  | Plan.P_window_slot _ ->
+    failwith "Exec: P_window_slot in eval_expr — must be substituted by planner before evaluation"
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -1631,7 +1633,8 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
-  | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _ ->
+  | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
+  | Plan.Op_window _ ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -1770,6 +1773,7 @@ let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) 
   | Plan.Op_except r          -> Plan.Op_except { left = go r.left; right = go r.right }
   | Plan.Op_with_cte r when not (String.equal r.cte_name cte_name) ->
     Plan.Op_with_cte { r with query = go r.query }
+  | Plan.Op_window r -> Plan.Op_window { r with child = go r.child }
   | _ -> op
 
 let rec pre_eval_subquery
@@ -2546,13 +2550,15 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
     let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
     Lwt.return (Lwt_stream.of_list [row])
-  | Plan.Op_with_cte { cte_name; def; query } ->
+  | Plan.Op_with_cte { cte_name; def; query; recursive = _ } ->
     let* def_stream = to_stream clock params store ~mode ~cat def in
     let* cte_rows = Lwt_stream.to_list def_stream in
     let patched = substitute_cte ~cte_name ~rows:cte_rows query in
     to_stream clock params store ~mode ~cat patched
   | Plan.Op_cte_scan { cte_name; _ } ->
     failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
+  | Plan.Op_window _ ->
+    failwith "Exec: Op_window execution not yet implemented (Phase 14 exec pending)"
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _

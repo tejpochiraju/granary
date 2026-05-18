@@ -40,6 +40,7 @@ let rec plan_expr = function
     }
   | Sema.BE_cast (e, ty) -> Plan.P_cast (plan_expr e, ty)
   | Sema.BE_excluded_col i -> Plan.P_excluded_col i
+  | Sema.BE_window_slot i -> Plan.P_window_slot i
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -143,10 +144,46 @@ let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
   | Sema.AP_group_col   -> Plan.PI_group_col
   | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
 
+let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
+  { Plan.func         = ws.Sema.func;
+    args         = List.map plan_expr ws.Sema.args;
+    partition_by = List.map plan_expr ws.Sema.partition_by;
+    order_by     = List.map (fun (bk : Sema.bound_order_key) ->
+      let dir = match bk.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+      (plan_expr bk.Sema.key, dir)
+    ) ws.Sema.order_by;
+  }
+
+let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
+  let go = substitute_window_slots ~n_input_cols in
+  match e with
+  | Plan.P_window_slot i -> Plan.P_col (n_input_cols + i)
+  | Plan.P_binop (op, a, b) -> Plan.P_binop (op, go a, go b)
+  | Plan.P_not e -> Plan.P_not (go e)
+  | Plan.P_is_null e -> Plan.P_is_null (go e)
+  | Plan.P_is_not_null e -> Plan.P_is_not_null (go e)
+  | Plan.P_neg e -> Plan.P_neg (go e)
+  | Plan.P_bitnot e -> Plan.P_bitnot (go e)
+  | Plan.P_between (x, lo, hi) -> Plan.P_between (go x, go lo, go hi)
+  | Plan.P_in (x, vs) -> Plan.P_in (go x, List.map go vs)
+  | Plan.P_func (f, args) -> Plan.P_func (f, List.map go args)
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Plan.P_case { scrutinee = Option.map go scrutinee;
+                  branches = List.map (fun (c, r) -> (go c, go r)) branches;
+                  else_ = Option.map go else_ }
+  | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
+  | e' -> e'
+
 let plan_select cat
     ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~joins
-    ~group_by ~aggs ~having ~agg_proj ~distinct =
+    ~group_by ~aggs ~having ~agg_proj ~distinct ~windows =
   let has_joins = joins <> [] in
+  let n_input_cols =
+    List.length table_meta.Cat.columns
+    + List.fold_left (fun acc (bj : Sema.bound_join) ->
+        acc + List.length bj.Sema.right_meta.Cat.columns
+      ) 0 joins
+  in
   (* Try to use an index lookup if possible (single-table path). *)
   let base =
     if has_joins then
@@ -201,6 +238,16 @@ let plan_select cat
       after_joins
   in
   let is_aggregated = aggs <> [] || group_by <> None in
+  (* Insert Op_window after scan+filter+joins when windows are present. *)
+  let after_window =
+    if windows = [] then after_where
+    else
+      Plan.Op_window {
+        child        = after_where;
+        windows      = List.map plan_window_item windows;
+        n_input_cols;
+      }
+  in
   (* For non-aggregate queries: sort BEFORE projection so col_idx correctly
      addresses the original table schema (pre-projection row layout).
      For aggregate queries: sort AFTER aggregation because ORDER BY refers
@@ -217,8 +264,8 @@ let plan_select cat
     else Plan.Op_sort { keys; child }
   in
   let after_sort =
-    if is_aggregated then after_where
-    else make_sort after_where
+    if is_aggregated then after_window
+    else make_sort after_window
   in
   let projected =
     if is_aggregated then
@@ -231,7 +278,12 @@ let plan_select cat
       }
     else if expr_proj <> [] then
       Plan.Op_expr_project {
-        exprs = List.map (fun (be, alias) -> (plan_expr be, alias)) expr_proj;
+        exprs = List.map (fun (be, alias) ->
+          let e = plan_expr be in
+          let e' = if windows = [] then e
+                   else substitute_window_slots ~n_input_cols e in
+          (e', alias)
+        ) expr_proj;
         child = after_sort;
       }
     else
@@ -267,11 +319,11 @@ let rec plan ?cat = function
                      returning = List.map plan_expr returning;
                      upsert_update = plan_upsert }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
-                     joins; group_by; aggs; having; agg_proj } ->
+                     joins; group_by; aggs; having; agg_proj; windows } ->
     (match cat with
      | Some cat ->
        plan_select cat ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset
-         ~joins ~group_by ~aggs ~having ~agg_proj ~distinct
+         ~joins ~group_by ~aggs ~having ~agg_proj ~distinct ~windows
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
@@ -316,6 +368,21 @@ let rec plan ?cat = function
          | None   -> after_joins
          | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins }
        in
+       let n_input_cols_no_cat =
+         List.length table_meta.Cat.columns
+         + List.fold_left (fun acc (bj : Sema.bound_join) ->
+             acc + List.length bj.Sema.right_meta.Cat.columns
+           ) 0 joins
+       in
+       let after_window_no_cat =
+         if windows = [] then filtered
+         else
+           Plan.Op_window {
+             child        = filtered;
+             windows      = List.map plan_window_item windows;
+             n_input_cols = n_input_cols_no_cat;
+           }
+       in
        let is_aggregated = aggs <> [] || group_by <> None in
        let make_sort_keys () =
          List.map (fun (bkey : Sema.bound_order_key) ->
@@ -329,8 +396,8 @@ let rec plan ?cat = function
          else Plan.Op_sort { keys; child }
        in
        let after_sort =
-         if is_aggregated then filtered
-         else make_sort filtered
+         if is_aggregated then after_window_no_cat
+         else make_sort after_window_no_cat
        in
        let projected =
          if is_aggregated then
@@ -343,7 +410,12 @@ let rec plan ?cat = function
            }
          else if expr_proj <> [] then
            Plan.Op_expr_project {
-             exprs = List.map (fun (be, alias) -> (plan_expr be, alias)) expr_proj;
+             exprs = List.map (fun (be, alias) ->
+               let e = plan_expr be in
+               let e' = if windows = [] then e
+                        else substitute_window_slots ~n_input_cols:n_input_cols_no_cat e in
+               (e', alias)
+             ) expr_proj;
              child = after_sort;
            }
          else
@@ -463,11 +535,12 @@ let rec plan ?cat = function
         ) idxs
     in
     Plan.Op_pragma_rows { rows }
-  | Sema.BS_with_cte { name; def; query } ->
+  | Sema.BS_with_cte { name; def; query; recursive } ->
     Plan.Op_with_cte {
-      cte_name = name;
-      def      = plan ?cat def;
-      query    = plan ?cat query;
+      cte_name  = name;
+      def       = plan ?cat def;
+      query     = plan ?cat query;
+      recursive;
     }
   | Sema.BS_create_view { name; query } ->
     Plan.Op_create_view { name; query }

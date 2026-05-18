@@ -32,6 +32,15 @@ type expr =
   | P_cast of expr * Ast.ty
   | P_excluded_col of int
     (** Column reference into the proposed INSERT excluded row. *)
+  | P_window_slot of int
+    (** Window function slot reference — substituted to P_col(n_input_cols+i) by planner. *)
+
+type window_plan_item = {
+  func         : Ast.window_func;
+  args         : expr list;
+  partition_by : expr list;
+  order_by     : (expr * [`Asc | `Desc]) list;
+}
 
 type op =
   | Op_create_table of {
@@ -192,10 +201,16 @@ type op =
   | Op_const_select of {
       exprs : expr list;
     }
+  | Op_window of {
+      child        : op;
+      windows      : window_plan_item list;
+      n_input_cols : int;
+    }
   | Op_with_cte of {
-      cte_name : string;
-      def      : op;
-      query    : op;
+      cte_name  : string;
+      def       : op;
+      query     : op;
+      recursive : bool;
     }
   | Op_cte_scan of {
       cte_name : string;
