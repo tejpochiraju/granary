@@ -1925,7 +1925,15 @@ let bind_alter_table cat ~table ~action =
      | Ast.AA_rename_column (old_col, _new_col) ->
        let exists = List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns in
        if not exists then Lwt.return (Error (Unknown_column { table; column = old_col }))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action })))
+       else Lwt.return (Ok (BS_alter_table { table_meta; action }))
+     | Ast.AA_drop_column col_name ->
+       let exists = List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns in
+       if not exists then
+         Lwt.return (Error (Unknown_column { table; column = col_name }))
+       else if List.length table_meta.Cat.columns <= 1 then
+         Lwt.return (Error (Unsupported "cannot drop the only column of a table"))
+       else
+         Lwt.return (Ok (BS_alter_table { table_meta; action })))
 
 (* ------------------------------------------------------------------ *)
 (* DROP TABLE                                                           *)

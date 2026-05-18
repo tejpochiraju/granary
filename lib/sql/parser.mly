@@ -141,6 +141,10 @@ alter_table:
     { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
   | ALTER TABLE table = IDENT RENAME old_col = IDENT TO new_col = IDENT
     { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
+  | ALTER TABLE table = IDENT DROP COLUMN col = IDENT
+    { Ast.S_alter_table { table; action = Ast.AA_drop_column col } }
+  | ALTER TABLE table = IDENT DROP col = IDENT
+    { Ast.S_alter_table { table; action = Ast.AA_drop_column col } }
 
 begin_stmt:
   | BEGIN    { S_begin }

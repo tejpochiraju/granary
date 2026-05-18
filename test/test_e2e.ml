@@ -3919,6 +3919,37 @@ let test_collate_binary_eq () =
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "lowercase alice" (Db.V_text "alice") (List.nth rows 0).(0)
 
+let test_drop_column_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)";
+  exec db "INSERT INTO t VALUES (1, 'Alice', 30), (2, 'Bob', 25)";
+  exec db "ALTER TABLE t DROP COLUMN age";
+  let rows = query_ok db "SELECT id, name FROM t ORDER BY id" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "row1 id"   (Db.V_int 1L)       (List.nth rows 0).(0);
+  Alcotest.check value_testable "row1 name" (Db.V_text "Alice")  (List.nth rows 0).(1);
+  Alcotest.check value_testable "row2 id"   (Db.V_int 2L)       (List.nth rows 1).(0);
+  Alcotest.check value_testable "row2 name" (Db.V_text "Bob")    (List.nth rows 1).(1)
+
+let test_drop_column_schema () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, score REAL)";
+  exec db "ALTER TABLE t DROP COLUMN score";
+  exec db "INSERT INTO t (id, name) VALUES (1, 'Alice')";
+  let rows = query_ok db "SELECT * FROM t" in
+  Alcotest.(check int) "2 cols" 2 (Array.length (List.nth rows 0))
+
+let test_drop_column_nonexistent_fails () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  let err = run (
+    let* r = Db.execute db "ALTER TABLE t DROP COLUMN foo" in
+    Lwt.return (err_or_fail "drop nonexistent" r)
+  ) in
+  let msg = fmt_err err in
+  Alcotest.(check bool) "error mentions column" true
+    (String.length msg > 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4328,5 +4359,10 @@ let () =
       Alcotest.test_case "nocase_eq"    `Quick test_collate_nocase_eq;
       Alcotest.test_case "nocase_order" `Quick test_collate_nocase_order;
       Alcotest.test_case "binary_eq"    `Quick test_collate_binary_eq;
+    ];
+    "drop_column", [
+      Alcotest.test_case "basic"           `Quick test_drop_column_basic;
+      Alcotest.test_case "schema"          `Quick test_drop_column_schema;
+      Alcotest.test_case "nonexistent_err" `Quick test_drop_column_nonexistent_fails;
     ];
   ]

@@ -250,6 +250,7 @@ and alter_action =
   | AA_add_column    of column_def
   | AA_rename_table  of string              (* new table name *)
   | AA_rename_column of string * string     (* old_col_name * new_col_name *)
+  | AA_drop_column   of string              (** column name to drop *)
 
 let binop_to_sql = function
   | Eq -> "=" | Ne -> "!=" | Lt -> "<" | Le -> "<=" | Gt -> ">" | Ge -> ">="

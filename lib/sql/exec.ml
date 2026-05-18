@@ -1649,6 +1649,51 @@ let execute_with_count ?(mode = Auto)
            ~table_name:table_meta.Cat.name ~old_col ~new_col in
        (match result with
         | Error msg -> Lwt.fail_with msg
+        | Ok ()     -> Lwt.return 0)
+     | Ast.AA_drop_column col_name ->
+       let table_name = table_meta.Cat.name in
+       let col_idx = find_col_idx_by_name table_meta.Cat.columns col_name in
+       let new_columns = List.filteri (fun i _ -> i <> col_idx) table_meta.Cat.columns in
+       (* Drop indexes referencing the dropped column *)
+       let idxs_on_col = List.filter (fun (idx : Cat.index_info) ->
+         List.mem col_name idx.Cat.idx_columns)
+         (Cat.indexes_for_table cat ~table:table_name) in
+       let* () = if idxs_on_col = [] then Lwt.return_unit
+         else begin
+           let* tx_idx = S.rw_begin store in
+           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+             Cat.drop_index cat tx_idx ~name:idx.idx_name
+           ) idxs_on_col in
+           S.commit tx_idx
+         end
+       in
+       (* Migrate data rows: scan → decode → re-encode without col_idx *)
+       let* tx_ro = S.ro_begin store in
+       let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
+       let _sr = S.cursor_first cur in
+       let rows = ref [] in
+       let rec drain () =
+         match S.cursor_next cur with
+         | None -> ()
+         | Some (k, v) ->
+           let old_row = Row.decode table_meta.Cat.columns v in
+           let new_row = Array.of_list
+             (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
+           rows := (Bytes.copy k, new_row) :: !rows;
+           drain ()
+       in
+       drain ();
+       S.cursor_close cur;
+       let* () = S.ro_end tx_ro in
+       let* tx = S.rw_begin store in
+       let* () = Lwt_list.iter_s (fun (k, new_row) ->
+         let new_bytes = Row.encode new_columns new_row in
+         S.put tx table_meta.Cat.tree_id k new_bytes
+       ) !rows in
+       let* () = S.commit tx in
+       let* result = Cat.drop_column cat ~table_name ~col_name in
+       (match result with
+        | Error msg -> Lwt.fail_with msg
         | Ok ()     -> Lwt.return 0))
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"

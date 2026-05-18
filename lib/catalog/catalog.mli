@@ -129,6 +129,13 @@ val rename_table :
 val rename_column :
   t -> table_name:string -> old_col:string -> new_col:string -> (unit, string) result Lwt.t
 
+(** Remove a column from an existing table.
+    Re-keys all column entries with ordinal > drop_idx (shift down by 1).
+    Does NOT migrate existing row data — caller (the executor) is responsible.
+    Returns [Error msg] if the table or column does not exist. *)
+val drop_column :
+  t -> table_name:string -> col_name:string -> (unit, string) result Lwt.t
+
 (** Find an FTS table by name. Returns [None] if not found. *)
 val find_fts : t -> string -> fts_table_meta option
 

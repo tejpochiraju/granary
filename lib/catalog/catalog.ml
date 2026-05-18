@@ -722,6 +722,44 @@ let rename_column t ~table_name ~old_col ~new_col =
          Hashtbl.replace t.cache table_name { meta with columns = new_columns };
          Lwt.return (Ok ()))
 
+let drop_column t ~table_name ~col_name =
+  match Hashtbl.find_opt t.cache table_name with
+  | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
+  | Some meta ->
+    let rec find_idx i = function
+      | [] -> None
+      | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
+      | _ :: rest -> find_idx (i + 1) rest
+    in
+    match find_idx 0 meta.columns with
+    | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" col_name))
+    | Some drop_idx ->
+      let n_cols = List.length meta.columns in
+      let%lwt tx = S.rw_begin t.store in
+      (* Delete the dropped column's entry *)
+      let%lwt () = S.del tx sys_columns_tid (column_key table_name drop_idx) in
+      (* Re-key all columns after drop_idx: shift ordinal down by 1 *)
+      let%lwt () =
+        let rec shift i =
+          if i >= n_cols then Lwt.return_unit
+          else
+            let old_k = column_key table_name i in
+            let new_k = column_key table_name (i - 1) in
+            let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
+            (match bytes_opt with
+             | None -> shift (i + 1)
+             | Some bytes ->
+               let%lwt () = S.del tx sys_columns_tid old_k in
+               let%lwt () = S.put tx sys_columns_tid new_k bytes in
+               shift (i + 1))
+        in
+        shift (drop_idx + 1)
+      in
+      let%lwt () = S.commit tx in
+      let new_columns = List.filteri (fun i _ -> i <> drop_idx) meta.columns in
+      Hashtbl.replace t.cache table_name { meta with columns = new_columns };
+      Lwt.return (Ok ())
+
 (* ------------------------------------------------------------------ *)
 (* FTS public API                                                       *)
 (* ------------------------------------------------------------------ *)
