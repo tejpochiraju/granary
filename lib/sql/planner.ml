@@ -255,7 +255,10 @@ let plan_select cat
   let make_sort_keys () =
     List.map (fun (bkey : Sema.bound_order_key) ->
       let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-      (plan_expr bkey.key, dir)
+      let e = plan_expr bkey.key in
+      let e' = if windows = [] then e
+               else substitute_window_slots ~n_input_cols e in
+      (e', dir)
     ) order
   in
   let make_sort child =

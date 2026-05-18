@@ -3873,6 +3873,17 @@ let test_window_no_partition () =
   Alcotest.check value_testable "x=2 rn=2" (Db.V_int 2L) (List.nth rows 1).(1);
   Alcotest.check value_testable "x=3 rn=3" (Db.V_int 3L) (List.nth rows 2).(1)
 
+let test_window_orderby_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE emp (dept TEXT, name TEXT, salary INTEGER)";
+  exec db "INSERT INTO emp VALUES ('eng','Alice',90000),('eng','Bob',80000),('hr','Carol',70000),('hr','Dave',60000)";
+  let rows = query_ok db "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp ORDER BY dept, rn" in
+  Alcotest.(check int) "4 rows" 4 (List.length rows);
+  Alcotest.check value_testable "Alice rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "Bob rn=2"   (Db.V_int 2L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "Carol rn=1" (Db.V_int 1L) (List.nth rows 2).(1);
+  Alcotest.check value_testable "Dave rn=2"  (Db.V_int 2L) (List.nth rows 3).(1)
+
 let test_window_first_last_value () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (salary INTEGER)";
@@ -4279,6 +4290,7 @@ let () =
       Alcotest.test_case "sum_over"         `Quick test_window_sum_over;
       Alcotest.test_case "no_partition"     `Quick test_window_no_partition;
       Alcotest.test_case "first_last_value" `Quick test_window_first_last_value;
+      Alcotest.test_case "orderby_alias"    `Quick test_window_orderby_alias;
     ];
     "recursive_cte", [
       Alcotest.test_case "series"                  `Quick test_recursive_cte_series;
