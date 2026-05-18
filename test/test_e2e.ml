@@ -3801,6 +3801,36 @@ let test_view_independent_per_db () =
       (match result with Error _ -> true | Ok _ -> false);
     Lwt.return_unit)
 
+let test_view_persistence () =
+  with_tempfile (fun path ->
+    run (
+      let* db_res = Db.open_file ~path in
+      let db = match db_res with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "open_file failed"
+      in
+      let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+      let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+      let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
+      let* _ = Db.execute db "CREATE VIEW v AS SELECT name FROM t WHERE id = 1" in
+      let* () = Db.close db in
+      let* db_res2 = Db.open_file ~path in
+      let db2 = match db_res2 with
+        | Ok d -> d
+        | Error _ -> Alcotest.fail "reopen failed"
+      in
+      let* rq = Db.query db2 "SELECT name FROM v" in
+      let* rows = match rq with
+        | Ok stream -> Lwt_stream.to_list stream
+        | Error e -> Alcotest.failf "query failed after reopen: %a" Db.pp_error e
+      in
+      Alcotest.(check int) "1 row" 1 (List.length rows);
+      let r = List.hd rows in
+      Alcotest.check value_testable "name=alice" (Db.V_text "alice") r.(0);
+      Db.close db2
+    )
+  )
+
 (* ------------------------------------------------------------------ *)
 (* Window function tests                                                *)
 (* ------------------------------------------------------------------ *)
@@ -4331,12 +4361,13 @@ let () =
       Alcotest.test_case "preserves_others"     `Quick test_upsert_preserves_non_conflict_rows;
     ];
     "view", [
-      Alcotest.test_case "basic"      `Quick test_view_basic;
-      Alcotest.test_case "filter"     `Quick test_view_with_filter;
-      Alcotest.test_case "agg"        `Quick test_view_aggregation;
-      Alcotest.test_case "drop"       `Quick test_view_drop;
-      Alcotest.test_case "count"      `Quick test_view_count;
-      Alcotest.test_case "per_db"     `Quick test_view_independent_per_db;
+      Alcotest.test_case "basic"        `Quick test_view_basic;
+      Alcotest.test_case "filter"       `Quick test_view_with_filter;
+      Alcotest.test_case "agg"          `Quick test_view_aggregation;
+      Alcotest.test_case "drop"         `Quick test_view_drop;
+      Alcotest.test_case "count"        `Quick test_view_count;
+      Alcotest.test_case "per_db"       `Quick test_view_independent_per_db;
+      Alcotest.test_case "persistence"  `Quick test_view_persistence;
     ];
     "window", [
       Alcotest.test_case "row_number"       `Quick test_window_row_number;

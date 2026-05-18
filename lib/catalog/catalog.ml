@@ -8,6 +8,7 @@ let sys_columns_tid : S.tree_id = 1
 let sys_indexes_tid : S.tree_id = 2
 let sys_meta_tid    : S.tree_id = 3
 let sys_fts_tid     : S.tree_id = 4
+let sys_views_tid   : S.tree_id = 5
 
 (* Rowid counter key suffix for FTS tables: name ++ "\x00rowid" *)
 let sys_fts_rowid_suffix = Bytes.of_string "\x00rowid"
@@ -431,6 +432,37 @@ let load_all_fts store =
   S.cursor_close cur;
   let%lwt () = S.ro_end tx in
   Lwt.return tbl
+
+(* ------------------------------------------------------------------ *)
+(* View persistence                                                     *)
+(* ------------------------------------------------------------------ *)
+
+let load_all_views store =
+  let%lwt tx = S.ro_begin store in
+  let%lwt cur = S.cursor_open tx sys_views_tid in
+  let _sr = S.cursor_first cur in
+  let pairs = ref [] in
+  let rec walk () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (k, v) ->
+      pairs := (Bytes.to_string k, Bytes.to_string v) :: !pairs;
+      walk ()
+  in
+  walk ();
+  S.cursor_close cur;
+  let%lwt () = S.ro_end tx in
+  Lwt.return (List.rev !pairs)
+
+let persist_view store ~name ~sql =
+  let%lwt tx = S.rw_begin store in
+  let%lwt () = S.put tx sys_views_tid (Bytes.of_string name) (Bytes.of_string sql) in
+  S.commit tx
+
+let remove_view store ~name =
+  let%lwt tx = S.rw_begin store in
+  let%lwt () = S.del tx sys_views_tid (Bytes.of_string name) in
+  S.commit tx
 
 (* ------------------------------------------------------------------ *)
 (* Public API                                                           *)

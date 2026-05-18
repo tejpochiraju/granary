@@ -31,6 +31,20 @@ let open_in_memory ?clock () =
   let* catalog = Cat.open_ store in
   Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4 }
 
+let load_views_into_hashtbl store views_tbl =
+  let* pairs = Cat.load_all_views store in
+  List.iter (fun (name, sql) ->
+    (match
+      let lexbuf = Lexing.from_string sql in
+      Sql.Parser.stmt_eof Sql.Lexer.token lexbuf
+    with
+    | Sql.Ast.S_create_view { query; _ } ->
+      Hashtbl.replace views_tbl name query
+    | _ -> ()
+    | exception _ -> ())
+  ) pairs;
+  Lwt.return_unit
+
 let open_file ~path =
   let* result = S.open_file ~path in
   match result with
@@ -39,7 +53,9 @@ let open_file ~path =
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views = Hashtbl.create 4 })
+    let views = Hashtbl.create 4 in
+    let* () = load_views_into_hashtbl store views in
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -51,7 +67,9 @@ let open_block
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views = Hashtbl.create 4 })
+    let views = Hashtbl.create 4 in
+    let* () = load_views_into_hashtbl store views in
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views })
 
 let close t = S.close t.store
 
@@ -122,9 +140,11 @@ let execute t sql =
   | Ok Sql.Plan.Op_rollback -> rollback_txn t
   | Ok Sql.Plan.Op_create_view { name; query } ->
     Hashtbl.replace t.views name query;
+    let* () = Cat.persist_view t.store ~name ~sql in
     Lwt.return (Ok ())
   | Ok Sql.Plan.Op_drop_view { name } ->
     Hashtbl.remove t.views name;
+    let* () = Cat.remove_view t.store ~name in
     Lwt.return (Ok ())
   | Ok op ->
     (* SELECT always uses snapshot reads inside exec.ml (ro_begin/ro_end),
@@ -164,9 +184,11 @@ let execute_change_count t sql =
     (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
   | Ok Sql.Plan.Op_create_view { name; query } ->
     Hashtbl.replace t.views name query;
+    let* () = Cat.persist_view t.store ~name ~sql in
     Lwt.return (Ok 0)
   | Ok Sql.Plan.Op_drop_view { name } ->
     Hashtbl.remove t.views name;
+    let* () = Cat.remove_view t.store ~name in
     Lwt.return (Ok 0)
   | Ok op ->
     let mode = match t.explicit_txn with

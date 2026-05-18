@@ -148,3 +148,12 @@ val create_fts_table : t -> name:string -> columns:string list -> fts_table_meta
     RW transaction.  Does NOT commit; the caller owns the commit. *)
 val next_fts_rowid_in_txn :
   t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t
+
+(** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
+val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+
+(** Persist a view's SQL text to the sys_views B-tree. *)
+val persist_view : Sqlocaml_store.Store.t -> name:string -> sql:string -> unit Lwt.t
+
+(** Remove a view's SQL text from the sys_views B-tree. *)
+val remove_view : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
