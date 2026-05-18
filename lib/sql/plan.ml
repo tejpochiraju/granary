@@ -29,6 +29,7 @@ type expr =
       branches  : (expr * expr) list;
       else_     : expr option;
     }
+  | P_cast of expr * Ast.ty
 
 type op =
   | Op_create_table of {

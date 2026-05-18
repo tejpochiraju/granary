@@ -255,6 +255,50 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
         else find_match rest
     in
     find_match branches
+  | Plan.P_cast (e, ty) ->
+    let v = eval_expr clock params row e in
+    (match v with
+     | Row.V_null -> Row.V_null
+     | _ ->
+       (match ty with
+        | Ast.Ty_int ->
+          (match v with
+           | Row.V_int n  -> Row.V_int n
+           | Row.V_real f -> Row.V_int (Int64.of_float f)
+           | Row.V_text s ->
+             let s = String.trim s in
+             (match Int64.of_string_opt s with
+              | Some n -> Row.V_int n
+              | None ->
+                (match float_of_string_opt s with
+                 | Some f -> Row.V_int (Int64.of_float f)
+                 | None   -> Row.V_int 0L))
+           | Row.V_blob _ -> Row.V_int 0L
+           | Row.V_null   -> assert false)
+        | Ast.Ty_real ->
+          (match v with
+           | Row.V_int n  -> Row.V_real (Int64.to_float n)
+           | Row.V_real f -> Row.V_real f
+           | Row.V_text s ->
+             (match float_of_string_opt (String.trim s) with
+              | Some f -> Row.V_real f
+              | None   -> Row.V_real 0.0)
+           | Row.V_blob _ -> Row.V_real 0.0
+           | Row.V_null   -> assert false)
+        | Ast.Ty_text ->
+          (match v with
+           | Row.V_int n  -> Row.V_text (Int64.to_string n)
+           | Row.V_real f -> Row.V_text (Printf.sprintf "%.15g" f)
+           | Row.V_text s -> Row.V_text s
+           | Row.V_blob b -> Row.V_text (Bytes.to_string b)
+           | Row.V_null   -> assert false)
+        | Ast.Ty_blob ->
+          (match v with
+           | Row.V_blob b -> Row.V_blob b
+           | Row.V_text s -> Row.V_blob (Bytes.of_string s)
+           | Row.V_int n  -> Row.V_blob (Bytes.of_string (Int64.to_string n))
+           | Row.V_real f -> Row.V_blob (Bytes.of_string (Printf.sprintf "%.15g" f))
+           | Row.V_null   -> assert false)))
   | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ ->
     (* These are replaced by pre_eval_subquery before row evaluation. *)
     Row.V_null
@@ -564,6 +608,7 @@ let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan
       branches  = List.map (fun (c, r) -> (go c, go r)) branches;
       else_     = Option.map go else_;
     }
+  | Ast.E_cast (e, ty) -> Plan.P_cast (ast_expr_to_plan_check columns e, ty)
   | _ -> failwith "ast_expr_to_plan_check: unsupported expression in CHECK"
 
 let compile_check_expr (table_name : string) (col_idx : int)
@@ -1627,6 +1672,9 @@ let rec pre_eval_subquery
         Some e'
     in
     Plan.P_case { scrutinee = scrutinee'; branches = branches'; else_ = else_' }
+  | Plan.P_cast (e, ty) ->
+    let* e' = pre_eval_subquery clock store params cat_opt e in
+    Lwt.return (Plan.P_cast (e', ty))
   | _ -> Lwt.return e
 
 and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =

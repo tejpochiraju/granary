@@ -96,6 +96,8 @@ type expr =
       branches  : (expr * expr) list;    (** (WHEN condition/value, THEN result) *)
       else_     : expr option;
     }
+  | E_cast of expr * ty
+    (** CAST(expr AS type) — SQLite type coercion *)
 
 and order_key = {
   expr : expr;
@@ -261,5 +263,11 @@ let rec expr_to_sql = function
       | Some e -> " ELSE " ^ expr_to_sql e
     in
     Printf.sprintf "CASE%s %s%s END" scr brs el
+  | E_cast (e, ty) ->
+    let tn = match ty with
+      | Ty_int  -> "INTEGER" | Ty_text -> "TEXT"
+      | Ty_real -> "REAL"    | Ty_blob -> "BLOB"
+    in
+    Printf.sprintf "CAST(%s AS %s)" (expr_to_sql e) tn
   | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ ->
     failwith "expr_to_sql: unsupported expression form"

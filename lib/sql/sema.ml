@@ -28,6 +28,7 @@ type bound_expr =
       branches  : (bound_expr * bound_expr) list;
       else_     : bound_expr option;
     }
+  | BE_cast of bound_expr * Ast.ty
 
 type bound_order_key = {
   key : bound_expr;
@@ -364,6 +365,10 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
            | Error e -> Error e
            | Ok bound_else ->
              Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+  | Ast.E_cast (e, ty) ->
+    (match bind_expr ~param_counter ~named_params meta e with
+     | Ok be   -> Ok (BE_cast (be, ty))
+     | Error e -> Error e)
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -505,6 +510,10 @@ let rec bind_expr_join
            | Error e -> Error e
            | Ok bound_else ->
              Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+  | Ast.E_cast (e, ty) ->
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
+     | Ok be   -> Ok (BE_cast (be, ty))
+     | Error e -> Error e)
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -673,6 +682,8 @@ let bind_expr_agg
              | Error e -> Error e
              | Ok bound_else ->
                Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+    | Ast.E_cast (e, ty) ->
+      (match go e with Ok be -> Ok (BE_cast (be, ty)) | Error e -> Error e)
   in
   match go e with
   | Error e -> Error e
@@ -695,6 +706,7 @@ let rec expr_has_subquery = function
     (match scrutinee with Some e -> expr_has_subquery e | None -> false)
     || List.exists (fun (c, r) -> expr_has_subquery c || expr_has_subquery r) branches
     || (match else_ with Some e -> expr_has_subquery e | None -> false)
+  | BE_cast (e, _) -> expr_has_subquery e
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
@@ -712,6 +724,7 @@ let rec expr_has_agg = function
     (match scrutinee with Some e -> expr_has_agg e | None -> false)
     || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
     || (match else_ with Some e -> expr_has_agg e | None -> false)
+  | Ast.E_cast (e, _) -> expr_has_agg e
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -743,6 +756,7 @@ let bind_create cat ~name ~columns ~constraints =
         (match scrutinee with Some e -> check_expr_unsupported e | None -> false)
         || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
         || (match else_ with Some e -> check_expr_unsupported e | None -> false)
+      | Ast.E_cast _ -> false
     in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
       match c.check with
@@ -1443,6 +1457,12 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
   | BE_exists _ -> Some Row.Integer (* EXISTS returns boolean 0/1 *)
   | BE_in_select _ -> Some Row.Integer (* IN (SELECT) returns boolean 0/1 *)
   | BE_case _ -> None               (* CASE result type depends on branches *)
+  | BE_cast (_, ty) ->              (* CAST target type is statically known *)
+    Some (match ty with
+      | Ast.Ty_int  -> Row.Integer
+      | Ast.Ty_text -> Row.Text
+      | Ast.Ty_real -> Row.Real
+      | Ast.Ty_blob -> Row.Blob)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)

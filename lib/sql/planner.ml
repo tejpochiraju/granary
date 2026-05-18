@@ -38,6 +38,7 @@ let rec plan_expr = function
       branches  = List.map (fun (c, r) -> (plan_expr c, plan_expr r)) branches;
       else_     = Option.map plan_expr else_;
     }
+  | Sema.BE_cast (e, ty) -> Plan.P_cast (plan_expr e, ty)
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.

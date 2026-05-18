@@ -43,6 +43,7 @@
 %token LIKE GLOB
 %token BETWEEN IN EXISTS
 %token CASE WHEN THEN ELSE END
+%token AS CAST NULLIF IIF
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -172,6 +173,12 @@ col_ty:
   | TEXT_TY    { Ty_text }
   | REAL_TY    { Ty_real }
   | BLOB_TY    { Ty_blob }
+
+type_name:
+  | INTEGER_TY { Ast.Ty_int }
+  | TEXT_TY    { Ast.Ty_text }
+  | REAL_TY    { Ast.Ty_real }
+  | BLOB_TY    { Ast.Ty_blob }
 
 column_constraint:
   | NOT NULL              { Col_not_null }
@@ -348,6 +355,16 @@ scalar_expr:
     { E_func (Fn_time,      args) }
   | UNIXEPOCH LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
     { E_func (Fn_unixepoch, args) }
+  | CAST LPAREN e = expr AS t = type_name RPAREN
+    { E_cast (e, t) }
+  | NULLIF LPAREN a = expr COMMA b = expr RPAREN
+    { E_case { scrutinee = None;
+               branches  = [(E_binop (Eq, a, b), E_lit L_null)];
+               else_     = Some a } }
+  | IIF LPAREN c = expr COMMA t = expr COMMA f = expr RPAREN
+    { E_case { scrutinee = None;
+               branches  = [(c, t)];
+               else_     = Some f } }
 
 proj_item:
   | e = expr { match e with E_col name -> `Col name | _ -> `Expr e }

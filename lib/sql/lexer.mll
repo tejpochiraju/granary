@@ -145,6 +145,13 @@ rule token = parse
   | ':' (ident as id) { NAMED_PARAM id }
   | '@' (ident as id) { NAMED_PARAM id }
   | '$' (ident as id) { NAMED_PARAM id }
-  | ident as id             { IDENT id }
+  | ident as id             {
+      match String.uppercase_ascii id with
+      | "AS"     -> AS
+      | "CAST"   -> CAST
+      | "NULLIF" -> NULLIF
+      | "IIF"    -> IIF
+      | _        -> IDENT id
+    }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }

@@ -3237,6 +3237,100 @@ let test_multi_join_middle_col () =
   Alcotest.(check int) "b.val" 42
     (match (List.hd rows).(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 11: CAST, NULLIF, IIF                                          *)
+(* ------------------------------------------------------------------ *)
+
+let test_cast_int_to_text () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (42)";
+  let rows = query_ok db "SELECT CAST(n AS TEXT) FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "int to text"
+    [| Db.V_text "42" |] (List.nth rows 0)
+
+let test_cast_text_to_int () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT)";
+  exec db "INSERT INTO t VALUES ('123')";
+  let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
+  Alcotest.(check row_testable) "text to int"
+    [| Db.V_int 123L |] (List.nth rows 0)
+
+let test_cast_text_to_int_invalid () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT)";
+  exec db "INSERT INTO t VALUES ('abc')";
+  let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
+  Alcotest.(check row_testable) "invalid text to int gives 0"
+    [| Db.V_int 0L |] (List.nth rows 0)
+
+let test_cast_real_to_int () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (r REAL)";
+  exec db "INSERT INTO t VALUES (3.9)";
+  let rows = query_ok db "SELECT CAST(r AS INTEGER) FROM t" in
+  Alcotest.(check row_testable) "real truncated to int"
+    [| Db.V_int 3L |] (List.nth rows 0)
+
+let test_cast_int_to_real () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (5)";
+  let rows = query_ok db "SELECT CAST(n AS REAL) FROM t" in
+  Alcotest.(check row_testable) "int to real"
+    [| Db.V_real 5.0 |] (List.nth rows 0)
+
+let test_cast_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  let rows = query_ok db "SELECT CAST(n AS TEXT) FROM t" in
+  Alcotest.(check row_testable) "null cast is null"
+    [| Db.V_null |] (List.nth rows 0)
+
+let test_cast_in_where () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT)";
+  exec db "INSERT INTO t VALUES ('10')";
+  exec db "INSERT INTO t VALUES ('3')";
+  let rows = query_ok db "SELECT s FROM t WHERE CAST(s AS INTEGER) > 5 ORDER BY s" in
+  Alcotest.(check int) "one row passes" 1 (List.length rows);
+  Alcotest.(check row_testable) "val" [| Db.V_text "10" |] (List.nth rows 0)
+
+let test_nullif_equal () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (5)";
+  let rows = query_ok db "SELECT NULLIF(n, 5) FROM t" in
+  Alcotest.(check row_testable) "nullif returns null when equal"
+    [| Db.V_null |] (List.nth rows 0)
+
+let test_nullif_unequal () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (5)";
+  let rows = query_ok db "SELECT NULLIF(n, 3) FROM t" in
+  Alcotest.(check row_testable) "nullif returns a when unequal"
+    [| Db.V_int 5L |] (List.nth rows 0)
+
+let test_iif_true () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (10)";
+  let rows = query_ok db "SELECT IIF(n > 5, 'big', 'small') FROM t" in
+  Alcotest.(check row_testable) "iif true branch"
+    [| Db.V_text "big" |] (List.nth rows 0)
+
+let test_iif_false () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t VALUES (2)";
+  let rows = query_ok db "SELECT IIF(n > 5, 'big', 'small') FROM t" in
+  Alcotest.(check row_testable) "iif false branch"
+    [| Db.V_text "small" |] (List.nth rows 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3560,5 +3654,20 @@ let () =
       Alcotest.test_case "case_in_join"       `Quick test_case_in_join;
       Alcotest.test_case "four_table_join"    `Quick test_four_table_join;
       Alcotest.test_case "multi_join_mid_col" `Quick test_multi_join_middle_col;
+    ];
+    "cast_expr", [
+      Alcotest.test_case "cast_int_to_text"      `Quick test_cast_int_to_text;
+      Alcotest.test_case "cast_text_to_int"      `Quick test_cast_text_to_int;
+      Alcotest.test_case "cast_text_to_int_inv"  `Quick test_cast_text_to_int_invalid;
+      Alcotest.test_case "cast_real_to_int"      `Quick test_cast_real_to_int;
+      Alcotest.test_case "cast_int_to_real"      `Quick test_cast_int_to_real;
+      Alcotest.test_case "cast_null"             `Quick test_cast_null;
+      Alcotest.test_case "cast_in_where"         `Quick test_cast_in_where;
+    ];
+    "nullif_iif", [
+      Alcotest.test_case "nullif_equal"   `Quick test_nullif_equal;
+      Alcotest.test_case "nullif_unequal" `Quick test_nullif_unequal;
+      Alcotest.test_case "iif_true"       `Quick test_iif_true;
+      Alcotest.test_case "iif_false"      `Quick test_iif_false;
     ];
   ]

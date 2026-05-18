@@ -35,6 +35,7 @@ type bound_expr =
       else_     : bound_expr option;
     }
     (** CASE [scrutinee] WHEN ... THEN ... [ELSE ...] END *)
+  | BE_cast of bound_expr * Ast.ty
 
 type bound_order_key = {
   key : bound_expr;
