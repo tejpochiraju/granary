@@ -2586,6 +2586,19 @@ let phase17_ine_cases = [
     unordered = false };
 ]
 
+let phase17_cast_real_cases = [
+  { name = "cast_real_to_text";
+    setup = [
+      "CREATE TABLE cast_t (v REAL)";
+      "INSERT INTO cast_t VALUES (1.0)";
+      "INSERT INTO cast_t VALUES (10.0)";
+      "INSERT INTO cast_t VALUES (-5.0)";
+      "INSERT INTO cast_t VALUES (3.14)";
+    ];
+    query = "SELECT CAST(v AS TEXT) FROM cast_t ORDER BY v";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2612,4 +2625,5 @@ let () =
     "phase17_frame",           List.map make_test phase17_frame_cases;
     "phase17_pctrank",         List.map make_test phase17_pctrank_cases;
     "phase17_ine",             List.map make_test phase17_ine_cases;
+    "phase17_cast_real",       List.map make_test phase17_cast_real_cases;
   ]

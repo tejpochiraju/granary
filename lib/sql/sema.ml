@@ -1273,6 +1273,11 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
              if not (expr_has_window e) then Lwt.return (bind_one e)
              else match e with
                | Ast.E_window { func; args; window } ->
+                 (* Validate frame spec: only aggregate window functions support frames *)
+                 (match window.Ast.frame with
+                  | Some _ when (match func with Ast.WF_agg _ -> false | _ -> true) ->
+                    Lwt.return (Error (Unsupported "ROWS/RANGE frame spec is only supported for aggregate window functions"))
+                  | _ ->
                  let slot = Queue.length windows_queue in
                  let bind_list es =
                    List.fold_left (fun acc_r ex ->
@@ -1308,7 +1313,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                                    order_by = bound_ob;
                                    frame = window.Ast.frame } in
                         Queue.push ws windows_queue;
-                        Lwt.return (Ok (BE_window_slot slot)))
+                        Lwt.return (Ok (BE_window_slot slot))))
                | Ast.E_binop (op, a, b) ->
                  let* ba = bind_ww a in
                  let* bb = bind_ww b in

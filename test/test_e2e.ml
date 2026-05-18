@@ -4069,6 +4069,23 @@ let test_window_cume_dist_desc () =
       "cume_dist_desc" [(30, 0.25); (20, 0.75); (20, 0.75); (10, 1.0)] pairs;
     Lwt.return_unit)
 
+let test_window_frame_non_agg_error () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec_ok sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec_ok "CREATE TABLE t (n INTEGER)" in
+    let* () = exec_ok "INSERT INTO t VALUES (1)" in
+    let* result = Db.execute db "SELECT RANK() OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected error for ROWS frame on non-aggregate window function");
+    Lwt.return_unit)
+
 let test_collate_nocase_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
@@ -4585,8 +4602,9 @@ let () =
       Alcotest.test_case "rows_unbounded"   `Quick test_window_rows_unbounded;
       Alcotest.test_case "percent_rank"      `Quick test_window_percent_rank;
       Alcotest.test_case "cume_dist"         `Quick test_window_cume_dist;
-      Alcotest.test_case "percent_rank_desc" `Quick test_window_percent_rank_desc;
-      Alcotest.test_case "cume_dist_desc"    `Quick test_window_cume_dist_desc;
+      Alcotest.test_case "percent_rank_desc"    `Quick test_window_percent_rank_desc;
+      Alcotest.test_case "cume_dist_desc"        `Quick test_window_cume_dist_desc;
+      Alcotest.test_case "frame_non_agg_error"   `Quick test_window_frame_non_agg_error;
     ];
     "recursive_cte", [
       Alcotest.test_case "series"                  `Quick test_recursive_cte_series;
