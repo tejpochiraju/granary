@@ -339,7 +339,13 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
         | Ast.Ty_text ->
           (match v with
            | Row.V_int n  -> Row.V_text (Int64.to_string n)
-           | Row.V_real f -> Row.V_text (Printf.sprintf "%.15g" f)
+           | Row.V_real f ->
+             (* SQLite appends ".0" when the %.15g result has no decimal point
+                or exponent, so that CAST(1.0 AS TEXT) → "1.0" not "1". *)
+             let s = Printf.sprintf "%.15g" f in
+             let needs_dot = not (String.contains s '.' || String.contains s 'e'
+                                  || String.contains s 'E' || String.contains s 'n') in
+             Row.V_text (if needs_dot then s ^ ".0" else s)
            | Row.V_text s -> Row.V_text s
            | Row.V_blob b -> Row.V_text (Bytes.to_string b)
            | Row.V_null   -> assert false)

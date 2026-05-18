@@ -2493,6 +2493,99 @@ let phase16_drop_column_cases = [
     unordered = false };
 ]
 
+(* ── Phase 17 tests ────────────────────────────────────────────── *)
+
+let phase17_frame_cases = [
+  { name = "rows_1_preceding_sum";
+    setup = [
+      "CREATE TABLE fr1 (n INTEGER)";
+      "INSERT INTO fr1 VALUES (1)";
+      "INSERT INTO fr1 VALUES (2)";
+      "INSERT INTO fr1 VALUES (3)";
+      "INSERT INTO fr1 VALUES (4)";
+      "INSERT INTO fr1 VALUES (5)";
+    ];
+    query = "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM fr1 ORDER BY n";
+    unordered = false };
+
+  { name = "rows_unbounded_preceding_sum";
+    setup = [
+      "CREATE TABLE fr2 (n INTEGER)";
+      "INSERT INTO fr2 VALUES (10)";
+      "INSERT INTO fr2 VALUES (20)";
+      "INSERT INTO fr2 VALUES (30)";
+    ];
+    query = "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM fr2 ORDER BY n";
+    unordered = false };
+
+  { name = "rows_centered_sum";
+    setup = [
+      "CREATE TABLE fr3 (n INTEGER)";
+      "INSERT INTO fr3 VALUES (1)";
+      "INSERT INTO fr3 VALUES (2)";
+      "INSERT INTO fr3 VALUES (3)";
+      "INSERT INTO fr3 VALUES (4)";
+      "INSERT INTO fr3 VALUES (5)";
+    ];
+    query = "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM fr3 ORDER BY n";
+    unordered = false };
+]
+
+let phase17_pctrank_cases = [
+  { name = "percent_rank";
+    setup = [
+      "CREATE TABLE pr1 (s INTEGER)";
+      "INSERT INTO pr1 VALUES (10)";
+      "INSERT INTO pr1 VALUES (20)";
+      "INSERT INTO pr1 VALUES (20)";
+      "INSERT INTO pr1 VALUES (30)";
+    ];
+    query = "SELECT s, CAST(ROUND(PERCENT_RANK() OVER (ORDER BY s), 3) AS TEXT) AS pr FROM pr1 ORDER BY s";
+    unordered = false };
+
+  { name = "cume_dist";
+    setup = [
+      "CREATE TABLE cd1 (s INTEGER)";
+      "INSERT INTO cd1 VALUES (10)";
+      "INSERT INTO cd1 VALUES (20)";
+      "INSERT INTO cd1 VALUES (20)";
+      "INSERT INTO cd1 VALUES (30)";
+    ];
+    query = "SELECT s, CAST(ROUND(CUME_DIST() OVER (ORDER BY s), 2) AS TEXT) AS cd FROM cd1 ORDER BY s";
+    unordered = false };
+
+  { name = "percent_rank_desc";
+    setup = [
+      "CREATE TABLE pr2 (s INTEGER)";
+      "INSERT INTO pr2 VALUES (10)";
+      "INSERT INTO pr2 VALUES (20)";
+      "INSERT INTO pr2 VALUES (20)";
+      "INSERT INTO pr2 VALUES (30)";
+    ];
+    query = "SELECT s, CAST(ROUND(PERCENT_RANK() OVER (ORDER BY s DESC), 3) AS TEXT) AS pr FROM pr2 ORDER BY s DESC";
+    unordered = false };
+]
+
+let phase17_ine_cases = [
+  { name = "create_table_ine";
+    setup = [
+      "CREATE TABLE ine1 (id INTEGER)";
+      "INSERT INTO ine1 VALUES (1)";
+      "CREATE TABLE IF NOT EXISTS ine1 (id INTEGER, extra TEXT)";
+    ];
+    query = "SELECT COUNT(*) FROM ine1";
+    unordered = false };
+
+  { name = "create_index_ine";
+    setup = [
+      "CREATE TABLE ine2 (id INTEGER)";
+      "CREATE INDEX ine2_idx ON ine2 (id)";
+      "CREATE INDEX IF NOT EXISTS ine2_idx ON ine2 (id)";
+    ];
+    query = "SELECT COUNT(*) FROM ine2";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2516,4 +2609,7 @@ let () =
     "phase16_window_alias",    List.map make_test phase16_window_alias_cases;
     "phase16_collate",         List.map make_test phase16_collate_cases;
     "phase16_drop_column",     List.map make_test phase16_drop_column_cases;
+    "phase17_frame",           List.map make_test phase17_frame_cases;
+    "phase17_pctrank",         List.map make_test phase17_pctrank_cases;
+    "phase17_ine",             List.map make_test phase17_ine_cases;
   ]
