@@ -776,6 +776,7 @@ let rec expr_has_window = function
     (match scrutinee with Some e -> expr_has_window e | None -> false)
     || List.exists (fun (c, r) -> expr_has_window c || expr_has_window r) branches
     || (match else_ with Some e -> expr_has_window e | None -> false)
+  | Ast.E_cast (e, _) -> expr_has_window e
   | _ -> false
 
 (* ------------------------------------------------------------------ *)
@@ -1354,6 +1355,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                        Lwt.return (Result.map (fun b -> bs @ [b]) r)
                    ) (Ok []) fargs in
                  Lwt.return (Result.map (fun ba -> BE_func (f, ba)) bargs)
+               | Ast.E_cast (e, ty) ->
+                 let* be = bind_ww e in
+                 Lwt.return (Result.map (fun x -> BE_cast (x, ty)) be)
                | _ -> Lwt.return (bind_one e)
            in
            let ords_result_lwt =
