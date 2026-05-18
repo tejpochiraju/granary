@@ -46,9 +46,10 @@ type window_plan_item = {
 
 type op =
   | Op_create_table of {
-      name      : string;
-      columns   : Sqlocaml_encoding.Row.column list;
-      uniq_idxs : (string * string list) list;
+      name          : string;
+      columns       : Sqlocaml_encoding.Row.column list;
+      uniq_idxs     : (string * string list) list;
+      if_not_exists : bool;
     }
   | Op_insert of {
       table_meta    : Cat.table_meta;
@@ -83,14 +84,15 @@ type op =
       child  : op;
     }
   | Op_create_index of {
-      name     : string;
-      table    : string;
-      tree_id  : int;          (** table's tree_id *)
-      col_idxs : int list;     (** column ordinals in table schema *)
-      unique   : bool;
-      columns  : Sqlocaml_encoding.Row.column list;
+      name          : string;
+      table         : string;
+      tree_id       : int;          (** table's tree_id *)
+      col_idxs      : int list;     (** column ordinals in table schema *)
+      unique        : bool;
+      columns       : Sqlocaml_encoding.Row.column list;
         (** columns of the target table — needed for row decoding
             during index population *)
+      if_not_exists : bool;
     }
   | Op_index_lookup of {
       table_tree : int;                 (** table's tree_id *)

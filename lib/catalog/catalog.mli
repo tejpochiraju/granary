@@ -136,6 +136,12 @@ val rename_column :
 val drop_column :
   t -> table_name:string -> col_name:string -> (unit, string) result Lwt.t
 
+(** True if a table with [name] exists in the catalog. *)
+val table_exists : t -> name:string -> bool
+
+(** True if an index with [name] exists in the catalog. *)
+val index_exists : t -> name:string -> bool
+
 (** Find an FTS table by name. Returns [None] if not found. *)
 val find_fts : t -> string -> fts_table_meta option
 

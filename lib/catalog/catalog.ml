@@ -596,6 +596,10 @@ let indexes_for_table t ~table =
 let find_index t ~name =
   Hashtbl.find_opt t.indexes name
 
+let table_exists t ~name = Hashtbl.mem t.cache name
+
+let index_exists t ~name = Hashtbl.mem t.indexes name
+
 (** Scan _sys_indexes (using the given txn) to find the key for [name].
     Returns [None] if not found.
 

@@ -1489,32 +1489,40 @@ let execute_with_count ?(mode = Auto)
     ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
-  | Plan.Op_create_table { name; columns; uniq_idxs } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists } ->
     (* Note: create_table acquires its own RW txn internally via catalog.
        This means CREATE TABLE is NOT atomic within an explicit BEGIN/COMMIT block —
        it commits immediately regardless of mode. Phase 4 work to fix. *)
-    let* _tid = Cat.create_table cat ~name ~columns in
-    let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
-      let* result = Cat.create_index cat ~name:idx_name ~table:name
-          ~columns:col_names ~unique:true in
-      match result with
-      | Error msg -> Lwt.fail_with msg
-      | Ok _      -> Lwt.return_unit
-    ) uniq_idxs in
-    Lwt.return 0
+    if if_not_exists && Cat.table_exists cat ~name then
+      Lwt.return 0
+    else begin
+      let* _tid = Cat.create_table cat ~name ~columns in
+      let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
+        let* result = Cat.create_index cat ~name:idx_name ~table:name
+            ~columns:col_names ~unique:true in
+        match result with
+        | Error msg -> Lwt.fail_with msg
+        | Ok _      -> Lwt.return_unit
+      ) uniq_idxs in
+      Lwt.return 0
+    end
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     Lwt_list.fold_left_s (fun count row_vals ->
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
-  | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns } ->
+  | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns; if_not_exists } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
        block — it commits immediately. Phase 4 work to fix. *)
-    let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                ~col_idxs ~unique ~columns in
-    Lwt.return 0
+    if if_not_exists && Cat.index_exists cat ~name then
+      Lwt.return 0
+    else begin
+      let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
+                  ~col_idxs ~unique ~columns in
+      Lwt.return 0
+    end
   | Plan.Op_update { table_meta; assignments; where; indexes; returning = _ } ->
     execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes; returning = _ } ->

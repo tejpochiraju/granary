@@ -41,7 +41,7 @@
 %token RETURNING
 %token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
-%token BETWEEN IN EXISTS
+%token BETWEEN IN EXISTS IF
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
@@ -168,7 +168,11 @@ create_table:
   | CREATE TABLE name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
-      S_create_table { name; columns = cols; constraints = cons } }
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = false } }
+  | CREATE TABLE IF NOT EXISTS name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+    { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
+      let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = true } }
 
 create_fts_table:
   | CREATE VIRTUAL TABLE name = IDENT USING FTS5
@@ -178,10 +182,16 @@ create_fts_table:
 create_index:
   | CREATE INDEX name = IDENT ON table = IDENT
       LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-    { S_create_index { name; table; columns = cols; unique = false } }
+    { S_create_index { name; table; columns = cols; unique = false; if_not_exists = false } }
   | CREATE UNIQUE INDEX name = IDENT ON table = IDENT
       LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-    { S_create_index { name; table; columns = cols; unique = true } }
+    { S_create_index { name; table; columns = cols; unique = true; if_not_exists = false } }
+  | CREATE INDEX IF NOT EXISTS name = IDENT ON table = IDENT
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { S_create_index { name; table; columns = cols; unique = false; if_not_exists = true } }
+  | CREATE UNIQUE INDEX IF NOT EXISTS name = IDENT ON table = IDENT
+      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { S_create_index { name; table; columns = cols; unique = true; if_not_exists = true } }
 
 column_def:
   | name = IDENT ty = col_ty cs = column_constraint*

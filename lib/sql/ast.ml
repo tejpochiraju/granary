@@ -162,9 +162,10 @@ and upsert_update = {
 
 and stmt =
   | S_create_table of {
-      name        : string;
-      columns     : column_def list;
-      constraints : table_constraint list;
+      name          : string;
+      columns       : column_def list;
+      constraints   : table_constraint list;
+      if_not_exists : bool;
     }
   | S_insert of {
       table         : string;
@@ -191,10 +192,11 @@ and stmt =
       offset      : int option;
     }
   | S_create_index of {
-      name    : string;
-      table   : string;
-      columns : string list;
-      unique  : bool;
+      name          : string;
+      table         : string;
+      columns       : string list;
+      unique        : bool;
+      if_not_exists : bool;
     }
   | S_update of {
       table       : string;

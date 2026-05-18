@@ -69,9 +69,10 @@ type bound_join = {
 
 type bound_stmt =
   | BS_create_table of {
-      name      : string;
-      columns   : Row.column list;
-      uniq_idxs : (string * string list) list;
+      name          : string;
+      columns       : Row.column list;
+      uniq_idxs     : (string * string list) list;
+      if_not_exists : bool;
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -102,10 +103,11 @@ type bound_stmt =
       windows    : window_sema list;
     }
   | BS_create_index of {
-      name       : string;
-      table_meta : Cat.table_meta;
-      col_idxs   : int list;
-      unique     : bool;
+      name          : string;
+      table_meta    : Cat.table_meta;
+      col_idxs      : int list;
+      unique        : bool;
+      if_not_exists : bool;
     }
   | BS_update of {
       table_meta  : Cat.table_meta;
@@ -799,10 +801,12 @@ let rec expr_has_window = function
 (* CREATE TABLE                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let bind_create cat ~name ~columns ~constraints =
+let bind_create cat ~name ~columns ~constraints ~if_not_exists =
   let* existing = Cat.find_table cat ~name in
   match existing with
-  | Some _ -> Lwt.return (Error (Already_exists name))
+  | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+  | Some _ (* if_not_exists = true: silently succeed *) ->
+    Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true }))
   | None ->
     (* Validate CHECK expressions — reject forms that can't be serialized *)
     let rec check_expr_unsupported = function
@@ -870,7 +874,7 @@ let bind_create cat ~name ~columns ~constraints =
               name (String.concat "_" cols) i in
           (idx_name, cols)
       ) constraints in
-      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs }))
+      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists }))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
@@ -1747,7 +1751,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
 (* CREATE INDEX                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let bind_create_index cat ~name ~table ~columns ~unique =
+let bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -1763,13 +1767,22 @@ let bind_create_index cat ~name ~table ~columns ~unique =
      | [] ->
        let col_idxs = List.filter_map (function Ok i -> Some i | Error _ -> None) col_idxs_r in
        (match Cat.find_index cat ~name with
-        | Some _ -> Lwt.return (Error (Already_exists name))
+        | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+        | Some _ (* if_not_exists = true: silently succeed *) ->
+          Lwt.return (Ok (BS_create_index {
+            name;
+            table_meta = meta;
+            col_idxs;
+            unique;
+            if_not_exists = true;
+          }))
         | None ->
           Lwt.return (Ok (BS_create_index {
             name;
             table_meta = meta;
             col_idxs;
             unique;
+            if_not_exists;
           }))))
 
 (* ------------------------------------------------------------------ *)
@@ -2063,7 +2076,7 @@ let rec col_names_of_ast_stmt = function
 
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
   match stmt with
-  | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
+  | Ast.S_create_table { name; columns; constraints; if_not_exists } -> bind_create cat ~name ~columns ~constraints ~if_not_exists
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } as sel ->
     let* meta_opt = Cat.find_table cat ~name:table in
@@ -2079,8 +2092,8 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
         | None ->
           bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias
             ~joins ~where ~group_by ~having ~order ~limit ~offset))
-  | Ast.S_create_index { name; table; columns; unique } ->
-    bind_create_index cat ~name ~table ~columns ~unique
+  | Ast.S_create_index { name; table; columns; unique; if_not_exists } ->
+    bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists
   | Ast.S_update { table; assignments; where; returning } ->
     bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~returning
   | Ast.S_delete { table; where; returning } ->

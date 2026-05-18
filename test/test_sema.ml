@@ -35,7 +35,7 @@ let bind_create_new () =
     Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None; check = None };
     Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None; check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { name; _ }) ->
     Alcotest.(check string) "table name" "items" name
@@ -50,7 +50,7 @@ let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
   let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None; check = None }] in
-  let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
   | Error _ -> Alcotest.fail "expected Already_exists \"users\""
@@ -62,7 +62,7 @@ let bind_create_preserves_cols () =
     Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None };
     Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     Alcotest.(check int) "two columns" 2 (List.length columns);
@@ -505,7 +505,7 @@ let bind_select_negative_offset () =
 let bind_create_index_basic () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx_id"; table = "users"; columns = ["id"]; unique = false;
+    name = "idx_id"; table = "users"; columns = ["id"]; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_create_index { name; col_idxs; unique; _ }) ->
@@ -517,7 +517,7 @@ let bind_create_index_basic () =
 let bind_create_index_unique () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "uidx"; table = "users"; columns = ["name"]; unique = true;
+    name = "uidx"; table = "users"; columns = ["name"]; unique = true; if_not_exists = false;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_create_index { col_idxs = [1]; unique = true; _ }) -> ()
@@ -526,7 +526,7 @@ let bind_create_index_unique () =
 let bind_create_index_unknown_table () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "ghost"; columns = ["x"]; unique = false;
+    name = "idx"; table = "ghost"; columns = ["x"]; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -535,7 +535,7 @@ let bind_create_index_unknown_table () =
 let bind_create_index_unknown_column () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "users"; columns = ["bogus"]; unique = false;
+    name = "idx"; table = "users"; columns = ["bogus"]; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
@@ -549,7 +549,7 @@ let bind_create_index_duplicate () =
       ~columns:["id"] ~unique:false
   ) in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "users"; columns = ["id"]; unique = false;
+    name = "idx"; table = "users"; columns = ["id"]; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Already_exists "idx") -> ()
@@ -1736,7 +1736,7 @@ let bind_create_default_null () =
     Ast.{ name = "x"; ty = Ty_int; not_null = false; primary_key = false;
           default = Some Ast.L_null; check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1751,7 +1751,7 @@ let bind_create_default_real () =
     Ast.{ name = "x"; ty = Ty_real; not_null = false; primary_key = false;
           default = Some (Ast.L_real 3.14); check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1766,7 +1766,7 @@ let bind_create_default_blob () =
     Ast.{ name = "x"; ty = Ty_blob; not_null = false; primary_key = false;
           default = Some (Ast.L_blob (Bytes.of_string "hi")); check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with

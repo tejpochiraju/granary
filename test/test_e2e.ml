@@ -4126,6 +4126,62 @@ let test_drop_column_nonexistent_fails () =
   Alcotest.(check bool) "error mentions column" true
     (String.length msg > 0)
 
+(* ------------------------------------------------------------------ *)
+(* IF NOT EXISTS                                                         *)
+(* ------------------------------------------------------------------ *)
+
+let test_create_table_if_not_exists () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec_sql sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec_sql "CREATE TABLE t_ine (id INTEGER)" in
+    let* () = exec_sql "INSERT INTO t_ine VALUES (42)" in
+    (* Second CREATE IF NOT EXISTS should succeed silently *)
+    let* () = exec_sql "CREATE TABLE IF NOT EXISTS t_ine (id INTEGER)" in
+    let* rows_r = Db.query db "SELECT id FROM t_ine" in
+    let rows = match rows_r with
+      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    (* Table should still have the row — not re-created *)
+    Alcotest.(check int) "one row preserved" 1 (List.length rows);
+    Lwt.return_unit)
+
+let test_create_index_if_not_exists () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec_sql sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec_sql "CREATE TABLE idx_t (id INTEGER)" in
+    let* () = exec_sql "CREATE INDEX idx_t_id ON idx_t (id)" in
+    (* Second CREATE INDEX IF NOT EXISTS should succeed silently *)
+    let* () = exec_sql "CREATE INDEX IF NOT EXISTS idx_t_id ON idx_t (id)" in
+    Lwt.return_unit)
+
+let test_create_table_no_ine_fails () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec_sql sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec_sql "CREATE TABLE t_dup (id INTEGER)" in
+    let* result = Db.execute db "CREATE TABLE t_dup (id INTEGER)" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected error for duplicate table without IF NOT EXISTS");
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4547,5 +4603,10 @@ let () =
       Alcotest.test_case "basic"           `Quick test_drop_column_basic;
       Alcotest.test_case "schema"          `Quick test_drop_column_schema;
       Alcotest.test_case "nonexistent_err" `Quick test_drop_column_nonexistent_fails;
+    ];
+    "if_not_exists", [
+      Alcotest.test_case "create_table_ine"     `Quick test_create_table_if_not_exists;
+      Alcotest.test_case "create_index_ine"     `Quick test_create_index_if_not_exists;
+      Alcotest.test_case "create_table_no_ine"  `Quick test_create_table_no_ine_fails;
     ];
   ]

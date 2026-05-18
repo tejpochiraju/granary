@@ -34,10 +34,10 @@ let plan_create_table () =
     Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None };
     Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = [] } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   let bound = bind cat stmt in
   match Planner.plan bound with
-  | Plan.Op_create_table { name; columns; uniq_idxs = _ } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs = _; _ } ->
     Alcotest.(check string) "table name" "items" name;
     Alcotest.(check int) "column count" 2 (List.length columns)
   | _ -> Alcotest.fail "expected Op_create_table"
@@ -442,7 +442,7 @@ let plan_no_index_falls_back_to_filter () =
 let plan_create_index () =
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_create_index {
-    name = "idx2"; table = "users"; columns = ["name"]; unique = true;
+    name = "idx2"; table = "users"; columns = ["name"]; unique = true; if_not_exists = false;
   } in
   let bound = bind cat stmt in
   match Planner.plan ~cat bound with

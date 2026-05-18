@@ -70,6 +70,7 @@ rule token = parse
   | "ABS"      { ABS }
   | "COALESCE" { COALESCE }
   | "IFNULL"   { IFNULL }
+  | "IF" | "if" { IF }
   | "SUBSTR"   { SUBSTR }
   | "TRIM"     { TRIM }
   | "LTRIM"    { LTRIM }
