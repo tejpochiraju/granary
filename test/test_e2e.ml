@@ -3145,7 +3145,11 @@ let test_star_three_tables () =
   exec db "INSERT INTO z VALUES (3)";
   let rows = query_ok db "SELECT * FROM x JOIN y ON 1=1 JOIN z ON 1=1" in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check int) "three cols" 3 (Array.length (List.hd rows))
+  let row = List.hd rows in
+  Alcotest.(check int) "three cols" 3 (Array.length row);
+  Alcotest.(check int) "a=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
+  Alcotest.(check int) "b=2" 2 (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1);
+  Alcotest.(check int) "c=3" 3 (match row.(2) with Db.V_int n -> Int64.to_int n | _ -> -1)
 
 let test_multi_join_regression_one () =
   (* Regression: single JOIN still works *)
