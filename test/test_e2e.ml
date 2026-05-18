@@ -3043,13 +3043,13 @@ let test_case_no_else () =
     (List.map (fun r -> r.(0) = Db.V_null) rows)
 
 let test_case_null_scrutinee () =
-  (* CASE NULL WHEN NULL THEN 1 END = 1 (IS semantics) *)
+  (* CASE NULL WHEN NULL THEN 1 ELSE 0 END = 0: simple CASE uses = (not IS) semantics *)
   let db = fresh_db () in
   exec db "CREATE TABLE t (v INTEGER)";
   exec db "INSERT INTO t VALUES (NULL)";
   let rows = query_ok db "SELECT CASE v WHEN NULL THEN 1 ELSE 0 END FROM t" in
   let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "null_scrutinee" [1] vals
+  Alcotest.(check (list int)) "null_scrutinee" [0] vals
 
 let test_case_in_where () =
   let db = fresh_db () in

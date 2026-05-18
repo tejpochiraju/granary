@@ -246,7 +246,10 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
           | None ->
             value_truthy (eval_expr clock params row cond)
           | Some sv ->
-            compare_values sv (eval_expr clock params row cond) = 0
+            let cv = eval_expr clock params row cond in
+            (match sv, cv with
+             | Row.V_null, _ | _, Row.V_null -> false
+             | _ -> compare_values sv cv = 0)
         in
         if matched then eval_expr clock params row result
         else find_match rest
@@ -554,6 +557,13 @@ let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan
                List.map (ast_expr_to_plan_check columns) vals)
   | Ast.E_func (f, args) ->
     Plan.P_func (f, List.map (ast_expr_to_plan_check columns) args)
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    let go = ast_expr_to_plan_check columns in
+    Plan.P_case {
+      scrutinee = Option.map go scrutinee;
+      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
+      else_     = Option.map go else_;
+    }
   | _ -> failwith "ast_expr_to_plan_check: unsupported expression in CHECK"
 
 let compile_check_expr (table_name : string) (col_idx : int)
