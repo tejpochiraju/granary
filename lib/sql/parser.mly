@@ -174,12 +174,6 @@ col_ty:
   | REAL_TY    { Ty_real }
   | BLOB_TY    { Ty_blob }
 
-type_name:
-  | INTEGER_TY { Ast.Ty_int }
-  | TEXT_TY    { Ast.Ty_text }
-  | REAL_TY    { Ast.Ty_real }
-  | BLOB_TY    { Ast.Ty_blob }
-
 column_constraint:
   | NOT NULL              { Col_not_null }
   | PRIMARY KEY           { Col_primary_key }
@@ -355,7 +349,7 @@ scalar_expr:
     { E_func (Fn_time,      args) }
   | UNIXEPOCH LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
     { E_func (Fn_unixepoch, args) }
-  | CAST LPAREN e = expr AS t = type_name RPAREN
+  | CAST LPAREN e = expr AS t = col_ty RPAREN
     { E_cast (e, t) }
   | NULLIF LPAREN a = expr COMMA b = expr RPAREN
     { E_case { scrutinee = None;

@@ -97,6 +97,52 @@ let str_trim_spaces s =
   while !r >= !l && (let c = s.[!r] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do decr r done;
   if !l > !r then "" else String.sub s !l (!r - !l + 1)
 
+let parse_int_prefix s =
+  let s = String.trim s in
+  match Int64.of_string_opt s with
+  | Some n -> n
+  | None ->
+    match float_of_string_opt s with
+    | Some f -> Int64.of_float f
+    | None ->
+      (* Scan leading numeric prefix: optional sign, digits, optional decimal *)
+      let n = String.length s in
+      let i = ref 0 in
+      if !i < n && (s.[!i] = '-' || s.[!i] = '+') then incr i;
+      let digit_start = !i in
+      while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do incr i done;
+      (* Include decimal part for float->int conversion *)
+      let has_dot = !i < n && s.[!i] = '.' in
+      if has_dot then begin
+        incr i;
+        while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do incr i done
+      end;
+      if !i > digit_start then
+        (match float_of_string_opt (String.sub s 0 !i) with
+         | Some f -> Int64.of_float f
+         | None ->
+           match Int64.of_string_opt (String.sub s 0 !i) with
+           | Some v -> v
+           | None -> 0L)
+      else 0L
+
+let parse_real_prefix s =
+  let s = String.trim s in
+  match float_of_string_opt s with
+  | Some f -> f
+  | None ->
+    (* Try progressively shorter prefixes until one parses *)
+    let n = String.length s in
+    let result = ref 0.0 in
+    let found = ref false in
+    let i = ref n in
+    while !i > 0 && not !found do
+      (match float_of_string_opt (String.sub s 0 !i) with
+       | Some f -> result := f; found := true
+       | None   -> decr i)
+    done;
+    !result
+
 let str_trim_chars s chars =
   let n = String.length s in
   let l = ref 0 and r = ref (n - 1) in
@@ -265,24 +311,14 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
           (match v with
            | Row.V_int n  -> Row.V_int n
            | Row.V_real f -> Row.V_int (Int64.of_float f)
-           | Row.V_text s ->
-             let s = String.trim s in
-             (match Int64.of_string_opt s with
-              | Some n -> Row.V_int n
-              | None ->
-                (match float_of_string_opt s with
-                 | Some f -> Row.V_int (Int64.of_float f)
-                 | None   -> Row.V_int 0L))
+           | Row.V_text s -> Row.V_int (parse_int_prefix s)
            | Row.V_blob _ -> Row.V_int 0L
            | Row.V_null   -> assert false)
         | Ast.Ty_real ->
           (match v with
            | Row.V_int n  -> Row.V_real (Int64.to_float n)
            | Row.V_real f -> Row.V_real f
-           | Row.V_text s ->
-             (match float_of_string_opt (String.trim s) with
-              | Some f -> Row.V_real f
-              | None   -> Row.V_real 0.0)
+           | Row.V_text s -> Row.V_real (parse_real_prefix s)
            | Row.V_blob _ -> Row.V_real 0.0
            | Row.V_null   -> assert false)
         | Ast.Ty_text ->

@@ -3299,6 +3299,14 @@ let test_cast_in_where () =
   Alcotest.(check int) "one row passes" 1 (List.length rows);
   Alcotest.(check row_testable) "val" [| Db.V_text "10" |] (List.nth rows 0)
 
+let test_cast_text_float_prefix_to_int () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT)";
+  exec db "INSERT INTO t VALUES ('3.7')";
+  let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
+  Alcotest.(check row_testable) "float prefix to int"
+    [| Db.V_int 3L |] (List.nth rows 0)
+
 let test_nullif_equal () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
@@ -3663,6 +3671,7 @@ let () =
       Alcotest.test_case "cast_int_to_real"      `Quick test_cast_int_to_real;
       Alcotest.test_case "cast_null"             `Quick test_cast_null;
       Alcotest.test_case "cast_in_where"         `Quick test_cast_in_where;
+      Alcotest.test_case "cast_text_float_pfx"  `Quick test_cast_text_float_prefix_to_int;
     ];
     "nullif_iif", [
       Alcotest.test_case "nullif_equal"   `Quick test_nullif_equal;
