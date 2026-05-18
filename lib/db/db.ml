@@ -40,7 +40,8 @@ let load_views_into_hashtbl store views_tbl =
     with
     | Sql.Ast.S_create_view { query; _ } ->
       Hashtbl.replace views_tbl name query
-    | _ -> ()
+    | _ ->
+      Printf.eprintf "warning: skipping non-view SQL in sys_views (name: %s)\n%!" name
     | exception _ -> ())
   ) pairs;
   Lwt.return_unit
@@ -139,10 +140,12 @@ let execute t sql =
   | Ok Sql.Plan.Op_commit   -> commit_txn t
   | Ok Sql.Plan.Op_rollback -> rollback_txn t
   | Ok Sql.Plan.Op_create_view { name; query } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.replace t.views name query;
     let* () = Cat.persist_view t.store ~name ~sql in
     Lwt.return (Ok ())
   | Ok Sql.Plan.Op_drop_view { name } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.remove t.views name;
     let* () = Cat.remove_view t.store ~name in
     Lwt.return (Ok ())
@@ -183,10 +186,12 @@ let execute_change_count t sql =
     let* r = rollback_txn t in
     (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
   | Ok Sql.Plan.Op_create_view { name; query } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.replace t.views name query;
     let* () = Cat.persist_view t.store ~name ~sql in
     Lwt.return (Ok 0)
   | Ok Sql.Plan.Op_drop_view { name } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.remove t.views name;
     let* () = Cat.remove_view t.store ~name in
     Lwt.return (Ok 0)

@@ -1,6 +1,6 @@
 (** In-memory catalog backed by system trees in the Store.
     System tree allocation: 0=_sys_tables, 1=_sys_columns, 2=_sys_indexes,
-    3=_sys_meta, 4=_sys_fts_tables.  User tables and indexes use tree_ids >= 16. *)
+    3=_sys_meta, 4=_sys_fts_tables, 5=_sys_views.  User tables and indexes use tree_ids >= 16. *)
 
 type t
 
