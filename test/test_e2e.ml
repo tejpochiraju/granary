@@ -3579,6 +3579,18 @@ let test_corr_in_select () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "alice" [| Db.V_text "alice" |] (List.nth rows 0)
 
+let test_corr_not_in_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE users (id INTEGER, name TEXT)";
+  exec db "CREATE TABLE blocked (user_id INTEGER)";
+  exec db "INSERT INTO users VALUES (1, 'alice')";
+  exec db "INSERT INTO users VALUES (2, 'bob')";
+  exec db "INSERT INTO blocked VALUES (1)";
+  let rows = query_ok db
+    "SELECT name FROM users WHERE users.id NOT IN (SELECT user_id FROM blocked WHERE blocked.user_id = users.id)" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.check row_testable "bob" [| Db.V_text "bob" |] (List.nth rows 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3950,5 +3962,6 @@ let () =
       Alcotest.test_case "exists"     `Quick test_corr_exists;
       Alcotest.test_case "not_exists" `Quick test_corr_not_exists;
       Alcotest.test_case "in_select"  `Quick test_corr_in_select;
+      Alcotest.test_case "not_in"     `Quick test_corr_not_in_select;
     ];
   ]

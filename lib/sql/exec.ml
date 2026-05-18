@@ -1838,12 +1838,16 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     else begin
       (* Slow path: correlated subqueries remain — evaluate async per row *)
       let outer_meta = get_outer_scan_meta child in
-      Lwt.return (Lwt_stream.filter_s (fun row ->
+      match outer_meta with
+      | None ->
+        (* No outer table meta: correlated substitution impossible.
+           Return false for all rows — matches pre-existing behavior for
+           unresolvable subqueries, but O(1) instead of O(n) bind calls. *)
+        Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
+      | Some meta ->
+        Lwt.return (Lwt_stream.filter_s (fun row ->
         (* 1. Substitute outer column refs in embedded Ast.stmt nodes *)
         let subst_pred =
-          match outer_meta with
-          | None -> pred'
-          | Some meta ->
             let rec subst_plan e =
               match e with
               | Plan.P_exists inner ->
