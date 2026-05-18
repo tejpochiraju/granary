@@ -3080,6 +3080,83 @@ let test_case_arithmetic () =
   Alcotest.(check (list int)) "arithmetic" [40] vals
 
 (* ------------------------------------------------------------------ *)
+(* ── Multiple JOINs ──────────────────────────────────────────────── *)
+
+let test_three_table_join () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER, name TEXT)";
+  exec db "CREATE TABLE b (aid INTEGER, val INTEGER)";
+  exec db "CREATE TABLE c (bid INTEGER, extra TEXT)";
+  exec db "INSERT INTO a VALUES (1, 'alice')";
+  exec db "INSERT INTO b VALUES (1, 42)";
+  exec db "INSERT INTO c VALUES (42, 'extra')";
+  let rows = query_ok db
+    "SELECT a.name, b.val, c.extra FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check string) "name"  "alice" (match row.(0) with Db.V_text s -> s | _ -> "?");
+  Alcotest.(check int)    "val"   42      (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1);
+  Alcotest.(check string) "extra" "extra" (match row.(2) with Db.V_text s -> s | _ -> "?")
+
+let test_two_joins_with_where () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE u (id INTEGER, name TEXT)";
+  exec db "CREATE TABLE o (uid INTEGER, item TEXT)";
+  exec db "CREATE TABLE p (item TEXT, price INTEGER)";
+  exec db "INSERT INTO u VALUES (1, 'alice')";
+  exec db "INSERT INTO u VALUES (2, 'bob')";
+  exec db "INSERT INTO o VALUES (1, 'hat')";
+  exec db "INSERT INTO o VALUES (2, 'book')";
+  exec db "INSERT INTO p VALUES ('hat', 10)";
+  exec db "INSERT INTO p VALUES ('book', 5)";
+  let rows = query_ok db
+    "SELECT u.name, p.price FROM u JOIN o ON u.id = o.uid JOIN p ON o.item = p.item WHERE u.id = 1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check string) "name"  "alice" (match row.(0) with Db.V_text s -> s | _ -> "?");
+  Alcotest.(check int)    "price" 10      (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1)
+
+let test_two_left_joins () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER)";
+  exec db "CREATE TABLE b (aid INTEGER, v TEXT)";
+  exec db "CREATE TABLE c (aid INTEGER, w TEXT)";
+  exec db "INSERT INTO a VALUES (1)";
+  exec db "INSERT INTO a VALUES (2)";
+  exec db "INSERT INTO b VALUES (1, 'B1')";
+  exec db "INSERT INTO c VALUES (2, 'C2')";
+  let rows = query_ok db
+    "SELECT a.id, b.v, c.w FROM a LEFT JOIN b ON a.id = b.aid LEFT JOIN c ON a.id = c.aid ORDER BY a.id" in
+  Alcotest.(check int) "two rows" 2 (List.length rows);
+  let r0 = List.nth rows 0 in
+  let r1 = List.nth rows 1 in
+  Alcotest.(check bool) "b.v row0 not null" true (r0.(1) <> Db.V_null);
+  Alcotest.(check bool) "c.w row0 null"     true (r0.(2) = Db.V_null);
+  Alcotest.(check bool) "b.v row1 null"     true (r1.(1) = Db.V_null);
+  Alcotest.(check bool) "c.w row1 not null" true (r1.(2) <> Db.V_null)
+
+let test_star_three_tables () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE x (a INTEGER)";
+  exec db "CREATE TABLE y (b INTEGER)";
+  exec db "CREATE TABLE z (c INTEGER)";
+  exec db "INSERT INTO x VALUES (1)";
+  exec db "INSERT INTO y VALUES (2)";
+  exec db "INSERT INTO z VALUES (3)";
+  let rows = query_ok db "SELECT * FROM x JOIN y ON 1=1 JOIN z ON 1=1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check int) "three cols" 3 (Array.length (List.hd rows))
+
+let test_multi_join_regression_one () =
+  (* Regression: single JOIN still works *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER, v TEXT)";
+  exec db "CREATE TABLE b (aid INTEGER, w TEXT)";
+  exec db "INSERT INTO a VALUES (1, 'X')";
+  exec db "INSERT INTO b VALUES (1, 'Y')";
+  let rows = query_ok db "SELECT a.v, b.w FROM a JOIN b ON a.id = b.aid" in
+  Alcotest.(check int) "one row" 1 (List.length rows)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3388,5 +3465,12 @@ let () =
       Alcotest.test_case "case_in_where"       `Quick test_case_in_where;
       Alcotest.test_case "case_nested"         `Quick test_case_nested;
       Alcotest.test_case "case_arithmetic"     `Quick test_case_arithmetic;
+    ];
+    "multi_join", [
+      Alcotest.test_case "three_table_join"    `Quick test_three_table_join;
+      Alcotest.test_case "two_joins_with_where" `Quick test_two_joins_with_where;
+      Alcotest.test_case "two_left_joins"      `Quick test_two_left_joins;
+      Alcotest.test_case "star_three_tables"   `Quick test_star_three_tables;
+      Alcotest.test_case "regression_one_join" `Quick test_multi_join_regression_one;
     ];
   ]

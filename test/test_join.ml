@@ -197,7 +197,7 @@ let sema_qualified_column_resolves () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; proj; _ }) ->
+  | Ok (Sema.BS_select { joins = _ :: _; proj; _ }) ->
     Alcotest.(check (list int)) "select * → left ++ right ordinals" [0; 1] proj
   | _ -> Alcotest.fail "expected Ok BS_select with qualified columns resolved"
 

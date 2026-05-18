@@ -76,7 +76,7 @@ type bound_stmt =
       order      : bound_order_key list;
       limit      : int option;
       offset     : int option;
-      join       : bound_join option;
+      joins      : bound_join list;
       group_by   : int option;
       aggs       : agg_spec list;
       having     : bound_expr option;
@@ -374,62 +374,56 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
 let rec bind_expr_join
     ~param_counter
     ~named_params
-    ~(left_meta : Cat.table_meta)
-    ~(right_meta : Cat.table_meta)
-    ~(right_offset : int)
+    ~(tables : (Cat.table_meta * int) list)
   = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
-    let in_left  = col_index left_meta.columns  name in
-    let in_right = col_index right_meta.columns name in
-    (match in_left, in_right with
-     | Some _, Some _ -> Error (Ambiguous_column name)
-     | Some i, None   -> Ok (BE_col i)
-     | None,   Some i -> Ok (BE_col (right_offset + i))
-     | None,   None   ->
-       (* Report unknown_column against the left table for consistency. *)
-       Error (Unknown_column { table = left_meta.name; column = name }))
+    let matches = List.filter_map (fun (tm, base) ->
+      match col_index tm.Cat.columns name with
+      | Some i -> Some (BE_col (base + i))
+      | None   -> None
+    ) tables in
+    (match matches with
+     | [be]   -> Ok be
+     | []     -> Error (Unknown_column { table = (fst (List.hd tables)).Cat.name; column = name })
+     | _ :: _ -> Error (Ambiguous_column name))
   | Ast.E_tbl_col (tbl, name) ->
-    if String.equal tbl left_meta.name then
-      (match col_index left_meta.columns name with
-       | Some i -> Ok (BE_col i)
-       | None   -> Error (Unknown_column { table = tbl; column = name }))
-    else if String.equal tbl right_meta.name then
-      (match col_index right_meta.columns name with
-       | Some i -> Ok (BE_col (right_offset + i))
-       | None   -> Error (Unknown_column { table = tbl; column = name }))
-    else
-      Error (Unknown_table tbl)
+    (match List.find_opt (fun (tm, _) -> String.equal tm.Cat.name tbl) tables with
+     | None            -> Error (Unknown_table tbl)
+     | Some (tm, base) ->
+       (match col_index tm.Cat.columns name with
+        | Some i -> Ok (BE_col (base + i))
+        | None   -> Error (Unknown_column { table = tbl; column = name })))
   | Ast.E_binop (op, a, b) ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset a,
-           bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset b with
+    (match bind_expr_join ~param_counter ~named_params ~tables a,
+           bind_expr_join ~param_counter ~named_params ~tables b with
      | Ok ba, Ok bb  -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
      | Error e, _    -> Error e
      | Ok _,  Error e -> Error e)
   | Ast.E_not e ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be -> Ok (BE_not be) | Error e -> Error e)
   | Ast.E_is_null e ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be -> Ok (BE_is_null be) | Error e -> Error e)
   | Ast.E_is_not_null e ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be -> Ok (BE_is_not_null be) | Error e -> Error e)
   | Ast.E_neg e ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be -> Ok (BE_neg be) | Error e -> Error e)
   | Ast.E_bitnot e ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be -> Ok (BE_bitnot be) | Error e -> Error e)
   | Ast.E_between (x, lo, hi) ->
-    (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset x,
-           bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset lo,
-           bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset hi with
+    (match bind_expr_join ~param_counter ~named_params ~tables x,
+           bind_expr_join ~param_counter ~named_params ~tables lo,
+           bind_expr_join ~param_counter ~named_params ~tables hi with
      | Ok bx, Ok blo, Ok bhi -> Ok (BE_between (bx, blo, bhi))
      | Error e, _, _ | _, Error e, _ | _, _, Error e -> Error e)
   | Ast.E_in (x, vals) ->
-    let bx = bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset x in
-    let bvals = List.map (bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset) vals in
+    let bx = bind_expr_join ~param_counter ~named_params ~tables x in
+    let bvals = List.map (bind_expr_join ~param_counter ~named_params ~tables) vals in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bvals in
     (match bx, errors with
      | Error e, _ -> Error e
@@ -442,7 +436,7 @@ let rec bind_expr_join
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    let bound = List.map (bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset) args in
+    let bound = List.map (bind_expr_join ~param_counter ~named_params ~tables) args in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
     (match errors with
      | e :: _ -> Error e
@@ -475,7 +469,7 @@ let rec bind_expr_join
       match scrutinee with
       | None   -> Ok None
       | Some e ->
-        (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+        (match bind_expr_join ~param_counter ~named_params ~tables e with
          | Ok be   -> Ok (Some be)
          | Error e -> Error e)
     in
@@ -484,8 +478,8 @@ let rec bind_expr_join
      | Ok bound_scr ->
        let branch_results =
          List.map (fun (cond, res) ->
-           match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset cond,
-                 bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset res with
+           match bind_expr_join ~param_counter ~named_params ~tables cond,
+                 bind_expr_join ~param_counter ~named_params ~tables res with
            | Ok bc, Ok br -> Ok (bc, br)
            | Error e, _   -> Error e
            | _, Error e   -> Error e
@@ -503,7 +497,7 @@ let rec bind_expr_join
             match else_ with
             | None   -> Ok None
             | Some e ->
-              (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+              (match bind_expr_join ~param_counter ~named_params ~tables e with
                | Ok be   -> Ok (Some be)
                | Error e -> Error e)
           in
@@ -1036,61 +1030,48 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
         | None -> Lwt.return (Error (Unknown_table table))
         | Some _ -> Lwt.return (Error (Unsupported "FTS tables do not support this query form"))))
   | Some meta ->
-    (* Phase 2: support a single JOIN clause. *)
-    if List.length joins > 1 then
-      Lwt.return (Error (Unsupported
-        "more than one JOIN clause is not supported in Phase 2"))
-    else
-    let* join_meta_result =
-      match joins with
-      | [] -> Lwt.return (Ok None)
-      | [ (jc : Ast.join_clause) ] ->
-        let* rm_opt = Cat.find_table cat ~name:jc.table in
-        (match rm_opt with
-         | None -> Lwt.return (Error (Unknown_table jc.table))
-         | Some rm -> Lwt.return (Ok (Some (jc, rm))))
-      | _ -> Lwt.return (Ok None)   (* unreachable due to length check *)
+    (* Resolve all join table metas in order *)
+    let* joined_pairs_result =
+      Lwt_list.fold_left_s (fun acc (jc : Ast.join_clause) ->
+        match acc with
+        | Error e -> Lwt.return (Error e)
+        | Ok pairs ->
+          let* rm_opt = Cat.find_table cat ~name:jc.table in
+          (match rm_opt with
+           | None    -> Lwt.return (Error (Unknown_table jc.table))
+           | Some rm -> Lwt.return (Ok (pairs @ [(jc, rm)])))
+      ) (Ok []) joins
     in
-    (match join_meta_result with
+    (match joined_pairs_result with
      | Error e -> Lwt.return (Error e)
-     | Ok join_info ->
+     | Ok joined_pairs ->
        let n_left = List.length meta.columns in
-       let right_offset = n_left in
+       (* tables: [(primary_meta, 0); (rm0, n_left); (rm1, n_left+n_rm0); ...] *)
+       let (tables, _) =
+         List.fold_left (fun (acc, off) (_, rm) ->
+           let n = List.length rm.Cat.columns in
+           (acc @ [(rm, off)], off + n)
+         ) ([(meta, 0)], n_left) joined_pairs
+       in
        (* Combined-row column lookup with full error reporting (Ambiguous,
           Unknown).  Used for proj and ORDER BY name resolution. *)
        let proj_lookup name : (int, error) result =
-         match join_info with
-         | None ->
-           (match col_index meta.columns name with
-            | None   -> Error (Unknown_column { table; column = name })
-            | Some i -> Ok i)
-         | Some (_jc, rm) ->
-           let in_left  = col_index meta.columns name in
-           let in_right = col_index rm.columns    name in
-           (match in_left, in_right with
-            | Some _, Some _ -> Error (Ambiguous_column name)
-            | Some i, None   -> Ok i
-            | None,   Some i -> Ok (right_offset + i)
-            | None,   None   -> Error (Unknown_column { table; column = name }))
+         let hits = List.filter_map (fun (tm, base) ->
+           match col_index tm.Cat.columns name with
+           | Some i -> Some (base + i) | None -> None
+         ) tables in
+         (match hits with
+          | [i]    -> Ok i
+          | []     -> Error (Unknown_column { table = meta.Cat.name; column = name })
+          | _ :: _ -> Error (Ambiguous_column name))
        in
        let qual_lookup t c : (int, error) result =
-         match join_info with
-         | None ->
-           if String.equal t meta.name then
-             (match col_index meta.columns c with
-              | Some i -> Ok i
-              | None -> Error (Unknown_column { table = t; column = c }))
-           else Error (Unknown_table t)
-         | Some (_jc, rm) ->
-           if String.equal t meta.name then
-             (match col_index meta.columns c with
-              | Some i -> Ok i
-              | None -> Error (Unknown_column { table = t; column = c }))
-           else if String.equal t rm.Cat.name then
-             (match col_index rm.columns c with
-              | Some i -> Ok (right_offset + i)
-              | None -> Error (Unknown_column { table = t; column = c }))
-           else Error (Unknown_table t)
+         match List.find_opt (fun (tm, _) -> String.equal tm.Cat.name t) tables with
+         | None            -> Error (Unknown_table t)
+         | Some (tm, base) ->
+           (match col_index tm.Cat.columns c with
+            | Some i -> Ok (base + i)
+            | None   -> Error (Unknown_column { table = t; column = c }))
        in
        (* Detect whether this is an aggregated query: any aggregate in
           projection or HAVING, or GROUP BY present. *)
@@ -1132,21 +1113,18 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
          if not is_aggregated then
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6. *)
            let bind_one e =
-             match join_info with
-             | None -> bind_expr ~param_counter ~named_params meta e
-             | Some (_jc, rm) ->
-               bind_expr_join ~param_counter ~named_params ~left_meta:meta ~right_meta:rm ~right_offset e
+             if joined_pairs = [] then
+               bind_expr ~param_counter ~named_params meta e
+             else
+               bind_expr_join ~param_counter ~named_params ~tables e
            in
            let ords_result =
              match proj with
              | `All ->
-               let left_ords = List.mapi (fun i _ -> i) meta.columns in
-               (match join_info with
-                | None -> Ok (`Ords left_ords)
-                | Some (_jc, rm) ->
-                  let n_right = List.length rm.columns in
-                  let right_ords = List.init n_right (fun i -> right_offset + i) in
-                  Ok (`Ords (left_ords @ right_ords)))
+               let all_ords = List.concat_map (fun (tm, base) ->
+                 List.mapi (fun i _ -> base + i) tm.Cat.columns
+               ) tables in
+               Ok (`Ords all_ords)
              | `Cols names ->
                List.fold_left (fun acc name ->
                  match acc with
@@ -1206,11 +1184,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
              | Ast.E_agg (func, arg_opt) ->
                (* SUM/AVG type check. *)
                let validate_numeric col_ord =
-                 let cols =
-                   match join_info with
-                   | None -> meta.columns
-                   | Some (_jc, rm) -> meta.columns @ rm.Cat.columns
-                 in
+                 let cols = List.concat_map (fun (tm, _) -> tm.Cat.columns) tables in
                  let col = List.nth cols col_ord in
                  match col.Row.ty with
                  | Row.Integer | Row.Real -> Ok ()
@@ -1285,32 +1259,30 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
        (match proj_result with
         | Error e -> Lwt.return (Error e)
         | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs) ->
-          (* Bind the JOIN ON predicate (must use two-table resolution). *)
-          let bound_join_result : (bound_join option, error) result =
-            match join_info with
-            | None -> Ok None
-            | Some (jc, rm) ->
-              (match bind_expr_join
-                       ~param_counter
-                       ~named_params
-                       ~left_meta:meta
-                       ~right_meta:rm
-                       ~right_offset jc.Ast.on with
-               | Error e -> Error e
-               | Ok be ->
-                 Ok (Some { kind = jc.Ast.kind;
-                            right_meta = rm;
-                            on = be;
-                            right_col_offset = right_offset }))
+          (* Bind each join ON predicate against tables visible so far *)
+          let bind_joins_result : (bound_join list, error) result =
+            let rec go acc tbl_acc offset = function
+              | [] -> Ok (List.rev acc)
+              | ((jc : Ast.join_clause), rm) :: rest ->
+                let tables_so_far = tbl_acc @ [(rm, offset)] in
+                (match bind_expr_join ~param_counter ~named_params
+                         ~tables:tables_so_far jc.Ast.on with
+                 | Error e -> Error e
+                 | Ok be   ->
+                   let bj = { kind = jc.Ast.kind; right_meta = rm;
+                              on = be; right_col_offset = offset } in
+                   go (bj :: acc) tables_so_far (offset + List.length rm.Cat.columns) rest)
+            in
+            go [] [(meta, 0)] n_left joined_pairs
           in
-          (match bound_join_result with
+          (match bind_joins_result with
            | Error e -> Lwt.return (Error e)
-           | Ok bound_join ->
+           | Ok bound_joins ->
              let bind_combined e =
-               match join_info with
-               | None -> bind_expr ~param_counter ~named_params meta e
-               | Some (_jc, rm) ->
-                 bind_expr_join ~param_counter ~named_params ~left_meta:meta ~right_meta:rm ~right_offset e
+               if joined_pairs = [] then
+                 bind_expr ~param_counter ~named_params meta e
+               else
+                 bind_expr_join ~param_counter ~named_params ~tables e
              in
              let where_result =
                match where with
@@ -1383,12 +1355,10 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                     | Error _ -> acc
                     | Ok keys ->
                       let bound_e =
-                        match join_info with
-                        | None ->
+                        if joined_pairs = [] then
                           bind_expr ~param_counter ~named_params meta ok.Ast.expr
-                        | Some (_jc, rm) ->
-                          bind_expr_join ~param_counter ~named_params ~left_meta:meta
-                            ~right_meta:rm ~right_offset ok.Ast.expr
+                        else
+                          bind_expr_join ~param_counter ~named_params ~tables ok.Ast.expr
                       in
                       (match bound_e with
                        | Error e -> Error e
@@ -1425,7 +1395,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~joins ~
                            order      = bound_order;
                            limit      = valid_limit;
                            offset     = valid_offset;
-                           join       = bound_join;
+                           joins      = bound_joins;
                            group_by   = group_col;
                            aggs       = all_aggs;
                            having     = bound_having;

@@ -136,17 +136,17 @@ let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
   | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
 
 let plan_select cat
-    ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~join
+    ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~joins
     ~group_by ~aggs ~having ~agg_proj ~distinct =
+  let has_joins = joins <> [] in
   (* Try to use an index lookup if possible (single-table path). *)
   let base =
-    match join with
-    | Some _ ->
-      (* With a JOIN, we always start from a seq scan of the left table
+    if has_joins then
+      (* With JOINs, we always start from a seq scan of the left table
          and let plan_join wrap it.  WHERE applies to the combined row
          (handled below). *)
       Plan.Op_seq_scan { table_meta }
-    | None ->
+    else
       (match where with
        | None -> Plan.Op_seq_scan { table_meta }
        | Some e ->
@@ -176,19 +176,21 @@ let plan_select cat
               child = Plan.Op_seq_scan { table_meta };
             }))
   in
-  (* Apply JOIN (if any), then WHERE (post-join). *)
-  let after_join =
-    match join with
-    | None -> base
-    | Some bj ->
-      let n_left = List.length table_meta.columns in
-      plan_join cat bj base n_left
+  (* Chain all joins left to right *)
+  let (after_joins, _) =
+    List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
+      let joined = plan_join cat bj op n_left in
+      let n_left' = n_left + List.length bj.Sema.right_meta.Cat.columns in
+      (joined, n_left')
+    ) (base, List.length table_meta.columns) joins
   in
   let after_where =
-    match join, where with
-    | Some _, Some e ->
-      Plan.Op_filter { pred = plan_expr e; child = after_join }
-    | _ -> after_join
+    if has_joins then
+      (match where with
+       | None   -> after_joins
+       | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins })
+    else
+      after_joins
   in
   let is_aggregated = aggs <> [] || group_by <> None in
   (* For non-aggregate queries: sort BEFORE projection so col_idx correctly
@@ -249,54 +251,54 @@ let rec plan ?cat = function
     Plan.Op_insert { table_meta; ordinals; values = List.map plan_expr values; on_conflict;
                      returning = List.map plan_expr returning }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
-                     join; group_by; aggs; having; agg_proj } ->
+                     joins; group_by; aggs; having; agg_proj } ->
     (match cat with
      | Some cat ->
        plan_select cat ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset
-         ~join ~group_by ~aggs ~having ~agg_proj ~distinct
+         ~joins ~group_by ~aggs ~having ~agg_proj ~distinct
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
           chain manually. *)
        let base = Plan.Op_seq_scan { table_meta } in
-       let after_join : Plan.op = match join with
-         | None -> base
-         | Some bj ->
-           let n_left = List.length table_meta.columns in
-           let n_right_cols = List.length bj.Sema.right_meta.Cat.columns in
+       let (after_joins, _) =
+         List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
+           let n_right_cols = List.length bj.right_meta.Cat.columns in
            let right_offset = bj.right_col_offset in
            let join_kind = match bj.kind with
              | Ast.Inner -> `Inner | Ast.Left -> `Left
            in
-           (match recognise_eq_col_col bj.on with
-            | Some (a, b) when (a < n_left) && (b >= right_offset) ->
-              Plan.Op_hash_join {
-                left = base;
-                right = Plan.Op_seq_scan { table_meta = bj.right_meta };
-                left_key = a; right_key = b - right_offset;
-                join_kind; right_col_offset = right_offset; n_right_cols;
-              }
-            | Some (a, b) when (b < n_left) && (a >= right_offset) ->
-              Plan.Op_hash_join {
-                left = base;
-                right = Plan.Op_seq_scan { table_meta = bj.right_meta };
-                left_key = b; right_key = a - right_offset;
-                join_kind; right_col_offset = right_offset; n_right_cols;
-              }
-            | _ ->
-              let cart =
+           let joined =
+             (match recognise_eq_col_col bj.on with
+              | Some (a, b) when (a < n_left) && (b >= right_offset) ->
                 Plan.Op_hash_join {
-                  left = base;
+                  left = op;
+                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  left_key = a; right_key = b - right_offset;
+                  join_kind; right_col_offset = right_offset; n_right_cols;
+                }
+              | Some (a, b) when (b < n_left) && (a >= right_offset) ->
+                Plan.Op_hash_join {
+                  left = op;
+                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  left_key = b; right_key = a - right_offset;
+                  join_kind; right_col_offset = right_offset; n_right_cols;
+                }
+              | _ ->
+                let cart = Plan.Op_hash_join {
+                  left = op;
                   right = Plan.Op_seq_scan { table_meta = bj.right_meta };
                   left_key = -1; right_key = -1;
                   join_kind; right_col_offset = right_offset; n_right_cols;
-                }
-              in
-              Plan.Op_filter { pred = plan_expr bj.on; child = cart })
+                } in
+                Plan.Op_filter { pred = plan_expr bj.on; child = cart })
+           in
+           (joined, n_left + n_right_cols)
+         ) (base, List.length table_meta.columns) joins
        in
        let filtered = match where with
-         | None   -> after_join
-         | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_join }
+         | None   -> after_joins
+         | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins }
        in
        let is_aggregated = aggs <> [] || group_by <> None in
        let make_sort_keys () =

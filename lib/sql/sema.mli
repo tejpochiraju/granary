@@ -100,7 +100,7 @@ type bound_stmt =
       order      : bound_order_key list;
       limit      : int option;
       offset     : int option;
-      join       : bound_join option;   (** Phase 2: single optional JOIN *)
+      joins      : bound_join list;     (** Phase 10: zero or more JOINs *)
       group_by   : int option;
         (** [Some i] = GROUP BY column at ordinal [i] (in combined row).
             [None] with non-empty [aggs] = one big group over all rows.

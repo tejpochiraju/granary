@@ -939,7 +939,7 @@ let bind_select_join_qualified_col_ok () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with join"
 
 let bind_select_join_qualified_unknown_table () =
@@ -1383,7 +1383,7 @@ let bind_select_join_unqual_right_only () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with right-only col in ON"
 
 (** bind_expr_join E_tbl_col on RIGHT table OK (lines 194-196). *)
@@ -1399,7 +1399,7 @@ let bind_select_join_qual_right_col () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with right-table qual in ON"
 
 (** bind_expr_join E_binop right-side error path (line 205). *)
@@ -1429,7 +1429,7 @@ let bind_select_join_on_not () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with E_not in ON"
 
 (** bind_expr_join E_not error (line 208). *)
@@ -1457,7 +1457,7 @@ let bind_select_join_on_is_null () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with E_is_null in ON"
 
 (** bind_expr_join E_is_null error (line 211). *)
@@ -1485,7 +1485,7 @@ let bind_select_join_on_is_not_null () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with E_is_not_null in ON"
 
 (** bind_expr_join E_is_not_null error (line 214). *)
@@ -1513,7 +1513,7 @@ let bind_select_join_on_neg () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with E_neg in ON"
 
 (** bind_expr_join E_neg error (line 217). *)
@@ -1917,7 +1917,7 @@ let bind_select_join_on_unqual_left_only () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok BS_select with left-only unqual col in ON"
 
 (** bind_expr_join qualified left-table unknown column inside ON (line 193). *)
@@ -2542,7 +2542,7 @@ let bind_select_join_bitnot_ok () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok with E_bitnot in ON"
 
 (** bind_expr_join E_bitnot error. *)
@@ -2573,7 +2573,7 @@ let bind_select_join_between_ok () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok with E_between in ON"
 
 (** bind_expr_join E_between error (hi unknown col). *)
@@ -2606,7 +2606,7 @@ let bind_select_join_in_ok () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok with E_in in ON"
 
 (** bind_expr_join E_in error (value unknown col). *)
@@ -2638,7 +2638,7 @@ let bind_select_join_param () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Ok (Sema.BS_select { join = Some _; _ }) -> ()
+  | Ok (Sema.BS_select { joins = _ :: _; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok with E_param in ON"
 
 (** bind_expr_join E_func arity mismatch. *)
