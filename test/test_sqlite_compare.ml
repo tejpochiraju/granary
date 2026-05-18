@@ -2437,6 +2437,62 @@ let phase14_recursive_cte_cases = [
     unordered = false };
 ]
 
+let phase16_window_alias_cases = [
+  { name = "window_orderby_alias_rn";
+    setup = [
+      "CREATE TABLE emp (dept TEXT, name TEXT, salary INTEGER)";
+      "INSERT INTO emp VALUES ('eng','Alice',90000),('eng','Bob',80000),('hr','Carol',70000),('hr','Dave',60000)";
+    ];
+    query = "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp ORDER BY dept, rn";
+    unordered = false };
+
+  { name = "window_orderby_alias_dr";
+    setup = [
+      "CREATE TABLE scores (name TEXT, score INTEGER)";
+      "INSERT INTO scores VALUES ('A',100),('B',100),('C',90),('D',80)";
+    ];
+    query = "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY dr, name";
+    unordered = false };
+]
+
+let phase16_collate_cases = [
+  { name = "collate_nocase_eq";
+    setup = [
+      "CREATE TABLE t (name TEXT)";
+      "INSERT INTO t VALUES ('Alice'),('BOB'),('charlie')";
+    ];
+    query = "SELECT name FROM t WHERE name COLLATE NOCASE = 'alice' ORDER BY name";
+    unordered = false };
+
+  { name = "collate_nocase_order";
+    setup = [
+      "CREATE TABLE t (name TEXT)";
+      "INSERT INTO t VALUES ('banana'),('Apple'),('cherry')";
+    ];
+    query = "SELECT name FROM t ORDER BY name COLLATE NOCASE";
+    unordered = false };
+]
+
+let phase16_drop_column_cases = [
+  { name = "drop_column_basic";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT, age INTEGER)";
+      "INSERT INTO t VALUES (1,'Alice',30),(2,'Bob',25)";
+      "ALTER TABLE t DROP COLUMN age";
+    ];
+    query = "SELECT id, name FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "drop_column_then_insert";
+    setup = [
+      "CREATE TABLE t (id INTEGER, name TEXT, score REAL)";
+      "ALTER TABLE t DROP COLUMN score";
+      "INSERT INTO t (id, name) VALUES (1,'Alice'),(2,'Bob')";
+    ];
+    query = "SELECT id, name FROM t ORDER BY id";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2457,4 +2513,7 @@ let () =
     "phase13_view",       List.map make_test phase13_view_cases;
     "phase14_window",          List.map make_test phase14_window_cases;
     "phase14_recursive_cte",   List.map make_test phase14_recursive_cte_cases;
+    "phase16_window_alias",    List.map make_test phase16_window_alias_cases;
+    "phase16_collate",         List.map make_test phase16_collate_cases;
+    "phase16_drop_column",     List.map make_test phase16_drop_column_cases;
   ]
