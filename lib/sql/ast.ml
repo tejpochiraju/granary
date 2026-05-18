@@ -134,6 +134,8 @@ and window_func =
   | WF_last_value
   | WF_nth_value
   | WF_agg of agg_func
+  | WF_percent_rank
+  | WF_cume_dist
 
 and window_spec = {
   partition_by : expr list;

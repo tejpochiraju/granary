@@ -2125,6 +2125,46 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        results.(sorted_orig_idxs.(pos)) <- v
      done
 
+   | Ast.WF_percent_rank ->
+     (* PERCENT_RANK = (rank - 1) / (n - 1), where rank = 1 + #{rows with strictly smaller ORDER BY key} *)
+     let peer_vals pos =
+       List.map (fun (e, _) -> eval_expr clock params sorted_rows.(pos) e) wplan.Plan.order_by
+     in
+     for pos = 0 to n - 1 do
+       let rank =
+         if wplan.Plan.order_by = [] then 1
+         else
+           let cur_vals = peer_vals pos in
+           let strictly_before i =
+             List.fold_left2 (fun acc a b ->
+               if acc <> 0 then acc else compare_values a b
+             ) 0 (peer_vals i) cur_vals < 0
+           in
+           1 + List.length (List.filter strictly_before (List.init pos (fun i -> i)))
+       in
+       let pct = if n <= 1 then 0.0
+                 else Float.of_int (rank - 1) /. Float.of_int (n - 1) in
+       results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
+     done
+
+   | Ast.WF_cume_dist ->
+     (* CUME_DIST = count(rows with ORDER BY key <= current) / n *)
+     let peer_vals pos =
+       List.map (fun (e, _) -> eval_expr clock params sorted_rows.(pos) e) wplan.Plan.order_by
+     in
+     for pos = 0 to n - 1 do
+       let cur_vals = peer_vals pos in
+       let at_or_before i =
+         if wplan.Plan.order_by = [] then true
+         else
+           List.fold_left2 (fun acc a b ->
+             if acc <> 0 then acc else compare_values a b
+           ) 0 (peer_vals i) cur_vals <= 0
+       in
+       let count = List.length (List.filter at_or_before (List.init n (fun i -> i))) in
+       results.(sorted_orig_idxs.(pos)) <- Row.V_real (Float.of_int count /. Float.of_int n)
+     done
+
    | Ast.WF_agg agg_func ->
      let has_order = wplan.Plan.order_by <> [] in
      let arg_expr = match wplan.Plan.args with e :: _ -> Some e | [] -> None in

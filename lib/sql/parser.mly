@@ -510,8 +510,10 @@ window_func_name:
       | "LEAD"        -> Ast.WF_lead
       | "FIRST_VALUE" -> Ast.WF_first_value
       | "LAST_VALUE"  -> Ast.WF_last_value
-      | "NTH_VALUE"   -> Ast.WF_nth_value
-      | other         -> failwith (Printf.sprintf "Unknown window function: %s" other) }
+      | "NTH_VALUE"    -> Ast.WF_nth_value
+      | "PERCENT_RANK" -> Ast.WF_percent_rank
+      | "CUME_DIST"    -> Ast.WF_cume_dist
+      | other          -> failwith (Printf.sprintf "Unknown window function: %s" other) }
 
 when_clause:
   | WHEN cond = expr THEN result = expr { (cond, result) }
