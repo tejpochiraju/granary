@@ -3531,6 +3531,14 @@ let test_multirow_on_conflict () =
   Alcotest.check row_testable "row 1" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0);
   Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "c" |] (List.nth rows 1)
 
+let test_multirow_returning () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  let rows = query_ok db "INSERT INTO t VALUES (1, 'alice'), (2, 'bob') RETURNING id" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check row_testable "row 1" [| Db.V_int 1L |] (List.nth rows 0);
+  Alcotest.check row_testable "row 2" [| Db.V_int 2L |] (List.nth rows 1)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3896,5 +3904,6 @@ let () =
       Alcotest.test_case "basic"         `Quick test_multirow_basic;
       Alcotest.test_case "single_works"  `Quick test_multirow_single_still_works;
       Alcotest.test_case "on_conflict"   `Quick test_multirow_on_conflict;
+      Alcotest.test_case "returning"     `Quick test_multirow_returning;
     ];
   ]

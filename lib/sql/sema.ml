@@ -981,7 +981,7 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
     ) (Ok []) values in
     (match rows_result with
      | Error e -> Lwt.return (Error e)
-     | Ok [] -> Lwt.return (Error (Arity_mismatch { expected = 1; got = 0 }))
+     | Ok [] -> Lwt.return (Error (Unsupported "INSERT with empty VALUES list"))
      | Ok ((ordinals, _) :: _ as bound_rows) ->
        let all_vals = List.map snd bound_rows in
        (match bind_returning_exprs ~param_counter ~named_params meta returning with
