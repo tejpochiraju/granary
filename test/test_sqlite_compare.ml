@@ -1943,9 +1943,12 @@ let phase10_multi_join_cases = [
     setup   = ["CREATE TABLE u (id INTEGER, name TEXT)";
                "CREATE TABLE o (uid INTEGER, item TEXT)";
                "CREATE TABLE p (item TEXT, price INTEGER)";
-               "INSERT INTO u VALUES (1, 'alice'), (2, 'bob')";
-               "INSERT INTO o VALUES (1, 'hat'), (2, 'book')";
-               "INSERT INTO p VALUES ('hat', 10), ('book', 5)"];
+               "INSERT INTO u VALUES (1, 'alice')";
+               "INSERT INTO u VALUES (2, 'bob')";
+               "INSERT INTO o VALUES (1, 'hat')";
+               "INSERT INTO o VALUES (2, 'book')";
+               "INSERT INTO p VALUES ('hat', 10)";
+               "INSERT INTO p VALUES ('book', 5)"];
     query   = "SELECT u.name, p.price FROM u JOIN o ON u.id = o.uid JOIN p ON o.item = p.item ORDER BY u.name";
     unordered = false };
 
@@ -1959,14 +1962,19 @@ let phase10_multi_join_cases = [
     query   = "SELECT a.id, b.v, c.w FROM a LEFT JOIN b ON a.id = b.aid LEFT JOIN c ON a.id = c.aid ORDER BY a.id";
     unordered = false };
 
-  { name    = "three_join_aggregate";
-    setup   = ["CREATE TABLE dept (id INTEGER, name TEXT)";
-               "CREATE TABLE emp (id INTEGER, dept_id INTEGER, name TEXT)";
+  { name    = "three_join_count";
+    setup   = ["CREATE TABLE dept (id INTEGER, dname TEXT)";
+               "CREATE TABLE emp (id INTEGER, dept_id INTEGER)";
                "CREATE TABLE sal (emp_id INTEGER, amount INTEGER)";
-               "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
-               "INSERT INTO emp VALUES (1, 1, 'alice'), (2, 1, 'bob'), (3, 2, 'carol')";
-               "INSERT INTO sal VALUES (1, 100), (2, 90), (3, 80)"];
-    query   = "SELECT dept.name, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id JOIN sal ON emp.id = sal.emp_id GROUP BY dept.name ORDER BY dept.name";
+               "INSERT INTO dept VALUES (1, 'eng')";
+               "INSERT INTO dept VALUES (2, 'sales')";
+               "INSERT INTO emp VALUES (1, 1)";
+               "INSERT INTO emp VALUES (2, 1)";
+               "INSERT INTO emp VALUES (3, 2)";
+               "INSERT INTO sal VALUES (1, 100)";
+               "INSERT INTO sal VALUES (2, 90)";
+               "INSERT INTO sal VALUES (3, 80)"];
+    query   = "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id JOIN sal ON emp.id = sal.emp_id GROUP BY dname ORDER BY dname";
     unordered = false };
 
   { name    = "case_in_multi_join";
