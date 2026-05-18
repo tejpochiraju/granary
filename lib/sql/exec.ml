@@ -361,7 +361,7 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     let v = eval_expr clock params row e in
     (match v with Row.V_text s -> Row.V_text (String.lowercase_ascii s) | o -> o)
   | Plan.P_collate (e, _) ->
-    eval_expr clock params row e
+    eval_expr clock params row e  (* Collate_binary and Collate_rtrim are identity *)
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with

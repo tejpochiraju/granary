@@ -315,5 +315,12 @@ let rec expr_to_sql = function
       | Ty_real -> "REAL"    | Ty_blob -> "BLOB"
     in
     Printf.sprintf "CAST(%s AS %s)" (expr_to_sql e) tn
-  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ | E_collate _ ->
+  | E_collate (e, c) ->
+    let cname = match c with
+      | Collate_nocase -> "NOCASE"
+      | Collate_binary -> "BINARY"
+      | Collate_rtrim  -> "RTRIM"
+    in
+    Printf.sprintf "(%s) COLLATE %s" (expr_to_sql e) cname
+  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
     failwith "expr_to_sql: unsupported expression form"
