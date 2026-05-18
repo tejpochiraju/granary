@@ -53,6 +53,7 @@ type window_sema = {
   args         : bound_expr list;
   partition_by : bound_expr list;
   order_by     : bound_order_key list;
+  frame        : Ast.frame_spec option;
 }
 
 (** Specification of a single aggregate computation.

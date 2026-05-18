@@ -41,6 +41,7 @@ type window_plan_item = {
   args         : expr list;
   partition_by : expr list;
   order_by     : (expr * [`Asc | `Desc]) list;
+  frame        : Ast.frame_spec option;
 }
 
 type op =

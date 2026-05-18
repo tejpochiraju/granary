@@ -47,6 +47,7 @@ type window_sema = {
   args         : bound_expr list;
   partition_by : bound_expr list;
   order_by     : bound_order_key list;
+  frame        : Ast.frame_spec option;
 }
 
 type agg_spec = {
@@ -1300,7 +1301,8 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                       | Ok bound_ob ->
                         let ws = { func; args = bound_args;
                                    partition_by = bound_pb;
-                                   order_by = bound_ob } in
+                                   order_by = bound_ob;
+                                   frame = window.Ast.frame } in
                         Queue.push ws windows_queue;
                         Lwt.return (Ok (BE_window_slot slot)))
                | Ast.E_binop (op, a, b) ->

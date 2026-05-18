@@ -62,6 +62,21 @@ type order_dir = Asc | Desc
 
 type collation = Collate_binary | Collate_nocase | Collate_rtrim
 
+type frame_unit = Frame_rows | Frame_range
+
+type frame_bound =
+  | FB_unbounded_preceding
+  | FB_preceding of int
+  | FB_current_row
+  | FB_following of int
+  | FB_unbounded_following
+
+type frame_spec = {
+  unit  : frame_unit;
+  start : frame_bound;
+  end_  : frame_bound;
+}
+
 type join_kind = Inner | Left
 
 type table_constraint =
@@ -123,6 +138,7 @@ and window_func =
 and window_spec = {
   partition_by : expr list;
   order_by     : order_key list;
+  frame        : frame_spec option;
 }
 
 and order_key = {

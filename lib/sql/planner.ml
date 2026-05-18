@@ -153,6 +153,7 @@ let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
       let dir = match bk.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
       (plan_expr bk.Sema.key, dir)
     ) ws.Sema.order_by;
+    frame        = ws.Sema.frame;
   }
 
 let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =

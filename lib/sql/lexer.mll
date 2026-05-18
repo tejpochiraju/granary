@@ -159,6 +159,8 @@ rule token = parse
       | "PARTITION" -> PARTITION
       | "RECURSIVE" -> RECURSIVE
       | "COLLATE"   -> COLLATE
+      | "PRECEDING" -> PRECEDING
+      | "FOLLOWING" -> FOLLOWING
       | _           -> IDENT id
     }
   | eof                     { EOF }

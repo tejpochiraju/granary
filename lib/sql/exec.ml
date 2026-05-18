@@ -2133,13 +2133,34 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        | Some e -> eval_expr clock params sorted_rows.(pos) e
        | None   -> Row.V_null
      ) in
+     let resolve_bound bound pos =
+       match bound with
+       | Ast.FB_unbounded_preceding -> 0
+       | Ast.FB_preceding k         -> max 0 (pos - k)
+       | Ast.FB_current_row         -> pos
+       | Ast.FB_following k         -> min (n - 1) (pos + k)
+       | Ast.FB_unbounded_following -> n - 1
+     in
      for pos = 0 to n - 1 do
-       let frame_end = if has_order then pos else n - 1 in
-       let indices = List.init (frame_end + 1) (fun i -> i) in
+       let (frame_start, frame_end) = match wplan.Plan.frame with
+         | None ->
+           (* Default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW when ORDER BY
+              present, RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING otherwise *)
+           let fe = if has_order then pos else n - 1 in
+           (0, fe)
+         | Some spec ->
+           (* RANGE with numeric bounds approximated as ROWS — full value-based RANGE
+              semantics not implemented *)
+           (resolve_bound spec.Ast.start pos, resolve_bound spec.Ast.end_ pos)
+       in
+       let frame_start = max 0 frame_start in
+       let frame_end   = min (n - 1) frame_end in
+       let indices = if frame_start > frame_end then []
+                     else List.init (frame_end - frame_start + 1) (fun i -> frame_start + i) in
        let result = match agg_func with
          | Ast.Agg_count ->
            let cnt =
-             if arg_expr = None then frame_end + 1
+             if arg_expr = None then List.length indices
              else List.length (List.filter (fun i ->
                not (arg_vals.(i) = Row.V_null)) indices)
            in

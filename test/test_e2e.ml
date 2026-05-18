@@ -3923,6 +3923,40 @@ let test_window_first_last_value () =
   Alcotest.check value_testable "last row0=90000" (Db.V_int 90000L) (List.nth rows 0).(2);
   Alcotest.check value_testable "last row2=70000" (Db.V_int 70000L) (List.nth rows 2).(2)
 
+let test_window_rows_frame () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE nums (n INTEGER)";
+  exec db "INSERT INTO nums VALUES (1)";
+  exec db "INSERT INTO nums VALUES (2)";
+  exec db "INSERT INTO nums VALUES (3)";
+  exec db "INSERT INTO nums VALUES (4)";
+  exec db "INSERT INTO nums VALUES (5)";
+  let rows = query_ok db
+    "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM nums ORDER BY n" in
+  (* n=1: sum(1)=1; n=2: sum(1,2)=3; n=3: sum(2,3)=5; n=4: sum(3,4)=7; n=5: sum(4,5)=9 *)
+  let pairs = List.map (fun row ->
+    match row.(0), row.(1) with
+    | Db.V_int n, Db.V_int s -> (Int64.to_int n, Int64.to_int s)
+    | _ -> (-1, -1)) rows in
+  Alcotest.(check (list (pair int int)))
+    "rows_1_preceding" [(1,1);(2,3);(3,5);(4,7);(5,9)] pairs
+
+let test_window_rows_unbounded () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE nums2 (n INTEGER)";
+  exec db "INSERT INTO nums2 VALUES (10)";
+  exec db "INSERT INTO nums2 VALUES (20)";
+  exec db "INSERT INTO nums2 VALUES (30)";
+  let rows = query_ok db
+    "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM nums2 ORDER BY n" in
+  (* running sum: 10, 30, 60 *)
+  let pairs = List.map (fun row ->
+    match row.(0), row.(1) with
+    | Db.V_int n, Db.V_int s -> (Int64.to_int n, Int64.to_int s)
+    | _ -> (-1, -1)) rows in
+  Alcotest.(check (list (pair int int)))
+    "unbounded_preceding" [(10,10);(20,30);(30,60)] pairs
+
 let test_collate_nocase_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
@@ -4379,6 +4413,8 @@ let () =
       Alcotest.test_case "no_partition"     `Quick test_window_no_partition;
       Alcotest.test_case "first_last_value" `Quick test_window_first_last_value;
       Alcotest.test_case "orderby_alias"    `Quick test_window_orderby_alias;
+      Alcotest.test_case "rows_frame"       `Quick test_window_rows_frame;
+      Alcotest.test_case "rows_unbounded"   `Quick test_window_rows_unbounded;
     ];
     "recursive_cte", [
       Alcotest.test_case "series"                  `Quick test_recursive_cte_series;

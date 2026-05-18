@@ -46,6 +46,7 @@
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
 %token OVER PARTITION RECURSIVE COLLATE
+%token PRECEDING FOLLOWING
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -454,8 +455,33 @@ agg_or_window_expr:
       | Some w -> E_window { func = WF_agg Agg_max; args = [e]; window = w } }
 
 window_spec:
-  | LPAREN pb = partition_clause ob = order_by_clause RPAREN
-    { Ast.{ partition_by = pb; order_by = ob } }
+  | LPAREN pb = partition_clause ob = order_by_clause fs = option(frame_spec) RPAREN
+    { Ast.{ partition_by = pb; order_by = ob; frame = fs } }
+
+frame_spec:
+  | unit_id = IDENT BETWEEN start = frame_bound AND end_ = frame_bound
+    { let unit = match String.uppercase_ascii unit_id with
+        | "ROWS"  -> Ast.Frame_rows
+        | "RANGE" -> Ast.Frame_range
+        | other   -> failwith (Printf.sprintf "expected ROWS or RANGE, got: %s" other)
+      in
+      Ast.{ unit; start; end_ } }
+
+frame_bound:
+  | u = IDENT PRECEDING
+    { match String.uppercase_ascii u with
+      | "UNBOUNDED" -> Ast.FB_unbounded_preceding
+      | other -> failwith (Printf.sprintf "expected UNBOUNDED PRECEDING, got: %s PRECEDING" other) }
+  | n = INT_LIT PRECEDING { Ast.FB_preceding (Int64.to_int n) }
+  | c = IDENT r = IDENT
+    { match String.uppercase_ascii c, String.uppercase_ascii r with
+      | "CURRENT", "ROW" -> Ast.FB_current_row
+      | _ -> failwith (Printf.sprintf "expected CURRENT ROW, got: %s %s" c r) }
+  | n = INT_LIT FOLLOWING { Ast.FB_following (Int64.to_int n) }
+  | u = IDENT FOLLOWING
+    { match String.uppercase_ascii u with
+      | "UNBOUNDED" -> Ast.FB_unbounded_following
+      | other -> failwith (Printf.sprintf "expected UNBOUNDED FOLLOWING, got: %s FOLLOWING" other) }
 
 collation_name:
   | id = IDENT
