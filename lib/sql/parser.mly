@@ -42,6 +42,7 @@
 %token UNION INTERSECT EXCEPT ALL
 %token LIKE GLOB
 %token BETWEEN IN EXISTS
+%token CASE WHEN THEN ELSE END
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -385,6 +386,18 @@ agg_expr:
   | MIN   LPAREN e = expr RPAREN      { E_agg (Agg_min,   Some e) }
   | MAX   LPAREN e = expr RPAREN      { E_agg (Agg_max,   Some e) }
 
+when_clause:
+  | WHEN cond = expr THEN result = expr { (cond, result) }
+
+else_clause:
+  | ELSE e = expr { e }
+
+case_expr:
+  | CASE bs = nonempty_list(when_clause) el = option(else_clause) END
+    { E_case { scrutinee = None; branches = bs; else_ = el } }
+  | CASE scr = expr bs = nonempty_list(when_clause) el = option(else_clause) END
+    { E_case { scrutinee = Some scr; branches = bs; else_ = el } }
+
 (* between_bound is an expression that may not contain a bare AND binary
    operator at the top level.  This prevents the reduce/reduce conflict that
    arises in  "expr BETWEEN expr AND expr"  where the AND token is ambiguous
@@ -417,6 +430,7 @@ between_bound:
   | a = between_bound LIKE b = between_bound { E_binop (Like, a, b) }
   | a = between_bound GLOB b = between_bound { E_binop (Glob, a, b) }
   | LPAREN e = expr RPAREN                 { e }
+  | e = case_expr                           { e }
   | QUESTION        { E_param Param_anon }
   | i = IPARAM      { E_param (Param_index i) }
   | n = NAMED_PARAM { E_param (Param_name n) }
@@ -466,6 +480,7 @@ expr:
     { E_not (E_in (a, vals)) }
   | EXISTS LPAREN s = compound_select RPAREN
     { E_exists s }
+  | e = case_expr { e }
   | e = expr IS NULL                  { E_is_null e }
   | e = expr IS NOT NULL              { E_is_not_null e }
   | t = IDENT MATCH s = STRING_LIT    { E_match (t, s) }

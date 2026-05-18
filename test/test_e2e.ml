@@ -3009,6 +3009,77 @@ let test_replace_empty_old () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
+(* CASE WHEN                                                            *)
+(* ------------------------------------------------------------------ *)
+
+let test_case_searched () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "INSERT INTO t VALUES (-1)";
+  exec db "INSERT INTO t VALUES (0)";
+  let rows = query_ok db
+    "SELECT CASE WHEN v > 0 THEN 'pos' WHEN v < 0 THEN 'neg' ELSE 'zero' END FROM t ORDER BY v" in
+  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
+  Alcotest.(check (list string)) "case_searched" ["neg"; "zero"; "pos"] labels
+
+let test_case_simple () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db
+    "SELECT CASE v WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t ORDER BY v" in
+  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
+  Alcotest.(check (list string)) "case_simple" ["one"; "two"; "other"] labels
+
+let test_case_no_else () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (99)";
+  let rows = query_ok db "SELECT CASE WHEN v = 0 THEN 'zero' END FROM t" in
+  Alcotest.(check (list bool)) "null" [true]
+    (List.map (fun r -> r.(0) = Db.V_null) rows)
+
+let test_case_null_scrutinee () =
+  (* CASE NULL WHEN NULL THEN 1 END = 1 (IS semantics) *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  let rows = query_ok db "SELECT CASE v WHEN NULL THEN 1 ELSE 0 END FROM t" in
+  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
+  Alcotest.(check (list int)) "null_scrutinee" [1] vals
+
+let test_case_in_where () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  let rows = query_ok db
+    "SELECT v FROM t WHERE CASE WHEN v > 1 THEN 1 ELSE 0 END = 1 ORDER BY v" in
+  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
+  Alcotest.(check (list int)) "case_in_where" [2; 3] vals
+
+let test_case_nested () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (5)";
+  let rows = query_ok db
+    "SELECT CASE WHEN v > 0 THEN CASE WHEN v > 3 THEN 'big' ELSE 'small' END ELSE 'neg' END FROM t" in
+  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
+  Alcotest.(check (list string)) "nested_case" ["big"] labels
+
+let test_case_arithmetic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v INTEGER)";
+  exec db "INSERT INTO t VALUES (4)";
+  let rows = query_ok db "SELECT CASE WHEN v > 2 THEN v * 10 ELSE v END FROM t" in
+  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
+  Alcotest.(check (list int)) "arithmetic" [40] vals
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -3308,5 +3379,14 @@ let () =
       Alcotest.test_case "trim_all_whitespace"    `Quick test_trim_all_whitespace;
       Alcotest.test_case "trim_chars_all_removed" `Quick test_trim_chars_all_removed;
       Alcotest.test_case "replace_empty_old"      `Quick test_replace_empty_old;
+    ];
+    "case_when", [
+      Alcotest.test_case "case_searched"       `Quick test_case_searched;
+      Alcotest.test_case "case_simple"         `Quick test_case_simple;
+      Alcotest.test_case "case_no_else"        `Quick test_case_no_else;
+      Alcotest.test_case "case_null_scrutinee" `Quick test_case_null_scrutinee;
+      Alcotest.test_case "case_in_where"       `Quick test_case_in_where;
+      Alcotest.test_case "case_nested"         `Quick test_case_nested;
+      Alcotest.test_case "case_arithmetic"     `Quick test_case_arithmetic;
     ];
   ]

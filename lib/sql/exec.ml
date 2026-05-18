@@ -234,6 +234,24 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     eval_binop op (eval_expr clock params row a) (eval_expr clock params row b)
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    let scr_val = Option.map (eval_expr clock params row) scrutinee in
+    let rec find_match = function
+      | [] ->
+        (match else_ with
+         | None   -> Row.V_null
+         | Some e -> eval_expr clock params row e)
+      | (cond, result) :: rest ->
+        let matched = match scr_val with
+          | None ->
+            value_truthy (eval_expr clock params row cond)
+          | Some sv ->
+            compare_values sv (eval_expr clock params row cond) = 0
+        in
+        if matched then eval_expr clock params row result
+        else find_match rest
+    in
+    find_match branches
   | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ ->
     (* These are replaced by pre_eval_subquery before row evaluation. *)
     Row.V_null
@@ -1578,6 +1596,27 @@ let rec pre_eval_subquery
   | Plan.P_func (f, args) ->
     let* args' = Lwt_list.map_s (pre_eval_subquery clock store params cat_opt) args in
     Lwt.return (Plan.P_func (f, args'))
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    let* scrutinee' =
+      match scrutinee with
+      | None   -> Lwt.return None
+      | Some e ->
+        let+ e' = pre_eval_subquery clock store params cat_opt e in
+        Some e'
+    in
+    let* branches' = Lwt_list.map_s (fun (cond, res) ->
+      let* cond' = pre_eval_subquery clock store params cat_opt cond in
+      let+ res'  = pre_eval_subquery clock store params cat_opt res  in
+      (cond', res')
+    ) branches in
+    let+ else_' =
+      match else_ with
+      | None   -> Lwt.return None
+      | Some e ->
+        let+ e' = pre_eval_subquery clock store params cat_opt e in
+        Some e'
+    in
+    Plan.P_case { scrutinee = scrutinee'; branches = branches'; else_ = else_' }
   | _ -> Lwt.return e
 
 and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =

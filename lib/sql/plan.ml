@@ -24,6 +24,11 @@ type expr =
   | P_subquery  of Ast.stmt
   | P_exists    of Ast.stmt
   | P_in_select of expr * Ast.stmt
+  | P_case of {
+      scrutinee : expr option;
+      branches  : (expr * expr) list;
+      else_     : expr option;
+    }
 
 type op =
   | Op_create_table of {

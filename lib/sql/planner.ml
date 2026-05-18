@@ -32,6 +32,12 @@ let rec plan_expr = function
   | Sema.BE_subquery inner      -> Plan.P_subquery inner
   | Sema.BE_exists inner        -> Plan.P_exists inner
   | Sema.BE_in_select (bx, inner) -> Plan.P_in_select (plan_expr bx, inner)
+  | Sema.BE_case { scrutinee; branches; else_ } ->
+    Plan.P_case {
+      scrutinee = Option.map plan_expr scrutinee;
+      branches  = List.map (fun (c, r) -> (plan_expr c, plan_expr r)) branches;
+      else_     = Option.map plan_expr else_;
+    }
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.

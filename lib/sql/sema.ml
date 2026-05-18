@@ -23,6 +23,11 @@ type bound_expr =
   | BE_subquery  of Ast.stmt
   | BE_exists    of Ast.stmt
   | BE_in_select of bound_expr * Ast.stmt
+  | BE_case of {
+      scrutinee : bound_expr option;
+      branches  : (bound_expr * bound_expr) list;
+      else_     : bound_expr option;
+    }
 
 type bound_order_key = {
   key : bound_expr;
@@ -318,6 +323,47 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
     (match bind_expr ~param_counter ~named_params meta x with
      | Error e -> Error e
      | Ok bx   -> Ok (BE_in_select (bx, inner)))
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    let scrutinee_result =
+      match scrutinee with
+      | None   -> Ok None
+      | Some e ->
+        (match bind_expr ~param_counter ~named_params meta e with
+         | Ok be   -> Ok (Some be)
+         | Error e -> Error e)
+    in
+    (match scrutinee_result with
+     | Error e -> Error e
+     | Ok bound_scr ->
+       let branch_results =
+         List.map (fun (cond, res) ->
+           match bind_expr ~param_counter ~named_params meta cond,
+                 bind_expr ~param_counter ~named_params meta res with
+           | Ok bc, Ok br -> Ok (bc, br)
+           | Error e, _   -> Error e
+           | _, Error e   -> Error e
+         ) branches
+       in
+       let branch_errors = List.filter_map
+         (function Error e -> Some e | Ok _ -> None) branch_results in
+       (match branch_errors with
+        | e :: _ -> Error e
+        | [] ->
+          let bound_branches =
+            List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
+          in
+          let else_result =
+            match else_ with
+            | None   -> Ok None
+            | Some e ->
+              (match bind_expr ~param_counter ~named_params meta e with
+               | Ok be   -> Ok (Some be)
+               | Error e -> Error e)
+          in
+          (match else_result with
+           | Error e -> Error e
+           | Ok bound_else ->
+             Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -424,6 +470,47 @@ let rec bind_expr_join
     Error (Unsupported "MATCH in JOIN context")
   | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
     Error (Unsupported "subqueries are not supported in JOIN ON conditions")
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    let scrutinee_result =
+      match scrutinee with
+      | None   -> Ok None
+      | Some e ->
+        (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+         | Ok be   -> Ok (Some be)
+         | Error e -> Error e)
+    in
+    (match scrutinee_result with
+     | Error e -> Error e
+     | Ok bound_scr ->
+       let branch_results =
+         List.map (fun (cond, res) ->
+           match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset cond,
+                 bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset res with
+           | Ok bc, Ok br -> Ok (bc, br)
+           | Error e, _   -> Error e
+           | _, Error e   -> Error e
+         ) branches
+       in
+       let branch_errors = List.filter_map
+         (function Error e -> Some e | Ok _ -> None) branch_results in
+       (match branch_errors with
+        | e :: _ -> Error e
+        | [] ->
+          let bound_branches =
+            List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
+          in
+          let else_result =
+            match else_ with
+            | None   -> Ok None
+            | Some e ->
+              (match bind_expr_join ~param_counter ~named_params ~left_meta ~right_meta ~right_offset e with
+               | Ok be   -> Ok (Some be)
+               | Error e -> Error e)
+          in
+          (match else_result with
+           | Error e -> Error e
+           | Ok bound_else ->
+             Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -558,6 +645,40 @@ let bind_expr_agg
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
     | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
       Error (Unsupported "subqueries are not supported in aggregate expressions")
+    | Ast.E_case { scrutinee; branches; else_ } ->
+      let scrutinee_result =
+        match scrutinee with
+        | None   -> Ok None
+        | Some e -> (match go e with Ok be -> Ok (Some be) | Error e -> Error e)
+      in
+      (match scrutinee_result with
+       | Error e -> Error e
+       | Ok bound_scr ->
+         let branch_results =
+           List.map (fun (cond, res) ->
+             match go cond, go res with
+             | Ok bc, Ok br -> Ok (bc, br)
+             | Error e, _   -> Error e
+             | _, Error e   -> Error e
+           ) branches
+         in
+         let branch_errors = List.filter_map
+           (function Error e -> Some e | Ok _ -> None) branch_results in
+         (match branch_errors with
+          | e :: _ -> Error e
+          | [] ->
+            let bound_branches =
+              List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
+            in
+            let else_result =
+              match else_ with
+              | None   -> Ok None
+              | Some e -> (match go e with Ok be -> Ok (Some be) | Error e -> Error e)
+            in
+            (match else_result with
+             | Error e -> Error e
+             | Ok bound_else ->
+               Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
   in
   match go e with
   | Error e -> Error e
@@ -576,6 +697,10 @@ let rec expr_has_subquery = function
     expr_has_subquery x || List.exists expr_has_subquery vals
   | BE_func (_, args) -> List.exists expr_has_subquery args
   | BE_lit _ | BE_col _ | BE_param _ | BE_match _ -> false
+  | BE_case { scrutinee; branches; else_ } ->
+    (match scrutinee with Some e -> expr_has_subquery e | None -> false)
+    || List.exists (fun (c, r) -> expr_has_subquery c || expr_has_subquery r) branches
+    || (match else_ with Some e -> expr_has_subquery e | None -> false)
 
 (** Check if any [E_agg] appears anywhere in an [expr]. *)
 let rec expr_has_agg = function
@@ -589,6 +714,10 @@ let rec expr_has_agg = function
   | Ast.E_between (x, lo, hi) -> expr_has_agg x || expr_has_agg lo || expr_has_agg hi
   | Ast.E_in (x, vals) -> expr_has_agg x || List.exists expr_has_agg vals
   | Ast.E_func (_, args) -> List.exists expr_has_agg args
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    (match scrutinee with Some e -> expr_has_agg e | None -> false)
+    || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
+    || (match else_ with Some e -> expr_has_agg e | None -> false)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE TABLE                                                         *)
@@ -616,6 +745,10 @@ let bind_create cat ~name ~columns ~constraints =
         check_expr_unsupported x || List.exists check_expr_unsupported vals
       | Ast.E_func (_, args) -> List.exists check_expr_unsupported args
       | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
+      | Ast.E_case { scrutinee; branches; else_ } ->
+        (match scrutinee with Some e -> check_expr_unsupported e | None -> false)
+        || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
+        || (match else_ with Some e -> check_expr_unsupported e | None -> false)
     in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
       match c.check with
@@ -1339,6 +1472,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
   | BE_subquery _ -> None           (* subquery type unknown at bind time *)
   | BE_exists _ -> Some Row.Integer (* EXISTS returns boolean 0/1 *)
   | BE_in_select _ -> Some Row.Integer (* IN (SELECT) returns boolean 0/1 *)
+  | BE_case _ -> None               (* CASE result type depends on branches *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)

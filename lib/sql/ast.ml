@@ -91,6 +91,11 @@ type expr =
   | E_subquery  of stmt               (** scalar subquery: (SELECT ...) in expr position *)
   | E_exists    of stmt               (** EXISTS (SELECT ...) *)
   | E_in_select of expr * stmt        (** x IN (SELECT ...) *)
+  | E_case of {
+      scrutinee : expr option;           (** None = searched form, Some = simple form *)
+      branches  : (expr * expr) list;    (** (WHEN condition/value, THEN result) *)
+      else_     : expr option;
+    }
 
 and order_key = {
   expr : expr;
@@ -243,5 +248,18 @@ let rec expr_to_sql = function
   | E_func (f, args) ->
     Printf.sprintf "%s(%s)" (func_to_sql f)
       (String.concat ", " (List.map expr_to_sql args))
+  | E_case { scrutinee; branches; else_ } ->
+    let scr = match scrutinee with
+      | None   -> ""
+      | Some e -> " " ^ expr_to_sql e
+    in
+    let brs = String.concat " " (List.map (fun (cond, res) ->
+      Printf.sprintf "WHEN %s THEN %s" (expr_to_sql cond) (expr_to_sql res)
+    ) branches) in
+    let el = match else_ with
+      | None   -> ""
+      | Some e -> " ELSE " ^ expr_to_sql e
+    in
+    Printf.sprintf "CASE%s %s%s END" scr brs el
   | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ ->
     failwith "expr_to_sql: unsupported expression form"

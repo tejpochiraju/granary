@@ -29,6 +29,12 @@ type bound_expr =
     (** EXISTS predicate: [EXISTS (SELECT ...)]. *)
   | BE_in_select of bound_expr * Ast.stmt
     (** IN subquery: [x IN (SELECT ...)]. *)
+  | BE_case of {
+      scrutinee : bound_expr option;
+      branches  : (bound_expr * bound_expr) list;
+      else_     : bound_expr option;
+    }
+    (** CASE [scrutinee] WHEN ... THEN ... [ELSE ...] END *)
 
 type bound_order_key = {
   key : bound_expr;

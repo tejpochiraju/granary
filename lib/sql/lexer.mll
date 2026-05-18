@@ -107,6 +107,11 @@ rule token = parse
   | "IN"       { IN }
   | "EXISTS"   { EXISTS }
   | "exists"   { EXISTS }
+  | "CASE"  | "case"  { CASE }
+  | "WHEN"  | "when"  { WHEN }
+  | "THEN"  | "then"  { THEN }
+  | "ELSE"  | "else"  { ELSE }
+  | "END"   | "end"   { END }
   | "*"        { STAR }
   | "("        { LPAREN }
   | ")"        { RPAREN }
