@@ -2135,9 +2135,15 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
          Cat.next_rowid = 0L;
        } in
        Cat.register_ephemeral cat cte_meta;
-       (* Now bind the full def (for recursive CTEs the CTE name is now in
-          scope, so the recursive arm can resolve it). *)
-       let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
+       (* For non-recursive CTEs col_source already is the fully-bound def —
+          reuse it directly.  For recursive CTEs we must bind the full def now
+          that the CTE name is in scope (so the recursive arm can resolve it). *)
+       let* def_r =
+         if recursive then
+           bind_internal ~views ~named_params ~param_counter cat def
+         else
+           Lwt.return (Ok col_source)
+       in
        (match def_r with
         | Error e ->
           Cat.unregister_ephemeral cat ~name;

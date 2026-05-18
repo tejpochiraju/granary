@@ -2799,15 +2799,20 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     in
     let* base_stream = to_stream clock params store ~mode ~cat base_op in
     let* seed_rows = Lwt_stream.to_list base_stream in
-    let rec iterate acc working =
+    let max_iterations = 1000 in
+    let rec iterate depth acc working =
       if working = [] then Lwt.return acc
+      else if depth >= max_iterations then
+        failwith (Printf.sprintf
+          "Exec: recursive CTE '%s' exceeded maximum iteration depth of %d"
+          cte_name max_iterations)
       else
         let patched_arm = substitute_cte ~cte_name ~rows:working recursive_arm in
         let* new_stream = to_stream clock params store ~mode ~cat patched_arm in
         let* new_rows = Lwt_stream.to_list new_stream in
-        iterate (acc @ new_rows) new_rows
+        iterate (depth + 1) (acc @ new_rows) new_rows
     in
-    let* all_rows = iterate seed_rows seed_rows in
+    let* all_rows = iterate 0 seed_rows seed_rows in
     let patched_query = substitute_cte ~cte_name ~rows:all_rows query in
     to_stream clock params store ~mode ~cat patched_query
   | Plan.Op_cte_scan { cte_name; _ } ->
