@@ -150,6 +150,11 @@ type bound_stmt =
   | BS_const_select of {
       exprs : bound_expr list;
     }
+  | BS_with_cte of {
+      name  : string;
+      def   : bound_stmt;
+      query : bound_stmt;
+    }
 
 type error =
   | Unknown_table       of string
@@ -1743,7 +1748,49 @@ let rec compound_col_count = function
     else List.length proj
   | BS_compound { left; _ } -> compound_col_count left
   | BS_const_select { exprs } -> List.length exprs
+  | BS_with_cte { query; _ } -> compound_col_count query
   | _ -> 0  (* non-select stmts in compound: don't validate *)
+
+let rec col_names_of_bound_stmt bs =
+  let n = compound_col_count bs in
+  match bs with
+  | BS_select { expr_proj; proj; table_meta; agg_proj; _ } ->
+    if agg_proj <> [] then
+      (* For aggregated queries, agg_proj contains the final projection order.
+         agg_proj has the actual number of output columns.
+         Return generic names — callers can override with AST aliases if needed. *)
+      List.mapi (fun i _ -> Printf.sprintf "col_%d" (i + 1)) agg_proj
+    else if expr_proj <> [] then
+      List.mapi (fun i (_, alias_opt) ->
+        Option.value alias_opt ~default:(Printf.sprintf "col_%d" (i + 1))
+      ) expr_proj
+    else
+      List.filter_map (fun i ->
+        if i < List.length table_meta.Cat.columns
+        then Some (List.nth table_meta.Cat.columns i).Row.name
+        else None
+      ) proj
+  | BS_compound { left; _ } -> col_names_of_bound_stmt left
+  | _ -> List.init n (fun i -> Printf.sprintf "col_%d" (i + 1))
+
+(** Extract output column names from an AST SELECT stmt (best-effort; used for CTEs). *)
+let rec col_names_of_ast_stmt = function
+  | Ast.S_select { proj; _ } ->
+    (match proj with
+     | `All -> []   (* unknown until resolved *)
+     | `Cols names -> names
+     | `Exprs items ->
+       List.mapi (fun i (expr, alias_opt) ->
+         match alias_opt with
+         | Some a -> a
+         | None ->
+           (match expr with
+            | Ast.E_col name -> name
+            | Ast.E_tbl_col (_, name) -> name
+            | _ -> Printf.sprintf "col_%d" (i + 1))
+       ) items)
+  | Ast.S_compound { left; _ } -> col_names_of_ast_stmt left
+  | _ -> []
 
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
@@ -1790,6 +1837,42 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
      | [] ->
        let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
+  | Ast.S_with_cte { name; def; query } ->
+    let* def_r = bind_internal ~named_params ~param_counter cat def in
+    (match def_r with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_def ->
+       (* Derive column names: prefer AST-level names (which preserve aliases
+          for aggregated projections) and fall back to bound-stmt names. *)
+       let ast_names = col_names_of_ast_stmt def in
+       let bound_names = col_names_of_bound_stmt bound_def in
+       (* Use AST names when available (non-empty), filling gaps from bound names. *)
+       let n_cols = List.length bound_names in
+       let col_names = List.init n_cols (fun i ->
+         if i < List.length ast_names then List.nth ast_names i
+         else List.nth bound_names i)
+       in
+       let cte_cols = List.map (fun col_name ->
+         { Row.name        = col_name;
+           Row.ty          = Row.Integer;
+           Row.not_null    = false;
+           Row.primary_key = false;
+           Row.default     = None;
+           Row.check_sql   = None;
+         }) col_names in
+       let cte_meta : Cat.table_meta = {
+         Cat.name       = name;
+         Cat.tree_id    = -1;
+         Cat.columns    = cte_cols;
+         Cat.next_rowid = 0L;
+       } in
+       Cat.register_ephemeral cat cte_meta;
+       let* query_r = bind_internal ~named_params ~param_counter cat query in
+       Cat.unregister_ephemeral cat ~name;
+       (match query_r with
+        | Error e -> Lwt.return (Error e)
+        | Ok bound_query ->
+          Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query }))))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~named_params ~param_counter cat right in

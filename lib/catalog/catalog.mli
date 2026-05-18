@@ -45,6 +45,13 @@ val find_table : t -> name:string -> table_meta option Lwt.t
     is updated on every DDL operation. *)
 val find_table_cached : t -> name:string -> table_meta option
 
+(** Temporarily register an ephemeral (CTE) table entry in the in-memory cache.
+    tree_id = -1 is the sentinel for CTE virtual tables. *)
+val register_ephemeral : t -> table_meta -> unit
+
+(** Remove a previously registered ephemeral table entry from the in-memory cache. *)
+val unregister_ephemeral : t -> name:string -> unit
+
 (** List all known tables. Order is unspecified. *)
 val list_tables : t -> table_meta list Lwt.t
 

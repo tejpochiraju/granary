@@ -189,6 +189,15 @@ type op =
   | Op_const_select of {
       exprs : expr list;
     }
+  | Op_with_cte of {
+      cte_name : string;
+      def      : op;
+      query    : op;
+    }
+  | Op_cte_scan of {
+      cte_name : string;
+      n_cols   : int;
+    }
 
 and proj_item =
   | PI_group_col            (** project the group column (must have [group_col = Some _]) *)

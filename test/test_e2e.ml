@@ -3392,6 +3392,60 @@ let test_col_alias_cast () =
 (* Phase 11: Table aliases                                              *)
 (* ------------------------------------------------------------------ *)
 
+let test_cte_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  exec db "INSERT INTO t VALUES (2, 'b')";
+  let rows = query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte ORDER BY id" in
+  Alcotest.(check int) "two rows" 2 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0);
+  Alcotest.(check row_testable) "row 1" [| Db.V_int 2L; Db.V_text "b" |] (List.nth rows 1)
+
+let test_cte_filter () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'a')";
+  exec db "INSERT INTO t VALUES (2, 'b')";
+  let rows = query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte WHERE id = 1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0)
+
+let test_cte_agg () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE orders (user_id INTEGER, amount INTEGER)";
+  exec db "INSERT INTO orders VALUES (1, 100)";
+  exec db "INSERT INTO orders VALUES (1, 50)";
+  exec db "INSERT INTO orders VALUES (2, 200)";
+  let rows = query_ok db
+    "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT * FROM totals ORDER BY user_id" in
+  Alcotest.(check int) "two rows" 2 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_int 150L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "row 1" [| Db.V_int 2L; Db.V_int 200L |] (List.nth rows 1)
+
+let test_cte_col_name () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'alice')";
+  exec db "INSERT INTO t VALUES (2, 'bob')";
+  let rows = query_ok db
+    "WITH cte AS (SELECT id, name FROM t) SELECT cte.name FROM cte WHERE cte.id = 1" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_text "alice" |] (List.nth rows 0)
+
+let test_cte_order () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  let rows = query_ok db
+    "WITH cte AS (SELECT x FROM t) SELECT * FROM cte ORDER BY x" in
+  Alcotest.(check int) "three rows" 3 (List.length rows);
+  Alcotest.(check row_testable) "row 0" [| Db.V_int 1L |] (List.nth rows 0);
+  Alcotest.(check row_testable) "row 1" [| Db.V_int 2L |] (List.nth rows 1);
+  Alcotest.(check row_testable) "row 2" [| Db.V_int 3L |] (List.nth rows 2)
+
 let test_tbl_alias_from () =
   let db = fresh_db () in
   exec db "CREATE TABLE products (id INTEGER, name TEXT)";
@@ -3798,5 +3852,12 @@ let () =
       Alcotest.test_case "where"      `Quick test_tbl_alias_where;
       Alcotest.test_case "order_by"   `Quick test_tbl_alias_order_by;
       Alcotest.test_case "three_join" `Quick test_tbl_alias_three_join;
+    ];
+    "cte", [
+      Alcotest.test_case "basic"    `Quick test_cte_basic;
+      Alcotest.test_case "filter"   `Quick test_cte_filter;
+      Alcotest.test_case "agg"      `Quick test_cte_agg;
+      Alcotest.test_case "col_name" `Quick test_cte_col_name;
+      Alcotest.test_case "order"    `Quick test_cte_order;
     ];
   ]

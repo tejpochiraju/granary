@@ -183,6 +183,11 @@ type bound_stmt =
   | BS_const_select of {
       exprs : bound_expr list;
     }
+  | BS_with_cte of {
+      name  : string;
+      def   : bound_stmt;
+      query : bound_stmt;
+    }
 
 type error =
   | Unknown_table       of string

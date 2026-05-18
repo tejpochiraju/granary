@@ -151,6 +151,7 @@ rule token = parse
       | "CAST"   -> CAST
       | "NULLIF" -> NULLIF
       | "IIF"    -> IIF
+      | "WITH"   -> WITH
       | _        -> IDENT id
     }
   | eof                     { EOF }

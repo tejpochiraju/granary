@@ -43,7 +43,7 @@
 %token LIKE GLOB
 %token BETWEEN IN EXISTS
 %token CASE WHEN THEN ELSE END
-%token AS CAST NULLIF IIF
+%token AS CAST NULLIF IIF WITH
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -82,6 +82,7 @@ stmt_eof:
   | s = stmt SEMI? EOF { s }
 
 stmt:
+  | s = with_cte          { s }
   | s = create_table      { s }
   | s = create_fts_table  { s }
   | s = create_index      { s }
@@ -96,6 +97,10 @@ stmt:
   | s = rollback_stmt     { s }
   | s = pragma_stmt       { s }
   | s = alter_table       { s }
+
+with_cte:
+  | WITH name = IDENT AS LPAREN def = compound_select RPAREN query = compound_select
+    { Ast.S_with_cte { name; def; query } }
 
 pragma_stmt:
   | PRAGMA name = IDENT LPAREN arg = IDENT RPAREN

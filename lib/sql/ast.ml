@@ -187,6 +187,11 @@ and stmt =
           outermost query level (e.g. [SELECT (SELECT max(v) FROM t)]). *)
       exprs : expr list;
     }
+  | S_with_cte of {
+      name  : string;
+      def   : stmt;
+      query : stmt;
+    }
 
 and pragma_kind =
   | Pragma_table_info of string

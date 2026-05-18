@@ -1555,7 +1555,7 @@ let execute_with_count ?(mode = Auto)
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
-  | Plan.Op_const_select _ ->
+  | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _ ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -1600,9 +1600,31 @@ let fts_query_terms query =
   List.sort_uniq String.compare (collect query)
 
 (* ------------------------------------------------------------------ *)
+(* substitute_cte: replace Op_cte_scan nodes with Op_pragma_rows       *)
 (* to_stream: convert a read op tree into a Row stream                  *)
 (* pre_eval_subquery: resolve subquery Plan.expr nodes before row scan  *)
 (* ------------------------------------------------------------------ *)
+
+let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
+  let go = substitute_cte ~cte_name ~rows in
+  match op with
+  | Plan.Op_cte_scan { cte_name = n; _ } when String.equal n cte_name ->
+    Plan.Op_pragma_rows { rows }
+  | Plan.Op_filter r          -> Plan.Op_filter { r with child = go r.child }
+  | Plan.Op_project r         -> Plan.Op_project { r with child = go r.child }
+  | Plan.Op_expr_project r    -> Plan.Op_expr_project { r with child = go r.child }
+  | Plan.Op_sort r            -> Plan.Op_sort { r with child = go r.child }
+  | Plan.Op_limit r           -> Plan.Op_limit { r with child = go r.child }
+  | Plan.Op_distinct r        -> Plan.Op_distinct { child = go r.child }
+  | Plan.Op_aggregate r       -> Plan.Op_aggregate { r with child = go r.child }
+  | Plan.Op_nested_loop_join r -> Plan.Op_nested_loop_join { r with left = go r.left }
+  | Plan.Op_hash_join r       -> Plan.Op_hash_join { r with left = go r.left; right = go r.right }
+  | Plan.Op_union r           -> Plan.Op_union { r with left = go r.left; right = go r.right }
+  | Plan.Op_intersect r       -> Plan.Op_intersect { left = go r.left; right = go r.right }
+  | Plan.Op_except r          -> Plan.Op_except { left = go r.left; right = go r.right }
+  | Plan.Op_with_cte r when not (String.equal r.cte_name cte_name) ->
+    Plan.Op_with_cte { r with query = go r.query }
+  | _ -> op
 
 let rec pre_eval_subquery
     (clock : (unit -> float) option)
@@ -2327,6 +2349,13 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) exprs in
     let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
     Lwt.return (Lwt_stream.of_list [row])
+  | Plan.Op_with_cte { cte_name; def; query } ->
+    let* def_stream = to_stream clock params store ~mode ~cat def in
+    let* cte_rows = Lwt_stream.to_list def_stream in
+    let patched = substitute_cte ~cte_name ~rows:cte_rows query in
+    to_stream clock params store ~mode ~cat patched
+  | Plan.Op_cte_scan _ ->
+    Lwt.return (Lwt_stream.of_list [])
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _

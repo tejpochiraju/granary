@@ -469,6 +469,12 @@ let find_table t ~name =
 
 let find_table_cached t ~name = Hashtbl.find_opt t.cache name
 
+let register_ephemeral t (meta : table_meta) =
+  Hashtbl.replace t.cache meta.name meta
+
+let unregister_ephemeral t ~name =
+  Hashtbl.remove t.cache name
+
 let list_tables t =
   Lwt.return (Hashtbl.fold (fun _ v acc -> v :: acc) t.cache [])
 

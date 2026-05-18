@@ -72,6 +72,12 @@ let recognise_eq_col_col = function
   | Sema.BE_binop (Sema.Eq, Sema.BE_col a, Sema.BE_col b) -> Some (a, b)
   | _ -> None
 
+let make_scan (meta : Cat.table_meta) : Plan.op =
+  if meta.Cat.tree_id = -1 then
+    Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
+  else
+    Plan.Op_seq_scan { table_meta = meta }
+
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
     either Op_nested_loop_join (when the right join column has an index)
     or Op_hash_join (otherwise).  If the ON predicate is not a simple
@@ -101,7 +107,7 @@ let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Pl
     | None ->
       Plan.Op_hash_join {
         left = left_op;
-        right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+        right = make_scan bj.right_meta;
         left_key  = left_col;
         right_key = right_col;
         join_kind;
@@ -119,7 +125,7 @@ let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Pl
     let cart =
       Plan.Op_hash_join {
         left = left_op;
-        right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+        right = make_scan bj.right_meta;
         left_key  = -1;
         right_key = -1;
         join_kind;
@@ -146,10 +152,10 @@ let plan_select cat
       (* With JOINs, we always start from a seq scan of the left table
          and let plan_join wrap it.  WHERE applies to the combined row
          (handled below). *)
-      Plan.Op_seq_scan { table_meta }
+      make_scan table_meta
     else
       (match where with
-       | None -> Plan.Op_seq_scan { table_meta }
+       | None -> make_scan table_meta
        | Some e ->
          (match recognise_eq_col_lit e with
           | Some (col_idx, lit_expr) ->
@@ -169,12 +175,12 @@ let plan_select cat
              | None ->
                Plan.Op_filter {
                  pred = plan_expr e;
-                 child = Plan.Op_seq_scan { table_meta };
+                 child = make_scan table_meta;
                })
           | None ->
             Plan.Op_filter {
               pred = plan_expr e;
-              child = Plan.Op_seq_scan { table_meta };
+              child = make_scan table_meta;
             }))
   in
   (* Chain all joins left to right *)
@@ -261,7 +267,7 @@ let rec plan ?cat = function
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
           chain manually. *)
-       let base = Plan.Op_seq_scan { table_meta } in
+       let base = make_scan table_meta in
        let (after_joins, _) =
          List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
            let n_right_cols = List.length bj.right_meta.Cat.columns in
@@ -274,21 +280,21 @@ let rec plan ?cat = function
               | Some (a, b) when (a < n_left) && (b >= right_offset) ->
                 Plan.Op_hash_join {
                   left = op;
-                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  right = make_scan bj.right_meta;
                   left_key = a; right_key = b - right_offset;
                   join_kind; right_col_offset = right_offset; n_right_cols;
                 }
               | Some (a, b) when (b < n_left) && (a >= right_offset) ->
                 Plan.Op_hash_join {
                   left = op;
-                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  right = make_scan bj.right_meta;
                   left_key = b; right_key = a - right_offset;
                   join_kind; right_col_offset = right_offset; n_right_cols;
                 }
               | _ ->
                 let cart = Plan.Op_hash_join {
                   left = op;
-                  right = Plan.Op_seq_scan { table_meta = bj.right_meta };
+                  right = make_scan bj.right_meta;
                   left_key = -1; right_key = -1;
                   join_kind; right_col_offset = right_offset; n_right_cols;
                 } in
@@ -448,3 +454,9 @@ let rec plan ?cat = function
         ) idxs
     in
     Plan.Op_pragma_rows { rows }
+  | Sema.BS_with_cte { name; def; query } ->
+    Plan.Op_with_cte {
+      cte_name = name;
+      def      = plan ?cat def;
+      query    = plan ?cat query;
+    }
