@@ -1608,6 +1608,76 @@ let fts_query_terms query =
 (* pre_eval_subquery: resolve subquery Plan.expr nodes before row scan  *)
 (* ------------------------------------------------------------------ *)
 
+(** Check whether any unresolved subquery nodes remain in a Plan.expr. *)
+let rec plan_expr_has_subquery : Plan.expr -> bool = function
+  | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ -> true
+  | Plan.P_binop (_, a, b)        -> plan_expr_has_subquery a || plan_expr_has_subquery b
+  | Plan.P_not e | Plan.P_is_null e | Plan.P_is_not_null e
+  | Plan.P_neg e | Plan.P_bitnot e -> plan_expr_has_subquery e
+  | Plan.P_between (x, lo, hi)    ->
+    plan_expr_has_subquery x || plan_expr_has_subquery lo || plan_expr_has_subquery hi
+  | Plan.P_in (x, vs)             -> plan_expr_has_subquery x || List.exists plan_expr_has_subquery vs
+  | Plan.P_func (_, args)         -> List.exists plan_expr_has_subquery args
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    Option.fold ~none:false ~some:plan_expr_has_subquery scrutinee
+    || List.exists (fun (c, r) -> plan_expr_has_subquery c || plan_expr_has_subquery r) branches
+    || Option.fold ~none:false ~some:plan_expr_has_subquery else_
+  | Plan.P_cast (e, _)            -> plan_expr_has_subquery e
+  | _                             -> false
+
+(** Extract table_meta from the leftmost seq scan in a plan op. *)
+let rec get_outer_scan_meta : Plan.op -> Cat.table_meta option = function
+  | Plan.Op_seq_scan { table_meta } -> Some table_meta
+  | Plan.Op_filter  { child; _ }    -> get_outer_scan_meta child
+  | Plan.Op_sort    { child; _ }    -> get_outer_scan_meta child
+  | Plan.Op_limit   { child; _ }    -> get_outer_scan_meta child
+  | Plan.Op_index_lookup { table_meta; _ } -> Some table_meta
+  | _                               -> None
+
+(** Substitute outer column refs (table.col) with literal values from the outer row. *)
+let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.expr) : Ast.expr =
+  let go = substitute_outer_in_expr meta row in
+  match e with
+  | Ast.E_tbl_col (tbl, col) when String.equal tbl meta.Cat.name ->
+    (try
+       let i = find_col_idx_by_name meta.Cat.columns col in
+       Ast.E_lit (value_to_literal row.(i))
+     with _ -> e)
+  | Ast.E_binop (op, a, b)         -> Ast.E_binop (op, go a, go b)
+  | Ast.E_not a                    -> Ast.E_not (go a)
+  | Ast.E_is_null a                -> Ast.E_is_null (go a)
+  | Ast.E_is_not_null a            -> Ast.E_is_not_null (go a)
+  | Ast.E_neg a                    -> Ast.E_neg (go a)
+  | Ast.E_bitnot a                 -> Ast.E_bitnot (go a)
+  | Ast.E_between (x, lo, hi)      -> Ast.E_between (go x, go lo, go hi)
+  | Ast.E_in (x, vals)             -> Ast.E_in (go x, List.map go vals)
+  | Ast.E_func (f, args)           -> Ast.E_func (f, List.map go args)
+  | Ast.E_cast (x, ty)             -> Ast.E_cast (go x, ty)
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    Ast.E_case {
+      scrutinee = Option.map go scrutinee;
+      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
+      else_     = Option.map go else_;
+    }
+  | _ -> e
+
+(** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
+let rec substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.stmt) : Ast.stmt =
+  let go_e = substitute_outer_in_expr meta row in
+  let go_s = substitute_outer_in_stmt meta row in
+  match s with
+  | Ast.S_select r ->
+    Ast.S_select { r with
+      where  = Option.map go_e r.where;
+      having = Option.map go_e r.having;
+      joins  = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins;
+    }
+  | Ast.S_compound { op; left; right } ->
+    Ast.S_compound { op; left = go_s left; right = go_s right }
+  | Ast.S_with_cte { name; def; query } ->
+    Ast.S_with_cte { name; def = go_s def; query = go_s query }
+  | _ -> s
+
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
   let go = substitute_cte ~cte_name ~rows in
   match op with
@@ -1642,7 +1712,7 @@ let rec pre_eval_subquery
      | Some cat ->
        let* bound_r = Sema.bind cat inner_ast in
        (match bound_r with
-        | Error _ -> Lwt.return (Plan.P_lit Ast.L_null)
+        | Error _ -> Lwt.return e
         | Ok bound ->
           let op = Planner.plan ~cat bound in
           let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
@@ -1659,7 +1729,7 @@ let rec pre_eval_subquery
      | Some cat ->
        let* bound_r = Sema.bind cat inner_ast in
        (match bound_r with
-        | Error _ -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
+        | Error _ -> Lwt.return e
         | Ok bound ->
           let op = Planner.plan ~cat bound in
           let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
@@ -1671,7 +1741,7 @@ let rec pre_eval_subquery
      | Some cat ->
        let* bound_r = Sema.bind cat inner_ast in
        (match bound_r with
-        | Error _ -> Lwt.return (Plan.P_in (x, []))
+        | Error _ -> Lwt.return e
         | Ok bound ->
           let op = Planner.plan ~cat bound in
           let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
@@ -1758,9 +1828,56 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     ) in
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
-    let* inner = to_stream clock params store ~mode ~cat child in
+    let* child_stream = to_stream clock params store ~mode ~cat child in
     let* pred' = pre_eval_subquery clock store params cat pred in
-    Lwt.return (Lwt_stream.filter (fun row -> value_truthy (eval_expr clock params row pred')) inner)
+    if not (plan_expr_has_subquery pred') then
+      (* Fast path: all subqueries resolved — filter synchronously *)
+      Lwt.return (Lwt_stream.filter (fun row ->
+        value_truthy (eval_expr clock params row pred')
+      ) child_stream)
+    else begin
+      (* Slow path: correlated subqueries remain — evaluate async per row *)
+      let outer_meta = get_outer_scan_meta child in
+      Lwt.return (Lwt_stream.filter_s (fun row ->
+        (* 1. Substitute outer column refs in embedded Ast.stmt nodes *)
+        let subst_pred =
+          match outer_meta with
+          | None -> pred'
+          | Some meta ->
+            let rec subst_plan e =
+              match e with
+              | Plan.P_exists inner ->
+                Plan.P_exists (substitute_outer_in_stmt meta row inner)
+              | Plan.P_in_select (x, inner) ->
+                Plan.P_in_select (x, substitute_outer_in_stmt meta row inner)
+              | Plan.P_subquery inner ->
+                Plan.P_subquery (substitute_outer_in_stmt meta row inner)
+              | Plan.P_binop (op, a, b)   -> Plan.P_binop (op, subst_plan a, subst_plan b)
+              | Plan.P_not a              -> Plan.P_not (subst_plan a)
+              | Plan.P_is_null a          -> Plan.P_is_null (subst_plan a)
+              | Plan.P_is_not_null a      -> Plan.P_is_not_null (subst_plan a)
+              | Plan.P_neg a              -> Plan.P_neg (subst_plan a)
+              | Plan.P_bitnot a           -> Plan.P_bitnot (subst_plan a)
+              | Plan.P_between (x, lo, hi) ->
+                Plan.P_between (subst_plan x, subst_plan lo, subst_plan hi)
+              | Plan.P_in (x, vs)         -> Plan.P_in (subst_plan x, List.map subst_plan vs)
+              | Plan.P_func (f, args)     -> Plan.P_func (f, List.map subst_plan args)
+              | Plan.P_case { scrutinee; branches; else_ } ->
+                Plan.P_case {
+                  scrutinee = Option.map subst_plan scrutinee;
+                  branches  = List.map (fun (c, r) -> (subst_plan c, subst_plan r)) branches;
+                  else_     = Option.map subst_plan else_;
+                }
+              | Plan.P_cast (e, ty)       -> Plan.P_cast (subst_plan e, ty)
+              | _                         -> e
+            in
+            subst_plan pred'
+        in
+        (* 2. Re-evaluate subqueries with outer values now substituted as literals *)
+        let* resolved = pre_eval_subquery clock store params cat subst_pred in
+        Lwt.return (value_truthy (eval_expr clock params row resolved))
+      ) child_stream)
+    end
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
