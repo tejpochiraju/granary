@@ -107,7 +107,7 @@ and order_key = {
 and join_clause = {
   kind  : join_kind;
   table : string;                (** right-side table name *)
-  alias : string option;         (** optional alias — stored but unused in Phase 2 *)
+  alias : string option;         (** optional alias — used in E_tbl_col resolution *)
   on    : expr;                  (** join condition (predicate over both tables) *)
 }
 
