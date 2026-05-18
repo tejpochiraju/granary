@@ -1855,12 +1855,24 @@ let rec col_names_of_ast_stmt = function
   | Ast.S_compound { left; _ } -> col_names_of_ast_stmt left
   | _ -> []
 
-let rec bind_internal ~named_params ~param_counter cat stmt =
+let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
-  | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } ->
-    bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset
+  | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } as sel ->
+    let* meta_opt = Cat.find_table cat ~name:table in
+    (match meta_opt with
+     | Some _ ->
+       bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias
+         ~joins ~where ~group_by ~having ~order ~limit ~offset
+     | None ->
+       (match Hashtbl.find_opt views table with
+        | Some view_def ->
+          bind_internal ~views ~named_params ~param_counter cat
+            (Ast.S_with_cte { name = table; def = view_def; query = sel })
+        | None ->
+          bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias
+            ~joins ~where ~group_by ~having ~order ~limit ~offset))
   | Ast.S_create_index { name; table; columns; unique } ->
     bind_create_index cat ~name ~table ~columns ~unique
   | Ast.S_update { table; assignments; where; returning } ->
@@ -1901,7 +1913,7 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
        let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
        Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
   | Ast.S_with_cte { name; def; query } ->
-    let* def_r = bind_internal ~named_params ~param_counter cat def in
+    let* def_r = bind_internal ~views ~named_params ~param_counter cat def in
     (match def_r with
      | Error e -> Lwt.return (Error e)
      | Ok bound_def ->
@@ -1930,22 +1942,22 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
          Cat.next_rowid = 0L;
        } in
        Cat.register_ephemeral cat cte_meta;
-       let* query_r = bind_internal ~named_params ~param_counter cat query in
+       let* query_r = bind_internal ~views ~named_params ~param_counter cat query in
        Cat.unregister_ephemeral cat ~name;
        (match query_r with
         | Error e -> Lwt.return (Error e)
         | Ok bound_query ->
           Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query }))))
   | Ast.S_create_view { name; query } ->
-    let* bound_r = bind_internal ~named_params ~param_counter cat query in
+    let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
     (match bound_r with
      | Error e -> Lwt.return (Error e)
      | Ok _ -> Lwt.return (Ok (BS_create_view { name; query })))
   | Ast.S_drop_view { name } ->
     Lwt.return (Ok (BS_drop_view { name }))
   | Ast.S_compound { op; left; right } ->
-    let* left_r  = bind_internal ~named_params ~param_counter cat left  in
-    let* right_r = bind_internal ~named_params ~param_counter cat right in
+    let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in
+    let* right_r = bind_internal ~views ~named_params ~param_counter cat right in
     (match left_r, right_r with
      | Ok l, Ok r   ->
        let n_left  = compound_col_count l in
@@ -1957,15 +1969,15 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
      | Error e, _
      | _, Error e   -> Lwt.return (Error e))
 
-let bind cat ast =
+let bind ?(views : (string, Ast.stmt) Hashtbl.t = Hashtbl.create 0) cat ast =
   let named_params : (string, int) Hashtbl.t = Hashtbl.create 4 in
   let param_counter = ref 0 in
-  bind_internal ~named_params ~param_counter cat ast
+  bind_internal ~views ~named_params ~param_counter cat ast
 
-let bind_returning_params cat ast =
+let bind_returning_params ?(views : (string, Ast.stmt) Hashtbl.t = Hashtbl.create 0) cat ast =
   let named_params : (string, int) Hashtbl.t = Hashtbl.create 4 in
   let param_counter = ref 0 in
-  let* result = bind_internal ~named_params ~param_counter cat ast in
+  let* result = bind_internal ~views ~named_params ~param_counter cat ast in
   match result with
   | Error e -> Lwt.return (Error e)
   | Ok bs   ->

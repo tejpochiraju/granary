@@ -9,6 +9,7 @@ type t = {
   catalog          : Cat.t;
   clock            : (unit -> float) option;
   mutable explicit_txn : S.rw S.txn option;
+  views            : (string, Sql.Ast.stmt) Hashtbl.t;
 }
 
 type value = Row.value =
@@ -28,7 +29,7 @@ type error =
 let open_in_memory ?clock () =
   let store = S.create () in
   let* catalog = Cat.open_ store in
-  Lwt.return { store; catalog; clock; explicit_txn = None }
+  Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4 }
 
 let open_file ~path =
   let* result = S.open_file ~path in
@@ -38,7 +39,7 @@ let open_file ~path =
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views = Hashtbl.create 4 })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -50,7 +51,7 @@ let open_block
     Lwt.return (Error (Runtime msg))
   | Ok store ->
     let* catalog = Cat.open_ store in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views = Hashtbl.create 4 })
 
 let close t = S.close t.store
 
@@ -67,7 +68,7 @@ let compile t sql =
   match parse sql with
   | Error e -> Lwt.return (Error e)
   | Ok ast  ->
-    let* bound = Sql.Sema.bind t.catalog ast in
+    let* bound = Sql.Sema.bind ~views:t.views t.catalog ast in
     match bound with
     | Error e -> Lwt.return (Error (Sema e))
     | Ok b    -> Lwt.return (Ok (Sql.Planner.plan ~cat:t.catalog b))
@@ -119,6 +120,12 @@ let execute t sql =
   | Ok Sql.Plan.Op_begin    -> begin_txn t
   | Ok Sql.Plan.Op_commit   -> commit_txn t
   | Ok Sql.Plan.Op_rollback -> rollback_txn t
+  | Ok Sql.Plan.Op_create_view { name; query } ->
+    Hashtbl.replace t.views name query;
+    Lwt.return (Ok ())
+  | Ok Sql.Plan.Op_drop_view { name } ->
+    Hashtbl.remove t.views name;
+    Lwt.return (Ok ())
   | Ok op ->
     (* SELECT always uses snapshot reads inside exec.ml (ro_begin/ro_end),
        so it reads committed state regardless of an active explicit txn.
@@ -155,6 +162,12 @@ let execute_change_count t sql =
   | Ok Sql.Plan.Op_rollback ->
     let* r = rollback_txn t in
     (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+  | Ok Sql.Plan.Op_create_view { name; query } ->
+    Hashtbl.replace t.views name query;
+    Lwt.return (Ok 0)
+  | Ok Sql.Plan.Op_drop_view { name } ->
+    Hashtbl.remove t.views name;
+    Lwt.return (Ok 0)
   | Ok op ->
     let mode = match t.explicit_txn with
       | None    -> Sql.Exec.Auto
@@ -194,7 +207,7 @@ let prepare t sql =
   match parse sql with
   | Error e -> Lwt.return (Error e)
   | Ok ast  ->
-    let* bound = Sql.Sema.bind_returning_params t.catalog ast in
+    let* bound = Sql.Sema.bind_returning_params ~views:t.views t.catalog ast in
     (match bound with
      | Error e         -> Lwt.return (Error (Sema e))
      | Ok (b, names)  ->

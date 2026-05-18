@@ -210,11 +210,13 @@ type error =
 val pp_error : Format.formatter -> error -> unit
 
 val bind :
+  ?views:(string, Ast.stmt) Hashtbl.t ->
   Sqlocaml_catalog.Catalog.t ->
   Ast.stmt ->
   (bound_stmt, error) result Lwt.t
 
 val bind_returning_params :
+  ?views:(string, Ast.stmt) Hashtbl.t ->
   Sqlocaml_catalog.Catalog.t ->
   Ast.stmt ->
   ((bound_stmt * (string * int) list), error) result Lwt.t

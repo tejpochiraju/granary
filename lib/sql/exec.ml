@@ -339,8 +339,7 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     (* These are replaced by pre_eval_subquery before row evaluation. *)
     Row.V_null
   | Plan.P_excluded_col _ ->
-    (* Excluded-column references are evaluated by the UPSERT executor — not reachable here. *)
-    Row.V_null
+    failwith "Exec: P_excluded_col in eval_expr — must be substituted before evaluation"
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -980,6 +979,37 @@ let release_txn tx owned =
 (* execute: write operations only                                       *)
 (* ------------------------------------------------------------------ *)
 
+(** Replace every [P_excluded_col i] with [P_lit (value_to_literal excluded_row.(i))].
+    Used to materialise UPSERT excluded-row refs before [eval_expr]. *)
+let rec substitute_excluded (excluded_row : Row.t) (e : Plan.expr) : Plan.expr =
+  match e with
+  | Plan.P_excluded_col i -> Plan.P_lit (value_to_literal excluded_row.(i))
+  | Plan.P_binop (op, a, b) ->
+    Plan.P_binop (op, substitute_excluded excluded_row a, substitute_excluded excluded_row b)
+  | Plan.P_not e      -> Plan.P_not (substitute_excluded excluded_row e)
+  | Plan.P_is_null e  -> Plan.P_is_null (substitute_excluded excluded_row e)
+  | Plan.P_is_not_null e -> Plan.P_is_not_null (substitute_excluded excluded_row e)
+  | Plan.P_neg e      -> Plan.P_neg (substitute_excluded excluded_row e)
+  | Plan.P_bitnot e   -> Plan.P_bitnot (substitute_excluded excluded_row e)
+  | Plan.P_between (x, lo, hi) ->
+    Plan.P_between (substitute_excluded excluded_row x,
+                    substitute_excluded excluded_row lo,
+                    substitute_excluded excluded_row hi)
+  | Plan.P_in (x, vals) ->
+    Plan.P_in (substitute_excluded excluded_row x,
+               List.map (substitute_excluded excluded_row) vals)
+  | Plan.P_func (f, args) ->
+    Plan.P_func (f, List.map (substitute_excluded excluded_row) args)
+  | Plan.P_case { scrutinee; branches; else_ } ->
+    let go = substitute_excluded excluded_row in
+    Plan.P_case {
+      scrutinee = Option.map go scrutinee;
+      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
+      else_     = Option.map go else_;
+    }
+  | Plan.P_cast (e, ty) -> Plan.P_cast (substitute_excluded excluded_row e, ty)
+  | other -> other
+
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
@@ -987,6 +1017,7 @@ let release_txn tx owned =
 let execute_insert ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
     ?(on_conflict : Ast.conflict_action option = None)
+    ?(upsert_update : (string list * (int * Plan.expr) list) option = None)
     ?(prebuilt_row : Row.t option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
@@ -1010,10 +1041,11 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       let* rowid = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
       let idxs   = Cat.indexes_for_table cat ~table:table_meta.name in
       (* Phase 1: check UNIQUE constraints BEFORE writing the row.
-         Collect skip flag and list of conflicting rowids to delete. *)
-      let* (skip, to_delete) =
-        Lwt_list.fold_left_s (fun (skip, dels) (idx : Cat.index_info) ->
-          if skip || not idx.idx_unique then Lwt.return (skip, dels)
+         Collect skip flag, list of conflicting rowids to delete, and
+         the rowid to update in-place for UPSERT. *)
+      let* (skip, to_delete, upsert_rowid) =
+        Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+          if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
           else begin
             let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
             let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
@@ -1039,54 +1071,91 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             in
             S.cursor_close cur;
             match conflict_rowid_opt with
-            | None -> Lwt.return (false, dels)
+            | None -> Lwt.return (false, dels, upsert_rid)
             | Some old_rowid ->
-              (match on_conflict with
-               | Some Ast.CA_ignore ->
-                 Lwt.return (true, dels)  (* skip=true, stop checking *)
-               | Some Ast.CA_replace ->
-                 Lwt.return (false, old_rowid :: dels)
+              (match on_conflict, upsert_update with
+               | Some Ast.CA_ignore, _ ->
+                 Lwt.return (true, dels, upsert_rid)  (* skip=true, stop checking *)
+               | Some Ast.CA_replace, _ ->
+                 Lwt.return (false, old_rowid :: dels, upsert_rid)
+               | _, Some (conflict_cols, _) when
+                   List.sort String.compare idx.idx_columns =
+                   List.sort String.compare conflict_cols ->
+                 Lwt.return (false, dels, Some old_rowid)
                | _ ->
                  Lwt.fail_with (Printf.sprintf
                    "UNIQUE constraint violated: duplicate value in columns (%s)"
                    (String.concat ", " idx.idx_columns)))
           end
-        ) (false, []) idxs
+        ) (false, [], None) idxs
       in
-      if skip then begin
-        (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.return false
-      end else begin
-        (* REPLACE: delete all conflicting rows first *)
-        let* () = Lwt_list.iter_s (fun old_rowid ->
-          let old_key = Rowid.encode old_rowid in
-          let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
-          match old_bytes_opt with
-          | None -> Lwt.return_unit
-          | Some old_bytes ->
-            let old_row = Row.decode table_meta.columns old_bytes in
-            let* () = S.del tx table_meta.tree_id old_key in
-            Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
-              let col_is2 = List.map (find_col_idx_by_name table_meta.columns) idx2.idx_columns in
-              let iks2    = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is2 in
-              let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
-              S.del tx idx2.idx_tree_id old_ikey
-            ) idxs
-        ) (List.sort_uniq compare to_delete) in
-        (* Phase 2: write new row and index entries *)
-        let key   = Rowid.encode rowid in
-        let bytes = Row.encode table_meta.columns row in
-        let* () = S.put tx table_meta.tree_id key bytes in
-        let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-          let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
-          let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-          let ikey   = Index_key.encode iks ~rowid in
-          S.put tx idx.idx_tree_id ikey Bytes.empty
-        ) idxs in
-        let* () = release_txn tx owned in
-        Lwt.return true
-      end)
+      match upsert_update, upsert_rowid with
+      | Some (_, assigns), Some old_rowid ->
+        let old_key = Rowid.encode old_rowid in
+        let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+        (match old_bytes_opt with
+         | None ->
+           let* () = if owned then S.rollback tx else Lwt.return_unit in
+           Lwt.return false
+         | Some old_bytes ->
+           let old_row = Row.decode table_meta.columns old_bytes in
+           let new_row = Array.copy old_row in
+           List.iter (fun (col_ord, expr) ->
+             let e' = substitute_excluded row expr in
+             new_row.(col_ord) <- eval_expr clock params old_row e'
+           ) assigns;
+           eval_check_constraints clock params table_meta new_row;
+           let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
+           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+             let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+             let old_iks = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is in
+             let new_iks = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
+             let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
+             let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
+             let* () = S.del tx idx.idx_tree_id old_ikey in
+             S.put tx idx.idx_tree_id new_ikey Bytes.empty
+           ) idxs2 in
+           let new_bytes = Row.encode table_meta.columns new_row in
+           let* () = S.del tx table_meta.tree_id old_key in
+           let* () = S.put tx table_meta.tree_id old_key new_bytes in
+           let* () = release_txn tx owned in
+           Lwt.return true)
+      | _ ->
+        (* Normal path: skip, replace, or plain insert *)
+        if skip then begin
+          (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
+          let* () = if owned then S.rollback tx else Lwt.return_unit in
+          Lwt.return false
+        end else begin
+          (* REPLACE: delete all conflicting rows first *)
+          let* () = Lwt_list.iter_s (fun old_rowid ->
+            let old_key = Rowid.encode old_rowid in
+            let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+            match old_bytes_opt with
+            | None -> Lwt.return_unit
+            | Some old_bytes ->
+              let old_row = Row.decode table_meta.columns old_bytes in
+              let* () = S.del tx table_meta.tree_id old_key in
+              Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
+                let col_is2 = List.map (find_col_idx_by_name table_meta.columns) idx2.idx_columns in
+                let iks2    = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is2 in
+                let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
+                S.del tx idx2.idx_tree_id old_ikey
+              ) idxs
+          ) (List.sort_uniq compare to_delete) in
+          (* Phase 2: write new row and index entries *)
+          let key   = Rowid.encode rowid in
+          let bytes = Row.encode table_meta.columns row in
+          let* () = S.put tx table_meta.tree_id key bytes in
+          let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+            let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+            let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+            let ikey   = Index_key.encode iks ~rowid in
+            S.put tx idx.idx_tree_id ikey Bytes.empty
+          ) idxs in
+          let* () = release_txn tx owned in
+          Lwt.return true
+        end)
     (fun exn ->
       (* On any exception: rollback if we own the txn, then re-raise. *)
       let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -1409,9 +1478,9 @@ let execute_with_count ?(mode = Auto)
       | Ok _      -> Lwt.return_unit
     ) uniq_idxs in
     Lwt.return 0
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update = _ } ->
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     Lwt_list.fold_left_s (fun count row_vals ->
-      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
+      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
@@ -2386,7 +2455,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       else (Hashtbl.replace seen k (); true)
     ) left_list in
     Lwt.return (Lwt_stream.of_list result)
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update = _ }
+  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     when returning <> [] ->
     (match cat with
      | None -> failwith "Exec.query: RETURNING requires catalog context"
@@ -2398,7 +2467,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
            inserted_row.(ord) <- eval_expr clock params [||] e
          ) ordinals row_vals;
          let* inserted =
-           execute_insert ~mode ~clock ~on_conflict ~prebuilt_row:(Some inserted_row)
+           execute_insert ~mode ~clock ~on_conflict ~upsert_update ~prebuilt_row:(Some inserted_row)
              store c ~table_meta ~ordinals ~values:row_vals
          in
          if not inserted then Lwt.return []
