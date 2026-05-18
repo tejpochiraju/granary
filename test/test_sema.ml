@@ -1216,7 +1216,8 @@ let bind_select_agg_in_where_rejected () =
   | Error (Sema.Unsupported _) -> ()
   | _ -> Alcotest.fail "expected Unsupported for agg in WHERE"
 
-let bind_select_more_than_one_join_rejected () =
+let bind_select_multi_join_supported () =
+  (* Previously rejected; now supported — verify it succeeds with 2 joins *)
   let cat = make_join_cat () in
   let join_clause tbl = { Ast.kind = Ast.Inner; table = tbl; alias = None;
                           on = Ast.E_lit (Ast.L_int 1L) } in
@@ -1227,8 +1228,9 @@ let bind_select_more_than_one_join_rejected () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for 2+ JOINs"
+  | Ok (Sema.BS_select { joins; _ }) ->
+    Alcotest.(check int) "two joins bound" 2 (List.length joins)
+  | _ -> Alcotest.fail "expected successful bind with 2 joins"
 
 (* ------------------------------------------------------------------ *)
 (* Group 10: NOT NULL violation in INSERT                               *)
@@ -1805,7 +1807,8 @@ let bind_insert_not_null_late () =
   | _ -> Alcotest.fail "expected Not_null_violation"
 
 (** Multi-JOIN explicit error path (line 444). *)
-let bind_select_multi_join_explicit_error () =
+let bind_select_multi_join_explicit_success () =
+  (* Previously rejected; now supported — verify bind succeeds with explicit 2-join AST *)
   let cat = make_join_cat () in
   let stmt = Ast.S_select {
     distinct = false;
@@ -1819,8 +1822,9 @@ let bind_select_multi_join_explicit_error () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   match bind cat stmt with
-  | Error (Sema.Unsupported _) -> ()
-  | _ -> Alcotest.fail "expected Unsupported for > 1 JOIN"
+  | Ok (Sema.BS_select { joins; _ }) ->
+    Alcotest.(check int) "two joins bound" 2 (List.length joins)
+  | _ -> Alcotest.fail "expected successful bind with 2 joins"
 
 (** proj_lookup with JOIN where col is only in right table (line 476).
     users has 2 cols (id, name) so right_offset = 2; orders.item is at
@@ -3180,7 +3184,7 @@ let () =
       Alcotest.test_case "bind_select_join_agg_in_on_rejected"  `Quick bind_select_join_agg_in_on_rejected;
       Alcotest.test_case "bind_select_join_qualified_col_unknown_col" `Quick bind_select_join_qualified_col_unknown_col;
       Alcotest.test_case "bind_select_join_where_unknown_col"   `Quick bind_select_join_where_unknown_col;
-      Alcotest.test_case "bind_select_more_than_one_join"       `Quick bind_select_more_than_one_join_rejected;
+      Alcotest.test_case "bind_select_multi_join_supported"     `Quick bind_select_multi_join_supported;
     ];
     "aggregate", [
       Alcotest.test_case "bind_select_count_star"                  `Quick bind_select_count_star;
@@ -3242,7 +3246,7 @@ let () =
       Alcotest.test_case "bind_insert_default_real"           `Quick bind_insert_default_real;
       Alcotest.test_case "bind_insert_default_blob"           `Quick bind_insert_default_blob;
       Alcotest.test_case "bind_insert_not_null_late"          `Quick bind_insert_not_null_late;
-      Alcotest.test_case "bind_select_multi_join_explicit_error" `Quick bind_select_multi_join_explicit_error;
+      Alcotest.test_case "bind_select_multi_join_explicit_success" `Quick bind_select_multi_join_explicit_success;
       Alcotest.test_case "bind_select_join_right_only_col_proj" `Quick bind_select_join_right_only_col_proj;
       Alcotest.test_case "bind_select_qual_no_join"           `Quick bind_select_qual_no_join;
       Alcotest.test_case "bind_select_qual_no_join_unknown_col" `Quick bind_select_qual_no_join_unknown_col;
