@@ -1771,6 +1771,7 @@ let rec col_names_of_bound_stmt bs =
         else None
       ) proj
   | BS_compound { left; _ } -> col_names_of_bound_stmt left
+  | BS_with_cte { query; _ } -> col_names_of_bound_stmt query
   | _ -> List.init n (fun i -> Printf.sprintf "col_%d" (i + 1))
 
 (** Extract output column names from an AST SELECT stmt (best-effort; used for CTEs). *)

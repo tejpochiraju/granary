@@ -2354,8 +2354,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* cte_rows = Lwt_stream.to_list def_stream in
     let patched = substitute_cte ~cte_name ~rows:cte_rows query in
     to_stream clock params store ~mode ~cat patched
-  | Plan.Op_cte_scan _ ->
-    Lwt.return (Lwt_stream.of_list [])
+  | Plan.Op_cte_scan { cte_name; _ } ->
+    failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
