@@ -1885,6 +1885,236 @@ let rec pre_eval_subquery
     Lwt.return (Plan.P_cast (e', ty))
   | _ -> Lwt.return e
 
+(* ------------------------------------------------------------------ *)
+(* Window function helpers                                              *)
+(* ------------------------------------------------------------------ *)
+
+and eval_partition_key clock params (row : Row.t) (partition_by : Plan.expr list) : Row.value list =
+  List.map (eval_expr clock params row) partition_by
+
+and partition_keys_equal (a : Row.value list) (b : Row.value list) : bool =
+  List.length a = List.length b &&
+  List.for_all2 (fun x y -> compare_values x y = 0) a b
+
+and group_by_partition clock params (partition_by : Plan.expr list)
+    (indexed_rows : (int * Row.t) list)
+    : (Row.value list * (int * Row.t) list) list =
+  List.fold_left (fun acc (idx, row) ->
+    let key = eval_partition_key clock params row partition_by in
+    match List.find_opt (fun (k, _) -> partition_keys_equal k key) acc with
+    | Some _ ->
+      List.map (fun (k, pairs) ->
+        if partition_keys_equal k key then (k, pairs @ [(idx, row)]) else (k, pairs)
+      ) acc
+    | None -> acc @ [(key, [(idx, row)])]
+  ) [] indexed_rows
+
+and sort_partition_by clock params (order_by : (Plan.expr * [`Asc | `Desc]) list)
+    (indexed_rows : (int * Row.t) list) : (int * Row.t) list =
+  if order_by = [] then indexed_rows
+  else
+    List.sort (fun (_, ra) (_, rb) ->
+      let rec cmp = function
+        | [] -> 0
+        | (e, dir) :: rest ->
+          let va = eval_expr clock params ra e in
+          let vb = eval_expr clock params rb e in
+          let c = compare_values va vb in
+          let c' = match dir with `Asc -> c | `Desc -> -c in
+          if c' <> 0 then c' else cmp rest
+      in cmp order_by
+    ) indexed_rows
+
+and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
+    (sorted_indexed : (int * Row.t) list) (n_total : int) : Row.value array =
+  let results = Array.make n_total Row.V_null in
+  let sorted_rows = Array.of_list (List.map snd sorted_indexed) in
+  let sorted_orig_idxs = Array.of_list (List.map fst sorted_indexed) in
+  let n = Array.length sorted_rows in
+  (match wplan.Plan.func with
+   | Ast.WF_row_number ->
+     for pos = 0 to n - 1 do
+       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int (pos + 1))
+     done
+
+   | Ast.WF_rank ->
+     let cur_rank = ref 1 in
+     for pos = 0 to n - 1 do
+       if pos > 0 then begin
+         let order_changed = List.exists (fun (e, _) ->
+           compare_values
+             (eval_expr clock params sorted_rows.(pos)   e)
+             (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+         ) wplan.Plan.order_by in
+         if order_changed then cur_rank := pos + 1
+       end;
+       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
+     done
+
+   | Ast.WF_dense_rank ->
+     let cur_rank = ref 1 in
+     for pos = 0 to n - 1 do
+       if pos > 0 then begin
+         let order_changed = List.exists (fun (e, _) ->
+           compare_values
+             (eval_expr clock params sorted_rows.(pos)   e)
+             (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+         ) wplan.Plan.order_by in
+         if order_changed then incr cur_rank
+       end;
+       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
+     done
+
+   | Ast.WF_ntile ->
+     let n_buckets =
+       match wplan.Plan.args with
+       | [e] -> (match eval_expr clock params [||] e with
+                 | Row.V_int k -> Int64.to_int k
+                 | _ -> 1)
+       | _ -> 1
+     in
+     let n_buckets = max 1 n_buckets in
+     for pos = 0 to n - 1 do
+       let bucket = (pos * n_buckets / n) + 1 in
+       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int bucket)
+     done
+
+   | Ast.WF_lag | Ast.WF_lead ->
+     let is_lag = (wplan.Plan.func = Ast.WF_lag) in
+     let offset =
+       match wplan.Plan.args with
+       | _ :: e :: _ -> (match eval_expr clock params [||] e with
+                         | Row.V_int k -> Int64.to_int k
+                         | _ -> 1)
+       | _ -> 1
+     in
+     let default_expr =
+       match wplan.Plan.args with _ :: _ :: e :: _ -> Some e | _ -> None
+     in
+     for pos = 0 to n - 1 do
+       let src_pos = if is_lag then pos - offset else pos + offset in
+       let v =
+         if src_pos >= 0 && src_pos < n then
+           (match wplan.Plan.args with
+            | e :: _ -> eval_expr clock params sorted_rows.(src_pos) e
+            | []     -> Row.V_null)
+         else
+           (match default_expr with
+            | Some e -> eval_expr clock params sorted_rows.(pos) e
+            | None   -> Row.V_null)
+       in
+       results.(sorted_orig_idxs.(pos)) <- v
+     done
+
+   | Ast.WF_first_value ->
+     let arg_expr =
+       match wplan.Plan.args with
+       | e :: _ -> e
+       | [] -> failwith "FIRST_VALUE requires one argument"
+     in
+     let first_val =
+       if n > 0 then eval_expr clock params sorted_rows.(0) arg_expr
+       else Row.V_null
+     in
+     for pos = 0 to n - 1 do
+       results.(sorted_orig_idxs.(pos)) <- first_val
+     done
+
+   | Ast.WF_last_value ->
+     let arg_expr =
+       match wplan.Plan.args with
+       | e :: _ -> e
+       | [] -> failwith "LAST_VALUE requires one argument"
+     in
+     for pos = 0 to n - 1 do
+       results.(sorted_orig_idxs.(pos)) <-
+         eval_expr clock params sorted_rows.(pos) arg_expr
+     done
+
+   | Ast.WF_nth_value ->
+     let arg_expr =
+       match wplan.Plan.args with
+       | e :: _ -> e
+       | [] -> failwith "NTH_VALUE requires at least one argument"
+     in
+     let n_arg =
+       match wplan.Plan.args with
+       | _ :: e :: _ -> (match eval_expr clock params [||] e with
+                         | Row.V_int k -> Int64.to_int k
+                         | _ -> 1)
+       | _ -> 1
+     in
+     for pos = 0 to n - 1 do
+       let v =
+         if n_arg >= 1 && n_arg <= pos + 1 then
+           eval_expr clock params sorted_rows.(n_arg - 1) arg_expr
+         else
+           Row.V_null
+       in
+       results.(sorted_orig_idxs.(pos)) <- v
+     done
+
+   | Ast.WF_agg agg_func ->
+     let has_order = wplan.Plan.order_by <> [] in
+     let arg_expr = match wplan.Plan.args with e :: _ -> Some e | [] -> None in
+     let arg_vals = Array.init n (fun pos ->
+       match arg_expr with
+       | Some e -> eval_expr clock params sorted_rows.(pos) e
+       | None   -> Row.V_null
+     ) in
+     for pos = 0 to n - 1 do
+       let frame_end = if has_order then pos else n - 1 in
+       let indices = List.init (frame_end + 1) (fun i -> i) in
+       let result = match agg_func with
+         | Ast.Agg_count ->
+           let cnt =
+             if arg_expr = None then frame_end + 1
+             else List.length (List.filter (fun i ->
+               not (arg_vals.(i) = Row.V_null)) indices)
+           in
+           Row.V_int (Int64.of_int cnt)
+         | Ast.Agg_sum ->
+           List.fold_left (fun acc i ->
+             match acc, arg_vals.(i) with
+             | _, Row.V_null                       -> acc
+             | Row.V_null, v                       -> v
+             | Row.V_int  a, Row.V_int  b          -> Row.V_int  (Int64.add a b)
+             | Row.V_real a, Row.V_real b          -> Row.V_real (a +. b)
+             | Row.V_int  a, Row.V_real b          -> Row.V_real (Int64.to_float a +. b)
+             | Row.V_real a, Row.V_int  b          -> Row.V_real (a +. Int64.to_float b)
+             | _, _                                -> acc
+           ) Row.V_null indices
+         | Ast.Agg_avg ->
+           let vals = List.filter_map (fun i ->
+             match arg_vals.(i) with
+             | Row.V_int  n -> Some (Int64.to_float n)
+             | Row.V_real f -> Some f
+             | _            -> None
+           ) indices in
+           if vals = [] then Row.V_null
+           else Row.V_real (List.fold_left ( +. ) 0.0 vals /. float_of_int (List.length vals))
+         | Ast.Agg_min ->
+           List.fold_left (fun acc i ->
+             match arg_vals.(i) with
+             | Row.V_null -> acc
+             | v -> (match acc with
+               | Row.V_null -> v
+               | acc_v -> if compare_values v acc_v < 0 then v else acc_v)
+           ) Row.V_null indices
+         | Ast.Agg_max ->
+           List.fold_left (fun acc i ->
+             match arg_vals.(i) with
+             | Row.V_null -> acc
+             | v -> (match acc with
+               | Row.V_null -> v
+               | acc_v -> if compare_values v acc_v > 0 then v else acc_v)
+           ) Row.V_null indices
+       in
+       results.(sorted_orig_idxs.(pos)) <- result
+     done
+  );
+  results
+
 and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
   match op with
   | Plan.Op_seq_scan { table_meta } ->
@@ -2557,8 +2787,36 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     to_stream clock params store ~mode ~cat patched
   | Plan.Op_cte_scan { cte_name; _ } ->
     failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
-  | Plan.Op_window _ ->
-    failwith "Exec: Op_window execution not yet implemented (Phase 14 exec pending)"
+  | Plan.Op_window { child; windows; n_input_cols = _ } ->
+    let* child_stream = to_stream clock params store ~mode ~cat child in
+    let* all_rows = Lwt_stream.to_list child_stream in
+    let n_rows = List.length all_rows in
+    if n_rows = 0 then Lwt.return (Lwt_stream.of_list [])
+    else begin
+      let all_rows_arr = Array.of_list all_rows in
+      let n_windows = List.length windows in
+      let window_results : Row.value array array =
+        Array.init n_windows (fun wi ->
+          let wplan = List.nth windows wi in
+          let indexed_rows = List.mapi (fun i row -> (i, row)) all_rows in
+          let partitions = group_by_partition clock params wplan.Plan.partition_by indexed_rows in
+          let combined = Array.make n_rows Row.V_null in
+          List.iter (fun (_, partition_idx_rows) ->
+            let sorted = sort_partition_by clock params wplan.Plan.order_by partition_idx_rows in
+            let part_results = compute_window_for_partition clock params wplan sorted n_rows in
+            List.iter (fun (orig_idx, _) ->
+              combined.(orig_idx) <- part_results.(orig_idx)
+            ) sorted
+          ) partitions;
+          combined
+        )
+      in
+      let augmented = Array.to_list (Array.mapi (fun i row ->
+        let extras = Array.init n_windows (fun wi -> window_results.(wi).(i)) in
+        Array.append row extras
+      ) all_rows_arr) in
+      Lwt.return (Lwt_stream.of_list augmented)
+    end
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _

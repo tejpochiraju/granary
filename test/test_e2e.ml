@@ -3746,6 +3746,87 @@ let test_view_independent_per_db () =
       (match result with Error _ -> true | Ok _ -> false);
     Lwt.return_unit)
 
+(* ------------------------------------------------------------------ *)
+(* Window function tests                                                *)
+(* ------------------------------------------------------------------ *)
+
+let test_window_row_number () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (dept TEXT, name TEXT, salary INTEGER)";
+  exec db "INSERT INTO t VALUES ('eng', 'Alice', 90000), ('eng', 'Bob', 80000), ('hr', 'Carol', 70000), ('hr', 'Dave', 60000)";
+  (* Sort by dept and salary so the partition ordering is deterministic *)
+  let rows = query_ok db "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM t ORDER BY dept, salary DESC" in
+  Alcotest.(check int) "4 rows" 4 (List.length rows);
+  Alcotest.check value_testable "Alice rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "Bob rn=2"   (Db.V_int 2L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "Carol rn=1" (Db.V_int 1L) (List.nth rows 2).(1);
+  Alcotest.check value_testable "Dave rn=2"  (Db.V_int 2L) (List.nth rows 3).(1)
+
+let test_window_rank () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE scores (name TEXT, score INTEGER)";
+  exec db "INSERT INTO scores VALUES ('A', 100), ('B', 100), ('C', 90), ('D', 80)";
+  let rows = query_ok db "SELECT name, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY name" in
+  Alcotest.(check int) "4 rows" 4 (List.length rows);
+  Alcotest.check value_testable "A rank=1" (Db.V_int 1L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "B rank=1" (Db.V_int 1L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "C rank=3" (Db.V_int 3L) (List.nth rows 2).(1);
+  Alcotest.check value_testable "D rank=4" (Db.V_int 4L) (List.nth rows 3).(1)
+
+let test_window_dense_rank () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE scores (name TEXT, score INTEGER)";
+  exec db "INSERT INTO scores VALUES ('A', 100), ('B', 100), ('C', 90), ('D', 80)";
+  let rows = query_ok db "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY name" in
+  Alcotest.check value_testable "A dr=1" (Db.V_int 1L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "C dr=2" (Db.V_int 2L) (List.nth rows 2).(1);
+  Alcotest.check value_testable "D dr=3" (Db.V_int 3L) (List.nth rows 3).(1)
+
+let test_window_lag () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE vals (id INTEGER, v INTEGER)";
+  exec db "INSERT INTO vals VALUES (1, 10), (2, 20), (3, 30)";
+  let rows = query_ok db "SELECT id, v, LAG(v, 1, 0) OVER (ORDER BY id) AS prev FROM vals ORDER BY id" in
+  Alcotest.check value_testable "id=1 prev=0"  (Db.V_int 0L)  (List.nth rows 0).(2);
+  Alcotest.check value_testable "id=2 prev=10" (Db.V_int 10L) (List.nth rows 1).(2);
+  Alcotest.check value_testable "id=3 prev=20" (Db.V_int 20L) (List.nth rows 2).(2)
+
+let test_window_lead () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE vals (id INTEGER, v INTEGER)";
+  exec db "INSERT INTO vals VALUES (1, 10), (2, 20), (3, 30)";
+  let rows = query_ok db "SELECT id, v, LEAD(v, 1, 0) OVER (ORDER BY id) AS nxt FROM vals ORDER BY id" in
+  Alcotest.check value_testable "id=1 nxt=20" (Db.V_int 20L) (List.nth rows 0).(2);
+  Alcotest.check value_testable "id=2 nxt=30" (Db.V_int 30L) (List.nth rows 1).(2);
+  Alcotest.check value_testable "id=3 nxt=0"  (Db.V_int 0L)  (List.nth rows 2).(2)
+
+let test_window_sum_over () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE sales (id INTEGER, amount INTEGER)";
+  exec db "INSERT INTO sales VALUES (1, 100), (2, 200), (3, 300)";
+  let rows = query_ok db "SELECT id, SUM(amount) OVER (ORDER BY id) AS running FROM sales ORDER BY id" in
+  Alcotest.check value_testable "id=1 running=100" (Db.V_int 100L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "id=2 running=300" (Db.V_int 300L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "id=3 running=600" (Db.V_int 600L) (List.nth rows 2).(1)
+
+let test_window_no_partition () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (x INTEGER)";
+  exec db "INSERT INTO t VALUES (3), (1), (2)";
+  let rows = query_ok db "SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM t ORDER BY x" in
+  Alcotest.check value_testable "x=1 rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "x=2 rn=2" (Db.V_int 2L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "x=3 rn=3" (Db.V_int 3L) (List.nth rows 2).(1)
+
+let test_window_first_last_value () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (salary INTEGER)";
+  exec db "INSERT INTO t VALUES (90000), (80000), (70000)";
+  let rows = query_ok db "SELECT salary, FIRST_VALUE(salary) OVER (ORDER BY salary DESC) AS first, LAST_VALUE(salary) OVER (ORDER BY salary DESC) AS last FROM t ORDER BY salary DESC" in
+  Alcotest.check value_testable "first=90000" (Db.V_int 90000L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "last row0=90000" (Db.V_int 90000L) (List.nth rows 0).(2);
+  Alcotest.check value_testable "last row2=70000" (Db.V_int 70000L) (List.nth rows 2).(2)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4133,5 +4214,15 @@ let () =
       Alcotest.test_case "drop"       `Quick test_view_drop;
       Alcotest.test_case "count"      `Quick test_view_count;
       Alcotest.test_case "per_db"     `Quick test_view_independent_per_db;
+    ];
+    "window", [
+      Alcotest.test_case "row_number"       `Quick test_window_row_number;
+      Alcotest.test_case "rank"             `Quick test_window_rank;
+      Alcotest.test_case "dense_rank"       `Quick test_window_dense_rank;
+      Alcotest.test_case "lag"              `Quick test_window_lag;
+      Alcotest.test_case "lead"             `Quick test_window_lead;
+      Alcotest.test_case "sum_over"         `Quick test_window_sum_over;
+      Alcotest.test_case "no_partition"     `Quick test_window_no_partition;
+      Alcotest.test_case "first_last_value" `Quick test_window_first_last_value;
     ];
   ]
