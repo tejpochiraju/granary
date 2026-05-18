@@ -1245,12 +1245,12 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
          in go 0 lst
        in
        let group_cols_result : (int list, error) result =
-         List.fold_left (fun acc col_name ->
+         let result = List.fold_left (fun acc col_name ->
            match acc with
            | Error _ as e -> e
            | Ok indices ->
              (match proj_lookup col_name with
-              | Ok i -> Ok (indices @ [i])
+              | Ok i -> Ok (i :: indices)  (* prepend, reverse later *)
               | Error _ ->
                 (* try qualified lookup across all tables *)
                 let found = List.find_map (fun (tm, _, _) ->
@@ -1259,9 +1259,11 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                   | Error _ -> None
                 ) tables in
                 (match found with
-                 | Some i -> Ok (indices @ [i])
+                 | Some i -> Ok (i :: indices)
                  | None -> Error (Unknown_column { table = ""; column = col_name })))
          ) (Ok []) group_by
+         in
+         (match result with Ok indices -> Ok (List.rev indices) | Error _ as e -> e)
        in
        (match group_cols_result with
         | Error e -> Lwt.return (Error e)

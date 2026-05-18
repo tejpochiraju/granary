@@ -4251,6 +4251,30 @@ let test_group_by_two_cols_sum () =
       "two-col sum" [("eng","dev",220);("eng","mgr",200)] triples;
     Lwt.return_unit)
 
+let test_group_by_two_cols_having () =
+  let db = fresh_db () in
+  run (
+    let exec sql = let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit in
+    let* () = exec "CREATE TABLE emp4 (dept TEXT, role TEXT, salary INTEGER)" in
+    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 100)" in
+    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 120)" in
+    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'mgr', 200)" in
+    let* () = exec "INSERT INTO emp4 VALUES ('hr',  'dev', 80)" in
+    let* rows_r = Db.query db
+      "SELECT dept, role, COUNT(*) FROM emp4 GROUP BY dept, role HAVING COUNT(*) > 1 ORDER BY dept, role" in
+    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
+    (* Only (eng, dev) has COUNT > 1 *)
+    let triples = List.map (fun row ->
+      match row.(0), row.(1), row.(2) with
+      | Db.V_text d, Db.V_text r, Db.V_int c -> (d, r, Int64.to_int c)
+      | _ -> ("?","?",0)) rows in
+    Alcotest.(check (list (triple string string int)))
+      "having_count_gt1" [("eng","dev",2)] triples;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4680,7 +4704,8 @@ let () =
       Alcotest.test_case "create_table_no_ine"  `Quick test_create_table_no_ine_fails;
     ];
     "group_by_multi", [
-      Alcotest.test_case "two_cols_count" `Quick test_group_by_two_cols;
-      Alcotest.test_case "two_cols_sum"   `Quick test_group_by_two_cols_sum;
+      Alcotest.test_case "two_cols_count"  `Quick test_group_by_two_cols;
+      Alcotest.test_case "two_cols_sum"    `Quick test_group_by_two_cols_sum;
+      Alcotest.test_case "two_cols_having" `Quick test_group_by_two_cols_having;
     ];
   ]
