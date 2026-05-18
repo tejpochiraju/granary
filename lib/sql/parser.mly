@@ -44,6 +44,7 @@
 %token BETWEEN IN EXISTS
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
+%token CONFLICT DO VIEW
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -83,6 +84,8 @@ stmt_eof:
 
 stmt:
   | s = with_cte          { s }
+  | s = create_view       { s }
+  | s = drop_view         { s }
   | s = create_table      { s }
   | s = create_fts_table  { s }
   | s = create_index      { s }
@@ -114,6 +117,14 @@ drop_table:
 
 drop_index:
   | DROP INDEX name = IDENT { S_drop_index { name } }
+
+create_view:
+  | CREATE VIEW name = IDENT AS query = compound_select
+    { Ast.S_create_view { name; query } }
+
+drop_view:
+  | DROP VIEW name = IDENT
+    { Ast.S_drop_view { name } }
 
 alter_table:
   | ALTER TABLE table = IDENT ADD COLUMN col = column_def
@@ -210,16 +221,26 @@ insert:
   | INSERT oc = opt_conflict INTO table = IDENT
       LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
       VALUES rows = separated_nonempty_list(COMMA, value_row)
+      upsert = opt_upsert
       ret = opt_returning
-    { Ast.S_insert { table; columns = cols; values = rows; on_conflict = oc; returning = ret } }
+    { Ast.S_insert { table; columns = cols; values = rows; on_conflict = oc; returning = ret;
+                     upsert_update = upsert } }
   | INSERT oc = opt_conflict INTO table = IDENT
       VALUES rows = separated_nonempty_list(COMMA, value_row)
+      upsert = opt_upsert
       ret = opt_returning
-    { Ast.S_insert { table; columns = []; values = rows; on_conflict = oc; returning = ret } }
+    { Ast.S_insert { table; columns = []; values = rows; on_conflict = oc; returning = ret;
+                     upsert_update = upsert } }
 
 opt_returning:
   | RETURNING exprs = separated_nonempty_list(COMMA, expr) { exprs }
   |                                                         { [] }
+
+opt_upsert:
+  | ON CONFLICT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    DO UPDATE SET assigns = separated_nonempty_list(COMMA, assignment)
+    { Some Ast.{ conflict_cols = cols; assignments = assigns } }
+  |  { None }
 
 literal:
   | n = INT_LIT    { L_int n }

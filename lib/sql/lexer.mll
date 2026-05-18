@@ -151,8 +151,11 @@ rule token = parse
       | "CAST"   -> CAST
       | "NULLIF" -> NULLIF
       | "IIF"    -> IIF
-      | "WITH"   -> WITH
-      | _        -> IDENT id
+      | "WITH"     -> WITH
+      | "CONFLICT" -> CONFLICT
+      | "DO"       -> DO
+      | "VIEW"     -> VIEW
+      | _          -> IDENT id
     }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }

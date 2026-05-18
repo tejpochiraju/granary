@@ -45,11 +45,12 @@ let plan_create_table () =
 let plan_insert () =
   let cat = make_cat () in
   let stmt = Ast.S_insert {
-    table       = "users";
-    columns     = ["id"; "name"];
-    values      = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]];
-    on_conflict = None;
-    returning   = [];
+    table         = "users";
+    columns       = ["id"; "name"];
+    values        = [[Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_text "alice")]];
+    on_conflict   = None;
+    returning     = [];
+    upsert_update = None;
   } in
   let bound = bind cat stmt in
   match Planner.plan bound with

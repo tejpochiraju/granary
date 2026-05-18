@@ -111,6 +111,11 @@ and join_clause = {
   on    : expr;                  (** join condition (predicate over both tables) *)
 }
 
+and upsert_update = {
+  conflict_cols : string list;
+  assignments   : (string * expr) list;
+}
+
 and stmt =
   | S_create_table of {
       name        : string;
@@ -118,11 +123,12 @@ and stmt =
       constraints : table_constraint list;
     }
   | S_insert of {
-      table       : string;
-      columns     : string list;   (** named columns; empty = "all in order" *)
-      values      : expr list list;   (** one inner list per VALUES row *)
-      on_conflict : conflict_action option;
-      returning   : expr list;   (** empty = no RETURNING *)
+      table         : string;
+      columns       : string list;   (** named columns; empty = "all in order" *)
+      values        : expr list list;   (** one inner list per VALUES row *)
+      on_conflict   : conflict_action option;
+      returning     : expr list;   (** empty = no RETURNING *)
+      upsert_update : upsert_update option;
     }
   | S_select of {
       distinct    : bool;
@@ -191,6 +197,13 @@ and stmt =
       name  : string;
       def   : stmt;
       query : stmt;
+    }
+  | S_create_view of {
+      name  : string;
+      query : stmt;
+    }
+  | S_drop_view of {
+      name : string;
     }
 
 and pragma_kind =

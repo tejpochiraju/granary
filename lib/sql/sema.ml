@@ -1816,7 +1816,7 @@ let rec col_names_of_ast_stmt = function
 let rec bind_internal ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns; constraints }        -> bind_create cat ~name ~columns ~constraints
-  | Ast.S_insert { table; columns; values; on_conflict; returning } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
+  | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update = _ } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } ->
     bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset
   | Ast.S_create_index { name; table; columns; unique } ->
@@ -1894,6 +1894,10 @@ let rec bind_internal ~named_params ~param_counter cat stmt =
         | Error e -> Lwt.return (Error e)
         | Ok bound_query ->
           Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query }))))
+  | Ast.S_create_view _ ->
+    Lwt.return (Error (Unsupported "CREATE VIEW not yet implemented"))
+  | Ast.S_drop_view _ ->
+    Lwt.return (Error (Unsupported "DROP VIEW not yet implemented"))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~named_params ~param_counter cat right in
