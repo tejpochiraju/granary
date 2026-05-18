@@ -3893,6 +3893,32 @@ let test_window_first_last_value () =
   Alcotest.check value_testable "last row0=90000" (Db.V_int 90000L) (List.nth rows 0).(2);
   Alcotest.check value_testable "last row2=70000" (Db.V_int 70000L) (List.nth rows 2).(2)
 
+let test_collate_nocase_eq () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (name TEXT)";
+  exec db "INSERT INTO t VALUES ('Alice'), ('BOB'), ('charlie')";
+  let rows = query_ok db "SELECT name FROM t WHERE name COLLATE NOCASE = 'alice' ORDER BY name" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "Alice" (Db.V_text "Alice") (List.nth rows 0).(0)
+
+let test_collate_nocase_order () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (name TEXT)";
+  exec db "INSERT INTO t VALUES ('banana'), ('Apple'), ('cherry')";
+  let rows = query_ok db "SELECT name FROM t ORDER BY name COLLATE NOCASE" in
+  Alcotest.(check int) "3 rows" 3 (List.length rows);
+  Alcotest.check value_testable "Apple first"   (Db.V_text "Apple")  (List.nth rows 0).(0);
+  Alcotest.check value_testable "banana second" (Db.V_text "banana") (List.nth rows 1).(0);
+  Alcotest.check value_testable "cherry third"  (Db.V_text "cherry") (List.nth rows 2).(0)
+
+let test_collate_binary_eq () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (name TEXT)";
+  exec db "INSERT INTO t VALUES ('Alice'), ('alice')";
+  let rows = query_ok db "SELECT name FROM t WHERE name COLLATE BINARY = 'alice' ORDER BY name" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "lowercase alice" (Db.V_text "alice") (List.nth rows 0).(0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4297,5 +4323,10 @@ let () =
       Alcotest.test_case "sum"                     `Quick test_recursive_cte_sum;
       Alcotest.test_case "tree"                    `Quick test_recursive_cte_tree;
       Alcotest.test_case "non_recursive_unchanged" `Quick test_recursive_cte_non_recursive_unchanged;
+    ];
+    "collate", [
+      Alcotest.test_case "nocase_eq"    `Quick test_collate_nocase_eq;
+      Alcotest.test_case "nocase_order" `Quick test_collate_nocase_order;
+      Alcotest.test_case "binary_eq"    `Quick test_collate_binary_eq;
     ];
   ]

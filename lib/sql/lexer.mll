@@ -158,6 +158,7 @@ rule token = parse
       | "OVER"      -> OVER
       | "PARTITION" -> PARTITION
       | "RECURSIVE" -> RECURSIVE
+      | "COLLATE"   -> COLLATE
       | _           -> IDENT id
     }
   | eof                     { EOF }

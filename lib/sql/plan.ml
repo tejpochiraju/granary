@@ -34,6 +34,7 @@ type expr =
     (** Column reference into the proposed INSERT excluded row. *)
   | P_window_slot of int
     (** Window function slot reference — substituted to P_col(n_input_cols+i) by planner. *)
+  | P_collate of expr * Ast.collation
 
 type window_plan_item = {
   func         : Ast.window_func;

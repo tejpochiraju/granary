@@ -45,7 +45,7 @@
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
-%token OVER PARTITION RECURSIVE
+%token OVER PARTITION RECURSIVE COLLATE
 %token CHECK
 %token REFERENCES FOREIGN
 %token QUESTION
@@ -70,6 +70,7 @@
 %left PLUS MINUS
 %left STAR SLASH PERCENT
 %left CONCAT
+%nonassoc COLLATE_PREC
 %nonassoc TILDE UMINUS
 
 %start <Ast.stmt> stmt_eof
@@ -452,6 +453,14 @@ window_spec:
   | LPAREN pb = partition_clause ob = order_by_clause RPAREN
     { Ast.{ partition_by = pb; order_by = ob } }
 
+collation_name:
+  | id = IDENT
+    { match String.uppercase_ascii id with
+      | "NOCASE"  -> Ast.Collate_nocase
+      | "BINARY"  -> Ast.Collate_binary
+      | "RTRIM"   -> Ast.Collate_rtrim
+      | other     -> failwith ("unknown collation: " ^ other) }
+
 partition_clause:
   |                                                                   { [] }
   | PARTITION BY es = separated_nonempty_list(COMMA, expr)           { es }
@@ -579,3 +588,5 @@ expr:
   | QUESTION        { E_param Param_anon }
   | i = IPARAM      { E_param (Param_index i) }
   | n = NAMED_PARAM { E_param (Param_name n) }
+  | e = expr COLLATE c = collation_name
+      { E_collate (e, c) }             %prec COLLATE_PREC

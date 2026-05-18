@@ -276,8 +276,23 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_null
      | v -> if value_truthy v then Row.V_int 0L else Row.V_int 1L)
-  | Plan.P_binop (op, a, b) ->
-    eval_binop op (eval_expr clock params row a) (eval_expr clock params row b)
+  | Plan.P_binop (op, lhs_e, rhs_e) ->
+    let lv = eval_expr clock params row lhs_e in
+    let rv = eval_expr clock params row rhs_e in
+    let is_nocase = function
+      | Plan.P_collate (_, Ast.Collate_nocase) -> true
+      | _ -> false
+    in
+    let nocase_text v = match v with
+      | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
+      | o -> o
+    in
+    let (lv', rv') =
+      if is_nocase lhs_e then (lv, nocase_text rv)
+      else if is_nocase rhs_e then (nocase_text lv, rv)
+      else (lv, rv)
+    in
+    eval_binop op lv' rv'
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
   | Plan.P_case { scrutinee; branches; else_ } ->
@@ -342,6 +357,11 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
     failwith "Exec: P_excluded_col in eval_expr — must be substituted before evaluation"
   | Plan.P_window_slot _ ->
     failwith "Exec: P_window_slot in eval_expr — must be substituted by planner before evaluation"
+  | Plan.P_collate (e, Ast.Collate_nocase) ->
+    let v = eval_expr clock params row e in
+    (match v with Row.V_text s -> Row.V_text (String.lowercase_ascii s) | o -> o)
+  | Plan.P_collate (e, _) ->
+    eval_expr clock params row e
 
 and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
   match func, args with
@@ -649,6 +669,7 @@ let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan
       else_     = Option.map go else_;
     }
   | Ast.E_cast (e, ty) -> Plan.P_cast (ast_expr_to_plan_check columns e, ty)
+  | Ast.E_collate (e, c) -> Plan.P_collate (ast_expr_to_plan_check columns e, c)
   | _ -> failwith "ast_expr_to_plan_check: unsupported expression in CHECK"
 
 let compile_check_expr (table_name : string) (col_idx : int)
@@ -1010,6 +1031,7 @@ let rec substitute_excluded (excluded_row : Row.t) (e : Plan.expr) : Plan.expr =
       else_     = Option.map go else_;
     }
   | Plan.P_cast (e, ty) -> Plan.P_cast (substitute_excluded excluded_row e, ty)
+  | Plan.P_collate (e, c) -> Plan.P_collate (substitute_excluded excluded_row e, c)
   | other -> other
 
 (** Run [Op_insert] against the store: write the new row to the table
@@ -1699,6 +1721,7 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
     || List.exists (fun (c, r) -> plan_expr_has_subquery c || plan_expr_has_subquery r) branches
     || Option.fold ~none:false ~some:plan_expr_has_subquery else_
   | Plan.P_cast (e, _)            -> plan_expr_has_subquery e
+  | Plan.P_collate (e, _)        -> plan_expr_has_subquery e
   | _                             -> false
 
 (** Extract table_meta from the leftmost seq scan in a plan op. *)
@@ -1883,6 +1906,9 @@ let rec pre_eval_subquery
   | Plan.P_cast (e, ty) ->
     let* e' = pre_eval_subquery clock store params cat_opt e in
     Lwt.return (Plan.P_cast (e', ty))
+  | Plan.P_collate (e, c) ->
+    let* e' = pre_eval_subquery clock store params cat_opt e in
+    Lwt.return (Plan.P_collate (e', c))
   | _ -> Lwt.return e
 
 (* ------------------------------------------------------------------ *)

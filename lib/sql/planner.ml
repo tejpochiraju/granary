@@ -41,6 +41,7 @@ let rec plan_expr = function
   | Sema.BE_cast (e, ty) -> Plan.P_cast (plan_expr e, ty)
   | Sema.BE_excluded_col i -> Plan.P_excluded_col i
   | Sema.BE_window_slot i -> Plan.P_window_slot i
+  | Sema.BE_collate (be, c) -> Plan.P_collate (plan_expr be, c)
 
 (** Try to recognise an equality predicate of the form
     [col = lit] (or [lit = col]) at the top level of the WHERE clause.
@@ -172,6 +173,7 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
                   branches = List.map (fun (c, r) -> (go c, go r)) branches;
                   else_ = Option.map go else_ }
   | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
+  | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
   | e' -> e'
 
 let plan_select cat

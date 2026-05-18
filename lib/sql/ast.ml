@@ -60,6 +60,8 @@ type set_op = Union | Union_all | Intersect | Except
 
 type order_dir = Asc | Desc
 
+type collation = Collate_binary | Collate_nocase | Collate_rtrim
+
 type join_kind = Inner | Left
 
 type table_constraint =
@@ -104,6 +106,7 @@ type expr =
       window : window_spec;
     }
     (** Window function call: FUNC(...) OVER (PARTITION BY ... ORDER BY ...) *)
+  | E_collate of expr * collation   (** expr COLLATE collation_name *)
 
 and window_func =
   | WF_row_number
@@ -312,5 +315,5 @@ let rec expr_to_sql = function
       | Ty_real -> "REAL"    | Ty_blob -> "BLOB"
     in
     Printf.sprintf "CAST(%s AS %s)" (expr_to_sql e) tn
-  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
+  | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ | E_collate _ ->
     failwith "expr_to_sql: unsupported expression form"

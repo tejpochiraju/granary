@@ -40,6 +40,8 @@ type bound_expr =
     (** Reference to the i-th column of the proposed INSERT row (the 'excluded' pseudo-table). *)
   | BE_window_slot of int
     (** Reference to the i-th window function result appended after input columns by Op_window. *)
+  | BE_collate of bound_expr * Ast.collation
+    (** expr COLLATE collation_name *)
 
 type bound_order_key = {
   key : bound_expr;

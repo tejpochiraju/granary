@@ -34,6 +34,8 @@ type bound_expr =
 
   | BE_window_slot of int
     (** Reference to the i-th window function result appended after input columns by Op_window. *)
+  | BE_collate of bound_expr * Ast.collation
+    (** expr COLLATE collation_name *)
 
 type bound_order_key = {
   key : bound_expr;
@@ -392,6 +394,10 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
     (match bind_expr ~param_counter ~named_params meta e with
      | Ok be   -> Ok (BE_cast (be, ty))
      | Error e -> Error e)
+  | Ast.E_collate (e, c) ->
+    (match bind_expr ~param_counter ~named_params meta e with
+     | Ok be   -> Ok (BE_collate (be, c))
+     | Error e -> Error e)
   | Ast.E_window _ ->
     Error (Unsupported "window functions not yet supported in single-table context")
 
@@ -543,6 +549,10 @@ let rec bind_expr_join
   | Ast.E_cast (e, ty) ->
     (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be   -> Ok (BE_cast (be, ty))
+     | Error e -> Error e)
+  | Ast.E_collate (e, c) ->
+    (match bind_expr_join ~param_counter ~named_params ~tables e with
+     | Ok be   -> Ok (BE_collate (be, c))
      | Error e -> Error e)
   | Ast.E_window _ ->
     Error (Unsupported "window functions not yet supported in join context")
@@ -716,6 +726,8 @@ let bind_expr_agg
                Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
     | Ast.E_cast (e, ty) ->
       (match go e with Ok be -> Ok (BE_cast (be, ty)) | Error e -> Error e)
+    | Ast.E_collate (e, c) ->
+      (match go e with Ok be -> Ok (BE_collate (be, c)) | Error e -> Error e)
     | Ast.E_window _ ->
       Error (Unsupported "window functions not yet supported in aggregate context")
   in
@@ -741,6 +753,7 @@ let rec expr_has_subquery = function
     || List.exists (fun (c, r) -> expr_has_subquery c || expr_has_subquery r) branches
     || (match else_ with Some e -> expr_has_subquery e | None -> false)
   | BE_cast (e, _) -> expr_has_subquery e
+  | BE_collate (e, _) -> expr_has_subquery e
   | BE_excluded_col _ -> false
   | BE_window_slot _ -> false
 
@@ -761,6 +774,7 @@ let rec expr_has_agg = function
     || List.exists (fun (c, r) -> expr_has_agg c || expr_has_agg r) branches
     || (match else_ with Some e -> expr_has_agg e | None -> false)
   | Ast.E_cast (e, _) -> expr_has_agg e
+  | Ast.E_collate (e, _) -> expr_has_agg e
   | Ast.E_window _ -> false
 
 let rec expr_has_window = function
@@ -777,6 +791,7 @@ let rec expr_has_window = function
     || List.exists (fun (c, r) -> expr_has_window c || expr_has_window r) branches
     || (match else_ with Some e -> expr_has_window e | None -> false)
   | Ast.E_cast (e, _) -> expr_has_window e
+  | Ast.E_collate (e, _) -> expr_has_window e
   | _ -> false
 
 (* ------------------------------------------------------------------ *)
@@ -810,6 +825,7 @@ let bind_create cat ~name ~columns ~constraints =
         || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
         || (match else_ with Some e -> check_expr_unsupported e | None -> false)
       | Ast.E_cast _ -> false
+      | Ast.E_collate (e, _) -> check_expr_unsupported e
       | Ast.E_window _ -> true
     in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
@@ -1358,6 +1374,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                | Ast.E_cast (e, ty) ->
                  let* be = bind_ww e in
                  Lwt.return (Result.map (fun x -> BE_cast (x, ty)) be)
+               | Ast.E_collate (e, c) ->
+                 let* be = bind_ww e in
+                 Lwt.return (Result.map (fun x -> BE_collate (x, c)) be)
                | _ -> Lwt.return (bind_one e)
            in
            let ords_result_lwt =
@@ -1720,6 +1739,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
       | Ast.Ty_blob -> Row.Blob)
   | BE_excluded_col _ -> None      (* type of excluded col unknown at bind time *)
   | BE_window_slot _ -> None       (* type of window func result unknown at bind time *)
+  | BE_collate (e, _) -> infer_type cols e   (* collation doesn't change type *)
 
 (* ------------------------------------------------------------------ *)
 (* CREATE INDEX                                                         *)
