@@ -2930,6 +2930,67 @@ let phase21_fk_cases = [
     unordered = false };
 ]
 
+(* ── Phase 22: Triggers ─────────────────────────────────────────── *)
+
+let phase22_trigger_cases = [
+  { name = "after_insert_trigger";
+    setup = [
+      "CREATE TABLE t (id INTEGER, val TEXT)";
+      "CREATE TABLE audit (t_id INTEGER, action TEXT)";
+      "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END";
+      "INSERT INTO t VALUES (1, 'hello')";
+      "INSERT INTO t VALUES (2, 'world')";
+    ];
+    query = "SELECT t_id, action FROM audit ORDER BY t_id";
+    unordered = false };
+
+  { name = "after_delete_trigger";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "CREATE TABLE del_log (old_id INTEGER)";
+      "INSERT INTO t VALUES (10)";
+      "INSERT INTO t VALUES (20)";
+      "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO del_log VALUES (OLD.id); END";
+      "DELETE FROM t WHERE id = 10";
+    ];
+    query = "SELECT old_id FROM del_log";
+    unordered = false };
+
+  { name = "after_update_trigger";
+    setup = [
+      "CREATE TABLE t (id INTEGER, val TEXT)";
+      "CREATE TABLE changes (t_id INTEGER, old_val TEXT, new_val TEXT)";
+      "INSERT INTO t VALUES (1, 'original')";
+      "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO changes VALUES (OLD.id, OLD.val, NEW.val); END";
+      "UPDATE t SET val = 'updated' WHERE id = 1";
+    ];
+    query = "SELECT t_id, old_val, new_val FROM changes";
+    unordered = false };
+
+  { name = "trigger_when_clause";
+    setup = [
+      "CREATE TABLE t (id INTEGER, score INTEGER)";
+      "CREATE TABLE high_scores (t_id INTEGER)";
+      "CREATE TRIGGER t_when AFTER INSERT ON t WHEN NEW.score > 100 BEGIN INSERT INTO high_scores VALUES (NEW.id); END";
+      "INSERT INTO t VALUES (1, 50)";
+      "INSERT INTO t VALUES (2, 150)";
+    ];
+    query = "SELECT t_id FROM high_scores";
+    unordered = false };
+
+  { name = "drop_trigger";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "CREATE TABLE audit (id INTEGER)";
+      "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END";
+      "INSERT INTO t VALUES (1)";
+      "DROP TRIGGER t_ai";
+      "INSERT INTO t VALUES (2)";
+    ];
+    query = "SELECT id FROM audit ORDER BY id";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2966,4 +3027,5 @@ let () =
     "phase20_json_mut",        List.map make_test phase20_json_mutation_cases;
     "phase21_savepoint",       List.map make_test phase21_savepoint_cases;
     "phase21_fk",              List.map make_test phase21_fk_cases;
+    "phase22_trigger",         List.map make_test phase22_trigger_cases;
   ]
