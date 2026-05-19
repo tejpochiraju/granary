@@ -4,10 +4,19 @@
 
 type t
 
+type fk_action =
+  | FA_no_action
+  | FA_restrict
+  | FA_cascade
+  | FA_set_null
+  | FA_set_default
+
 type fk_constraint = {
   fk_local_col    : string;
   fk_parent_table : string;
   fk_parent_col   : string;
+  fk_on_delete    : fk_action;
+  fk_on_update    : fk_action;
 }
 
 type table_meta = {

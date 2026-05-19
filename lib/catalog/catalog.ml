@@ -2,6 +2,13 @@ module S = Sqlocaml_store.Store
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint
 
+type fk_action =
+  | FA_no_action
+  | FA_restrict
+  | FA_cascade
+  | FA_set_null
+  | FA_set_default
+
 (* System tree IDs *)
 let sys_tables_tid  : S.tree_id = 0
 let sys_columns_tid : S.tree_id = 1
@@ -24,6 +31,8 @@ type fk_constraint = {
   fk_local_col    : string;
   fk_parent_table : string;
   fk_parent_col   : string;
+  fk_on_delete    : fk_action;
+  fk_on_update    : fk_action;
 }
 
 type table_meta = {
@@ -511,9 +520,30 @@ let remove_trigger store ~name =
 let fk_meta_key table_name =
   Bytes.of_string ("fk:" ^ table_name)
 
+let fk_action_to_string = function
+  | FA_no_action   -> "no_action"
+  | FA_restrict    -> "restrict"
+  | FA_cascade     -> "cascade"
+  | FA_set_null    -> "set_null"
+  | FA_set_default -> "set_default"
+
+let fk_action_of_string = function
+  | "no_action"   -> FA_no_action
+  | "restrict"    -> FA_restrict
+  | "cascade"     -> FA_cascade
+  | "set_null"    -> FA_set_null
+  | "set_default" -> FA_set_default
+  | s             -> failwith ("catalog: unknown fk_action: " ^ s)
+
 let encode_fks fks =
   let lines = List.map (fun fk ->
-    fk.fk_local_col ^ "\t" ^ fk.fk_parent_table ^ "\t" ^ fk.fk_parent_col
+    String.concat "\t" [
+      fk.fk_local_col;
+      fk.fk_parent_table;
+      fk.fk_parent_col;
+      fk_action_to_string fk.fk_on_delete;
+      fk_action_to_string fk.fk_on_update;
+    ]
   ) fks in
   Bytes.of_string (String.concat "\n" lines)
 
@@ -523,7 +553,13 @@ let decode_fks bytes =
   else
     List.filter_map (fun line ->
       match String.split_on_char '\t' line with
-      | [lc; pt; pc] -> Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc }
+      | [lc; pt; pc] ->
+        Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc;
+               fk_on_delete = FA_restrict; fk_on_update = FA_restrict }
+      | [lc; pt; pc; od; ou] ->
+        Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc;
+               fk_on_delete = fk_action_of_string od;
+               fk_on_update = fk_action_of_string ou }
       | _ -> None
     ) (String.split_on_char '\n' s)
 
