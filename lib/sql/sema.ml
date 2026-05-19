@@ -899,17 +899,25 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
        | Error e -> Lwt.return (Error e)
        | Ok col_fks ->
       (* Extract FK constraints from table-level FOREIGN KEY *)
-      let tbl_fks = List.filter_map (function
-        | Ast.TC_foreign_key { local_cols; parent_table; parent_cols } ->
-          (* Multi-column FK: only the first local/parent column pair is enforced.
-             Full multi-column FK enforcement is deferred. *)
-          (match local_cols, parent_cols with
-           | lc :: _, pc :: _ -> Some (lc, parent_table, pc)
-           | _ -> None)
-        | _ -> None
-      ) constraints in
+      let tbl_fks_result =
+        List.fold_left (fun acc c ->
+          match acc with
+          | Error _ as e -> e
+          | Ok fks ->
+            (match c with
+             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols } ->
+               (match local_cols, parent_cols with
+                | [lc], [pc] -> Ok (fks @ [(lc, parent_table, pc)])
+                | _ ->
+                  Error (Unsupported "multi-column FOREIGN KEY constraints are not yet supported"))
+             | _ -> Ok fks)
+        ) (Ok []) constraints
+      in
+      (match tbl_fks_result with
+       | Error e -> Lwt.return (Error e)
+       | Ok tbl_fks ->
       let fk_constraints = col_fks @ tbl_fks in
-      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints })))
+      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints }))))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)

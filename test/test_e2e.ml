@@ -2596,6 +2596,18 @@ let test_fk_null_allowed () =
       (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
     Lwt.return_unit)
 
+let test_fk_multi_col_unsupported () =
+  let db = fresh_db () in
+  run (
+    let* () = (let* r = Db.execute db "CREATE TABLE fp (x INTEGER, y INTEGER)" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let* result = Db.execute db
+      "CREATE TABLE fc (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES fp(x, y))" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected error for multi-column FK");
+    Lwt.return_unit)
+
 (* ------------------------------------------------------------------ *)
 (* CHECK constraints                                                     *)
 (* ------------------------------------------------------------------ *)
@@ -4609,9 +4621,10 @@ let () =
       Alcotest.test_case "fk_references_no_col"  `Quick test_fk_parse_no_col;
     ];
     "foreign_key", [
-      Alcotest.test_case "valid_insert"   `Quick test_fk_valid_insert;
-      Alcotest.test_case "invalid_insert" `Quick test_fk_invalid_insert;
-      Alcotest.test_case "null_allowed"   `Quick test_fk_null_allowed;
+      Alcotest.test_case "valid_insert"          `Quick test_fk_valid_insert;
+      Alcotest.test_case "invalid_insert"        `Quick test_fk_invalid_insert;
+      Alcotest.test_case "null_allowed"          `Quick test_fk_null_allowed;
+      Alcotest.test_case "multi_col_unsupported" `Quick test_fk_multi_col_unsupported;
     ];
     "check_constraints", [
       Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
