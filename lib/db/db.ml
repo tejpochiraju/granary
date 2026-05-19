@@ -375,7 +375,9 @@ let make_trigger_hook t table_meta ~timing ~event =
           let* bound = Sql.Sema.bind ~views:t.views t.catalog
             (Sql.Ast.S_const_select { exprs = [(subst, None)] }) in
           (match bound with
-           | Error _ -> Lwt.return true
+           | Error e ->
+             Lwt.fail_with (Format.asprintf
+               "trigger WHEN clause binding error: %a" Sql.Sema.pp_error e)
            | Ok bw ->
              let op = Sql.Planner.plan ~cat:t.catalog bw in
              let mode = match t.explicit_txn with
@@ -586,9 +588,22 @@ let run st ~params =
     | None    -> Sql.Exec.Auto
     | Some tx -> Sql.Exec.In_txn tx
   in
+  let (before_hook, after_hook) = match st.plan with
+    | Sql.Plan.Op_insert { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
+    | Sql.Plan.Op_update { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Update,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Update)
+    | Sql.Plan.Op_delete { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Delete,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
+    | _ -> (None, None)
+  in
   Lwt.catch
     (fun () ->
-      let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr t.store t.catalog st.plan in
+      let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr
+                 ~before_hook ~after_hook t.store t.catalog st.plan in
       Lwt.return (Ok n))
     (function
      | Failure msg -> Lwt.return (Error (Runtime msg))

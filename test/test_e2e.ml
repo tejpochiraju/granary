@@ -4956,6 +4956,45 @@ let test_trigger_multiple_body_stmts () =
     Alcotest.check value_testable "tlog2 id=42" (Db.V_int 42L) (List.hd rows2).(0);
     Lwt.return_unit)
 
+let test_trigger_persists_across_reopen () =
+  let path = Filename.temp_file "sqlocaml_test" ".db" in
+  Lwt_main.run (
+    (* First session: create table, trigger, insert *)
+    let* result1 = Db.open_file ~path in
+    let db1 = match result1 with Ok db -> db | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e in
+    let exec1 sql =
+      let* r = Db.execute db1 sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "execute: %a" Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec1 "CREATE TABLE t (id INTEGER)" in
+    let* () = exec1 "CREATE TABLE audit (id INTEGER)" in
+    let* () = exec1 "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
+    let* () = exec1 "INSERT INTO t VALUES (1)" in
+    let* () = Db.close db1 in
+    (* Second session: reopen, insert again, verify trigger fired both times *)
+    let* result2 = Db.open_file ~path in
+    let db2 = match result2 with Ok db -> db | Error e -> Alcotest.failf "reopen: %a" Db.pp_error e in
+    let exec2 sql =
+      let* r = Db.execute db2 sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "execute2: %a" Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec2 "INSERT INTO t VALUES (2)" in
+    let* r = Db.query db2 "SELECT id FROM audit ORDER BY id" in
+    let rows = match r with
+      | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+    in
+    Alcotest.(check int) "two audit rows after reopen" 2 (List.length rows);
+    let id_of row = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1 in
+    Alcotest.(check int) "first audit id = 1" 1 (id_of (List.nth rows 0));
+    Alcotest.(check int) "second audit id = 2" 2 (id_of (List.nth rows 1));
+    let* () = Db.close db2 in
+    Sys.remove path;
+    Lwt.return_unit
+  )
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5445,5 +5484,6 @@ let () =
       Alcotest.test_case "when_clause_conditional" `Quick test_when_clause_conditional;
       Alcotest.test_case "drop_trigger"          `Quick test_drop_trigger;
       Alcotest.test_case "multiple_body_stmts"   `Quick test_trigger_multiple_body_stmts;
+      Alcotest.test_case "persists_across_reopen" `Quick test_trigger_persists_across_reopen;
     ];
   ]
