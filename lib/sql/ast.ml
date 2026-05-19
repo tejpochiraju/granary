@@ -81,6 +81,10 @@ type scalar_func =
   | Fn_json_array     (** json_array(v,...) *)
   | Fn_json_type      (** json_type(json[,path]) *)
   | Fn_json_valid     (** json_valid(json) → 0|1 *)
+  | Fn_json_set     (** json_set(json, path, val[, path, val ...]) *)
+  | Fn_json_insert  (** json_insert — insert only if absent *)
+  | Fn_json_replace (** json_replace — update only if present *)
+  | Fn_json_remove  (** json_remove(json, path[, path ...]) *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -332,6 +336,8 @@ let func_to_sql = function
   | Fn_json_extract -> "JSON_EXTRACT" | Fn_json_object -> "JSON_OBJECT"
   | Fn_json_array -> "JSON_ARRAY"     | Fn_json_type   -> "JSON_TYPE"
   | Fn_json_valid -> "JSON_VALID"
+  | Fn_json_set -> "JSON_SET"         | Fn_json_insert  -> "JSON_INSERT"
+  | Fn_json_replace -> "JSON_REPLACE" | Fn_json_remove  -> "JSON_REMOVE"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n

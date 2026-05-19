@@ -357,6 +357,8 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
          | Ast.Fn_json_array -> true
          | Ast.Fn_json_type -> n = 1 || n = 2
          | Ast.Fn_json_valid -> n = 1
+         | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
+         | Ast.Fn_json_remove -> n >= 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -532,6 +534,8 @@ let rec bind_expr_join
          | Ast.Fn_json_array -> true
          | Ast.Fn_json_type -> n = 1 || n = 2
          | Ast.Fn_json_valid -> n = 1
+         | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
+         | Ast.Fn_json_remove -> n >= 2
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -730,6 +734,8 @@ let bind_expr_agg
            | Ast.Fn_json_array -> true
            | Ast.Fn_json_type -> n = 1 || n = 2
            | Ast.Fn_json_valid -> n = 1
+           | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
+           | Ast.Fn_json_remove -> n >= 2
          in
          if not arity_ok then
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })

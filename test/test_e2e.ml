@@ -4543,6 +4543,45 @@ let test_json_valid () =
   let r4 = query_ok db {|SELECT json_valid(NULL)|} in
   Alcotest.(check row_testable) "json_valid(NULL) = null" [| Db.V_null |] (List.nth r4 0)
 
+let test_json_set () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_set('{"a":1}', '$.a', 99)|} in
+  Alcotest.(check row_testable) "set existing key"
+    [| Db.V_text {|{"a":99}|} |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_set('{"a":1}', '$.b', 2)|} in
+  Alcotest.(check row_testable) "set new key"
+    [| Db.V_text {|{"a":1,"b":2}|} |] (List.nth r2 0);
+  let r3 = query_ok db {|SELECT json_set('[1,2,3]', '$[1]', 99)|} in
+  Alcotest.(check row_testable) "set array index"
+    [| Db.V_text "[1,99,3]" |] (List.nth r3 0)
+
+let test_json_insert () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_insert('{"a":1}', '$.a', 99)|} in
+  Alcotest.(check row_testable) "insert existing no-op"
+    [| Db.V_text {|{"a":1}|} |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_insert('{"a":1}', '$.b', 2)|} in
+  Alcotest.(check row_testable) "insert new key"
+    [| Db.V_text {|{"a":1,"b":2}|} |] (List.nth r2 0)
+
+let test_json_replace () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_replace('{"a":1}', '$.a', 99)|} in
+  Alcotest.(check row_testable) "replace existing"
+    [| Db.V_text {|{"a":99}|} |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_replace('{"a":1}', '$.b', 2)|} in
+  Alcotest.(check row_testable) "replace non-existing no-op"
+    [| Db.V_text {|{"a":1}|} |] (List.nth r2 0)
+
+let test_json_remove () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_remove('{"a":1,"b":2}', '$.a')|} in
+  Alcotest.(check row_testable) "remove object key"
+    [| Db.V_text {|{"b":2}|} |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_remove('[1,2,3]', '$[1]')|} in
+  Alcotest.(check row_testable) "remove array element"
+    [| Db.V_text "[1,3]" |] (List.nth r2 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5004,5 +5043,9 @@ let () =
       Alcotest.test_case "json_array"   `Quick test_json_array;
       Alcotest.test_case "json_type"    `Quick test_json_type;
       Alcotest.test_case "json_valid"   `Quick test_json_valid;
+      Alcotest.test_case "json_set"     `Quick test_json_set;
+      Alcotest.test_case "json_insert"  `Quick test_json_insert;
+      Alcotest.test_case "json_replace" `Quick test_json_replace;
+      Alcotest.test_case "json_remove"  `Quick test_json_remove;
     ];
   ]

@@ -190,6 +190,10 @@ rule token = parse
       | "JSON_ARRAY"   -> JSON_ARRAY_FN
       | "JSON_TYPE"    -> JSON_TYPE
       | "JSON_VALID"   -> JSON_VALID
+      | "JSON_SET"     -> JSON_SET
+      | "JSON_INSERT"  -> JSON_INSERT_FN
+      | "JSON_REPLACE" -> JSON_REPLACE_FN
+      | "JSON_REMOVE"  -> JSON_REMOVE
       | _           -> IDENT id
     }
   | eof                     { EOF }

@@ -2789,6 +2789,33 @@ let phase20_json_cases = [
     query = {|SELECT json_valid('not json')|} };
 ]
 
+let phase20_json_mutation_cases = [
+  { name = "json_set_existing";
+    setup = []; unordered = false;
+    query = {|SELECT json_set('{"a":1}', '$.a', 99)|} };
+  { name = "json_set_new";
+    setup = []; unordered = false;
+    query = {|SELECT json_set('{"a":1}', '$.b', 2)|} };
+  { name = "json_insert_existing_noop";
+    setup = []; unordered = false;
+    query = {|SELECT json_insert('{"a":1}', '$.a', 99)|} };
+  { name = "json_insert_new";
+    setup = []; unordered = false;
+    query = {|SELECT json_insert('{"a":1}', '$.b', 2)|} };
+  { name = "json_replace_existing";
+    setup = []; unordered = false;
+    query = {|SELECT json_replace('{"a":1}', '$.a', 99)|} };
+  { name = "json_replace_missing_noop";
+    setup = []; unordered = false;
+    query = {|SELECT json_replace('{"a":1}', '$.b', 2)|} };
+  { name = "json_remove_key";
+    setup = []; unordered = false;
+    query = {|SELECT json_remove('{"a":1,"b":2}', '$.a')|} };
+  { name = "json_remove_array_elem";
+    setup = []; unordered = false;
+    query = {|SELECT json_remove('[1,2,3]', '$[1]')|} };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2822,4 +2849,5 @@ let () =
     "phase19_nulls",           List.map make_test phase19_nulls_cases;
     "phase19_window_agg",      List.map make_test phase19_window_agg_cases;
     "phase20_json",            List.map make_test phase20_json_cases;
+    "phase20_json_mut",        List.map make_test phase20_json_mutation_cases;
   ]

@@ -52,6 +52,7 @@
 %token CEIL FLOOR SQRT POW EXP LN LOG LOG2 LOG10 SIGN TRUNC PI
 %token SIN COS TAN ASIN ACOS ATAN ATAN2 DEGREES RADIANS
 %token JSON_EXTRACT JSON_OBJECT_FN JSON_ARRAY_FN JSON_TYPE JSON_VALID
+%token JSON_SET JSON_INSERT_FN JSON_REPLACE_FN JSON_REMOVE
 %token NULLS
 %token QUESTION
 %token <int>    IPARAM
@@ -458,6 +459,14 @@ scalar_expr:
     { E_func (Fn_json_type, [e; p]) }
   | JSON_VALID LPAREN e = expr RPAREN
     { E_func (Fn_json_valid, [e]) }
+  | JSON_SET LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_set, args) }
+  | JSON_INSERT_FN LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_insert, args) }
+  | JSON_REPLACE_FN LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_replace, args) }
+  | JSON_REMOVE LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_remove, args) }
 
 proj_item:
   | e = expr AS alias = IDENT { `ExprA (e, Some alias) }

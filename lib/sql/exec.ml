@@ -640,6 +640,52 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
      | Row.V_text s ->
        (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
      | _ -> Row.V_int 0L)
+  | Ast.Fn_json_set, json_v :: rest ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv ->
+       let rec apply jv = function
+         | path_v :: val_v :: rest ->
+           let path = (match path_v with Row.V_text s -> s | _ -> "") in
+           apply (Json.path_set jv path (json_of_sql val_v)) rest
+         | _ -> jv
+       in
+       Row.V_text (Json.to_string (apply jv rest)))
+  | Ast.Fn_json_insert, json_v :: rest ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv ->
+       let rec apply jv = function
+         | path_v :: val_v :: rest ->
+           let path = (match path_v with Row.V_text s -> s | _ -> "") in
+           apply (Json.path_insert jv path (json_of_sql val_v)) rest
+         | _ -> jv
+       in
+       Row.V_text (Json.to_string (apply jv rest)))
+  | Ast.Fn_json_replace, json_v :: rest ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv ->
+       let rec apply jv = function
+         | path_v :: val_v :: rest ->
+           let path = (match path_v with Row.V_text s -> s | _ -> "") in
+           apply (Json.path_replace jv path (json_of_sql val_v)) rest
+         | _ -> jv
+       in
+       Row.V_text (Json.to_string (apply jv rest)))
+  | Ast.Fn_json_remove, json_v :: paths ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv ->
+       let result = List.fold_left (fun acc path_v ->
+         let path = (match path_v with Row.V_text s -> s | _ -> "") in
+         Json.path_remove acc path
+       ) jv paths in
+       Row.V_text (Json.to_string result))
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
