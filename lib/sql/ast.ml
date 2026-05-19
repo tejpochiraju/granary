@@ -251,11 +251,17 @@ and stmt =
       table       : string;
       assignments : (string * expr) list;   (** [(col_name, new_value_expr)] *)
       where       : expr option;
+      order       : order_key list;
+      limit       : int option;
+      offset      : int option;
       returning   : expr list;
     }
   | S_delete of {
       table     : string;
       where     : expr option;
+      order     : order_key list;
+      limit     : int option;
+      offset    : int option;
       returning : expr list;
     }
   | S_drop_table of {

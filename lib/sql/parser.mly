@@ -479,12 +479,16 @@ update:
   | UPDATE table = any_ident SET
       assignments = separated_nonempty_list(COMMA, assignment)
       wh = where_opt
+      ob = order_by_clause
+      lim = limit_clause
       ret = opt_returning
-    { S_update { table; assignments; where = wh; returning = ret } }
+    { let (limit, offset) = lim in
+      S_update { table; assignments; where = wh; order = ob; limit; offset; returning = ret } }
 
 delete:
-  | DELETE FROM table = any_ident wh = where_opt ret = opt_returning
-    { S_delete { table; where = wh; returning = ret } }
+  | DELETE FROM table = any_ident wh = where_opt ob = order_by_clause lim = limit_clause ret = opt_returning
+    { let (limit, offset) = lim in
+      S_delete { table; where = wh; order = ob; limit; offset; returning = ret } }
 
 assignment:
   | col = any_ident EQ value = expr { (col, value) }
