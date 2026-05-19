@@ -74,6 +74,20 @@ val commit   : rw txn -> unit Lwt.t
     writer lock. Phase 3 introduces true rollback. *)
 val rollback : rw txn -> unit Lwt.t
 
+(** Push a named savepoint by snapshotting current Mem tree state.
+    No-op on the B-tree backend (deferred). *)
+val savepoint_begin   : rw txn -> string -> unit Lwt.t
+
+(** Release the named savepoint and all newer ones.
+    Writes accumulated since the savepoint remain in the outer transaction.
+    No-op on the B-tree backend. *)
+val savepoint_release : rw txn -> string -> unit Lwt.t
+
+(** Restore to the named savepoint, dropping all newer savepoints.
+    The named savepoint is kept so ROLLBACK TO can be repeated.
+    No-op on the B-tree backend. *)
+val savepoint_rollback : rw txn -> string -> unit Lwt.t
+
 (** End a read-only transaction. *)
 val ro_end   : ro txn -> unit Lwt.t
 

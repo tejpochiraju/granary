@@ -73,6 +73,9 @@ type t = {
      Used to implement rollback for the in-memory backend.
      None when no RW transaction is active. *)
   mutable mem_rw_snapshot : (tree_id * Bytes.t BytesMap.t) list option;
+  (* Savepoint stack for the Mem backend; newest entry at front.
+     Each entry is (savepoint_name, snapshot_of_all_trees). *)
+  mutable mem_savepoints  : (string * (tree_id * Bytes.t BytesMap.t) list) list;
 }
 
 type ro_snapshot = {
@@ -247,7 +250,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 
 let create () : t =
   { backend = Mem (Hashtbl.create 16); rw_mutex = Lwt_mutex.create ();
-    mem_rw_snapshot = None }
+    mem_rw_snapshot = None; mem_savepoints = [] }
 
 let map_unix_err (e : Unix_file.error) : error =
   match e with
@@ -330,7 +333,7 @@ let open_file ~path : (t, error) result Lwt.t =
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
-              mem_rw_snapshot = None }
+              mem_rw_snapshot = None; mem_savepoints = [] }
     end else begin
       let pager = pager_of_unix_file file ~freelist:Freelist.empty in
       let%lwt hr = Header.read_live pager in
@@ -351,7 +354,7 @@ let open_file ~path : (t, error) result Lwt.t =
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
-            mem_rw_snapshot = None }
+            mem_rw_snapshot = None; mem_savepoints = [] }
     end
 
 let close (t : t) : unit Lwt.t =
@@ -394,7 +397,7 @@ let open_block
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
-            mem_rw_snapshot = None }))
+            mem_rw_snapshot = None; mem_savepoints = [] }))
   | Error e -> Lwt.return_error (map_header_err e)
   | Ok h ->
     Pager.set_n_pages pager h.n_pages_total;
@@ -411,7 +414,7 @@ let open_block
     in
     Lwt.return_ok
       { backend = Btree st; rw_mutex = Lwt_mutex.create ();
-        mem_rw_snapshot = None }
+        mem_rw_snapshot = None; mem_savepoints = [] }
 
 (* ------------------------------------------------------------------ *)
 (* Transactions                                                         *)
@@ -441,7 +444,8 @@ let rw_begin t =
    | Mem trees ->
      (* Snapshot all currently-existing trees so rollback can restore them. *)
      let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-     t.mem_rw_snapshot <- Some snap
+     t.mem_rw_snapshot <- Some snap;
+     t.mem_savepoints <- []
    | Btree st ->
      let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
      Pager.set_txn_id st.pager current_rw_txn_id;
@@ -568,6 +572,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
    | Mem _ ->
      t.mem_rw_snapshot <- None;
+     t.mem_savepoints <- [];
      Lwt.return_unit
    | Btree st ->
      (* 1. Free old freelist pages from the previous commit *)
@@ -647,7 +652,8 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
           if not (List.mem tid snap_tids) then
             Hashtbl.remove trees tid
         ) (Hashtbl.copy trees);
-        t.mem_rw_snapshot <- None)
+        t.mem_rw_snapshot <- None;
+        t.mem_savepoints <- [])
    | Btree st ->
      (* Drop the per-tree cache so subsequent reads pick up the
         last-committed roots from the meta-tree.  Note: the meta-tree
@@ -664,6 +670,60 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
       | None -> ()));
   Lwt_mutex.unlock t.rw_mutex;
   Lwt.return_unit
+
+(* ------------------------------------------------------------------ *)
+(* Savepoints (Mem backend only; B-tree deferred)                      *)
+(* ------------------------------------------------------------------ *)
+
+(** Push a named savepoint: snapshot current Mem tree state. *)
+let savepoint_begin (Rw t : rw txn) name =
+  match t.backend with
+  | Mem trees ->
+    let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+    t.mem_savepoints <- (name, snap) :: t.mem_savepoints;
+    Lwt.return_unit
+  | Btree _ -> Lwt.return_unit   (* B-tree savepoints deferred to a future phase *)
+
+(** Release the named savepoint and all newer ones (writes are kept). *)
+let savepoint_release (Rw t : rw txn) name =
+  match t.backend with
+  | Mem _ ->
+    let rec drop = function
+      | [] -> []
+      | (n, _) :: rest when String.equal n name -> rest
+      | _ :: rest -> drop rest
+    in
+    t.mem_savepoints <- drop t.mem_savepoints;
+    Lwt.return_unit
+  | Btree _ -> Lwt.return_unit
+
+(** Rollback to the named savepoint: restore snapshot, drop newer savepoints,
+    keep the named savepoint so it can be rolled back to again. *)
+let savepoint_rollback (Rw t : rw txn) name =
+  match t.backend with
+  | Mem trees ->
+    let rec find = function
+      | [] -> ()   (* savepoint not found — no-op *)
+      | (n, snap) :: rest when String.equal n name ->
+        (* Restore tree contents to this snapshot. *)
+        List.iter (fun (tid, map) ->
+          match Hashtbl.find_opt trees tid with
+          | None -> ()
+          | Some r -> r := map
+        ) snap;
+        (* Remove trees that were created after this savepoint. *)
+        let snap_tids = List.map fst snap in
+        Hashtbl.iter (fun tid _ ->
+          if not (List.mem tid snap_tids) then
+            Hashtbl.remove trees tid
+        ) (Hashtbl.copy trees);
+        (* Keep the named savepoint at the top so it can be re-used. *)
+        t.mem_savepoints <- (name, snap) :: rest
+      | _ :: rest -> find rest
+    in
+    find t.mem_savepoints;
+    Lwt.return_unit
+  | Btree _ -> Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
 (* get / put / del                                                      *)
