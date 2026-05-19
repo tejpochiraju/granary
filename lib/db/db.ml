@@ -26,13 +26,12 @@ type row = Row.t
 
 (** In-memory representation of a trigger, extracted from S_create_trigger AST. *)
 type trigger_meta = {
-  trig_name   : string;
   trig_table  : string;
   trig_timing : [ `Before | `After ];
   trig_event  : [ `Insert | `Update | `Delete ];
   trig_when   : Sql.Ast.expr option;
   trig_body   : Sql.Ast.stmt list;
-} [@@warning "-69"]
+}
 
 type error =
   | Parse   of string
@@ -72,7 +71,9 @@ let load_triggers_into_hashtbl store trig_tbl =
        Hashtbl.replace trig_tbl name ast
      | _ ->
        Printf.eprintf "warning: skipping non-trigger SQL in sys_triggers (name: %s)\n%!" name
-     | exception _ -> ())
+     | exception exn ->
+       Printf.eprintf "warning: failed to parse trigger SQL for '%s': %s\n%!" name
+         (Printexc.to_string exn))
   ) pairs;
   Lwt.return_unit
 
@@ -221,7 +222,7 @@ let rollback_to_savepoint t name =
 (* Trigger firing helpers                                               *)
 (* ------------------------------------------------------------------ *)
 
-let trigger_meta_of_ast name = function
+let trigger_meta_of_ast _name = function
   | Sql.Ast.S_create_trigger { timing; event; table; when_; body; _ } ->
     let trig_timing = (match timing with
       | Sql.Ast.TT_before -> `Before
@@ -230,7 +231,7 @@ let trigger_meta_of_ast name = function
       | Sql.Ast.TE_insert -> `Insert
       | Sql.Ast.TE_update -> `Update
       | Sql.Ast.TE_delete -> `Delete) in
-    Some { trig_name = name; trig_table = table; trig_timing; trig_event;
+    Some { trig_table = table; trig_timing; trig_event;
            trig_when = when_; trig_body = body }
   | _ -> None
 
@@ -266,6 +267,9 @@ let rec map_expr f e =
     }
   | Sql.Ast.E_cast (x, ty)    -> Sql.Ast.E_cast (go x, ty)
   | Sql.Ast.E_collate (x, c)  -> Sql.Ast.E_collate (go x, c)
+  (* NEW/OLD references inside subquery expressions (E_subquery, E_exists,
+     E_in_select, E_window) are not substituted. Trigger bodies should not
+     reference NEW/OLD inside subqueries. *)
   | other -> other
 
 let make_subst_fn ~schema ~(new_row : Row.t option) ~(old_row : Row.t option) =
@@ -316,7 +320,9 @@ let subst_new_old ~schema ~new_row ~old_row stmt =
       proj = (match proj with
         | `Exprs es -> `Exprs (List.map (fun (e, a) -> (ge e, a)) es)
         | other -> other);
-      table; table_alias; joins;
+      table; table_alias;
+      joins = List.map (fun j ->
+        { j with Sql.Ast.on = ge j.Sql.Ast.on }) joins;
       where = Option.map ge where;
       group_by;
       having = Option.map ge having;
@@ -326,7 +332,9 @@ let subst_new_old ~schema ~new_row ~old_row stmt =
     }
   | other -> other
 
-(** Compile and execute one pre-substituted trigger body statement within the db context. *)
+(** Compile and execute one pre-substituted trigger body statement within the db context.
+    Note: triggers fired here do NOT recursively fire further triggers (nested trigger
+    firing is not supported in Phase 22). *)
 let fire_trigger_stmt t stmt =
   let* bound = Sql.Sema.bind ~views:t.views t.catalog stmt in
   match bound with
@@ -337,16 +345,16 @@ let fire_trigger_stmt t stmt =
       | None    -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
     in
-    Lwt.catch
-      (fun () -> Sql.Exec.execute ~mode ~clock:t.clock t.store t.catalog op)
-      (function
-       | Failure msg -> Lwt.fail_with msg
-       | exn         -> Lwt.fail exn)
+    Sql.Exec.execute ~mode ~clock:t.clock t.store t.catalog op
 
-(** Find all triggers matching table/timing/event, fire them with NEW/OLD row context. *)
-let fire_triggers t ~timing ~event ~table_meta ~new_row ~old_row =
-  let schema = table_meta.Cat.columns in
-  let trigs =
+(** Build a DML hook for exec.ml that fires triggers.
+    Returns None if no triggers exist for the given table/timing/event (fast path).
+    Scans the trigger hashtable exactly once to collect matching triggers. *)
+(* Atomicity note: AFTER triggers fire after the DML transaction commits.
+   If an AFTER trigger body fails, the committed DML row is NOT rolled back.
+   This differs from SQLite's semantics where all-or-nothing applies. *)
+let make_trigger_hook t table_meta ~timing ~event =
+  let matching =
     Hashtbl.fold (fun _name ast acc ->
       match trigger_meta_of_ast _name ast with
       | Some m when
@@ -356,48 +364,36 @@ let fire_triggers t ~timing ~event ~table_meta ~new_row ~old_row =
       | _ -> acc
     ) t.triggers []
   in
-  Lwt_list.iter_s (fun m ->
-    (* Evaluate WHEN clause - skip if false *)
-    let* should_fire = match m.trig_when with
-      | None -> Lwt.return true
-      | Some when_expr ->
-        let subst = map_expr (make_subst_fn ~schema ~new_row ~old_row) when_expr in
-        let* bound = Sql.Sema.bind ~views:t.views t.catalog
-          (Sql.Ast.S_const_select { exprs = [(subst, None)] }) in
-        (match bound with
-         | Error _ -> Lwt.return true  (* binding error -> fire trigger *)
-         | Ok bw ->
-           let op = Sql.Planner.plan ~cat:t.catalog bw in
-           let mode = match t.explicit_txn with
-             | None -> Sql.Exec.Auto | Some tx -> Sql.Exec.In_txn tx in
-           let* stream = Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op in
-           let* rows = Lwt_stream.to_list stream in
-           Lwt.return (match rows with
-             | row :: _ when Array.length row > 0 ->
-               (match row.(0) with Row.V_int 0L | Row.V_null -> false | _ -> true)
-             | _ -> true))
-    in
-    if not should_fire then Lwt.return_unit
-    else
-      Lwt_list.iter_s (fun stmt ->
-        let substituted = subst_new_old ~schema ~new_row ~old_row stmt in
-        fire_trigger_stmt t substituted
-      ) m.trig_body
-  ) trigs
-
-(** Build a DML hook for exec.ml that fires triggers.
-    Returns None if no triggers exist for the given table/timing/event (fast path). *)
-let make_trigger_hook t table_meta ~timing ~event =
-  let has_any = Hashtbl.fold (fun _name ast acc ->
-    acc || (match trigger_meta_of_ast _name ast with
-      | Some m ->
-        String.equal m.trig_table table_meta.Cat.name &&
-        m.trig_timing = timing && m.trig_event = event
-      | None -> false)
-  ) t.triggers false in
-  if not has_any then None
+  if matching = [] then None
   else Some (fun ~new_row ~old_row ->
-    fire_triggers t ~timing ~event ~table_meta ~new_row ~old_row
+    let schema = table_meta.Cat.columns in
+    Lwt_list.iter_s (fun m ->
+      let* should_fire = match m.trig_when with
+        | None -> Lwt.return true
+        | Some when_expr ->
+          let subst = map_expr (make_subst_fn ~schema ~new_row ~old_row) when_expr in
+          let* bound = Sql.Sema.bind ~views:t.views t.catalog
+            (Sql.Ast.S_const_select { exprs = [(subst, None)] }) in
+          (match bound with
+           | Error _ -> Lwt.return true
+           | Ok bw ->
+             let op = Sql.Planner.plan ~cat:t.catalog bw in
+             let mode = match t.explicit_txn with
+               | None -> Sql.Exec.Auto | Some tx -> Sql.Exec.In_txn tx in
+             let* stream = Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op in
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (match rows with
+               | row :: _ when Array.length row > 0 ->
+                 (match row.(0) with Row.V_int 0L | Row.V_null -> false | _ -> true)
+               | _ -> true))
+      in
+      if not should_fire then Lwt.return_unit
+      else
+        Lwt_list.iter_s (fun stmt ->
+          let substituted = subst_new_old ~schema ~new_row ~old_row stmt in
+          fire_trigger_stmt t substituted
+        ) m.trig_body
+    ) matching
   )
 
 (* ------------------------------------------------------------------ *)
