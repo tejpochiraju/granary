@@ -31,8 +31,8 @@ let bind cat stmt = Lwt_main.run (Sema.bind cat stmt) |> Result.get_ok
 let plan_create_table () =
   let cat = make_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None };
-    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None };
+    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
+    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   let bound = bind cat stmt in

@@ -69,10 +69,12 @@ type bound_join = {
 
 type bound_stmt =
   | BS_create_table of {
-      name          : string;
-      columns       : Row.column list;
-      uniq_idxs     : (string * string list) list;
-      if_not_exists : bool;
+      name           : string;
+      columns        : Row.column list;
+      uniq_idxs      : (string * string list) list;
+      if_not_exists  : bool;
+      fk_constraints : (string * string * string) list;
+        (** [(local_col, parent_table, parent_col)] *)
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -209,10 +211,11 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
     Row.{ name; ty = Row.Text; not_null = true;
           primary_key = false; default = None; check_sql = None }
   ) m.Cat.fts_columns in
-  { Cat.name       = m.Cat.fts_name;
-    Cat.tree_id    = m.Cat.fts_content_tree;
+  { Cat.name           = m.Cat.fts_name;
+    Cat.tree_id        = m.Cat.fts_content_tree;
     Cat.columns;
-    Cat.next_rowid = 0L }
+    Cat.next_rowid     = 0L;
+    Cat.fk_constraints = [] }
 
 let lit_ty = function
   | Ast.L_int _  -> Some Row.Integer
@@ -806,7 +809,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
   match existing with
   | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
   | Some _ (* if_not_exists = true: silently succeed *) ->
-    Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true }))
+    Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true; fk_constraints = [] }))
   | None ->
     (* Validate CHECK expressions — reject forms that can't be serialized *)
     let rec check_expr_unsupported = function
@@ -863,18 +866,35 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
               check_sql   = Option.map Ast.expr_to_sql c.check }
       ) columns in
       (* Generate auto-UNIQUE index specs for table-level constraints *)
-      let uniq_idxs = List.mapi (fun i tc ->
+      let uniq_idxs = List.filter_map (fun (i, tc) ->
         match tc with
         | Ast.TC_unique cols ->
           let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
               name (String.concat "_" cols) i in
-          (idx_name, cols)
+          Some (idx_name, cols)
         | Ast.TC_primary_key cols ->
           let idx_name = Printf.sprintf "__pk_%s_%s_%d"
               name (String.concat "_" cols) i in
-          (idx_name, cols)
+          Some (idx_name, cols)
+        | Ast.TC_foreign_key _ -> None
+      ) (List.mapi (fun i tc -> (i, tc)) constraints) in
+      (* Extract FK constraints from column-level REFERENCES *)
+      let col_fks = List.filter_map (fun (cd : Ast.column_def) ->
+        match cd.Ast.fk_ref with
+        | None -> None
+        | Some (parent_table, parent_col) ->
+          Some (cd.Ast.name, parent_table, parent_col)
+      ) columns in
+      (* Extract FK constraints from table-level FOREIGN KEY *)
+      let tbl_fks = List.filter_map (function
+        | Ast.TC_foreign_key { local_cols; parent_table; parent_cols } ->
+          (match local_cols, parent_cols with
+           | lc :: _, pc :: _ -> Some (lc, parent_table, pc)
+           | _ -> None)
+        | _ -> None
       ) constraints in
-      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists }))
+      let fk_constraints = col_fks @ tbl_fks in
+      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints }))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
@@ -2143,10 +2163,11 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
     (* FROM-less SELECT: bind each expression without any table context.
        We use a dummy empty table_meta for the resolver. *)
     let dummy_meta : Cat.table_meta = {
-      Cat.name    = "__const__";
-      Cat.tree_id = 0;
-      Cat.columns = [];
-      Cat.next_rowid = 0L;
+      Cat.name           = "__const__";
+      Cat.tree_id        = 0;
+      Cat.columns        = [];
+      Cat.next_rowid     = 0L;
+      Cat.fk_constraints = [];
     } in
     let bound = List.map (fun (expr, alias) ->
       match bind_expr ~param_counter ~named_params dummy_meta expr with
@@ -2196,10 +2217,11 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
            Row.check_sql   = None;
          }) col_names in
        let cte_meta : Cat.table_meta = {
-         Cat.name       = name;
-         Cat.tree_id    = -1;
-         Cat.columns    = cte_cols;
-         Cat.next_rowid = 0L;
+         Cat.name           = name;
+         Cat.tree_id        = -1;
+         Cat.columns        = cte_cols;
+         Cat.next_rowid     = 0L;
+         Cat.fk_constraints = [];
        } in
        Cat.register_ephemeral cat cte_meta;
        (* For non-recursive CTEs col_source already is the fully-bound def —

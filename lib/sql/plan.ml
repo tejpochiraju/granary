@@ -46,10 +46,12 @@ type window_plan_item = {
 
 type op =
   | Op_create_table of {
-      name          : string;
-      columns       : Sqlocaml_encoding.Row.column list;
-      uniq_idxs     : (string * string list) list;
-      if_not_exists : bool;
+      name           : string;
+      columns        : Sqlocaml_encoding.Row.column list;
+      uniq_idxs      : (string * string list) list;
+      if_not_exists  : bool;
+      fk_constraints : (string * string * string) list;
+        (** [(local_col, parent_table, parent_col)] *)
     }
   | Op_insert of {
       table_meta    : Cat.table_meta;

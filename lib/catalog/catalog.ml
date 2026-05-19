@@ -19,11 +19,18 @@ let next_user_tid_init = 16
 (* Counter for monotonically-increasing index IDs, stored in sys_meta. *)
 let next_index_id_key = Bytes.of_string "next_index_id"
 
+type fk_constraint = {
+  fk_local_col    : string;
+  fk_parent_table : string;
+  fk_parent_col   : string;
+}
+
 type table_meta = {
-  name : string;
-  tree_id : S.tree_id;
-  columns : Row.column list;
-  next_rowid : int64;
+  name            : string;
+  tree_id         : S.tree_id;
+  columns         : Row.column list;
+  next_rowid      : int64;
+  fk_constraints  : fk_constraint list;
 }
 
 type index_info = {
@@ -373,6 +380,7 @@ let load_all_tables store =
         tree_id = tid;
         columns = cols;
         next_rowid;
+        fk_constraints = [];
       };
       walk_tables ()
   in
@@ -465,6 +473,48 @@ let remove_view store ~name =
   S.commit tx
 
 (* ------------------------------------------------------------------ *)
+(* FK constraint persistence                                            *)
+(* ------------------------------------------------------------------ *)
+
+let fk_meta_key table_name =
+  Bytes.of_string ("fk:" ^ table_name)
+
+let encode_fks fks =
+  let lines = List.map (fun fk ->
+    fk.fk_local_col ^ "\t" ^ fk.fk_parent_table ^ "\t" ^ fk.fk_parent_col
+  ) fks in
+  Bytes.of_string (String.concat "\n" lines)
+
+let decode_fks bytes =
+  let s = Bytes.to_string bytes in
+  if s = "" then []
+  else
+    List.filter_map (fun line ->
+      match String.split_on_char '\t' line with
+      | [lc; pt; pc] -> Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc }
+      | _ -> None
+    ) (String.split_on_char '\n' s)
+
+let load_fk_constraints_raw store table_name =
+  let key = fk_meta_key table_name in
+  let%lwt tx = S.ro_begin store in
+  let%lwt v = S.get tx sys_meta_tid key in
+  let%lwt () = S.ro_end tx in
+  Lwt.return (match v with None -> [] | Some b -> decode_fks b)
+
+let save_fk_constraints t ~table_name ~fks =
+  let key = fk_meta_key table_name in
+  let%lwt tx = S.rw_begin t.store in
+  let%lwt () = if fks = [] then S.del tx sys_meta_tid key
+               else S.put tx sys_meta_tid key (encode_fks fks) in
+  S.commit tx
+
+let set_fk_constraints t ~table_name ~fks =
+  match Hashtbl.find_opt t.cache table_name with
+  | None -> ()
+  | Some meta -> Hashtbl.replace t.cache table_name { meta with fk_constraints = fks }
+
+(* ------------------------------------------------------------------ *)
 (* Public API                                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -472,6 +522,15 @@ let open_ store =
   let%lwt cache = load_all_tables store in
   let%lwt indexes = load_all_indexes store in
   let%lwt fts = load_all_fts store in
+  (* Load FK constraints for each table *)
+  let names = Hashtbl.fold (fun k _ acc -> k :: acc) cache [] in
+  let%lwt () = Lwt_list.iter_s (fun name ->
+    let%lwt fks = load_fk_constraints_raw store name in
+    (match Hashtbl.find_opt cache name with
+     | Some meta -> Hashtbl.replace cache name { meta with fk_constraints = fks }
+     | None -> ());
+    Lwt.return_unit
+  ) names in
   Lwt.return { store; cache; indexes; fts }
 
 (** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
@@ -484,7 +543,7 @@ let create_table t ~name ~columns =
   if Hashtbl.mem t.cache name then
     failwith (Printf.sprintf "table '%s' already exists" name);
   let%lwt tid = next_user_tid t in
-  let m = { name; tree_id = tid; columns; next_rowid = 1L } in
+  let m = { name; tree_id = tid; columns; next_rowid = 1L; fk_constraints = [] } in
   let%lwt tx = S.rw_begin t.store in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
   let%lwt () =

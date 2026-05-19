@@ -102,6 +102,7 @@ rule token = parse
   | "references" { REFERENCES }
   | "FOREIGN"  { FOREIGN }
   | "foreign"  { FOREIGN }
+  | "key"      { KEY }
   | "LIKE"     { LIKE }
   | "GLOB"     { GLOB }
   | "BETWEEN"  { BETWEEN }

@@ -311,8 +311,8 @@ let plan_select cat
     Plan.Op_limit { limit = n; offset = off; child = after_distinct }
 
 let rec plan ?cat = function
-  | Sema.BS_create_table { name; columns; uniq_idxs; if_not_exists } ->
-    Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists }
+  | Sema.BS_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints } ->
+    Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update } ->
     let plan_upsert = match upsert_update with
       | None -> None

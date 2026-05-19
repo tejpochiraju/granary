@@ -32,8 +32,8 @@ let bind cat stmt = Lwt_main.run (Sema.bind cat stmt)
 let bind_create_new () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None; check = None };
-    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None; check = None };
+    Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
+    Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
@@ -49,7 +49,7 @@ let bind_create_new () =
 let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
-  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None; check = None }] in
+  let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None; check = None; fk_ref = None }] in
   let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
@@ -59,8 +59,8 @@ let bind_create_duplicate () =
 let bind_create_preserves_cols () =
   let cat = two_col_cat () in
   let cols = [
-    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None };
-    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None };
+    Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
+    Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
@@ -1734,7 +1734,7 @@ let bind_create_default_null () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_int; not_null = false; primary_key = false;
-          default = Some Ast.L_null; check = None };
+          default = Some Ast.L_null; check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
@@ -1749,7 +1749,7 @@ let bind_create_default_real () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_real; not_null = false; primary_key = false;
-          default = Some (Ast.L_real 3.14); check = None };
+          default = Some (Ast.L_real 3.14); check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with
@@ -1764,7 +1764,7 @@ let bind_create_default_blob () =
   let cat = two_col_cat () in
   let cols = [
     Ast.{ name = "x"; ty = Ty_blob; not_null = false; primary_key = false;
-          default = Some (Ast.L_blob (Bytes.of_string "hi")); check = None };
+          default = Some (Ast.L_blob (Bytes.of_string "hi")); check = None; fk_ref = None };
   ] in
   let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
   match bind cat stmt with

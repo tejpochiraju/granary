@@ -87,12 +87,14 @@ type bound_join = {
 
 type bound_stmt =
   | BS_create_table of {
-      name          : string;
-      columns       : Sqlocaml_encoding.Row.column list;
-      uniq_idxs     : (string * string list) list;
+      name           : string;
+      columns        : Sqlocaml_encoding.Row.column list;
+      uniq_idxs      : (string * string list) list;
         (** Auto-generated UNIQUE index specs: (index_name, [col_name; ...]).
             Planner creates Op_create_index for each. *)
-      if_not_exists : bool;
+      if_not_exists  : bool;
+      fk_constraints : (string * string * string) list;
+        (** [(local_col, parent_table, parent_col)] *)
     }
   | BS_insert of {
       table_meta    : Sqlocaml_catalog.Catalog.table_meta;

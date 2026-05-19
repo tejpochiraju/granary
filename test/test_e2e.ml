@@ -2501,30 +2501,97 @@ let test_not_in_select_subquery () =
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
-(* FOREIGN KEY parse-only                                                *)
+(* FOREIGN KEY parse and enforcement                                      *)
 (* ------------------------------------------------------------------ *)
 
 let test_fk_parse_create () =
   run (
     let* db = Db.open_in_memory () in
     let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+    let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
     (* FK syntax must be accepted without error *)
     let* _ = Db.execute db
       "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))" in
+    (* Valid FK insert: user_id=1 exists in users *)
     let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
-    Alcotest.(check bool) "insert into FK table works (no enforcement)" true (n = Ok ());
+    Alcotest.(check bool) "valid FK insert succeeds" true (n = Ok ());
     Lwt.return_unit)
 
 let test_fk_parse_no_col () =
   run (
     let* db = Db.open_in_memory () in
     let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+    let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
     (* REFERENCES without explicit column is also valid SQL syntax *)
     let* _ = Db.execute db
       "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
-    let* n = Db.execute db "INSERT INTO orders VALUES (1, 999)" in
-    (* No FK enforcement — 999 doesn't exist in users but insert succeeds *)
-    Alcotest.(check bool) "insert without FK enforcement" true (n = Ok ());
+    (* Valid FK insert: user_id=1 exists in users *)
+    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+    Alcotest.(check bool) "REFERENCES no_col valid insert succeeds" true (n = Ok ());
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
+(* FOREIGN KEY enforcement                                               *)
+(* ------------------------------------------------------------------ *)
+
+let test_fk_valid_insert () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)" in
+    let* () = exec "INSERT INTO fk_parent VALUES (1, 'alice')" in
+    let* () = exec "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES fk_parent(id))" in
+    let* () = exec "INSERT INTO fk_child VALUES (10, 1)" in
+    let rows = query_ok db "SELECT COUNT(*) FROM fk_child" in
+    Alcotest.(check int) "one row" 1
+      (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_invalid_insert () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fk_parent2 (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fk_parent2 VALUES (1)" in
+    let* () = exec "CREATE TABLE fk_child2 (id INTEGER, pid INTEGER REFERENCES fk_parent2(id))" in
+    let* result = Db.execute db "INSERT INTO fk_child2 VALUES (10, 99)" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected FK constraint error");
+    Lwt.return_unit)
+
+let test_fk_null_allowed () =
+  let db = fresh_db () in
+  run (
+    let open Lwt.Syntax in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fk_parent3 (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fk_parent3 VALUES (1)" in
+    let* () = exec "CREATE TABLE fk_child3 (id INTEGER, pid INTEGER REFERENCES fk_parent3(id))" in
+    let* () = exec "INSERT INTO fk_child3 VALUES (10, NULL)" in
+    let rows = query_ok db "SELECT COUNT(*) FROM fk_child3" in
+    Alcotest.(check int) "null fk ok" 1
+      (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
@@ -4538,6 +4605,11 @@ let () =
     "fk_parse", [
       Alcotest.test_case "fk_references_col"     `Quick test_fk_parse_create;
       Alcotest.test_case "fk_references_no_col"  `Quick test_fk_parse_no_col;
+    ];
+    "foreign_key", [
+      Alcotest.test_case "valid_insert"   `Quick test_fk_valid_insert;
+      Alcotest.test_case "invalid_insert" `Quick test_fk_invalid_insert;
+      Alcotest.test_case "null_allowed"   `Quick test_fk_null_allowed;
     ];
     "check_constraints", [
       Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;

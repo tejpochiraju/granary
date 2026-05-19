@@ -6,7 +6,7 @@
     | Col_primary_key
     | Col_default of literal
     | Col_check   of expr
-    | Col_fk_ref             (* parse-only FK reference — no semantic meaning *)
+    | Col_fk_ref  of string * string option  (* parent_table, parent_col *)
 
   type table_item =
     | TI_col of column_def
@@ -163,6 +163,13 @@ table_item:
     { TI_constraint (Ast.TC_unique cols) }
   | PRIMARY KEY LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
     { TI_constraint (Ast.TC_primary_key cols) }
+  | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+      REFERENCES parent_table = IDENT LPAREN parent_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+    { TI_constraint (Ast.TC_foreign_key {
+        local_cols;
+        parent_table;
+        parent_cols;
+      }) }
 
 create_table:
   | CREATE TABLE name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
@@ -201,7 +208,12 @@ column_def:
           match c with Col_default l -> Some l | _ -> acc) None cs in
       let check       = List.fold_left (fun acc c ->
           match c with Col_check e -> Some e | _ -> acc) None cs in
-      { name; ty; not_null; primary_key; default; check } }
+      let fk_ref      = List.fold_left (fun acc c ->
+          match c with
+          | Col_fk_ref (t, col_opt) ->
+            Some (t, Option.value ~default:name col_opt)
+          | _ -> acc) None cs in
+      { name; ty; not_null; primary_key; default; check; fk_ref } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -214,8 +226,8 @@ column_constraint:
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
-  | REFERENCES t = IDENT                                { ignore t; Col_fk_ref }
-  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN       { ignore t; ignore c; Col_fk_ref }
+  | REFERENCES t = IDENT                                { Col_fk_ref (t, None) }
+  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN       { Col_fk_ref (t, Some c) }
 
 def_value:
   | n = INT_LIT              { L_int n }

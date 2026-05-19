@@ -1061,6 +1061,59 @@ let execute_insert ?(mode = Auto) ?(params = [||])
   in
   (* Evaluate CHECK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
+  (* Evaluate FK constraints before any writes. *)
+  let* () =
+    let fks = table_meta.Cat.fk_constraints in
+    if fks = [] then Lwt.return_unit
+    else
+      let find_col_idx cols col_name =
+        let rec fi i = function
+          | [] -> None
+          | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
+          | _ :: rest -> fi (i + 1) rest
+        in fi 0 cols
+      in
+      Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+        match find_col_idx table_meta.Cat.columns fk.fk_local_col with
+        | None -> Lwt.return_unit
+        | Some local_idx ->
+          let v = row.(local_idx) in
+          (match v with
+           | Row.V_null -> Lwt.return_unit  (* NULL FK is always valid *)
+           | fk_val ->
+             (match Cat.find_table_cached cat ~name:fk.fk_parent_table with
+              | None ->
+                Lwt.fail_with (Printf.sprintf "FOREIGN KEY: parent table '%s' not found"
+                                 fk.fk_parent_table)
+              | Some parent_meta ->
+                let parent_col_idx =
+                  match find_col_idx parent_meta.Cat.columns fk.fk_parent_col with
+                  | Some i -> i
+                  | None -> 0
+                in
+                let* ro_tx = S.ro_begin store in
+                let* cur = S.cursor_open ro_tx parent_meta.Cat.tree_id in
+                let _sr = S.cursor_first cur in
+                let found = ref false in
+                let rec scan () =
+                  if !found then ()
+                  else match S.cursor_next cur with
+                  | None -> ()
+                  | Some (_k, vbytes) ->
+                    let parent_row = Row.decode parent_meta.Cat.columns vbytes in
+                    if compare_values parent_row.(parent_col_idx) fk_val = 0 then
+                      found := true
+                    else scan ()
+                in
+                scan ();
+                S.cursor_close cur;
+                let* () = S.ro_end ro_tx in
+                if !found then Lwt.return_unit
+                else Lwt.fail_with (Printf.sprintf
+                       "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
+                       fk.fk_parent_table fk.fk_parent_col)))
+      ) fks
+  in
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -1495,7 +1548,7 @@ let execute_with_count ?(mode = Auto)
     ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
-  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints } ->
     (* Note: create_table acquires its own RW txn internally via catalog.
        This means CREATE TABLE is NOT atomic within an explicit BEGIN/COMMIT block —
        it commits immediately regardless of mode. Phase 4 work to fix. *)
@@ -1510,6 +1563,18 @@ let execute_with_count ?(mode = Auto)
         | Error msg -> Lwt.fail_with msg
         | Ok _      -> Lwt.return_unit
       ) uniq_idxs in
+      (* Persist FK constraints if any *)
+      let* () =
+        if fk_constraints = [] then Lwt.return_unit
+        else begin
+          let fk_list = List.map (fun (lc, pt, pc) ->
+            Cat.{ fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc }
+          ) fk_constraints in
+          let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
+          Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
+          Lwt.return_unit
+        end
+      in
       Lwt.return 0
     end
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->

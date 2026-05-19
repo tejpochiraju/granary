@@ -4,11 +4,18 @@
 
 type t
 
+type fk_constraint = {
+  fk_local_col    : string;
+  fk_parent_table : string;
+  fk_parent_col   : string;
+}
+
 type table_meta = {
-  name : string;
-  tree_id : Sqlocaml_store.Store.tree_id;
-  columns : Sqlocaml_encoding.Row.column list;
-  next_rowid : int64;
+  name            : string;
+  tree_id         : Sqlocaml_store.Store.tree_id;
+  columns         : Sqlocaml_encoding.Row.column list;
+  next_rowid      : int64;
+  fk_constraints  : fk_constraint list;
 }
 
 type index_info = {
@@ -154,6 +161,12 @@ val create_fts_table : t -> name:string -> columns:string list -> fts_table_meta
     RW transaction.  Does NOT commit; the caller owns the commit. *)
 val next_fts_rowid_in_txn :
   t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t
+
+(** Persist FK constraints for a table to the sys_meta B-tree. *)
+val save_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> unit Lwt.t
+
+(** Update FK constraints in the in-memory cache for a table. *)
+val set_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> unit
 
 (** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
 val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t

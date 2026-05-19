@@ -82,6 +82,11 @@ type join_kind = Inner | Left
 type table_constraint =
   | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
   | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
+  | TC_foreign_key of {
+      local_cols   : string list;
+      parent_table : string;
+      parent_cols  : string list;
+    }  (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) *)
 
 (** Expressions, statements, and column_def are mutually recursive because
     column_def.check embeds an [expr], and subquery expressions embed a [stmt]. *)
@@ -264,6 +269,8 @@ and column_def = {
   primary_key : bool;
   default     : literal option;  (* None = no DEFAULT *)
   check       : expr option;     (* None = no CHECK constraint *)
+  fk_ref      : (string * string) option;
+  (** [(parent_table, parent_col)]. None = no FK. *)
 }
 
 and alter_action =
