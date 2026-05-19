@@ -113,6 +113,13 @@ type frame_spec = {
 
 type join_kind = Inner | Left
 
+type fk_action = Sqlocaml_catalog.Catalog.fk_action =
+  | FA_no_action
+  | FA_restrict
+  | FA_cascade
+  | FA_set_null
+  | FA_set_default
+
 type table_constraint =
   | TC_unique      of string list   (** UNIQUE(col1, col2, ...) *)
   | TC_primary_key of string list   (** PRIMARY KEY(col1, col2, ...) *)
@@ -120,7 +127,9 @@ type table_constraint =
       local_cols   : string list;
       parent_table : string;
       parent_cols  : string list;
-    }  (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) *)
+      on_delete    : fk_action;
+      on_update    : fk_action;
+    }  (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) ON DELETE/UPDATE action *)
 
 (** Expressions, statements, and column_def are mutually recursive because
     column_def.check embeds an [expr], and subquery expressions embed a [stmt]. *)
@@ -318,8 +327,8 @@ and column_def = {
   primary_key : bool;
   default     : literal option;  (* None = no DEFAULT *)
   check       : expr option;     (* None = no CHECK constraint *)
-  fk_ref      : (string * string) option;
-  (** [(parent_table, parent_col)]. None = no FK. *)
+  fk_ref      : (string * string * fk_action * fk_action) option;
+  (** [(parent_table, parent_col, on_delete, on_update)]. None = no FK. *)
 }
 
 and alter_action =
