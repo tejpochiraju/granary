@@ -1564,6 +1564,62 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
   let* () = S.ro_end ro_tx in
   Lwt.return !found
 
+(** Scan [child_meta] using an existing RW transaction for rows where
+    [child_col_idx] equals [parent_val]. Returns (rowid, row) list. *)
+let[@warning "-32"] scan_child_rows_tx tx (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
+  let schema = child_meta.Cat.columns in
+  let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
+  let _sr    = S.cursor_first cur in
+  let buf    = ref [] in
+  let rec scan () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (kbytes, vbytes) ->
+      let rowid = Rowid.decode kbytes in
+      let row   = Row.decode schema vbytes in
+      if compare_values row.(child_col_idx) parent_val = 0 then
+        buf := (rowid, row) :: !buf;
+      scan ()
+  in
+  scan ();
+  S.cursor_close cur;
+  Lwt.return (List.rev !buf)
+
+(** Delete a single row and its index entries within an existing RW transaction. *)
+let[@warning "-32"] delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+  let rowid_key  = Rowid.encode rowid in
+  let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
+  let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    let col_is   = List.map (find_col_idx_by_name meta.Cat.columns) idx.idx_columns in
+    let iks      = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+    let old_ikey = Index_key.encode iks ~rowid in
+    S.del tx idx.idx_tree_id old_ikey
+  ) child_idxs in
+  S.del tx meta.Cat.tree_id rowid_key
+
+(** Update one column to [new_val] in a row within an existing RW transaction.
+    Also updates index entries for any index that covers [col_idx]. *)
+let[@warning "-32"] update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
+  let schema     = meta.Cat.columns in
+  let rowid_key  = Rowid.encode rowid in
+  let new_row    = Array.copy row in
+  new_row.(col_idx) <- new_val;
+  let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
+  let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
+    if not (List.mem col_idx col_is) then Lwt.return_unit
+    else begin
+      let old_iks  = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+      let new_iks  = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
+      let old_ikey = Index_key.encode old_iks ~rowid in
+      let new_ikey = Index_key.encode new_iks ~rowid in
+      let* () = S.del tx idx.idx_tree_id old_ikey in
+      S.put tx idx.idx_tree_id new_ikey Bytes.empty
+    end
+  ) child_idxs in
+  let new_bytes = Row.encode schema new_row in
+  S.put tx meta.Cat.tree_id rowid_key new_bytes
+
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
