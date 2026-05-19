@@ -1566,7 +1566,7 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
 
 (** Scan [child_meta] using an existing RW transaction for rows where
     [child_col_idx] equals [parent_val]. Returns (rowid, row) list. *)
-let[@warning "-32"] scan_child_rows_tx tx (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
+let scan_child_rows_tx tx (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
   let schema = child_meta.Cat.columns in
   let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
   let _sr    = S.cursor_first cur in
@@ -1586,7 +1586,7 @@ let[@warning "-32"] scan_child_rows_tx tx (child_meta : Cat.table_meta) ~child_c
   Lwt.return (List.rev !buf)
 
 (** Delete a single row and its index entries within an existing RW transaction. *)
-let[@warning "-32"] delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
   let rowid_key  = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
@@ -1599,7 +1599,7 @@ let[@warning "-32"] delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~r
 
 (** Update one column to [new_val] in a row within an existing RW transaction.
     Also updates index entries for any index that covers [col_idx]. *)
-let[@warning "-32"] update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
+let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
   let schema     = meta.Cat.columns in
   let rowid_key  = Rowid.encode rowid in
   let new_row    = Array.copy row in
@@ -1785,40 +1785,43 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                 ~col_idx:child_col_idx ~new_val
                             ) child_rows
                           | Cat.FA_set_null ->
-                            let col = List.nth child_meta.Cat.columns child_col_idx in
-                            if col.Row.not_null then
-                              Lwt.fail_with (Printf.sprintf
-                                "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
-                                child_meta.Cat.name fk.fk_local_col)
+                            let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
+                            if child_rows = [] then Lwt.return_unit
                             else begin
-                              let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
-                              Lwt_list.iter_s (fun (crid, crow) ->
-                                update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                                  ~col_idx:child_col_idx ~new_val:Row.V_null
-                              ) child_rows
+                              let col = List.nth child_meta.Cat.columns child_col_idx in
+                              if col.Row.not_null then
+                                Lwt.fail_with (Printf.sprintf
+                                  "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
+                                  child_meta.Cat.name fk.fk_local_col)
+                              else
+                                Lwt_list.iter_s (fun (crid, crow) ->
+                                  update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                    ~col_idx:child_col_idx ~new_val:Row.V_null
+                                ) child_rows
                             end
                           | Cat.FA_set_default ->
-                            let col = List.nth child_meta.Cat.columns child_col_idx in
-                            let default_val = match col.Row.default with
-                              | None               -> Row.V_null
-                              | Some Row.DV_int  n -> Row.V_int  n
-                              | Some Row.DV_text s -> Row.V_text s
-                              | Some Row.DV_real f -> Row.V_real f
-                              | Some Row.DV_blob b -> Row.V_blob b
-                              | Some Row.DV_null   -> Row.V_null
-                            in
-                            let* () =
+                            let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
+                            if child_rows = [] then Lwt.return_unit
+                            else begin
+                              let col = List.nth child_meta.Cat.columns child_col_idx in
+                              let default_val = match col.Row.default with
+                                | None               -> Row.V_null
+                                | Some Row.DV_int  n -> Row.V_int  n
+                                | Some Row.DV_text s -> Row.V_text s
+                                | Some Row.DV_real f -> Row.V_real f
+                                | Some Row.DV_blob b -> Row.V_blob b
+                                | Some Row.DV_null   -> Row.V_null
+                              in
                               if col.Row.not_null && default_val = Row.V_null then
                                 Lwt.fail_with (Printf.sprintf
                                   "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                                   child_meta.Cat.name fk.fk_local_col)
-                              else Lwt.return_unit
-                            in
-                            let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
-                            Lwt_list.iter_s (fun (crid, crow) ->
-                              update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                                ~col_idx:child_col_idx ~new_val:default_val
-                            ) child_rows))
+                              else
+                                Lwt_list.iter_s (fun (crid, crow) ->
+                                  update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                    ~col_idx:child_col_idx ~new_val:default_val
+                                ) child_rows
+                            end))
                   ) fks
                 ) child_refs
             in
@@ -1961,40 +1964,43 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                             delete_row_in_tx tx cat child_meta ~rowid:crid ~row:crow
                           ) child_rows
                         | Cat.FA_set_null ->
-                          let col = List.nth child_meta.Cat.columns child_col_idx in
-                          if col.Row.not_null then
-                            Lwt.fail_with (Printf.sprintf
-                              "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
-                              child_meta.Cat.name fk.fk_local_col)
+                          let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in
+                          if child_rows = [] then Lwt.return_unit
                           else begin
-                            let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in
-                            Lwt_list.iter_s (fun (crid, crow) ->
-                              update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                                ~col_idx:child_col_idx ~new_val:Row.V_null
-                            ) child_rows
+                            let col = List.nth child_meta.Cat.columns child_col_idx in
+                            if col.Row.not_null then
+                              Lwt.fail_with (Printf.sprintf
+                                "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
+                                child_meta.Cat.name fk.fk_local_col)
+                            else
+                              Lwt_list.iter_s (fun (crid, crow) ->
+                                update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                  ~col_idx:child_col_idx ~new_val:Row.V_null
+                              ) child_rows
                           end
                         | Cat.FA_set_default ->
-                          let col = List.nth child_meta.Cat.columns child_col_idx in
-                          let default_val = match col.Row.default with
-                            | None               -> Row.V_null
-                            | Some Row.DV_int  n -> Row.V_int  n
-                            | Some Row.DV_text s -> Row.V_text s
-                            | Some Row.DV_real f -> Row.V_real f
-                            | Some Row.DV_blob b -> Row.V_blob b
-                            | Some Row.DV_null   -> Row.V_null
-                          in
-                          let* () =
+                          let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in
+                          if child_rows = [] then Lwt.return_unit
+                          else begin
+                            let col = List.nth child_meta.Cat.columns child_col_idx in
+                            let default_val = match col.Row.default with
+                              | None               -> Row.V_null
+                              | Some Row.DV_int  n -> Row.V_int  n
+                              | Some Row.DV_text s -> Row.V_text s
+                              | Some Row.DV_real f -> Row.V_real f
+                              | Some Row.DV_blob b -> Row.V_blob b
+                              | Some Row.DV_null   -> Row.V_null
+                            in
                             if col.Row.not_null && default_val = Row.V_null then
                               Lwt.fail_with (Printf.sprintf
                                 "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                                 child_meta.Cat.name fk.fk_local_col)
-                            else Lwt.return_unit
-                          in
-                          let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in
-                          Lwt_list.iter_s (fun (crid, crow) ->
-                            update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                              ~col_idx:child_col_idx ~new_val:default_val
-                          ) child_rows))
+                            else
+                              Lwt_list.iter_s (fun (crid, crow) ->
+                                update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                  ~col_idx:child_col_idx ~new_val:default_val
+                              ) child_rows
+                          end))
                   ) fks
                 ) child_refs
             in
