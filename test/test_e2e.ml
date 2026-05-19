@@ -5249,6 +5249,86 @@ let case_insensitive_tests =
            Lwt.return_unit)))
   ]
 
+(* ------------------------------------------------------------------ *)
+(* DEFAULT CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME             *)
+(* ------------------------------------------------------------------ *)
+
+let default_expression_tests =
+  (* 2024-01-15 00:00:00 UTC as unix timestamp (same as test_date_now) *)
+  let fixed_ts = 1705276800.0 in
+  let fixed_clock = fun () -> fixed_ts in
+  let fresh_clock_db () = run (Db.open_in_memory ~clock:fixed_clock ()) in
+  let exec_db db sql =
+    run (
+      let* result = Db.execute db sql in
+      (match result with
+       | Ok () -> ()
+       | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
+      Lwt.return_unit)
+  in
+  let query_db db sql =
+    run (
+      let* result = Db.query db sql in
+      match result with
+      | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
+      | Ok stream -> Lwt_stream.to_list stream)
+  in
+  [ Alcotest.test_case "default current_timestamp" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP)";
+      exec_db db "INSERT INTO t (id) VALUES (1)";
+      let rows = query_db db "SELECT ts FROM t" in
+      Alcotest.(check int) "one row" 1 (List.length rows);
+      (match rows with
+       | [| Db.V_text ts |] :: _ ->
+         Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
+       | _ -> Alcotest.fail "expected text value"))
+  ; Alcotest.test_case "default current_date" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, d TEXT DEFAULT CURRENT_DATE)";
+      exec_db db "INSERT INTO t (id) VALUES (42)";
+      let rows = query_db db "SELECT d FROM t" in
+      (match rows with
+       | [| Db.V_text d |] :: _ ->
+         Alcotest.(check string) "date value" "2024-01-15" d
+       | _ -> Alcotest.fail "expected text value"))
+  ; Alcotest.test_case "default current_time" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, tm TEXT DEFAULT CURRENT_TIME)";
+      exec_db db "INSERT INTO t (id) VALUES (1)";
+      let rows = query_db db "SELECT tm FROM t" in
+      (match rows with
+       | [| Db.V_text tm |] :: _ ->
+         Alcotest.(check string) "time value" "00:00:00" tm
+       | _ -> Alcotest.fail "expected text value"))
+  ; Alcotest.test_case "explicit value overrides default" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP)";
+      exec_db db "INSERT INTO t (id, ts) VALUES (1, '2020-01-01 00:00:00')";
+      let rows = query_db db "SELECT ts FROM t" in
+      (match rows with
+       | [| Db.V_text ts |] :: _ ->
+         Alcotest.(check string) "explicit value" "2020-01-01 00:00:00" ts
+       | _ -> Alcotest.fail "expected text value"))
+  ; Alcotest.test_case "null overrides default for nullable" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP)";
+      exec_db db "INSERT INTO t (id, ts) VALUES (1, NULL)";
+      let rows = query_db db "SELECT ts FROM t" in
+      (match rows with
+       | [| Db.V_null |] :: _ -> ()
+       | _ -> Alcotest.fail "expected NULL"))
+  ; Alcotest.test_case "case insensitive current_timestamp" `Quick (fun () ->
+      let db = fresh_clock_db () in
+      exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT current_timestamp)";
+      exec_db db "INSERT INTO t (id) VALUES (1)";
+      let rows = query_db db "SELECT ts FROM t" in
+      (match rows with
+       | [| Db.V_text ts |] :: _ ->
+         Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
+       | _ -> Alcotest.fail "expected text value"))
+  ]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5750,4 +5830,5 @@ let () =
     ];
     "case_insensitive", case_insensitive_tests;
     "update_delete_limit", update_delete_limit_tests;
+    "default_expressions", default_expression_tests;
   ]

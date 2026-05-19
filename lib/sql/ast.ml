@@ -14,6 +14,9 @@ type literal =
   | L_null
   | L_real of float
   | L_blob of bytes
+  | L_current_timestamp
+  | L_current_date
+  | L_current_time
 
 type param =
   | Param_anon            (** ? — assigned next slot in encounter order *)
@@ -380,6 +383,9 @@ let rec expr_to_sql = function
   | E_lit L_null     -> "NULL"
   | E_lit (L_real f) -> Printf.sprintf "%.17g" f
   | E_lit (L_blob _) -> failwith "expr_to_sql: BLOB literals not supported in CHECK constraints"
+  | E_lit L_current_timestamp -> "CURRENT_TIMESTAMP"
+  | E_lit L_current_date      -> "CURRENT_DATE"
+  | E_lit L_current_time      -> "CURRENT_TIME"
   | E_col name       -> name
   | E_tbl_col (t, c) -> Printf.sprintf "%s.%s" t c
   | E_param Param_anon -> "?"

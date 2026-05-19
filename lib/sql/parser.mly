@@ -374,6 +374,11 @@ def_value:
   | f = FLOAT_LIT            { L_real f }
   | MINUS n = INT_LIT        { L_int (Int64.neg n) }
   | MINUS f = FLOAT_LIT      { L_real (-. f) }
+  | id = any_ident           { match String.uppercase_ascii id with
+                               | "CURRENT_TIMESTAMP" -> L_current_timestamp
+                               | "CURRENT_DATE"      -> L_current_date
+                               | "CURRENT_TIME"      -> L_current_time
+                               | _ -> failwith (Printf.sprintf "unknown DEFAULT value: %s" id) }
 
 opt_conflict:
   | OR REPLACE  { Some Ast.CA_replace  }

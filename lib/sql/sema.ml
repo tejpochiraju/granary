@@ -245,6 +245,9 @@ let lit_ty = function
   | Ast.L_null   -> None   (* NULL is compatible with any column *)
   | Ast.L_real _ -> Some Row.Real
   | Ast.L_blob _ -> Some Row.Blob
+  | Ast.L_current_timestamp
+  | Ast.L_current_date
+  | Ast.L_current_time -> Some Row.Text  (* resolved to TEXT at runtime *)
 
 let ty_equal (a : Row.ty) (b : Row.ty) = match a, b with
   | Row.Integer, Row.Integer -> true
@@ -919,6 +922,9 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
         | Ast.L_null   -> Row.DV_null
         | Ast.L_real f -> Row.DV_real f
         | Ast.L_blob b -> Row.DV_blob b
+        | Ast.L_current_timestamp -> Row.DV_current_timestamp
+        | Ast.L_current_date      -> Row.DV_current_date
+        | Ast.L_current_time      -> Row.DV_current_time
       in
       let row_cols = List.map (fun (c : Ast.column_def) ->
         Row.{ name        = c.name;
@@ -990,13 +996,16 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
 (* INSERT                                                               *)
 (* ------------------------------------------------------------------ *)
 
-(** Convert a [Row.default_value] to an [Ast.literal]. *)
-let dv_to_lit : Row.default_value -> Ast.literal = function
-  | Row.DV_int  n -> Ast.L_int n
-  | Row.DV_text s -> Ast.L_text s
-  | Row.DV_null   -> Ast.L_null
-  | Row.DV_real f -> Ast.L_real f
-  | Row.DV_blob b -> Ast.L_blob b
+(** Convert a [Row.default_value] to a [bound_expr] suitable for INSERT planning. *)
+let dv_to_bound_expr : Row.default_value -> bound_expr = function
+  | Row.DV_int  n -> BE_lit (Ast.L_int n)
+  | Row.DV_text s -> BE_lit (Ast.L_text s)
+  | Row.DV_null   -> BE_lit Ast.L_null
+  | Row.DV_real f -> BE_lit (Ast.L_real f)
+  | Row.DV_blob b -> BE_lit (Ast.L_blob b)
+  | Row.DV_current_timestamp -> BE_func (Ast.Fn_datetime, [BE_lit (Ast.L_text "now")])
+  | Row.DV_current_date      -> BE_func (Ast.Fn_date,     [BE_lit (Ast.L_text "now")])
+  | Row.DV_current_time      -> BE_func (Ast.Fn_time,     [BE_lit (Ast.L_text "now")])
 
 let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
   match Cat.find_fts cat table with
@@ -1139,11 +1148,11 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
                | Some bexpr -> (i, bexpr)
                | None ->
                  (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
-                 let lit = match col.Row.default with
-                   | Some dv -> dv_to_lit dv
-                   | None    -> Ast.L_null
+                 let bexpr = match col.Row.default with
+                   | Some dv -> dv_to_bound_expr dv
+                   | None    -> BE_lit Ast.L_null
                  in
-                 (i, BE_lit lit))
+                 (i, bexpr))
            in
            let full_pairs = per_col_results in
            (* 3. NOT NULL enforcement: reject if any NOT NULL column has a NULL literal.

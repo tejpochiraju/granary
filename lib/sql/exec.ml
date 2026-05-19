@@ -16,6 +16,10 @@ let lit_to_value : Ast.literal -> Row.value = function
   | Ast.L_null   -> Row.V_null
   | Ast.L_real f -> Row.V_real f
   | Ast.L_blob b -> Row.V_blob b
+  | Ast.L_current_timestamp
+  | Ast.L_current_date
+  | Ast.L_current_time ->
+    failwith "lit_to_value: CURRENT_* should not appear as a plan literal"
 
 let value_to_literal : Row.value -> Ast.literal = function
   | Row.V_int n  -> Ast.L_int n
@@ -1850,6 +1854,15 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                 | Some Row.DV_real f -> Row.V_real f
                                 | Some Row.DV_blob b -> Row.V_blob b
                                 | Some Row.DV_null   -> Row.V_null
+                                | Some Row.DV_current_timestamp ->
+                                  eval_expr clock params [||]
+                                    (Plan.P_func (Ast.Fn_datetime, [Plan.P_lit (Ast.L_text "now")]))
+                                | Some Row.DV_current_date ->
+                                  eval_expr clock params [||]
+                                    (Plan.P_func (Ast.Fn_date, [Plan.P_lit (Ast.L_text "now")]))
+                                | Some Row.DV_current_time ->
+                                  eval_expr clock params [||]
+                                    (Plan.P_func (Ast.Fn_time, [Plan.P_lit (Ast.L_text "now")]))
                               in
                               if col.Row.not_null && default_val = Row.V_null then
                                 Lwt.fail_with (Printf.sprintf
@@ -2056,6 +2069,15 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                               | Some Row.DV_real f -> Row.V_real f
                               | Some Row.DV_blob b -> Row.V_blob b
                               | Some Row.DV_null   -> Row.V_null
+                              | Some Row.DV_current_timestamp ->
+                                eval_expr clock params [||]
+                                  (Plan.P_func (Ast.Fn_datetime, [Plan.P_lit (Ast.L_text "now")]))
+                              | Some Row.DV_current_date ->
+                                eval_expr clock params [||]
+                                  (Plan.P_func (Ast.Fn_date, [Plan.P_lit (Ast.L_text "now")]))
+                              | Some Row.DV_current_time ->
+                                eval_expr clock params [||]
+                                  (Plan.P_func (Ast.Fn_time, [Plan.P_lit (Ast.L_text "now")]))
                             in
                             if col.Row.not_null && default_val = Row.V_null then
                               Lwt.fail_with (Printf.sprintf
@@ -2306,7 +2328,10 @@ let execute_with_count ?(mode = Auto)
                             | Some (Ast.L_int  n) -> Some (Row.DV_int  n)
                             | Some (Ast.L_text s) -> Some (Row.DV_text s)
                             | Some (Ast.L_real f) -> Some (Row.DV_real f)
-                            | Some (Ast.L_blob b) -> Some (Row.DV_blob b));
+                            | Some (Ast.L_blob b) -> Some (Row.DV_blob b)
+                            | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
+                            | Some Ast.L_current_date      -> Some Row.DV_current_date
+                            | Some Ast.L_current_time      -> Some Row.DV_current_time);
          Row.check_sql   = Option.map Ast.expr_to_sql col_def.Ast.check;
        } in
        let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
