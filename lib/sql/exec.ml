@@ -52,6 +52,18 @@ let compare_with_nulls (dir : [`Asc | `Desc]) (nulls : [`Nulls_first | `Nulls_la
     let c = compare_values va vb in
     (match dir with `Asc -> c | `Desc -> -c)
 
+let list_drop n lst =
+  let rec go k = function
+    | [] -> []
+    | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
+  in go n lst
+
+let list_take n lst =
+  let rec go k = function
+    | [] -> []
+    | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
+  in go n lst
+
 (** Find a column ordinal by name within a [Row.column] list. *)
 let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
   let rec find i = function
@@ -1664,18 +1676,6 @@ let execute_update ?(mode = Auto) ?(params = [||])
   let matches = List.rev !buf in
   (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
   let matches =
-    let drop n lst =
-      let rec go k = function
-        | [] -> []
-        | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
-      in go n lst
-    in
-    let take n lst =
-      let rec go k = function
-        | [] -> []
-        | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
-      in go n lst
-    in
     let sorted =
       if order = [] then matches
       else
@@ -1692,11 +1692,11 @@ let execute_update ?(mode = Auto) ?(params = [||])
     in
     let after_offset = match offset with
       | None | Some 0 -> sorted
-      | Some n -> drop n sorted
+      | Some n -> list_drop n sorted
     in
     match limit with
     | None -> after_offset
-    | Some n -> take n after_offset
+    | Some n -> list_take n after_offset
   in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
@@ -1946,18 +1946,6 @@ let execute_delete ?(mode = Auto) ?(params = [||])
   let matches = List.rev !buf in
   (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
   let matches =
-    let drop n lst =
-      let rec go k = function
-        | [] -> []
-        | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
-      in go n lst
-    in
-    let take n lst =
-      let rec go k = function
-        | [] -> []
-        | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
-      in go n lst
-    in
     let sorted =
       if order = [] then matches
       else
@@ -1974,11 +1962,11 @@ let execute_delete ?(mode = Auto) ?(params = [||])
     in
     let after_offset = match offset with
       | None | Some 0 -> sorted
-      | Some n -> drop n sorted
+      | Some n -> list_drop n sorted
     in
     match limit with
     | None -> after_offset
-    | Some n -> take n after_offset
+    | Some n -> list_take n after_offset
   in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
@@ -3602,18 +3590,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let matched = List.rev !buf in
     (* Apply ORDER BY, OFFSET, LIMIT *)
     let matched =
-      let drop n lst =
-        let rec go k = function
-          | [] -> []
-          | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
-        in go n lst
-      in
-      let take n lst =
-        let rec go k = function
-          | [] -> []
-          | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
-        in go n lst
-      in
       let sorted =
         if order = [] then matched
         else
@@ -3630,11 +3606,11 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       in
       let after_offset = match offset with
         | None | Some 0 -> sorted
-        | Some n -> drop n sorted
+        | Some n -> list_drop n sorted
       in
       match limit with
       | None -> after_offset
-      | Some n -> take n after_offset
+      | Some n -> list_take n after_offset
     in
     (* Compute new values for each matched row, project RETURNING from new row. *)
     let result_rows = List.map (fun (_, old_row) ->
@@ -3644,7 +3620,10 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       ) assignments;
       Array.of_list (List.map (eval_expr clock params new_row) returning)
     ) matched in
-    (* Execute the actual update. *)
+    (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot
+       and the actual write use separate table scans that both apply the same
+       order/limit/offset. Non-deterministic expressions (e.g. random()) could
+       return RETURNING values for rows different from those actually modified. *)
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
     let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
@@ -3674,18 +3653,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let matched = List.rev !buf in
     (* Apply ORDER BY, OFFSET, LIMIT *)
     let matched =
-      let drop n lst =
-        let rec go k = function
-          | [] -> []
-          | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
-        in go n lst
-      in
-      let take n lst =
-        let rec go k = function
-          | [] -> []
-          | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
-        in go n lst
-      in
       let sorted =
         if order = [] then matched
         else
@@ -3702,15 +3669,19 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       in
       let after_offset = match offset with
         | None | Some 0 -> sorted
-        | Some n -> drop n sorted
+        | Some n -> list_drop n sorted
       in
       match limit with
       | None -> after_offset
-      | Some n -> take n after_offset
+      | Some n -> list_take n after_offset
     in
     let result_rows = List.map (fun old_row ->
       Array.of_list (List.map (eval_expr clock params old_row) returning)
     ) matched in
+    (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot
+       and the actual write use separate table scans that both apply the same
+       order/limit/offset. Non-deterministic expressions (e.g. random()) could
+       return RETURNING values for rows different from those actually modified. *)
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
     let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~order ~limit ~offset ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
