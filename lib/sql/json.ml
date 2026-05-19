@@ -281,7 +281,7 @@ let path_modify mode v path new_val =
   match parse_path path with
   | Error _ -> v
   | Ok [] ->
-    (match mode with Set -> new_val | Insert | Replace -> v)
+    (match mode with Set | Replace -> new_val | Insert -> v)
   | Ok steps ->
     let rec go v steps =
       match steps with
@@ -307,7 +307,11 @@ let path_modify mode v path new_val =
            let n = List.length elems in
            let i = if i < 0 then n + i else i in
            (match mode with
-            | Set | Replace ->
+            | Set ->
+              if i < 0 || i > n then v
+              else if i = n then J_array (elems @ [new_val])
+              else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
+            | Replace ->
               if i < 0 || i >= n then v
               else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
             | Insert ->

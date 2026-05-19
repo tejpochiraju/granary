@@ -4556,7 +4556,10 @@ let test_json_set () =
     [| Db.V_text "[1,99,3]" |] (List.nth r3 0);
   let r4 = query_ok db {|SELECT json_set('{"a":1}', '$.b', 2, '$.c', 3)|} in
   Alcotest.(check row_testable) "set multiple pairs"
-    [| Db.V_text {|{"a":1,"b":2,"c":3}|} |] (List.nth r4 0)
+    [| Db.V_text {|{"a":1,"b":2,"c":3}|} |] (List.nth r4 0);
+  let r5 = query_ok db {|SELECT json_set('[1,2,3]', '$[3]', 4)|} in
+  Alcotest.(check row_testable) "set at array length = append"
+    [| Db.V_text "[1,2,3,4]" |] (List.nth r5 0)
 
 let test_json_insert () =
   let db = fresh_db () in
@@ -4574,7 +4577,10 @@ let test_json_replace () =
     [| Db.V_text {|{"a":99}|} |] (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_replace('{"a":1}', '$.b', 2)|} in
   Alcotest.(check row_testable) "replace non-existing no-op"
-    [| Db.V_text {|{"a":1}|} |] (List.nth r2 0)
+    [| Db.V_text {|{"a":1}|} |] (List.nth r2 0);
+  let r3 = query_ok db {|SELECT json_replace('[1,2,3]', '$[3]', 4)|} in
+  Alcotest.(check row_testable) "replace out-of-bounds = no-op"
+    [| Db.V_text "[1,2,3]" |] (List.nth r3 0)
 
 let test_json_remove () =
   let db = fresh_db () in

@@ -2787,6 +2787,12 @@ let phase20_json_cases = [
   { name = "json_valid_false";
     setup = []; unordered = false;
     query = {|SELECT json_valid('not json')|} };
+  { name = "json_type_true";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('true')|} };
+  { name = "json_type_false";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('false')|} };
 ]
 
 let phase20_json_mutation_cases = [
@@ -2817,6 +2823,12 @@ let phase20_json_mutation_cases = [
   { name = "json_set_null_input";
     setup = []; unordered = false;
     query = {|SELECT json_set(NULL, '$.a', 1)|} };
+  { name = "json_set_array_append";
+    setup = []; unordered = false;
+    query = {|SELECT json_set('[1,2,3]', '$[3]', 4)|} };
+  { name = "json_remove_nonexistent";
+    setup = []; unordered = false;
+    query = {|SELECT json_remove('{"a":1}', '$.b')|} };
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
