@@ -108,12 +108,18 @@ type op =
       table_meta  : Cat.table_meta;
       assignments : (int * expr) list;  (** [(col_ordinal, new_value_expr)] *)
       where       : expr option;
+      order       : (expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list;
+      limit       : int option;
+      offset      : int option;
       indexes     : Cat.index_info list;
       returning   : expr list;
     }
   | Op_delete of {
       table_meta : Cat.table_meta;
       where      : expr option;
+      order      : (expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list;
+      limit      : int option;
+      offset     : int option;
       indexes    : Cat.index_info list;
       returning  : expr list;
     }

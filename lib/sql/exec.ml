@@ -2119,7 +2119,7 @@ let execute_with_count ?(mode = Auto)
                   ~col_idxs ~unique ~columns in
       Lwt.return 0
     end
-  | Plan.Op_update { table_meta; assignments; where; indexes; returning = _ } ->
+  | Plan.Op_update { table_meta; assignments; where; order = _; limit = _; offset = _; indexes; returning = _ } ->
     let bh = Option.map (fun f ~old_row ~new_row ->
       f ~new_row:(Some new_row) ~old_row:(Some old_row)
     ) before_hook in
@@ -2128,7 +2128,7 @@ let execute_with_count ?(mode = Auto)
     ) after_hook in
     execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
       store cat ~table_meta ~assignments ~where ~indexes
-  | Plan.Op_delete { table_meta; where; indexes; returning = _ } ->
+  | Plan.Op_delete { table_meta; where; order = _; limit = _; offset = _; indexes; returning = _ } ->
     let bh = Option.map (fun f ~old_row ->
       f ~new_row:None ~old_row:(Some old_row)
     ) before_hook in
@@ -3497,7 +3497,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
            Lwt.return [result]
        ) values in
        Lwt.return (Lwt_stream.of_list (List.concat result_lists)))
-  | Plan.Op_update { table_meta; assignments; where; indexes; returning }
+  | Plan.Op_update { table_meta; assignments; where; order = _; limit = _; offset = _; indexes; returning }
     when returning <> [] ->
     let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
@@ -3533,7 +3533,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
     let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
-  | Plan.Op_delete { table_meta; where; indexes; returning }
+  | Plan.Op_delete { table_meta; where; order = _; limit = _; offset = _; indexes; returning }
     when returning <> [] ->
     let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)

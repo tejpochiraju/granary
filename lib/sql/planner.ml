@@ -468,30 +468,50 @@ let rec plan ?cat = function
       columns  = table_meta.columns;
       if_not_exists;
     }
-  | Sema.BS_update { table_meta; assignments; where; returning } ->
+  | Sema.BS_update { table_meta; assignments; where; order; limit; offset; returning } ->
     let indexes = match cat with
       | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
       | None   -> []
     in
-    let plan_assignments =
-      List.map (fun (i, e) -> (i, plan_expr e)) assignments
-    in
-    let plan_where = Option.map plan_expr where in
+    let plan_order = List.map (fun (bk : Sema.bound_order_key) ->
+      let dir = match bk.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+      let nulls = match bk.nulls with
+        | Some `Nulls_first -> `Nulls_first
+        | Some `Nulls_last  -> `Nulls_last
+        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+      in
+      (plan_expr bk.key, dir, nulls)
+    ) order in
     Plan.Op_update {
       table_meta;
-      assignments = plan_assignments;
-      where       = plan_where;
+      assignments = List.map (fun (i, e) -> (i, plan_expr e)) assignments;
+      where       = Option.map plan_expr where;
+      order       = plan_order;
+      limit;
+      offset;
       indexes;
       returning   = List.map plan_expr returning;
     }
-  | Sema.BS_delete { table_meta; where; returning } ->
+  | Sema.BS_delete { table_meta; where; order; limit; offset; returning } ->
     let indexes = match cat with
       | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
       | None   -> []
     in
+    let plan_order = List.map (fun (bk : Sema.bound_order_key) ->
+      let dir = match bk.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+      let nulls = match bk.nulls with
+        | Some `Nulls_first -> `Nulls_first
+        | Some `Nulls_last  -> `Nulls_last
+        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+      in
+      (plan_expr bk.key, dir, nulls)
+    ) order in
     Plan.Op_delete {
       table_meta;
       where     = Option.map plan_expr where;
+      order     = plan_order;
+      limit;
+      offset;
       indexes;
       returning = List.map plan_expr returning;
     }

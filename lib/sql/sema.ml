@@ -119,11 +119,17 @@ type bound_stmt =
       table_meta  : Cat.table_meta;
       assignments : (int * bound_expr) list;
       where       : bound_expr option;
+      order       : bound_order_key list;
+      limit       : int option;
+      offset      : int option;
       returning   : bound_expr list;
     }
   | BS_delete of {
       table_meta : Cat.table_meta;
       where      : bound_expr option;
+      order      : bound_order_key list;
+      limit      : int option;
+      offset     : int option;
       returning  : bound_expr list;
     }
   | BS_drop_table of {
@@ -2020,7 +2026,17 @@ let bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists =
 (* UPDATE                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~returning =
+let bind_order_keys ~param_counter ~named_params (meta : Cat.table_meta) (oks : Ast.order_key list) =
+  List.fold_left (fun acc_r ok ->
+    match acc_r with
+    | Error _ as e -> e
+    | Ok acc ->
+      (match bind_expr ~param_counter ~named_params meta ok.Ast.expr with
+       | Error e -> Error e
+       | Ok be   -> Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls }]))
+  ) (Ok []) oks
+
+let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~order ~limit ~offset ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -2077,15 +2093,22 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~ret
           if has_subquery_in_where || has_subquery_in_assign then
             Lwt.return (Error (Unsupported "subqueries in UPDATE WHERE/SET are not supported"))
           else
-          (match bind_returning_exprs ~param_counter ~named_params meta returning with
+          let order_result = bind_order_keys ~param_counter ~named_params meta order in
+          (match order_result with
            | Error e -> Lwt.return (Error e)
-           | Ok ret_bound ->
-             Lwt.return (Ok (BS_update {
-               table_meta  = meta;
-               assignments = bound_assigns;
-               where       = bound_where;
-               returning   = ret_bound;
-             })))))
+           | Ok bound_order ->
+             (match bind_returning_exprs ~param_counter ~named_params meta returning with
+              | Error e -> Lwt.return (Error e)
+              | Ok ret_bound ->
+                Lwt.return (Ok (BS_update {
+                  table_meta  = meta;
+                  assignments = bound_assigns;
+                  where       = bound_where;
+                  order       = bound_order;
+                  limit;
+                  offset;
+                  returning   = ret_bound;
+                }))))))
 
 (* ------------------------------------------------------------------ *)
 (* DELETE                                                               *)
@@ -2112,7 +2135,7 @@ let bind_fts_delete cat ~param_counter ~named_params ~table ~where =
          where = bound_where;
        })))
 
-let bind_delete cat ~param_counter ~named_params ~table ~where ~returning =
+let bind_delete cat ~param_counter ~named_params ~table ~where ~order ~limit ~offset ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
@@ -2138,14 +2161,21 @@ let bind_delete cat ~param_counter ~named_params ~table ~where ~returning =
        if has_subquery_in_where then
          Lwt.return (Error (Unsupported "subqueries in DELETE WHERE are not supported"))
        else
-       (match bind_returning_exprs ~param_counter ~named_params meta returning with
-        | Error e -> Lwt.return (Error e)
-        | Ok ret_bound ->
-          Lwt.return (Ok (BS_delete {
-            table_meta = meta;
-            where      = bound_where;
-            returning  = ret_bound;
-          }))))
+         let order_result = bind_order_keys ~param_counter ~named_params meta order in
+         (match order_result with
+          | Error e -> Lwt.return (Error e)
+          | Ok bound_order ->
+            (match bind_returning_exprs ~param_counter ~named_params meta returning with
+             | Error e -> Lwt.return (Error e)
+             | Ok ret_bound ->
+               Lwt.return (Ok (BS_delete {
+                 table_meta = meta;
+                 where      = bound_where;
+                 order      = bound_order;
+                 limit;
+                 offset;
+                 returning  = ret_bound;
+               })))))
 
 (* ------------------------------------------------------------------ *)
 (* ALTER TABLE                                                          *)
@@ -2325,10 +2355,10 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
             ~joins ~where ~group_by ~having ~order ~limit ~offset))
   | Ast.S_create_index { name; table; columns; unique; if_not_exists } ->
     bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists
-  | Ast.S_update { table; assignments; where; returning } ->
-    bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~returning
-  | Ast.S_delete { table; where; returning } ->
-    bind_delete cat ~param_counter ~named_params ~table ~where ~returning
+  | Ast.S_update { table; assignments; where; order; limit; offset; returning } ->
+    bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~order ~limit ~offset ~returning
+  | Ast.S_delete { table; where; order; limit; offset; returning } ->
+    bind_delete cat ~param_counter ~named_params ~table ~where ~order ~limit ~offset ~returning
   | Ast.S_drop_table { name } ->
     bind_drop_table cat ~name
   | Ast.S_drop_index { name } ->

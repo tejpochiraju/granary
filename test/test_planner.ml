@@ -585,6 +585,9 @@ let plan_update_no_cat () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   let bound = bind cat stmt in
@@ -595,7 +598,7 @@ let plan_update_no_cat () =
 (** Plan BS_delete without ~cat → indexes = [] (None arm). *)
 let plan_delete_no_cat () =
   let cat = make_cat () in
-  let stmt = Ast.S_delete { table = "users"; where = None; returning = [] } in
+  let stmt = Ast.S_delete { table = "users"; where = None; order = []; limit = None; offset = None; returning = [] } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_delete { indexes = []; _ } -> ()

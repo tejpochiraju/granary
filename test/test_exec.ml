@@ -1360,9 +1360,11 @@ let exec_update_no_match_returns_zero () =
            table_meta  = m;
            assignments = [(1, Plan.P_lit (Ast.L_text "z"))];
            where       = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
+           order       = [];
+           limit       = None;
+           offset      = None;
            indexes     = [];
-         
-          returning     = [] }) in
+           returning   = [] }) in
     Alcotest.(check int) "no match → 0 rows affected" 0 n;
     Lwt.return_unit
   )
@@ -1381,9 +1383,11 @@ let exec_update_match_returns_count () =
            table_meta  = m;
            assignments = [(1, Plan.P_lit (Ast.L_text "updated"))];
            where       = None;  (* update all *)
+           order       = [];
+           limit       = None;
+           offset      = None;
            indexes     = [];
-         
-          returning     = [] }) in
+           returning   = [] }) in
     Alcotest.(check int) "all 2 rows affected" 2 n;
     Lwt.return_unit
   )
@@ -1401,9 +1405,11 @@ let exec_update_raises_in_query () =
             table_meta = m;
             assignments = [(1, Plan.P_lit (Ast.L_text "x"))];
             where = None;
+            order = [];
+            limit = None;
+            offset = None;
             indexes = [];
-          
-          returning     = [] }));
+            returning = [] }));
        Alcotest.fail "expected Failure for Op_update in query"
      with Failure _ -> ());
     Lwt.return_unit
@@ -1425,9 +1431,11 @@ let exec_delete_no_match_returns_zero () =
         (Plan.Op_delete {
            table_meta = m;
            where = Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)));
+           order = [];
+           limit = None;
+           offset = None;
            indexes = [];
-         
-          returning     = [] }) in
+           returning = [] }) in
     Alcotest.(check int) "no match → 0 deleted" 0 n;
     Lwt.return_unit
   )
@@ -1443,8 +1451,8 @@ let exec_delete_all_returns_count () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let* n = Exec.execute_with_count store cat
-        (Plan.Op_delete { table_meta = m; where = None; indexes = [];
-          returning     = [] }) in
+        (Plan.Op_delete { table_meta = m; where = None; order = []; limit = None; offset = None; indexes = [];
+          returning = [] }) in
     Alcotest.(check int) "all 3 deleted" 3 n;
     Lwt.return_unit
   )
@@ -1458,8 +1466,8 @@ let exec_delete_raises_in_query () =
     let m = Option.get meta_opt in
     (try
        ignore (Exec.query store cat
-         (Plan.Op_delete { table_meta = m; where = None; indexes = [];
-          returning     = [] }));
+         (Plan.Op_delete { table_meta = m; where = None; order = []; limit = None; offset = None; indexes = [];
+          returning = [] }));
        Alcotest.fail "expected Failure for Op_delete in query"
      with Failure _ -> ());
     Lwt.return_unit

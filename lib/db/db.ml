@@ -305,14 +305,20 @@ let subst_new_old ~schema ~new_row ~old_row stmt =
             List.map (fun (c, e) -> (c, ge e)) u.Sql.Ast.assignments }
       ) upsert_update;
     }
-  | Sql.Ast.S_update { table; assignments; where; returning } ->
+  | Sql.Ast.S_update { table; assignments; where; order; limit; offset; returning } ->
     Sql.Ast.S_update { table;
       assignments = List.map (fun (c, e) -> (c, ge e)) assignments;
       where = Option.map ge where;
+      order = List.map (fun ok -> { ok with Sql.Ast.expr = ge ok.Sql.Ast.expr }) order;
+      limit;
+      offset;
       returning = List.map ge returning;
     }
-  | Sql.Ast.S_delete { table; where; returning } ->
+  | Sql.Ast.S_delete { table; where; order; limit; offset; returning } ->
     Sql.Ast.S_delete { table; where = Option.map ge where;
+      order = List.map (fun ok -> { ok with Sql.Ast.expr = ge ok.Sql.Ast.expr }) order;
+      limit;
+      offset;
       returning = List.map ge returning }
   | Sql.Ast.S_select { distinct; proj; table; table_alias; joins;
                         where; group_by; having; order; limit; offset } ->

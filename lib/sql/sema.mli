@@ -152,11 +152,17 @@ type bound_stmt =
       assignments : (int * bound_expr) list;
         (** [(col_ordinal, new_value_expr)] *)
       where       : bound_expr option;
+      order       : bound_order_key list;
+      limit       : int option;
+      offset      : int option;
       returning   : bound_expr list;
     }
   | BS_delete of {
       table_meta : Sqlocaml_catalog.Catalog.table_meta;
       where      : bound_expr option;
+      order      : bound_order_key list;
+      limit      : int option;
+      offset     : int option;
       returning  : bound_expr list;
     }
   | BS_drop_table of {

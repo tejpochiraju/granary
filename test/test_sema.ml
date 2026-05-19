@@ -593,6 +593,9 @@ let bind_update_basic () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "carol"))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -604,6 +607,9 @@ let bind_update_unknown_table () =
   let cat = two_col_cat () in
   let stmt = Ast.S_update {
     table = "ghost"; assignments = [("x", Ast.E_lit (Ast.L_int 1L))]; where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -614,6 +620,9 @@ let bind_update_unknown_col () =
   let cat = two_col_cat () in
   let stmt = Ast.S_update {
     table = "users"; assignments = [("bogus", Ast.E_lit (Ast.L_int 1L))]; where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -625,6 +634,9 @@ let bind_update_type_mismatch () =
   (* SET id (INTEGER) = 'text' *)
   let stmt = Ast.S_update {
     table = "users"; assignments = [("id", Ast.E_lit (Ast.L_text "bad"))]; where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -639,6 +651,9 @@ let bind_update_not_null_violation () =
   (* SET id = NULL on a NOT NULL column *)
   let stmt = Ast.S_update {
     table = "users"; assignments = [("id", Ast.E_lit Ast.L_null)]; where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -651,6 +666,9 @@ let bind_update_with_where () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -663,6 +681,9 @@ let bind_update_where_unknown_col () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_col "bogus");
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -675,7 +696,7 @@ let bind_update_where_unknown_col () =
 
 let bind_delete_basic () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_delete { table = "users"; where = None; returning = [] } in
+  let stmt = Ast.S_delete { table = "users"; where = None; order = []; limit = None; offset = None; returning = [] } in
   match bind cat stmt with
   | Ok (Sema.BS_delete { where = None; _ }) -> ()
   | _ -> Alcotest.fail "expected BS_delete with no where"
@@ -685,6 +706,9 @@ let bind_delete_with_where () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)));
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -693,7 +717,7 @@ let bind_delete_with_where () =
 
 let bind_delete_unknown_table () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_delete { table = "ghost"; where = None; returning = [] } in
+  let stmt = Ast.S_delete { table = "ghost"; where = None; order = []; limit = None; offset = None; returning = [] } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
   | _ -> Alcotest.fail "expected Unknown_table ghost"
@@ -703,6 +727,9 @@ let bind_delete_where_unknown_col () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_col "bogus");
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -736,6 +763,9 @@ let bind_update_set_subquery_rejected () =
     table = "users";
     assignments = [("id", Ast.E_subquery dummy_subquery)];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -750,6 +780,9 @@ let bind_update_where_subquery_rejected () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_in_select (Ast.E_col "id", dummy_subquery));
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -764,6 +797,9 @@ let bind_update_where_exists_rejected () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = Some (Ast.E_exists dummy_subquery);
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -777,6 +813,9 @@ let bind_delete_where_subquery_rejected () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_in_select (Ast.E_col "id", dummy_subquery));
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -790,6 +829,9 @@ let bind_delete_where_exists_rejected () =
   let stmt = Ast.S_delete {
     table = "users";
     where = Some (Ast.E_exists dummy_subquery);
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -820,6 +862,9 @@ let bind_update_returning_subquery_rejected () =
     table = "users";
     assignments = [("name", Ast.E_lit (Ast.L_text "x"))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [Ast.E_subquery dummy_subquery];
   } in
   match bind cat stmt with
@@ -833,6 +878,9 @@ let bind_delete_returning_subquery_rejected () =
   let stmt = Ast.S_delete {
     table = "users";
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [Ast.E_subquery dummy_subquery];
   } in
   match bind cat stmt with
@@ -2219,6 +2267,9 @@ let bind_update_neg_col_ok () =
     table = "users";
     assignments = [("id", Ast.E_neg (Ast.E_col "id"))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2232,6 +2283,9 @@ let bind_update_bitnot_col_ok () =
     table = "users";
     assignments = [("id", Ast.E_bitnot (Ast.E_col "id"))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2248,6 +2302,9 @@ let bind_update_between_ok () =
       Ast.E_lit (Ast.L_int 1L),
       Ast.E_lit (Ast.L_int 10L)))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2263,6 +2320,9 @@ let bind_update_in_ok () =
       Ast.E_col "id",
       [Ast.E_lit (Ast.L_int 1L); Ast.E_lit (Ast.L_int 2L)]))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2280,6 +2340,9 @@ let bind_update_arith_real_mismatch () =
       Ast.E_col "id",
       Ast.E_lit (Ast.L_real 1.5)))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2298,6 +2361,9 @@ let bind_update_concat_type_mismatch () =
       Ast.E_col "name",
       Ast.E_lit (Ast.L_text "x")))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2312,6 +2378,9 @@ let bind_update_func_no_type_check () =
     table = "users";
     assignments = [("id", Ast.E_func (Ast.Fn_length, [Ast.E_col "name"]))];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
@@ -2326,6 +2395,9 @@ let bind_update_param_no_type_check () =
     table = "users";
     assignments = [("id", Ast.E_param Ast.Param_anon)];
     where = None;
+    order = [];
+    limit = None;
+    offset = None;
     returning = [];
   } in
   match bind cat stmt with
