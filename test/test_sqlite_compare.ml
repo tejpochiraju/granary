@@ -25,11 +25,15 @@ let fresh_db_path () =
     (Unix.getpid ()) (Random.bits () land 0xFFFFFF)
 
 let sqlite3_run_setup ~db_path stmts =
-  List.iter (fun sql ->
+  (* Run all setup statements in a single sqlite3 invocation so that
+     transactional statements (BEGIN/SAVEPOINT/…) share one connection. *)
+  match stmts with
+  | [] -> ()
+  | _ ->
+    let batch = String.concat "; " stmts in
     let cmd = Printf.sprintf "sqlite3 %s %s >/dev/null 2>&1"
-      (Filename.quote db_path) (Filename.quote sql) in
+      (Filename.quote db_path) (Filename.quote batch) in
     ignore (Sys.command cmd)
-  ) stmts
 
 let sqlite3_run_query ~db_path query =
   let cmd = Printf.sprintf
@@ -2831,6 +2835,62 @@ let phase20_json_mutation_cases = [
     query = {|SELECT json_remove('{"a":1}', '$.b')|} };
 ]
 
+(* ── Phase 21: SAVEPOINT ────────────────────────────────────────── *)
+
+let phase21_savepoint_cases = [
+  { name = "rollback_undoes_insert";
+    setup = [
+      "CREATE TABLE sp1 (x INTEGER)";
+      "BEGIN";
+      "SAVEPOINT s";
+      "INSERT INTO sp1 VALUES (1)";
+      "ROLLBACK TO s";
+      "COMMIT";
+    ];
+    query = "SELECT COUNT(*) FROM sp1";
+    unordered = false };
+
+  { name = "release_keeps_insert";
+    setup = [
+      "CREATE TABLE sp2 (x INTEGER)";
+      "BEGIN";
+      "SAVEPOINT s";
+      "INSERT INTO sp2 VALUES (42)";
+      "RELEASE s";
+      "COMMIT";
+    ];
+    query = "SELECT x FROM sp2";
+    unordered = false };
+
+  { name = "partial_rollback";
+    setup = [
+      "CREATE TABLE sp3 (x INTEGER)";
+      "BEGIN";
+      "INSERT INTO sp3 VALUES (1)";
+      "SAVEPOINT s";
+      "INSERT INTO sp3 VALUES (2)";
+      "ROLLBACK TO s";
+      "COMMIT";
+    ];
+    query = "SELECT COUNT(*) FROM sp3";
+    unordered = false };
+
+  { name = "nested_savepoints";
+    setup = [
+      "CREATE TABLE sp4 (x INTEGER)";
+      "BEGIN";
+      "SAVEPOINT outer";
+      "INSERT INTO sp4 VALUES (1)";
+      "SAVEPOINT inner";
+      "INSERT INTO sp4 VALUES (2)";
+      "ROLLBACK TO inner";
+      "RELEASE inner";
+      "COMMIT";
+    ];
+    query = "SELECT COUNT(*) FROM sp4";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2865,4 +2925,5 @@ let () =
     "phase19_window_agg",      List.map make_test phase19_window_agg_cases;
     "phase20_json",            List.map make_test phase20_json_cases;
     "phase20_json_mut",        List.map make_test phase20_json_mutation_cases;
+    "phase21_savepoint",       List.map make_test phase21_savepoint_cases;
   ]

@@ -4594,6 +4594,90 @@ let test_json_remove () =
   Alcotest.(check row_testable) "remove multiple paths"
     [| Db.V_text {|{"b":2}|} |] (List.nth r3 0)
 
+(* ── Phase 21: SAVEPOINT / RELEASE / ROLLBACK TO ──────────────── *)
+
+let test_savepoint_rollback_undoes_insert () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sp_t1 (x INTEGER)" in
+    let* () = exec "BEGIN" in
+    let* () = exec "SAVEPOINT s1" in
+    let* () = exec "INSERT INTO sp_t1 VALUES (1)" in
+    let* () = exec "ROLLBACK TO s1" in
+    let* () = exec "COMMIT" in
+    let* r = Db.query db "SELECT COUNT(*) FROM sp_t1" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "0 rows after rollback to savepoint" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_savepoint_release_keeps_insert () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sp_t2 (x INTEGER)" in
+    let* () = exec "BEGIN" in
+    let* () = exec "SAVEPOINT s1" in
+    let* () = exec "INSERT INTO sp_t2 VALUES (42)" in
+    let* () = exec "RELEASE s1" in
+    let* () = exec "COMMIT" in
+    let* r = Db.query db "SELECT x FROM sp_t2" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "1 row after release" 1 (List.length rows);
+    Lwt.return_unit)
+
+let test_savepoint_partial_rollback () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sp_t3 (x INTEGER)" in
+    let* () = exec "BEGIN" in
+    let* () = exec "INSERT INTO sp_t3 VALUES (1)" in
+    let* () = exec "SAVEPOINT s1" in
+    let* () = exec "INSERT INTO sp_t3 VALUES (2)" in
+    let* () = exec "ROLLBACK TO s1" in
+    let* () = exec "COMMIT" in
+    let* r = Db.query db "SELECT COUNT(*) FROM sp_t3" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "only pre-savepoint row survives" 1
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_savepoint_double_rollback () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sp_t4 (x INTEGER)" in
+    let* () = exec "BEGIN" in
+    let* () = exec "SAVEPOINT s" in
+    let* () = exec "INSERT INTO sp_t4 VALUES (1)" in
+    let* () = exec "ROLLBACK TO s" in
+    let* () = exec "INSERT INTO sp_t4 VALUES (2)" in
+    let* () = exec "ROLLBACK TO s" in
+    let* () = exec "COMMIT" in
+    let* r = Db.query db "SELECT COUNT(*) FROM sp_t4" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "savepoint reusable, 0 rows" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5059,5 +5143,11 @@ let () =
       Alcotest.test_case "json_insert"  `Quick test_json_insert;
       Alcotest.test_case "json_replace" `Quick test_json_replace;
       Alcotest.test_case "json_remove"  `Quick test_json_remove;
+    ];
+    "savepoint", [
+      Alcotest.test_case "rollback_undoes_insert"  `Quick test_savepoint_rollback_undoes_insert;
+      Alcotest.test_case "release_keeps_insert"    `Quick test_savepoint_release_keeps_insert;
+      Alcotest.test_case "partial_rollback"        `Quick test_savepoint_partial_rollback;
+      Alcotest.test_case "double_rollback"         `Quick test_savepoint_double_rollback;
     ];
   ]

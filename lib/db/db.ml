@@ -8,8 +8,10 @@ type t = {
   store            : S.t;
   catalog          : Cat.t;
   clock            : (unit -> float) option;
-  mutable explicit_txn : S.rw S.txn option;
+  mutable explicit_txn    : S.rw S.txn option;
   views            : (string, Sql.Ast.stmt) Hashtbl.t;
+  mutable savepoint_names : string list;  (* active savepoints, newest first *)
+  mutable auto_began      : bool;         (* txn started implicitly by SAVEPOINT *)
 }
 
 type value = Row.value =
@@ -29,7 +31,8 @@ type error =
 let open_in_memory ?clock () =
   let store = S.create () in
   let* catalog = Cat.open_ store in
-  Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4 }
+  Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4;
+             savepoint_names = []; auto_began = false }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -56,7 +59,8 @@ let open_file ~path =
     let* catalog = Cat.open_ store in
     let views = Hashtbl.create 4 in
     let* () = load_views_into_hashtbl store views in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
+                 savepoint_names = []; auto_began = false })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -70,7 +74,8 @@ let open_block
     let* catalog = Cat.open_ store in
     let views = Hashtbl.create 4 in
     let* () = load_views_into_hashtbl store views in
-    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views })
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
+                 savepoint_names = []; auto_began = false })
 
 let close t = S.close t.store
 
@@ -128,6 +133,51 @@ let rollback_txn t =
     t.explicit_txn <- None;
     Lwt.return (Ok ())
 
+let savepoint_txn t name =
+  let* tx = match t.explicit_txn with
+    | Some tx -> Lwt.return tx
+    | None ->
+      let* tx = S.rw_begin t.store in
+      t.explicit_txn <- Some tx;
+      t.auto_began <- true;
+      Lwt.return tx
+  in
+  let* () = S.savepoint_begin tx name in
+  t.savepoint_names <- name :: t.savepoint_names;
+  Lwt.return (Ok ())
+
+let release_savepoint t name =
+  match t.explicit_txn with
+  | None -> Lwt.return (Error (Runtime "no active transaction for RELEASE"))
+  | Some tx ->
+    let* () = S.savepoint_release tx name in
+    let rec drop = function
+      | [] -> []
+      | n :: rest when String.equal n name -> rest
+      | _ :: rest -> drop rest
+    in
+    t.savepoint_names <- drop t.savepoint_names;
+    if t.auto_began && t.savepoint_names = [] then begin
+      let* () = S.commit tx in
+      t.explicit_txn <- None;
+      t.auto_began <- false;
+      Lwt.return (Ok ())
+    end else
+      Lwt.return (Ok ())
+
+let rollback_to_savepoint t name =
+  match t.explicit_txn with
+  | None -> Lwt.return (Error (Runtime "no active transaction for ROLLBACK TO"))
+  | Some tx ->
+    let* () = S.savepoint_rollback tx name in
+    let rec trim = function
+      | [] -> []
+      | n :: _ as rest when String.equal n name -> rest
+      | _ :: rest -> trim rest
+    in
+    t.savepoint_names <- trim t.savepoint_names;
+    Lwt.return (Ok ())
+
 (* ------------------------------------------------------------------ *)
 (* Public execute / query API                                           *)
 (* ------------------------------------------------------------------ *)
@@ -139,6 +189,9 @@ let execute t sql =
   | Ok Sql.Plan.Op_begin    -> begin_txn t
   | Ok Sql.Plan.Op_commit   -> commit_txn t
   | Ok Sql.Plan.Op_rollback -> rollback_txn t
+  | Ok Sql.Plan.Op_savepoint name   -> savepoint_txn t name
+  | Ok Sql.Plan.Op_release name     -> release_savepoint t name
+  | Ok Sql.Plan.Op_rollback_to name -> rollback_to_savepoint t name
   | Ok Sql.Plan.Op_create_view { name; query } ->
     (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.replace t.views name query;
@@ -184,6 +237,15 @@ let execute_change_count t sql =
     (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
   | Ok Sql.Plan.Op_rollback ->
     let* r = rollback_txn t in
+    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+  | Ok Sql.Plan.Op_savepoint name ->
+    let* r = savepoint_txn t name in
+    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+  | Ok Sql.Plan.Op_release name ->
+    let* r = release_savepoint t name in
+    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+  | Ok Sql.Plan.Op_rollback_to name ->
+    let* r = rollback_to_savepoint t name in
     (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
   | Ok Sql.Plan.Op_create_view { name; query } ->
     (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
