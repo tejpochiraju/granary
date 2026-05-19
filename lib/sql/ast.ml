@@ -170,8 +170,9 @@ and window_spec = {
 }
 
 and order_key = {
-  expr : expr;
-  dir  : order_dir;
+  expr  : expr;
+  dir   : order_dir;
+  nulls : [`Nulls_first | `Nulls_last] option;
 }
 
 and join_clause = {

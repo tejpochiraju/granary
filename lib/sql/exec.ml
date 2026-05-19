@@ -42,6 +42,16 @@ let compare_values (a : Row.value) (b : Row.value) : int =
   | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
   | _,            _            -> 0  (* cross-type: shouldn't happen *)
 
+let compare_with_nulls (dir : [`Asc | `Desc]) (nulls : [`Nulls_first | `Nulls_last])
+    (va : Row.value) (vb : Row.value) : int =
+  match va, vb with
+  | Row.V_null, Row.V_null -> 0
+  | Row.V_null, _ -> (match nulls with `Nulls_first -> -1 | `Nulls_last -> 1)
+  | _, Row.V_null -> (match nulls with `Nulls_first -> 1 | `Nulls_last -> -1)
+  | _, _ ->
+    let c = compare_values va vb in
+    (match dir with `Asc -> c | `Desc -> -c)
+
 (** Find a column ordinal by name within a [Row.column] list. *)
 let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
   let rec find i = function
@@ -2133,19 +2143,19 @@ and group_by_partition clock params (partition_by : Plan.expr list)
     | None -> acc @ [(key, [(idx, row)])]
   ) [] indexed_rows
 
-and sort_partition_by clock params (order_by : (Plan.expr * [`Asc | `Desc]) list)
+and sort_partition_by clock params
+    (order_by : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
     (indexed_rows : (int * Row.t) list) : (int * Row.t) list =
   if order_by = [] then indexed_rows
   else
     List.sort (fun (_, ra) (_, rb) ->
       let rec cmp = function
         | [] -> 0
-        | (e, dir) :: rest ->
+        | (e, dir, nulls) :: rest ->
           let va = eval_expr clock params ra e in
           let vb = eval_expr clock params rb e in
-          let c = compare_values va vb in
-          let c' = match dir with `Asc -> c | `Desc -> -c in
-          if c' <> 0 then c' else cmp rest
+          let c = compare_with_nulls dir nulls va vb in
+          if c <> 0 then c else cmp rest
       in cmp order_by
     ) indexed_rows
 
@@ -2165,8 +2175,8 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
      let cur_rank = ref 1 in
      for pos = 0 to n - 1 do
        if pos > 0 then begin
-         let order_changed = List.exists (fun (e, _) ->
-           compare_values
+         let order_changed = List.exists (fun (e, dir, nulls) ->
+           compare_with_nulls dir nulls
              (eval_expr clock params sorted_rows.(pos)   e)
              (eval_expr clock params sorted_rows.(pos-1) e) <> 0
          ) wplan.Plan.order_by in
@@ -2179,8 +2189,8 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
      let cur_rank = ref 1 in
      for pos = 0 to n - 1 do
        if pos > 0 then begin
-         let order_changed = List.exists (fun (e, _) ->
-           compare_values
+         let order_changed = List.exists (fun (e, dir, nulls) ->
+           compare_with_nulls dir nulls
              (eval_expr clock params sorted_rows.(pos)   e)
              (eval_expr clock params sorted_rows.(pos-1) e) <> 0
          ) wplan.Plan.order_by in
@@ -2287,8 +2297,8 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        let peer_start = ref 0 in
        for pos = 0 to n - 1 do
          if pos > 0 then begin
-           let order_changed = List.exists (fun (e, _) ->
-             compare_values
+           let order_changed = List.exists (fun (e, dir, nulls) ->
+             compare_with_nulls dir nulls
                (eval_expr clock params sorted_rows.(pos)   e)
                (eval_expr clock params sorted_rows.(pos-1) e) <> 0
            ) wplan.Plan.order_by in
@@ -2311,8 +2321,8 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
          (* Find the end of the current peer group *)
          let peer_end = ref !pos in
          while !peer_end + 1 < n &&
-               List.for_all (fun (e, _) ->
-                 compare_values
+               List.for_all (fun (e, dir, nulls) ->
+                 compare_with_nulls dir nulls
                    (eval_expr clock params sorted_rows.(!peer_end + 1) e)
                    (eval_expr clock params sorted_rows.(!peer_end)     e) = 0
                ) wplan.Plan.order_by
@@ -2499,17 +2509,16 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_sort { keys; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
-    let* keys' = Lwt_list.map_s (fun (e, dir) ->
+    let* keys' = Lwt_list.map_s (fun (e, dir, nulls) ->
         let* e' = pre_eval_subquery clock store params cat e in
-        Lwt.return (e', dir)) keys in
+        Lwt.return (e', dir, nulls)) keys in
     let cmp a b =
-      List.fold_left (fun acc (key, dir) ->
+      List.fold_left (fun acc (key, dir, nulls) ->
         if acc <> 0 then acc
         else
           let va = eval_expr clock params a key
           and vb = eval_expr clock params b key in
-          let c = compare_values va vb in
-          if dir = `Asc then c else -c
+          compare_with_nulls dir nulls va vb
       ) 0 keys'
     in
     let sorted = List.sort cmp rows in

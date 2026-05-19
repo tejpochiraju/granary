@@ -621,7 +621,7 @@ let query_sort_asc () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_project {
         ordinals = [0; 1];
         child = Plan.Op_seq_scan { table_meta = m };
@@ -647,7 +647,7 @@ let query_sort_desc () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Desc)];
+      keys = [(Plan.P_col 0, `Desc, `Nulls_last)];
       child = Plan.Op_project {
         ordinals = [0; 1];
         child = Plan.Op_seq_scan { table_meta = m };
@@ -674,7 +674,7 @@ let query_sort_nulls_first () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_project {
         ordinals = [0];
         child = Plan.Op_seq_scan { table_meta = m };
@@ -704,7 +704,7 @@ let query_sort_empty () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_project {
         ordinals = [0; 1];
         child = Plan.Op_seq_scan { table_meta = m };
@@ -829,7 +829,7 @@ let execute_sort_raises () =
     let m = Option.get meta_opt in
     (try
        ignore (Exec.execute store cat
-         (Plan.Op_sort { keys = [(Plan.P_col 0, `Asc)];
+         (Plan.Op_sort { keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
                          child = Plan.Op_seq_scan { table_meta = m } }));
        Alcotest.fail "expected Failure for Op_sort in execute"
      with Failure _ -> ());
@@ -1245,7 +1245,7 @@ let query_sort_real () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_seq_scan { table_meta = m };
     } in
     let* stream = Exec.query store cat op in
@@ -1267,7 +1267,7 @@ let query_sort_blob () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_seq_scan { table_meta = m };
     } in
     let* stream = Exec.query store cat op in
@@ -1313,7 +1313,7 @@ let query_sort_multiple_nulls () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first)];
       child = Plan.Op_seq_scan { table_meta = m };
     } in
     let* stream = Exec.query store cat op in
@@ -2044,7 +2044,7 @@ let query_multikey_sort () =
     let* meta_opt = Cat.find_table cat ~name:"t" in
     let m = Option.get meta_opt in
     let op = Plan.Op_sort {
-      keys = [(Plan.P_col 0, `Asc); (Plan.P_col 1, `Asc)];
+      keys = [(Plan.P_col 0, `Asc, `Nulls_first); (Plan.P_col 1, `Asc, `Nulls_first)];
       child = Plan.Op_seq_scan { table_meta = m };
     } in
     let* stream = Exec.query store cat op in

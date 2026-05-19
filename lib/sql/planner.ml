@@ -151,7 +151,12 @@ let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
     partition_by = List.map plan_expr ws.Sema.partition_by;
     order_by     = List.map (fun (bk : Sema.bound_order_key) ->
       let dir = match bk.Sema.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-      (plan_expr bk.Sema.key, dir)
+      let nulls = match bk.Sema.nulls with
+        | Some `Nulls_first -> `Nulls_first
+        | Some `Nulls_last  -> `Nulls_last
+        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+      in
+      (plan_expr bk.Sema.key, dir, nulls)
     ) ws.Sema.order_by;
     frame        = ws.Sema.frame;
   }
@@ -258,10 +263,15 @@ let plan_select cat
   let make_sort_keys () =
     List.map (fun (bkey : Sema.bound_order_key) ->
       let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+      let nulls = match bkey.nulls with
+        | Some `Nulls_first -> `Nulls_first
+        | Some `Nulls_last  -> `Nulls_last
+        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+      in
       let e = plan_expr bkey.key in
       let e' = if windows = [] then e
                else substitute_window_slots ~n_input_cols e in
-      (e', dir)
+      (e', dir, nulls)
     ) order
   in
   let make_sort child =
@@ -393,7 +403,12 @@ let rec plan ?cat = function
        let make_sort_keys () =
          List.map (fun (bkey : Sema.bound_order_key) ->
            let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-           (plan_expr bkey.key, dir)
+           let nulls = match bkey.nulls with
+             | Some `Nulls_first -> `Nulls_first
+             | Some `Nulls_last  -> `Nulls_last
+             | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+           in
+           (plan_expr bkey.key, dir, nulls)
          ) order
        in
        let make_sort child =

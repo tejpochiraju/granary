@@ -184,6 +184,7 @@ rule token = parse
       | "ATAN2" -> ATAN2
       | "DEGREES" -> DEGREES
       | "RADIANS" -> RADIANS
+      | "NULLS"   -> NULLS
       | _           -> IDENT id
     }
   | eof                     { EOF }

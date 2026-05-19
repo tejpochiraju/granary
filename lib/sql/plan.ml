@@ -40,7 +40,7 @@ type window_plan_item = {
   func         : Ast.window_func;
   args         : expr list;
   partition_by : expr list;
-  order_by     : (expr * [`Asc | `Desc]) list;
+  order_by     : (expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list;
   frame        : Ast.frame_spec option;
 }
 
@@ -77,7 +77,7 @@ type op =
       child : op;
     }
   | Op_sort of {
-      keys  : (expr * [`Asc | `Desc]) list;
+      keys  : (expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list;
       child : op;
     }
   | Op_limit of {

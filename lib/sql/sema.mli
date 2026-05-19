@@ -44,8 +44,9 @@ type bound_expr =
     (** expr COLLATE collation_name *)
 
 type bound_order_key = {
-  key : bound_expr;
-  dir : Ast.order_dir;
+  key   : bound_expr;
+  dir   : Ast.order_dir;
+  nulls : [`Nulls_first | `Nulls_last] option;
 }
 
 type window_sema = {

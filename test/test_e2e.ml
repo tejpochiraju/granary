@@ -4429,6 +4429,25 @@ let test_math_log () =
    | Db.V_real v -> Alcotest.(check bool) "log(10,100)~2" true (abs_float (v -. 2.0) < 1e-10)
    | _ -> Alcotest.fail "expected real value for LOG(10,100)")
 
+let test_nulls_first_last () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE tnull (x INTEGER)";
+  exec db "INSERT INTO tnull VALUES (1)";
+  exec db "INSERT INTO tnull VALUES (NULL)";
+  exec db "INSERT INTO tnull VALUES (3)";
+  let r1 = query_ok db "SELECT x FROM tnull ORDER BY x ASC NULLS LAST" in
+  Alcotest.check (Alcotest.list row_testable) "asc nulls last"
+    [[| Db.V_int 1L |]; [| Db.V_int 3L |]; [| Db.V_null |]] r1;
+  let r2 = query_ok db "SELECT x FROM tnull ORDER BY x ASC NULLS FIRST" in
+  Alcotest.check (Alcotest.list row_testable) "asc nulls first"
+    [[| Db.V_null |]; [| Db.V_int 1L |]; [| Db.V_int 3L |]] r2;
+  let r3 = query_ok db "SELECT x FROM tnull ORDER BY x DESC NULLS FIRST" in
+  Alcotest.check (Alcotest.list row_testable) "desc nulls first"
+    [[| Db.V_null |]; [| Db.V_int 3L |]; [| Db.V_int 1L |]] r3;
+  let r4 = query_ok db "SELECT x FROM tnull ORDER BY x DESC NULLS LAST" in
+  Alcotest.check (Alcotest.list row_testable) "desc nulls last"
+    [[| Db.V_int 3L |]; [| Db.V_int 1L |]; [| Db.V_null |]] r4
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4499,6 +4518,9 @@ let () =
       Alcotest.test_case "order_by_text"        `Quick order_by_text;
       Alcotest.test_case "order_by_expr"        `Quick order_by_expr;
       Alcotest.test_case "join_order_by"        `Quick test_order_by_expr_join;
+    ];
+    "nulls_first_last", [
+      Alcotest.test_case "nulls_first_last" `Quick test_nulls_first_last;
     ];
     "limit_offset", [
       Alcotest.test_case "limit_no_order"       `Quick limit_no_order;

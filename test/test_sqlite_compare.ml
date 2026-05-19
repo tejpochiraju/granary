@@ -2703,6 +2703,18 @@ let phase19_math_cases = [
   (* TRUNCATE is a sqlocaml extension not present in SQLite, skipped from comparison *)
 ]
 
+let phase19_nulls_cases =
+  let setup = ["CREATE TABLE tn (x INTEGER)";
+               "INSERT INTO tn VALUES (1)";
+               "INSERT INTO tn VALUES (NULL)";
+               "INSERT INTO tn VALUES (3)"] in
+  [
+    { name = "nulls last asc";   setup; query = "SELECT x FROM tn ORDER BY x ASC NULLS LAST";   unordered = false };
+    { name = "nulls first asc";  setup; query = "SELECT x FROM tn ORDER BY x ASC NULLS FIRST";  unordered = false };
+    { name = "nulls first desc"; setup; query = "SELECT x FROM tn ORDER BY x DESC NULLS FIRST"; unordered = false };
+    { name = "nulls last desc";  setup; query = "SELECT x FROM tn ORDER BY x DESC NULLS LAST";  unordered = false };
+  ]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2733,4 +2745,5 @@ let () =
     "phase18_multigroup",      List.map make_test phase18_multigroup_cases;
     "phase18_fk",              List.map make_test phase18_fk_cases;
     "phase19_math",            List.map make_test phase19_math_cases;
+    "phase19_nulls",           List.map make_test phase19_nulls_cases;
   ]

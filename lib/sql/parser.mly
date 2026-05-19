@@ -51,6 +51,7 @@
 %token REFERENCES FOREIGN
 %token CEIL FLOOR SQRT POW EXP LN LOG LOG2 LOG10 SIGN TRUNC PI
 %token SIN COS TAN ASIN ACOS ATAN ATAN2 DEGREES RADIANS
+%token NULLS
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -465,10 +466,20 @@ order_by_clause:
   |                                                                 { [] }
   | ORDER BY keys = separated_nonempty_list(COMMA, order_key)      { keys }
 
+nulls_clause:
+  | NULLS fkw = IDENT
+    { match String.uppercase_ascii fkw with
+      | "FIRST" -> `Nulls_first
+      | "LAST"  -> `Nulls_last
+      | _ -> failwith (Printf.sprintf "expected FIRST or LAST after NULLS, got: %s" fkw) }
+
 order_key:
-  | e = expr      { { expr = e; dir = Asc } }
-  | e = expr ASC  { { expr = e; dir = Asc } }
-  | e = expr DESC { { expr = e; dir = Desc } }
+  | e = expr                               { { expr = e; dir = Asc;  nulls = None } }
+  | e = expr ASC                           { { expr = e; dir = Asc;  nulls = None } }
+  | e = expr DESC                          { { expr = e; dir = Desc; nulls = None } }
+  | e = expr nc = nulls_clause             { { expr = e; dir = Asc;  nulls = Some nc } }
+  | e = expr ASC  nc = nulls_clause        { { expr = e; dir = Asc;  nulls = Some nc } }
+  | e = expr DESC nc = nulls_clause        { { expr = e; dir = Desc; nulls = Some nc } }
 
 limit_clause:
   |                                         { (None, None) }

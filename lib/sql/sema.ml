@@ -38,8 +38,9 @@ type bound_expr =
     (** expr COLLATE collation_name *)
 
 type bound_order_key = {
-  key : bound_expr;
-  dir : Ast.order_dir;
+  key   : bound_expr;
+  dir   : Ast.order_dir;
+  nulls : [`Nulls_first | `Nulls_last] option;
 }
 
 type window_sema = {
@@ -1382,7 +1383,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                      | Ok acc ->
                        match bind_one ok.Ast.expr with
                        | Error er -> Error er
-                       | Ok be    -> Ok (acc @ [{ key = be; dir = ok.Ast.dir }])
+                       | Ok be    -> Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls }])
                    ) (Ok []) es
                  in
                  (match bind_list args with
@@ -1746,7 +1747,7 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                     | Ok keys ->
                       (match bind_order_expr ok.Ast.expr with
                        | Error e -> Error e
-                       | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir }]))
+                       | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir; nulls = ok.Ast.nulls }]))
                   ) (Ok []) order
                 in
                 (match order_result with
