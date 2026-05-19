@@ -703,6 +703,7 @@ collation_name:
       | "BINARY"  -> Ast.Collate_binary
       | "RTRIM"   -> Ast.Collate_rtrim
       | other     -> failwith ("unknown collation: " ^ other) }
+  | RTRIM  { Ast.Collate_rtrim }
 
 partition_clause:
   |                                                                   { [] }
@@ -746,8 +747,8 @@ case_expr:
    between the BETWEEN separator and the binary AND operator. *)
 between_bound:
   | l = literal                            { E_lit l }
-  | name = IDENT                           { E_col name }
-  | t = IDENT DOT c = IDENT               { E_tbl_col (t, c) }
+  | name = any_ident                       { E_col name }
+  | t = any_ident DOT c = any_ident       { E_tbl_col (t, c) }
   | e = agg_or_window_expr                 { e }
   | e = scalar_expr                        { e }
   | NOT e = between_bound                  { E_not e }
@@ -779,8 +780,8 @@ between_bound:
 
 expr:
   | l = literal                       { E_lit l }
-  | name = IDENT                      { E_col name }
-  | t = IDENT DOT c = IDENT           { E_tbl_col (t, c) }
+  | name = any_ident                  { E_col name }
+  | t = any_ident DOT c = any_ident  { E_tbl_col (t, c) }
   | e = agg_or_window_expr            { e }
   | e = scalar_expr                   { e }
   | func = window_func_name LPAREN args = window_func_args RPAREN OVER ws = window_spec
