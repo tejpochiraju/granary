@@ -199,6 +199,8 @@ rule token = parse
       | "TRIGGER"   -> TRIGGER
       | "BEFORE"    -> BEFORE
       | "AFTER"     -> AFTER
+      | "CASCADE"   -> CASCADE
+      | "RESTRICT"  -> RESTRICT
       | _           -> IDENT id
     }
   | eof                     { EOF }

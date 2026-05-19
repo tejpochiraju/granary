@@ -6,7 +6,7 @@
     | Col_primary_key
     | Col_default of literal
     | Col_check   of expr
-    | Col_fk_ref  of string * string option  (* parent_table, parent_col *)
+    | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action
 
   type table_item =
     | TI_col of column_def
@@ -46,6 +46,7 @@
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
 %token TRIGGER BEFORE AFTER
+%token CASCADE RESTRICT
 %token OVER PARTITION RECURSIVE COLLATE
 %token PRECEDING FOLLOWING
 %token CHECK
@@ -172,6 +173,23 @@ trigger_body:
   | s = stmt SEMI             { [s] }
   | s = stmt SEMI rest = trigger_body { s :: rest }
 
+(* Single referential action: CASCADE | RESTRICT | SET NULL | SET DEFAULT | NO ACTION *)
+fk_ref_action:
+  | CASCADE       { Ast.FA_cascade }
+  | RESTRICT      { Ast.FA_restrict }
+  | SET NULL      { Ast.FA_set_null }
+  | SET DEFAULT   { Ast.FA_set_default }
+  | IDENT IDENT   { Ast.FA_no_action }
+  | IDENT         { Ast.FA_restrict }
+
+(* Optional ON DELETE / ON UPDATE pair in any order *)
+fk_on_clauses:
+  | ON DELETE od = fk_ref_action ON UPDATE ou = fk_ref_action { (od, ou) }
+  | ON UPDATE ou = fk_ref_action ON DELETE od = fk_ref_action { (od, ou) }
+  | ON DELETE od = fk_ref_action  { (od, Ast.FA_no_action) }
+  | ON UPDATE ou = fk_ref_action  { (Ast.FA_no_action, ou) }
+  |                               { (Ast.FA_no_action, Ast.FA_no_action) }
+
 alter_table:
   | ALTER TABLE table = IDENT ADD COLUMN col = column_def
     { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
@@ -215,10 +233,10 @@ table_item:
     { TI_constraint (Ast.TC_primary_key cols) }
   | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
       REFERENCES parent_table = IDENT LPAREN parent_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-    { TI_constraint (Ast.TC_foreign_key {
-        local_cols;
-        parent_table;
-        parent_cols;
+      oc = fk_on_clauses
+    { let (on_delete, on_update) = oc in
+      TI_constraint (Ast.TC_foreign_key {
+        local_cols; parent_table; parent_cols; on_delete; on_update;
       }) }
 
 create_table:
@@ -260,8 +278,8 @@ column_def:
           match c with Col_check e -> Some e | _ -> acc) None cs in
       let fk_ref      = List.fold_left (fun acc c ->
           match c with
-          | Col_fk_ref (t, col_opt) ->
-            Some (t, Option.value ~default:"" col_opt)
+          | Col_fk_ref (t, col_opt, od, ou) ->
+            Some (t, Option.value ~default:"" col_opt, od, ou)
           | _ -> acc) None cs in
       { name; ty; not_null; primary_key; default; check; fk_ref } }
 
@@ -276,8 +294,10 @@ column_constraint:
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
-  | REFERENCES t = IDENT                                { Col_fk_ref (t, None) }
-  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN       { Col_fk_ref (t, Some c) }
+  | REFERENCES t = IDENT oc = fk_on_clauses
+    { let (od, ou) = oc in Col_fk_ref (t, None, od, ou) }
+  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN oc = fk_on_clauses
+    { let (od, ou) = oc in Col_fk_ref (t, Some c, od, ou) }
 
 def_value:
   | n = INT_LIT              { L_int n }
