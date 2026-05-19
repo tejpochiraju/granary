@@ -1524,6 +1524,40 @@ let unique_violation_on_update
   S.cursor_close cur;
   Lwt.return result
 
+(** Build the list of (child_table_meta, relevant_fk_constraints) pairs
+    for tables that have FK constraints pointing to [parent_table_name]. *)
+let build_child_refs cat ~parent_table_name =
+  let* all_tables = Cat.list_tables cat in
+  Lwt.return (List.filter_map (fun (child_meta : Cat.table_meta) ->
+    let fks = List.filter (fun (fk : Cat.fk_constraint) ->
+      String.equal fk.fk_parent_table parent_table_name
+    ) child_meta.Cat.fk_constraints in
+    if fks = [] then None else Some (child_meta, fks)
+  ) all_tables)
+
+(** Scan [child_meta] for any row where [child_col_idx] equals [parent_val].
+    Opens and closes its own RO snapshot. *)
+let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
+  let schema = child_meta.Cat.columns in
+  let* ro_tx = S.ro_begin store in
+  let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
+  let _sr    = S.cursor_first cur in
+  let found  = ref false in
+  let rec scan () =
+    if !found then ()
+    else match S.cursor_next cur with
+    | None -> ()
+    | Some (_k, vbytes) ->
+      let row = Row.decode schema vbytes in
+      if compare_values row.(child_col_idx) parent_val = 0 then
+        found := true
+      else scan ()
+  in
+  scan ();
+  S.cursor_close cur;
+  let* () = S.ro_end ro_tx in
+  Lwt.return !found
+
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
@@ -1531,6 +1565,7 @@ let unique_violation_on_update
 let execute_update ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
     (store : S.t)
+    (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
     ~(assignments : (int * Plan.expr) list)
     ~(where : Plan.expr option)
@@ -1563,6 +1598,38 @@ let execute_update ?(mode = Auto) ?(params = [||])
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
+    (* FK parent-side check: fail if updating a referenced parent column. *)
+    let* child_refs = build_child_refs cat ~parent_table_name:table_meta.Cat.name in
+    let* () =
+      if child_refs = [] then Lwt.return_unit
+      else
+        Lwt_list.iter_s (fun (_rowid, old_row) ->
+          let new_row = Array.copy old_row in
+          List.iter (fun (i, expr) ->
+            new_row.(i) <- eval_expr clock params old_row expr
+          ) assignments;
+          Lwt_list.iter_s (fun (child_meta, fks) ->
+            Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+              let parent_col_idx = find_col_idx_by_name table_meta.Cat.columns fk.fk_parent_col in
+              let old_val = old_row.(parent_col_idx) in
+              let new_val = new_row.(parent_col_idx) in
+              if compare_values old_val new_val = 0 then Lwt.return_unit
+              else
+                (match old_val with
+                 | Row.V_null -> Lwt.return_unit
+                 | _ ->
+                   let child_col_idx = find_col_idx_by_name child_meta.Cat.columns fk.fk_local_col in
+                   let* has_ref = fk_child_has_ref store child_meta ~child_col_idx ~parent_val:old_val in
+                   if has_ref then
+                     Lwt.fail_with (Printf.sprintf
+                       "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
+                       table_meta.Cat.name fk.fk_parent_col
+                       child_meta.Cat.name fk.fk_local_col)
+                   else Lwt.return_unit)
+            ) fks
+          ) child_refs
+        ) matches
+    in
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
@@ -1647,6 +1714,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
 let execute_delete ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
     (store : S.t)
+    (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
     ~(where : Plan.expr option)
     ~(indexes : Cat.index_info list)
@@ -1677,6 +1745,31 @@ let execute_delete ?(mode = Auto) ?(params = [||])
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
+    (* FK parent-side check: fail if any child row references a to-be-deleted row. *)
+    let* child_refs = build_child_refs cat ~parent_table_name:table_meta.Cat.name in
+    let* () =
+      if child_refs = [] then Lwt.return_unit
+      else
+        Lwt_list.iter_s (fun (_rowid, row) ->
+          Lwt_list.iter_s (fun (child_meta, fks) ->
+            Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+              let parent_col_idx = find_col_idx_by_name table_meta.Cat.columns fk.fk_parent_col in
+              let parent_val = row.(parent_col_idx) in
+              (match parent_val with
+               | Row.V_null -> Lwt.return_unit
+               | _ ->
+                 let child_col_idx = find_col_idx_by_name child_meta.Cat.columns fk.fk_local_col in
+                 let* has_ref = fk_child_has_ref store child_meta ~child_col_idx ~parent_val in
+                 if has_ref then
+                   Lwt.fail_with (Printf.sprintf
+                     "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
+                     table_meta.Cat.name fk.fk_parent_col
+                     child_meta.Cat.name fk.fk_local_col)
+                 else Lwt.return_unit)
+            ) fks
+          ) child_refs
+        ) matches
+    in
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
@@ -1786,9 +1879,9 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     end
   | Plan.Op_update { table_meta; assignments; where; indexes; returning = _ } ->
-    execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes
+    execute_update ~mode ~params ~clock store cat ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes; returning = _ } ->
-    execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes
+    execute_delete ~mode ~params ~clock store cat ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     (* Invalidate cached CHECK expressions for the dropped table *)
@@ -3178,7 +3271,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       Array.of_list (List.map (eval_expr clock params new_row) returning)
     ) matched in
     (* Execute the actual update. *)
-    let* _ = execute_update ~mode ~params ~clock store ~table_meta ~assignments ~where ~indexes in
+    let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
+    let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_delete { table_meta; where; indexes; returning }
     when returning <> [] ->
@@ -3207,7 +3301,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let result_rows = List.map (fun old_row ->
       Array.of_list (List.map (eval_expr clock params old_row) returning)
     ) matched in
-    let* _ = execute_delete ~mode ~params ~clock store ~table_meta ~where ~indexes in
+    let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
+    let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_const_select { exprs } ->
     (* FROM-less SELECT: evaluate each expression with an empty row and

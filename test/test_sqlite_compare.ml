@@ -2891,6 +2891,45 @@ let phase21_savepoint_cases = [
     unordered = false };
 ]
 
+(* ── Phase 21: FK DELETE/UPDATE parent-side ─────────────────────── *)
+
+let phase21_fk_cases = [
+  { name = "delete_unreferenced_parent_ok";
+    setup = [
+      "CREATE TABLE fkpd (id INTEGER PRIMARY KEY)";
+      "INSERT INTO fkpd VALUES (1)";
+      "INSERT INTO fkpd VALUES (2)";
+      "CREATE TABLE fkcd (pid INTEGER REFERENCES fkpd(id))";
+      "INSERT INTO fkcd VALUES (2)";
+      "DELETE FROM fkpd WHERE id = 1";
+    ];
+    query = "SELECT COUNT(*) FROM fkpd";
+    unordered = false };
+
+  { name = "update_unreferenced_parent_ok";
+    setup = [
+      "CREATE TABLE fkpu (id INTEGER PRIMARY KEY)";
+      "INSERT INTO fkpu VALUES (1)";
+      "INSERT INTO fkpu VALUES (2)";
+      "CREATE TABLE fkcu (pid INTEGER REFERENCES fkpu(id))";
+      "INSERT INTO fkcu VALUES (1)";
+      "UPDATE fkpu SET id = 99 WHERE id = 2";
+    ];
+    query = "SELECT COUNT(*) FROM fkpu";
+    unordered = false };
+
+  { name = "delete_parent_null_child_ok";
+    setup = [
+      "CREATE TABLE fkpn (id INTEGER PRIMARY KEY)";
+      "INSERT INTO fkpn VALUES (1)";
+      "CREATE TABLE fkcn (pid INTEGER REFERENCES fkpn(id))";
+      "INSERT INTO fkcn VALUES (NULL)";
+      "DELETE FROM fkpn WHERE id = 1";
+    ];
+    query = "SELECT COUNT(*) FROM fkpn";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2926,4 +2965,5 @@ let () =
     "phase20_json",            List.map make_test phase20_json_cases;
     "phase20_json_mut",        List.map make_test phase20_json_mutation_cases;
     "phase21_savepoint",       List.map make_test phase21_savepoint_cases;
+    "phase21_fk",              List.map make_test phase21_fk_cases;
   ]

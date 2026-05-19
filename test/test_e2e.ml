@@ -4697,6 +4697,99 @@ let test_savepoint_auto_begin () =
     Alcotest.(check int) "auto-committed after release" 1 (List.length rows);
     Lwt.return_unit)
 
+(* ── Phase 21: FK DELETE/UPDATE parent-side enforcement ─────────── *)
+
+let test_fk_delete_referenced_parent_fails () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fkp (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fkp VALUES (1)" in
+    let* () = exec "CREATE TABLE fkc (id INTEGER, pid INTEGER REFERENCES fkp(id))" in
+    let* () = exec "INSERT INTO fkc VALUES (10, 1)" in
+    let* result = Db.execute db "DELETE FROM fkp WHERE id = 1" in
+    Alcotest.(check bool) "delete referenced parent fails" true (Result.is_error result);
+    Lwt.return_unit)
+
+let test_fk_delete_unreferenced_parent_ok () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fkp2 (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fkp2 VALUES (1)" in
+    let* () = exec "INSERT INTO fkp2 VALUES (2)" in
+    let* () = exec "CREATE TABLE fkc2 (id INTEGER, pid INTEGER REFERENCES fkp2(id))" in
+    let* () = exec "INSERT INTO fkc2 VALUES (10, 2)" in
+    let* () = exec "DELETE FROM fkp2 WHERE id = 1" in
+    let* r = Db.query db "SELECT COUNT(*) FROM fkp2" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "unreferenced parent deleted ok" 1
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_delete_null_child_ok () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fkp3 (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fkp3 VALUES (1)" in
+    let* () = exec "CREATE TABLE fkc3 (id INTEGER, pid INTEGER REFERENCES fkp3(id))" in
+    let* () = exec "INSERT INTO fkc3 VALUES (10, NULL)" in
+    let* () = exec "DELETE FROM fkp3 WHERE id = 1" in
+    let* r = Db.query db "SELECT COUNT(*) FROM fkp3" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "parent deleted when child FK is null" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_update_referenced_col_fails () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fkpu (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fkpu VALUES (1)" in
+    let* () = exec "CREATE TABLE fkcu (pid INTEGER REFERENCES fkpu(id))" in
+    let* () = exec "INSERT INTO fkcu VALUES (1)" in
+    let* result = Db.execute db "UPDATE fkpu SET id = 99 WHERE id = 1" in
+    Alcotest.(check bool) "update referenced parent col fails" true (Result.is_error result);
+    Lwt.return_unit)
+
+let test_fk_update_unreferenced_col_ok () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE fkpu2 (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO fkpu2 VALUES (1)" in
+    let* () = exec "INSERT INTO fkpu2 VALUES (2)" in
+    let* () = exec "CREATE TABLE fkcu2 (pid INTEGER REFERENCES fkpu2(id))" in
+    let* () = exec "INSERT INTO fkcu2 VALUES (1)" in
+    let* () = exec "UPDATE fkpu2 SET id = 99 WHERE id = 2" in
+    let* r = Db.query db "SELECT COUNT(*) FROM fkpu2" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "unreferenced parent update ok" 2
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5169,5 +5262,12 @@ let () =
       Alcotest.test_case "partial_rollback"        `Quick test_savepoint_partial_rollback;
       Alcotest.test_case "double_rollback"         `Quick test_savepoint_double_rollback;
       Alcotest.test_case "auto_begin"              `Quick test_savepoint_auto_begin;
+    ];
+    "fk_delete_update", [
+      Alcotest.test_case "delete_ref_fails"     `Quick test_fk_delete_referenced_parent_fails;
+      Alcotest.test_case "delete_no_ref_ok"     `Quick test_fk_delete_unreferenced_parent_ok;
+      Alcotest.test_case "delete_null_child_ok" `Quick test_fk_delete_null_child_ok;
+      Alcotest.test_case "update_ref_fails"     `Quick test_fk_update_referenced_col_fails;
+      Alcotest.test_case "update_no_ref_ok"     `Quick test_fk_update_unreferenced_col_ok;
     ];
   ]
