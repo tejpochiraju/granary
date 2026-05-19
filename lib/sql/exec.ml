@@ -1965,8 +1965,9 @@ let execute_with_count ?(mode = Auto)
        (match result with
         | Error msg -> Lwt.fail_with msg
         | Ok ()     -> Lwt.return 0))
-  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
-    failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK handled by Db layer"
+  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
+  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
+    failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
@@ -3287,7 +3288,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
   | Plan.Op_alter_table _
   | Plan.Op_create_view _ | Plan.Op_drop_view _
-  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback ->
+  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
+  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

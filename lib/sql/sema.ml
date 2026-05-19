@@ -137,6 +137,9 @@ type bound_stmt =
   | BS_begin
   | BS_commit
   | BS_rollback
+  | BS_savepoint   of string
+  | BS_release     of string
+  | BS_rollback_to of string
   | BS_create_fts_table of {
       name    : string;
       columns : string list;
@@ -2326,6 +2329,9 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   | Ast.S_begin    -> Lwt.return (Ok BS_begin)
   | Ast.S_commit   -> Lwt.return (Ok BS_commit)
   | Ast.S_rollback -> Lwt.return (Ok BS_rollback)
+  | Ast.S_savepoint name   -> Lwt.return (Ok (BS_savepoint name))
+  | Ast.S_release name     -> Lwt.return (Ok (BS_release name))
+  | Ast.S_rollback_to name -> Lwt.return (Ok (BS_rollback_to name))
   | Ast.S_create_fts_table { name; columns } ->
     let* tbl = Cat.find_table cat ~name in
     let fts_existing = Cat.find_fts cat name in

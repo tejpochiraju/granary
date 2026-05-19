@@ -508,6 +508,9 @@ let rec plan ?cat = function
   | Sema.BS_begin    -> Plan.Op_begin
   | Sema.BS_commit   -> Plan.Op_commit
   | Sema.BS_rollback -> Plan.Op_rollback
+  | Sema.BS_savepoint name   -> Plan.Op_savepoint name
+  | Sema.BS_release name     -> Plan.Op_release name
+  | Sema.BS_rollback_to name -> Plan.Op_rollback_to name
   | Sema.BS_create_fts_table { name; columns } ->
     Plan.Op_create_fts_table { name; columns }
   | Sema.BS_fts_insert { fts_meta; col_names; col_values } ->

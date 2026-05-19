@@ -258,6 +258,9 @@ and stmt =
   | S_begin
   | S_commit
   | S_rollback
+  | S_savepoint   of string  (** SAVEPOINT name *)
+  | S_release     of string  (** RELEASE name *)
+  | S_rollback_to of string  (** ROLLBACK TO name *)
   | S_compound of {
       op    : set_op;
       left  : stmt;

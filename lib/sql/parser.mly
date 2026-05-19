@@ -26,7 +26,7 @@
 %token DELETE
 %token DISTINCT
 %token DROP
-%token BEGIN COMMIT ROLLBACK
+%token BEGIN COMMIT ROLLBACK SAVEPOINT RELEASE
 %token ABORT IGNORE FAIL
 %token JOIN INNER LEFT OUTER
 %token GROUP HAVING
@@ -106,6 +106,9 @@ stmt:
   | s = begin_stmt        { s }
   | s = commit_stmt       { s }
   | s = rollback_stmt     { s }
+  | s = savepoint_stmt    { s }
+  | s = release_stmt      { s }
+  | s = rollback_to_stmt  { s }
   | s = pragma_stmt       { s }
   | s = alter_table       { s }
 
@@ -160,6 +163,15 @@ commit_stmt:
 
 rollback_stmt:
   | ROLLBACK { S_rollback }
+
+savepoint_stmt:
+  | SAVEPOINT name = IDENT { Ast.S_savepoint name }
+
+release_stmt:
+  | RELEASE name = IDENT { Ast.S_release name }
+
+rollback_to_stmt:
+  | ROLLBACK TO name = IDENT { Ast.S_rollback_to name }
 
 table_item:
   | col = column_def

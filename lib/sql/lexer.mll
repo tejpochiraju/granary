@@ -194,6 +194,8 @@ rule token = parse
       | "JSON_INSERT"  -> JSON_INSERT_FN
       | "JSON_REPLACE" -> JSON_REPLACE_FN
       | "JSON_REMOVE"  -> JSON_REMOVE
+      | "SAVEPOINT" -> SAVEPOINT
+      | "RELEASE"   -> RELEASE
       | _           -> IDENT id
     }
   | eof                     { EOF }

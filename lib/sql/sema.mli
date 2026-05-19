@@ -170,6 +170,9 @@ type bound_stmt =
   | BS_begin
   | BS_commit
   | BS_rollback
+  | BS_savepoint   of string
+  | BS_release     of string
+  | BS_rollback_to of string
   | BS_create_fts_table of {
       name    : string;
       columns : string list;

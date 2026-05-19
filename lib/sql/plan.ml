@@ -164,6 +164,9 @@ type op =
   | Op_begin
   | Op_commit
   | Op_rollback
+  | Op_savepoint   of string
+  | Op_release     of string
+  | Op_rollback_to of string
   | Op_create_fts_table of {
       name    : string;
       columns : string list;
