@@ -1,6 +1,6 @@
 (** In-memory catalog backed by system trees in the Store.
     System tree allocation: 0=_sys_tables, 1=_sys_columns, 2=_sys_indexes,
-    3=_sys_meta, 4=_sys_fts_tables, 5=_sys_views.  User tables and indexes use tree_ids >= 16. *)
+    3=_sys_meta, 4=_sys_fts_tables, 5=_sys_views, 6=_sys_triggers.  User tables and indexes use tree_ids >= 16. *)
 
 type t
 
@@ -176,3 +176,14 @@ val persist_view : Sqlocaml_store.Store.t -> name:string -> sql:string -> unit L
 
 (** Remove a view's SQL text from the sys_views B-tree. *)
 val remove_view : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
+
+(** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
+val load_all_triggers : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+
+(** Persist a trigger's CREATE TRIGGER SQL to the sys_triggers B-tree.
+    Call this whenever CREATE TRIGGER is executed. *)
+val persist_trigger : Sqlocaml_store.Store.t -> name:string -> sql:string -> unit Lwt.t
+
+(** Remove a trigger's SQL from the sys_triggers B-tree.
+    Call this whenever DROP TRIGGER is executed. *)
+val remove_trigger : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
