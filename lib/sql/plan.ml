@@ -50,8 +50,8 @@ type op =
       columns        : Sqlocaml_encoding.Row.column list;
       uniq_idxs      : (string * string list) list;
       if_not_exists  : bool;
-      fk_constraints : (string * string * string) list;
-        (** [(local_col, parent_table, parent_col)] *)
+      fk_constraints : (string * string * string * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action) list;
+        (** [(local_col, parent_table, parent_col, on_delete, on_update)] *)
     }
   | Op_insert of {
       table_meta    : Cat.table_meta;

@@ -1900,8 +1900,9 @@ let execute_with_count ?(mode = Auto)
       let* () =
         if fk_constraints = [] then Lwt.return_unit
         else begin
-          let fk_list = List.map (fun (lc, pt, pc) ->
-            Cat.{ fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc }
+          let fk_list = List.map (fun (lc, pt, pc, od, ou) ->
+            Cat.{ fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc;
+                  fk_on_delete = od; fk_on_update = ou }
           ) fk_constraints in
           let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
           Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;

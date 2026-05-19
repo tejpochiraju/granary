@@ -75,8 +75,8 @@ type bound_stmt =
       columns        : Row.column list;
       uniq_idxs      : (string * string list) list;
       if_not_exists  : bool;
-      fk_constraints : (string * string * string) list;
-        (** [(local_col, parent_table, parent_col)] *)
+      fk_constraints : (string * string * string * Cat.fk_action * Cat.fk_action) list;
+        (** [(local_col, parent_table, parent_col, on_delete, on_update)] *)
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -948,12 +948,12 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Ok fks ->
             (match cd.Ast.fk_ref with
              | None -> Ok fks
-             | Some (parent_table, "") ->
+             | Some (parent_table, "", _, _) ->
                Error (Unsupported (Printf.sprintf
                  "FOREIGN KEY on '%s': explicit parent column required, write REFERENCES %s(col)"
                  cd.Ast.name parent_table))
-             | Some (parent_table, parent_col) ->
-               Ok (fks @ [(cd.Ast.name, parent_table, parent_col)]))
+             | Some (parent_table, parent_col, od, ou) ->
+               Ok (fks @ [(cd.Ast.name, parent_table, parent_col, od, ou)]))
         ) (Ok []) columns
       in
       (match col_fks_result with
@@ -966,9 +966,9 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Error _ as e -> e
           | Ok fks ->
             (match c with
-             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols } ->
+             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update } ->
                (match local_cols, parent_cols with
-                | [lc], [pc] -> Ok (fks @ [(lc, parent_table, pc)])
+                | [lc], [pc] -> Ok (fks @ [(lc, parent_table, pc, on_delete, on_update)])
                 | _ ->
                   Error (Unsupported "multi-column FOREIGN KEY constraints are not yet supported"))
              | _ -> Ok fks)
