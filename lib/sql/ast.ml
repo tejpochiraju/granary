@@ -88,6 +88,10 @@ type scalar_func =
 
 type set_op = Union | Union_all | Intersect | Except
 
+type trigger_timing = TT_before | TT_after
+
+type trigger_event  = TE_insert | TE_update | TE_delete
+
 type order_dir = Asc | Desc
 
 type collation = Collate_binary | Collate_nocase | Collate_rtrim
@@ -289,6 +293,17 @@ and stmt =
       query : stmt;
     }
   | S_drop_view of {
+      name : string;
+    }
+  | S_create_trigger of {
+      name    : string;
+      timing  : trigger_timing;
+      event   : trigger_event;
+      table   : string;
+      when_   : expr option;       (** WHEN clause; None if absent *)
+      body    : stmt list;         (** statements between BEGIN…END *)
+    }
+  | S_drop_trigger of {
       name : string;
     }
 
