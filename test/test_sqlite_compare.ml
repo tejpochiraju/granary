@@ -2599,6 +2599,84 @@ let phase17_cast_real_cases = [
     unordered = false };
 ]
 
+(* ── Phase 18 tests ────────────────────────────────────────────── *)
+
+let phase18_multigroup_cases = [
+  (* Two-column GROUP BY with COUNT *)
+  { name = "two_col_count";
+    setup = [
+      "CREATE TABLE mg1 (dept TEXT, role TEXT, n INTEGER)";
+      "INSERT INTO mg1 VALUES ('eng','dev',1)";
+      "INSERT INTO mg1 VALUES ('eng','dev',2)";
+      "INSERT INTO mg1 VALUES ('eng','mgr',3)";
+      "INSERT INTO mg1 VALUES ('hr','dev',4)";
+    ];
+    query = "SELECT dept, role, COUNT(*) FROM mg1 GROUP BY dept, role ORDER BY dept, role";
+    unordered = false };
+
+  (* Two-column GROUP BY with SUM *)
+  { name = "two_col_sum";
+    setup = [
+      "CREATE TABLE mg2 (a TEXT, b TEXT, v INTEGER)";
+      "INSERT INTO mg2 VALUES ('x','p',10)";
+      "INSERT INTO mg2 VALUES ('x','p',20)";
+      "INSERT INTO mg2 VALUES ('x','q',30)";
+      "INSERT INTO mg2 VALUES ('y','p',40)";
+    ];
+    query = "SELECT a, b, SUM(v) FROM mg2 GROUP BY a, b ORDER BY a, b";
+    unordered = false };
+
+  (* Two-column GROUP BY with HAVING *)
+  { name = "two_col_having";
+    setup = [
+      "CREATE TABLE mg3 (dept TEXT, role TEXT)";
+      "INSERT INTO mg3 VALUES ('eng','dev')";
+      "INSERT INTO mg3 VALUES ('eng','dev')";
+      "INSERT INTO mg3 VALUES ('eng','mgr')";
+      "INSERT INTO mg3 VALUES ('hr','dev')";
+    ];
+    query = "SELECT dept, role, COUNT(*) FROM mg3 GROUP BY dept, role HAVING COUNT(*) > 1 ORDER BY dept, role";
+    unordered = false };
+
+  (* Three-column GROUP BY *)
+  { name = "three_col_sum";
+    setup = [
+      "CREATE TABLE mg4 (a TEXT, b TEXT, c TEXT, n INTEGER)";
+      "INSERT INTO mg4 VALUES ('x','y','z',1)";
+      "INSERT INTO mg4 VALUES ('x','y','z',2)";
+      "INSERT INTO mg4 VALUES ('x','y','w',3)";
+    ];
+    query = "SELECT a, b, c, SUM(n) FROM mg4 GROUP BY a, b, c ORDER BY c, a, b";
+    unordered = false };
+]
+
+let phase18_fk_cases = [
+  (* Valid FK inserts succeed *)
+  { name = "fk_valid_inserts";
+    setup = [
+      "CREATE TABLE fk_p1 (id INTEGER PRIMARY KEY)";
+      "INSERT INTO fk_p1 VALUES (1)";
+      "INSERT INTO fk_p1 VALUES (2)";
+      "CREATE TABLE fk_c1 (id INTEGER, pid INTEGER REFERENCES fk_p1(id))";
+      "INSERT INTO fk_c1 VALUES (10, 1)";
+      "INSERT INTO fk_c1 VALUES (20, 2)";
+    ];
+    query = "SELECT COUNT(*) FROM fk_c1";
+    unordered = false };
+
+  (* FK with NULL allowed *)
+  { name = "fk_null_allowed";
+    setup = [
+      "CREATE TABLE fk_p2 (id INTEGER PRIMARY KEY)";
+      "INSERT INTO fk_p2 VALUES (1)";
+      "CREATE TABLE fk_c2 (id INTEGER, pid INTEGER REFERENCES fk_p2(id))";
+      "INSERT INTO fk_c2 VALUES (10, NULL)";
+      "INSERT INTO fk_c2 VALUES (20, 1)";
+    ];
+    query = "SELECT COUNT(*) FROM fk_c2";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2626,4 +2704,6 @@ let () =
     "phase17_pctrank",         List.map make_test phase17_pctrank_cases;
     "phase17_ine",             List.map make_test phase17_ine_cases;
     "phase17_cast_real",       List.map make_test phase17_cast_real_cases;
+    "phase18_multigroup",      List.map make_test phase18_multigroup_cases;
+    "phase18_fk",              List.map make_test phase18_fk_cases;
   ]
