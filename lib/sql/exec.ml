@@ -1308,7 +1308,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       ) fks
   in
   (* Fire BEFORE INSERT triggers *)
-  let* () = match before_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
+  let* () = match before_hook with None -> Lwt.return_unit | Some f -> f ~new_row:(Array.copy row) in
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -1721,7 +1721,9 @@ let execute_update ?(mode = Auto) ?(params = [||])
           ) matches
         in
         let* () = release_txn tx owned in
-        (* Fire AFTER UPDATE triggers (per row) *)
+        (* After-hook new_row is recomputed from the pre-write snapshot; for
+           non-deterministic expressions (e.g. random(), now()) the value seen
+           by the trigger may differ from the committed row. *)
         let* () = match after_hook with
           | None -> Lwt.return_unit
           | Some f ->
