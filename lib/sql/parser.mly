@@ -49,6 +49,8 @@
 %token PRECEDING FOLLOWING
 %token CHECK
 %token REFERENCES FOREIGN
+%token CEIL FLOOR SQRT POW EXP LN LOG LOG2 LOG10 SIGN TRUNC PI
+%token SIN COS TAN ASIN ACOS ATAN ATAN2 DEGREES RADIANS
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -419,6 +421,29 @@ scalar_expr:
     { E_case { scrutinee = None;
                branches  = [(c, t)];
                else_     = Some f } }
+  | CEIL    LPAREN e = expr RPAREN                            { E_func (Fn_ceil,    [e]) }
+  | FLOOR   LPAREN e = expr RPAREN                            { E_func (Fn_floor,   [e]) }
+  | SQRT    LPAREN e = expr RPAREN                            { E_func (Fn_sqrt,    [e]) }
+  | POW     LPAREN b = expr COMMA e = expr RPAREN             { E_func (Fn_pow,     [b; e]) }
+  | EXP     LPAREN e = expr RPAREN                            { E_func (Fn_exp,     [e]) }
+  | LN      LPAREN e = expr RPAREN                            { E_func (Fn_ln,      [e]) }
+  | LOG     LPAREN e = expr RPAREN                            { E_func (Fn_log,     [e]) }
+  | LOG     LPAREN b = expr COMMA x = expr RPAREN             { E_func (Fn_log,     [b; x]) }
+  | LOG2    LPAREN e = expr RPAREN                            { E_func (Fn_log2,    [e]) }
+  | LOG10   LPAREN e = expr RPAREN                            { E_func (Fn_log10,   [e]) }
+  | SIGN    LPAREN e = expr RPAREN                            { E_func (Fn_sign,    [e]) }
+  | TRUNC   LPAREN e = expr RPAREN                            { E_func (Fn_trunc,   [e]) }
+  | TRUNC   LPAREN e = expr COMMA d = expr RPAREN             { E_func (Fn_trunc,   [e; d]) }
+  | PI      LPAREN RPAREN                                     { E_func (Fn_pi,      []) }
+  | SIN     LPAREN e = expr RPAREN                            { E_func (Fn_sin,     [e]) }
+  | COS     LPAREN e = expr RPAREN                            { E_func (Fn_cos,     [e]) }
+  | TAN     LPAREN e = expr RPAREN                            { E_func (Fn_tan,     [e]) }
+  | ASIN    LPAREN e = expr RPAREN                            { E_func (Fn_asin,    [e]) }
+  | ACOS    LPAREN e = expr RPAREN                            { E_func (Fn_acos,    [e]) }
+  | ATAN    LPAREN e = expr RPAREN                            { E_func (Fn_atan,    [e]) }
+  | ATAN2   LPAREN y = expr COMMA x = expr RPAREN             { E_func (Fn_atan2,   [y; x]) }
+  | DEGREES LPAREN e = expr RPAREN                            { E_func (Fn_degrees, [e]) }
+  | RADIANS LPAREN e = expr RPAREN                            { E_func (Fn_radians, [e]) }
 
 proj_item:
   | e = expr AS alias = IDENT { `ExprA (e, Some alias) }

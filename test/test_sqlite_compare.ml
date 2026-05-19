@@ -2677,6 +2677,32 @@ let phase18_fk_cases = [
     unordered = false };
 ]
 
+(* ── Phase 19 tests ────────────────────────────────────────────── *)
+
+let phase19_math_cases = [
+  { name = "ceil_pos";    setup = []; query = "SELECT CEIL(2.3)";       unordered = false };
+  { name = "ceil_neg";    setup = []; query = "SELECT CEIL(-2.3)";      unordered = false };
+  { name = "floor_pos";   setup = []; query = "SELECT FLOOR(2.7)";      unordered = false };
+  { name = "floor_neg";   setup = []; query = "SELECT FLOOR(-2.7)";     unordered = false };
+  { name = "sqrt_exact";  setup = []; query = "SELECT SQRT(4.0)";       unordered = false };
+  { name = "pow_exact";   setup = []; query = "SELECT POW(2.0, 10.0)";  unordered = false };
+  { name = "sign_neg";    setup = []; query = "SELECT SIGN(-5)";        unordered = false };
+  { name = "sign_zero";   setup = []; query = "SELECT SIGN(0)";         unordered = false };
+  { name = "sign_pos";    setup = []; query = "SELECT SIGN(5)";         unordered = false };
+  { name = "trunc_pos";   setup = []; query = "SELECT TRUNC(3.7)";      unordered = false };
+  { name = "trunc_neg";   setup = []; query = "SELECT TRUNC(-3.7)";     unordered = false };
+  { name = "log2_exact";  setup = []; query = "SELECT LOG2(8.0)";       unordered = false };
+  { name = "log10_exact"; setup = []; query = "SELECT LOG10(1000.0)";   unordered = false };
+  { name = "sin_zero";    setup = []; query = "SELECT SIN(0.0)";        unordered = false };
+  { name = "cos_zero";    setup = []; query = "SELECT COS(0.0)";        unordered = false };
+  { name = "tan_zero";    setup = []; query = "SELECT TAN(0.0)";        unordered = false };
+  { name = "exp_zero";    setup = []; query = "SELECT EXP(0.0)";        unordered = false };
+  { name = "ln_one";      setup = []; query = "SELECT LN(1.0)";         unordered = false };
+  { name = "ceil_alias";  setup = []; query = "SELECT CEILING(2.3)";    unordered = false };
+  { name = "pow_alias";   setup = []; query = "SELECT POWER(2.0, 3.0)"; unordered = false };
+  (* TRUNCATE is a sqlocaml extension not present in SQLite, skipped from comparison *)
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2706,4 +2732,5 @@ let () =
     "phase17_cast_real",       List.map make_test phase17_cast_real_cases;
     "phase18_multigroup",      List.map make_test phase18_multigroup_cases;
     "phase18_fk",              List.map make_test phase18_fk_cases;
+    "phase19_math",            List.map make_test phase19_math_cases;
   ]

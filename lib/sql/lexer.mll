@@ -163,6 +163,27 @@ rule token = parse
       | "COLLATE"   -> COLLATE
       | "PRECEDING" -> PRECEDING
       | "FOLLOWING" -> FOLLOWING
+      | "CEIL" | "CEILING" -> CEIL
+      | "FLOOR" -> FLOOR
+      | "SQRT" -> SQRT
+      | "POW" | "POWER" -> POW
+      | "EXP" -> EXP
+      | "LN" -> LN
+      | "LOG" -> LOG
+      | "LOG2" -> LOG2
+      | "LOG10" -> LOG10
+      | "SIGN" -> SIGN
+      | "TRUNC" | "TRUNCATE" -> TRUNC
+      | "PI" -> PI
+      | "SIN" -> SIN
+      | "COS" -> COS
+      | "TAN" -> TAN
+      | "ASIN" -> ASIN
+      | "ACOS" -> ACOS
+      | "ATAN" -> ATAN
+      | "ATAN2" -> ATAN2
+      | "DEGREES" -> DEGREES
+      | "RADIANS" -> RADIANS
       | _           -> IDENT id
     }
   | eof                     { EOF }

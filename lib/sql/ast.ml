@@ -55,6 +55,27 @@ type scalar_func =
   | Fn_strftime                          (** STRFTIME(fmt, ts[, mod...]) → formatted string *)
   | Fn_julianday                         (** JULIANDAY(ts[, mod...]) → float *)
   | Fn_unixepoch                         (** UNIXEPOCH(ts[, mod...]) → integer *)
+  | Fn_ceil          (** CEIL(x) / CEILING(x) — round up *)
+  | Fn_floor         (** FLOOR(x) — round down *)
+  | Fn_sqrt          (** SQRT(x) — square root *)
+  | Fn_pow           (** POW(x,y) / POWER(x,y) — x^y *)
+  | Fn_exp           (** EXP(x) — e^x *)
+  | Fn_ln            (** LN(x) — natural log *)
+  | Fn_log           (** LOG(x) → ln x; LOG(B,x) → log base B of x *)
+  | Fn_log2          (** LOG2(x) — log base 2 *)
+  | Fn_log10         (** LOG10(x) — log base 10 *)
+  | Fn_sign          (** SIGN(x) → -1 | 0 | 1 as integer *)
+  | Fn_trunc         (** TRUNC(x[,d]) — truncate toward zero *)
+  | Fn_pi            (** PI() — constant π, zero args *)
+  | Fn_sin           (** SIN(x) *)
+  | Fn_cos           (** COS(x) *)
+  | Fn_tan           (** TAN(x) *)
+  | Fn_asin          (** ASIN(x) *)
+  | Fn_acos          (** ACOS(x) *)
+  | Fn_atan          (** ATAN(x) *)
+  | Fn_atan2         (** ATAN2(y,x) — two-argument arctangent *)
+  | Fn_degrees       (** DEGREES(x) — radians to degrees *)
+  | Fn_radians       (** RADIANS(x) — degrees to radians *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -295,6 +316,13 @@ let func_to_sql = function
   | Fn_date -> "DATE" | Fn_time -> "TIME" | Fn_datetime -> "DATETIME"
   | Fn_strftime -> "STRFTIME" | Fn_julianday -> "JULIANDAY"
   | Fn_unixepoch -> "UNIXEPOCH"
+  | Fn_ceil -> "CEIL" | Fn_floor -> "FLOOR" | Fn_sqrt -> "SQRT"
+  | Fn_pow -> "POW" | Fn_exp -> "EXP" | Fn_ln -> "LN"
+  | Fn_log -> "LOG" | Fn_log2 -> "LOG2" | Fn_log10 -> "LOG10"
+  | Fn_sign -> "SIGN" | Fn_trunc -> "TRUNC" | Fn_pi -> "PI"
+  | Fn_sin -> "SIN" | Fn_cos -> "COS" | Fn_tan -> "TAN"
+  | Fn_asin -> "ASIN" | Fn_acos -> "ACOS" | Fn_atan -> "ATAN"
+  | Fn_atan2 -> "ATAN2" | Fn_degrees -> "DEGREES" | Fn_radians -> "RADIANS"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n

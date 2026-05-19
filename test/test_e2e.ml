@@ -4356,6 +4356,79 @@ let test_group_by_two_cols_having () =
       "having_count_gt1" [("eng","dev",2)] triples;
     Lwt.return_unit)
 
+(* ------------------------------------------------------------------ *)
+(* Phase 19: Math scalar functions                                       *)
+(* ------------------------------------------------------------------ *)
+
+let test_math_ceil () =
+  let db = fresh_db () in
+  let rows = query_ok db "SELECT CEIL(2.3)" in
+  Alcotest.(check row_testable) "ceil(2.3)=3.0" [| Db.V_real 3.0 |] (List.nth rows 0);
+  let rows2 = query_ok db "SELECT CEIL(-2.3)" in
+  Alcotest.(check row_testable) "ceil(-2.3)=-2.0" [| Db.V_real (-2.0) |] (List.nth rows2 0)
+
+let test_math_floor () =
+  let db = fresh_db () in
+  let rows = query_ok db "SELECT FLOOR(2.7)" in
+  Alcotest.(check row_testable) "floor(2.7)=2.0" [| Db.V_real 2.0 |] (List.nth rows 0);
+  let rows2 = query_ok db "SELECT FLOOR(-2.7)" in
+  Alcotest.(check row_testable) "floor(-2.7)=-3.0" [| Db.V_real (-3.0) |] (List.nth rows2 0)
+
+let test_math_sqrt () =
+  let db = fresh_db () in
+  let rows = query_ok db "SELECT SQRT(4.0)" in
+  Alcotest.(check row_testable) "sqrt(4.0)=2.0" [| Db.V_real 2.0 |] (List.nth rows 0)
+
+let test_math_pow () =
+  let db = fresh_db () in
+  let rows = query_ok db "SELECT POW(2.0, 10.0)" in
+  Alcotest.(check row_testable) "pow(2,10)=1024" [| Db.V_real 1024.0 |] (List.nth rows 0)
+
+let test_math_sign () =
+  let db = fresh_db () in
+  let r1 = query_ok db "SELECT SIGN(-5)" in
+  Alcotest.(check row_testable) "sign(-5)=-1" [| Db.V_int (-1L) |] (List.nth r1 0);
+  let r2 = query_ok db "SELECT SIGN(0)" in
+  Alcotest.(check row_testable) "sign(0)=0" [| Db.V_int 0L |] (List.nth r2 0);
+  let r3 = query_ok db "SELECT SIGN(5)" in
+  Alcotest.(check row_testable) "sign(5)=1" [| Db.V_int 1L |] (List.nth r3 0)
+
+let test_math_trunc () =
+  let db = fresh_db () in
+  let r1 = query_ok db "SELECT TRUNC(3.7)" in
+  Alcotest.(check row_testable) "trunc(3.7)=3.0" [| Db.V_real 3.0 |] (List.nth r1 0);
+  let r2 = query_ok db "SELECT TRUNC(-3.7)" in
+  Alcotest.(check row_testable) "trunc(-3.7)=-3.0" [| Db.V_real (-3.0) |] (List.nth r2 0)
+
+let test_math_pi () =
+  let db = fresh_db () in
+  let rows = query_ok db "SELECT PI()" in
+  (match (List.nth rows 0).(0) with
+   | Db.V_real v ->
+     let diff = abs_float (v -. Float.pi) in
+     Alcotest.(check bool) "pi close to Float.pi" true (diff < 1e-10)
+   | _ -> Alcotest.fail "expected real value for PI()")
+
+let test_math_trig () =
+  let db = fresh_db () in
+  let r1 = query_ok db "SELECT SIN(0.0)" in
+  Alcotest.(check row_testable) "sin(0)=0" [| Db.V_real 0.0 |] (List.nth r1 0);
+  let r2 = query_ok db "SELECT COS(0.0)" in
+  Alcotest.(check row_testable) "cos(0)=1" [| Db.V_real 1.0 |] (List.nth r2 0);
+  let r3 = query_ok db "SELECT TAN(0.0)" in
+  Alcotest.(check row_testable) "tan(0)=0" [| Db.V_real 0.0 |] (List.nth r3 0)
+
+let test_math_log () =
+  let db = fresh_db () in
+  let r1 = query_ok db "SELECT LOG2(8.0)" in
+  Alcotest.(check row_testable) "log2(8)=3" [| Db.V_real 3.0 |] (List.nth r1 0);
+  let r2 = query_ok db "SELECT LOG10(1000.0)" in
+  Alcotest.(check row_testable) "log10(1000)=3" [| Db.V_real 3.0 |] (List.nth r2 0);
+  let r3 = query_ok db "SELECT LOG(10.0, 100.0)" in
+  (match (List.nth r3 0).(0) with
+   | Db.V_real v -> Alcotest.(check bool) "log(10,100)~2" true (abs_float (v -. 2.0) < 1e-10)
+   | _ -> Alcotest.fail "expected real value for LOG(10,100)")
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4794,5 +4867,16 @@ let () =
       Alcotest.test_case "two_cols_count"  `Quick test_group_by_two_cols;
       Alcotest.test_case "two_cols_sum"    `Quick test_group_by_two_cols_sum;
       Alcotest.test_case "two_cols_having" `Quick test_group_by_two_cols_having;
+    ];
+    "math", [
+      Alcotest.test_case "math_ceil"  `Quick test_math_ceil;
+      Alcotest.test_case "math_floor" `Quick test_math_floor;
+      Alcotest.test_case "math_sqrt"  `Quick test_math_sqrt;
+      Alcotest.test_case "math_pow"   `Quick test_math_pow;
+      Alcotest.test_case "math_sign"  `Quick test_math_sign;
+      Alcotest.test_case "math_trunc" `Quick test_math_trunc;
+      Alcotest.test_case "math_pi"    `Quick test_math_pi;
+      Alcotest.test_case "math_trig"  `Quick test_math_trig;
+      Alcotest.test_case "math_log"   `Quick test_math_log;
     ];
   ]

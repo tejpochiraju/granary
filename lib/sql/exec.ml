@@ -498,6 +498,182 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
          | Error _ -> Row.V_null
          | Ok dt   -> Row.V_text (Datetime.strftime fmt dt))
      | _ -> Row.V_null)
+  | Ast.Fn_ceil, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.ceil f) | None -> Row.V_null)
+  | Ast.Fn_floor, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.floor f) | None -> Row.V_null)
+  | Ast.Fn_sqrt, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.sqrt f) | None -> Row.V_null)
+  | Ast.Fn_pow, [b; e] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt b, to_float_opt e with
+     | Some bf, Some ef -> Row.V_real (bf ** ef)
+     | _ -> Row.V_null)
+  | Ast.Fn_exp, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.exp f) | None -> Row.V_null)
+  | Ast.Fn_ln, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
+  | Ast.Fn_log, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
+  | Ast.Fn_log, [b; x] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt b, to_float_opt x with
+     | Some bf, Some xf -> Row.V_real (Float.log xf /. Float.log bf)
+     | _ -> Row.V_null)
+  | Ast.Fn_log2, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with
+     | Some f -> Row.V_real (Float.log f /. Float.log 2.0)
+     | None -> Row.V_null)
+  | Ast.Fn_log10, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.log10 f) | None -> Row.V_null)
+  | Ast.Fn_sign, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with
+     | Some f -> Row.V_int (if f > 0.0 then 1L else if f < 0.0 then (-1L) else 0L)
+     | None -> Row.V_null)
+  | Ast.Fn_trunc, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with
+     | Some f -> Row.V_real (if f >= 0.0 then Float.floor f else Float.ceil f)
+     | None -> Row.V_null)
+  | Ast.Fn_trunc, [v; d] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v, to_float_opt d with
+     | Some f, Some df ->
+       let factor = 10.0 ** (Float.round df) in
+       let fx = f *. factor in
+       Row.V_real ((if fx >= 0.0 then Float.floor fx else Float.ceil fx) /. factor)
+     | _ -> Row.V_null)
+  | Ast.Fn_pi, [] -> Row.V_real Float.pi
+  | Ast.Fn_sin, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.sin f) | None -> Row.V_null)
+  | Ast.Fn_cos, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.cos f) | None -> Row.V_null)
+  | Ast.Fn_tan, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.tan f) | None -> Row.V_null)
+  | Ast.Fn_asin, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.asin f) | None -> Row.V_null)
+  | Ast.Fn_acos, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.acos f) | None -> Row.V_null)
+  | Ast.Fn_atan, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with Some f -> Row.V_real (Float.atan f) | None -> Row.V_null)
+  | Ast.Fn_atan2, [y; x] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt y, to_float_opt x with
+     | Some yf, Some xf -> Row.V_real (Float.atan2 yf xf)
+     | _ -> Row.V_null)
+  | Ast.Fn_degrees, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with
+     | Some f -> Row.V_real (f *. 180.0 /. Float.pi)
+     | None -> Row.V_null)
+  | Ast.Fn_radians, [v] ->
+    let to_float_opt = function
+      | Row.V_real f -> Some f
+      | Row.V_int n  -> Some (Int64.to_float n)
+      | _            -> None
+    in
+    (match to_float_opt v with
+     | Some f -> Row.V_real (f *. Float.pi /. 180.0)
+     | None -> Row.V_null)
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 

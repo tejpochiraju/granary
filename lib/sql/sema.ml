@@ -340,6 +340,14 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
          | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
          | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
          | Ast.Fn_strftime -> n >= 2
+         | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
+         | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
+         | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
+         | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
+         | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
+         | Ast.Fn_log -> n = 1 || n = 2
+         | Ast.Fn_trunc -> n = 1 || n = 2
+         | Ast.Fn_pi -> n = 0
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -502,6 +510,14 @@ let rec bind_expr_join
          | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
          | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
          | Ast.Fn_strftime -> n >= 2
+         | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
+         | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
+         | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
+         | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
+         | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
+         | Ast.Fn_log -> n = 1 || n = 2
+         | Ast.Fn_trunc -> n = 1 || n = 2
+         | Ast.Fn_pi -> n = 0
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -687,6 +703,14 @@ let bind_expr_agg
            | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
            | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
            | Ast.Fn_strftime -> n >= 2
+           | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
+           | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
+           | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
+           | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
+           | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
+           | Ast.Fn_log -> n = 1 || n = 2
+           | Ast.Fn_trunc -> n = 1 || n = 2
+           | Ast.Fn_pi -> n = 0
          in
          if not arity_ok then
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
