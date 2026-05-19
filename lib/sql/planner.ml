@@ -574,3 +574,7 @@ let rec plan ?cat = function
     Plan.Op_create_view { name; query }
   | Sema.BS_drop_view { name } ->
     Plan.Op_drop_view { name }
+  | Sema.BS_create_trigger { name; timing; event; table; when_; body } ->
+    Plan.Op_create_trigger { name; timing; event; table; when_; body }
+  | Sema.BS_drop_trigger { name } ->
+    Plan.Op_drop_trigger { name }

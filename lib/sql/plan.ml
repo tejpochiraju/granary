@@ -234,6 +234,15 @@ type op =
   | Op_drop_view of {
       name : string;
     }
+  | Op_create_trigger of {
+      name    : string;
+      timing  : Ast.trigger_timing;
+      event   : Ast.trigger_event;
+      table   : string;
+      when_   : Ast.expr option;
+      body    : Ast.stmt list;
+    }
+  | Op_drop_trigger of { name : string }
 
 and proj_item =
   | PI_group_col of int     (** project the i-th GROUP BY column (index into group_cols) *)

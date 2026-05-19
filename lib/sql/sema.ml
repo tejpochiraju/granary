@@ -186,6 +186,15 @@ type bound_stmt =
     }
   | BS_create_view of { name: string; query: Ast.stmt }
   | BS_drop_view   of { name: string }
+  | BS_create_trigger of {
+      name    : string;
+      timing  : Ast.trigger_timing;
+      event   : Ast.trigger_event;
+      table   : string;
+      when_   : Ast.expr option;
+      body    : Ast.stmt list;
+    }
+  | BS_drop_trigger of { name : string }
 
 type error =
   | Unknown_table       of string
@@ -2432,6 +2441,10 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
      | Ok _ -> Lwt.return (Ok (BS_create_view { name; query })))
   | Ast.S_drop_view { name } ->
     Lwt.return (Ok (BS_drop_view { name }))
+  | Ast.S_create_trigger { name; timing; event; table; when_; body } ->
+    Lwt.return (Ok (BS_create_trigger { name; timing; event; table; when_; body }))
+  | Ast.S_drop_trigger { name } ->
+    Lwt.return (Ok (BS_drop_trigger { name }))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~views ~named_params ~param_counter cat right in

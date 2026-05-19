@@ -219,6 +219,15 @@ type bound_stmt =
     }
   | BS_create_view of { name: string; query: Ast.stmt }
   | BS_drop_view   of { name: string }
+  | BS_create_trigger of {
+      name    : string;
+      timing  : Ast.trigger_timing;
+      event   : Ast.trigger_event;
+      table   : string;
+      when_   : Ast.expr option;
+      body    : Ast.stmt list;
+    }
+  | BS_drop_trigger of { name : string }
 
 type error =
   | Unknown_table       of string

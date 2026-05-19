@@ -2062,7 +2062,8 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
-  | Plan.Op_create_view _ | Plan.Op_drop_view _ -> Lwt.return 0
+  | Plan.Op_create_view _ | Plan.Op_drop_view _
+  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
   | Plan.Op_window _ ->
@@ -3383,6 +3384,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
   | Plan.Op_alter_table _
   | Plan.Op_create_view _ | Plan.Op_drop_view _
+  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.query: use Exec.execute for write operations"
