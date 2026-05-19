@@ -5149,6 +5149,51 @@ let test_trigger_persists_across_reopen () =
     Lwt.return_unit
   )
 
+(* ------------------------------------------------------------------ *)
+(* Case-insensitive keyword tests                                        *)
+(* ------------------------------------------------------------------ *)
+
+let case_insensitive_tests =
+  [ Alcotest.test_case "lowercase select" `Quick (fun () ->
+      run (
+        let* db = Db.open_in_memory () in
+        let* _ = Db.execute db "create table t (id integer, name text)" in
+        let* _ = Db.execute db "insert into t values (1, 'alice')" in
+        let* rows = Db.query db "select id, name from t where id = 1" in
+        (match rows with
+         | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+         | Ok s ->
+           let* lst = Lwt_stream.to_list s in
+           Alcotest.(check int) "row count" 1 (List.length lst);
+           Lwt.return_unit)))
+  ; Alcotest.test_case "mixed case ddl" `Quick (fun () ->
+      run (
+        let* db = Db.open_in_memory () in
+        let* _ = Db.execute db "CREATE TABLE t (id INTEGER, val TEXT NOT NULL)" in
+        let* _ = Db.execute db "Insert Into t (id, val) VALUES (42, 'hello')" in
+        let* rows = Db.query db "SELECT * From t" in
+        (match rows with
+         | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+         | Ok s ->
+           let* lst = Lwt_stream.to_list s in
+           Alcotest.(check int) "row count" 1 (List.length lst);
+           Lwt.return_unit)))
+  ; Alcotest.test_case "lowercase update delete" `Quick (fun () ->
+      run (
+        let* db = Db.open_in_memory () in
+        let* _ = Db.execute db "create table t (id integer, v text)" in
+        let* _ = Db.execute db "insert into t values (1, 'a'), (2, 'b')" in
+        let* _ = Db.execute db "update t set v = 'x' where id = 1" in
+        let* _ = Db.execute db "delete from t where id = 2" in
+        let* rows = Db.query db "select * from t" in
+        (match rows with
+         | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+         | Ok s ->
+           let* lst = Lwt_stream.to_list s in
+           Alcotest.(check int) "row count" 1 (List.length lst);
+           Lwt.return_unit)))
+  ]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5648,4 +5693,5 @@ let () =
       Alcotest.test_case "multiple_body_stmts"   `Quick test_trigger_multiple_body_stmts;
       Alcotest.test_case "persists_across_reopen" `Quick test_trigger_persists_across_reopen;
     ];
+    "case_insensitive", case_insensitive_tests;
   ]
