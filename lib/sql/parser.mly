@@ -211,7 +211,7 @@ column_def:
       let fk_ref      = List.fold_left (fun acc c ->
           match c with
           | Col_fk_ref (t, col_opt) ->
-            Some (t, Option.value ~default:name col_opt)
+            Some (t, Option.value ~default:"" col_opt)
           | _ -> acc) None cs in
       { name; ty; not_null; primary_key; default; check; fk_ref } }
 

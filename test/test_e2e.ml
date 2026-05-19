@@ -2522,12 +2522,14 @@ let test_fk_parse_no_col () =
     let* db = Db.open_in_memory () in
     let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
     let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
-    (* REFERENCES without explicit column is also valid SQL syntax *)
-    let* _ = Db.execute db
+    (* REFERENCES without explicit column is rejected with an Unsupported error *)
+    let* result = Db.execute db
       "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
-    (* Valid FK insert: user_id=1 exists in users *)
-    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
-    Alcotest.(check bool) "REFERENCES no_col valid insert succeeds" true (n = Ok ());
+    let is_unsupported = match result with
+      | Error (Db.Sema (Sqlocaml_sql.Sema.Unsupported _)) -> true
+      | _ -> false
+    in
+    Alcotest.(check bool) "REFERENCES no_col rejected with Unsupported" true is_unsupported;
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)

@@ -878,23 +878,38 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           Some (idx_name, cols)
         | Ast.TC_foreign_key _ -> None
       ) (List.mapi (fun i tc -> (i, tc)) constraints) in
-      (* Extract FK constraints from column-level REFERENCES *)
-      let col_fks = List.filter_map (fun (cd : Ast.column_def) ->
-        match cd.Ast.fk_ref with
-        | None -> None
-        | Some (parent_table, parent_col) ->
-          Some (cd.Ast.name, parent_table, parent_col)
-      ) columns in
+      (* Extract FK constraints from column-level REFERENCES.
+         Reject REFERENCES without an explicit column (parent_col = ""). *)
+      let col_fks_result =
+        List.fold_left (fun acc (cd : Ast.column_def) ->
+          match acc with
+          | Error _ as e -> e
+          | Ok fks ->
+            (match cd.Ast.fk_ref with
+             | None -> Ok fks
+             | Some (parent_table, "") ->
+               Error (Unsupported (Printf.sprintf
+                 "FOREIGN KEY on '%s': explicit parent column required, write REFERENCES %s(col)"
+                 cd.Ast.name parent_table))
+             | Some (parent_table, parent_col) ->
+               Ok (fks @ [(cd.Ast.name, parent_table, parent_col)]))
+        ) (Ok []) columns
+      in
+      (match col_fks_result with
+       | Error e -> Lwt.return (Error e)
+       | Ok col_fks ->
       (* Extract FK constraints from table-level FOREIGN KEY *)
       let tbl_fks = List.filter_map (function
         | Ast.TC_foreign_key { local_cols; parent_table; parent_cols } ->
+          (* Multi-column FK: only the first local/parent column pair is enforced.
+             Full multi-column FK enforcement is deferred. *)
           (match local_cols, parent_cols with
            | lc :: _, pc :: _ -> Some (lc, parent_table, pc)
            | _ -> None)
         | _ -> None
       ) constraints in
       let fk_constraints = col_fks @ tbl_fks in
-      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints }))
+      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints })))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)

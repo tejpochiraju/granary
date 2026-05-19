@@ -1086,10 +1086,13 @@ let execute_insert ?(mode = Auto) ?(params = [||])
                 Lwt.fail_with (Printf.sprintf "FOREIGN KEY: parent table '%s' not found"
                                  fk.fk_parent_table)
               | Some parent_meta ->
-                let parent_col_idx =
+                let* parent_col_idx =
                   match find_col_idx parent_meta.Cat.columns fk.fk_parent_col with
-                  | Some i -> i
-                  | None -> 0
+                  | Some i -> Lwt.return i
+                  | None ->
+                    Lwt.fail_with (Printf.sprintf
+                      "FOREIGN KEY: column '%s' not found in parent table '%s'"
+                      fk.Cat.fk_parent_col fk.Cat.fk_parent_table)
                 in
                 let* ro_tx = S.ro_begin store in
                 let* cur = S.cursor_open ro_tx parent_meta.Cat.tree_id in
