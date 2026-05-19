@@ -4790,6 +4790,172 @@ let test_fk_update_unreferenced_col_ok () =
       (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
     Lwt.return_unit)
 
+(* ------------------------------------------------------------------ *)
+(* Triggers                                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_after_insert_trigger () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+    let* () = exec "CREATE TABLE audit (t_id INTEGER, action TEXT)" in
+    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END" in
+    let* () = exec "INSERT INTO t VALUES (1, 'hello')" in
+    let* r = Db.query db "SELECT t_id, action FROM audit" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "1 audit row" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.check value_testable "t_id=1"       (Db.V_int 1L)         row.(0);
+    Alcotest.check value_testable "action=INSERT" (Db.V_text "INSERT")  row.(1);
+    Lwt.return_unit)
+
+let test_after_insert_two_rows () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+    let* () = exec "CREATE TABLE audit (t_id INTEGER)" in
+    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
+    let* () = exec "INSERT INTO t VALUES (10, 'a')" in
+    let* () = exec "INSERT INTO t VALUES (20, 'b')" in
+    let* r = Db.query db "SELECT t_id FROM audit ORDER BY t_id" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "2 audit rows" 2 (List.length rows);
+    Alcotest.check value_testable "first id=10"  (Db.V_int 10L) (List.nth rows 0).(0);
+    Alcotest.check value_testable "second id=20" (Db.V_int 20L) (List.nth rows 1).(0);
+    Lwt.return_unit)
+
+let test_after_delete_trigger () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER)" in
+    let* () = exec "CREATE TABLE del_log (old_id INTEGER)" in
+    let* () = exec "INSERT INTO t VALUES (5)" in
+    let* () = exec "INSERT INTO t VALUES (6)" in
+    let* () = exec "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO del_log VALUES (OLD.id); END" in
+    let* () = exec "DELETE FROM t WHERE id = 5" in
+    let* r = Db.query db "SELECT old_id FROM del_log" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "1 del_log row" 1 (List.length rows);
+    Alcotest.check value_testable "old_id=5" (Db.V_int 5L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+let test_after_update_trigger () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+    let* () = exec "CREATE TABLE changes (t_id INTEGER, old_val TEXT, new_val TEXT)" in
+    let* () = exec "INSERT INTO t VALUES (1, 'original')" in
+    let* () = exec "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO changes VALUES (OLD.id, OLD.val, NEW.val); END" in
+    let* () = exec "UPDATE t SET val = 'updated' WHERE id = 1" in
+    let* r = Db.query db "SELECT t_id, old_val, new_val FROM changes" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "1 changes row" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.check value_testable "t_id=1"            (Db.V_int 1L)           row.(0);
+    Alcotest.check value_testable "old_val=original"  (Db.V_text "original")  row.(1);
+    Alcotest.check value_testable "new_val=updated"   (Db.V_text "updated")   row.(2);
+    Lwt.return_unit)
+
+let test_before_insert_trigger_aborts () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER)" in
+    let* () = exec "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO no_such_table VALUES (1); END" in
+    let* result = Db.execute db "INSERT INTO t VALUES (99)" in
+    Alcotest.(check bool) "before insert trigger failure aborts" true (Result.is_error result);
+    let* r = Db.query db "SELECT COUNT(*) FROM t" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "t is empty" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_when_clause_conditional () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER, score INTEGER)" in
+    let* () = exec "CREATE TABLE high_scores (t_id INTEGER)" in
+    let* () = exec "CREATE TRIGGER t_when AFTER INSERT ON t WHEN NEW.score > 100 BEGIN INSERT INTO high_scores VALUES (NEW.id); END" in
+    let* () = exec "INSERT INTO t VALUES (1, 50)" in
+    let* () = exec "INSERT INTO t VALUES (2, 150)" in
+    let* r = Db.query db "SELECT t_id FROM high_scores" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "1 high_score row" 1 (List.length rows);
+    Alcotest.check value_testable "t_id=2" (Db.V_int 2L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+let test_drop_trigger () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER)" in
+    let* () = exec "CREATE TABLE audit (id INTEGER)" in
+    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
+    let* () = exec "INSERT INTO t VALUES (1)" in
+    let* () = exec "DROP TRIGGER t_ai" in
+    let* () = exec "INSERT INTO t VALUES (2)" in
+    let* r = Db.query db "SELECT id FROM audit ORDER BY id" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "only 1 audit row after drop" 1 (List.length rows);
+    Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+let test_trigger_multiple_body_stmts () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE t (id INTEGER)" in
+    let* () = exec "CREATE TABLE tlog1 (id INTEGER)" in
+    let* () = exec "CREATE TABLE tlog2 (id INTEGER)" in
+    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO tlog1 VALUES (NEW.id); INSERT INTO tlog2 VALUES (NEW.id); END" in
+    let* () = exec "INSERT INTO t VALUES (42)" in
+    let* r1 = Db.query db "SELECT id FROM tlog1" in
+    let rows1 = match r1 with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "tlog1 has 1 row" 1 (List.length rows1);
+    Alcotest.check value_testable "tlog1 id=42" (Db.V_int 42L) (List.hd rows1).(0);
+    let* r2 = Db.query db "SELECT id FROM tlog2" in
+    let rows2 = match r2 with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "tlog2 has 1 row" 1 (List.length rows2);
+    Alcotest.check value_testable "tlog2 id=42" (Db.V_int 42L) (List.hd rows2).(0);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5269,5 +5435,15 @@ let () =
       Alcotest.test_case "delete_null_child_ok" `Quick test_fk_delete_null_child_ok;
       Alcotest.test_case "update_ref_fails"     `Quick test_fk_update_referenced_col_fails;
       Alcotest.test_case "update_no_ref_ok"     `Quick test_fk_update_unreferenced_col_ok;
+    ];
+    "triggers", [
+      Alcotest.test_case "after_insert"          `Quick test_after_insert_trigger;
+      Alcotest.test_case "after_insert_two_rows" `Quick test_after_insert_two_rows;
+      Alcotest.test_case "after_delete"          `Quick test_after_delete_trigger;
+      Alcotest.test_case "after_update"          `Quick test_after_update_trigger;
+      Alcotest.test_case "before_insert_aborts"  `Quick test_before_insert_trigger_aborts;
+      Alcotest.test_case "when_clause_conditional" `Quick test_when_clause_conditional;
+      Alcotest.test_case "drop_trigger"          `Quick test_drop_trigger;
+      Alcotest.test_case "multiple_body_stmts"   `Quick test_trigger_multiple_body_stmts;
     ];
   ]

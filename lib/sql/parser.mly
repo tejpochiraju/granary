@@ -296,7 +296,7 @@ opt_conflict:
   |             { None }
 
 value_row:
-  | LPAREN vals = separated_nonempty_list(COMMA, insert_expr) RPAREN { vals }
+  | LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN { vals }
 
 insert:
   | INSERT oc = opt_conflict INTO table = IDENT
