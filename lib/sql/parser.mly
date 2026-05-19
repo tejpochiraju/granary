@@ -92,6 +92,67 @@ expr_only:
 stmt_eof:
   | s = stmt SEMI? EOF { s }
 
+(* Allow SQL keywords to be used as identifiers in non-keyword positions.
+   This is necessary because many keywords (SUM, DESC, etc.) are commonly
+   used as column aliases, CTE names, table names, and column names. *)
+any_ident:
+  | id = IDENT    { id }
+  | ASC           { "asc" }
+  | DESC          { "desc" }
+  | SUM           { "sum" }
+  | AVG           { "avg" }
+  | MIN           { "min" }
+  | MAX           { "max" }
+  | COUNT         { "count" }
+  | ALL           { "all" }
+  | ADD           { "add" }
+  | AFTER         { "after" }
+  | BEFORE        { "before" }
+  | BEGIN         { "begin" }
+  | CASCADE       { "cascade" }
+  | COLUMN        { "column" }
+  | CONFLICT      { "conflict" }
+  | DEFAULT       { "default" }
+  | DO            { "do" }
+  | END           { "end" }
+  | FAIL          { "fail" }
+  | FOLLOWING     { "following" }
+  | IGNORE        { "ignore" }
+  | INDEX         { "index" }
+  | INNER         { "inner" }
+  | INTO          { "into" }
+  | IS            { "is" }
+  | JOIN          { "join" }
+  | KEY           { "key" }
+  | LEFT          { "left" }
+  | MATCH         { "match" }
+  | NULLS         { "nulls" }
+  | OFFSET        { "offset" }
+  | OUTER         { "outer" }
+  | OVER          { "over" }
+  | PARTITION     { "partition" }
+  | PRECEDING     { "preceding" }
+  | PRIMARY       { "primary" }
+  | RECURSIVE     { "recursive" }
+  | RELEASE       { "release" }
+  | RENAME        { "rename" }
+  | REPLACE       { "replace" }
+  | RESTRICT      { "restrict" }
+  | RETURNING     { "returning" }
+  | ROLLBACK      { "rollback" }
+  | SAVEPOINT     { "savepoint" }
+  | SET           { "set" }
+  | TABLE         { "table" }
+  | TO            { "to" }
+  | TRIGGER       { "trigger" }
+  | UNIQUE        { "unique" }
+  | UPDATE        { "update" }
+  | USING         { "using" }
+  | VALUES        { "values" }
+  | VIEW          { "view" }
+  | VIRTUAL       { "virtual" }
+  | ABORT         { "abort" }
+
 stmt:
   | s = with_cte          { s }
   | s = create_view       { s }
@@ -117,18 +178,18 @@ stmt:
   | s = alter_table       { s }
 
 with_cte:
-  | WITH name = IDENT AS LPAREN def = compound_select RPAREN query = compound_select
+  | WITH name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select
     { Ast.S_with_cte { name; def; query; recursive = false } }
-  | WITH RECURSIVE name = IDENT AS LPAREN def = compound_select RPAREN query = compound_select
+  | WITH RECURSIVE name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select
     { Ast.S_with_cte { name; def; query; recursive = true } }
 
 pragma_stmt:
-  | PRAGMA name = IDENT LPAREN arg = IDENT RPAREN
+  | PRAGMA name = any_ident LPAREN arg = any_ident RPAREN
     { match String.lowercase_ascii name with
       | "table_info" -> S_pragma (Pragma_table_info arg)
       | "index_list" -> S_pragma (Pragma_index_list arg)
       | _ -> failwith (Printf.sprintf "unknown pragma: %s" name) }
-  | PRAGMA name = IDENT EQ value = pragma_value
+  | PRAGMA name = any_ident EQ value = pragma_value
     { S_pragma (Pragma_set (name, value)) }
 
 pragma_value:
@@ -137,30 +198,30 @@ pragma_value:
   | n = INT_LIT            { Int64.to_string n }
 
 drop_table:
-  | DROP TABLE name = IDENT { S_drop_table { name } }
+  | DROP TABLE name = any_ident { S_drop_table { name } }
 
 drop_index:
-  | DROP INDEX name = IDENT { S_drop_index { name } }
+  | DROP INDEX name = any_ident { S_drop_index { name } }
 
 create_view:
-  | CREATE VIEW name = IDENT AS query = compound_select
+  | CREATE VIEW name = any_ident AS query = compound_select
     { Ast.S_create_view { name; query } }
 
 drop_view:
-  | DROP VIEW name = IDENT
+  | DROP VIEW name = any_ident
     { Ast.S_drop_view { name } }
 
 create_trigger:
-  | CREATE TRIGGER name = IDENT
+  | CREATE TRIGGER name = any_ident
     timing = trigger_timing
     event  = trigger_event
-    ON table = IDENT
+    ON table = any_ident
     when_  = trigger_when
     BEGIN body = trigger_body END
     { Ast.S_create_trigger { name; timing; event; table; when_; body } }
 
 drop_trigger:
-  | DROP TRIGGER name = IDENT
+  | DROP TRIGGER name = any_ident
     { Ast.S_drop_trigger { name } }
 
 trigger_timing:
@@ -198,19 +259,19 @@ fk_on_clauses:
   |                               { (Ast.FA_no_action, Ast.FA_no_action) }
 
 alter_table:
-  | ALTER TABLE table = IDENT ADD COLUMN col = column_def
+  | ALTER TABLE table = any_ident ADD COLUMN col = column_def
     { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
-  | ALTER TABLE table = IDENT ADD col = column_def
+  | ALTER TABLE table = any_ident ADD col = column_def
     { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
-  | ALTER TABLE table = IDENT RENAME TO new_name = IDENT
+  | ALTER TABLE table = any_ident RENAME TO new_name = any_ident
     { Ast.S_alter_table { table; action = Ast.AA_rename_table new_name } }
-  | ALTER TABLE table = IDENT RENAME COLUMN old_col = IDENT TO new_col = IDENT
+  | ALTER TABLE table = any_ident RENAME COLUMN old_col = any_ident TO new_col = any_ident
     { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
-  | ALTER TABLE table = IDENT RENAME old_col = IDENT TO new_col = IDENT
+  | ALTER TABLE table = any_ident RENAME old_col = any_ident TO new_col = any_ident
     { Ast.S_alter_table { table; action = Ast.AA_rename_column (old_col, new_col) } }
-  | ALTER TABLE table = IDENT DROP COLUMN col = IDENT
+  | ALTER TABLE table = any_ident DROP COLUMN col = any_ident
     { Ast.S_alter_table { table; action = Ast.AA_drop_column col } }
-  | ALTER TABLE table = IDENT DROP col = IDENT
+  | ALTER TABLE table = any_ident DROP col = any_ident
     { Ast.S_alter_table { table; action = Ast.AA_drop_column col } }
 
 begin_stmt:
@@ -223,23 +284,23 @@ rollback_stmt:
   | ROLLBACK { S_rollback }
 
 savepoint_stmt:
-  | SAVEPOINT name = IDENT { Ast.S_savepoint name }
+  | SAVEPOINT name = any_ident { Ast.S_savepoint name }
 
 release_stmt:
-  | RELEASE name = IDENT { Ast.S_release name }
+  | RELEASE name = any_ident { Ast.S_release name }
 
 rollback_to_stmt:
-  | ROLLBACK TO name = IDENT { Ast.S_rollback_to name }
+  | ROLLBACK TO name = any_ident { Ast.S_rollback_to name }
 
 table_item:
   | col = column_def
     { TI_col col }
-  | UNIQUE LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | UNIQUE LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { TI_constraint (Ast.TC_unique cols) }
-  | PRIMARY KEY LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | PRIMARY KEY LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { TI_constraint (Ast.TC_primary_key cols) }
-  | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
-      REFERENCES parent_table = IDENT LPAREN parent_cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+      REFERENCES parent_table = any_ident LPAREN parent_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       oc = fk_on_clauses
     { let (on_delete, on_update) = oc in
       TI_constraint (Ast.TC_foreign_key {
@@ -247,36 +308,36 @@ table_item:
       }) }
 
 create_table:
-  | CREATE TABLE name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+  | CREATE TABLE name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
       S_create_table { name; columns = cols; constraints = cons; if_not_exists = false } }
-  | CREATE TABLE IF NOT EXISTS name = IDENT LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+  | CREATE TABLE IF NOT EXISTS name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
       S_create_table { name; columns = cols; constraints = cons; if_not_exists = true } }
 
 create_fts_table:
-  | CREATE VIRTUAL TABLE name = IDENT USING FTS5
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | CREATE VIRTUAL TABLE name = any_ident USING FTS5
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_fts_table { name; columns = cols } }
 
 create_index:
-  | CREATE INDEX name = IDENT ON table = IDENT
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | CREATE INDEX name = any_ident ON table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_index { name; table; columns = cols; unique = false; if_not_exists = false } }
-  | CREATE UNIQUE INDEX name = IDENT ON table = IDENT
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | CREATE UNIQUE INDEX name = any_ident ON table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_index { name; table; columns = cols; unique = true; if_not_exists = false } }
-  | CREATE INDEX IF NOT EXISTS name = IDENT ON table = IDENT
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | CREATE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_index { name; table; columns = cols; unique = false; if_not_exists = true } }
-  | CREATE UNIQUE INDEX IF NOT EXISTS name = IDENT ON table = IDENT
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | CREATE UNIQUE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_index { name; table; columns = cols; unique = true; if_not_exists = true } }
 
 column_def:
-  | name = IDENT ty = col_ty cs = column_constraint*
+  | name = any_ident ty = col_ty cs = column_constraint*
     { let not_null    = List.mem Col_not_null cs in
       let primary_key = List.mem Col_primary_key cs in
       let default     = List.fold_left (fun acc c ->
@@ -301,9 +362,9 @@ column_constraint:
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
-  | REFERENCES t = IDENT oc = fk_on_clauses
+  | REFERENCES t = any_ident oc = fk_on_clauses
     { let (od, ou) = oc in Col_fk_ref (t, None, od, ou) }
-  | REFERENCES t = IDENT LPAREN c = IDENT RPAREN oc = fk_on_clauses
+  | REFERENCES t = any_ident LPAREN c = any_ident RPAREN oc = fk_on_clauses
     { let (od, ou) = oc in Col_fk_ref (t, Some c, od, ou) }
 
 def_value:
@@ -326,14 +387,14 @@ value_row:
   | LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN { vals }
 
 insert:
-  | INSERT oc = opt_conflict INTO table = IDENT
-      LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | INSERT oc = opt_conflict INTO table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       VALUES rows = separated_nonempty_list(COMMA, value_row)
       upsert = opt_upsert
       ret = opt_returning
     { Ast.S_insert { table; columns = cols; values = rows; on_conflict = oc; returning = ret;
                      upsert_update = upsert } }
-  | INSERT oc = opt_conflict INTO table = IDENT
+  | INSERT oc = opt_conflict INTO table = any_ident
       VALUES rows = separated_nonempty_list(COMMA, value_row)
       upsert = opt_upsert
       ret = opt_returning
@@ -345,7 +406,7 @@ opt_returning:
   |                                                         { [] }
 
 opt_upsert:
-  | ON CONFLICT LPAREN cols = separated_nonempty_list(COMMA, IDENT) RPAREN
+  | ON CONFLICT LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     DO UPDATE SET assigns = separated_nonempty_list(COMMA, assignment)
     { Some Ast.{ conflict_cols = cols; assignments = assigns } }
   |  { None }
@@ -393,7 +454,7 @@ select:
         S_const_select { exprs } }
 
 from_tail:
-  | FROM table = IDENT tbl_alias = option(preceded(AS, IDENT))
+  | FROM table = any_ident tbl_alias = option(preceded(AS, any_ident))
       js = join_clauses wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
@@ -405,28 +466,28 @@ join_clauses:
   | j = join_clause rest = join_clauses { j :: rest }
 
 join_clause:
-  | INNER JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+  | INNER JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
     { { kind = Inner; table = t; alias; on = e } }
-  | LEFT JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+  | LEFT JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
     { { kind = Left;  table = t; alias; on = e } }
-  | LEFT OUTER JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+  | LEFT OUTER JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
     { { kind = Left;  table = t; alias; on = e } }
-  | JOIN t = IDENT alias = option(preceded(AS, IDENT)) ON e = expr
+  | JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
     { { kind = Inner; table = t; alias; on = e } }
 
 update:
-  | UPDATE table = IDENT SET
+  | UPDATE table = any_ident SET
       assignments = separated_nonempty_list(COMMA, assignment)
       wh = where_opt
       ret = opt_returning
     { S_update { table; assignments; where = wh; returning = ret } }
 
 delete:
-  | DELETE FROM table = IDENT wh = where_opt ret = opt_returning
+  | DELETE FROM table = any_ident wh = where_opt ret = opt_returning
     { S_delete { table; where = wh; returning = ret } }
 
 assignment:
-  | col = IDENT EQ value = expr { (col, value) }
+  | col = any_ident EQ value = expr { (col, value) }
 
 projection:
   | STAR                                             { `All }
@@ -541,7 +602,7 @@ scalar_expr:
     { E_func (Fn_json_remove, args) }
 
 proj_item:
-  | e = expr AS alias = IDENT { `ExprA (e, Some alias) }
+  | e = expr AS alias = any_ident { `ExprA (e, Some alias) }
   | e = expr { match e with E_col name -> `Col name | _ -> `ExprA (e, None) }
 
 where_opt:
@@ -550,7 +611,7 @@ where_opt:
 
 group_by_clause:
   |                                                                 { [] }
-  | GROUP BY cs = separated_nonempty_list(COMMA, IDENT)            { cs }
+  | GROUP BY cs = separated_nonempty_list(COMMA, any_ident)        { cs }
 
 having_clause:
   |                                                                 { None }
