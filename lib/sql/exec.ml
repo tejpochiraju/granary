@@ -1237,6 +1237,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     ?(on_conflict : Ast.conflict_action option = None)
     ?(upsert_update : (string list * (int * Plan.expr) list) option = None)
     ?(prebuilt_row : Row.t option = None)
+    ?(before_hook : (new_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
   let n   = List.length table_meta.columns in
@@ -1305,6 +1307,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
                        fk.fk_parent_table fk.fk_parent_col)))
       ) fks
   in
+  (* Fire BEFORE INSERT triggers *)
+  let* () = match before_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
@@ -1393,6 +1397,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            let* () = S.del tx table_meta.tree_id old_key in
            let* () = S.put tx table_meta.tree_id old_key new_bytes in
            let* () = release_txn tx owned in
+           let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row in
            Lwt.return true)
       | _ ->
         (* Normal path: skip, replace, or plain insert *)
@@ -1428,6 +1433,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             S.put tx idx.idx_tree_id ikey Bytes.empty
           ) idxs in
           let* () = release_txn tx owned in
+          let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
           Lwt.return true
         end)
     (fun exn ->
@@ -1564,6 +1570,8 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
     number of rows whose contents were modified. *)
 let execute_update ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
+    ?(before_hook : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t)
     (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
@@ -1628,6 +1636,18 @@ let execute_update ?(mode = Auto) ?(params = [||])
                    else Lwt.return_unit)
             ) fks
           ) child_refs
+        ) matches
+    in
+    (* Fire BEFORE UPDATE triggers (per row) *)
+    let* () = match before_hook with
+      | None -> Lwt.return_unit
+      | Some f ->
+        Lwt_list.iter_s (fun (_rowid, old_row) ->
+          let new_row = Array.copy old_row in
+          List.iter (fun (i, expr) ->
+            new_row.(i) <- eval_expr clock params old_row expr
+          ) assignments;
+          f ~old_row ~new_row
         ) matches
     in
     let* (tx, owned) = acquire_txn store mode in
@@ -1701,6 +1721,18 @@ let execute_update ?(mode = Auto) ?(params = [||])
           ) matches
         in
         let* () = release_txn tx owned in
+        (* Fire AFTER UPDATE triggers (per row) *)
+        let* () = match after_hook with
+          | None -> Lwt.return_unit
+          | Some f ->
+            Lwt_list.iter_s (fun (_rowid, old_row) ->
+              let new_row = Array.copy old_row in
+              List.iter (fun (i, expr) ->
+                new_row.(i) <- eval_expr clock params old_row expr
+              ) assignments;
+              f ~old_row ~new_row
+            ) matches
+        in
         Lwt.return n)
       (fun exn ->
         (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -1713,6 +1745,8 @@ let execute_update ?(mode = Auto) ?(params = [||])
     row itself from the table tree.  Returns the number of rows deleted. *)
 let execute_delete ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
+    ?(before_hook : (old_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (old_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t)
     (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
@@ -1770,6 +1804,11 @@ let execute_delete ?(mode = Auto) ?(params = [||])
           ) child_refs
         ) matches
     in
+    (* Fire BEFORE DELETE triggers (per row) *)
+    let* () = match before_hook with
+      | None -> Lwt.return_unit
+      | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~old_row) matches
+    in
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
@@ -1788,6 +1827,11 @@ let execute_delete ?(mode = Auto) ?(params = [||])
           ) matches
         in
         let* () = release_txn tx owned in
+        (* Fire AFTER DELETE triggers (per row) *)
+        let* () = match after_hook with
+          | None -> Lwt.return_unit
+          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~old_row) matches
+        in
         Lwt.return n)
       (fun exn ->
         (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -1829,7 +1873,10 @@ let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
     number of rows whose contents were modified. *)
 let execute_with_count ?(mode = Auto)
     ?(clock : (unit -> float) option = None)
-    ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op)
+    ?(params = [||])
+    ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
   | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints } ->
@@ -1862,8 +1909,11 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     end
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
+    let bh = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) before_hook in
+    let ah = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) after_hook in
     Lwt_list.fold_left_s (fun count row_vals ->
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
+                        ~before_hook:bh ~after_hook:ah
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
@@ -1879,9 +1929,23 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     end
   | Plan.Op_update { table_meta; assignments; where; indexes; returning = _ } ->
-    execute_update ~mode ~params ~clock store cat ~table_meta ~assignments ~where ~indexes
+    let bh = Option.map (fun f ~old_row ~new_row ->
+      f ~new_row:(Some new_row) ~old_row:(Some old_row)
+    ) before_hook in
+    let ah = Option.map (fun f ~old_row ~new_row ->
+      f ~new_row:(Some new_row) ~old_row:(Some old_row)
+    ) after_hook in
+    execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
+      store cat ~table_meta ~assignments ~where ~indexes
   | Plan.Op_delete { table_meta; where; indexes; returning = _ } ->
-    execute_delete ~mode ~params ~clock store cat ~table_meta ~where ~indexes
+    let bh = Option.map (fun f ~old_row ->
+      f ~new_row:None ~old_row:(Some old_row)
+    ) before_hook in
+    let ah = Option.map (fun f ~old_row ->
+      f ~new_row:None ~old_row:(Some old_row)
+    ) after_hook in
+    execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
+      store cat ~table_meta ~where ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     (* Invalidate cached CHECK expressions for the dropped table *)
@@ -2079,8 +2143,11 @@ let execute_with_count ?(mode = Auto)
 (** Compatibility entry point: discards the rows-affected count. *)
 let execute ?(mode = Auto)
     ?(clock : (unit -> float) option = None)
-    ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count ~mode ~clock ~params store cat op in
+    ?(params = [||])
+    ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
+  let* _n = execute_with_count ~mode ~clock ~params ~before_hook ~after_hook store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)

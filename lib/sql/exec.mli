@@ -12,6 +12,12 @@ val execute :
   ?mode:txn_mode ->
   ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
+  ?before_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+                old_row:Sqlocaml_encoding.Row.t option ->
+                unit Lwt.t) option ->
+  ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+               old_row:Sqlocaml_encoding.Row.t option ->
+               unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
@@ -26,6 +32,12 @@ val execute_with_count :
   ?mode:txn_mode ->
   ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
+  ?before_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+                old_row:Sqlocaml_encoding.Row.t option ->
+                unit Lwt.t) option ->
+  ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+               old_row:Sqlocaml_encoding.Row.t option ->
+               unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
