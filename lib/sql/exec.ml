@@ -641,7 +641,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
        (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
      | _ -> Row.V_int 0L)
   | Ast.Fn_json_set, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
     (match Json.parse json_s with
      | Error _ -> Row.V_null
      | Ok jv ->
@@ -653,7 +653,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
        in
        Row.V_text (Json.to_string (apply jv rest)))
   | Ast.Fn_json_insert, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
     (match Json.parse json_s with
      | Error _ -> Row.V_null
      | Ok jv ->
@@ -665,7 +665,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
        in
        Row.V_text (Json.to_string (apply jv rest)))
   | Ast.Fn_json_replace, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
     (match Json.parse json_s with
      | Error _ -> Row.V_null
      | Ok jv ->
@@ -677,7 +677,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
        in
        Row.V_text (Json.to_string (apply jv rest)))
   | Ast.Fn_json_remove, json_v :: paths ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "{}") in
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
     (match Json.parse json_s with
      | Error _ -> Row.V_null
      | Ok jv ->

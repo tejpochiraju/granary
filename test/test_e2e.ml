@@ -4553,7 +4553,10 @@ let test_json_set () =
     [| Db.V_text {|{"a":1,"b":2}|} |] (List.nth r2 0);
   let r3 = query_ok db {|SELECT json_set('[1,2,3]', '$[1]', 99)|} in
   Alcotest.(check row_testable) "set array index"
-    [| Db.V_text "[1,99,3]" |] (List.nth r3 0)
+    [| Db.V_text "[1,99,3]" |] (List.nth r3 0);
+  let r4 = query_ok db {|SELECT json_set('{"a":1}', '$.b', 2, '$.c', 3)|} in
+  Alcotest.(check row_testable) "set multiple pairs"
+    [| Db.V_text {|{"a":1,"b":2,"c":3}|} |] (List.nth r4 0)
 
 let test_json_insert () =
   let db = fresh_db () in
@@ -4580,7 +4583,10 @@ let test_json_remove () =
     [| Db.V_text {|{"b":2}|} |] (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_remove('[1,2,3]', '$[1]')|} in
   Alcotest.(check row_testable) "remove array element"
-    [| Db.V_text "[1,3]" |] (List.nth r2 0)
+    [| Db.V_text "[1,3]" |] (List.nth r2 0);
+  let r3 = query_ok db {|SELECT json_remove('{"a":1,"b":2,"c":3}', '$.a', '$.c')|} in
+  Alcotest.(check row_testable) "remove multiple paths"
+    [| Db.V_text {|{"b":2}|} |] (List.nth r3 0)
 
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)

@@ -2814,6 +2814,9 @@ let phase20_json_mutation_cases = [
   { name = "json_remove_array_elem";
     setup = []; unordered = false;
     query = {|SELECT json_remove('[1,2,3]', '$[1]')|} };
+  { name = "json_set_null_input";
+    setup = []; unordered = false;
+    query = {|SELECT json_set(NULL, '$.a', 1)|} };
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
