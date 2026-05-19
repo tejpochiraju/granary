@@ -4167,6 +4167,39 @@ let test_window_frame_non_agg_error () =
      | Ok () -> Alcotest.fail "expected error for ROWS frame on non-aggregate window function");
     Lwt.return_unit)
 
+let test_window_in_agg () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE wagg (dept TEXT, sal INTEGER)";
+  exec db "INSERT INTO wagg VALUES ('eng', 100)";
+  exec db "INSERT INTO wagg VALUES ('eng', 200)";
+  exec db "INSERT INTO wagg VALUES ('mkt', 150)";
+  exec db "INSERT INTO wagg VALUES ('mkt', 50)";
+  let rows = query_ok db
+    "SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal) DESC) FROM wagg GROUP BY dept ORDER BY dept" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "eng dept"   (Db.V_text "eng") (List.nth rows 0).(0);
+  Alcotest.check value_testable "eng sum"    (Db.V_int 300L)   (List.nth rows 0).(1);
+  Alcotest.check value_testable "eng rank=1" (Db.V_int 1L)     (List.nth rows 0).(2);
+  Alcotest.check value_testable "mkt dept"   (Db.V_text "mkt") (List.nth rows 1).(0);
+  Alcotest.check value_testable "mkt sum"    (Db.V_int 200L)   (List.nth rows 1).(1);
+  Alcotest.check value_testable "mkt rank=2" (Db.V_int 2L)     (List.nth rows 1).(2)
+
+let test_window_in_agg_count () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE wagg2 (dept TEXT, sal INTEGER)";
+  exec db "INSERT INTO wagg2 VALUES ('eng', 100)";
+  exec db "INSERT INTO wagg2 VALUES ('eng', 200)";
+  exec db "INSERT INTO wagg2 VALUES ('mkt', 150)";
+  let rows = query_ok db
+    "SELECT dept, COUNT(*), DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) FROM wagg2 GROUP BY dept ORDER BY dept" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "eng dept"         (Db.V_text "eng") (List.nth rows 0).(0);
+  Alcotest.check value_testable "eng count=2"      (Db.V_int 2L)     (List.nth rows 0).(1);
+  Alcotest.check value_testable "eng dense_rank=1" (Db.V_int 1L)     (List.nth rows 0).(2);
+  Alcotest.check value_testable "mkt dept"         (Db.V_text "mkt") (List.nth rows 1).(0);
+  Alcotest.check value_testable "mkt count=1"      (Db.V_int 1L)     (List.nth rows 1).(1);
+  Alcotest.check value_testable "mkt dense_rank=2" (Db.V_int 2L)     (List.nth rows 1).(2)
+
 let test_collate_nocase_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
@@ -4863,6 +4896,8 @@ let () =
       Alcotest.test_case "percent_rank_desc"    `Quick test_window_percent_rank_desc;
       Alcotest.test_case "cume_dist_desc"        `Quick test_window_cume_dist_desc;
       Alcotest.test_case "frame_non_agg_error"   `Quick test_window_frame_non_agg_error;
+      Alcotest.test_case "window_in_agg"         `Quick test_window_in_agg;
+      Alcotest.test_case "window_in_agg_count"   `Quick test_window_in_agg_count;
     ];
     "recursive_cte", [
       Alcotest.test_case "series"                  `Quick test_recursive_cte_series;

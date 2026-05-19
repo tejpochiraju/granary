@@ -142,8 +142,9 @@ let sema_agg_to_plan (a : Sema.agg_spec) : Plan.agg_spec =
   { Plan.func = a.func; col_ord = a.col_ord }
 
 let sema_agg_proj_to_plan : Sema.agg_proj_item -> Plan.proj_item = function
-  | Sema.AP_group_col i -> Plan.PI_group_col i
-  | Sema.AP_agg_slot i  -> Plan.PI_agg_slot i
+  | Sema.AP_group_col i   -> Plan.PI_group_col i
+  | Sema.AP_agg_slot i    -> Plan.PI_agg_slot i
+  | Sema.AP_window_slot i -> Plan.PI_window_slot i
 
 let plan_window_item (ws : Sema.window_sema) : Plan.window_plan_item =
   { Plan.func         = ws.Sema.func;
@@ -184,7 +185,7 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
 
 let plan_select cat
     ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~joins
-    ~group_by ~aggs ~having ~agg_proj ~distinct ~windows =
+    ~group_by ~aggs ~having ~agg_proj ~distinct ~windows ~agg_windows =
   let has_joins = joins <> [] in
   let n_input_cols =
     List.length table_meta.Cat.columns
@@ -291,6 +292,7 @@ let plan_select cat
         aggs = List.map sema_agg_to_plan aggs;
         having = Option.map plan_expr having;
         proj = List.map sema_agg_proj_to_plan agg_proj;
+        windows = List.map plan_window_item agg_windows;
       }
     else if expr_proj <> [] then
       Plan.Op_expr_project {
@@ -335,11 +337,11 @@ let rec plan ?cat = function
                      returning = List.map plan_expr returning;
                      upsert_update = plan_upsert }
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
-                     joins; group_by; aggs; having; agg_proj; windows } ->
+                     joins; group_by; aggs; having; agg_proj; windows; agg_windows } ->
     (match cat with
      | Some cat ->
        plan_select cat ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset
-         ~joins ~group_by ~aggs ~having ~agg_proj ~distinct ~windows
+         ~joins ~group_by ~aggs ~having ~agg_proj ~distinct ~windows ~agg_windows
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
           (for JOIN) no index-based NLJ.  Build a hash-join + filter
@@ -428,6 +430,7 @@ let rec plan ?cat = function
              aggs = List.map sema_agg_to_plan aggs;
              having = Option.map plan_expr having;
              proj = List.map sema_agg_proj_to_plan agg_proj;
+             windows = List.map plan_window_item agg_windows;
            }
          else if expr_proj <> [] then
            Plan.Op_expr_project {

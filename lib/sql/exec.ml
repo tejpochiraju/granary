@@ -2733,7 +2733,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       ) left_rows;
       Lwt.return (Lwt_stream.of_list (List.rev !out))
     end
-  | Plan.Op_aggregate { child; group_cols; aggs; having; proj } ->
+  | Plan.Op_aggregate { child; group_cols; aggs; having; proj; windows = agg_windows } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
     let n_group_cols = List.length group_cols in
@@ -2852,14 +2852,40 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | Some pred ->
         List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
     in
+    (* Compute post-aggregate window functions if any. *)
+    let n_agg_cols = n_group_cols + List.length aggs in
+    let with_windows =
+      if agg_windows = [] then after_having
+      else begin
+        let n_total = List.length after_having in
+        let indexed = List.mapi (fun i r -> (i, r)) after_having in
+        let window_arrays = List.map (fun (wplan : Plan.window_plan_item) ->
+          let partitions = group_by_partition clock params wplan.Plan.partition_by indexed in
+          let combined = Array.make n_total Row.V_null in
+          List.iter (fun (_, partition_indexed) ->
+            let sorted = sort_partition_by clock params wplan.Plan.order_by partition_indexed in
+            let part_results = compute_window_for_partition clock params wplan sorted n_total in
+            List.iter (fun (orig_idx, _) ->
+              combined.(orig_idx) <- part_results.(orig_idx)
+            ) sorted
+          ) partitions;
+          combined
+        ) agg_windows in
+        List.mapi (fun i row ->
+          let extras = List.map (fun arr -> arr.(i)) window_arrays in
+          Array.append row (Array.of_list extras)
+        ) after_having
+      end
+    in
     (* Project to final output row. *)
     let final_rows =
       List.map (fun agg_row ->
         Array.of_list (List.map (function
-          | Plan.PI_group_col i -> agg_row.(i)
-          | Plan.PI_agg_slot k  -> agg_row.(n_group_cols + k)
+          | Plan.PI_group_col i   -> agg_row.(i)
+          | Plan.PI_agg_slot k    -> agg_row.(n_group_cols + k)
+          | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
         ) proj)
-      ) after_having
+      ) with_windows
     in
     Lwt.return (Lwt_stream.of_list final_rows)
   | Plan.Op_fts_seq_scan { fts_meta; where } ->

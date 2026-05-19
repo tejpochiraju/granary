@@ -2715,6 +2715,26 @@ let phase19_nulls_cases =
     { name = "nulls last desc";  setup; query = "SELECT x FROM tn ORDER BY x DESC NULLS LAST";  unordered = false };
   ]
 
+let phase19_window_agg_cases =
+  let setup = ["CREATE TABLE wagg (dept TEXT, sal INTEGER)";
+               "INSERT INTO wagg VALUES ('eng', 100)";
+               "INSERT INTO wagg VALUES ('eng', 200)";
+               "INSERT INTO wagg VALUES ('mkt', 150)";
+               "INSERT INTO wagg VALUES ('mkt', 50)"] in
+  [
+    { name = "rank over sum";
+      setup;
+      query = "SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal) DESC) FROM wagg GROUP BY dept ORDER BY dept";
+      unordered = false };
+    { name = "dense_rank over count";
+      setup = ["CREATE TABLE wagg (dept TEXT, sal INTEGER)";
+               "INSERT INTO wagg VALUES ('eng', 100)";
+               "INSERT INTO wagg VALUES ('eng', 200)";
+               "INSERT INTO wagg VALUES ('mkt', 150)"];
+      query = "SELECT dept, COUNT(*), DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) FROM wagg GROUP BY dept ORDER BY dept";
+      unordered = false };
+  ]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2746,4 +2766,5 @@ let () =
     "phase18_fk",              List.map make_test phase18_fk_cases;
     "phase19_math",            List.map make_test phase19_math_cases;
     "phase19_nulls",           List.map make_test phase19_nulls_cases;
+    "phase19_window_agg",      List.map make_test phase19_window_agg_cases;
   ]

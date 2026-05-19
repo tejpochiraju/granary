@@ -74,6 +74,7 @@ type agg_spec = {
 type agg_proj_item =
   | AP_group_col of int       (** project the i-th GROUP BY column (index into group_cols list) *)
   | AP_agg_slot of int        (** project the [i]-th aggregate result from the aggregate output *)
+  | AP_window_slot of int     (** post-aggregate window function result *)
 
 (** A bound JOIN clause.
     Column ordinals in [on] are absolute within the combined
@@ -135,7 +136,9 @@ type bound_stmt =
       agg_proj   : agg_proj_item list;
         (** When [aggs] is non-empty, this is the projection list over
             the aggregate output row (ignore [proj]).  Empty otherwise. *)
-      windows    : window_sema list;
+      windows     : window_sema list;
+      agg_windows : window_sema list;
+        (** Window functions computed AFTER aggregation, over the aggregated output rows. *)
     }
   | BS_create_index of {
       name          : string;

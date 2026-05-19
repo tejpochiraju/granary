@@ -59,6 +59,7 @@ type agg_spec = {
 type agg_proj_item =
   | AP_group_col of int     (** index into group_cols list *)
   | AP_agg_slot of int
+  | AP_window_slot of int   (** post-aggregate window function result *)
 
 (** A bound JOIN clause.  See sema.mli for layout details. *)
 type bound_join = {
@@ -102,8 +103,10 @@ type bound_stmt =
       group_by   : int list;
       aggs       : agg_spec list;
       having     : bound_expr option;
-      agg_proj   : agg_proj_item list;
-      windows    : window_sema list;
+      agg_proj    : agg_proj_item list;
+      windows     : window_sema list;
+      agg_windows : window_sema list;
+        (** Window functions computed AFTER aggregation, over aggregated output rows. *)
     }
   | BS_create_index of {
       name          : string;
@@ -1338,13 +1341,14 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
         | Ok group_cols ->
        let offset_for_aggs = List.length group_cols in
        (* Build proj/agg_proj.
-          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj, windows).
+          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj, windows, agg_windows).
           [expr_proj] is non-empty only for scalar-function projections
           (Phase 5); [col_ordinals] is empty in that case.
-          [windows] is non-empty only for window-function projections (Phase 14). *)
+          [windows] is non-empty only for window-function projections (Phase 14).
+          [agg_windows] is non-empty only for window functions in aggregated context. *)
        let* proj_result :
            (int list * agg_proj_item list * agg_spec list * (bound_expr * string option) list
-            * window_sema list,
+            * window_sema list * window_sema list,
             error) result =
          if not is_aggregated then
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6,
@@ -1517,14 +1521,15 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
            let windows_list = Queue.fold (fun acc w -> acc @ [w]) [] windows_queue in
            (match ords_result with
             | Error e -> Lwt.return (Error e)
-            | Ok (`Ords o)    -> Lwt.return (Ok (o, [], [], [], windows_list))
-            | Ok (`Exprs bes) -> Lwt.return (Ok ([], [], [], bes, windows_list)))
+            | Ok (`Ords o)    -> Lwt.return (Ok (o, [], [], [], windows_list, []))
+            | Ok (`Exprs bes) -> Lwt.return (Ok ([], [], [], bes, windows_list, [])))
          else begin
            (* Aggregated SELECT — build agg_proj and aggs list. *)
            (* Helper: walk an expression that is an explicit projection
               item.  For a bare column reference, produce a non-agg slot;
               for an aggregate, produce an AP_agg_slot. *)
            let acc_aggs = ref [] in
+           let agg_windows_queue : window_sema Queue.t = Queue.create () in
            let add_agg spec =
              let idx = List.length !acc_aggs in
              acc_aggs := !acc_aggs @ [spec];
@@ -1588,6 +1593,105 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                    | Ok () ->
                      let slot = add_agg { func; col_ord = co } in
                      Ok (AP_agg_slot slot)))
+             | Ast.E_window { func; args; window } ->
+               (* Window function in aggregated projection: bind args in
+                  post-agg context (GROUP BY cols and agg slots allowed). *)
+               let bind_post_agg e =
+                 let rec go = function
+                   | Ast.E_lit l -> Ok (BE_lit l)
+                   | Ast.E_col name ->
+                     (match proj_lookup name with
+                      | Error e -> Error e
+                      | Ok i ->
+                        match find_pos group_cols i with
+                        | Some pos -> Ok (BE_col pos)
+                        | None -> Error (Unsupported (Printf.sprintf
+                            "column '%s' must appear in GROUP BY to be referenced in a window function in this context" name)))
+                   | Ast.E_tbl_col (t, c) ->
+                     (match qual_lookup t c with
+                      | Error e -> Error e
+                      | Ok i ->
+                        match find_pos group_cols i with
+                        | Some pos -> Ok (BE_col pos)
+                        | None -> Error (Unsupported (Printf.sprintf
+                            "column '%s.%s' must appear in GROUP BY to be referenced in a window function in this context" t c)))
+                   | Ast.E_agg (func, arg_opt) ->
+                     let col_ord_result : (int option, error) result =
+                       match arg_opt with
+                       | None -> (match func with
+                                  | Ast.Agg_count -> Ok None
+                                  | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+                       | Some (Ast.E_col name) ->
+                         (match proj_lookup name with
+                          | Error e -> Error e | Ok i -> Ok (Some i))
+                       | Some (Ast.E_tbl_col (t, c)) ->
+                         (match qual_lookup t c with
+                          | Error e -> Error e | Ok i -> Ok (Some i))
+                       | Some _ ->
+                         Error (Unsupported "aggregate argument in window function must be a column reference")
+                     in
+                     (match col_ord_result with
+                      | Error e -> Error e
+                      | Ok co ->
+                        let spec = { func; col_ord = co } in
+                        let rec find_slot i = function
+                          | [] ->
+                            acc_aggs := !acc_aggs @ [spec];
+                            List.length !acc_aggs - 1
+                          | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
+                          | _ :: rest -> find_slot (i + 1) rest
+                        in
+                        let slot = find_slot 0 !acc_aggs in
+                        Ok (BE_col (offset_for_aggs + slot)))
+                   | Ast.E_neg e -> (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
+                   | Ast.E_not e -> (match go e with Ok be -> Ok (BE_not be) | Error e -> Error e)
+                   | Ast.E_binop (op, a, b) ->
+                     (match go a, go b with
+                      | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
+                      | Error e, _ | _, Error e -> Error e)
+                   | Ast.E_window _ -> Error (Unsupported "nested window functions not supported")
+                   | _ -> Error (Unsupported "only GROUP BY columns and aggregate expressions are supported in window function arguments in this context")
+                 in go e
+               in
+               let bind_list es =
+                 List.fold_left (fun acc_r ex ->
+                   match acc_r with
+                   | Error _ as err -> err
+                   | Ok acc ->
+                     match bind_post_agg ex with
+                     | Error er -> Error er
+                     | Ok be    -> Ok (acc @ [be])
+                 ) (Ok []) es
+               in
+               let bind_ok_list (oks : Ast.order_key list) =
+                 List.fold_left (fun acc_r ok ->
+                   match acc_r with
+                   | Error _ as err -> err
+                   | Ok acc ->
+                     match bind_post_agg ok.Ast.expr with
+                     | Error er -> Error er
+                     | Ok be    ->
+                       let nulls = ok.Ast.nulls in
+                       Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls }])
+                 ) (Ok []) oks
+               in
+               (match bind_list args with
+                | Error er -> Error er
+                | Ok bound_args ->
+                  match bind_list window.Ast.partition_by with
+                  | Error er -> Error er
+                  | Ok bound_pb ->
+                    match bind_ok_list window.Ast.order_by with
+                    | Error er -> Error er
+                    | Ok bound_ob ->
+                      let slot = Queue.length agg_windows_queue in
+                      Queue.push
+                        { func; args = bound_args;
+                          partition_by = bound_pb;
+                          order_by = bound_ob;
+                          frame = window.Ast.frame }
+                        agg_windows_queue;
+                      Ok (AP_window_slot slot))
              | _ ->
                Error (Unsupported "complex expression in aggregated projection not supported")
            in
@@ -1619,14 +1723,15 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                     | Ok item -> Ok (items @ [item]))
                ) (Ok []) exprs_to_project
              in
+             let agg_wins = Queue.fold (fun acc w -> acc @ [w]) [] agg_windows_queue in
              Lwt.return (match agg_proj_result with
               | Error e -> Error e
-              | Ok items -> Ok ([], items, !acc_aggs, [], []))
+              | Ok items -> Ok ([], items, !acc_aggs, [], [], agg_wins))
          end
        in
        (match proj_result with
         | Error e -> Lwt.return (Error e)
-        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows) ->
+        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows, agg_wins) ->
           (* Bind each join ON predicate against tables visible so far *)
           let bind_joins_result : (bound_join list, error) result =
             let rec go acc tbl_acc offset = function
@@ -1784,8 +1889,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                            group_by   = group_cols;
                            aggs       = all_aggs;
                            having     = bound_having;
-                           agg_proj   = agg_proj_items;
-                           windows    = proj_windows;
+                           agg_proj    = agg_proj_items;
+                           windows     = proj_windows;
+                           agg_windows = agg_wins;
                          })))))))))))
 
 (* ------------------------------------------------------------------ *)

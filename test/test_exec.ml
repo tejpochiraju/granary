@@ -1744,6 +1744,7 @@ let query_aggregate_count_star () =
       aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1770,6 +1771,7 @@ let query_aggregate_sum_int () =
       aggs      = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1796,6 +1798,7 @@ let query_aggregate_sum_real () =
       aggs      = [ { Plan.func = Ast.Agg_sum; col_ord = Some 0 } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1820,6 +1823,7 @@ let query_aggregate_avg () =
       aggs      = [ { Plan.func = Ast.Agg_avg; col_ord = Some 0 } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1846,6 +1850,7 @@ let query_aggregate_min_max () =
                     { Plan.func = Ast.Agg_max; col_ord = Some 0 } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0; Plan.PI_agg_slot 1 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1877,6 +1882,7 @@ let query_aggregate_count_col_skips_null () =
       aggs      = [ { Plan.func = Ast.Agg_count; col_ord = Some 0 } ];
       having    = None;
       proj      = [ Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1902,6 +1908,7 @@ let query_aggregate_with_group_by () =
       aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
       having    = None;
       proj      = [ Plan.PI_group_col 0; Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1926,6 +1933,7 @@ let query_aggregate_with_having () =
       aggs      = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
       having    = Some (Plan.P_binop (Plan.Gt, Plan.P_col 1, Plan.P_lit (Ast.L_int 1L)));
       proj      = [ Plan.PI_group_col 0; Plan.PI_agg_slot 0 ];
+      windows   = [];
     } in
     let* stream = Exec.query store cat op in
     let rows = collect stream in
@@ -1951,6 +1959,7 @@ let query_aggregate_raises_in_execute () =
             aggs = [ { Plan.func = Ast.Agg_count; col_ord = None } ];
             having = None;
             proj = [ Plan.PI_agg_slot 0 ];
+            windows = [];
           }));
        Alcotest.fail "expected Failure for Op_aggregate in execute"
      with Failure _ -> ());

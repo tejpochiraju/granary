@@ -154,6 +154,8 @@ type op =
       proj       : proj_item list;
         (** projection over the aggregate output row.  Maps to the final
             row emitted to downstream operators. *)
+      windows    : window_plan_item list;
+        (** Post-aggregate window functions; [] for plain GROUP BY. *)
     }
   | Op_alter_table of {
       table_meta : Cat.table_meta;
@@ -233,6 +235,7 @@ type op =
 and proj_item =
   | PI_group_col of int     (** project the i-th GROUP BY column (index into group_cols) *)
   | PI_agg_slot of int      (** project the k-th aggregate result *)
+  | PI_window_slot of int   (** project the j-th post-aggregate window function result *)
 
 and agg_spec = {
   func    : Ast.agg_func;
