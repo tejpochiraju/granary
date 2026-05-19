@@ -10,6 +10,9 @@ type default_value =
   | DV_null
   | DV_real of float
   | DV_blob of bytes
+  | DV_current_timestamp
+  | DV_current_date
+  | DV_current_time
 
 type column = {
   name        : string;
@@ -156,7 +159,8 @@ let decode schema encoded =
         | Some (DV_text s) -> V_text s
         | Some (DV_real f) -> V_real f
         | Some (DV_blob b) -> V_blob b
-        | Some DV_null | None -> V_null)
+        | Some DV_null | None -> V_null
+        | Some DV_current_timestamp | Some DV_current_date | Some DV_current_time -> V_null)
     end
   ) schema;
   result

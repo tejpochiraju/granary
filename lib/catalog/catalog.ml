@@ -113,6 +113,9 @@ let default_value_tag : Row.default_value -> int = function
   | Row.DV_real _ -> 2
   | Row.DV_text _ -> 3
   | Row.DV_blob _ -> 4
+  | Row.DV_current_timestamp -> 5
+  | Row.DV_current_date      -> 6
+  | Row.DV_current_time      -> 7
 
 let encode_default_value buf (dv : Row.default_value) =
   Varint.encode_uint64 buf (Int64.of_int (default_value_tag dv));
@@ -140,6 +143,9 @@ let encode_default_value buf (dv : Row.default_value) =
   | Row.DV_blob b ->
     Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
     Buffer.add_bytes buf b
+  | Row.DV_current_timestamp
+  | Row.DV_current_date
+  | Row.DV_current_time   -> ()   (* tag alone is sufficient — no payload *)
 
 let decode_default_value bytes off =
   let tag, off = Varint.decode_uint64 bytes off in
@@ -169,6 +175,9 @@ let decode_default_value bytes off =
     let len = Int64.to_int len in
     let b = Bytes.sub bytes off len in
     (Row.DV_blob b, off + len)
+  | 5 -> (Row.DV_current_timestamp, off)
+  | 6 -> (Row.DV_current_date, off)
+  | 7 -> (Row.DV_current_time, off)
   | n -> failwith (Printf.sprintf "unknown default value tag %d" n)
 
 let encode_column (col : Row.column) =
