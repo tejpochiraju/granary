@@ -196,6 +196,9 @@ rule token = parse
       | "JSON_REMOVE"  -> JSON_REMOVE
       | "SAVEPOINT" -> SAVEPOINT
       | "RELEASE"   -> RELEASE
+      | "TRIGGER"   -> TRIGGER
+      | "BEFORE"    -> BEFORE
+      | "AFTER"     -> AFTER
       | _           -> IDENT id
     }
   | eof                     { EOF }

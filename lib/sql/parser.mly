@@ -45,6 +45,7 @@
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
+%token TRIGGER BEFORE AFTER
 %token OVER PARTITION RECURSIVE COLLATE
 %token PRECEDING FOLLOWING
 %token CHECK
@@ -94,6 +95,8 @@ stmt:
   | s = with_cte          { s }
   | s = create_view       { s }
   | s = drop_view         { s }
+  | s = create_trigger    { s }
+  | s = drop_trigger      { s }
   | s = create_table      { s }
   | s = create_fts_table  { s }
   | s = create_index      { s }
@@ -138,6 +141,36 @@ create_view:
 drop_view:
   | DROP VIEW name = IDENT
     { Ast.S_drop_view { name } }
+
+create_trigger:
+  | CREATE TRIGGER name = IDENT
+    timing = trigger_timing
+    event  = trigger_event
+    ON table = IDENT
+    when_  = trigger_when
+    BEGIN body = trigger_body END
+    { Ast.S_create_trigger { name; timing; event; table; when_; body } }
+
+drop_trigger:
+  | DROP TRIGGER name = IDENT
+    { Ast.S_drop_trigger { name } }
+
+trigger_timing:
+  | BEFORE { Ast.TT_before }
+  | AFTER  { Ast.TT_after  }
+
+trigger_event:
+  | INSERT { Ast.TE_insert }
+  | UPDATE { Ast.TE_update }
+  | DELETE { Ast.TE_delete }
+
+trigger_when:
+  | WHEN e = expr { Some e }
+  |               { None   }
+
+trigger_body:
+  | s = stmt SEMI             { [s] }
+  | s = stmt SEMI rest = trigger_body { s :: rest }
 
 alter_table:
   | ALTER TABLE table = IDENT ADD COLUMN col = column_def
