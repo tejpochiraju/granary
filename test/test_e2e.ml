@@ -5150,6 +5150,61 @@ let test_trigger_persists_across_reopen () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* UPDATE/DELETE with LIMIT/OFFSET/ORDER BY tests                       *)
+(* ------------------------------------------------------------------ *)
+
+let update_delete_limit_tests =
+  [ Alcotest.test_case "delete limit" `Quick (fun () ->
+      let db = fresh_db () in
+      exec db "CREATE TABLE t (id INTEGER, v TEXT)";
+      exec db "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')";
+      exec db "DELETE FROM t LIMIT 2";
+      let rows = query_ok db "SELECT id FROM t" in
+      Alcotest.(check int) "1 row remains" 1 (List.length rows))
+  ; Alcotest.test_case "delete order limit" `Quick (fun () ->
+      let db = fresh_db () in
+      exec db "CREATE TABLE t (id INTEGER, v TEXT)";
+      exec db "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')";
+      exec db "DELETE FROM t ORDER BY id DESC LIMIT 1";
+      let rows = query_ok db "SELECT id FROM t ORDER BY id" in
+      Alcotest.(check int) "2 rows remain" 2 (List.length rows);
+      let ids = List.map (fun row ->
+        match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1
+      ) rows in
+      Alcotest.(check (list int)) "ids 1,2 remain" [1;2] ids)
+  ; Alcotest.test_case "delete order limit offset" `Quick (fun () ->
+      let db = fresh_db () in
+      exec db "CREATE TABLE t (id INTEGER)";
+      exec db "INSERT INTO t VALUES (1),(2),(3),(4),(5)";
+      exec db "DELETE FROM t ORDER BY id LIMIT 2 OFFSET 1";
+      let rows = query_ok db "SELECT id FROM t ORDER BY id" in
+      let ids = List.map (fun row ->
+        match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1
+      ) rows in
+      Alcotest.(check (list int)) "ids 1,4,5 remain" [1;4;5] ids)
+  ; Alcotest.test_case "update order limit" `Quick (fun () ->
+      let db = fresh_db () in
+      exec db "CREATE TABLE t (id INTEGER, v TEXT)";
+      exec db "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')";
+      exec db "UPDATE t SET v = 'z' ORDER BY id DESC LIMIT 1";
+      let rows = query_ok db "SELECT id, v FROM t ORDER BY id" in
+      let vals = List.map (fun row ->
+        match row.(1) with Db.V_text s -> s | _ -> "?"
+      ) rows in
+      Alcotest.(check (list string)) "only id=3 updated" ["a";"b";"z"] vals)
+  ; Alcotest.test_case "update limit no order" `Quick (fun () ->
+      let db = fresh_db () in
+      exec db "CREATE TABLE t (id INTEGER, v TEXT)";
+      exec db "INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'a')";
+      exec db "UPDATE t SET v = 'x' LIMIT 2";
+      let rows = query_ok db "SELECT v FROM t" in
+      let nx = List.length (List.filter (fun row ->
+        match row.(0) with Db.V_text s -> s = "x" | _ -> false
+      ) rows) in
+      Alcotest.(check int) "2 rows updated" 2 nx)
+  ]
+
+(* ------------------------------------------------------------------ *)
 (* Case-insensitive keyword tests                                        *)
 (* ------------------------------------------------------------------ *)
 
@@ -5694,4 +5749,5 @@ let () =
       Alcotest.test_case "persists_across_reopen" `Quick test_trigger_persists_across_reopen;
     ];
     "case_insensitive", case_insensitive_tests;
+    "update_delete_limit", update_delete_limit_tests;
   ]

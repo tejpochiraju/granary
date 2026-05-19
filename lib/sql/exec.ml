@@ -1633,6 +1633,9 @@ let execute_update ?(mode = Auto) ?(params = [||])
     ~(table_meta : Cat.table_meta)
     ~(assignments : (int * Plan.expr) list)
     ~(where : Plan.expr option)
+    ~(order : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
+    ~(limit : int option)
+    ~(offset : int option)
     ~(indexes : Cat.index_info list)
   : int Lwt.t =
   let schema = table_meta.Cat.columns in
@@ -1659,6 +1662,42 @@ let execute_update ?(mode = Auto) ?(params = [||])
   S.cursor_close cur;
   let* () = S.ro_end tx_ro in
   let matches = List.rev !buf in
+  (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
+  let matches =
+    let drop n lst =
+      let rec go k = function
+        | [] -> []
+        | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
+      in go n lst
+    in
+    let take n lst =
+      let rec go k = function
+        | [] -> []
+        | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
+      in go n lst
+    in
+    let sorted =
+      if order = [] then matches
+      else
+        List.sort (fun (_, ra) (_, rb) ->
+          let rec cmp = function
+            | [] -> 0
+            | (e, dir, nulls) :: rest ->
+              let va = eval_expr clock params ra e in
+              let vb = eval_expr clock params rb e in
+              let c = compare_with_nulls dir nulls va vb in
+              if c <> 0 then c else cmp rest
+          in cmp order
+        ) matches
+    in
+    let after_offset = match offset with
+      | None | Some 0 -> sorted
+      | Some n -> drop n sorted
+    in
+    match limit with
+    | None -> after_offset
+    | Some n -> take n after_offset
+  in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
@@ -1877,6 +1916,9 @@ let execute_delete ?(mode = Auto) ?(params = [||])
     (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
     ~(where : Plan.expr option)
+    ~(order : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
+    ~(limit : int option)
+    ~(offset : int option)
     ~(indexes : Cat.index_info list)
   : int Lwt.t =
   let schema = table_meta.Cat.columns in
@@ -1902,6 +1944,42 @@ let execute_delete ?(mode = Auto) ?(params = [||])
   S.cursor_close cur;
   let* () = S.ro_end tx_ro in
   let matches = List.rev !buf in
+  (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
+  let matches =
+    let drop n lst =
+      let rec go k = function
+        | [] -> []
+        | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
+      in go n lst
+    in
+    let take n lst =
+      let rec go k = function
+        | [] -> []
+        | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
+      in go n lst
+    in
+    let sorted =
+      if order = [] then matches
+      else
+        List.sort (fun (_, ra) (_, rb) ->
+          let rec cmp = function
+            | [] -> 0
+            | (e, dir, nulls) :: rest ->
+              let va = eval_expr clock params ra e in
+              let vb = eval_expr clock params rb e in
+              let c = compare_with_nulls dir nulls va vb in
+              if c <> 0 then c else cmp rest
+          in cmp order
+        ) matches
+    in
+    let after_offset = match offset with
+      | None | Some 0 -> sorted
+      | Some n -> drop n sorted
+    in
+    match limit with
+    | None -> after_offset
+    | Some n -> take n after_offset
+  in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
@@ -2119,7 +2197,7 @@ let execute_with_count ?(mode = Auto)
                   ~col_idxs ~unique ~columns in
       Lwt.return 0
     end
-  | Plan.Op_update { table_meta; assignments; where; order = _; limit = _; offset = _; indexes; returning = _ } ->
+  | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
     let bh = Option.map (fun f ~old_row ~new_row ->
       f ~new_row:(Some new_row) ~old_row:(Some old_row)
     ) before_hook in
@@ -2127,8 +2205,8 @@ let execute_with_count ?(mode = Auto)
       f ~new_row:(Some new_row) ~old_row:(Some old_row)
     ) after_hook in
     execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-      store cat ~table_meta ~assignments ~where ~indexes
-  | Plan.Op_delete { table_meta; where; order = _; limit = _; offset = _; indexes; returning = _ } ->
+      store cat ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
+  | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
     let bh = Option.map (fun f ~old_row ->
       f ~new_row:None ~old_row:(Some old_row)
     ) before_hook in
@@ -2136,7 +2214,7 @@ let execute_with_count ?(mode = Auto)
       f ~new_row:None ~old_row:(Some old_row)
     ) after_hook in
     execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-      store cat ~table_meta ~where ~indexes
+      store cat ~table_meta ~where ~order ~limit ~offset ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
     (* Invalidate cached CHECK expressions for the dropped table *)
@@ -3497,7 +3575,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
            Lwt.return [result]
        ) values in
        Lwt.return (Lwt_stream.of_list (List.concat result_lists)))
-  | Plan.Op_update { table_meta; assignments; where; order = _; limit = _; offset = _; indexes; returning }
+  | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
@@ -3508,21 +3586,58 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let rec drain () =
       match S.cursor_next cur with
       | None -> ()
-      | Some (_kbytes, vbytes) ->
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
         let row = Row.decode schema vbytes in
         let keep = match where with
           | None      -> true
           | Some pred -> value_truthy (eval_expr clock params row pred)
         in
-        if keep then buf := row :: !buf;
+        if keep then buf := (rowid, row) :: !buf;
         drain ()
     in
     drain ();
     S.cursor_close cur;
     let* () = S.ro_end tx_ro in
     let matched = List.rev !buf in
+    (* Apply ORDER BY, OFFSET, LIMIT *)
+    let matched =
+      let drop n lst =
+        let rec go k = function
+          | [] -> []
+          | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
+        in go n lst
+      in
+      let take n lst =
+        let rec go k = function
+          | [] -> []
+          | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
+        in go n lst
+      in
+      let sorted =
+        if order = [] then matched
+        else
+          List.sort (fun (_, ra) (_, rb) ->
+            let rec cmp = function
+              | [] -> 0
+              | (e, dir, nulls) :: rest ->
+                let va = eval_expr clock params ra e in
+                let vb = eval_expr clock params rb e in
+                let c = compare_with_nulls dir nulls va vb in
+                if c <> 0 then c else cmp rest
+            in cmp order
+          ) matched
+      in
+      let after_offset = match offset with
+        | None | Some 0 -> sorted
+        | Some n -> drop n sorted
+      in
+      match limit with
+      | None -> after_offset
+      | Some n -> take n after_offset
+    in
     (* Compute new values for each matched row, project RETURNING from new row. *)
-    let result_rows = List.map (fun old_row ->
+    let result_rows = List.map (fun (_, old_row) ->
       let new_row = Array.copy old_row in
       List.iter (fun (i, expr) ->
         new_row.(i) <- eval_expr clock params old_row expr
@@ -3531,9 +3646,9 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     ) matched in
     (* Execute the actual update. *)
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
-    let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~indexes in
+    let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
-  | Plan.Op_delete { table_meta; where; order = _; limit = _; offset = _; indexes; returning }
+  | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)
@@ -3557,11 +3672,47 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     S.cursor_close cur;
     let* () = S.ro_end tx_ro in
     let matched = List.rev !buf in
+    (* Apply ORDER BY, OFFSET, LIMIT *)
+    let matched =
+      let drop n lst =
+        let rec go k = function
+          | [] -> []
+          | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
+        in go n lst
+      in
+      let take n lst =
+        let rec go k = function
+          | [] -> []
+          | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
+        in go n lst
+      in
+      let sorted =
+        if order = [] then matched
+        else
+          List.sort (fun ra rb ->
+            let rec cmp = function
+              | [] -> 0
+              | (e, dir, nulls) :: rest ->
+                let va = eval_expr clock params ra e in
+                let vb = eval_expr clock params rb e in
+                let c = compare_with_nulls dir nulls va vb in
+                if c <> 0 then c else cmp rest
+            in cmp order
+          ) matched
+      in
+      let after_offset = match offset with
+        | None | Some 0 -> sorted
+        | Some n -> drop n sorted
+      in
+      match limit with
+      | None -> after_offset
+      | Some n -> take n after_offset
+    in
     let result_rows = List.map (fun old_row ->
       Array.of_list (List.map (eval_expr clock params old_row) returning)
     ) matched in
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
-    let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~indexes in
+    let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~order ~limit ~offset ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_const_select { exprs } ->
     (* FROM-less SELECT: evaluate each expression with an empty row and

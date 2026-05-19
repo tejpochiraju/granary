@@ -3062,6 +3062,26 @@ let phase23_cascade_cases = [
     unordered = false };
 ]
 
+let phase24_limit_cases = [
+  { name = "delete_order_limit";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')";
+      "DELETE FROM t ORDER BY id ASC LIMIT 1";
+    ];
+    query = "SELECT id FROM t ORDER BY id";
+    unordered = false };
+
+  { name = "update_order_limit";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "INSERT INTO t VALUES (1,'x'),(2,'y'),(3,'z')";
+      "UPDATE t SET v='w' ORDER BY id DESC LIMIT 1";
+    ];
+    query = "SELECT id, v FROM t ORDER BY id";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3100,4 +3120,5 @@ let () =
     "phase21_fk",              List.map make_test phase21_fk_cases;
     "phase22_trigger",         List.map make_test phase22_trigger_cases;
     "phase23_cascade",         List.map make_test phase23_cascade_cases;
+    "phase24_limit",           List.map make_test phase24_limit_cases;
   ]
