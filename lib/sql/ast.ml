@@ -319,6 +319,7 @@ and stmt =
 and pragma_kind =
   | Pragma_table_info of string
   | Pragma_index_list of string
+  | Pragma_set of string * string  (* name, value — treated as no-op *)
 
 and column_def = {
   name        : string;

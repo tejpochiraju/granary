@@ -128,6 +128,13 @@ pragma_stmt:
       | "table_info" -> S_pragma (Pragma_table_info arg)
       | "index_list" -> S_pragma (Pragma_index_list arg)
       | _ -> failwith (Printf.sprintf "unknown pragma: %s" name) }
+  | PRAGMA name = IDENT EQ value = pragma_value
+    { S_pragma (Pragma_set (name, value)) }
+
+pragma_value:
+  | v = IDENT              { v }
+  | ON                     { "on" }
+  | n = INT_LIT            { Int64.to_string n }
 
 drop_table:
   | DROP TABLE name = IDENT { S_drop_table { name } }

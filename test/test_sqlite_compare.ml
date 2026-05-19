@@ -2991,6 +2991,77 @@ let phase22_trigger_cases = [
     unordered = false };
 ]
 
+(* ── Phase 23: FK referential actions (CASCADE, SET NULL) ──────── *)
+
+let phase23_cascade_cases = [
+  { name = "cascade_delete_basic";
+    setup = [
+      "PRAGMA foreign_keys = ON";
+      "CREATE TABLE par (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi (id INTEGER, pid INTEGER REFERENCES par(id) ON DELETE CASCADE)";
+      "INSERT INTO par VALUES (1)";
+      "INSERT INTO par VALUES (2)";
+      "INSERT INTO chi VALUES (10, 1)";
+      "INSERT INTO chi VALUES (11, 1)";
+      "INSERT INTO chi VALUES (12, 2)";
+      "DELETE FROM par WHERE id = 1";
+    ];
+    query = "SELECT COUNT(*) FROM chi";
+    unordered = false };
+
+  { name = "cascade_delete_all";
+    setup = [
+      "PRAGMA foreign_keys = ON";
+      "CREATE TABLE par2 (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi2 (id INTEGER, pid INTEGER REFERENCES par2(id) ON DELETE CASCADE)";
+      "INSERT INTO par2 VALUES (1)";
+      "INSERT INTO par2 VALUES (2)";
+      "INSERT INTO chi2 VALUES (10, 1)";
+      "INSERT INTO chi2 VALUES (20, 2)";
+      "DELETE FROM par2";
+    ];
+    query = "SELECT COUNT(*) FROM chi2";
+    unordered = false };
+
+  { name = "cascade_update";
+    setup = [
+      "PRAGMA foreign_keys = ON";
+      "CREATE TABLE par3 (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi3 (id INTEGER, pid INTEGER REFERENCES par3(id) ON UPDATE CASCADE)";
+      "INSERT INTO par3 VALUES (1)";
+      "INSERT INTO chi3 VALUES (10, 1)";
+      "INSERT INTO chi3 VALUES (11, 1)";
+      "UPDATE par3 SET id = 99 WHERE id = 1";
+    ];
+    query = "SELECT pid FROM chi3 ORDER BY id";
+    unordered = false };
+
+  { name = "set_null_on_delete";
+    setup = [
+      "PRAGMA foreign_keys = ON";
+      "CREATE TABLE par4 (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi4 (id INTEGER, pid INTEGER REFERENCES par4(id) ON DELETE SET NULL)";
+      "INSERT INTO par4 VALUES (1)";
+      "INSERT INTO chi4 VALUES (10, 1)";
+      "DELETE FROM par4 WHERE id = 1";
+    ];
+    query = "SELECT pid IS NULL FROM chi4";
+    unordered = false };
+
+  { name = "cascade_table_level_fk";
+    setup = [
+      "PRAGMA foreign_keys = ON";
+      "CREATE TABLE par5 (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi5 (id INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES par5(id) ON DELETE CASCADE)";
+      "INSERT INTO par5 VALUES (1)";
+      "INSERT INTO chi5 VALUES (10, 1)";
+      "INSERT INTO chi5 VALUES (11, 1)";
+      "DELETE FROM par5";
+    ];
+    query = "SELECT COUNT(*) FROM chi5";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3028,4 +3099,5 @@ let () =
     "phase21_savepoint",       List.map make_test phase21_savepoint_cases;
     "phase21_fk",              List.map make_test phase21_fk_cases;
     "phase22_trigger",         List.map make_test phase22_trigger_cases;
+    "phase23_cascade",         List.map make_test phase23_cascade_cases;
   ]

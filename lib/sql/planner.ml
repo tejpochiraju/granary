@@ -561,6 +561,7 @@ let rec plan ?cat = function
              Row.V_text idx.idx_name;
              Row.V_int (if idx.idx_unique then 1L else 0L) |]
         ) idxs
+      | Ast.Pragma_set (_, _) -> []  (* setter pragmas are no-ops *)
     in
     Plan.Op_pragma_rows { rows }
   | Sema.BS_with_cte { name; def; query; recursive } ->
