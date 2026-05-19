@@ -4678,6 +4678,25 @@ let test_savepoint_double_rollback () =
       (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
     Lwt.return_unit)
 
+let test_savepoint_auto_begin () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sp_ab (x INTEGER)" in
+    (* No BEGIN — SAVEPOINT should auto-begin *)
+    let* () = exec "SAVEPOINT s" in
+    let* () = exec "INSERT INTO sp_ab VALUES (99)" in
+    let* () = exec "RELEASE s" in
+    (* RELEASE should auto-commit since auto_began=true and savepoint_names=[] *)
+    let* r = Db.query db "SELECT x FROM sp_ab" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "auto-committed after release" 1 (List.length rows);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5149,5 +5168,6 @@ let () =
       Alcotest.test_case "release_keeps_insert"    `Quick test_savepoint_release_keeps_insert;
       Alcotest.test_case "partial_rollback"        `Quick test_savepoint_partial_rollback;
       Alcotest.test_case "double_rollback"         `Quick test_savepoint_double_rollback;
+      Alcotest.test_case "auto_begin"              `Quick test_savepoint_auto_begin;
     ];
   ]

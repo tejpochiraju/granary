@@ -123,6 +123,8 @@ let commit_txn t =
   | Some tx ->
     let* () = S.commit tx in
     t.explicit_txn <- None;
+    t.savepoint_names <- [];
+    t.auto_began <- false;
     Lwt.return (Ok ())
 
 let rollback_txn t =
@@ -131,6 +133,8 @@ let rollback_txn t =
   | Some tx ->
     let* () = S.rollback tx in
     t.explicit_txn <- None;
+    t.savepoint_names <- [];
+    t.auto_began <- false;
     Lwt.return (Ok ())
 
 let savepoint_txn t name =
@@ -151,12 +155,14 @@ let release_savepoint t name =
   | None -> Lwt.return (Error (Runtime "no active transaction for RELEASE"))
   | Some tx ->
     let* () = S.savepoint_release tx name in
-    let rec drop = function
-      | [] -> []
-      | n :: rest when String.equal n name -> rest
-      | _ :: rest -> drop rest
-    in
-    t.savepoint_names <- drop t.savepoint_names;
+    if List.mem name t.savepoint_names then begin
+      let rec drop = function
+        | [] -> []
+        | n :: rest when String.equal n name -> rest
+        | _ :: rest -> drop rest
+      in
+      t.savepoint_names <- drop t.savepoint_names
+    end;
     if t.auto_began && t.savepoint_names = [] then begin
       let* () = S.commit tx in
       t.explicit_txn <- None;
@@ -170,12 +176,14 @@ let rollback_to_savepoint t name =
   | None -> Lwt.return (Error (Runtime "no active transaction for ROLLBACK TO"))
   | Some tx ->
     let* () = S.savepoint_rollback tx name in
-    let rec trim = function
-      | [] -> []
-      | n :: _ as rest when String.equal n name -> rest
-      | _ :: rest -> trim rest
-    in
-    t.savepoint_names <- trim t.savepoint_names;
+    if List.mem name t.savepoint_names then begin
+      let rec trim = function
+        | [] -> []
+        | n :: _ as rest when String.equal n name -> rest
+        | _ :: rest -> trim rest
+      in
+      t.savepoint_names <- trim t.savepoint_names
+    end;
     Lwt.return (Ok ())
 
 (* ------------------------------------------------------------------ *)
