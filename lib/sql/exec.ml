@@ -612,7 +612,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
         | k :: v :: rest ->
           let key = (match k with Row.V_text s -> s | _ -> "") in
           (key, json_of_sql v) :: make_pairs rest
-        | [_]         -> []
+        | [_]         -> assert false
       in
       Row.V_text (Json.to_string (Json.J_object (make_pairs pairs)))
   | Ast.Fn_json_array, elems ->
@@ -636,6 +636,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
      | _ -> Row.V_null)
   | Ast.Fn_json_valid, [json_v] ->
     (match json_v with
+     | Row.V_null -> Row.V_null
      | Row.V_text s ->
        (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
      | _ -> Row.V_int 0L)

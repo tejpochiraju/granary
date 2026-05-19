@@ -4539,7 +4539,9 @@ let test_json_valid () =
   let r2 = query_ok db {|SELECT json_valid('not json')|} in
   Alcotest.(check row_testable) "invalid json = 0" [| Db.V_int 0L |] (List.nth r2 0);
   let r3 = query_ok db {|SELECT json_valid('[]')|} in
-  Alcotest.(check row_testable) "array is valid" [| Db.V_int 1L |] (List.nth r3 0)
+  Alcotest.(check row_testable) "array is valid" [| Db.V_int 1L |] (List.nth r3 0);
+  let r4 = query_ok db {|SELECT json_valid(NULL)|} in
+  Alcotest.(check row_testable) "json_valid(NULL) = null" [| Db.V_null |] (List.nth r4 0)
 
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
