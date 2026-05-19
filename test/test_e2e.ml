@@ -4790,6 +4790,160 @@ let test_fk_update_unreferenced_col_ok () =
       (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
     Lwt.return_unit)
 
+let test_fk_cascade_delete () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE cpar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE cchi (id INTEGER, pid INTEGER REFERENCES cpar(id) ON DELETE CASCADE)" in
+    let* () = exec "INSERT INTO cpar VALUES (1)" in
+    let* () = exec "INSERT INTO cpar VALUES (2)" in
+    let* () = exec "INSERT INTO cchi VALUES (10, 1)" in
+    let* () = exec "INSERT INTO cchi VALUES (11, 1)" in
+    let* () = exec "INSERT INTO cchi VALUES (12, 2)" in
+    let* () = exec "DELETE FROM cpar WHERE id = 1" in
+    let* r = Db.query db "SELECT COUNT(*) FROM cchi" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "cascade deleted 2 rows, 1 remains" 1
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_cascade_delete_no_children () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE npar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE nchi (id INTEGER, pid INTEGER REFERENCES npar(id) ON DELETE CASCADE)" in
+    let* () = exec "INSERT INTO npar VALUES (1)" in
+    let* () = exec "DELETE FROM npar WHERE id = 1" in
+    let* r = Db.query db "SELECT COUNT(*) FROM npar" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "parent deleted when no children" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_cascade_update () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE upar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE uchi (id INTEGER, pid INTEGER REFERENCES upar(id) ON UPDATE CASCADE)" in
+    let* () = exec "INSERT INTO upar VALUES (1)" in
+    let* () = exec "INSERT INTO uchi VALUES (10, 1)" in
+    let* () = exec "INSERT INTO uchi VALUES (11, 1)" in
+    let* () = exec "UPDATE upar SET id = 99 WHERE id = 1" in
+    let* r = Db.query db "SELECT pid FROM uchi ORDER BY id" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "2 child rows updated" 2 (List.length rows);
+    Alcotest.check value_testable "child1 pid=99" (Db.V_int 99L) (List.nth rows 0).(0);
+    Alcotest.check value_testable "child2 pid=99" (Db.V_int 99L) (List.nth rows 1).(0);
+    Lwt.return_unit)
+
+let test_fk_set_null_delete () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE snpar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE snchi (id INTEGER, pid INTEGER REFERENCES snpar(id) ON DELETE SET NULL)" in
+    let* () = exec "INSERT INTO snpar VALUES (1)" in
+    let* () = exec "INSERT INTO snchi VALUES (10, 1)" in
+    let* () = exec "DELETE FROM snpar WHERE id = 1" in
+    let* r = Db.query db "SELECT pid IS NULL FROM snchi" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "child pid set to null" 1
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_set_null_update () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE snupar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE snuchi (id INTEGER, pid INTEGER REFERENCES snupar(id) ON UPDATE SET NULL)" in
+    let* () = exec "INSERT INTO snupar VALUES (1)" in
+    let* () = exec "INSERT INTO snuchi VALUES (10, 1)" in
+    let* () = exec "UPDATE snupar SET id = 99 WHERE id = 1" in
+    let* r = Db.query db "SELECT pid IS NULL FROM snuchi" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "child pid set to null after parent update" 1
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_set_default_delete () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE sdpar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO sdpar VALUES (0)" in
+    let* () = exec "INSERT INTO sdpar VALUES (1)" in
+    let* () = exec "CREATE TABLE sdchi (id INTEGER, pid INTEGER DEFAULT 0 REFERENCES sdpar(id) ON DELETE SET DEFAULT)" in
+    let* () = exec "INSERT INTO sdchi VALUES (10, 1)" in
+    let* () = exec "DELETE FROM sdpar WHERE id = 1" in
+    let* r = Db.query db "SELECT pid FROM sdchi" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "child pid reset to default 0" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
+let test_fk_no_action_blocks_delete () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE napar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "INSERT INTO napar VALUES (1)" in
+    let* () = exec "CREATE TABLE nachi (id INTEGER, pid INTEGER REFERENCES napar(id) ON DELETE NO ACTION)" in
+    let* () = exec "INSERT INTO nachi VALUES (10, 1)" in
+    let* result = Db.execute db "DELETE FROM napar WHERE id = 1" in
+    Alcotest.(check bool) "NO ACTION blocks delete" true (Result.is_error result);
+    Lwt.return_unit)
+
+let test_fk_cascade_table_level_fk () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let exec sql =
+      let* r = Db.execute db sql in
+      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec "CREATE TABLE tlpar (id INTEGER PRIMARY KEY)" in
+    let* () = exec "CREATE TABLE tlchi (id INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES tlpar(id) ON DELETE CASCADE)" in
+    let* () = exec "INSERT INTO tlpar VALUES (1)" in
+    let* () = exec "INSERT INTO tlchi VALUES (10, 1)" in
+    let* () = exec "DELETE FROM tlpar WHERE id = 1" in
+    let* r = Db.query db "SELECT COUNT(*) FROM tlchi" in
+    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
+    Alcotest.(check int) "table-level CASCADE FK deletes child" 0
+      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
+    Lwt.return_unit)
+
 (* ------------------------------------------------------------------ *)
 (* Triggers                                                             *)
 (* ------------------------------------------------------------------ *)
@@ -5474,6 +5628,14 @@ let () =
       Alcotest.test_case "delete_null_child_ok" `Quick test_fk_delete_null_child_ok;
       Alcotest.test_case "update_ref_fails"     `Quick test_fk_update_referenced_col_fails;
       Alcotest.test_case "update_no_ref_ok"     `Quick test_fk_update_unreferenced_col_ok;
+      Alcotest.test_case "cascade_delete"         `Quick test_fk_cascade_delete;
+      Alcotest.test_case "cascade_delete_empty"   `Quick test_fk_cascade_delete_no_children;
+      Alcotest.test_case "cascade_update"         `Quick test_fk_cascade_update;
+      Alcotest.test_case "set_null_delete"        `Quick test_fk_set_null_delete;
+      Alcotest.test_case "set_null_update"        `Quick test_fk_set_null_update;
+      Alcotest.test_case "set_default_delete"     `Quick test_fk_set_default_delete;
+      Alcotest.test_case "no_action_blocks"       `Quick test_fk_no_action_blocks_delete;
+      Alcotest.test_case "cascade_table_level_fk" `Quick test_fk_cascade_table_level_fk;
     ];
     "triggers", [
       Alcotest.test_case "after_insert"          `Quick test_after_insert_trigger;
