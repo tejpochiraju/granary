@@ -185,6 +185,11 @@ rule token = parse
       | "DEGREES" -> DEGREES
       | "RADIANS" -> RADIANS
       | "NULLS"   -> NULLS
+      | "JSON_EXTRACT" -> JSON_EXTRACT
+      | "JSON_OBJECT"  -> JSON_OBJECT_FN
+      | "JSON_ARRAY"   -> JSON_ARRAY_FN
+      | "JSON_TYPE"    -> JSON_TYPE
+      | "JSON_VALID"   -> JSON_VALID
       | _           -> IDENT id
     }
   | eof                     { EOF }

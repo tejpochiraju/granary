@@ -2735,6 +2735,60 @@ let phase19_window_agg_cases =
       unordered = false };
   ]
 
+let phase20_json_cases = [
+  { name = "extract_int";
+    setup = []; unordered = false;
+    query = {|SELECT json_extract('{"a":1,"b":2}', '$.a')|} };
+  { name = "extract_text";
+    setup = []; unordered = false;
+    query = {|SELECT json_extract('{"a":"hi"}', '$.a')|} };
+  { name = "extract_array_idx";
+    setup = []; unordered = false;
+    query = {|SELECT json_extract('[10,20,30]', '$[1]')|} };
+  { name = "extract_nested";
+    setup = []; unordered = false;
+    query = {|SELECT json_extract('{"a":{"b":99}}', '$.a.b')|} };
+  { name = "extract_missing";
+    setup = []; unordered = false;
+    query = {|SELECT json_extract('{"a":1}', '$.z')|} };
+  { name = "json_object_int";
+    setup = []; unordered = false;
+    query = {|SELECT json_object('a', 1, 'b', 2)|} };
+  { name = "json_object_text";
+    setup = []; unordered = false;
+    query = {|SELECT json_object('k', 'hello')|} };
+  { name = "json_array_ints";
+    setup = []; unordered = false;
+    query = {|SELECT json_array(1, 2, 3)|} };
+  { name = "json_array_empty";
+    setup = []; unordered = false;
+    query = {|SELECT json_array()|} };
+  { name = "json_type_object";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('{"a":1}')|} };
+  { name = "json_type_array";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('[1,2]')|} };
+  { name = "json_type_text";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('"hello"')|} };
+  { name = "json_type_integer";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('42')|} };
+  { name = "json_type_null";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('null')|} };
+  { name = "json_type_with_path";
+    setup = []; unordered = false;
+    query = {|SELECT json_type('{"a":1}', '$.a')|} };
+  { name = "json_valid_true";
+    setup = []; unordered = false;
+    query = {|SELECT json_valid('{"a":1}')|} };
+  { name = "json_valid_false";
+    setup = []; unordered = false;
+    query = {|SELECT json_valid('not json')|} };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -2767,4 +2821,5 @@ let () =
     "phase19_math",            List.map make_test phase19_math_cases;
     "phase19_nulls",           List.map make_test phase19_nulls_cases;
     "phase19_window_agg",      List.map make_test phase19_window_agg_cases;
+    "phase20_json",            List.map make_test phase20_json_cases;
   ]

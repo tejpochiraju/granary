@@ -4481,6 +4481,66 @@ let test_nulls_first_last () =
   Alcotest.check (Alcotest.list row_testable) "desc nulls last"
     [[| Db.V_int 3L |]; [| Db.V_int 1L |]; [| Db.V_null |]] r4
 
+let test_json_extract () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_extract('{"a":1,"b":"hi"}', '$.a')|} in
+  Alcotest.(check row_testable) "extract int" [| Db.V_int 1L |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_extract('{"a":1,"b":"hi"}', '$.b')|} in
+  Alcotest.(check row_testable) "extract text" [| Db.V_text "hi" |] (List.nth r2 0);
+  let r3 = query_ok db {|SELECT json_extract('[10,20,30]', '$[1]')|} in
+  Alcotest.(check row_testable) "extract array index" [| Db.V_int 20L |] (List.nth r3 0);
+  let r4 = query_ok db {|SELECT json_extract('{"a":{"b":99}}', '$.a.b')|} in
+  Alcotest.(check row_testable) "extract nested" [| Db.V_int 99L |] (List.nth r4 0);
+  let r5 = query_ok db {|SELECT json_extract('{"a":1}', '$.missing')|} in
+  Alcotest.(check row_testable) "extract missing = null" [| Db.V_null |] (List.nth r5 0);
+  let r6 = query_ok db {|SELECT json_extract('{"a":1.5}', '$.a')|} in
+  Alcotest.(check row_testable) "extract real" [| Db.V_real 1.5 |] (List.nth r6 0)
+
+let test_json_object () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_object('a', 1, 'b', 'hi')|} in
+  Alcotest.(check row_testable) "json_object basic"
+    [| Db.V_text {|{"a":1,"b":"hi"}|} |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_object()|} in
+  Alcotest.(check row_testable) "json_object empty"
+    [| Db.V_text "{}" |] (List.nth r2 0)
+
+let test_json_array () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_array(1, 2, 3)|} in
+  Alcotest.(check row_testable) "json_array ints"
+    [| Db.V_text "[1,2,3]" |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_array()|} in
+  Alcotest.(check row_testable) "json_array empty"
+    [| Db.V_text "[]" |] (List.nth r2 0)
+
+let test_json_type () =
+  let db = fresh_db () in
+  let check q expected =
+    let r = query_ok db q in
+    Alcotest.(check row_testable) (q ^ "=" ^ expected) [| Db.V_text expected |] (List.nth r 0)
+  in
+  check {|SELECT json_type('{"a":1}')|} "object";
+  check {|SELECT json_type('[1,2]')|} "array";
+  check {|SELECT json_type('"hello"')|} "text";
+  check {|SELECT json_type('42')|} "integer";
+  check {|SELECT json_type('3.14')|} "real";
+  check {|SELECT json_type('null')|} "null";
+  check {|SELECT json_type('true')|} "true";
+  check {|SELECT json_type('false')|} "false";
+  (* 2-arg form with path *)
+  let r2 = query_ok db {|SELECT json_type('{"a":1}', '$.a')|} in
+  Alcotest.(check row_testable) "json_type with path" [| Db.V_text "integer" |] (List.nth r2 0)
+
+let test_json_valid () =
+  let db = fresh_db () in
+  let r1 = query_ok db {|SELECT json_valid('{"a":1}')|} in
+  Alcotest.(check row_testable) "valid json = 1" [| Db.V_int 1L |] (List.nth r1 0);
+  let r2 = query_ok db {|SELECT json_valid('not json')|} in
+  Alcotest.(check row_testable) "invalid json = 0" [| Db.V_int 0L |] (List.nth r2 0);
+  let r3 = query_ok db {|SELECT json_valid('[]')|} in
+  Alcotest.(check row_testable) "array is valid" [| Db.V_int 1L |] (List.nth r3 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -4935,5 +4995,12 @@ let () =
       Alcotest.test_case "math_pi"    `Quick test_math_pi;
       Alcotest.test_case "math_trig"  `Quick test_math_trig;
       Alcotest.test_case "math_log"   `Quick test_math_log;
+    ];
+    "json", [
+      Alcotest.test_case "json_extract" `Quick test_json_extract;
+      Alcotest.test_case "json_object"  `Quick test_json_object;
+      Alcotest.test_case "json_array"   `Quick test_json_array;
+      Alcotest.test_case "json_type"    `Quick test_json_type;
+      Alcotest.test_case "json_valid"   `Quick test_json_valid;
     ];
   ]

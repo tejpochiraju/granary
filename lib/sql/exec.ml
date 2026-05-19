@@ -231,6 +231,22 @@ let row_key (row : Row.t) : string =
   ) row;
   Buffer.contents buf
 
+let json_of_sql : Row.value -> Json.value = function
+  | Row.V_null   -> Json.J_null
+  | Row.V_int n  -> Json.J_int n
+  | Row.V_real f -> Json.J_float f
+  | Row.V_text s -> Json.J_string s
+  | Row.V_blob b -> Json.J_string (Bytes.to_string b)
+
+let sql_of_json : Json.value -> Row.value = function
+  | Json.J_null     -> Row.V_null
+  | Json.J_bool b   -> Row.V_int (if b then 1L else 0L)
+  | Json.J_int n    -> Row.V_int n
+  | Json.J_float f  -> Row.V_real f
+  | Json.J_string s -> Row.V_text s
+  | Json.J_array _  as v -> Row.V_text (Json.to_string v)
+  | Json.J_object _ as v -> Row.V_text (Json.to_string v)
+
 let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
@@ -579,6 +595,50 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
     (match to_float_opt v with
      | Some f -> Row.V_real (f *. Float.pi /. 180.0)
      | None -> Row.V_null)
+  | Ast.Fn_json_extract, [json_v; path_v] ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
+    let path_s = (match path_v with Row.V_text s -> s | _ -> "") in
+    (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv   ->
+       (match Json.path_get jv path_s with
+        | None   -> Row.V_null
+        | Some v -> sql_of_json v))
+  | Ast.Fn_json_object, pairs ->
+    if List.length pairs mod 2 <> 0 then Row.V_null
+    else
+      let rec make_pairs = function
+        | []          -> []
+        | k :: v :: rest ->
+          let key = (match k with Row.V_text s -> s | _ -> "") in
+          (key, json_of_sql v) :: make_pairs rest
+        | [_]         -> []
+      in
+      Row.V_text (Json.to_string (Json.J_object (make_pairs pairs)))
+  | Ast.Fn_json_array, elems ->
+    Row.V_text (Json.to_string (Json.J_array (List.map json_of_sql elems)))
+  | Ast.Fn_json_type, [json_v] ->
+    (match json_v with
+     | Row.V_text s ->
+       (match Json.parse s with
+        | Error _ -> Row.V_null
+        | Ok jv   -> Row.V_text (Json.type_name jv))
+     | _ -> Row.V_null)
+  | Ast.Fn_json_type, [json_v; path_v] ->
+    (match json_v, path_v with
+     | Row.V_text s, Row.V_text path ->
+       (match Json.parse s with
+        | Error _ -> Row.V_null
+        | Ok jv   ->
+          (match Json.path_get jv path with
+           | None    -> Row.V_null
+           | Some sub -> Row.V_text (Json.type_name sub)))
+     | _ -> Row.V_null)
+  | Ast.Fn_json_valid, [json_v] ->
+    (match json_v with
+     | Row.V_text s ->
+       (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
+     | _ -> Row.V_int 0L)
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 

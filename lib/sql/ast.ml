@@ -76,6 +76,11 @@ type scalar_func =
   | Fn_atan2         (** ATAN2(y,x) — two-argument arctangent *)
   | Fn_degrees       (** DEGREES(x) — radians to degrees *)
   | Fn_radians       (** RADIANS(x) — degrees to radians *)
+  | Fn_json_extract   (** json_extract(json, path) *)
+  | Fn_json_object    (** json_object(k,v,...) *)
+  | Fn_json_array     (** json_array(v,...) *)
+  | Fn_json_type      (** json_type(json[,path]) *)
+  | Fn_json_valid     (** json_valid(json) → 0|1 *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -324,6 +329,9 @@ let func_to_sql = function
   | Fn_sin -> "SIN" | Fn_cos -> "COS" | Fn_tan -> "TAN"
   | Fn_asin -> "ASIN" | Fn_acos -> "ACOS" | Fn_atan -> "ATAN"
   | Fn_atan2 -> "ATAN2" | Fn_degrees -> "DEGREES" | Fn_radians -> "RADIANS"
+  | Fn_json_extract -> "JSON_EXTRACT" | Fn_json_object -> "JSON_OBJECT"
+  | Fn_json_array -> "JSON_ARRAY"     | Fn_json_type   -> "JSON_TYPE"
+  | Fn_json_valid -> "JSON_VALID"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n

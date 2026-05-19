@@ -51,6 +51,7 @@
 %token REFERENCES FOREIGN
 %token CEIL FLOOR SQRT POW EXP LN LOG LOG2 LOG10 SIGN TRUNC PI
 %token SIN COS TAN ASIN ACOS ATAN ATAN2 DEGREES RADIANS
+%token JSON_EXTRACT JSON_OBJECT_FN JSON_ARRAY_FN JSON_TYPE JSON_VALID
 %token NULLS
 %token QUESTION
 %token <int>    IPARAM
@@ -445,6 +446,18 @@ scalar_expr:
   | ATAN2   LPAREN y = expr COMMA x = expr RPAREN             { E_func (Fn_atan2,   [y; x]) }
   | DEGREES LPAREN e = expr RPAREN                            { E_func (Fn_degrees, [e]) }
   | RADIANS LPAREN e = expr RPAREN                            { E_func (Fn_radians, [e]) }
+  | JSON_EXTRACT LPAREN j = expr COMMA p = expr RPAREN
+    { E_func (Fn_json_extract, [j; p]) }
+  | JSON_OBJECT_FN LPAREN args = separated_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_object, args) }
+  | JSON_ARRAY_FN LPAREN args = separated_list(COMMA, expr) RPAREN
+    { E_func (Fn_json_array, args) }
+  | JSON_TYPE LPAREN e = expr RPAREN
+    { E_func (Fn_json_type, [e]) }
+  | JSON_TYPE LPAREN e = expr COMMA p = expr RPAREN
+    { E_func (Fn_json_type, [e; p]) }
+  | JSON_VALID LPAREN e = expr RPAREN
+    { E_func (Fn_json_valid, [e]) }
 
 proj_item:
   | e = expr AS alias = IDENT { `ExprA (e, Some alias) }
