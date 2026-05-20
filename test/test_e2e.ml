@@ -2586,6 +2586,7 @@ let test_fk_null_allowed () =
     Lwt.return_unit)
 
 let test_fk_multi_col_unsupported () =
+  (* Multi-column FK is now supported; this test verifies CREATE TABLE succeeds *)
   let db = fresh_db () in
   run (
     let* () = (let* r = Db.execute db "CREATE TABLE fp (x INTEGER, y INTEGER)" in
@@ -2593,8 +2594,8 @@ let test_fk_multi_col_unsupported () =
     let* result = Db.execute db
       "CREATE TABLE fc (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES fp(x, y))" in
     (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected error for multi-column FK");
+     | Ok () -> ()
+     | Error e -> Alcotest.fail (Format.asprintf "unexpected error: %a" Db.pp_error e));
     Lwt.return_unit)
 
 let fk_implicit_parent_col () =
@@ -6817,6 +6818,83 @@ let test_randomblob_zero_length () =
   let r = query_ok db "SELECT LENGTH(RANDOMBLOB(0))" in
   Alcotest.(check row_testable) "randomblob zero length" [| Db.V_int 1L |] (List.nth r 0)
 
+(* ── Phase 32 Task 3: multi-column FOREIGN KEY ─────────────────────── *)
+
+let test_multi_col_fk_valid_insert () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (1, 2)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* () = exec_in db "INSERT INTO child VALUES (1, 2)" in
+    let* rows = query_rows db "SELECT COUNT(*) FROM child" in
+    check_rows "child row inserted" [[| Db.V_int 1L |]] rows;
+    Lwt.return_unit)
+
+let test_multi_col_fk_invalid_insert () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (1, 2)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let result = exec_err db "INSERT INTO child VALUES (1, 99)" in
+    check_error "fk violation blocks insert" result;
+    Lwt.return_unit)
+
+let test_multi_col_fk_partial_null () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    (* NULL in one FK column skips enforcement *)
+    let* () = exec_in db "INSERT INTO child VALUES (1, NULL)" in
+    let* rows = query_rows db "SELECT a, b FROM child" in
+    check_rows "null fk allowed" [[| Db.V_int 1L; Db.V_null |]] rows;
+    Lwt.return_unit)
+
+let test_multi_col_fk_cascade_delete () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (10, 20)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE CASCADE)" in
+    let* () = exec_in db "INSERT INTO child VALUES (10, 20)" in
+    let* () = exec_in db "DELETE FROM parent WHERE x = 10" in
+    let* rows = query_rows db "SELECT COUNT(*) FROM child" in
+    check_rows "child cascaded" [[| Db.V_int 0L |]] rows;
+    Lwt.return_unit)
+
+let test_multi_col_fk_pragma_list_count () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* rows = query_rows db "PRAGMA foreign_key_list(child)" in
+    Alcotest.(check int) "one fk row" 1 (List.length rows);
+    Lwt.return_unit)
+
+let test_multi_col_fk_restrict_delete_blocks () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (5, 6)" in
+    let* () = exec_in db
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE RESTRICT)" in
+    let* () = exec_in db "INSERT INTO child VALUES (5, 6)" in
+    let result = exec_err db "DELETE FROM parent WHERE x = 5" in
+    check_error "restrict delete blocked" result;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7087,7 +7165,7 @@ let () =
       Alcotest.test_case "valid_insert"          `Quick test_fk_valid_insert;
       Alcotest.test_case "invalid_insert"        `Quick test_fk_invalid_insert;
       Alcotest.test_case "null_allowed"          `Quick test_fk_null_allowed;
-      Alcotest.test_case "multi_col_unsupported" `Quick test_fk_multi_col_unsupported;
+      Alcotest.test_case "multi_col_supported"   `Quick test_fk_multi_col_unsupported;
       Alcotest.test_case "implicit_parent_col"        `Quick fk_implicit_parent_col;
       Alcotest.test_case "implicit_no_pk_error"       `Quick fk_implicit_no_pk_error;
       Alcotest.test_case "implicit_parent_not_found"  `Quick fk_implicit_parent_not_found;
@@ -7423,5 +7501,13 @@ let () =
       Alcotest.test_case "random_is_integer"             `Quick test_random_is_integer;
       Alcotest.test_case "randomblob_length"             `Quick test_randomblob_length;
       Alcotest.test_case "randomblob_zero_length"        `Quick test_randomblob_zero_length;
+    ];
+    "phase32_multi_col_fk", [
+      Alcotest.test_case "valid_insert"           `Quick test_multi_col_fk_valid_insert;
+      Alcotest.test_case "invalid_insert"         `Quick test_multi_col_fk_invalid_insert;
+      Alcotest.test_case "partial_null"           `Quick test_multi_col_fk_partial_null;
+      Alcotest.test_case "cascade_delete"         `Quick test_multi_col_fk_cascade_delete;
+      Alcotest.test_case "pragma_list_count"      `Quick test_multi_col_fk_pragma_list_count;
+      Alcotest.test_case "restrict_delete_blocks" `Quick test_multi_col_fk_restrict_delete_blocks;
     ];
   ]

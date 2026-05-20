@@ -12,9 +12,9 @@ type fk_action =
   | FA_set_default
 
 type fk_constraint = {
-  fk_local_col    : string;
+  fk_local_cols   : string list;
   fk_parent_table : string;
-  fk_parent_col   : string;
+  fk_parent_cols  : string list;
   fk_on_delete    : fk_action;
   fk_on_update    : fk_action;
 }

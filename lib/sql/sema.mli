@@ -97,8 +97,8 @@ type bound_stmt =
         (** Auto-generated UNIQUE index specs: (index_name, [col_name; ...]).
             Planner creates Op_create_index for each. *)
       if_not_exists  : bool;
-      fk_constraints : (string * string * string * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action) list;
-        (** [(local_col, parent_table, parent_col, on_delete, on_update)] *)
+      fk_constraints : (string list * string * string list * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action) list;
+        (** [(local_cols, parent_table, parent_cols, on_delete, on_update)] *)
     }
   | BS_insert of {
       table_meta    : Sqlocaml_catalog.Catalog.table_meta;

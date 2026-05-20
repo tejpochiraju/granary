@@ -689,8 +689,8 @@ let rec plan ?cat = function
              [| Row.V_int (Int64.of_int i);
                 Row.V_int 0L;               (* seq: always 0 for single-col FKs *)
                 Row.V_text fk.Cat.fk_parent_table;
-                Row.V_text fk.Cat.fk_local_col;
-                Row.V_text fk.Cat.fk_parent_col;
+                Row.V_text (String.concat "," fk.Cat.fk_local_cols);
+                Row.V_text (String.concat "," fk.Cat.fk_parent_cols);
                 Row.V_text (fk_action_str fk.Cat.fk_on_update);
                 Row.V_text (fk_action_str fk.Cat.fk_on_delete);
                 Row.V_text "NONE" |]        (* match: always NONE *)

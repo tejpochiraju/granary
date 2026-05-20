@@ -101,8 +101,8 @@ type bound_stmt =
       columns        : Row.column list;
       uniq_idxs      : (string * string list) list;
       if_not_exists  : bool;
-      fk_constraints : (string * string * string * Cat.fk_action * Cat.fk_action) list;
-        (** [(local_col, parent_table, parent_col, on_delete, on_update)] *)
+      fk_constraints : (string list * string * string list * Cat.fk_action * Cat.fk_action) list;
+        (** [(local_cols, parent_table, parent_cols, on_delete, on_update)] *)
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -1066,9 +1066,9 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
                        "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer column"
                        cd.Ast.name parent_table))
                    | Some pk_col ->
-                     Ok (fks @ [(cd.Ast.name, parent_table, pk_col.name, od, ou)])))
+                     Ok (fks @ [([cd.Ast.name], parent_table, [pk_col.name], od, ou)])))
              | Some (parent_table, parent_col, od, ou) ->
-               Ok (fks @ [(cd.Ast.name, parent_table, parent_col, od, ou)]))
+               Ok (fks @ [([cd.Ast.name], parent_table, [parent_col], od, ou)]))
         ) (Ok []) columns
       in
       (match col_fks_result with
@@ -1082,10 +1082,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Ok fks ->
             (match c with
              | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update } ->
-               (match local_cols, parent_cols with
-                | [lc], [pc] -> Ok (fks @ [(lc, parent_table, pc, on_delete, on_update)])
-                | _ ->
-                  Error (Unsupported "multi-column FOREIGN KEY constraints are not yet supported"))
+               Ok (fks @ [(local_cols, parent_table, parent_cols, on_delete, on_update)])
              | _ -> Ok fks)
         ) (Ok []) constraints
       in

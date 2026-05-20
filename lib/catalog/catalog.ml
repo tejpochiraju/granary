@@ -47,9 +47,9 @@ let write_user_version_tx tx (v : int64) : unit Lwt.t =
 [@@warning "-32"]
 
 type fk_constraint = {
-  fk_local_col    : string;
+  fk_local_cols   : string list;
   fk_parent_table : string;
-  fk_parent_col   : string;
+  fk_parent_cols  : string list;
   fk_on_delete    : fk_action;
   fk_on_update    : fk_action;
 }
@@ -640,9 +640,9 @@ let fk_action_of_string = function
 let encode_fks fks =
   let lines = List.map (fun fk ->
     String.concat "\t" [
-      fk.fk_local_col;
+      String.concat "," fk.fk_local_cols;
       fk.fk_parent_table;
-      fk.fk_parent_col;
+      String.concat "," fk.fk_parent_cols;
       fk_action_to_string fk.fk_on_delete;
       fk_action_to_string fk.fk_on_update;
     ]
@@ -656,10 +656,14 @@ let decode_fks bytes =
     List.filter_map (fun line ->
       match String.split_on_char '\t' line with
       | [lc; pt; pc] ->
-        Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc;
+        Some { fk_local_cols  = String.split_on_char ',' lc;
+               fk_parent_table = pt;
+               fk_parent_cols  = String.split_on_char ',' pc;
                fk_on_delete = FA_restrict; fk_on_update = FA_restrict }
       | [lc; pt; pc; od; ou] ->
-        Some { fk_local_col = lc; fk_parent_table = pt; fk_parent_col = pc;
+        Some { fk_local_cols  = String.split_on_char ',' lc;
+               fk_parent_table = pt;
+               fk_parent_cols  = String.split_on_char ',' pc;
                fk_on_delete = fk_action_of_string od;
                fk_on_update = fk_action_of_string ou }
       | _ -> None

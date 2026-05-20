@@ -3459,6 +3459,44 @@ let phase31_alter_fk_cases = [
     unordered = false };
 ]
 
+let phase32_multi_col_fk_cases = [
+  { name = "multi_fk_valid_insert";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+      "INSERT INTO parent VALUES (1, 2)";
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y))";
+      "INSERT INTO child VALUES (1, 2)";
+    ];
+    query = "SELECT COUNT(*) FROM child";
+    unordered = false };
+
+  { name = "multi_fk_null_in_col_allowed";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+      "CREATE TABLE child (id INTEGER, pa INTEGER, pb INTEGER, \
+       FOREIGN KEY (pa, pb) REFERENCES parent(x, y))";
+      "INSERT INTO child VALUES (1, NULL, 99)";
+    ];
+    query = "SELECT id, pa FROM child";
+    unordered = false };
+
+  { name = "multi_fk_cascade_delete";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE parent (x INTEGER, y INTEGER, PRIMARY KEY (x, y))";
+      "INSERT INTO parent VALUES (10, 20)";
+      "CREATE TABLE child (a INTEGER, b INTEGER, \
+       FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE CASCADE)";
+      "INSERT INTO child VALUES (10, 20)";
+      "DELETE FROM parent WHERE x = 10";
+    ];
+    query = "SELECT COUNT(*) FROM child";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3507,4 +3545,5 @@ let () =
     "phase31_alter_fk",        List.map make_test phase31_alter_fk_cases;
     "phase31_scalar",          List.map make_test phase31_scalar_cases;
     "phase32_session_fns",     List.map make_test phase32_session_fn_cases;
+    "phase32_multi_col_fk",   List.map make_test phase32_multi_col_fk_cases;
   ]
