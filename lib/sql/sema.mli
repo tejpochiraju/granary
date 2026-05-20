@@ -88,6 +88,8 @@ type bound_join = {
 }
 
 type bound_stmt =
+  | BS_no_op
+    (** Emitted by IF EXISTS DROP when the named object does not exist. *)
   | BS_create_table of {
       name           : string;
       columns        : Sqlocaml_encoding.Row.column list;

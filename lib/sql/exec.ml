@@ -2622,7 +2622,8 @@ let execute_with_count ?(mode = Auto)
     let* () = S.commit tx in
     Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
-  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _ -> Lwt.return 0
+  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
+  | Plan.Op_no_op -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
   | Plan.Op_window _
@@ -4047,6 +4048,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       ) all_rows_arr) in
       Lwt.return (Lwt_stream.of_list augmented)
     end
+  | Plan.Op_no_op -> Lwt.return (Lwt_stream.of_list [])
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _

@@ -70,6 +70,8 @@ type bound_join = {
 }
 
 type bound_stmt =
+  | BS_no_op
+    (** Emitted by IF EXISTS DROP when the named object does not exist. *)
   | BS_create_table of {
       name           : string;
       columns        : Row.column list;
@@ -2267,9 +2269,10 @@ let bind_alter_table cat ~table ~action =
 (* DROP TABLE                                                           *)
 (* ------------------------------------------------------------------ *)
 
-let bind_drop_table cat ~name =
+let bind_drop_table cat ~name ~if_exists =
   let* meta_opt = Cat.find_table cat ~name in
   match meta_opt with
+  | None when if_exists -> Lwt.return (Ok BS_no_op)
   | None -> Lwt.return (Error (Unknown_table name))
   | Some table_meta ->
     Lwt.return (Ok (BS_drop_table { name; table_meta }))
@@ -2278,8 +2281,9 @@ let bind_drop_table cat ~name =
 (* DROP INDEX                                                           *)
 (* ------------------------------------------------------------------ *)
 
-let bind_drop_index cat ~name =
+let bind_drop_index cat ~name ~if_exists =
   match Cat.find_index cat ~name with
+  | None when if_exists -> Lwt.return (Ok BS_no_op)
   | None -> Lwt.return (Error (Unknown_index name))
   | Some idx_info ->
     Lwt.return (Ok (BS_drop_index { name; idx_info }))
@@ -2411,10 +2415,10 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
     bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~order ~limit ~offset ~returning
   | Ast.S_delete { table; where; order; limit; offset; returning } ->
     bind_delete cat ~param_counter ~named_params ~table ~where ~order ~limit ~offset ~returning
-  | Ast.S_drop_table { name } ->
-    bind_drop_table cat ~name
-  | Ast.S_drop_index { name } ->
-    bind_drop_index cat ~name
+  | Ast.S_drop_table { name; if_exists } ->
+    bind_drop_table cat ~name ~if_exists
+  | Ast.S_drop_index { name; if_exists } ->
+    bind_drop_index cat ~name ~if_exists
   | Ast.S_alter_table { table; action } ->
     bind_alter_table cat ~table ~action
   | Ast.S_begin    -> Lwt.return (Ok BS_begin)
@@ -2522,11 +2526,11 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
     (match bound_r with
      | Error e -> Lwt.return (Error e)
      | Ok _ -> Lwt.return (Ok (BS_create_view { name; query })))
-  | Ast.S_drop_view { name } ->
+  | Ast.S_drop_view { name; if_exists = _ } ->
     Lwt.return (Ok (BS_drop_view { name }))
   | Ast.S_create_trigger { name; timing; event; table; when_; body } ->
     Lwt.return (Ok (BS_create_trigger { name; timing; event; table; when_; body }))
-  | Ast.S_drop_trigger { name } ->
+  | Ast.S_drop_trigger { name; if_exists = _ } ->
     Lwt.return (Ok (BS_drop_trigger { name }))
   | Ast.S_compound { op; left; right } ->
     let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in

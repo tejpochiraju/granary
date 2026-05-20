@@ -895,7 +895,7 @@ let bind_delete_returning_subquery_rejected () =
 
 let bind_drop_table_basic () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_drop_table { name = "users" } in
+  let stmt = Ast.S_drop_table { name = "users"; if_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_drop_table { name; _ }) ->
     Alcotest.(check string) "name" "users" name
@@ -903,7 +903,7 @@ let bind_drop_table_basic () =
 
 let bind_drop_table_unknown () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_drop_table { name = "ghost" } in
+  let stmt = Ast.S_drop_table { name = "ghost"; if_exists = false } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
   | _ -> Alcotest.fail "expected Unknown_table ghost"
@@ -914,7 +914,7 @@ let bind_drop_index_basic () =
     Sqlocaml_catalog.Catalog.create_index cat ~name:"idx" ~table:"users"
       ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None
   ) in
-  let stmt = Ast.S_drop_index { name = "idx" } in
+  let stmt = Ast.S_drop_index { name = "idx"; if_exists = false } in
   match bind cat stmt with
   | Ok (Sema.BS_drop_index { name; _ }) ->
     Alcotest.(check string) "index name" "idx" name
@@ -922,7 +922,7 @@ let bind_drop_index_basic () =
 
 let bind_drop_index_unknown () =
   let cat = two_col_cat () in
-  let stmt = Ast.S_drop_index { name = "no_such_idx" } in
+  let stmt = Ast.S_drop_index { name = "no_such_idx"; if_exists = false } in
   match bind cat stmt with
   | Error (Sema.Unknown_index "no_such_idx") -> ()
   | _ -> Alcotest.fail "expected Unknown_index"

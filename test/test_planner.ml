@@ -607,7 +607,7 @@ let plan_delete_no_cat () =
 (** Plan BS_drop_table without ~cat → indexes = [] (None arm). *)
 let plan_drop_table_no_cat () =
   let cat = make_cat () in
-  let stmt = Ast.S_drop_table { name = "users" } in
+  let stmt = Ast.S_drop_table { name = "users"; if_exists = false } in
   let bound = bind cat stmt in
   match Planner.plan bound with
   | Plan.Op_drop_table { indexes = []; _ } -> ()

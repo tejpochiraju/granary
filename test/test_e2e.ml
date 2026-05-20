@@ -5751,6 +5751,53 @@ let pragma_tests = [
   Alcotest.test_case "integrity_check_partial_ok" `Quick pragma_integrity_check_partial_ok;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 27: DROP IF EXISTS                                             *)
+(* ------------------------------------------------------------------ *)
+
+let test_drop_table_if_exists_nonexistent () =
+  let db = fresh_db () in
+  (match Lwt_main.run (Db.execute db "DROP TABLE IF EXISTS no_such_table") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+
+let test_drop_table_if_exists_existing () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  (match Lwt_main.run (Db.execute db "DROP TABLE IF EXISTS t") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e);
+  (match Lwt_main.run (Db.execute db "DROP TABLE t") with
+   | Error (Db.Sema _) -> ()
+   | Ok () -> Alcotest.fail "expected error dropping nonexistent table"
+   | Error e -> Alcotest.failf "unexpected error: %a" Db.pp_error e)
+
+let test_drop_index_if_exists_nonexistent () =
+  let db = fresh_db () in
+  (match Lwt_main.run (Db.execute db "DROP INDEX IF EXISTS no_such_idx") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+
+let test_drop_view_if_exists_nonexistent () =
+  let db = fresh_db () in
+  (match Lwt_main.run (Db.execute db "DROP VIEW IF EXISTS no_such_view") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+
+let test_drop_trigger_if_exists_nonexistent () =
+  let db = fresh_db () in
+  (match Lwt_main.run (Db.execute db "DROP TRIGGER IF EXISTS no_such_trig") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+
+let drop_if_exists_tests = [
+  Alcotest.test_case "drop_table_ine_nonexistent"   `Quick test_drop_table_if_exists_nonexistent;
+  Alcotest.test_case "drop_table_ine_existing"      `Quick test_drop_table_if_exists_existing;
+  Alcotest.test_case "drop_index_ine_nonexistent"   `Quick test_drop_index_if_exists_nonexistent;
+  Alcotest.test_case "drop_view_ine_nonexistent"    `Quick test_drop_view_if_exists_nonexistent;
+  Alcotest.test_case "drop_trigger_ine_nonexistent" `Quick test_drop_trigger_if_exists_nonexistent;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6257,4 +6304,5 @@ let () =
     "expression_indexes", expression_index_tests;
     "generated_columns", generated_col_tests;
     "phase26_pragma", pragma_tests;
+    "phase27_drop_ife", drop_if_exists_tests;
   ]

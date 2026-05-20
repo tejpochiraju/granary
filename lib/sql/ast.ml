@@ -269,10 +269,12 @@ and stmt =
       returning : expr list;
     }
   | S_drop_table of {
-      name : string;
+      name      : string;
+      if_exists : bool;
     }
   | S_drop_index of {
-      name : string;
+      name      : string;
+      if_exists : bool;
     }
   | S_alter_table of {
       table  : string;
@@ -312,7 +314,8 @@ and stmt =
       query : stmt;
     }
   | S_drop_view of {
-      name : string;
+      name      : string;
+      if_exists : bool;
     }
   | S_create_trigger of {
       name    : string;
@@ -323,7 +326,8 @@ and stmt =
       body    : stmt list;         (** statements between BEGIN…END *)
     }
   | S_drop_trigger of {
-      name : string;
+      name      : string;
+      if_exists : bool;
     }
 
 and pragma_kind =

@@ -217,10 +217,16 @@ pragma_value:
   | n = INT_LIT            { Int64.to_string n }
 
 drop_table:
-  | DROP TABLE name = any_ident { S_drop_table { name } }
+  | DROP TABLE name = any_ident
+    { S_drop_table { name; if_exists = false } }
+  | DROP TABLE IF EXISTS name = any_ident
+    { S_drop_table { name; if_exists = true } }
 
 drop_index:
-  | DROP INDEX name = any_ident { S_drop_index { name } }
+  | DROP INDEX name = any_ident
+    { S_drop_index { name; if_exists = false } }
+  | DROP INDEX IF EXISTS name = any_ident
+    { S_drop_index { name; if_exists = true } }
 
 create_view:
   | CREATE VIEW name = any_ident AS query = compound_select
@@ -228,7 +234,9 @@ create_view:
 
 drop_view:
   | DROP VIEW name = any_ident
-    { Ast.S_drop_view { name } }
+    { Ast.S_drop_view { name; if_exists = false } }
+  | DROP VIEW IF EXISTS name = any_ident
+    { Ast.S_drop_view { name; if_exists = true } }
 
 create_trigger:
   | CREATE TRIGGER name = any_ident
@@ -241,7 +249,9 @@ create_trigger:
 
 drop_trigger:
   | DROP TRIGGER name = any_ident
-    { Ast.S_drop_trigger { name } }
+    { Ast.S_drop_trigger { name; if_exists = false } }
+  | DROP TRIGGER IF EXISTS name = any_ident
+    { Ast.S_drop_trigger { name; if_exists = true } }
 
 trigger_timing:
   | BEFORE { Ast.TT_before }

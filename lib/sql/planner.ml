@@ -668,3 +668,4 @@ let rec plan ?cat = function
     Plan.Op_create_trigger { name; timing; event; table; when_; body }
   | Sema.BS_drop_trigger { name } ->
     Plan.Op_drop_trigger { name }
+  | Sema.BS_no_op -> Plan.Op_no_op

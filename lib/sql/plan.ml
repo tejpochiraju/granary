@@ -258,6 +258,8 @@ type op =
       body    : Ast.stmt list;
     }
   | Op_drop_trigger of { name : string }
+  | Op_no_op
+    (** No-op plan node produced by IF EXISTS DROP when object not found. *)
 
 and proj_item =
   | PI_group_col of int     (** project the i-th GROUP BY column (index into group_cols) *)
