@@ -900,16 +900,25 @@ let compile_check_expr (table_name : string) (col_idx : int)
     Hashtbl.add check_expr_cache key plan_expr;
     plan_expr
 
-let compile_index_where (idx_name : string) (where_sql : string)
-    (columns : Row.column list) : Plan.expr =
-  (* Re-parse each time: caching would require a schema-aware key to avoid
-     collisions when the same index name appears on tables with different schemas. *)
-  let lexbuf = Lexing.from_string where_sql in
-  let ast_expr =
-    try Parser.expr_only Lexer.token lexbuf
-    with _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx_name where_sql)
-  in
-  ast_expr_to_plan_check columns ast_expr
+let index_where_cache : (string * string * string * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
+
+let compile_index_where (idx : Cat.index_info) (columns : Row.column list) : Plan.expr =
+  match idx.idx_where_sql with
+  | None -> failwith "compile_index_where: called on non-partial index"
+  | Some sql ->
+    let schema_sig = String.concat "," (List.map (fun c -> c.Row.name) columns) in
+    let key = (idx.idx_name, idx.idx_table, sql, schema_sig) in
+    match Hashtbl.find_opt index_where_cache key with
+    | Some e -> e
+    | None ->
+      let lexbuf = Lexing.from_string sql in
+      let ast_expr =
+        try Parser.expr_only Lexer.token lexbuf
+        with _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx.idx_name sql)
+      in
+      let plan_expr = ast_expr_to_plan_check columns ast_expr in
+      Hashtbl.add index_where_cache key plan_expr;
+      plan_expr
 
 let row_matches_index_where
     (clock : (unit -> float) option)
@@ -919,8 +928,8 @@ let row_matches_index_where
     (row : Row.t) : bool =
   match idx.idx_where_sql with
   | None -> true
-  | Some sql ->
-    let plan_e = compile_index_where idx.idx_name sql schema in
+  | Some _ ->
+    let plan_e = compile_index_where idx schema in
     value_truthy (eval_expr clock params row plan_e)
 
 let eval_check_constraints
@@ -1674,7 +1683,9 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
     let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
-    if not (List.mem col_idx col_is) then Lwt.return_unit
+    let has_where = idx.idx_where_sql <> None in
+    (* Only skip if: col is not indexed AND index has no WHERE (membership can't change) *)
+    if not (List.mem col_idx col_is) && not has_where then Lwt.return_unit
     else begin
       let old_matches = row_matches_index_where None [||] idx schema row in
       let new_matches = row_matches_index_where None [||] idx schema new_row in

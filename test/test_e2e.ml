@@ -5374,11 +5374,26 @@ let partial_unique_rejects_duplicate () =
    | Db.Runtime _ -> ()
    | _ -> Alcotest.fail "expected Runtime error for partial UNIQUE violation")
 
+let partial_index_update_membership () =
+  (* When the WHERE predicate column changes, rows enter/leave the partial index *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, active INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(id) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 0)";  (* not in index initially *)
+  (* Flip active from 0 to 1: row enters the index *)
+  exec db "UPDATE t SET active = 1 WHERE id = 1";
+  (* Now a second INSERT with same id but active=1 should violate UNIQUE *)
+  let result = run (Db.execute db "INSERT INTO t VALUES (1, 1)") in
+  (match err_or_fail "partial_update_membership" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected UNIQUE violation after row entered partial index")
+
 let partial_index_tests = [
   Alcotest.test_case "partial_index_basic"               `Quick partial_index_basic;
   Alcotest.test_case "partial_index_skips_non_matching"  `Quick partial_index_skips_non_matching;
   Alcotest.test_case "partial_unique_index"              `Quick partial_unique_index;
   Alcotest.test_case "partial_unique_rejects_duplicate"  `Quick partial_unique_rejects_duplicate;
+  Alcotest.test_case "partial_index_update_membership"   `Quick partial_index_update_membership;
 ]
 
 (* Runner                                                               *)
