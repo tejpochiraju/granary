@@ -5396,6 +5396,58 @@ let partial_index_tests = [
   Alcotest.test_case "partial_index_update_membership"   `Quick partial_index_update_membership;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Expression indexes (#57)                                             *)
+(* ------------------------------------------------------------------ *)
+
+let expression_index_lower () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'Alice')";
+  exec db "INSERT INTO t VALUES (2, 'Bob')";
+  exec db "INSERT INTO t VALUES (3, 'Carol')";
+  exec db "CREATE INDEX idx_lower ON t(lower(name))";
+  let rows = query_ok db "SELECT id FROM t WHERE lower(name) = 'alice'" in
+  Alcotest.(check int) "found alice" 1 (List.length rows);
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0)
+
+let expression_index_unique_enforced () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "CREATE UNIQUE INDEX idx ON t(lower(name))";
+  exec db "INSERT INTO t VALUES (1, 'Alice')";
+  let result = run (Db.execute db "INSERT INTO t VALUES (2, 'alice')") in
+  (match err_or_fail "expr_unique_enforced" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected Runtime error for UNIQUE expression index violation")
+
+let expression_index_update_maintains () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT)";
+  exec db "CREATE UNIQUE INDEX idx ON t(upper(name))";
+  exec db "INSERT INTO t VALUES (1, 'alice')";
+  exec db "UPDATE t SET name = 'bob' WHERE id = 1";
+  exec db "INSERT INTO t VALUES (2, 'alice')";
+  let rows = query_ok db "SELECT COUNT(*) FROM t" in
+  Alcotest.check value_testable "two rows" (Db.V_int 2L) (List.hd rows).(0)
+
+let expression_index_delete_maintains () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, score INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(abs(score))";
+  exec db "INSERT INTO t VALUES (1, -5)";
+  exec db "DELETE FROM t WHERE id = 1";
+  exec db "INSERT INTO t VALUES (2, -5)";
+  let rows = query_ok db "SELECT COUNT(*) FROM t" in
+  Alcotest.check value_testable "insert after delete succeeds" (Db.V_int 1L) (List.hd rows).(0)
+
+let expression_index_tests = [
+  Alcotest.test_case "expression_index_lower"    `Quick expression_index_lower;
+  Alcotest.test_case "expression_index_unique"   `Quick expression_index_unique_enforced;
+  Alcotest.test_case "expression_index_update"   `Quick expression_index_update_maintains;
+  Alcotest.test_case "expression_index_delete"   `Quick expression_index_delete_maintains;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5899,4 +5951,5 @@ let () =
     "update_delete_limit", update_delete_limit_tests;
     "default_expressions", default_expression_tests;
     "partial_indexes", partial_index_tests;
+    "expression_indexes", expression_index_tests;
   ]

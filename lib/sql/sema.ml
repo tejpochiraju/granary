@@ -109,13 +109,15 @@ type bound_stmt =
         (** Window functions computed AFTER aggregation, over aggregated output rows. *)
     }
   | BS_create_index of {
-      name          : string;
-      table_meta    : Cat.table_meta;
-      col_idxs      : int list;
-      where_expr    : bound_expr option;
-      where_ast     : Ast.expr option;
-      unique        : bool;
-      if_not_exists : bool;
+      name           : string;
+      table_meta     : Cat.table_meta;
+      col_exprs      : bound_expr list;      (* bound column expressions *)
+      col_sqls       : string list;          (* col name (plain) or expr SQL (expression) *)
+      col_expr_flags : bool list;            (* true = expression index *)
+      where_expr     : bound_expr option;
+      where_ast      : Ast.expr option;
+      unique         : bool;
+      if_not_exists  : bool;
     }
   | BS_update of {
       table_meta  : Cat.table_meta;
@@ -2004,21 +2006,30 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some meta ->
-    let col_idxs_r = List.map (fun col ->
-      match col_index meta.columns col with
-      | None -> Error (Unknown_column { table; column = col })
-      | Some i -> Ok i
+    let pc = ref 0 in
+    let np = Hashtbl.create 0 in
+    (* Bind each column expression against the table schema *)
+    let col_results = List.map (fun col_ast ->
+      match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
+      | Error e -> Error e
+      | Ok be   -> Ok (be, col_ast)
     ) columns in
-    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) col_idxs_r in
+    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) col_results in
     (match errors with
      | e :: _ -> Lwt.return (Error e)
      | [] ->
-       let col_idxs = List.filter_map (function Ok i -> Some i | Error _ -> None) col_idxs_r in
+       let bound_pairs = List.filter_map (function Ok p -> Some p | _ -> None) col_results in
+       let col_exprs = List.map fst bound_pairs in
+       (* Compute col_sqls and col_expr_flags from the original AST *)
+       let col_sqls, col_expr_flags = List.split (List.map (fun col_ast ->
+         match col_ast with
+         | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> (cname, false)
+         | _ -> (Ast.expr_to_sql col_ast, true)
+       ) columns) in
+       (* Bind WHERE clause *)
        let where_result = match where_clause with
          | None -> Ok (None, None)
          | Some w_ast ->
-           let pc = ref 0 in
-           let np = Hashtbl.create 0 in
            (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
             | Error e -> Error e
             | Ok bw -> Ok (Some bw, Some w_ast))
@@ -2032,7 +2043,9 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
              Lwt.return (Ok (BS_create_index {
                name;
                table_meta = meta;
-               col_idxs;
+               col_exprs;
+               col_sqls;
+               col_expr_flags;
                where_expr;
                where_ast;
                unique;
@@ -2042,7 +2055,9 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
              Lwt.return (Ok (BS_create_index {
                name;
                table_meta = meta;
-               col_idxs;
+               col_exprs;
+               col_sqls;
+               col_expr_flags;
                where_expr;
                where_ast;
                unique;

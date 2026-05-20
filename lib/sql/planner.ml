@@ -67,11 +67,18 @@ let find_index_on_col cat (meta : Cat.table_meta) col_idx =
   List.find_opt (fun (i : Cat.index_info) ->
     (* Partial indexes (with WHERE clause) are not safe to use for general
        query optimization: a row absent from the index may still satisfy
-       the query's WHERE clause, so we must always fall back to a full scan. *)
-    i.idx_where_sql = None &&
-    (match i.idx_columns with
-     | [col] -> col = col_name
-     | _ -> false  (* multi-column indexes not used for lookup optimization *))
+       the query's WHERE clause, so we must always fall back to a full scan.
+       Expression indexes are also excluded from Op_index_lookup optimization:
+       the optimizer cannot trivially match query predicates to expression index keys. *)
+    let is_plain_cols = match i.Cat.idx_expr_flags with
+      | [] -> true                             (* old format: no flags = all plain *)
+      | flags -> not (List.exists Fun.id flags) (* no expression columns *)
+    in
+    is_plain_cols
+    && i.Cat.idx_where_sql = None
+    && (match i.Cat.idx_columns with
+        | [col] -> col = col_name
+        | _ -> false  (* multi-column indexes not used for lookup optimization *))
   ) candidates
 
 (** Detect [BE_col a = BE_col b] equality at the top level. *)
@@ -462,16 +469,19 @@ let rec plan ?cat = function
        | Some n ->
          let off = Option.value ~default:0 offset in
          Plan.Op_limit { limit = n; offset = off; child = after_distinct })
-  | Sema.BS_create_index { name; table_meta; col_idxs; where_expr; where_ast; unique; if_not_exists } ->
+  | Sema.BS_create_index { name; table_meta; col_exprs; col_sqls; col_expr_flags;
+                           where_expr; where_ast; unique; if_not_exists } ->
     Plan.Op_create_index {
       name;
-      table     = table_meta.name;
-      tree_id   = table_meta.tree_id;
-      col_idxs;
-      where_expr = Option.map plan_expr where_expr;
-      where_sql  = Option.map Ast.expr_to_sql where_ast;
+      table          = table_meta.Cat.name;
+      tree_id        = table_meta.Cat.tree_id;
+      col_exprs      = List.map plan_expr col_exprs;
+      col_sqls;
+      col_expr_flags;
+      where_expr     = Option.map plan_expr where_expr;
+      where_sql      = Option.map Ast.expr_to_sql where_ast;
       unique;
-      columns   = table_meta.columns;
+      columns        = table_meta.Cat.columns;
       if_not_exists;
     }
   | Sema.BS_update { table_meta; assignments; where; order; limit; offset; returning } ->

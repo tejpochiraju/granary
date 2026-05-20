@@ -246,7 +246,7 @@ and stmt =
   | S_create_index of {
       name          : string;
       table         : string;
-      columns       : string list;
+      columns       : expr list;        (* E_col "name" for plain cols, any expr for expression indexes *)
       where_clause  : expr option;
       unique        : bool;
       if_not_exists : bool;

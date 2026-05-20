@@ -201,19 +201,19 @@ let select_cols_where () =
 
 let create_index_basic () =
   match parse "CREATE INDEX idx_t_id ON t (id);" with
-  | Ast.S_create_index { name = "idx_t_id"; table = "t"; columns = ["id"];
+  | Ast.S_create_index { name = "idx_t_id"; table = "t"; columns = [Ast.E_col "id"];
                          unique = false; _ } -> ()
   | _ -> Alcotest.fail "expected S_create_index"
 
 let create_index_unique () =
   match parse "CREATE UNIQUE INDEX uidx ON users (email);" with
-  | Ast.S_create_index { name = "uidx"; table = "users"; columns = ["email"];
+  | Ast.S_create_index { name = "uidx"; table = "users"; columns = [Ast.E_col "email"];
                          unique = true; _ } -> ()
   | _ -> Alcotest.fail "expected S_create_index with unique=true"
 
 let create_index_no_semi () =
   match parse "CREATE INDEX i ON t (x)" with
-  | Ast.S_create_index { name = "i"; table = "t"; columns = ["x"]; unique = false; _ } -> ()
+  | Ast.S_create_index { name = "i"; table = "t"; columns = [Ast.E_col "x"]; unique = false; _ } -> ()
   | _ -> Alcotest.fail "expected S_create_index without semi"
 
 let create_index_missing_column_list () =

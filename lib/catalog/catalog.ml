@@ -44,12 +44,13 @@ type table_meta = {
 }
 
 type index_info = {
-  idx_name     : string;
-  idx_table    : string;
-  idx_columns  : string list;
-  idx_unique   : bool;
-  idx_tree_id  : S.tree_id;
-  idx_where_sql: string option;
+  idx_name      : string;
+  idx_table     : string;
+  idx_columns   : string list;      (* col names for plain; expr SQL for expression indexes *)
+  idx_unique    : bool;
+  idx_tree_id   : S.tree_id;
+  idx_expr_flags: bool list;        (* true = expression index column, false = plain column *)
+  idx_where_sql : string option;
 }
 
 type fts_table_meta = {
@@ -257,8 +258,13 @@ let encode_index_value (idx : index_info) =
   ) idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
-  (* Extended fields: version 1 = has where_sql field *)
-  Varint.encode_uint64 buf 1L;
+  (* Extended fields version 2: expr flags + optional WHERE *)
+  Varint.encode_uint64 buf 2L;
+  (* One varint per column: 0 = plain column, 1 = expression column *)
+  List.iter (fun is_expr ->
+    Varint.encode_uint64 buf (if is_expr then 1L else 0L)
+  ) idx.idx_expr_flags;
+  (* WHERE clause SQL *)
   (match idx.idx_where_sql with
    | None -> Varint.encode_uint64 buf 0L
    | Some sql ->
@@ -287,26 +293,48 @@ let decode_index_value bytes =
   ) in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
-  let idx_where_sql =
-    if off2 >= Bytes.length bytes then None
+  let idx_expr_flags, idx_where_sql =
+    if off2 >= Bytes.length bytes then
+      (List.map (fun _ -> false) cols, None)   (* old format: no extended fields *)
     else
       let version, off3 = Varint.decode_uint64 bytes off2 in
-      if Int64.to_int version <> 1 then None
-      else
-        let has_where, off4 = Varint.decode_uint64 bytes off3 in
-        if Int64.to_int has_where = 0 then None
-        else
-          let sql_len, off5 = Varint.decode_uint64 bytes off4 in
-          Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+      (match Int64.to_int version with
+       | 1 ->
+         (* Version 1 (Task 1): only WHERE clause, no expr flags *)
+         let has_where, off4 = Varint.decode_uint64 bytes off3 in
+         let where_sql =
+           if Int64.to_int has_where = 0 then None
+           else
+             let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+             Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+         in
+         (List.map (fun _ -> false) cols, where_sql)
+       | 2 ->
+         (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
+         let off_ref = ref off3 in
+         let expr_flags = List.map (fun _ ->
+           let flag, next = Varint.decode_uint64 bytes !off_ref in
+           off_ref := next;
+           Int64.to_int flag = 1
+         ) cols in
+         let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
+         let where_sql =
+           if Int64.to_int has_where = 0 then None
+           else
+             let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+             Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+         in
+         (expr_flags, where_sql)
+       | _ ->
+         (List.map (fun _ -> false) cols, None))
   in
-  {
-    idx_name     = name;
-    idx_table    = tbl;
-    idx_columns  = cols;
-    idx_unique   = (unique_byte <> 0);
-    idx_tree_id  = Int64.to_int tree_id;
-    idx_where_sql;
-  }
+  { idx_name      = name;
+    idx_table     = tbl;
+    idx_columns   = cols;
+    idx_unique    = (unique_byte <> 0);
+    idx_tree_id   = Int64.to_int tree_id;
+    idx_expr_flags;
+    idx_where_sql }
 
 (* FTS value encoding:
    varint(content_tree) ++ varint(index_tree) ++ varint(n_cols)
@@ -694,18 +722,21 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 
-let create_index t ~name ~table ~columns ~unique ~where_sql =
+let create_index t ~name ~table ~columns ~unique ~expr_flags ~where_sql =
   if Hashtbl.mem t.indexes name then
     Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))
   else match Hashtbl.find_opt t.cache table with
     | None ->
       Lwt.return (Error (Printf.sprintf "no table '%s'" table))
     | Some tm ->
-      let missing = List.find_opt (fun col ->
+      (* Validate: for plain columns, check they exist in the table; skip for expression columns *)
+      let col_with_flags = List.combine columns expr_flags in
+      let missing = List.find_opt (fun (col, is_expr) ->
+        not is_expr &&
         not (List.exists (fun (c : Row.column) -> c.name = col) tm.columns)
-      ) columns in
+      ) col_with_flags in
       (match missing with
-       | Some col ->
+       | Some (col, _) ->
          Lwt.return (Error (Printf.sprintf
                                "no column '%s' on table '%s'" col table))
        | None ->
@@ -713,12 +744,13 @@ let create_index t ~name ~table ~columns ~unique ~where_sql =
          let%lwt id = read_next_index_id t.store in
          let%lwt () = write_next_index_id t.store (id + 1) in
          let info = {
-           idx_name     = name;
-           idx_table    = table;
-           idx_columns  = columns;
-           idx_unique   = unique;
-           idx_tree_id  = tid;
-           idx_where_sql = where_sql;
+           idx_name       = name;
+           idx_table      = table;
+           idx_columns    = columns;
+           idx_unique     = unique;
+           idx_tree_id    = tid;
+           idx_expr_flags = expr_flags;
+           idx_where_sql  = where_sql;
          } in
          let%lwt tx = S.rw_begin t.store in
          let%lwt () =

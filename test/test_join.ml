@@ -82,7 +82,8 @@ let make_two_table_cat ?(orders_idx=false) () =
       if orders_idx then
         let* r =
           Cat.create_index cat ~name:"idx_orders_uid"
-            ~table:"orders" ~columns:["uid"] ~unique:false ~where_sql:None in
+            ~table:"orders" ~columns:["uid"] ~unique:false
+            ~expr_flags:[false] ~where_sql:None in
         (match r with Ok _ -> () | Error e -> failwith e);
         Lwt.return_unit
       else Lwt.return_unit

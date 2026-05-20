@@ -384,7 +384,7 @@ let make_cat_with_index ~col_name =
       { Row.name = "name"; ty = Row.Text; not_null = false; primary_key = false; default = None; check_sql = None };
     ] in
     let* _ = Cat.create_index cat ~name:"idx" ~table:"users"
-      ~columns:[col_name] ~unique:false ~where_sql:None in
+      ~columns:[col_name] ~unique:false ~expr_flags:[false] ~where_sql:None in
     Lwt.return cat
   )
 
@@ -442,12 +442,12 @@ let plan_no_index_falls_back_to_filter () =
 let plan_create_index () =
   let cat = make_cat_with_index ~col_name:"id" in
   let stmt = Ast.S_create_index {
-    name = "idx2"; table = "users"; columns = ["name"]; where_clause = None; unique = true; if_not_exists = false;
+    name = "idx2"; table = "users"; columns = [Ast.E_col "name"]; where_clause = None; unique = true; if_not_exists = false;
   } in
   let bound = bind cat stmt in
   match Planner.plan ~cat bound with
-  | Plan.Op_create_index { name = "idx2"; table = "users"; col_idxs = [1];
-                           unique = true; _ } -> ()
+  | Plan.Op_create_index { name = "idx2"; table = "users"; col_sqls = ["name"];
+                           col_expr_flags = [false]; unique = true; _ } -> ()
   | _ -> Alcotest.fail "expected Op_create_index { name=idx2; ... }"
 
 (* ------------------------------------------------------------------ *)

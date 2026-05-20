@@ -86,17 +86,19 @@ type op =
       child  : op;
     }
   | Op_create_index of {
-      name          : string;
-      table         : string;
-      tree_id       : int;          (** table's tree_id *)
-      col_idxs      : int list;     (** column ordinals in table schema *)
-      where_expr    : expr option;
-      where_sql     : string option;
-      unique        : bool;
-      columns       : Sqlocaml_encoding.Row.column list;
+      name           : string;
+      table          : string;
+      tree_id        : int;          (** table's tree_id *)
+      col_exprs      : expr list;    (** bound col expressions (P_col i for plain, arbitrary for expr) *)
+      col_sqls       : string list;  (** col name (plain) or expr SQL (expression) *)
+      col_expr_flags : bool list;    (** true = expression index column, false = plain column *)
+      where_expr     : expr option;
+      where_sql      : string option;
+      unique         : bool;
+      columns        : Sqlocaml_encoding.Row.column list;
         (** columns of the target table — needed for row decoding
             during index population *)
-      if_not_exists : bool;
+      if_not_exists  : bool;
     }
   | Op_index_lookup of {
       table_tree : int;                 (** table's tree_id *)

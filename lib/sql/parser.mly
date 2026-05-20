@@ -322,18 +322,21 @@ create_fts_table:
       LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { S_create_fts_table { name; columns = cols } }
 
+index_col_expr:
+  | e = expr { e }
+
 create_index:
   | CREATE INDEX name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+      LPAREN cols = separated_nonempty_list(COMMA, index_col_expr) RPAREN wh = where_opt
     { S_create_index { name; table; columns = cols; where_clause = wh; unique = false; if_not_exists = false } }
   | CREATE UNIQUE INDEX name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+      LPAREN cols = separated_nonempty_list(COMMA, index_col_expr) RPAREN wh = where_opt
     { S_create_index { name; table; columns = cols; where_clause = wh; unique = true; if_not_exists = false } }
   | CREATE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+      LPAREN cols = separated_nonempty_list(COMMA, index_col_expr) RPAREN wh = where_opt
     { S_create_index { name; table; columns = cols; where_clause = wh; unique = false; if_not_exists = true } }
   | CREATE UNIQUE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+      LPAREN cols = separated_nonempty_list(COMMA, index_col_expr) RPAREN wh = where_opt
     { S_create_index { name; table; columns = cols; where_clause = wh; unique = true; if_not_exists = true } }
 
 column_def:
