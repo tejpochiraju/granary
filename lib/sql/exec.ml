@@ -1723,10 +1723,13 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     else
       Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
         (* Collect the local values for all FK columns *)
-        let local_idxs = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
-        let local_vals = List.map (fun idx_opt ->
-          match idx_opt with Some i -> row.(i) | None -> Row.V_null
-        ) local_idxs in
+        let local_idxs_opt = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
+        if List.exists Option.is_none local_idxs_opt then
+          Lwt.fail_with (Printf.sprintf "FOREIGN KEY: some local columns not found in table '%s'"
+            table_meta.Cat.name)
+        else
+        let local_idxs = List.filter_map Fun.id local_idxs_opt in
+        let local_vals = List.map (fun i -> row.(i)) local_idxs in
         (* NULL in any FK column => skip enforcement *)
         if any_null_val local_vals then Lwt.return_unit
         else
@@ -2173,15 +2176,21 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
     Lwt_list.iter_s (fun (child_meta, fks) ->
       Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
         (* Get the parent values for all FK parent columns *)
-        let parent_col_idxs = List.map
-          (fun c -> find_col_idx_by_name meta.Cat.columns c) fk.Cat.fk_parent_cols
+        let parent_col_idxs_opt = List.map
+          (find_col_idx_by_name_opt meta.Cat.columns) fk.Cat.fk_parent_cols
         in
+        if List.exists Option.is_none parent_col_idxs_opt then Lwt.return_unit
+        else
+        let parent_col_idxs = List.filter_map Fun.id parent_col_idxs_opt in
         let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
         if any_null_val parent_vals then Lwt.return_unit
         else begin
-          let child_col_idxs = List.map
-            (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
+          let child_col_idxs_opt = List.map
+            (find_col_idx_by_name_opt child_meta.Cat.columns) fk.Cat.fk_local_cols
           in
+          if List.exists Option.is_none child_col_idxs_opt then Lwt.return_unit
+          else
+          let child_col_idxs = List.filter_map Fun.id child_col_idxs_opt in
           (match fk.Cat.fk_on_delete with
            | Cat.FA_restrict | Cat.FA_no_action ->
              let* child_rows =
