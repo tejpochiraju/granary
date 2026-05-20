@@ -1,6 +1,8 @@
 module Cat = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 
+(* Produces uppercase SQLite PRAGMA wire-format strings ("CASCADE", "NO ACTION", etc.)
+   Distinct from Cat.fk_action_to_string which uses lowercase for internal serialization. *)
 let fk_action_str = function
   | Cat.FA_no_action   -> "NO ACTION"
   | Cat.FA_restrict    -> "RESTRICT"

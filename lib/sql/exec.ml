@@ -2616,7 +2616,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
-  | Plan.Op_pragma_set_user_version _ -> Lwt.return 0  (* stub: exec-time handled later *)
+  | Plan.Op_pragma_set_user_version _ -> Lwt.return 0  (* stub: implemented in Phase 26 Task 4 *)
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
