@@ -5872,11 +5872,10 @@ let test_group_concat_skips_null () =
   exec db "INSERT INTO t VALUES ('hello')";
   exec db "INSERT INTO t VALUES (NULL)";
   exec db "INSERT INTO t VALUES ('world')";
-  let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
+  let rows = query_ok db "SELECT GROUP_CONCAT(v, ',') FROM t" in
   let v = (List.hd rows).(0) in
   (match v with
-   | Db.V_text s ->
-     Alcotest.(check bool) "no null in result" false (String.contains s 'N')
+   | Db.V_text s -> Alcotest.(check string) "null skipped" "hello,world" s
    | _ -> Alcotest.fail "expected text")
 
 let test_group_concat_empty () =
