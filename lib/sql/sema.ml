@@ -1125,6 +1125,12 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
                | None ->
                  Error (Unknown_column { table; column = col_name })
                | Some i ->
+                 let col = List.nth meta.columns i in
+                 if col.Row.generated_as <> None then
+                   Error (Unsupported (Printf.sprintf
+                     "cannot INSERT into generated column '%s' — computed automatically"
+                     col.Row.name))
+                 else
                  (match bind_value_expr expr_ast with
                   | Error e -> Error e
                   | Ok bexpr ->
@@ -2095,6 +2101,11 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~ord
              Error (Unknown_column { table; column = col_name })
            | Some i ->
              let col = List.nth meta.columns i in
+             if col.Row.generated_as <> None then
+               Error (Unsupported (Printf.sprintf
+                 "cannot UPDATE generated column '%s' — computed automatically"
+                 col.Row.name))
+             else
              (* Static NOT NULL check for literal NULL assignments. *)
              if col.Row.not_null && expr_ast = Ast.E_lit Ast.L_null then
                Error (Not_null_violation col.Row.name)

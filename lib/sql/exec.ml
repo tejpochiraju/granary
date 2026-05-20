@@ -900,6 +900,43 @@ let compile_check_expr (table_name : string) (col_idx : int)
     Hashtbl.add check_expr_cache key plan_expr;
     plan_expr
 
+(* Cache for compiled generated-column expressions.
+   Key: (table_name, col_idx, expr_sql) — same three-part pattern as check_expr_cache.
+   Schema changes invalidate entries via clear on DROP TABLE / DROP COLUMN. *)
+let generated_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
+
+let compile_generated_expr (table_name : string) (col_idx : int)
+    (columns : Row.column list) (expr_sql : string) : Plan.expr =
+  let key = (table_name, col_idx, expr_sql) in
+  match Hashtbl.find_opt generated_expr_cache key with
+  | Some e -> e
+  | None ->
+    let lexbuf = Lexing.from_string expr_sql in
+    let ast_expr =
+      try Parser.expr_only Lexer.token lexbuf
+      with _ -> failwith (Printf.sprintf
+        "generated column expr parse error for %s.col%d: %s" table_name col_idx expr_sql)
+    in
+    let plan_expr = ast_expr_to_plan_check columns ast_expr in
+    Hashtbl.add generated_expr_cache key plan_expr;
+    plan_expr
+
+(** Compute all generated columns in [row] in-place.
+    Iterates columns in schema order; earlier generated columns are available
+    to later generated column expressions (in-order dependency). *)
+let compute_generated_cols
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (meta : Cat.table_meta)
+    (row : Row.t) : unit =
+  List.iteri (fun i (col : Row.column) ->
+    match col.Row.generated_as with
+    | None -> ()
+    | Some (sql, _is_stored) ->
+      let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
+      row.(i) <- eval_expr clock params row plan_e
+  ) meta.Cat.columns
+
 let index_where_cache : (string * string * string * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
 
 let compile_index_where (idx : Cat.index_info) (columns : Row.column list) : Plan.expr =
@@ -1343,6 +1380,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
       r
   in
+  compute_generated_cols clock params table_meta row;
   (* Evaluate CHECK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
   (* Evaluate FK constraints before any writes. *)
@@ -1478,6 +1516,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
              let e' = substitute_excluded row expr in
              new_row.(col_ord) <- eval_expr clock params old_row e'
            ) assigns;
+           compute_generated_cols clock params table_meta new_row;
            eval_check_constraints clock params table_meta new_row;
            let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
@@ -1893,6 +1932,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
             List.iter (fun (i, expr) ->
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
+            compute_generated_cols clock params table_meta new_row;
             (* Evaluate CHECK constraints on the new row before writes. *)
             eval_check_constraints clock params table_meta new_row;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
@@ -1934,6 +1974,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
             List.iter (fun (i, expr) ->
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
+            compute_generated_cols clock params table_meta new_row;
             (* Apply FK cascade UPDATE actions (CASCADE / SET NULL / SET DEFAULT). *)
             let* () =
               if child_refs = [] then Lwt.return_unit
@@ -2373,6 +2414,10 @@ let execute_with_count ?(mode = Auto)
     Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
       if String.equal tbl table_meta.name then None else Some v
     ) check_expr_cache;
+    (* Invalidate cached generated-column expressions for the dropped table *)
+    Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
+      if String.equal tbl table_meta.name then None else Some v
+    ) generated_expr_cache;
     Lwt.return 0
   | Plan.Op_drop_index { idx_info } ->
     let* () = execute_drop_index ~mode store cat ~idx_info in
@@ -2496,6 +2541,14 @@ let execute_with_count ?(mode = Auto)
             Hashtbl.remove check_expr_cache (table_meta.Cat.name, idx, sql)) to_add;
           List.iter (fun (new_t, idx, sql, v) ->
             Hashtbl.add check_expr_cache (new_t, idx, sql) v) to_add;
+          (* Remap cached generated-column entries from old_name to new_name *)
+          let to_add_gen = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
+            if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
+            else acc) generated_expr_cache [] in
+          List.iter (fun (_, idx, sql, _) ->
+            Hashtbl.remove generated_expr_cache (table_meta.Cat.name, idx, sql)) to_add_gen;
+          List.iter (fun (new_t, idx, sql, v) ->
+            Hashtbl.add generated_expr_cache (new_t, idx, sql) v) to_add_gen;
           Lwt.return 0)
      | Ast.AA_rename_column (old_col, new_col) ->
        let* result = Cat.rename_column cat
@@ -2547,7 +2600,17 @@ let execute_with_count ?(mode = Auto)
        let* result = Cat.drop_column cat ~table_name ~col_name in
        (match result with
         | Error msg -> Lwt.fail_with msg
-        | Ok ()     -> Lwt.return 0))
+        | Ok ()     ->
+          (* Invalidate cached CHECK and generated-column expressions for this table *)
+          let to_clear_chk = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
+            if String.equal tn table_name then (tn, idx, sql) :: acc else acc
+          ) check_expr_cache [] in
+          List.iter (Hashtbl.remove check_expr_cache) to_clear_chk;
+          let to_clear_gen = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
+            if String.equal tn table_name then (tn, idx, sql) :: acc else acc
+          ) generated_expr_cache [] in
+          List.iter (Hashtbl.remove generated_expr_cache) to_clear_gen;
+          Lwt.return 0))
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
@@ -3787,6 +3850,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       List.iter (fun (i, expr) ->
         new_row.(i) <- eval_expr clock params old_row expr
       ) assignments;
+      compute_generated_cols clock params table_meta new_row;
       Array.of_list (List.map (eval_expr clock params new_row) returning)
     ) matched in
     (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot

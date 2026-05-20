@@ -3062,6 +3062,38 @@ let phase23_cascade_cases = [
     unordered = false };
 ]
 
+let phase25_generated_cases = [
+  { name = "generated_stored_basic";
+    setup = [
+      {|CREATE TABLE t (
+        id INTEGER, name TEXT,
+        upper_name TEXT GENERATED ALWAYS AS (upper(name)) STORED
+      )|};
+      "INSERT INTO t (id, name) VALUES (1, 'hello')";
+    ];
+    query = "SELECT upper_name FROM t WHERE id = 1";
+    unordered = false };
+
+  { name = "generated_arithmetic";
+    setup = [
+      {|CREATE TABLE t (a INTEGER, b INTEGER,
+        c INTEGER GENERATED ALWAYS AS (a + b) STORED)|};
+      "INSERT INTO t (a, b) VALUES (3, 7)";
+    ];
+    query = "SELECT c FROM t";
+    unordered = false };
+
+  { name = "generated_update_recomputes";
+    setup = [
+      {|CREATE TABLE t (x INTEGER,
+        y INTEGER GENERATED ALWAYS AS (x * 2) STORED)|};
+      "INSERT INTO t (x) VALUES (5)";
+      "UPDATE t SET x = 10";
+    ];
+    query = "SELECT y FROM t";
+    unordered = false };
+]
+
 let phase24_limit_cases = [
   { name = "delete_order_limit";
     setup = [
@@ -3121,4 +3153,5 @@ let () =
     "phase22_trigger",         List.map make_test phase22_trigger_cases;
     "phase23_cascade",         List.map make_test phase23_cascade_cases;
     "phase24_limit",           List.map make_test phase24_limit_cases;
+    "phase25_generated",       List.map make_test phase25_generated_cases;
   ]
