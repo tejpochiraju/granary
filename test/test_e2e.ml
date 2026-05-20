@@ -3362,6 +3362,36 @@ let test_multi_join_middle_col () =
   Alcotest.(check int) "b.val" 42
     (match (List.hd rows).(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
 
+let three_join_group_order () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE dept (id INTEGER, dname TEXT)";
+  exec db "CREATE TABLE emp  (id INTEGER, dept_id INTEGER)";
+  exec db "CREATE TABLE sal  (emp_id INTEGER, amount INTEGER)";
+  exec db "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
+  exec db "INSERT INTO emp  VALUES (1, 1), (2, 1), (3, 2)";
+  exec db "INSERT INTO sal  VALUES (1, 100), (2, 90), (3, 80)";
+  let rows = query_ok db
+    "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id \
+     JOIN sal ON emp.id = sal.emp_id GROUP BY dname ORDER BY dname" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "first=eng"   (Db.V_text "eng")   (List.nth rows 0).(0);
+  Alcotest.check value_testable "first=2"     (Db.V_int 2L)        (List.nth rows 0).(1);
+  Alcotest.check value_testable "second=sales" (Db.V_text "sales") (List.nth rows 1).(0);
+  Alcotest.check value_testable "second=1"    (Db.V_int 1L)        (List.nth rows 1).(1)
+
+let two_join_group_order_regression () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE dept (id INTEGER, dname TEXT)";
+  exec db "CREATE TABLE emp  (id INTEGER, dept_id INTEGER)";
+  exec db "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
+  exec db "INSERT INTO emp  VALUES (1, 1), (2, 1), (3, 2)";
+  let rows = query_ok db
+    "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id \
+     GROUP BY dname ORDER BY dname" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "first=eng"   (Db.V_text "eng")   (List.nth rows 0).(0);
+  Alcotest.check value_testable "second=sales" (Db.V_text "sales") (List.nth rows 1).(0)
+
 (* ------------------------------------------------------------------ *)
 (* Phase 11: CAST, NULLIF, IIF                                          *)
 (* ------------------------------------------------------------------ *)
@@ -6434,6 +6464,8 @@ let () =
       Alcotest.test_case "two_left_joins"      `Quick test_two_left_joins;
       Alcotest.test_case "star_three_tables"   `Quick test_star_three_tables;
       Alcotest.test_case "regression_one_join" `Quick test_multi_join_regression_one;
+      Alcotest.test_case "three_join_group_order"       `Quick three_join_group_order;
+      Alcotest.test_case "two_join_group_order_regression" `Quick two_join_group_order_regression;
     ];
     "phase10_edge", [
       Alcotest.test_case "case_in_order_by"   `Quick test_case_in_order_by;

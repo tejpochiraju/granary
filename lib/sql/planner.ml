@@ -329,7 +329,43 @@ let plan_select cat
   in
   (* Post-aggregation sort (only for aggregated queries). *)
   let sorted =
-    if is_aggregated then make_sort projected
+    if is_aggregated then begin
+      (* For aggregated queries, ORDER BY col indices are in pre-aggregation space.
+         Translate P_col pre_idx to the post-agg output position. *)
+      let plan_proj = List.map sema_agg_proj_to_plan agg_proj in
+      let find_idx pred lst =
+        let rec go k = function
+          | [] -> None
+          | x :: rest -> if pred x then Some k else go (k + 1) rest
+        in go 0 lst
+      in
+      let remap_e e =
+        match e with
+        | Plan.P_col i ->
+          (match find_idx (( = ) i) group_by with
+           | None -> e
+           | Some gc_pos ->
+             (match find_idx (function
+                | Plan.PI_group_col k -> k = gc_pos
+                | _ -> false) plan_proj with
+              | Some out_pos -> Plan.P_col out_pos
+              | None -> e))
+        | _ -> e
+      in
+      let keys = List.map (fun (bkey : Sema.bound_order_key) ->
+        let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+        let nulls = match bkey.nulls with
+          | Some `Nulls_first -> `Nulls_first
+          | Some `Nulls_last  -> `Nulls_last
+          | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+        in
+        let e = plan_expr bkey.key in
+        let e' = remap_e e in
+        (e', dir, nulls)
+      ) order in
+      if keys = [] then projected
+      else Plan.Op_sort { keys; child = projected }
+    end
     else projected
   in
   let after_distinct =
