@@ -3196,6 +3196,50 @@ let phase27_cases = [
     unordered = false };
 ]
 
+let phase30_cascade_cases = [
+  { name = "cascade_delete_three_levels";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE b (id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)";
+      "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE CASCADE)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (10, 1)";
+      "INSERT INTO c VALUES (100, 10)";
+      "DELETE FROM a WHERE id = 1";
+    ];
+    query = "SELECT COUNT(*) FROM b UNION ALL SELECT COUNT(*) FROM c";
+    unordered = false };
+
+  { name = "cascade_update_three_levels";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE b (bid INTEGER PRIMARY KEY, aid INTEGER, UNIQUE (aid), FOREIGN KEY (aid) REFERENCES a(id) ON UPDATE CASCADE)";
+      "CREATE TABLE c (cid INTEGER, c_ref INTEGER REFERENCES b(aid) ON UPDATE CASCADE)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (10, 1)";
+      "INSERT INTO c VALUES (100, 1)";
+      "UPDATE a SET id = 99 WHERE id = 1";
+    ];
+    query = "SELECT c_ref FROM c";
+    unordered = false };
+
+  { name = "cascade_delete_set_null_grandchild";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE b (id INTEGER PRIMARY KEY, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)";
+      "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE SET NULL)";
+      "INSERT INTO a VALUES (1)";
+      "INSERT INTO b VALUES (10, 1)";
+      "INSERT INTO c VALUES (100, 10)";
+      "DELETE FROM a WHERE id = 1";
+    ];
+    query = "SELECT id, bid FROM c";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3238,4 +3282,5 @@ let () =
     "phase25_generated",       List.map make_test phase25_generated_cases;
     "phase26_pragma",          List.map make_test phase26_pragma_cases;
     "phase27",                 List.map make_test phase27_cases;
+    "phase30_cascade",         List.map make_test phase30_cascade_cases;
   ]

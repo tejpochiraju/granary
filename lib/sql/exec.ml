@@ -1804,6 +1804,184 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let new_bytes = Row.encode schema new_row in
   S.put tx meta.Cat.tree_id rowid_key new_bytes
 
+(** Recursively delete a row and cascade FK actions to child tables.
+    Only runs cascade logic when FK enforcement is enabled in [cat]. *)
+let rec cascade_delete_row_in_tx tx (cat : Cat.t)
+    (clock : (unit -> float) option) (params : Row.value array)
+    (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+  let* child_refs =
+    if Cat.get_fk_enforcement cat then
+      build_child_refs cat ~parent_table_name:meta.Cat.name
+    else Lwt.return []
+  in
+  let* () =
+    Lwt_list.iter_s (fun (child_meta, fks) ->
+      Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+        let parent_col_idx =
+          find_col_idx_by_name meta.Cat.columns fk.Cat.fk_parent_col
+        in
+        let parent_val = row.(parent_col_idx) in
+        match parent_val with
+        | Row.V_null -> Lwt.return_unit
+        | _ ->
+          let child_col_idx =
+            find_col_idx_by_name child_meta.Cat.columns fk.Cat.fk_local_col
+          in
+          (match fk.Cat.fk_on_delete with
+           | Cat.FA_restrict | Cat.FA_no_action ->
+             let* child_rows =
+               scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
+             in
+             if child_rows <> [] then
+               Lwt.fail_with (Printf.sprintf
+                 "FOREIGN KEY constraint failed: '%s.%s' is still \
+                  referenced by '%s.%s'"
+                 meta.Cat.name fk.Cat.fk_parent_col
+                 child_meta.Cat.name fk.Cat.fk_local_col)
+             else Lwt.return_unit
+           | Cat.FA_cascade ->
+             let* child_rows =
+               scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
+             in
+             Lwt_list.iter_s (fun (crid, crow) ->
+               cascade_delete_row_in_tx tx cat clock params
+                 child_meta ~rowid:crid ~row:crow
+             ) child_rows
+           | Cat.FA_set_null ->
+             let* child_rows =
+               scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
+             in
+             Lwt_list.iter_s (fun (crid, crow) ->
+               update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                 ~col_idx:child_col_idx ~new_val:Row.V_null
+             ) child_rows
+           | Cat.FA_set_default ->
+             let* child_rows =
+               scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
+             in
+             Lwt_list.iter_s (fun (crid, crow) ->
+               let col = List.nth child_meta.Cat.columns child_col_idx in
+               let default_val = match col.Row.default with
+                 | None               -> Row.V_null
+                 | Some Row.DV_int  n -> Row.V_int  n
+                 | Some Row.DV_text s -> Row.V_text s
+                 | Some Row.DV_real f -> Row.V_real f
+                 | Some Row.DV_blob b -> Row.V_blob b
+                 | Some Row.DV_null   -> Row.V_null
+                 | Some Row.DV_current_timestamp ->
+                   eval_expr clock params [||]
+                     (Plan.P_func (Ast.Fn_datetime,
+                        [Plan.P_lit (Ast.L_text "now")]))
+                 | Some Row.DV_current_date ->
+                   eval_expr clock params [||]
+                     (Plan.P_func (Ast.Fn_date,
+                        [Plan.P_lit (Ast.L_text "now")]))
+                 | Some Row.DV_current_time ->
+                   eval_expr clock params [||]
+                     (Plan.P_func (Ast.Fn_time,
+                        [Plan.P_lit (Ast.L_text "now")]))
+               in
+               update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                 ~col_idx:child_col_idx ~new_val:default_val
+             ) child_rows)
+      ) fks
+    ) child_refs
+  in
+  delete_row_in_tx tx cat meta ~rowid ~row
+
+(** Recursively update a column and cascade FK UPDATE actions to child tables
+    that reference this column. *)
+and cascade_update_col_in_tx tx (cat : Cat.t)
+    (clock : (unit -> float) option) (params : Row.value array)
+    (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
+  let old_val = row.(col_idx) in
+  let* () =
+    update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val
+  in
+  if not (Cat.get_fk_enforcement cat) then Lwt.return_unit
+  else begin
+    let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
+    let* all_child_refs =
+      build_child_refs cat ~parent_table_name:meta.Cat.name
+    in
+    let col_child_refs =
+      List.filter_map (fun (child_meta, fks) ->
+        let matching_fks =
+          List.filter (fun (fk : Cat.fk_constraint) ->
+            String.equal fk.Cat.fk_parent_col parent_col_name
+          ) fks
+        in
+        if matching_fks = [] then None
+        else Some (child_meta, matching_fks)
+      ) all_child_refs
+    in
+    Lwt_list.iter_s (fun (child_meta, fks) ->
+      Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+        let child_col_idx =
+          find_col_idx_by_name child_meta.Cat.columns fk.Cat.fk_local_col
+        in
+        match fk.Cat.fk_on_update with
+        | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
+        | Cat.FA_cascade ->
+          let* child_rows =
+            scan_child_rows_tx tx child_meta ~child_col_idx
+              ~parent_val:old_val
+          in
+          Lwt_list.iter_s (fun (crid, crow) ->
+            cascade_update_col_in_tx tx cat clock params child_meta
+              ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val
+          ) child_rows
+        | Cat.FA_set_null ->
+          let col = List.nth child_meta.Cat.columns child_col_idx in
+          if col.Row.not_null then
+            Lwt.fail_with (Printf.sprintf
+              "FOREIGN KEY constraint failed: ON UPDATE SET NULL on \
+               NOT NULL column '%s.%s'"
+              child_meta.Cat.name fk.Cat.fk_local_col)
+          else begin
+            let* child_rows =
+              scan_child_rows_tx tx child_meta ~child_col_idx
+                ~parent_val:old_val
+            in
+            Lwt_list.iter_s (fun (crid, crow) ->
+              update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                ~col_idx:child_col_idx ~new_val:Row.V_null
+            ) child_rows
+          end
+        | Cat.FA_set_default ->
+          let* child_rows =
+            scan_child_rows_tx tx child_meta ~child_col_idx
+              ~parent_val:old_val
+          in
+          Lwt_list.iter_s (fun (crid, crow) ->
+            let col = List.nth child_meta.Cat.columns child_col_idx in
+            let default_val = match col.Row.default with
+              | None               -> Row.V_null
+              | Some Row.DV_int  n -> Row.V_int  n
+              | Some Row.DV_text s -> Row.V_text s
+              | Some Row.DV_real f -> Row.V_real f
+              | Some Row.DV_blob b -> Row.V_blob b
+              | Some Row.DV_null   -> Row.V_null
+              | Some Row.DV_current_timestamp ->
+                eval_expr clock params [||]
+                  (Plan.P_func (Ast.Fn_datetime,
+                     [Plan.P_lit (Ast.L_text "now")]))
+              | Some Row.DV_current_date ->
+                eval_expr clock params [||]
+                  (Plan.P_func (Ast.Fn_date,
+                     [Plan.P_lit (Ast.L_text "now")]))
+              | Some Row.DV_current_time ->
+                eval_expr clock params [||]
+                  (Plan.P_func (Ast.Fn_time,
+                     [Plan.P_lit (Ast.L_text "now")]))
+            in
+            update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+              ~col_idx:child_col_idx ~new_val:default_val
+          ) child_rows
+      ) fks
+    ) col_child_refs
+  end
+
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
@@ -2000,8 +2178,8 @@ let execute_update ?(mode = Auto) ?(params = [||])
                           | Cat.FA_cascade ->
                             let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
                             Lwt_list.iter_s (fun (crid, crow) ->
-                              update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                                ~col_idx:child_col_idx ~new_val
+                              cascade_update_col_in_tx tx cat clock params child_meta
+                                ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val
                             ) child_rows
                           | Cat.FA_set_null ->
                             let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val:old_val in
@@ -2224,7 +2402,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                         | Cat.FA_cascade ->
                           let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in
                           Lwt_list.iter_s (fun (crid, crow) ->
-                            delete_row_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                            cascade_delete_row_in_tx tx cat clock params child_meta ~rowid:crid ~row:crow
                           ) child_rows
                         | Cat.FA_set_null ->
                           let* child_rows = scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val in

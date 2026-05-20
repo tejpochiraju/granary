@@ -6197,6 +6197,118 @@ let insert_select_bad_column () =
    | Error _ -> ()
    | Ok ()   -> Alcotest.fail "expected error for unknown column name")
 
+(* ── Phase 30: Transitive FK CASCADE ─────────────────────────── *)
+
+(** Convenience: open an in-memory DB, pass it to [f], run the Lwt monad. *)
+let with_db f =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    f db)
+
+(** Execute SQL; fail the test on error. *)
+let exec_in db sql =
+  let* r = Db.execute db sql in
+  (match r with
+   | Ok ()   -> ()
+   | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+  Lwt.return_unit
+
+(** Query and collect rows; fail on error. *)
+let query_rows db sql =
+  let* r = Db.query db sql in
+  match r with
+  | Error e -> Alcotest.failf "query %S: %a" sql Db.pp_error e
+  | Ok s    -> Lwt_stream.to_list s
+
+(** Assert that the row list matches the expected list of value arrays. *)
+let check_rows label expected actual =
+  Alcotest.(check int) (label ^ " row count") (List.length expected) (List.length actual);
+  List.iteri (fun i (exp_row, act_row) ->
+    Array.iteri (fun j exp_val ->
+      Alcotest.check value_testable
+        (Printf.sprintf "%s row[%d] col[%d]" label i j)
+        exp_val act_row.(j)
+    ) exp_row
+  ) (List.combine expected actual)
+
+(** Assert that an execute result is an error (any error). *)
+let check_error label result =
+  match result with
+  | Error _ -> ()
+  | Ok ()   -> Alcotest.failf "%s: expected Error, got Ok" label
+
+(** Execute SQL and return the result (Ok/Error) without failing. *)
+let exec_err db sql =
+  Lwt_main.run (Db.execute db sql)
+
+let test_cascade_delete_three_levels () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "INSERT INTO a VALUES (1)" in
+    let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
+    let* () = exec_in db "DELETE FROM a WHERE id = 1" in
+    let* b_rows = query_rows db "SELECT id FROM b" in
+    check_rows "b empty after cascade" [] b_rows;
+    let* c_rows = query_rows db "SELECT id FROM c" in
+    check_rows "c empty after cascade" [] c_rows;
+    Lwt.return_unit)
+
+let test_cascade_delete_mixed_actions () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE SET NULL)" in
+    let* () = exec_in db "INSERT INTO a VALUES (1)" in
+    let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
+    let* () = exec_in db "DELETE FROM a WHERE id = 1" in
+    let* b_rows = query_rows db "SELECT id FROM b" in
+    check_rows "b empty" [] b_rows;
+    let* c_rows = query_rows db "SELECT id, bid FROM c" in
+    check_rows "c.bid set to null" [[| Db.V_int 100L; Db.V_null |]] c_rows;
+    Lwt.return_unit)
+
+let test_cascade_update_three_levels () =
+  (* a.id -> b.aid (ON UPDATE CASCADE); b.bid -> c.c_ref (ON UPDATE CASCADE).
+     Updating a.id cascades to b.aid; b.bid stays constant so c is unchanged.
+     This verifies that cascade_update_col_in_tx does NOT infinitely recurse
+     and correctly propagates to c when b.bid is what c references and it changes.
+     Use a simpler two-hop: update a.id -> b.aid cascades; c references b.bid (PK).
+     To truly test 3-level, we make c reference b.aid via a REFERENCES clause
+     and use table-level UNIQUE on b.aid. *)
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE b (bid INTEGER PRIMARY KEY, aid INTEGER, UNIQUE (aid), FOREIGN KEY (aid) REFERENCES a(id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "CREATE TABLE c (cid INTEGER, c_ref INTEGER REFERENCES b(aid) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO a VALUES (1)" in
+    let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO c VALUES (100, 1)" in
+    let* () = exec_in db "UPDATE a SET id = 99 WHERE id = 1" in
+    let* b_rows = query_rows db "SELECT bid, aid FROM b ORDER BY bid" in
+    check_rows "b.aid updated" [[| Db.V_int 10L; Db.V_int 99L |]] b_rows;
+    let* c_rows = query_rows db "SELECT cid, c_ref FROM c ORDER BY cid" in
+    check_rows "c.c_ref transitively updated" [[| Db.V_int 100L; Db.V_int 99L |]] c_rows;
+    Lwt.return_unit)
+
+let test_cascade_restrict_on_grandchild () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE RESTRICT)" in
+    let* () = exec_in db "INSERT INTO a VALUES (1)" in
+    let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
+    check_error "restrict blocks transitive delete"
+      (exec_err db "DELETE FROM a WHERE id = 1");
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6728,5 +6840,11 @@ let () =
       Alcotest.test_case "insert_select_empty_source"  `Quick insert_select_empty_source;
       Alcotest.test_case "insert_select_self_copy"     `Quick insert_select_self_copy;
       Alcotest.test_case "insert_select_bad_column"    `Quick insert_select_bad_column;
+    ];
+    "phase30_cascade", [
+      Alcotest.test_case "three_levels_delete"  `Quick test_cascade_delete_three_levels;
+      Alcotest.test_case "mixed_actions_delete" `Quick test_cascade_delete_mixed_actions;
+      Alcotest.test_case "three_levels_update"  `Quick test_cascade_update_three_levels;
+      Alcotest.test_case "restrict_grandchild"  `Quick test_cascade_restrict_on_grandchild;
     ];
   ]
