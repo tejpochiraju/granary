@@ -42,6 +42,9 @@ rule token = parse
   | ':' (ident as id) { NAMED_PARAM id }
   | '@' (ident as id) { NAMED_PARAM id }
   | '$' (ident as id) { NAMED_PARAM id }
+  | '"' ([^ '"']* as id) '"'  { IDENT id }
+  | '`' ([^ '`']* as id) '`'  { IDENT id }
+  | '[' ([^ ']']* as id) ']'  { IDENT id }
   | ident as id             {
       match String.uppercase_ascii id with
       | "CREATE"     -> CREATE

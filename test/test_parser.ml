@@ -245,6 +245,31 @@ let parse_bitnot () =
   | _ -> Alcotest.fail "expected bitnot"
 
 (* ------------------------------------------------------------------ *)
+(* Group 6: Quoted identifiers                                          *)
+(* ------------------------------------------------------------------ *)
+
+let quoted_double_quote_table () =
+  match parse {|SELECT * FROM "users";|} with
+  | Ast.S_select { table = "users"; _ } -> ()
+  | _ -> Alcotest.fail "expected table name from double-quoted ident"
+
+let quoted_backtick_col () =
+  match parse {|SELECT `name` FROM t;|} with
+  | Ast.S_select { proj = `Cols ["name"]; _ } -> ()
+  | _ -> Alcotest.fail "expected col from backtick-quoted ident"
+
+let quoted_bracket_col () =
+  match parse {|SELECT [name] FROM t;|} with
+  | Ast.S_select { proj = `Cols ["name"]; _ } -> ()
+  | _ -> Alcotest.fail "expected col from bracket-quoted ident"
+
+let quoted_keyword_as_col () =
+  match parse {|CREATE TABLE t ("select" INTEGER);|} with
+  | Ast.S_create_table { columns = [c]; _ } ->
+    Alcotest.(check string) "col name" "select" c.name
+  | _ -> Alcotest.fail "expected quoted keyword as col name"
+
+(* ------------------------------------------------------------------ *)
 (* Main                                                                 *)
 (* ------------------------------------------------------------------ *)
 
@@ -296,5 +321,11 @@ let () =
       Alcotest.test_case "concat"  `Quick parse_concat;
       Alcotest.test_case "mod"     `Quick parse_mod;
       Alcotest.test_case "bitnot"  `Quick parse_bitnot;
+    ];
+    "quoted-ident", [
+      Alcotest.test_case "double-quote-table"  `Quick quoted_double_quote_table;
+      Alcotest.test_case "backtick-col"        `Quick quoted_backtick_col;
+      Alcotest.test_case "bracket-col"         `Quick quoted_bracket_col;
+      Alcotest.test_case "keyword-as-col"      `Quick quoted_keyword_as_col;
     ];
   ]
