@@ -1128,7 +1128,7 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
                  let col = List.nth meta.columns i in
                  if col.Row.generated_as <> None then
                    Error (Unsupported (Printf.sprintf
-                     "cannot INSERT into generated column '%s' — computed automatically"
+                     "cannot INSERT into generated column '%s'"
                      col.Row.name))
                  else
                  (match bind_value_expr expr_ast with
@@ -2103,7 +2103,7 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~ord
              let col = List.nth meta.columns i in
              if col.Row.generated_as <> None then
                Error (Unsupported (Printf.sprintf
-                 "cannot UPDATE generated column '%s' — computed automatically"
+                 "cannot UPDATE generated column '%s'"
                  col.Row.name))
              else
              (* Static NOT NULL check for literal NULL assignments. *)

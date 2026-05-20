@@ -1771,6 +1771,7 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let rowid_key  = Rowid.encode rowid in
   let new_row    = Array.copy row in
   new_row.(col_idx) <- new_val;
+  compute_generated_cols None [||] meta new_row;
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
     let has_where = idx.idx_where_sql <> None in

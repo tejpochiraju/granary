@@ -5533,8 +5533,8 @@ let generated_col_reject_insert () =
   )|};
   let result = run (Db.execute db "INSERT INTO t (x, y) VALUES (1, 99)") in
   (match err_or_fail "generated_col_reject_insert" result with
-   | Db.Sema _ | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected error when inserting into generated column")
+   | Db.Sema _ -> ()
+   | _ -> Alcotest.fail "expected Sema error when inserting into generated column")
 
 let generated_col_reject_update () =
   let db = fresh_db () in
@@ -5545,8 +5545,8 @@ let generated_col_reject_update () =
   exec db "INSERT INTO t (x) VALUES (5)";
   let result = run (Db.execute db "UPDATE t SET y = 99") in
   (match err_or_fail "generated_col_reject_update" result with
-   | Db.Sema _ | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected error when updating generated column")
+   | Db.Sema _ -> ()
+   | _ -> Alcotest.fail "expected Sema error when updating generated column")
 
 let generated_col_update_dependency () =
   let db = fresh_db () in
@@ -5560,6 +5560,38 @@ let generated_col_update_dependency () =
   let rows = query_ok db "SELECT doubled FROM t WHERE id = 1" in
   Alcotest.check value_testable "doubled=40" (Db.V_int 40L) (List.hd rows).(0)
 
+let generated_col_chained () =
+  (* Generated column that references another generated column (in-order eval) *)
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    x   INTEGER,
+    y   INTEGER GENERATED ALWAYS AS (x + 1) STORED,
+    z   INTEGER GENERATED ALWAYS AS (y * 2) STORED
+  )|};
+  exec db "INSERT INTO t (x) VALUES (3)";
+  let rows = query_ok db "SELECT x, y, z FROM t" in
+  let row = List.hd rows in
+  Alcotest.check value_testable "y=x+1=4"  (Db.V_int 4L) row.(1);
+  Alcotest.check value_testable "z=y*2=8"  (Db.V_int 8L) row.(2)
+
+let generated_col_fk_cascade () =
+  (* FK cascade on child table with a generated column — generated col must be recomputed *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+  exec db {|CREATE TABLE child (
+    pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE,
+    doubled INTEGER GENERATED ALWAYS AS (pid * 2) STORED
+  )|};
+  exec db "INSERT INTO parent VALUES (5)";
+  exec db "INSERT INTO child (pid) VALUES (5)";
+  (* Verify initial value *)
+  let rows = query_ok db "SELECT doubled FROM child" in
+  Alcotest.check value_testable "initial doubled=10" (Db.V_int 10L) (List.hd rows).(0);
+  (* Cascade update: parent id changes, child pid updates via CASCADE *)
+  exec db "UPDATE parent SET id = 7 WHERE id = 5";
+  let rows2 = query_ok db "SELECT doubled FROM child" in
+  Alcotest.check value_testable "cascade doubled=14" (Db.V_int 14L) (List.hd rows2).(0)
+
 let generated_col_tests = [
   Alcotest.test_case "generated_stored_basic"       `Quick generated_col_stored_basic;
   Alcotest.test_case "generated_virtual_as_stored"  `Quick generated_col_virtual_treated_as_stored;
@@ -5567,6 +5599,8 @@ let generated_col_tests = [
   Alcotest.test_case "generated_reject_insert"      `Quick generated_col_reject_insert;
   Alcotest.test_case "generated_reject_update"      `Quick generated_col_reject_update;
   Alcotest.test_case "generated_update_dependency"  `Quick generated_col_update_dependency;
+  Alcotest.test_case "generated_chained"            `Quick generated_col_chained;
+  Alcotest.test_case "generated_fk_cascade"         `Quick generated_col_fk_cascade;
 ]
 
 (* Runner                                                               *)
