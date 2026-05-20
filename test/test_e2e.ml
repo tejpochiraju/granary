@@ -6187,6 +6187,16 @@ let insert_select_self_copy () =
   let rows = query_ok db "SELECT count(*) FROM t" in
   Alcotest.check value_testable "4 rows" (Db.V_int 4L) (List.hd rows).(0)
 
+let insert_select_bad_column () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE src (id INTEGER)";
+  exec db "CREATE TABLE dst (id INTEGER, name TEXT)";
+  exec db "INSERT INTO src VALUES (1)";
+  (* 'bad_col' does not exist in dst — should error *)
+  (match run (Db.execute db "INSERT INTO dst (bad_col) SELECT id FROM src") with
+   | Error _ -> ()
+   | Ok ()   -> Alcotest.fail "expected error for unknown column name")
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6717,5 +6727,6 @@ let () =
       Alcotest.test_case "insert_select_with_where"    `Quick insert_select_with_where;
       Alcotest.test_case "insert_select_empty_source"  `Quick insert_select_empty_source;
       Alcotest.test_case "insert_select_self_copy"     `Quick insert_select_self_copy;
+      Alcotest.test_case "insert_select_bad_column"    `Quick insert_select_bad_column;
     ];
   ]

@@ -2910,6 +2910,8 @@ let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) 
   | Plan.Op_with_cte r when not (String.equal r.cte_name cte_name) ->
     Plan.Op_with_cte { r with query = go r.query }
   | Plan.Op_window r -> Plan.Op_window { r with child = go r.child }
+  | Plan.Op_insert_select ({ source; _ } as r) ->
+    Plan.Op_insert_select { r with source = go source }
   | _ -> op
 
 let rec pre_eval_subquery

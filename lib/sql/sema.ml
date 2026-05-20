@@ -2441,28 +2441,35 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
     (match table_meta_opt with
      | None -> Lwt.return (Error (Unknown_table table))
      | Some table_meta ->
-       let ordinals =
+       let ordinals_result =
          if columns = [] then
-           List.filter_map Fun.id
-             (List.mapi (fun i (c : Row.column) ->
-               match c.generated_as with
-               | Some _ -> None
-               | None   -> Some i
-             ) table_meta.Cat.columns)
+           Ok (List.filter_map Fun.id
+               (List.mapi (fun i (c : Row.column) ->
+                 match c.generated_as with
+                 | Some _ -> None
+                 | None   -> Some i
+               ) table_meta.Cat.columns))
          else
-           List.filter_map (fun col_name ->
-             let rec fi i = function
-               | [] -> None
-               | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
-               | _ :: rest -> fi (i + 1) rest
-             in fi 0 table_meta.Cat.columns
-           ) columns
+           List.fold_left (fun acc col_name ->
+             match acc with
+             | Error _ as e -> e
+             | Ok ords ->
+               let rec fi i = function
+                 | [] -> Error (Unknown_column { table = table_meta.Cat.name; column = col_name })
+                 | (c : Row.column) :: _ when String.equal c.name col_name ->
+                   Ok (ords @ [i])
+                 | _ :: rest -> fi (i + 1) rest
+               in fi 0 table_meta.Cat.columns
+           ) (Ok []) columns
        in
-       let* source_result = bind_internal ~views ~named_params ~param_counter cat select in
-       (match source_result with
+       (match ordinals_result with
         | Error e -> Lwt.return (Error e)
-        | Ok source ->
-          Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict }))))
+        | Ok ordinals ->
+          let* source_result = bind_internal ~views ~named_params ~param_counter cat select in
+          (match source_result with
+           | Error e -> Lwt.return (Error e)
+           | Ok source ->
+             Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict })))))
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } as sel ->
     let* meta_opt = Cat.find_table cat ~name:table in
     (match meta_opt with
