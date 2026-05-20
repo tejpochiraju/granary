@@ -2364,6 +2364,8 @@ let op_name = function
   | Plan.Op_with_cte { cte_name; _ } -> "WithCte(" ^ cte_name ^ ")"
   | Plan.Op_cte_scan { cte_name; _ } -> "CteScan(" ^ cte_name ^ ")"
   | Plan.Op_insert { table_meta; _ } -> "Insert(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_insert_select { table_meta; _ } ->
+    "InsertSelect(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_update { table_meta; _ } -> "Update(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_delete { table_meta; _ } -> "Delete(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_create_table { name; _ } -> "CreateTable(" ^ name ^ ")"
@@ -2418,6 +2420,7 @@ let op_children = function
   | Plan.Op_except { left; right }   -> [left; right]
   | Plan.Op_with_cte { def; query; _ } -> [def; query]
   | Plan.Op_explain { inner; _ }     -> [inner]
+  | Plan.Op_insert_select { source; _ } -> [source]
   | _                                -> []
 
 let explain_plan op =
@@ -2431,6 +2434,13 @@ let explain_plan op =
     my_row :: List.concat_map (walk id) (op_children op)
   in
   walk (-1) op
+
+(** Forward reference to [to_stream], which is defined in the mutually-recursive
+    block starting at [pre_eval_subquery].  [execute_with_count] needs this to
+    implement [Op_insert_select] (read source, then write rows). *)
+let to_stream_ref : ((unit -> float) option -> Row.value array -> S.t -> ?mode:txn_mode -> ?cat:Cat.t option -> Plan.op -> Row.t Lwt_stream.t Lwt.t) ref =
+  ref (fun _clock _params _store ?mode:_ ?cat:_ _op ->
+    failwith "to_stream_ref not yet initialised")
 
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
@@ -2484,6 +2494,24 @@ let execute_with_count ?(mode = Auto)
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
+    let n_cols = List.length table_meta.Cat.columns in
+    let bh = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) before_hook in
+    let ah = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) after_hook in
+    let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
+    let* src_rows = Lwt_stream.to_list stream in
+    Lwt_list.fold_left_s (fun count src_row ->
+      let row_arr = Array.make n_cols Row.V_null in
+      List.iteri (fun i ord ->
+        if i < Array.length src_row then
+          row_arr.(ord) <- src_row.(i)
+      ) ordinals;
+      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
+                        ~before_hook:bh ~after_hook:ah
+                        store cat ~table_meta ~ordinals ~values:[]
+                        ~prebuilt_row:(Some row_arr) in
+      Lwt.return (count + if inserted then 1 else 0)
+    ) 0 src_rows
   | Plan.Op_create_index { name; table; tree_id; col_sqls; col_expr_flags;
                            where_expr; where_sql; unique; columns; if_not_exists } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
@@ -4203,7 +4231,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       let t0 = match clock with Some c -> c () | None -> 0.0 in
       let* n =
         let is_write = match inner with
-          | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _
+          | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _
           | Plan.Op_create_table _ | Plan.Op_create_index _
           | Plan.Op_drop_table _ | Plan.Op_drop_index _
           | Plan.Op_alter_table _ | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
@@ -4248,8 +4276,13 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_user_version _
   | Plan.Op_pragma_set_fk _ ->
     failwith "Exec.query: use Exec.execute for write operations"
-  | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->
+  | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
+
+(* Wire the forward reference so execute_with_count can call to_stream for
+   Op_insert_select.  This runs once at module initialization time, after both
+   functions are fully defined in the let-rec block above. *)
+let () = to_stream_ref := to_stream
 
 (* ------------------------------------------------------------------ *)
 (* Public query entry point                                             *)

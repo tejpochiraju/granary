@@ -234,6 +234,12 @@ and stmt =
       returning     : expr list;   (** empty = no RETURNING *)
       upsert_update : upsert_update option;
     }
+  | S_insert_select of {
+      table       : string;
+      columns     : string list;          (** empty = all non-generated columns *)
+      on_conflict : conflict_action option;
+      select      : stmt;
+    }
   | S_select of {
       distinct    : bool;
       proj        : [ `All | `Cols of string list | `Exprs of (expr * string option) list ];

@@ -457,6 +457,19 @@ value_row:
   | LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN { vals }
 
 insert:
+  (* INSERT INTO t (cols) SELECT ... *)
+  | INSERT oc = opt_conflict INTO table = any_ident
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+      sel = compound_select
+    { Ast.S_insert_select { table; columns = cols; on_conflict = oc; select = sel } }
+  (* INSERT INTO t SELECT ... / INSERT INTO t WITH ... SELECT ... *)
+  | INSERT oc = opt_conflict INTO table = any_ident
+      sel = compound_select
+    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel } }
+  | INSERT oc = opt_conflict INTO table = any_ident
+      sel = with_cte
+    { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel } }
+  (* existing VALUES alternatives *)
   | INSERT oc = opt_conflict INTO table = any_ident
       LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       VALUES rows = separated_nonempty_list(COMMA, value_row)

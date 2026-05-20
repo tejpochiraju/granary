@@ -453,6 +453,9 @@ let execute t sql =
       | Sql.Plan.Op_insert { table_meta; _ } ->
         (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
          make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
+      | Sql.Plan.Op_insert_select { table_meta; _ } ->
+        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
+         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
       | Sql.Plan.Op_update { table_meta; _ } ->
         (make_trigger_hook t table_meta ~timing:`Before ~event:`Update,
          make_trigger_hook t table_meta ~timing:`After  ~event:`Update)
@@ -521,6 +524,9 @@ let execute_change_count t sql =
     in
     let (before_hook, after_hook) = match op with
       | Sql.Plan.Op_insert { table_meta; _ } ->
+        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
+         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
+      | Sql.Plan.Op_insert_select { table_meta; _ } ->
         (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
          make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
       | Sql.Plan.Op_update { table_meta; _ } ->
@@ -596,6 +602,9 @@ let run st ~params =
   in
   let (before_hook, after_hook) = match st.plan with
     | Sql.Plan.Op_insert { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
+    | Sql.Plan.Op_insert_select { table_meta; _ } ->
       (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
        make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
     | Sql.Plan.Op_update { table_meta; _ } ->

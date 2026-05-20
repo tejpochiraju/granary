@@ -381,6 +381,13 @@ let plan_select cat
 let rec plan ?cat = function
   | Sema.BS_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints } ->
     Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints }
+  | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict } ->
+    Plan.Op_insert_select {
+      table_meta;
+      ordinals;
+      source = plan ?cat source;
+      on_conflict;
+    }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update } ->
     let plan_upsert = match upsert_update with
       | None -> None

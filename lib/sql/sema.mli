@@ -108,6 +108,12 @@ type bound_stmt =
       returning     : bound_expr list;
       upsert_update : (string list * (int * bound_expr) list) option;
     }
+  | BS_insert_select of {
+      table_meta  : Sqlocaml_catalog.Catalog.table_meta;
+      ordinals    : int list;
+      source      : bound_stmt;
+      on_conflict : Ast.conflict_action option;
+    }
   | BS_select of {
       distinct   : bool;
       table_meta : Sqlocaml_catalog.Catalog.table_meta;

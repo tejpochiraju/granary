@@ -61,6 +61,12 @@ type op =
       returning     : expr list;
       upsert_update : (string list * (int * expr) list) option;
     }
+  | Op_insert_select of {
+      table_meta  : Cat.table_meta;
+      ordinals    : int list;
+      source      : op;
+      on_conflict : Ast.conflict_action option;
+    }
   | Op_seq_scan of {
       table_meta : Cat.table_meta;
     }

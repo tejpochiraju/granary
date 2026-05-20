@@ -88,6 +88,12 @@ type bound_stmt =
       returning     : bound_expr list;
       upsert_update : (string list * (int * bound_expr) list) option;
     }
+  | BS_insert_select of {
+      table_meta  : Cat.table_meta;
+      ordinals    : int list;
+      source      : bound_stmt;
+      on_conflict : Ast.conflict_action option;
+    }
   | BS_select of {
       distinct   : bool;
       table_meta : Cat.table_meta;
@@ -2430,6 +2436,33 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   match stmt with
   | Ast.S_create_table { name; columns; constraints; if_not_exists } -> bind_create cat ~name ~columns ~constraints ~if_not_exists
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
+  | Ast.S_insert_select { table; columns; on_conflict; select } ->
+    let* table_meta_opt = Cat.find_table cat ~name:table in
+    (match table_meta_opt with
+     | None -> Lwt.return (Error (Unknown_table table))
+     | Some table_meta ->
+       let ordinals =
+         if columns = [] then
+           List.filter_map Fun.id
+             (List.mapi (fun i (c : Row.column) ->
+               match c.generated_as with
+               | Some _ -> None
+               | None   -> Some i
+             ) table_meta.Cat.columns)
+         else
+           List.filter_map (fun col_name ->
+             let rec fi i = function
+               | [] -> None
+               | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
+               | _ :: rest -> fi (i + 1) rest
+             in fi 0 table_meta.Cat.columns
+           ) columns
+       in
+       let* source_result = bind_internal ~views ~named_params ~param_counter cat select in
+       (match source_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok source ->
+          Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict }))))
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } as sel ->
     let* meta_opt = Cat.find_table cat ~name:table in
     (match meta_opt with

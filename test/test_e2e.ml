@@ -6136,6 +6136,57 @@ let test_explain_analyze_child_nulls () =
     end
   ) rows
 
+(* ------------------------------------------------------------------ *)
+(* Group phase29_insert_select: INSERT INTO ... SELECT ...             *)
+(* ------------------------------------------------------------------ *)
+
+let insert_select_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE src (id INTEGER, name TEXT)";
+  exec db "CREATE TABLE dst (id INTEGER, name TEXT)";
+  exec db "INSERT INTO src VALUES (1, 'alice'), (2, 'bob')";
+  exec db "INSERT INTO dst SELECT * FROM src";
+  let rows = query_ok db "SELECT id, name FROM dst ORDER BY id" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "id=1"       (Db.V_int 1L)       (List.nth rows 0).(0);
+  Alcotest.check value_testable "name=alice" (Db.V_text "alice") (List.nth rows 0).(1)
+
+let insert_select_with_cols () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE src (id INTEGER, name TEXT, extra TEXT)";
+  exec db "CREATE TABLE dst (id INTEGER, label TEXT)";
+  exec db "INSERT INTO src VALUES (1, 'alice', 'x'), (2, 'bob', 'y')";
+  exec db "INSERT INTO dst (id, label) SELECT id, name FROM src ORDER BY id";
+  let rows = query_ok db "SELECT id, label FROM dst ORDER BY id" in
+  Alcotest.(check int) "2 rows" 2 (List.length rows);
+  Alcotest.check value_testable "id=1"        (Db.V_int 1L)       (List.nth rows 0).(0);
+  Alcotest.check value_testable "label=alice" (Db.V_text "alice") (List.nth rows 0).(1)
+
+let insert_select_with_where () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE src (id INTEGER, v INTEGER)";
+  exec db "CREATE TABLE dst (id INTEGER, v INTEGER)";
+  exec db "INSERT INTO src VALUES (1, 10), (2, 20), (3, 5)";
+  exec db "INSERT INTO dst SELECT id, v FROM src WHERE v > 8";
+  let rows = query_ok db "SELECT count(*) FROM dst" in
+  Alcotest.check value_testable "2 rows copied" (Db.V_int 2L) (List.hd rows).(0)
+
+let insert_select_empty_source () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE src (id INTEGER)";
+  exec db "CREATE TABLE dst (id INTEGER)";
+  exec db "INSERT INTO dst SELECT id FROM src";
+  let rows = query_ok db "SELECT count(*) FROM dst" in
+  Alcotest.check value_testable "0 rows" (Db.V_int 0L) (List.hd rows).(0)
+
+let insert_select_self_copy () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, v INTEGER)";
+  exec db "INSERT INTO t VALUES (1, 10), (2, 20)";
+  exec db "INSERT INTO t SELECT id + 10, v * 2 FROM t";
+  let rows = query_ok db "SELECT count(*) FROM t" in
+  Alcotest.check value_testable "4 rows" (Db.V_int 4L) (List.hd rows).(0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6659,5 +6710,12 @@ let () =
       Alcotest.test_case "explain does not execute" `Quick test_explain_does_not_execute;
       Alcotest.test_case "explain analyze as col names" `Quick test_explain_analyze_as_col_names;
       Alcotest.test_case "analyze child rows have null stats" `Quick test_explain_analyze_child_nulls;
+    ];
+    "phase29_insert_select", [
+      Alcotest.test_case "insert_select_basic"         `Quick insert_select_basic;
+      Alcotest.test_case "insert_select_with_cols"     `Quick insert_select_with_cols;
+      Alcotest.test_case "insert_select_with_where"    `Quick insert_select_with_where;
+      Alcotest.test_case "insert_select_empty_source"  `Quick insert_select_empty_source;
+      Alcotest.test_case "insert_select_self_copy"     `Quick insert_select_self_copy;
     ];
   ]
