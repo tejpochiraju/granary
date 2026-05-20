@@ -1553,7 +1553,6 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     the table tree and populate the index tree with one entry per row. *)
 let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
     ~name ~table ~tree_id
-    ~(_col_exprs : Plan.expr list)   (* bound exprs from planner; we re-compile from SQL *)
     ~col_sqls
     ~col_expr_flags
     ~(where_expr : Plan.expr option)
@@ -2337,7 +2336,7 @@ let execute_with_count ?(mode = Auto)
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
-  | Plan.Op_create_index { name; table; tree_id; col_exprs; col_sqls; col_expr_flags;
+  | Plan.Op_create_index { name; table; tree_id; col_sqls; col_expr_flags;
                            where_expr; where_sql; unique; columns; if_not_exists } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
@@ -2346,7 +2345,7 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     else begin
       let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                  ~_col_exprs:col_exprs ~col_sqls ~col_expr_flags
+                  ~col_sqls ~col_expr_flags
                   ~where_expr ~where_sql ~unique ~columns in
       Lwt.return 0
     end

@@ -143,7 +143,6 @@ type bound_stmt =
   | BS_create_index of {
       name           : string;
       table_meta     : Sqlocaml_catalog.Catalog.table_meta;
-      col_exprs      : bound_expr list;      (** bound column expressions *)
       col_sqls       : string list;          (** col name (plain) or expr SQL (expression) *)
       col_expr_flags : bool list;            (** true = expression index *)
       where_expr     : bound_expr option;

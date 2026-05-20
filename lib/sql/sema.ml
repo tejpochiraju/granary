@@ -111,7 +111,6 @@ type bound_stmt =
   | BS_create_index of {
       name           : string;
       table_meta     : Cat.table_meta;
-      col_exprs      : bound_expr list;      (* bound column expressions *)
       col_sqls       : string list;          (* col name (plain) or expr SQL (expression) *)
       col_expr_flags : bool list;            (* true = expression index *)
       where_expr     : bound_expr option;
@@ -2008,18 +2007,17 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
   | Some meta ->
     let pc = ref 0 in
     let np = Hashtbl.create 0 in
-    (* Bind each column expression against the table schema *)
+    (* Bind each column expression to validate it; discard the bound forms —
+       the SQL strings in col_sqls are sufficient for runtime eval. *)
     let col_results = List.map (fun col_ast ->
       match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
       | Error e -> Error e
-      | Ok be   -> Ok (be, col_ast)
+      | Ok _    -> Ok col_ast    (* keep AST for SQL serialization only *)
     ) columns in
     let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) col_results in
     (match errors with
      | e :: _ -> Lwt.return (Error e)
      | [] ->
-       let bound_pairs = List.filter_map (function Ok p -> Some p | _ -> None) col_results in
-       let col_exprs = List.map fst bound_pairs in
        (* Compute col_sqls and col_expr_flags from the original AST *)
        let col_sqls, col_expr_flags = List.split (List.map (fun col_ast ->
          match col_ast with
@@ -2043,7 +2041,6 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
              Lwt.return (Ok (BS_create_index {
                name;
                table_meta = meta;
-               col_exprs;
                col_sqls;
                col_expr_flags;
                where_expr;
@@ -2055,7 +2052,6 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
              Lwt.return (Ok (BS_create_index {
                name;
                table_meta = meta;
-               col_exprs;
                col_sqls;
                col_expr_flags;
                where_expr;

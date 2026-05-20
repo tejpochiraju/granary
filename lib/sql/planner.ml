@@ -469,13 +469,12 @@ let rec plan ?cat = function
        | Some n ->
          let off = Option.value ~default:0 offset in
          Plan.Op_limit { limit = n; offset = off; child = after_distinct })
-  | Sema.BS_create_index { name; table_meta; col_exprs; col_sqls; col_expr_flags;
+  | Sema.BS_create_index { name; table_meta; col_sqls; col_expr_flags;
                            where_expr; where_ast; unique; if_not_exists } ->
     Plan.Op_create_index {
       name;
       table          = table_meta.Cat.name;
       tree_id        = table_meta.Cat.tree_id;
-      col_exprs      = List.map plan_expr col_exprs;
       col_sqls;
       col_expr_flags;
       where_expr     = Option.map plan_expr where_expr;

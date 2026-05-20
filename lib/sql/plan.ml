@@ -89,7 +89,6 @@ type op =
       name           : string;
       table          : string;
       tree_id        : int;          (** table's tree_id *)
-      col_exprs      : expr list;    (** bound col expressions (P_col i for plain, arbitrary for expr) *)
       col_sqls       : string list;  (** col name (plain) or expr SQL (expression) *)
       col_expr_flags : bool list;    (** true = expression index column, false = plain column *)
       where_expr     : expr option;

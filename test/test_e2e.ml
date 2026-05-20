@@ -5441,11 +5441,43 @@ let expression_index_delete_maintains () =
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
   Alcotest.check value_testable "insert after delete succeeds" (Db.V_int 1L) (List.hd rows).(0)
 
+let expression_index_mixed_plain_expr () =
+  (* Mixed index: one plain column + one expression column *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, score INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(id, lower(name))";
+  exec db "INSERT INTO t VALUES (1, 'Alice', 10)";
+  (* Same id, different lower(name): should succeed *)
+  exec db "INSERT INTO t VALUES (1, 'Bob', 20)";
+  (* Same id AND same lower(name): UNIQUE violation *)
+  let result = run (Db.execute db "INSERT INTO t VALUES (1, 'alice', 30)") in
+  (match err_or_fail "mixed_idx_unique" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected UNIQUE violation for (id, lower(name))");
+  let rows = query_ok db "SELECT COUNT(*) FROM t" in
+  Alcotest.check value_testable "two rows before violation" (Db.V_int 2L) (List.hd rows).(0)
+
+let expression_index_catalog_version2 () =
+  (* Exercise the v2 catalog path: expression + partial on same index *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, active INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(lower(name)) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 'Alice', 1)";
+  exec db "INSERT INTO t VALUES (2, 'alice', 0)";  (* inactive: not in index, no conflict *)
+  let result = run (Db.execute db "INSERT INTO t VALUES (3, 'alice', 1)") in
+  (match err_or_fail "v2_expr_partial_unique" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "active expr+partial UNIQUE should be enforced");
+  let rows = query_ok db "SELECT COUNT(*) FROM t" in
+  Alcotest.check value_testable "two rows" (Db.V_int 2L) (List.hd rows).(0)
+
 let expression_index_tests = [
   Alcotest.test_case "expression_index_lower"    `Quick expression_index_lower;
   Alcotest.test_case "expression_index_unique"   `Quick expression_index_unique_enforced;
   Alcotest.test_case "expression_index_update"   `Quick expression_index_update_maintains;
   Alcotest.test_case "expression_index_delete"   `Quick expression_index_delete_maintains;
+  Alcotest.test_case "expression_index_mixed"    `Quick expression_index_mixed_plain_expr;
+  Alcotest.test_case "expression_index_v2_catalog" `Quick expression_index_catalog_version2;
 ]
 
 (* Runner                                                               *)
