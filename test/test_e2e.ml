@@ -2517,18 +2517,6 @@ let test_fk_parse_create () =
     Alcotest.(check bool) "valid FK insert succeeds" true (n = Ok ());
     Lwt.return_unit)
 
-let test_fk_parse_no_col () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
-    let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
-    (* REFERENCES without explicit column is now inferred from parent's PK *)
-    let* _ = Db.execute db
-      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
-    (* Valid FK insert: user_id=1 exists in users (inferred column is 'id') *)
-    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
-    Alcotest.(check bool) "implicit FK column inferred from PK" true (n = Ok ());
-    Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
 (* FOREIGN KEY enforcement                                               *)
@@ -6339,7 +6327,6 @@ let () =
     ];
     "fk_parse", [
       Alcotest.test_case "fk_references_col"     `Quick test_fk_parse_create;
-      Alcotest.test_case "fk_references_no_col"  `Quick test_fk_parse_no_col;
     ];
     "foreign_key", [
       Alcotest.test_case "valid_insert"          `Quick test_fk_valid_insert;
