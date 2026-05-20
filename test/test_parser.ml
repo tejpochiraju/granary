@@ -107,7 +107,7 @@ let insert_null_value () =
 
 let insert_negative_int () =
   match parse "INSERT INTO t (n) VALUES (-99);" with
-  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_int (-99L))]]; _ } -> ()
+  | Ast.S_insert { values = [[Ast.E_neg (Ast.E_lit (Ast.L_int 99L))]]; _ } -> ()
   | _ -> Alcotest.fail "expected negative int"
 
 let insert_empty_string () =
@@ -135,8 +135,8 @@ let insert_real_zero () =
 
 let insert_real_negative () =
   match parse "INSERT INTO t (f) VALUES (-1.5);" with
-  | Ast.S_insert { values = [[Ast.E_lit (Ast.L_real f)]]; _ } ->
-    Alcotest.(check bool) "f = -1.5" true (Float.equal f (-1.5))
+  | Ast.S_insert { values = [[Ast.E_neg (Ast.E_lit (Ast.L_real f))]]; _ } ->
+    Alcotest.(check bool) "f = 1.5" true (Float.equal f 1.5)
   | _ -> Alcotest.fail "expected FLOAT_LIT -1.5"
 
 let insert_no_col_list () =
