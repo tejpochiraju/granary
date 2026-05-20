@@ -32,12 +32,16 @@ let is_query_stmt sql =
       | None,   Some a, Some b -> String.sub upper 0 (min a b)
       | Some a, Some b, Some c -> String.sub upper 0 (min a (min b c))
     in
+    (* Note: writeable CTEs (WITH ... INSERT/UPDATE/DELETE) are mis-routed to
+       Db.query and will fail at runtime rather than execute. *)
     match first_word with
     | "SELECT" | "WITH" | "EXPLAIN" | "VALUES" | "PRAGMA" -> true
     | _ -> false
 
 let run_sql db sql =
   let stmts =
+    (* Note: splitting on ';' does not handle semicolons inside string literals.
+       Such inputs produce parse errors rather than silent corruption. *)
     String.split_on_char ';' sql
     |> List.map String.trim
     |> List.filter (fun s -> s <> "")
@@ -72,11 +76,17 @@ let read_file path =
   Bytes.to_string s
 
 let read_stdin () =
-  let buf = Buffer.create 256 in
-  (try while true do
-    Buffer.add_channel buf stdin 4096
-  done with End_of_file -> ());
-  Buffer.contents buf
+  let buf = Buffer.create 4096 in
+  let chunk = Bytes.create 4096 in
+  let rec loop () =
+    let n = input stdin chunk 0 4096 in
+    if n = 0 then Buffer.contents buf
+    else begin
+      Buffer.add_subbytes buf chunk 0 n;
+      loop ()
+    end
+  in
+  loop ()
 
 let () =
   let args = Array.to_list Sys.argv |> List.tl in
