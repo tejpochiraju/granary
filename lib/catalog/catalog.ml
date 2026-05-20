@@ -27,6 +27,25 @@ let next_user_tid_init = 16
 (* Counter for monotonically-increasing index IDs, stored in sys_meta. *)
 let next_index_id_key = Bytes.of_string "next_index_id"
 
+let user_version_key = Bytes.of_string "\x00user_version"
+
+(** Read user_version from an already-open RW or RO transaction.
+    Returns 0 if never set. *)
+let read_user_version_tx tx : int64 Lwt.t =
+  let%lwt v = S.get tx sys_meta_tid user_version_key in
+  Lwt.return (match v with
+    | None   -> 0L
+    | Some b -> Bytes.get_int64_be b 0)
+[@@warning "-32"]
+
+(** Write user_version inside an already-open RW transaction.
+    Caller is responsible for commit. *)
+let write_user_version_tx tx (v : int64) : unit Lwt.t =
+  let b = Bytes.create 8 in
+  Bytes.set_int64_be b 0 v;
+  S.put tx sys_meta_tid user_version_key b
+[@@warning "-32"]
+
 type fk_constraint = {
   fk_local_col    : string;
   fk_parent_table : string;
