@@ -5997,6 +5997,30 @@ let test_explain_analyze_as_col_names () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check value_testable) "explain col" (Db.V_text "plan") (List.hd rows).(0)
 
+let test_explain_analyze_child_nulls () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
+  run (Db.execute db "INSERT INTO t VALUES (1)") |> ignore;
+  (* Filter + SeqScan = at least 2 plan nodes *)
+  let stream = run (Db.query db "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 0") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "at least 2 nodes" true (List.length rows >= 2);
+  (* Root (index 0) has non-NULL actual_rows and elapsed_ms *)
+  let root = List.nth rows 0 in
+  (match root.(3) with
+   | Db.V_int _ -> ()
+   | _ -> Alcotest.fail "root actual_rows should be V_int");
+  (match root.(4) with
+   | Db.V_real _ -> ()
+   | _ -> Alcotest.fail "root elapsed_ms should be V_real");
+  (* All other nodes have NULL *)
+  List.iteri (fun i row ->
+    if i > 0 then begin
+      Alcotest.(check value_testable) (Printf.sprintf "node %d actual_rows null" i) Db.V_null row.(3);
+      Alcotest.(check value_testable) (Printf.sprintf "node %d elapsed_ms null" i) Db.V_null row.(4)
+    end
+  ) rows
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6513,5 +6537,6 @@ let () =
       Alcotest.test_case "analyze insert" `Quick test_explain_analyze_insert;
       Alcotest.test_case "explain does not execute" `Quick test_explain_does_not_execute;
       Alcotest.test_case "explain analyze as col names" `Quick test_explain_analyze_as_col_names;
+      Alcotest.test_case "analyze child rows have null stats" `Quick test_explain_analyze_child_nulls;
     ];
   ]

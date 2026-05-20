@@ -4191,7 +4191,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | Plan.Op_create_view _ | Plan.Op_drop_view _
           | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
           | Plan.Op_pragma_set_user_version _
-          | Plan.Op_fts_insert _ | Plan.Op_fts_delete _ -> true
+          | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
+          | Plan.Op_create_fts_table _ -> true
           | _ -> false
         in
         if is_write then
