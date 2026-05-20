@@ -1112,7 +1112,7 @@ let query_index_lookup_real () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_r"; table = "t"; tree_id = m.Cat.tree_id;
-           col_sqls = ["id"]; col_expr_flags = [false]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_sqls = ["r"]; col_expr_flags = [false]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_r" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1145,7 +1145,7 @@ let query_index_lookup_blob () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_b"; table = "t"; tree_id = m.Cat.tree_id;
-           col_sqls = ["id"]; col_expr_flags = [false]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_sqls = ["b"]; col_expr_flags = [false]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_b" in
     let (idx : Cat.index_info) = Option.get idx_opt in
