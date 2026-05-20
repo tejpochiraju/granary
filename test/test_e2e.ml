@@ -6542,6 +6542,69 @@ let test_alter_add_fk_null_is_allowed () =
     check_rows "NULL FK allowed" [[| Db.V_int 1L; Db.V_null |]] rows;
     Lwt.return_unit)
 
+(* ── Phase 31: INSTEAD OF triggers on views ──────────────────────── *)
+
+let test_instead_of_insert () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
+       INSERT INTO real_t VALUES (NEW.id, NEW.name); END" in
+    let* () = exec_in db "INSERT INTO v VALUES (1, 'alice')" in
+    let* rows = query_rows db "SELECT id, name FROM real_t" in
+    check_rows "row in real_t" [[| Db.V_int 1L; Db.V_text "alice" |]] rows;
+    Lwt.return_unit)
+
+let test_instead_of_insert_multirow () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
+       INSERT INTO real_t VALUES (NEW.id, NEW.name); END" in
+    let* () = exec_in db "INSERT INTO v VALUES (1, 'alice'), (2, 'bob')" in
+    let* rows = query_rows db "SELECT COUNT(*) FROM real_t" in
+    check_rows "two rows inserted" [[| Db.V_int 2L |]] rows;
+    Lwt.return_unit)
+
+let test_instead_of_delete () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "INSERT INTO real_t VALUES (1, 'alice')" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF DELETE ON v BEGIN \
+       DELETE FROM real_t; END" in
+    let* () = exec_in db "DELETE FROM v" in
+    let* rows = query_rows db "SELECT id FROM real_t" in
+    check_rows "real_t empty after delete via view" [] rows;
+    Lwt.return_unit)
+
+let test_instead_of_no_trigger_fails () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id FROM real_t" in
+    let result = exec_err db "INSERT INTO v VALUES (1)" in
+    check_error "insert into view without trigger fails" result;
+    Lwt.return_unit)
+
+let test_instead_of_insert_multiple_body_stmts () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "CREATE TABLE audit (entry TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
+       INSERT INTO real_t VALUES (NEW.id, NEW.name); \
+       INSERT INTO audit VALUES ('inserted'); END" in
+    let* () = exec_in db "INSERT INTO v VALUES (42, 'carol')" in
+    let* audit_rows = query_rows db "SELECT entry FROM audit" in
+    check_rows "audit has entry" [[| Db.V_text "inserted" |]] audit_rows;
+    let* real_rows = query_rows db "SELECT id FROM real_t" in
+    check_rows "real_t has row" [[| Db.V_int 42L |]] real_rows;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7104,5 +7167,12 @@ let () =
       Alcotest.test_case "bad_parent_table"      `Quick test_alter_add_fk_bad_parent_table;
       Alcotest.test_case "bad_parent_column"     `Quick test_alter_add_fk_bad_parent_column;
       Alcotest.test_case "null_is_allowed"       `Quick test_alter_add_fk_null_is_allowed;
+    ];
+    "phase31_instead_of", [
+      Alcotest.test_case "insert"                `Quick test_instead_of_insert;
+      Alcotest.test_case "insert_multirow"       `Quick test_instead_of_insert_multirow;
+      Alcotest.test_case "delete"                `Quick test_instead_of_delete;
+      Alcotest.test_case "no_trigger_fails"      `Quick test_instead_of_no_trigger_fails;
+      Alcotest.test_case "multiple_body_stmts"   `Quick test_instead_of_insert_multiple_body_stmts;
     ];
   ]

@@ -27,7 +27,7 @@ type row = Row.t
 (** In-memory representation of a trigger, extracted from S_create_trigger AST. *)
 type trigger_meta = {
   trig_table  : string;
-  trig_timing : [ `Before | `After ];
+  trig_timing : [ `Before | `After | `Instead_of ];
   trig_event  : [ `Insert | `Update | `Delete ];
   trig_when   : Sql.Ast.expr option;
   trig_body   : Sql.Ast.stmt list;
@@ -225,8 +225,9 @@ let rollback_to_savepoint t name =
 let trigger_meta_of_ast _name = function
   | Sql.Ast.S_create_trigger { timing; event; table; when_; body; _ } ->
     let trig_timing = (match timing with
-      | Sql.Ast.TT_before -> `Before
-      | Sql.Ast.TT_after  -> `After) in
+      | Sql.Ast.TT_before     -> `Before
+      | Sql.Ast.TT_after      -> `After
+      | Sql.Ast.TT_instead_of -> `Instead_of) in
     let trig_event = (match event with
       | Sql.Ast.TE_insert -> `Insert
       | Sql.Ast.TE_update -> `Update
@@ -404,6 +405,110 @@ let make_trigger_hook t table_meta ~timing ~event =
     ) matching
   )
 
+(** Extract column names from a view query's projection, in order.
+    Returns [] if the projection cannot be resolved to simple column names. *)
+let view_col_names view_query =
+  let extract_from_select = function
+    | Sql.Ast.S_select { proj = `Cols cols; _ } -> cols
+    | Sql.Ast.S_select { proj = `Exprs exprs; _ } ->
+      List.filter_map (fun (expr, alias) ->
+        match alias with
+        | Some a -> Some a
+        | None   -> (match expr with
+          | Sql.Ast.E_col name         -> Some name
+          | Sql.Ast.E_tbl_col (_, col) -> Some col
+          | _                          -> None)
+      ) exprs
+    | _ -> []
+  in
+  match view_query with
+  | Sql.Ast.S_select _ -> extract_from_select view_query
+  | Sql.Ast.S_compound { left; _ } -> extract_from_select left
+  | _ -> []
+
+(** Build a Row.column schema list from a list of column name strings. *)
+let make_col_schema names =
+  List.map (fun col_name ->
+    { Row.name = col_name;
+      Row.ty = Row.Text;
+      Row.not_null = false;
+      Row.primary_key = false;
+      Row.default = None;
+      Row.check_sql = None;
+      Row.generated_as = None }
+  ) names
+
+(** Execute INSTEAD OF triggers for a view write operation. *)
+let execute_instead_of t view_name ast =
+  let find_instead_of event =
+    Hashtbl.fold (fun _name trig_ast acc ->
+      match trigger_meta_of_ast _name trig_ast with
+      | Some m when
+          String.equal m.trig_table view_name &&
+          m.trig_timing = `Instead_of &&
+          m.trig_event = event -> m :: acc
+      | _ -> acc
+    ) t.triggers []
+  in
+  let eval_insert_ast_value = function
+    | Sql.Ast.E_lit (Sql.Ast.L_int n)  -> Row.V_int n
+    | Sql.Ast.E_lit (Sql.Ast.L_text s) -> Row.V_text s
+    | Sql.Ast.E_lit (Sql.Ast.L_real f) -> Row.V_real f
+    | Sql.Ast.E_lit (Sql.Ast.L_blob b) -> Row.V_blob b
+    | Sql.Ast.E_lit Sql.Ast.L_null     -> Row.V_null
+    | Sql.Ast.E_neg (Sql.Ast.E_lit (Sql.Ast.L_int n)) ->
+      Row.V_int (Int64.neg n)
+    | _ -> Row.V_null
+  in
+  match ast with
+  | Sql.Ast.S_insert { columns; values; _ } ->
+    let matching = find_instead_of `Insert in
+    if matching = [] then
+      Lwt.return (Error (Sema (Sql.Sema.Unsupported
+        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF INSERT trigger)"
+           view_name))))
+    else begin
+      (* When INSERT has no explicit column list, derive column names from the view's SELECT. *)
+      let effective_cols =
+        if columns <> [] then columns
+        else
+          match Hashtbl.find_opt t.views view_name with
+          | Some view_query -> view_col_names view_query
+          | None -> []
+      in
+      let* () = Lwt_list.iter_s (fun value_exprs ->
+        let schema = make_col_schema effective_cols in
+        let new_vals = List.map eval_insert_ast_value value_exprs in
+        let new_row = Some (Array.of_list new_vals) in
+        Lwt_list.iter_s (fun m ->
+          let substituted_body = List.map (fun stmt ->
+            subst_new_old ~schema ~new_row ~old_row:None stmt
+          ) m.trig_body in
+          Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+        ) matching
+      ) values in
+      Lwt.return (Ok ())
+    end
+  | Sql.Ast.S_delete _ ->
+    let matching = find_instead_of `Delete in
+    if matching = [] then
+      Lwt.return (Error (Sema (Sql.Sema.Unsupported
+        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF DELETE trigger)"
+           view_name))))
+    else begin
+      let schema = [] in
+      let* () = Lwt_list.iter_s (fun m ->
+        let substituted_body = List.map (fun stmt ->
+          subst_new_old ~schema ~new_row:None ~old_row:None stmt
+        ) m.trig_body in
+        Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+      ) matching in
+      Lwt.return (Ok ())
+    end
+  | _ ->
+    Lwt.return (Error (Sema (Sql.Sema.Unsupported
+      (Printf.sprintf "view '%s' is not directly modifiable" view_name))))
+
 (* ------------------------------------------------------------------ *)
 (* Public execute / query API                                           *)
 (* ------------------------------------------------------------------ *)
@@ -411,6 +516,11 @@ let make_trigger_hook t table_meta ~timing ~event =
 let execute t sql =
   let* op = compile t sql in
   match op with
+  | Error (Sema (Sql.Sema.Unknown_table view_name))
+    when Hashtbl.mem t.views view_name ->
+    (match parse sql with
+     | Error _ -> Lwt.return (Error (Parse "syntax error"))
+     | Ok ast  -> execute_instead_of t view_name ast)
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_begin    -> begin_txn t
   | Ok Sql.Plan.Op_commit   -> commit_txn t
@@ -479,6 +589,13 @@ let execute t sql =
 let execute_change_count t sql =
   let* op = compile t sql in
   match op with
+  | Error (Sema (Sql.Sema.Unknown_table view_name))
+    when Hashtbl.mem t.views view_name ->
+    (match parse sql with
+     | Error _ -> Lwt.return (Error (Parse "syntax error"))
+     | Ok ast  ->
+       let* r = execute_instead_of t view_name ast in
+       (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e)))
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_begin    ->
     let* r = begin_txn t in

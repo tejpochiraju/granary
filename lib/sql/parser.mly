@@ -47,6 +47,7 @@
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
 %token TRIGGER BEFORE AFTER
+%token INSTEAD
 %token CASCADE RESTRICT
 %token OVER PARTITION RECURSIVE COLLATE
 %token PRECEDING FOLLOWING
@@ -158,9 +159,10 @@ any_ident:
   | ABORT         { "abort" }
   | GROUP_CONCAT  { "group_concat" }
   | STRING_AGG    { "string_agg" }
-  | EXPLAIN { "explain" }
-  | ANALYZE { "analyze" }
-  | SNIPPET { "snippet" }
+  | EXPLAIN  { "explain" }
+  | ANALYZE  { "analyze" }
+  | SNIPPET  { "snippet" }
+  | INSTEAD  { "instead" }
 
 stmt:
   | s = with_cte          { s }
@@ -275,8 +277,9 @@ drop_trigger:
     { Ast.S_drop_trigger { name; if_exists = true } }
 
 trigger_timing:
-  | BEFORE { Ast.TT_before }
-  | AFTER  { Ast.TT_after  }
+  | BEFORE            { Ast.TT_before }
+  | AFTER             { Ast.TT_after  }
+  | INSTEAD any_ident { Ast.TT_instead_of }
 
 trigger_event:
   | INSERT { Ast.TE_insert }

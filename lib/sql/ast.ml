@@ -98,7 +98,7 @@ type scalar_func =
 
 type set_op = Union | Union_all | Intersect | Except
 
-type trigger_timing = TT_before | TT_after
+type trigger_timing = TT_before | TT_after | TT_instead_of
 
 type trigger_event  = TE_insert | TE_update | TE_delete
 

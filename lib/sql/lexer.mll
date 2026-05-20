@@ -202,6 +202,7 @@ rule token = parse
       | "TRIGGER"      -> TRIGGER
       | "BEFORE"       -> BEFORE
       | "AFTER"        -> AFTER
+      | "INSTEAD"      -> INSTEAD
       | "CASCADE"      -> CASCADE
       | "RESTRICT"     -> RESTRICT
       | "GROUP_CONCAT" -> GROUP_CONCAT
