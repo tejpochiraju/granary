@@ -5603,6 +5603,154 @@ let generated_col_tests = [
   Alcotest.test_case "generated_fk_cascade"         `Quick generated_col_fk_cascade;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 26: PRAGMA tests                                               *)
+(* ------------------------------------------------------------------ *)
+
+(* PRAGMA foreign_keys → [[V_int 1]] *)
+let pragma_foreign_keys () =
+  let db = fresh_db () in
+  let rows = query_ok db "PRAGMA foreign_keys" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check int) "one column" 1 (Array.length row);
+  Alcotest.check value_testable "foreign_keys=1" (Db.V_int 1L) row.(0)
+
+(* PRAGMA journal_mode → [["delete"]] *)
+let pragma_journal_mode () =
+  let db = fresh_db () in
+  let rows = query_ok db "PRAGMA journal_mode" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.(check int) "one column" 1 (Array.length row);
+  Alcotest.check value_testable "journal_mode=delete" (Db.V_text "delete") row.(0)
+
+(* PRAGMA user_version default → 0 *)
+let pragma_user_version_default () =
+  let db = fresh_db () in
+  let rows = query_ok db "PRAGMA user_version" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "user_version default=0" (Db.V_int 0L) row.(0)
+
+(* PRAGMA user_version = 42; PRAGMA user_version → 42 *)
+let pragma_user_version_set_get () =
+  let db = fresh_db () in
+  exec db "PRAGMA user_version = 42";
+  let rows = query_ok db "PRAGMA user_version" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "user_version=42" (Db.V_int 42L) row.(0)
+
+(* Set twice — last write wins *)
+let pragma_user_version_update () =
+  let db = fresh_db () in
+  exec db "PRAGMA user_version = 10";
+  exec db "PRAGMA user_version = 99";
+  let rows = query_ok db "PRAGMA user_version" in
+  let row = List.hd rows in
+  Alcotest.check value_testable "user_version=99 (last wins)" (Db.V_int 99L) row.(0)
+
+(* Set to 0 (reset) *)
+let pragma_user_version_zero () =
+  let db = fresh_db () in
+  exec db "PRAGMA user_version = 7";
+  exec db "PRAGMA user_version = 0";
+  let rows = query_ok db "PRAGMA user_version" in
+  let row = List.hd rows in
+  Alcotest.check value_testable "user_version reset to 0" (Db.V_int 0L) row.(0)
+
+(* Table with no FKs → empty result *)
+let pragma_foreign_key_list_empty () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+  let rows = query_ok db "PRAGMA foreign_key_list(t)" in
+  Alcotest.(check int) "no FK rows" 0 (List.length rows)
+
+(* Table with one FK → 1 row; check parent table, local col, parent col *)
+let pragma_foreign_key_list_one () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+  exec db "CREATE TABLE child (pid INTEGER REFERENCES parent(id))";
+  let rows = query_ok db "PRAGMA foreign_key_list(child)" in
+  Alcotest.(check int) "one FK row" 1 (List.length rows);
+  let row = List.hd rows in
+  (* col 2 = parent table name *)
+  Alcotest.check value_testable "parent table" (Db.V_text "parent") row.(2);
+  (* col 3 = local column *)
+  Alcotest.check value_testable "local col" (Db.V_text "pid") row.(3);
+  (* col 4 = parent column *)
+  Alcotest.check value_testable "parent col" (Db.V_text "id") row.(4)
+
+(* FK with ON DELETE CASCADE: verify on_delete column = "CASCADE" *)
+let pragma_foreign_key_list_cascade () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE p (id INTEGER PRIMARY KEY)";
+  exec db "CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION)";
+  let rows = query_ok db "PRAGMA foreign_key_list(c)" in
+  Alcotest.(check int) "one FK row" 1 (List.length rows);
+  let row = List.hd rows in
+  (* col 5 = on_update *)
+  Alcotest.check value_testable "on_update=NO ACTION" (Db.V_text "NO ACTION") row.(5);
+  (* col 6 = on_delete *)
+  Alcotest.check value_testable "on_delete=CASCADE" (Db.V_text "CASCADE") row.(6);
+  (* col 7 = match = "NONE" *)
+  Alcotest.check value_testable "match=NONE" (Db.V_text "NONE") row.(7)
+
+(* Non-existent table → empty result *)
+let pragma_foreign_key_list_no_table () =
+  let db = fresh_db () in
+  let rows = query_ok db "PRAGMA foreign_key_list(no_such_table)" in
+  Alcotest.(check int) "empty for unknown table" 0 (List.length rows)
+
+(* Empty database → "ok" *)
+let pragma_integrity_check_empty () =
+  let db = fresh_db () in
+  let rows = query_ok db "PRAGMA integrity_check" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+
+(* Database with tables + data + indexes → "ok" *)
+let pragma_integrity_check_clean () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)";
+  exec db "CREATE INDEX idx_name ON t (name)";
+  exec db "INSERT INTO t VALUES (1, 'alice')";
+  exec db "INSERT INTO t VALUES (2, 'bob')";
+  let rows = query_ok db "PRAGMA integrity_check" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+
+(* Partial index: fewer index entries than rows is expected and OK *)
+let pragma_integrity_check_partial_ok () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, val INTEGER)";
+  exec db "CREATE INDEX idx_partial ON t (val) WHERE val > 5";
+  exec db "INSERT INTO t VALUES (1, 3)";   (* not indexed *)
+  exec db "INSERT INTO t VALUES (2, 10)";  (* indexed *)
+  let rows = query_ok db "PRAGMA integrity_check" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+
+let pragma_tests = [
+  Alcotest.test_case "foreign_keys"               `Quick pragma_foreign_keys;
+  Alcotest.test_case "journal_mode"               `Quick pragma_journal_mode;
+  Alcotest.test_case "user_version_default"       `Quick pragma_user_version_default;
+  Alcotest.test_case "user_version_set_get"       `Quick pragma_user_version_set_get;
+  Alcotest.test_case "user_version_update"        `Quick pragma_user_version_update;
+  Alcotest.test_case "user_version_zero"          `Quick pragma_user_version_zero;
+  Alcotest.test_case "fk_list_empty"              `Quick pragma_foreign_key_list_empty;
+  Alcotest.test_case "fk_list_one"                `Quick pragma_foreign_key_list_one;
+  Alcotest.test_case "fk_list_cascade"            `Quick pragma_foreign_key_list_cascade;
+  Alcotest.test_case "fk_list_no_table"           `Quick pragma_foreign_key_list_no_table;
+  Alcotest.test_case "integrity_check_empty"      `Quick pragma_integrity_check_empty;
+  Alcotest.test_case "integrity_check_clean"      `Quick pragma_integrity_check_clean;
+  Alcotest.test_case "integrity_check_partial_ok" `Quick pragma_integrity_check_partial_ok;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6108,4 +6256,5 @@ let () =
     "partial_indexes", partial_index_tests;
     "expression_indexes", expression_index_tests;
     "generated_columns", generated_col_tests;
+    "phase26_pragma", pragma_tests;
   ]

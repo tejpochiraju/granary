@@ -3114,6 +3114,44 @@ let phase24_limit_cases = [
     unordered = false };
 ]
 
+(* ── Phase 26: PRAGMA cases ────────────────────────────────────── *)
+
+let phase26_pragma_cases = [
+  (* NOTE: pragma_foreign_keys is intentionally excluded from SQLite comparison:
+     SQLite returns 0 by default (FK enforcement off), while sqlocaml always
+     returns 1 (FK enforcement always on). This difference is intentional. *)
+
+  { name = "pragma_journal_mode";
+    setup = [];
+    query = "PRAGMA journal_mode";
+    unordered = false };
+
+  { name = "pragma_user_version_default";
+    setup = [];
+    query = "PRAGMA user_version";
+    unordered = false };
+
+  { name = "pragma_user_version_set_get";
+    setup = [ "PRAGMA user_version = 7" ];
+    query = "PRAGMA user_version";
+    unordered = false };
+
+  { name = "pragma_fk_list_single";
+    setup = [
+      "CREATE TABLE p (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE c (pid INTEGER REFERENCES p(id))";
+    ];
+    query = "PRAGMA foreign_key_list(c)";
+    unordered = false };
+
+  { name = "pragma_fk_list_empty";
+    setup = [
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+    ];
+    query = "PRAGMA foreign_key_list(t)";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3154,4 +3192,5 @@ let () =
     "phase23_cascade",         List.map make_test phase23_cascade_cases;
     "phase24_limit",           List.map make_test phase24_limit_cases;
     "phase25_generated",       List.map make_test phase25_generated_cases;
+    "phase26_pragma",          List.map make_test phase26_pragma_cases;
   ]
