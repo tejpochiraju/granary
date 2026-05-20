@@ -2616,7 +2616,11 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
-  | Plan.Op_pragma_set_user_version _ -> Lwt.return 0  (* stub: implemented in Phase 26 Task 4 *)
+  | Plan.Op_pragma_set_user_version { version } ->
+    let* tx = S.rw_begin store in
+    let* () = Cat.write_user_version_tx tx version in
+    let* () = S.commit tx in
+    Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
@@ -3733,11 +3737,54 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
-    (* stub: exec-time user_version read — return 0 until Phase 26 Task 4 *)
-    Lwt.return (Lwt_stream.of_list [ [| Row.V_int 0L |] ])
+    let* tx = S.ro_begin store in
+    let* v  = Cat.read_user_version_tx tx in
+    let* () = S.ro_end tx in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int v |] ])
   | Plan.Op_pragma_integrity_check ->
-    (* stub: integrity check — return "ok" until Phase 26 Task 4 *)
-    Lwt.return (Lwt_stream.of_list [ [| Row.V_text "ok" |] ])
+    let cat_val = match cat with
+      | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
+      | Some c -> c
+    in
+    let* tables = Cat.list_tables cat_val in
+    let errors  = ref [] in
+    let add_err msg = errors := msg :: !errors in
+    let count_entries tx tid =
+      let count = ref 0 in
+      let* cur  = S.cursor_open tx tid in
+      let _sr   = S.cursor_first cur in
+      let rec go () =
+        match S.cursor_next cur with
+        | None   -> Lwt.return_unit
+        | Some _ -> incr count; go ()
+      in
+      let* () = go () in
+      S.cursor_close cur;
+      Lwt.return !count
+    in
+    let* tx = S.ro_begin store in
+    let* () =
+      Lwt_list.iter_s (fun (meta : Cat.table_meta) ->
+        let* row_count = count_entries tx meta.tree_id in
+        let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
+        Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+          let is_partial = idx.idx_where_sql <> None in
+          let* idx_count = count_entries tx idx.idx_tree_id in
+          (if (not is_partial) && idx_count <> row_count then
+            add_err (Printf.sprintf
+              "index %s on %s: %d entries != %d rows"
+              idx.idx_name meta.name idx_count row_count));
+          Lwt.return_unit
+        ) idxs
+      ) tables
+    in
+    let* () = S.ro_end tx in
+    let result = List.rev !errors in
+    let rows =
+      if result = [] then [ [| Row.V_text "ok" |] ]
+      else List.map (fun msg -> [| Row.V_text msg |]) result
+    in
+    Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_union { all; left; right } ->
     let* ls = to_stream clock params store ~mode ~cat left  in
     let* rs = to_stream clock params store ~mode ~cat right in

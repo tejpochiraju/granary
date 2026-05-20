@@ -48,6 +48,15 @@ type fts_table_meta = {
     Loads all existing table metadata and index metadata from the store. *)
 val open_ : Sqlocaml_store.Store.t -> t Lwt.t
 
+(** Read the user_version from the sys_meta tree inside an already-open
+    transaction (RO or RW).  Returns 0 if not yet set. *)
+val read_user_version_tx : _ Sqlocaml_store.Store.txn -> int64 Lwt.t
+
+(** Write user_version to the sys_meta tree inside an already-open RW
+    transaction.  Caller is responsible for the commit. *)
+val write_user_version_tx :
+  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 -> unit Lwt.t
+
 (** Create a new table, returning its assigned tree_id.
     Raises [Failure] if a table with that name already exists. *)
 val create_table :
