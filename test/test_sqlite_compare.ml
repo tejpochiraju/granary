@@ -3152,6 +3152,50 @@ let phase26_pragma_cases = [
     unordered = false };
 ]
 
+let phase27_cases = [
+  { name = "group_concat_basic";
+    setup = [ "CREATE TABLE t (v TEXT)";
+              "INSERT INTO t VALUES ('a')";
+              "INSERT INTO t VALUES ('b')";
+              "INSERT INTO t VALUES ('c')" ];
+    query = "SELECT GROUP_CONCAT(v, ',') FROM t";
+    unordered = false };
+
+  { name = "group_concat_sep";
+    setup = [ "CREATE TABLE t (v TEXT)";
+              "INSERT INTO t VALUES ('x')";
+              "INSERT INTO t VALUES ('y')" ];
+    query = "SELECT GROUP_CONCAT(v, '|') FROM t";
+    unordered = false };
+
+  { name = "group_concat_null_skip";
+    setup = [ "CREATE TABLE t (v TEXT)";
+              "INSERT INTO t VALUES ('hi')";
+              "INSERT INTO t VALUES (NULL)";
+              "INSERT INTO t VALUES ('bye')" ];
+    query = "SELECT GROUP_CONCAT(v, ',') FROM t";
+    unordered = false };
+
+  { name = "group_concat_empty";
+    setup = [ "CREATE TABLE t (v TEXT)" ];
+    query = "SELECT GROUP_CONCAT(v) FROM t";
+    unordered = false };
+
+  { name = "group_concat_group_by";
+    setup = [ "CREATE TABLE t (k TEXT, v TEXT)";
+              "INSERT INTO t VALUES ('a', '1')";
+              "INSERT INTO t VALUES ('a', '2')";
+              "INSERT INTO t VALUES ('b', '3')" ];
+    query = "SELECT k, GROUP_CONCAT(v, ',') FROM t GROUP BY k ORDER BY k";
+    unordered = false };
+
+  { name = "pk_col_unique_violation";
+    setup = [ "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+              "INSERT INTO t VALUES (1, 'a')" ];
+    query = "SELECT id FROM t";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3193,4 +3237,5 @@ let () =
     "phase24_limit",           List.map make_test phase24_limit_cases;
     "phase25_generated",       List.map make_test phase25_generated_cases;
     "phase26_pragma",          List.map make_test phase26_pragma_cases;
+    "phase27",                 List.map make_test phase27_cases;
   ]
