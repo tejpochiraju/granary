@@ -2533,6 +2533,7 @@ let test_fk_valid_insert () =
        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)" in
     let* () = exec "INSERT INTO fk_parent VALUES (1, 'alice')" in
     let* () = exec "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES fk_parent(id))" in
@@ -2574,6 +2575,7 @@ let test_fk_null_allowed () =
        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE fk_parent3 (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO fk_parent3 VALUES (1)" in
     let* () = exec "CREATE TABLE fk_child3 (id INTEGER, pid INTEGER REFERENCES fk_parent3(id))" in
