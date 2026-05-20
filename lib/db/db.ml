@@ -519,6 +519,29 @@ let execute_instead_of t view_name ast =
       ) matching in
       Lwt.return (Ok ())
     end
+  | Sql.Ast.S_update { assignments; _ } ->
+    let matching = find_instead_of `Update in
+    if matching = [] then
+      Lwt.return (Error (Sema (Sql.Sema.Unsupported
+        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF UPDATE trigger)"
+           view_name))))
+    else begin
+      (* Build NEW row from assignment expressions.
+         Only literal values are substituted; complex expressions become NULL.
+         The WHERE clause is not applied here — the trigger body handles filtering. *)
+      let assign_cols  = List.map fst assignments in
+      let assign_exprs = List.map snd assignments in
+      let schema   = make_col_schema assign_cols in
+      let new_vals = List.map eval_insert_ast_value assign_exprs in
+      let new_row  = Some (Array.of_list new_vals) in
+      let* () = Lwt_list.iter_s (fun m ->
+        let substituted_body = List.map (fun stmt ->
+          subst_new_old ~schema ~new_row ~old_row:None stmt
+        ) m.trig_body in
+        Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+      ) matching in
+      Lwt.return (Ok ())
+    end
   | _ ->
     Lwt.return (Error (Sema (Sql.Sema.Unsupported
       (Printf.sprintf "view '%s' is not directly modifiable" view_name))))

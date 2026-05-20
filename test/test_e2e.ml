@@ -6605,6 +6605,59 @@ let test_instead_of_insert_multiple_body_stmts () =
     check_rows "real_t has row" [[| Db.V_int 42L |]] real_rows;
     Lwt.return_unit)
 
+(* ── Phase 32 Task 1: INSTEAD OF UPDATE triggers ──────────────────── *)
+
+let test_instead_of_update () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "INSERT INTO real_t VALUES (1, 'alice')" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
+       UPDATE real_t SET name = NEW.name; END" in
+    let* () = exec_in db "UPDATE v SET name = 'updated'" in
+    let* rows = query_rows db "SELECT id, name FROM real_t" in
+    check_rows "row in real_t updated" [[| Db.V_int 1L; Db.V_text "updated" |]] rows;
+    Lwt.return_unit)
+
+let test_instead_of_update_multi_assign () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (a TEXT, b TEXT)" in
+    let* () = exec_in db "INSERT INTO real_t VALUES ('old_a', 'old_b')" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT a, b FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
+       UPDATE real_t SET a = NEW.a, b = NEW.b; END" in
+    let* () = exec_in db "UPDATE v SET a = 'hello', b = 'world'" in
+    let* rows = query_rows db "SELECT a, b FROM real_t" in
+    check_rows "both columns updated" [[| Db.V_text "hello"; Db.V_text "world" |]] rows;
+    Lwt.return_unit)
+
+let test_instead_of_update_no_trigger_fails () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let result = exec_err db "UPDATE v SET name = 'fail'" in
+    check_error "update view without trigger fails" result;
+    Lwt.return_unit)
+
+let test_instead_of_update_multi_stmt_body () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "INSERT INTO real_t VALUES (1, 'original')" in
+    let* () = exec_in db "CREATE TABLE audit (action TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
+    let* () = exec_in db
+      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
+       UPDATE real_t SET name = NEW.name; \
+       INSERT INTO audit VALUES ('updated'); END" in
+    let* () = exec_in db "UPDATE v SET name = 'changed'" in
+    let* audit_rows = query_rows db "SELECT action FROM audit" in
+    check_rows "audit has entry" [[| Db.V_text "updated" |]] audit_rows;
+    let* real_rows = query_rows db "SELECT name FROM real_t" in
+    check_rows "real_t updated" [[| Db.V_text "changed" |]] real_rows;
+    Lwt.return_unit)
+
 (* ── Phase 31 Task 3: scalar utility functions ──────────────────── *)
 
 let test_hex_blob () =
@@ -7277,6 +7330,12 @@ let () =
       Alcotest.test_case "delete"                `Quick test_instead_of_delete;
       Alcotest.test_case "no_trigger_fails"      `Quick test_instead_of_no_trigger_fails;
       Alcotest.test_case "multiple_body_stmts"   `Quick test_instead_of_insert_multiple_body_stmts;
+    ];
+    "phase32_instead_of_update", [
+      Alcotest.test_case "update"                `Quick test_instead_of_update;
+      Alcotest.test_case "update_multi_assign"   `Quick test_instead_of_update_multi_assign;
+      Alcotest.test_case "update_no_trigger_fails" `Quick test_instead_of_update_no_trigger_fails;
+      Alcotest.test_case "update_multi_stmt_body" `Quick test_instead_of_update_multi_stmt_body;
     ];
     "phase31_scalar", [
       Alcotest.test_case "hex_blob"              `Quick test_hex_blob;
