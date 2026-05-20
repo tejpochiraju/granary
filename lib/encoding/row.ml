@@ -15,12 +15,15 @@ type default_value =
   | DV_current_time
 
 type column = {
-  name        : string;
-  ty          : ty;
-  not_null    : bool;
-  primary_key : bool;
-  default     : default_value option;  (* None = no DEFAULT *)
-  check_sql   : string option;         (* None = no CHECK constraint *)
+  name         : string;
+  ty           : ty;
+  not_null     : bool;
+  primary_key  : bool;
+  default      : default_value option;  (* None = no DEFAULT *)
+  check_sql    : string option;         (* None = no CHECK constraint *)
+  generated_as : (string * bool) option;
+  (** Some (expr_sql, is_stored): GENERATED ALWAYS AS expr.
+      is_stored=true => STORED; false => VIRTUAL (both computed at write time). *)
 }
 type schema = column list
 

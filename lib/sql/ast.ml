@@ -332,14 +332,16 @@ and pragma_kind =
   | Pragma_set of string * string  (* name, value — treated as no-op *)
 
 and column_def = {
-  name        : string;
-  ty          : ty;
-  not_null    : bool;
-  primary_key : bool;
-  default     : literal option;  (* None = no DEFAULT *)
-  check       : expr option;     (* None = no CHECK constraint *)
-  fk_ref      : (string * string * fk_action * fk_action) option;
+  name         : string;
+  ty           : ty;
+  not_null     : bool;
+  primary_key  : bool;
+  default      : literal option;  (* None = no DEFAULT *)
+  check        : expr option;     (* None = no CHECK constraint *)
+  fk_ref       : (string * string * fk_action * fk_action) option;
   (** [(parent_table, parent_col, on_delete, on_update)]. None = no FK. *)
+  generated_as : (expr * [`Stored | `Virtual]) option;
+  (** GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]. None = not generated. *)
 }
 
 and alter_action =

@@ -71,12 +71,12 @@ let make_two_table_cat ?(orders_idx=false) () =
     let store = S.create () in
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"users" ~columns:[
-      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+      { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     let* _ = Cat.create_table cat ~name:"orders" ~columns:[
-      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+      { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     let* () =
       if orders_idx then
@@ -159,10 +159,10 @@ let sema_ambiguous_column () =
     let store = S.create () in
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"a" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     let* _ = Cat.create_table cat ~name:"b" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     Lwt.return cat
   ) in
@@ -183,10 +183,10 @@ let sema_qualified_column_resolves () =
     let store = S.create () in
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"a" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     let* _ = Cat.create_table cat ~name:"b" ~columns:[
-      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
     ] in
     Lwt.return cat
   ) in

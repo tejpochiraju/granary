@@ -201,6 +201,14 @@ let encode_column (col : Row.column) =
      Varint.encode_uint64 buf 1L;
      Varint.encode_uint64 buf (Int64.of_int (String.length sql));
      Buffer.add_string buf sql);
+  (* Phase 25: generated_as field — appended for backward compat *)
+  (match col.generated_as with
+   | None -> Varint.encode_uint64 buf 0L
+   | Some (sql, is_stored) ->
+     Varint.encode_uint64 buf 1L;
+     Varint.encode_uint64 buf (if is_stored then 1L else 0L);
+     Varint.encode_uint64 buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
   Buffer.to_bytes buf
 
 let decode_column bytes =
@@ -213,7 +221,8 @@ let decode_column bytes =
   let bytes_left = Bytes.length bytes - off in
   if bytes_left = 0 then
     Row.{ name; ty = type_of_tag (Int64.to_int tag);
-          not_null = false; primary_key = false; default = None; check_sql = None }
+          not_null = false; primary_key = false; default = None; check_sql = None;
+          generated_as = None }
   else begin
     let nn, off  = Varint.decode_uint64 bytes off in
     let pk, off  = Varint.decode_uint64 bytes off in
@@ -223,22 +232,36 @@ let decode_column bytes =
       else let dv, off' = decode_default_value bytes off in (Some dv, off')
     in
     let bytes_left2 = Bytes.length bytes - off in
-    let check_sql =
-      if bytes_left2 <= 0 then None
+    let check_sql, final_off =
+      if bytes_left2 <= 0 then (None, off)
       else
-        let has_check, off = Varint.decode_uint64 bytes off in
-        if Int64.to_int has_check = 0 then None
+        let has_check, off2 = Varint.decode_uint64 bytes off in
+        if Int64.to_int has_check = 0 then (None, off2)
         else
-          let sql_len, off = Varint.decode_uint64 bytes off in
-          let sql = Bytes.sub_string bytes off (Int64.to_int sql_len) in
-          ignore off;
-          Some sql
+          let sql_len, off3 = Varint.decode_uint64 bytes off2 in
+          let sql = Bytes.sub_string bytes off3 (Int64.to_int sql_len) in
+          let off4 = off3 + Int64.to_int sql_len in
+          (Some sql, off4)
+    in
+    let generated_as =
+      let remaining = Bytes.length bytes - final_off in
+      if remaining <= 0 then None
+      else
+        let has_gen, off2 = Varint.decode_uint64 bytes final_off in
+        if Int64.to_int has_gen = 0 then None
+        else
+          let is_stored, off3 = Varint.decode_uint64 bytes off2 in
+          let sql_len, off4   = Varint.decode_uint64 bytes off3 in
+          let sql = Bytes.sub_string bytes off4 (Int64.to_int sql_len) in
+          ignore (off4 + Int64.to_int sql_len);
+          Some (sql, Int64.to_int is_stored = 1)
     in
     Row.{ name; ty = type_of_tag (Int64.to_int tag);
           not_null    = (Int64.to_int nn <> 0);
           primary_key = (Int64.to_int pk <> 0);
           default;
-          check_sql }
+          check_sql;
+          generated_as }
   end
 
 (* Index value encoding:

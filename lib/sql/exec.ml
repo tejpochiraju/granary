@@ -2474,7 +2474,9 @@ let execute_with_count ?(mode = Auto)
                             | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
                             | Some Ast.L_current_date      -> Some Row.DV_current_date
                             | Some Ast.L_current_time      -> Some Row.DV_current_time);
-         Row.check_sql   = Option.map Ast.expr_to_sql col_def.Ast.check;
+         Row.check_sql    = Option.map Ast.expr_to_sql col_def.Ast.check;
+         Row.generated_as = Option.map (fun (e, s) ->
+           (Ast.expr_to_sql e, s = `Stored)) col_def.Ast.generated_as;
        } in
        let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
        (match result with

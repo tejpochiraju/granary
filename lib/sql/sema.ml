@@ -234,7 +234,8 @@ let col_index (cols : Row.column list) name =
 let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
   let columns = List.map (fun name ->
     Row.{ name; ty = Row.Text; not_null = true;
-          primary_key = false; default = None; check_sql = None }
+          primary_key = false; default = None; check_sql = None;
+          generated_as = None }
   ) m.Cat.fts_columns in
   { Cat.name           = m.Cat.fts_name;
     Cat.tree_id        = m.Cat.fts_content_tree;
@@ -939,7 +940,9 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
               not_null    = c.not_null;
               primary_key = c.primary_key;
               default     = Option.map ast_lit_to_dv c.default;
-              check_sql   = Option.map Ast.expr_to_sql c.check }
+              check_sql   = Option.map Ast.expr_to_sql c.check;
+              generated_as = Option.map (fun (e, s) ->
+                (Ast.expr_to_sql e, s = `Stored)) c.generated_as }
       ) columns in
       (* Generate auto-UNIQUE index specs for table-level constraints *)
       let uniq_idxs = List.filter_map (fun (i, tc) ->
@@ -2467,12 +2470,13 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
          else List.nth bound_names i)
        in
        let cte_cols = List.map (fun col_name ->
-         { Row.name        = col_name;
-           Row.ty          = Row.Integer;
-           Row.not_null    = false;
-           Row.primary_key = false;
-           Row.default     = None;
-           Row.check_sql   = None;
+         { Row.name         = col_name;
+           Row.ty           = Row.Integer;
+           Row.not_null     = false;
+           Row.primary_key  = false;
+           Row.default      = None;
+           Row.check_sql    = None;
+           Row.generated_as = None;
          }) col_names in
        let cte_meta : Cat.table_meta = {
          Cat.name           = name;

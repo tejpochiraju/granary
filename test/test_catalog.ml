@@ -11,7 +11,7 @@ module Varint = Sqlocaml_encoding.Varint
 
 let run = Lwt_main.run
 
-let mk_col name ty : Row.column = { name; ty; not_null = false; primary_key = false; default = None; check_sql = None }
+let mk_col name ty : Row.column = { name; ty; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }
 
 let int_col name = mk_col name Row.Integer
 let txt_col name = mk_col name Row.Text
@@ -409,9 +409,9 @@ let test_default_blob_roundtrip () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let cols : Row.column list = [
-      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "b"; ty = Row.Blob;    not_null = false; primary_key = false;
-        default = Some (Row.DV_blob (Bytes.of_string "binary")); check_sql = None };
+        default = Some (Row.DV_blob (Bytes.of_string "binary")); check_sql = None; generated_as = None };
     ] in
     let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
     let* cat2 = C.open_ store in
@@ -432,9 +432,9 @@ let test_default_real_roundtrip () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let cols : Row.column list = [
-      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "f"; ty = Row.Real;    not_null = false; primary_key = false;
-        default = Some (Row.DV_real 3.14159); check_sql = None };
+        default = Some (Row.DV_real 3.14159); check_sql = None; generated_as = None };
     ] in
     let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
     let* cat2 = C.open_ store in
@@ -455,9 +455,9 @@ let test_default_text_roundtrip () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let cols : Row.column list = [
-      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+      { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "s"; ty = Row.Text;    not_null = false; primary_key = false;
-        default = Some (Row.DV_text "hello"); check_sql = None };
+        default = Some (Row.DV_text "hello"); check_sql = None; generated_as = None };
     ] in
     let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
     let* cat2 = C.open_ store in
@@ -479,7 +479,7 @@ let test_default_null_roundtrip () =
     let* cat1 = C.open_ store in
     let cols : Row.column list = [
       { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
-        default = Some Row.DV_null; check_sql = None };
+        default = Some Row.DV_null; check_sql = None; generated_as = None };
     ] in
     let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
     let* cat2 = C.open_ store in
@@ -504,7 +504,7 @@ let corrupt_default_tag () =
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t"
       ~columns:[{ Row.name = "x"; ty = Row.Integer; not_null = false;
-                  primary_key = false; default = None; check_sql = None }] in
+                  primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let col_key =
       let tn = Bytes.of_string "t" in
       let ord = Bytes.make 8 '\x00' in
@@ -537,7 +537,7 @@ let test_default_int_roundtrip () =
     let* cat1 = C.open_ store in
     let cols : Row.column list = [
       { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
-        default = Some (Row.DV_int 12345L); check_sql = None };
+        default = Some (Row.DV_int 12345L); check_sql = None; generated_as = None };
     ] in
     let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
     let* cat2 = C.open_ store in
@@ -612,7 +612,7 @@ let corrupt_column_type_tag () =
   run (
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users"
-      ~columns:[{ Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+      ~columns:[{ Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     (* Overwrite the column entry with a corrupt type tag (0) *)
     let col_key =
       let tn = Bytes.of_string "users" in

@@ -13,8 +13,8 @@ module Exec = Sqlocaml_sql.Exec
 
 let run = Lwt_main.run
 
-let int_col name : Row.column = { name; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }
-let txt_col name : Row.column = { name; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None }
+let int_col name : Row.column = { name; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }
+let txt_col name : Row.column = { name; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }
 
 (** Standard two-column schema: id INTEGER, name TEXT *)
 let id_name_cols = [int_col "id"; txt_col "name"]
@@ -1103,7 +1103,7 @@ let query_index_lookup_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
@@ -1136,7 +1136,7 @@ let query_index_lookup_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AAAA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BBBB")]);
@@ -1199,7 +1199,7 @@ let query_filter_eq_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
     insert store cat "t" ([0], [Ast.L_real 2.5]);
@@ -1221,7 +1221,7 @@ let query_filter_eq_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "BB")]);
@@ -1245,7 +1245,7 @@ let query_sort_real () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_real 3.0]);
     insert store cat "t" ([0], [Ast.L_real 1.0]);
@@ -1267,7 +1267,7 @@ let query_sort_blob () =
   run (
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t";
-                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }];
+                                columns = [{ name = "b"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }];
                                 uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "CC")]);
     insert store cat "t" ([0], [Ast.L_blob (Bytes.of_string "AA")]);
@@ -1805,7 +1805,7 @@ let query_aggregate_sum_int () =
 let query_aggregate_sum_real () =
   let store, cat = setup () in
   run (
-    let schema = [{ Row.name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "r"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let* () = Exec.execute store cat
         (Plan.Op_create_table { name = "t"; columns = schema; uniq_idxs = []; if_not_exists = false; fk_constraints = [] }) in
     insert store cat "t" ([0], [Ast.L_real 1.5]);
@@ -2037,7 +2037,7 @@ let query_hash_join_raises_in_execute () =
 
 let query_distinct_blob () =
   let blob_col name : Row.column =
-    { name; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }
+    { name; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }
   in
   let store, cat = setup () in
   run (

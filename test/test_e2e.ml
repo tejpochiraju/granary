@@ -5480,6 +5480,95 @@ let expression_index_tests = [
   Alcotest.test_case "expression_index_v2_catalog" `Quick expression_index_catalog_version2;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Generated columns (#58)                                              *)
+(* ------------------------------------------------------------------ *)
+
+let generated_col_stored_basic () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    id    INTEGER,
+    name  TEXT,
+    upper_name TEXT GENERATED ALWAYS AS (upper(name)) STORED
+  )|};
+  exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
+  let rows = query_ok db "SELECT id, name, upper_name FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "upper_name computed" (Db.V_text "ALICE") row.(2)
+
+let generated_col_virtual_treated_as_stored () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    a INTEGER,
+    b INTEGER,
+    c INTEGER GENERATED ALWAYS AS (a + b)
+  )|};
+  exec db "INSERT INTO t (a, b) VALUES (3, 4)";
+  let rows = query_ok db "SELECT c FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.check value_testable "c=7" (Db.V_int 7L) (List.hd rows).(0)
+
+let generated_col_multiple () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE products (
+    price  REAL,
+    qty    INTEGER,
+    total  REAL    GENERATED ALWAYS AS (price * qty) STORED,
+    label  TEXT    GENERATED ALWAYS AS (cast(qty as text)) STORED
+  )|};
+  exec db "INSERT INTO products (price, qty) VALUES (9.99, 3)";
+  let rows = query_ok db "SELECT total, label FROM products" in
+  let row = List.hd rows in
+  (match row.(0) with
+   | Db.V_real f -> Alcotest.(check bool) "total~29.97" true (Float.abs (f -. 29.97) < 0.01)
+   | _ -> Alcotest.fail "expected real for total");
+  Alcotest.check value_testable "label" (Db.V_text "3") row.(1)
+
+let generated_col_reject_insert () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    x INTEGER,
+    y INTEGER GENERATED ALWAYS AS (x * 2) STORED
+  )|};
+  let result = run (Db.execute db "INSERT INTO t (x, y) VALUES (1, 99)") in
+  (match err_or_fail "generated_col_reject_insert" result with
+   | Db.Sema _ | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected error when inserting into generated column")
+
+let generated_col_reject_update () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    x INTEGER,
+    y INTEGER GENERATED ALWAYS AS (x + 1) STORED
+  )|};
+  exec db "INSERT INTO t (x) VALUES (5)";
+  let result = run (Db.execute db "UPDATE t SET y = 99") in
+  (match err_or_fail "generated_col_reject_update" result with
+   | Db.Sema _ | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected error when updating generated column")
+
+let generated_col_update_dependency () =
+  let db = fresh_db () in
+  exec db {|CREATE TABLE t (
+    id INTEGER,
+    val INTEGER,
+    doubled INTEGER GENERATED ALWAYS AS (val * 2) STORED
+  )|};
+  exec db "INSERT INTO t (id, val) VALUES (1, 10)";
+  exec db "UPDATE t SET val = 20 WHERE id = 1";
+  let rows = query_ok db "SELECT doubled FROM t WHERE id = 1" in
+  Alcotest.check value_testable "doubled=40" (Db.V_int 40L) (List.hd rows).(0)
+
+let generated_col_tests = [
+  Alcotest.test_case "generated_stored_basic"       `Quick generated_col_stored_basic;
+  Alcotest.test_case "generated_virtual_as_stored"  `Quick generated_col_virtual_treated_as_stored;
+  Alcotest.test_case "generated_multiple"           `Quick generated_col_multiple;
+  Alcotest.test_case "generated_reject_insert"      `Quick generated_col_reject_insert;
+  Alcotest.test_case "generated_reject_update"      `Quick generated_col_reject_update;
+  Alcotest.test_case "generated_update_dependency"  `Quick generated_col_update_dependency;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5984,4 +6073,5 @@ let () =
     "default_expressions", default_expression_tests;
     "partial_indexes", partial_index_tests;
     "expression_indexes", expression_index_tests;
+    "generated_columns", generated_col_tests;
   ]

@@ -7,6 +7,7 @@
     | Col_default of literal
     | Col_check   of expr
     | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action
+    | Col_generated of expr * [`Stored | `Virtual]
 
   type table_item =
     | TI_col of column_def
@@ -352,7 +353,9 @@ column_def:
           | Col_fk_ref (t, col_opt, od, ou) ->
             Some (t, Option.value ~default:"" col_opt, od, ou)
           | _ -> acc) None cs in
-      { name; ty; not_null; primary_key; default; check; fk_ref } }
+      let generated_as = List.fold_left (fun acc c ->
+          match c with Col_generated (e, s) -> Some (e, s) | _ -> acc) None cs in
+      { name; ty; not_null; primary_key; default; check; fk_ref; generated_as } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -369,6 +372,18 @@ column_constraint:
     { let (od, ou) = oc in Col_fk_ref (t, None, od, ou) }
   | REFERENCES t = any_ident LPAREN c = any_ident RPAREN oc = fk_on_clauses
     { let (od, ou) = oc in Col_fk_ref (t, Some c, od, ou) }
+  | gen = any_ident always = any_ident AS LPAREN e = expr RPAREN storage = generated_storage
+    { if String.uppercase_ascii gen <> "GENERATED"
+         || String.uppercase_ascii always <> "ALWAYS"
+      then failwith (Printf.sprintf
+             "expected GENERATED ALWAYS AS (...), got: %s %s AS" gen always);
+      Col_generated (e, storage) }
+
+generated_storage:
+  | id = any_ident { if String.uppercase_ascii id = "STORED" then `Stored
+                     else if String.uppercase_ascii id = "VIRTUAL" then `Virtual
+                     else failwith (Printf.sprintf "expected STORED or VIRTUAL, got %s" id) }
+  |                { `Virtual }
 
 def_value:
   | n = INT_LIT              { L_int n }

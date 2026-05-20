@@ -3,51 +3,51 @@ open Sqlocaml_encoding
 (* ── Schemas ─────────────────────────────────────────────────────────── *)
 
 let schema_ints : Row.schema = [
-  { Row.name = "a"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "b"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "a"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "b"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_mixed : Row.schema = [
-  { Row.name = "id"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "name"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "id"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "name"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_texts : Row.schema = [
-  { Row.name = "x"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "y"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "x"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "y"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_mixed_rev : Row.schema = [
-  { Row.name = "name"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "id"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "name"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "id"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_4col : Row.schema = [
-  { Row.name = "a"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "b"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "c"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "d"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "a"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "b"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "c"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "d"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_single_int : Row.schema = [
-  { Row.name = "x"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "x"; ty = Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_single_text : Row.schema = [
-  { Row.name = "x"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "x"; ty = Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_single_real : Row.schema = [
-  { Row.name = "x"; ty = Real; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "x"; ty = Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_single_blob : Row.schema = [
-  { Row.name = "x"; ty = Blob; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "x"; ty = Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 let schema_real_blob : Row.schema = [
-  { Row.name = "f"; ty = Real; not_null = false; primary_key = false; default = None; check_sql = None };
-  { Row.name = "b"; ty = Blob; not_null = false; primary_key = false; default = None; check_sql = None };
+  { Row.name = "f"; ty = Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+  { Row.name = "b"; ty = Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
 ]
 
 (* ── Alcotest testable for Row.t ─────────────────────────────────────── *)
@@ -189,7 +189,7 @@ let equal_tests = [
 (* ── Category 6: Error conditions ────────────────────────────────────── *)
 
 let encode_arity_too_many () =
-  let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+  let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
   (* Row has 2 elements but schema expects 1 *)
   let row = [| Row.V_int 1L; Row.V_int 2L |] in
   try
@@ -200,10 +200,10 @@ let encode_arity_too_many () =
 let decode_arity_too_few_encoded () =
   (* Encode a 1-column row, decode against a 2-column schema.
      Row.decode now fills missing columns with NULL instead of raising. *)
-  let schema1 = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+  let schema1 = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
   let schema2 = [
-    { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None };
-    { Row.name = "y"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None };
+    { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
+    { Row.name = "y"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
   ] in
   let encoded = Row.encode schema1 [| Row.V_int 42L |] in
   let decoded  = Row.decode schema2 encoded in
@@ -243,7 +243,7 @@ let error_tests = [
 
   "type mismatch: int in text column",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Text; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Text; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_int 42L |] in
     try
       let _ = Row.encode schema row in
@@ -252,7 +252,7 @@ let error_tests = [
 
   "type mismatch: text in integer column",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_text "hello" |] in
     try
       let _ = Row.encode schema row in
@@ -445,7 +445,7 @@ let value_equal_new_tests = [
 let type_mismatch_new_tests = [
   "real in integer col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_real 1.5 |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
@@ -453,7 +453,7 @@ let type_mismatch_new_tests = [
 
   "blob in integer col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_blob Bytes.empty |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
@@ -461,7 +461,7 @@ let type_mismatch_new_tests = [
 
   "int in real col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_int 1L |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
@@ -469,7 +469,7 @@ let type_mismatch_new_tests = [
 
   "text in blob col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_text "hi" |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
@@ -477,7 +477,7 @@ let type_mismatch_new_tests = [
 
   "real in blob col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Blob; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_real 1.0 |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
@@ -485,7 +485,7 @@ let type_mismatch_new_tests = [
 
   "blob in real col",
   (fun () ->
-    let schema = [{ Row.name = "x"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None }] in
+    let schema = [{ Row.name = "x"; ty = Row.Real; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
     let row = [| Row.V_blob Bytes.empty |] in
     match Row.encode schema row with
     | _ -> Alcotest.fail "expected Invalid_argument"
