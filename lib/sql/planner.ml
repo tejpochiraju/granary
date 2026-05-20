@@ -98,6 +98,8 @@ let recognise_eq_col_col = function
 let make_scan (meta : Cat.table_meta) : Plan.op =
   if meta.Cat.tree_id = -1 then
     Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
+  else if meta.Cat.tree_id = -2 then
+    Plan.Op_sqlite_master
   else
     Plan.Op_seq_scan { table_meta = meta }
 

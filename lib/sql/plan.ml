@@ -277,6 +277,8 @@ type op =
       body    : Ast.stmt list;
     }
   | Op_drop_trigger of { name : string }
+  | Op_sqlite_master
+    (** Virtual scan that reconstructs sqlite_master rows from catalog metadata. *)
   | Op_no_op
     (** No-op plan node produced by IF EXISTS DROP when object not found. *)
   | Op_explain of {

@@ -6386,6 +6386,85 @@ let test_fts_snippet_term_in_other_col () =
     Alcotest.(check bool) "fallback is non-empty" true (String.length snip > 0);
     Lwt.return_unit)
 
+(* ── Phase 30: sqlite_master virtual table ────────────────────── *)
+
+let test_sqlite_master_tables () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" in
+    let* rows = query_rows db
+      "SELECT type, name FROM sqlite_master WHERE type='table' ORDER BY name" in
+    check_rows "tables" [[| Db.V_text "table"; Db.V_text "users" |]] rows;
+    Lwt.return_unit)
+
+let test_sqlite_master_indexes () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER, name TEXT)" in
+    let* () = exec_in db "CREATE UNIQUE INDEX idx_name ON t (name)" in
+    let* rows = query_rows db
+      "SELECT type, name, tbl_name FROM sqlite_master \
+       WHERE type='index' AND name='idx_name' ORDER BY name" in
+    check_rows "indexes"
+      [[| Db.V_text "index"; Db.V_text "idx_name"; Db.V_text "t" |]] rows;
+    Lwt.return_unit)
+
+let test_sqlite_master_sql_shape () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER NOT NULL, v TEXT DEFAULT 'x')" in
+    let* rows = query_rows db
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    let sql = match rows with
+      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
+      | [] -> ""
+    in
+    Alcotest.(check bool) "sql starts with CREATE TABLE" true
+      (String.length sql >= 12 &&
+       String.sub sql 0 12 = "CREATE TABLE");
+    Lwt.return_unit)
+
+let test_sqlite_master_views () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER, v TEXT)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, v FROM t" in
+    let* rows = query_rows db
+      "SELECT type, name FROM sqlite_master WHERE type='view'" in
+    check_rows "view" [[| Db.V_text "view"; Db.V_text "v" |]] rows;
+    Lwt.return_unit)
+
+let test_sqlite_master_all_types () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER)" in
+    let* () = exec_in db "CREATE INDEX idx ON t (id)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id FROM t" in
+    let* rows = query_rows db
+      "SELECT type FROM sqlite_master ORDER BY type, name" in
+    let types = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "") rows in
+    Alcotest.(check bool) "has index" true (List.mem "index" types);
+    Alcotest.(check bool) "has table" true (List.mem "table" types);
+    Alcotest.(check bool) "has view"  true (List.mem "view"  types);
+    Lwt.return_unit)
+
+let test_sqlite_schema_alias () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER)" in
+    let* rows = query_rows db "SELECT COUNT(*) FROM sqlite_schema" in
+    Alcotest.(check int) "schema alias works" 1 (List.length rows);
+    Lwt.return_unit)
+
+let test_sqlite_master_count_star () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE a (id INTEGER)" in
+    let* () = exec_in db "CREATE TABLE b (id INTEGER)" in
+    let* rows = query_rows db
+      "SELECT COUNT(*) FROM sqlite_master WHERE type='table'" in
+    Alcotest.(check int) "count row" 1 (List.length rows);
+    let n = match rows with
+      | r :: _ -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
+      | [] -> -1
+    in
+    Alcotest.(check int) "two tables" 2 n;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6930,5 +7009,14 @@ let () =
       Alcotest.test_case "window"        `Quick test_fts_snippet_window;
       Alcotest.test_case "with_rank"     `Quick test_fts_snippet_with_rank;
       Alcotest.test_case "term_in_other_col" `Quick test_fts_snippet_term_in_other_col;
+    ];
+    "phase30_sqlite_master", [
+      Alcotest.test_case "tables"       `Quick test_sqlite_master_tables;
+      Alcotest.test_case "indexes"      `Quick test_sqlite_master_indexes;
+      Alcotest.test_case "sql_shape"    `Quick test_sqlite_master_sql_shape;
+      Alcotest.test_case "views"        `Quick test_sqlite_master_views;
+      Alcotest.test_case "all_types"    `Quick test_sqlite_master_all_types;
+      Alcotest.test_case "schema_alias" `Quick test_sqlite_schema_alias;
+      Alcotest.test_case "count_star"   `Quick test_sqlite_master_count_star;
     ];
   ]

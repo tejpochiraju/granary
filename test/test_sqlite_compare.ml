@@ -3259,6 +3259,43 @@ let phase30_snippet_cases = [
     unordered = false };
 ]
 
+let phase30_sqlite_master_cases = [
+  { name = "sqlite_master_table_type";
+    setup = [ "CREATE TABLE users (id INTEGER, name TEXT)" ];
+    query = "SELECT type, name FROM sqlite_master \
+             WHERE type='table' AND name='users'";
+    unordered = false };
+
+  { name = "sqlite_master_index_type";
+    setup = [
+      "CREATE TABLE t (id INTEGER, v TEXT)";
+      "CREATE INDEX idx_v ON t (v)";
+    ];
+    query = "SELECT type, name, tbl_name FROM sqlite_master WHERE type='index'";
+    unordered = false };
+
+  { name = "sqlite_master_count_tables";
+    setup = [
+      "CREATE TABLE a (id INTEGER)";
+      "CREATE TABLE b (id INTEGER)";
+    ];
+    query = "SELECT COUNT(*) FROM sqlite_master WHERE type='table'";
+    unordered = false };
+
+  { name = "sqlite_schema_alias";
+    setup = [ "CREATE TABLE t (id INTEGER)" ];
+    query = "SELECT COUNT(*) FROM sqlite_schema WHERE type='table'";
+    unordered = false };
+
+  { name = "sqlite_master_view_type";
+    setup = [
+      "CREATE TABLE t (id INTEGER)";
+      "CREATE VIEW v AS SELECT id FROM t";
+    ];
+    query = "SELECT type, name FROM sqlite_master WHERE type='view'";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3303,4 +3340,5 @@ let () =
     "phase27",                 List.map make_test phase27_cases;
     "phase30_cascade",         List.map make_test phase30_cascade_cases;
     "phase30_snippet",         List.map make_test phase30_snippet_cases;
+    "phase30_sqlite_master",   List.map make_test phase30_sqlite_master_cases;
   ]

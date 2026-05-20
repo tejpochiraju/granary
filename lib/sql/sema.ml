@@ -2,6 +2,30 @@ open Lwt.Syntax
 module Row = Sqlocaml_encoding.Row
 module Cat = Sqlocaml_catalog.Catalog
 
+let sqlite_master_meta : Cat.table_meta = {
+  Cat.name        = "sqlite_master";
+  Cat.tree_id     = -2;
+  Cat.columns     = [
+    { Row.name = "type";     Row.ty = Row.Text;    Row.not_null = false;
+      Row.primary_key = false; Row.default = None;
+      Row.check_sql = None; Row.generated_as = None };
+    { Row.name = "name";     Row.ty = Row.Text;    Row.not_null = false;
+      Row.primary_key = false; Row.default = None;
+      Row.check_sql = None; Row.generated_as = None };
+    { Row.name = "tbl_name"; Row.ty = Row.Text;    Row.not_null = false;
+      Row.primary_key = false; Row.default = None;
+      Row.check_sql = None; Row.generated_as = None };
+    { Row.name = "rootpage"; Row.ty = Row.Integer; Row.not_null = false;
+      Row.primary_key = false; Row.default = None;
+      Row.check_sql = None; Row.generated_as = None };
+    { Row.name = "sql";      Row.ty = Row.Text;    Row.not_null = false;
+      Row.primary_key = false; Row.default = None;
+      Row.check_sql = None; Row.generated_as = None };
+  ];
+  Cat.next_rowid  = 0L;
+  Cat.fk_constraints = [];
+}
+
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
            | Concat | Mod | Bit_and | Bit_or | Lshift | Rshift
            | Like | Glob
@@ -1382,7 +1406,14 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
           }))))
 
 let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset =
-  let* meta_opt = Cat.find_table cat ~name:table in
+  let* meta_opt =
+    let tbl_lower = String.lowercase_ascii table in
+    if String.equal tbl_lower "sqlite_master"
+    || String.equal tbl_lower "sqlite_schema" then
+      Lwt.return (Some sqlite_master_meta)
+    else
+      Cat.find_table cat ~name:table
+  in
   match meta_opt with
   | None ->
     (* Not a regular table — check if it's an FTS table (only plain SELECT supported) *)

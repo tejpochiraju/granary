@@ -83,6 +83,86 @@ let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
    name and column index across DB instances (e.g. test isolation). *)
 let check_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.create 16
 
+(* ── DDL reconstruction for Op_sqlite_master ─────────────────── *)
+
+let sql_of_row_type = function
+  | Row.Integer -> "INTEGER"
+  | Row.Text    -> "TEXT"
+  | Row.Real    -> "REAL"
+  | Row.Blob    -> "BLOB"
+
+let sql_of_default_value = function
+  | Row.DV_int n  -> Int64.to_string n
+  | Row.DV_text s ->
+    let escaped = String.concat "''" (String.split_on_char '\'' s) in
+    Printf.sprintf "'%s'" escaped
+  | Row.DV_real f -> Printf.sprintf "%g" f
+  | Row.DV_blob _ -> "X''"
+  | Row.DV_null   -> "NULL"
+  | Row.DV_current_timestamp -> "CURRENT_TIMESTAMP"
+  | Row.DV_current_date      -> "CURRENT_DATE"
+  | Row.DV_current_time      -> "CURRENT_TIME"
+
+let sql_of_fk_action = function
+  | Cat.FA_no_action   -> "NO ACTION"
+  | Cat.FA_restrict    -> "RESTRICT"
+  | Cat.FA_cascade     -> "CASCADE"
+  | Cat.FA_set_null    -> "SET NULL"
+  | Cat.FA_set_default -> "SET DEFAULT"
+
+let ddl_of_table (meta : Cat.table_meta) =
+  let col_parts = List.map (fun (col : Row.column) ->
+    let buf = Buffer.create 64 in
+    Buffer.add_string buf col.Row.name;
+    Buffer.add_char   buf ' ';
+    Buffer.add_string buf (sql_of_row_type col.Row.ty);
+    if col.Row.not_null    then Buffer.add_string buf " NOT NULL";
+    if col.Row.primary_key then Buffer.add_string buf " PRIMARY KEY";
+    (match col.Row.default with
+     | None    -> ()
+     | Some dv ->
+       Buffer.add_string buf " DEFAULT ";
+       Buffer.add_string buf (sql_of_default_value dv));
+    (match col.Row.check_sql with
+     | None     -> ()
+     | Some sql ->
+       Buffer.add_string buf " CHECK(";
+       Buffer.add_string buf sql;
+       Buffer.add_char   buf ')');
+    (match col.Row.generated_as with
+     | None -> ()
+     | Some (expr_sql, is_stored) ->
+       Buffer.add_string buf " GENERATED ALWAYS AS (";
+       Buffer.add_string buf expr_sql;
+       Buffer.add_string buf ") ";
+       Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
+    Buffer.contents buf
+  ) meta.Cat.columns in
+  let fk_parts = List.map (fun (fk : Cat.fk_constraint) ->
+    Printf.sprintf "FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s ON UPDATE %s"
+      fk.Cat.fk_local_col
+      fk.Cat.fk_parent_table
+      fk.Cat.fk_parent_col
+      (sql_of_fk_action fk.Cat.fk_on_delete)
+      (sql_of_fk_action fk.Cat.fk_on_update)
+  ) meta.Cat.fk_constraints in
+  Printf.sprintf "CREATE TABLE %s (%s)"
+    meta.Cat.name
+    (String.concat ", " (col_parts @ fk_parts))
+
+let ddl_of_index (idx : Cat.index_info) =
+  let unique_kw = if idx.Cat.idx_unique then "UNIQUE " else "" in
+  let col_strs = List.map2 (fun col_sql is_expr ->
+    if is_expr then Printf.sprintf "(%s)" col_sql else col_sql
+  ) idx.Cat.idx_columns idx.Cat.idx_expr_flags in
+  let cols_str = String.concat ", " col_strs in
+  let where_clause = match idx.Cat.idx_where_sql with
+    | None     -> ""
+    | Some sql -> Printf.sprintf " WHERE %s" sql
+  in
+  Printf.sprintf "CREATE %sINDEX %s ON %s (%s)%s"
+    unique_kw idx.Cat.idx_name idx.Cat.idx_table cols_str where_clause
+
 
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
@@ -2606,6 +2686,7 @@ let op_name = function
   | Plan.Op_fts_seq_scan { fts_meta; _ } -> "FtsSeqScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_fts_match_scan { fts_meta; _ } ->
     "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_sqlite_master -> "SqliteMaster"
 
 let op_children = function
   | Plan.Op_filter { child; _ }      -> [child]
@@ -2976,7 +3057,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
   | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _
   | Plan.Op_fts_seq_scan _ | Plan.Op_fts_match_scan _
-  | Plan.Op_distinct _ ->
+  | Plan.Op_distinct _ | Plan.Op_sqlite_master ->
     failwith "Exec.execute: use Exec.query for read operations"
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -4234,6 +4315,48 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       else List.map (fun msg -> [| Row.V_text msg |]) result
     in
     Lwt.return (Lwt_stream.of_list rows)
+  | Plan.Op_sqlite_master ->
+    let cat_val = match cat with
+      | None   -> failwith "Exec.to_stream: Op_sqlite_master requires catalog"
+      | Some c -> c
+    in
+    let* tables = Cat.list_tables cat_val in
+    let table_rows = List.map (fun (meta : Cat.table_meta) ->
+      [| Row.V_text "table";
+         Row.V_text meta.Cat.name;
+         Row.V_text meta.Cat.name;
+         Row.V_int  (Int64.of_int meta.Cat.tree_id);
+         Row.V_text (ddl_of_table meta) |]
+    ) tables in
+    let index_rows =
+      List.concat_map (fun (meta : Cat.table_meta) ->
+        List.map (fun (idx : Cat.index_info) ->
+          [| Row.V_text "index";
+             Row.V_text idx.Cat.idx_name;
+             Row.V_text idx.Cat.idx_table;
+             Row.V_int  (Int64.of_int idx.Cat.idx_tree_id);
+             Row.V_text (ddl_of_index idx) |]
+        ) (Cat.indexes_for_table cat_val ~table:meta.Cat.name)
+      ) tables
+    in
+    let* views = Cat.load_all_views store in
+    let view_rows = List.map (fun (name, sql) ->
+      [| Row.V_text "view";
+         Row.V_text name;
+         Row.V_text name;
+         Row.V_int  0L;
+         Row.V_text sql |]
+    ) views in
+    let* triggers = Cat.load_all_triggers store in
+    let trigger_rows = List.map (fun (name, sql) ->
+      [| Row.V_text "trigger";
+         Row.V_text name;
+         Row.V_text name;
+         Row.V_int  0L;
+         Row.V_text sql |]
+    ) triggers in
+    let all_rows = table_rows @ index_rows @ view_rows @ trigger_rows in
+    Lwt.return (Lwt_stream.of_list all_rows)
   | Plan.Op_union { all; left; right } ->
     let* ls = to_stream clock params store ~mode ~cat left  in
     let* rs = to_stream clock params store ~mode ~cat right in
