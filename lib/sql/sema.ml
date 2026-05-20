@@ -971,8 +971,20 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
         else None
       ) columns in
       let uniq_idxs = tbl_uniq_idxs @ col_pk_idxs in
+      (* Mark columns that are declared primary key via table-level PRIMARY KEY (col) *)
+      let row_cols =
+        List.fold_left (fun cols c ->
+          match c with
+          | Ast.TC_primary_key [pk_col] ->
+            List.map (fun (col : Row.column) ->
+              if String.equal col.name pk_col then { col with primary_key = true }
+              else col
+            ) cols
+          | _ -> cols
+        ) row_cols constraints
+      in
       (* Extract FK constraints from column-level REFERENCES.
-         Reject REFERENCES without an explicit column (parent_col = ""). *)
+         When parent_col is empty, infer from the parent table's PRIMARY KEY. *)
       let col_fks_result =
         List.fold_left (fun acc (cd : Ast.column_def) ->
           match acc with

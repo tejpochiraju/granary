@@ -2632,6 +2632,35 @@ let fk_implicit_no_pk_error () =
      | Ok () -> Alcotest.fail "expected error for REFERENCES table with no PK");
     Lwt.return_unit)
 
+let fk_implicit_parent_not_found () =
+  let db = fresh_db () in
+  run (
+    (* ghost_table does not exist *)
+    let* result = Db.execute db "CREATE TABLE child (x INTEGER REFERENCES ghost_table)" in
+    (match result with
+     | Error _ -> ()
+     | Ok ()   -> Alcotest.fail "expected error for REFERENCES to non-existent table");
+    Lwt.return_unit)
+
+let fk_implicit_infers_pk_column () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)";
+  exec db "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users)";
+  (* PRAGMA foreign_key_list columns: id, seq, table, from, to, on_update, on_delete, match *)
+  (* "to" column (index 4) should be "id" (the PK) *)
+  let rows = query_ok db "PRAGMA foreign_key_list(orders)" in
+  Alcotest.(check int) "1 fk row" 1 (List.length rows);
+  Alcotest.check value_testable "parent_col=id" (Db.V_text "id") (List.hd rows).(4)
+
+let fk_implicit_table_level_pk () =
+  (* Table-level PRIMARY KEY (id) should also work for inference *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE users (id INTEGER, name TEXT, PRIMARY KEY (id))";
+  exec db "CREATE TABLE orders (id INTEGER, user_id INTEGER REFERENCES users)";
+  let rows = query_ok db "PRAGMA foreign_key_list(orders)" in
+  Alcotest.(check int) "1 fk row" 1 (List.length rows);
+  Alcotest.check value_testable "parent_col=id" (Db.V_text "id") (List.hd rows).(4)
+
 (* ------------------------------------------------------------------ *)
 (* CHECK constraints                                                     *)
 (* ------------------------------------------------------------------ *)
@@ -6317,8 +6346,11 @@ let () =
       Alcotest.test_case "invalid_insert"        `Quick test_fk_invalid_insert;
       Alcotest.test_case "null_allowed"          `Quick test_fk_null_allowed;
       Alcotest.test_case "multi_col_unsupported" `Quick test_fk_multi_col_unsupported;
-      Alcotest.test_case "implicit_parent_col"   `Quick fk_implicit_parent_col;
-      Alcotest.test_case "implicit_no_pk_error"  `Quick fk_implicit_no_pk_error;
+      Alcotest.test_case "implicit_parent_col"        `Quick fk_implicit_parent_col;
+      Alcotest.test_case "implicit_no_pk_error"       `Quick fk_implicit_no_pk_error;
+      Alcotest.test_case "implicit_parent_not_found"  `Quick fk_implicit_parent_not_found;
+      Alcotest.test_case "implicit_infers_pk_column"  `Quick fk_implicit_infers_pk_column;
+      Alcotest.test_case "implicit_table_level_pk"    `Quick fk_implicit_table_level_pk;
     ];
     "check_constraints", [
       Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
