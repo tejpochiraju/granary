@@ -587,6 +587,12 @@ let rec plan ?cat = function
      | Ast.Pragma_integrity_check ->
        Plan.Op_pragma_integrity_check
 
+     | Ast.Pragma_foreign_keys ->
+       Plan.Op_pragma_get_fk
+
+     | Ast.Pragma_foreign_keys_set on ->
+       Plan.Op_pragma_set_fk { on }
+
      | _ ->
        let rows = match kind with
          | Ast.Pragma_table_info table_name ->
@@ -639,9 +645,6 @@ let rec plan ?cat = function
                 Row.V_text "NONE" |]        (* match: always NONE *)
            ) fks
 
-         | Ast.Pragma_foreign_keys ->
-           [ [| Row.V_int 1L |] ]    (* sqlocaml always enforces FKs *)
-
          | Ast.Pragma_journal_mode ->
            [ [| Row.V_text "delete" |] ]
 
@@ -649,7 +652,8 @@ let rec plan ?cat = function
            []    (* no-op setter: return empty result *)
 
          | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
-         | Ast.Pragma_integrity_check ->
+         | Ast.Pragma_integrity_check
+         | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _ ->
            assert false   (* handled by outer match above *)
        in
        Plan.Op_pragma_rows { rows })

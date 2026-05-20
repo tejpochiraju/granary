@@ -86,6 +86,7 @@ type t = {
   indexes : (string, index_info) Hashtbl.t;
   (* fts_name -> fts_table_meta *)
   fts : (string, fts_table_meta) Hashtbl.t;
+  mutable fk_enforcement : bool;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -700,7 +701,7 @@ let open_ store =
      | None -> ());
     Lwt.return_unit
   ) names in
-  Lwt.return { store; cache; indexes; fts }
+  Lwt.return { store; cache; indexes; fts; fk_enforcement = false }
 
 (** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
 let next_user_tid t =
@@ -1071,3 +1072,6 @@ let next_fts_rowid_in_txn (_t : t) ~name (tx : S.rw S.txn) : int64 Lwt.t =
   Varint.encode_int64 nbuf next;
   let%lwt () = S.put tx sys_fts_tid rowid_key (Buffer.to_bytes nbuf) in
   Lwt.return cur
+
+let get_fk_enforcement t = t.fk_enforcement
+let set_fk_enforcement t v = t.fk_enforcement <- v

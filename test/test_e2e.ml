@@ -2553,6 +2553,7 @@ let test_fk_invalid_insert () =
        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE fk_parent2 (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO fk_parent2 VALUES (1)" in
     let* () = exec "CREATE TABLE fk_child2 (id INTEGER, pid INTEGER REFERENCES fk_parent2(id))" in
@@ -4748,6 +4749,7 @@ let test_fk_delete_referenced_parent_fails () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE fkp (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO fkp VALUES (1)" in
     let* () = exec "CREATE TABLE fkc (id INTEGER, pid INTEGER REFERENCES fkp(id))" in
@@ -4803,6 +4805,7 @@ let test_fk_update_referenced_col_fails () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE fkpu (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO fkpu VALUES (1)" in
     let* () = exec "CREATE TABLE fkcu (pid INTEGER REFERENCES fkpu(id))" in
@@ -4839,6 +4842,7 @@ let test_fk_cascade_delete () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE cpar (id INTEGER PRIMARY KEY)" in
     let* () = exec "CREATE TABLE cchi (id INTEGER, pid INTEGER REFERENCES cpar(id) ON DELETE CASCADE)" in
     let* () = exec "INSERT INTO cpar VALUES (1)" in
@@ -4879,6 +4883,7 @@ let test_fk_cascade_update () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE upar (id INTEGER PRIMARY KEY)" in
     let* () = exec "CREATE TABLE uchi (id INTEGER, pid INTEGER REFERENCES upar(id) ON UPDATE CASCADE)" in
     let* () = exec "INSERT INTO upar VALUES (1)" in
@@ -4900,6 +4905,7 @@ let test_fk_set_null_delete () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE snpar (id INTEGER PRIMARY KEY)" in
     let* () = exec "CREATE TABLE snchi (id INTEGER, pid INTEGER REFERENCES snpar(id) ON DELETE SET NULL)" in
     let* () = exec "INSERT INTO snpar VALUES (1)" in
@@ -4919,6 +4925,7 @@ let test_fk_set_null_update () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE snupar (id INTEGER PRIMARY KEY)" in
     let* () = exec "CREATE TABLE snuchi (id INTEGER, pid INTEGER REFERENCES snupar(id) ON UPDATE SET NULL)" in
     let* () = exec "INSERT INTO snupar VALUES (1)" in
@@ -4938,6 +4945,7 @@ let test_fk_set_default_delete () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE sdpar (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO sdpar VALUES (0)" in
     let* () = exec "INSERT INTO sdpar VALUES (1)" in
@@ -4958,6 +4966,7 @@ let test_fk_no_action_blocks_delete () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE napar (id INTEGER PRIMARY KEY)" in
     let* () = exec "INSERT INTO napar VALUES (1)" in
     let* () = exec "CREATE TABLE nachi (id INTEGER, pid INTEGER REFERENCES napar(id) ON DELETE NO ACTION)" in
@@ -4974,6 +4983,7 @@ let test_fk_cascade_table_level_fk () =
       (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
       Lwt.return_unit
     in
+    let* () = exec "PRAGMA foreign_keys = 1" in
     let* () = exec "CREATE TABLE tlpar (id INTEGER PRIMARY KEY)" in
     let* () = exec "CREATE TABLE tlchi (id INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES tlpar(id) ON DELETE CASCADE)" in
     let* () = exec "INSERT INTO tlpar VALUES (1)" in
@@ -5618,6 +5628,7 @@ let generated_col_chained () =
 let generated_col_fk_cascade () =
   (* FK cascade on child table with a generated column — generated col must be recomputed *)
   let db = fresh_db () in
+  exec db "PRAGMA foreign_keys = 1";
   exec db "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
   exec db {|CREATE TABLE child (
     pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE,
@@ -5648,14 +5659,14 @@ let generated_col_tests = [
 (* Phase 26: PRAGMA tests                                               *)
 (* ------------------------------------------------------------------ *)
 
-(* PRAGMA foreign_keys → [[V_int 1]] *)
+(* PRAGMA foreign_keys → [[V_int 0]] by default *)
 let pragma_foreign_keys () =
   let db = fresh_db () in
   let rows = query_ok db "PRAGMA foreign_keys" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "one column" 1 (Array.length row);
-  Alcotest.check value_testable "foreign_keys=1" (Db.V_int 1L) row.(0)
+  Alcotest.check value_testable "foreign_keys=0" (Db.V_int 0L) row.(0)
 
 (* PRAGMA journal_mode → [["delete"]] *)
 let pragma_journal_mode () =
@@ -5776,6 +5787,34 @@ let pragma_integrity_check_partial_ok () =
   let row = List.hd rows in
   Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
 
+let fk_off_by_default () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE users (id INTEGER PRIMARY KEY)";
+  exec db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+  (* FK is OFF by default — orphan insert should succeed *)
+  exec db "INSERT INTO orders VALUES (1, 999)";
+  let rows = query_ok db "SELECT id, user_id FROM orders" in
+  Alcotest.(check int) "1 row" 1 (List.length rows);
+  Alcotest.check value_testable "user_id=999" (Db.V_int 999L) (List.hd rows).(1)
+
+let fk_on_enforces () =
+  let db = fresh_db () in
+  exec db "PRAGMA foreign_keys = 1";
+  exec db "CREATE TABLE users (id INTEGER PRIMARY KEY)";
+  exec db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+  (* FK is ON — orphan insert must fail *)
+  (match Lwt_main.run (Db.execute db "INSERT INTO orders VALUES (1, 999)") with
+   | Error _ -> ()
+   | Ok ()   -> Alcotest.fail "expected FK violation error")
+
+let fk_pragma_roundtrip () =
+  let db = fresh_db () in
+  let off = query_ok db "PRAGMA foreign_keys" in
+  Alcotest.check value_testable "default off" (Db.V_int 0L) (List.hd off).(0);
+  exec db "PRAGMA foreign_keys = 1";
+  let on = query_ok db "PRAGMA foreign_keys" in
+  Alcotest.check value_testable "now on" (Db.V_int 1L) (List.hd on).(0)
+
 let pragma_tests = [
   Alcotest.test_case "foreign_keys"               `Quick pragma_foreign_keys;
   Alcotest.test_case "journal_mode"               `Quick pragma_journal_mode;
@@ -5790,6 +5829,9 @@ let pragma_tests = [
   Alcotest.test_case "integrity_check_empty"      `Quick pragma_integrity_check_empty;
   Alcotest.test_case "integrity_check_clean"      `Quick pragma_integrity_check_clean;
   Alcotest.test_case "integrity_check_partial_ok" `Quick pragma_integrity_check_partial_ok;
+  Alcotest.test_case "fk_off_by_default"          `Quick fk_off_by_default;
+  Alcotest.test_case "fk_on_enforces"             `Quick fk_on_enforces;
+  Alcotest.test_case "fk_pragma_roundtrip"        `Quick fk_pragma_roundtrip;
 ]
 
 (* ------------------------------------------------------------------ *)

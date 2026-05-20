@@ -209,3 +209,9 @@ val persist_trigger : Sqlocaml_store.Store.t -> name:string -> sql:string -> uni
 (** Remove a trigger's SQL from the sys_triggers B-tree.
     Call this whenever DROP TRIGGER is executed. *)
 val remove_trigger : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
+
+(** Get the current FK enforcement flag (default false). *)
+val get_fk_enforcement : t -> bool
+
+(** Set the FK enforcement flag (PRAGMA foreign_keys = 0/1). *)
+val set_fk_enforcement : t -> bool -> unit

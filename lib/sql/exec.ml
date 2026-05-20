@@ -1386,7 +1386,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
   (* Evaluate FK constraints before any writes. *)
   let* () =
     let fks = table_meta.Cat.fk_constraints in
-    if fks = [] then Lwt.return_unit
+    if fks = [] || not (Cat.get_fk_enforcement cat) then Lwt.return_unit
     else
       let find_col_idx cols col_name =
         let rec fi i = function
@@ -1875,7 +1875,11 @@ let execute_update ?(mode = Auto) ?(params = [||])
   else begin
     (* FK pre-check: fail for RESTRICT/NO_ACTION when referenced key changes.
        CASCADE/SET_NULL/SET_DEFAULT applied inside the RW transaction below. *)
-    let* child_refs = build_child_refs cat ~parent_table_name:table_meta.Cat.name in
+    let* child_refs =
+      if Cat.get_fk_enforcement cat then
+        build_child_refs cat ~parent_table_name:table_meta.Cat.name
+      else Lwt.return []
+    in
     let* () =
       if child_refs = [] then Lwt.return_unit
       else
@@ -2162,7 +2166,11 @@ let execute_delete ?(mode = Auto) ?(params = [||])
   else begin
     (* FK pre-check: fail immediately for RESTRICT/NO_ACTION.
        CASCADE/SET_NULL/SET_DEFAULT are applied inside the RW transaction below. *)
-    let* child_refs = build_child_refs cat ~parent_table_name:table_meta.Cat.name in
+    let* child_refs =
+      if Cat.get_fk_enforcement cat then
+        build_child_refs cat ~parent_table_name:table_meta.Cat.name
+      else Lwt.return []
+    in
     let* () =
       if child_refs = [] then Lwt.return_unit
       else
@@ -2382,6 +2390,8 @@ let op_name = function
   | Plan.Op_pragma_set_user_version { version } ->
     Printf.sprintf "Pragma(set_user_version=%Ld)" version
   | Plan.Op_pragma_integrity_check     -> "Pragma(integrity_check)"
+  | Plan.Op_pragma_get_fk              -> "Pragma(get_foreign_keys)"
+  | Plan.Op_pragma_set_fk { on }       -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_explain { analyze; _ }     ->
     if analyze then "ExplainAnalyze" else "Explain"
@@ -2717,6 +2727,9 @@ let execute_with_count ?(mode = Auto)
     let* () = Cat.write_user_version_tx tx version in
     let* () = S.commit tx in
     Lwt.return 0
+  | Plan.Op_pragma_set_fk { on } ->
+    Cat.set_fk_enforcement cat on;
+    Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -2724,7 +2737,8 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
   | Plan.Op_window _
-  | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check ->
+  | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
+  | Plan.Op_pragma_get_fk ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -3865,6 +3879,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* v  = Cat.read_user_version_tx tx in
     let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int v |] ])
+  | Plan.Op_pragma_get_fk ->
+    let v = match cat with
+      | None     -> false
+      | Some cat -> Cat.get_fk_enforcement cat
+    in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check ->
     let cat_val = match cat with
       | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
@@ -4191,6 +4211,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | Plan.Op_create_view _ | Plan.Op_drop_view _
           | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
           | Plan.Op_pragma_set_user_version _
+          | Plan.Op_pragma_set_fk _
           | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
           | Plan.Op_create_fts_table _ -> true
           | _ -> false
@@ -4224,7 +4245,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
-  | Plan.Op_pragma_set_user_version _ ->
+  | Plan.Op_pragma_set_user_version _
+  | Plan.Op_pragma_set_fk _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

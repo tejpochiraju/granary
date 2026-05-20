@@ -208,6 +208,10 @@ type op =
     (** Write user_version to sys_meta; DDL-like, returns 0 rows. *)
   | Op_pragma_integrity_check
     (** Scan all table + index B-trees; return [["ok"]] or list of error strings. *)
+  | Op_pragma_get_fk
+    (** Read fk_enforcement flag from catalog; returns one row [[V_int 0|1]]. *)
+  | Op_pragma_set_fk of { on : bool }
+    (** Write fk_enforcement flag to catalog; DDL-like, returns 0 rows. *)
   | Op_distinct of {
       child : op;
     }

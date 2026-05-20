@@ -213,6 +213,12 @@ pragma_stmt:
         (try Ast.S_pragma (Ast.Pragma_user_version_set (Int64.of_string value))
          with Failure _ ->
            failwith (Printf.sprintf "PRAGMA user_version: expected integer, got %s" value))
+      | "foreign_keys" ->
+        let on = match String.lowercase_ascii value with
+          | "1" | "on" | "true" -> true
+          | _ -> false
+        in
+        Ast.S_pragma (Ast.Pragma_foreign_keys_set on)
       | _ -> Ast.S_pragma (Ast.Pragma_set (name, value)) }
 
   (* Bare getter form: PRAGMA name — new in Phase 26 *)
