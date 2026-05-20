@@ -5329,6 +5329,58 @@ let default_expression_tests =
        | _ -> Alcotest.fail "expected text value"))
   ]
 
+(* ------------------------------------------------------------------ *)
+(* Partial indexes (#57)                                                *)
+(* ------------------------------------------------------------------ *)
+
+let partial_index_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, active INTEGER)";
+  exec db "CREATE INDEX idx_active ON t(id) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 'alice', 1)";
+  exec db "INSERT INTO t VALUES (2, 'bob',   0)";
+  exec db "INSERT INTO t VALUES (3, 'carol', 1)";
+  let rows = query_ok db "SELECT id FROM t WHERE id = 2" in
+  Alcotest.(check int) "bob found via scan" 1 (List.length rows)
+
+let partial_index_skips_non_matching () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, active INTEGER)";
+  exec db "CREATE INDEX idx ON t(id) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 1)";
+  exec db "INSERT INTO t VALUES (2, 0)";
+  exec db "DELETE FROM t WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "one row left" 1 (List.length rows);
+  Alcotest.check value_testable "bob remains" (Db.V_int 2L) (List.hd rows).(0)
+
+let partial_unique_index () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, active INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(name) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 'alice', 1)";
+  exec db "INSERT INTO t VALUES (2, 'alice', 0)";
+  let rows = query_ok db "SELECT COUNT(*) FROM t" in
+  Alcotest.(check int) "two rows" 1 (List.length rows);
+  Alcotest.check value_testable "count=2" (Db.V_int 2L) (List.hd rows).(0)
+
+let partial_unique_rejects_duplicate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, name TEXT, active INTEGER)";
+  exec db "CREATE UNIQUE INDEX idx ON t(name) WHERE active = 1";
+  exec db "INSERT INTO t VALUES (1, 'alice', 1)";
+  let result = run (Db.execute db "INSERT INTO t VALUES (2, 'alice', 1)") in
+  (match err_or_fail "partial_unique_rejects_duplicate" result with
+   | Db.Runtime _ -> ()
+   | _ -> Alcotest.fail "expected Runtime error for partial UNIQUE violation")
+
+let partial_index_tests = [
+  Alcotest.test_case "partial_index_basic"               `Quick partial_index_basic;
+  Alcotest.test_case "partial_index_skips_non_matching"  `Quick partial_index_skips_non_matching;
+  Alcotest.test_case "partial_unique_index"              `Quick partial_unique_index;
+  Alcotest.test_case "partial_unique_rejects_duplicate"  `Quick partial_unique_rejects_duplicate;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -5831,4 +5883,5 @@ let () =
     "case_insensitive", case_insensitive_tests;
     "update_delete_limit", update_delete_limit_tests;
     "default_expressions", default_expression_tests;
+    "partial_indexes", partial_index_tests;
   ]

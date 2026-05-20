@@ -83,6 +83,7 @@ let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
    name and column index across DB instances (e.g. test isolation). *)
 let check_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.create 16
 
+
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
 (* (Defined before [execute] so that [Op_update] can evaluate WHERE     *)
@@ -899,6 +900,29 @@ let compile_check_expr (table_name : string) (col_idx : int)
     Hashtbl.add check_expr_cache key plan_expr;
     plan_expr
 
+let compile_index_where (idx_name : string) (where_sql : string)
+    (columns : Row.column list) : Plan.expr =
+  (* Re-parse each time: caching would require a schema-aware key to avoid
+     collisions when the same index name appears on tables with different schemas. *)
+  let lexbuf = Lexing.from_string where_sql in
+  let ast_expr =
+    try Parser.expr_only Lexer.token lexbuf
+    with _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx_name where_sql)
+  in
+  ast_expr_to_plan_check columns ast_expr
+
+let row_matches_index_where
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (idx : Cat.index_info)
+    (schema : Row.column list)
+    (row : Row.t) : bool =
+  match idx.idx_where_sql with
+  | None -> true
+  | Some sql ->
+    let plan_e = compile_index_where idx.idx_name sql schema in
+    value_truthy (eval_expr clock params row plan_e)
+
 let eval_check_constraints
     (clock : (unit -> float) option)
     (params : Row.value array)
@@ -1340,6 +1364,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       let* (skip, to_delete, upsert_rowid) =
         Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
           if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
+          else if not (row_matches_index_where clock params idx table_meta.columns row)
+          then Lwt.return (skip, dels, upsert_rid)
           else begin
             let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
             let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
@@ -1401,13 +1427,16 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            eval_check_constraints clock params table_meta new_row;
            let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+             let old_matches = row_matches_index_where clock params idx table_meta.columns old_row in
+             let new_matches = row_matches_index_where clock params idx table_meta.columns new_row in
              let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
              let old_iks = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is in
              let new_iks = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
              let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
              let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
-             let* () = S.del tx idx.idx_tree_id old_ikey in
-             S.put tx idx.idx_tree_id new_ikey Bytes.empty
+             let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
+             if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+             else Lwt.return_unit
            ) idxs2 in
            let new_bytes = Row.encode table_meta.columns new_row in
            let* () = S.del tx table_meta.tree_id old_key in
@@ -1432,10 +1461,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
               let old_row = Row.decode table_meta.columns old_bytes in
               let* () = S.del tx table_meta.tree_id old_key in
               Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
-                let col_is2 = List.map (find_col_idx_by_name table_meta.columns) idx2.idx_columns in
-                let iks2    = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is2 in
-                let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
-                S.del tx idx2.idx_tree_id old_ikey
+                if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
+                then Lwt.return_unit
+                else begin
+                  let col_is2 = List.map (find_col_idx_by_name table_meta.columns) idx2.idx_columns in
+                  let iks2    = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is2 in
+                  let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
+                  S.del tx idx2.idx_tree_id old_ikey
+                end
               ) idxs
           ) (List.sort_uniq compare to_delete) in
           (* Phase 2: write new row and index entries *)
@@ -1443,10 +1476,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
           let bytes = Row.encode table_meta.columns row in
           let* () = S.put tx table_meta.tree_id key bytes in
           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-            let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
-            let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-            let ikey   = Index_key.encode iks ~rowid in
-            S.put tx idx.idx_tree_id ikey Bytes.empty
+            if not (row_matches_index_where clock params idx table_meta.columns row)
+            then Lwt.return_unit
+            else begin
+              let col_is = List.map (find_col_idx_by_name table_meta.columns) idx.idx_columns in
+              let iks    = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+              let ikey   = Index_key.encode iks ~rowid in
+              S.put tx idx.idx_tree_id ikey Bytes.empty
+            end
           ) idxs in
           let* () = release_txn tx owned in
           let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
@@ -1460,10 +1497,13 @@ let execute_insert ?(mode = Auto) ?(params = [||])
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
 let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~name ~table ~tree_id ~col_idxs ~unique
+    ~name ~table ~tree_id ~col_idxs
+    ~(where_expr : Plan.expr option)
+    ~where_sql
+    ~unique
     ~(columns : Row.column list) : unit Lwt.t =
   let col_names = List.map (fun ci -> (List.nth columns ci).Row.name) col_idxs in
-  let* res = Cat.create_index cat ~name ~table ~columns:col_names ~unique in
+  let* res = Cat.create_index cat ~name ~table ~columns:col_names ~unique ~where_sql in
   match res with
   | Error msg -> failwith msg
   | Ok info ->
@@ -1478,10 +1518,17 @@ let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
           | Some (kbytes, vbytes) ->
             let rowid = Rowid.decode kbytes in
             let row = Row.decode columns vbytes in
-            let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_idxs in
-            let ikey = Index_key.encode iks ~rowid in
-            let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
-            walk ()
+            let skip = match where_expr with
+              | None -> false
+              | Some we -> not (value_truthy (eval_expr None [||] row we))
+            in
+            if skip then walk ()
+            else begin
+              let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_idxs in
+              let ikey = Index_key.encode iks ~rowid in
+              let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
+              walk ()
+            end
         in
         let* () = walk () in
         S.cursor_close cur;
@@ -1606,10 +1653,14 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let rowid_key  = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    let col_is   = List.map (find_col_idx_by_name meta.Cat.columns) idx.idx_columns in
-    let iks      = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-    let old_ikey = Index_key.encode iks ~rowid in
-    S.del tx idx.idx_tree_id old_ikey
+    if not (row_matches_index_where None [||] idx meta.Cat.columns row)
+    then Lwt.return_unit
+    else begin
+      let col_is   = List.map (find_col_idx_by_name meta.Cat.columns) idx.idx_columns in
+      let iks      = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+      let old_ikey = Index_key.encode iks ~rowid in
+      S.del tx idx.idx_tree_id old_ikey
+    end
   ) child_idxs in
   S.del tx meta.Cat.tree_id rowid_key
 
@@ -1625,12 +1676,15 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
     let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
     if not (List.mem col_idx col_is) then Lwt.return_unit
     else begin
+      let old_matches = row_matches_index_where None [||] idx schema row in
+      let new_matches = row_matches_index_where None [||] idx schema new_row in
       let old_iks  = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
       let new_iks  = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
       let old_ikey = Index_key.encode old_iks ~rowid in
       let new_ikey = Index_key.encode new_iks ~rowid in
-      let* () = S.del tx idx.idx_tree_id old_ikey in
-      S.put tx idx.idx_tree_id new_ikey Bytes.empty
+      let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
+      if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+      else Lwt.return_unit
     end
   ) child_idxs in
   let new_bytes = Row.encode schema new_row in
@@ -1769,6 +1823,8 @@ let execute_update ?(mode = Auto) ?(params = [||])
             eval_check_constraints clock params table_meta new_row;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
+              else if not (row_matches_index_where clock params idx schema new_row)
+              then Lwt.return_unit
               else begin
                 let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
                 (* Only check if any of the indexed values actually changed *)
@@ -1880,13 +1936,16 @@ let execute_update ?(mode = Auto) ?(params = [||])
             let key = Rowid.encode rowid in
             (* Update index entries: delete old, insert new. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+              let old_matches = row_matches_index_where clock params idx schema old_row in
+              let new_matches = row_matches_index_where clock params idx schema new_row in
               let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
               let old_iks = List.map (fun ci -> row_value_to_index_value old_row.(ci)) col_is in
               let new_iks = List.map (fun ci -> row_value_to_index_value new_row.(ci)) col_is in
               let old_ikey = Index_key.encode old_iks ~rowid in
               let new_ikey = Index_key.encode new_iks ~rowid in
-              let* () = S.del tx idx.idx_tree_id old_ikey in
-              S.put tx idx.idx_tree_id new_ikey Bytes.empty
+              let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
+              if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+              else Lwt.return_unit
             ) indexes in
             (* Update the row in the table tree.  We could just S.put on
                the same key (overwriting), but the task spec asks for an
@@ -2095,10 +2154,14 @@ let execute_delete ?(mode = Auto) ?(params = [||])
             let rowid_key = Rowid.encode rowid in
             (* Remove index entries for this row. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
-              let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
-              let old_ikey = Index_key.encode iks ~rowid in
-              S.del tx idx.idx_tree_id old_ikey
+              if not (row_matches_index_where clock params idx schema row)
+              then Lwt.return_unit
+              else begin
+                let col_is = List.map (find_col_idx_by_name schema) idx.idx_columns in
+                let iks = List.map (fun ci -> row_value_to_index_value row.(ci)) col_is in
+                let old_ikey = Index_key.encode iks ~rowid in
+                S.del tx idx.idx_tree_id old_ikey
+              end
             ) indexes in
             (* Remove the row from the table tree. *)
             S.del tx table_meta.tree_id rowid_key
@@ -2167,7 +2230,7 @@ let execute_with_count ?(mode = Auto)
       let* _tid = Cat.create_table cat ~name ~columns in
       let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
         let* result = Cat.create_index cat ~name:idx_name ~table:name
-            ~columns:col_names ~unique:true in
+            ~columns:col_names ~unique:true ~where_sql:None in
         match result with
         | Error msg -> Lwt.fail_with msg
         | Ok _      -> Lwt.return_unit
@@ -2196,7 +2259,7 @@ let execute_with_count ?(mode = Auto)
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
-  | Plan.Op_create_index { name; table; tree_id; col_idxs; unique; columns; if_not_exists } ->
+  | Plan.Op_create_index { name; table; tree_id; col_idxs; where_expr; where_sql; unique; columns; if_not_exists } ->
     (* Note: create_index calls catalog functions that acquire their own RW txn.
        Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
        block — it commits immediately. Phase 4 work to fix. *)
@@ -2204,7 +2267,7 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     else begin
       let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                  ~col_idxs ~unique ~columns in
+                  ~col_idxs ~where_expr ~where_sql ~unique ~columns in
       Lwt.return 0
     end
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->

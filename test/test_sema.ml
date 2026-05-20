@@ -505,7 +505,7 @@ let bind_select_negative_offset () =
 let bind_create_index_basic () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx_id"; table = "users"; columns = ["id"]; unique = false; if_not_exists = false;
+    name = "idx_id"; table = "users"; columns = ["id"]; where_clause = None; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_create_index { name; col_idxs; unique; _ }) ->
@@ -517,7 +517,7 @@ let bind_create_index_basic () =
 let bind_create_index_unique () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "uidx"; table = "users"; columns = ["name"]; unique = true; if_not_exists = false;
+    name = "uidx"; table = "users"; columns = ["name"]; where_clause = None; unique = true; if_not_exists = false;
   } in
   match bind cat stmt with
   | Ok (Sema.BS_create_index { col_idxs = [1]; unique = true; _ }) -> ()
@@ -526,7 +526,7 @@ let bind_create_index_unique () =
 let bind_create_index_unknown_table () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "ghost"; columns = ["x"]; unique = false; if_not_exists = false;
+    name = "idx"; table = "ghost"; columns = ["x"]; where_clause = None; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_table "ghost") -> ()
@@ -535,7 +535,7 @@ let bind_create_index_unknown_table () =
 let bind_create_index_unknown_column () =
   let cat = two_col_cat () in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "users"; columns = ["bogus"]; unique = false; if_not_exists = false;
+    name = "idx"; table = "users"; columns = ["bogus"]; where_clause = None; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Unknown_column { table = "users"; column = "bogus" }) -> ()
@@ -546,10 +546,10 @@ let bind_create_index_duplicate () =
   (* First creation succeeds via catalog directly *)
   let _ = Lwt_main.run (
     Sqlocaml_catalog.Catalog.create_index cat ~name:"idx" ~table:"users"
-      ~columns:["id"] ~unique:false
+      ~columns:["id"] ~unique:false ~where_sql:None
   ) in
   let stmt = Ast.S_create_index {
-    name = "idx"; table = "users"; columns = ["id"]; unique = false; if_not_exists = false;
+    name = "idx"; table = "users"; columns = ["id"]; where_clause = None; unique = false; if_not_exists = false;
   } in
   match bind cat stmt with
   | Error (Sema.Already_exists "idx") -> ()
@@ -911,7 +911,7 @@ let bind_drop_index_basic () =
   let cat = two_col_cat () in
   let _ = Lwt_main.run (
     Sqlocaml_catalog.Catalog.create_index cat ~name:"idx" ~table:"users"
-      ~columns:["id"] ~unique:false
+      ~columns:["id"] ~unique:false ~where_sql:None
   ) in
   let stmt = Ast.S_drop_index { name = "idx" } in
   match bind cat stmt with

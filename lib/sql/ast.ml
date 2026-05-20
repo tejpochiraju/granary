@@ -247,6 +247,7 @@ and stmt =
       name          : string;
       table         : string;
       columns       : string list;
+      where_clause  : expr option;
       unique        : bool;
       if_not_exists : bool;
     }

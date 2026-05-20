@@ -90,6 +90,8 @@ type op =
       table         : string;
       tree_id       : int;          (** table's tree_id *)
       col_idxs      : int list;     (** column ordinals in table schema *)
+      where_expr    : expr option;
+      where_sql     : string option;
       unique        : bool;
       columns       : Sqlocaml_encoding.Row.column list;
         (** columns of the target table — needed for row decoding

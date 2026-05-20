@@ -28,11 +28,12 @@ type table_meta = {
 }
 
 type index_info = {
-  idx_name    : string;
-  idx_table   : string;
-  idx_columns : string list;
-  idx_unique  : bool;
-  idx_tree_id : Sqlocaml_store.Store.tree_id;
+  idx_name     : string;
+  idx_table    : string;
+  idx_columns  : string list;
+  idx_unique   : bool;
+  idx_tree_id  : Sqlocaml_store.Store.tree_id;
+  idx_where_sql: string option;
 }
 
 type fts_table_meta = {
@@ -98,6 +99,7 @@ val create_index :
   table:string ->
   columns:string list ->
   unique:bool ->
+  where_sql:string option ->
   (index_info, string) result Lwt.t
 
 (** Return the list of indexes on the given table.  Order is unspecified. *)

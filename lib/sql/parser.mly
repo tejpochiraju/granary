@@ -324,17 +324,17 @@ create_fts_table:
 
 create_index:
   | CREATE INDEX name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-    { S_create_index { name; table; columns = cols; unique = false; if_not_exists = false } }
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+    { S_create_index { name; table; columns = cols; where_clause = wh; unique = false; if_not_exists = false } }
   | CREATE UNIQUE INDEX name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-    { S_create_index { name; table; columns = cols; unique = true; if_not_exists = false } }
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+    { S_create_index { name; table; columns = cols; where_clause = wh; unique = true; if_not_exists = false } }
   | CREATE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-    { S_create_index { name; table; columns = cols; unique = false; if_not_exists = true } }
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+    { S_create_index { name; table; columns = cols; where_clause = wh; unique = false; if_not_exists = true } }
   | CREATE UNIQUE INDEX IF NOT EXISTS name = any_ident ON table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-    { S_create_index { name; table; columns = cols; unique = true; if_not_exists = true } }
+      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN wh = where_opt
+    { S_create_index { name; table; columns = cols; where_clause = wh; unique = true; if_not_exists = true } }
 
 column_def:
   | name = any_ident ty = col_ty cs = column_constraint*

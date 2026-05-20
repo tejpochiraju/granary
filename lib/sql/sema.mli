@@ -144,6 +144,8 @@ type bound_stmt =
       name          : string;
       table_meta    : Sqlocaml_catalog.Catalog.table_meta;
       col_idxs      : int list;            (** column ordinals in the table *)
+      where_expr    : bound_expr option;
+      where_ast     : Ast.expr option;
       unique        : bool;
       if_not_exists : bool;
     }

@@ -112,6 +112,8 @@ type bound_stmt =
       name          : string;
       table_meta    : Cat.table_meta;
       col_idxs      : int list;
+      where_expr    : bound_expr option;
+      where_ast     : Ast.expr option;
       unique        : bool;
       if_not_exists : bool;
     }
@@ -1997,7 +1999,7 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
 (* CREATE INDEX                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists =
+let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_exists =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -2012,24 +2014,40 @@ let bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists =
      | e :: _ -> Lwt.return (Error e)
      | [] ->
        let col_idxs = List.filter_map (function Ok i -> Some i | Error _ -> None) col_idxs_r in
-       (match Cat.find_index cat ~name with
-        | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-        | Some _ (* if_not_exists = true: silently succeed *) ->
-          Lwt.return (Ok (BS_create_index {
-            name;
-            table_meta = meta;
-            col_idxs;
-            unique;
-            if_not_exists = true;
-          }))
-        | None ->
-          Lwt.return (Ok (BS_create_index {
-            name;
-            table_meta = meta;
-            col_idxs;
-            unique;
-            if_not_exists;
-          }))))
+       let where_result = match where_clause with
+         | None -> Ok (None, None)
+         | Some w_ast ->
+           let pc = ref 0 in
+           let np = Hashtbl.create 0 in
+           (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
+            | Error e -> Error e
+            | Ok bw -> Ok (Some bw, Some w_ast))
+       in
+       (match where_result with
+        | Error e -> Lwt.return (Error e)
+        | Ok (where_expr, where_ast) ->
+          (match Cat.find_index cat ~name with
+           | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+           | Some _ (* if_not_exists = true: silently succeed *) ->
+             Lwt.return (Ok (BS_create_index {
+               name;
+               table_meta = meta;
+               col_idxs;
+               where_expr;
+               where_ast;
+               unique;
+               if_not_exists = true;
+             }))
+           | None ->
+             Lwt.return (Ok (BS_create_index {
+               name;
+               table_meta = meta;
+               col_idxs;
+               where_expr;
+               where_ast;
+               unique;
+               if_not_exists;
+             })))))
 
 (* ------------------------------------------------------------------ *)
 (* UPDATE                                                               *)
@@ -2362,8 +2380,8 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
         | None ->
           bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias
             ~joins ~where ~group_by ~having ~order ~limit ~offset))
-  | Ast.S_create_index { name; table; columns; unique; if_not_exists } ->
-    bind_create_index cat ~name ~table ~columns ~unique ~if_not_exists
+  | Ast.S_create_index { name; table; columns; where_clause; unique; if_not_exists } ->
+    bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_exists
   | Ast.S_update { table; assignments; where; order; limit; offset; returning } ->
     bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~order ~limit ~offset ~returning
   | Ast.S_delete { table; where; order; limit; offset; returning } ->

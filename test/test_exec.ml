@@ -925,6 +925,8 @@ let exec_create_index_basic () =
            table         = "t";
            tree_id       = m.Cat.tree_id;
            col_idxs      = [0];
+           where_expr    = None;
+           where_sql     = None;
            unique        = false;
            columns       = m.Cat.columns;
            if_not_exists = false;
@@ -946,7 +948,8 @@ let query_create_index_raises () =
        ignore (Exec.query store cat
          (Plan.Op_create_index {
             name = "idx"; table = "tci"; tree_id = m.Cat.tree_id;
-            col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+            col_idxs = [0]; where_expr = None; where_sql = None;
+            unique = false; columns = m.Cat.columns; if_not_exists = false;
           }));
        Alcotest.fail "expected Failure for Op_create_index in query"
      with Failure _ -> ());
@@ -970,7 +973,7 @@ let query_index_lookup_basic () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_id"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_id" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1004,7 +1007,7 @@ let query_index_lookup_type_mismatch () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_id2"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_id2" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1040,7 +1043,7 @@ let query_index_lookup_multiple_matches () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_id_multi"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_id_multi" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1071,7 +1074,7 @@ let query_index_lookup_text () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_name"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [1]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [1]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_name" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1104,7 +1107,7 @@ let query_index_lookup_real () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_r"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_r" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1137,7 +1140,7 @@ let query_index_lookup_blob () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_b"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_b" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1167,7 +1170,7 @@ let query_index_lookup_null () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_n"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = false; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = false; columns = m.Cat.columns; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx_n" in
     let (idx : Cat.index_info) = Option.get idx_opt in
@@ -1289,7 +1292,7 @@ let exec_create_index_unknown_table () =
            let* () = Exec.execute store cat
                (Plan.Op_create_index {
                   name = "i"; table = "no_such_table";
-                  tree_id = 99; col_idxs = [0]; unique = false;
+                  tree_id = 99; col_idxs = [0]; where_expr = None; where_sql = None; unique = false;
                   columns = id_name_cols; if_not_exists = false;
                 }) in
            Lwt.return `Ok)
@@ -1334,7 +1337,7 @@ let unique_index_first_insert_succeeds () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx_u"; table = "t"; tree_id = m.Cat.tree_id;
-           col_idxs = [0]; unique = true; columns = m.Cat.columns; if_not_exists = false;
+           col_idxs = [0]; where_expr = None; where_sql = None; unique = true; columns = m.Cat.columns; if_not_exists = false;
          }) in
     (* Insert two distinct values: each triggers the unique check
        (no duplicate) so the else-arm is exercised on both. *)
@@ -1527,7 +1530,7 @@ let exec_drop_index_basic () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx"; table = "t";
-           tree_id = 16; col_idxs = [0]; unique = false;
+           tree_id = 16; col_idxs = [0]; where_expr = None; where_sql = None; unique = false;
            columns = id_name_cols; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx" in
@@ -1547,7 +1550,7 @@ let exec_drop_index_returns_zero () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx2"; table = "t";
-           tree_id = 16; col_idxs = [0]; unique = false;
+           tree_id = 16; col_idxs = [0]; where_expr = None; where_sql = None; unique = false;
            columns = id_name_cols; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx2" in
@@ -1566,7 +1569,7 @@ let exec_drop_index_raises_in_query () =
     let* () = Exec.execute store cat
         (Plan.Op_create_index {
            name = "idx3"; table = "t";
-           tree_id = 16; col_idxs = [0]; unique = false;
+           tree_id = 16; col_idxs = [0]; where_expr = None; where_sql = None; unique = false;
            columns = id_name_cols; if_not_exists = false;
          }) in
     let idx_opt = Cat.find_index cat ~name:"idx3" in

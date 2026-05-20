@@ -44,11 +44,12 @@ type table_meta = {
 }
 
 type index_info = {
-  idx_name    : string;
-  idx_table   : string;
-  idx_columns : string list;
-  idx_unique  : bool;
-  idx_tree_id : S.tree_id;
+  idx_name     : string;
+  idx_table    : string;
+  idx_columns  : string list;
+  idx_unique   : bool;
+  idx_tree_id  : S.tree_id;
+  idx_where_sql: string option;
 }
 
 type fts_table_meta = {
@@ -256,6 +257,14 @@ let encode_index_value (idx : index_info) =
   ) idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
+  (* Extended fields: version 1 = has where_sql field *)
+  Varint.encode_uint64 buf 1L;
+  (match idx.idx_where_sql with
+   | None -> Varint.encode_uint64 buf 0L
+   | Some sql ->
+     Varint.encode_uint64 buf 1L;
+     Varint.encode_uint64 buf (Int64.of_int (String.length sql));
+     Buffer.add_string buf sql);
   Buffer.to_bytes buf
 
 let decode_index_value bytes =
@@ -277,13 +286,26 @@ let decode_index_value bytes =
     col
   ) in
   let unique_byte = Bytes.get_uint8 bytes !off in
-  let tree_id, _ = Varint.decode_uint64 bytes (!off + 1) in
+  let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
+  let idx_where_sql =
+    if off2 >= Bytes.length bytes then None
+    else
+      let version, off3 = Varint.decode_uint64 bytes off2 in
+      if Int64.to_int version <> 1 then None
+      else
+        let has_where, off4 = Varint.decode_uint64 bytes off3 in
+        if Int64.to_int has_where = 0 then None
+        else
+          let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+          Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+  in
   {
-    idx_name    = name;
-    idx_table   = tbl;
-    idx_columns = cols;
-    idx_unique  = (unique_byte <> 0);
-    idx_tree_id = Int64.to_int tree_id;
+    idx_name     = name;
+    idx_table    = tbl;
+    idx_columns  = cols;
+    idx_unique   = (unique_byte <> 0);
+    idx_tree_id  = Int64.to_int tree_id;
+    idx_where_sql;
   }
 
 (* FTS value encoding:
@@ -672,7 +694,7 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 
-let create_index t ~name ~table ~columns ~unique =
+let create_index t ~name ~table ~columns ~unique ~where_sql =
   if Hashtbl.mem t.indexes name then
     Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))
   else match Hashtbl.find_opt t.cache table with
@@ -691,11 +713,12 @@ let create_index t ~name ~table ~columns ~unique =
          let%lwt id = read_next_index_id t.store in
          let%lwt () = write_next_index_id t.store (id + 1) in
          let info = {
-           idx_name    = name;
-           idx_table   = table;
-           idx_columns = columns;
-           idx_unique  = unique;
-           idx_tree_id = tid;
+           idx_name     = name;
+           idx_table    = table;
+           idx_columns  = columns;
+           idx_unique   = unique;
+           idx_tree_id  = tid;
+           idx_where_sql = where_sql;
          } in
          let%lwt tx = S.rw_begin t.store in
          let%lwt () =
@@ -851,7 +874,7 @@ let rename_table t ~old_name ~new_name =
          scan_idxs ();
          S.cursor_close cur;
          let%lwt () = S.ro_end tx_ro_idx in
-         let%lwt () = Lwt_list.iter_s (fun (k, info) ->
+         let%lwt () = Lwt_list.iter_s (fun (k, (info : index_info)) ->
            let new_info = { info with idx_table = new_name } in
            S.put tx sys_indexes_tid k (encode_index_value new_info)
          ) !idx_updates in
