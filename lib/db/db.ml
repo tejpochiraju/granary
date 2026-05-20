@@ -476,6 +476,20 @@ let execute_instead_of t view_name ast =
           | Some view_query -> view_col_names view_query
           | None -> []
       in
+      (* Validate column count matches values arity *)
+      let* () =
+        match values with
+        | [] -> Lwt.return_unit
+        | first_row :: _ ->
+          let n_vals = List.length first_row in
+          let n_cols = List.length effective_cols in
+          if effective_cols = [] then Lwt.return_unit  (* no columns = no schema, trigger may not use NEW.col *)
+          else if n_cols <> n_vals then
+            Lwt.fail_with (Printf.sprintf
+              "INSTEAD OF INSERT on view '%s': cannot derive column names for all values (view has computed expressions without aliases)"
+              view_name)
+          else Lwt.return_unit
+      in
       let* () = Lwt_list.iter_s (fun value_exprs ->
         let schema = make_col_schema effective_cols in
         let new_vals = List.map eval_insert_ast_value value_exprs in
