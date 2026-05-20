@@ -327,9 +327,15 @@ and stmt =
     }
 
 and pragma_kind =
-  | Pragma_table_info of string
-  | Pragma_index_list of string
-  | Pragma_set of string * string  (* name, value — treated as no-op *)
+  | Pragma_table_info       of string   (* PRAGMA table_info(tbl) *)
+  | Pragma_index_list       of string   (* PRAGMA index_list(tbl) *)
+  | Pragma_foreign_key_list of string   (* PRAGMA foreign_key_list(tbl) *)
+  | Pragma_foreign_keys                 (* PRAGMA foreign_keys  → always 1 *)
+  | Pragma_user_version                 (* PRAGMA user_version  → read from meta *)
+  | Pragma_user_version_set of int64    (* PRAGMA user_version = N → write *)
+  | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
+  | Pragma_integrity_check              (* PRAGMA integrity_check → errors or "ok" *)
+  | Pragma_set of string * string       (* fallback no-op setter *)
 
 and column_def = {
   name         : string;

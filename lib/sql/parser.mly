@@ -185,13 +185,31 @@ with_cte:
     { Ast.S_with_cte { name; def; query; recursive = true } }
 
 pragma_stmt:
+  (* Arg form: PRAGMA name(arg) — must come first to avoid conflicts *)
   | PRAGMA name = any_ident LPAREN arg = any_ident RPAREN
     { match String.lowercase_ascii name with
-      | "table_info" -> S_pragma (Pragma_table_info arg)
-      | "index_list" -> S_pragma (Pragma_index_list arg)
-      | _ -> failwith (Printf.sprintf "unknown pragma: %s" name) }
+      | "table_info"       -> Ast.S_pragma (Ast.Pragma_table_info arg)
+      | "index_list"       -> Ast.S_pragma (Ast.Pragma_index_list arg)
+      | "foreign_key_list" -> Ast.S_pragma (Ast.Pragma_foreign_key_list arg)
+      | _ -> failwith (Printf.sprintf "unknown pragma: %s(%s)" name arg) }
+
+  (* Setter form: PRAGMA name = value *)
   | PRAGMA name = any_ident EQ value = pragma_value
-    { S_pragma (Pragma_set (name, value)) }
+    { match String.lowercase_ascii name with
+      | "user_version" ->
+        (try Ast.S_pragma (Ast.Pragma_user_version_set (Int64.of_string value))
+         with Failure _ ->
+           failwith (Printf.sprintf "PRAGMA user_version: expected integer, got %s" value))
+      | _ -> Ast.S_pragma (Ast.Pragma_set (name, value)) }
+
+  (* Bare getter form: PRAGMA name — new in Phase 26 *)
+  | PRAGMA name = any_ident
+    { match String.lowercase_ascii name with
+      | "foreign_keys"    -> Ast.S_pragma Ast.Pragma_foreign_keys
+      | "user_version"    -> Ast.S_pragma Ast.Pragma_user_version
+      | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
+      | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
+      | _                 -> Ast.S_pragma (Ast.Pragma_set (name, "")) }
 
 pragma_value:
   | v = IDENT              { v }
