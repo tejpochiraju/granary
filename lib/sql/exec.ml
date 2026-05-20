@@ -97,7 +97,13 @@ let sql_of_default_value = function
     let escaped = String.concat "''" (String.split_on_char '\'' s) in
     Printf.sprintf "'%s'" escaped
   | Row.DV_real f -> Printf.sprintf "%g" f
-  | Row.DV_blob _ -> "X''"
+  | Row.DV_blob b ->
+    let hex = Bytes.to_seq b
+      |> Seq.map (fun c -> Printf.sprintf "%02X" (Char.code c))
+      |> List.of_seq
+      |> String.concat ""
+    in
+    Printf.sprintf "X'%s'" hex
   | Row.DV_null   -> "NULL"
   | Row.DV_current_timestamp -> "CURRENT_TIMESTAMP"
   | Row.DV_current_date      -> "CURRENT_DATE"
@@ -149,6 +155,33 @@ let ddl_of_table (meta : Cat.table_meta) =
   Printf.sprintf "CREATE TABLE %s (%s)"
     meta.Cat.name
     (String.concat ", " (col_parts @ fk_parts))
+
+(** Extract the ON <table> target from a CREATE TRIGGER statement.
+    Falls back to the trigger name if the ON clause is not found. *)
+let trigger_table_of_sql trigger_name sql =
+  (* Look for " ON " followed by identifier, case-insensitive *)
+  let upper = String.uppercase_ascii sql in
+  match String.index_opt upper 'O' with
+  | None -> trigger_name
+  | _ ->
+    let n = String.length upper in
+    (* Search for " ON " pattern *)
+    let rec search i =
+      if i + 4 >= n then trigger_name
+      else if upper.[i] = ' ' && upper.[i+1] = 'O' && upper.[i+2] = 'N' && upper.[i+3] = ' ' then
+        (* Found " ON " — extract the identifier that follows *)
+        let start = i + 4 in
+        let j = ref start in
+        while !j < n &&
+              (let c = upper.[!j] in
+               (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_') do
+          incr j
+        done;
+        if !j > start then String.sub sql start (!j - start)
+        else trigger_name
+      else search (i + 1)
+    in
+    search 0
 
 let ddl_of_index (idx : Cat.index_info) =
   let unique_kw = if idx.Cat.idx_unique then "UNIQUE " else "" in
@@ -4349,9 +4382,10 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     ) views in
     let* triggers = Cat.load_all_triggers store in
     let trigger_rows = List.map (fun (name, sql) ->
+      let tbl_name = trigger_table_of_sql name sql in
       [| Row.V_text "trigger";
          Row.V_text name;
-         Row.V_text name;
+         Row.V_text tbl_name;
          Row.V_int  0L;
          Row.V_text sql |]
     ) triggers in

@@ -6420,6 +6420,8 @@ let test_sqlite_master_sql_shape () =
     Alcotest.(check bool) "sql starts with CREATE TABLE" true
       (String.length sql >= 12 &&
        String.sub sql 0 12 = "CREATE TABLE");
+    Alcotest.(check bool) "sql contains NOT NULL" true (contains_pat "NOT NULL" sql);
+    Alcotest.(check bool) "sql contains DEFAULT" true (contains_pat "DEFAULT" sql);
     Lwt.return_unit)
 
 let test_sqlite_master_views () =
@@ -6463,6 +6465,19 @@ let test_sqlite_master_count_star () =
       | [] -> -1
     in
     Alcotest.(check int) "two tables" 2 n;
+    Lwt.return_unit)
+
+let test_sqlite_master_trigger_tblname () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER)" in
+    let* () = exec_in db "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END" in
+    let* rows = query_rows db
+      "SELECT type, name, tbl_name FROM sqlite_master WHERE type='trigger'" in
+    Alcotest.(check int) "one trigger" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.check value_testable "trigger type" (Db.V_text "trigger") row.(0);
+    Alcotest.check value_testable "trigger name" (Db.V_text "trg") row.(1);
+    Alcotest.check value_testable "trigger tbl_name" (Db.V_text "t") row.(2);
     Lwt.return_unit)
 
 (* Runner                                                               *)
@@ -7017,6 +7032,7 @@ let () =
       Alcotest.test_case "views"        `Quick test_sqlite_master_views;
       Alcotest.test_case "all_types"    `Quick test_sqlite_master_all_types;
       Alcotest.test_case "schema_alias" `Quick test_sqlite_schema_alias;
-      Alcotest.test_case "count_star"   `Quick test_sqlite_master_count_star;
+      Alcotest.test_case "count_star"      `Quick test_sqlite_master_count_star;
+      Alcotest.test_case "trigger_tblname" `Quick test_sqlite_master_trigger_tblname;
     ];
   ]
