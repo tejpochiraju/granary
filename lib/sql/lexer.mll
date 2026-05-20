@@ -208,6 +208,7 @@ rule token = parse
       | "STRING_AGG"   -> STRING_AGG
       | "EXPLAIN"  -> EXPLAIN
       | "ANALYZE"  -> ANALYZE
+      | "SNIPPET"  -> SNIPPET
       | _              -> IDENT id
     }
   | eof                     { EOF }

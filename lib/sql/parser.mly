@@ -59,6 +59,7 @@
 %token NULLS
 %token GROUP_CONCAT STRING_AGG
 %token EXPLAIN ANALYZE
+%token SNIPPET
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -159,6 +160,7 @@ any_ident:
   | STRING_AGG    { "string_agg" }
   | EXPLAIN { "explain" }
   | ANALYZE { "analyze" }
+  | SNIPPET { "snippet" }
 
 stmt:
   | s = with_cte          { s }
@@ -687,6 +689,22 @@ scalar_expr:
     { E_func (Fn_json_replace, args) }
   | JSON_REMOVE LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
     { E_func (Fn_json_remove, args) }
+  | SNIPPET LPAREN
+      tbl = any_ident COMMA
+      col = INT_LIT COMMA
+      start_tag = STRING_LIT COMMA
+      end_tag   = STRING_LIT COMMA
+      ellipsis  = STRING_LIT COMMA
+      n         = INT_LIT
+    RPAREN
+    { Ast.E_fts_snippet {
+        table     = tbl;
+        col_idx   = Int64.to_int col;
+        start_tag;
+        end_tag;
+        ellipsis;
+        n_tokens  = Int64.to_int n;
+      } }
 
 proj_item:
   | e = expr AS alias = any_ident { `ExprA (e, Some alias) }

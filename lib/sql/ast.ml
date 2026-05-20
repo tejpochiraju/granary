@@ -180,6 +180,15 @@ type expr =
     }
     (** Window function call: FUNC(...) OVER (PARTITION BY ... ORDER BY ...) *)
   | E_collate of expr * collation   (** expr COLLATE collation_name *)
+  | E_fts_snippet of {
+      table     : string;
+      col_idx   : int;
+      start_tag : string;
+      end_tag   : string;
+      ellipsis  : string;
+      n_tokens  : int;
+    }
+    (** snippet(table, col_idx, start_tag, end_tag, ellipsis, n_tokens) *)
 
 and window_func =
   | WF_row_number
@@ -464,5 +473,8 @@ let rec expr_to_sql = function
       | Collate_rtrim  -> "RTRIM"
     in
     Printf.sprintf "(%s) COLLATE %s" (expr_to_sql e) cname
+  | E_fts_snippet { table; col_idx; start_tag; end_tag; ellipsis; n_tokens } ->
+    Printf.sprintf "snippet(%s,%d,'%s','%s','%s',%d)"
+      table col_idx start_tag end_tag ellipsis n_tokens
   | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
     failwith "expr_to_sql: unsupported expression form"

@@ -1,7 +1,9 @@
 type token = {
-  term : string;
-  col  : int;
-  pos  : int;
+  term       : string;
+  col        : int;
+  pos        : int;
+  start_byte : int;
+  end_byte   : int;
 }
 
 let is_word_char c =
@@ -23,9 +25,10 @@ let tokenize_string ~col text =
     (* consume word chars *)
     while !i < n && is_word_char text.[!i] do incr i done;
     if !i > start then begin
-      let raw = String.sub text start (!i - start) in
+      let raw  = String.sub text start (!i - start) in
       let term = String.lowercase_ascii raw in
-      tokens := { term; col; pos = !pos } :: !tokens;
+      tokens := { term; col; pos = !pos;
+                  start_byte = start; end_byte = !i } :: !tokens;
       incr pos
     end
   done;

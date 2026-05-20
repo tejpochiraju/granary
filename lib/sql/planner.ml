@@ -607,8 +607,8 @@ let rec plan ?cat = function
     Plan.Op_fts_delete { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_seq_scan { fts_meta; where } ->
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
-  | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank } ->
-    Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank }
+  | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
+    Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets }
   | Sema.BS_compound { op; left; right } ->
     let l = plan ?cat left in
     let r = plan ?cat right in

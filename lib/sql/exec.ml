@@ -3016,6 +3016,57 @@ let fts_query_terms query =
   in
   List.sort_uniq String.compare (collect query)
 
+(** Build a highlighted excerpt of [col_text] for the given snippet [spec].
+    Finds the first token matching a query term, centres a window, reconstructs
+    original-cased text with matching terms wrapped in [start_tag]/[end_tag]. *)
+let compute_snippet ~col_text ~query_terms ~(spec : Plan.snippet_spec) =
+  let tokens = Fts_tokenizer.tokenize_string ~col:0 col_text in
+  let n_toks = List.length tokens in
+  let first_match =
+    List.find_opt (fun tok ->
+      List.mem tok.Fts_tokenizer.term query_terms
+    ) tokens
+  in
+  match first_match with
+  | None ->
+    let max_len = min (String.length col_text) 50 in
+    let text = String.sub col_text 0 max_len in
+    if String.length col_text > 50 then text ^ spec.Plan.ellipsis else text
+  | Some matched ->
+    let center   = matched.Fts_tokenizer.pos in
+    let win_half = spec.Plan.n_tokens in
+    let win_start = max 0 (center - win_half) in
+    let win_end   = min (n_toks - 1) (center + win_half) in
+    let arr = Array.of_list tokens in
+    let window = Array.to_list (Array.sub arr win_start (win_end - win_start + 1)) in
+    let prefix = if win_start > 0 then spec.Plan.ellipsis else "" in
+    let suffix = if win_end < n_toks - 1 then spec.Plan.ellipsis else "" in
+    let buf = Buffer.create 128 in
+    Buffer.add_string buf prefix;
+    let first_tok_start =
+      match window with [] -> 0 | t :: _ -> t.Fts_tokenizer.start_byte
+    in
+    let prev_end = ref first_tok_start in
+    List.iter (fun tok ->
+      if tok.Fts_tokenizer.start_byte > !prev_end then
+        Buffer.add_string buf
+          (String.sub col_text !prev_end
+             (tok.Fts_tokenizer.start_byte - !prev_end));
+      let raw =
+        String.sub col_text tok.Fts_tokenizer.start_byte
+          (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte)
+      in
+      if List.mem tok.Fts_tokenizer.term query_terms then begin
+        Buffer.add_string buf spec.Plan.start_tag;
+        Buffer.add_string buf raw;
+        Buffer.add_string buf spec.Plan.end_tag
+      end else
+        Buffer.add_string buf raw;
+      prev_end := tok.Fts_tokenizer.end_byte
+    ) window;
+    Buffer.add_string buf suffix;
+    Buffer.contents buf
+
 (* ------------------------------------------------------------------ *)
 (* substitute_cte: replace Op_cte_scan nodes with Op_pragma_rows       *)
 (* to_stream: convert a read op tree into a Row stream                  *)
@@ -4049,7 +4100,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           else read_next ()
     in
     Lwt.return (Lwt_stream.from read_next)
-  | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank } ->
+  | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
     let* tx = S.ro_begin store in
     let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
     (* Compute BM25 scores when rank is requested *)
@@ -4091,6 +4142,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let sorted = if include_rank then
       List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
     else scored_matches in
+    let query_terms = fts_query_terms query in
     let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
       let key = Rowid.encode rowid in
       let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
@@ -4099,9 +4151,29 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | Some bytes ->
         let texts = fts_decode_content bytes in
         let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        let projected = if proj = [] then Array.to_list full_row
-                        else List.map (fun i -> full_row.(i)) proj in
-        let row_values = projected @ (if include_rank then [Row.V_real score] else []) in
+        (* If proj=[] and there are snippets, it means only snippets were selected
+           (no regular columns). If proj=[] with no snippets, it means SELECT *. *)
+        let projected =
+          if proj = [] && snippets = [] then Array.to_list full_row
+          else List.map (fun i -> full_row.(i)) proj
+        in
+        let snippet_vals =
+          List.map (fun (spec : Plan.snippet_spec) ->
+            let col_text =
+              let idx =
+                if spec.Plan.col_idx < 0 then 0
+                else min spec.Plan.col_idx (max 0 (List.length texts - 1))
+              in
+              if texts = [] then "" else List.nth texts idx
+            in
+            Row.V_text (compute_snippet ~col_text ~query_terms ~spec)
+          ) snippets
+        in
+        let row_values =
+          projected
+          @ (if include_rank then [Row.V_real score] else [])
+          @ snippet_vals
+        in
         Lwt.return (Some (Array.of_list row_values))) sorted in
     let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list rows)

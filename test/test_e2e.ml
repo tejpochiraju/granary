@@ -6309,6 +6309,65 @@ let test_cascade_restrict_on_grandchild () =
       (exec_err db "DELETE FROM a WHERE id = 1");
     Lwt.return_unit)
 
+(* ── Phase 30: FTS snippet() ─────────────────────────────────── *)
+
+let test_fts_snippet_basic () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('the quick brown fox')" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('a lazy dog')" in
+    let* rows = query_rows db
+      "SELECT snippet(docs, 0, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'fox'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    let snip = match (List.hd rows).(0) with
+      | Db.V_text s -> s
+      | _ -> Alcotest.fail "expected V_text"
+    in
+    Alcotest.(check bool) "snippet contains [fox]" true (contains_pat "[fox]" snip);
+    Lwt.return_unit)
+
+let test_fts_snippet_no_match_doc () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('the quick brown fox')" in
+    let* rows = query_rows db
+      "SELECT snippet(docs, 0, '<b>', '</b>', '...', 3) FROM docs WHERE docs MATCH 'zebra'" in
+    check_rows "no docs match zebra" [] rows;
+    Lwt.return_unit)
+
+let test_fts_snippet_window () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('hello world from ocaml')" in
+    let* rows = query_rows db
+      "SELECT snippet(docs, 0, '*', '*', '...', 1) FROM docs WHERE docs MATCH 'world'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    let snip = match (List.hd rows).(0) with
+      | Db.V_text s -> s
+      | _ -> Alcotest.fail "expected V_text"
+    in
+    Alcotest.(check bool) "snippet contains *world*" true (contains_pat "*world*" snip);
+    Lwt.return_unit)
+
+let test_fts_snippet_with_rank () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(title, body)" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'Learn OCaml programming')" in
+    let* rows = query_rows db
+      "SELECT title, rank, snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'ocaml'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    let row = List.hd rows in
+    (match row.(0) with
+     | Db.V_text s -> Alcotest.(check string) "title" "OCaml Guide" s
+     | _ -> Alcotest.fail "expected V_text for title");
+    let snip = match row.(2) with
+      | Db.V_text s -> s
+      | _ -> Alcotest.fail "expected V_text for snippet"
+    in
+    Alcotest.(check bool) "snippet has [OCaml] or [ocaml]" true
+      (contains_pat "[OCaml]" snip || contains_pat "[ocaml]" snip);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6846,5 +6905,11 @@ let () =
       Alcotest.test_case "mixed_actions_delete" `Quick test_cascade_delete_mixed_actions;
       Alcotest.test_case "three_levels_update"  `Quick test_cascade_update_three_levels;
       Alcotest.test_case "restrict_grandchild"  `Quick test_cascade_restrict_on_grandchild;
+    ];
+    "phase30_snippet", [
+      Alcotest.test_case "basic"         `Quick test_fts_snippet_basic;
+      Alcotest.test_case "no_match_doc"  `Quick test_fts_snippet_no_match_doc;
+      Alcotest.test_case "window"        `Quick test_fts_snippet_window;
+      Alcotest.test_case "with_rank"     `Quick test_fts_snippet_with_rank;
     ];
   ]

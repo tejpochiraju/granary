@@ -3240,6 +3240,25 @@ let phase30_cascade_cases = [
     unordered = false };
 ]
 
+let phase30_snippet_cases = [
+  { name = "snippet_fts_basic_match";
+    setup = [
+      "CREATE VIRTUAL TABLE docs USING fts5(body)";
+      "INSERT INTO docs VALUES ('hello world')";
+      "INSERT INTO docs VALUES ('goodbye world')";
+    ];
+    query = "SELECT body FROM docs WHERE docs MATCH 'hello'";
+    unordered = false };
+
+  { name = "snippet_col_name";
+    setup = [
+      "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
+      "INSERT INTO docs VALUES ('guide', 'learn programming')";
+    ];
+    query = "SELECT title FROM docs WHERE docs MATCH 'guide'";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3283,4 +3302,5 @@ let () =
     "phase26_pragma",          List.map make_test phase26_pragma_cases;
     "phase27",                 List.map make_test phase27_cases;
     "phase30_cascade",         List.map make_test phase30_cascade_cases;
+    "phase30_snippet",         List.map make_test phase30_snippet_cases;
   ]

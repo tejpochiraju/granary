@@ -44,6 +44,14 @@ type window_plan_item = {
   frame        : Ast.frame_spec option;
 }
 
+type snippet_spec = {
+  col_idx   : int;
+  start_tag : string;
+  end_tag   : string;
+  ellipsis  : string;
+  n_tokens  : int;
+}
+
 type op =
   | Op_create_table of {
       name           : string;
@@ -204,6 +212,7 @@ type op =
       query        : Fts_query.fts_query;
       proj         : int list;
       include_rank : bool;  (** if true, append BM25 score as last projected column *)
+      snippets     : snippet_spec list;
     }
   | Op_pragma_rows of {
       rows : Sqlocaml_encoding.Row.t list;

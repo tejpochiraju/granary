@@ -212,6 +212,7 @@ type bound_stmt =
       query        : Fts_query.fts_query;
       proj         : int list;
       include_rank : bool;
+      snippets     : Plan.snippet_spec list;
     }
   | BS_pragma of {
       kind : Ast.pragma_kind;

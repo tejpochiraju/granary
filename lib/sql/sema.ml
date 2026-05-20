@@ -179,6 +179,7 @@ type bound_stmt =
       query        : Fts_query.fts_query;
       proj         : int list;
       include_rank : bool;
+      snippets     : Plan.snippet_spec list;
     }
   | BS_pragma of {
       kind : Ast.pragma_kind;
@@ -462,6 +463,8 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
      | Error e -> Error e)
   | Ast.E_window _ ->
     Error (Unsupported "window functions not yet supported in single-table context")
+  | Ast.E_fts_snippet _ ->
+    Error (Unsupported "snippet() is only supported in FTS SELECT projection")
 
 (* ------------------------------------------------------------------ *)
 (* Two-table column resolution used when a JOIN is present.            *)
@@ -633,6 +636,8 @@ let rec bind_expr_join
      | Error e -> Error e)
   | Ast.E_window _ ->
     Error (Unsupported "window functions not yet supported in join context")
+  | Ast.E_fts_snippet _ ->
+    Error (Unsupported "snippet() is only supported in FTS SELECT projection")
 
 (* ------------------------------------------------------------------ *)
 (* Aggregate-aware binding.                                             *)
@@ -822,6 +827,8 @@ let bind_expr_agg
       (match go e with Ok be -> Ok (BE_collate (be, c)) | Error e -> Error e)
     | Ast.E_window _ ->
       Error (Unsupported "window functions not yet supported in aggregate context")
+    | Ast.E_fts_snippet _ ->
+      Error (Unsupported "snippet() is only supported in FTS SELECT projection")
   in
   match go e with
   | Error e -> Error e
@@ -868,6 +875,7 @@ let rec expr_has_agg = function
   | Ast.E_cast (e, _) -> expr_has_agg e
   | Ast.E_collate (e, _) -> expr_has_agg e
   | Ast.E_window _ -> false
+  | Ast.E_fts_snippet _ -> false
 
 let rec expr_has_window = function
   | Ast.E_window _ -> true
@@ -921,6 +929,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
       | Ast.E_cast _ -> false
       | Ast.E_collate (e, _) -> check_expr_unsupported e
       | Ast.E_window _ -> true
+      | Ast.E_fts_snippet _ -> true
     in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
       match c.check with
@@ -1061,6 +1070,8 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
   | None -> Lwt.return (Error (Unknown_table table))
   | Some fts_meta ->
     let fts_cols = fts_meta.Cat.fts_columns in
+    (* If no columns specified, default to all FTS columns in order *)
+    let columns = if columns = [] then fts_cols else columns in
     (* Validate that all specified columns exist in fts_meta.fts_columns *)
     let bad = List.find_opt (fun c -> not (List.mem c fts_cols)) columns in
     (match bad with
@@ -1289,33 +1300,69 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
                `rank` is not a real column — it triggers include_rank=true and
                is NOT added to proj (the executor appends it as the last value). *)
             let all_real_ords = List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns in
-            let (col_ords, include_rank) = match proj with
-              | `All ->
-                (* SELECT * from FTS: no explicit rank requested *)
-                (all_real_ords, false)
-              | `Cols names ->
-                let has_rank = List.exists (String.equal "rank") names in
-                let real_ords = List.filter_map (fun name ->
-                  if String.equal name "rank" then None
-                  else
-                    let rec find i = function
-                      | [] -> None
-                      | c :: _ when String.equal c name -> Some i
-                      | _ :: rest -> find (i+1) rest
-                    in
-                    find 0 fts_meta.Cat.fts_columns
-                ) names in
-                (real_ords, has_rank)
-              | `Exprs _ ->
-                (* Expression projections: treat as SELECT * with no rank *)
-                (all_real_ords, false)
-            in
-            Lwt.return (Ok (BS_fts_match_scan {
-              fts_meta;
-              query = q;
-              proj  = col_ords;
-              include_rank;
-            })))
+            (match proj with
+             | `All ->
+               Lwt.return (Ok (BS_fts_match_scan {
+                 fts_meta; query = q;
+                 proj = all_real_ords; include_rank = false; snippets = [];
+               }))
+             | `Cols names ->
+               let has_rank = List.exists (String.equal "rank") names in
+               let real_ords = List.filter_map (fun name ->
+                 if String.equal name "rank" then None
+                 else
+                   let rec find i = function
+                     | [] -> None
+                     | c :: _ when String.equal c name -> Some i
+                     | _ :: rest -> find (i + 1) rest
+                   in
+                   find 0 fts_meta.Cat.fts_columns
+               ) names in
+               Lwt.return (Ok (BS_fts_match_scan {
+                 fts_meta; query = q;
+                 proj = real_ords; include_rank = has_rank; snippets = [];
+               }))
+             | `Exprs exprs ->
+               let process_result =
+                 List.fold_left (fun acc (e, _alias) ->
+                   match acc with
+                   | Error _ as err -> err
+                   | Ok (ords, has_rank, snips) ->
+                     (match e with
+                      | Ast.E_col col_name ->
+                        if String.equal (String.lowercase_ascii col_name) "rank" then
+                          Ok (ords, true, snips)
+                        else
+                          (let rec find i = function
+                             | [] -> None
+                             | c :: _ when String.equal c col_name -> Some i
+                             | _ :: rest -> find (i + 1) rest
+                           in
+                           match find 0 fts_meta.Cat.fts_columns with
+                           | None ->
+                             Error (Unknown_column {
+                               table = fts_meta.Cat.fts_name; column = col_name
+                             })
+                           | Some i -> Ok (ords @ [i], has_rank, snips))
+                      | Ast.E_fts_snippet { table; col_idx; start_tag; end_tag; ellipsis; n_tokens } ->
+                        let tbl_lower = String.lowercase_ascii table in
+                        let fts_lower = String.lowercase_ascii fts_meta.Cat.fts_name in
+                        if not (String.equal tbl_lower fts_lower) then
+                          Error (Unknown_table table)
+                        else
+                          let spec = Plan.{ col_idx; start_tag; end_tag; ellipsis; n_tokens } in
+                          Ok (ords, has_rank, snips @ [spec])
+                      | _ ->
+                        Error (Unsupported
+                          "only column references and snippet() are supported in FTS SELECT"))
+                 ) (Ok ([], false, [])) exprs
+               in
+               (match process_result with
+                | Error e -> Lwt.return (Error e)
+                | Ok (col_ords, include_rank, snippets) ->
+                  Lwt.return (Ok (BS_fts_match_scan {
+                    fts_meta; query = q; proj = col_ords; include_rank; snippets;
+                  })))))
      | _ ->
        let synth_meta = fts_as_table_meta fts_meta in
        let where_result =
