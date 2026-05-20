@@ -424,6 +424,10 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
          | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
          | Ast.Fn_char -> true
          | Ast.Fn_printf -> n >= 1
+         | Ast.Fn_random -> n = 0
+         | Ast.Fn_randomblob -> n = 1
+         | Ast.Fn_changes -> n = 0
+         | Ast.Fn_last_insert_rowid -> n = 0
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -606,6 +610,10 @@ let rec bind_expr_join
          | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
          | Ast.Fn_char -> true
          | Ast.Fn_printf -> n >= 1
+         | Ast.Fn_random -> n = 0
+         | Ast.Fn_randomblob -> n = 1
+         | Ast.Fn_changes -> n = 0
+         | Ast.Fn_last_insert_rowid -> n = 0
        in
        if not arity_ok then
          Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
@@ -811,6 +819,10 @@ let bind_expr_agg
            | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
            | Ast.Fn_char -> true
            | Ast.Fn_printf -> n >= 1
+           | Ast.Fn_random -> n = 0
+           | Ast.Fn_randomblob -> n = 1
+           | Ast.Fn_changes -> n = 0
+           | Ast.Fn_last_insert_rowid -> n = 0
          in
          if not arity_ok then
            Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })

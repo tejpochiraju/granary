@@ -225,7 +225,11 @@ rule token = parse
       | "UNICODE"  -> UNICODE
       | "PRINTF"   -> PRINTF
       | "FORMAT"   -> FORMAT
-      | "ZEROBLOB" -> ZEROBLOB
+      | "ZEROBLOB"           -> ZEROBLOB
+      | "RANDOM"             -> RANDOM
+      | "RANDOMBLOB"         -> RANDOMBLOB
+      | "CHANGES"            -> CHANGES
+      | "LAST_INSERT_ROWID"  -> LAST_INSERT_ROWID
       | _              -> IDENT id
     }
   | eof                     { EOF }

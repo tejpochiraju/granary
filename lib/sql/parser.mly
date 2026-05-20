@@ -63,6 +63,7 @@
 %token EXPLAIN ANALYZE
 %token SNIPPET
 %token HEX CHAR UNICODE PRINTF FORMAT ZEROBLOB
+%token RANDOM RANDOMBLOB CHANGES LAST_INSERT_ROWID
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -171,6 +172,10 @@ any_ident:
   | PRINTF   { "printf" }
   | FORMAT   { "format" }
   | ZEROBLOB { "zeroblob" }
+  | RANDOM            { "random" }
+  | RANDOMBLOB        { "randomblob" }
+  | CHANGES           { "changes" }
+  | LAST_INSERT_ROWID { "last_insert_rowid" }
 
 stmt:
   | s = with_cte          { s }
@@ -729,6 +734,14 @@ scalar_expr:
     { E_func (Fn_printf, args) }
   | ZEROBLOB LPAREN e = expr RPAREN
     { E_func (Fn_zeroblob, [e]) }
+  | RANDOM LPAREN RPAREN
+    { E_func (Fn_random, []) }
+  | RANDOMBLOB LPAREN e = expr RPAREN
+    { E_func (Fn_randomblob, [e]) }
+  | CHANGES LPAREN RPAREN
+    { E_func (Fn_changes, []) }
+  | LAST_INSERT_ROWID LPAREN RPAREN
+    { E_func (Fn_last_insert_rowid, []) }
 
 proj_item:
   | e = expr AS alias = any_ident { `ExprA (e, Some alias) }

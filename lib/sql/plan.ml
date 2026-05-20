@@ -281,6 +281,10 @@ type op =
     (** Virtual scan that reconstructs sqlite_master rows from catalog metadata. *)
   | Op_no_op
     (** No-op plan node produced by IF EXISTS DROP when object not found. *)
+  | Op_changes
+    (** Returns rows affected by last DML. Intercepted in db.ml query — not exec.ml. *)
+  | Op_last_insert_rowid
+    (** Returns rowid of last INSERT. Intercepted in db.ml query — not exec.ml. *)
   | Op_explain of {
       analyze : bool;
       inner   : op;

@@ -3393,6 +3393,37 @@ let phase31_scalar_cases = [
     unordered = false };
 ]
 
+let phase32_session_fn_cases = [
+  { name = "random_typeof";
+    setup = [];
+    query = "SELECT TYPEOF(RANDOM())";
+    unordered = false };
+
+  { name = "randomblob_length_10";
+    setup = [];
+    query = "SELECT LENGTH(RANDOMBLOB(10))";
+    unordered = false };
+
+  { name = "randomblob_zero";
+    setup = [];
+    query = "SELECT LENGTH(RANDOMBLOB(0))";
+    unordered = false };
+
+  { name = "changes_initial";
+    setup = ["CREATE TABLE t (id INTEGER)"];
+    query = "SELECT CHANGES()";
+    unordered = false };
+
+  (* Note: changes_after_insert and last_insert_rowid_after_inserts are not
+     comparable against SQLite via separate sqlite3 invocations (changes() resets
+     per connection). Those are tested in the e2e suite instead. *)
+
+  { name = "last_insert_rowid_initial";
+    setup = ["CREATE TABLE t (id INTEGER)"];
+    query = "SELECT LAST_INSERT_ROWID()";
+    unordered = false };
+]
+
 let phase31_alter_fk_cases = [
   { name = "alter_add_fk_valid_insert";
     setup = [
@@ -3475,4 +3506,5 @@ let () =
     "phase30_sqlite_master",   List.map make_test phase30_sqlite_master_cases;
     "phase31_alter_fk",        List.map make_test phase31_alter_fk_cases;
     "phase31_scalar",          List.map make_test phase31_scalar_cases;
+    "phase32_session_fns",     List.map make_test phase32_session_fn_cases;
   ]

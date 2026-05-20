@@ -6761,6 +6761,62 @@ let test_zeroblob_zero_len () =
   let r = query_ok db "SELECT LENGTH(ZEROBLOB(0))" in
   Alcotest.(check row_testable) "zeroblob zero len" [| Db.V_int 0L |] (List.nth r 0)
 
+(* ── Phase 32 Task 2: CHANGES, LAST_INSERT_ROWID, RANDOM, RANDOMBLOB ── *)
+
+let test_changes_initial () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  let r = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "changes initial" [| Db.V_int 0L |] (List.nth r 0)
+
+let test_changes_after_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  let r = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "changes after insert" [| Db.V_int 1L |] (List.nth r 0)
+
+let test_changes_after_delete_multiple () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (1)";
+  exec db "INSERT INTO t VALUES (2)";
+  exec db "INSERT INTO t VALUES (3)";
+  exec db "DELETE FROM t";
+  let r = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "changes after delete multiple" [| Db.V_int 3L |] (List.nth r 0)
+
+let test_last_insert_rowid_initial () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
+  Alcotest.(check row_testable) "last_insert_rowid initial" [| Db.V_int 0L |] (List.nth r 0)
+
+let test_last_insert_rowid_after_inserts () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (10)";
+  exec db "INSERT INTO t VALUES (20)";
+  exec db "INSERT INTO t VALUES (30)";
+  let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
+  Alcotest.(check row_testable) "last_insert_rowid after inserts" [| Db.V_int 3L |] (List.nth r 0)
+
+let test_random_is_integer () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT TYPEOF(RANDOM())" in
+  Alcotest.(check row_testable) "random is integer" [| Db.V_text "integer" |] (List.nth r 0)
+
+let test_randomblob_length () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT LENGTH(RANDOMBLOB(8))" in
+  Alcotest.(check row_testable) "randomblob length" [| Db.V_int 8L |] (List.nth r 0)
+
+let test_randomblob_zero_length () =
+  (* SQLite returns 1 for RANDOMBLOB(0) — minimum 1 byte is always allocated *)
+  let db = fresh_db () in
+  let r = query_ok db "SELECT LENGTH(RANDOMBLOB(0))" in
+  Alcotest.(check row_testable) "randomblob zero length" [| Db.V_int 1L |] (List.nth r 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7357,5 +7413,15 @@ let () =
       Alcotest.test_case "zeroblob_length"       `Quick test_zeroblob_length;
       Alcotest.test_case "zeroblob_hex"          `Quick test_zeroblob_hex;
       Alcotest.test_case "zeroblob_zero_len"     `Quick test_zeroblob_zero_len;
+    ];
+    "phase32_session_fns", [
+      Alcotest.test_case "changes_initial"               `Quick test_changes_initial;
+      Alcotest.test_case "changes_after_insert"          `Quick test_changes_after_insert;
+      Alcotest.test_case "changes_after_delete_multiple" `Quick test_changes_after_delete_multiple;
+      Alcotest.test_case "last_insert_rowid_initial"     `Quick test_last_insert_rowid_initial;
+      Alcotest.test_case "last_insert_rowid_after_inserts" `Quick test_last_insert_rowid_after_inserts;
+      Alcotest.test_case "random_is_integer"             `Quick test_random_is_integer;
+      Alcotest.test_case "randomblob_length"             `Quick test_randomblob_length;
+      Alcotest.test_case "randomblob_zero_length"        `Quick test_randomblob_zero_length;
     ];
   ]

@@ -620,7 +620,13 @@ let rec plan ?cat = function
      | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
      | Ast.Except    -> Plan.Op_except    { left = l; right = r })
   | Sema.BS_const_select { exprs } ->
-    Plan.Op_const_select { exprs = List.map (fun (e, alias) -> (plan_expr e, alias)) exprs }
+    (match exprs with
+     | [(Sema.BE_func (Ast.Fn_changes, []), _)] ->
+       Plan.Op_changes
+     | [(Sema.BE_func (Ast.Fn_last_insert_rowid, []), _)] ->
+       Plan.Op_last_insert_rowid
+     | _ ->
+       Plan.Op_const_select { exprs = List.map (fun (e, alias) -> (plan_expr e, alias)) exprs })
   | Sema.BS_pragma { kind } ->
     (match kind with
      | Ast.Pragma_user_version ->

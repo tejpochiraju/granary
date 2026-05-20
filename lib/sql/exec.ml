@@ -957,6 +957,36 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
     Row.V_blob (Bytes.make (Int64.to_int n) '\000')
   | Ast.Fn_zeroblob, _ -> Row.V_null
 
+  (* ── RANDOM ──────────────────────────────────────────────────── *)
+  | Ast.Fn_random, [] ->
+    let b0 = Int64.of_int (Random.bits ()) in
+    let b1 = Int64.of_int (Random.bits ()) in
+    let b2 = Int64.of_int (Random.bits ()) in
+    let sign = if Random.bool () then Int64.min_int else 0L in
+    let v =
+      Int64.logor sign
+        (Int64.logor
+          (Int64.shift_left b2 60)
+          (Int64.logor (Int64.shift_left b1 30) b0))
+    in
+    Row.V_int v
+  | Ast.Fn_random, _ -> Row.V_null
+
+  (* ── RANDOMBLOB ──────────────────────────────────────────────── *)
+  (* SQLite always generates at least 1 byte, even for n <= 0.
+     Clamp to [1, Sys.max_string_length] to avoid allocation errors. *)
+  | Ast.Fn_randomblob, [Row.V_int n] ->
+    let sz = max 1 (if n < 0L || n > Int64.of_int Sys.max_string_length
+                    then 1 else Int64.to_int n) in
+    Row.V_blob (Bytes.init sz (fun _ -> Char.chr (Random.int 256)))
+  | Ast.Fn_randomblob, _ -> Row.V_null
+
+  (* ── CHANGES / LAST_INSERT_ROWID fallback ─────────────────────── *)
+  | Ast.Fn_changes, [] -> Row.V_int 0L
+  | Ast.Fn_changes, _  -> Row.V_null
+  | Ast.Fn_last_insert_rowid, [] -> Row.V_int 0L
+  | Ast.Fn_last_insert_rowid, _  -> Row.V_null
+
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
@@ -2852,6 +2882,8 @@ let op_name = function
   | Plan.Op_pragma_get_fk              -> "Pragma(get_foreign_keys)"
   | Plan.Op_pragma_set_fk { on }       -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
   | Plan.Op_no_op                      -> "NoOp"
+  | Plan.Op_changes                    -> "Changes"
+  | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
   | Plan.Op_explain { analyze; _ }     ->
     if analyze then "ExplainAnalyze" else "Explain"
   | Plan.Op_create_fts_table { name; _ } -> "CreateFtsTable(" ^ name ^ ")"
@@ -3253,7 +3285,8 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
   | Plan.Op_window _
   | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
-  | Plan.Op_pragma_get_fk ->
+  | Plan.Op_pragma_get_fk
+  | Plan.Op_changes | Plan.Op_last_insert_rowid ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -4750,6 +4783,10 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
     let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~order ~limit ~offset ~indexes in
     Lwt.return (Lwt_stream.of_list result_rows)
+  | Plan.Op_changes ->
+    failwith "Exec.to_stream: Op_changes must be intercepted in db.ml query"
+  | Plan.Op_last_insert_rowid ->
+    failwith "Exec.to_stream: Op_last_insert_rowid must be intercepted in db.ml query"
   | Plan.Op_const_select { exprs } ->
     (* FROM-less SELECT: evaluate each expression with an empty row and
        return a single result row. Aliases are stored in the plan for

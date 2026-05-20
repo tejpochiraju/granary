@@ -13,6 +13,8 @@ type t = {
   triggers         : (string, Sql.Ast.stmt) Hashtbl.t;  (* trigger_name -> S_create_trigger AST *)
   mutable savepoint_names : string list;  (* active savepoints, newest first *)
   mutable auto_began      : bool;         (* txn started implicitly by SAVEPOINT *)
+  mutable last_changes      : int;   (** rows affected by the last DML statement *)
+  mutable last_insert_rowid : int64; (** rowid of the last INSERT row *)
 }
 
 type value = Row.value =
@@ -43,7 +45,8 @@ let open_in_memory ?clock () =
   let* catalog = Cat.open_ store in
   Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4;
              triggers = Hashtbl.create 4;
-             savepoint_names = []; auto_began = false }
+             savepoint_names = []; auto_began = false;
+             last_changes = 0; last_insert_rowid = 0L }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -90,7 +93,8 @@ let open_file ~path =
     let triggers = Hashtbl.create 4 in
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
-                 triggers; savepoint_names = []; auto_began = false })
+                 triggers; savepoint_names = []; auto_began = false;
+                 last_changes = 0; last_insert_rowid = 0L })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -107,7 +111,8 @@ let open_block
     let triggers = Hashtbl.create 4 in
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
-                 triggers; savepoint_names = []; auto_began = false })
+                 triggers; savepoint_names = []; auto_began = false;
+                 last_changes = 0; last_insert_rowid = 0L })
 
 let close t = S.close t.store
 
@@ -611,13 +616,25 @@ let execute t sql =
          make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
       | _ -> (None, None)
     in
-    (match Sql.Exec.execute ~mode ~clock:t.clock
+    let insert_table_name = match op with
+      | Sql.Plan.Op_insert { table_meta; _ }        -> Some table_meta.Cat.name
+      | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
+      | _ -> None
+    in
+    (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
              ~before_hook ~after_hook t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
        Lwt.catch
          (fun () ->
-           let* () = lwt_op in
+           let* n = lwt_op in
+           t.last_changes <- n;
+           (match insert_table_name with
+            | Some tbl when n > 0 ->
+              (match Cat.find_table_cached t.catalog ~name:tbl with
+               | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+               | None -> ())
+            | _ -> ());
            Lwt.return (Ok ()))
          (function
           | Failure msg -> Lwt.return (Error (Runtime msg))
@@ -691,6 +708,11 @@ let execute_change_count t sql =
          make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
       | _ -> (None, None)
     in
+    let insert_table_name = match op with
+      | Sql.Plan.Op_insert { table_meta; _ }        -> Some table_meta.Cat.name
+      | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
+      | _ -> None
+    in
     (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
              ~before_hook ~after_hook t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
@@ -698,6 +720,13 @@ let execute_change_count t sql =
        Lwt.catch
          (fun () ->
            let* n = lwt_op in
+           t.last_changes <- n;
+           (match insert_table_name with
+            | Some tbl when n > 0 ->
+              (match Cat.find_table_cached t.catalog ~name:tbl with
+               | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+               | None -> ())
+            | _ -> ());
            Lwt.return (Ok n))
          (function
           | Failure msg -> Lwt.return (Error (Runtime msg))
@@ -707,6 +736,12 @@ let query t sql =
   let* op = compile t sql in
   match op with
   | Error e -> Lwt.return (Error e)
+  | Ok Sql.Plan.Op_changes ->
+    Lwt.return (Ok (Lwt_stream.of_list
+      [ [| Row.V_int (Int64.of_int t.last_changes) |] ]))
+  | Ok Sql.Plan.Op_last_insert_rowid ->
+    Lwt.return (Ok (Lwt_stream.of_list
+      [ [| Row.V_int t.last_insert_rowid |] ]))
   | Ok op   ->
     let mode = match t.explicit_txn with
       | None    -> Sql.Exec.Auto

@@ -100,6 +100,10 @@ type scalar_func =
   | Fn_unicode   (** UNICODE(s) — first Unicode code point of string, or NULL *)
   | Fn_printf    (** PRINTF(fmt,...) / FORMAT(fmt,...) — printf-style formatting *)
   | Fn_zeroblob  (** ZEROBLOB(n) — blob of n zero bytes *)
+  | Fn_random           (** RANDOM() — random 64-bit integer *)
+  | Fn_randomblob       (** RANDOMBLOB(n) — random blob of n bytes *)
+  | Fn_changes          (** CHANGES() — rows affected by last DML *)
+  | Fn_last_insert_rowid (** LAST_INSERT_ROWID() — rowid of last INSERT *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -425,6 +429,10 @@ let func_to_sql = function
   | Fn_unicode  -> "UNICODE"
   | Fn_printf   -> "PRINTF"
   | Fn_zeroblob -> "ZEROBLOB"
+  | Fn_random            -> "RANDOM"
+  | Fn_randomblob        -> "RANDOMBLOB"
+  | Fn_changes           -> "CHANGES"
+  | Fn_last_insert_rowid -> "LAST_INSERT_ROWID"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n
