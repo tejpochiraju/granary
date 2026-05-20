@@ -18,6 +18,7 @@
 %token <int64>  INT_LIT
 %token <string> STRING_LIT
 %token <float>  FLOAT_LIT
+%token <bytes>  BLOB_LIT
 %token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE
 %token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
 %token NOT NULL PRIMARY KEY DEFAULT AND OR IS
@@ -61,6 +62,7 @@
 %token GROUP_CONCAT STRING_AGG
 %token EXPLAIN ANALYZE
 %token SNIPPET
+%token HEX CHAR UNICODE PRINTF FORMAT ZEROBLOB
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -163,6 +165,12 @@ any_ident:
   | ANALYZE  { "analyze" }
   | SNIPPET  { "snippet" }
   | INSTEAD  { "instead" }
+  | HEX      { "hex" }
+  | CHAR     { "char" }
+  | UNICODE  { "unicode" }
+  | PRINTF   { "printf" }
+  | FORMAT   { "format" }
+  | ZEROBLOB { "zeroblob" }
 
 stmt:
   | s = with_cte          { s }
@@ -504,6 +512,7 @@ literal:
   | s = STRING_LIT { L_text s }
   | NULL           { L_null }
   | f = FLOAT_LIT  { L_real f }
+  | b = BLOB_LIT   { L_blob b }
 
 (* INSERT VALUES allows a leading unary minus on numeric literals and
    positional parameters (?). *)
@@ -708,6 +717,18 @@ scalar_expr:
         ellipsis;
         n_tokens  = Int64.to_int n;
       } }
+  | HEX      LPAREN e = expr RPAREN
+    { E_func (Fn_hex, [e]) }
+  | CHAR     LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_char, args) }
+  | UNICODE  LPAREN e = expr RPAREN
+    { E_func (Fn_unicode, [e]) }
+  | PRINTF   LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_printf, args) }
+  | FORMAT   LPAREN args = separated_nonempty_list(COMMA, expr) RPAREN
+    { E_func (Fn_printf, args) }
+  | ZEROBLOB LPAREN e = expr RPAREN
+    { E_func (Fn_zeroblob, [e]) }
 
 proj_item:
   | e = expr AS alias = any_ident { `ExprA (e, Some alias) }

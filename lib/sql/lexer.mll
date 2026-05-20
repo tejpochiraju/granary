@@ -35,6 +35,16 @@ rule token = parse
   | (digit+ as i) '.' (digit* as f)
     { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }
   | digit+ as n             { INT_LIT (Int64.of_string n) }
+  | ['x' 'X'] '\'' (['0'-'9' 'a'-'f' 'A'-'F']* as h) '\''
+    { (* X'...' blob literal — convert hex pairs to bytes *)
+      let n = String.length h in
+      if n mod 2 <> 0 then failwith "blob literal must have an even number of hex digits";
+      let b = Bytes.create (n / 2) in
+      for k = 0 to (n / 2) - 1 do
+        let pair = String.sub h (k * 2) 2 in
+        Bytes.set b k (Char.chr (int_of_string ("0x" ^ pair)))
+      done;
+      BLOB_LIT b }
   | '\'' ([^ '\'']* as s) '\''  { STRING_LIT s }
   | '\'' [^ '\'']*          { failwith "unterminated string literal" }
   | '?' (digit+ as n) { IPARAM (int_of_string n) }
@@ -210,6 +220,12 @@ rule token = parse
       | "EXPLAIN"  -> EXPLAIN
       | "ANALYZE"  -> ANALYZE
       | "SNIPPET"  -> SNIPPET
+      | "HEX"      -> HEX
+      | "CHAR"     -> CHAR
+      | "UNICODE"  -> UNICODE
+      | "PRINTF"   -> PRINTF
+      | "FORMAT"   -> FORMAT
+      | "ZEROBLOB" -> ZEROBLOB
       | _              -> IDENT id
     }
   | eof                     { EOF }

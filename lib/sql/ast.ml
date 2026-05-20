@@ -95,6 +95,11 @@ type scalar_func =
   | Fn_json_insert  (** json_insert — insert only if absent *)
   | Fn_json_replace (** json_replace — update only if present *)
   | Fn_json_remove  (** json_remove(json, path[, path ...]) *)
+  | Fn_hex       (** HEX(x) — hex encoding of blob, text, or integer *)
+  | Fn_char      (** CHAR(x,...) — Unicode code points to UTF-8 string *)
+  | Fn_unicode   (** UNICODE(s) — first Unicode code point of string, or NULL *)
+  | Fn_printf    (** PRINTF(fmt,...) / FORMAT(fmt,...) — printf-style formatting *)
+  | Fn_zeroblob  (** ZEROBLOB(n) — blob of n zero bytes *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -415,6 +420,11 @@ let func_to_sql = function
   | Fn_json_valid -> "JSON_VALID"
   | Fn_json_set -> "JSON_SET"         | Fn_json_insert  -> "JSON_INSERT"
   | Fn_json_replace -> "JSON_REPLACE" | Fn_json_remove  -> "JSON_REMOVE"
+  | Fn_hex      -> "HEX"
+  | Fn_char     -> "CHAR"
+  | Fn_unicode  -> "UNICODE"
+  | Fn_printf   -> "PRINTF"
+  | Fn_zeroblob -> "ZEROBLOB"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n

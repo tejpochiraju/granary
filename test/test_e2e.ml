@@ -6605,6 +6605,109 @@ let test_instead_of_insert_multiple_body_stmts () =
     check_rows "real_t has row" [[| Db.V_int 42L |]] real_rows;
     Lwt.return_unit)
 
+(* ── Phase 31 Task 3: scalar utility functions ──────────────────── *)
+
+let test_hex_blob () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT HEX(X'DEADBEEF')" in
+  Alcotest.(check row_testable) "hex blob" [| Db.V_text "DEADBEEF" |] (List.nth r 0)
+
+let test_hex_text () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT HEX('abc')" in
+  Alcotest.(check row_testable) "hex text" [| Db.V_text "616263" |] (List.nth r 0)
+
+let test_hex_null () =
+  let db = fresh_db () in
+  (* SQLite HEX(NULL) returns empty string, not NULL *)
+  let r = query_ok db "SELECT HEX(NULL)" in
+  Alcotest.(check row_testable) "hex null" [| Db.V_text "" |] (List.nth r 0)
+
+let test_hex_int_zero () =
+  let db = fresh_db () in
+  (* SQLite HEX(int) hexes the decimal string: HEX(0) = HEX("0") = "30" *)
+  let r = query_ok db "SELECT HEX(0)" in
+  Alcotest.(check row_testable) "hex int zero" [| Db.V_text "30" |] (List.nth r 0)
+
+let test_hex_int_nonzero () =
+  let db = fresh_db () in
+  (* HEX(255) = HEX("255") = "323535" *)
+  let r = query_ok db "SELECT HEX(255)" in
+  Alcotest.(check row_testable) "hex int 255" [| Db.V_text "323535" |] (List.nth r 0)
+
+let test_char_basic () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT CHAR(65, 66, 67)" in
+  Alcotest.(check row_testable) "char basic" [| Db.V_text "ABC" |] (List.nth r 0)
+
+let test_char_single () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT CHAR(65)" in
+  Alcotest.(check row_testable) "char single" [| Db.V_text "A" |] (List.nth r 0)
+
+let test_char_unicode () =
+  let db = fresh_db () in
+  (* CHAR(9731) is U+2603 SNOWMAN; UNICODE() should round-trip back to 9731 *)
+  let r = query_ok db "SELECT UNICODE(CHAR(9731))" in
+  Alcotest.(check row_testable) "char snowman unicode roundtrip" [| Db.V_int 9731L |] (List.nth r 0)
+
+let test_unicode_basic () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT UNICODE('A')" in
+  Alcotest.(check row_testable) "unicode A" [| Db.V_int 65L |] (List.nth r 0)
+
+let test_unicode_empty () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT UNICODE('')" in
+  Alcotest.(check row_testable) "unicode empty" [| Db.V_null |] (List.nth r 0)
+
+let test_unicode_null () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT UNICODE(NULL)" in
+  Alcotest.(check row_testable) "unicode null" [| Db.V_null |] (List.nth r 0)
+
+let test_printf_basic () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT PRINTF('hello %s %d', 'world', 42)" in
+  Alcotest.(check row_testable) "printf basic" [| Db.V_text "hello world 42" |] (List.nth r 0)
+
+let test_printf_percent () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT PRINTF('100%%')" in
+  Alcotest.(check row_testable) "printf percent" [| Db.V_text "100%" |] (List.nth r 0)
+
+let test_printf_q_simple () =
+  let db = fresh_db () in
+  (* SQLite %q escapes internal quotes but does NOT add surrounding quotes *)
+  let r = query_ok db "SELECT PRINTF('%q', 'hello')" in
+  Alcotest.(check row_testable) "printf %q simple" [| Db.V_text "hello" |] (List.nth r 0)
+
+let test_printf_q_with_quotes () =
+  let db = fresh_db () in
+  (* Use CHAR(39) to inject a single-quote character, then verify %q escapes it *)
+  let r = query_ok db "SELECT PRINTF('%q', CHAR(104, 105, 39, 115))" in
+  Alcotest.(check row_testable) "printf %q with quotes" [| Db.V_text "hi''s" |] (List.nth r 0)
+
+let test_format_alias () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT FORMAT('val=%d', 99)" in
+  Alcotest.(check row_testable) "format alias" [| Db.V_text "val=99" |] (List.nth r 0)
+
+let test_zeroblob_length () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT LENGTH(ZEROBLOB(5))" in
+  Alcotest.(check row_testable) "zeroblob length" [| Db.V_int 5L |] (List.nth r 0)
+
+let test_zeroblob_hex () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT HEX(ZEROBLOB(3))" in
+  Alcotest.(check row_testable) "zeroblob hex" [| Db.V_text "000000" |] (List.nth r 0)
+
+let test_zeroblob_zero_len () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT LENGTH(ZEROBLOB(0))" in
+  Alcotest.(check row_testable) "zeroblob zero len" [| Db.V_int 0L |] (List.nth r 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7174,5 +7277,26 @@ let () =
       Alcotest.test_case "delete"                `Quick test_instead_of_delete;
       Alcotest.test_case "no_trigger_fails"      `Quick test_instead_of_no_trigger_fails;
       Alcotest.test_case "multiple_body_stmts"   `Quick test_instead_of_insert_multiple_body_stmts;
+    ];
+    "phase31_scalar", [
+      Alcotest.test_case "hex_blob"              `Quick test_hex_blob;
+      Alcotest.test_case "hex_text"              `Quick test_hex_text;
+      Alcotest.test_case "hex_null"              `Quick test_hex_null;
+      Alcotest.test_case "hex_int_zero"          `Quick test_hex_int_zero;
+      Alcotest.test_case "hex_int_nonzero"       `Quick test_hex_int_nonzero;
+      Alcotest.test_case "char_basic"            `Quick test_char_basic;
+      Alcotest.test_case "char_single"           `Quick test_char_single;
+      Alcotest.test_case "char_unicode"          `Quick test_char_unicode;
+      Alcotest.test_case "unicode_basic"         `Quick test_unicode_basic;
+      Alcotest.test_case "unicode_empty"         `Quick test_unicode_empty;
+      Alcotest.test_case "unicode_null"          `Quick test_unicode_null;
+      Alcotest.test_case "printf_basic"          `Quick test_printf_basic;
+      Alcotest.test_case "printf_percent"        `Quick test_printf_percent;
+      Alcotest.test_case "printf_q_simple"       `Quick test_printf_q_simple;
+      Alcotest.test_case "printf_q_with_quotes"  `Quick test_printf_q_with_quotes;
+      Alcotest.test_case "format_alias"          `Quick test_format_alias;
+      Alcotest.test_case "zeroblob_length"       `Quick test_zeroblob_length;
+      Alcotest.test_case "zeroblob_hex"          `Quick test_zeroblob_hex;
+      Alcotest.test_case "zeroblob_zero_len"     `Quick test_zeroblob_zero_len;
     ];
   ]

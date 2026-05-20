@@ -3296,6 +3296,103 @@ let phase30_sqlite_master_cases = [
     unordered = false };
 ]
 
+let phase31_scalar_cases = [
+  { name = "hex_blob";
+    setup = [];
+    query = "SELECT HEX(X'DEADBEEF')";
+    unordered = false };
+
+  { name = "hex_text";
+    setup = [];
+    query = "SELECT HEX('abc')";
+    unordered = false };
+
+  { name = "hex_null";
+    setup = [];
+    query = "SELECT TYPEOF(HEX(NULL))";
+    unordered = false };
+
+  { name = "hex_int_zero";
+    setup = [];
+    query = "SELECT HEX(0)";
+    unordered = false };
+
+  { name = "hex_int_nonzero";
+    setup = [];
+    query = "SELECT HEX(255)";
+    unordered = false };
+
+  { name = "char_basic";
+    setup = [];
+    query = "SELECT CHAR(65, 66, 67)";
+    unordered = false };
+
+  { name = "char_single";
+    setup = [];
+    query = "SELECT CHAR(65)";
+    unordered = false };
+
+  { name = "char_unicode_roundtrip";
+    setup = [];
+    query = "SELECT UNICODE(CHAR(9731))";
+    unordered = false };
+
+  { name = "unicode_basic";
+    setup = [];
+    query = "SELECT UNICODE('A')";
+    unordered = false };
+
+  { name = "unicode_empty";
+    setup = [];
+    query = "SELECT UNICODE('')";
+    unordered = false };
+
+  { name = "unicode_null";
+    setup = [];
+    query = "SELECT UNICODE(NULL)";
+    unordered = false };
+
+  { name = "printf_basic";
+    setup = [];
+    query = "SELECT PRINTF('hello %s %d', 'world', 42)";
+    unordered = false };
+
+  { name = "printf_percent";
+    setup = [];
+    query = "SELECT PRINTF('100%%')";
+    unordered = false };
+
+  { name = "printf_q_simple";
+    setup = [];
+    query = "SELECT PRINTF('%q', 'hello')";
+    unordered = false };
+
+  { name = "printf_q_with_quotes";
+    setup = [];
+    query = "SELECT PRINTF('%q', CHAR(104, 105, 39, 115))";
+    unordered = false };
+
+  { name = "format_alias";
+    setup = [];
+    query = "SELECT FORMAT('val=%d', 99)";
+    unordered = false };
+
+  { name = "zeroblob_length";
+    setup = [];
+    query = "SELECT LENGTH(ZEROBLOB(5))";
+    unordered = false };
+
+  { name = "zeroblob_hex";
+    setup = [];
+    query = "SELECT HEX(ZEROBLOB(3))";
+    unordered = false };
+
+  { name = "zeroblob_zero_len";
+    setup = [];
+    query = "SELECT LENGTH(ZEROBLOB(0))";
+    unordered = false };
+]
+
 let phase31_alter_fk_cases = [
   { name = "alter_add_fk_valid_insert";
     setup = [
@@ -3377,4 +3474,5 @@ let () =
     "phase30_snippet",         List.map make_test phase30_snippet_cases;
     "phase30_sqlite_master",   List.map make_test phase30_sqlite_master_cases;
     "phase31_alter_fk",        List.map make_test phase31_alter_fk_cases;
+    "phase31_scalar",          List.map make_test phase31_scalar_cases;
   ]

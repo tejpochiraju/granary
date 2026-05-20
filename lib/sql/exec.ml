@@ -816,6 +816,147 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
          Json.path_remove acc path
        ) jv paths in
        Row.V_text (Json.to_string result))
+  (* ── HEX ──────────────────────────────────────────────────────── *)
+  | Ast.Fn_hex, [Row.V_blob b] ->
+    let buf = Buffer.create (Bytes.length b * 2) in
+    Bytes.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) b;
+    Row.V_text (Buffer.contents buf)
+  | Ast.Fn_hex, [Row.V_text s] ->
+    let buf = Buffer.create (String.length s * 2) in
+    String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
+    Row.V_text (Buffer.contents buf)
+  | Ast.Fn_hex, [Row.V_int n] ->
+    (* SQLite converts the integer to its decimal string representation, then hexes that *)
+    let s = Int64.to_string n in
+    let buf = Buffer.create (String.length s * 2) in
+    String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
+    Row.V_text (Buffer.contents buf)
+  | Ast.Fn_hex, [Row.V_null] -> Row.V_text ""
+
+  (* ── CHAR ──────────────────────────────────────────────────────── *)
+  | Ast.Fn_char, args ->
+    let buf = Buffer.create 16 in
+    List.iter (fun v ->
+      match v with
+      | Row.V_int n when n >= 1L && n <= 0x10FFFFL ->
+        let cp = Int64.to_int n in
+        if cp < 0x80 then
+          Buffer.add_char buf (Char.chr cp)
+        else if cp < 0x800 then begin
+          Buffer.add_char buf (Char.chr (0xC0 lor (cp lsr 6)));
+          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+        end else if cp < 0x10000 then begin
+          Buffer.add_char buf (Char.chr (0xE0 lor (cp lsr 12)));
+          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+        end else begin
+          Buffer.add_char buf (Char.chr (0xF0 lor (cp lsr 18)));
+          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+        end
+      | _ -> ()
+    ) args;
+    Row.V_text (Buffer.contents buf)
+
+  (* ── UNICODE ──────────────────────────────────────────────────── *)
+  | Ast.Fn_unicode, [Row.V_text s] when String.length s > 0 ->
+    let b0 = Char.code s.[0] in
+    let cp =
+      if b0 < 0x80 then b0
+      else if b0 < 0xE0 && String.length s >= 2 then
+        ((b0 land 0x1F) lsl 6) lor (Char.code s.[1] land 0x3F)
+      else if b0 < 0xF0 && String.length s >= 3 then
+        ((b0 land 0x0F) lsl 12)
+        lor ((Char.code s.[1] land 0x3F) lsl 6)
+        lor (Char.code s.[2] land 0x3F)
+      else if b0 >= 0xF0 && String.length s >= 4 then
+        ((b0 land 0x07) lsl 18)
+        lor ((Char.code s.[1] land 0x3F) lsl 12)
+        lor ((Char.code s.[2] land 0x3F) lsl 6)
+        lor (Char.code s.[3] land 0x3F)
+      else b0
+    in
+    Row.V_int (Int64.of_int cp)
+  | Ast.Fn_unicode, [Row.V_text _] -> Row.V_null
+  | Ast.Fn_unicode, [Row.V_null]   -> Row.V_null
+
+  (* ── PRINTF / FORMAT ──────────────────────────────────────────── *)
+  | Ast.Fn_printf, (Row.V_text fmt :: rest) ->
+    let args_arr = Array.of_list rest in
+    let arg_idx = ref 0 in
+    let buf = Buffer.create 64 in
+    let n = String.length fmt in
+    let i = ref 0 in
+    while !i < n do
+      if fmt.[!i] = '%' then begin
+        incr i;
+        if !i < n then begin
+          let get_arg () =
+            let v = if !arg_idx < Array.length args_arr
+                    then args_arr.(!arg_idx)
+                    else Row.V_null in
+            incr arg_idx; v
+          in
+          (match fmt.[!i] with
+           | '%' -> Buffer.add_char buf '%'
+           | 'd' | 'i' ->
+             (match get_arg () with
+              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+              | Row.V_real f -> Buffer.add_string buf (string_of_int (int_of_float f))
+              | Row.V_text s -> (try Buffer.add_string buf (string_of_int (int_of_string s))
+                                 with _ -> ())
+              | _ -> ())
+           | 'f' ->
+             (match get_arg () with
+              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%f" f)
+              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%f" (Int64.to_float n2))
+              | _ -> ())
+           | 'e' ->
+             (match get_arg () with
+              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%e" f)
+              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%e" (Int64.to_float n2))
+              | _ -> ())
+           | 'g' ->
+             (match get_arg () with
+              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%g" (Int64.to_float n2))
+              | _ -> ())
+           | 's' ->
+             (match get_arg () with
+              | Row.V_text s -> Buffer.add_string buf s
+              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+              | Row.V_null   -> Buffer.add_string buf "NULL"
+              | Row.V_blob _ -> Buffer.add_string buf "")
+           | 'q' ->
+             (match get_arg () with
+              | Row.V_text s ->
+                String.iter (fun c ->
+                  if c = '\'' then Buffer.add_string buf "''"
+                  else Buffer.add_char buf c) s
+              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+              | Row.V_null   -> Buffer.add_string buf "NULL"
+              | Row.V_blob _ -> ())
+           | c ->
+             Buffer.add_char buf '%';
+             Buffer.add_char buf c);
+          incr i
+        end
+      end else begin
+        Buffer.add_char buf fmt.[!i];
+        incr i
+      end
+    done;
+    Row.V_text (Buffer.contents buf)
+  | Ast.Fn_printf, _ -> Row.V_null
+
+  (* ── ZEROBLOB ──────────────────────────────────────────────────── *)
+  | Ast.Fn_zeroblob, [Row.V_int n] when n >= 0L ->
+    Row.V_blob (Bytes.make (Int64.to_int n) '\000')
+  | Ast.Fn_zeroblob, _ -> Row.V_null
+
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
