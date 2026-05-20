@@ -1851,15 +1851,25 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
              let* child_rows =
                scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
              in
-             Lwt_list.iter_s (fun (crid, crow) ->
-               update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                 ~col_idx:child_col_idx ~new_val:Row.V_null
-             ) child_rows
+             if child_rows = [] then Lwt.return_unit
+             else begin
+               let col = List.nth child_meta.Cat.columns child_col_idx in
+               if col.Row.not_null then
+                 Lwt.fail_with (Printf.sprintf
+                   "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
+                   child_meta.Cat.name fk.Cat.fk_local_col)
+               else
+                 Lwt_list.iter_s (fun (crid, crow) ->
+                   update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                     ~col_idx:child_col_idx ~new_val:Row.V_null
+                 ) child_rows
+             end
            | Cat.FA_set_default ->
              let* child_rows =
                scan_child_rows_tx tx child_meta ~child_col_idx ~parent_val
              in
-             Lwt_list.iter_s (fun (crid, crow) ->
+             if child_rows = [] then Lwt.return_unit
+             else begin
                let col = List.nth child_meta.Cat.columns child_col_idx in
                let default_val = match col.Row.default with
                  | None               -> Row.V_null
@@ -1881,9 +1891,16 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                      (Plan.P_func (Ast.Fn_time,
                         [Plan.P_lit (Ast.L_text "now")]))
                in
-               update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-                 ~col_idx:child_col_idx ~new_val:default_val
-             ) child_rows)
+               if col.Row.not_null && default_val = Row.V_null then
+                 Lwt.fail_with (Printf.sprintf
+                   "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
+                   child_meta.Cat.name fk.Cat.fk_local_col)
+               else
+                 Lwt_list.iter_s (fun (crid, crow) ->
+                   update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                     ~col_idx:child_col_idx ~new_val:default_val
+                 ) child_rows
+             end)
       ) fks
     ) child_refs
   in
@@ -1953,7 +1970,8 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
             scan_child_rows_tx tx child_meta ~child_col_idx
               ~parent_val:old_val
           in
-          Lwt_list.iter_s (fun (crid, crow) ->
+          if child_rows = [] then Lwt.return_unit
+          else begin
             let col = List.nth child_meta.Cat.columns child_col_idx in
             let default_val = match col.Row.default with
               | None               -> Row.V_null
@@ -1975,9 +1993,16 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
                   (Plan.P_func (Ast.Fn_time,
                      [Plan.P_lit (Ast.L_text "now")]))
             in
-            update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
-              ~col_idx:child_col_idx ~new_val:default_val
-          ) child_rows
+            if col.Row.not_null && default_val = Row.V_null then
+              Lwt.fail_with (Printf.sprintf
+                "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
+                child_meta.Cat.name fk.Cat.fk_local_col)
+            else
+              Lwt_list.iter_s (fun (crid, crow) ->
+                update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                  ~col_idx:child_col_idx ~new_val:default_val
+              ) child_rows
+          end
       ) fks
     ) col_child_refs
   end
