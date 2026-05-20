@@ -939,7 +939,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
                              | Ast.Ty_text -> Row.Text
                              | Ast.Ty_real -> Row.Real
                              | Ast.Ty_blob -> Row.Blob);
-              not_null    = c.not_null;
+              not_null    = c.not_null || c.primary_key;
               primary_key = c.primary_key;
               default     = Option.map ast_lit_to_dv c.default;
               check_sql   = Option.map Ast.expr_to_sql c.check;
@@ -947,7 +947,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
                 (Ast.expr_to_sql e, s = `Stored)) c.generated_as }
       ) columns in
       (* Generate auto-UNIQUE index specs for table-level constraints *)
-      let uniq_idxs = List.filter_map (fun (i, tc) ->
+      let tbl_uniq_idxs = List.filter_map (fun (i, tc) ->
         match tc with
         | Ast.TC_unique cols ->
           let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
@@ -959,6 +959,14 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           Some (idx_name, cols)
         | Ast.TC_foreign_key _ -> None
       ) (List.mapi (fun i tc -> (i, tc)) constraints) in
+      (* Column-level PRIMARY KEY: also emit a unique index *)
+      let col_pk_idxs = List.filter_map (fun (c : Ast.column_def) ->
+        if c.primary_key then
+          let idx_name = Printf.sprintf "__pk_%s_%s" name c.name in
+          Some (idx_name, [c.name])
+        else None
+      ) columns in
+      let uniq_idxs = tbl_uniq_idxs @ col_pk_idxs in
       (* Extract FK constraints from column-level REFERENCES.
          Reject REFERENCES without an explicit column (parent_col = ""). *)
       let col_fks_result =

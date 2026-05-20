@@ -5798,6 +5798,42 @@ let drop_if_exists_tests = [
   Alcotest.test_case "drop_trigger_ine_nonexistent" `Quick test_drop_trigger_if_exists_nonexistent;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 27: Primary KEY enforcement                                    *)
+(* ------------------------------------------------------------------ *)
+
+let test_pk_col_rejects_duplicate () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'alice')";
+  (match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") with
+   | Error (Db.Runtime _) -> ()
+   | Ok () -> Alcotest.fail "expected unique constraint violation on PK"
+   | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e)
+
+let test_pk_col_allows_distinct () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
+  exec db "INSERT INTO t VALUES (1, 'alice')";
+  exec db "INSERT INTO t VALUES (2, 'bob')";
+  let rows = query_ok db "SELECT id FROM t ORDER BY id" in
+  Alcotest.(check int) "two rows" 2 (List.length rows)
+
+let test_pk_col_rejects_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+  (match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (NULL, 1)") with
+   | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "id")) -> ()
+   | Error (Db.Runtime _) -> ()   (* also acceptable: runtime enforcement *)
+   | Ok () -> Alcotest.fail "expected NOT NULL violation on PK"
+   | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e)
+
+let pk_enforcement_tests = [
+  Alcotest.test_case "rejects_duplicate" `Quick test_pk_col_rejects_duplicate;
+  Alcotest.test_case "allows_distinct"   `Quick test_pk_col_allows_distinct;
+  Alcotest.test_case "rejects_null"      `Quick test_pk_col_rejects_null;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6305,4 +6341,5 @@ let () =
     "generated_columns", generated_col_tests;
     "phase26_pragma", pragma_tests;
     "phase27_drop_ife", drop_if_exists_tests;
+    "phase27_pk", pk_enforcement_tests;
   ]
