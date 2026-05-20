@@ -239,6 +239,10 @@ type bound_stmt =
       body    : Ast.stmt list;
     }
   | BS_drop_trigger of { name : string }
+  | BS_explain of {
+      analyze : bool;
+      inner   : bound_stmt;
+    }
 
 type error =
   | Unknown_table       of string

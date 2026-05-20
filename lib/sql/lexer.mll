@@ -206,6 +206,8 @@ rule token = parse
       | "RESTRICT"     -> RESTRICT
       | "GROUP_CONCAT" -> GROUP_CONCAT
       | "STRING_AGG"   -> STRING_AGG
+      | "EXPLAIN"  -> EXPLAIN
+      | "ANALYZE"  -> ANALYZE
       | _              -> IDENT id
     }
   | eof                     { EOF }

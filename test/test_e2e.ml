@@ -5915,6 +5915,88 @@ let group_concat_tests = [
   Alcotest.test_case "string_agg"     `Quick test_string_agg_alias;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 28: EXPLAIN / EXPLAIN ANALYZE                                  *)
+(* ------------------------------------------------------------------ *)
+
+let contains_pat pat s =
+  let pn = String.length pat and n = String.length s in
+  let rec f i = if i > n - pn then false
+    else if String.sub s i pn = pat then true else f (i+1)
+  in f 0
+
+let test_explain_seqscan () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)") |> ignore;
+  run (Db.execute db "INSERT INTO t VALUES (1, 'a')") |> ignore;
+  let stream = run (Db.query db "EXPLAIN SELECT * FROM t") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "non-empty" true (rows <> []);
+  let root = List.hd rows in
+  Alcotest.(check int) "5 cols" 5 (Array.length root);
+  Alcotest.(check value_testable) "root parent = -1" (Db.V_int (-1L)) root.(1);
+  (* Check that at least one node contains "SeqScan" *)
+  let has_seqscan = List.exists (fun row ->
+    match row.(2) with
+    | Db.V_text s -> contains_pat "SeqScan" s
+    | _ -> false
+  ) rows in
+  Alcotest.(check bool) "has SeqScan" true has_seqscan
+
+let test_explain_nulls () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
+  let stream = run (Db.query db "EXPLAIN SELECT * FROM t WHERE id > 5") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "multiple nodes" true (List.length rows >= 2);
+  List.iter (fun row ->
+    Alcotest.(check value_testable) "actual_rows null" Db.V_null row.(3);
+    Alcotest.(check value_testable) "elapsed_ms null" Db.V_null row.(4)
+  ) rows
+
+let test_explain_analyze_count () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
+  run (Db.execute db "INSERT INTO t VALUES (1)") |> ignore;
+  run (Db.execute db "INSERT INTO t VALUES (2)") |> ignore;
+  let stream = run (Db.query db "EXPLAIN ANALYZE SELECT * FROM t") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "non-empty" true (rows <> []);
+  let root = List.hd rows in
+  Alcotest.(check value_testable) "actual_rows = 2" (Db.V_int 2L) root.(3);
+  (match root.(4) with
+   | Db.V_real f -> Alcotest.(check bool) "elapsed >= 0" true (f >= 0.0)
+   | _ -> Alcotest.fail "elapsed_ms not V_real")
+
+let test_explain_analyze_insert () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
+  let stream = run (Db.query db "EXPLAIN ANALYZE INSERT INTO t VALUES (1)") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check bool) "non-empty" true (rows <> []);
+  let root = List.hd rows in
+  (match root.(3) with
+   | Db.V_int n -> Alcotest.(check bool) "n >= 0" true (Int64.compare n 0L >= 0)
+   | _ -> Alcotest.fail "actual_rows not V_int")
+
+let test_explain_does_not_execute () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
+  let _stream = run (Db.query db "EXPLAIN INSERT INTO t VALUES (99)") |> Result.get_ok in
+  let _ = run (Lwt_stream.to_list _stream) in
+  let data_stream = run (Db.query db "SELECT * FROM t") |> Result.get_ok in
+  let data = run (Lwt_stream.to_list data_stream) in
+  Alcotest.(check int) "table empty after EXPLAIN INSERT" 0 (List.length data)
+
+let test_explain_analyze_as_col_names () =
+  let db = fresh_db () in
+  run (Db.execute db "CREATE TABLE t (explain TEXT, analyze INTEGER)") |> ignore;
+  run (Db.execute db "INSERT INTO t VALUES ('plan', 1)") |> ignore;
+  let stream = run (Db.query db "SELECT explain, analyze FROM t") |> Result.get_ok in
+  let rows = run (Lwt_stream.to_list stream) in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check value_testable) "explain col" (Db.V_text "plan") (List.hd rows).(0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6424,4 +6506,12 @@ let () =
     "phase27_drop_ife", drop_if_exists_tests;
     "phase27_pk", pk_enforcement_tests;
     "phase27_group_concat", group_concat_tests;
+    "phase28_explain", [
+      Alcotest.test_case "seqscan plan" `Quick test_explain_seqscan;
+      Alcotest.test_case "explain nulls for non-analyze" `Quick test_explain_nulls;
+      Alcotest.test_case "analyze select count" `Quick test_explain_analyze_count;
+      Alcotest.test_case "analyze insert" `Quick test_explain_analyze_insert;
+      Alcotest.test_case "explain does not execute" `Quick test_explain_does_not_execute;
+      Alcotest.test_case "explain analyze as col names" `Quick test_explain_analyze_as_col_names;
+    ];
   ]

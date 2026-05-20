@@ -336,6 +336,10 @@ and stmt =
       name      : string;
       if_exists : bool;
     }
+  | S_explain of {
+      analyze : bool;   (** false = EXPLAIN; true = EXPLAIN ANALYZE *)
+      stmt    : stmt;
+    }
 
 and pragma_kind =
   | Pragma_table_info       of string   (* PRAGMA table_info(tbl) *)

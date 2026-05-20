@@ -669,3 +669,5 @@ let rec plan ?cat = function
   | Sema.BS_drop_trigger { name } ->
     Plan.Op_drop_trigger { name }
   | Sema.BS_no_op -> Plan.Op_no_op
+  | Sema.BS_explain { analyze; inner } ->
+    Plan.Op_explain { analyze; inner = plan ?cat inner }

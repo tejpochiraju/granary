@@ -58,6 +58,7 @@
 %token JSON_SET JSON_INSERT_FN JSON_REPLACE_FN JSON_REMOVE
 %token NULLS
 %token GROUP_CONCAT STRING_AGG
+%token EXPLAIN ANALYZE
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -156,6 +157,8 @@ any_ident:
   | ABORT         { "abort" }
   | GROUP_CONCAT  { "group_concat" }
   | STRING_AGG    { "string_agg" }
+  | EXPLAIN { "explain" }
+  | ANALYZE { "analyze" }
 
 stmt:
   | s = with_cte          { s }
@@ -180,12 +183,19 @@ stmt:
   | s = rollback_to_stmt  { s }
   | s = pragma_stmt       { s }
   | s = alter_table       { s }
+  | s = explain_stmt      { s }
 
 with_cte:
   | WITH name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select
     { Ast.S_with_cte { name; def; query; recursive = false } }
   | WITH RECURSIVE name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select
     { Ast.S_with_cte { name; def; query; recursive = true } }
+
+explain_stmt:
+  | EXPLAIN inner = stmt
+    { Ast.S_explain { analyze = false; stmt = inner } }
+  | EXPLAIN ANALYZE inner = stmt
+    { Ast.S_explain { analyze = true; stmt = inner } }
 
 pragma_stmt:
   (* Arg form: PRAGMA name(arg) — must come first to avoid conflicts *)

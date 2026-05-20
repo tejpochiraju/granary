@@ -2326,6 +2326,102 @@ let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
       let* () = if owned then S.rollback tx else Lwt.return_unit in
       Lwt.fail exn)
 
+(* ------------------------------------------------------------------ *)
+(* EXPLAIN plan-tree pretty-printer                                     *)
+(* ------------------------------------------------------------------ *)
+
+let op_name = function
+  | Plan.Op_seq_scan { table_meta } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_filter _                -> "Filter"
+  | Plan.Op_project _               -> "Project"
+  | Plan.Op_expr_project _          -> "ExprProject"
+  | Plan.Op_sort _                  -> "Sort"
+  | Plan.Op_limit { limit; offset; _ } ->
+    Printf.sprintf "Limit(%d offset %d)" limit offset
+  | Plan.Op_aggregate _             -> "Aggregate"
+  | Plan.Op_hash_join { join_kind; _ } ->
+    (match join_kind with `Inner -> "HashJoin" | `Left -> "LeftHashJoin")
+  | Plan.Op_nested_loop_join { join_kind; right_meta; _ } ->
+    (match join_kind with
+     | `Inner -> "NestedLoopJoin(" ^ right_meta.Cat.name ^ ")"
+     | `Left  -> "LeftNestedLoopJoin(" ^ right_meta.Cat.name ^ ")")
+  | Plan.Op_index_lookup { table_meta; _ } ->
+    "IndexLookup(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_union { all; _ }        -> if all then "UnionAll" else "Union"
+  | Plan.Op_intersect _             -> "Intersect"
+  | Plan.Op_except _                -> "Except"
+  | Plan.Op_distinct _              -> "Distinct"
+  | Plan.Op_const_select _          -> "ConstSelect"
+  | Plan.Op_window _                -> "Window"
+  | Plan.Op_with_cte { cte_name; _ } -> "WithCte(" ^ cte_name ^ ")"
+  | Plan.Op_cte_scan { cte_name; _ } -> "CteScan(" ^ cte_name ^ ")"
+  | Plan.Op_insert { table_meta; _ } -> "Insert(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_update { table_meta; _ } -> "Update(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_delete { table_meta; _ } -> "Delete(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_create_table { name; _ } -> "CreateTable(" ^ name ^ ")"
+  | Plan.Op_create_index { name; table; _ } ->
+    "CreateIndex(" ^ name ^ " on " ^ table ^ ")"
+  | Plan.Op_drop_table { table_meta; _ } ->
+    "DropTable(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_drop_index { idx_info } ->
+    "DropIndex(" ^ idx_info.Cat.idx_name ^ ")"
+  | Plan.Op_alter_table { table_meta; _ } ->
+    "AlterTable(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_begin               -> "Begin"
+  | Plan.Op_commit              -> "Commit"
+  | Plan.Op_rollback            -> "Rollback"
+  | Plan.Op_savepoint name      -> "Savepoint(" ^ name ^ ")"
+  | Plan.Op_release name        -> "Release(" ^ name ^ ")"
+  | Plan.Op_rollback_to name    -> "RollbackTo(" ^ name ^ ")"
+  | Plan.Op_create_view { name; _ }    -> "CreateView(" ^ name ^ ")"
+  | Plan.Op_drop_view { name }         -> "DropView(" ^ name ^ ")"
+  | Plan.Op_create_trigger { name; _ } -> "CreateTrigger(" ^ name ^ ")"
+  | Plan.Op_drop_trigger { name }      -> "DropTrigger(" ^ name ^ ")"
+  | Plan.Op_pragma_rows _              -> "Pragma"
+  | Plan.Op_pragma_get_user_version    -> "Pragma(get_user_version)"
+  | Plan.Op_pragma_set_user_version { version } ->
+    Printf.sprintf "Pragma(set_user_version=%Ld)" version
+  | Plan.Op_pragma_integrity_check     -> "Pragma(integrity_check)"
+  | Plan.Op_no_op                      -> "NoOp"
+  | Plan.Op_explain { analyze; _ }     ->
+    if analyze then "ExplainAnalyze" else "Explain"
+  | Plan.Op_create_fts_table { name; _ } -> "CreateFtsTable(" ^ name ^ ")"
+  | Plan.Op_fts_insert { fts_meta; _ }   -> "FtsInsert(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_delete { fts_meta; _ }   -> "FtsDelete(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_seq_scan { fts_meta; _ } -> "FtsSeqScan(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_match_scan { fts_meta; _ } ->
+    "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
+
+let op_children = function
+  | Plan.Op_filter { child; _ }      -> [child]
+  | Plan.Op_project { child; _ }     -> [child]
+  | Plan.Op_expr_project { child; _ }-> [child]
+  | Plan.Op_sort { child; _ }        -> [child]
+  | Plan.Op_limit { child; _ }       -> [child]
+  | Plan.Op_distinct { child }       -> [child]
+  | Plan.Op_aggregate { child; _ }   -> [child]
+  | Plan.Op_window { child; _ }      -> [child]
+  | Plan.Op_hash_join { left; right; _ } -> [left; right]
+  | Plan.Op_nested_loop_join { left; _ } -> [left]
+  | Plan.Op_union { left; right; _ } -> [left; right]
+  | Plan.Op_intersect { left; right } -> [left; right]
+  | Plan.Op_except { left; right }   -> [left; right]
+  | Plan.Op_with_cte { def; query; _ } -> [def; query]
+  | Plan.Op_explain { inner; _ }     -> [inner]
+  | _                                -> []
+
+let explain_plan op =
+  let counter = ref 0 in
+  let rec walk parent op =
+    let id = !counter in
+    incr counter;
+    let my_row = [| Row.V_int (Int64.of_int id);
+                    Row.V_int (Int64.of_int parent);
+                    Row.V_text (op_name op) |] in
+    my_row :: List.concat_map (walk id) (op_children op)
+  in
+  walk (-1) op
+
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
@@ -2624,6 +2720,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
+  | Plan.Op_explain _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
   | Plan.Op_window _
@@ -4075,6 +4172,48 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       Lwt.return (Lwt_stream.of_list augmented)
     end
   | Plan.Op_no_op -> Lwt.return (Lwt_stream.of_list [])
+  | Plan.Op_explain { analyze; inner } ->
+    let plan_rows = explain_plan inner in
+    let nullify row = Array.append row [| Row.V_null; Row.V_null |] in
+    if not analyze then
+      Lwt.return (Lwt_stream.of_list (List.map nullify plan_rows))
+    else begin
+      let cat_v = match cat with Some c -> c
+        | None -> failwith "EXPLAIN ANALYZE requires a catalog" in
+      let t0 = match clock with Some c -> c () | None -> 0.0 in
+      let* n =
+        let is_write = match inner with
+          | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _
+          | Plan.Op_create_table _ | Plan.Op_create_index _
+          | Plan.Op_drop_table _ | Plan.Op_drop_index _
+          | Plan.Op_alter_table _ | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
+          | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
+          | Plan.Op_create_view _ | Plan.Op_drop_view _
+          | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
+          | Plan.Op_pragma_set_user_version _
+          | Plan.Op_fts_insert _ | Plan.Op_fts_delete _ -> true
+          | _ -> false
+        in
+        if is_write then
+          execute_with_count ~mode ~clock ~params store cat_v inner
+        else begin
+          let* s = to_stream clock params store ~mode ~cat inner in
+          let* rows = Lwt_stream.to_list s in
+          Lwt.return (List.length rows)
+        end
+      in
+      let elapsed_ms =
+        match clock with Some c -> (c () -. t0) *. 1000.0 | None -> 0.0
+      in
+      let rows = List.mapi (fun i row ->
+        if i = 0 then
+          Array.append row
+            [| Row.V_int (Int64.of_int n); Row.V_real elapsed_ms |]
+        else
+          nullify row
+      ) plan_rows in
+      Lwt.return (Lwt_stream.of_list rows)
+    end
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
