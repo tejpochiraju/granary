@@ -1,6 +1,13 @@
 module Cat = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 
+let fk_action_str = function
+  | Cat.FA_no_action   -> "NO ACTION"
+  | Cat.FA_restrict    -> "RESTRICT"
+  | Cat.FA_cascade     -> "CASCADE"
+  | Cat.FA_set_null    -> "SET NULL"
+  | Cat.FA_set_default -> "SET DEFAULT"
+
 let plan_binop : Sema.binop -> Plan.binop = function
   | Sema.Eq  -> Plan.Eq  | Sema.Ne  -> Plan.Ne
   | Sema.Lt  -> Plan.Lt  | Sema.Le  -> Plan.Le
@@ -568,40 +575,82 @@ let rec plan ?cat = function
   | Sema.BS_const_select { exprs } ->
     Plan.Op_const_select { exprs = List.map (fun (e, alias) -> (plan_expr e, alias)) exprs }
   | Sema.BS_pragma { kind } ->
-    let rows = match kind with
-      | Ast.Pragma_table_info table_name ->
-        (match cat with
-         | None -> []
-         | Some c ->
-           (match Cat.find_table_cached c ~name:table_name with
+    (match kind with
+     | Ast.Pragma_user_version ->
+       Plan.Op_pragma_get_user_version
+
+     | Ast.Pragma_user_version_set v ->
+       Plan.Op_pragma_set_user_version { version = v }
+
+     | Ast.Pragma_integrity_check ->
+       Plan.Op_pragma_integrity_check
+
+     | _ ->
+       let rows = match kind with
+         | Ast.Pragma_table_info table_name ->
+           (match cat with
             | None -> []
-            | Some meta ->
-              List.mapi (fun i (col : Row.column) ->
-                [| Row.V_int (Int64.of_int i);
-                   Row.V_text col.name;
-                   Row.V_text (match col.ty with
-                     | Row.Integer -> "INTEGER" | Row.Text -> "TEXT"
-                     | Row.Real    -> "REAL"    | Row.Blob -> "BLOB");
-                   Row.V_int (if col.not_null then 1L else 0L);
-                   Row.V_null;  (* dflt_value — simplified *)
-                   Row.V_int (if col.primary_key then 1L else 0L) |]
-              ) meta.columns))
-      | Ast.Pragma_index_list table_name ->
-        let idxs = match cat with
-          | None -> []
-          | Some c -> Cat.indexes_for_table c ~table:table_name
-        in
-        List.mapi (fun i (idx : Cat.index_info) ->
-          [| Row.V_int (Int64.of_int i);
-             Row.V_text idx.idx_name;
-             Row.V_int (if idx.idx_unique then 1L else 0L) |]
-        ) idxs
-      | Ast.Pragma_foreign_key_list _ | Ast.Pragma_foreign_keys
-      | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
-      | Ast.Pragma_journal_mode | Ast.Pragma_integrity_check -> []  (* new variants handled in Task 3 *)
-      | Ast.Pragma_set (_, _) -> []  (* setter pragmas are no-ops *)
-    in
-    Plan.Op_pragma_rows { rows }
+            | Some c ->
+              (match Cat.find_table_cached c ~name:table_name with
+               | None -> []
+               | Some meta ->
+                 List.mapi (fun i (col : Row.column) ->
+                   [| Row.V_int (Int64.of_int i);
+                      Row.V_text col.name;
+                      Row.V_text (match col.ty with
+                        | Row.Integer -> "INTEGER" | Row.Text -> "TEXT"
+                        | Row.Real    -> "REAL"    | Row.Blob -> "BLOB");
+                      Row.V_int (if col.not_null then 1L else 0L);
+                      Row.V_null;  (* dflt_value — simplified *)
+                      Row.V_int (if col.primary_key then 1L else 0L) |]
+                 ) meta.columns))
+
+         | Ast.Pragma_index_list table_name ->
+           let idxs = match cat with
+             | None   -> []
+             | Some c -> Cat.indexes_for_table c ~table:table_name
+           in
+           List.mapi (fun i (idx : Cat.index_info) ->
+             [| Row.V_int (Int64.of_int i);
+                Row.V_text idx.idx_name;
+                Row.V_int (if idx.idx_unique then 1L else 0L) |]
+           ) idxs
+
+         | Ast.Pragma_foreign_key_list table_name ->
+           let fks = match cat with
+             | None   -> []
+             | Some c ->
+               (match Cat.find_table_cached c ~name:table_name with
+                | None -> []
+                | Some meta -> meta.Cat.fk_constraints)
+           in
+           (* SQLite column order: id, seq, table (parent), from (local), to (parent col),
+              on_update, on_delete, match *)
+           List.mapi (fun i (fk : Cat.fk_constraint) ->
+             [| Row.V_int (Int64.of_int i);
+                Row.V_int 0L;               (* seq: always 0 for single-col FKs *)
+                Row.V_text fk.Cat.fk_parent_table;
+                Row.V_text fk.Cat.fk_local_col;
+                Row.V_text fk.Cat.fk_parent_col;
+                Row.V_text (fk_action_str fk.Cat.fk_on_update);
+                Row.V_text (fk_action_str fk.Cat.fk_on_delete);
+                Row.V_text "NONE" |]        (* match: always NONE *)
+           ) fks
+
+         | Ast.Pragma_foreign_keys ->
+           [ [| Row.V_int 1L |] ]    (* sqlocaml always enforces FKs *)
+
+         | Ast.Pragma_journal_mode ->
+           [ [| Row.V_text "delete" |] ]
+
+         | Ast.Pragma_set _ ->
+           []    (* no-op setter: return empty result *)
+
+         | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
+         | Ast.Pragma_integrity_check ->
+           assert false   (* handled by outer match above *)
+       in
+       Plan.Op_pragma_rows { rows })
   | Sema.BS_with_cte { name; def; query; recursive } ->
     Plan.Op_with_cte {
       cte_name  = name;

@@ -202,6 +202,12 @@ type op =
   | Op_pragma_rows of {
       rows : Sqlocaml_encoding.Row.t list;
     }
+  | Op_pragma_get_user_version
+    (** Read user_version from sys_meta at exec time; returns one row [[V_int n]]. *)
+  | Op_pragma_set_user_version of { version : int64 }
+    (** Write user_version to sys_meta; DDL-like, returns 0 rows. *)
+  | Op_pragma_integrity_check
+    (** Scan all table + index B-trees; return [["ok"]] or list of error strings. *)
   | Op_distinct of {
       child : op;
     }

@@ -2616,11 +2616,13 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
+  | Plan.Op_pragma_set_user_version _ -> Lwt.return 0  (* stub: exec-time handled later *)
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _ -> Lwt.return 0
   | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
   | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
-  | Plan.Op_window _ ->
+  | Plan.Op_window _
+  | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -3730,6 +3732,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
+  | Plan.Op_pragma_get_user_version ->
+    (* stub: exec-time user_version read — return 0 until Phase 26 Task 4 *)
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int 0L |] ])
+  | Plan.Op_pragma_integrity_check ->
+    (* stub: integrity check — return "ok" until Phase 26 Task 4 *)
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_text "ok" |] ])
   | Plan.Op_union { all; left; right } ->
     let* ls = to_stream clock params store ~mode ~cat left  in
     let* rs = to_stream clock params store ~mode ~cat right in
@@ -4000,7 +4008,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
-  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
+  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
+  | Plan.Op_pragma_set_user_version _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
