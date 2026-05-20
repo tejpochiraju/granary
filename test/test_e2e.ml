@@ -5834,6 +5834,88 @@ let pk_enforcement_tests = [
   Alcotest.test_case "rejects_null"      `Quick test_pk_col_rejects_null;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 27: GROUP_CONCAT                                               *)
+(* ------------------------------------------------------------------ *)
+
+let test_group_concat_basic () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v TEXT)";
+  exec db "INSERT INTO t VALUES ('a')";
+  exec db "INSERT INTO t VALUES ('b')";
+  exec db "INSERT INTO t VALUES ('c')";
+  let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  let v = (List.hd rows).(0) in
+  (match v with
+   | Db.V_text s ->
+     Alcotest.(check bool) "contains a" true (String.contains s 'a');
+     Alcotest.(check bool) "contains b" true (String.contains s 'b');
+     Alcotest.(check bool) "contains c" true (String.contains s 'c')
+   | _ -> Alcotest.fail "expected text")
+
+let test_group_concat_custom_sep () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v TEXT)";
+  exec db "INSERT INTO t VALUES ('x')";
+  exec db "INSERT INTO t VALUES ('y')";
+  let rows = query_ok db "SELECT GROUP_CONCAT(v, '|') FROM t" in
+  let v = (List.hd rows).(0) in
+  (match v with
+   | Db.V_text s ->
+     Alcotest.(check bool) "contains pipe" true (String.contains s '|')
+   | _ -> Alcotest.fail "expected text")
+
+let test_group_concat_skips_null () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v TEXT)";
+  exec db "INSERT INTO t VALUES ('hello')";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES ('world')";
+  let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
+  let v = (List.hd rows).(0) in
+  (match v with
+   | Db.V_text s ->
+     Alcotest.(check bool) "no null in result" false (String.contains s 'N')
+   | _ -> Alcotest.fail "expected text")
+
+let test_group_concat_empty () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v TEXT)";
+  let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.(check bool) "null for empty" true ((List.hd rows).(0) = Db.V_null)
+
+let test_group_concat_with_group_by () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (k TEXT, v TEXT)";
+  exec db "INSERT INTO t VALUES ('a', '1')";
+  exec db "INSERT INTO t VALUES ('a', '2')";
+  exec db "INSERT INTO t VALUES ('b', '3')";
+  let rows = query_ok db "SELECT k, GROUP_CONCAT(v) FROM t GROUP BY k ORDER BY k" in
+  Alcotest.(check int) "two groups" 2 (List.length rows)
+
+let test_string_agg_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (v TEXT)";
+  exec db "INSERT INTO t VALUES ('p')";
+  exec db "INSERT INTO t VALUES ('q')";
+  let rows = query_ok db "SELECT STRING_AGG(v, '-') FROM t" in
+  let v = (List.hd rows).(0) in
+  (match v with
+   | Db.V_text s ->
+     Alcotest.(check bool) "contains dash" true (String.contains s '-')
+   | _ -> Alcotest.fail "expected text")
+
+let group_concat_tests = [
+  Alcotest.test_case "basic"          `Quick test_group_concat_basic;
+  Alcotest.test_case "custom_sep"     `Quick test_group_concat_custom_sep;
+  Alcotest.test_case "skips_null"     `Quick test_group_concat_skips_null;
+  Alcotest.test_case "empty_table"    `Quick test_group_concat_empty;
+  Alcotest.test_case "with_group_by"  `Quick test_group_concat_with_group_by;
+  Alcotest.test_case "string_agg"     `Quick test_string_agg_alias;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6342,4 +6424,5 @@ let () =
     "phase26_pragma", pragma_tests;
     "phase27_drop_ife", drop_if_exists_tests;
     "phase27_pk", pk_enforcement_tests;
+    "phase27_group_concat", group_concat_tests;
   ]

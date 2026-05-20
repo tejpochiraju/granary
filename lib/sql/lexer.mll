@@ -197,14 +197,16 @@ rule token = parse
       | "JSON_INSERT"  -> JSON_INSERT_FN
       | "JSON_REPLACE" -> JSON_REPLACE_FN
       | "JSON_REMOVE"  -> JSON_REMOVE
-      | "SAVEPOINT"  -> SAVEPOINT
-      | "RELEASE"    -> RELEASE
-      | "TRIGGER"    -> TRIGGER
-      | "BEFORE"     -> BEFORE
-      | "AFTER"      -> AFTER
-      | "CASCADE"    -> CASCADE
-      | "RESTRICT"   -> RESTRICT
-      | _            -> IDENT id
+      | "SAVEPOINT"    -> SAVEPOINT
+      | "RELEASE"      -> RELEASE
+      | "TRIGGER"      -> TRIGGER
+      | "BEFORE"       -> BEFORE
+      | "AFTER"        -> AFTER
+      | "CASCADE"      -> CASCADE
+      | "RESTRICT"     -> RESTRICT
+      | "GROUP_CONCAT" -> GROUP_CONCAT
+      | "STRING_AGG"   -> STRING_AGG
+      | _              -> IDENT id
     }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }

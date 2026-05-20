@@ -3179,6 +3179,18 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
                | Row.V_null -> v
                | acc_v -> if compare_values v acc_v > 0 then v else acc_v)
            ) Row.V_null indices
+         | Ast.Agg_group_concat sep ->
+           let separator = Option.value sep ~default:"," in
+           let parts = List.filter_map (fun i ->
+             match arg_vals.(i) with
+             | Row.V_null -> None
+             | Row.V_int  n -> Some (Int64.to_string n)
+             | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+             | Row.V_text s -> Some s
+             | Row.V_blob _ -> Some ""
+           ) indices in
+           if parts = [] then Row.V_null
+           else Row.V_text (String.concat separator parts)
        in
        results.(sorted_orig_idxs.(pos)) <- result
      done
@@ -3601,6 +3613,20 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | v, cur ->
             if compare_values v cur > 0 then v else cur
         ) Row.V_null group_rows
+      | Ast.Agg_group_concat sep, Some i ->
+        let separator = Option.value sep ~default:"," in
+        let parts = List.filter_map (fun r ->
+          match r.(i) with
+          | Row.V_null -> None
+          | Row.V_int  n -> Some (Int64.to_string n)
+          | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+          | Row.V_text s -> Some s
+          | Row.V_blob _ -> Some ""
+        ) group_rows in
+        if parts = [] then Row.V_null
+        else Row.V_text (String.concat separator parts)
+      | Ast.Agg_group_concat _, None ->
+        failwith "GROUP_CONCAT requires a column argument"
       | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
         failwith "non-COUNT aggregate must have a column argument"
     in

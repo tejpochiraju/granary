@@ -36,7 +36,14 @@ type binop =
   | Like | Glob                    (** pattern matching *)
 
 (** Aggregate functions supported in Phase 2 Task 6. *)
-type agg_func = Agg_count | Agg_sum | Agg_avg | Agg_min | Agg_max
+type agg_func =
+  | Agg_count
+  | Agg_sum
+  | Agg_avg
+  | Agg_min
+  | Agg_max
+  | Agg_group_concat of string option
+    (** GROUP_CONCAT(col) → None (default sep ","); GROUP_CONCAT(col, 'sep') → Some sep *)
 
 (** Scalar functions supported in Phase 5 Task 1. *)
 type scalar_func =

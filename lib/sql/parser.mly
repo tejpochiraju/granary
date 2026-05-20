@@ -57,6 +57,7 @@
 %token JSON_EXTRACT JSON_OBJECT_FN JSON_ARRAY_FN JSON_TYPE JSON_VALID
 %token JSON_SET JSON_INSERT_FN JSON_REPLACE_FN JSON_REMOVE
 %token NULLS
+%token GROUP_CONCAT STRING_AGG
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -153,6 +154,8 @@ any_ident:
   | VIEW          { "view" }
   | VIRTUAL       { "virtual" }
   | ABORT         { "abort" }
+  | GROUP_CONCAT  { "group_concat" }
+  | STRING_AGG    { "string_agg" }
 
 stmt:
   | s = with_cte          { s }
@@ -721,6 +724,12 @@ agg_or_window_expr:
     { match ow with
       | None   -> E_agg (Agg_max, Some e)
       | Some w -> E_window { func = WF_agg Agg_max; args = [e]; window = w } }
+  | GROUP_CONCAT LPAREN e = expr RPAREN
+    { E_agg (Agg_group_concat None, Some e) }
+  | GROUP_CONCAT LPAREN e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg (Agg_group_concat (Some sep), Some e) }
+  | STRING_AGG LPAREN e = expr COMMA sep = STRING_LIT RPAREN
+    { E_agg (Agg_group_concat (Some sep), Some e) }
 
 window_spec:
   | LPAREN pb = partition_clause ob = order_by_clause fs = option(frame_spec) RPAREN
