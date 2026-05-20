@@ -980,10 +980,21 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Ok fks ->
             (match cd.Ast.fk_ref with
              | None -> Ok fks
-             | Some (parent_table, "", _, _) ->
-               Error (Unsupported (Printf.sprintf
-                 "FOREIGN KEY on '%s': explicit parent column required, write REFERENCES %s(col)"
-                 cd.Ast.name parent_table))
+             | Some (parent_table, "", od, ou) ->
+               (match Cat.find_table_cached cat ~name:parent_table with
+                | None ->
+                  Error (Unsupported (Printf.sprintf
+                    "FOREIGN KEY on '%s': parent table '%s' not found"
+                    cd.Ast.name parent_table))
+                | Some parent_meta ->
+                  (match List.find_opt (fun (c : Row.column) -> c.primary_key)
+                                       parent_meta.Cat.columns with
+                   | None ->
+                     Error (Unsupported (Printf.sprintf
+                       "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer column"
+                       cd.Ast.name parent_table))
+                   | Some pk_col ->
+                     Ok (fks @ [(cd.Ast.name, parent_table, pk_col.name, od, ou)])))
              | Some (parent_table, parent_col, od, ou) ->
                Ok (fks @ [(cd.Ast.name, parent_table, parent_col, od, ou)]))
         ) (Ok []) columns

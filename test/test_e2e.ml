@@ -2522,14 +2522,12 @@ let test_fk_parse_no_col () =
     let* db = Db.open_in_memory () in
     let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
     let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
-    (* REFERENCES without explicit column is rejected with an Unsupported error *)
-    let* result = Db.execute db
+    (* REFERENCES without explicit column is now inferred from parent's PK *)
+    let* _ = Db.execute db
       "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
-    let is_unsupported = match result with
-      | Error (Db.Sema (Sqlocaml_sql.Sema.Unsupported _)) -> true
-      | _ -> false
-    in
-    Alcotest.(check bool) "REFERENCES no_col rejected with Unsupported" true is_unsupported;
+    (* Valid FK insert: user_id=1 exists in users (inferred column is 'id') *)
+    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+    Alcotest.(check bool) "implicit FK column inferred from PK" true (n = Ok ());
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
@@ -2606,6 +2604,32 @@ let test_fk_multi_col_unsupported () =
     (match result with
      | Error _ -> ()
      | Ok () -> Alcotest.fail "expected error for multi-column FK");
+    Lwt.return_unit)
+
+let fk_implicit_parent_col () =
+  let db = fresh_db () in
+  run (
+    let* () = (let* r = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let* () = (let* r = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let* () = (let* r = Db.execute db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let* () = (let* r = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let rows = query_ok db "SELECT count(*) FROM orders" in
+    Alcotest.check value_testable "count" (Db.V_int 1L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+let fk_implicit_no_pk_error () =
+  let db = fresh_db () in
+  run (
+    let* () = (let* r = Db.execute db "CREATE TABLE nopk (name TEXT)" in
+      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
+    let* result = Db.execute db "CREATE TABLE child (x INTEGER REFERENCES nopk)" in
+    (match result with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected error for REFERENCES table with no PK");
     Lwt.return_unit)
 
 (* ------------------------------------------------------------------ *)
@@ -6293,6 +6317,8 @@ let () =
       Alcotest.test_case "invalid_insert"        `Quick test_fk_invalid_insert;
       Alcotest.test_case "null_allowed"          `Quick test_fk_null_allowed;
       Alcotest.test_case "multi_col_unsupported" `Quick test_fk_multi_col_unsupported;
+      Alcotest.test_case "implicit_parent_col"   `Quick fk_implicit_parent_col;
+      Alcotest.test_case "implicit_no_pk_error"  `Quick fk_implicit_no_pk_error;
     ];
     "check_constraints", [
       Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
