@@ -2368,7 +2368,32 @@ let bind_alter_table cat ~table ~action =
                                          col_def.Ast.default = Some Ast.L_null) then
          Lwt.return (Error (Unsupported
            "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action }))
+       else
+         (match col_def.Ast.fk_ref with
+          | None -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
+          | Some (parent_table, parent_col, _od, _ou) ->
+            (match Cat.find_table_cached cat ~name:parent_table with
+             | None ->
+               Lwt.return (Error (Unsupported
+                 (Printf.sprintf "REFERENCES: table '%s' does not exist" parent_table)))
+             | Some parent_meta ->
+               let actual_parent_col =
+                 if parent_col = "" then
+                   (match List.find_opt (fun (c : Row.column) -> c.primary_key) parent_meta.Cat.columns with
+                    | None -> None
+                    | Some pk -> Some pk.Row.name)
+                 else
+                   (if List.exists (fun (c : Row.column) -> String.equal c.name parent_col) parent_meta.Cat.columns
+                    then Some parent_col
+                    else None)
+               in
+               match actual_parent_col with
+               | None ->
+                 Lwt.return (Error (Unsupported
+                   (Printf.sprintf "REFERENCES: column '%s' not found in '%s'"
+                      parent_col parent_table)))
+               | Some _ ->
+                 Lwt.return (Ok (BS_alter_table { table_meta; action }))))
      | Ast.AA_rename_table _ ->
        Lwt.return (Ok (BS_alter_table { table_meta; action }))
      | Ast.AA_rename_column (old_col, _new_col) ->

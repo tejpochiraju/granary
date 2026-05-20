@@ -3296,6 +3296,41 @@ let phase30_sqlite_master_cases = [
     unordered = false };
 ]
 
+let phase31_alter_fk_cases = [
+  { name = "alter_add_fk_valid_insert";
+    setup = [
+      "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+      "INSERT INTO parent VALUES (1)";
+      "INSERT INTO parent VALUES (2)";
+      "CREATE TABLE child (id INTEGER)";
+      "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)";
+      "INSERT INTO child VALUES (10, 1)";
+      "INSERT INTO child VALUES (20, 2)";
+    ];
+    query = "SELECT COUNT(*) FROM child";
+    unordered = false };
+
+  { name = "alter_add_fk_null_allowed";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE child (id INTEGER)";
+      "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)";
+      "INSERT INTO child VALUES (1, NULL)";
+    ];
+    query = "SELECT id, parent_id FROM child";
+    unordered = false };
+
+  { name = "alter_add_fk_pragma_list";
+    setup = [
+      "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE child (id INTEGER)";
+      "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)";
+    ];
+    query = "PRAGMA foreign_key_list(child)";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3341,4 +3376,5 @@ let () =
     "phase30_cascade",         List.map make_test phase30_cascade_cases;
     "phase30_snippet",         List.map make_test phase30_snippet_cases;
     "phase30_sqlite_master",   List.map make_test phase30_sqlite_master_cases;
+    "phase31_alter_fk",        List.map make_test phase31_alter_fk_cases;
   ]

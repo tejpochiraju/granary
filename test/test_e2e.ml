@@ -6480,6 +6480,68 @@ let test_sqlite_master_trigger_tblname () =
     Alcotest.check value_testable "trigger tbl_name" (Db.V_text "t") row.(2);
     Lwt.return_unit)
 
+(* ── Phase 31: ALTER TABLE ADD COLUMN REFERENCES ────────────────── *)
+
+let test_alter_add_fk_column_valid_insert () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (1)" in
+    let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
+    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "INSERT INTO child VALUES (10, 1)" in
+    let* rows = query_rows db "SELECT id, parent_id FROM child" in
+    check_rows "valid FK insert" [[| Db.V_int 10L; Db.V_int 1L |]] rows;
+    Lwt.return_unit)
+
+let test_alter_add_fk_column_invalid_insert_fails () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
+    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
+    check_error "FK violation on missing parent"
+      (exec_err db "INSERT INTO child VALUES (10, 999)");
+    Lwt.return_unit)
+
+let test_alter_add_fk_inferred_pk () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (42)" in
+    let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
+    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent" in
+    let* () = exec_in db "INSERT INTO child VALUES (1, 42)" in
+    let* rows = query_rows db "SELECT id, parent_id FROM child" in
+    check_rows "inferred PK FK insert" [[| Db.V_int 1L; Db.V_int 42L |]] rows;
+    Lwt.return_unit)
+
+let test_alter_add_fk_bad_parent_table () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
+    check_error "bad parent table rejected"
+      (exec_err db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES no_such_table(id)");
+    Lwt.return_unit)
+
+let test_alter_add_fk_bad_parent_column () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE child (x INTEGER)" in
+    check_error "bad parent column rejected"
+      (exec_err db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(no_such_col)");
+    Lwt.return_unit)
+
+let test_alter_add_fk_null_is_allowed () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
+    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
+    let* () = exec_in db "INSERT INTO child VALUES (1, NULL)" in
+    let* rows = query_rows db "SELECT id, parent_id FROM child" in
+    check_rows "NULL FK allowed" [[| Db.V_int 1L; Db.V_null |]] rows;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7034,5 +7096,13 @@ let () =
       Alcotest.test_case "schema_alias" `Quick test_sqlite_schema_alias;
       Alcotest.test_case "count_star"      `Quick test_sqlite_master_count_star;
       Alcotest.test_case "trigger_tblname" `Quick test_sqlite_master_trigger_tblname;
+    ];
+    "phase31_alter_fk", [
+      Alcotest.test_case "valid_insert"          `Quick test_alter_add_fk_column_valid_insert;
+      Alcotest.test_case "invalid_insert_fails"  `Quick test_alter_add_fk_column_invalid_insert_fails;
+      Alcotest.test_case "inferred_pk"           `Quick test_alter_add_fk_inferred_pk;
+      Alcotest.test_case "bad_parent_table"      `Quick test_alter_add_fk_bad_parent_table;
+      Alcotest.test_case "bad_parent_column"     `Quick test_alter_add_fk_bad_parent_column;
+      Alcotest.test_case "null_is_allowed"       `Quick test_alter_add_fk_null_is_allowed;
     ];
   ]

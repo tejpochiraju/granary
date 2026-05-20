@@ -2978,7 +2978,36 @@ let execute_with_count ?(mode = Auto)
        let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
        (match result with
         | Error msg -> Lwt.fail_with msg
-        | Ok ()     -> Lwt.return 0)
+        | Ok () ->
+          (match col_def.Ast.fk_ref with
+           | None -> Lwt.return 0
+           | Some (parent_table, parent_col, ast_od, ast_ou) ->
+             let inferred_parent_col =
+               if parent_col = "" then
+                 (match Cat.find_table_cached cat ~name:parent_table with
+                  | None -> parent_col
+                  | Some pm ->
+                    (match List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns with
+                     | None -> parent_col
+                     | Some pk -> pk.Row.name))
+               else parent_col
+             in
+             let new_fk : Cat.fk_constraint = {
+               Cat.fk_local_col    = col_def.Ast.name;
+               Cat.fk_parent_table = parent_table;
+               Cat.fk_parent_col   = inferred_parent_col;
+               Cat.fk_on_delete    = ast_od;
+               Cat.fk_on_update    = ast_ou;
+             } in
+             let existing_fks =
+               match Cat.find_table_cached cat ~name:table_meta.Cat.name with
+               | None -> []
+               | Some m -> m.Cat.fk_constraints
+             in
+             let new_fks = existing_fks @ [new_fk] in
+             let* () = Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks in
+             Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
+             Lwt.return 0))
      | Ast.AA_rename_table new_name ->
        let* result = Cat.rename_table cat
            ~old_name:table_meta.Cat.name ~new_name in
