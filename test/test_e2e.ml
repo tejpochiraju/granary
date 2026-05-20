@@ -6368,6 +6368,24 @@ let test_fts_snippet_with_rank () =
       (contains_pat "[OCaml]" snip || contains_pat "[ocaml]" snip);
     Lwt.return_unit)
 
+let test_fts_snippet_term_in_other_col () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(title, body)" in
+    let* () = exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'learn programming here')" in
+    (* Match is on 'title' (col 0), but snippet requests col 1 ('body') where 'ocaml' does not appear *)
+    let* rows = query_rows db
+      "SELECT snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'ocaml'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    (* col 1 does not contain 'ocaml', so snippet falls back to truncated text without tags *)
+    let snip = match (List.hd rows).(0) with
+      | Db.V_text s -> s
+      | _ -> Alcotest.fail "expected V_text"
+    in
+    Alcotest.(check bool) "no tag in fallback snippet" true
+      (not (contains_pat "[" snip) && not (contains_pat "]" snip));
+    Alcotest.(check bool) "fallback is non-empty" true (String.length snip > 0);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -6911,5 +6929,6 @@ let () =
       Alcotest.test_case "no_match_doc"  `Quick test_fts_snippet_no_match_doc;
       Alcotest.test_case "window"        `Quick test_fts_snippet_window;
       Alcotest.test_case "with_rank"     `Quick test_fts_snippet_with_rank;
+      Alcotest.test_case "term_in_other_col" `Quick test_fts_snippet_term_in_other_col;
     ];
   ]
