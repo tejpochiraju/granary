@@ -328,4 +328,27 @@ let () =
       Alcotest.test_case "bracket-col"         `Quick quoted_bracket_col;
       Alcotest.test_case "keyword-as-col"      `Quick quoted_keyword_as_col;
     ];
+    "quoted-ident-escape", [
+      Alcotest.test_case "doubled-double-quote" `Quick (fun () ->
+        (* doubled double-quote inside double-quoted ident → literal quote char *)
+        let tok = Lexer.token (Lexing.from_string {|"foo""bar"|}) in
+        Alcotest.(check string) "ident" {|foo"bar|}
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "doubled-backtick" `Quick (fun () ->
+        let tok = Lexer.token (Lexing.from_string "`foo``bar`") in
+        Alcotest.(check string) "ident" "foo`bar"
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "bracket-double-close" `Quick (fun () ->
+        (* doubled close-bracket inside bracket-quoted ident → literal ] char *)
+        let tok = Lexer.token (Lexing.from_string "[foo]]bar]") in
+        Alcotest.(check string) "ident" "foo]bar"
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "unterminated-double-quote" `Quick (fun () ->
+        Alcotest.check_raises "raises" (Failure "unterminated quoted identifier")
+          (fun () -> ignore (Lexer.token (Lexing.from_string {|"foo|})))
+      );
+    ];
   ]

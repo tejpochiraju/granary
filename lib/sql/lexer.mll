@@ -42,9 +42,9 @@ rule token = parse
   | ':' (ident as id) { NAMED_PARAM id }
   | '@' (ident as id) { NAMED_PARAM id }
   | '$' (ident as id) { NAMED_PARAM id }
-  | '"' ([^ '"']* as id) '"'  { IDENT id }
-  | '`' ([^ '`']* as id) '`'  { IDENT id }
-  | '[' ([^ ']']* as id) ']'  { IDENT id }
+  | '"'  { read_double_quoted (Buffer.create 16) lexbuf }
+  | '`'  { read_backtick_quoted (Buffer.create 16) lexbuf }
+  | '['  { read_bracket_quoted (Buffer.create 16) lexbuf }
   | ident as id             {
       match String.uppercase_ascii id with
       | "CREATE"     -> CREATE
@@ -210,3 +210,24 @@ rule token = parse
     }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }
+
+and read_double_quoted buf = parse
+  | '"' '"'    { Buffer.add_char buf '"'; read_double_quoted buf lexbuf }
+  | '"'        { IDENT (Buffer.contents buf) }
+  | [^ '"']+   { Buffer.add_string buf (Lexing.lexeme lexbuf);
+                 read_double_quoted buf lexbuf }
+  | eof        { failwith "unterminated quoted identifier" }
+
+and read_backtick_quoted buf = parse
+  | '`' '`'   { Buffer.add_char buf '`'; read_backtick_quoted buf lexbuf }
+  | '`'       { IDENT (Buffer.contents buf) }
+  | [^ '`']+  { Buffer.add_string buf (Lexing.lexeme lexbuf);
+                read_backtick_quoted buf lexbuf }
+  | eof       { failwith "unterminated quoted identifier" }
+
+and read_bracket_quoted buf = parse
+  | "]]"      { Buffer.add_char buf ']'; read_bracket_quoted buf lexbuf }
+  | ']'       { IDENT (Buffer.contents buf) }
+  | [^ ']']+  { Buffer.add_string buf (Lexing.lexeme lexbuf);
+                read_bracket_quoted buf lexbuf }
+  | eof       { failwith "unterminated quoted identifier" }
