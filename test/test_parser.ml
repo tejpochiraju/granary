@@ -350,5 +350,28 @@ let () =
         Alcotest.check_raises "raises" (Failure "unterminated quoted identifier")
           (fun () -> ignore (Lexer.token (Lexing.from_string {|"foo|})))
       );
+      Alcotest.test_case "empty-double-quote" `Quick (fun () ->
+        let tok = Lexer.token (Lexing.from_string {|""|}) in
+        Alcotest.(check string) "empty ident" ""
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "empty-backtick" `Quick (fun () ->
+        let tok = Lexer.token (Lexing.from_string "``") in
+        Alcotest.(check string) "empty ident" ""
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "empty-bracket" `Quick (fun () ->
+        let tok = Lexer.token (Lexing.from_string "[]") in
+        Alcotest.(check string) "empty ident" ""
+          (match tok with Parser.IDENT s -> s | _ -> "NOT_IDENT")
+      );
+      Alcotest.test_case "unterminated-backtick" `Quick (fun () ->
+        Alcotest.check_raises "raises" (Failure "unterminated quoted identifier")
+          (fun () -> ignore (Lexer.token (Lexing.from_string "`foo")))
+      );
+      Alcotest.test_case "unterminated-bracket" `Quick (fun () ->
+        Alcotest.check_raises "raises" (Failure "unterminated quoted identifier")
+          (fun () -> ignore (Lexer.token (Lexing.from_string "[foo")))
+      );
     ];
   ]
