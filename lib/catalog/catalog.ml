@@ -1091,6 +1091,9 @@ let drop_column t ~table_name ~col_name =
 
 let find_fts (t : t) name = Hashtbl.find_opt t.fts name
 
+let list_fts_tables (t : t) =
+  Hashtbl.fold (fun _name meta acc -> meta :: acc) t.fts []
+
 let create_fts_table (t : t) ~name ~columns : fts_table_meta Lwt.t =
   (* NOTE: tree-ID allocation and metadata write span multiple transactions.
      A crash between the two next_user_tid calls leaks a tree-ID slot (non-fatal;

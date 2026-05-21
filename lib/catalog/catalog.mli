@@ -186,6 +186,9 @@ val index_exists : t -> name:string -> bool
 (** Find an FTS table by name. Returns [None] if not found. *)
 val find_fts : t -> string -> fts_table_meta option
 
+(** List all FTS virtual tables in the catalog. Order is unspecified. *)
+val list_fts_tables : t -> fts_table_meta list
+
 (** Create a new FTS virtual table.  Allocates two new tree IDs (content tree
     and inverted-index tree) and persists the entry in the [_sys_fts_tables]
     system tree.  Raises [Failure] if a table with that name already exists. *)

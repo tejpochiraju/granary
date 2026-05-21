@@ -196,6 +196,10 @@ let ddl_of_index (idx : Cat.index_info) =
   Printf.sprintf "CREATE %sINDEX %s ON %s (%s)%s"
     unique_kw idx.Cat.idx_name idx.Cat.idx_table cols_str where_clause
 
+let ddl_of_fts (m : Cat.fts_table_meta) =
+  Printf.sprintf "CREATE VIRTUAL TABLE %s USING fts5(%s)"
+    m.Cat.fts_name (String.concat ", " m.Cat.fts_columns)
+
 
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
@@ -5068,7 +5072,14 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
          Row.V_int  0L;
          Row.V_text sql |]
     ) triggers in
-    let all_rows = table_rows @ index_rows @ view_rows @ trigger_rows in
+    let fts_rows = List.map (fun (m : Cat.fts_table_meta) ->
+      [| Row.V_text "table";
+         Row.V_text m.Cat.fts_name;
+         Row.V_text m.Cat.fts_name;
+         Row.V_int  (Int64.of_int m.Cat.fts_content_tree);
+         Row.V_text (ddl_of_fts m) |]
+    ) (Cat.list_fts_tables cat_val) in
+    let all_rows = table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows in
     Lwt.return (Lwt_stream.of_list all_rows)
   | Plan.Op_union { all; left; right } ->
     let* ls = to_stream clock params store ~mode ~cat left  in

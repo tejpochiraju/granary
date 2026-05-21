@@ -3296,6 +3296,32 @@ let phase30_sqlite_master_cases = [
     unordered = false };
 ]
 
+let phase34_master_fts_cases = [
+  { name = "sqlite_master_lists_fts_as_table_type";
+    setup = [ "CREATE VIRTUAL TABLE docs USING fts5(title, body)" ];
+    query = "SELECT type, name, tbl_name FROM sqlite_master WHERE name='docs'";
+    unordered = false };
+
+  { name = "sqlite_master_fts_and_regular_both_table_type";
+    setup = [
+      "CREATE TABLE regular (n INT)";
+      "CREATE VIRTUAL TABLE search USING fts5(content)";
+    ];
+    query = "SELECT name FROM sqlite_master \
+             WHERE type='table' AND (name='regular' OR name='search') \
+             ORDER BY name";
+    unordered = false };
+
+  { name = "sqlite_master_count_includes_fts";
+    setup = [
+      "CREATE TABLE a (id INT)";
+      "CREATE VIRTUAL TABLE b USING fts5(x)";
+    ];
+    query = "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type='table' AND (name='a' OR name='b')";
+    unordered = false };
+]
+
 let phase31_scalar_cases = [
   { name = "hex_blob";
     setup = [];
@@ -3638,4 +3664,5 @@ let () =
     "phase33_trigger",         List.map make_test phase33_trigger_cases;
     "phase33_new_fns",         List.map make_test phase33_new_fn_cases;
     "phase33_virtual_gen",     List.map make_test phase33_virtual_gen_cases;
+    "phase34_master_fts",      List.map make_test phase34_master_fts_cases;
   ]

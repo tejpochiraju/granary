@@ -7953,6 +7953,53 @@ let phase34_prepared_counters_tests = [
     `Quick test_phase34_prepared_changes_is_per_statement;
 ]
 
+(* ── Phase 34 Task 4: sqlite_master lists FTS5 virtual tables ──────── *)
+
+let test_phase34_master_lists_fts () =
+  let db = fresh_db () in
+  exec db "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
+  let rows = query_ok db
+    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'docs'" in
+  Alcotest.(check int) "exactly one FTS row in sqlite_master" 1 (List.length rows);
+  Alcotest.(check row_testable) "FTS row fields match"
+    [| Db.V_text "table";
+       Db.V_text "docs";
+       Db.V_text "docs";
+       Db.V_text "CREATE VIRTUAL TABLE docs USING fts5(title, body)" |]
+    (List.hd rows)
+
+let test_phase34_master_fts_and_regular_both_listed_as_table () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE regular (n INT)";
+  exec db "CREATE VIRTUAL TABLE search USING fts5(content)";
+  let rows = query_ok db
+    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" in
+  Alcotest.(check int) "two type='table' rows" 2 (List.length rows);
+  Alcotest.(check row_testable) "first is regular"
+    [| Db.V_text "regular" |] (List.nth rows 0);
+  Alcotest.(check row_testable) "second is FTS search"
+    [| Db.V_text "search" |] (List.nth rows 1)
+
+let test_phase34_master_fts_sql_column () =
+  (* Verify the reconstructed CREATE VIRTUAL TABLE statement is exactly what
+     SQLite stores in sqlite_master.sql for an FTS5 table. *)
+  let db = fresh_db () in
+  exec db "CREATE VIRTUAL TABLE docs USING fts5(body)";
+  let rows = query_ok db
+    "SELECT sql FROM sqlite_master WHERE name='docs'" in
+  Alcotest.(check row_testable) "sql column matches canonical form"
+    [| Db.V_text "CREATE VIRTUAL TABLE docs USING fts5(body)" |]
+    (List.hd rows)
+
+let phase34_master_fts_tests = [
+  Alcotest.test_case "master_lists_fts_table_row"
+    `Quick test_phase34_master_lists_fts;
+  Alcotest.test_case "master_fts_and_regular_both_listed_as_table"
+    `Quick test_phase34_master_fts_and_regular_both_listed_as_table;
+  Alcotest.test_case "master_fts_sql_column_canonical"
+    `Quick test_phase34_master_fts_sql_column;
+]
+
 let phase33_virtual_gen_tests = [
   Alcotest.test_case "virtual_basic"
     `Quick test_virtual_gen_column_basic;
@@ -8633,4 +8680,5 @@ let () =
     "phase34_recursive_triggers", phase34_recursive_triggers_tests;
     "phase34_transitive_setnull", phase34_transitive_setnull_tests;
     "phase34_prepared_counters", phase34_prepared_counters_tests;
+    "phase34_master_fts", phase34_master_fts_tests;
   ]
