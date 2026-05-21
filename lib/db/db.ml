@@ -986,12 +986,25 @@ let run st ~params =
   let (on_replace_delete, on_upsert_update) =
     insert_replace_upsert_hooks t st.plan
   in
+  let insert_table_name = match st.plan with
+    | Sql.Plan.Op_insert { table_meta; _ }        -> Some table_meta.Cat.name
+    | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
+    | _ -> None
+  in
   Lwt.catch
     (fun () ->
       let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr
                  ~before_hook ~after_hook
                  ~on_replace_delete ~on_upsert_update
                  t.store t.catalog st.plan in
+      t.last_changes <- n;
+      t.total_changes <- t.total_changes + n;
+      (match insert_table_name with
+       | Some tbl when n > 0 ->
+         (match Cat.find_table_cached t.catalog ~name:tbl with
+          | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+          | None -> ())
+       | _ -> ());
       Lwt.return (Ok n))
     (function
      | Failure msg -> Lwt.return (Error (Runtime msg))

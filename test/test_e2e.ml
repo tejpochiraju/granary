@@ -7841,6 +7841,118 @@ let phase34_transitive_setnull_tests = [
     `Quick test_phase34_inline_update_setnull_propagates;
 ]
 
+(* ── Phase 34 Task 3: prepared statements counter tracking ──────────── *)
+
+(* Helper: prepare and unwrap, failing the test if compilation fails. *)
+let prepare_ok db sql =
+  run (
+    let* r = Db.prepare db sql in
+    match r with
+    | Ok st  -> Lwt.return st
+    | Error e -> Alcotest.failf "prepare(%s): %s" sql (fmt_err e)
+  )
+
+(* Helper: run prepared statement with given params, returning rows-changed
+   count, failing the test on Error. *)
+let run_ok st params =
+  run (
+    let* r = Db.run st ~params in
+    match r with
+    | Ok n   -> Lwt.return n
+    | Error e -> Alcotest.failf "run: %s" (fmt_err e)
+  )
+
+let test_phase34_prepared_insert_updates_changes () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
+  let n1 = run_ok st [Db.V_int 1L] in
+  Alcotest.(check int) "prepared insert returns 1" 1 n1;
+  let r = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "CHANGES() after prepared insert"
+    [| Db.V_int 1L |] (List.nth r 0)
+
+let test_phase34_prepared_insert_updates_total_changes () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
+  let _ = run_ok st [Db.V_int 1L] in
+  let _ = run_ok st [Db.V_int 2L] in
+  let _ = run_ok st [Db.V_int 3L] in
+  let r = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "TOTAL_CHANGES() after 3 prepared inserts"
+    [| Db.V_int 3L |] (List.nth r 0)
+
+let test_phase34_prepared_insert_updates_last_insert_rowid () =
+  (* Each INSERT auto-assigns the next rowid; after two prepared inserts
+     into a fresh table the latest rowid should be 2. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
+  let _ = run_ok st [Db.V_int 10L] in
+  let _ = run_ok st [Db.V_int 20L] in
+  let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
+  Alcotest.(check row_testable) "LAST_INSERT_ROWID() after 2 prepared inserts"
+    [| Db.V_int 2L |] (List.nth r 0)
+
+let test_phase34_prepared_update_updates_changes () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
+  exec db "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30)";
+  let st = prepare_ok db "UPDATE t SET n = ? WHERE id <= ?" in
+  let n = run_ok st [Db.V_int 99L; Db.V_int 2L] in
+  Alcotest.(check int) "prepared update returns 2" 2 n;
+  let r_changes = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "CHANGES() after prepared update"
+    [| Db.V_int 2L |] (List.nth r_changes 0);
+  let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "TOTAL_CHANGES() includes prepared update"
+    [| Db.V_int 5L |] (List.nth r_total 0)
+
+let test_phase34_prepared_delete_updates_changes () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
+  exec db "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)";
+  let st = prepare_ok db "DELETE FROM t WHERE n >= ?" in
+  let n = run_ok st [Db.V_int 30L] in
+  Alcotest.(check int) "prepared delete returns 2" 2 n;
+  let r_changes = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "CHANGES() after prepared delete"
+    [| Db.V_int 2L |] (List.nth r_changes 0);
+  let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "TOTAL_CHANGES() includes prepared delete"
+    [| Db.V_int 6L |] (List.nth r_total 0)
+
+let test_phase34_prepared_changes_is_per_statement () =
+  (* CHANGES() reflects only the last DML; running a prepared insert
+     after a multi-row insert exposes the per-statement contract. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (n INTEGER)";
+  exec db "INSERT INTO t (n) VALUES (10), (20), (30)";
+  let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
+  let _ = run_ok st [Db.V_int 99L] in
+  let r_changes = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "CHANGES() reflects last prepared insert"
+    [| Db.V_int 1L |] (List.nth r_changes 0);
+  let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "TOTAL_CHANGES() accumulates across kinds"
+    [| Db.V_int 4L |] (List.nth r_total 0)
+
+let phase34_prepared_counters_tests = [
+  Alcotest.test_case "prepared_insert_updates_changes"
+    `Quick test_phase34_prepared_insert_updates_changes;
+  Alcotest.test_case "prepared_insert_updates_total_changes"
+    `Quick test_phase34_prepared_insert_updates_total_changes;
+  Alcotest.test_case "prepared_insert_updates_last_insert_rowid"
+    `Quick test_phase34_prepared_insert_updates_last_insert_rowid;
+  Alcotest.test_case "prepared_update_updates_changes"
+    `Quick test_phase34_prepared_update_updates_changes;
+  Alcotest.test_case "prepared_delete_updates_changes"
+    `Quick test_phase34_prepared_delete_updates_changes;
+  Alcotest.test_case "prepared_changes_is_per_statement"
+    `Quick test_phase34_prepared_changes_is_per_statement;
+]
+
 let phase33_virtual_gen_tests = [
   Alcotest.test_case "virtual_basic"
     `Quick test_virtual_gen_column_basic;
@@ -8520,4 +8632,5 @@ let () =
     "phase33_virtual_gen", phase33_virtual_gen_tests;
     "phase34_recursive_triggers", phase34_recursive_triggers_tests;
     "phase34_transitive_setnull", phase34_transitive_setnull_tests;
+    "phase34_prepared_counters", phase34_prepared_counters_tests;
   ]
