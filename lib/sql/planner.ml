@@ -625,6 +625,8 @@ let rec plan ?cat = function
        Plan.Op_changes
      | [(Sema.BE_func (Ast.Fn_last_insert_rowid, []), _)] ->
        Plan.Op_last_insert_rowid
+     | [(Sema.BE_func (Ast.Fn_total_changes, []), _)] ->
+       Plan.Op_total_changes
      | _ ->
        Plan.Op_const_select { exprs = List.map (fun (e, alias) -> (plan_expr e, alias)) exprs })
   | Sema.BS_pragma { kind } ->

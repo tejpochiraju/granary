@@ -230,6 +230,8 @@ rule token = parse
       | "RANDOMBLOB"         -> RANDOMBLOB
       | "CHANGES"            -> CHANGES
       | "LAST_INSERT_ROWID"  -> LAST_INSERT_ROWID
+      | "TOTAL_CHANGES"      -> TOTAL_CHANGES
+      | "SQLITE_VERSION"     -> SQLITE_VERSION
       | "FOR"                -> FOR
       | "EACH"               -> EACH
       | "ROW"                -> ROW

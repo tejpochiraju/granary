@@ -7272,6 +7272,59 @@ let test_fk_index_consistency_with_fallback () =
     ) rows_idx rows_noi;
     Lwt.return_unit)
 
+(* ── Phase 33 Task 3: TOTAL_CHANGES() and SQLITE_VERSION() ─────────── *)
+
+let test_total_changes_initial () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  let r = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "total_changes initial"
+    [| Db.V_int 0L |] (List.nth r 0)
+
+let test_total_changes_after_multi_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (1),(2),(3)";
+  exec db "INSERT INTO t VALUES (4),(5)";
+  let r = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "total_changes after 5 inserts"
+    [| Db.V_int 5L |] (List.nth r 0)
+
+let test_total_changes_accumulates_across_dml_kinds () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (1),(2),(3)";
+  exec db "DELETE FROM t WHERE id = 1";
+  let r = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "total_changes after 3 inserts + 1 delete"
+    [| Db.V_int 4L |] (List.nth r 0)
+
+let test_total_changes_vs_changes () =
+  (* TOTAL_CHANGES accumulates; CHANGES is per-statement *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER)";
+  exec db "INSERT INTO t VALUES (1),(2),(3)";
+  exec db "INSERT INTO t VALUES (4)";
+  let r_changes = query_ok db "SELECT CHANGES()" in
+  Alcotest.(check row_testable) "changes is last-DML count"
+    [| Db.V_int 1L |] (List.nth r_changes 0);
+  let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
+  Alcotest.(check row_testable) "total_changes is cumulative"
+    [| Db.V_int 4L |] (List.nth r_total 0)
+
+let test_sqlite_version_value () =
+  let db = fresh_db () in
+  let r = query_ok db "SELECT SQLITE_VERSION()" in
+  Alcotest.(check row_testable) "sqlite_version literal"
+    [| Db.V_text "3.45.0-sqlocaml" |] (List.nth r 0)
+
+let test_sqlite_version_in_expression () =
+  (* Verify it can be used inside string functions *)
+  let db = fresh_db () in
+  let r = query_ok db "SELECT LENGTH(SQLITE_VERSION())" in
+  Alcotest.(check row_testable) "sqlite_version length"
+    [| Db.V_int (Int64.of_int (String.length "3.45.0-sqlocaml")) |] (List.nth r 0)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7910,5 +7963,19 @@ let () =
       Alcotest.test_case "set_null"                `Quick test_fk_index_set_null;
       Alcotest.test_case "update_restrict_blocks"  `Quick test_fk_index_update_restrict_blocks;
       Alcotest.test_case "consistency_with_fallback" `Quick test_fk_index_consistency_with_fallback;
+    ];
+    "phase33_new_fns", [
+      Alcotest.test_case "total_changes_initial"
+        `Quick test_total_changes_initial;
+      Alcotest.test_case "total_changes_after_multi_insert"
+        `Quick test_total_changes_after_multi_insert;
+      Alcotest.test_case "total_changes_accumulates_across_dml_kinds"
+        `Quick test_total_changes_accumulates_across_dml_kinds;
+      Alcotest.test_case "total_changes_vs_changes"
+        `Quick test_total_changes_vs_changes;
+      Alcotest.test_case "sqlite_version_value"
+        `Quick test_sqlite_version_value;
+      Alcotest.test_case "sqlite_version_in_expression"
+        `Quick test_sqlite_version_in_expression;
     ];
   ]

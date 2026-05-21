@@ -64,6 +64,7 @@
 %token SNIPPET
 %token HEX CHAR UNICODE PRINTF FORMAT ZEROBLOB
 %token RANDOM RANDOMBLOB CHANGES LAST_INSERT_ROWID
+%token TOTAL_CHANGES SQLITE_VERSION
 %token FOR EACH ROW
 %token QUESTION
 %token <int>    IPARAM
@@ -177,6 +178,8 @@ any_ident:
   | RANDOMBLOB        { "randomblob" }
   | CHANGES           { "changes" }
   | LAST_INSERT_ROWID { "last_insert_rowid" }
+  | TOTAL_CHANGES     { "total_changes" }
+  | SQLITE_VERSION    { "sqlite_version" }
   | FOR               { "for" }
   | EACH              { "each" }
   | ROW               { "row" }
@@ -751,6 +754,10 @@ scalar_expr:
     { E_func (Fn_changes, []) }
   | LAST_INSERT_ROWID LPAREN RPAREN
     { E_func (Fn_last_insert_rowid, []) }
+  | TOTAL_CHANGES LPAREN RPAREN
+    { E_func (Fn_total_changes, []) }
+  | SQLITE_VERSION LPAREN RPAREN
+    { E_func (Fn_sqlite_version, []) }
 
 proj_item:
   | e = expr AS alias = any_ident { `ExprA (e, Some alias) }

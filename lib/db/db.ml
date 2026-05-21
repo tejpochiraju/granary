@@ -15,6 +15,7 @@ type t = {
   mutable auto_began      : bool;         (* txn started implicitly by SAVEPOINT *)
   mutable last_changes      : int;   (** rows affected by the last DML statement *)
   mutable last_insert_rowid : int64; (** rowid of the last INSERT row *)
+  mutable total_changes     : int;   (** total rows affected by DML since connection opened *)
   mutable trigger_depth     : int;   (** recursion depth for nested trigger firing *)
 }
 
@@ -47,7 +48,7 @@ let open_in_memory ?clock () =
   Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4;
              triggers = Hashtbl.create 4;
              savepoint_names = []; auto_began = false;
-             last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 }
+             last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -95,7 +96,7 @@ let open_file ~path =
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 })
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -113,7 +114,7 @@ let open_block
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 })
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
 
 let close t = S.close t.store
 
@@ -793,6 +794,7 @@ let execute t sql =
          (fun () ->
            let* n = lwt_op in
            t.last_changes <- n;
+           t.total_changes <- t.total_changes + n;
            (match insert_table_name with
             | Some tbl when n > 0 ->
               (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -888,6 +890,7 @@ let execute_change_count t sql =
          (fun () ->
            let* n = lwt_op in
            t.last_changes <- n;
+           t.total_changes <- t.total_changes + n;
            (match insert_table_name with
             | Some tbl when n > 0 ->
               (match Cat.find_table_cached t.catalog ~name:tbl with
@@ -909,6 +912,9 @@ let query t sql =
   | Ok Sql.Plan.Op_last_insert_rowid ->
     Lwt.return (Ok (Lwt_stream.of_list
       [ [| Row.V_int t.last_insert_rowid |] ]))
+  | Ok Sql.Plan.Op_total_changes ->
+    Lwt.return (Ok (Lwt_stream.of_list
+      [ [| Row.V_int (Int64.of_int t.total_changes) |] ]))
   | Ok op   ->
     let mode = match t.explicit_txn with
       | None    -> Sql.Exec.Auto

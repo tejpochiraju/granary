@@ -987,6 +987,14 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
   | Ast.Fn_last_insert_rowid, [] -> Row.V_int 0L
   | Ast.Fn_last_insert_rowid, _  -> Row.V_null
 
+  (* ── TOTAL_CHANGES fallback (intercepted in db.ml when at top level) ── *)
+  | Ast.Fn_total_changes, [] -> Row.V_int 0L
+  | Ast.Fn_total_changes, _  -> Row.V_null
+
+  (* ── SQLITE_VERSION (constant text; evaluated inline, no plan op) ─── *)
+  | Ast.Fn_sqlite_version, [] -> Row.V_text "3.45.0-sqlocaml"
+  | Ast.Fn_sqlite_version, _  -> Row.V_null
+
   | _ ->
     failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
 
@@ -3228,6 +3236,7 @@ let op_name = function
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
+  | Plan.Op_total_changes              -> "TotalChanges"
   | Plan.Op_explain { analyze; _ }     ->
     if analyze then "ExplainAnalyze" else "Explain"
   | Plan.Op_create_fts_table { name; _ } -> "CreateFtsTable(" ^ name ^ ")"
@@ -3634,7 +3643,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_window _
   | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_get_fk
-  | Plan.Op_changes | Plan.Op_last_insert_rowid ->
+  | Plan.Op_changes | Plan.Op_last_insert_rowid | Plan.Op_total_changes ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -5138,6 +5147,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     failwith "Exec.to_stream: Op_changes must be intercepted in db.ml query"
   | Plan.Op_last_insert_rowid ->
     failwith "Exec.to_stream: Op_last_insert_rowid must be intercepted in db.ml query"
+  | Plan.Op_total_changes ->
+    failwith "Exec.to_stream: Op_total_changes must be intercepted in db.ml query"
   | Plan.Op_const_select { exprs } ->
     (* FROM-less SELECT: evaluate each expression with an empty row and
        return a single result row. Aliases are stored in the plan for

@@ -3533,6 +3533,23 @@ let phase33_trigger_cases = [
     unordered = false };
 ]
 
+(* ── Phase 33 Task 3: TOTAL_CHANGES + SQLITE_VERSION ────────────── *)
+
+let phase33_new_fn_cases = [
+  (* Only the initial (zero) case is comparable: TOTAL_CHANGES is a
+     per-connection counter, and the test harness opens a fresh sqlite3
+     connection for the query phase — so SQLite always sees 0 here, while
+     sqlocaml runs setup + query in one in-memory connection. Cases that
+     perform DML in setup are exercised in the e2e suite instead.
+
+     SQLITE_VERSION is intentionally not compared: our value
+     ("3.45.0-sqlocaml") diverges from real sqlite3's build version. *)
+  { name = "total_changes_initial";
+    setup = ["CREATE TABLE t (id INTEGER)"];
+    query = "SELECT TOTAL_CHANGES()";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3583,4 +3600,5 @@ let () =
     "phase32_session_fns",     List.map make_test phase32_session_fn_cases;
     "phase32_multi_col_fk",   List.map make_test phase32_multi_col_fk_cases;
     "phase33_trigger",         List.map make_test phase33_trigger_cases;
+    "phase33_new_fns",         List.map make_test phase33_new_fn_cases;
   ]

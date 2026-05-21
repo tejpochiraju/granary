@@ -104,6 +104,8 @@ type scalar_func =
   | Fn_randomblob       (** RANDOMBLOB(n) — random blob of n bytes *)
   | Fn_changes          (** CHANGES() — rows affected by last DML *)
   | Fn_last_insert_rowid (** LAST_INSERT_ROWID() — rowid of last INSERT *)
+  | Fn_total_changes    (** TOTAL_CHANGES() — total rows affected since connection open *)
+  | Fn_sqlite_version   (** SQLITE_VERSION() — constant text version string *)
 
 type set_op = Union | Union_all | Intersect | Except
 
@@ -433,6 +435,8 @@ let func_to_sql = function
   | Fn_randomblob        -> "RANDOMBLOB"
   | Fn_changes           -> "CHANGES"
   | Fn_last_insert_rowid -> "LAST_INSERT_ROWID"
+  | Fn_total_changes     -> "TOTAL_CHANGES"
+  | Fn_sqlite_version    -> "SQLITE_VERSION"
 
 let rec expr_to_sql = function
   | E_lit (L_int n)  -> Int64.to_string n

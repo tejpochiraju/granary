@@ -285,6 +285,9 @@ type op =
     (** Returns rows affected by last DML. Intercepted in db.ml query — not exec.ml. *)
   | Op_last_insert_rowid
     (** Returns rowid of last INSERT. Intercepted in db.ml query — not exec.ml. *)
+  | Op_total_changes
+    (** Returns total rows affected since the connection was opened.
+        Intercepted in db.ml query — not exec.ml. *)
   | Op_explain of {
       analyze : bool;
       inner   : op;
