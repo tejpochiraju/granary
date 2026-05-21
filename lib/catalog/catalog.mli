@@ -227,3 +227,12 @@ val get_fk_enforcement : t -> bool
 
 (** Set the FK enforcement flag (PRAGMA foreign_keys = 0/1). *)
 val set_fk_enforcement : t -> bool -> unit
+
+(** Get the current recursive-triggers flag (default true in sqlocaml — a
+    deliberate divergence from real SQLite which defaults OFF). When this
+    flag is false, DML executed inside a trigger body does NOT fire further
+    triggers. *)
+val get_recursive_triggers : t -> bool
+
+(** Set the recursive-triggers flag (PRAGMA recursive_triggers = 0/1). *)
+val set_recursive_triggers : t -> bool -> unit

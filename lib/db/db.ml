@@ -358,6 +358,12 @@ let rec fire_trigger_stmt t stmt =
   if t.trigger_depth >= max_trigger_depth then
     Lwt.fail_with (Printf.sprintf
       "trigger recursion limit (%d) exceeded" max_trigger_depth)
+  else if t.trigger_depth > 0
+       && not (Cat.get_recursive_triggers t.catalog) then
+    (* Recursion disabled by PRAGMA recursive_triggers = OFF; nested DML
+       inside a trigger body does not fire further triggers. The top-level
+       trigger (depth = 0 → about to become 1) still fires. *)
+    Lwt.return_unit
   else begin
     t.trigger_depth <- t.trigger_depth + 1;
     let finally () =

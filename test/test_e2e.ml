@@ -7444,6 +7444,107 @@ let test_virtual_in_check_rejected () =
   Alcotest.(check bool) "CHECK on VIRTUAL rejected"
     true (match result with Error _ -> true | Ok _ -> false)
 
+(* ── Phase 34 Task 1: PRAGMA recursive_triggers ───────────────── *)
+
+(** With recursive_triggers defaulting ON, a chain of triggers
+    a→b→a→b... eventually exceeds the recursion limit and surfaces
+    as an error. This confirms the default behavior is unchanged. *)
+let test_recursive_triggers_default_on () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE a (n INT)" in
+    let* () = exec_in db "CREATE TABLE b (m INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER tb AFTER INSERT ON b \
+       BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); END" in
+    let* result = Db.execute db "INSERT INTO a(n) VALUES(1)" in
+    check_error "recursive chain hits limit with default ON" result;
+    Lwt.return_unit)
+
+(** With recursive_triggers OFF, the top-level trigger still fires
+    once but nested DML inside the trigger body does not fire further
+    triggers. *)
+let test_recursive_triggers_off () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA recursive_triggers = OFF" in
+    let* () = exec_in db "CREATE TABLE a (n INT)" in
+    let* () = exec_in db "CREATE TABLE b (m INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER tb AFTER INSERT ON b \
+       BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); END" in
+    let* () = exec_in db "INSERT INTO a(n) VALUES(1)" in
+    let* rows_a = query_rows db "SELECT n FROM a" in
+    let* rows_b = query_rows db "SELECT m FROM b" in
+    (* With recursion OFF: INSERT a(1) fires ta → INSERT b(1).
+       That nested INSERT into b is inside the trigger body so tb does
+       NOT fire. So a has its original row, b has the one inserted row. *)
+    Alcotest.(check int) "a has only original row" 1 (List.length rows_a);
+    Alcotest.(check int) "b has one inserted row"  1 (List.length rows_b);
+    Lwt.return_unit)
+
+(** PRAGMA recursive_triggers (read) returns 1 by default and reflects
+    the current flag after a write. *)
+let test_recursive_triggers_pragma_read () =
+  with_db (fun db ->
+    let* rows = query_rows db "PRAGMA recursive_triggers" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    Alcotest.check value_testable "default reads 1"
+      (Db.V_int 1L) (List.hd rows).(0);
+    let* () = exec_in db "PRAGMA recursive_triggers = OFF" in
+    let* rows = query_rows db "PRAGMA recursive_triggers" in
+    Alcotest.check value_testable "after OFF reads 0"
+      (Db.V_int 0L) (List.hd rows).(0);
+    let* () = exec_in db "PRAGMA recursive_triggers = 1" in
+    let* rows = query_rows db "PRAGMA recursive_triggers" in
+    Alcotest.check value_testable "after ON reads 1"
+      (Db.V_int 1L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+(** Verifying the OFF gate at depth > 0: insert into table a fires
+    trigger ta; ta inserts into b, which (with recursion ON) would
+    fire trigger tb. With recursion OFF the gate suppresses tb.
+    We assert b is populated but the chain stops, and explicitly that
+    the depth-0 trigger ta did still fire (i.e. the gate is depth > 0,
+    not depth >= 0). *)
+let test_recursive_triggers_off_top_level_still_fires () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA recursive_triggers = 0" in
+    let* () = exec_in db "CREATE TABLE a (n INT)" in
+    let* () = exec_in db "CREATE TABLE b (m INT)" in
+    let* () = exec_in db "CREATE TABLE c (k INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER tb AFTER INSERT ON b \
+       BEGIN INSERT INTO c(k) VALUES(NEW.m); END" in
+    let* () = exec_in db "INSERT INTO a(n) VALUES(7)" in
+    let* rows_b = query_rows db "SELECT m FROM b" in
+    let* rows_c = query_rows db "SELECT k FROM c" in
+    (* ta (the depth-0 trigger) DID fire — b got the row.
+       tb (which would be depth-1) did NOT fire — c is empty. *)
+    Alcotest.(check int) "b populated by top-level trigger" 1 (List.length rows_b);
+    Alcotest.check value_testable "b.m = 7"
+      (Db.V_int 7L) (List.hd rows_b).(0);
+    Alcotest.(check int) "c empty (nested trigger suppressed)" 0 (List.length rows_c);
+    Lwt.return_unit)
+
+let phase34_recursive_triggers_tests = [
+  Alcotest.test_case "default_on_chain_hits_limit"
+    `Quick test_recursive_triggers_default_on;
+  Alcotest.test_case "off_blocks_nested_firing"
+    `Quick test_recursive_triggers_off;
+  Alcotest.test_case "pragma_read_reflects_flag"
+    `Quick test_recursive_triggers_pragma_read;
+  Alcotest.test_case "off_top_level_still_fires"
+    `Quick test_recursive_triggers_off_top_level_still_fires;
+]
+
 let phase33_virtual_gen_tests = [
   Alcotest.test_case "virtual_basic"
     `Quick test_virtual_gen_column_basic;
@@ -8121,4 +8222,5 @@ let () =
         `Quick test_sqlite_version_in_expression;
     ];
     "phase33_virtual_gen", phase33_virtual_gen_tests;
+    "phase34_recursive_triggers", phase34_recursive_triggers_tests;
   ]

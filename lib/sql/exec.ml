@@ -3297,6 +3297,10 @@ let op_name = function
   | Plan.Op_pragma_integrity_check     -> "Pragma(integrity_check)"
   | Plan.Op_pragma_get_fk              -> "Pragma(get_foreign_keys)"
   | Plan.Op_pragma_set_fk { on }       -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
+  | Plan.Op_pragma_get_recursive_triggers ->
+    "Pragma(get_recursive_triggers)"
+  | Plan.Op_pragma_set_recursive_triggers { on } ->
+    Printf.sprintf "Pragma(set_recursive_triggers=%b)" on
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
@@ -3698,6 +3702,9 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_set_fk { on } ->
     Cat.set_fk_enforcement cat on;
     Lwt.return 0
+  | Plan.Op_pragma_set_recursive_triggers { on } ->
+    Cat.set_recursive_triggers cat on;
+    Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -3707,6 +3714,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_window _
   | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_get_fk
+  | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_changes | Plan.Op_last_insert_rowid | Plan.Op_total_changes ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
@@ -4931,6 +4939,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | Some cat -> Cat.get_fk_enforcement cat
     in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
+  | Plan.Op_pragma_get_recursive_triggers ->
+    let v = match cat with
+      | None     -> true  (* default ON when no catalog is supplied *)
+      | Some cat -> Cat.get_recursive_triggers cat
+    in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check ->
     let cat_val = match cat with
       | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
@@ -5305,6 +5319,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
           | Plan.Op_pragma_set_user_version _
           | Plan.Op_pragma_set_fk _
+          | Plan.Op_pragma_set_recursive_triggers _
           | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
           | Plan.Op_create_fts_table _ -> true
           | _ -> false
@@ -5339,7 +5354,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
   | Plan.Op_pragma_set_user_version _
-  | Plan.Op_pragma_set_fk _ ->
+  | Plan.Op_pragma_set_fk _
+  | Plan.Op_pragma_set_recursive_triggers _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

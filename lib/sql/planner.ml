@@ -646,6 +646,12 @@ let rec plan ?cat = function
      | Ast.Pragma_foreign_keys_set on ->
        Plan.Op_pragma_set_fk { on }
 
+     | Ast.Pragma_recursive_triggers ->
+       Plan.Op_pragma_get_recursive_triggers
+
+     | Ast.Pragma_recursive_triggers_set on ->
+       Plan.Op_pragma_set_recursive_triggers { on }
+
      | _ ->
        let rows = match kind with
          | Ast.Pragma_table_info table_name ->
@@ -706,7 +712,8 @@ let rec plan ?cat = function
 
          | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
          | Ast.Pragma_integrity_check
-         | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _ ->
+         | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _
+         | Ast.Pragma_recursive_triggers | Ast.Pragma_recursive_triggers_set _ ->
            assert false   (* handled by outer match above *)
        in
        Plan.Op_pragma_rows { rows })

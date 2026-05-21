@@ -87,6 +87,7 @@ type t = {
   (* fts_name -> fts_table_meta *)
   fts : (string, fts_table_meta) Hashtbl.t;
   mutable fk_enforcement : bool;
+  mutable recursive_triggers : bool;
 }
 
 (* ------------------------------------------------------------------ *)
@@ -705,7 +706,8 @@ let open_ store =
      | None -> ());
     Lwt.return_unit
   ) names in
-  Lwt.return { store; cache; indexes; fts; fk_enforcement = false }
+  Lwt.return { store; cache; indexes; fts; fk_enforcement = false;
+               recursive_triggers = true }
 
 (** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
 let next_user_tid t =
@@ -1128,3 +1130,6 @@ let next_fts_rowid_in_txn (_t : t) ~name (tx : S.rw S.txn) : int64 Lwt.t =
 
 let get_fk_enforcement t = t.fk_enforcement
 let set_fk_enforcement t v = t.fk_enforcement <- v
+
+let get_recursive_triggers t = t.recursive_triggers
+let set_recursive_triggers t v = t.recursive_triggers <- v

@@ -243,12 +243,21 @@ pragma_stmt:
           | _ -> false
         in
         Ast.S_pragma (Ast.Pragma_foreign_keys_set on)
+      | "recursive_triggers" ->
+        let on = match String.lowercase_ascii value with
+          | "1" | "on" | "true" -> true
+          | "0" | "off" | "false" -> false
+          | _ -> failwith (Printf.sprintf
+                   "PRAGMA recursive_triggers = %s: expected 0/1/on/off" value)
+        in
+        Ast.S_pragma (Ast.Pragma_recursive_triggers_set on)
       | _ -> Ast.S_pragma (Ast.Pragma_set (name, value)) }
 
   (* Bare getter form: PRAGMA name — new in Phase 26 *)
   | PRAGMA name = any_ident
     { match String.lowercase_ascii name with
       | "foreign_keys"    -> Ast.S_pragma Ast.Pragma_foreign_keys
+      | "recursive_triggers" -> Ast.S_pragma Ast.Pragma_recursive_triggers
       | "user_version"    -> Ast.S_pragma Ast.Pragma_user_version
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check

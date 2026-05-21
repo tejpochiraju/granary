@@ -227,6 +227,10 @@ type op =
     (** Read fk_enforcement flag from catalog; returns one row [[V_int 0|1]]. *)
   | Op_pragma_set_fk of { on : bool }
     (** Write fk_enforcement flag to catalog; DDL-like, returns 0 rows. *)
+  | Op_pragma_get_recursive_triggers
+    (** Read recursive_triggers flag from catalog; returns one row [[V_int 0|1]]. *)
+  | Op_pragma_set_recursive_triggers of { on : bool }
+    (** Write recursive_triggers flag to catalog; DDL-like, returns 0 rows. *)
   | Op_distinct of {
       child : op;
     }

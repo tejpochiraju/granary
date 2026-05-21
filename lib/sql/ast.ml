@@ -373,6 +373,8 @@ and pragma_kind =
   | Pragma_foreign_key_list of string   (* PRAGMA foreign_key_list(tbl) *)
   | Pragma_foreign_keys                 (* PRAGMA foreign_keys  → read flag *)
   | Pragma_foreign_keys_set of bool    (* PRAGMA foreign_keys = 0/1 → set flag *)
+  | Pragma_recursive_triggers              (* PRAGMA recursive_triggers   → read flag *)
+  | Pragma_recursive_triggers_set of bool  (* PRAGMA recursive_triggers = 0/1 → set *)
   | Pragma_user_version                 (* PRAGMA user_version  → read from meta *)
   | Pragma_user_version_set of int64    (* PRAGMA user_version = N → write *)
   | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
