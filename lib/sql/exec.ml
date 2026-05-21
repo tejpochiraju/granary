@@ -1870,11 +1870,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            let* () = S.del tx table_meta.tree_id old_key in
            let* () = S.put tx table_meta.tree_id old_key new_bytes in
            let* () = release_txn tx owned in
+           (* UPSERT DO UPDATE branch: SQLite fires only AFTER UPDATE triggers,
+              NOT AFTER INSERT.  Suppress [after_hook] for this row and fire
+              [on_upsert_update] exclusively, preserving the per-row invariant
+              that exactly one of (INSERT after_hook, on_upsert_update) runs. *)
            let* () = match on_upsert_update with
              | None -> Lwt.return_unit
              | Some f -> f ~old_row ~new_row
            in
-           let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row in
            Lwt.return true)
       | _ ->
         (* Normal path: skip, replace, or plain insert *)

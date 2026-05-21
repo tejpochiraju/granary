@@ -6982,7 +6982,11 @@ let test_replace_fires_delete_trigger () =
     Lwt.return_unit)
 
 (** UPSERT (INSERT ... ON CONFLICT DO UPDATE) fires UPDATE triggers
-    with OLD bound to the pre-update row. *)
+    with OLD bound to the pre-update row, and does NOT fire INSERT
+    after_hook when the DO UPDATE branch is taken (per SQLite semantics).
+    The initial non-conflicting INSERT and the conflicting UPSERT exercise
+    both branches: INSERT path fires INSERT trigger only; UPSERT-update
+    path fires UPDATE trigger only. *)
 let test_upsert_fires_update_trigger () =
   with_db (fun db ->
     let* () = exec_in db
@@ -6990,17 +6994,149 @@ let test_upsert_fires_update_trigger () =
     let* () = exec_in db
       "CREATE TABLE upd_audit (old_n INT, new_n INT)" in
     let* () = exec_in db
+      "CREATE TABLE ins_audit (new_n INT)" in
+    let* () = exec_in db
       "CREATE TRIGGER tu AFTER UPDATE ON t \
        BEGIN INSERT INTO upd_audit VALUES(OLD.n, NEW.n); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER ti AFTER INSERT ON t \
+       BEGIN INSERT INTO ins_audit VALUES(NEW.n); END" in
+    (* Non-conflicting INSERT: INSERT trigger fires, UPDATE trigger does not. *)
     let* () = exec_in db "INSERT INTO t VALUES (1, 10)" in
+    let* ins_rows1 = query_rows db "SELECT new_n FROM ins_audit" in
+    let* upd_rows1 = query_rows db "SELECT old_n, new_n FROM upd_audit" in
+    Alcotest.(check int) "after plain INSERT, ins_audit has 1 row" 1
+      (List.length ins_rows1);
+    Alcotest.(check int) "after plain INSERT, upd_audit has 0 rows" 0
+      (List.length upd_rows1);
+    (* Conflicting UPSERT taking DO UPDATE branch: UPDATE trigger fires,
+       INSERT trigger does NOT fire for the conflicting row. *)
     let* () = exec_in db
       "INSERT INTO t VALUES (1, 99) \
        ON CONFLICT(id) DO UPDATE SET n = excluded.n" in
-    let* rows = query_rows db "SELECT old_n, new_n FROM upd_audit" in
-    Alcotest.(check int) "1 log row" 1 (List.length rows);
-    let row = List.hd rows in
-    Alcotest.check value_testable "old_n=10" (Db.V_int 10L) row.(0);
-    Alcotest.check value_testable "new_n=99" (Db.V_int 99L) row.(1);
+    let* ins_rows2 = query_rows db "SELECT new_n FROM ins_audit" in
+    let* upd_rows2 = query_rows db "SELECT old_n, new_n FROM upd_audit" in
+    Alcotest.(check int)
+      "after UPSERT-update, ins_audit unchanged (still 1 row)" 1
+      (List.length ins_rows2);
+    Alcotest.(check int)
+      "after UPSERT-update, upd_audit has 1 row" 1 (List.length upd_rows2);
+    let upd_row = List.hd upd_rows2 in
+    Alcotest.check value_testable "old_n=10" (Db.V_int 10L) upd_row.(0);
+    Alcotest.check value_testable "new_n=99" (Db.V_int 99L) upd_row.(1);
+    Lwt.return_unit)
+
+(** Issue 1: a nested INSERT OR REPLACE inside a trigger body fires
+    DELETE triggers on conflict-displaced rows.  Setup:
+      - trigger AFTER INSERT ON A: runs INSERT OR REPLACE INTO B(...)
+      - trigger AFTER DELETE ON B: logs displaced id into del_audit
+    A single user INSERT into A should fire both the inner REPLACE and,
+    transitively, the DELETE trigger on B for the displaced row. *)
+let test_nested_trigger_insert_replace_fires_delete () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE a (id INTEGER PRIMARY KEY, v INT)" in
+    let* () = exec_in db
+      "CREATE TABLE b (id INTEGER PRIMARY KEY, v INT)" in
+    let* () = exec_in db
+      "CREATE TABLE del_audit (deleted_id INT, deleted_v INT)" in
+    (* Seed B with id=1 so the replace inside the trigger will displace it. *)
+    let* () = exec_in db "INSERT INTO b VALUES (1, 100)" in
+    let* () = exec_in db
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT OR REPLACE INTO b VALUES (NEW.id, NEW.v); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER tb AFTER DELETE ON b \
+       BEGIN INSERT INTO del_audit VALUES (OLD.id, OLD.v); END" in
+    (* Inserting (1, 999) into A should cause the body to run
+       INSERT OR REPLACE INTO B(1, 999), displacing (1, 100). *)
+    let* () = exec_in db "INSERT INTO a VALUES (1, 999)" in
+    let* del_rows = query_rows db
+      "SELECT deleted_id, deleted_v FROM del_audit" in
+    Alcotest.(check int) "1 delete-audit row" 1 (List.length del_rows);
+    let row = List.hd del_rows in
+    Alcotest.check value_testable "deleted_id=1" (Db.V_int 1L) row.(0);
+    Alcotest.check value_testable "deleted_v=100" (Db.V_int 100L) row.(1);
+    Lwt.return_unit)
+
+(** Issue 2a: INSTEAD OF UPDATE on a view with derivable column names but
+    a WHERE clause that matches zero view rows must NOT fire the trigger. *)
+let test_instead_of_update_old_row_zero_matches () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
+    let* () = exec_in db
+      "CREATE TABLE audit (old_val INT, new_val INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
+         INSERT INTO audit VALUES (OLD.val, NEW.val); \
+       END" in
+    (* WHERE matches no rows; trigger must fire zero times. *)
+    let* () = exec_in db "UPDATE v SET val = 999 WHERE id = 42" in
+    let* rows = query_rows db "SELECT old_val, new_val FROM audit" in
+    Alcotest.(check int) "0 audit rows for zero-match UPDATE" 0
+      (List.length rows);
+    Lwt.return_unit)
+
+(** Issue 2b: INSTEAD OF UPDATE on a view whose projection is purely
+    expressions without aliases (so [view_col_names] returns []) must
+    preserve the Phase 32 fallback of firing once with OLD=NULL. *)
+let test_instead_of_update_old_row_unnamed_view_cols () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "INSERT INTO base VALUES (1, 100)" in
+    (* View projects an unaliased expression so column names can't be
+       derived from the projection. *)
+    let* () = exec_in db "CREATE VIEW v AS SELECT id + 0, val + 0 FROM base" in
+    let* () = exec_in db
+      "CREATE TABLE audit (new_val INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
+         INSERT INTO audit VALUES (NEW.val); \
+       END" in
+    (* WHERE clause can't bind to view columns either, but trigger must
+       still fire once with NEW populated and OLD=NULL (the fallback). *)
+    let* () = exec_in db "UPDATE v SET val = 999" in
+    let* rows = query_rows db "SELECT new_val FROM audit" in
+    Alcotest.(check int) "1 audit row (fallback fires once)" 1
+      (List.length rows);
+    Alcotest.check value_testable "new_val=999" (Db.V_int 999L)
+      (List.hd rows).(0);
+    Lwt.return_unit)
+
+(** Issue 3: INSTEAD OF UPDATE with a subquery in the WHERE clause must
+    not crash even though [expr_to_sql] can't serialize subqueries.
+    The trigger may fire once with OLD=NULL (the unresolved fallback)
+    — that's acceptable; the important thing is no Failure escapes. *)
+let test_instead_of_update_where_subquery_no_crash () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
+    let* () = exec_in db "CREATE TABLE pick (id INT)" in
+    let* () = exec_in db "INSERT INTO pick VALUES (1)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
+    let* () = exec_in db
+      "CREATE TABLE audit (new_val INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
+         INSERT INTO audit VALUES (NEW.val); \
+       END" in
+    (* WHERE contains a subquery; expr_to_sql will fail; we must fall
+       back to firing once with OLD=NULL rather than crashing. *)
+    let* r = Db.execute db
+      "UPDATE v SET val = 999 WHERE id IN (SELECT id FROM pick)" in
+    (match r with
+     | Ok ()   -> ()
+     | Error e -> Alcotest.failf "expected no crash: %a" Db.pp_error e);
+    (* Trigger fired once (NEW.val=999, OLD=NULL fallback). *)
+    let* rows = query_rows db "SELECT new_val FROM audit" in
+    Alcotest.(check int) "1 audit row from fallback" 1 (List.length rows);
+    Alcotest.check value_testable "new_val=999" (Db.V_int 999L)
+      (List.hd rows).(0);
     Lwt.return_unit)
 
 (* Runner                                                               *)
@@ -7625,5 +7761,13 @@ let () =
       Alcotest.test_case "instead_of_update_old_row" `Quick test_instead_of_update_old_row;
       Alcotest.test_case "replace_fires_delete_trigger" `Quick test_replace_fires_delete_trigger;
       Alcotest.test_case "upsert_fires_update_trigger"  `Quick test_upsert_fires_update_trigger;
+      Alcotest.test_case "nested_trigger_insert_replace_fires_delete"
+        `Quick test_nested_trigger_insert_replace_fires_delete;
+      Alcotest.test_case "instead_of_update_old_row_zero_matches"
+        `Quick test_instead_of_update_old_row_zero_matches;
+      Alcotest.test_case "instead_of_update_old_row_unnamed_view_cols"
+        `Quick test_instead_of_update_old_row_unnamed_view_cols;
+      Alcotest.test_case "instead_of_update_where_subquery_no_crash"
+        `Quick test_instead_of_update_where_subquery_no_crash;
     ];
   ]

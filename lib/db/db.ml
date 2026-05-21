@@ -392,7 +392,19 @@ let rec fire_trigger_stmt t stmt =
              make_trigger_hook t tm ~timing:`After  ~event:ev)
           | _ -> (None, None)
         in
-        Sql.Exec.execute ~before_hook ~after_hook ~mode ~clock:t.clock
+        (* For INSERT-ish ops, also install the REPLACE-displaced-DELETE and
+           UPSERT-DO-UPDATE hooks so nested INSERT OR REPLACE / UPSERT bodies
+           fire DELETE/UPDATE triggers on conflict-displaced rows. *)
+        let on_replace_delete, on_upsert_update =
+          match op with
+          | Sql.Plan.Op_insert _ | Sql.Plan.Op_insert_select _ ->
+            insert_replace_upsert_hooks t op
+          | _ -> (None, None)
+        in
+        Sql.Exec.execute
+          ~before_hook ~after_hook
+          ~on_replace_delete ~on_upsert_update
+          ~mode ~clock:t.clock
           t.store t.catalog op
     ) finally
   end
@@ -447,6 +459,38 @@ and make_trigger_hook t table_meta ~timing ~event =
         ) m.trig_body
     ) matching
   )
+
+(** Build the REPLACE-conflict-delete and UPSERT-conflict-update hooks for
+    an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a
+    UNIQUE index (DELETE triggers on the displaced row) or when the UPSERT
+    [DO UPDATE] branch runs (UPDATE triggers on the updated row).
+    Returns [(None, None)] for ops that are not insert-like.
+
+    Part of the [fire_trigger_stmt] recursive group so that nested trigger
+    bodies that perform INSERT OR REPLACE / UPSERT also fire DELETE/UPDATE
+    triggers on conflict-displaced or upsert-updated rows. *)
+and insert_replace_upsert_hooks t op =
+  let table_meta_opt = match op with
+    | Sql.Plan.Op_insert { table_meta; _ }
+    | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta
+    | _ -> None
+  in
+  match table_meta_opt with
+  | None -> (None, None)
+  | Some tm ->
+    let delete_hook = make_trigger_hook t tm ~timing:`After ~event:`Delete in
+    let update_hook = make_trigger_hook t tm ~timing:`After ~event:`Update in
+    let on_replace_delete =
+      Option.map (fun hook -> fun ~old_row ->
+        hook ~new_row:None ~old_row:(Some old_row)
+      ) delete_hook
+    in
+    let on_upsert_update =
+      Option.map (fun hook -> fun ~old_row ~new_row ->
+        hook ~new_row:(Some new_row) ~old_row:(Some old_row)
+      ) update_hook
+    in
+    (on_replace_delete, on_upsert_update)
 
 (** Extract column names from a view query's projection, in order.
     Returns [] if the projection cannot be resolved to simple column names. *)
@@ -577,7 +621,15 @@ let execute_instead_of t view_name ast =
       let new_vals     = List.map eval_insert_ast_value assign_exprs in
       let new_row      = Some (Array.of_list new_vals) in
       (* Populate OLD rows by selecting from the view under the WHERE clause.
-         Mirrors SQLite's INSTEAD OF UPDATE semantics. *)
+         Mirrors SQLite's INSTEAD OF UPDATE semantics.
+
+         We distinguish three outcomes:
+         - [`Resolved rows]: OLD column names derivable AND the SELECT
+           succeeded; fire once per row (zero times if [rows = []]).
+         - [`Unresolved]: OLD column names not derivable, OR the WHERE
+           clause cannot be round-tripped via [expr_to_sql] (e.g. it
+           contains a subquery), OR the SELECT failed to compile/execute.
+           Fall back to Phase 32 behavior: fire once with OLD=NULL. *)
       let view_query = Hashtbl.find_opt t.views view_name in
       let old_col_names =
         match view_query with
@@ -585,32 +637,51 @@ let execute_instead_of t view_name ast =
         | None    -> []
       in
       let old_schema = make_col_schema old_col_names in
-      let* old_rows =
+      let* outcome =
         match view_query with
-        | None -> Lwt.return []
+        | None -> Lwt.return `Unresolved
+        | Some _ when old_col_names = [] ->
+          (* View projects unnamed expressions; OLD.col can't bind.
+             Preserve Phase 32 fallback: fire once with OLD=NULL. *)
+          Lwt.return `Unresolved
         | Some _ ->
-          let select_sql =
+          (* Re-serialize the WHERE clause to SQL.  [expr_to_sql] raises
+             Failure for subqueries, aggregates, blob literals, etc.; in
+             those cases we cannot determine OLD rows, so fall back to
+             firing once with OLD=NULL. *)
+          let where_sql_opt =
             match where with
-            | None    -> Printf.sprintf "SELECT * FROM %s" view_name
-            | Some w  -> Printf.sprintf "SELECT * FROM %s WHERE %s"
-                           view_name (Sql.Ast.expr_to_sql w)
+            | None -> Some None
+            | Some w ->
+              (try Some (Some (Sql.Ast.expr_to_sql w))
+               with Failure _ -> None)
           in
-          let* op = compile t select_sql in
-          (match op with
-           | Error _ -> Lwt.return []
-           | Ok plan_op ->
-             let mode = match t.explicit_txn with
-               | None    -> Sql.Exec.Auto
-               | Some tx -> Sql.Exec.In_txn tx
+          (match where_sql_opt with
+           | None -> Lwt.return `Unresolved
+           | Some where_sql ->
+             let select_sql =
+               match where_sql with
+               | None       -> Printf.sprintf "SELECT * FROM %s" view_name
+               | Some w_sql -> Printf.sprintf "SELECT * FROM %s WHERE %s"
+                                 view_name w_sql
              in
-             (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog plan_op with
-              | exception Failure _ -> Lwt.return []
-              | lwt_stream ->
-                Lwt.catch
-                  (fun () ->
-                    let* stream = lwt_stream in
-                    Lwt_stream.to_list stream)
-                  (fun _ -> Lwt.return [])))
+             let* op = compile t select_sql in
+             (match op with
+              | Error _ -> Lwt.return `Unresolved
+              | Ok plan_op ->
+                let mode = match t.explicit_txn with
+                  | None    -> Sql.Exec.Auto
+                  | Some tx -> Sql.Exec.In_txn tx
+                in
+                (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog plan_op with
+                 | exception Failure _ -> Lwt.return `Unresolved
+                 | lwt_stream ->
+                   Lwt.catch
+                     (fun () ->
+                       let* stream = lwt_stream in
+                       let* rows = Lwt_stream.to_list stream in
+                       Lwt.return (`Resolved rows))
+                     (fun _ -> Lwt.return `Unresolved))))
       in
       let process_one_old_row old_row_opt =
         Lwt_list.iter_s (fun m ->
@@ -626,8 +697,10 @@ let execute_instead_of t view_name ast =
         ) matching
       in
       let* () =
-        if old_rows = [] then process_one_old_row None
-        else Lwt_list.iter_s (fun r -> process_one_old_row (Some r)) old_rows
+        match outcome with
+        | `Unresolved      -> process_one_old_row None
+        | `Resolved rows   ->
+          Lwt_list.iter_s (fun r -> process_one_old_row (Some r)) rows
       in
       Lwt.return (Ok ())
     end
@@ -639,33 +712,9 @@ let execute_instead_of t view_name ast =
 (* Public execute / query API                                           *)
 (* ------------------------------------------------------------------ *)
 
-(** Build the REPLACE-conflict-delete and UPSERT-conflict-update hooks for
-    an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a
-    UNIQUE index (DELETE triggers on the displaced row) or when the UPSERT
-    [DO UPDATE] branch runs (UPDATE triggers on the updated row).
-    Returns [(None, None)] for ops that are not insert-like. *)
-let insert_replace_upsert_hooks t op =
-  let table_meta_opt = match op with
-    | Sql.Plan.Op_insert { table_meta; _ }
-    | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta
-    | _ -> None
-  in
-  match table_meta_opt with
-  | None -> (None, None)
-  | Some tm ->
-    let delete_hook = make_trigger_hook t tm ~timing:`After ~event:`Delete in
-    let update_hook = make_trigger_hook t tm ~timing:`After ~event:`Update in
-    let on_replace_delete =
-      Option.map (fun hook -> fun ~old_row ->
-        hook ~new_row:None ~old_row:(Some old_row)
-      ) delete_hook
-    in
-    let on_upsert_update =
-      Option.map (fun hook -> fun ~old_row ~new_row ->
-        hook ~new_row:(Some new_row) ~old_row:(Some old_row)
-      ) update_hook
-    in
-    (on_replace_delete, on_upsert_update)
+(* Note: [insert_replace_upsert_hooks] is defined as part of the
+   [fire_trigger_stmt] / [make_trigger_hook] recursive group above so that
+   nested trigger bodies can install REPLACE/UPSERT secondary hooks. *)
 
 let execute t sql =
   let* op = compile t sql in
