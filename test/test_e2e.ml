@@ -7726,6 +7726,104 @@ let test_phase34_setdefault_propagates_via_on_update_cascade () =
       (Db.V_int 99L) (List.hd rows_d).(0);
     Lwt.return_unit)
 
+(** Exercises the INLINE FK enforcement in execute_delete (not the
+    cascade_delete_row_in_tx helper).  Schema:
+      A: id PK
+      B: id PK, a_id REFERENCES A(id) ON DELETE SET NULL, UNIQUE(a_id)
+      C: c_id PK, b_aid REFERENCES B(a_id) ON UPDATE CASCADE
+
+    Top-level [DELETE FROM A WHERE id = 1]:
+      1. execute_delete hits the inline ON DELETE SET NULL path on B.a_id.
+      2. Pre-fix: that inline path writes NULL via [update_col_in_tx],
+         so C(100).b_aid stays at 1 (orphan).
+      3. Post-fix: that inline path writes NULL via
+         [cascade_update_col_in_tx], so C(100).b_aid cascades to NULL via
+         B.a_id's ON UPDATE CASCADE in C. *)
+let test_phase34_inline_delete_setnull_propagates () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34iA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE p34iB (id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34iA(id) ON DELETE SET NULL, \
+       UNIQUE (a_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34iC (c_id INTEGER PRIMARY KEY, \
+       b_aid INT REFERENCES p34iB(a_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34iA VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34iB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34iC VALUES (100, 1)" in
+    let* () = exec_in db "DELETE FROM p34iA WHERE id = 1" in
+    (* B row preserved with a_id SET NULL. *)
+    let* rows_b = query_rows db "SELECT a_id FROM p34iB WHERE id = 10" in
+    Alcotest.(check int) "b row preserved (SET NULL, not deleted)"
+      1 (List.length rows_b);
+    Alcotest.check value_testable "b.a_id SET NULL"
+      Db.V_null (List.hd rows_b).(0);
+    (* With the fix: c.b_aid should have cascaded to NULL via
+       cascade_update_col_in_tx (B's ON UPDATE CASCADE to C). *)
+    let* rows_c = query_rows db "SELECT b_aid FROM p34iC WHERE c_id = 100" in
+    Alcotest.(check int) "c row preserved" 1 (List.length rows_c);
+    Alcotest.check value_testable
+      "c.b_aid cascaded to NULL via the inline SET NULL on b.a_id"
+      Db.V_null (List.hd rows_c).(0);
+    Lwt.return_unit)
+
+(** SET DEFAULT counterpart of the inline-DELETE test above.  Identical
+    shape, but the inline FK action is ON DELETE SET DEFAULT (default
+    value = 99) and so the descendant cascade flips C.b_aid from 1 to 99. *)
+let test_phase34_inline_delete_setdefault_propagates () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34idA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "INSERT INTO p34idA VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34idA VALUES (99)" in
+    let* () = exec_in db
+      "CREATE TABLE p34idB (id INTEGER PRIMARY KEY, \
+       a_id INT DEFAULT 99 REFERENCES p34idA(id) ON DELETE SET DEFAULT, \
+       UNIQUE (a_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34idC (c_id INTEGER PRIMARY KEY, \
+       b_aid INT REFERENCES p34idB(a_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34idB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34idC VALUES (100, 1)" in
+    let* () = exec_in db "DELETE FROM p34idA WHERE id = 1" in
+    let* rows_b = query_rows db "SELECT a_id FROM p34idB WHERE id = 10" in
+    Alcotest.check value_testable "b.a_id reset to default 99"
+      (Db.V_int 99L) (List.hd rows_b).(0);
+    let* rows_c = query_rows db "SELECT b_aid FROM p34idC WHERE c_id = 100" in
+    Alcotest.check value_testable
+      "c.b_aid cascaded to 99 via the inline SET DEFAULT on b.a_id"
+      (Db.V_int 99L) (List.hd rows_c).(0);
+    Lwt.return_unit)
+
+(** UPDATE counterpart: top-level UPDATE on A triggers the inline ON
+    UPDATE SET NULL on B, which must in turn cascade to C via ON UPDATE
+    CASCADE on B.a_id. *)
+let test_phase34_inline_update_setnull_propagates () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34iuA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE p34iuB (id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34iuA(id) ON UPDATE SET NULL, \
+       UNIQUE (a_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34iuC (c_id INTEGER PRIMARY KEY, \
+       b_aid INT REFERENCES p34iuB(a_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34iuA VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34iuB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34iuC VALUES (100, 1)" in
+    let* () = exec_in db "UPDATE p34iuA SET id = 99 WHERE id = 1" in
+    let* rows_b = query_rows db "SELECT a_id FROM p34iuB WHERE id = 10" in
+    Alcotest.check value_testable "b.a_id SET NULL via inline ON UPDATE"
+      Db.V_null (List.hd rows_b).(0);
+    let* rows_c = query_rows db "SELECT b_aid FROM p34iuC WHERE c_id = 100" in
+    Alcotest.check value_testable
+      "c.b_aid cascaded to NULL via the inline ON UPDATE SET NULL on b.a_id"
+      Db.V_null (List.hd rows_c).(0);
+    Lwt.return_unit)
+
 let phase34_transitive_setnull_tests = [
   Alcotest.test_case "setnull_single_level_regression"
     `Quick test_phase34_setnull_single_level_still_works;
@@ -7735,6 +7833,12 @@ let phase34_transitive_setnull_tests = [
     `Quick test_phase34_update_setnull_propagates;
   Alcotest.test_case "setdefault_propagates_via_on_update_cascade"
     `Quick test_phase34_setdefault_propagates_via_on_update_cascade;
+  Alcotest.test_case "inline_delete_setnull_propagates_via_on_update_cascade"
+    `Quick test_phase34_inline_delete_setnull_propagates;
+  Alcotest.test_case "inline_delete_setdefault_propagates_via_on_update_cascade"
+    `Quick test_phase34_inline_delete_setdefault_propagates;
+  Alcotest.test_case "inline_update_setnull_propagates_via_on_update_cascade"
+    `Quick test_phase34_inline_update_setnull_propagates;
 ]
 
 let phase33_virtual_gen_tests = [

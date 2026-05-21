@@ -2905,8 +2905,14 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                  "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
                                  child_meta.Cat.name col.Row.name)
                              else
+                               (* Route through cascade_update_col_in_tx so the
+                                  SET NULL itself propagates down any further
+                                  ON UPDATE FK chains on the just-written
+                                  column.  TODO(phase34): no cycle detection
+                                  on the SET NULL recursion. *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                   ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:Row.V_null
                                ) child_rows
                            ) child_col_idxs in
@@ -2941,8 +2947,12 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                  "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                                  child_meta.Cat.name col.Row.name)
                              else
+                               (* Route through cascade_update_col_in_tx (see
+                                  SET NULL arm above for rationale and the
+                                  cycle-detection TODO). *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                   ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:default_val
                                ) child_rows
                            ) child_col_idxs in
@@ -3150,8 +3160,14 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                                  "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
                                  child_meta.Cat.name col.Row.name)
                              else
+                               (* Route through cascade_update_col_in_tx so the
+                                  SET NULL itself propagates down any further
+                                  ON UPDATE FK chains on the just-written
+                                  column.  TODO(phase34): no cycle detection
+                                  on the SET NULL recursion. *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                   ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:Row.V_null
                                ) child_rows
                            ) child_col_idxs in
@@ -3186,8 +3202,12 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                                  "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                                  child_meta.Cat.name col.Row.name)
                              else
+                               (* Route through cascade_update_col_in_tx (see
+                                  SET NULL arm above for rationale and the
+                                  cycle-detection TODO). *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                   ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:default_val
                                ) child_rows
                            ) child_col_idxs in
