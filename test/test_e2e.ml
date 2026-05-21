@@ -7325,6 +7325,96 @@ let test_sqlite_version_in_expression () =
   Alcotest.(check row_testable) "sqlite_version length"
     [| Db.V_int (Int64.of_int (String.length "3.45.0-sqlocaml")) |] (List.nth r 0)
 
+(* ── Phase 33 Task 4: VIRTUAL vs STORED generated columns ────────────── *)
+
+let test_virtual_gen_column_basic () =
+  (* VIRTUAL: NOT persisted; recomputed on every SELECT. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "INSERT INTO t(a, b) VALUES (3, 4), (10, 20)";
+  let rows = query_ok db "SELECT a, b, c FROM t ORDER BY a" in
+  Alcotest.(check int) "two rows" 2 (List.length rows);
+  let r0 = List.nth rows 0 and r1 = List.nth rows 1 in
+  Alcotest.check value_testable "row0 a=3"  (Db.V_int 3L)  r0.(0);
+  Alcotest.check value_testable "row0 b=4"  (Db.V_int 4L)  r0.(1);
+  Alcotest.check value_testable "row0 c=7"  (Db.V_int 7L)  r0.(2);
+  Alcotest.check value_testable "row1 a=10" (Db.V_int 10L) r1.(0);
+  Alcotest.check value_testable "row1 b=20" (Db.V_int 20L) r1.(1);
+  Alcotest.check value_testable "row1 c=30" (Db.V_int 30L) r1.(2)
+
+let test_virtual_gen_changes_with_underlying () =
+  (* UPDATE a base column; VIRTUAL must reflect the new value on subsequent SELECT. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "INSERT INTO t(a, b) VALUES (1, 1)";
+  exec db "UPDATE t SET a = 100 WHERE a = 1";
+  let rows = query_ok db "SELECT c FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.check value_testable "c reflects updated a" (Db.V_int 101L) (List.hd rows).(0)
+
+let test_stored_gen_column_still_works () =
+  (* Regression: STORED gen cols must still persist (Task 4 must not break Task 1). *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a * b) STORED)";
+  exec db "INSERT INTO t(a, b) VALUES (3, 4)";
+  let rows = query_ok db "SELECT c FROM t" in
+  Alcotest.(check int) "one row" 1 (List.length rows);
+  Alcotest.check value_testable "stored c=12" (Db.V_int 12L) (List.hd rows).(0)
+
+let test_virtual_gen_in_update_where () =
+  (* Virtual column referenced in the WHERE clause of an UPDATE — predicate must
+     evaluate against the recomputed value, not the V_null placeholder. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 3, 4), (2, 10, 20), (3, 5, 5)";
+  (* Update only the row whose virtual c = 30 (10+20). *)
+  exec db "UPDATE t SET a = 0 WHERE c = 30";
+  let rows = query_ok db "SELECT id, a, c FROM t ORDER BY id" in
+  Alcotest.(check int) "three rows" 3 (List.length rows);
+  let r0 = List.nth rows 0 and r1 = List.nth rows 1 and r2 = List.nth rows 2 in
+  Alcotest.check value_testable "row0 a unchanged" (Db.V_int 3L) r0.(1);
+  Alcotest.check value_testable "row0 c=7" (Db.V_int 7L) r0.(2);
+  Alcotest.check value_testable "row1 a zeroed" (Db.V_int 0L) r1.(1);
+  Alcotest.check value_testable "row1 c=20 (0+20)" (Db.V_int 20L) r1.(2);
+  Alcotest.check value_testable "row2 a unchanged" (Db.V_int 5L) r2.(1);
+  Alcotest.check value_testable "row2 c=10" (Db.V_int 10L) r2.(2)
+
+let test_virtual_gen_in_delete_where () =
+  (* Virtual column referenced in DELETE WHERE — predicate must recompute. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 3, 4), (2, 10, 20), (3, 5, 5)";
+  exec db "DELETE FROM t WHERE c > 15";
+  let rows = query_ok db "SELECT id FROM t ORDER BY id" in
+  Alcotest.(check int) "two rows remain" 2 (List.length rows);
+  Alcotest.check value_testable "id 1 remains" (Db.V_int 1L) (List.nth rows 0).(0);
+  Alcotest.check value_testable "id 3 remains" (Db.V_int 3L) (List.nth rows 1).(0)
+
+let test_virtual_gen_default_is_virtual () =
+  (* When neither STORED nor VIRTUAL is specified, SQLite (and our parser)
+     default to VIRTUAL. Verify the new semantics apply by default. *)
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a * b))";
+  exec db "INSERT INTO t(a, b) VALUES (6, 7)";
+  exec db "UPDATE t SET a = 2 WHERE b = 7";
+  let rows = query_ok db "SELECT c FROM t" in
+  Alcotest.check value_testable "c recomputed after UPDATE" (Db.V_int 14L) (List.hd rows).(0)
+
+let phase33_virtual_gen_tests = [
+  Alcotest.test_case "virtual_basic"
+    `Quick test_virtual_gen_column_basic;
+  Alcotest.test_case "virtual_changes_with_underlying"
+    `Quick test_virtual_gen_changes_with_underlying;
+  Alcotest.test_case "stored_still_works"
+    `Quick test_stored_gen_column_still_works;
+  Alcotest.test_case "virtual_in_update_where"
+    `Quick test_virtual_gen_in_update_where;
+  Alcotest.test_case "virtual_in_delete_where"
+    `Quick test_virtual_gen_in_delete_where;
+  Alcotest.test_case "virtual_default_keyword_omitted"
+    `Quick test_virtual_gen_default_is_virtual;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7978,4 +8068,5 @@ let () =
       Alcotest.test_case "sqlite_version_in_expression"
         `Quick test_sqlite_version_in_expression;
     ];
+    "phase33_virtual_gen", phase33_virtual_gen_tests;
   ]

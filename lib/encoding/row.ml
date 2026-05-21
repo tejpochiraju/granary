@@ -56,21 +56,31 @@ let encode schema row =
   let buf = Buffer.create 32 in
   (* 1. column count *)
   Varint.encode_uint64 buf (Int64.of_int n);
-  (* 2. null bitmap: bit i set  => column i is NULL *)
+  (* 2. null bitmap: bit i set  => column i is NULL.
+        VIRTUAL generated columns are always encoded as NULL — their value
+        is recomputed on read (see decode_with_virtual in lib/sql/exec.ml).
+        STORED generated columns are persisted normally. *)
   let bitmap_bytes = (n + 7) / 8 in
   let bitmap = Bytes.make bitmap_bytes '\x00' in
+  let is_virtual_col i =
+    let col = List.nth schema i in
+    match col.generated_as with
+    | Some (_, false) -> true
+    | _ -> false
+  in
   Array.iteri (fun i v ->
-    match v with
-    | V_null ->
+    let null_in_bitmap = is_virtual_col i || (match v with V_null -> true | _ -> false) in
+    if null_in_bitmap then begin
       let byte_idx = i / 8 and bit_idx = i mod 8 in
       let cur = Bytes.get_uint8 bitmap byte_idx in
       Bytes.set_uint8 bitmap byte_idx (cur lor (1 lsl bit_idx))
-    | _ -> ()
+    end
   ) row;
   Buffer.add_bytes buf bitmap;
-  (* 3. non-null values in column order *)
+  (* 3. non-null values in column order — skip VIRTUAL generated cols *)
   List.iteri (fun i col ->
-    match row.(i) with
+    if is_virtual_col i then ()
+    else match row.(i) with
     | V_null   -> ()
     | V_int n ->
       (match col.ty with

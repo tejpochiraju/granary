@@ -1216,7 +1216,10 @@ let compile_generated_expr (table_name : string) (col_idx : int)
 (** Compute all generated columns in [row] in-place.
     Iterates columns in schema order; earlier generated columns are available
     to later generated column expressions (in-order dependency). *)
-let compute_generated_cols
+(** Compute STORED generated columns on the write path. VIRTUAL generated
+    columns are set to [V_null] in memory and on disk; they are recomputed
+    on read via [compute_virtual_generated_cols]. *)
+let compute_stored_generated_cols
     (clock : (unit -> float) option)
     (params : Row.value array)
     (meta : Cat.table_meta)
@@ -1224,10 +1227,75 @@ let compute_generated_cols
   List.iteri (fun i (col : Row.column) ->
     match col.Row.generated_as with
     | None -> ()
-    | Some (sql, _is_stored) ->
+    | Some (sql, true) ->
       let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
       row.(i) <- eval_expr clock params row plan_e
+    | Some (_, false) ->
+      (* VIRTUAL: write NULL placeholder; recomputed on read. *)
+      row.(i) <- Row.V_null
   ) meta.Cat.columns
+
+(** Recompute VIRTUAL generated columns from the underlying row values.
+    Invoked after [Row.decode] for table-row reads in [exec.ml]. *)
+let compute_virtual_generated_cols
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (meta : Cat.table_meta)
+    (row : Row.t) : unit =
+  List.iteri (fun i (col : Row.column) ->
+    match col.Row.generated_as with
+    | Some (sql, false) ->
+      let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
+      row.(i) <- eval_expr clock params row plan_e
+    | _ -> ()
+  ) meta.Cat.columns
+
+(** Like [compute_virtual_generated_cols] but driven by [(name, columns)]
+    rather than a full [Cat.table_meta]. Used by call sites that only have
+    a column list in scope (e.g., [execute_create_index]). *)
+let compute_virtual_generated_cols_cols
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    ~(table_name : string)
+    (columns : Row.column list)
+    (row : Row.t) : unit =
+  List.iteri (fun i (col : Row.column) ->
+    match col.Row.generated_as with
+    | Some (sql, false) ->
+      let plan_e = compile_generated_expr table_name i columns sql in
+      row.(i) <- eval_expr clock params row plan_e
+    | _ -> ()
+  ) columns
+
+let has_virtual_cols (columns : Row.column list) : bool =
+  List.exists (fun (c : Row.column) ->
+    match c.Row.generated_as with Some (_, false) -> true | _ -> false
+  ) columns
+
+(** [decode_with_virtual]: like [Row.decode], but also recomputes any VIRTUAL
+    generated columns in the schema. Skips the recompute when the table has
+    no virtual cols (the common case). *)
+let decode_with_virtual
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (meta : Cat.table_meta)
+    (bytes : bytes) : Row.t =
+  let row = Row.decode meta.Cat.columns bytes in
+  if has_virtual_cols meta.Cat.columns
+  then compute_virtual_generated_cols clock params meta row;
+  row
+
+(** Variant that takes a [(table_name, columns)] pair instead of a full meta. *)
+let decode_with_virtual_cols
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    ~(table_name : string)
+    (columns : Row.column list)
+    (bytes : bytes) : Row.t =
+  let row = Row.decode columns bytes in
+  if has_virtual_cols columns
+  then compute_virtual_generated_cols_cols clock params ~table_name columns row;
+  row
 
 let index_where_cache : (string * string * string * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
 
@@ -1705,7 +1773,6 @@ let decode_index_key_rowid (ikey : bytes) : int64 =
     Opens and closes its own RO snapshot. *)
 let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
-  let schema = child_meta.Cat.columns in
   match
     Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
       ~col_idxs:child_col_idxs
@@ -1741,7 +1808,7 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
           (match row_opt with
            | None -> walk ()
            | Some vbytes ->
-             let row = Row.decode schema vbytes in
+             let row = decode_with_virtual None [||] child_meta vbytes in
              let ok = List.for_all2 (fun ci pv ->
                compare_values row.(ci) pv = 0
              ) child_col_idxs parent_vals in
@@ -1768,7 +1835,7 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
       else match S.cursor_next cur with
       | None -> ()
       | Some (_k, vbytes) ->
-        let row = Row.decode schema vbytes in
+        let row = decode_with_virtual None [||] child_meta vbytes in
         let all_match = List.for_all2 (fun ci pv ->
           compare_values row.(ci) pv = 0
         ) child_col_idxs parent_vals in
@@ -1803,7 +1870,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
       r
   in
-  compute_generated_cols clock params table_meta row;
+  compute_stored_generated_cols clock params table_meta row;
   (* Evaluate CHECK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
   (* Evaluate FK constraints before any writes. *)
@@ -1844,7 +1911,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
                  else match S.cursor_next cur with
                  | None -> ()
                  | Some (_k, vbytes) ->
-                   let parent_row = Row.decode parent_meta.Cat.columns vbytes in
+                   let parent_row = decode_with_virtual clock params parent_meta vbytes in
                    let all_match = List.for_all2 (fun pi lv ->
                      compare_values parent_row.(pi) lv = 0
                    ) parent_idxs local_vals in
@@ -1932,13 +1999,13 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            let* () = if owned then S.rollback tx else Lwt.return_unit in
            Lwt.return false
          | Some old_bytes ->
-           let old_row = Row.decode table_meta.columns old_bytes in
+           let old_row = decode_with_virtual clock params table_meta old_bytes in
            let new_row = Array.copy old_row in
            List.iter (fun (col_ord, expr) ->
              let e' = substitute_excluded row expr in
              new_row.(col_ord) <- eval_expr clock params old_row e'
            ) assigns;
-           compute_generated_cols clock params table_meta new_row;
+           compute_stored_generated_cols clock params table_meta new_row;
            eval_check_constraints clock params table_meta new_row;
            let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
@@ -1985,7 +2052,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             match old_bytes_opt with
             | None -> Lwt.return_unit
             | Some old_bytes ->
-              let old_row = Row.decode table_meta.columns old_bytes in
+              let old_row = decode_with_virtual clock params table_meta old_bytes in
               displaced_rows := old_row :: !displaced_rows;
               let* () = S.del tx table_meta.tree_id old_key in
               Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
@@ -2053,7 +2120,7 @@ let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
           | None -> Lwt.return_unit
           | Some (kbytes, vbytes) ->
             let rowid = Rowid.decode kbytes in
-            let row = Row.decode columns vbytes in
+            let row = decode_with_virtual_cols None [||] ~table_name:table columns vbytes in
             let skip = match where_expr with
               | None -> false
               | Some we -> not (value_truthy (eval_expr None [||] row we))
@@ -2147,7 +2214,6 @@ let build_child_refs cat ~parent_table_name =
 (** Scan [child_meta] for any row where [child_col_idx] equals [parent_val].
     Opens and closes its own RO snapshot. *)
 let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
-  let schema = child_meta.Cat.columns in
   let* ro_tx = S.ro_begin store in
   let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
   let _sr    = S.cursor_first cur in
@@ -2157,7 +2223,7 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
     else match S.cursor_next cur with
     | None -> ()
     | Some (_k, vbytes) ->
-      let row = Row.decode schema vbytes in
+      let row = decode_with_virtual None [||] child_meta vbytes in
       if compare_values row.(child_col_idx) parent_val = 0 then
         found := true
       else scan ()
@@ -2172,7 +2238,6 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
     [child_col_idx] equals [parent_val]. Returns (rowid, row) list. *)
 let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
     ~child_col_idx ~(parent_val : Row.value) =
-  let schema = child_meta.Cat.columns in
   match
     Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
       ~col_idxs:[child_col_idx]
@@ -2199,7 +2264,7 @@ let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
           (match row_opt with
            | None -> walk ()
            | Some vbytes ->
-             let row = Row.decode schema vbytes in
+             let row = decode_with_virtual None [||] child_meta vbytes in
              if compare_values row.(child_col_idx) parent_val = 0 then
                buf := (rowid, row) :: !buf;
              walk ())
@@ -2220,7 +2285,7 @@ let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
       | None -> ()
       | Some (kbytes, vbytes) ->
         let rowid = Rowid.decode kbytes in
-        let row   = Row.decode schema vbytes in
+        let row   = decode_with_virtual None [||] child_meta vbytes in
         if compare_values row.(child_col_idx) parent_val = 0 then
           buf := (rowid, row) :: !buf;
         scan ()
@@ -2237,7 +2302,6 @@ let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
     Returns (rowid, row) list. *)
 let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
     ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
-  let schema = child_meta.Cat.columns in
   match
     Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
       ~col_idxs:child_col_idxs
@@ -2263,7 +2327,7 @@ let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
           (match row_opt with
            | None -> walk ()
            | Some vbytes ->
-             let row = Row.decode schema vbytes in
+             let row = decode_with_virtual None [||] child_meta vbytes in
              let all_match = List.for_all2 (fun ci pv ->
                compare_values row.(ci) pv = 0
              ) child_col_idxs parent_vals in
@@ -2286,7 +2350,7 @@ let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
       | None -> ()
       | Some (kbytes, vbytes) ->
         let rowid = Rowid.decode kbytes in
-        let row   = Row.decode schema vbytes in
+        let row   = decode_with_virtual None [||] child_meta vbytes in
         let all_match = List.for_all2 (fun ci pv ->
           compare_values row.(ci) pv = 0
         ) child_col_idxs parent_vals in
@@ -2320,7 +2384,7 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let rowid_key  = Rowid.encode rowid in
   let new_row    = Array.copy row in
   new_row.(col_idx) <- new_val;
-  compute_generated_cols None [||] meta new_row;
+  compute_stored_generated_cols None [||] meta new_row;
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
     let has_where = idx.idx_where_sql <> None in
@@ -2626,7 +2690,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
     | None -> ()
     | Some (kbytes, vbytes) ->
       let rowid = Rowid.decode kbytes in
-      let row   = Row.decode schema vbytes in
+      let row   = decode_with_virtual clock params table_meta vbytes in
       let keep  = match where with
         | None      -> true
         | Some pred -> value_truthy (eval_expr clock params row pred)
@@ -2736,7 +2800,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
             List.iter (fun (i, expr) ->
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
-            compute_generated_cols clock params table_meta new_row;
+            compute_stored_generated_cols clock params table_meta new_row;
             (* Evaluate CHECK constraints on the new row before writes. *)
             eval_check_constraints clock params table_meta new_row;
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
@@ -2778,7 +2842,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
             List.iter (fun (i, expr) ->
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
-            compute_generated_cols clock params table_meta new_row;
+            compute_stored_generated_cols clock params table_meta new_row;
             (* Apply FK cascade UPDATE actions (CASCADE / SET NULL / SET DEFAULT). *)
             let* () =
               if child_refs = [] then Lwt.return_unit
@@ -2942,7 +3006,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
     | None -> ()
     | Some (kbytes, vbytes) ->
       let rowid = Rowid.decode kbytes in
-      let row   = Row.decode schema vbytes in
+      let row   = decode_with_virtual clock params table_meta vbytes in
       let keep  = match where with
         | None      -> true
         | Some pred -> value_truthy (eval_expr clock params row pred)
@@ -3593,7 +3657,7 @@ let execute_with_count ?(mode = Auto)
          match S.cursor_next cur with
          | None -> ()
          | Some (k, v) ->
-           let old_row = Row.decode table_meta.Cat.columns v in
+           let old_row = decode_with_virtual None [||] table_meta v in
            let new_row = Array.of_list
              (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
            rows := (Bytes.copy k, new_row) :: !rows;
@@ -4284,7 +4348,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
         let%lwt () = S.ro_end tx in
         Lwt.return_none
       | Some (_key, vbytes) ->
-        let row = Row.decode table_meta.columns vbytes in
+        let row = decode_with_virtual clock params table_meta vbytes in
         Lwt.return_some row
     ) in
     Lwt.return stream
@@ -4438,7 +4502,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
                 (* Skip orphan index entries gracefully. *)
                 next ()
               | Some vbytes ->
-                let row = Row.decode table_meta.Cat.columns vbytes in
+                let row = decode_with_virtual clock params table_meta vbytes in
                 Lwt.return_some row
             end else begin
               exhausted := true;
@@ -4497,7 +4561,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
                 (match vrow with
                  | None -> scan ()
                  | Some vbytes ->
-                   let rrow = Row.decode right_meta.Cat.columns vbytes in
+                   let rrow = decode_with_virtual clock params right_meta vbytes in
                    let combined = Array.append lrow rrow in
                    out := combined :: !out;
                    found := true;
@@ -5022,7 +5086,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
        Lwt.return (Lwt_stream.of_list (List.concat result_lists)))
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
     let* tx_ro = S.ro_begin store in
     let* cur   = S.cursor_open tx_ro table_meta.tree_id in
@@ -5033,7 +5096,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | None -> ()
       | Some (kbytes, vbytes) ->
         let rowid = Rowid.decode kbytes in
-        let row = Row.decode schema vbytes in
+        let row = decode_with_virtual clock params table_meta vbytes in
         let keep = match where with
           | None      -> true
           | Some pred -> value_truthy (eval_expr clock params row pred)
@@ -5075,7 +5138,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       List.iter (fun (i, expr) ->
         new_row.(i) <- eval_expr clock params old_row expr
       ) assignments;
-      compute_generated_cols clock params table_meta new_row;
+      compute_stored_generated_cols clock params table_meta new_row;
       Array.of_list (List.map (eval_expr clock params new_row) returning)
     ) matched in
     (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot
@@ -5087,7 +5150,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     Lwt.return (Lwt_stream.of_list result_rows)
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    let schema = table_meta.Cat.columns in
     (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)
     let* tx_ro = S.ro_begin store in
     let* cur   = S.cursor_open tx_ro table_meta.tree_id in
@@ -5097,7 +5159,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       match S.cursor_next cur with
       | None -> ()
       | Some (_kbytes, vbytes) ->
-        let row = Row.decode schema vbytes in
+        let row = decode_with_virtual clock params table_meta vbytes in
         let keep = match where with
           | None      -> true
           | Some pred -> value_truthy (eval_expr clock params row pred)

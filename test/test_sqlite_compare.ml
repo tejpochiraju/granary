@@ -3550,6 +3550,42 @@ let phase33_new_fn_cases = [
     unordered = false };
 ]
 
+let phase33_virtual_gen_cases = [
+  { name = "virtual_gen_basic";
+    setup = [
+      "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "INSERT INTO t(a, b) VALUES (1, 2), (3, 5)";
+    ];
+    query = "SELECT a, b, c FROM t ORDER BY a";
+    unordered = false };
+
+  { name = "stored_gen_basic";
+    setup = [
+      "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a * b) STORED)";
+      "INSERT INTO t(a, b) VALUES (3, 7)";
+    ];
+    query = "SELECT c FROM t";
+    unordered = false };
+
+  { name = "virtual_gen_after_update";
+    setup = [
+      "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "INSERT INTO t(id, a, b) VALUES (1, 1, 1)";
+      "UPDATE t SET a = 100 WHERE id = 1";
+    ];
+    query = "SELECT c FROM t";
+    unordered = false };
+
+  { name = "virtual_gen_in_where";
+    setup = [
+      "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "INSERT INTO t(id, a, b) VALUES (1, 3, 4), (2, 10, 20), (3, 5, 5)";
+      "DELETE FROM t WHERE c > 15";
+    ];
+    query = "SELECT id FROM t ORDER BY id";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3601,4 +3637,5 @@ let () =
     "phase32_multi_col_fk",   List.map make_test phase32_multi_col_fk_cases;
     "phase33_trigger",         List.map make_test phase33_trigger_cases;
     "phase33_new_fns",         List.map make_test phase33_new_fn_cases;
+    "phase33_virtual_gen",     List.map make_test phase33_virtual_gen_cases;
   ]
