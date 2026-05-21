@@ -7545,6 +7545,198 @@ let phase34_recursive_triggers_tests = [
     `Quick test_recursive_triggers_off_top_level_still_fires;
 ]
 
+(* phase34 task-2: SET NULL / SET DEFAULT inside transitive cascade chains. *)
+
+(** Regression check: a single-level ON DELETE SET NULL still nulls the
+    child column.  This is the simple case the old non-recursive code path
+    handled; if Task 2's redirect to cascade_update_col_in_tx accidentally
+    broke it, this would catch the regression. *)
+let test_phase34_setnull_single_level_still_works () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34a (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE p34b (id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34a(id) ON DELETE SET NULL)" in
+    let* () = exec_in db "INSERT INTO p34a VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34b VALUES (10, 1)" in
+    let* () = exec_in db "DELETE FROM p34a WHERE id = 1" in
+    let* rows = query_rows db "SELECT a_id FROM p34b WHERE id = 10" in
+    Alcotest.(check int) "one b row remains" 1 (List.length rows);
+    Alcotest.check value_testable "a_id was SET NULL"
+      Db.V_null (List.hd rows).(0);
+    Lwt.return_unit)
+
+(** The Task 2 fix in action.  Schema:
+      a(id PK)
+      b(b_id PK, a_id REFERENCES a(id) ON DELETE CASCADE)
+      c(c_id PK, b_id REFERENCES b(b_id) ON DELETE SET NULL)
+      d(d_id PK, c_b_id REFERENCES c(b_id) ON UPDATE CASCADE)
+
+    DELETE a(1):
+      1. execute_delete cascades a → calls cascade_delete_row_in_tx(b[10]).
+      2. cascade_delete_row_in_tx(b[10]) sees C's ON DELETE SET NULL on
+         c.b_id and SET-NULLs c(100).b_id.
+      3. Before this task: the SET NULL writes NULL via update_col_in_tx
+         and stops; d(1000).c_b_id is left dangling at 10.
+      4. After this task: the SET NULL writes NULL via
+         cascade_update_col_in_tx, which then walks d's ON UPDATE CASCADE
+         on d.c_b_id and updates d(1000).c_b_id to NULL.
+
+    Note: This scenario specifically exercises the cascade_delete_row_in_tx
+    SET NULL branch — the inline SET NULL in execute_delete only runs at
+    the top level, so reaching cascade_delete_row_in_tx requires the
+    top-level DELETE to first CASCADE into an intermediate table. *)
+let test_phase34_setnull_propagates_via_on_update_cascade () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34tA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE p34tB (b_id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34tA(id) ON DELETE CASCADE)" in
+    (* Column-level UNIQUE isn't supported here, so emit the constraint as
+       a table-level UNIQUE on c.b_id.  c.b_id must be UNIQUE so d can FK
+       to it. *)
+    let* () = exec_in db
+      "CREATE TABLE p34tC (c_id INTEGER PRIMARY KEY, \
+       b_id INT REFERENCES p34tB(b_id) ON DELETE SET NULL, \
+       UNIQUE (b_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34tD (d_id INTEGER PRIMARY KEY, \
+       c_b_id INT REFERENCES p34tC(b_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34tA VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34tB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34tC VALUES (100, 10)" in
+    let* () = exec_in db "INSERT INTO p34tD VALUES (1000, 10)" in
+    let* () = exec_in db "DELETE FROM p34tA WHERE id = 1" in
+    (* b should have been deleted via CASCADE. *)
+    let* rows_b = query_rows db "SELECT b_id FROM p34tB" in
+    Alcotest.(check int) "b cascaded-deleted" 0 (List.length rows_b);
+    (* c.b_id should have been SET NULL by cascade_delete_row_in_tx. *)
+    let* rows_c = query_rows db "SELECT b_id FROM p34tC WHERE c_id = 100" in
+    Alcotest.(check int) "c row preserved (SET NULL, not deleted)"
+      1 (List.length rows_c);
+    Alcotest.check value_testable "c.b_id SET NULL"
+      Db.V_null (List.hd rows_c).(0);
+    (* d.c_b_id should have cascaded to NULL via cascade_update_col_in_tx. *)
+    let* rows_d = query_rows db "SELECT c_b_id FROM p34tD WHERE d_id = 1000" in
+    Alcotest.(check int) "d row preserved" 1 (List.length rows_d);
+    Alcotest.check value_testable
+      "d.c_b_id was UPDATE-CASCADEd from the SET NULL on c.b_id"
+      Db.V_null (List.hd rows_d).(0);
+    Lwt.return_unit)
+
+(** Same idea via UPDATE-side cascade, exercising the cascade_update_col_in_tx
+    SET NULL branch.  Schema:
+      a(id PK)
+      b(b_id PK, a_id REFERENCES a(id) ON UPDATE CASCADE)
+      c(c_id PK, b_id REFERENCES b(b_id) ON UPDATE SET NULL, UNIQUE(b_id))
+      d(d_id PK, c_b_id REFERENCES c(b_id) ON UPDATE CASCADE)
+
+    UPDATE a SET id = 99:
+      1. execute_update cascades to b via ON UPDATE CASCADE on b.a_id.
+         (This is the inline cascade in execute_update which calls
+         cascade_update_col_in_tx for CASCADE.)
+      2. cascade_update_col_in_tx(b[10], a_id := 99) — but wait, b's b_id
+         didn't change, so c isn't touched yet.  To reach the SET NULL
+         branch in cascade_update_col_in_tx, the update must touch a column
+         that c's FK references.  Drop this scenario; the SET NULL branch
+         of cascade_update_col_in_tx fires when an ALREADY-recursing
+         cascade UPDATEs a column with an ON UPDATE SET NULL further down.
+         Build that: change b.b_id via cascade.
+      In practice the simplest reachable case is the DELETE→CASCADE→SET NULL
+      chain above.  Keep this UPDATE variant focused on the SET DEFAULT
+      arm of cascade_update_col_in_tx by routing through ON UPDATE
+      CASCADE → ON UPDATE SET NULL.  This requires the intermediate
+      cascade to touch a column that has both an inbound CASCADE update
+      and an outbound SET NULL FK.
+
+    Concretely: UPDATE p34uA SET id = 99 cascades to b.a_id := 99 via
+    cascade_update_col_in_tx (called from execute_update inline CASCADE).
+    Inside cascade_update_col_in_tx(b, col=a_id, new_val=99), it walks
+    children of b referencing a_id — c has ON UPDATE SET NULL on c.a_id,
+    so c.a_id := NULL.  With the Task 2 fix, that SET NULL is routed
+    through cascade_update_col_in_tx, which then walks d's ON UPDATE
+    CASCADE on c.a_id. *)
+let test_phase34_update_setnull_propagates () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34uA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE p34uB (b_id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34uA(id) ON UPDATE CASCADE, \
+       UNIQUE (a_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34uC (c_id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34uB(a_id) ON UPDATE SET NULL, \
+       UNIQUE (a_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34uD (d_id INTEGER PRIMARY KEY, \
+       c_a_id INT REFERENCES p34uC(a_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34uA VALUES (1)" in
+    let* () = exec_in db "INSERT INTO p34uB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34uC VALUES (100, 1)" in
+    let* () = exec_in db "INSERT INTO p34uD VALUES (1000, 1)" in
+    let* () = exec_in db "UPDATE p34uA SET id = 99 WHERE id = 1" in
+    (* b.a_id cascaded to 99. *)
+    let* rows_b = query_rows db "SELECT a_id FROM p34uB WHERE b_id = 10" in
+    Alcotest.check value_testable "b.a_id cascaded to 99"
+      (Db.V_int 99L) (List.hd rows_b).(0);
+    (* c.a_id should be SET NULL (cascade_update_col_in_tx SET NULL arm). *)
+    let* rows_c = query_rows db "SELECT a_id FROM p34uC WHERE c_id = 100" in
+    Alcotest.check value_testable "c.a_id SET NULL via transitive UPDATE"
+      Db.V_null (List.hd rows_c).(0);
+    (* With the fix: d.c_a_id should also have cascaded to NULL. *)
+    let* rows_d = query_rows db "SELECT c_a_id FROM p34uD WHERE d_id = 1000" in
+    Alcotest.check value_testable
+      "d.c_a_id cascaded to NULL via the transitive SET NULL on c.a_id"
+      Db.V_null (List.hd rows_d).(0);
+    Lwt.return_unit)
+
+(** SET DEFAULT counterpart: a top-level DELETE on A cascades to B; B's
+    deletion has SET DEFAULT on C; that becomes an UPDATE on C which is
+    routed (post-fix) through cascade_update_col_in_tx, propagating to D
+    via ON UPDATE CASCADE. *)
+let test_phase34_setdefault_propagates_via_on_update_cascade () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p34dA (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db "INSERT INTO p34dA VALUES (7)" in
+    let* () = exec_in db "INSERT INTO p34dA VALUES (1)" in
+    let* () = exec_in db
+      "CREATE TABLE p34dB (b_id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES p34dA(id) ON DELETE CASCADE)" in
+    let* () = exec_in db
+      "CREATE TABLE p34dC (c_id INTEGER PRIMARY KEY, \
+       b_id INT DEFAULT 99 REFERENCES p34dB(b_id) ON DELETE SET DEFAULT, \
+       UNIQUE (b_id))" in
+    let* () = exec_in db
+      "CREATE TABLE p34dD (d_id INTEGER PRIMARY KEY, \
+       c_b_id INT REFERENCES p34dC(b_id) ON UPDATE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p34dB VALUES (10, 1)" in
+    let* () = exec_in db "INSERT INTO p34dC VALUES (100, 10)" in
+    let* () = exec_in db "INSERT INTO p34dD VALUES (1000, 10)" in
+    let* () = exec_in db "DELETE FROM p34dA WHERE id = 1" in
+    let* rows_c = query_rows db "SELECT b_id FROM p34dC WHERE c_id = 100" in
+    Alcotest.check value_testable "c.b_id reset to default 99"
+      (Db.V_int 99L) (List.hd rows_c).(0);
+    let* rows_d = query_rows db "SELECT c_b_id FROM p34dD WHERE d_id = 1000" in
+    Alcotest.check value_testable
+      "d.c_b_id cascaded to 99 via the transitive SET DEFAULT on c.b_id"
+      (Db.V_int 99L) (List.hd rows_d).(0);
+    Lwt.return_unit)
+
+let phase34_transitive_setnull_tests = [
+  Alcotest.test_case "setnull_single_level_regression"
+    `Quick test_phase34_setnull_single_level_still_works;
+  Alcotest.test_case "setnull_propagates_via_on_update_cascade"
+    `Quick test_phase34_setnull_propagates_via_on_update_cascade;
+  Alcotest.test_case "update_setnull_propagates_via_on_update_cascade"
+    `Quick test_phase34_update_setnull_propagates;
+  Alcotest.test_case "setdefault_propagates_via_on_update_cascade"
+    `Quick test_phase34_setdefault_propagates_via_on_update_cascade;
+]
+
 let phase33_virtual_gen_tests = [
   Alcotest.test_case "virtual_basic"
     `Quick test_virtual_gen_column_basic;
@@ -8223,4 +8415,5 @@ let () =
     ];
     "phase33_virtual_gen", phase33_virtual_gen_tests;
     "phase34_recursive_triggers", phase34_recursive_triggers_tests;
+    "phase34_transitive_setnull", phase34_transitive_setnull_tests;
   ]

@@ -2484,8 +2484,15 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                      "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
                      child_meta.Cat.name col.Row.name)
                  else
+                   (* Route through cascade_update_col_in_tx so the resulting
+                      column UPDATE itself walks any ON UPDATE FK chains on
+                      descendents of [child_meta].  TODO(phase34): like the
+                      pre-existing CASCADE branch above, this path has no
+                      cycle detection — a cyclic SET NULL/DEFAULT graph
+                      could loop forever. *)
                    Lwt_list.iter_s (fun (crid, crow) ->
-                     update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                     cascade_update_col_in_tx tx cat clock params child_meta
+                       ~rowid:crid ~row:crow
                        ~col_idx:child_col_idx ~new_val:Row.V_null
                    ) child_rows
                ) child_col_idxs in
@@ -2525,8 +2532,12 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                      "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                      child_meta.Cat.name col.Row.name)
                  else
+                   (* Route through cascade_update_col_in_tx (see SET NULL
+                      arm above for rationale and the cycle-detection
+                      TODO). *)
                    Lwt_list.iter_s (fun (crid, crow) ->
-                     update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                     cascade_update_col_in_tx tx cat clock params child_meta
+                       ~rowid:crid ~row:crow
                        ~col_idx:child_col_idx ~new_val:default_val
                    ) child_rows
                ) child_col_idxs in
@@ -2610,8 +2621,12 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
               scan_child_rows_multi_tx cat tx child_meta
                 ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
             in
+            (* Route through cascade_update_col_in_tx so the SET NULL itself
+               propagates down any further ON UPDATE chains.  TODO(phase34):
+               no cycle detection — same gap as the CASCADE branch. *)
             Lwt_list.iter_s (fun (crid, crow) ->
-              update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+              cascade_update_col_in_tx tx cat clock params child_meta
+                ~rowid:crid ~row:crow
                 ~col_idx:child_col_idx ~new_val:Row.V_null
             ) child_rows
           end
@@ -2651,8 +2666,11 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
                 "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                 child_meta.Cat.name child_col_name)
             else
+              (* Route through cascade_update_col_in_tx (see SET NULL arm
+                 above for rationale and the cycle-detection TODO). *)
               Lwt_list.iter_s (fun (crid, crow) ->
-                update_col_in_tx tx cat child_meta ~rowid:crid ~row:crow
+                cascade_update_col_in_tx tx cat clock params child_meta
+                  ~rowid:crid ~row:crow
                   ~col_idx:child_col_idx ~new_val:default_val
               ) child_rows
           end
