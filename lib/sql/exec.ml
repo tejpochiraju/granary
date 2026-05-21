@@ -1703,6 +1703,8 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     ?(prebuilt_row : Row.t option = None)
     ?(before_hook : (new_row:Row.t -> unit Lwt.t) option = None)
     ?(after_hook  : (new_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
   let n   = List.length table_meta.columns in
@@ -1868,6 +1870,10 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            let* () = S.del tx table_meta.tree_id old_key in
            let* () = S.put tx table_meta.tree_id old_key new_bytes in
            let* () = release_txn tx owned in
+           let* () = match on_upsert_update with
+             | None -> Lwt.return_unit
+             | Some f -> f ~old_row ~new_row
+           in
            let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row in
            Lwt.return true)
       | _ ->
@@ -1877,7 +1883,11 @@ let execute_insert ?(mode = Auto) ?(params = [||])
           let* () = if owned then S.rollback tx else Lwt.return_unit in
           Lwt.return false
         end else begin
-          (* REPLACE: delete all conflicting rows first *)
+          (* REPLACE: delete all conflicting rows first.  Capture the
+             displaced rows so DELETE triggers can fire on them AFTER the
+             enclosing txn is released — firing while still in-txn would
+             deadlock when the trigger body acquires its own RW txn. *)
+          let displaced_rows : Row.t list ref = ref [] in
           let* () = Lwt_list.iter_s (fun old_rowid ->
             let old_key = Rowid.encode old_rowid in
             let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
@@ -1885,6 +1895,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             | None -> Lwt.return_unit
             | Some old_bytes ->
               let old_row = Row.decode table_meta.columns old_bytes in
+              displaced_rows := old_row :: !displaced_rows;
               let* () = S.del tx table_meta.tree_id old_key in
               Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
                 if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
@@ -1912,6 +1923,12 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             end
           ) idxs in
           let* () = release_txn tx owned in
+          (* Fire DELETE triggers on each displaced row after release. *)
+          let* () = match on_replace_delete with
+            | None   -> Lwt.return_unit
+            | Some f ->
+              Lwt_list.iter_s (fun old_row -> f ~old_row) (List.rev !displaced_rows)
+          in
           let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
           Lwt.return true
         end)
@@ -3101,6 +3118,8 @@ let execute_with_count ?(mode = Auto)
     ?(params = [||])
     ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
     ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
@@ -3142,6 +3161,7 @@ let execute_with_count ?(mode = Auto)
     Lwt_list.fold_left_s (fun count row_vals ->
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
                         ~before_hook:bh ~after_hook:ah
+                        ~on_replace_delete ~on_upsert_update
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
@@ -3159,6 +3179,7 @@ let execute_with_count ?(mode = Auto)
       ) ordinals;
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
                         ~before_hook:bh ~after_hook:ah
+                        ~on_replace_delete ~on_upsert_update
                         store cat ~table_meta ~ordinals ~values:[]
                         ~prebuilt_row:(Some row_arr) in
       Lwt.return (count + if inserted then 1 else 0)
@@ -3463,8 +3484,11 @@ let execute ?(mode = Auto)
     ?(params = [||])
     ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
     ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count ~mode ~clock ~params ~before_hook ~after_hook store cat op in
+  let* _n = execute_with_count ~mode ~clock ~params ~before_hook ~after_hook
+              ~on_replace_delete ~on_upsert_update store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)

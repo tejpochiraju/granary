@@ -3497,6 +3497,42 @@ let phase32_multi_col_fk_cases = [
     unordered = false };
 ]
 
+(* ── Phase 33 Task 1: trigger improvements ─────────────────────── *)
+
+let phase33_trigger_cases = [
+  (* Note: SQLite by default does NOT fire DELETE triggers on the rows
+     displaced by an INSERT OR REPLACE conflict — that behaviour is gated
+     on [PRAGMA recursive_triggers = ON].  Sqlocaml always fires them,
+     which matches recursive_triggers=ON; that divergence is intentional
+     and covered by the e2e test suite, so no comparison case is included
+     here. *)
+
+  { name = "nested_trigger_fires";
+    setup = [
+      "CREATE TABLE a (n INT)";
+      "CREATE TABLE b (m INT)";
+      "CREATE TABLE c (s INT)";
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT INTO b(m) VALUES(NEW.n); END";
+      "CREATE TRIGGER tb AFTER INSERT ON b \
+       BEGIN INSERT INTO c(s) VALUES(NEW.m); END";
+      "INSERT INTO a(n) VALUES(7)";
+    ];
+    query = "SELECT s FROM c";
+    unordered = false };
+
+  { name = "for_each_row_accepted";
+    setup = [
+      "CREATE TABLE t (id INTEGER, val TEXT)";
+      "CREATE TABLE audit (t_id INTEGER, action TEXT)";
+      "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW \
+       BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END";
+      "INSERT INTO t VALUES (1, 'hello')";
+    ];
+    query = "SELECT t_id, action FROM audit";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3546,4 +3582,5 @@ let () =
     "phase31_scalar",          List.map make_test phase31_scalar_cases;
     "phase32_session_fns",     List.map make_test phase32_session_fn_cases;
     "phase32_multi_col_fk",   List.map make_test phase32_multi_col_fk_cases;
+    "phase33_trigger",         List.map make_test phase33_trigger_cases;
   ]

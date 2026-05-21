@@ -18,6 +18,10 @@ val execute :
   ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
                old_row:Sqlocaml_encoding.Row.t option ->
                unit Lwt.t) option ->
+  ?on_replace_delete:(old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_upsert_update:(old_row:Sqlocaml_encoding.Row.t ->
+                     new_row:Sqlocaml_encoding.Row.t ->
+                     unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->
@@ -38,6 +42,10 @@ val execute_with_count :
   ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
                old_row:Sqlocaml_encoding.Row.t option ->
                unit Lwt.t) option ->
+  ?on_replace_delete:(old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_upsert_update:(old_row:Sqlocaml_encoding.Row.t ->
+                     new_row:Sqlocaml_encoding.Row.t ->
+                     unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
   Sqlocaml_catalog.Catalog.t ->
   Plan.op ->

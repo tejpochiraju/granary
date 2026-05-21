@@ -15,6 +15,7 @@ type t = {
   mutable auto_began      : bool;         (* txn started implicitly by SAVEPOINT *)
   mutable last_changes      : int;   (** rows affected by the last DML statement *)
   mutable last_insert_rowid : int64; (** rowid of the last INSERT row *)
+  mutable trigger_depth     : int;   (** recursion depth for nested trigger firing *)
 }
 
 type value = Row.value =
@@ -46,7 +47,7 @@ let open_in_memory ?clock () =
   Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4;
              triggers = Hashtbl.create 4;
              savepoint_names = []; auto_began = false;
-             last_changes = 0; last_insert_rowid = 0L }
+             last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -94,7 +95,7 @@ let open_file ~path =
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L })
+                 last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -112,7 +113,7 @@ let open_block
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L })
+                 last_changes = 0; last_insert_rowid = 0L; trigger_depth = 0 })
 
 let close t = S.close t.store
 
@@ -344,20 +345,57 @@ let subst_new_old ~schema ~new_row ~old_row stmt =
     }
   | other -> other
 
-(** Compile and execute one pre-substituted trigger body statement within the db context.
-    Note: triggers fired here do NOT recursively fire further triggers (nested trigger
-    firing is not supported in Phase 22). *)
-let fire_trigger_stmt t stmt =
-  let* bound = Sql.Sema.bind ~views:t.views t.catalog stmt in
-  match bound with
-  | Error e -> Lwt.fail_with (Format.asprintf "trigger sema: %a" Sql.Sema.pp_error e)
-  | Ok b ->
-    let op = Sql.Planner.plan ~cat:t.catalog b in
-    let mode = match t.explicit_txn with
-      | None    -> Sql.Exec.Auto
-      | Some tx -> Sql.Exec.In_txn tx
+(** Maximum trigger recursion depth.  Mirrors SQLite's
+    SQLITE_MAX_TRIGGER_DEPTH default. *)
+let max_trigger_depth = 32
+
+(** Compile and execute one pre-substituted trigger body statement within the
+    db context.  This installs hooks for the nested DML so triggers fired from
+    within a trigger body can themselves fire further triggers, up to
+    [max_trigger_depth] levels deep. *)
+let rec fire_trigger_stmt t stmt =
+  if t.trigger_depth >= max_trigger_depth then
+    Lwt.fail_with (Printf.sprintf
+      "trigger recursion limit (%d) exceeded" max_trigger_depth)
+  else begin
+    t.trigger_depth <- t.trigger_depth + 1;
+    let finally () =
+      t.trigger_depth <- t.trigger_depth - 1;
+      Lwt.return_unit
     in
-    Sql.Exec.execute ~mode ~clock:t.clock t.store t.catalog op
+    Lwt.finalize (fun () ->
+      let* bound = Sql.Sema.bind ~views:t.views t.catalog stmt in
+      match bound with
+      | Error e ->
+        Lwt.fail_with (Format.asprintf "trigger sema: %a" Sql.Sema.pp_error e)
+      | Ok b ->
+        let op = Sql.Planner.plan ~cat:t.catalog b in
+        let mode = match t.explicit_txn with
+          | None    -> Sql.Exec.Auto
+          | Some tx -> Sql.Exec.In_txn tx
+        in
+        (* Build hooks for the nested op so further triggers fire. *)
+        let table_meta_opt, event_opt = match op with
+          | Sql.Plan.Op_insert { table_meta; _ }
+          | Sql.Plan.Op_insert_select { table_meta; _ } ->
+            (Some table_meta, Some `Insert)
+          | Sql.Plan.Op_update { table_meta; _ } ->
+            (Some table_meta, Some `Update)
+          | Sql.Plan.Op_delete { table_meta; _ } ->
+            (Some table_meta, Some `Delete)
+          | _ -> (None, None)
+        in
+        let before_hook, after_hook =
+          match table_meta_opt, event_opt with
+          | Some tm, Some ev ->
+            (make_trigger_hook t tm ~timing:`Before ~event:ev,
+             make_trigger_hook t tm ~timing:`After  ~event:ev)
+          | _ -> (None, None)
+        in
+        Sql.Exec.execute ~before_hook ~after_hook ~mode ~clock:t.clock
+          t.store t.catalog op
+    ) finally
+  end
 
 (** Build a DML hook for exec.ml that fires triggers.
     Returns None if no triggers exist for the given table/timing/event (fast path).
@@ -365,7 +403,7 @@ let fire_trigger_stmt t stmt =
 (* Atomicity note: AFTER triggers fire after the DML transaction commits.
    If an AFTER trigger body fails, the committed DML row is NOT rolled back.
    This differs from SQLite's semantics where all-or-nothing applies. *)
-let make_trigger_hook t table_meta ~timing ~event =
+and make_trigger_hook t table_meta ~timing ~event =
   let matching =
     Hashtbl.fold (fun _name ast acc ->
       match trigger_meta_of_ast _name ast with
@@ -524,7 +562,7 @@ let execute_instead_of t view_name ast =
       ) matching in
       Lwt.return (Ok ())
     end
-  | Sql.Ast.S_update { assignments; _ } ->
+  | Sql.Ast.S_update { assignments; where; _ } ->
     let matching = find_instead_of `Update in
     if matching = [] then
       Lwt.return (Error (Sema (Sql.Sema.Unsupported
@@ -532,19 +570,65 @@ let execute_instead_of t view_name ast =
            view_name))))
     else begin
       (* Build NEW row from assignment expressions.
-         Only literal values are substituted; complex expressions become NULL.
-         The WHERE clause is not applied here — the trigger body handles filtering. *)
+         Only literal values are substituted; complex expressions become NULL. *)
       let assign_cols  = List.map fst assignments in
       let assign_exprs = List.map snd assignments in
-      let schema   = make_col_schema assign_cols in
-      let new_vals = List.map eval_insert_ast_value assign_exprs in
-      let new_row  = Some (Array.of_list new_vals) in
-      let* () = Lwt_list.iter_s (fun m ->
-        let substituted_body = List.map (fun stmt ->
-          subst_new_old ~schema ~new_row ~old_row:None stmt
-        ) m.trig_body in
-        Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
-      ) matching in
+      let new_schema   = make_col_schema assign_cols in
+      let new_vals     = List.map eval_insert_ast_value assign_exprs in
+      let new_row      = Some (Array.of_list new_vals) in
+      (* Populate OLD rows by selecting from the view under the WHERE clause.
+         Mirrors SQLite's INSTEAD OF UPDATE semantics. *)
+      let view_query = Hashtbl.find_opt t.views view_name in
+      let old_col_names =
+        match view_query with
+        | Some vq -> view_col_names vq
+        | None    -> []
+      in
+      let old_schema = make_col_schema old_col_names in
+      let* old_rows =
+        match view_query with
+        | None -> Lwt.return []
+        | Some _ ->
+          let select_sql =
+            match where with
+            | None    -> Printf.sprintf "SELECT * FROM %s" view_name
+            | Some w  -> Printf.sprintf "SELECT * FROM %s WHERE %s"
+                           view_name (Sql.Ast.expr_to_sql w)
+          in
+          let* op = compile t select_sql in
+          (match op with
+           | Error _ -> Lwt.return []
+           | Ok plan_op ->
+             let mode = match t.explicit_txn with
+               | None    -> Sql.Exec.Auto
+               | Some tx -> Sql.Exec.In_txn tx
+             in
+             (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog plan_op with
+              | exception Failure _ -> Lwt.return []
+              | lwt_stream ->
+                Lwt.catch
+                  (fun () ->
+                    let* stream = lwt_stream in
+                    Lwt_stream.to_list stream)
+                  (fun _ -> Lwt.return [])))
+      in
+      let process_one_old_row old_row_opt =
+        Lwt_list.iter_s (fun m ->
+          let substituted_body = List.map (fun stmt ->
+            (* Substitute NEW first using the assignment-column schema,
+               then OLD using the view's column schema.  Both passes are
+               disjoint: each only rewrites references whose alias matches
+               its schema. *)
+            let s1 = subst_new_old ~schema:new_schema ~new_row ~old_row:None stmt in
+            subst_new_old ~schema:old_schema ~new_row:None ~old_row:old_row_opt s1
+          ) m.trig_body in
+          Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+        ) matching
+      in
+      let* () =
+        if old_rows = [] then process_one_old_row None
+        else Lwt_list.iter_s (fun r -> process_one_old_row (Some r)) old_rows
+      in
       Lwt.return (Ok ())
     end
   | _ ->
@@ -554,6 +638,34 @@ let execute_instead_of t view_name ast =
 (* ------------------------------------------------------------------ *)
 (* Public execute / query API                                           *)
 (* ------------------------------------------------------------------ *)
+
+(** Build the REPLACE-conflict-delete and UPSERT-conflict-update hooks for
+    an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a
+    UNIQUE index (DELETE triggers on the displaced row) or when the UPSERT
+    [DO UPDATE] branch runs (UPDATE triggers on the updated row).
+    Returns [(None, None)] for ops that are not insert-like. *)
+let insert_replace_upsert_hooks t op =
+  let table_meta_opt = match op with
+    | Sql.Plan.Op_insert { table_meta; _ }
+    | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta
+    | _ -> None
+  in
+  match table_meta_opt with
+  | None -> (None, None)
+  | Some tm ->
+    let delete_hook = make_trigger_hook t tm ~timing:`After ~event:`Delete in
+    let update_hook = make_trigger_hook t tm ~timing:`After ~event:`Update in
+    let on_replace_delete =
+      Option.map (fun hook -> fun ~old_row ->
+        hook ~new_row:None ~old_row:(Some old_row)
+      ) delete_hook
+    in
+    let on_upsert_update =
+      Option.map (fun hook -> fun ~old_row ~new_row ->
+        hook ~new_row:(Some new_row) ~old_row:(Some old_row)
+      ) update_hook
+    in
+    (on_replace_delete, on_upsert_update)
 
 let execute t sql =
   let* op = compile t sql in
@@ -621,8 +733,11 @@ let execute t sql =
       | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
       | _ -> None
     in
+    let (on_replace_delete, on_upsert_update) = insert_replace_upsert_hooks t op in
     (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
-             ~before_hook ~after_hook t.store t.catalog op with
+             ~before_hook ~after_hook
+             ~on_replace_delete ~on_upsert_update
+             t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
        Lwt.catch
@@ -713,8 +828,11 @@ let execute_change_count t sql =
       | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
       | _ -> None
     in
+    let (on_replace_delete, on_upsert_update) = insert_replace_upsert_hooks t op in
     (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
-             ~before_hook ~after_hook t.store t.catalog op with
+             ~before_hook ~after_hook
+             ~on_replace_delete ~on_upsert_update
+             t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_op ->
        Lwt.catch
@@ -804,10 +922,15 @@ let run st ~params =
        make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
     | _ -> (None, None)
   in
+  let (on_replace_delete, on_upsert_update) =
+    insert_replace_upsert_hooks t st.plan
+  in
   Lwt.catch
     (fun () ->
       let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr
-                 ~before_hook ~after_hook t.store t.catalog st.plan in
+                 ~before_hook ~after_hook
+                 ~on_replace_delete ~on_upsert_update
+                 t.store t.catalog st.plan in
       Lwt.return (Ok n))
     (function
      | Failure msg -> Lwt.return (Error (Runtime msg))

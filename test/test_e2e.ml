@@ -6895,6 +6895,114 @@ let test_multi_col_fk_restrict_delete_blocks () =
     check_error "restrict delete blocked" result;
     Lwt.return_unit)
 
+(* ── Phase 33 Task 1: trigger improvements ───────────────────────── *)
+
+(** Accept (and ignore) FOR EACH ROW after the event clause. *)
+let test_for_each_row_parses () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (id INTEGER, val TEXT)" in
+    let* () = exec_in db "CREATE TABLE audit (t_id INTEGER, action TEXT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW \
+       BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END" in
+    let* () = exec_in db "INSERT INTO t VALUES (1, 'hello')" in
+    let* rows = query_rows db "SELECT t_id, action FROM audit" in
+    Alcotest.(check int) "1 audit row" 1 (List.length rows);
+    Alcotest.check value_testable "t_id=1"        (Db.V_int 1L)        (List.hd rows).(0);
+    Alcotest.check value_testable "action=INSERT" (Db.V_text "INSERT") (List.hd rows).(1);
+    Lwt.return_unit)
+
+(** Nested trigger firing: INSERT on a -> INSERT on b -> INSERT on c. *)
+let test_nested_trigger_fires () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE a (n INT)" in
+    let* () = exec_in db "CREATE TABLE b (src INT)" in
+    let* () = exec_in db "CREATE TABLE c (src INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER ta AFTER INSERT ON a \
+       BEGIN INSERT INTO b(src) VALUES(NEW.n); END" in
+    let* () = exec_in db
+      "CREATE TRIGGER tb AFTER INSERT ON b \
+       BEGIN INSERT INTO c(src) VALUES(NEW.src); END" in
+    let* () = exec_in db "INSERT INTO a(n) VALUES(42)" in
+    let* rows = query_rows db "SELECT src FROM c" in
+    Alcotest.(check int) "1 row in c" 1 (List.length rows);
+    Alcotest.check value_testable "c.src=42" (Db.V_int 42L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+(** Self-firing trigger should hit the recursion limit and surface as
+    an error rather than diverge. *)
+let test_trigger_recursion_limit () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE TABLE t (n INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER tt AFTER INSERT ON t \
+       BEGIN INSERT INTO t(n) VALUES(NEW.n + 1); END" in
+    let* result = Db.execute db "INSERT INTO t(n) VALUES(1)" in
+    check_error "trigger recursion limit reached" result;
+    Lwt.return_unit)
+
+(** INSTEAD OF UPDATE: OLD.* references resolve against the view's
+    matching row(s) selected under the WHERE clause. *)
+let test_instead_of_update_old_row () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
+    let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
+    let* () = exec_in db
+      "CREATE TABLE audit (old_val INT, new_val INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
+         INSERT INTO audit VALUES (OLD.val, NEW.val); \
+       END" in
+    let* () = exec_in db "UPDATE v SET val = 999 WHERE id = 1" in
+    let* rows = query_rows db "SELECT old_val, new_val FROM audit" in
+    Alcotest.(check int) "1 audit row" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.check value_testable "old_val=100" (Db.V_int 100L) row.(0);
+    Alcotest.check value_testable "new_val=999" (Db.V_int 999L) row.(1);
+    Lwt.return_unit)
+
+(** INSERT OR REPLACE fires DELETE triggers on rows displaced by the
+    UNIQUE conflict. *)
+let test_replace_fires_delete_trigger () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
+    let* () = exec_in db "CREATE TABLE del_audit (deleted_id INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER td AFTER DELETE ON t \
+       BEGIN INSERT INTO del_audit VALUES(OLD.id); END" in
+    let* () = exec_in db "INSERT INTO t VALUES (1, 10)" in
+    let* () = exec_in db "INSERT OR REPLACE INTO t VALUES (1, 99)" in
+    let* rows = query_rows db "SELECT deleted_id FROM del_audit" in
+    Alcotest.(check int) "1 log row" 1 (List.length rows);
+    Alcotest.check value_testable "deleted_id=1" (Db.V_int 1L) (List.hd rows).(0);
+    Lwt.return_unit)
+
+(** UPSERT (INSERT ... ON CONFLICT DO UPDATE) fires UPDATE triggers
+    with OLD bound to the pre-update row. *)
+let test_upsert_fires_update_trigger () =
+  with_db (fun db ->
+    let* () = exec_in db
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
+    let* () = exec_in db
+      "CREATE TABLE upd_audit (old_n INT, new_n INT)" in
+    let* () = exec_in db
+      "CREATE TRIGGER tu AFTER UPDATE ON t \
+       BEGIN INSERT INTO upd_audit VALUES(OLD.n, NEW.n); END" in
+    let* () = exec_in db "INSERT INTO t VALUES (1, 10)" in
+    let* () = exec_in db
+      "INSERT INTO t VALUES (1, 99) \
+       ON CONFLICT(id) DO UPDATE SET n = excluded.n" in
+    let* rows = query_rows db "SELECT old_n, new_n FROM upd_audit" in
+    Alcotest.(check int) "1 log row" 1 (List.length rows);
+    let row = List.hd rows in
+    Alcotest.check value_testable "old_n=10" (Db.V_int 10L) row.(0);
+    Alcotest.check value_testable "new_n=99" (Db.V_int 99L) row.(1);
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7509,5 +7617,13 @@ let () =
       Alcotest.test_case "cascade_delete"         `Quick test_multi_col_fk_cascade_delete;
       Alcotest.test_case "pragma_list_count"      `Quick test_multi_col_fk_pragma_list_count;
       Alcotest.test_case "restrict_delete_blocks" `Quick test_multi_col_fk_restrict_delete_blocks;
+    ];
+    "phase33_triggers", [
+      Alcotest.test_case "for_each_row_parses"      `Quick test_for_each_row_parses;
+      Alcotest.test_case "nested_trigger_fires"     `Quick test_nested_trigger_fires;
+      Alcotest.test_case "trigger_recursion_limit"  `Quick test_trigger_recursion_limit;
+      Alcotest.test_case "instead_of_update_old_row" `Quick test_instead_of_update_old_row;
+      Alcotest.test_case "replace_fires_delete_trigger" `Quick test_replace_fires_delete_trigger;
+      Alcotest.test_case "upsert_fires_update_trigger"  `Quick test_upsert_fires_update_trigger;
     ];
   ]

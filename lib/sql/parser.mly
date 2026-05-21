@@ -64,6 +64,7 @@
 %token SNIPPET
 %token HEX CHAR UNICODE PRINTF FORMAT ZEROBLOB
 %token RANDOM RANDOMBLOB CHANGES LAST_INSERT_ROWID
+%token FOR EACH ROW
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -176,6 +177,9 @@ any_ident:
   | RANDOMBLOB        { "randomblob" }
   | CHANGES           { "changes" }
   | LAST_INSERT_ROWID { "last_insert_rowid" }
+  | FOR               { "for" }
+  | EACH              { "each" }
+  | ROW               { "row" }
 
 stmt:
   | s = with_cte          { s }
@@ -279,9 +283,14 @@ create_trigger:
     timing = trigger_timing
     event  = trigger_event
     ON table = any_ident
+    for_each_row_opt
     when_  = trigger_when
     BEGIN body = trigger_body END
     { Ast.S_create_trigger { name; timing; event; table; when_; body } }
+
+for_each_row_opt:
+  | /* empty */    { () }
+  | FOR EACH ROW   { () }
 
 drop_trigger:
   | DROP TRIGGER name = any_ident
@@ -838,6 +847,10 @@ frame_bound:
     { match String.uppercase_ascii c, String.uppercase_ascii r with
       | "CURRENT", "ROW" -> Ast.FB_current_row
       | _ -> failwith (Printf.sprintf "expected CURRENT ROW, got: %s %s" c r) }
+  | c = IDENT ROW
+    { match String.uppercase_ascii c with
+      | "CURRENT" -> Ast.FB_current_row
+      | _ -> failwith (Printf.sprintf "expected CURRENT ROW, got: %s ROW" c) }
   | n = INT_LIT FOLLOWING { Ast.FB_following (Int64.to_int n) }
   | u = IDENT FOLLOWING
     { match String.uppercase_ascii u with

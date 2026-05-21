@@ -230,6 +230,9 @@ rule token = parse
       | "RANDOMBLOB"         -> RANDOMBLOB
       | "CHANGES"            -> CHANGES
       | "LAST_INSERT_ROWID"  -> LAST_INSERT_ROWID
+      | "FOR"                -> FOR
+      | "EACH"               -> EACH
+      | "ROW"                -> ROW
       | _              -> IDENT id
     }
   | eof                     { EOF }
