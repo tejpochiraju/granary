@@ -7400,6 +7400,50 @@ let test_virtual_gen_default_is_virtual () =
   let rows = query_ok db "SELECT c FROM t" in
   Alcotest.check value_testable "c recomputed after UPDATE" (Db.V_int 14L) (List.hd rows).(0)
 
+let test_virtual_in_index_rejected () =
+  (* Phase 33 Task 4 review: CREATE INDEX on a VIRTUAL generated column must
+     be rejected at bind time. The in-memory write-path row has VIRTUAL
+     cells set to V_null, so the index would be keyed by NULL instead of
+     the recomputed value. *)
+  let db = fresh_db () in
+  exec db
+    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  let result = run (Db.execute db "CREATE INDEX idx ON t(c)") in
+  Alcotest.(check bool) "CREATE INDEX on VIRTUAL rejected"
+    true (match result with Error _ -> true | Ok _ -> false)
+
+let test_virtual_in_index_expr_rejected () =
+  (* The walk must also catch expression indexes that reference a VIRTUAL
+     column by name. *)
+  let db = fresh_db () in
+  exec db
+    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  let result = run (Db.execute db "CREATE INDEX idx ON t(c + 1)") in
+  Alcotest.(check bool) "CREATE INDEX on VIRTUAL expr rejected"
+    true (match result with Error _ -> true | Ok _ -> false)
+
+let test_stored_in_index_still_allowed () =
+  (* Regression: STORED generated columns must still be indexable — only
+     VIRTUAL is the problem. *)
+  let db = fresh_db () in
+  exec db
+    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)";
+  let result = run (Db.execute db "CREATE INDEX idx ON t(c)") in
+  Alcotest.(check bool) "CREATE INDEX on STORED still allowed"
+    true (match result with Ok _ -> true | Error _ -> false)
+
+let test_virtual_in_check_rejected () =
+  (* CHECK that references a VIRTUAL generated column must be rejected at
+     CREATE TABLE time — the CHECK is evaluated on the in-memory row where
+     VIRTUAL cells are V_null. Column-level CHECKs are the only form the
+     parser supports today, so we attach the CHECK to a sibling column. *)
+  let db = fresh_db () in
+  let result = run (Db.execute db
+    "CREATE TABLE t (a INT, b INT CHECK (c > 0), \
+     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)") in
+  Alcotest.(check bool) "CHECK on VIRTUAL rejected"
+    true (match result with Error _ -> true | Ok _ -> false)
+
 let phase33_virtual_gen_tests = [
   Alcotest.test_case "virtual_basic"
     `Quick test_virtual_gen_column_basic;
@@ -7413,6 +7457,14 @@ let phase33_virtual_gen_tests = [
     `Quick test_virtual_gen_in_delete_where;
   Alcotest.test_case "virtual_default_keyword_omitted"
     `Quick test_virtual_gen_default_is_virtual;
+  Alcotest.test_case "virtual_in_index_rejected"
+    `Quick test_virtual_in_index_rejected;
+  Alcotest.test_case "virtual_in_index_expr_rejected"
+    `Quick test_virtual_in_index_expr_rejected;
+  Alcotest.test_case "stored_in_index_still_allowed"
+    `Quick test_stored_in_index_still_allowed;
+  Alcotest.test_case "virtual_in_check_rejected"
+    `Quick test_virtual_in_check_rejected;
 ]
 
 (* Runner                                                               *)
