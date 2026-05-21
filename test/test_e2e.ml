@@ -7139,6 +7139,139 @@ let test_instead_of_update_where_subquery_no_crash () =
       (List.hd rows).(0);
     Lwt.return_unit)
 
+(* ── Phase 33 Task 2: FK index-based child-row lookup ────────────── *)
+
+(** With a covering index on the child FK column, ON DELETE CASCADE must
+    delete exactly the matching child rows. *)
+let test_fk_index_cascade_delete () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE child (id INTEGER PRIMARY KEY, \
+       parent_id INT REFERENCES parent(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "CREATE INDEX idx_child_parent ON child(parent_id)" in
+    let* () = exec_in db "INSERT INTO parent VALUES (1), (2), (3)" in
+    let* () = exec_in db
+      "INSERT INTO child VALUES (10, 1), (20, 1), (30, 2), (40, 3)" in
+    let* () = exec_in db "DELETE FROM parent WHERE id = 1" in
+    let* rows = query_rows db "SELECT id FROM child ORDER BY id" in
+    check_rows "cascade via index"
+      [[| Db.V_int 30L |]; [| Db.V_int 40L |]] rows;
+    Lwt.return_unit)
+
+(** No index present: the fallback scan path must still produce the
+    correct cascade behaviour. *)
+let test_fk_index_no_index_fallback () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+       p_id INT REFERENCES p(id) ON DELETE CASCADE)" in
+    let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
+    let* () = exec_in db "INSERT INTO c VALUES (10, 1), (20, 2)" in
+    let* () = exec_in db "DELETE FROM p WHERE id = 1" in
+    let* rows = query_rows db "SELECT id FROM c" in
+    check_rows "cascade without index" [[| Db.V_int 20L |]] rows;
+    Lwt.return_unit)
+
+(** Multi-column FK with a covering composite index: RESTRICT must block
+    the parent delete just as the scan path does. *)
+let test_fk_index_multi_col_restrict () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db
+      "CREATE TABLE p (a INT, b INT, PRIMARY KEY(a, b))" in
+    let* () = exec_in db
+      "CREATE TABLE c (id INT PRIMARY KEY, ca INT, cb INT, \
+       FOREIGN KEY(ca, cb) REFERENCES p(a, b) ON DELETE RESTRICT)" in
+    let* () = exec_in db "CREATE INDEX idx_c_ab ON c(ca, cb)" in
+    let* () = exec_in db "INSERT INTO p VALUES (1, 10), (2, 20)" in
+    let* () = exec_in db "INSERT INTO c VALUES (1, 1, 10)" in
+    let result = exec_err db "DELETE FROM p WHERE a = 1 AND b = 10" in
+    check_error "RESTRICT fires with composite index" result;
+    let* rows = query_rows db "SELECT a, b FROM p ORDER BY a" in
+    check_rows "parent still has both rows"
+      [[| Db.V_int 1L; Db.V_int 10L |];
+       [| Db.V_int 2L; Db.V_int 20L |]] rows;
+    Lwt.return_unit)
+
+(** SET NULL via index: parent delete should NULL out the child column. *)
+let test_fk_index_set_null () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+       p_id INT REFERENCES p(id) ON DELETE SET NULL)" in
+    let* () = exec_in db "CREATE INDEX idx_c_p ON c(p_id)" in
+    let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
+    let* () = exec_in db "INSERT INTO c VALUES (10, 1), (20, 1), (30, 2)" in
+    let* () = exec_in db "DELETE FROM p WHERE id = 1" in
+    let* rows = query_rows db "SELECT id, p_id FROM c ORDER BY id" in
+    check_rows "SET NULL via index"
+      [[| Db.V_int 10L; Db.V_null |];
+       [| Db.V_int 20L; Db.V_null |];
+       [| Db.V_int 30L; Db.V_int 2L |]] rows;
+    Lwt.return_unit)
+
+(** INSERT-side validation: presence check uses the parent's primary-key
+    tree.  Insert a child row that references a non-existent parent —
+    should be rejected.  This exercises [fk_child_has_ref_multi] only
+    indirectly (its real use is on parent UPDATE), so we also test the
+    UPDATE-RESTRICT path. *)
+let test_fk_index_update_restrict_blocks () =
+  with_db (fun db ->
+    let* () = exec_in db "PRAGMA foreign_keys = 1" in
+    let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
+    let* () = exec_in db
+      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
+       p_id INT REFERENCES p(id) ON UPDATE RESTRICT)" in
+    let* () = exec_in db "CREATE INDEX idx_c_p ON c(p_id)" in
+    let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
+    let* () = exec_in db "INSERT INTO c VALUES (10, 1)" in
+    let result = exec_err db "UPDATE p SET id = 99 WHERE id = 1" in
+    check_error "UPDATE RESTRICT detected via index" result;
+    Lwt.return_unit)
+
+(** Index path must agree with fallback scan path: same rows, same order.
+    We seed the same data into two databases — one with the FK index, one
+    without — and verify the post-cascade child contents are identical. *)
+let test_fk_index_consistency_with_fallback () =
+  Lwt_main.run (
+    let setup_and_delete db ~create_index =
+      let* () = exec_in db "PRAGMA foreign_keys = 1" in
+      let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT)" in
+      let* () = exec_in db
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT, payload TEXT, \
+         FOREIGN KEY(p_id) REFERENCES p(id) ON DELETE CASCADE)" in
+      let* () = if create_index
+                then exec_in db "CREATE INDEX idx_c_p ON c(p_id)"
+                else Lwt.return_unit in
+      let* () = exec_in db
+        "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')" in
+      let* () = exec_in db
+        "INSERT INTO c VALUES \
+         (10, 1, 'x1'), (11, 1, 'x2'), (12, 2, 'y'), \
+         (13, 3, 'z1'), (14, 3, 'z2'), (15, 4, 'w')" in
+      let* () = exec_in db "DELETE FROM p WHERE id IN (1, 3)" in
+      query_rows db "SELECT id, p_id, payload FROM c ORDER BY id"
+    in
+    let* db_idx = Db.open_in_memory () in
+    let* rows_idx = setup_and_delete db_idx ~create_index:true in
+    let* db_noi = Db.open_in_memory () in
+    let* rows_noi = setup_and_delete db_noi ~create_index:false in
+    Alcotest.(check int) "index path: row count" 2 (List.length rows_idx);
+    Alcotest.(check int) "scan  path: row count" 2 (List.length rows_noi);
+    (* Equality cell-by-cell. *)
+    List.iter2 (fun ri rn ->
+      Array.iter2 (fun a b ->
+        Alcotest.check value_testable "index path == scan path" a b
+      ) ri rn
+    ) rows_idx rows_noi;
+    Lwt.return_unit)
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -7769,5 +7902,13 @@ let () =
         `Quick test_instead_of_update_old_row_unnamed_view_cols;
       Alcotest.test_case "instead_of_update_where_subquery_no_crash"
         `Quick test_instead_of_update_where_subquery_no_crash;
+    ];
+    "phase33_fk_index", [
+      Alcotest.test_case "cascade_delete"          `Quick test_fk_index_cascade_delete;
+      Alcotest.test_case "no_index_fallback"       `Quick test_fk_index_no_index_fallback;
+      Alcotest.test_case "multi_col_restrict"      `Quick test_fk_index_multi_col_restrict;
+      Alcotest.test_case "set_null"                `Quick test_fk_index_set_null;
+      Alcotest.test_case "update_restrict_blocks"  `Quick test_fk_index_update_restrict_blocks;
+      Alcotest.test_case "consistency_with_fallback" `Quick test_fk_index_consistency_with_fallback;
     ];
   ]

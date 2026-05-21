@@ -834,6 +834,55 @@ let indexes_for_table t ~table =
 let find_index t ~name =
   Hashtbl.find_opt t.indexes name
 
+let find_index_covering_cols t ~table_name ~col_idxs =
+  match Hashtbl.find_opt t.cache table_name with
+  | None -> None
+  | Some meta ->
+    let n_target = List.length col_idxs in
+    if n_target = 0 then None
+    else begin
+      (* Resolve col_idxs to column names; bail out if any idx is out of range. *)
+      let cols_arr = Array.of_list meta.columns in
+      let n_cols = Array.length cols_arr in
+      let target_names_opt =
+        try
+          Some (List.map (fun i ->
+            if i < 0 || i >= n_cols then raise Exit
+            else (cols_arr.(i)).Row.name
+          ) col_idxs)
+        with Exit -> None
+      in
+      match target_names_opt with
+      | None -> None
+      | Some target_names ->
+        let candidates = indexes_for_table t ~table:table_name in
+        List.find_opt (fun (i : index_info) ->
+          (* Skip partial indexes — a row absent from the index may still
+             satisfy the FK predicate (the WHERE clause masks rows). *)
+          if i.idx_where_sql <> None then false
+          else
+            (* Skip indexes that contain any expression column in the leading
+               prefix we'd be scanning — we cannot match a raw value list
+               against an expression key. *)
+            let n_idx = List.length i.idx_columns in
+            if n_idx < n_target then false
+            else begin
+              let prefix_names =
+                List.filteri (fun k _ -> k < n_target) i.idx_columns
+              in
+              let prefix_flags =
+                let len_flags = List.length i.idx_expr_flags in
+                if len_flags = 0 then List.init n_target (fun _ -> false)
+                else List.filteri (fun k _ -> k < n_target) i.idx_expr_flags
+              in
+              let no_expr_in_prefix = not (List.exists Fun.id prefix_flags) in
+              no_expr_in_prefix &&
+              (try List.for_all2 String.equal prefix_names target_names
+               with Invalid_argument _ -> false)
+            end
+        ) candidates
+    end
+
 let table_exists t ~name = Hashtbl.mem t.cache name
 
 let index_exists t ~name = Hashtbl.mem t.indexes name

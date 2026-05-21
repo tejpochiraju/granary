@@ -1666,31 +1666,111 @@ let find_col_idx_by_name_opt schema col_name =
   in fi 0 schema
 [@@warning "-32"]
 
-(** Scan [child_meta] for any row where all [child_col_idxs] match [parent_vals] simultaneously.
+(** Encode a multi-column index-key prefix (no rowid).  Used by FK enforcement
+    to seek to the first entry whose leading key columns match a target value
+    list.  Returns the prefix bytes and their length. *)
+let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
+  let parts = List.map Index_key.encode_value ivs in
+  let total = List.fold_left (fun acc b -> acc + Bytes.length b) 0 parts in
+  let buf = Bytes.create total in
+  let off = ref 0 in
+  List.iter (fun b ->
+    let len = Bytes.length b in
+    Bytes.blit b 0 buf !off len;
+    off := !off + len
+  ) parts;
+  (buf, total)
+
+(** Decode the rowid from the trailing 8 bytes of an index key. *)
+let decode_index_key_rowid (ikey : bytes) : int64 =
+  let n = Bytes.length ikey in
+  let v = ref 0L in
+  for i = 0 to 7 do
+    v := Int64.logor (Int64.shift_left !v 8)
+           (Int64.of_int (Bytes.get_uint8 ikey (n - 8 + i)))
+  done;
+  Int64.logxor !v Int64.min_int
+
+(** Scan [child_meta] for any row where all [child_col_idxs] match [parent_vals]
+    simultaneously.  When an index covers [child_col_idxs] as a leading prefix,
+    use it; otherwise fall back to a full table scan.
     Opens and closes its own RO snapshot. *)
-let fk_child_has_ref_multi store (child_meta : Cat.table_meta)
+let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
   let schema = child_meta.Cat.columns in
-  let* ro_tx = S.ro_begin store in
-  let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let found  = ref false in
-  let rec scan () =
-    if !found then ()
-    else match S.cursor_next cur with
-    | None -> ()
-    | Some (_k, vbytes) ->
-      let row = Row.decode schema vbytes in
-      let all_match = List.for_all2 (fun ci pv ->
-        compare_values row.(ci) pv = 0
-      ) child_col_idxs parent_vals in
-      if all_match then found := true
-      else scan ()
-  in
-  scan ();
-  S.cursor_close cur;
-  let* () = S.ro_end ro_tx in
-  Lwt.return !found
+  match
+    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+      ~col_idxs:child_col_idxs
+  with
+  | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
+    (* Index path: seek to the first entry whose leading key columns equal
+       [parent_vals] and walk while the prefix matches.
+       Encode prefix as bytes; seek to prefix ++ min_rowid so any entry with
+       this exact prefix is reachable. *)
+    let ivs = List.map row_value_to_index_value parent_vals in
+    let prefix, plen = encode_index_key_prefix ivs in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* ro_tx = S.ro_begin store in
+    let* cur   = S.cursor_open ro_tx idx.Cat.idx_tree_id in
+    let _sr    = S.cursor_seek cur seek_key in
+    let found  = ref false in
+    let exhausted = ref false in
+    let rec walk () =
+      if !found || !exhausted then Lwt.return_unit
+      else match S.cursor_next cur with
+      | None -> exhausted := true; Lwt.return_unit
+      | Some (ikey, _ival) ->
+        if Bytes.length ikey >= plen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then begin
+          (* Index entry with matching prefix.  Verify the underlying row
+             still exists (defensive against orphan entries) and that the
+             decoded values actually match. *)
+          let rowid = decode_index_key_rowid ikey in
+          let* row_opt =
+            S.get ro_tx child_meta.Cat.tree_id (Rowid.encode rowid)
+          in
+          (match row_opt with
+           | None -> walk ()
+           | Some vbytes ->
+             let row = Row.decode schema vbytes in
+             let ok = List.for_all2 (fun ci pv ->
+               compare_values row.(ci) pv = 0
+             ) child_col_idxs parent_vals in
+             if ok then begin found := true; Lwt.return_unit end
+             else walk ())
+        end else begin
+          (* Past the prefix range — index is sorted. *)
+          exhausted := true;
+          Lwt.return_unit
+        end
+    in
+    let* () = walk () in
+    S.cursor_close cur;
+    let* () = S.ro_end ro_tx in
+    Lwt.return !found
+  | _ ->
+    (* Fallback: full table scan. *)
+    let* ro_tx = S.ro_begin store in
+    let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
+    let _sr    = S.cursor_first cur in
+    let found  = ref false in
+    let rec scan () =
+      if !found then ()
+      else match S.cursor_next cur with
+      | None -> ()
+      | Some (_k, vbytes) ->
+        let row = Row.decode schema vbytes in
+        let all_match = List.for_all2 (fun ci pv ->
+          compare_values row.(ci) pv = 0
+        ) child_col_idxs parent_vals in
+        if all_match then found := true
+        else scan ()
+    in
+    scan ();
+    S.cursor_close cur;
+    let* () = S.ro_end ro_tx in
+    Lwt.return !found
 
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
@@ -2082,49 +2162,132 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
 
 (** Scan [child_meta] using an existing RW transaction for rows where
     [child_col_idx] equals [parent_val]. Returns (rowid, row) list. *)
-let scan_child_rows_tx tx (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
+let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
+    ~child_col_idx ~(parent_val : Row.value) =
   let schema = child_meta.Cat.columns in
-  let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
-  let rec scan () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (kbytes, vbytes) ->
-      let rowid = Rowid.decode kbytes in
-      let row   = Row.decode schema vbytes in
-      if compare_values row.(child_col_idx) parent_val = 0 then
-        buf := (rowid, row) :: !buf;
-      scan ()
-  in
-  scan ();
-  S.cursor_close cur;
-  Lwt.return (List.rev !buf)
+  match
+    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+      ~col_idxs:[child_col_idx]
+  with
+  | Some idx when parent_val <> Row.V_null ->
+    let prefix, plen =
+      encode_index_key_prefix [row_value_to_index_value parent_val]
+    in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
+    let _sr  = S.cursor_seek cur seek_key in
+    let buf  = ref [] in
+    let exhausted = ref false in
+    let rec walk () =
+      if !exhausted then Lwt.return_unit
+      else match S.cursor_next cur with
+      | None -> exhausted := true; Lwt.return_unit
+      | Some (ikey, _ival) ->
+        if Bytes.length ikey >= plen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then begin
+          let rowid = decode_index_key_rowid ikey in
+          let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+          (match row_opt with
+           | None -> walk ()
+           | Some vbytes ->
+             let row = Row.decode schema vbytes in
+             if compare_values row.(child_col_idx) parent_val = 0 then
+               buf := (rowid, row) :: !buf;
+             walk ())
+        end else begin
+          exhausted := true;
+          Lwt.return_unit
+        end
+    in
+    let* () = walk () in
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
+  | _ ->
+    let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec scan () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let row   = Row.decode schema vbytes in
+        if compare_values row.(child_col_idx) parent_val = 0 then
+          buf := (rowid, row) :: !buf;
+        scan ()
+    in
+    scan ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
 [@@warning "-32"]
 
 (** Scan [child_meta] using an existing RW transaction for rows where all
-    [child_col_idxs] match [parent_vals] simultaneously. Returns (rowid, row) list. *)
-let scan_child_rows_multi_tx tx (child_meta : Cat.table_meta)
+    [child_col_idxs] match [parent_vals] simultaneously.  When an index covers
+    [child_col_idxs] as a leading prefix, the scan is driven by the index;
+    otherwise it falls back to a full table scan.
+    Returns (rowid, row) list. *)
+let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
     ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
   let schema = child_meta.Cat.columns in
-  let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
-  let rec scan () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (kbytes, vbytes) ->
-      let rowid = Rowid.decode kbytes in
-      let row   = Row.decode schema vbytes in
-      let all_match = List.for_all2 (fun ci pv ->
-        compare_values row.(ci) pv = 0
-      ) child_col_idxs parent_vals in
-      if all_match then buf := (rowid, row) :: !buf;
-      scan ()
-  in
-  scan ();
-  S.cursor_close cur;
-  Lwt.return (List.rev !buf)
+  match
+    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+      ~col_idxs:child_col_idxs
+  with
+  | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
+    let ivs = List.map row_value_to_index_value parent_vals in
+    let prefix, plen = encode_index_key_prefix ivs in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
+    let _sr  = S.cursor_seek cur seek_key in
+    let buf  = ref [] in
+    let exhausted = ref false in
+    let rec walk () =
+      if !exhausted then Lwt.return_unit
+      else match S.cursor_next cur with
+      | None -> exhausted := true; Lwt.return_unit
+      | Some (ikey, _ival) ->
+        if Bytes.length ikey >= plen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then begin
+          let rowid = decode_index_key_rowid ikey in
+          let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+          (match row_opt with
+           | None -> walk ()
+           | Some vbytes ->
+             let row = Row.decode schema vbytes in
+             let all_match = List.for_all2 (fun ci pv ->
+               compare_values row.(ci) pv = 0
+             ) child_col_idxs parent_vals in
+             if all_match then buf := (rowid, row) :: !buf;
+             walk ())
+        end else begin
+          exhausted := true;
+          Lwt.return_unit
+        end
+    in
+    let* () = walk () in
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
+  | _ ->
+    let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec scan () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let row   = Row.decode schema vbytes in
+        let all_match = List.for_all2 (fun ci pv ->
+          compare_values row.(ci) pv = 0
+        ) child_col_idxs parent_vals in
+        if all_match then buf := (rowid, row) :: !buf;
+        scan ()
+    in
+    scan ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
 
 (** Delete a single row and its index entries within an existing RW transaction. *)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
@@ -2214,7 +2377,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
           (match fk.Cat.fk_on_delete with
            | Cat.FA_restrict | Cat.FA_no_action ->
              let* child_rows =
-               scan_child_rows_multi_tx tx child_meta
+               scan_child_rows_multi_tx cat tx child_meta
                  ~child_col_idxs ~parent_vals
              in
              if child_rows <> [] then
@@ -2226,7 +2389,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
              else Lwt.return_unit
            | Cat.FA_cascade ->
              let* child_rows =
-               scan_child_rows_multi_tx tx child_meta
+               scan_child_rows_multi_tx cat tx child_meta
                  ~child_col_idxs ~parent_vals
              in
              Lwt_list.iter_s (fun (crid, crow) ->
@@ -2235,7 +2398,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
              ) child_rows
            | Cat.FA_set_null ->
              let* child_rows =
-               scan_child_rows_multi_tx tx child_meta
+               scan_child_rows_multi_tx cat tx child_meta
                  ~child_col_idxs ~parent_vals
              in
              if child_rows = [] then Lwt.return_unit
@@ -2258,7 +2421,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
              end
            | Cat.FA_set_default ->
              let* child_rows =
-               scan_child_rows_multi_tx tx child_meta
+               scan_child_rows_multi_tx cat tx child_meta
                  ~child_col_idxs ~parent_vals
              in
              if child_rows = [] then Lwt.return_unit
@@ -2353,7 +2516,7 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
             (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
           in
           let* child_rows =
-            scan_child_rows_multi_tx tx child_meta
+            scan_child_rows_multi_tx cat tx child_meta
               ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
           in
           Lwt_list.iter_s (fun (crid, crow) ->
@@ -2372,7 +2535,7 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
               (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
             in
             let* child_rows =
-              scan_child_rows_multi_tx tx child_meta
+              scan_child_rows_multi_tx cat tx child_meta
                 ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
             in
             Lwt_list.iter_s (fun (crid, crow) ->
@@ -2385,7 +2548,7 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
             (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
           in
           let* child_rows =
-            scan_child_rows_multi_tx tx child_meta
+            scan_child_rows_multi_tx cat tx child_meta
               ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
           in
           if child_rows = [] then Lwt.return_unit
@@ -2528,7 +2691,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                     (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
                     fk.fk_local_cols
                   in
-                  let* has_ref = fk_child_has_ref_multi store child_meta
+                  let* has_ref = fk_child_has_ref_multi cat store child_meta
                     ~child_col_idxs ~parent_vals:old_vals in
                   if has_ref then
                     Lwt.fail_with (Printf.sprintf
@@ -2631,7 +2794,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                       (match fk.fk_on_update with
                        | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
                        | Cat.FA_cascade ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals:old_vals in
                          (* For cascade, use the first child col (single-col FK compat) *)
                          let child_col_idx = List.hd child_col_idxs in
@@ -2641,7 +2804,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                              ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:new_val_single
                          ) child_rows
                        | Cat.FA_set_null ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals:old_vals in
                          if child_rows = [] then Lwt.return_unit
                          else begin
@@ -2660,7 +2823,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                            Lwt.return_unit
                          end
                        | Cat.FA_set_default ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals:old_vals in
                          if child_rows = [] then Lwt.return_unit
                          else begin
@@ -2837,7 +3000,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                     (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
                     fk.fk_local_cols
                   in
-                  let* has_ref = fk_child_has_ref_multi store child_meta
+                  let* has_ref = fk_child_has_ref_multi cat store child_meta
                     ~child_col_idxs ~parent_vals in
                   if has_ref then
                     Lwt.fail_with (Printf.sprintf
@@ -2880,13 +3043,13 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                       (match fk.fk_on_delete with
                        | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
                        | Cat.FA_cascade ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals in
                          Lwt_list.iter_s (fun (crid, crow) ->
                            cascade_delete_row_in_tx tx cat clock params child_meta ~rowid:crid ~row:crow
                          ) child_rows
                        | Cat.FA_set_null ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals in
                          if child_rows = [] then Lwt.return_unit
                          else begin
@@ -2905,7 +3068,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                            Lwt.return_unit
                          end
                        | Cat.FA_set_default ->
-                         let* child_rows = scan_child_rows_multi_tx tx child_meta
+                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals in
                          if child_rows = [] then Lwt.return_unit
                          else begin

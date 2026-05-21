@@ -119,6 +119,18 @@ val indexes_for_table : t -> table:string -> index_info list
 (** Look up an index by name. *)
 val find_index : t -> name:string -> index_info option
 
+(** [find_index_covering_cols cat ~table_name ~col_idxs] returns an index whose
+    leading key columns match [col_idxs] (in order), and which is safe to use
+    for FK enforcement scans:
+      - all columns are plain (no expression columns);
+      - no partial-index WHERE clause.
+    Returns [None] if no such index exists.
+
+    The index may have more columns than [col_idxs]; only the leading prefix is
+    required to match. *)
+val find_index_covering_cols :
+  t -> table_name:string -> col_idxs:int list -> index_info option
+
 (** Remove a table and all its indexes from the catalog.
     Removes entries from _sys_tables, _sys_columns, and _sys_indexes.
     The B+-tree pages for the table and its indexes are NOT reclaimed (Phase 3). *)
