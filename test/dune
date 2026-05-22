@@ -52,4 +52,5 @@
 
 (test
  (name test_sqlite_corpus)
- (libraries sqlocaml alcotest lwt.unix unix))
+ (libraries sqlocaml alcotest lwt.unix unix)
+ (deps (source_tree sqlite_corpus)))

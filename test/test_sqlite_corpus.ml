@@ -97,6 +97,8 @@ let row_to_string row =
     | Db.V_int n  -> Int64.to_string n
     | Db.V_text s -> s
     | Db.V_null   -> "NULL"
+    (* NaN/Inf fall through to %g and print as "nan"/"inf"; corpus avoids
+       non-finite arithmetic so this is unreachable. *)
     | Db.V_real f ->
       (* Match sqlite default formatting: trim trailing zeros where possible *)
       if Float.is_integer f then Printf.sprintf "%.1f" f
@@ -122,17 +124,19 @@ let run_file open_db close_db path =
   Lwt_main.run (
     let steps = parse_file path in
     let* db = open_db () in
-    let* () = Lwt_list.iter_s (fun step ->
-      match step with
-      | Exec sql -> exec_stmt db sql
-      | Query (sql, expected) ->
-        let* actual = query_rows db sql in
-        Alcotest.(check (list string))
-          (Printf.sprintf "%s :: %s" (Filename.basename path) sql)
-          expected actual;
-        Lwt.return_unit
-    ) steps in
-    close_db db
+    Lwt.finalize
+      (fun () ->
+        Lwt_list.iter_s (fun step ->
+          match step with
+          | Exec sql -> exec_stmt db sql
+          | Query (sql, expected) ->
+            let* actual = query_rows db sql in
+            Alcotest.(check (list string))
+              (Printf.sprintf "%s :: %s" (Filename.basename path) sql)
+              expected actual;
+            Lwt.return_unit
+        ) steps)
+      (fun () -> close_db db)
   )
 
 let open_mem () = Db.open_in_memory ()
@@ -141,13 +145,18 @@ let open_file path () =
   let* r = Db.open_file ~path in
   match r with
   | Ok db -> Lwt.return db
-  | Error _ -> Alcotest.failf "open_file failed"
+  | Error e ->
+    let msg = match e with
+      | Db.Parse s   -> "Parse: " ^ s
+      | Db.Runtime s -> "Runtime: " ^ s
+      | Db.Sema _    -> "Sema error" in
+    Alcotest.failf "open_file failed: %s" msg
 let close_file path db =
   let* () = Db.close db in
   (try Unix.unlink path with _ -> ());
   Lwt.return_unit
 
-let corpus_dir = "test/sqlite_corpus"
+let corpus_dir = "sqlite_corpus"
 
 let corpus_files () =
   Sys.readdir corpus_dir
@@ -164,7 +173,9 @@ let () =
   let file_cases = List.map (fun f ->
     Alcotest.test_case (Filename.basename f) `Quick (fun () ->
       let path = Filename.temp_file "sqlocaml_corpus_" ".db" in
-      run_file (open_file path) (close_file path) f)) files in
+      Fun.protect
+        ~finally:(fun () -> try Unix.unlink path with _ -> ())
+        (fun () -> run_file (open_file path) (close_file path) f))) files in
   Alcotest.run "sqlite_corpus" [
     "mem", mem_cases;
     "btree", file_cases;
