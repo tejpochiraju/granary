@@ -40,19 +40,32 @@ let lex query =
   done;
   List.rev !toks
 
+(* Normalize a query term through the same Unicode pipeline used to
+   tokenize documents. For multi-token inputs (e.g. an accent + space
+   in a phrase) Fts_tokenizer may emit multiple tokens; for a single
+   query word we take the concatenation of the folded forms, which
+   matches what the document indexer stored. *)
+let fold_term raw =
+  let toks = Fts_tokenizer.tokenize_string ~col:0 raw in
+  String.concat "" (List.map (fun t -> t.Fts_tokenizer.term) toks)
+
+let split_phrase p =
+  List.filter (fun s -> s <> "")
+    (List.map (fun t -> t.Fts_tokenizer.term)
+       (Fts_tokenizer.tokenize_string ~col:0 p))
+
 let parse_raw_tok = function
   | RT_word w ->
     let q = if String.length w > 0 && w.[String.length w - 1] = '*' then
-      FQ_term (FT_prefix (String.lowercase_ascii (String.sub w 0 (String.length w - 1))))
+      FQ_term (FT_prefix (fold_term (String.sub w 0 (String.length w - 1))))
     else
-      FQ_term (FT_exact (String.lowercase_ascii w))
+      FQ_term (FT_exact (fold_term w))
     in Ok q
   | RT_phrase p ->
-    let words = List.filter (fun s -> s <> "")
-                  (String.split_on_char ' ' (String.lowercase_ascii p)) in
+    let words = split_phrase p in
     Ok (FQ_term (FT_phrase words))
   | RT_not_word w ->
-    Ok (FQ_not (FQ_term (FT_exact (String.lowercase_ascii w))))
+    Ok (FQ_not (FQ_term (FT_exact (fold_term w))))
   | RT_or -> Error "unexpected OR"
 
 let parse query =

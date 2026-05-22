@@ -3811,6 +3811,30 @@ let phase35_snippet_parity_cases = [
       "SELECT snippet(t, 0, '<b>', '</b>', '...', 6) FROM t WHERE t MATCH " ^
       "'\"quick brown\"'";
     unordered = false };
+
+  { name = "fts_match_german_case_fold";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('Größe matters für alle')";
+    ];
+    query = "SELECT c FROM t WHERE t MATCH 'größe'";
+    unordered = false };
+
+  { name = "fts_match_french_accent_case";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('Café CAFÉ café')";
+    ];
+    query = "SELECT c FROM t WHERE t MATCH 'café'";
+    unordered = false };
+
+  { name = "fts_match_turkish_dotted_i";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('İstanbul Istanbul')";
+    ];
+    query = "SELECT c FROM t WHERE t MATCH 'istanbul'";
+    unordered = false };
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)
