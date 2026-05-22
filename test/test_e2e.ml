@@ -6387,6 +6387,94 @@ let test_fts_snippet_term_in_other_col () =
     Alcotest.(check bool) "fallback is non-empty" true (String.length snip > 0);
     Lwt.return_unit)
 
+(* ── Phase 35 Task 4: FTS snippet() SQLite parity ─────────────── *)
+
+let snippet_text rows =
+  match (List.hd rows).(0) with
+  | Db.V_text s -> s
+  | _ -> Alcotest.fail "expected V_text"
+
+let test_phase35_snippet_prefix_highlights_full_token () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
+    let* () = exec_in db "INSERT INTO t VALUES ('foo food foobar football')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'foo*'" in
+    Alcotest.(check int) "one row" 1 (List.length rows);
+    Alcotest.(check string) "prefix highlight wraps entire token"
+      "<b>foo</b> <b>food</b> <b>foobar</b> <b>football</b>"
+      (snippet_text rows);
+    Lwt.return_unit)
+
+let test_phase35_snippet_start_of_doc_no_leading_ellipsis () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
+    let* () = exec_in db "INSERT INTO t VALUES ('foo a b c d e f')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'" in
+    Alcotest.(check string) "no leading ellipsis when window at token 0"
+      "<b>foo</b> a b..."
+      (snippet_text rows);
+    Lwt.return_unit)
+
+let test_phase35_snippet_end_of_doc_no_trailing_ellipsis () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
+    let* () = exec_in db "INSERT INTO t VALUES ('a b c d e foo')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'" in
+    Alcotest.(check string) "no trailing ellipsis when window covers last token"
+      "...d e <b>foo</b>"
+      (snippet_text rows);
+    Lwt.return_unit)
+
+let test_phase35_snippet_sentence_aligned_window () =
+  (* Per SQLite FTS5: when the document has no internal sentence boundaries,
+     the +120 sentence bonus at position 0 favors the first window over a
+     denser cluster further into the document.  This mirrors the real-world
+     behavior that ledes are more informative than mid-doc clusters. *)
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
+    let* () = exec_in db
+      "INSERT INTO t VALUES ('aaa bbb ccc foo a b c d e f g h i j foo bar foo baz qux')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 4) FROM t WHERE t MATCH 'foo'" in
+    Alcotest.(check string) "first-sentence bonus wins"
+      "aaa bbb ccc <b>foo</b>..."
+      (snippet_text rows);
+    Lwt.return_unit)
+
+let test_phase35_snippet_dense_cluster_wins_when_no_lede () =
+  (* When the early matches are too far from start to benefit from the
+     sentence-0 bonus, the dense cluster window wins. *)
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
+    let* () = exec_in db
+      "INSERT INTO t VALUES \
+       ('w1 w2 w3 w4 w5 w6 w7 w8 w9 wa wb wc wd we wf foo bar foo baz qux')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 5) FROM t WHERE t MATCH 'foo'" in
+    (* foo at positions 15 and 17.  Window=5 around the cluster captures
+       both → score 1001.  No sentence bonus reaches it (matches > nToken
+       away from sentence 0).  Should center around the cluster. *)
+    Alcotest.(check string) "dense cluster picked when start too far"
+      "...wf <b>foo</b> bar <b>foo</b> baz..."
+      (snippet_text rows);
+    Lwt.return_unit)
+
+let test_phase35_snippet_no_match_returns_lede () =
+  with_db (fun db ->
+    let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(title, body)" in
+    let* () = exec_in db
+      "INSERT INTO t VALUES ('OCaml Guide', 'learn programming here today')" in
+    let* rows = query_rows db
+      "SELECT snippet(t, 1, '[', ']', '...', 3) FROM t WHERE t MATCH 'ocaml'" in
+    (* col 1 has no matches; SQLite emits first n_token tokens. *)
+    Alcotest.(check string) "no-match fallback returns leading tokens"
+      "learn programming here..."
+      (snippet_text rows);
+    Lwt.return_unit)
+
 (* ── Phase 30: sqlite_master virtual table ────────────────────── *)
 
 let test_sqlite_master_tables () =
@@ -9222,6 +9310,20 @@ let () =
       Alcotest.test_case "window"        `Quick test_fts_snippet_window;
       Alcotest.test_case "with_rank"     `Quick test_fts_snippet_with_rank;
       Alcotest.test_case "term_in_other_col" `Quick test_fts_snippet_term_in_other_col;
+    ];
+    "phase35_snippet_parity", [
+      Alcotest.test_case "prefix_highlights_full_token" `Quick
+        test_phase35_snippet_prefix_highlights_full_token;
+      Alcotest.test_case "start_of_doc_no_leading_ellipsis" `Quick
+        test_phase35_snippet_start_of_doc_no_leading_ellipsis;
+      Alcotest.test_case "end_of_doc_no_trailing_ellipsis" `Quick
+        test_phase35_snippet_end_of_doc_no_trailing_ellipsis;
+      Alcotest.test_case "sentence_aligned_window" `Quick
+        test_phase35_snippet_sentence_aligned_window;
+      Alcotest.test_case "dense_cluster_wins_when_no_lede" `Quick
+        test_phase35_snippet_dense_cluster_wins_when_no_lede;
+      Alcotest.test_case "no_match_returns_lede" `Quick
+        test_phase35_snippet_no_match_returns_lede;
     ];
     "phase30_sqlite_master", [
       Alcotest.test_case "tables"       `Quick test_sqlite_master_tables;

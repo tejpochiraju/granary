@@ -4149,56 +4149,238 @@ let fts_query_terms query =
   in
   List.sort_uniq String.compare (collect query)
 
-(** Build a highlighted excerpt of [col_text] for the given snippet [spec].
-    Finds the first token matching a query term, centres a window, reconstructs
-    original-cased text with matching terms wrapped in [start_tag]/[end_tag]. *)
-let compute_snippet ~col_text ~query_terms ~(spec : Plan.snippet_spec) =
-  let tokens = Fts_tokenizer.tokenize_string ~col:0 col_text in
-  let n_toks = List.length tokens in
-  let first_match =
-    List.find_opt (fun tok ->
-      List.mem tok.Fts_tokenizer.term query_terms
-    ) tokens
+(** Collect positive query terms paired with their match kind.
+    Exact terms match a token only on full string equality; Prefix terms
+    match any token whose lowercased value starts with the prefix.
+    Phrase terms decompose into a sequence of Exact terms (we treat each
+    word as its own phrase for snippet scoring, matching what our posting
+    list code already does). *)
+let fts_query_terms_with_kind query =
+  let rec collect = function
+    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [(t, `Exact)]
+    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [(t, `Prefix)]
+    | Fts_query.FQ_term (Fts_query.FT_phrase ts) -> List.map (fun t -> (t, `Exact)) ts
+    | Fts_query.FQ_and qs | Fts_query.FQ_or qs   -> List.concat_map collect qs
+    | Fts_query.FQ_not _                          -> []
   in
-  match first_match with
-  | None ->
-    let max_len = min (String.length col_text) 50 in
-    let text = String.sub col_text 0 max_len in
-    if String.length col_text > 50 then text ^ spec.Plan.ellipsis else text
-  | Some matched ->
-    let center   = matched.Fts_tokenizer.pos in
-    let win_half = spec.Plan.n_tokens in
-    let win_start = max 0 (center - win_half) in
-    let win_end   = min (n_toks - 1) (center + win_half) in
-    let arr = Array.of_list tokens in
-    let window = Array.to_list (Array.sub arr win_start (win_end - win_start + 1)) in
-    let prefix = if win_start > 0 then spec.Plan.ellipsis else "" in
-    let suffix = if win_end < n_toks - 1 then spec.Plan.ellipsis else "" in
-    let buf = Buffer.create 128 in
-    Buffer.add_string buf prefix;
-    let first_tok_start =
-      match window with [] -> 0 | t :: _ -> t.Fts_tokenizer.start_byte
-    in
-    let prev_end = ref first_tok_start in
-    List.iter (fun tok ->
-      if tok.Fts_tokenizer.start_byte > !prev_end then
-        Buffer.add_string buf
-          (String.sub col_text !prev_end
-             (tok.Fts_tokenizer.start_byte - !prev_end));
-      let raw =
-        String.sub col_text tok.Fts_tokenizer.start_byte
-          (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte)
+  (* Deduplicate by (term, kind). *)
+  let cmp (t1, k1) (t2, k2) =
+    let c = String.compare t1 t2 in
+    if c <> 0 then c
+    else match k1, k2 with
+      | `Exact, `Exact | `Prefix, `Prefix -> 0
+      | `Exact, `Prefix -> -1
+      | `Prefix, `Exact -> 1
+  in
+  List.sort_uniq cmp (collect query)
+
+(** Test whether a token term matches any phrase. Returns the phrase index
+    (0-based) of the first phrase that matches, or [None]. *)
+let token_phrase_idx ~(phrases : (string * [`Exact | `Prefix]) array) (term : string) : int option =
+  let n = Array.length phrases in
+  let rec loop i =
+    if i >= n then None
+    else
+      let (t, k) = phrases.(i) in
+      let hit = match k with
+        | `Exact  -> String.equal term t
+        | `Prefix ->
+          String.length term >= String.length t
+          && String.equal (String.sub term 0 (String.length t)) t
       in
-      if List.mem tok.Fts_tokenizer.term query_terms then begin
-        Buffer.add_string buf spec.Plan.start_tag;
-        Buffer.add_string buf raw;
-        Buffer.add_string buf spec.Plan.end_tag
+      if hit then Some i else loop (i + 1)
+  in
+  loop 0
+
+(** Identify FTS5 "sentence start" token positions in a column.
+    Position 0 is always a sentence start. Any token preceded (after any
+    intervening whitespace) by '.' or ':' also starts a sentence. *)
+let fts_sentence_starts ~col_text ~(tokens : Fts_tokenizer.token array) : int array =
+  let n = Array.length tokens in
+  let buf = Buffer.create 8 in
+  for i = 0 to n - 1 do
+    let tok = tokens.(i) in
+    if i = 0 then Buffer.add_string buf (string_of_int 0)
+    else begin
+      let start = tok.Fts_tokenizer.start_byte in
+      (* Walk backwards skipping ' ', '\t', '\n', '\r'. *)
+      let j = ref (start - 1) in
+      while !j >= 0
+            && (let c = col_text.[!j] in
+                c = ' ' || c = '\t' || c = '\n' || c = '\r')
+      do decr j done;
+      if !j >= 0 then begin
+        let c = col_text.[!j] in
+        if c = '.' || c = ':' then begin
+          if Buffer.length buf > 0 then Buffer.add_char buf ',';
+          Buffer.add_string buf (string_of_int i)
+        end
+      end
+    end
+  done;
+  if Buffer.length buf = 0 then [| 0 |]
+  else
+    Array.of_list
+      (List.map int_of_string
+         (String.split_on_char ',' (Buffer.contents buf)))
+
+(** Score a candidate window [i_pos, i_pos + n_token).
+    Returns [(score, i_adj)] where:
+      - score = 1000 for each new phrase seen + 1 for repeats of seen phrases.
+      - i_adj = the actual starting position after centering adjustment,
+                clamped to [0, n_docsize - n_token] (or 0 if window > doc).
+    [a_seen] is reset by the caller before each call.
+    [instances] is a sorted list of [(phrase_idx, position)]. *)
+let fts_snippet_score
+    ~(instances : (int * int) list)
+    ~(a_seen : bool array)
+    ~(i_pos : int) ~(n_token : int) ~(n_docsize : int) : int * int =
+  let i_end = i_pos + n_token in
+  let score = ref 0 in
+  let i_first = ref (-1) in
+  let i_last  = ref 0 in
+  List.iter (fun (ip, io) ->
+    if io >= i_pos && io < i_end then begin
+      score := !score + (if a_seen.(ip) then 1 else 1000);
+      a_seen.(ip) <- true;
+      if !i_first < 0 then i_first := io;
+      (* phrase size is 1 token for our model; iLast = io + 1 *)
+      i_last := io + 1
+    end
+  ) instances;
+  let i_adj =
+    if !i_first < 0 then i_pos
+    else !i_first - (n_token - (!i_last - !i_first)) / 2
+  in
+  let i_adj =
+    if i_adj + n_token > n_docsize then n_docsize - n_token else i_adj
+  in
+  let i_adj = if i_adj < 0 then 0 else i_adj in
+  (!score, i_adj)
+
+(** Build a highlighted excerpt of [col_text] for the given snippet [spec].
+    Replicates SQLite FTS5's snippet() algorithm:
+      - For each phrase instance, score the window anchored at its position
+        (with centering adjustment), and also the window anchored at the
+        latest preceding sentence start (with a +100 or +120 bonus).
+      - Pick the (strictly) highest-scoring window; tie → earliest considered.
+      - Reconstruct text from byte offsets, wrapping matched tokens (whole
+        token for prefix matches) with [start_tag]/[end_tag].
+      - Prepend [ellipsis] unless window starts at token 0.
+      - Append [ellipsis] unless window covers through the last token.
+    [query_terms] is a list of [(term, kind)] pairs. *)
+let compute_snippet
+    ~col_text
+    ~(query_terms : (string * [`Exact | `Prefix]) list)
+    ~(spec : Plan.snippet_spec) =
+  let tokens_list = Fts_tokenizer.tokenize_string ~col:0 col_text in
+  let tokens = Array.of_list tokens_list in
+  let n_toks = Array.length tokens in
+  let phrases = Array.of_list query_terms in
+  let n_phrases = Array.length phrases in
+  let n_token = max 1 spec.Plan.n_tokens in
+  (* Build instance list: [(phrase_idx, position)] for each matching token,
+     in token order. *)
+  let instances =
+    let acc = ref [] in
+    for i = n_toks - 1 downto 0 do
+      match token_phrase_idx ~phrases tokens.(i).Fts_tokenizer.term with
+      | None    -> ()
+      | Some ip -> acc := (ip, tokens.(i).Fts_tokenizer.pos) :: !acc
+    done;
+    !acc
+  in
+  if instances = [] || n_phrases = 0 then begin
+    (* No matches: SQLite's snippet() degrades to highlighting nothing, but
+       its window selection still anchors at sentence start 0 with score 120
+       and emits the first n_token tokens (no leading ellipsis, trailing
+       ellipsis if doc longer than window).  Replicate that. *)
+    if n_toks = 0 then ""
+    else begin
+      let win_end_excl = min n_toks n_token in
+      let last_tok = tokens.(win_end_excl - 1) in
+      let prefix_text = String.sub col_text 0 last_tok.Fts_tokenizer.end_byte in
+      if win_end_excl >= n_toks then prefix_text
+      else prefix_text ^ spec.Plan.ellipsis
+    end
+  end else begin
+    let a_seen = Array.make (max 1 n_phrases) false in
+    let sentence_starts = fts_sentence_starts ~col_text ~tokens in
+    let best_score = ref 0 in
+    let best_start = ref 0 in
+    let consider score start_pos =
+      if score > !best_score then begin
+        best_score := score;
+        best_start := start_pos
+      end
+    in
+    List.iter (fun (_ip, io) ->
+      (* Non-sentence-aligned: window anchored at this instance, centered. *)
+      Array.fill a_seen 0 n_phrases false;
+      let (score, i_adj) =
+        fts_snippet_score ~instances ~a_seen
+          ~i_pos:io ~n_token ~n_docsize:n_toks
+      in
+      consider score i_adj;
+      (* Sentence-aligned: find latest sentence start strictly before io. *)
+      if n_toks > n_token then begin
+        let n_sent = Array.length sentence_starts in
+        let jj = ref 0 in
+        while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
+        let s_start = sentence_starts.(!jj) in
+        if s_start < io then begin
+          Array.fill a_seen 0 n_phrases false;
+          let (score, _) =
+            fts_snippet_score ~instances ~a_seen
+              ~i_pos:s_start ~n_token ~n_docsize:n_toks
+          in
+          let bonus = if s_start = 0 then 120 else 100 in
+          consider (score + bonus) s_start
+        end
+      end
+    ) instances;
+    let i_best_start = !best_start in
+    let i_range_end  = i_best_start + n_token - 1 in
+    (* Reconstruct text. *)
+    let buf = Buffer.create 128 in
+    if i_best_start > 0 then Buffer.add_string buf spec.Plan.ellipsis;
+    (* Find first token at or after i_best_start (which by construction is
+       just tokens.(i_best_start) for our model where positions are dense). *)
+    if n_toks > 0 then begin
+      let first_in_range = i_best_start in
+      let last_in_range  = min (n_toks - 1) i_range_end in
+      let prev_end = ref tokens.(first_in_range).Fts_tokenizer.start_byte in
+      for i = first_in_range to last_in_range do
+        let tok = tokens.(i) in
+        if tok.Fts_tokenizer.start_byte > !prev_end then
+          Buffer.add_string buf
+            (String.sub col_text !prev_end
+               (tok.Fts_tokenizer.start_byte - !prev_end));
+        let raw =
+          String.sub col_text tok.Fts_tokenizer.start_byte
+            (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte)
+        in
+        (match token_phrase_idx ~phrases tok.Fts_tokenizer.term with
+         | Some _ ->
+           Buffer.add_string buf spec.Plan.start_tag;
+           Buffer.add_string buf raw;
+           Buffer.add_string buf spec.Plan.end_tag
+         | None ->
+           Buffer.add_string buf raw);
+        prev_end := tok.Fts_tokenizer.end_byte
+      done;
+      (* Trailing handling: if the claimed range_end reaches or exceeds the
+         last token, append the rest of the source text; else append ellipsis. *)
+      if i_range_end >= n_toks - 1 then begin
+        let last_end = tokens.(last_in_range).Fts_tokenizer.end_byte in
+        if last_end < String.length col_text then
+          Buffer.add_string buf
+            (String.sub col_text last_end (String.length col_text - last_end))
       end else
-        Buffer.add_string buf raw;
-      prev_end := tok.Fts_tokenizer.end_byte
-    ) window;
-    Buffer.add_string buf suffix;
+        Buffer.add_string buf spec.Plan.ellipsis
+    end;
     Buffer.contents buf
+  end
 
 (* ------------------------------------------------------------------ *)
 (* substitute_cte: replace Op_cte_scan nodes with Op_pragma_rows       *)
@@ -5275,7 +5457,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let sorted = if include_rank then
       List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
     else scored_matches in
-    let query_terms = fts_query_terms query in
+    let snippet_terms = fts_query_terms_with_kind query in
     let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
       let key = Rowid.encode rowid in
       let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
@@ -5299,7 +5481,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
               in
               if texts = [] then "" else List.nth texts idx
             in
-            Row.V_text (compute_snippet ~col_text ~query_terms ~spec)
+            Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec)
           ) snippets
         in
         let row_values =

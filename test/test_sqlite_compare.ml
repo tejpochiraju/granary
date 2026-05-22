@@ -3689,6 +3689,105 @@ let phase35_virtual_index_cases = [
     unordered = false };
 ]
 
+(* ── Phase 35 Task 4: FTS snippet() parity ──────────────────── *)
+let phase35_snippet_parity_cases = [
+  { name = "snippet_window_8_lede";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'fox'";
+    unordered = false };
+
+  { name = "snippet_prefix_highlight_full_token";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('foo food foobar football')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'foo*'";
+    unordered = false };
+
+  { name = "snippet_window_3_centers";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'fox'";
+    unordered = false };
+
+  { name = "snippet_window_size_one";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('hello world from ocaml')";
+    ];
+    query = "SELECT snippet(t, 0, '*', '*', '...', 1) FROM t WHERE t MATCH 'world'";
+    unordered = false };
+
+  { name = "snippet_start_of_doc";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('foo a b c d e f')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'";
+    unordered = false };
+
+  { name = "snippet_end_of_doc";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('a b c d e foo')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'";
+    unordered = false };
+
+  { name = "snippet_window_covers_full_doc";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 9) FROM t WHERE t MATCH 'fox'";
+    unordered = false };
+
+  { name = "snippet_sentence_lede_bonus";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('aaa bbb ccc foo a b c d e f g h i j foo bar foo baz qux')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 4) FROM t WHERE t MATCH 'foo'";
+    unordered = false };
+
+  { name = "snippet_dense_cluster_wins";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('w1 w2 w3 w4 w5 w6 w7 w8 w9 wa wb wc wd we wf foo bar foo baz qux')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 5) FROM t WHERE t MATCH 'foo'";
+    unordered = false };
+
+  { name = "snippet_no_match_in_col";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(title, body)";
+      "INSERT INTO t VALUES('OCaml Guide', 'learn programming here today')";
+    ];
+    query = "SELECT snippet(t, 1, '[', ']', '...', 3) FROM t WHERE t MATCH 'ocaml'";
+    unordered = false };
+
+  { name = "snippet_last_token_match";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'dog'";
+    unordered = false };
+
+  { name = "snippet_first_token_match_repeated";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'the'";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3744,4 +3843,5 @@ let () =
     "phase34_master_fts",      List.map make_test phase34_master_fts_cases;
     "phase35_fk_deferrable",   List.map make_test phase35_fk_deferrable_cases;
     "phase35_virtual_index",   List.map make_test phase35_virtual_index_cases;
+    "phase35_snippet_parity",  List.map make_test phase35_snippet_parity_cases;
   ]
