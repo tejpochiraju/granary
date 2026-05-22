@@ -92,6 +92,41 @@ let test_tokenizer_numbers () =
   Alcotest.(check string) "first" "abc123" (List.nth tokens 0).Tok.term;
   Alcotest.(check string) "second" "456def" (List.nth tokens 1).Tok.term
 
+let test_tokenizer_unicode_german () =
+  (* Unicode default case folding folds U+00DF (sharp s, eszett) to
+     "ss" — this matches SQLite unicode61's full case folding. *)
+  let toks = Tok.tokenize_string ~col:0 "Größe" in
+  Alcotest.(check int) "one token" 1 (List.length toks);
+  Alcotest.(check string) "folded term"
+    "grösse" (List.hd toks).Tok.term
+
+let test_tokenizer_unicode_french_case () =
+  let toks = Tok.tokenize_string ~col:0 "Café CAFÉ" in
+  Alcotest.(check int) "two tokens" 2 (List.length toks);
+  Alcotest.(check (list string)) "folded match"
+    ["café"; "café"]
+    (List.map (fun t -> t.Tok.term) toks)
+
+let test_tokenizer_unicode_turkish_dotted_i () =
+  (* SQLite unicode61 folds U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE
+     to "i̇" (small i + combining dot above) per default Unicode
+     case folding. *)
+  let toks = Tok.tokenize_string ~col:0 "\xC4\xB0stanbul" in
+  Alcotest.(check int) "one token" 1 (List.length toks);
+  Alcotest.(check string) "Turkish dotted-I fold"
+    "i\xCC\x87stanbul" (List.hd toks).Tok.term
+
+let test_tokenizer_unicode_cjk_splits () =
+  (* CJK ideographs are individually "Lo" — each is a word char, so a
+     string of N CJK ideographs without separators should still be a
+     single run from SQLite's perspective. (Hanzi parity is approximate;
+     this asserts at least that the bytes round-trip and case fold is
+     a no-op for ideographs.) *)
+  let toks = Tok.tokenize_string ~col:0 "\xE4\xBD\xA0\xE5\xA5\xBD" in
+  Alcotest.(check int) "one token" 1 (List.length toks);
+  Alcotest.(check string) "no folding of ideographs"
+    "\xE4\xBD\xA0\xE5\xA5\xBD" (List.hd toks).Tok.term
+
 let test_fts_insert () =
   run (fun () ->
     let* db = D.open_in_memory () in
@@ -327,6 +362,10 @@ let () =
       Alcotest.test_case "empty"       `Quick test_tokenizer_empty;
       Alcotest.test_case "punct_only"  `Quick test_tokenizer_only_punct;
       Alcotest.test_case "numbers"     `Quick test_tokenizer_numbers;
+      Alcotest.test_case "unicode_german"        `Quick test_tokenizer_unicode_german;
+      Alcotest.test_case "unicode_french_case"   `Quick test_tokenizer_unicode_french_case;
+      Alcotest.test_case "unicode_turkish_i"     `Quick test_tokenizer_unicode_turkish_dotted_i;
+      Alcotest.test_case "unicode_cjk_runs"      `Quick test_tokenizer_unicode_cjk_splits;
     ];
     "write", [
       Alcotest.test_case "insert"   `Quick test_fts_insert;
