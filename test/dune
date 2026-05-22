@@ -76,3 +76,7 @@
  (name test_crash_property)
  (libraries sqlocaml.store sqlocaml.storage alcotest qcheck-core
             qcheck-alcotest lwt.unix unix))
+
+(test
+ (name test_wal_fault_injection)
+ (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
