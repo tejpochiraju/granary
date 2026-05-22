@@ -180,3 +180,8 @@ val freelist_entries : t -> (int32 * int64) list
 
 (** Current total file page count (diagnostics / testing). *)
 val n_pages : t -> int64
+
+(** Enumerate every [tree_id] currently registered in the meta tree.
+    The list is unordered.  On the in-memory backend, returns the keys
+    of the per-tree hashtable.  Used by VACUUM (phase 37). *)
+val list_tree_ids : t -> tree_id list Lwt.t

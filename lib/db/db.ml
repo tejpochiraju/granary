@@ -5,8 +5,8 @@ module Sql    = Sqlocaml_sql
 module Row    = Sqlocaml_encoding.Row
 
 type t = {
-  store            : S.t;
-  catalog          : Cat.t;
+  mutable store            : S.t;
+  mutable catalog          : Cat.t;
   clock            : (unit -> float) option;
   mutable explicit_txn    : S.rw S.txn option;
   views            : (string, Sql.Ast.stmt) Hashtbl.t;
@@ -17,6 +17,9 @@ type t = {
   mutable last_insert_rowid : int64; (** rowid of the last INSERT row *)
   mutable total_changes     : int;   (** total rows affected by DML since connection opened *)
   mutable trigger_depth     : int;   (** recursion depth for nested trigger firing *)
+  file_path         : string option;
+    (** Set when opened via [open_file] / [open_file_wal].  VACUUM needs
+        this to rebuild the file in-place. *)
 }
 
 type value = Row.value =
@@ -48,7 +51,8 @@ let open_in_memory ?clock () =
   Lwt.return { store; catalog; clock; explicit_txn = None; views = Hashtbl.create 4;
              triggers = Hashtbl.create 4;
              savepoint_names = []; auto_began = false;
-             last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 }
+             last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
+             trigger_depth = 0; file_path = None }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -96,7 +100,8 @@ let open_file ~path =
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
+                 trigger_depth = 0; file_path = Some path })
 
 let open_file_wal ~path =
   let* result = S.open_file_wal ~path in
@@ -112,7 +117,8 @@ let open_file_wal ~path =
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
+                 trigger_depth = 0; file_path = Some path })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -130,9 +136,97 @@ let open_block
     let* () = load_triggers_into_hashtbl store triggers in
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
-                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
+                 trigger_depth = 0; file_path = None })
 
 let close t = S.close t.store
+
+(* ------------------------------------------------------------------ *)
+(* VACUUM (#120)                                                       *)
+(* ------------------------------------------------------------------ *)
+
+(* Copy every tree from [src] to [dst].  We commit every batch_size
+   entries so freed CoW pages become reusable in subsequent batches —
+   without periodic commits, a long single transaction makes the
+   destination file BIGGER than the source because each [put] CoWs
+   the leaf and the freed pages can't be reused inside the same txn
+   (alloc_min_safe is pinned at rw_begin). *)
+let copy_all_trees ~src ~dst ~tids =
+  let batch_size = 16 in
+  let* tx_ro = S.ro_begin src in
+  let* () =
+    Lwt_list.iter_s (fun tid ->
+      let* cur = S.cursor_open tx_ro tid in
+      let _    = S.cursor_first cur in
+      let rec drain tx_rw_opt count =
+        let* tx_rw = match tx_rw_opt with
+          | Some t -> Lwt.return t
+          | None -> S.rw_begin dst
+        in
+        match S.cursor_next cur with
+        | None ->
+          (match tx_rw_opt with
+           | Some _ -> S.commit tx_rw
+           | None -> S.rollback tx_rw)
+        | Some (k, v) ->
+          let* () = S.put tx_rw tid k v in
+          if count + 1 >= batch_size then begin
+            let* () = S.commit tx_rw in
+            drain None 0
+          end else
+            drain (Some tx_rw) (count + 1)
+      in
+      let* () = drain None 0 in
+      S.cursor_close cur;
+      Lwt.return_unit
+    ) tids
+  in
+  S.ro_end tx_ro
+
+(* Compact rebuild: copy every tree from [src] into a fresh [dst] file at
+   [tmp_path], then atomically rename it over [path].  After this the
+   caller MUST swap its [store]/[catalog] references to the freshly opened
+   destination. *)
+let vacuum t : unit Lwt.t =
+  match t.file_path with
+  | None ->
+    Lwt.fail_with
+      "VACUUM: only supported on file-backed databases"
+  | Some path ->
+    if t.explicit_txn <> None then
+      Lwt.fail_with "VACUUM cannot run inside an explicit transaction"
+    else begin
+      let tmp_path = path ^ ".vacuum-tmp" in
+      (try Unix.unlink tmp_path with _ -> ());
+      (try Unix.unlink (tmp_path ^ "-wal") with _ -> ());
+      let* dst_r = S.open_file ~path:tmp_path in
+      match dst_r with
+      | Error e ->
+        let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
+        Lwt.fail_with msg
+      | Ok dst ->
+        let* tids = S.list_tree_ids t.store in
+        let* () = copy_all_trees ~src:t.store ~dst ~tids in
+        let* () = S.close dst in
+        let* () = S.close t.store in
+        (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
+        (try Unix.unlink (path ^ "-wal") with _ -> ());
+        Unix.rename tmp_path path;
+        let* new_store_r = S.open_file ~path in
+        match new_store_r with
+        | Error e ->
+          let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
+          Lwt.fail_with msg
+        | Ok new_store ->
+          let* new_catalog = Cat.open_ new_store in
+          t.store <- new_store;
+          t.catalog <- new_catalog;
+          Hashtbl.clear t.views;
+          let* () = load_views_into_hashtbl new_store t.views in
+          Hashtbl.clear t.triggers;
+          let* () = load_triggers_into_hashtbl new_store t.triggers in
+          Lwt.return_unit
+    end
 
 let parse sql =
   match
@@ -838,6 +932,14 @@ let execute t sql =
     Hashtbl.remove t.triggers name;
     let* () = Cat.remove_trigger t.store ~name in
     Lwt.return (Ok ())
+  | Ok Sql.Plan.Op_vacuum ->
+    Lwt.catch
+      (fun () ->
+        let* () = vacuum t in
+        Lwt.return (Ok ()))
+      (function
+       | Failure msg -> Lwt.return (Error (Runtime msg))
+       | e -> Lwt.return (Error (Runtime (Printexc.to_string e))))
   | Ok op ->
     (* SELECT always uses snapshot reads inside exec.ml (ro_begin/ro_end),
        so it reads committed state regardless of an active explicit txn.

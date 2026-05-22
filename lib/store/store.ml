@@ -1275,3 +1275,30 @@ let n_pages t =
   match t.backend with
   | Mem _ -> 0L
   | Btree st -> Pager.n_pages st.pager
+
+(* Enumerate all tree_ids known to the meta tree.  For VACUUM. *)
+let list_tree_ids t : tree_id list Lwt.t =
+  match t.backend with
+  | Mem trees ->
+    Lwt.return (Hashtbl.fold (fun tid _ acc -> tid :: acc) trees [])
+  | Btree st ->
+    let* r = Btree.cursor_open st.meta in
+    match r with
+    | Error e ->
+      Lwt.fail_with
+        (Format.asprintf "Store.list_tree_ids: %a" pp_error (map_btree_err e))
+    | Ok cur ->
+      let rec loop acc =
+        let* r = Btree.cursor_next cur in
+        match r with
+        | Error e ->
+          Lwt.fail_with
+            (Format.asprintf "Store.list_tree_ids: %a" pp_error (map_btree_err e))
+        | Ok None -> Lwt.return (List.rev acc)
+        | Ok (Some (k, _v)) ->
+          let tid, _ = Varint.decode_int64 k 0 in
+          loop (Int64.to_int tid :: acc)
+      in
+      let* result = loop [] in
+      Btree.cursor_close cur;
+      Lwt.return result

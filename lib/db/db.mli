@@ -48,6 +48,20 @@ val open_block :
 
 val close : t -> unit Lwt.t
 
+(** Rebuild the database file in place: copies every tree from the
+    current file into a fresh sibling [path ^ ".vacuum-tmp"], then
+    atomically renames it over the original.  This drops free-list
+    pages and re-packs everything densely.
+
+    Only works on file-backed databases (opened via [open_file] or
+    [open_file_wal]); in-memory and arbitrary-block-device handles
+    raise [Failure].
+
+    Must not be called inside an explicit transaction.  Any open
+    prepared statements created from the previous file will continue
+    to work logically but observe the recompacted file.  Phase 37 / #120. *)
+val vacuum : t -> unit Lwt.t
+
 (** Execute a DDL or DML statement (CREATE TABLE, INSERT, UPDATE, ...).
     Returns [Ok ()] on success, [Error e] on failure. *)
 val execute : t -> string -> (unit, error) result Lwt.t

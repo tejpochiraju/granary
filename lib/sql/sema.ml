@@ -210,6 +210,7 @@ type bound_stmt =
   | BS_pragma of {
       kind : Ast.pragma_kind;
     }
+  | BS_vacuum
   | BS_alter_table of {
       table_meta : Cat.table_meta;
       action     : Ast.alter_action;
@@ -2716,6 +2717,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
      | None, None ->
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
+  | Ast.S_vacuum -> Lwt.return (Ok BS_vacuum)
   | Ast.S_const_select { exprs } ->
     (* FROM-less SELECT: bind each expression without any table context.
        We use a dummy empty table_meta for the resolver. *)

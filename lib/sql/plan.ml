@@ -238,6 +238,8 @@ type op =
     (** Write defer_foreign_keys flag to catalog; DDL-like, returns 0 rows. *)
   | Op_pragma_wal_checkpoint
     (** Migrate WAL contents to main DB and reset; no-op outside WAL mode. *)
+  | Op_vacuum
+    (** Compact-rebuild the database file (phase 37 / #120). *)
   | Op_distinct of {
       child : op;
     }

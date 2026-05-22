@@ -3707,6 +3707,7 @@ let op_name = function
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint      -> "Pragma(wal_checkpoint)"
+  | Plan.Op_vacuum                     -> "Vacuum"
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
@@ -4118,6 +4119,12 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_wal_checkpoint ->
     let* () = S.checkpoint store in
     Lwt.return 0
+  | Plan.Op_vacuum ->
+    (* Intercepted by Db.execute before reaching exec; reaching this point
+       means VACUUM was executed without a Db wrapper, which is not
+       supported. *)
+    Lwt.fail_with
+      "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -6053,7 +6060,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_fk _
   | Plan.Op_pragma_set_recursive_triggers _
   | Plan.Op_pragma_set_defer_fk _
-  | Plan.Op_pragma_wal_checkpoint ->
+  | Plan.Op_pragma_wal_checkpoint
+  | Plan.Op_vacuum ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

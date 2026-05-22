@@ -266,6 +266,10 @@ stmt:
   | s = pragma_stmt       { s }
   | s = alter_table       { s }
   | s = explain_stmt      { s }
+  | s = vacuum_stmt       { s }
+
+vacuum_stmt:
+  | VACUUM { Ast.S_vacuum }
 
 with_cte:
   | WITH name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select

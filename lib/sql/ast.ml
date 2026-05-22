@@ -377,6 +377,10 @@ and stmt =
       analyze : bool;   (** false = EXPLAIN; true = EXPLAIN ANALYZE *)
       stmt    : stmt;
     }
+  | S_vacuum
+    (** Compact-rebuild the database file in place (phase 37 / #120).
+        Executed by [Db.vacuum]; surfaces a sema error if invoked on a
+        non-file-backed database. *)
 
 and pragma_kind =
   | Pragma_table_info       of string   (* PRAGMA table_info(tbl) *)
