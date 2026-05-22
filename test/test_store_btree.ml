@@ -684,20 +684,21 @@ let test_put_key_too_large_btree () =
     let* () = S.close s in
     Lwt.return_unit))
 
-(* put with value > 1024 bytes triggers Btree.Value_too_large *)
+(* Large values now spill to an overflow chain instead of erroring.
+   Verify a 2000-byte value round-trips. *)
 let test_put_value_too_large_btree () =
   run (with_fresh_db ~f:(fun path ->
     let* r = S.open_file ~path in
     let s = ok_store r in
     let* tx = S.rw_begin s in
     let big_val = Bytes.make 2000 'v' in
-    let* exc =
-      Lwt.catch
-        (fun () -> let* () = S.put tx 0 (bs "k") big_val in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    Alcotest.(check bool) "put raised on oversized value" true (exc <> None);
-    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+    let* () = S.put tx 0 (bs "k") big_val in
+    let* () = S.commit tx in
+    let* tx_ro = S.ro_begin s in
+    let* g = S.get tx_ro 0 (bs "k") in
+    let* () = S.ro_end tx_ro in
+    Alcotest.(check bool) "2000-byte value round-trips via overflow chain"
+      true (g = Some big_val);
     let* () = S.close s in
     Lwt.return_unit))
 

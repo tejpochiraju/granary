@@ -13,13 +13,14 @@ let max_data_bytes = 4080  (* 4096 - 16 *)
 (* Kind                                                                *)
 (* ------------------------------------------------------------------ *)
 
-type kind = Header | Branch | Leaf | Freelist
+type kind = Header | Branch | Leaf | Freelist | Overflow
 
 let kind_of_byte = function
   | 0 -> Header
   | 1 -> Branch
   | 2 -> Leaf
   | 3 -> Freelist
+  | 4 -> Overflow
   | n -> failwith (Printf.sprintf "invalid page kind: %d" n)
 
 let byte_of_kind = function
@@ -27,6 +28,7 @@ let byte_of_kind = function
   | Branch   -> 1
   | Leaf     -> 2
   | Freelist -> 3
+  | Overflow -> 4
 
 (* ------------------------------------------------------------------ *)
 (* Common header                                                       *)
@@ -295,3 +297,41 @@ let freelist_set_entry buf ~index ~page_id ~freed_at_txn_id =
   let off = data_offset + index * freelist_entry_size in
   Cstruct.BE.set_uint32 buf off page_id;
   Cstruct.BE.set_uint64 buf (off + 4) freed_at_txn_id
+
+(* ------------------------------------------------------------------ *)
+(* Overflow page (kind = Overflow)                                     *)
+(* ------------------------------------------------------------------ *)
+
+(*
+  Overflow page layout:
+    +0   [16] common header (kind=Overflow; right_page = next_pid; n_keys = 0)
+    +16  [2]  payload_len (uint16 BE)
+    +18  [payload_len] payload bytes
+    +18+payload_len..4095 unused (zero-fill)
+*)
+
+let max_overflow_payload_bytes = max_data_bytes - 2
+
+let overflow_payload_len buf = Cstruct.BE.get_uint16 buf data_offset
+
+let overflow_payload buf =
+  let len = overflow_payload_len buf in
+  let out = Bytes.create len in
+  Cstruct.blit_to_bytes buf (data_offset + 2) out 0 len;
+  out
+
+let write_overflow buf ~next_pid ~payload ~payload_off ~payload_len =
+  if payload_len < 0 || payload_len > max_overflow_payload_bytes then
+    invalid_arg (Printf.sprintf
+      "write_overflow: payload_len %d out of range" payload_len);
+  Cstruct.memset buf 0;
+  let common = {
+    kind = Overflow;
+    flags = 0;
+    n_keys = 0;
+    right_page = next_pid;
+    crc32 = 0l;
+  } in
+  write_common buf common;
+  Cstruct.BE.set_uint16 buf data_offset payload_len;
+  Cstruct.blit_from_bytes payload payload_off buf (data_offset + 2) payload_len

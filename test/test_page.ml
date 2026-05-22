@@ -113,11 +113,12 @@ let test_invalid_kind_byte () =
   | _ -> Alcotest.fail "expected Failure for invalid kind byte"
   | exception Failure _ -> ()  (* expected *)
 
+(* Byte 4 is now a valid kind (Overflow, added in phase 37). *)
 let test_invalid_kind_byte_4 () =
   let buf = fresh_page () in
-  Cstruct.set_uint8 buf 0 4;
+  Cstruct.set_uint8 buf 0 5;
   match P.read_common buf with
-  | _ -> Alcotest.fail "expected Failure for kind byte 4"
+  | _ -> Alcotest.fail "expected Failure for kind byte 5"
   | exception Failure _ -> ()
 
 (* ------------------------------------------------------------------ *)
@@ -643,7 +644,7 @@ let () =
     ];
     "invalid_kind", [
       Alcotest.test_case "kind byte 255 raises Failure"     `Quick test_invalid_kind_byte;
-      Alcotest.test_case "kind byte 4 raises Failure"       `Quick test_invalid_kind_byte_4;
+      Alcotest.test_case "kind byte 5 raises Failure"       `Quick test_invalid_kind_byte_4;
     ];
     "crc32", [
       Alcotest.test_case "compute_crc is deterministic"     `Quick test_crc_deterministic;

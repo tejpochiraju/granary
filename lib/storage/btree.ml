@@ -5,7 +5,21 @@
 (* ------------------------------------------------------------------ *)
 
 let max_key_size   = 512
-let max_value_size = 1024
+
+(* Largest user-supplied value supported.  Values larger than
+   [inline_value_threshold] spill to an overflow page chain; the leaf cell
+   only stores a 17-byte marker (tag + head_pid + total_size). *)
+let inline_value_threshold = 800
+
+(* Hard ceiling on individual values.  The overflow chain itself can hold
+   essentially arbitrary sizes — this bound is conservative and keeps a
+   single value's chain bounded so allocation latency stays predictable. *)
+let max_value_size = 1 lsl 30  (* 1 GiB *)
+
+(* Leaf value tag bytes. *)
+let tag_inline   = 0x00
+let tag_overflow = 0x01
+let overflow_marker_size = 1 + 8 + 8  (* tag + head_pid + total_size *)
 
 (* Transaction ids are now managed by the Pager itself.  The B+-tree
    uses [Pager.get_txn_id] to stamp freed pages and [Pager.alloc] reads
@@ -58,6 +72,171 @@ let bind_pager r f =
    ids fit in 32 bits for Phase 1.  Conversion preserves bit pattern. *)
 let int32_of_page_id (id : int64) : int32 = Int64.to_int32 id
 let page_id_of_int32 (id : int32) : int64 = Int64.logand 0xFFFFFFFFL (Int64.of_int32 id)
+
+(* ------------------------------------------------------------------ *)
+(* Overflow page chains                                                 *)
+(* ------------------------------------------------------------------ *)
+
+(* Encode the leaf marker for an overflow chain.
+   Layout: [tag=0x01][head_pid: u64 BE][total_size: u64 BE]  (17 bytes) *)
+let encode_overflow_marker ~head_pid ~total_size : bytes =
+  let b = Bytes.create overflow_marker_size in
+  Bytes.set_uint8 b 0 tag_overflow;
+  Bytes.set_int64_be b 1 head_pid;
+  Bytes.set_int64_be b 9 (Int64.of_int total_size);
+  b
+
+(* Wrap an inline value with the inline tag byte. *)
+let wrap_inline_value (v : bytes) : bytes =
+  let n = Bytes.length v in
+  let out = Bytes.create (n + 1) in
+  Bytes.set_uint8 out 0 tag_inline;
+  Bytes.blit v 0 out 1 n;
+  out
+
+(* Allocate an overflow chain that stores [value], returning the head page
+   id and the total payload size.  Each chain page holds at most
+   [Page.max_overflow_payload_bytes] payload bytes; the last page has
+   next_pid = 0. *)
+let write_overflow_chain pager (value : bytes) :
+  (int64 * int, error) result Lwt.t =
+  let total = Bytes.length value in
+  let chunk = Page.max_overflow_payload_bytes in
+  (* Number of pages needed (at least one even for empty values, though we
+     never spill empties). *)
+  let n_pages = max 1 ((total + chunk - 1) / chunk) in
+  (* Allocate all page ids up front so we can chain them. *)
+  let rec alloc_n n acc =
+    if n = 0 then return_ok (List.rev acc)
+    else
+      let* r = Pager.alloc pager in
+      bind_pager r (fun pid -> alloc_n (n - 1) (pid :: acc))
+  in
+  let* allocs = alloc_n n_pages [] in
+  match allocs with
+  | Error e -> return_error e
+  | Ok pids ->
+    (* Write each page, chained to the next. *)
+    let rec write_chain idx pids' offset =
+      match pids' with
+      | [] -> return_ok ()
+      | pid :: rest ->
+        let next_pid = match rest with
+          | [] -> 0l
+          | p :: _ -> int32_of_page_id p
+        in
+        let remaining = total - offset in
+        let payload_len = min chunk remaining in
+        let buf = Cstruct.create Page.page_size in
+        Page.write_overflow buf ~next_pid
+          ~payload:value ~payload_off:offset ~payload_len;
+        Page.seal buf;
+        Pager.write pager pid buf;
+        write_chain (idx + 1) rest (offset + payload_len)
+    in
+    let* w = write_chain 0 pids 0 in
+    match w with
+    | Error e -> return_error e
+    | Ok () ->
+      let head_pid = List.hd pids in
+      return_ok (head_pid, total)
+
+(* Read an overflow chain back into a single bytes buffer. *)
+let read_overflow_chain pager ~head_pid ~total_size :
+  (bytes, error) result Lwt.t =
+  let out = Bytes.create total_size in
+  let rec loop pid offset =
+    if Int64.equal pid 0L then
+      if offset = total_size then return_ok out
+      else return_error (Tree_corrupt
+        (Printf.sprintf "overflow chain short: got %d of %d bytes"
+           offset total_size))
+    else
+      let* r = Pager.read pager pid in
+      bind_pager r (fun buf ->
+        let common = Page.read_common buf in
+        if common.kind <> Page.Overflow then
+          return_error (Tree_corrupt
+            "overflow chain points to non-overflow page")
+        else begin
+          let payload_len = Page.overflow_payload_len buf in
+          let remaining = total_size - offset in
+          if payload_len > remaining then
+            return_error (Tree_corrupt
+              (Printf.sprintf "overflow chain page payload %d exceeds remaining %d"
+                 payload_len remaining))
+          else begin
+            Cstruct.blit_to_bytes buf
+              (Page.data_offset + 2) out offset payload_len;
+            let next_pid = page_id_of_int32 common.right_page in
+            loop next_pid (offset + payload_len)
+          end
+        end)
+  in
+  loop head_pid 0
+
+(* Free every page in an overflow chain starting at [head_pid].
+   Stamps each freed page with the current txn_id. *)
+let free_overflow_chain pager ~head_pid : (unit, error) result Lwt.t =
+  let rec loop pid =
+    if Int64.equal pid 0L then return_ok ()
+    else
+      let* r = Pager.read pager pid in
+      bind_pager r (fun buf ->
+        let common = Page.read_common buf in
+        if common.kind <> Page.Overflow then
+          (* Defensive: don't free non-overflow pages. *)
+          return_ok ()
+        else begin
+          let next_pid = page_id_of_int32 common.right_page in
+          Pager.free pager ~page_id:pid
+            ~freed_at_txn_id:(Pager.get_txn_id pager);
+          loop next_pid
+        end)
+  in
+  loop head_pid
+
+(* Decode a stored leaf value: returns the user-visible value.
+   Inline values strip the leading [0x00] tag; overflow markers follow
+   the chain. *)
+let decode_leaf_value pager (stored : bytes) :
+  (bytes, error) result Lwt.t =
+  let n = Bytes.length stored in
+  if n = 0 then return_ok stored
+  else
+    let tag = Bytes.get_uint8 stored 0 in
+    if tag = tag_inline then begin
+      let out = Bytes.create (n - 1) in
+      Bytes.blit stored 1 out 0 (n - 1);
+      return_ok out
+    end
+    else if tag = tag_overflow then begin
+      if n <> overflow_marker_size then
+        return_error (Tree_corrupt
+          (Printf.sprintf "overflow marker size %d (expected %d)"
+             n overflow_marker_size))
+      else
+        let head_pid = Bytes.get_int64_be stored 1 in
+        let total_size = Int64.to_int (Bytes.get_int64_be stored 9) in
+        read_overflow_chain pager ~head_pid ~total_size
+    end
+    else
+      return_error (Tree_corrupt
+        (Printf.sprintf "unknown leaf-value tag 0x%02x" tag))
+
+(* If [stored] is an overflow marker, free its chain.  Inline values are
+   no-ops. *)
+let maybe_free_overflow_of pager (stored : bytes) :
+  (unit, error) result Lwt.t =
+  let n = Bytes.length stored in
+  if n = 0 then return_ok ()
+  else
+    let tag = Bytes.get_uint8 stored 0 in
+    if tag <> tag_overflow then return_ok ()
+    else if n <> overflow_marker_size then return_ok ()
+    else
+      let head_pid = Bytes.get_int64_be stored 1 in
+      free_overflow_chain pager ~head_pid
 
 (* ------------------------------------------------------------------ *)
 (* Reading / decoding a page                                            *)
@@ -179,6 +358,40 @@ let pick_branch_child (branch_entries : Page.branch_entry list)
 (* ------------------------------------------------------------------ *)
 
 let get t key : (bytes option, error) result Lwt.t =
+  if Int64.compare t.root_page 0L = 0 then return_ok None
+  else
+    let rec descend page_id =
+      let* r = Pager.read t.pager page_id in
+      bind_pager r (fun buf ->
+          let common = Page.read_common buf in
+          match common.kind with
+          | Page.Leaf ->
+            let (entries, _) = decode_leaf_entries buf common in
+            let rec lookup = function
+              | [] -> return_ok None
+              | (e : Page.leaf_entry) :: rest ->
+                let c = Bytes.compare key e.key in
+                if c = 0 then
+                  let* dv = decode_leaf_value t.pager e.value in
+                  (match dv with
+                   | Ok v -> return_ok (Some v)
+                   | Error e -> return_error e)
+                else if c < 0 then return_ok None
+                else lookup rest
+            in
+            lookup entries
+          | Page.Branch ->
+            let (entries, _) = decode_branch_entries buf common in
+            let child = pick_branch_child entries common key in
+            descend child
+          | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+    in
+    descend t.root_page
+
+(* Return the raw stored bytes for [key] (still tagged) without decoding
+   overflow chains.  Used by [put] / [del] to detect and free an existing
+   overflow chain before overwriting it. *)
+let get_raw t key : (bytes option, error) result Lwt.t =
   if Int64.compare t.root_page 0L = 0 then return_ok None
   else
     let rec descend page_id =
@@ -515,59 +728,96 @@ let rec propagate_up pager (path : path_step list)
 (* PUT                                                                  *)
 (* ------------------------------------------------------------------ *)
 
+(* Wrap [value] for storage in a leaf cell.  Small values are tag-prefixed
+   inline; large values spill to an overflow page chain and the leaf cell
+   stores a 17-byte marker. *)
+let prepare_stored_value pager (value : bytes) :
+  (bytes, error) result Lwt.t =
+  if Bytes.length value <= inline_value_threshold then
+    return_ok (wrap_inline_value value)
+  else
+    let* r = write_overflow_chain pager value in
+    match r with
+    | Error e -> return_error e
+    | Ok (head_pid, total_size) ->
+      return_ok (encode_overflow_marker ~head_pid ~total_size)
+
 let put t key value : (t, error) result Lwt.t =
   let key_len = Bytes.length key in
   let val_len = Bytes.length value in
   if key_len > max_key_size then return_error (Key_too_large key_len)
   else if val_len > max_value_size then return_error (Value_too_large val_len)
-  else if Int64.compare t.root_page 0L = 0 then begin
-    (* Empty tree → create a single leaf page with one entry, set as root. *)
-    let* alloc_r = Pager.alloc t.pager in
-    bind_pager alloc_r (fun new_pid ->
-        let* w = build_and_write_leaf t.pager ~page_id:new_pid
-            ~entries:[(key, value)] ~right_page:0L in
-        match w with
-        | Error e -> return_error e
-        | Ok () -> return_ok { t with root_page = new_pid })
-  end else begin
-    let* path_r = find_leaf t key in
-    match path_r with
+  else
+    (* Before installing the new value, free any existing overflow chain
+       under [key].  Doing this BEFORE allocating the new chain keeps the
+       freelist available for reuse where possible. *)
+    let* existing_r =
+      if Int64.compare t.root_page 0L = 0 then return_ok None
+      else get_raw t key
+    in
+    match existing_r with
     | Error e -> return_error e
-    | Ok (path, leaf_pid) ->
-      let* leaf_r = Pager.read t.pager leaf_pid in
-      bind_pager leaf_r (fun leaf_buf ->
-          let leaf_common = Page.read_common leaf_buf in
-          let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
-          let leaf_right = page_id_of_int32 leaf_common.right_page in
-          let plain_entries =
-            List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
-          in
-          let new_entries = leaf_insert_or_replace plain_entries key value in
-          (* Free the old leaf page first. *)
-          Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-          let* w = write_leaf_maybe_split t.pager new_entries
-              ~right_page:leaf_right in
-          match w with
-          | Error e -> return_error e
-          | Ok wr ->
-            let* up = propagate_up t.pager (List.rev path) wr in
-            match up with
+    | Ok existing_opt ->
+      let* free_r = match existing_opt with
+        | None -> return_ok ()
+        | Some stored -> maybe_free_overflow_of t.pager stored
+      in
+      match free_r with
+      | Error e -> return_error e
+      | Ok () ->
+        let* prep_r = prepare_stored_value t.pager value in
+        match prep_r with
+        | Error e -> return_error e
+        | Ok stored_value ->
+          if Int64.compare t.root_page 0L = 0 then begin
+            (* Empty tree → create a single leaf page. *)
+            let* alloc_r = Pager.alloc t.pager in
+            bind_pager alloc_r (fun new_pid ->
+                let* w = build_and_write_leaf t.pager ~page_id:new_pid
+                    ~entries:[(key, stored_value)] ~right_page:0L in
+                match w with
+                | Error e -> return_error e
+                | Ok () -> return_ok { t with root_page = new_pid })
+          end else begin
+            let* path_r = find_leaf t key in
+            match path_r with
             | Error e -> return_error e
-            | Ok (One_page new_root) ->
-              return_ok { t with root_page = new_root }
-            | Ok (Split (left_pid, split_key, right_pid)) ->
-              (* Root split — create a new branch root with one entry. *)
-              let* alloc_r = Pager.alloc t.pager in
-              bind_pager alloc_r (fun new_root_pid ->
-                  let* w2 = build_and_write_branch t.pager
-                      ~page_id:new_root_pid
-                      ~entries:[(split_key, left_pid)]
-                      ~right_page:right_pid in
-                  match w2 with
+            | Ok (path, leaf_pid) ->
+              let* leaf_r = Pager.read t.pager leaf_pid in
+              bind_pager leaf_r (fun leaf_buf ->
+                  let leaf_common = Page.read_common leaf_buf in
+                  let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
+                  let leaf_right = page_id_of_int32 leaf_common.right_page in
+                  let plain_entries =
+                    List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
+                  in
+                  let new_entries =
+                    leaf_insert_or_replace plain_entries key stored_value
+                  in
+                  Pager.free t.pager ~page_id:leaf_pid
+                    ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+                  let* w = write_leaf_maybe_split t.pager new_entries
+                      ~right_page:leaf_right in
+                  match w with
                   | Error e -> return_error e
-                  | Ok () ->
-                    return_ok { t with root_page = new_root_pid }))
-  end
+                  | Ok wr ->
+                    let* up = propagate_up t.pager (List.rev path) wr in
+                    match up with
+                    | Error e -> return_error e
+                    | Ok (One_page new_root) ->
+                      return_ok { t with root_page = new_root }
+                    | Ok (Split (left_pid, split_key, right_pid)) ->
+                      let* alloc_r = Pager.alloc t.pager in
+                      bind_pager alloc_r (fun new_root_pid ->
+                          let* w2 = build_and_write_branch t.pager
+                              ~page_id:new_root_pid
+                              ~entries:[(split_key, left_pid)]
+                              ~right_page:right_pid in
+                          match w2 with
+                          | Error e -> return_error e
+                          | Ok () ->
+                            return_ok { t with root_page = new_root_pid }))
+          end
 
 (* ------------------------------------------------------------------ *)
 (* DEL                                                                  *)
@@ -603,6 +853,20 @@ let del t key : (t, error) result Lwt.t =
           let plain_entries =
             List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
           in
+          (* If we're about to remove an entry whose stored value is an
+             overflow marker, free its chain first. *)
+          let stored_for_key =
+            List.find_map
+              (fun (k, v) -> if Bytes.equal k key then Some v else None)
+              plain_entries
+          in
+          let* free_r = match stored_for_key with
+            | None -> return_ok ()
+            | Some v -> maybe_free_overflow_of t.pager v
+          in
+          match free_r with
+          | Error e -> return_error e
+          | Ok () ->
           let (new_entries, removed) = leaf_remove key plain_entries in
           if not removed then return_ok t
           else begin
@@ -786,7 +1050,10 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
              | Ok true -> cursor_next c)
           | `Entry e ->
             c.offset <- e.next_offset;
-            return_ok (Some (e.key, e.value))
+            let* dv = decode_leaf_value c.c_pager e.value in
+            (match dv with
+             | Ok v -> return_ok (Some (e.key, v))
+             | Error err -> return_error err)
         end)
   end
 

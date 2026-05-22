@@ -17,7 +17,7 @@ val max_data_bytes : int
 (** 4080 — bytes available in the data area (bytes 16..4095). *)
 
 (** Kind of a page. *)
-type kind = Header | Branch | Leaf | Freelist
+type kind = Header | Branch | Leaf | Freelist | Overflow
 
 (** Common page header fields (bytes 0–15). *)
 type common = {
@@ -122,3 +122,23 @@ val freelist_entry_at : Cstruct.t -> index:int -> freelist_entry
 
 (** Write a freelist entry at 0-based [index]. *)
 val freelist_set_entry : Cstruct.t -> index:int -> page_id:int32 -> freed_at_txn_id:int64 -> unit
+
+(** Maximum payload bytes per overflow page = 4080 - 2 (payload_len header). *)
+val max_overflow_payload_bytes : int
+
+(** Read the payload length stored at bytes 16..17 of an Overflow page. *)
+val overflow_payload_len : Cstruct.t -> int
+
+(** Slice the payload bytes from an Overflow page. *)
+val overflow_payload : Cstruct.t -> bytes
+
+(** Write an overflow page: sets kind=Overflow, n_keys=0, right_page=next_pid,
+    payload_len, and copies [payload] into the data area.  Does NOT seal — caller
+    invokes [seal]. *)
+val write_overflow :
+  Cstruct.t ->
+  next_pid:int32 ->
+  payload:bytes ->
+  payload_off:int ->
+  payload_len:int ->
+  unit
