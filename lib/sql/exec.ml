@@ -116,10 +116,25 @@ let sql_of_fk_action = function
   | Cat.FA_set_null    -> "SET NULL"
   | Cat.FA_set_default -> "SET DEFAULT"
 
+(* Phase 35 task 3b: quote DDL identifiers that contain non-alphanumeric
+   characters, start with a digit, or are empty.  Embedded double-quotes are
+   doubled per SQL identifier syntax. *)
+let needs_quoting s =
+  String.length s = 0 ||
+  (let c = s.[0] in not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_')) ||
+  String.exists (fun c ->
+    not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c = '_')) s
+
+let quote_ident s =
+  if needs_quoting s then
+    "\"" ^ String.concat "\"\"" (String.split_on_char '"' s) ^ "\""
+  else s
+
 let ddl_of_table (meta : Cat.table_meta) =
   let col_parts = List.map (fun (col : Row.column) ->
     let buf = Buffer.create 64 in
-    Buffer.add_string buf col.Row.name;
+    Buffer.add_string buf (quote_ident col.Row.name);
     Buffer.add_char   buf ' ';
     Buffer.add_string buf (sql_of_row_type col.Row.ty);
     if col.Row.not_null    then Buffer.add_string buf " NOT NULL";
@@ -146,14 +161,14 @@ let ddl_of_table (meta : Cat.table_meta) =
   ) meta.Cat.columns in
   let fk_parts = List.map (fun (fk : Cat.fk_constraint) ->
     Printf.sprintf "FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s ON UPDATE %s"
-      (String.concat ", " fk.Cat.fk_local_cols)
-      fk.Cat.fk_parent_table
-      (String.concat ", " fk.Cat.fk_parent_cols)
+      (String.concat ", " (List.map quote_ident fk.Cat.fk_local_cols))
+      (quote_ident fk.Cat.fk_parent_table)
+      (String.concat ", " (List.map quote_ident fk.Cat.fk_parent_cols))
       (sql_of_fk_action fk.Cat.fk_on_delete)
       (sql_of_fk_action fk.Cat.fk_on_update)
   ) meta.Cat.fk_constraints in
   Printf.sprintf "CREATE TABLE %s (%s)"
-    meta.Cat.name
+    (quote_ident meta.Cat.name)
     (String.concat ", " (col_parts @ fk_parts))
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -186,7 +201,8 @@ let trigger_table_of_sql trigger_name sql =
 let ddl_of_index (idx : Cat.index_info) =
   let unique_kw = if idx.Cat.idx_unique then "UNIQUE " else "" in
   let col_strs = List.map2 (fun col_sql is_expr ->
-    if is_expr then Printf.sprintf "(%s)" col_sql else col_sql
+    if is_expr then Printf.sprintf "(%s)" col_sql
+    else quote_ident col_sql
   ) idx.Cat.idx_columns idx.Cat.idx_expr_flags in
   let cols_str = String.concat ", " col_strs in
   let where_clause = match idx.Cat.idx_where_sql with
@@ -194,11 +210,15 @@ let ddl_of_index (idx : Cat.index_info) =
     | Some sql -> Printf.sprintf " WHERE %s" sql
   in
   Printf.sprintf "CREATE %sINDEX %s ON %s (%s)%s"
-    unique_kw idx.Cat.idx_name idx.Cat.idx_table cols_str where_clause
+    unique_kw
+    (quote_ident idx.Cat.idx_name)
+    (quote_ident idx.Cat.idx_table)
+    cols_str where_clause
 
 let ddl_of_fts (m : Cat.fts_table_meta) =
   Printf.sprintf "CREATE VIRTUAL TABLE %s USING fts5(%s)"
-    m.Cat.fts_name (String.concat ", " m.Cat.fts_columns)
+    (quote_ident m.Cat.fts_name)
+    (String.concat ", " (List.map quote_ident m.Cat.fts_columns))
 
 
 (* ------------------------------------------------------------------ *)
@@ -2615,8 +2635,13 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
 (** Recursively delete a row and cascade FK actions to child tables.
     Only runs cascade logic when FK enforcement is enabled in [cat]. *)
 let rec cascade_delete_row_in_tx tx (cat : Cat.t)
+    ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
     (clock : (unit -> float) option) (params : Row.value array)
     (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+  let visited_key = (meta.Cat.name, rowid) in
+  if Hashtbl.mem visited visited_key then Lwt.return_unit
+  else begin
+  Hashtbl.add visited visited_key ();
   let* child_refs =
     if Cat.get_fk_enforcement cat then
       build_child_refs cat ~parent_table_name:meta.Cat.name
@@ -2689,7 +2714,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                  ~child_col_idxs ~parent_vals
              in
              Lwt_list.iter_s (fun (crid, crow) ->
-               cascade_delete_row_in_tx tx cat clock params
+               cascade_delete_row_in_tx tx cat ~visited clock params
                  child_meta ~rowid:crid ~row:crow
              ) child_rows
            | Cat.FA_set_null ->
@@ -2710,12 +2735,12 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                  else
                    (* Route through cascade_update_col_in_tx so the resulting
                       column UPDATE itself walks any ON UPDATE FK chains on
-                      descendents of [child_meta].  TODO(phase34): like the
-                      pre-existing CASCADE branch above, this path has no
-                      cycle detection — a cyclic SET NULL/DEFAULT graph
-                      could loop forever. *)
+                      descendents of [child_meta].  Phase 35 task 3a: cycle
+                      detection via [~visited] keeps mutually-cascading
+                      SET NULL graphs from looping forever. *)
                    Lwt_list.iter_s (fun (crid, crow) ->
-                     cascade_update_col_in_tx tx cat clock params child_meta
+                     cascade_update_col_in_tx tx cat ~visited clock params
+                       child_meta
                        ~rowid:crid ~row:crow
                        ~col_idx:child_col_idx ~new_val:Row.V_null
                    ) child_rows
@@ -2757,10 +2782,10 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                      child_meta.Cat.name col.Row.name)
                  else
                    (* Route through cascade_update_col_in_tx (see SET NULL
-                      arm above for rationale and the cycle-detection
-                      TODO). *)
+                      arm above; cycle detection via [~visited]). *)
                    Lwt_list.iter_s (fun (crid, crow) ->
-                     cascade_update_col_in_tx tx cat clock params child_meta
+                     cascade_update_col_in_tx tx cat ~visited clock params
+                       child_meta
                        ~rowid:crid ~row:crow
                        ~col_idx:child_col_idx ~new_val:default_val
                    ) child_rows
@@ -2772,12 +2797,18 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
     ) child_refs
   in
   delete_row_in_tx tx cat meta ~rowid ~row
+  end
 
 (** Recursively update a column and cascade FK UPDATE actions to child tables
     that reference this column. *)
 and cascade_update_col_in_tx tx (cat : Cat.t)
+    ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
     (clock : (unit -> float) option) (params : Row.value array)
     (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
+  let visited_key = (meta.Cat.name, rowid) in
+  if Hashtbl.mem visited visited_key then Lwt.return_unit
+  else begin
+  Hashtbl.add visited visited_key ();
   let* () =
     update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val
   in
@@ -2827,7 +2858,7 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
               ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
           in
           Lwt_list.iter_s (fun (crid, crow) ->
-            cascade_update_col_in_tx tx cat clock params child_meta
+            cascade_update_col_in_tx tx cat ~visited clock params child_meta
               ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val
           ) child_rows
         | Cat.FA_set_null ->
@@ -2846,10 +2877,10 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
                 ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
             in
             (* Route through cascade_update_col_in_tx so the SET NULL itself
-               propagates down any further ON UPDATE chains.  TODO(phase34):
-               no cycle detection — same gap as the CASCADE branch. *)
+               propagates down any further ON UPDATE chains.  Phase 35 task 3a:
+               cycle detection via [~visited]. *)
             Lwt_list.iter_s (fun (crid, crow) ->
-              cascade_update_col_in_tx tx cat clock params child_meta
+              cascade_update_col_in_tx tx cat ~visited clock params child_meta
                 ~rowid:crid ~row:crow
                 ~col_idx:child_col_idx ~new_val:Row.V_null
             ) child_rows
@@ -2890,16 +2921,17 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
                 "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
                 child_meta.Cat.name child_col_name)
             else
-              (* Route through cascade_update_col_in_tx (see SET NULL arm
-                 above for rationale and the cycle-detection TODO). *)
+              (* Route through cascade_update_col_in_tx (cycle detection via
+                 [~visited]). *)
               Lwt_list.iter_s (fun (crid, crow) ->
-                cascade_update_col_in_tx tx cat clock params child_meta
+                cascade_update_col_in_tx tx cat ~visited clock params child_meta
                   ~rowid:crid ~row:crow
                   ~col_idx:child_col_idx ~new_val:default_val
               ) child_rows
           end
       ) fks
     ) col_child_refs
+  end
   end
 
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
@@ -3120,6 +3152,10 @@ let execute_update ?(mode = Auto) ?(params = [||])
               new_row.(i) <- eval_expr clock params old_row expr
             ) assignments;
             compute_stored_generated_cols clock params table_meta new_row;
+            (* Phase 35 task 3a: per-row visited set seeded with parent
+               rowid, so cyclic ON UPDATE cascades terminate. *)
+            let visited = Hashtbl.create 16 in
+            Hashtbl.add visited (table_meta.Cat.name, rowid) ();
             (* Apply FK cascade UPDATE actions (CASCADE / SET NULL / SET DEFAULT). *)
             let* () =
               if child_refs = [] then Lwt.return_unit
@@ -3149,7 +3185,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                          let child_col_idx = List.hd child_col_idxs in
                          let new_val_single = List.hd new_vals in
                          Lwt_list.iter_s (fun (crid, crow) ->
-                           cascade_update_col_in_tx tx cat clock params child_meta
+                           cascade_update_col_in_tx tx cat ~visited clock params child_meta
                              ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:new_val_single
                          ) child_rows
                        | Cat.FA_set_null ->
@@ -3167,10 +3203,10 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                (* Route through cascade_update_col_in_tx so the
                                   SET NULL itself propagates down any further
                                   ON UPDATE FK chains on the just-written
-                                  column.  TODO(phase34): no cycle detection
-                                  on the SET NULL recursion. *)
+                                  column.  Phase 35 task 3a: cycle detection
+                                  via [~visited]. *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
                                    ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:Row.V_null
                                ) child_rows
@@ -3207,10 +3243,10 @@ let execute_update ?(mode = Auto) ?(params = [||])
                                  child_meta.Cat.name col.Row.name)
                              else
                                (* Route through cascade_update_col_in_tx (see
-                                  SET NULL arm above for rationale and the
-                                  cycle-detection TODO). *)
+                                  SET NULL arm above; cycle detection via
+                                  [~visited]). *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
                                    ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:default_val
                                ) child_rows
@@ -3418,6 +3454,10 @@ let execute_delete ?(mode = Auto) ?(params = [||])
       (fun () ->
         let* () =
           Lwt_list.iter_s (fun (rowid, row) ->
+            (* Phase 35 task 3a: seed per-row visited set with the parent
+               (this row) so cycles routing back through this rowid stop. *)
+            let visited = Hashtbl.create 16 in
+            Hashtbl.add visited (table_meta.Cat.name, rowid) ();
             (* Apply FK cascade actions (CASCADE / SET NULL / SET DEFAULT) within same tx. *)
             let* () =
               if child_refs = [] then Lwt.return_unit
@@ -3441,7 +3481,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                          let* child_rows = scan_child_rows_multi_tx cat tx child_meta
                            ~child_col_idxs ~parent_vals in
                          Lwt_list.iter_s (fun (crid, crow) ->
-                           cascade_delete_row_in_tx tx cat clock params child_meta ~rowid:crid ~row:crow
+                           cascade_delete_row_in_tx tx cat ~visited clock params child_meta ~rowid:crid ~row:crow
                          ) child_rows
                        | Cat.FA_set_null ->
                          let* child_rows = scan_child_rows_multi_tx cat tx child_meta
@@ -3458,10 +3498,10 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                                (* Route through cascade_update_col_in_tx so the
                                   SET NULL itself propagates down any further
                                   ON UPDATE FK chains on the just-written
-                                  column.  TODO(phase34): no cycle detection
-                                  on the SET NULL recursion. *)
+                                  column.  Phase 35 task 3a: cycle detection
+                                  via [~visited]. *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
                                    ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:Row.V_null
                                ) child_rows
@@ -3498,10 +3538,10 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                                  child_meta.Cat.name col.Row.name)
                              else
                                (* Route through cascade_update_col_in_tx (see
-                                  SET NULL arm above for rationale and the
-                                  cycle-detection TODO). *)
+                                  SET NULL arm above; cycle detection via
+                                  [~visited]). *)
                                Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat clock params child_meta
+                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
                                    ~rowid:crid ~row:crow
                                    ~col_idx:child_col_idx ~new_val:default_val
                                ) child_rows

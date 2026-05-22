@@ -8474,6 +8474,183 @@ let test_phase35_deferred_btree_backend () =
         Lwt.return_unit)
       (fun () -> (try Sys.remove path with _ -> ()); Lwt.return_unit))
 
+(* ------------------------------------------------------------------ *)
+(* Phase 35 task 3 — FK cascade cycle detection + DDL identifier quoting *)
+(* ------------------------------------------------------------------ *)
+
+(* Two tables with mutually CASCADE FKs forming a cycle.  Deleting one row
+   used to recurse indefinitely; with the visited-set guard, the operation
+   must terminate and clear both rows. *)
+let test_phase35_cascade_cycle_terminates () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE cyc_a (id INTEGER PRIMARY KEY, b_id INT)" in
+    let* () = exec_lwt
+      "CREATE TABLE cyc_b (id INTEGER PRIMARY KEY, \
+       a_id INT REFERENCES cyc_a(id) ON DELETE CASCADE)" in
+    let* () = exec_lwt
+      "ALTER TABLE cyc_a ADD COLUMN b_ref INT \
+       REFERENCES cyc_b(id) ON DELETE CASCADE" in
+    let* () = exec_lwt "INSERT INTO cyc_a (id, b_id) VALUES (1, NULL)" in
+    let* () = exec_lwt "INSERT INTO cyc_b (id, a_id) VALUES (10, 1)" in
+    let* () = exec_lwt "UPDATE cyc_a SET b_ref = 10 WHERE id = 1" in
+    let* () = exec_lwt "DELETE FROM cyc_a WHERE id = 1" in
+    let n_a = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM cyc_a")) in
+    let n_b = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM cyc_b")) in
+    Alcotest.(check int) "cyc_a count after cycle delete" 0 n_a;
+    Alcotest.(check int) "cyc_b count after cycle delete" 0 n_b;
+    Lwt.return_unit)
+
+(* Same cycle but seeded via UPDATE: changing parent column on cyc_a triggers
+   ON UPDATE cascade through cyc_b which references back to cyc_a.id.  Without
+   cycle detection the UPDATE could loop. *)
+let test_phase35_cascade_update_cycle_terminates () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt
+      "CREATE TABLE upd_a (id INTEGER PRIMARY KEY, val INTEGER)" in
+    let* () = exec_lwt
+      "CREATE TABLE upd_b (id INTEGER PRIMARY KEY, \
+       a_val INTEGER REFERENCES upd_a(val) ON UPDATE CASCADE)" in
+    let* () = exec_lwt "INSERT INTO upd_a VALUES (1, 100)" in
+    let* () = exec_lwt "INSERT INTO upd_b VALUES (10, 100)" in
+    (* Cascade-update the parent column; child must follow.  Cycle guard
+       prevents infinite loops if the FK graph were cyclic. *)
+    let* () = exec_lwt "UPDATE upd_a SET val = 200 WHERE id = 1" in
+    let v_b = int_of_row (List.hd
+      (query_ok db "SELECT a_val FROM upd_b WHERE id = 10")) in
+    Alcotest.(check int) "upd_b.a_val cascaded" 200 v_b;
+    Lwt.return_unit)
+
+(* Verify ddl_of_table quotes a table name containing a space, and that the
+   quoted SQL stored in sqlite_master.sql round-trips through the parser
+   (re-executes cleanly on a fresh DB). *)
+let test_phase35_ddl_quoting_table_with_space () =
+  let db = fresh_db () in
+  run (
+    let* () =
+      let* r = Db.execute db "CREATE TABLE \"my table\" (\"a col\" INTEGER)" in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
+      Lwt.return_unit
+    in
+    let rows = query_ok db
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='my table'" in
+    Alcotest.(check int) "one row from sqlite_master" 1 (List.length rows);
+    let sql = match rows with
+      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
+      | [] -> ""
+    in
+    Alcotest.(check bool) "table name quoted in DDL" true
+      (contains_pat "\"my table\"" sql);
+    Alcotest.(check bool) "column name quoted in DDL" true
+      (contains_pat "\"a col\"" sql);
+    (* Round-trip: feed the SQL back to a fresh DB.  If quoting is wrong
+       the parser will choke on the bare identifier. *)
+    let db2 = fresh_db () in
+    let* r = Db.execute db2 sql in
+    (match r with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "round-trip error: %a" Db.pp_error e);
+    Lwt.return_unit)
+
+(* Normal identifiers (alphanumeric + underscore) must not get spurious
+   quotes — regression guard. *)
+let test_phase35_ddl_quoting_normal_identifiers_unquoted () =
+  let db = fresh_db () in
+  run (
+    let* () =
+      let* r = Db.execute db
+        "CREATE TABLE plain_t (id INTEGER PRIMARY KEY, name TEXT)" in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
+      Lwt.return_unit
+    in
+    let rows = query_ok db
+      "SELECT sql FROM sqlite_master WHERE type='table' AND name='plain_t'" in
+    let sql = match rows with
+      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
+      | [] -> ""
+    in
+    Alcotest.(check bool) "no quoting on plain_t" false
+      (contains_pat "\"plain_t\"" sql);
+    Alcotest.(check bool) "no quoting on id"      false
+      (contains_pat "\"id\"" sql);
+    Alcotest.(check bool) "no quoting on name"    false
+      (contains_pat "\"name\"" sql);
+    Lwt.return_unit)
+
+(* Index names and column references containing weird chars round-trip. *)
+let test_phase35_ddl_quoting_index () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
+    let* () = exec_lwt
+      "CREATE INDEX \"weird idx\" ON \"weird tbl\" (\"col x\")" in
+    let rows = query_ok db
+      "SELECT sql FROM sqlite_master WHERE type='index' AND name='weird idx'" in
+    let sql = match rows with
+      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
+      | [] -> ""
+    in
+    Alcotest.(check bool) "index name quoted"  true
+      (contains_pat "\"weird idx\"" sql);
+    Alcotest.(check bool) "index table quoted" true
+      (contains_pat "\"weird tbl\"" sql);
+    Alcotest.(check bool) "index col quoted"   true
+      (contains_pat "\"col x\"" sql);
+    let db2 = fresh_db () in
+    let* () =
+      let* r = Db.execute db2 "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "create2: %a" Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* r = Db.execute db2 sql in
+    (match r with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "round-trip index: %a" Db.pp_error e);
+    Lwt.return_unit)
+
+let phase35_task3_tests = [
+  Alcotest.test_case "cascade_cycle_delete_terminates"
+    `Quick test_phase35_cascade_cycle_terminates;
+  Alcotest.test_case "cascade_cycle_update_terminates"
+    `Quick test_phase35_cascade_update_cycle_terminates;
+  Alcotest.test_case "ddl_quoting_table_with_space"
+    `Quick test_phase35_ddl_quoting_table_with_space;
+  Alcotest.test_case "ddl_quoting_normal_identifiers_unquoted"
+    `Quick test_phase35_ddl_quoting_normal_identifiers_unquoted;
+  Alcotest.test_case "ddl_quoting_index_identifiers"
+    `Quick test_phase35_ddl_quoting_index;
+]
+
 let phase35_fk_deferrable_tests = [
   Alcotest.test_case "deferred_child_before_parent"
     `Quick test_phase35_deferred_child_before_parent;
@@ -9160,4 +9337,5 @@ let () =
     "phase34_prepared_counters", phase34_prepared_counters_tests;
     "phase34_master_fts", phase34_master_fts_tests;
     "phase35_fk_deferrable", phase35_fk_deferrable_tests;
+    "phase35_task3", phase35_task3_tests;
   ]
