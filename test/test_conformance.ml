@@ -60,17 +60,21 @@ let check_rows expected actual =
     Alcotest.check row_testable (Printf.sprintf "row %d" i) exp got
   ) (List.combine expected actual)
 
+let error_msg = function
+  | Db.Parse s   -> "Parse: " ^ s
+  | Db.Runtime s -> "Runtime: " ^ s
+  | Db.Sema _    -> "Sema error"
+
 let exec_ok db sql =
   let* result = Db.execute db sql in
-  (match result with
-   | Ok () -> ()
-   | Error _ -> Alcotest.failf "exec_ok: unexpected error for: %s" sql);
-  Lwt.return_unit
+  match result with
+  | Ok () -> Lwt.return_unit
+  | Error e -> Alcotest.failf "exec_ok: %s (sql: %s)" (error_msg e) sql
 
 let query_rows db sql =
   let* result = Db.query db sql in
   match result with
-  | Error _ -> Alcotest.failf "query_rows: unexpected error for: %s" sql
+  | Error e -> Alcotest.failf "query_rows: %s (sql: %s)" (error_msg e) sql
   | Ok stream -> Lwt_stream.to_list stream
 
 (* Unique temp path per invocation to avoid collisions. *)
@@ -90,11 +94,13 @@ let run_suite open_db close_db tests =
     Alcotest.test_case t.name `Quick (fun () ->
       Lwt_main.run (
         let* db = open_db () in
-        let* () = Lwt_list.iter_s (exec_ok db) t.setup in
-        let* rows = query_rows db t.query in
-        let* () = close_db db in
-        check_rows t.expected rows;
-        Lwt.return_unit
+        Lwt.finalize
+          (fun () ->
+             let* () = Lwt_list.iter_s (exec_ok db) t.setup in
+             let* rows = query_rows db t.query in
+             check_rows t.expected rows;
+             Lwt.return_unit)
+          (fun () -> close_db db)
       )
     )
   ) tests
@@ -642,9 +648,9 @@ let tests = [
    the conformance suite stays green; the underlying gaps are tracked as
    separate engine bugs and reinstated as they are fixed. *)
 let all_backends_known_failures = [
-  "self_join";                         (* self-join with aliases — query error *)
-  "union_all";                         (* UNION ALL with ORDER BY — wrong order *)
-  "trigger_after_insert_log";          (* CREATE TABLE log — possible keyword clash *)
+  "self_join";                         (* #144 — self-join with aliases fails at runtime *)
+  "union_all";                         (* #145 — UNION ALL + ORDER BY produces wrong order *)
+  "trigger_after_insert_log";          (* #146 — CREATE TABLE log fails (LOG reserved) *)
 ]
 
 (* Btree (Unix_file + Mirage) currently lacks SAVEPOINT support — issue #136
@@ -670,24 +676,22 @@ let unique_index_duplicate_rejected_case backend_name open_db close_db =
   Alcotest.test_case "unique_index_duplicate_rejected" `Quick (fun () ->
     Lwt_main.run (
       let* db = open_db () in
-      let* () = exec_ok db "CREATE TABLE t (id INTEGER, name TEXT)" in
-      let* () = exec_ok db "CREATE UNIQUE INDEX idx ON t (id)" in
-      let* () = exec_ok db "INSERT INTO t (id, name) VALUES (1, 'alice')" in
-      let* result = Db.execute db "INSERT INTO t (id, name) VALUES (1, 'bob')" in
-      (match result with
-       | Error (Db.Runtime _) -> ()
-       | Ok () ->
-         Alcotest.failf "%s: expected Runtime error for UNIQUE violation, got Ok"
-           backend_name
-       | Error e ->
-         let msg = match e with
-           | Db.Parse s  -> "Parse: " ^ s
-           | Db.Sema _   -> "Sema"
-           | Db.Runtime s -> "Runtime: " ^ s
-         in
-         Alcotest.failf "%s: expected Runtime error, got %s" backend_name msg);
-      let* () = close_db db in
-      Lwt.return_unit
+      Lwt.finalize
+        (fun () ->
+           let* () = exec_ok db "CREATE TABLE t (id INTEGER, name TEXT)" in
+           let* () = exec_ok db "CREATE UNIQUE INDEX idx ON t (id)" in
+           let* () = exec_ok db "INSERT INTO t (id, name) VALUES (1, 'alice')" in
+           let* result = Db.execute db "INSERT INTO t (id, name) VALUES (1, 'bob')" in
+           (match result with
+            | Error (Db.Runtime _) -> ()
+            | Ok () ->
+              Alcotest.failf "%s: expected Runtime error for UNIQUE violation, got Ok"
+                backend_name
+            | Error e ->
+              Alcotest.failf "%s: expected Runtime error, got %s"
+                backend_name (error_msg e));
+           Lwt.return_unit)
+        (fun () -> close_db db)
     )
   )
 
@@ -697,30 +701,48 @@ let unique_index_duplicate_rejected_case backend_name open_db close_db =
 
 let persistence_test path =
   Alcotest.test_case "persistence_survive_close_reopen" `Quick (fun () ->
-    Lwt_main.run (
-      (* Phase 1: open, insert, close *)
-      let* db1 = open_unix_file path () in
-      let* () = exec_ok db1 "CREATE TABLE t (id INTEGER, name TEXT)" in
-      let* () = exec_ok db1 "INSERT INTO t (id, name) VALUES (1, 'alice')" in
-      let* () = exec_ok db1 "INSERT INTO t (id, name) VALUES (2, 'bob')" in
-      let* () = Db.close db1 in
-      (* Phase 2: reopen, query, verify *)
-      let* db2 = open_unix_file path () in
-      let* rows = query_rows db2 "SELECT * FROM t ORDER BY id ASC" in
-      let* () = Db.close db2 in
-      (try Unix.unlink path with Unix.Unix_error _ -> ());
-      let expected = [
-        [| Db.V_int 1L; Db.V_text "alice" |];
-        [| Db.V_int 2L; Db.V_text "bob"   |];
-      ] in
-      check_rows expected rows;
-      Lwt.return_unit
-    )
+    Fun.protect
+      ~finally:(fun () ->
+        try Unix.unlink path with Unix.Unix_error _ -> ())
+      (fun () ->
+        Lwt_main.run (
+          (* Phase 1: open, insert, close *)
+          let* db1 = open_unix_file path () in
+          let* () =
+            Lwt.finalize
+              (fun () ->
+                 let* () = exec_ok db1 "CREATE TABLE t (id INTEGER, name TEXT)" in
+                 let* () = exec_ok db1 "INSERT INTO t (id, name) VALUES (1, 'alice')" in
+                 let* () = exec_ok db1 "INSERT INTO t (id, name) VALUES (2, 'bob')" in
+                 Lwt.return_unit)
+              (fun () -> Db.close db1)
+          in
+          (* Phase 2: reopen, query, verify *)
+          let* db2 = open_unix_file path () in
+          Lwt.finalize
+            (fun () ->
+               let* rows = query_rows db2 "SELECT * FROM t ORDER BY id ASC" in
+               let expected = [
+                 [| Db.V_int 1L; Db.V_text "alice" |];
+                 [| Db.V_int 2L; Db.V_text "bob"   |];
+               ] in
+               check_rows expected rows;
+               Lwt.return_unit)
+            (fun () -> Db.close db2)
+        )
+      )
   )
 
 (* ------------------------------------------------------------------ *)
 (* Build per-backend test suites                                         *)
 (* ------------------------------------------------------------------ *)
+
+(* Shared helper: each test gets its own fresh path + open/close pair. *)
+let per_path_suite fresh_path open_with close_with tests =
+  List.map (fun t ->
+    let path = fresh_path () in
+    List.hd (run_suite (open_with path) (close_with path) [t])
+  ) tests
 
 let mem_suite () =
   let open_db = open_mem in
@@ -729,15 +751,8 @@ let mem_suite () =
   @ [ unique_index_duplicate_rejected_case "mem" open_db close_db ]
 
 let unix_file_suite () =
-  (* Each test gets its own fresh temp file path. *)
   let cases =
-    List.map (fun t ->
-      let path = fresh_temp_path () in
-      let open_db = open_unix_file path in
-      let close_db = close_and_delete_file path in
-      let cases = run_suite open_db close_db [t] in
-      List.hd cases
-    ) tests_for_btree
+    per_path_suite fresh_temp_path open_unix_file close_and_delete_file tests_for_btree
   in
   let uniq_path = fresh_temp_path () in
   let open_db   = open_unix_file uniq_path in
@@ -781,12 +796,7 @@ let close_and_delete_mirage path db =
   Lwt.return_unit
 
 let mirage_suite () =
-  List.map (fun t ->
-    let path = fresh_mirage_path () in
-    let open_db = open_mirage path in
-    let close_db = close_and_delete_mirage path in
-    List.hd (run_suite open_db close_db [t])
-  ) tests_for_btree
+  per_path_suite fresh_mirage_path open_mirage close_and_delete_mirage tests_for_btree
 
 (* ------------------------------------------------------------------ *)
 (* Runner                                                                *)
