@@ -1,7 +1,7 @@
 (library
  (name sqlocaml_sql)
  (public_name sqlocaml.sql)
- (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.catalog)
+ (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.catalog uutf uucp)
  (preprocess (pps lwt_ppx))
  (instrumentation (backend bisect_ppx)))
 
