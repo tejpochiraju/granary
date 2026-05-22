@@ -66,3 +66,7 @@
 (test
  (name test_wal)
  (libraries sqlocaml.storage alcotest lwt.unix))
+
+(test
+ (name test_store_wal)
+ (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))

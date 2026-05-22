@@ -10,6 +10,12 @@
 
 let cache_capacity = 64
 
+type wal_callbacks = {
+  wal_find_page    : int64 -> int option;
+  wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
+  wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+}
+
 type t = {
   read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
   write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
@@ -22,6 +28,7 @@ type t = {
   mutable freelist      : Freelist.t;
   mutable current_txn_id  : int64;
   mutable alloc_min_safe  : int64;
+  mutable wal            : wal_callbacks option;
 }
 
 type error = Block_error of string | Corruption of string
@@ -42,7 +49,11 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
     freelist;
     current_txn_id  = 0L;
     alloc_min_safe  = 0L;
+    wal             = None;
   }
+
+let set_wal t cb = t.wal <- cb
+let wal_mode t = t.wal <> None
 
 (** Evict the oldest cache entry if the cache is at capacity.
     Never evicts dirty pages. *)
@@ -88,26 +99,49 @@ let cstruct_dup src =
   dst
 
 let read t page_id =
-  (* Dirty takes priority — it is always more recent *)
+  (* Dirty (uncommitted current-txn writes) takes priority — it is
+     always more recent than anything elsewhere. *)
   match Hashtbl.find_opt t.dirty page_id with
   | Some buf ->
     Lwt.return_ok (cstruct_dup buf)
   | None ->
-    (* Check the read cache *)
-    (match Hashtbl.find_opt t.cache page_id with
-     | Some buf ->
-       Lwt.return_ok (cstruct_dup buf)
-     | None ->
-       (* Read from BLOCK *)
-       let buf = Cstruct.create Page.page_size in
-       let open Lwt.Syntax in
-       let* result = t.read_page ~page_id buf in
-       match result with
-       | Error msg -> Lwt.return_error (Block_error msg)
-       | Ok () ->
-         let copy = cstruct_dup buf in
-         cache_add t page_id copy;
-         Lwt.return_ok (cstruct_dup copy))
+    let open Lwt.Syntax in
+    (* If WAL mode is on, check the WAL before the cache or main DB:
+       a committed WAL frame is always more recent than the main DB,
+       and may differ from a cache entry populated before the WAL
+       frame was appended (notably, the alternating-header pages). *)
+    let from_wal () =
+      match t.wal with
+      | None -> Lwt.return_ok None
+      | Some cb ->
+        (match cb.wal_find_page page_id with
+         | None -> Lwt.return_ok None
+         | Some frame_idx ->
+           let* r = cb.wal_read_frame frame_idx in
+           (match r with
+            | Error s -> Lwt.return_error (Block_error s)
+            | Ok page ->
+              let copy = cstruct_dup page in
+              Hashtbl.replace t.cache page_id (cstruct_dup copy);
+              Lwt.return_ok (Some copy)))
+    in
+    let* wal_r = from_wal () in
+    (match wal_r with
+     | Error e -> Lwt.return_error e
+     | Ok (Some page) -> Lwt.return_ok page
+     | Ok None ->
+       (match Hashtbl.find_opt t.cache page_id with
+        | Some buf ->
+          Lwt.return_ok (cstruct_dup buf)
+        | None ->
+          let buf = Cstruct.create Page.page_size in
+          let* result = t.read_page ~page_id buf in
+          match result with
+          | Error msg -> Lwt.return_error (Block_error msg)
+          | Ok () ->
+            let copy = cstruct_dup buf in
+            cache_add t page_id copy;
+            Lwt.return_ok (cstruct_dup copy)))
 
 let write t page_id buf =
   let copy = cstruct_dup buf in
@@ -141,23 +175,35 @@ let free t ~page_id ~freed_at_txn_id =
 
 let flush t =
   let open Lwt.Syntax in
-  (* Write every dirty page to BLOCK *)
   let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
-  let rec write_all = function
-    | [] ->
-      let* sync_result = t.sync () in
-      (match sync_result with
-       | Error msg -> Lwt.return_error (Block_error msg)
-       | Ok () ->
-         Hashtbl.clear t.dirty;
-         Lwt.return_ok ())
-    | (pid, buf) :: rest ->
-      let* result = t.write_page ~page_id:pid buf in
-      (match result with
-       | Error msg -> Lwt.return_error (Block_error msg)
-       | Ok ()     -> write_all rest)
-  in
-  write_all entries
+  match t.wal with
+  | Some cb ->
+    if entries = [] then Lwt.return_ok ()
+    else begin
+      let* r = cb.wal_append_commit entries in
+      match r with
+      | Error msg -> Lwt.return_error (Block_error msg)
+      | Ok () ->
+        Hashtbl.clear t.dirty;
+        Lwt.return_ok ()
+    end
+  | None ->
+    (* Legacy path: write every dirty page to the main DB and sync. *)
+    let rec write_all = function
+      | [] ->
+        let* sync_result = t.sync () in
+        (match sync_result with
+         | Error msg -> Lwt.return_error (Block_error msg)
+         | Ok () ->
+           Hashtbl.clear t.dirty;
+           Lwt.return_ok ())
+      | (pid, buf) :: rest ->
+        let* result = t.write_page ~page_id:pid buf in
+        (match result with
+         | Error msg -> Lwt.return_error (Block_error msg)
+         | Ok ()     -> write_all rest)
+    in
+    write_all entries
 
 let n_pages t = t.n_pages
 

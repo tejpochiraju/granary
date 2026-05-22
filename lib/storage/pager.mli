@@ -66,6 +66,24 @@ val set_n_pages : t -> int64 -> unit
     being visible. *)
 val clear_dirty : t -> unit
 
+(** Optional WAL hook. When set, [read] consults [wal_find_page] before
+    falling back to the read cache + main DB; [flush] appends the dirty
+    set to the WAL as a single commit batch instead of writing to the
+    main DB. The Pager does not depend on [Sqlocaml_storage.Wal] — the
+    caller wires the callbacks in. *)
+type wal_callbacks = {
+  wal_find_page    : int64 -> int option;
+  wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
+  wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+}
+
+(** Install (or clear) the WAL hook. Pass [None] to revert to direct
+    main-DB writes. *)
+val set_wal : t -> wal_callbacks option -> unit
+
+(** True iff a WAL hook is currently installed. *)
+val wal_mode : t -> bool
+
 (** Opaque snapshot of the dirty page set, captured at a given moment.
     Used by Store.savepoint to roll back to an intermediate state without
     aborting the entire transaction. *)

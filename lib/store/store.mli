@@ -55,6 +55,28 @@ val open_block :
   close      : (unit -> unit Lwt.t) ->
   (t, error) result Lwt.t
 
+(** Open a B+-tree backed store in WAL mode. Commits append dirty pages
+    to the WAL device; reads route through the WAL first and fall back
+    to the main DB. Crash recovery is performed automatically when the
+    WAL is opened. *)
+val open_block_wal :
+  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  sync       : (unit -> (unit, string) result Lwt.t) ->
+  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
+  n_pages    : int64 ->
+  wal_read_at  : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  wal_write_at : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  wal_sync     : (unit -> (unit, string) result Lwt.t) ->
+  wal_size_bytes : int64 ->
+  close      : (unit -> unit Lwt.t) ->
+  wal_close  : (unit -> unit Lwt.t) ->
+  (t, error) result Lwt.t
+
+(** Convenience wrapper: open WAL-mode store using two Unix files,
+    [path] for the main DB and [path ^ "-wal"] for the WAL. *)
+val open_file_wal : path:string -> (t, error) result Lwt.t
+
 (** Close the store. After this, any use of the store or its txns is
     undefined. *)
 val close : t -> unit Lwt.t
@@ -140,6 +162,10 @@ val cursor_next : cursor -> (bytes * bytes) option
 (** Return the value at the current cursor position without advancing,
     or [None] if the cursor is not positioned (exhausted or before first). *)
 val cursor_value : cursor -> bytes option
+
+(** True if the store is operating in WAL mode (opened via
+    [open_block_wal] / [open_file_wal]). *)
+val wal_mode : t -> bool
 
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int

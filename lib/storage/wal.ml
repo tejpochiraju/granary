@@ -28,7 +28,10 @@ type t = {
   read_at  : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
   write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
   sync     : unit -> (unit, string) result Lwt.t;
-  size_bytes : int64;
+  mutable size_bytes : int64;
+  (* Tracks the high-water mark of the WAL device — initialised to the
+     size at open, grows as we append frames so subsequent reads know
+     which frames are addressable. *)
   salt : int64;
   seed : int64;
   mutable committed_frames : int;
@@ -278,10 +281,18 @@ let append_commit t pages =
     match r with
     | Error e -> Lwt.return_error e
     | Ok () ->
-      (* Sync succeeded — publish: update index + committed_frames. *)
+      (* Sync succeeded — publish: update index, committed_frames, and
+         the dynamic high-water mark used by [read_frame_raw]. *)
       List.iteri (fun i (page_id, _) ->
         Hashtbl.replace t.index page_id (base + i)) pages;
       t.committed_frames <- base + n;
+      let new_end =
+        Int64.add (Int64.of_int header_size_bytes)
+          (Int64.mul (Int64.of_int (base + n))
+             (Int64.of_int frame_size_bytes))
+      in
+      if Int64.compare new_end t.size_bytes > 0 then
+        t.size_bytes <- new_end;
       Lwt.return_ok ()
 
 let reset t =

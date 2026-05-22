@@ -71,6 +71,10 @@ type bt_state = {
   (* Maps snap_txn_id -> reference count of active RO txns at that snapshot *)
   mutable bt_savepoints : bt_savepoint list;
   (* Stack of named savepoints; newest at front. Cleared on commit/rollback. *)
+  wal : Sqlocaml_storage.Wal.t option;
+  (* When set, commits append to this WAL instead of writing to the main
+     DB; reads route through it via the Pager hook. *)
+  wal_close : (unit -> unit Lwt.t) option;
 }
 
 type backend =
@@ -341,7 +345,7 @@ let open_file ~path : (t, error) result Lwt.t =
               schema_version = h.schema_version;
               txn_freelist_snapshot = None;
               active_readers = Hashtbl.create 4;
-              bt_savepoints = [] }
+              bt_savepoints = []; wal = None; wal_close = None }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -363,7 +367,7 @@ let open_file ~path : (t, error) result Lwt.t =
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
-              bt_savepoints = [] }
+              bt_savepoints = []; wal = None; wal_close = None }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -373,7 +377,13 @@ let open_file ~path : (t, error) result Lwt.t =
 let close (t : t) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
-  | Btree st -> st.close_fn ()
+  | Btree st ->
+    let* () =
+      match st.wal_close with
+      | None -> Lwt.return_unit
+      | Some f -> f ()
+    in
+    st.close_fn ()
 
 let open_block
     ~(read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -407,7 +417,7 @@ let open_block
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
-              bt_savepoints = [] }
+              bt_savepoints = []; wal = None; wal_close = None }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -425,11 +435,229 @@ let open_block
         schema_version = h.schema_version;
         txn_freelist_snapshot = None;
         active_readers = Hashtbl.create 4;
-              bt_savepoints = [] }
+              bt_savepoints = []; wal = None; wal_close = None }
     in
     Lwt.return_ok
       { backend = Btree st; rw_mutex = Lwt_mutex.create ();
         mem_rw_snapshot = None; mem_savepoints = [] }
+
+(* ------------------------------------------------------------------ *)
+(* WAL-mode opens                                                       *)
+(* ------------------------------------------------------------------ *)
+
+module Wal = Sqlocaml_storage.Wal
+
+let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
+  let cb : Pager.wal_callbacks = {
+    wal_find_page = (fun pid -> Wal.find_page wal pid);
+    wal_read_frame = (fun idx ->
+      let* r = Wal.read_frame wal idx in
+      match r with
+      | Ok page -> Lwt.return_ok page
+      | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
+    wal_append_commit = (fun pages ->
+      let* r = Wal.append_commit wal pages in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
+  } in
+  Pager.set_wal pager (Some cb)
+
+let open_block_wal
+    ~(read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(sync       : unit -> (unit, string) result Lwt.t)
+    ~(resize     : n_pages:int64 -> (unit, string) result Lwt.t)
+    ~(n_pages    : int64)
+    ~(wal_read_at  : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(wal_write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+    ~(wal_sync     : unit -> (unit, string) result Lwt.t)
+    ~(wal_size_bytes : int64)
+    ~(close      : unit -> unit Lwt.t)
+    ~(wal_close  : unit -> unit Lwt.t)
+    : (t, error) result Lwt.t =
+  let pager =
+    Pager.create ~read_page ~write_page ~sync ~resize ~n_pages
+      ~freelist:Freelist.empty
+  in
+  (* Step 1: read the main-DB header (or initialise if fresh). The WAL
+     hook is NOT installed yet, so writes go directly to the main DB.
+     [was_fresh] flag preserves the post-init n_pages override below. *)
+  let%lwt hr = Header.read_live pager in
+  let%lwt init_result =
+    match hr with
+    | Error Header.Both_headers_corrupt ->
+      let%lwt ir = Header.init pager in
+      (match ir with
+       | Error e -> Lwt.return_error (map_header_err e)
+       | Ok () ->
+         Pager.set_n_pages pager 2L;
+         Lwt.return_ok true)
+    | Error e -> Lwt.return_error (map_header_err e)
+    | Ok _ -> Lwt.return_ok false
+  in
+  match init_result with
+  | Error e -> Lwt.return_error e
+  | Ok was_fresh ->
+    (* Step 2: open the WAL and recover its index. *)
+    let%lwt wr =
+      Wal.open_ ~read_at:wal_read_at ~write_at:wal_write_at
+        ~sync:wal_sync ~size_bytes:wal_size_bytes
+    in
+    (match wr with
+     | Error e ->
+       Lwt.return_error
+         (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
+     | Ok wal ->
+       (* Step 3: install the hook so subsequent reads consult the WAL. *)
+       install_wal_hook pager wal;
+       (* Step 4: re-read the header — now WAL-aware. This returns the
+          latest committed header (from WAL) if any, or the main-DB
+          header otherwise. *)
+       let%lwt hr2 = Header.read_live pager in
+       (match hr2 with
+        | Error e -> Lwt.return_error (map_header_err e)
+        | Ok h ->
+          (* If the header n_pages_total is below the pager's current
+             allocation, prefer the pager's value (the freshly-init'd
+             headers carry n_pages_total = 0). *)
+          let chosen_n_pages =
+            if was_fresh
+            then Int64.max h.n_pages_total (Pager.n_pages pager)
+            else h.n_pages_total
+          in
+          Pager.set_n_pages pager chosen_n_pages;
+          let%lwt fl =
+            read_freelist_pages pager ~first_page:h.freelist_page
+          in
+          Pager.set_freelist pager fl;
+          let meta = Btree.create pager ~root_page:h.root_page in
+          let st =
+            { close_fn = close; pager; meta;
+              trees = Hashtbl.create 16;
+              current_header = h;
+              schema_version = h.schema_version;
+              txn_freelist_snapshot = None;
+              active_readers = Hashtbl.create 4;
+              bt_savepoints = [];
+              wal = Some wal;
+              wal_close = Some wal_close }
+          in
+          Lwt.return_ok
+            { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+              mem_rw_snapshot = None; mem_savepoints = [] }))
+
+(* ------------------------------------------------------------------ *)
+(* WAL convenience: open a main DB + WAL on the same path prefix.       *)
+(* The main DB lives at [path] and the WAL at [path ^ "-wal"].          *)
+(* ------------------------------------------------------------------ *)
+
+let unix_file_read_at file ~offset (out : Cstruct.t) =
+  let len = Cstruct.length out in
+  try
+    let _ = Unix.lseek file (Int64.to_int offset) Unix.SEEK_SET in
+    let tmp = Bytes.create len in
+    let rec loop o r =
+      if r = 0 then ()
+      else
+        let n = Unix.read file tmp o r in
+        if n = 0 then begin
+          (* read past EOF — return zeros for the remainder *)
+          Bytes.fill tmp o r '\x00';
+        end else
+          loop (o + n) (r - n)
+    in
+    loop 0 len;
+    Cstruct.blit_from_bytes tmp 0 out 0 len;
+    Lwt.return (Ok ())
+  with Unix.Unix_error (e, _, _) -> Lwt.return (Error (Unix.error_message e))
+
+let unix_file_write_at file ~offset (src : Cstruct.t) =
+  let len = Cstruct.length src in
+  try
+    let _ = Unix.lseek file (Int64.to_int offset) Unix.SEEK_SET in
+    let tmp = Bytes.create len in
+    Cstruct.blit_to_bytes src 0 tmp 0 len;
+    let rec loop o r =
+      if r = 0 then ()
+      else
+        let n = Unix.write file tmp o r in
+        if n = 0 then failwith "short write"
+        else loop (o + n) (r - n)
+    in
+    loop 0 len;
+    Lwt.return (Ok ())
+  with Unix.Unix_error (e, _, _) -> Lwt.return (Error (Unix.error_message e))
+
+let open_file_wal ~path : (t, error) result Lwt.t =
+  let%lwt fr = Unix_file.open_ ~path in
+  match fr with
+  | Error e -> Lwt.return_error (map_unix_err e)
+  | Ok file ->
+    let wal_path = path ^ "-wal" in
+    let wal_fd =
+      try Unix.openfile wal_path [Unix.O_RDWR; Unix.O_CREAT] 0o644
+      with Unix.Unix_error _ ->
+        Unix.openfile wal_path [Unix.O_RDWR; Unix.O_CREAT] 0o644
+    in
+    let wal_size_bytes =
+      Int64.of_int (Unix.lseek wal_fd 0 Unix.SEEK_END)
+    in
+    let read_page ~page_id buf =
+      let%lwt r = Unix_file.read_page file ~page_id buf in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e ->
+        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+    in
+    let write_page ~page_id buf =
+      let%lwt r = Unix_file.write_page file ~page_id buf in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e ->
+        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+    in
+    let sync () =
+      let%lwt r = Unix_file.sync file in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e ->
+        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+    in
+    let resize ~n_pages =
+      let%lwt r = Unix_file.resize file ~n_pages in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e ->
+        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+    in
+    let n_pages = Unix_file.n_pages file in
+    (* Fresh main DB: pre-resize to 2 pages for the alternating headers. *)
+    let%lwt () =
+      if Int64.equal n_pages 0L then begin
+        let%lwt _ = Unix_file.resize file ~n_pages:2L in
+        Lwt.return_unit
+      end else Lwt.return_unit
+    in
+    let n_pages = Unix_file.n_pages file in
+    let wal_read_at  = unix_file_read_at  wal_fd in
+    let wal_write_at = unix_file_write_at wal_fd in
+    let wal_sync () =
+      try Unix.fsync wal_fd; Lwt.return_ok ()
+      with Unix.Unix_error (e, _, _) ->
+        Lwt.return_error (Unix.error_message e)
+    in
+    let close () =
+      let%lwt _ = Unix_file.close file in Lwt.return_unit
+    in
+    let wal_close () =
+      (try Unix.close wal_fd with Unix.Unix_error _ -> ());
+      Lwt.return_unit
+    in
+    open_block_wal
+      ~read_page ~write_page ~sync ~resize ~n_pages
+      ~wal_read_at ~wal_write_at ~wal_sync ~wal_size_bytes
+      ~close ~wal_close
 
 (* ------------------------------------------------------------------ *)
 (* Transactions                                                         *)
@@ -966,6 +1194,11 @@ let cursor_value c =
   match c.remaining with
   | (_, v) :: _ when c.ready -> Some v
   | _ -> None
+
+let wal_mode t =
+  match t.backend with
+  | Mem _ -> false
+  | Btree st -> st.wal <> None
 
 let freelist_size t =
   match t.backend with
