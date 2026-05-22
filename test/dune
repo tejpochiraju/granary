@@ -49,3 +49,7 @@
             sqlocaml.catalog sqlocaml.sql sqlocaml.storage
             sqlocaml.mirage_block mirage-block-unix
             alcotest lwt lwt.unix unix))
+
+(test
+ (name test_sqlite_corpus)
+ (libraries sqlocaml alcotest lwt.unix unix))
