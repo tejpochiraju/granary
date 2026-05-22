@@ -23,16 +23,29 @@ type fk_constraint = {
 (** Kind of pending FK check (matched against current row state at commit). *)
 type pending_fk_kind = [ `Insert | `Update | `Delete ]
 
+(** Re-verification callback for a queued FK violation.  Universally
+    polymorphic in the transaction mode so it accepts either the active
+    write txn (deferred path inside an explicit transaction) or an RO
+    snapshot opened after auto-commit. *)
+type pending_fk_recheck =
+  { recheck : 'm. 'm Sqlocaml_store.Store.txn -> bool Lwt.t }
+
 (** A queued FK violation awaiting re-verification at commit. *)
 type pending_fk_check = {
   pfk_kind    : pending_fk_kind;
   pfk_table   : string;
   pfk_rowid   : int64;
   pfk_message : string;
-  pfk_recheck : unit -> bool Lwt.t;
-    (** Re-run the FK check. Returns true if STILL violated; false if the
-        violation has been resolved (e.g. parent row now exists, child row
-        now deleted, etc.). *)
+  pfk_recheck : pending_fk_recheck;
+    (** Re-run the FK check.  An open transaction (the active write txn
+        about to be committed, or a fresh RO snapshot taken AFTER an
+        auto-commit) is supplied so the recheck observes the live state —
+        opening a separate RO snapshot mid-transaction on the B+-tree
+        backend would see only the pre-txn state and report spurious
+        violations.
+
+        Returns true if STILL violated; false if the violation has been
+        resolved (e.g. parent row now exists, child row now deleted). *)
 }
 
 type table_meta = {

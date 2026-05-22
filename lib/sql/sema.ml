@@ -2410,7 +2410,16 @@ let bind_alter_table cat ~table ~action =
        else
          (match col_def.Ast.fk_ref with
           | None -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
-          | Some (parent_table, parent_col, _od, _ou, _def) ->
+          | Some (parent_table, parent_col, on_delete, on_update, deferrable) ->
+            (* Bind every FK field explicitly so the sema-time view of the
+               constraint is faithful.  The exec layer currently recovers
+               [on_delete/on_update/deferrable] directly from [col_def.fk_ref]
+               (see [exec.ml] AA_add_column), so [BS_alter_table] only needs to
+               carry [action] verbatim — but if a future refactor migrates that
+               state into the bound representation we want to spot any flag
+               being silently dropped here.  Reference each field once to make
+               the dependency explicit. *)
+            let _ = (on_delete, on_update, deferrable) in
             (match Cat.find_table_cached cat ~name:parent_table with
              | None ->
                Lwt.return (Error (Unsupported

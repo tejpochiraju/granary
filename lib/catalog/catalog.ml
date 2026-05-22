@@ -57,12 +57,15 @@ type fk_constraint = {
 
 type pending_fk_kind = [ `Insert | `Update | `Delete ]
 
+type pending_fk_recheck =
+  { recheck : 'm. 'm S.txn -> bool Lwt.t }
+
 type pending_fk_check = {
   pfk_kind    : pending_fk_kind;
   pfk_table   : string;
   pfk_rowid   : int64;
   pfk_message : string;
-  pfk_recheck : unit -> bool Lwt.t;
+  pfk_recheck : pending_fk_recheck;
 }
 
 type table_meta = {

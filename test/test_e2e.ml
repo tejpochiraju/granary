@@ -8393,9 +8393,92 @@ let test_phase35_deferred_parent_delete_with_child_delete () =
       (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_chi2")));
     Lwt.return_unit)
 
+(* Regression: Phase 35 Task 1 review blocker.  All other deferred-FK tests
+   use [Db.open_in_memory], whose [ro_begin] reads the live tree and masks
+   the underlying defect.  On the B+-tree backend, [ro_begin] snapshots the
+   pre-txn committed header — so if a deferred-FK recheck opens a fresh RO
+   snapshot mid-transaction, it sees only state from BEFORE the active write
+   txn began.  The pending FK's recheck closure therefore reads stale (or
+   absent) tables and returns the wrong answer.
+
+   This test exercises [Db.open_file] (real B+-tree backend) for the two
+   scenarios where the staleness produces an incorrect verdict:
+
+   a) "happy path" — child-before-parent inside a txn, COMMIT must succeed.
+      Under the fix, the recheck sees the active txn's writes (parent now
+      present) and reports no violation.
+
+   b) "still-violated path" — child references missing parent, no resolution
+      inside the txn, COMMIT must fail.  Under the fix, the recheck again
+      sees the active txn's writes (child present, parent missing) and
+      correctly reports the violation.  Under the bug, a fresh RO snapshot
+      would see neither the child write nor the parent write (both pending),
+      report "no rows to check", and silently let the broken COMMIT through.
+*)
+let test_phase35_deferred_btree_backend () =
+  Lwt_main.run (
+    let path = Filename.temp_file "sqlocaml_phase35" ".db" in
+    (* [Filename.temp_file] creates the file; [Db.open_file] expects either
+       absent or a previously initialised database, so delete the empty stub
+       first. *)
+    (try Sys.remove path with _ -> ());
+    Lwt.finalize
+      (fun () ->
+        let* r = Db.open_file ~path in
+        let db = match r with
+          | Ok d -> d
+          | Error e -> Alcotest.failf "open_file failed: %a" Db.pp_error e
+        in
+        let exec_lwt sql =
+          let* r = Db.execute db sql in
+          (match r with
+           | Ok () -> ()
+           | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+          Lwt.return_unit
+        in
+        let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+        let* () = exec_lwt "CREATE TABLE bt_par (id INTEGER PRIMARY KEY)" in
+        let* () = exec_lwt
+          "CREATE TABLE bt_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+           REFERENCES bt_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+        (* a) Happy path: child before parent inside a txn — COMMIT succeeds. *)
+        let* () = exec_lwt "BEGIN" in
+        let* () = exec_lwt "INSERT INTO bt_chi VALUES (10, 1)" in
+        let* () = exec_lwt "INSERT INTO bt_par VALUES (1)" in
+        let* () = exec_lwt "COMMIT" in
+        let n_par =
+          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_par"))
+        in
+        let n_chi =
+          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_chi"))
+        in
+        Alcotest.(check int) "btree (a): parent count" 1 n_par;
+        Alcotest.(check int) "btree (a): child count"  1 n_chi;
+        (* b) Still-violated path: deferred FK with no resolution — COMMIT
+           must fail.  Under the bug, the fresh RO snapshot misses the child
+           write and reports "no violation", silently letting COMMIT through. *)
+        let* () = exec_lwt "BEGIN" in
+        let* () = exec_lwt "INSERT INTO bt_chi VALUES (20, 999)" in
+        let* r = Db.execute db "COMMIT" in
+        (match r with
+         | Error _ -> ()
+         | Ok () ->
+           Alcotest.fail
+             "btree (b): expected COMMIT to fail (deferred FK still violated)");
+        let n_chi2 =
+          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_chi"))
+        in
+        Alcotest.(check int) "btree (b): child still 1 after failed COMMIT"
+          1 n_chi2;
+        let* () = Db.close db in
+        Lwt.return_unit)
+      (fun () -> (try Sys.remove path with _ -> ()); Lwt.return_unit))
+
 let phase35_fk_deferrable_tests = [
   Alcotest.test_case "deferred_child_before_parent"
     `Quick test_phase35_deferred_child_before_parent;
+  Alcotest.test_case "deferred_btree_backend_regression"
+    `Quick test_phase35_deferred_btree_backend;
   Alcotest.test_case "immediate_still_rejects_at_insert"
     `Quick test_phase35_immediate_still_rejects_at_insert;
   Alcotest.test_case "deferred_still_violated_fails_at_commit"

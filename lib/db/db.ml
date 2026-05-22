@@ -157,15 +157,18 @@ let begin_txn t =
     Lwt.return (Ok ())
 
 (** Drain any pending deferred FK checks queued during the transaction.
-    For each entry, run the recheck closure; on the first one still violated,
+    For each entry, run the recheck closure (passing the active write txn so
+    it observes uncommitted writes); on the first one still violated,
     rollback the transaction and raise [Failure].  All entries are removed
-    from the queue regardless of outcome. *)
+    from the queue regardless of outcome — including on exception paths
+    (wrapped via [Lwt.finalize] to keep the queue state well-defined if a
+    recheck raises a non-[Failure] exception). *)
 let drain_pending_fks_or_fail t (tx : S.rw S.txn) : unit Lwt.t =
   let pending = Cat.drain_pending_fk_checks t.catalog in
   let rec loop = function
     | [] -> Lwt.return_unit
     | check :: rest ->
-      let* still = check.Cat.pfk_recheck () in
+      let* still = check.Cat.pfk_recheck.Cat.recheck tx in
       if still then begin
         (* Rollback the underlying txn so the caller gets a clean state. *)
         let* () = S.rollback tx in
@@ -176,7 +179,36 @@ let drain_pending_fks_or_fail t (tx : S.rw S.txn) : unit Lwt.t =
         Lwt.fail_with check.Cat.pfk_message
       end else loop rest
   in
-  loop pending
+  Lwt.finalize
+    (fun () -> loop pending)
+    (fun () -> Cat.clear_pending_fk_checks t.catalog; Lwt.return_unit)
+
+(** Drain pending FK checks after an auto-commit DML statement.  The active
+    write txn was already committed inside [Sql.Exec.execute_with_count]; we
+    open a fresh RO snapshot for the recheck (it now sees the just-committed
+    writes).  On the first still-violated check, returns
+    [Error (Runtime msg)]; otherwise [Ok ()].  The pending queue is cleared
+    unconditionally — including on non-[Failure] exceptions from the
+    recheck closure — to keep state well-defined for the next statement. *)
+let drain_pending_fks_autocommit t : (unit, error) result Lwt.t =
+  let pending = Cat.drain_pending_fk_checks t.catalog in
+  if pending = [] then Lwt.return (Ok ())
+  else
+    Lwt.finalize
+      (fun () ->
+        let* ro_tx = S.ro_begin t.store in
+        Lwt.finalize
+          (fun () ->
+            let rec loop = function
+              | [] -> Lwt.return (Ok ())
+              | check :: rest ->
+                let* still = check.Cat.pfk_recheck.Cat.recheck ro_tx in
+                if still then Lwt.return (Error (Runtime check.Cat.pfk_message))
+                else loop rest
+            in
+            loop pending)
+          (fun () -> S.ro_end ro_tx))
+      (fun () -> Cat.clear_pending_fk_checks t.catalog; Lwt.return_unit)
 
 let commit_txn t =
   match t.explicit_txn with
@@ -844,16 +876,11 @@ let execute t sql =
                | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
                | None -> ())
             | _ -> ());
-           (* Auto-commit mode: deferred FK checks behave like immediate. *)
-           if t.explicit_txn = None then
-             let pending = Cat.drain_pending_fk_checks t.catalog in
-             let rec loop = function
-               | [] -> Lwt.return (Ok ())
-               | check :: rest ->
-                 let* still = check.Cat.pfk_recheck () in
-                 if still then Lwt.return (Error (Runtime check.Cat.pfk_message))
-                 else loop rest
-             in loop pending
+           (* Auto-commit mode: deferred FK checks behave like immediate.
+              The txn was already committed inside [execute_with_count];
+              [drain_pending_fks_autocommit] opens a fresh RO snapshot that
+              observes the just-committed writes. *)
+           if t.explicit_txn = None then drain_pending_fks_autocommit t
            else Lwt.return (Ok ()))
          (function
           | Failure msg ->
@@ -955,14 +982,10 @@ let execute_change_count t sql =
                | None -> ())
             | _ -> ());
            if t.explicit_txn = None then
-             let pending = Cat.drain_pending_fk_checks t.catalog in
-             let rec loop = function
-               | [] -> Lwt.return (Ok n)
-               | check :: rest ->
-                 let* still = check.Cat.pfk_recheck () in
-                 if still then Lwt.return (Error (Runtime check.Cat.pfk_message))
-                 else loop rest
-             in loop pending
+             let* r = drain_pending_fks_autocommit t in
+             (match r with
+              | Ok ()   -> Lwt.return (Ok n)
+              | Error e -> Lwt.return (Error e))
            else Lwt.return (Ok n))
          (function
           | Failure msg ->
@@ -1068,14 +1091,10 @@ let run st ~params =
           | None -> ())
        | _ -> ());
       if t.explicit_txn = None then
-        let pending = Cat.drain_pending_fk_checks t.catalog in
-        let rec loop = function
-          | [] -> Lwt.return (Ok n)
-          | check :: rest ->
-            let* still = check.Cat.pfk_recheck () in
-            if still then Lwt.return (Error (Runtime check.Cat.pfk_message))
-            else loop rest
-        in loop pending
+        let* r = drain_pending_fks_autocommit t in
+        (match r with
+         | Ok ()   -> Lwt.return (Ok n)
+         | Error e -> Lwt.return (Error e))
       else Lwt.return (Ok n))
     (function
      | Failure msg ->

@@ -1806,6 +1806,75 @@ let decode_index_key_rowid (ikey : bytes) : int64 =
   done;
   Int64.logxor !v Int64.min_int
 
+(** Internal: scan [child_meta] within an already-open transaction (RO or RW)
+    for any row whose [child_col_idxs] match [parent_vals].  Used by both the
+    public store-opening variant below and the deferred FK recheck path
+    (which must see writes performed in the active RW txn — opening a fresh
+    [ro_begin] on the B+-tree backend would snapshot the pre-txn state and
+    miss the about-to-commit rows). *)
+let fk_child_has_ref_multi_in_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
+    ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
+  match
+    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+      ~col_idxs:child_col_idxs
+  with
+  | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
+    let ivs = List.map row_value_to_index_value parent_vals in
+    let prefix, plen = encode_index_key_prefix ivs in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* cur   = S.cursor_open tx idx.Cat.idx_tree_id in
+    let _sr    = S.cursor_seek cur seek_key in
+    let found  = ref false in
+    let exhausted = ref false in
+    let rec walk () =
+      if !found || !exhausted then Lwt.return_unit
+      else match S.cursor_next cur with
+      | None -> exhausted := true; Lwt.return_unit
+      | Some (ikey, _ival) ->
+        if Bytes.length ikey >= plen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then begin
+          let rowid = decode_index_key_rowid ikey in
+          let* row_opt =
+            S.get tx child_meta.Cat.tree_id (Rowid.encode rowid)
+          in
+          (match row_opt with
+           | None -> walk ()
+           | Some vbytes ->
+             let row = decode_with_virtual None [||] child_meta vbytes in
+             let ok = List.for_all2 (fun ci pv ->
+               compare_values row.(ci) pv = 0
+             ) child_col_idxs parent_vals in
+             if ok then begin found := true; Lwt.return_unit end
+             else walk ())
+        end else begin
+          exhausted := true;
+          Lwt.return_unit
+        end
+    in
+    let* () = walk () in
+    S.cursor_close cur;
+    Lwt.return !found
+  | _ ->
+    let* cur   = S.cursor_open tx child_meta.Cat.tree_id in
+    let _sr    = S.cursor_first cur in
+    let found  = ref false in
+    let rec scan () =
+      if !found then ()
+      else match S.cursor_next cur with
+      | None -> ()
+      | Some (_k, vbytes) ->
+        let row = decode_with_virtual None [||] child_meta vbytes in
+        let all_match = List.for_all2 (fun ci pv ->
+          compare_values row.(ci) pv = 0
+        ) child_col_idxs parent_vals in
+        if all_match then found := true
+        else scan ()
+    in
+    scan ();
+    S.cursor_close cur;
+    Lwt.return !found
+
 (** Scan [child_meta] for any row where all [child_col_idxs] match [parent_vals]
     simultaneously.  When an index covers [child_col_idxs] as a leading prefix,
     use it; otherwise fall back to a full table scan.
@@ -1886,13 +1955,13 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     let* () = S.ro_end ro_tx in
     Lwt.return !found
 
-(** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
-    Returns true iff such a row exists.  Used both at INSERT/UPDATE time
-    (immediate FK enforcement) and at commit time (deferred re-check). *)
-let fk_parent_has_row store (parent_meta : Cat.table_meta)
+(** Internal: scan [parent_meta] within an already-open transaction (RO or
+    RW) for a row matching [parent_vals] on [parent_idxs].  Used by the
+    deferred FK recheck path to observe uncommitted writes in the active
+    write txn. *)
+let fk_parent_has_row_in_tx tx (parent_meta : Cat.table_meta)
     ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
-  let* ro_tx = S.ro_begin store in
-  let* cur   = S.cursor_open ro_tx parent_meta.Cat.tree_id in
+  let* cur   = S.cursor_open tx parent_meta.Cat.tree_id in
   let _sr    = S.cursor_first cur in
   let found  = ref false in
   let rec scan () =
@@ -1909,14 +1978,25 @@ let fk_parent_has_row store (parent_meta : Cat.table_meta)
   in
   scan ();
   S.cursor_close cur;
-  let* () = S.ro_end ro_tx in
   Lwt.return !found
+
+(** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
+    Returns true iff such a row exists.  Used at INSERT/UPDATE time
+    (immediate FK enforcement); opens and closes its own RO snapshot. *)
+let fk_parent_has_row store (parent_meta : Cat.table_meta)
+    ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
+  let* ro_tx = S.ro_begin store in
+  let* found = fk_parent_has_row_in_tx ro_tx parent_meta
+                 ~parent_idxs ~parent_vals in
+  let* () = S.ro_end ro_tx in
+  Lwt.return found
 
 (** Helper for FK enforcement: routes a violation either to the pending
     queue (deferred) or raises immediately (immediate).  [recheck] is the
     closure invoked at commit time; it must return true iff the violation
     is still present. *)
-let fk_violation ~deferred (cat : Cat.t) ~kind ~table ~rowid ~msg ~recheck =
+let fk_violation ~deferred (cat : Cat.t) ~kind ~table ~rowid ~msg
+    ~(recheck : Cat.pending_fk_recheck) =
   if deferred then begin
     Cat.queue_pending_fk_check cat {
       Cat.pfk_kind    = kind;
@@ -2000,20 +2080,23 @@ let execute_insert ?(mode = Auto) ?(params = [||])
                if found then Lwt.return_unit
                else
                  (* Recheck closure for deferred path: at commit, the row may have
-                    been deleted (resolved) or the parent may have been inserted. *)
-                 let recheck () =
+                    been deleted (resolved) or the parent may have been inserted.
+                    The drain caller threads in the active write txn so the
+                    recheck observes uncommitted writes (B+-tree [ro_begin]
+                    would otherwise snapshot the pre-txn state). *)
+                 let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
                    match Cat.find_table_cached cat ~name:table_name,
                          Cat.find_table_cached cat ~name:parent_meta_name with
                    | None, _ | _, None -> Lwt.return false
                    | Some child_now, Some parent_now ->
-                     let* has_child = fk_child_has_ref_multi cat store child_now
+                     let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
                                         ~child_col_idxs ~parent_vals:local_vals in
                      if not has_child then Lwt.return false
                      else
-                       let* has_parent = fk_parent_has_row store parent_now
+                       let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
                                            ~parent_idxs ~parent_vals:local_vals in
                        Lwt.return (not has_parent)
-                 in
+                 } in
                  fk_violation ~deferred:is_deferred cat ~kind:`Insert
                    ~table:table_name ~rowid:0L ~msg ~recheck
              end)
@@ -2576,8 +2659,7 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                let child_meta_name = child_meta.Cat.name in
                let parent_cols_copy = fk.Cat.fk_parent_cols in
                let child_cols_copy = fk.Cat.fk_local_cols in
-               let store = Cat.store cat in
-               let recheck () =
+               let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
                  match Cat.find_table_cached cat ~name:child_meta_name,
                        Cat.find_table_cached cat ~name:parent_meta_name with
                  | None, _ | _, None -> Lwt.return false
@@ -2590,14 +2672,14 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
                       || List.length pci <> List.length parent_cols_copy
                    then Lwt.return false
                    else
-                     let* has_child = fk_child_has_ref_multi cat store child_now
+                     let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
                                         ~child_col_idxs:cci ~parent_vals in
                      if not has_child then Lwt.return false
                      else
-                       let* has_parent = fk_parent_has_row store parent_now
+                       let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
                                            ~parent_idxs:pci ~parent_vals in
                        Lwt.return (not has_parent)
-               in
+               } in
                fk_violation ~deferred:is_deferred cat ~kind:`Delete
                  ~table:parent_meta_name ~rowid ~msg ~recheck
              else Lwt.return_unit
@@ -2937,8 +3019,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
                     let parent_cols_copy = fk.fk_parent_cols in
                     let child_cols_copy = fk.fk_local_cols in
                     let captured_old_vals = old_vals in
-                    let store2 = Cat.store cat in
-                    let recheck () =
+                    let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
                       match Cat.find_table_cached cat ~name:child_meta_name,
                             Cat.find_table_cached cat ~name:parent_meta_name with
                       | None, _ | _, None -> Lwt.return false
@@ -2951,16 +3032,16 @@ let execute_update ?(mode = Auto) ?(params = [||])
                            || List.length pci <> List.length parent_cols_copy
                         then Lwt.return false
                         else
-                          let* has_child = fk_child_has_ref_multi cat store2 child_now
+                          let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
                                              ~child_col_idxs:cci
                                              ~parent_vals:captured_old_vals in
                           if not has_child then Lwt.return false
                           else
-                            let* has_parent = fk_parent_has_row store2 parent_now
+                            let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
                                                 ~parent_idxs:pci
                                                 ~parent_vals:captured_old_vals in
                             Lwt.return (not has_parent)
-                    in
+                    } in
                     fk_violation ~deferred:is_deferred cat ~kind:`Update
                       ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
                   else Lwt.return_unit
@@ -3296,8 +3377,7 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                     let parent_cols_copy = fk.fk_parent_cols in
                     let child_cols_copy = fk.fk_local_cols in
                     let captured_pv = parent_vals in
-                    let store2 = Cat.store cat in
-                    let recheck () =
+                    let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
                       match Cat.find_table_cached cat ~name:child_meta_name,
                             Cat.find_table_cached cat ~name:parent_meta_name with
                       | None, _ | _, None -> Lwt.return false
@@ -3310,16 +3390,16 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                            || List.length pci <> List.length parent_cols_copy
                         then Lwt.return false
                         else
-                          let* has_child = fk_child_has_ref_multi cat store2 child_now
+                          let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
                                              ~child_col_idxs:cci
                                              ~parent_vals:captured_pv in
                           if not has_child then Lwt.return false
                           else
-                            let* has_parent = fk_parent_has_row store2 parent_now
+                            let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
                                                 ~parent_idxs:pci
                                                 ~parent_vals:captured_pv in
                             Lwt.return (not has_parent)
-                    in
+                    } in
                     fk_violation ~deferred:is_deferred cat ~kind:`Delete
                       ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
                   else Lwt.return_unit
