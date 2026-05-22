@@ -65,3 +65,18 @@ val set_n_pages : t -> int64 -> unit
     writing them to disk. Used on rollback to prevent aborted writes from
     being visible. *)
 val clear_dirty : t -> unit
+
+(** Opaque snapshot of the dirty page set, captured at a given moment.
+    Used by Store.savepoint to roll back to an intermediate state without
+    aborting the entire transaction. *)
+type dirty_snapshot
+
+(** Clone the current dirty set. The Cstruct buffers themselves are not
+    deep-copied — they are only ever replaced (not mutated in-place) by
+    [write], so sharing references is safe. *)
+val dirty_clone : t -> dirty_snapshot
+
+(** Restore the dirty set to a snapshot. Any pages now-dirty but not in
+    the snapshot are removed; pages in the snapshot are reinstated with
+    their snapshotted content. The read cache is left as-is. *)
+val dirty_restore : t -> dirty_snapshot -> unit

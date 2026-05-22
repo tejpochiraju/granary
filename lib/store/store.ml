@@ -49,6 +49,15 @@ let pp_error fmt = function
    created via [get/put/del]; its OWN root_page is what we commit into
    the header. *)
 
+type bt_savepoint = {
+  sp_name        : string;
+  sp_meta_root   : int64;
+  sp_tree_roots  : (tree_id * int64) list;
+  sp_freelist    : Freelist.t;
+  sp_n_pages     : int64;
+  sp_dirty       : Pager.dirty_snapshot;
+}
+
 type bt_state = {
   close_fn             : unit -> unit Lwt.t;
   pager                : Pager.t;
@@ -60,6 +69,8 @@ type bt_state = {
   (* Snapshot of freelist taken at rw_begin; restored on rollback. None when no RW txn is active. *)
   active_readers : (int64, int) Hashtbl.t;
   (* Maps snap_txn_id -> reference count of active RO txns at that snapshot *)
+  mutable bt_savepoints : bt_savepoint list;
+  (* Stack of named savepoints; newest at front. Cleared on commit/rollback. *)
 }
 
 type backend =
@@ -329,7 +340,8 @@ let open_file ~path : (t, error) result Lwt.t =
               current_header = h;
               schema_version = h.schema_version;
               txn_freelist_snapshot = None;
-              active_readers = Hashtbl.create 4 }
+              active_readers = Hashtbl.create 4;
+              bt_savepoints = [] }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -350,7 +362,8 @@ let open_file ~path : (t, error) result Lwt.t =
             current_header = h;
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
-            active_readers = Hashtbl.create 4 }
+            active_readers = Hashtbl.create 4;
+              bt_savepoints = [] }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -393,7 +406,8 @@ let open_block
             current_header = h;
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
-            active_readers = Hashtbl.create 4 }
+            active_readers = Hashtbl.create 4;
+              bt_savepoints = [] }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -410,7 +424,8 @@ let open_block
         current_header = h;
         schema_version = h.schema_version;
         txn_freelist_snapshot = None;
-        active_readers = Hashtbl.create 4 }
+        active_readers = Hashtbl.create 4;
+              bt_savepoints = [] }
     in
     Lwt.return_ok
       { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -614,6 +629,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
          { new_state with
            txn_id = Int64.add st.current_header.txn_id 1L };
        st.txn_freelist_snapshot <- None;
+       st.bt_savepoints <- [];
        Lwt.return_unit
      | Error e ->
        Lwt.fail_with
@@ -667,7 +683,8 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         Pager.set_freelist st.pager fl;
         Pager.clear_dirty st.pager;
         st.txn_freelist_snapshot <- None
-      | None -> ()));
+      | None -> ());
+     st.bt_savepoints <- []);
   Lwt_mutex.unlock t.rw_mutex;
   Lwt.return_unit
 
@@ -675,14 +692,28 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
 (* Savepoints (Mem backend only; B-tree deferred)                      *)
 (* ------------------------------------------------------------------ *)
 
-(** Push a named savepoint: snapshot current Mem tree state. *)
+(** Push a named savepoint: snapshot current state. *)
 let savepoint_begin (Rw t : rw txn) name =
   match t.backend with
   | Mem trees ->
     let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
     t.mem_savepoints <- (name, snap) :: t.mem_savepoints;
     Lwt.return_unit
-  | Btree _ -> Lwt.return_unit   (* B-tree savepoints deferred to a future phase *)
+  | Btree st ->
+    let tree_roots =
+      Hashtbl.fold (fun tid bt acc -> (tid, Btree.root_page bt) :: acc)
+        st.trees []
+    in
+    let sp = {
+      sp_name       = name;
+      sp_meta_root  = Btree.root_page st.meta;
+      sp_tree_roots = tree_roots;
+      sp_freelist   = Pager.freelist st.pager;
+      sp_n_pages    = Pager.n_pages st.pager;
+      sp_dirty      = Pager.dirty_clone st.pager;
+    } in
+    st.bt_savepoints <- sp :: st.bt_savepoints;
+    Lwt.return_unit
 
 (** Release the named savepoint and all newer ones (writes are kept). *)
 let savepoint_release (Rw t : rw txn) name =
@@ -695,7 +726,14 @@ let savepoint_release (Rw t : rw txn) name =
     in
     t.mem_savepoints <- drop t.mem_savepoints;
     Lwt.return_unit
-  | Btree _ -> Lwt.return_unit
+  | Btree st ->
+    let rec drop = function
+      | [] -> []
+      | sp :: rest when String.equal sp.sp_name name -> rest
+      | _ :: rest -> drop rest
+    in
+    st.bt_savepoints <- drop st.bt_savepoints;
+    Lwt.return_unit
 
 (** Rollback to the named savepoint: restore snapshot, drop newer savepoints,
     keep the named savepoint so it can be rolled back to again. *)
@@ -723,7 +761,31 @@ let savepoint_rollback (Rw t : rw txn) name =
     in
     find t.mem_savepoints;
     Lwt.return_unit
-  | Btree _ -> Lwt.return_unit
+  | Btree st ->
+    let rec find = function
+      | [] -> ()
+      | sp :: rest when String.equal sp.sp_name name ->
+        (* Restore meta-tree root *)
+        st.meta <- Btree.create st.pager ~root_page:sp.sp_meta_root;
+        (* Restore per-tree roots: drop the cache, re-populate from snapshot. *)
+        Hashtbl.clear st.trees;
+        List.iter (fun (tid, root) ->
+          let bt = Btree.create st.pager ~root_page:root in
+          Hashtbl.replace st.trees tid bt
+        ) sp.sp_tree_roots;
+        (* Restore freelist + n_pages + dirty set. Pages above sp.sp_n_pages
+           that were freshly allocated in the rolled-back range become
+           orphans in the file but are not in any tree, freelist, or
+           dirty set — harmless storage leak. *)
+        Pager.set_freelist st.pager sp.sp_freelist;
+        Pager.set_n_pages  st.pager sp.sp_n_pages;
+        Pager.dirty_restore st.pager sp.sp_dirty;
+        (* Keep the named savepoint at the top so it can be re-used. *)
+        st.bt_savepoints <- sp :: rest
+      | _ :: rest -> find rest
+    in
+    find st.bt_savepoints;
+    Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
 (* get / put / del                                                      *)

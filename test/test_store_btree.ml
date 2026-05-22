@@ -1301,6 +1301,116 @@ let test_open_block_reopen_persists () =
   )
 
 (* ------------------------------------------------------------------ *)
+(* SAVEPOINT on B-tree (#136)                                           *)
+(* ------------------------------------------------------------------ *)
+
+let test_savepoint_rollback_undoes_writes () =
+  run @@ with_fresh_db ~f:(fun path ->
+    let* sr = S.open_file ~path in
+    let store = ok_store sr in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 16 (bs "before") (bs "1") in
+    let* () = S.savepoint_begin tx "sp1" in
+    let* () = S.put tx 16 (bs "inside") (bs "2") in
+    let* () = S.savepoint_rollback tx "sp1" in
+    let* v_before = S.get tx 16 (bs "before") in
+    let* v_inside = S.get tx 16 (bs "inside") in
+    Alcotest.(check bytes_opt_eq) "before survives" (Some (bs "1")) v_before;
+    Alcotest.(check bytes_opt_eq) "inside undone" None v_inside;
+    let* () = S.savepoint_release tx "sp1" in
+    let* () = S.commit tx in
+    let* () = S.close store in
+    Lwt.return_unit)
+
+let test_savepoint_release_keeps_writes () =
+  run @@ with_fresh_db ~f:(fun path ->
+    let* sr = S.open_file ~path in
+    let store = ok_store sr in
+    let* tx = S.rw_begin store in
+    let* () = S.savepoint_begin tx "sp1" in
+    let* () = S.put tx 16 (bs "k") (bs "v") in
+    let* () = S.savepoint_release tx "sp1" in
+    let* () = S.commit tx in
+    let* () = S.close store in
+    let* sr2 = S.open_file ~path in
+    let store2 = ok_store sr2 in
+    let* tx = S.ro_begin store2 in
+    let* v = S.get tx 16 (bs "k") in
+    let* () = S.ro_end tx in
+    Alcotest.(check bytes_opt_eq) "release persisted" (Some (bs "v")) v;
+    let* () = S.close store2 in
+    Lwt.return_unit)
+
+let test_savepoint_nested_partial_rollback () =
+  run @@ with_fresh_db ~f:(fun path ->
+    let* sr = S.open_file ~path in
+    let store = ok_store sr in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 16 (bs "a") (bs "1") in
+    let* () = S.savepoint_begin tx "outer" in
+    let* () = S.put tx 16 (bs "b") (bs "2") in
+    let* () = S.savepoint_begin tx "inner" in
+    let* () = S.put tx 16 (bs "c") (bs "3") in
+    (* Roll back the inner savepoint: c should disappear, b survives. *)
+    let* () = S.savepoint_rollback tx "inner" in
+    let* va = S.get tx 16 (bs "a") in
+    let* vb = S.get tx 16 (bs "b") in
+    let* vc = S.get tx 16 (bs "c") in
+    Alcotest.(check bytes_opt_eq) "a stays"      (Some (bs "1")) va;
+    Alcotest.(check bytes_opt_eq) "b stays"      (Some (bs "2")) vb;
+    Alcotest.(check bytes_opt_eq) "c undone"     None vc;
+    (* Roll back the outer savepoint: b should disappear too. *)
+    let* () = S.savepoint_rollback tx "outer" in
+    let* va = S.get tx 16 (bs "a") in
+    let* vb = S.get tx 16 (bs "b") in
+    Alcotest.(check bytes_opt_eq) "a still stays"   (Some (bs "1")) va;
+    Alcotest.(check bytes_opt_eq) "b now undone"    None vb;
+    let* () = S.commit tx in
+    let* () = S.close store in
+    Lwt.return_unit)
+
+let test_savepoint_double_rollback_reuses () =
+  run @@ with_fresh_db ~f:(fun path ->
+    let* sr = S.open_file ~path in
+    let store = ok_store sr in
+    let* tx = S.rw_begin store in
+    let* () = S.savepoint_begin tx "sp" in
+    let* () = S.put tx 16 (bs "x") (bs "1") in
+    let* () = S.savepoint_rollback tx "sp" in
+    (* Savepoint persists after rollback — can be rolled back again. *)
+    let* () = S.put tx 16 (bs "x") (bs "2") in
+    let* () = S.savepoint_rollback tx "sp" in
+    let* v = S.get tx 16 (bs "x") in
+    Alcotest.(check bytes_opt_eq) "x undone twice" None v;
+    let* () = S.savepoint_release tx "sp" in
+    let* () = S.commit tx in
+    let* () = S.close store in
+    Lwt.return_unit)
+
+let test_savepoint_then_commit_persists () =
+  run @@ with_fresh_db ~f:(fun path ->
+    let* sr = S.open_file ~path in
+    let store = ok_store sr in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 16 (bs "a") (bs "1") in
+    let* () = S.savepoint_begin tx "sp" in
+    let* () = S.put tx 16 (bs "b") (bs "2") in
+    (* RELEASE preserves the writes; subsequent commit must persist both. *)
+    let* () = S.savepoint_release tx "sp" in
+    let* () = S.commit tx in
+    let* () = S.close store in
+    let* sr2 = S.open_file ~path in
+    let store2 = ok_store sr2 in
+    let* tx = S.ro_begin store2 in
+    let* va = S.get tx 16 (bs "a") in
+    let* vb = S.get tx 16 (bs "b") in
+    let* () = S.ro_end tx in
+    Alcotest.(check bytes_opt_eq) "a persists" (Some (bs "1")) va;
+    Alcotest.(check bytes_opt_eq) "b persists" (Some (bs "2")) vb;
+    let* () = S.close store2 in
+    Lwt.return_unit)
+
+(* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -1378,5 +1488,12 @@ let () =
     "open_block", [
       Alcotest.test_case "fresh_init"       `Quick test_open_block_fresh;
       Alcotest.test_case "reopen_persists"  `Quick test_open_block_reopen_persists;
+    ];
+    "savepoint", [
+      Alcotest.test_case "rollback_undoes"      `Quick test_savepoint_rollback_undoes_writes;
+      Alcotest.test_case "release_keeps"        `Quick test_savepoint_release_keeps_writes;
+      Alcotest.test_case "nested_partial"       `Quick test_savepoint_nested_partial_rollback;
+      Alcotest.test_case "double_rollback"      `Quick test_savepoint_double_rollback_reuses;
+      Alcotest.test_case "commit_persists"      `Quick test_savepoint_then_commit_persists;
     ];
   ]

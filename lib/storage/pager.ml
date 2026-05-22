@@ -187,3 +187,11 @@ let clear_dirty t =
   Queue.iter (fun pid ->
     if not (Hashtbl.mem pids_set pid) then Queue.push pid t.fifo
   ) old_fifo
+
+type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
+
+let dirty_clone t = Hashtbl.copy t.dirty
+
+let dirty_restore t snap =
+  Hashtbl.reset t.dirty;
+  Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k v) snap

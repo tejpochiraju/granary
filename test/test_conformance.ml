@@ -650,12 +650,7 @@ let tests = [
 let all_backends_known_failures = [
 ]
 
-(* Btree (Unix_file + Mirage) currently lacks SAVEPOINT support — issue #136
-   is open and tracked for phase-36b. Filter these by name for now. *)
-let btree_known_failures = [
-  "savepoint_release_keeps_changes";   (* #136 — SAVEPOINT on B-tree open *)
-  "savepoint_rollback_to_discards";    (* #136 *)
-]
+let btree_known_failures = []
 
 let tests_for_mem =
   List.filter (fun t -> not (List.mem t.name all_backends_known_failures)) tests
