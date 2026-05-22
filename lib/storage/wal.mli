@@ -1,0 +1,88 @@
+(** Write-Ahead Log over byte-addressable storage.
+
+    Frames are 4096-byte pages tagged with metadata; the WAL is a sequence
+    of frames followed by an optional uncommitted tail. Each batch ends
+    with a frame that has the [commit] bit set; recovery on open scans
+    forward and accepts only frames whose commit batch is complete.
+
+    Layout
+    ------
+    The WAL begins with a 24-byte header containing a magic identifier,
+    a 64-bit salt assigned at open time when the WAL is empty, and a
+    64-bit seed used by the per-frame checksum. Frame [i] occupies
+    [header_size + i * frame_size_bytes] bytes.
+
+    Per-frame layout:
+        offset  0   page_id : uint64 big-endian
+        offset  8   flags   : uint64 big-endian  (bit 0 = commit marker)
+        offset 16   checksum: uint64 big-endian  (FNV-1a-64 of preceding
+                                                  fields || salt || seed
+                                                  || page bytes)
+        offset 24   page    : 4096 bytes
+
+    Crash-safety guarantee
+    ----------------------
+    A frame is considered durable only if (a) its checksum verifies and
+    (b) some later frame in the same forward scan has the commit bit set
+    without an intervening checksum failure. Partial trailing batches are
+    silently discarded on recovery and overwritten by the next append.
+
+    This module is purely an append-only frame store; integration with the
+    pager (read-from-WAL routing, checkpointing back to the main DB) lives
+    in the [Sqlocaml_store.Store] module. *)
+
+type t
+
+type frame = {
+  frame_idx : int;        (** 0-based index in WAL *)
+  page_id   : int64;
+  is_commit : bool;
+  page      : Cstruct.t;  (** 4096 bytes *)
+}
+
+val frame_size_bytes : int  (** = 4120 *)
+val header_size_bytes : int  (** = 24 *)
+
+type error =
+  | Block_error of string
+  | Corrupt_frame of int  (** frame_idx that failed checksum *)
+
+val pp_error : Format.formatter -> error -> unit
+
+(** Open a WAL over the given byte-addressable callbacks. If the device is
+    empty (or smaller than [header_size_bytes]) the WAL is initialised
+    with a fresh salt and seed. Otherwise the header is read, and a
+    forward scan recovers the index of every page in the last contiguous
+    committed batch. A trailing partial batch is silently discarded. *)
+val open_ :
+  read_at  : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  write_at : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
+  sync     : (unit -> (unit, string) result Lwt.t) ->
+  size_bytes : int64 ->
+  (t, error) result Lwt.t
+
+(** Total committed frames currently in the WAL. *)
+val committed_frames : t -> int
+
+(** Most recent committed frame index for [page_id], or [None] if absent. *)
+val find_page : t -> int64 -> int option
+
+(** Read the page bytes at a given frame index. The caller must not modify
+    the returned Cstruct; it is a fresh allocation per call. *)
+val read_frame : t -> int -> (Cstruct.t, error) result Lwt.t
+
+(** Append a batch of pages; the LAST entry in the list is automatically
+    marked as the commit frame. Performs a single [sync] at the end and
+    only then updates the in-memory index. If [sync] fails the index is
+    left unchanged so the partial batch is invisible to readers. *)
+val append_commit : t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
+
+(** Reset the WAL: discards all committed frames and the in-memory index.
+    Used by checkpointing to truncate the log after migrating its
+    contents to the main DB. The on-disk WAL is not physically truncated;
+    later appends overwrite from the beginning. *)
+val reset : t -> unit
+
+(** Iterate over every (page_id, frame_idx) currently in the WAL index.
+    Order is unspecified. *)
+val iter_index : t -> (int64 -> int -> unit) -> unit
