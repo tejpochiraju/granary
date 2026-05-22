@@ -650,7 +650,6 @@ let tests = [
 let all_backends_known_failures = [
   "self_join";                         (* #144 — self-join with aliases fails at runtime *)
   "union_all";                         (* #145 — UNION ALL + ORDER BY produces wrong order *)
-  "trigger_after_insert_log";          (* #146 — CREATE TABLE log fails (LOG reserved) *)
 ]
 
 (* Btree (Unix_file + Mirage) currently lacks SAVEPOINT support — issue #136

@@ -188,6 +188,47 @@ any_ident:
   | FOR               { "for" }
   | EACH              { "each" }
   | ROW               { "row" }
+  | LOG               { "log" }
+  | LN                { "ln" }
+  | LOG2              { "log2" }
+  | LOG10             { "log10" }
+  | EXP               { "exp" }
+  | SQRT              { "sqrt" }
+  | POW               { "pow" }
+  | CEIL              { "ceil" }
+  | FLOOR             { "floor" }
+  | SIGN              { "sign" }
+  | TRUNC             { "trunc" }
+  | PI                { "pi" }
+  | SIN               { "sin" }
+  | COS               { "cos" }
+  | TAN               { "tan" }
+  | ASIN              { "asin" }
+  | ACOS              { "acos" }
+  | ATAN              { "atan" }
+  | ATAN2             { "atan2" }
+  | DEGREES           { "degrees" }
+  | RADIANS           { "radians" }
+  | LENGTH            { "length" }
+  | LOWER             { "lower" }
+  | UPPER             { "upper" }
+  | ABS               { "abs" }
+  | COALESCE          { "coalesce" }
+  | IFNULL            { "ifnull" }
+  | SUBSTR            { "substr" }
+  | TRIM              { "trim" }
+  | LTRIM             { "ltrim" }
+  | INSTR             { "instr" }
+  | ROUND             { "round" }
+  | TYPEOF            { "typeof" }
+  | DATETIME          { "datetime" }
+  | DATE              { "date" }
+  | JULIANDAY         { "julianday" }
+  | STRFTIME          { "strftime" }
+  | TIME              { "time" }
+  | UNIXEPOCH         { "unixepoch" }
+  | NULLIF            { "nullif" }
+  | IIF               { "iif" }
 
 stmt:
   | s = with_cte          { s }
