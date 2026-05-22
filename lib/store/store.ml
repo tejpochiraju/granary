@@ -917,6 +917,67 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
+(* WAL checkpoint                                                       *)
+(* ------------------------------------------------------------------ *)
+
+(** Migrate every page currently in the WAL index to the main DB, sync
+    the main DB, then reset the WAL. Holds the RW mutex so no
+    concurrent commit can append fresh frames while we read the index.
+    On Mem stores or non-WAL Btree stores this is a no-op. *)
+let checkpoint (t : t) : unit Lwt.t =
+  match t.backend with
+  | Mem _ -> Lwt.return_unit
+  | Btree st ->
+    (match st.wal with
+     | None -> Lwt.return_unit
+     | Some wal ->
+       let* () = Lwt_mutex.lock t.rw_mutex in
+       Lwt.finalize
+         (fun () ->
+           (* Collect (page_id, frame_idx) pairs; we read frames directly
+              from the WAL (not via Pager.read) to avoid a redundant
+              cache hop and to keep the data path independent of the
+              hook. *)
+           let pairs = ref [] in
+           Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+           let rec write_each = function
+             | [] -> Lwt.return_unit
+             | (pid, idx) :: rest ->
+               let* r = Wal.read_frame wal idx in
+               (match r with
+                | Error e ->
+                  Lwt.fail_with (Format.asprintf "checkpoint read: %a"
+                                   Wal.pp_error e)
+                | Ok page ->
+                  (* Write through the pager's underlying main-DB
+                     callback rather than Pager.write (which would mark
+                     the page dirty and re-route via WAL on flush). *)
+                  let* wr =
+                    (* Pager doesn't expose write_page; use the raw
+                       callback via a small helper. *)
+                    Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page
+                  in
+                  (match wr with
+                   | Error e ->
+                     Lwt.fail_with
+                       (Format.asprintf "checkpoint write: %a"
+                          Pager.pp_error e)
+                   | Ok () -> write_each rest))
+           in
+           let* () = write_each !pairs in
+           let* sr = Pager.flush_sync_main st.pager in
+           (match sr with
+            | Error e ->
+              Lwt.fail_with
+                (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
+            | Ok () ->
+              Wal.reset wal;
+              (* Drop cached entries so subsequent reads see the
+                 main-DB contents (the WAL index is now empty). *)
+              Lwt.return_unit))
+         (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit))
+
+(* ------------------------------------------------------------------ *)
 (* Savepoints (Mem backend only; B-tree deferred)                      *)
 (* ------------------------------------------------------------------ *)
 

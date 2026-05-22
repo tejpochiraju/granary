@@ -26,6 +26,12 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     Creates the file if absent; reopens an existing database otherwise. *)
 val open_file : path:string -> (t, error) result Lwt.t
 
+(** Open a persistent B+-tree-backed database in WAL mode. The main DB
+    is [path] and the WAL is [path ^ "-wal"]. Crash recovery on the WAL
+    runs automatically at open. Use [PRAGMA wal_checkpoint] to migrate
+    WAL contents back to the main DB. *)
+val open_file_wal : path:string -> (t, error) result Lwt.t
+
 (** Open a SQL engine on any block device given as I/O callbacks.
     Use with [Sqlocaml_mirage_block.Mirage_backend.Make(B)] to build
     the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]

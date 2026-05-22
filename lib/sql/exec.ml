@@ -3680,6 +3680,7 @@ let op_name = function
   | Plan.Op_pragma_get_defer_fk        -> "Pragma(get_defer_foreign_keys)"
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
+  | Plan.Op_pragma_wal_checkpoint      -> "Pragma(wal_checkpoint)"
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
@@ -4087,6 +4088,9 @@ let execute_with_count ?(mode = Auto)
     Lwt.return 0
   | Plan.Op_pragma_set_defer_fk { on } ->
     Cat.set_defer_fks_pragma cat on;
+    Lwt.return 0
+  | Plan.Op_pragma_wal_checkpoint ->
+    let* () = S.checkpoint store in
     Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
@@ -6022,7 +6026,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_user_version _
   | Plan.Op_pragma_set_fk _
   | Plan.Op_pragma_set_recursive_triggers _
-  | Plan.Op_pragma_set_defer_fk _ ->
+  | Plan.Op_pragma_set_defer_fk _
+  | Plan.Op_pragma_wal_checkpoint ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

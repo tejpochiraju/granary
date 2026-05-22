@@ -167,6 +167,11 @@ val cursor_value : cursor -> bytes option
     [open_block_wal] / [open_file_wal]). *)
 val wal_mode : t -> bool
 
+(** Migrate every page in the WAL index to the main DB, sync, then
+    reset the WAL. No-op outside WAL mode. Acquires the RW mutex
+    internally so it serialises with commits. *)
+val checkpoint : t -> unit Lwt.t
+
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int
 

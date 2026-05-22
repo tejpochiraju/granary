@@ -327,6 +327,7 @@ pragma_stmt:
       | "user_version"    -> Ast.S_pragma Ast.Pragma_user_version
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
+      | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
       | _                 -> Ast.S_pragma (Ast.Pragma_set (name, "")) }
 
 pragma_value:

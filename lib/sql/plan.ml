@@ -235,6 +235,8 @@ type op =
     (** Read defer_foreign_keys flag from catalog; returns one row [[V_int 0|1]]. *)
   | Op_pragma_set_defer_fk of { on : bool }
     (** Write defer_foreign_keys flag to catalog; DDL-like, returns 0 rows. *)
+  | Op_pragma_wal_checkpoint
+    (** Migrate WAL contents to main DB and reset; no-op outside WAL mode. *)
   | Op_distinct of {
       child : op;
     }

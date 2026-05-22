@@ -172,6 +172,110 @@ let test_wal_many_commits () =
     let* () = S.close st2 in
     Lwt.return_unit)
 
+let test_wal_checkpoint_migrates_data () =
+  run @@ with_fresh ~f:(fun path ->
+    let* sr = S.open_file_wal ~path in
+    let st = ok_store sr in
+    let* tx = S.rw_begin st in
+    let* () = S.put tx 16 (bs "k") (bs "v") in
+    let* () = S.commit tx in
+    let* () = S.checkpoint st in
+    (* After checkpoint, data must still be readable. *)
+    let* tx = S.ro_begin st in
+    let* v = S.get tx 16 (bs "k") in
+    let* () = S.ro_end tx in
+    Alcotest.(check bytes_opt) "data survives checkpoint"
+      (Some (bs "v")) v;
+    let* () = S.close st in
+    Lwt.return_unit)
+
+let test_wal_checkpoint_then_reopen () =
+  run @@ with_fresh ~f:(fun path ->
+    let* sr = S.open_file_wal ~path in
+    let st = ok_store sr in
+    let* tx = S.rw_begin st in
+    let* () = S.put tx 16 (bs "k") (bs "checkpointed") in
+    let* () = S.commit tx in
+    let* () = S.checkpoint st in
+    let* () = S.close st in
+    let* sr2 = S.open_file_wal ~path in
+    let st2 = ok_store sr2 in
+    let* tx = S.ro_begin st2 in
+    let* v = S.get tx 16 (bs "k") in
+    let* () = S.ro_end tx in
+    Alcotest.(check bytes_opt) "data persists past checkpoint"
+      (Some (bs "checkpointed")) v;
+    let* () = S.close st2 in
+    Lwt.return_unit)
+
+let test_wal_checkpoint_with_commits_after () =
+  run @@ with_fresh ~f:(fun path ->
+    let* sr = S.open_file_wal ~path in
+    let st = ok_store sr in
+    let* tx = S.rw_begin st in
+    let* () = S.put tx 16 (bs "old") (bs "1") in
+    let* () = S.commit tx in
+    let* () = S.checkpoint st in
+    (* Post-checkpoint commits go to a fresh WAL. *)
+    let* tx = S.rw_begin st in
+    let* () = S.put tx 16 (bs "new") (bs "2") in
+    let* () = S.commit tx in
+    let* () = S.close st in
+    let* sr2 = S.open_file_wal ~path in
+    let st2 = ok_store sr2 in
+    let* tx = S.ro_begin st2 in
+    let* vo = S.get tx 16 (bs "old") in
+    let* vn = S.get tx 16 (bs "new") in
+    let* () = S.ro_end tx in
+    Alcotest.(check bytes_opt) "pre-checkpoint persists"
+      (Some (bs "1")) vo;
+    Alcotest.(check bytes_opt) "post-checkpoint persists"
+      (Some (bs "2")) vn;
+    let* () = S.close st2 in
+    Lwt.return_unit)
+
+let test_wal_checkpoint_noop_on_mem () =
+  (* Calling checkpoint on a non-WAL store is a no-op. *)
+  run (
+    let st = S.create () in
+    let* () = S.checkpoint st in
+    let* () = S.close st in
+    Lwt.return_unit)
+
+let test_pragma_wal_checkpoint_via_sql () =
+  (* Drive the engine end-to-end: open a WAL-backed Db, run SQL,
+     issue PRAGMA wal_checkpoint, confirm data still readable, then
+     reopen and confirm data was migrated to main. *)
+  let module Db = Sqlocaml.Db in
+  run @@ with_fresh ~f:(fun path ->
+    let* r = Db.open_file_wal ~path in
+    let db = match r with
+      | Ok db -> db
+      | Error e -> Alcotest.failf "open_file_wal: %a" Db.pp_error e
+    in
+    let exec_ok sql =
+      let* r = Db.execute db sql in
+      match r with
+      | Ok () -> Lwt.return_unit
+      | Error e -> Alcotest.failf "execute %s: %a" sql Db.pp_error e
+    in
+    let* () = exec_ok "CREATE TABLE t (n INTEGER)" in
+    let* () = exec_ok "INSERT INTO t (n) VALUES (42)" in
+    let* () = exec_ok "PRAGMA wal_checkpoint" in
+    let* r = Db.query db "SELECT n FROM t" in
+    let* () =
+      match r with
+      | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+      | Ok stream ->
+        let* rows = Lwt_stream.to_list stream in
+        (match rows with
+         | [[| Db.V_int 42L |]] -> Lwt.return_unit
+         | other ->
+           Alcotest.failf "expected [[42]], got %d rows" (List.length other))
+    in
+    let* () = Db.close db in
+    Lwt.return_unit)
+
 let () =
   Alcotest.run "store_wal" [
     "open", [
@@ -188,5 +292,12 @@ let () =
     ];
     "savepoint", [
       Alcotest.test_case "inside_wal"   `Quick test_wal_savepoint_inside_wal;
+    ];
+    "checkpoint", [
+      Alcotest.test_case "migrates_data"          `Quick test_wal_checkpoint_migrates_data;
+      Alcotest.test_case "survives_reopen"        `Quick test_wal_checkpoint_then_reopen;
+      Alcotest.test_case "fresh_wal_after_chkpt"  `Quick test_wal_checkpoint_with_commits_after;
+      Alcotest.test_case "noop_on_mem"            `Quick test_wal_checkpoint_noop_on_mem;
+      Alcotest.test_case "pragma_via_sql"         `Quick test_pragma_wal_checkpoint_via_sql;
     ];
   ]

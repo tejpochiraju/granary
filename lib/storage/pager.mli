@@ -84,6 +84,14 @@ val set_wal : t -> wal_callbacks option -> unit
 (** True iff a WAL hook is currently installed. *)
 val wal_mode : t -> bool
 
+(** Write a single page directly to the main-DB callback, bypassing the
+    WAL hook. Used by checkpointing. Does not sync. *)
+val flush_one_to_main :
+  t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t
+
+(** Sync the main-DB callback. Used at the end of checkpoint. *)
+val flush_sync_main : t -> (unit, error) result Lwt.t
+
 (** Opaque snapshot of the dirty page set, captured at a given moment.
     Used by Store.savepoint to roll back to an intermediate state without
     aborting the entire transaction. *)

@@ -69,4 +69,5 @@
 
 (test
  (name test_store_wal)
- (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.store sqlocaml.storage sqlocaml.catalog
+            alcotest lwt.unix unix))

@@ -241,3 +241,19 @@ let dirty_clone t = Hashtbl.copy t.dirty
 let dirty_restore t snap =
   Hashtbl.reset t.dirty;
   Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k v) snap
+
+let flush_one_to_main t ~page_id ~buf =
+  let open Lwt.Syntax in
+  let* r = t.write_page ~page_id buf in
+  match r with
+  | Ok () ->
+    Hashtbl.replace t.cache page_id (cstruct_dup buf);
+    Lwt.return_ok ()
+  | Error s -> Lwt.return_error (Block_error s)
+
+let flush_sync_main t =
+  let open Lwt.Syntax in
+  let* r = t.sync () in
+  match r with
+  | Ok () -> Lwt.return_ok ()
+  | Error s -> Lwt.return_error (Block_error s)

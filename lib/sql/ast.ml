@@ -388,6 +388,7 @@ and pragma_kind =
   | Pragma_user_version_set of int64    (* PRAGMA user_version = N → write *)
   | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
   | Pragma_integrity_check              (* PRAGMA integrity_check → errors or "ok" *)
+  | Pragma_wal_checkpoint               (* PRAGMA wal_checkpoint — migrate WAL → main *)
   | Pragma_set of string * string       (* fallback no-op setter *)
 
 and column_def = {

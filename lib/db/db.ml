@@ -98,6 +98,22 @@ let open_file ~path =
                  triggers; savepoint_names = []; auto_began = false;
                  last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
 
+let open_file_wal ~path =
+  let* result = S.open_file_wal ~path in
+  match result with
+  | Error e ->
+    let msg = Format.asprintf "%a" S.pp_error e in
+    Lwt.return (Error (Runtime msg))
+  | Ok store ->
+    let* catalog = Cat.open_ store in
+    let views = Hashtbl.create 4 in
+    let* () = load_views_into_hashtbl store views in
+    let triggers = Hashtbl.create 4 in
+    let* () = load_triggers_into_hashtbl store triggers in
+    Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
+                 triggers; savepoint_names = []; auto_began = false;
+                 last_changes = 0; last_insert_rowid = 0L; total_changes = 0; trigger_depth = 0 })
+
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
     : (t, error) result Lwt.t =

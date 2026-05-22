@@ -678,6 +678,9 @@ let rec plan ?cat = function
      | Ast.Pragma_defer_foreign_keys_set on ->
        Plan.Op_pragma_set_defer_fk { on }
 
+     | Ast.Pragma_wal_checkpoint ->
+       Plan.Op_pragma_wal_checkpoint
+
      | _ ->
        let rows = match kind with
          | Ast.Pragma_table_info table_name ->
@@ -740,7 +743,8 @@ let rec plan ?cat = function
          | Ast.Pragma_integrity_check
          | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _
          | Ast.Pragma_recursive_triggers | Ast.Pragma_recursive_triggers_set _
-         | Ast.Pragma_defer_foreign_keys | Ast.Pragma_defer_foreign_keys_set _ ->
+         | Ast.Pragma_defer_foreign_keys | Ast.Pragma_defer_foreign_keys_set _
+         | Ast.Pragma_wal_checkpoint ->
            assert false   (* handled by outer match above *)
        in
        Plan.Op_pragma_rows { rows })
