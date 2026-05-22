@@ -3786,6 +3786,31 @@ let phase35_snippet_parity_cases = [
     ];
     query = "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'the'";
     unordered = false };
+
+  (* Multi-token phrase: SQLite treats "quick brown" as one xPhraseSize=2
+     instance, so the highlighted window covers both tokens contiguously
+     and the centering uses (iLast - iFirst) = 2 rather than 1. See #142. *)
+  { name = "snippet_multi_token_phrase";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('the quick brown fox jumps over the lazy dog')";
+    ];
+    query =
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 5) FROM t WHERE t MATCH " ^
+      "'\"quick brown\"'";
+    unordered = false };
+
+  (* Phrase that appears twice — the repeat must be scored as +1 (same
+     phrase seen again), not as +1000+1 like our pre-fix behavior. *)
+  { name = "snippet_multi_token_phrase_repeated";
+    setup = [
+      "CREATE VIRTUAL TABLE t USING fts5(c)";
+      "INSERT INTO t VALUES('quick brown fox and another quick brown fox')";
+    ];
+    query =
+      "SELECT snippet(t, 0, '<b>', '</b>', '...', 6) FROM t WHERE t MATCH " ^
+      "'\"quick brown\"'";
+    unordered = false };
 ]
 
 (* ── runner ────────────────────────────────────────────────────── *)

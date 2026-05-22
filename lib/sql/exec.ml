@@ -4149,46 +4149,85 @@ let fts_query_terms query =
   in
   List.sort_uniq String.compare (collect query)
 
-(** Collect positive query terms paired with their match kind.
-    Exact terms match a token only on full string equality; Prefix terms
-    match any token whose lowercased value starts with the prefix.
-    Phrase terms decompose into a sequence of Exact terms (we treat each
-    word as its own phrase for snippet scoring, matching what our posting
-    list code already does). *)
-let fts_query_terms_with_kind query =
+(** A snippet phrase is the unit SQLite FTS5 reports via xPhraseSize:
+    either a single token (exact or prefix) or a multi-token exact
+    phrase. The multi-token form requires consecutive token matches
+    and is scored ONCE per occurrence (not once per constituent
+    token) to mirror SQLite's centering and bm25 behaviour. *)
+type snippet_phrase =
+  | SP_term   of string * [`Exact | `Prefix]
+  | SP_phrase of string list   (* length >= 2; all matched exactly *)
+
+(** Collect snippet phrases from a query in left-to-right order. *)
+let fts_query_terms_with_kind query : snippet_phrase list =
   let rec collect = function
-    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [(t, `Exact)]
-    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [(t, `Prefix)]
-    | Fts_query.FQ_term (Fts_query.FT_phrase ts) -> List.map (fun t -> (t, `Exact)) ts
+    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [SP_term (t, `Exact)]
+    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [SP_term (t, `Prefix)]
+    | Fts_query.FQ_term (Fts_query.FT_phrase ts) ->
+      (match ts with
+       | []   -> []
+       | [t]  -> [SP_term (t, `Exact)]
+       | _    -> [SP_phrase ts])
     | Fts_query.FQ_and qs | Fts_query.FQ_or qs   -> List.concat_map collect qs
     | Fts_query.FQ_not _                          -> []
   in
-  (* Deduplicate by (term, kind). *)
-  let cmp (t1, k1) (t2, k2) =
-    let c = String.compare t1 t2 in
-    if c <> 0 then c
-    else match k1, k2 with
-      | `Exact, `Exact | `Prefix, `Prefix -> 0
-      | `Exact, `Prefix -> -1
-      | `Prefix, `Exact -> 1
+  (* De-duplicate identical phrases (so a query like `foo AND foo` does
+     not over-credit token highlights). Preserve first-occurrence order. *)
+  let seen = Hashtbl.create 8 in
+  let key = function
+    | SP_term (t, `Exact)  -> "e:" ^ t
+    | SP_term (t, `Prefix) -> "p:" ^ t
+    | SP_phrase ts         -> "P:" ^ String.concat "\x00" ts
   in
-  List.sort_uniq cmp (collect query)
+  List.filter (fun p ->
+    let k = key p in
+    if Hashtbl.mem seen k then false
+    else (Hashtbl.add seen k (); true)) (collect query)
 
-(** Test whether a token term matches any phrase. Returns the phrase index
-    (0-based) of the first phrase that matches, or [None]. *)
-let token_phrase_idx ~(phrases : (string * [`Exact | `Prefix]) array) (term : string) : int option =
-  let n = Array.length phrases in
-  let rec loop i =
-    if i >= n then None
+(** Test whether the phrase at index [pi] matches the token sequence
+    starting at [tokens.(i)]. Returns the phrase length on hit (so the
+    caller can compute the end position), else [None]. *)
+let phrase_match_at
+    ~(phrases : snippet_phrase array)
+    ~(tokens  : Fts_tokenizer.token array)
+    (pi : int) (i : int) : int option =
+  let n_toks = Array.length tokens in
+  let token_at j = tokens.(j).Fts_tokenizer.term in
+  match phrases.(pi) with
+  | SP_term (t, `Exact) ->
+    if i < n_toks && String.equal (token_at i) t then Some 1 else None
+  | SP_term (t, `Prefix) ->
+    if i < n_toks then
+      let tk = token_at i in
+      if String.length tk >= String.length t
+         && String.equal (String.sub tk 0 (String.length t)) t
+      then Some 1 else None
+    else None
+  | SP_phrase ts ->
+    let len = List.length ts in
+    if i + len > n_toks then None
     else
-      let (t, k) = phrases.(i) in
-      let hit = match k with
-        | `Exact  -> String.equal term t
-        | `Prefix ->
-          String.length term >= String.length t
-          && String.equal (String.sub term 0 (String.length t)) t
+      let rec walk j = function
+        | []        -> true
+        | t :: rest ->
+          if String.equal (token_at (i + j)) t then walk (j + 1) rest
+          else false
       in
-      if hit then Some i else loop (i + 1)
+      if walk 0 ts then Some len else None
+
+(** Find the first phrase that matches at token position [i].
+    Returns [(phrase_idx, length)] if any. *)
+let token_phrase_match
+    ~(phrases : snippet_phrase array)
+    ~(tokens  : Fts_tokenizer.token array)
+    (i : int) : (int * int) option =
+  let n = Array.length phrases in
+  let rec loop pi =
+    if pi >= n then None
+    else
+      match phrase_match_at ~phrases ~tokens pi i with
+      | Some len -> Some (pi, len)
+      | None     -> loop (pi + 1)
   in
   loop 0
 
@@ -4226,26 +4265,29 @@ let fts_sentence_starts ~col_text ~(tokens : Fts_tokenizer.token array) : int ar
 
 (** Score a candidate window [i_pos, i_pos + n_token).
     Returns [(score, i_adj)] where:
-      - score = 1000 for each new phrase seen + 1 for repeats of seen phrases.
+      - score = 1000 for each new phrase instance seen + 1 for repeats.
       - i_adj = the actual starting position after centering adjustment,
                 clamped to [0, n_docsize - n_token] (or 0 if window > doc).
     [a_seen] is reset by the caller before each call.
-    [instances] is a sorted list of [(phrase_idx, position)]. *)
+    [instances] is a sorted list of [(phrase_idx, position, length)] —
+    a multi-token phrase counts as a single contiguous instance whose
+    extent spans [position, position + length). *)
 let fts_snippet_score
-    ~(instances : (int * int) list)
+    ~(instances : (int * int * int) list)
     ~(a_seen : bool array)
     ~(i_pos : int) ~(n_token : int) ~(n_docsize : int) : int * int =
   let i_end = i_pos + n_token in
   let score = ref 0 in
   let i_first = ref (-1) in
   let i_last  = ref 0 in
-  List.iter (fun (ip, io) ->
-    if io >= i_pos && io < i_end then begin
+  List.iter (fun (ip, io, len) ->
+    (* Phrase fully inside the window. SQLite requires the entire
+       phrase span to fit; partial overlaps don't count. *)
+    if io >= i_pos && io + len <= i_end then begin
       score := !score + (if a_seen.(ip) then 1 else 1000);
       a_seen.(ip) <- true;
       if !i_first < 0 then i_first := io;
-      (* phrase size is 1 token for our model; iLast = io + 1 *)
-      i_last := io + 1
+      i_last := io + len
     end
   ) instances;
   let i_adj =
@@ -4268,10 +4310,10 @@ let fts_snippet_score
         token for prefix matches) with [start_tag]/[end_tag].
       - Prepend [ellipsis] unless window starts at token 0.
       - Append [ellipsis] unless window covers through the last token.
-    [query_terms] is a list of [(term, kind)] pairs. *)
+    [query_terms] is a list of snippet phrases. *)
 let compute_snippet
     ~col_text
-    ~(query_terms : (string * [`Exact | `Prefix]) list)
+    ~(query_terms : snippet_phrase list)
     ~(spec : Plan.snippet_spec) =
   let tokens_list = Fts_tokenizer.tokenize_string ~col:0 col_text in
   let tokens = Array.of_list tokens_list in
@@ -4279,17 +4321,31 @@ let compute_snippet
   let phrases = Array.of_list query_terms in
   let n_phrases = Array.length phrases in
   let n_token = max 1 spec.Plan.n_tokens in
-  (* Build instance list: [(phrase_idx, position)] for each matching token,
-     in token order. *)
+  (* Build instance list: [(phrase_idx, position, length)] for each
+     matching token start, in token order. Greedy: at each position we
+     take the first phrase that matches and skip past its full length so
+     a multi-token phrase doesn't double-count its constituents. *)
   let instances =
     let acc = ref [] in
-    for i = n_toks - 1 downto 0 do
-      match token_phrase_idx ~phrases tokens.(i).Fts_tokenizer.term with
-      | None    -> ()
-      | Some ip -> acc := (ip, tokens.(i).Fts_tokenizer.pos) :: !acc
+    let i = ref 0 in
+    while !i < n_toks do
+      match token_phrase_match ~phrases ~tokens !i with
+      | None         -> incr i
+      | Some (ip, len) ->
+        acc := (ip, tokens.(!i).Fts_tokenizer.pos, len) :: !acc;
+        i := !i + len
     done;
-    !acc
+    List.rev !acc
   in
+  (* Mark each token position with the index of its covering instance
+     (not phrase index — instance index, so adjacent occurrences of the
+     same phrase emit separate wraps as SQLite does). -1 = unmatched. *)
+  let token_instance_at = Array.make (max 1 n_toks) (-1) in
+  List.iteri (fun inst_idx (_ip, io, len) ->
+    for k = 0 to len - 1 do
+      if io + k < n_toks then token_instance_at.(io + k) <- inst_idx
+    done
+  ) instances;
   if instances = [] || n_phrases = 0 then begin
     (* No matches: SQLite's snippet() degrades to highlighting nothing, but
        its window selection still anchors at sentence start 0 with score 120
@@ -4314,7 +4370,7 @@ let compute_snippet
         best_start := start_pos
       end
     in
-    List.iter (fun (_ip, io) ->
+    List.iter (fun (_ip, io, _len) ->
       (* Non-sentence-aligned: window anchored at this instance, centered. *)
       Array.fill a_seen 0 n_phrases false;
       let (score, i_adj) =
@@ -4350,25 +4406,33 @@ let compute_snippet
       let first_in_range = i_best_start in
       let last_in_range  = min (n_toks - 1) i_range_end in
       let prev_end = ref tokens.(first_in_range).Fts_tokenizer.start_byte in
+      let prev_inst = ref (-1) in
       for i = first_in_range to last_in_range do
         let tok = tokens.(i) in
-        if tok.Fts_tokenizer.start_byte > !prev_end then
-          Buffer.add_string buf
-            (String.sub col_text !prev_end
-               (tok.Fts_tokenizer.start_byte - !prev_end));
-        let raw =
-          String.sub col_text tok.Fts_tokenizer.start_byte
-            (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte)
+        let inst = token_instance_at.(i) in
+        let gap_len = tok.Fts_tokenizer.start_byte - !prev_end in
+        let gap =
+          if gap_len > 0 then String.sub col_text !prev_end gap_len else ""
         in
-        (match token_phrase_idx ~phrases tok.Fts_tokenizer.term with
-         | Some _ ->
-           Buffer.add_string buf spec.Plan.start_tag;
-           Buffer.add_string buf raw;
-           Buffer.add_string buf spec.Plan.end_tag
-         | None ->
-           Buffer.add_string buf raw);
-        prev_end := tok.Fts_tokenizer.end_byte
+        if !prev_inst <> inst then begin
+          (* Close the previous instance's wrap if any, emit gap outside,
+             then open a new wrap if entering a phrase instance. SQLite
+             treats whitespace between tokens of the same phrase as
+             internal to the wrap — kept in [gap] handling below. *)
+          if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
+          Buffer.add_string buf gap;
+          if inst >= 0 then Buffer.add_string buf spec.Plan.start_tag
+        end else
+          (* Same wrap state (both inside or both outside) — gap belongs
+             to the current state, e.g. the space inside <b>quick brown</b>. *)
+          Buffer.add_string buf gap;
+        Buffer.add_string buf
+          (String.sub col_text tok.Fts_tokenizer.start_byte
+             (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte));
+        prev_end := tok.Fts_tokenizer.end_byte;
+        prev_inst := inst
       done;
+      if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
       (* Trailing handling: if the claimed range_end reaches or exceeds the
          last token, append the rest of the source text; else append ellipsis. *)
       if i_range_end >= n_toks - 1 then begin
