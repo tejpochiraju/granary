@@ -321,9 +321,15 @@ and stmt =
   | S_release     of string  (** RELEASE name *)
   | S_rollback_to of string  (** ROLLBACK TO name *)
   | S_compound of {
-      op    : set_op;
-      left  : stmt;
-      right : stmt;
+      op     : set_op;
+      left   : stmt;
+      right  : stmt;
+      order  : order_key list;
+      (** ORDER BY applied to the combined result; empty if absent.
+          Parser lifts a trailing ORDER BY from the right arm so it
+          binds at the compound level (SQL semantics). *)
+      limit  : int option;
+      offset : int option;
     }
   | S_create_fts_table of {
       name    : string;

@@ -2417,8 +2417,10 @@ let bind_compound_nested () =
                             joins = []; where = None; group_by = []; having = None;
                             order = []; limit = None; offset = None } in
   (* ((sel UNION sel) UNION sel) — nested compound *)
-  let inner = Ast.S_compound { op = Ast.Union; left = sel; right = sel } in
-  let stmt  = Ast.S_compound { op = Ast.Union_all; left = inner; right = sel } in
+  let inner = Ast.S_compound { op = Ast.Union; left = sel; right = sel;
+                                order = []; limit = None; offset = None } in
+  let stmt  = Ast.S_compound { op = Ast.Union_all; left = inner; right = sel;
+                                order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_compound { op = Ast.Union_all; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok nested BS_compound"
@@ -2433,7 +2435,8 @@ let bind_compound_agg_select () =
     where = None; group_by = []; having = None; order = []; limit = None; offset = None;
   } in
   (* Two agg selects with 1 col each — should compound OK *)
-  let stmt = Ast.S_compound { op = Ast.Intersect; left = agg_sel; right = agg_sel } in
+  let stmt = Ast.S_compound { op = Ast.Intersect; left = agg_sel; right = agg_sel;
+                               order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_compound { op = Ast.Intersect; _ }) -> ()
   | _ -> Alcotest.fail "expected Ok for compound of agg selects"
@@ -3010,7 +3013,7 @@ let bind_compound_union_ok () =
                               table_alias = None;
                               joins = []; where = None; group_by = []; having = None;
                               order = []; limit = None; offset = None } in
-  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Ok (Sema.BS_compound { op = Ast.Union; _ }) -> ()
   | _ -> Alcotest.fail "expected BS_compound Union"
@@ -3030,7 +3033,7 @@ let bind_compound_col_mismatch () =
                               table_alias = None;
                               joins = []; where = None; group_by = []; having = None;
                               order = []; limit = None; offset = None } in
-  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Arity_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Arity_mismatch for compound column mismatch"
@@ -3045,7 +3048,7 @@ let bind_compound_left_error () =
                               table_alias = None;
                               joins = []; where = None; group_by = []; having = None;
                               order = []; limit = None; offset = None } in
-  let stmt = Ast.S_compound { op = Ast.Union; left; right } in
+  let stmt = Ast.S_compound { op = Ast.Union; left; right; order = []; limit = None; offset = None } in
   match bind cat stmt with
   | Error (Sema.Unknown_table _) -> ()
   | _ -> Alcotest.fail "expected Unknown_table for left side error in compound"

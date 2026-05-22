@@ -4453,8 +4453,8 @@ let rec substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.
       having = Option.map go_e r.having;
       joins  = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins;
     }
-  | Ast.S_compound { op; left; right } ->
-    Ast.S_compound { op; left = go_s left; right = go_s right }
+  | Ast.S_compound { op; left; right; order; limit; offset } ->
+    Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
   | Ast.S_with_cte { name; def; query; recursive } ->
     Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
   | _ -> s

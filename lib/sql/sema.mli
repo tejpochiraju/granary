@@ -222,9 +222,12 @@ type bound_stmt =
       action     : Ast.alter_action;
     }
   | BS_compound of {
-      op    : Ast.set_op;
-      left  : bound_stmt;
-      right : bound_stmt;
+      op     : Ast.set_op;
+      left   : bound_stmt;
+      right  : bound_stmt;
+      order  : bound_order_key list;
+      limit  : int option;
+      offset : int option;
     }
   | BS_const_select of {
       exprs : (bound_expr * string option) list;

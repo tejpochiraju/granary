@@ -12,6 +12,17 @@
   type table_item =
     | TI_col of column_def
     | TI_constraint of table_constraint
+
+  (* When a compound (UNION/UNION ALL/INTERSECT/EXCEPT) is built, any
+     trailing ORDER BY / LIMIT / OFFSET that the grammar swallowed into
+     the right-arm SELECT actually binds to the *combined* result.
+     Strip it from the right arm and surface it at the compound level. *)
+  let lift_compound_tail (right : Ast.stmt) =
+    match right with
+    | Ast.S_select s when s.order <> [] || s.limit <> None || s.offset <> None ->
+      let right' = Ast.S_select { s with order = []; limit = None; offset = None } in
+      (right', s.order, s.limit, s.offset)
+    | _ -> (right, [], None, None)
 %}
 
 %token <string> IDENT
@@ -619,13 +630,17 @@ insert_expr:
 compound_select:
   | s = select  { s }
   | left = compound_select UNION ALL right = select
-    { S_compound { op = Union_all; left; right } }
+    { let (right', order, limit, offset) = lift_compound_tail right in
+      S_compound { op = Union_all; left; right = right'; order; limit; offset } }
   | left = compound_select UNION right = select
-    { S_compound { op = Union; left; right } }
+    { let (right', order, limit, offset) = lift_compound_tail right in
+      S_compound { op = Union; left; right = right'; order; limit; offset } }
   | left = compound_select INTERSECT right = select
-    { S_compound { op = Intersect; left; right } }
+    { let (right', order, limit, offset) = lift_compound_tail right in
+      S_compound { op = Intersect; left; right = right'; order; limit; offset } }
   | left = compound_select EXCEPT right = select
-    { S_compound { op = Except; left; right } }
+    { let (right', order, limit, offset) = lift_compound_tail right in
+      S_compound { op = Except; left; right = right'; order; limit; offset } }
 
 select:
   | SELECT distinct = boption(DISTINCT) proj = projection ft = from_tail

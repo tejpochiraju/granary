@@ -611,14 +611,34 @@ let rec plan ?cat = function
     Plan.Op_fts_seq_scan { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
     Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets }
-  | Sema.BS_compound { op; left; right } ->
+  | Sema.BS_compound { op; left; right; order; limit; offset } ->
     let l = plan ?cat left in
     let r = plan ?cat right in
-    (match op with
+    let base = match op with
      | Ast.Union     -> Plan.Op_union     { all = false; left = l; right = r }
      | Ast.Union_all -> Plan.Op_union     { all = true;  left = l; right = r }
      | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
-     | Ast.Except    -> Plan.Op_except    { left = l; right = r })
+     | Ast.Except    -> Plan.Op_except    { left = l; right = r }
+    in
+    let sorted =
+      if order = [] then base
+      else
+        let keys = List.map (fun (bkey : Sema.bound_order_key) ->
+          let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+          let nulls = match bkey.nulls with
+            | Some `Nulls_first -> `Nulls_first
+            | Some `Nulls_last  -> `Nulls_last
+            | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+          in
+          (plan_expr bkey.key, dir, nulls)
+        ) order in
+        Plan.Op_sort { keys; child = base }
+    in
+    (match limit with
+     | None -> sorted
+     | Some n ->
+       let off = Option.value ~default:0 offset in
+       Plan.Op_limit { limit = n; offset = off; child = sorted })
   | Sema.BS_const_select { exprs } ->
     (match exprs with
      | [(Sema.BE_func (Ast.Fn_changes, []), _)] ->

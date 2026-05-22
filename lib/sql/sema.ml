@@ -213,9 +213,15 @@ type bound_stmt =
       action     : Ast.alter_action;
     }
   | BS_compound of {
-      op    : Ast.set_op;
-      left  : bound_stmt;
-      right : bound_stmt;
+      op     : Ast.set_op;
+      left   : bound_stmt;
+      right  : bound_stmt;
+      order  : bound_order_key list;
+      (** ORDER BY bound at the compound level (applied after the set op).
+          Bound against the leftmost-arm's table_meta — the common case
+          where both arms expose the same column names. *)
+      limit  : int option;
+      offset : int option;
     }
   | BS_const_select of {
       exprs : (bound_expr * string option) list;
@@ -2527,6 +2533,14 @@ let rec compound_col_count = function
   | BS_with_cte { query; recursive = _; _ } -> compound_col_count query
   | _ -> 0  (* non-select stmts in compound: don't validate *)
 
+(* Find the leftmost arm's table_meta. Used to bind compound-level ORDER BY
+   — column names in a compound come from the leftmost select. *)
+let rec leftmost_table_meta = function
+  | BS_select { table_meta; _ } -> Some table_meta
+  | BS_compound { left; _ } -> leftmost_table_meta left
+  | BS_with_cte { query; _ } -> leftmost_table_meta query
+  | _ -> None
+
 let rec col_names_of_bound_stmt bs =
   let n = compound_col_count bs in
   match bs with
@@ -2763,7 +2777,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
     (match r with
      | Error e -> Lwt.return (Error e)
      | Ok inner -> Lwt.return (Ok (BS_explain { analyze; inner })))
-  | Ast.S_compound { op; left; right } ->
+  | Ast.S_compound { op; left; right; order; limit; offset } ->
     let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in
     let* right_r = bind_internal ~views ~named_params ~param_counter cat right in
     (match left_r, right_r with
@@ -2773,7 +2787,26 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        if n_left <> n_right then
          Lwt.return (Error (Arity_mismatch { expected = n_left; got = n_right }))
        else
-         Lwt.return (Ok (BS_compound { op; left = l; right = r }))
+         (* Bind the compound-level ORDER BY against the leftmost arm's
+            table_meta — column names in a compound come from the leftmost
+            select per SQL convention. *)
+         let bound_order =
+           if order = [] then Ok []
+           else
+             match leftmost_table_meta l with
+             | Some meta ->
+               bind_order_keys ~param_counter ~named_params meta order
+             | None ->
+               (* No underlying table (e.g. const_select compound):
+                  treat as no order key. *)
+               Ok []
+         in
+         (match bound_order with
+          | Error e -> Lwt.return (Error e)
+          | Ok bo   ->
+            Lwt.return (Ok (BS_compound {
+              op; left = l; right = r;
+              order = bo; limit; offset })))
      | Error e, _
      | _, Error e   -> Lwt.return (Error e))
 
