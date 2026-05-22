@@ -7400,31 +7400,52 @@ let test_virtual_gen_default_is_virtual () =
   let rows = query_ok db "SELECT c FROM t" in
   Alcotest.check value_testable "c recomputed after UPDATE" (Db.V_int 14L) (List.hd rows).(0)
 
-let test_virtual_in_index_rejected () =
-  (* Phase 33 Task 4 review: CREATE INDEX on a VIRTUAL generated column must
-     be rejected at bind time. The in-memory write-path row has VIRTUAL
-     cells set to V_null, so the index would be keyed by NULL instead of
-     the recomputed value. *)
+let test_virtual_in_index_now_supported () =
+  (* Phase 35 Task 2: CREATE INDEX on a VIRTUAL generated column is now
+     supported. The exec write paths populate VIRTUAL cells into a scratch
+     row before extracting index keys, so the index is keyed by the
+     recomputed value rather than NULL. *)
   let db = fresh_db () in
   exec db
     "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
-  let result = run (Db.execute db "CREATE INDEX idx ON t(c)") in
-  Alcotest.(check bool) "CREATE INDEX on VIRTUAL rejected"
-    true (match result with Error _ -> true | Ok _ -> false)
+  exec db "CREATE INDEX idx_c ON t(c)";
+  exec db "INSERT INTO t(a, b) VALUES (1, 2), (3, 4), (10, 5)";
+  (* SELECT by virtual column should find rows via the index lookup. *)
+  let rows = query_ok db "SELECT a, b FROM t WHERE c = 7" in
+  Alcotest.(check int) "exactly one row matches c=7" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "a=3" (Db.V_int 3L) row.(0);
+  Alcotest.check value_testable "b=4" (Db.V_int 4L) row.(1);
+  let rows = query_ok db "SELECT a, b FROM t WHERE c = 15" in
+  Alcotest.(check int) "one row matches c=15" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "a=10" (Db.V_int 10L) row.(0);
+  Alcotest.check value_testable "b=5"  (Db.V_int 5L)  row.(1);
+  let rows = query_ok db "SELECT a FROM t WHERE c = 99" in
+  Alcotest.(check int) "no rows match c=99" 0 (List.length rows)
 
-let test_virtual_in_index_expr_rejected () =
-  (* The walk must also catch expression indexes that reference a VIRTUAL
-     column by name. *)
+let test_virtual_in_index_expr_now_supported () =
+  (* Expression indexes that reference a VIRTUAL column by name should also
+     work — the index expression is evaluated on the virtuals-populated
+     scratch row. *)
   let db = fresh_db () in
   exec db
     "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
-  let result = run (Db.execute db "CREATE INDEX idx ON t(c + 1)") in
-  Alcotest.(check bool) "CREATE INDEX on VIRTUAL expr rejected"
-    true (match result with Error _ -> true | Ok _ -> false)
+  exec db "CREATE INDEX idx_c1 ON t(c + 1)";
+  exec db "INSERT INTO t(a, b) VALUES (1, 2), (4, 5)";
+  let rows = query_ok db "SELECT a, b FROM t WHERE c + 1 = 4" in
+  Alcotest.(check int) "one row matches c+1=4" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "a=1" (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "b=2" (Db.V_int 2L) row.(1);
+  let rows = query_ok db "SELECT a, b FROM t WHERE c + 1 = 10" in
+  Alcotest.(check int) "one row matches c+1=10" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "a=4" (Db.V_int 4L) row.(0);
+  Alcotest.check value_testable "b=5" (Db.V_int 5L) row.(1)
 
 let test_stored_in_index_still_allowed () =
-  (* Regression: STORED generated columns must still be indexable — only
-     VIRTUAL is the problem. *)
+  (* Regression: STORED generated columns are still indexable. *)
   let db = fresh_db () in
   exec db
     "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)";
@@ -7432,17 +7453,73 @@ let test_stored_in_index_still_allowed () =
   Alcotest.(check bool) "CREATE INDEX on STORED still allowed"
     true (match result with Ok _ -> true | Error _ -> false)
 
-let test_virtual_in_check_rejected () =
-  (* CHECK that references a VIRTUAL generated column must be rejected at
-     CREATE TABLE time — the CHECK is evaluated on the in-memory row where
-     VIRTUAL cells are V_null. Column-level CHECKs are the only form the
-     parser supports today, so we attach the CHECK to a sibling column. *)
+let test_virtual_in_check_now_supported () =
+  (* Phase 35 Task 2: CHECK that references a VIRTUAL generated column is
+     now supported.  exec.ml evaluates the CHECK on a scratch row with
+     VIRTUAL cells populated. *)
   let db = fresh_db () in
-  let result = run (Db.execute db
+  exec db
     "CREATE TABLE t (a INT, b INT CHECK (c > 0), \
-     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)") in
-  Alcotest.(check bool) "CHECK on VIRTUAL rejected"
+     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  (* Row satisfying the CHECK (a + b > 0). *)
+  exec db "INSERT INTO t(a, b) VALUES (3, 4)";
+  let rows = query_ok db "SELECT a, b, c FROM t" in
+  Alcotest.(check int) "one row inserted" 1 (List.length rows);
+  let row = List.hd rows in
+  Alcotest.check value_testable "c=7" (Db.V_int 7L) row.(2);
+  (* Row violating the CHECK (a + b = 0). *)
+  let result = run (Db.execute db "INSERT INTO t(a, b) VALUES (-3, 3)") in
+  Alcotest.(check bool) "CHECK violation on virtual column rejected"
+    true (match result with Error _ -> true | Ok _ -> false);
+  (* Row violating the CHECK (a + b < 0). *)
+  let result = run (Db.execute db "INSERT INTO t(a, b) VALUES (-5, 1)") in
+  Alcotest.(check bool) "CHECK violation (negative) rejected"
     true (match result with Error _ -> true | Ok _ -> false)
+
+let test_virtual_in_index_update_underlying () =
+  (* Phase 35 Task 2: updating a base column that feeds a VIRTUAL column
+     must rewrite the index entry (delete old key, insert new key). *)
+  let db = fresh_db () in
+  exec db
+    "CREATE TABLE t (id INT, a INT, b INT, \
+     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "CREATE INDEX idx_c ON t(c)";
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 1, 2)";  (* c = 3 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (2, 5, 5)";  (* c = 10 *)
+  (* Before UPDATE: look up old value via index. *)
+  let rows = query_ok db "SELECT id FROM t WHERE c = 3" in
+  Alcotest.(check int) "row id=1 found via c=3" 1 (List.length rows);
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0);
+  (* UPDATE base column a, which changes c. *)
+  exec db "UPDATE t SET a = 100 WHERE id = 1";  (* c becomes 102 *)
+  (* Old index entry should be gone. *)
+  let rows = query_ok db "SELECT id FROM t WHERE c = 3" in
+  Alcotest.(check int) "old c=3 no longer found via index" 0 (List.length rows);
+  (* New index entry should exist. *)
+  let rows = query_ok db "SELECT id FROM t WHERE c = 102" in
+  Alcotest.(check int) "new c=102 found via index" 1 (List.length rows);
+  Alcotest.check value_testable "id=1 still" (Db.V_int 1L) (List.hd rows).(0);
+  (* Untouched row remains. *)
+  let rows = query_ok db "SELECT id FROM t WHERE c = 10" in
+  Alcotest.(check int) "row id=2 still found via c=10" 1 (List.length rows)
+
+let test_virtual_in_index_delete_drops_entry () =
+  (* Phase 35 Task 2: deleting a row must drop the corresponding index
+     entry on a VIRTUAL column. *)
+  let db = fresh_db () in
+  exec db
+    "CREATE TABLE t (id INT, a INT, b INT, \
+     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "CREATE INDEX idx_c ON t(c)";
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 2, 3)";  (* c = 5 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (2, 4, 4)";  (* c = 8 *)
+  let rows = query_ok db "SELECT id FROM t WHERE c = 5" in
+  Alcotest.(check int) "c=5 found before DELETE" 1 (List.length rows);
+  exec db "DELETE FROM t WHERE id = 1";
+  let rows = query_ok db "SELECT id FROM t WHERE c = 5" in
+  Alcotest.(check int) "c=5 not found after DELETE" 0 (List.length rows);
+  let rows = query_ok db "SELECT id FROM t WHERE c = 8" in
+  Alcotest.(check int) "c=8 still found" 1 (List.length rows)
 
 (* ── Phase 34 Task 1: PRAGMA recursive_triggers ───────────────── *)
 
@@ -8013,14 +8090,18 @@ let phase33_virtual_gen_tests = [
     `Quick test_virtual_gen_in_delete_where;
   Alcotest.test_case "virtual_default_keyword_omitted"
     `Quick test_virtual_gen_default_is_virtual;
-  Alcotest.test_case "virtual_in_index_rejected"
-    `Quick test_virtual_in_index_rejected;
-  Alcotest.test_case "virtual_in_index_expr_rejected"
-    `Quick test_virtual_in_index_expr_rejected;
+  Alcotest.test_case "virtual_in_index_now_supported"
+    `Quick test_virtual_in_index_now_supported;
+  Alcotest.test_case "virtual_in_index_expr_now_supported"
+    `Quick test_virtual_in_index_expr_now_supported;
   Alcotest.test_case "stored_in_index_still_allowed"
     `Quick test_stored_in_index_still_allowed;
-  Alcotest.test_case "virtual_in_check_rejected"
-    `Quick test_virtual_in_check_rejected;
+  Alcotest.test_case "virtual_in_check_now_supported"
+    `Quick test_virtual_in_check_now_supported;
+  Alcotest.test_case "virtual_in_index_update_underlying"
+    `Quick test_virtual_in_index_update_underlying;
+  Alcotest.test_case "virtual_in_index_delete_drops_entry"
+    `Quick test_virtual_in_index_delete_drops_entry;
 ]
 
 (* ------------------------------------------------------------------ *)

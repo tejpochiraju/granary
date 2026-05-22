@@ -3656,6 +3656,39 @@ let phase33_virtual_gen_cases = [
     unordered = false };
 ]
 
+(* Phase 35 Task 2: CREATE INDEX on a VIRTUAL generated column produces the
+   same query results as SQLite when looked up via the index. *)
+let phase35_virtual_index_cases = [
+  { name = "virtual_index_lookup_eq";
+    setup = [
+      "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "CREATE INDEX idx_c ON t(c)";
+      "INSERT INTO t(id, a, b) VALUES (1, 1, 2), (2, 3, 4), (3, 10, 5)";
+    ];
+    query = "SELECT id, a, b FROM t WHERE c = 7";
+    unordered = false };
+
+  { name = "virtual_index_update_underlying";
+    setup = [
+      "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "CREATE INDEX idx_c ON t(c)";
+      "INSERT INTO t(id, a, b) VALUES (1, 1, 2), (2, 5, 5)";
+      "UPDATE t SET a = 100 WHERE id = 1";
+    ];
+    query = "SELECT id FROM t WHERE c = 102";
+    unordered = false };
+
+  { name = "virtual_index_delete";
+    setup = [
+      "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+      "CREATE INDEX idx_c ON t(c)";
+      "INSERT INTO t(id, a, b) VALUES (1, 2, 3), (2, 4, 4)";
+      "DELETE FROM t WHERE id = 1";
+    ];
+    query = "SELECT id FROM t WHERE c = 5";
+    unordered = false };
+]
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -3710,4 +3743,5 @@ let () =
     "phase33_virtual_gen",     List.map make_test phase33_virtual_gen_cases;
     "phase34_master_fts",      List.map make_test phase34_master_fts_cases;
     "phase35_fk_deferrable",   List.map make_test phase35_fk_deferrable_cases;
+    "phase35_virtual_index",   List.map make_test phase35_virtual_index_cases;
   ]

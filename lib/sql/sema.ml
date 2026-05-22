@@ -949,52 +949,12 @@ let rec expr_has_window = function
 (* CREATE TABLE                                                         *)
 (* ------------------------------------------------------------------ *)
 
-(* Walk an [Ast.expr] and collect every column name referenced by name
-   ([E_col] / [E_tbl_col]). Used to reject CREATE INDEX or CHECK
-   expressions that touch a VIRTUAL generated column — those are stored
-   as NULL on the in-memory write-path row, so the index-maintenance and
-   CHECK-eval paths would see NULL instead of the recomputed value.
-   See Phase 33 Task 4 review. *)
-let rec expr_referenced_col_names : Ast.expr -> string list = function
-  | Ast.E_lit _ | Ast.E_param _ | Ast.E_match _
-  | Ast.E_subquery _ | Ast.E_exists _
-  | Ast.E_window _ | Ast.E_fts_snippet _ -> []
-  | Ast.E_col name -> [name]
-  | Ast.E_tbl_col (_, name) -> [name]
-  | Ast.E_binop (_, a, b) ->
-    expr_referenced_col_names a @ expr_referenced_col_names b
-  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e
-  | Ast.E_neg e | Ast.E_bitnot e -> expr_referenced_col_names e
-  | Ast.E_between (x, lo, hi) ->
-    expr_referenced_col_names x
-    @ expr_referenced_col_names lo
-    @ expr_referenced_col_names hi
-  | Ast.E_in (x, vals) ->
-    expr_referenced_col_names x
-    @ List.concat_map expr_referenced_col_names vals
-  | Ast.E_in_select (x, _) -> expr_referenced_col_names x
-  | Ast.E_agg (_, Some e) -> expr_referenced_col_names e
-  | Ast.E_agg (_, None) -> []
-  | Ast.E_func (_, args) -> List.concat_map expr_referenced_col_names args
-  | Ast.E_case { scrutinee; branches; else_ } ->
-    (match scrutinee with Some e -> expr_referenced_col_names e | None -> [])
-    @ List.concat_map (fun (c, r) ->
-        expr_referenced_col_names c @ expr_referenced_col_names r) branches
-    @ (match else_ with Some e -> expr_referenced_col_names e | None -> [])
-  | Ast.E_cast (e, _) -> expr_referenced_col_names e
-  | Ast.E_collate (e, _) -> expr_referenced_col_names e
-
-(* Given the columns of a table (as [Row.column list]) and an expression,
-   return [Some virt_col_name] if the expression references a VIRTUAL
-   generated column ([generated_as = Some (_, false)]) by name. *)
-let virtual_col_referenced_in_expr (cols : Row.column list) (e : Ast.expr) =
-  let names = expr_referenced_col_names e in
-  List.find_map (fun n ->
-    match List.find_opt (fun (c : Row.column) -> String.equal c.name n) cols with
-    | Some c when (match c.generated_as with Some (_, false) -> true | _ -> false) ->
-      Some c.name
-    | _ -> None
-  ) names
+(* Phase 33 helpers [expr_referenced_col_names] and
+   [virtual_col_referenced_in_expr] were removed in Phase 35 Task 2 once
+   the corresponding bind-time rejections of VIRTUAL generated columns in
+   CREATE INDEX / CHECK were lifted. The exec.ml index- and CHECK-write
+   paths now compute virtuals into a scratch row before key/expression
+   evaluation; see [with_computed_virtuals] in lib/sql/exec.ml. *)
 
 let bind_create cat ~name ~columns ~constraints ~if_not_exists =
   let* existing = Cat.find_table cat ~name in
@@ -1039,37 +999,10 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
       Lwt.return (Error (Unsupported
         (Printf.sprintf "CHECK constraint on column '%s' contains unsupported expression form (aggregates, subqueries, and parameters are not allowed)" col.name)))
     | None ->
-    (* Phase 33 Task 4 review: reject CHECK constraints that reference a
-       VIRTUAL generated column declared in the same table. The CHECK is
-       evaluated on the in-memory post-stored-compute row, where VIRTUAL
-       cells are V_null; the constraint would see NULL instead of the
-       recomputed value. Use a local [Row.column] view of the not-yet-
-       persisted [columns] so we can leverage [virtual_col_referenced_in_expr]. *)
-    let virtual_check_cols : Row.column list = List.map (fun (c : Ast.column_def) ->
-      Row.{ name = c.name;
-            ty = Row.Integer;            (* type not used by the check *)
-            not_null = false;
-            primary_key = false;
-            default = None;
-            check_sql = None;
-            generated_as = Option.map (fun (_, s) ->
-              ("", s = `Stored)) c.generated_as }
-    ) columns in
-    let check_virtual = List.find_map (fun (c : Ast.column_def) ->
-      match c.check with
-      | None -> None
-      | Some e ->
-        (match virtual_col_referenced_in_expr virtual_check_cols e with
-         | Some vname -> Some (c.name, vname)
-         | None -> None)
-    ) columns in
-    match check_virtual with
-    | Some (col_name, vname) ->
-      Lwt.return (Error (Unsupported
-        (Printf.sprintf
-          "CHECK constraint on column '%s' cannot reference VIRTUAL generated column '%s'"
-          col_name vname)))
-    | None ->
+    (* Phase 35 Task 2: CHECK constraints may reference VIRTUAL generated
+       columns. The exec.ml CHECK evaluation site computes virtuals into a
+       scratch row before evaluating the constraint, so they see the
+       up-to-date value rather than V_null. *)
       let ast_lit_to_dv : Ast.literal -> Row.default_value = function
         | Ast.L_int  n -> Row.DV_int n
         | Ast.L_text s -> Row.DV_text s
@@ -2250,22 +2183,10 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
     (match errors with
      | e :: _ -> Lwt.return (Error e)
      | [] ->
-       (* Phase 33 Task 4 review: reject indexes that reference a VIRTUAL
-          generated column. The on-disk encoding stores VIRTUAL cells as
-          NULL, and the in-memory write-path row also has them set to
-          V_null by [compute_stored_generated_cols]. Index maintenance
-          would therefore key by NULL instead of the recomputed value.
-          Conservatively fail at bind time until we plumb virtual recompute
-          through the index-write path. *)
-       let virt_in_index = List.find_map (fun col_ast ->
-         virtual_col_referenced_in_expr meta.Cat.columns col_ast
-       ) columns in
-       (match virt_in_index with
-        | Some vname ->
-          Lwt.return (Error (Unsupported (Printf.sprintf
-            "CREATE INDEX on VIRTUAL generated column '%s' is not supported"
-            vname)))
-        | None ->
+       (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
+          supported.  The exec.ml index-write paths recompute virtuals into
+          a scratch row before extracting index keys, so VIRTUAL cells
+          contribute their up-to-date value instead of NULL. *)
        (* Compute col_sqls and col_expr_flags from the original AST *)
        let col_sqls, col_expr_flags = List.split (List.map (fun col_ast ->
          match col_ast with
@@ -2306,7 +2227,7 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
                where_ast;
                unique;
                if_not_exists;
-             }))))))
+             })))))
 
 (* ------------------------------------------------------------------ *)
 (* UPDATE                                                               *)

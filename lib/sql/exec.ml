@@ -1276,6 +1276,37 @@ let has_virtual_cols (columns : Row.column list) : bool =
     match c.Row.generated_as with Some (_, false) -> true | _ -> false
   ) columns
 
+(** [with_computed_virtuals]: return a copy of [row] with any VIRTUAL
+    generated columns recomputed.  Used by the index-key extraction and
+    CHECK-evaluation write paths so that VIRTUAL cells contribute the
+    up-to-date value instead of [V_null].  Returns [row] unchanged when
+    the table has no virtual columns (the common case). *)
+let with_computed_virtuals
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    (meta : Cat.table_meta)
+    (row : Row.t) : Row.t =
+  if not (has_virtual_cols meta.Cat.columns) then row
+  else begin
+    let row' = Array.copy row in
+    compute_virtual_generated_cols clock params meta row';
+    row'
+  end
+
+(** Like [with_computed_virtuals] but takes a [(table_name, columns)] pair. *)
+let with_computed_virtuals_cols
+    (clock : (unit -> float) option)
+    (params : Row.value array)
+    ~(table_name : string)
+    (columns : Row.column list)
+    (row : Row.t) : Row.t =
+  if not (has_virtual_cols columns) then row
+  else begin
+    let row' = Array.copy row in
+    compute_virtual_generated_cols_cols clock params ~table_name columns row';
+    row'
+  end
+
 (** [decode_with_virtual]: like [Row.decode], but also recomputes any VIRTUAL
     generated columns in the schema. Skips the recompute when the table has
     no virtual cols (the common case). *)
@@ -1383,12 +1414,16 @@ let eval_check_constraints
     (params : Row.value array)
     (table_meta : Cat.table_meta)
     (row : Row.t) : unit =
+  (* Phase 35 Task 2: populate VIRTUAL generated columns into a scratch row
+     before evaluating CHECKs, so checks that reference a VIRTUAL column see
+     the up-to-date value instead of [V_null]. *)
+  let row_for_check = with_computed_virtuals clock params table_meta row in
   List.iteri (fun i (col : Row.column) ->
     match col.check_sql with
     | None -> ()
     | Some check_sql ->
       let check_plan = compile_check_expr table_meta.name i table_meta.columns check_sql in
-      let result = eval_expr clock params row check_plan in
+      let result = eval_expr clock params row_for_check check_plan in
       (* SQLite: NULL result -> passes (not a violation) *)
       if result <> Row.V_null && not (value_truthy result) then
         failwith (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name)
@@ -1998,14 +2033,18 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       (* Phase 1: check UNIQUE constraints BEFORE writing the row.
          Collect skip flag, list of conflicting rowids to delete, and
          the rowid to update in-place for UPSERT. *)
+      (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch
+         row before extracting index keys so that VIRTUAL cells contribute
+         the up-to-date value instead of NULL. *)
+      let row_for_idx = with_computed_virtuals clock params table_meta row in
       let* (skip, to_delete, upsert_rowid) =
         Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
           if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
-          else if not (row_matches_index_where clock params idx table_meta.columns row)
+          else if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
           then Lwt.return (skip, dels, upsert_rid)
           else begin
             let iks    = List.map row_value_to_index_value
-                           (get_index_key_values clock params idx table_meta.columns row) in
+                           (get_index_key_values clock params idx table_meta.columns row_for_idx) in
             let prefix =
               let buf = Buffer.create 32 in
               List.iter (fun ikv -> Buffer.add_bytes buf (Index_key.encode_value ikv)) iks;
@@ -2064,13 +2103,17 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            compute_stored_generated_cols clock params table_meta new_row;
            eval_check_constraints clock params table_meta new_row;
            let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
+           (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row
+              before extracting index keys. [old_row] was decoded via
+              [decode_with_virtual] so its VIRTUAL cells are already set. *)
+           let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
              let old_matches = row_matches_index_where clock params idx table_meta.columns old_row in
-             let new_matches = row_matches_index_where clock params idx table_meta.columns new_row in
+             let new_matches = row_matches_index_where clock params idx table_meta.columns new_row_for_idx in
              let old_iks = List.map row_value_to_index_value
                              (get_index_key_values clock params idx table_meta.columns old_row) in
              let new_iks = List.map row_value_to_index_value
-                             (get_index_key_values clock params idx table_meta.columns new_row) in
+                             (get_index_key_values clock params idx table_meta.columns new_row_for_idx) in
              let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
              let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
              let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
@@ -2127,11 +2170,13 @@ let execute_insert ?(mode = Auto) ?(params = [||])
           let bytes = Row.encode table_meta.columns row in
           let* () = S.put tx table_meta.tree_id key bytes in
           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-            if not (row_matches_index_where clock params idx table_meta.columns row)
+            (* Phase 35 Task 2: reuse the virtuals-populated scratch row
+               (computed once above for the UNIQUE check pass). *)
+            if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
             then Lwt.return_unit
             else begin
               let iks    = List.map row_value_to_index_value
-                             (get_index_key_values clock params idx table_meta.columns row) in
+                             (get_index_key_values clock params idx table_meta.columns row_for_idx) in
               let ikey   = Index_key.encode iks ~rowid in
               S.put tx idx.idx_tree_id ikey Bytes.empty
             end
@@ -2210,9 +2255,14 @@ let unique_violation_on_update
     ~(schema : Row.column list) : bool Lwt.t =
   (* For UNIQUE check we use the first value as the seek prefix.
      This is a conservative approach: we seek to the first key with the
-     matching first-column value, then compare the entire encoded key. *)
+     matching first-column value, then compare the entire encoded key.
+     Phase 35 Task 2: populate VIRTUAL gen cols on the new row so the
+     UNIQUE comparison keys reflect their computed value. *)
+  let new_row_for_idx =
+    with_computed_virtuals_cols None [||] ~table_name:idx.Cat.idx_table schema new_row
+  in
   let ik_values = List.map row_value_to_index_value
-                    (get_index_key_values None [||] idx schema new_row) in
+                    (get_index_key_values None [||] idx schema new_row_for_idx) in
   let full_key_no_rowid =
     (* Encode all values without rowid to use as a prefix for exact match *)
     let buf = Buffer.create 32 in
@@ -2421,12 +2471,14 @@ let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
   let rowid_key  = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
+  (* Phase 35 Task 2: ensure VIRTUAL gen cols are populated before key extraction. *)
+  let row_for_idx = with_computed_virtuals None [||] meta row in
   let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    if not (row_matches_index_where None [||] idx meta.Cat.columns row)
+    if not (row_matches_index_where None [||] idx meta.Cat.columns row_for_idx)
     then Lwt.return_unit
     else begin
       let iks      = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx meta.Cat.columns row) in
+                       (get_index_key_values None [||] idx meta.Cat.columns row_for_idx) in
       let old_ikey = Index_key.encode iks ~rowid in
       S.del tx idx.idx_tree_id old_ikey
     end
@@ -2457,12 +2509,16 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
     if not has_expr_col && not (List.mem col_idx col_is_plain) && not has_where
     then Lwt.return_unit
     else begin
-      let old_matches = row_matches_index_where None [||] idx schema row in
-      let new_matches = row_matches_index_where None [||] idx schema new_row in
+      (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row before
+         extracting index keys.  [row] was decoded with virtuals already. *)
+      let row_for_idx = with_computed_virtuals None [||] meta row in
+      let new_row_for_idx = with_computed_virtuals None [||] meta new_row in
+      let old_matches = row_matches_index_where None [||] idx schema row_for_idx in
+      let new_matches = row_matches_index_where None [||] idx schema new_row_for_idx in
       let old_iks  = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx schema row) in
+                       (get_index_key_values None [||] idx schema row_for_idx) in
       let new_iks  = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx schema new_row) in
+                       (get_index_key_values None [||] idx schema new_row_for_idx) in
       let old_ikey = Index_key.encode old_iks ~rowid in
       let new_ikey = Index_key.encode new_iks ~rowid in
       let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
@@ -2940,14 +2996,17 @@ let execute_update ?(mode = Auto) ?(params = [||])
             compute_stored_generated_cols clock params table_meta new_row;
             (* Evaluate CHECK constraints on the new row before writes. *)
             eval_check_constraints clock params table_meta new_row;
+            (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row
+               before checking UNIQUE on indexes that may include them. *)
+            let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
             Lwt_list.iter_s (fun (idx : Cat.index_info) ->
               if not idx.idx_unique then Lwt.return_unit
-              else if not (row_matches_index_where clock params idx schema new_row)
+              else if not (row_matches_index_where clock params idx schema new_row_for_idx)
               then Lwt.return_unit
               else begin
                 (* Only check if any of the indexed values actually changed *)
                 let old_vs = get_index_key_values clock params idx schema old_row in
-                let new_vs = get_index_key_values clock params idx schema new_row in
+                let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
                 let values_equal a b = match a, b with
                   | Row.V_null, Row.V_null     -> true
                   | Row.V_int  x, Row.V_int  y -> Int64.equal x y
@@ -3082,14 +3141,18 @@ let execute_update ?(mode = Auto) ?(params = [||])
                 ) child_refs
             in
             let key = Rowid.encode rowid in
+            (* Phase 35 Task 2: populate VIRTUAL gen cols on both rows
+               before extracting index keys. *)
+            let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
+            let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
             (* Update index entries: delete old, insert new. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              let old_matches = row_matches_index_where clock params idx schema old_row in
-              let new_matches = row_matches_index_where clock params idx schema new_row in
+              let old_matches = row_matches_index_where clock params idx schema old_row_for_idx in
+              let new_matches = row_matches_index_where clock params idx schema new_row_for_idx in
               let old_iks = List.map row_value_to_index_value
-                              (get_index_key_values clock params idx schema old_row) in
+                              (get_index_key_values clock params idx schema old_row_for_idx) in
               let new_iks = List.map row_value_to_index_value
-                              (get_index_key_values clock params idx schema new_row) in
+                              (get_index_key_values clock params idx schema new_row_for_idx) in
               let old_ikey = Index_key.encode old_iks ~rowid in
               let new_ikey = Index_key.encode new_iks ~rowid in
               let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
@@ -3370,13 +3433,16 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                 ) child_refs
             in
             let rowid_key = Rowid.encode rowid in
+            (* Phase 35 Task 2: populate VIRTUAL gen cols before extracting
+               index keys so DELETE drops the right index entries. *)
+            let row_for_idx = with_computed_virtuals clock params table_meta row in
             (* Remove index entries for this row. *)
             let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              if not (row_matches_index_where clock params idx schema row)
+              if not (row_matches_index_where clock params idx schema row_for_idx)
               then Lwt.return_unit
               else begin
                 let iks = List.map row_value_to_index_value
-                            (get_index_key_values clock params idx schema row) in
+                            (get_index_key_values clock params idx schema row_for_idx) in
                 let old_ikey = Index_key.encode iks ~rowid in
                 S.del tx idx.idx_tree_id old_ikey
               end
