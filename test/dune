@@ -54,3 +54,7 @@
  (name test_sqlite_corpus)
  (libraries sqlocaml alcotest lwt.unix unix)
  (deps (source_tree sqlite_corpus)))
+
+(test
+ (name test_parser_fuzz)
+ (libraries sqlocaml alcotest qcheck-core qcheck-alcotest lwt.unix unix))
