@@ -77,6 +77,7 @@ let test_injection_does_not_crash () =
                   (* CREATE TABLE itself tripped the fault — fine. *)
                   Lwt.return_unit
                 | Ok () ->
+                  let succeeded = ref 0 in
                   let rec loop i =
                     if i >= 200 then Lwt.return_unit
                     else
@@ -87,16 +88,27 @@ let test_injection_does_not_crash () =
                       in
                       let* r = exec_maybe db sql in
                       match r with
-                      | Ok () -> loop (i + 1)
+                      | Ok () -> incr succeeded; loop (i + 1)
                       | Error _ -> Lwt.return_unit
                   in
                   let* () = loop 0 in
                   (* Either the fault tripped, or every insert
-                     completed without tripping (fewer than 100
-                     underlying writes were performed).  Both outcomes
-                     are acceptable for the scaffold. *)
-                  let _ = FI.faulted handle in
-                  let _ = FI.writes_completed handle in
+                     completed without tripping (which would mean the
+                     fault budget exceeded total writes — should not
+                     happen with fail_after_writes=100 and 200 inserts
+                     of ~100 bytes each plus index updates). *)
+                  Alcotest.(check bool)
+                    "fault tripped or all 200 inserts completed"
+                    true
+                    (FI.faulted handle || !succeeded = 200);
+                  (* The meat: with 200 INSERTs * 100B payload + index
+                     updates we generate far more than 100 writes, so
+                     the fault must trip.  If this fails, the fault
+                     injector is not actually being exercised. *)
+                  Alcotest.(check bool)
+                    "fault should trip given 200 inserts of 100B each"
+                    true
+                    (FI.faulted handle);
                   Lwt.return_unit)
              (fun () ->
                 Lwt.catch
@@ -121,27 +133,38 @@ let test_reopen_after_fault () =
          let* () =
            match opened with
            | None -> Lwt.return_unit
-           | Some (db, _handle) ->
+           | Some (db, handle) ->
              Lwt.finalize
                (fun () ->
                   let* create_r =
                     exec_maybe db "CREATE TABLE t (n INTEGER)"
                   in
-                  match create_r with
-                  | Error _ -> Lwt.return_unit
-                  | Ok () ->
-                    let rec loop i =
-                      if i >= 50 then Lwt.return_unit
-                      else
-                        let* r =
-                          exec_maybe db
-                            (Printf.sprintf "INSERT INTO t VALUES (%d)" i)
-                        in
-                        match r with
-                        | Ok () -> loop (i + 1)
-                        | Error _ -> Lwt.return_unit
-                    in
-                    loop 0)
+                  let* () =
+                    match create_r with
+                    | Error _ -> Lwt.return_unit
+                    | Ok () ->
+                      let rec loop i =
+                        if i >= 50 then Lwt.return_unit
+                        else
+                          let* r =
+                            exec_maybe db
+                              (Printf.sprintf "INSERT INTO t VALUES (%d)" i)
+                          in
+                          match r with
+                          | Ok () -> loop (i + 1)
+                          | Error _ -> Lwt.return_unit
+                      in
+                      loop 0
+                  in
+                  (* With fail_after_writes=5 and 50 inserts (plus the
+                     CREATE TABLE that ran before), the fault must trip
+                     very early.  If it doesn't, the injector is not
+                     wired up correctly. *)
+                  Alcotest.(check bool)
+                    "fault tripped during 50 inserts"
+                    true
+                    (FI.faulted handle);
+                  Lwt.return_unit)
                (fun () ->
                   Lwt.catch
                     (fun () -> Db.close db)
