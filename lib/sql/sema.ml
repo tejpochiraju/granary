@@ -341,8 +341,11 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
      | None   -> Error (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
   | Ast.E_tbl_col (_tbl, name) ->
-    (* Phase 2 Task 1: single-table queries — ignore table qualifier.
-       Multi-table resolution arrives with JOIN support. *)
+    (* Single-table fallback: callers that own table_alias should prefer
+       [bind_expr_join] with a one-element [tables] so qualified column
+       refs go through the alias-aware path. Here we ignore the qualifier
+       (mirrors the original lenient behavior for code paths that don't
+       carry alias information — INSERT/UPDATE/DELETE/CHECK/DEFAULT). *)
     (match col_index meta.columns name with
      | None   -> Error (Unknown_column { table = meta.name; column = name })
      | Some i -> Ok (BE_col i))
@@ -631,8 +634,14 @@ let rec bind_expr_join
          Ok (BE_func (func, ok_args)))
   | Ast.E_match _ ->
     Error (Unsupported "MATCH in JOIN context")
-  | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
-    Error (Unsupported "subqueries are not supported in JOIN ON conditions")
+  | Ast.E_subquery inner ->
+    Ok (BE_subquery inner)
+  | Ast.E_exists inner ->
+    Ok (BE_exists inner)
+  | Ast.E_in_select (x, inner) ->
+    (match bind_expr_join ~param_counter ~named_params ~tables x with
+     | Error e -> Error e
+     | Ok bx   -> Ok (BE_in_select (bx, inner)))
   | Ast.E_case { scrutinee; branches; else_ } ->
     let scrutinee_result =
       match scrutinee with
@@ -1576,10 +1585,12 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
            (* Ordinary SELECT — keep behaviour identical to pre-Task-6,
               but also handle E_window via bind_ww. *)
            let bind_one e =
-             if joined_pairs = [] then
-               bind_expr ~param_counter ~named_params meta e
-             else
-               bind_expr_join ~param_counter ~named_params ~tables e
+             (* Always go through the alias-aware multi-table binder, even
+                for single-table queries — this ensures qualified column
+                refs like [a.id] only resolve when [a] is an in-scope table
+                or alias. Foreign qualifiers (e.g. correlated references
+                to an outer query) correctly fail with Unknown_table. *)
+             bind_expr_join ~param_counter ~named_params ~tables e
            in
            let windows_queue : window_sema Queue.t = Queue.create () in
            let rec bind_ww e =
@@ -1974,10 +1985,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
            | Error e -> Lwt.return (Error e)
            | Ok bound_joins ->
              let bind_combined e =
-               if joined_pairs = [] then
-                 bind_expr ~param_counter ~named_params meta e
-               else
-                 bind_expr_join ~param_counter ~named_params ~tables e
+               (* Alias-aware binder for both single-table and joined
+                  queries; see comment in [bind_one] above. *)
+               bind_expr_join ~param_counter ~named_params ~tables e
              in
              let where_result =
                match where with
@@ -2052,10 +2062,9 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
                 in
                 let bind_order_expr e =
                   let base_result =
-                    if joined_pairs = [] then
-                      bind_expr ~param_counter ~named_params meta e
-                    else
-                      bind_expr_join ~param_counter ~named_params ~tables e
+                    (* Alias-aware binder for both single-table and joined
+                       queries; see comment in [bind_one] above. *)
+                    bind_expr_join ~param_counter ~named_params ~tables e
                   in
                   match base_result with
                   | Ok _ -> base_result
