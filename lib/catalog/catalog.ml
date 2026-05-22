@@ -52,6 +52,17 @@ type fk_constraint = {
   fk_parent_cols  : string list;
   fk_on_delete    : fk_action;
   fk_on_update    : fk_action;
+  fk_deferrable   : bool;  (** false = IMMEDIATE (default), true = INITIALLY DEFERRED *)
+}
+
+type pending_fk_kind = [ `Insert | `Update | `Delete ]
+
+type pending_fk_check = {
+  pfk_kind    : pending_fk_kind;
+  pfk_table   : string;
+  pfk_rowid   : int64;
+  pfk_message : string;
+  pfk_recheck : unit -> bool Lwt.t;
 }
 
 type table_meta = {
@@ -88,6 +99,13 @@ type t = {
   fts : (string, fts_table_meta) Hashtbl.t;
   mutable fk_enforcement : bool;
   mutable recursive_triggers : bool;
+  mutable defer_fks_pragma : bool;
+    (** PRAGMA defer_foreign_keys — when ON, every FK enforcement site treats
+        the violation as deferred regardless of constraint definition.
+        Reset to false at every txn boundary by the db layer. *)
+  mutable pending_fk_checks : pending_fk_check list;
+    (** Queued deferred FK violations; drained at commit. The list is in
+        reverse insertion order; drain reverses again before returning. *)
 }
 
 (* ------------------------------------------------------------------ *)
@@ -646,6 +664,7 @@ let encode_fks fks =
       String.concat "," fk.fk_parent_cols;
       fk_action_to_string fk.fk_on_delete;
       fk_action_to_string fk.fk_on_update;
+      (if fk.fk_deferrable then "1" else "0");
     ]
   ) fks in
   Bytes.of_string (String.concat "\n" lines)
@@ -657,16 +676,28 @@ let decode_fks bytes =
     List.filter_map (fun line ->
       match String.split_on_char '\t' line with
       | [lc; pt; pc] ->
+        (* Legacy 3-field form (very old). *)
         Some { fk_local_cols  = String.split_on_char ',' lc;
                fk_parent_table = pt;
                fk_parent_cols  = String.split_on_char ',' pc;
-               fk_on_delete = FA_restrict; fk_on_update = FA_restrict }
+               fk_on_delete = FA_restrict; fk_on_update = FA_restrict;
+               fk_deferrable = false }
       | [lc; pt; pc; od; ou] ->
+        (* Pre-phase-35 5-field form: deferrable defaults false. *)
         Some { fk_local_cols  = String.split_on_char ',' lc;
                fk_parent_table = pt;
                fk_parent_cols  = String.split_on_char ',' pc;
                fk_on_delete = fk_action_of_string od;
-               fk_on_update = fk_action_of_string ou }
+               fk_on_update = fk_action_of_string ou;
+               fk_deferrable = false }
+      | [lc; pt; pc; od; ou; def] ->
+        (* Phase 35 6-field form. *)
+        Some { fk_local_cols  = String.split_on_char ',' lc;
+               fk_parent_table = pt;
+               fk_parent_cols  = String.split_on_char ',' pc;
+               fk_on_delete = fk_action_of_string od;
+               fk_on_update = fk_action_of_string ou;
+               fk_deferrable = (def = "1") }
       | _ -> None
     ) (String.split_on_char '\n' s)
 
@@ -707,7 +738,9 @@ let open_ store =
     Lwt.return_unit
   ) names in
   Lwt.return { store; cache; indexes; fts; fk_enforcement = false;
-               recursive_triggers = true }
+               recursive_triggers = true;
+               defer_fks_pragma = false;
+               pending_fk_checks = [] }
 
 (** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
 let next_user_tid t =
@@ -1136,3 +1169,21 @@ let set_fk_enforcement t v = t.fk_enforcement <- v
 
 let get_recursive_triggers t = t.recursive_triggers
 let set_recursive_triggers t v = t.recursive_triggers <- v
+
+let get_defer_fks_pragma t = t.defer_fks_pragma
+let set_defer_fks_pragma t v = t.defer_fks_pragma <- v
+
+let queue_pending_fk_check t check =
+  t.pending_fk_checks <- check :: t.pending_fk_checks
+
+let drain_pending_fk_checks t =
+  let pending = List.rev t.pending_fk_checks in
+  t.pending_fk_checks <- [];
+  pending
+
+let clear_pending_fk_checks t =
+  t.pending_fk_checks <- []
+
+let pending_fk_check_count t = List.length t.pending_fk_checks
+
+let store t = t.store

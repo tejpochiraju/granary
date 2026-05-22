@@ -1851,6 +1851,49 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     let* () = S.ro_end ro_tx in
     Lwt.return !found
 
+(** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
+    Returns true iff such a row exists.  Used both at INSERT/UPDATE time
+    (immediate FK enforcement) and at commit time (deferred re-check). *)
+let fk_parent_has_row store (parent_meta : Cat.table_meta)
+    ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
+  let* ro_tx = S.ro_begin store in
+  let* cur   = S.cursor_open ro_tx parent_meta.Cat.tree_id in
+  let _sr    = S.cursor_first cur in
+  let found  = ref false in
+  let rec scan () =
+    if !found then ()
+    else match S.cursor_next cur with
+    | None -> ()
+    | Some (_k, vbytes) ->
+      let row = decode_with_virtual None [||] parent_meta vbytes in
+      let ok = List.for_all2 (fun pi pv ->
+        compare_values row.(pi) pv = 0
+      ) parent_idxs parent_vals in
+      if ok then found := true
+      else scan ()
+  in
+  scan ();
+  S.cursor_close cur;
+  let* () = S.ro_end ro_tx in
+  Lwt.return !found
+
+(** Helper for FK enforcement: routes a violation either to the pending
+    queue (deferred) or raises immediately (immediate).  [recheck] is the
+    closure invoked at commit time; it must return true iff the violation
+    is still present. *)
+let fk_violation ~deferred (cat : Cat.t) ~kind ~table ~rowid ~msg ~recheck =
+  if deferred then begin
+    Cat.queue_pending_fk_check cat {
+      Cat.pfk_kind    = kind;
+      Cat.pfk_table   = table;
+      Cat.pfk_rowid   = rowid;
+      Cat.pfk_message = msg;
+      Cat.pfk_recheck = recheck;
+    };
+    Lwt.return_unit
+  end else
+    Lwt.fail_with msg
+
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
@@ -1877,12 +1920,15 @@ let execute_insert ?(mode = Auto) ?(params = [||])
   compute_stored_generated_cols clock params table_meta row;
   (* Evaluate CHECK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
-  (* Evaluate FK constraints before any writes. *)
+  (* Evaluate FK constraints before any writes.
+     If the constraint is DEFERRED (or PRAGMA defer_foreign_keys is on),
+     queue the recheck for commit time instead of raising immediately. *)
   let* () =
     let fks = table_meta.Cat.fk_constraints in
     if fks = [] || not (Cat.get_fk_enforcement cat) then Lwt.return_unit
     else
       Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
+        let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
         (* Collect the local values for all FK columns *)
         let local_idxs_opt = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
         if List.exists Option.is_none local_idxs_opt then
@@ -1906,29 +1952,35 @@ let execute_insert ?(mode = Auto) ?(params = [||])
                  "FOREIGN KEY: column not found in parent table '%s'"
                  fk.fk_parent_table)
              else begin
-               let* ro_tx = S.ro_begin store in
-               let* cur = S.cursor_open ro_tx parent_meta.Cat.tree_id in
-               let _sr = S.cursor_first cur in
-               let found = ref false in
-               let rec scan () =
-                 if !found then ()
-                 else match S.cursor_next cur with
-                 | None -> ()
-                 | Some (_k, vbytes) ->
-                   let parent_row = decode_with_virtual clock params parent_meta vbytes in
-                   let all_match = List.for_all2 (fun pi lv ->
-                     compare_values parent_row.(pi) lv = 0
-                   ) parent_idxs local_vals in
-                   if all_match then found := true
-                   else scan ()
+               let child_col_idxs = local_idxs in
+               let table_name = table_meta.Cat.name in
+               let parent_meta_name = parent_meta.Cat.name in
+               let msg = Printf.sprintf
+                 "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
+                 fk.fk_parent_table (String.concat ", " fk.fk_parent_cols)
                in
-               scan ();
-               S.cursor_close cur;
-               let* () = S.ro_end ro_tx in
-               if !found then Lwt.return_unit
-               else Lwt.fail_with (Printf.sprintf
-                      "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
-                      fk.fk_parent_table (String.concat ", " fk.fk_parent_cols))
+               (* Existence check: parent row matches local_vals? *)
+               let* found = fk_parent_has_row store parent_meta
+                              ~parent_idxs ~parent_vals:local_vals in
+               if found then Lwt.return_unit
+               else
+                 (* Recheck closure for deferred path: at commit, the row may have
+                    been deleted (resolved) or the parent may have been inserted. *)
+                 let recheck () =
+                   match Cat.find_table_cached cat ~name:table_name,
+                         Cat.find_table_cached cat ~name:parent_meta_name with
+                   | None, _ | _, None -> Lwt.return false
+                   | Some child_now, Some parent_now ->
+                     let* has_child = fk_child_has_ref_multi cat store child_now
+                                        ~child_col_idxs ~parent_vals:local_vals in
+                     if not has_child then Lwt.return false
+                     else
+                       let* has_parent = fk_parent_has_row store parent_now
+                                           ~parent_idxs ~parent_vals:local_vals in
+                       Lwt.return (not has_parent)
+                 in
+                 fk_violation ~deferred:is_deferred cat ~kind:`Insert
+                   ~table:table_name ~rowid:0L ~msg ~recheck
              end)
       ) fks
   in
@@ -2452,16 +2504,46 @@ let rec cascade_delete_row_in_tx tx (cat : Cat.t)
           let child_col_idxs = List.filter_map Fun.id child_col_idxs_opt in
           (match fk.Cat.fk_on_delete with
            | Cat.FA_restrict | Cat.FA_no_action ->
+             let is_deferred = fk.Cat.fk_deferrable || Cat.get_defer_fks_pragma cat in
              let* child_rows =
                scan_child_rows_multi_tx cat tx child_meta
                  ~child_col_idxs ~parent_vals
              in
              if child_rows <> [] then
-               Lwt.fail_with (Printf.sprintf
+               let msg = Printf.sprintf
                  "FOREIGN KEY constraint failed: '%s.%s' is still \
                   referenced by '%s.%s'"
                  meta.Cat.name (String.concat "," fk.Cat.fk_parent_cols)
-                 child_meta.Cat.name (String.concat "," fk.Cat.fk_local_cols))
+                 child_meta.Cat.name (String.concat "," fk.Cat.fk_local_cols)
+               in
+               let parent_meta_name = meta.Cat.name in
+               let child_meta_name = child_meta.Cat.name in
+               let parent_cols_copy = fk.Cat.fk_parent_cols in
+               let child_cols_copy = fk.Cat.fk_local_cols in
+               let store = Cat.store cat in
+               let recheck () =
+                 match Cat.find_table_cached cat ~name:child_meta_name,
+                       Cat.find_table_cached cat ~name:parent_meta_name with
+                 | None, _ | _, None -> Lwt.return false
+                 | Some child_now, Some parent_now ->
+                   let cci = List.filter_map
+                     (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
+                   let pci = List.filter_map
+                     (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
+                   if List.length cci <> List.length child_cols_copy
+                      || List.length pci <> List.length parent_cols_copy
+                   then Lwt.return false
+                   else
+                     let* has_child = fk_child_has_ref_multi cat store child_now
+                                        ~child_col_idxs:cci ~parent_vals in
+                     if not has_child then Lwt.return false
+                     else
+                       let* has_parent = fk_parent_has_row store parent_now
+                                           ~parent_idxs:pci ~parent_vals in
+                       Lwt.return (not has_parent)
+               in
+               fk_violation ~deferred:is_deferred cat ~kind:`Delete
+                 ~table:parent_meta_name ~rowid ~msg ~recheck
              else Lwt.return_unit
            | Cat.FA_cascade ->
              let* child_rows =
@@ -2761,7 +2843,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
     let* () =
       if child_refs = [] then Lwt.return_unit
       else
-        Lwt_list.iter_s (fun (_rowid, old_row) ->
+        Lwt_list.iter_s (fun (rowid_outer, old_row) ->
           let new_row = Array.copy old_row in
           List.iter (fun (i, expr) ->
             new_row.(i) <- eval_expr clock params old_row expr
@@ -2771,6 +2853,7 @@ let execute_update ?(mode = Auto) ?(params = [||])
               match fk.fk_on_update with
               | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
               | Cat.FA_restrict | Cat.FA_no_action ->
+                let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
                 let parent_col_idxs = List.map
                   (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
                   fk.fk_parent_cols
@@ -2788,10 +2871,42 @@ let execute_update ?(mode = Auto) ?(params = [||])
                   let* has_ref = fk_child_has_ref_multi cat store child_meta
                     ~child_col_idxs ~parent_vals:old_vals in
                   if has_ref then
-                    Lwt.fail_with (Printf.sprintf
+                    let msg = Printf.sprintf
                       "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
                       table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-                      child_meta.Cat.name (String.concat "," fk.fk_local_cols))
+                      child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+                    in
+                    let parent_meta_name = table_meta.Cat.name in
+                    let child_meta_name = child_meta.Cat.name in
+                    let parent_cols_copy = fk.fk_parent_cols in
+                    let child_cols_copy = fk.fk_local_cols in
+                    let captured_old_vals = old_vals in
+                    let store2 = Cat.store cat in
+                    let recheck () =
+                      match Cat.find_table_cached cat ~name:child_meta_name,
+                            Cat.find_table_cached cat ~name:parent_meta_name with
+                      | None, _ | _, None -> Lwt.return false
+                      | Some child_now, Some parent_now ->
+                        let cci = List.filter_map
+                          (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
+                        let pci = List.filter_map
+                          (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
+                        if List.length cci <> List.length child_cols_copy
+                           || List.length pci <> List.length parent_cols_copy
+                        then Lwt.return false
+                        else
+                          let* has_child = fk_child_has_ref_multi cat store2 child_now
+                                             ~child_col_idxs:cci
+                                             ~parent_vals:captured_old_vals in
+                          if not has_child then Lwt.return false
+                          else
+                            let* has_parent = fk_parent_has_row store2 parent_now
+                                                ~parent_idxs:pci
+                                                ~parent_vals:captured_old_vals in
+                            Lwt.return (not has_parent)
+                    in
+                    fk_violation ~deferred:is_deferred cat ~kind:`Update
+                      ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
                   else Lwt.return_unit
                 end
             ) fks
@@ -3087,12 +3202,13 @@ let execute_delete ?(mode = Auto) ?(params = [||])
     let* () =
       if child_refs = [] then Lwt.return_unit
       else
-        Lwt_list.iter_s (fun (_rowid, row) ->
+        Lwt_list.iter_s (fun (rowid_outer, row) ->
           Lwt_list.iter_s (fun (child_meta, fks) ->
             Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
               match fk.fk_on_delete with
               | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
               | Cat.FA_restrict | Cat.FA_no_action ->
+                let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
                 let parent_col_idxs = List.map
                   (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
                   fk.fk_parent_cols
@@ -3107,10 +3223,42 @@ let execute_delete ?(mode = Auto) ?(params = [||])
                   let* has_ref = fk_child_has_ref_multi cat store child_meta
                     ~child_col_idxs ~parent_vals in
                   if has_ref then
-                    Lwt.fail_with (Printf.sprintf
+                    let msg = Printf.sprintf
                       "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
                       table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-                      child_meta.Cat.name (String.concat "," fk.fk_local_cols))
+                      child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+                    in
+                    let parent_meta_name = table_meta.Cat.name in
+                    let child_meta_name = child_meta.Cat.name in
+                    let parent_cols_copy = fk.fk_parent_cols in
+                    let child_cols_copy = fk.fk_local_cols in
+                    let captured_pv = parent_vals in
+                    let store2 = Cat.store cat in
+                    let recheck () =
+                      match Cat.find_table_cached cat ~name:child_meta_name,
+                            Cat.find_table_cached cat ~name:parent_meta_name with
+                      | None, _ | _, None -> Lwt.return false
+                      | Some child_now, Some parent_now ->
+                        let cci = List.filter_map
+                          (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
+                        let pci = List.filter_map
+                          (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
+                        if List.length cci <> List.length child_cols_copy
+                           || List.length pci <> List.length parent_cols_copy
+                        then Lwt.return false
+                        else
+                          let* has_child = fk_child_has_ref_multi cat store2 child_now
+                                             ~child_col_idxs:cci
+                                             ~parent_vals:captured_pv in
+                          if not has_child then Lwt.return false
+                          else
+                            let* has_parent = fk_parent_has_row store2 parent_now
+                                                ~parent_idxs:pci
+                                                ~parent_vals:captured_pv in
+                            Lwt.return (not has_parent)
+                    in
+                    fk_violation ~deferred:is_deferred cat ~kind:`Delete
+                      ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
                   else Lwt.return_unit
                 end
             ) fks
@@ -3343,6 +3491,9 @@ let op_name = function
     "Pragma(get_recursive_triggers)"
   | Plan.Op_pragma_set_recursive_triggers { on } ->
     Printf.sprintf "Pragma(set_recursive_triggers=%b)" on
+  | Plan.Op_pragma_get_defer_fk        -> "Pragma(get_defer_foreign_keys)"
+  | Plan.Op_pragma_set_defer_fk { on } ->
+    Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
@@ -3429,9 +3580,9 @@ let execute_with_count ?(mode = Auto)
       let* () =
         if fk_constraints = [] then Lwt.return_unit
         else begin
-          let fk_list = List.map (fun (lcs, pt, pcs, od, ou) ->
+          let fk_list = List.map (fun (lcs, pt, pcs, od, ou, def) ->
             Cat.{ fk_local_cols = lcs; fk_parent_table = pt; fk_parent_cols = pcs;
-                  fk_on_delete = od; fk_on_update = ou }
+                  fk_on_delete = od; fk_on_update = ou; fk_deferrable = def }
           ) fk_constraints in
           let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
           Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
@@ -3621,7 +3772,7 @@ let execute_with_count ?(mode = Auto)
         | Ok () ->
           (match col_def.Ast.fk_ref with
            | None -> Lwt.return 0
-           | Some (parent_table, parent_col, ast_od, ast_ou) ->
+           | Some (parent_table, parent_col, ast_od, ast_ou, ast_def) ->
              let inferred_parent_col =
                if parent_col = "" then
                  (match Cat.find_table_cached cat ~name:parent_table with
@@ -3638,6 +3789,7 @@ let execute_with_count ?(mode = Auto)
                Cat.fk_parent_cols  = [inferred_parent_col];
                Cat.fk_on_delete    = ast_od;
                Cat.fk_on_update    = ast_ou;
+               Cat.fk_deferrable   = ast_def;
              } in
              let existing_fks =
                match Cat.find_table_cached cat ~name:table_meta.Cat.name with
@@ -3747,6 +3899,9 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_set_recursive_triggers { on } ->
     Cat.set_recursive_triggers cat on;
     Lwt.return 0
+  | Plan.Op_pragma_set_defer_fk { on } ->
+    Cat.set_defer_fks_pragma cat on;
+    Lwt.return 0
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -3757,6 +3912,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
+  | Plan.Op_pragma_get_defer_fk
   | Plan.Op_changes | Plan.Op_last_insert_rowid | Plan.Op_total_changes ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
@@ -4987,6 +5143,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | Some cat -> Cat.get_recursive_triggers cat
     in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
+  | Plan.Op_pragma_get_defer_fk ->
+    let v = match cat with
+      | None     -> false
+      | Some cat -> Cat.get_defer_fks_pragma cat
+    in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check ->
     let cat_val = match cat with
       | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
@@ -5369,6 +5531,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | Plan.Op_pragma_set_user_version _
           | Plan.Op_pragma_set_fk _
           | Plan.Op_pragma_set_recursive_triggers _
+          | Plan.Op_pragma_set_defer_fk _
           | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
           | Plan.Op_create_fts_table _ -> true
           | _ -> false
@@ -5404,7 +5567,8 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
   | Plan.Op_pragma_set_user_version _
   | Plan.Op_pragma_set_fk _
-  | Plan.Op_pragma_set_recursive_triggers _ ->
+  | Plan.Op_pragma_set_recursive_triggers _
+  | Plan.Op_pragma_set_defer_fk _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"

@@ -101,8 +101,8 @@ type bound_stmt =
       columns        : Row.column list;
       uniq_idxs      : (string * string list) list;
       if_not_exists  : bool;
-      fk_constraints : (string list * string * string list * Cat.fk_action * Cat.fk_action) list;
-        (** [(local_cols, parent_table, parent_cols, on_delete, on_update)] *)
+      fk_constraints : (string list * string * string list * Cat.fk_action * Cat.fk_action * bool) list;
+        (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -1136,7 +1136,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Ok fks ->
             (match cd.Ast.fk_ref with
              | None -> Ok fks
-             | Some (parent_table, "", od, ou) ->
+             | Some (parent_table, "", od, ou, def) ->
                (match Cat.find_table_cached cat ~name:parent_table with
                 | None ->
                   Error (Unsupported (Printf.sprintf
@@ -1150,9 +1150,9 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
                        "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer column"
                        cd.Ast.name parent_table))
                    | Some pk_col ->
-                     Ok (fks @ [([cd.Ast.name], parent_table, [pk_col.name], od, ou)])))
-             | Some (parent_table, parent_col, od, ou) ->
-               Ok (fks @ [([cd.Ast.name], parent_table, [parent_col], od, ou)]))
+                     Ok (fks @ [([cd.Ast.name], parent_table, [pk_col.name], od, ou, def)])))
+             | Some (parent_table, parent_col, od, ou, def) ->
+               Ok (fks @ [([cd.Ast.name], parent_table, [parent_col], od, ou, def)]))
         ) (Ok []) columns
       in
       (match col_fks_result with
@@ -1165,8 +1165,8 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
           | Error _ as e -> e
           | Ok fks ->
             (match c with
-             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update } ->
-               Ok (fks @ [(local_cols, parent_table, parent_cols, on_delete, on_update)])
+             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update; deferrable } ->
+               Ok (fks @ [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)])
              | _ -> Ok fks)
         ) (Ok []) constraints
       in
@@ -2489,7 +2489,7 @@ let bind_alter_table cat ~table ~action =
        else
          (match col_def.Ast.fk_ref with
           | None -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
-          | Some (parent_table, parent_col, _od, _ou) ->
+          | Some (parent_table, parent_col, _od, _ou, _def) ->
             (match Cat.find_table_cached cat ~name:parent_table with
              | None ->
                Lwt.return (Error (Unsupported

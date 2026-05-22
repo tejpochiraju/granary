@@ -150,6 +150,7 @@ type table_constraint =
       parent_cols  : string list;
       on_delete    : fk_action;
       on_update    : fk_action;
+      deferrable   : bool;
     }  (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) ON DELETE/UPDATE action *)
 
 (** Expressions, statements, and column_def are mutually recursive because
@@ -375,6 +376,8 @@ and pragma_kind =
   | Pragma_foreign_keys_set of bool    (* PRAGMA foreign_keys = 0/1 → set flag *)
   | Pragma_recursive_triggers              (* PRAGMA recursive_triggers   → read flag *)
   | Pragma_recursive_triggers_set of bool  (* PRAGMA recursive_triggers = 0/1 → set *)
+  | Pragma_defer_foreign_keys              (* PRAGMA defer_foreign_keys   → read flag *)
+  | Pragma_defer_foreign_keys_set of bool  (* PRAGMA defer_foreign_keys = 0/1 → set *)
   | Pragma_user_version                 (* PRAGMA user_version  → read from meta *)
   | Pragma_user_version_set of int64    (* PRAGMA user_version = N → write *)
   | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
@@ -388,8 +391,8 @@ and column_def = {
   primary_key  : bool;
   default      : literal option;  (* None = no DEFAULT *)
   check        : expr option;     (* None = no CHECK constraint *)
-  fk_ref       : (string * string * fk_action * fk_action) option;
-  (** [(parent_table, parent_col, on_delete, on_update)]. None = no FK. *)
+  fk_ref       : (string * string * fk_action * fk_action * bool) option;
+  (** [(parent_table, parent_col, on_delete, on_update, deferrable)]. None = no FK. *)
   generated_as : (expr * [`Stored | `Virtual]) option;
   (** GENERATED ALWAYS AS (expr) [STORED | VIRTUAL]. None = not generated. *)
 }

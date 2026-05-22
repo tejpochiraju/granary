@@ -58,8 +58,8 @@ type op =
       columns        : Sqlocaml_encoding.Row.column list;
       uniq_idxs      : (string * string list) list;
       if_not_exists  : bool;
-      fk_constraints : (string list * string * string list * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action) list;
-        (** [(local_cols, parent_table, parent_cols, on_delete, on_update)] *)
+      fk_constraints : (string list * string * string list * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action * bool) list;
+        (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
     }
   | Op_insert of {
       table_meta    : Cat.table_meta;
@@ -231,6 +231,10 @@ type op =
     (** Read recursive_triggers flag from catalog; returns one row [[V_int 0|1]]. *)
   | Op_pragma_set_recursive_triggers of { on : bool }
     (** Write recursive_triggers flag to catalog; DDL-like, returns 0 rows. *)
+  | Op_pragma_get_defer_fk
+    (** Read defer_foreign_keys flag from catalog; returns one row [[V_int 0|1]]. *)
+  | Op_pragma_set_defer_fk of { on : bool }
+    (** Write defer_foreign_keys flag to catalog; DDL-like, returns 0 rows. *)
   | Op_distinct of {
       child : op;
     }

@@ -3296,6 +3296,50 @@ let phase30_sqlite_master_cases = [
     unordered = false };
 ]
 
+let phase35_fk_deferrable_cases = [
+  { name = "deferred_child_before_parent_commits";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE par35 (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi35 (id INTEGER PRIMARY KEY, pid INTEGER \
+        REFERENCES par35(id) DEFERRABLE INITIALLY DEFERRED)";
+      "BEGIN";
+      "INSERT INTO chi35 VALUES (10, 1)";
+      "INSERT INTO par35 VALUES (1)";
+      "COMMIT";
+    ];
+    query = "SELECT (SELECT COUNT(*) FROM par35) || ',' || (SELECT COUNT(*) FROM chi35)";
+    unordered = false };
+
+  { name = "pragma_defer_foreign_keys_overrides";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE par35b (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi35b (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES par35b(id))";
+      "BEGIN";
+      "PRAGMA defer_foreign_keys = 1";
+      "INSERT INTO chi35b VALUES (10, 5)";
+      "INSERT INTO par35b VALUES (5)";
+      "COMMIT";
+    ];
+    query = "SELECT COUNT(*) FROM chi35b";
+    unordered = false };
+
+  { name = "deferred_resolved_by_child_delete";
+    setup = [
+      "PRAGMA foreign_keys = 1";
+      "CREATE TABLE par35c (id INTEGER PRIMARY KEY)";
+      "CREATE TABLE chi35c (id INTEGER PRIMARY KEY, pid INTEGER \
+        REFERENCES par35c(id) DEFERRABLE INITIALLY DEFERRED)";
+      "BEGIN";
+      "INSERT INTO chi35c VALUES (10, 99)";
+      "DELETE FROM chi35c WHERE id = 10";
+      "COMMIT";
+    ];
+    query = "SELECT COUNT(*) FROM chi35c";
+    unordered = false };
+]
+
 let phase34_master_fts_cases = [
   { name = "sqlite_master_lists_fts_as_table_type";
     setup = [ "CREATE VIRTUAL TABLE docs USING fts5(title, body)" ];
@@ -3665,4 +3709,5 @@ let () =
     "phase33_new_fns",         List.map make_test phase33_new_fn_cases;
     "phase33_virtual_gen",     List.map make_test phase33_virtual_gen_cases;
     "phase34_master_fts",      List.map make_test phase34_master_fts_cases;
+    "phase35_fk_deferrable",   List.map make_test phase35_fk_deferrable_cases;
   ]

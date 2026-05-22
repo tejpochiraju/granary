@@ -8023,6 +8023,320 @@ let phase33_virtual_gen_tests = [
     `Quick test_virtual_in_check_rejected;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Phase 35 — FK DEFERRABLE INITIALLY DEFERRED                          *)
+(* ------------------------------------------------------------------ *)
+
+let int_of_row = function
+  | [| Db.V_int n |] -> Int64.to_int n
+  | _ -> -1
+
+(* Inside a single explicit txn, insert child before parent, commit succeeds. *)
+let test_phase35_deferred_child_before_parent () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE d_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE d_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES d_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO d_chi VALUES (10, 1)" in  (* parent not yet inserted *)
+    let* () = exec_lwt "INSERT INTO d_par VALUES (1)" in
+    let* () = exec_lwt "COMMIT" in
+    let n_par = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM d_par")) in
+    let n_chi = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM d_chi")) in
+    Alcotest.(check int) "parent count" 1 n_par;
+    Alcotest.(check int) "child count"  1 n_chi;
+    Lwt.return_unit)
+
+(* If FK constraint is not deferred, the same INSERT-before-parent fails immediately. *)
+let test_phase35_immediate_still_rejects_at_insert () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE i_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE i_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES i_par(id))" in
+    let* () = exec_lwt "BEGIN" in
+    let* r = Db.execute db "INSERT INTO i_chi VALUES (10, 99)" in
+    (match r with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected immediate FK violation on INSERT");
+    let* _ = Db.execute db "ROLLBACK" in
+    Lwt.return_unit)
+
+(* Deferred FK still fails if violation persists at commit time. *)
+let test_phase35_deferred_still_violated_fails_at_commit () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE df_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE df_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES df_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO df_chi VALUES (10, 1)" in
+    let* r = Db.execute db "COMMIT" in
+    (match r with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected deferred FK violation at COMMIT");
+    Lwt.return_unit)
+
+(* If the child row is deleted before commit, the deferred violation drops. *)
+let test_phase35_deferred_resolved_by_delete () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE dr_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE dr_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES dr_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO dr_chi VALUES (10, 99)" in
+    let* () = exec_lwt "DELETE FROM dr_chi WHERE id = 10" in
+    let* () = exec_lwt "COMMIT" in
+    Alcotest.(check int) "child empty"  0
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM dr_chi")));
+    Lwt.return_unit)
+
+(* PRAGMA defer_foreign_keys = ON makes an IMMEDIATE constraint defer for the txn. *)
+let test_phase35_pragma_defer_foreign_keys () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE pd_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE pd_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES pd_par(id))" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "PRAGMA defer_foreign_keys = ON" in
+    let* () = exec_lwt "INSERT INTO pd_chi VALUES (10, 1)" in  (* would fail without pragma *)
+    let* () = exec_lwt "INSERT INTO pd_par VALUES (1)" in
+    let* () = exec_lwt "COMMIT" in
+    Alcotest.(check int) "child count" 1
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_chi")));
+    Alcotest.(check int) "parent count" 1
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_par")));
+    (* Verify PRAGMA is reset to OFF after txn ends. *)
+    let rows = query_ok db "PRAGMA defer_foreign_keys" in
+    Alcotest.(check int) "pragma resets to 0 after txn" 0
+      (int_of_row (List.hd rows));
+    Lwt.return_unit)
+
+(* Deferred INSERT of N children before parents within a txn commits cleanly. *)
+let test_phase35_multi_row_deferred () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE m_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE m_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES m_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO m_chi VALUES (10, 1)" in
+    let* () = exec_lwt "INSERT INTO m_chi VALUES (20, 2)" in
+    let* () = exec_lwt "INSERT INTO m_chi VALUES (30, 3)" in
+    let* () = exec_lwt "INSERT INTO m_par VALUES (1)" in
+    let* () = exec_lwt "INSERT INTO m_par VALUES (2)" in
+    let* () = exec_lwt "INSERT INTO m_par VALUES (3)" in
+    let* () = exec_lwt "COMMIT" in
+    Alcotest.(check int) "all children persisted" 3
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM m_chi")));
+    Lwt.return_unit)
+
+(* In autocommit mode, deferred FK still must enforce — behave like immediate. *)
+let test_phase35_autocommit_deferred_behaves_immediate () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE ac_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE ac_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES ac_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    (* No BEGIN: each INSERT is its own implicit txn. *)
+    let* r = Db.execute db "INSERT INTO ac_chi VALUES (10, 1)" in
+    (match r with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected immediate FK violation in autocommit");
+    Lwt.return_unit)
+
+(* Rollback clears pending deferred FK violations. *)
+let test_phase35_rollback_clears_pending () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE rb_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE rb_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES rb_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO rb_chi VALUES (10, 99)" in
+    let* () = exec_lwt "ROLLBACK" in
+    (* After ROLLBACK, the pending check is gone — next statement should succeed
+       even though the row that violated never got committed. *)
+    let* () = exec_lwt "INSERT INTO rb_par VALUES (1)" in
+    Alcotest.(check int) "parent inserted after rollback" 1
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM rb_par")));
+    Lwt.return_unit)
+
+(* DEFERRABLE INITIALLY IMMEDIATE is accepted but behaves IMMEDIATE. *)
+let test_phase35_initially_immediate_is_immediate () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE ii_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE ii_chi (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES ii_par(id) DEFERRABLE INITIALLY IMMEDIATE)" in
+    let* () = exec_lwt "BEGIN" in
+    let* r = Db.execute db "INSERT INTO ii_chi VALUES (10, 99)" in
+    (match r with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "INITIALLY IMMEDIATE should fail at insert");
+    let* _ = Db.execute db "ROLLBACK" in
+    Lwt.return_unit)
+
+(* Table-level FOREIGN KEY with DEFERRABLE INITIALLY DEFERRED. *)
+let test_phase35_table_level_deferred () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE tl_par (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE tl_chi (id INTEGER PRIMARY KEY, pid INTEGER, \
+       FOREIGN KEY (pid) REFERENCES tl_par(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "INSERT INTO tl_chi VALUES (1, 100)" in
+    let* () = exec_lwt "INSERT INTO tl_par VALUES (100)" in
+    let* () = exec_lwt "COMMIT" in
+    Alcotest.(check int) "child inserted" 1
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM tl_chi")));
+    Lwt.return_unit)
+
+(* Parent-side DELETE of referenced row: deferred RESTRICT permits temporary
+   violation iff the child row is also gone by commit. *)
+let test_phase35_deferred_parent_delete_with_child_delete () =
+  let db = fresh_db () in
+  run (
+    let exec_lwt sql =
+      let* r = Db.execute db sql in
+      (match r with
+       | Ok () -> ()
+       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+      Lwt.return_unit
+    in
+    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+    let* () = exec_lwt "CREATE TABLE pd_par2 (id INTEGER PRIMARY KEY)" in
+    let* () = exec_lwt
+      "CREATE TABLE pd_chi2 (id INTEGER PRIMARY KEY, pid INTEGER \
+       REFERENCES pd_par2(id) DEFERRABLE INITIALLY DEFERRED)" in
+    let* () = exec_lwt "INSERT INTO pd_par2 VALUES (1)" in
+    let* () = exec_lwt "INSERT INTO pd_chi2 VALUES (10, 1)" in
+    let* () = exec_lwt "BEGIN" in
+    let* () = exec_lwt "DELETE FROM pd_par2 WHERE id = 1" in  (* would fail under immediate *)
+    let* () = exec_lwt "DELETE FROM pd_chi2 WHERE id = 10" in
+    let* () = exec_lwt "COMMIT" in
+    Alcotest.(check int) "parent empty" 0
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_par2")));
+    Alcotest.(check int) "child empty" 0
+      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_chi2")));
+    Lwt.return_unit)
+
+let phase35_fk_deferrable_tests = [
+  Alcotest.test_case "deferred_child_before_parent"
+    `Quick test_phase35_deferred_child_before_parent;
+  Alcotest.test_case "immediate_still_rejects_at_insert"
+    `Quick test_phase35_immediate_still_rejects_at_insert;
+  Alcotest.test_case "deferred_still_violated_fails_at_commit"
+    `Quick test_phase35_deferred_still_violated_fails_at_commit;
+  Alcotest.test_case "deferred_resolved_by_delete"
+    `Quick test_phase35_deferred_resolved_by_delete;
+  Alcotest.test_case "pragma_defer_foreign_keys_overrides_immediate"
+    `Quick test_phase35_pragma_defer_foreign_keys;
+  Alcotest.test_case "multi_row_deferred_commit_ok"
+    `Quick test_phase35_multi_row_deferred;
+  Alcotest.test_case "autocommit_deferred_behaves_immediate"
+    `Quick test_phase35_autocommit_deferred_behaves_immediate;
+  Alcotest.test_case "rollback_clears_pending_violation"
+    `Quick test_phase35_rollback_clears_pending;
+  Alcotest.test_case "deferrable_initially_immediate_acts_immediate"
+    `Quick test_phase35_initially_immediate_is_immediate;
+  Alcotest.test_case "table_level_foreign_key_deferred"
+    `Quick test_phase35_table_level_deferred;
+  Alcotest.test_case "deferred_parent_delete_resolved_by_child_delete"
+    `Quick test_phase35_deferred_parent_delete_with_child_delete;
+]
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -8681,4 +8995,5 @@ let () =
     "phase34_transitive_setnull", phase34_transitive_setnull_tests;
     "phase34_prepared_counters", phase34_prepared_counters_tests;
     "phase34_master_fts", phase34_master_fts_tests;
+    "phase35_fk_deferrable", phase35_fk_deferrable_tests;
   ]

@@ -6,7 +6,7 @@
     | Col_primary_key
     | Col_default of literal
     | Col_check   of expr
-    | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action
+    | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action * bool
     | Col_generated of expr * [`Stored | `Virtual]
 
   type table_item =
@@ -50,6 +50,7 @@
 %token TRIGGER BEFORE AFTER
 %token INSTEAD
 %token CASCADE RESTRICT
+%token DEFERRABLE INITIALLY DEFERRED IMMEDIATE
 %token OVER PARTITION RECURSIVE COLLATE
 %token PRECEDING FOLLOWING
 %token CHECK
@@ -121,6 +122,10 @@ any_ident:
   | BEGIN         { "begin" }
   | CASCADE       { "cascade" }
   | COLUMN        { "column" }
+  | DEFERRABLE    { "deferrable" }
+  | DEFERRED      { "deferred" }
+  | IMMEDIATE     { "immediate" }
+  | INITIALLY     { "initially" }
   | CONFLICT      { "conflict" }
   | DEFAULT       { "default" }
   | DO            { "do" }
@@ -251,6 +256,14 @@ pragma_stmt:
                    "PRAGMA recursive_triggers = %s: expected 0/1/on/off" value)
         in
         Ast.S_pragma (Ast.Pragma_recursive_triggers_set on)
+      | "defer_foreign_keys" ->
+        let on = match String.lowercase_ascii value with
+          | "1" | "on" | "true" -> true
+          | "0" | "off" | "false" -> false
+          | _ -> failwith (Printf.sprintf
+                   "PRAGMA defer_foreign_keys = %s: expected 0/1/on/off" value)
+        in
+        Ast.S_pragma (Ast.Pragma_defer_foreign_keys_set on)
       | _ -> Ast.S_pragma (Ast.Pragma_set (name, value)) }
 
   (* Bare getter form: PRAGMA name — new in Phase 26 *)
@@ -258,6 +271,7 @@ pragma_stmt:
     { match String.lowercase_ascii name with
       | "foreign_keys"    -> Ast.S_pragma Ast.Pragma_foreign_keys
       | "recursive_triggers" -> Ast.S_pragma Ast.Pragma_recursive_triggers
+      | "defer_foreign_keys" -> Ast.S_pragma Ast.Pragma_defer_foreign_keys
       | "user_version"    -> Ast.S_pragma Ast.Pragma_user_version
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
@@ -345,6 +359,17 @@ fk_on_clauses:
   | ON UPDATE ou = fk_ref_action  { (Ast.FA_no_action, ou) }
   |                               { (Ast.FA_no_action, Ast.FA_no_action) }
 
+(* Optional DEFERRABLE clause after FK referential actions.
+   - [DEFERRABLE INITIALLY DEFERRED] = true; checks queued and verified at commit.
+   - [DEFERRABLE] (alone), [DEFERRABLE INITIALLY IMMEDIATE], [NOT DEFERRABLE],
+     and the absence of any clause all yield false (= IMMEDIATE). *)
+deferrable_clause:
+  |                                  { false }
+  | NOT DEFERRABLE                   { false }
+  | DEFERRABLE                       { false }
+  | DEFERRABLE INITIALLY DEFERRED    { true }
+  | DEFERRABLE INITIALLY IMMEDIATE   { false }
+
 alter_table:
   | ALTER TABLE table = any_ident ADD COLUMN col = column_def
     { Ast.S_alter_table { table; action = Ast.AA_add_column col } }
@@ -388,10 +413,10 @@ table_item:
     { TI_constraint (Ast.TC_primary_key cols) }
   | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       REFERENCES parent_table = any_ident LPAREN parent_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-      oc = fk_on_clauses
+      oc = fk_on_clauses deferrable = deferrable_clause
     { let (on_delete, on_update) = oc in
       TI_constraint (Ast.TC_foreign_key {
-        local_cols; parent_table; parent_cols; on_delete; on_update;
+        local_cols; parent_table; parent_cols; on_delete; on_update; deferrable;
       }) }
 
 create_table:
@@ -436,8 +461,8 @@ column_def:
           match c with Col_check e -> Some e | _ -> acc) None cs in
       let fk_ref      = List.fold_left (fun acc c ->
           match c with
-          | Col_fk_ref (t, col_opt, od, ou) ->
-            Some (t, Option.value ~default:"" col_opt, od, ou)
+          | Col_fk_ref (t, col_opt, od, ou, def) ->
+            Some (t, Option.value ~default:"" col_opt, od, ou, def)
           | _ -> acc) None cs in
       let generated_as = List.fold_left (fun acc c ->
           match c with Col_generated (e, s) -> Some (e, s) | _ -> acc) None cs in
@@ -454,10 +479,10 @@ column_constraint:
   | PRIMARY KEY           { Col_primary_key }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
-  | REFERENCES t = any_ident oc = fk_on_clauses
-    { let (od, ou) = oc in Col_fk_ref (t, None, od, ou) }
-  | REFERENCES t = any_ident LPAREN c = any_ident RPAREN oc = fk_on_clauses
-    { let (od, ou) = oc in Col_fk_ref (t, Some c, od, ou) }
+  | REFERENCES t = any_ident oc = fk_on_clauses deferrable = deferrable_clause
+    { let (od, ou) = oc in Col_fk_ref (t, None, od, ou, deferrable) }
+  | REFERENCES t = any_ident LPAREN c = any_ident RPAREN oc = fk_on_clauses deferrable = deferrable_clause
+    { let (od, ou) = oc in Col_fk_ref (t, Some c, od, ou, deferrable) }
   | gen = any_ident always = any_ident AS LPAREN e = expr RPAREN storage = generated_storage
     { if String.uppercase_ascii gen <> "GENERATED"
          || String.uppercase_ascii always <> "ALWAYS"

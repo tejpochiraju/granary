@@ -215,6 +215,10 @@ rule token = parse
       | "INSTEAD"      -> INSTEAD
       | "CASCADE"      -> CASCADE
       | "RESTRICT"     -> RESTRICT
+      | "DEFERRABLE"   -> DEFERRABLE
+      | "INITIALLY"    -> INITIALLY
+      | "DEFERRED"     -> DEFERRED
+      | "IMMEDIATE"    -> IMMEDIATE
       | "GROUP_CONCAT" -> GROUP_CONCAT
       | "STRING_AGG"   -> STRING_AGG
       | "EXPLAIN"  -> EXPLAIN

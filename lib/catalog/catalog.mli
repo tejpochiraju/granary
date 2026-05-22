@@ -17,6 +17,22 @@ type fk_constraint = {
   fk_parent_cols  : string list;
   fk_on_delete    : fk_action;
   fk_on_update    : fk_action;
+  fk_deferrable   : bool;  (** false = IMMEDIATE (default), true = INITIALLY DEFERRED *)
+}
+
+(** Kind of pending FK check (matched against current row state at commit). *)
+type pending_fk_kind = [ `Insert | `Update | `Delete ]
+
+(** A queued FK violation awaiting re-verification at commit. *)
+type pending_fk_check = {
+  pfk_kind    : pending_fk_kind;
+  pfk_table   : string;
+  pfk_rowid   : int64;
+  pfk_message : string;
+  pfk_recheck : unit -> bool Lwt.t;
+    (** Re-run the FK check. Returns true if STILL violated; false if the
+        violation has been resolved (e.g. parent row now exists, child row
+        now deleted, etc.). *)
 }
 
 type table_meta = {
@@ -239,3 +255,28 @@ val get_recursive_triggers : t -> bool
 
 (** Set the recursive-triggers flag (PRAGMA recursive_triggers = 0/1). *)
 val set_recursive_triggers : t -> bool -> unit
+
+(** Get the runtime PRAGMA defer_foreign_keys flag (default false). When ON
+    every FK enforcement site behaves as DEFERRED for the duration of the
+    transaction. SQLite resets this flag to OFF at every transaction end. *)
+val get_defer_fks_pragma : t -> bool
+
+(** Set the runtime PRAGMA defer_foreign_keys flag. *)
+val set_defer_fks_pragma : t -> bool -> unit
+
+(** Append a pending FK check to be drained at commit time. *)
+val queue_pending_fk_check : t -> pending_fk_check -> unit
+
+(** Return and clear the pending FK check list. *)
+val drain_pending_fk_checks : t -> pending_fk_check list
+
+(** Clear the pending FK check list without raising (used on rollback). *)
+val clear_pending_fk_checks : t -> unit
+
+(** Peek at the current pending FK check count (debugging/tests). *)
+val pending_fk_check_count : t -> int
+
+(** Underlying store handle. Exposed so subsystems (FK deferred rechecks)
+    can open their own RO snapshots without threading the store through
+    every function signature. *)
+val store : t -> Sqlocaml_store.Store.t
