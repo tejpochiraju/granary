@@ -58,3 +58,7 @@
 (test
  (name test_parser_fuzz)
  (libraries sqlocaml alcotest qcheck-core qcheck-alcotest lwt.unix unix))
+
+(test
+ (name test_crash_recovery)
+ (libraries sqlocaml sqlocaml.block alcotest lwt.unix unix))
