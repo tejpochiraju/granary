@@ -658,25 +658,33 @@ select:
         S_const_select { exprs } }
 
 from_tail:
-  | FROM table = any_ident tbl_alias = option(preceded(AS, any_ident))
+  | FROM table = any_ident tbl_alias = optional_table_alias
       js = join_clauses wh = where_opt
       gb = group_by_clause hv = having_clause ob = order_by_clause lim = limit_clause
     { let (limit, offset) = lim in
       Some (table, tbl_alias, js, wh, gb, hv, ob, limit, offset) }
   |   { None }
 
+(* Optional alias on a FROM table or JOIN target. SQL allows either
+   `AS name` or just `name`. The bare form uses plain IDENT (not
+   any_ident) to avoid shift-reduce explosions on keyword tokens. *)
+optional_table_alias:
+  | AS a = any_ident { Some a }
+  | a = IDENT        { Some a }
+  |                  { None }
+
 join_clauses:
   |                                  { [] }
   | j = join_clause rest = join_clauses { j :: rest }
 
 join_clause:
-  | INNER JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
+  | INNER JOIN t = any_ident alias = optional_table_alias ON e = expr
     { { kind = Inner; table = t; alias; on = e } }
-  | LEFT JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
+  | LEFT JOIN t = any_ident alias = optional_table_alias ON e = expr
     { { kind = Left;  table = t; alias; on = e } }
-  | LEFT OUTER JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
+  | LEFT OUTER JOIN t = any_ident alias = optional_table_alias ON e = expr
     { { kind = Left;  table = t; alias; on = e } }
-  | JOIN t = any_ident alias = option(preceded(AS, any_ident)) ON e = expr
+  | JOIN t = any_ident alias = optional_table_alias ON e = expr
     { { kind = Inner; table = t; alias; on = e } }
 
 update:

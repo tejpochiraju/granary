@@ -648,7 +648,6 @@ let tests = [
    the conformance suite stays green; the underlying gaps are tracked as
    separate engine bugs and reinstated as they are fixed. *)
 let all_backends_known_failures = [
-  "self_join";                         (* #144 — self-join with aliases fails at runtime *)
 ]
 
 (* Btree (Unix_file + Mirage) currently lacks SAVEPOINT support — issue #136
