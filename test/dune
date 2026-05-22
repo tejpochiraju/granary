@@ -84,3 +84,7 @@
 (test
  (name test_overflow)
  (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+
+(test
+ (name test_without_rowid)
+ (libraries sqlocaml sqlocaml.store sqlocaml.encoding alcotest lwt.unix unix))

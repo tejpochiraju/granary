@@ -239,6 +239,9 @@ rule token = parse
       | "FOR"                -> FOR
       | "EACH"               -> EACH
       | "ROW"                -> ROW
+      | "WITHOUT"            -> WITHOUT
+      | "ROWID"              -> ROWID
+      | "VACUUM"             -> VACUUM
       | _              -> IDENT id
     }
   | eof                     { EOF }

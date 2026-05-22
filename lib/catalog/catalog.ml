@@ -74,6 +74,8 @@ type table_meta = {
   columns         : Row.column list;
   next_rowid      : int64;
   fk_constraints  : fk_constraint list;
+  without_rowid   : bool;
+    (** WITHOUT ROWID — phase 37 #122. *)
 }
 
 type index_info = {
@@ -119,12 +121,21 @@ let encode_table_value m =
   let buf = Buffer.create 16 in
   Varint.encode_uint64 buf (Int64.of_int m.tree_id);
   Varint.encode_int64 buf m.next_rowid;
+  (* Trailing without_rowid flag (phase 37).  Old encodings have no trailing
+     bytes; the decoder treats their absence as [false]. *)
+  Varint.encode_uint64 buf (if m.without_rowid then 1L else 0L);
   Buffer.to_bytes buf
 
 let decode_table_value bytes =
   let tid, off = Varint.decode_uint64 bytes 0 in
-  let next, _ = Varint.decode_int64 bytes off in
-  (Int64.to_int tid, next)
+  let next, off' = Varint.decode_int64 bytes off in
+  let without_rowid =
+    if off' >= Bytes.length bytes then false
+    else
+      let v, _ = Varint.decode_uint64 bytes off' in
+      Int64.to_int v <> 0
+  in
+  (Int64.to_int tid, next, without_rowid)
 
 (* Column key: table_name ++ NUL ++ ordinal_be8 *)
 let column_key table_name ordinal =
@@ -507,7 +518,7 @@ let load_all_tables store =
     | None -> Lwt.return_unit
     | Some (k, v) ->
       let name = Bytes.to_string k in
-      let tid, next_rowid = decode_table_value v in
+      let tid, next_rowid, without_rowid = decode_table_value v in
       let%lwt cols = load_columns tx name in
       Hashtbl.replace tbl name {
         name;
@@ -515,6 +526,7 @@ let load_all_tables store =
         columns = cols;
         next_rowid;
         fk_constraints = [];
+        without_rowid;
       };
       walk_tables ()
   in
@@ -751,11 +763,12 @@ let next_user_tid t =
   let%lwt () = write_next_user_tid t.store (tid + 1) in
   Lwt.return tid
 
-let create_table t ~name ~columns =
+let create_table t ~name ~columns ~without_rowid =
   if Hashtbl.mem t.cache name then
     failwith (Printf.sprintf "table '%s' already exists" name);
   let%lwt tid = next_user_tid t in
-  let m = { name; tree_id = tid; columns; next_rowid = 1L; fk_constraints = [] } in
+  let m = { name; tree_id = tid; columns; next_rowid = 1L;
+            fk_constraints = []; without_rowid } in
   let%lwt tx = S.rw_begin t.store in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
   let%lwt () =

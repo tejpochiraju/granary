@@ -99,6 +99,10 @@ type bound_stmt =
       if_not_exists  : bool;
       fk_constraints : (string list * string * string list * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action * bool) list;
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
+      without_rowid  : bool;
+        (** When true, the table's INTEGER PRIMARY KEY column's value is
+            used directly as the rowid (no auto-allocation).  Sema enforces
+            that exactly one INTEGER PRIMARY KEY column exists. *)
     }
   | BS_insert of {
       table_meta    : Sqlocaml_catalog.Catalog.table_meta;

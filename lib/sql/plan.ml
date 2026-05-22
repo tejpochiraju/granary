@@ -60,6 +60,7 @@ type op =
       if_not_exists  : bool;
       fk_constraints : (string list * string * string list * Sqlocaml_catalog.Catalog.fk_action * Sqlocaml_catalog.Catalog.fk_action * bool) list;
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
+      without_rowid  : bool;
     }
   | Op_insert of {
       table_meta    : Cat.table_meta;

@@ -25,7 +25,7 @@ let test_create_then_find () =
     let store = S.create () in
     let* cat = C.open_ store in
     let cols = [int_col "id"; txt_col "name"] in
-    let* tid = C.create_table cat ~name:"users" ~columns:cols in
+    let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
     let* result = C.find_table cat ~name:"users" in
     (match result with
      | None -> Alcotest.fail "expected Some, got None"
@@ -49,7 +49,7 @@ let test_create_assigns_tree_id_16 () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* tid = C.create_table cat ~name:"first" ~columns:[int_col "x"] in
+    let* tid = C.create_table cat ~name:"first" ~columns:[int_col "x"] ~without_rowid:false in
     Alcotest.(check int) "first tree_id is 16" 16 tid;
     Lwt.return_unit
   )
@@ -58,8 +58,8 @@ let test_create_assigns_sequential_ids () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* tid_a = C.create_table cat ~name:"a" ~columns:[int_col "x"] in
-    let* tid_b = C.create_table cat ~name:"b" ~columns:[int_col "y"] in
+    let* tid_a = C.create_table cat ~name:"a" ~columns:[int_col "x"] ~without_rowid:false in
+    let* tid_b = C.create_table cat ~name:"b" ~columns:[int_col "y"] ~without_rowid:false in
     Alcotest.(check int) "a gets 16" 16 tid_a;
     Alcotest.(check int) "b gets 17" 17 tid_b;
     Lwt.return_unit
@@ -69,10 +69,10 @@ let test_duplicate_table () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"users" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"users" ~columns:[int_col "id"] ~without_rowid:false in
     (* failwith is synchronous — raised before any Lwt.t is constructed *)
     (try
-       ignore (C.create_table cat ~name:"users" ~columns:[int_col "id"]);
+       ignore (C.create_table cat ~name:"users" ~columns:[int_col "id"] ~without_rowid:false);
        Alcotest.fail "expected Failure for duplicate"
      with Failure _ -> ());
     Lwt.return_unit
@@ -91,7 +91,7 @@ let test_list_tables_one () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t1" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t1" ~columns:[int_col "id"] ~without_rowid:false in
     let* tables = C.list_tables cat in
     Alcotest.(check int) "one table" 1 (List.length tables);
     Lwt.return_unit
@@ -101,8 +101,8 @@ let test_list_tables_two () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t1" ~columns:[int_col "id"] in
-    let* _ = C.create_table cat ~name:"t2" ~columns:[txt_col "name"] in
+    let* _ = C.create_table cat ~name:"t1" ~columns:[int_col "id"] ~without_rowid:false in
+    let* _ = C.create_table cat ~name:"t2" ~columns:[txt_col "name"] ~without_rowid:false in
     let* tables = C.list_tables cat in
     Alcotest.(check int) "two tables" 2 (List.length tables);
     let names = List.map (fun m -> m.C.name) tables |> List.sort String.compare in
@@ -119,7 +119,7 @@ let test_columns_preserved () =
     let store = S.create () in
     let* cat = C.open_ store in
     let cols = [int_col "id"; txt_col "name"] in
-    let* _ = C.create_table cat ~name:"users" ~columns:cols in
+    let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
     let* result = C.find_table cat ~name:"users" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -133,7 +133,7 @@ let test_integer_column_type () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "x"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "x"] ~without_rowid:false in
     let* result = C.find_table cat ~name:"t" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -149,7 +149,7 @@ let test_text_column_type () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[txt_col "s"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[txt_col "s"] ~without_rowid:false in
     let* result = C.find_table cat ~name:"t" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -166,7 +166,7 @@ let test_real_column_type () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t"
-        ~columns:[mk_col "r" Row.Real] in
+        ~columns:[mk_col "r" Row.Real] ~without_rowid:false in
     let* result = C.find_table cat ~name:"t" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -183,7 +183,7 @@ let test_blob_column_type () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t"
-        ~columns:[mk_col "b" Row.Blob] in
+        ~columns:[mk_col "b" Row.Blob] ~without_rowid:false in
     let* result = C.find_table cat ~name:"t" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -217,7 +217,7 @@ let test_mixed_column_types_roundtrip () =
            mk_col "r" Row.Real;
            mk_col "b" Row.Blob;
          ] in
-         let* _ = C.create_table cat ~name:"mixed" ~columns:cols in
+         let* _ = C.create_table cat ~name:"mixed" ~columns:cols ~without_rowid:false in
          let* () = S.close store in
          (* Reopen and force the catalog to decode columns from disk *)
          let* sr2 = S.open_file ~path in
@@ -242,7 +242,7 @@ let test_single_column () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "only"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "only"] ~without_rowid:false in
     let* result = C.find_table cat ~name:"t" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -260,7 +260,7 @@ let test_many_columns () =
       int_col "c0"; txt_col "c1"; int_col "c2"; txt_col "c3"; int_col "c4";
       txt_col "c5"; int_col "c6"; txt_col "c7"; int_col "c8"; txt_col "c9";
     ] in
-    let* _ = C.create_table cat ~name:"wide" ~columns:cols in
+    let* _ = C.create_table cat ~name:"wide" ~columns:cols ~without_rowid:false in
     let* result = C.find_table cat ~name:"wide" in
     (match result with
      | None -> Alcotest.fail "expected Some"
@@ -285,7 +285,7 @@ let test_first_rowid_is_1 () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* rid = C.next_rowid cat ~name:"t" in
     Alcotest.(check int64) "first rowid is 1" 1L rid;
     Lwt.return_unit
@@ -295,7 +295,7 @@ let test_rowid_increments () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* r1 = C.next_rowid cat ~name:"t" in
     let* r2 = C.next_rowid cat ~name:"t" in
     let* r3 = C.next_rowid cat ~name:"t" in
@@ -309,8 +309,8 @@ let test_rowids_independent () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"a" ~columns:[int_col "id"] in
-    let* _ = C.create_table cat ~name:"b" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"a" ~columns:[int_col "id"] ~without_rowid:false in
+    let* _ = C.create_table cat ~name:"b" ~columns:[int_col "id"] ~without_rowid:false in
     let* ra1 = C.next_rowid cat ~name:"a" in
     let* rb1 = C.next_rowid cat ~name:"b" in
     let* ra2 = C.next_rowid cat ~name:"a" in
@@ -340,7 +340,7 @@ let test_metadata_survives_reopen () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"users" ~columns:[int_col "id"; txt_col "name"] in
+    let* _ = C.create_table cat1 ~name:"users" ~columns:[int_col "id"; txt_col "name"] ~without_rowid:false in
     (* Open a second catalog on the same store *)
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"users" in
@@ -357,7 +357,7 @@ let test_columns_survive_reopen () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let cols = [int_col "id"; txt_col "email"; int_col "age"] in
-    let* _ = C.create_table cat1 ~name:"persons" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"persons" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"persons" in
     (match result with
@@ -377,7 +377,7 @@ let test_rowid_survives_reopen () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* _ = C.next_rowid cat1 ~name:"t" in
     let* _ = C.next_rowid cat1 ~name:"t" in
     let* _ = C.next_rowid cat1 ~name:"t" in
@@ -392,7 +392,7 @@ let test_tree_id_survives_reopen () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* tid1 = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* tid1 = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -413,7 +413,7 @@ let test_default_blob_roundtrip () =
       { Row.name = "b"; ty = Row.Blob;    not_null = false; primary_key = false;
         default = Some (Row.DV_blob (Bytes.of_string "binary")); check_sql = None; generated_as = None };
     ] in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -436,7 +436,7 @@ let test_default_real_roundtrip () =
       { Row.name = "f"; ty = Row.Real;    not_null = false; primary_key = false;
         default = Some (Row.DV_real 3.14159); check_sql = None; generated_as = None };
     ] in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -459,7 +459,7 @@ let test_default_text_roundtrip () =
       { Row.name = "s"; ty = Row.Text;    not_null = false; primary_key = false;
         default = Some (Row.DV_text "hello"); check_sql = None; generated_as = None };
     ] in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -481,7 +481,7 @@ let test_default_null_roundtrip () =
       { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
         default = Some Row.DV_null; check_sql = None; generated_as = None };
     ] in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -504,7 +504,8 @@ let corrupt_default_tag () =
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"t"
       ~columns:[{ Row.name = "x"; ty = Row.Integer; not_null = false;
-                  primary_key = false; default = None; check_sql = None; generated_as = None }] in
+                  primary_key = false; default = None; check_sql = None; generated_as = None }]
+      ~without_rowid:false in
     let col_key =
       let tn = Bytes.of_string "t" in
       let ord = Bytes.make 8 '\x00' in
@@ -539,7 +540,7 @@ let test_default_int_roundtrip () =
       { Row.name = "n"; ty = Row.Integer; not_null = false; primary_key = false;
         default = Some (Row.DV_int 12345L); check_sql = None; generated_as = None };
     ] in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:cols in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
     let* cat2 = C.open_ store in
     let* result = C.find_table cat2 ~name:"t" in
     (match result with
@@ -559,8 +560,8 @@ let test_load_all_first_table_not_skipped () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"aardvark" ~columns:[int_col "id"] in
-    let* _ = C.create_table cat1 ~name:"zebra" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"aardvark" ~columns:[int_col "id"] ~without_rowid:false in
+    let* _ = C.create_table cat1 ~name:"zebra" ~columns:[int_col "id"] ~without_rowid:false in
     (* Open a fresh catalog — this calls load_all which walks the cursor *)
     let* cat2 = C.open_ store in
     let* r_a = C.find_table cat2 ~name:"aardvark" in
@@ -583,7 +584,7 @@ let test_create_empty_name () =
     let store = S.create () in
     let* cat = C.open_ store in
     (* Empty name should succeed — no restriction in spec *)
-    let* tid = C.create_table cat ~name:"" ~columns:[int_col "x"] in
+    let* tid = C.create_table cat ~name:"" ~columns:[int_col "x"] ~without_rowid:false in
     Alcotest.(check int) "empty name gets tree_id 16" 16 tid;
     let* result = C.find_table cat ~name:"" in
     (match result with
@@ -597,7 +598,7 @@ let test_create_empty_columns () =
     let store = S.create () in
     let* cat = C.open_ store in
     (* Zero columns should succeed — no column requirement in spec *)
-    let* tid = C.create_table cat ~name:"nocols" ~columns:[] in
+    let* tid = C.create_table cat ~name:"nocols" ~columns:[] ~without_rowid:false in
     Alcotest.(check int) "zero-col table gets tree_id 16" 16 tid;
     let* result = C.find_table cat ~name:"nocols" in
     (match result with
@@ -612,7 +613,8 @@ let corrupt_column_type_tag () =
   run (
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users"
-      ~columns:[{ Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }] in
+      ~columns:[{ Row.name = "id"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None }]
+      ~without_rowid:false in
     (* Overwrite the column entry with a corrupt type tag (0) *)
     let col_key =
       let tn = Bytes.of_string "users" in
@@ -647,7 +649,7 @@ let test_create_index_basic () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users"
-      ~columns:[int_col "id"; txt_col "name"] in
+      ~columns:[int_col "id"; txt_col "name"] ~without_rowid:false in
     let* result = C.create_index cat ~name:"idx_users_id"
       ~table:"users" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     (match result with
@@ -667,7 +669,7 @@ let test_indexes_for_table () =
     let store = S.create () in
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"users"
-      ~columns:[int_col "id"; txt_col "name"] in
+      ~columns:[int_col "id"; txt_col "name"] ~without_rowid:false in
     let before = C.indexes_for_table cat ~table:"users" in
     Alcotest.(check int) "no indexes initially" 0 (List.length before);
     let* _ = C.create_index cat ~name:"idx_id"
@@ -696,7 +698,7 @@ let test_create_index_unknown_column () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* r = C.create_index cat ~name:"idx" ~table:"t" ~columns:["bogus"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     (match r with
      | Error _ -> ()
@@ -708,7 +710,7 @@ let test_create_index_duplicate () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     let* r = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     (match r with
@@ -722,7 +724,7 @@ let test_index_persists_across_reopen () =
     let store = S.create () in
     let* cat1 = C.open_ store in
     let* _ = C.create_table cat1 ~name:"users"
-      ~columns:[int_col "id"; txt_col "name"] in
+      ~columns:[int_col "id"; txt_col "name"] ~without_rowid:false in
     let* _ = C.create_index cat1 ~name:"idx_users_id"
       ~table:"users" ~columns:["id"] ~unique:true ~expr_flags:[false] ~where_sql:None in
     (* Reopen *)
@@ -741,7 +743,7 @@ let test_find_index () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     Alcotest.(check bool) "missing index returns None"
       true (C.find_index cat ~name:"idx" = None);
     let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
@@ -761,7 +763,7 @@ let test_drop_table_basic () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* tx = S.rw_begin store in
     let* () = C.drop_table cat tx ~name:"t" in
     let* () = S.commit tx in
@@ -775,7 +777,7 @@ let test_drop_table_removes_from_disk () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* tx = S.rw_begin store in
     let* () = C.drop_table cat1 tx ~name:"t" in
     let* () = S.commit tx in
@@ -790,7 +792,7 @@ let test_drop_table_also_drops_indexes () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"; txt_col "name"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"; txt_col "name"] ~without_rowid:false in
     let* _ = C.create_index cat ~name:"idx_id" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     let* _ = C.create_index cat ~name:"idx_name" ~table:"t" ~columns:["name"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     (* Verify indexes exist before drop *)
@@ -823,7 +825,7 @@ let test_drop_index_basic () =
   run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* _ = C.create_index cat ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     let* tx = S.rw_begin store in
     let* () = C.drop_index cat tx ~name:"idx" in
@@ -837,7 +839,7 @@ let test_drop_index_persists () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     let* tx = S.rw_begin store in
     let* () = C.drop_index cat1 tx ~name:"idx" in
@@ -857,7 +859,7 @@ let test_drop_index_empty_sys_indexes () =
   run (
     let store = S.create () in
     let* cat1 = C.open_ store in
-    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] in
+    let* _ = C.create_table cat1 ~name:"t" ~columns:[int_col "id"] ~without_rowid:false in
     let* _ = C.create_index cat1 ~name:"idx" ~table:"t" ~columns:["id"] ~unique:false ~expr_flags:[false] ~where_sql:None in
     (* Delete all entries from sys_indexes_tid (tree_id=2) directly. *)
     let sys_indexes_tid = 2 in

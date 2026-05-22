@@ -54,6 +54,9 @@ type table_meta = {
   columns         : Sqlocaml_encoding.Row.column list;
   next_rowid      : int64;
   fk_constraints  : fk_constraint list;
+  without_rowid   : bool;
+    (** WITHOUT ROWID — the INTEGER PRIMARY KEY column's value is used
+        as the row's storage key (no auto-allocated rowid).  Phase 37. *)
 }
 
 type index_info = {
@@ -92,6 +95,7 @@ val create_table :
   t ->
   name:string ->
   columns:Sqlocaml_encoding.Row.column list ->
+  without_rowid:bool ->
   Sqlocaml_store.Store.tree_id Lwt.t
 
 (** Find a table by name. Returns [None] if not found. *)

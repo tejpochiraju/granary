@@ -73,11 +73,11 @@ let make_two_table_cat ?(orders_idx=false) () =
     let* _ = Cat.create_table cat ~name:"users" ~columns:[
       { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = Cat.create_table cat ~name:"orders" ~columns:[
       { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* () =
       if orders_idx then
         let* r =
@@ -160,10 +160,10 @@ let sema_ambiguous_column () =
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"a" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = Cat.create_table cat ~name:"b" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     Lwt.return cat
   ) in
   (* SELECT x FROM a JOIN b ON ...  — "x" appears in both *)
@@ -184,10 +184,10 @@ let sema_qualified_column_resolves () =
     let* cat = Cat.open_ store in
     let* _ = Cat.create_table cat ~name:"a" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = Cat.create_table cat ~name:"b" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {

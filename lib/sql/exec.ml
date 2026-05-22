@@ -2131,7 +2131,33 @@ let execute_insert ?(mode = Auto) ?(params = [||])
   let* (tx, owned) = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      let* rowid = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
+      (* For WITHOUT ROWID tables (phase 37 #122), the INTEGER PRIMARY KEY
+         column's value becomes the rowid — no auto-allocation.  The PK
+         must be present and non-NULL. *)
+      let* rowid =
+        if table_meta.Cat.without_rowid then begin
+          match
+            List.find_index
+              (fun (c : Row.column) -> c.primary_key)
+              table_meta.Cat.columns
+          with
+          | None ->
+            Lwt.fail_with (Printf.sprintf
+              "WITHOUT ROWID table '%s' has no PRIMARY KEY column"
+              table_meta.Cat.name)
+          | Some pk_idx ->
+            (match row.(pk_idx) with
+             | Row.V_int n -> Lwt.return n
+             | Row.V_null ->
+               Lwt.fail_with (Printf.sprintf
+                 "WITHOUT ROWID table '%s': PRIMARY KEY column must not be NULL"
+                 table_meta.Cat.name)
+             | _ ->
+               Lwt.fail_with (Printf.sprintf
+                 "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
+                 table_meta.Cat.name))
+        end
+        else Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
       let idxs   = Cat.indexes_for_table cat ~table:table_meta.name in
       (* Phase 1: check UNIQUE constraints BEFORE writing the row.
          Collect skip flag, list of conflicting rowids to delete, and
@@ -3746,14 +3772,14 @@ let execute_with_count ?(mode = Auto)
     (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
-  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints } ->
+  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
     (* Note: create_table acquires its own RW txn internally via catalog.
        This means CREATE TABLE is NOT atomic within an explicit BEGIN/COMMIT block —
        it commits immediately regardless of mode. Phase 4 work to fix. *)
     if if_not_exists && Cat.table_exists cat ~name then
       Lwt.return 0
     else begin
-      let* _tid = Cat.create_table cat ~name ~columns in
+      let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
       let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
         let* result = Cat.create_index cat ~name:idx_name ~table:name
             ~columns:col_names ~unique:true

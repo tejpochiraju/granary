@@ -78,6 +78,7 @@
 %token RANDOM RANDOMBLOB CHANGES LAST_INSERT_ROWID
 %token TOTAL_CHANGES SQLITE_VERSION
 %token FOR EACH ROW
+%token WITHOUT ROWID VACUUM
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -472,15 +473,19 @@ table_item:
         local_cols; parent_table; parent_cols; on_delete; on_update; deferrable;
       }) }
 
+without_rowid_opt:
+  | WITHOUT ROWID { true }
+  |               { false }
+
 create_table:
-  | CREATE TABLE name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+  | CREATE TABLE name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
-      S_create_table { name; columns = cols; constraints = cons; if_not_exists = false } }
-  | CREATE TABLE IF NOT EXISTS name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = false; without_rowid = wr } }
+  | CREATE TABLE IF NOT EXISTS name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
-      S_create_table { name; columns = cols; constraints = cons; if_not_exists = true } }
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = true; without_rowid = wr } }
 
 create_fts_table:
   | CREATE VIRTUAL TABLE name = any_ident USING FTS5

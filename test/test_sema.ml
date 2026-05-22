@@ -14,7 +14,7 @@ let make_catalog cols =
   Lwt_main.run (
     let store = S.create () in
     let* cat = C.open_ store in
-    let* _ = C.create_table cat ~name:"users" ~columns:cols in
+    let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
     Lwt.return cat
   )
 
@@ -35,7 +35,7 @@ let bind_create_new () =
     Ast.{ name = "sku"; ty = Ty_text;    not_null = false; primary_key = false; default = None; check = None; fk_ref = None; generated_as = None };
     Ast.{ name = "qty"; ty = Ty_int;     not_null = false; primary_key = false; default = None; check = None; fk_ref = None; generated_as = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { name; _ }) ->
     Alcotest.(check string) "table name" "items" name
@@ -50,7 +50,7 @@ let bind_create_duplicate () =
   let cat = two_col_cat () in
   (* "users" already exists in two_col_cat *)
   let cols = [Ast.{ name = "id"; ty = Ty_int; not_null = false; primary_key = false; default = None; check = None; fk_ref = None; generated_as = None }] in
-  let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "users"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Error (Sema.Already_exists "users") -> ()
   | Error _ -> Alcotest.fail "expected Already_exists \"users\""
@@ -62,7 +62,7 @@ let bind_create_preserves_cols () =
     Ast.{ name = "sku"; ty = Ty_text; not_null = false; primary_key = false; default = None; check = None; fk_ref = None; generated_as = None };
     Ast.{ name = "qty"; ty = Ty_int;  not_null = false; primary_key = false; default = None; check = None; fk_ref = None; generated_as = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     Alcotest.(check int) "two columns" 2 (List.length columns);
@@ -938,11 +938,11 @@ let make_join_cat () =
     let* _ = C.create_table cat ~name:"users" ~columns:[
       { Row.name = "id";   ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "name"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = C.create_table cat ~name:"orders" ~columns:[
       { Row.name = "uid";  ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
       { Row.name = "item"; ty = Row.Text;    not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     Lwt.return cat
   )
 
@@ -967,10 +967,10 @@ let bind_select_join_ambiguous_col () =
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"a" ~columns:[
       { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = C.create_table cat ~name:"b" ~columns:[
       { Row.name = "uid"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {
@@ -1785,7 +1785,7 @@ let bind_create_default_null () =
     Ast.{ name = "x"; ty = Ty_int; not_null = false; primary_key = false;
           default = Some Ast.L_null; check = None; fk_ref = None; generated_as = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1800,7 +1800,7 @@ let bind_create_default_real () =
     Ast.{ name = "x"; ty = Ty_real; not_null = false; primary_key = false;
           default = Some (Ast.L_real 3.14); check = None; fk_ref = None; generated_as = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1815,7 +1815,7 @@ let bind_create_default_blob () =
     Ast.{ name = "x"; ty = Ty_blob; not_null = false; primary_key = false;
           default = Some (Ast.L_blob (Bytes.of_string "hi")); check = None; fk_ref = None; generated_as = None };
   ] in
-  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false } in
+  let stmt = Ast.S_create_table { name = "items"; columns = cols; constraints = []; if_not_exists = false; without_rowid = false } in
   match bind cat stmt with
   | Ok (Sema.BS_create_table { columns; _ }) ->
     (match (List.hd columns).Row.default with
@@ -1992,10 +1992,10 @@ let bind_select_join_on_ambiguous () =
     let* cat = C.open_ store in
     let* _ = C.create_table cat ~name:"a" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     let* _ = C.create_table cat ~name:"b" ~columns:[
       { Row.name = "x"; ty = Row.Integer; not_null = false; primary_key = false; default = None; check_sql = None; generated_as = None };
-    ] in
+    ] ~without_rowid:false in
     Lwt.return cat
   ) in
   let stmt = Ast.S_select {

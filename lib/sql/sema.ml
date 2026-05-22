@@ -24,6 +24,7 @@ let sqlite_master_meta : Cat.table_meta = {
   ];
   Cat.next_rowid  = 0L;
   Cat.fk_constraints = [];
+  Cat.without_rowid = false;
 }
 
 type binop = Eq | Ne | Lt | Le | Gt | Ge | Add | Sub | Mul | Div | And | Or
@@ -103,6 +104,7 @@ type bound_stmt =
       if_not_exists  : bool;
       fk_constraints : (string list * string * string list * Cat.fk_action * Cat.fk_action * bool) list;
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
+      without_rowid  : bool;
     }
   | BS_insert of {
       table_meta    : Cat.table_meta;
@@ -284,7 +286,8 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
     Cat.tree_id        = m.Cat.fts_content_tree;
     Cat.columns;
     Cat.next_rowid     = 0L;
-    Cat.fk_constraints = [] }
+    Cat.fk_constraints = [];
+    Cat.without_rowid  = false }
 
 let lit_ty = function
   | Ast.L_int _  -> Some Row.Integer
@@ -971,12 +974,12 @@ let rec expr_has_window = function
    paths now compute virtuals into a scratch row before key/expression
    evaluation; see [with_computed_virtuals] in lib/sql/exec.ml. *)
 
-let bind_create cat ~name ~columns ~constraints ~if_not_exists =
+let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
   let* existing = Cat.find_table cat ~name in
   match existing with
   | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
   | Some _ (* if_not_exists = true: silently succeed *) ->
-    Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true; fk_constraints = [] }))
+    Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true; fk_constraints = []; without_rowid }))
   | None ->
     (* Validate CHECK expressions — reject forms that can't be serialized *)
     let rec check_expr_unsupported = function
@@ -1122,7 +1125,36 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists =
        | Error e -> Lwt.return (Error e)
        | Ok tbl_fks ->
       let fk_constraints = col_fks @ tbl_fks in
-      Lwt.return (Ok (BS_create_table { name; columns = row_cols; uniq_idxs; if_not_exists; fk_constraints }))))
+      (* WITHOUT ROWID validation: require exactly one INTEGER PRIMARY KEY
+         column.  More general PK shapes (TEXT, composite) require deep
+         changes to the rowid-keyed storage path and are deferred. *)
+      let validate_without_rowid () =
+        if not without_rowid then Ok ()
+        else begin
+          let pk_cols =
+            List.filter (fun (c : Row.column) -> c.primary_key) row_cols
+          in
+          match pk_cols with
+          | [] ->
+            Error (Unsupported (Printf.sprintf
+              "WITHOUT ROWID table '%s' requires a PRIMARY KEY column" name))
+          | _ :: _ :: _ ->
+            Error (Unsupported (Printf.sprintf
+              "WITHOUT ROWID table '%s' must have exactly one PRIMARY KEY column \
+               (composite PKs not supported in phase 37)" name))
+          | [pk] when pk.ty <> Row.Integer ->
+            Error (Unsupported (Printf.sprintf
+              "WITHOUT ROWID table '%s': PRIMARY KEY column '%s' must be INTEGER \
+               in phase 37" name pk.name))
+          | [_] -> Ok ()
+        end
+      in
+      (match validate_without_rowid () with
+       | Error e -> Lwt.return (Error e)
+       | Ok () ->
+         Lwt.return (Ok (BS_create_table {
+           name; columns = row_cols; uniq_idxs;
+           if_not_exists; fk_constraints; without_rowid })))))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
@@ -2608,7 +2640,7 @@ let rec col_names_of_ast_stmt = function
 
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
   match stmt with
-  | Ast.S_create_table { name; columns; constraints; if_not_exists } -> bind_create cat ~name ~columns ~constraints ~if_not_exists
+  | Ast.S_create_table { name; columns; constraints; if_not_exists; without_rowid } -> bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
   | Ast.S_insert_select { table; columns; on_conflict; select } ->
     let* table_meta_opt = Cat.find_table cat ~name:table in
@@ -2693,6 +2725,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
       Cat.columns        = [];
       Cat.next_rowid     = 0L;
       Cat.fk_constraints = [];
+      Cat.without_rowid  = false;
     } in
     let bound = List.map (fun (expr, alias) ->
       match bind_expr ~param_counter ~named_params dummy_meta expr with
@@ -2748,6 +2781,7 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
          Cat.columns        = cte_cols;
          Cat.next_rowid     = 0L;
          Cat.fk_constraints = [];
+         Cat.without_rowid  = false;
        } in
        Cat.register_ephemeral cat cte_meta;
        (* For non-recursive CTEs col_source already is the fully-bound def —
