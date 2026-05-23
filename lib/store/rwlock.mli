@@ -27,3 +27,11 @@ val readers : t -> int
 
 (** True iff a writer is currently holding (or queued for) the lock. *)
 val writer_pending : t -> bool
+
+(** True iff a writer is currently holding the lock (exclusive lock is
+    active).  Unlike [writer_pending], this is false when a writer is
+    only waiting (queued) but has not yet acquired.  Used by [Store.ro_begin]
+    to detect cooperative re-entrancy: if the current fiber holds the
+    exclusive lock and calls [ro_begin], we must skip [acquire_read] to
+    avoid deadlock. *)
+val writer_active : t -> bool

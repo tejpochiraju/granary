@@ -59,7 +59,7 @@ type bt_savepoint = {
 }
 
 (* Per-store commit queue for WAL-mode group commit (#77, #151).  After
-   a writer has staged its WAL frames it releases [rw_mutex] and joins
+   a writer has staged its WAL frames it releases [lock] and joins
    this queue to await one shared fsync.  [drainer] is set to [true] by
    the first arriving writer (acting as coordinator); subsequent writers
    register a resolver on [waiters] and block until the drainer wakes
@@ -102,7 +102,7 @@ type bt_state = {
   wal_close : (unit -> unit Lwt.t) option;
   mutable wal_autocheckpoint_threshold : int;
   (* When > 0 and committed WAL frames reach this number, the next
-     commit triggers an inline checkpoint (still under [rw_mutex]) so
+     commit triggers an inline checkpoint (still under [lock]) so
      the WAL stays bounded. 0 disables auto-checkpoint. Per-connection,
      not persisted. *)
   commit_queue : commit_queue;
@@ -118,7 +118,7 @@ type backend =
 
 type t = {
   backend  : backend;
-  rw_mutex : Lwt_mutex.t;
+  lock     : Rwlock.t;
   (* Snapshot of Mem backend tree contents taken at rw_begin.
      Used to implement rollback for the in-memory backend.
      None when no RW transaction is active. *)
@@ -135,6 +135,11 @@ type ro_snapshot = {
   rs_snap_trees     : (tree_id, Btree.t) Hashtbl.t;
   rs_snap_frames    : int;
   (* WAL committed_frames at ro_begin; 0 when no WAL is in effect. *)
+  rs_lock_taken     : bool;
+  (* True iff [ro_begin] acquired the shared read lock.  False when
+     [ro_begin] was called from within an active write transaction on
+     the same store (cooperative re-entrancy: the write lock is already
+     held by this fiber so the read lock is skipped to avoid deadlock). *)
 }
 
 type 'a txn =
@@ -312,7 +317,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 (* ------------------------------------------------------------------ *)
 
 let create () : t =
-  { backend = Mem (Hashtbl.create 16); rw_mutex = Lwt_mutex.create ();
+  { backend = Mem (Hashtbl.create 16); lock = Rwlock.create ();
     mem_rw_snapshot = None; mem_savepoints = [] }
 
 let map_unix_err (e : Unix_file.error) : error =
@@ -398,7 +403,7 @@ let open_file ~path : (t, error) result Lwt.t =
               commit_queue = create_commit_queue () }
           in
           Lwt.return_ok
-            { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+            { backend = Btree st; lock = Rwlock.create ();
               mem_rw_snapshot = None; mem_savepoints = [] }
     end else begin
       let pager = pager_of_unix_file file ~freelist:Freelist.empty in
@@ -422,7 +427,7 @@ let open_file ~path : (t, error) result Lwt.t =
               commit_queue = create_commit_queue () }
         in
         Lwt.return_ok
-          { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+          { backend = Btree st; lock = Rwlock.create ();
             mem_rw_snapshot = None; mem_savepoints = [] }
     end
 
@@ -474,7 +479,7 @@ let open_block
               commit_queue = create_commit_queue () }
         in
         Lwt.return_ok
-          { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+          { backend = Btree st; lock = Rwlock.create ();
             mem_rw_snapshot = None; mem_savepoints = [] }))
   | Error e -> Lwt.return_error (map_header_err e)
   | Ok h ->
@@ -494,7 +499,7 @@ let open_block
               commit_queue = create_commit_queue () }
     in
     Lwt.return_ok
-      { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+      { backend = Btree st; lock = Rwlock.create ();
         mem_rw_snapshot = None; mem_savepoints = [] }
 
 (* ------------------------------------------------------------------ *)
@@ -614,7 +619,7 @@ let open_block_wal
               commit_queue = create_commit_queue () }
           in
           Lwt.return_ok
-            { backend = Btree st; rw_mutex = Lwt_mutex.create ();
+            { backend = Btree st; lock = Rwlock.create ();
               mem_rw_snapshot = None; mem_savepoints = [] }))
 
 (* ------------------------------------------------------------------ *)
@@ -734,13 +739,23 @@ let open_file_wal ~path : (t, error) result Lwt.t =
 (* ------------------------------------------------------------------ *)
 
 let ro_begin t =
+  let open Lwt.Syntax in
+  (* Skip the shared lock acquisition when the current fiber already holds
+     the exclusive write lock (cooperative re-entrancy).  Under Lwt, if
+     [writer_active] is set then only this fiber can be running; any attempt
+     to [acquire_read] would wait for [writer_active] to clear — deadlock.
+     The boolean is recorded in the snapshot so [ro_end] releases only when
+     we actually acquired the lock. *)
+  let lock_taken = not (Rwlock.writer_active t.lock) in
+  let* () = if lock_taken then Rwlock.acquire_read t.lock else Lwt.return_unit in
   match t.backend with
   | Mem _ ->
     Lwt.return
       (Ro { rs_store = t; rs_snap_txn_id = 0L;
             rs_snap_meta_root = 0L;
             rs_snap_trees = Hashtbl.create 1;
-            rs_snap_frames = 0 })
+            rs_snap_frames = 0;
+            rs_lock_taken = lock_taken })
   | Btree st ->
     let snap_txn_id    = st.current_header.txn_id in
     let snap_meta_root = st.current_header.root_page in
@@ -756,10 +771,11 @@ let ro_begin t =
       (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
             rs_snap_meta_root = snap_meta_root;
             rs_snap_trees = Hashtbl.create 4;
-            rs_snap_frames = snap_frames })
+            rs_snap_frames = snap_frames;
+            rs_lock_taken = lock_taken })
 
 let rw_begin t =
-  let* () = Lwt_mutex.lock t.rw_mutex in
+  let* () = Rwlock.acquire_write t.lock in
   (match t.backend with
    | Mem trees ->
      (* Snapshot all currently-existing trees so rollback can restore them. *)
@@ -790,6 +806,7 @@ let ro_end (Ro snap : ro txn) =
      (match Hashtbl.find_opt st.active_readers tid with
       | None | Some 1 -> Hashtbl.remove st.active_readers tid
       | Some n -> Hashtbl.replace st.active_readers tid (n - 1)));
+  if snap.rs_lock_taken then Rwlock.release_read snap.rs_store.lock;
   Lwt.return_unit
 
 (* Free the previous freelist page chain back into the pager's in-memory
@@ -879,7 +896,7 @@ let write_freelist_pages pager : int64 Lwt.t =
   end
 
 (** Body of [checkpoint] without mutex management. Caller MUST already
-    hold [t.rw_mutex] (e.g. during [commit]). Defined here so [commit]
+    hold [t.lock] (e.g. during [commit]). Defined here so [commit]
     can invoke it via [maybe_autocheckpoint] below. *)
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let pairs = ref [] in
@@ -913,7 +930,7 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
      Wal.reset wal;
      Lwt.return_unit)
 
-(** Called from [commit] while [rw_mutex] is still held. If the WAL has
+(** Called from [commit] while [lock] is still held (exclusive). If the WAL has
     grown past the per-connection threshold, migrate it inline so
     subsequent commits start fresh. Best-effort: a checkpoint failure
     is swallowed (the commit itself already succeeded). *)
@@ -1067,7 +1084,7 @@ let commit_prepare_btree
      root_pages into the meta-tree, then write a new header pointing at
      the new meta root, sync inline, autocheckpoint, release.
    - Btree backend with WAL: same prepare phase but using
-     [Header.commit_no_sync] so the writer can release [rw_mutex]
+     [Header.commit_no_sync] so the writer can release [lock]
      before the fsync.  Writers then converge on a per-store
      [commit_queue]; one drainer fsyncs and resolves all waiters.  Only
      the drainer attempts the autocheckpoint (single check per fsync
@@ -1083,7 +1100,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
   | Mem _ ->
     t.mem_rw_snapshot <- None;
     t.mem_savepoints <- [];
-    Lwt_mutex.unlock t.rw_mutex;
+    Rwlock.release_write t.lock;
     Lwt.return_unit
   | Btree st ->
     match st.wal with
@@ -1094,13 +1111,13 @@ let commit (Rw t : rw txn) : unit Lwt.t =
             commit_prepare_btree ~header_commit:Header.commit st
           in
           maybe_autocheckpoint st)
-        (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit)
+        (fun () -> Rwlock.release_write t.lock; Lwt.return_unit)
     | Some _ ->
       let unlocked = ref false in
       let unlock_once () =
         if not !unlocked then begin
           unlocked := true;
-          Lwt_mutex.unlock t.rw_mutex
+          Rwlock.release_write t.lock
         end
       in
       Lwt.catch
@@ -1135,11 +1152,11 @@ let commit (Rw t : rw txn) : unit Lwt.t =
              else
                Lwt.catch
                  (fun () ->
-                   let* () = Lwt_mutex.lock t.rw_mutex in
+                   let* () = Rwlock.acquire_write t.lock in
                    Lwt.finalize
                      (fun () -> maybe_autocheckpoint st)
                      (fun () ->
-                       Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit))
+                       Rwlock.release_write t.lock; Lwt.return_unit))
                  (fun _ -> Lwt.return_unit)))
         (fun exn ->
           unlock_once ();
@@ -1191,7 +1208,7 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         st.txn_freelist_snapshot <- None
       | None -> ());
      st.bt_savepoints <- []);
-  Lwt_mutex.unlock t.rw_mutex;
+  Rwlock.release_write t.lock;
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
@@ -1209,10 +1226,10 @@ let checkpoint (t : t) : unit Lwt.t =
     (match st.wal with
      | None -> Lwt.return_unit
      | Some wal ->
-       let* () = Lwt_mutex.lock t.rw_mutex in
+       let* () = Rwlock.acquire_write t.lock in
        Lwt.finalize
          (fun () -> checkpoint_unlocked st wal)
-         (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit))
+         (fun () -> Rwlock.release_write t.lock; Lwt.return_unit))
 
 let wal_autocheckpoint (t : t) : int =
   match t.backend with

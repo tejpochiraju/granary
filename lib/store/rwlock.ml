@@ -17,6 +17,7 @@ let create () =
 
 let readers t = t.readers
 let writer_pending t = t.writer_active || t.writers_waiting > 0
+let writer_active t = t.writer_active
 
 let rec acquire_read t =
   if t.writer_active || t.writers_waiting > 0 then
