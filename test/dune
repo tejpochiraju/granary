@@ -133,3 +133,7 @@
 (test
  (name test_pager_versioned_cache)
  (libraries sqlocaml.storage alcotest lwt.unix))
+
+(test
+ (name test_wal_reader_snapshot)
+ (libraries sqlocaml alcotest lwt.unix unix))

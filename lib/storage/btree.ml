@@ -32,8 +32,12 @@ let overflow_marker_size = 1 + 8 + 8  (* tag + head_pid + total_size *)
 (* ------------------------------------------------------------------ *)
 
 type t = {
-  pager     : Pager.t;
-  root_page : int64;
+  pager           : Pager.t;
+  root_page       : int64;
+  snapshot_frames : int option;
+  (* When Some n, reads via this handle resolve against WAL frames
+     strictly less than n.  When None, the handle is a writer's tree
+     and reads consult the writer's dirty hashtable + latest WAL. *)
 }
 
 type error =
@@ -48,7 +52,7 @@ let pp_error fmt = function
   | Value_too_large n -> Format.fprintf fmt "Value_too_large(%d)" n
   | Tree_corrupt s -> Format.fprintf fmt "Tree_corrupt(%s)" s
 
-let create pager ~root_page = { pager; root_page }
+let create ?snapshot_frames pager ~root_page = { pager; root_page; snapshot_frames }
 let root_page t = t.root_page
 
 (* ------------------------------------------------------------------ *)
@@ -142,7 +146,7 @@ let write_overflow_chain pager (value : bytes) :
       return_ok (head_pid, total)
 
 (* Read an overflow chain back into a single bytes buffer. *)
-let read_overflow_chain pager ~head_pid ~total_size :
+let read_overflow_chain ?snapshot_frames pager ~head_pid ~total_size :
   (bytes, error) result Lwt.t =
   let out = Bytes.create total_size in
   let rec loop pid offset =
@@ -152,7 +156,7 @@ let read_overflow_chain pager ~head_pid ~total_size :
         (Printf.sprintf "overflow chain short: got %d of %d bytes"
            offset total_size))
     else
-      let* r = Pager.read pager pid in
+      let* r = Pager.read ?snapshot_frames pager pid in
       bind_pager r (fun buf ->
         let common = Page.read_common buf in
         if common.kind <> Page.Overflow then
@@ -199,7 +203,7 @@ let free_overflow_chain pager ~head_pid : (unit, error) result Lwt.t =
 (* Decode a stored leaf value: returns the user-visible value.
    Inline values strip the leading [0x00] tag; overflow markers follow
    the chain. *)
-let decode_leaf_value pager (stored : bytes) :
+let decode_leaf_value ?snapshot_frames pager (stored : bytes) :
   (bytes, error) result Lwt.t =
   let n = Bytes.length stored in
   if n = 0 then return_ok stored
@@ -218,7 +222,7 @@ let decode_leaf_value pager (stored : bytes) :
       else
         let head_pid = Bytes.get_int64_be stored 1 in
         let total_size = Int64.to_int (Bytes.get_int64_be stored 9) in
-        read_overflow_chain pager ~head_pid ~total_size
+        read_overflow_chain ?snapshot_frames pager ~head_pid ~total_size
     end
     else
       return_error (Tree_corrupt
@@ -361,7 +365,7 @@ let get t key : (bytes option, error) result Lwt.t =
   if Int64.compare t.root_page 0L = 0 then return_ok None
   else
     let rec descend page_id =
-      let* r = Pager.read t.pager page_id in
+      let* r = Pager.read ?snapshot_frames:t.snapshot_frames t.pager page_id in
       bind_pager r (fun buf ->
           let common = Page.read_common buf in
           match common.kind with
@@ -372,7 +376,7 @@ let get t key : (bytes option, error) result Lwt.t =
               | (e : Page.leaf_entry) :: rest ->
                 let c = Bytes.compare key e.key in
                 if c = 0 then
-                  let* dv = decode_leaf_value t.pager e.value in
+                  let* dv = decode_leaf_value ?snapshot_frames:t.snapshot_frames t.pager e.value in
                   (match dv with
                    | Ok v -> return_ok (Some v)
                    | Error e -> return_error e)
@@ -395,7 +399,7 @@ let get_raw t key : (bytes option, error) result Lwt.t =
   if Int64.compare t.root_page 0L = 0 then return_ok None
   else
     let rec descend page_id =
-      let* r = Pager.read t.pager page_id in
+      let* r = Pager.read ?snapshot_frames:t.snapshot_frames t.pager page_id in
       bind_pager r (fun buf ->
           let common = Page.read_common buf in
           match common.kind with
@@ -456,7 +460,7 @@ let pick_branch_child_with_idx
    Returns (path, leaf_page_id).  Path is ordered ROOT → ... → parent-of-leaf. *)
 let find_leaf t key : (path_step list * int64, error) result Lwt.t =
   let rec loop path page_id =
-    let* r = Pager.read t.pager page_id in
+    let* r = Pager.read ?snapshot_frames:t.snapshot_frames t.pager page_id in
     bind_pager r (fun buf ->
         let common = Page.read_common buf in
         match common.kind with
@@ -783,7 +787,7 @@ let put t key value : (t, error) result Lwt.t =
             match path_r with
             | Error e -> return_error e
             | Ok (path, leaf_pid) ->
-              let* leaf_r = Pager.read t.pager leaf_pid in
+              let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames t.pager leaf_pid in
               bind_pager leaf_r (fun leaf_buf ->
                   let leaf_common = Page.read_common leaf_buf in
                   let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
@@ -845,7 +849,7 @@ let del t key : (t, error) result Lwt.t =
     match path_r with
     | Error e -> return_error e
     | Ok (path, leaf_pid) ->
-      let* leaf_r = Pager.read t.pager leaf_pid in
+      let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames t.pager leaf_pid in
       bind_pager leaf_r (fun leaf_buf ->
           let leaf_common = Page.read_common leaf_buf in
           let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
@@ -927,6 +931,7 @@ type cursor_frame = {
 type cursor = {
   c_pager           : Pager.t;
   c_root            : int64;
+  c_snapshot_frames : int option;
   (* Path from current leaf back to root.  Empty when root is a leaf or
      tree is empty. *)
   mutable path      : cursor_frame list;
@@ -946,10 +951,10 @@ let frame_child (f : cursor_frame) : int64 =
 (* Descend to the leftmost leaf starting from [page_id], returning the new
    frames in DEEPEST-FIRST order (i.e. the frame whose child is the leaf is
    at the head). *)
-let leftmost_leaf_with_path pager page_id :
+let leftmost_leaf_with_path ?snapshot_frames pager page_id :
   (cursor_frame list * int64, error) result Lwt.t =
   let rec loop pid acc =
-    let* r = Pager.read pager pid in
+    let* r = Pager.read ?snapshot_frames pager pid in
     bind_pager r (fun buf ->
         let common = Page.read_common buf in
         match common.kind with
@@ -976,15 +981,18 @@ let leftmost_leaf_with_path pager page_id :
 
 let cursor_open t : (cursor, error) result Lwt.t =
   if Int64.compare t.root_page 0L = 0 then
-    return_ok { c_pager = t.pager; c_root = 0L; path = [];
+    return_ok { c_pager = t.pager; c_root = 0L;
+                c_snapshot_frames = t.snapshot_frames;
+                path = [];
                 leaf_page = 0L; offset = Page.data_offset; finished = true }
   else
-    let* r = leftmost_leaf_with_path t.pager t.root_page in
+    let* r = leftmost_leaf_with_path ?snapshot_frames:t.snapshot_frames t.pager t.root_page in
     match r with
     | Error e -> return_error e
     | Ok (path, leaf_pid) ->
       return_ok { c_pager = t.pager;
                   c_root = t.root_page;
+                  c_snapshot_frames = t.snapshot_frames;
                   path;
                   leaf_page = leaf_pid;
                   offset = Page.data_offset;
@@ -1007,7 +1015,7 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
     end else begin
       top.cf_child_idx <- top.cf_child_idx + 1;
       let next_child = frame_child top in
-      let* r = leftmost_leaf_with_path c.c_pager next_child in
+      let* r = leftmost_leaf_with_path ?snapshot_frames:c.c_snapshot_frames c.c_pager next_child in
       match r with
       | Error e -> return_error e
       | Ok (sub_path, leaf_pid) ->
@@ -1029,7 +1037,7 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
 let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
   if c.finished then return_ok None
   else begin
-    let* r = Pager.read c.c_pager c.leaf_page in
+    let* r = Pager.read ?snapshot_frames:c.c_snapshot_frames c.c_pager c.leaf_page in
     bind_pager r (fun buf ->
         let common = Page.read_common buf in
         let (_entries, end_offset) = decode_leaf_entries buf common in
@@ -1050,7 +1058,7 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
              | Ok true -> cursor_next c)
           | `Entry e ->
             c.offset <- e.next_offset;
-            let* dv = decode_leaf_value c.c_pager e.value in
+            let* dv = decode_leaf_value ?snapshot_frames:c.c_snapshot_frames c.c_pager e.value in
             (match dv with
              | Ok v -> return_ok (Some (e.key, v))
              | Error err -> return_error err)
@@ -1059,10 +1067,10 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
 
 (* Descend from [page_id] toward [key], recording the path deepest-first.
    Returns (path, leaf_pid). *)
-let descend_with_path_for_key pager page_id key :
+let descend_with_path_for_key ?snapshot_frames pager page_id key :
   (cursor_frame list * int64, error) result Lwt.t =
   let rec loop pid acc =
-    let* r = Pager.read pager pid in
+    let* r = Pager.read ?snapshot_frames pager pid in
     bind_pager r (fun buf ->
         let common = Page.read_common buf in
         match common.kind with
@@ -1091,7 +1099,7 @@ let cursor_seek c key :
     c.finished <- true;
     return_ok (`Not_found_after key)
   end else begin
-    let* r = descend_with_path_for_key c.c_pager c.c_root key in
+    let* r = descend_with_path_for_key ?snapshot_frames:c.c_snapshot_frames c.c_pager c.c_root key in
     match r with
     | Error e -> return_error e
     | Ok (path, leaf_pid) ->
@@ -1102,7 +1110,7 @@ let cursor_seek c key :
       let rec scan () =
         if c.finished then return_ok (`Not_found_after key)
         else
-          let* rr = Pager.read c.c_pager c.leaf_page in
+          let* rr = Pager.read ?snapshot_frames:c.c_snapshot_frames c.c_pager c.leaf_page in
           bind_pager rr (fun buf ->
               let common = Page.read_common buf in
               let (_entries, end_offset) = decode_leaf_entries buf common in

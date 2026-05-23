@@ -133,6 +133,8 @@ type ro_snapshot = {
   rs_snap_txn_id    : int64;
   rs_snap_meta_root : int64;
   rs_snap_trees     : (tree_id, Btree.t) Hashtbl.t;
+  rs_snap_frames    : int;
+  (* WAL committed_frames at ro_begin; 0 when no WAL is in effect. *)
 }
 
 type 'a txn =
@@ -247,18 +249,29 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
   match Hashtbl.find_opt snap.rs_snap_trees tid with
   | Some bt -> Lwt.return_ok bt
   | None ->
-    let snap_meta = Btree.create st.pager ~root_page:snap.rs_snap_meta_root in
+    let snap_frames = if snap.rs_snap_frames = 0 then None
+                      else Some snap.rs_snap_frames in
+    let snap_meta =
+      Btree.create ?snapshot_frames:snap_frames
+        st.pager ~root_page:snap.rs_snap_meta_root
+    in
     let key = encode_tree_id tid in
     let* r = Btree.get snap_meta key in
     match r with
     | Error e -> Lwt.return_error (map_btree_err e)
     | Ok None ->
-      let bt = Btree.create st.pager ~root_page:0L in
+      let bt =
+        Btree.create ?snapshot_frames:snap_frames
+          st.pager ~root_page:0L
+      in
       Hashtbl.replace snap.rs_snap_trees tid bt;
       Lwt.return_ok bt
     | Ok (Some v) ->
       let root_page = decode_root_page v in
-      let bt = Btree.create st.pager ~root_page in
+      let bt =
+        Btree.create ?snapshot_frames:snap_frames
+          st.pager ~root_page
+      in
       Hashtbl.replace snap.rs_snap_trees tid bt;
       Lwt.return_ok bt
 
@@ -726,17 +739,24 @@ let ro_begin t =
     Lwt.return
       (Ro { rs_store = t; rs_snap_txn_id = 0L;
             rs_snap_meta_root = 0L;
-            rs_snap_trees = Hashtbl.create 1 })
+            rs_snap_trees = Hashtbl.create 1;
+            rs_snap_frames = 0 })
   | Btree st ->
     let snap_txn_id    = st.current_header.txn_id in
     let snap_meta_root = st.current_header.root_page in
+    let snap_frames =
+      match st.wal with
+      | None   -> 0
+      | Some w -> Wal.committed_frames w
+    in
     let count = Option.value ~default:0
                   (Hashtbl.find_opt st.active_readers snap_txn_id) in
     Hashtbl.replace st.active_readers snap_txn_id (count + 1);
     Lwt.return
       (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
             rs_snap_meta_root = snap_meta_root;
-            rs_snap_trees = Hashtbl.create 4 })
+            rs_snap_trees = Hashtbl.create 4;
+            rs_snap_frames = snap_frames })
 
 let rw_begin t =
   let* () = Lwt_mutex.lock t.rw_mutex in
