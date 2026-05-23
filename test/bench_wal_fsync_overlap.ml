@@ -220,15 +220,19 @@ let writer_workload st ~n_commits ~tag =
 
 (* Reader: a single [ro_begin] held across [read_ops] cursor walks.
 
-   [Lwt.pause] between walks is load-bearing.  [Unix_file] is
-   synchronous internally (it wraps blocking [Unix.read] in
-   [Lwt.return]), so the implicit [let*] yields inside [cursor_open]
-   never actually surface to the Lwt event loop — the reader monopolises
-   the scheduler and the writer's sleep timers never fire while reads
-   are in progress.  An explicit [Lwt.pause ()] forces the event loop
-   tick that lets the writer's [wal_sync] complete.  This simulates an
-   I/O-bound reader on a slow device, which is the regime the
-   fsync-overlap win is meant to address. *)
+   [Lwt.pause] between walks is load-bearing on small trees.  Since
+   #158 the [Unix_file] backend yields the scheduler whenever it does
+   real I/O (verified by [test_unix_file]'s "read_page yields to
+   concurrent timer" case), but the bench's [tid_read] tree fits
+   entirely in the 64-page [Pager] cache after the first walk — so
+   subsequent walks are pure cache hits and never re-enter
+   [Unix_file].  Without an explicit yield in that hit-only loop the
+   reader monopolises the scheduler and the writer's [wal_sync] sleep
+   timer never fires.  Bumping [SEED_ROWS] high enough to overflow
+   the cache would force the reader into the genuine-yield path, but
+   then writer CoW evicts the reader's working set (#159) and
+   swamps the win we're trying to measure.  Keeping the pause keeps
+   this bench focused on the fsync-overlap question. *)
 let reader_workload st ~read_ops =
   let* ro = S.ro_begin st in
   let rec loop i =

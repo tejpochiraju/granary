@@ -5220,9 +5220,14 @@ let test_trigger_persists_across_reopen () =
     in
     let* () = exec2 "INSERT INTO t VALUES (2)" in
     let* r = Db.query db2 "SELECT id FROM audit ORDER BY id" in
-    let rows = match r with
+    (* Drain the stream with [let*] rather than a nested [Lwt_main.run]:
+       after #158, [Lwt_stream.to_list] on a freshly-reopened DB pulls
+       through real [Lwt_unix.pread] calls, so the inner run would clash
+       with the outer one. *)
+    let* rows =
+      match r with
       | Error e -> Alcotest.failf "query: %a" Db.pp_error e
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+      | Ok s -> Lwt_stream.to_list s
     in
     Alcotest.(check int) "two audit rows after reopen" 2 (List.length rows);
     let id_of row = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1 in
@@ -8524,6 +8529,16 @@ let test_phase35_deferred_btree_backend () =
            | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
           Lwt.return_unit
         in
+        (* Lwt-monadic [query_ok] equivalent: avoids the nested
+           [Lwt_main.run] inside [query_ok] (file-scope helper at
+           line 33), which after #158 deadlocks when [Lwt_stream.to_list]
+           pulls through real [Lwt_unix.pread] calls on this on-disk DB. *)
+        let query_ok_lwt sql =
+          let* r = Db.query db sql in
+          match r with
+          | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
+          | Ok stream -> Lwt_stream.to_list stream
+        in
         let* () = exec_lwt "PRAGMA foreign_keys = 1" in
         let* () = exec_lwt "CREATE TABLE bt_par (id INTEGER PRIMARY KEY)" in
         let* () = exec_lwt
@@ -8534,12 +8549,10 @@ let test_phase35_deferred_btree_backend () =
         let* () = exec_lwt "INSERT INTO bt_chi VALUES (10, 1)" in
         let* () = exec_lwt "INSERT INTO bt_par VALUES (1)" in
         let* () = exec_lwt "COMMIT" in
-        let n_par =
-          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_par"))
-        in
-        let n_chi =
-          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_chi"))
-        in
+        let* rows_par = query_ok_lwt "SELECT COUNT(*) FROM bt_par" in
+        let n_par = int_of_row (List.hd rows_par) in
+        let* rows_chi = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
+        let n_chi = int_of_row (List.hd rows_chi) in
         Alcotest.(check int) "btree (a): parent count" 1 n_par;
         Alcotest.(check int) "btree (a): child count"  1 n_chi;
         (* b) Still-violated path: deferred FK with no resolution — COMMIT
@@ -8553,9 +8566,8 @@ let test_phase35_deferred_btree_backend () =
          | Ok () ->
            Alcotest.fail
              "btree (b): expected COMMIT to fail (deferred FK still violated)");
-        let n_chi2 =
-          int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM bt_chi"))
-        in
+        let* rows_chi2 = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
+        let n_chi2 = int_of_row (List.hd rows_chi2) in
         Alcotest.(check int) "btree (b): child still 1 after failed COMMIT"
           1 n_chi2;
         let* () = Db.close db in

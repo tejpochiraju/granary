@@ -725,6 +725,101 @@ let prop_resize_n_pages_correct =
        result)
 
 (* ------------------------------------------------------------------ *)
+(* COOPERATION (#158)                                                  *)
+(* ------------------------------------------------------------------ *)
+
+(* [read_page] must hand the scheduler off to other Lwt fibers while the
+   syscall is in flight.  Before #158, [Unix_file] wrapped [Unix.read]
+   in [Lwt.return], so the bind never yielded — a tight reader loop
+   monopolised the scheduler and any concurrently posted timer (e.g.
+   the writer's [wal_sync] sleep) waited until the reader was done.
+
+   Verification: post a 50 ms timer alongside a 10 000-iteration
+   [read_page] loop.  If [read_page] is genuinely async the timer fires
+   close to its scheduled deadline and well before the reader finishes;
+   if it isn't, the timer is delayed until after the entire read loop.
+   The 5x slack on the timer-fired-before-reader-done assertion absorbs
+   container/CI jitter.  *)
+let read_page_yields_to_timer_test () =
+  Lwt_main.run (
+    let path = fresh_path () in
+    let* r = UF.open_ ~path in
+    match r with
+    | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
+    | Ok t ->
+      let n_pages = 16L in
+      let* rz = UF.resize t ~n_pages in
+      (match rz with
+       | Error e -> Alcotest.failf "resize error: %a" UF.pp_error e
+       | Ok () -> ());
+      (* Seed every page so [read_page] succeeds. *)
+      let wbuf = make_buf () in
+      Cstruct.set_char wbuf 0 'X';
+      let rec seed i =
+        if Int64.compare i n_pages >= 0 then Lwt.return_unit
+        else
+          let* _ = UF.write_page t ~page_id:i wbuf in
+          seed (Int64.add i 1L)
+      in
+      let* () = seed 0L in
+      let* _ = UF.sync t in
+
+      let t0 = Unix.gettimeofday () in
+      let timer_fired_at = ref None in
+      let reader_done_at = ref None in
+
+      let timer =
+        let* () = Lwt_unix.sleep 0.05 in
+        timer_fired_at := Some (Unix.gettimeofday () -. t0);
+        Lwt.return_unit
+      in
+      let reader =
+        let rbuf = make_buf () in
+        let rec loop i =
+          if i >= 10_000 then Lwt.return_unit
+          else
+            let pid = Int64.of_int (i mod 16) in
+            let* _ = UF.read_page t ~page_id:pid rbuf in
+            loop (i + 1)
+        in
+        let* () = loop 0 in
+        reader_done_at := Some (Unix.gettimeofday () -. t0);
+        Lwt.return_unit
+      in
+      let* () = Lwt.join [timer; reader] in
+
+      let* _ = UF.close t in
+      cleanup path;
+
+      (* The timer must have fired during the reader's run, not after it
+         completed.  If the reader monopolised the scheduler, both would
+         land at the same wall-time, so we require the timer to fire by
+         5x its nominal deadline (250 ms) — wide enough to absorb the
+         worst container/CI jitter we've observed, tight enough to fail
+         loudly if cooperation regresses to "never yields". *)
+      let timer_at =
+        match !timer_fired_at with
+        | Some t -> t
+        | None -> Alcotest.fail "timer never fired"
+      in
+      let reader_at =
+        match !reader_done_at with
+        | Some t -> t
+        | None -> Alcotest.fail "reader never finished"
+      in
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "timer fired (%.3fs) inside Lwt-budget (≤ 0.25s)" timer_at)
+        true (timer_at <= 0.25);
+      Alcotest.(check bool)
+        (Printf.sprintf
+           "timer fired (%.3fs) before reader finished (%.3fs)"
+           timer_at reader_at)
+        true (timer_at < reader_at);
+      Lwt.return_unit
+  )
+
+(* ------------------------------------------------------------------ *)
 (* RUNNER                                                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -772,6 +867,10 @@ let () =
     "pp_error", [
       Alcotest.test_case "pp_error_io"                     `Quick pp_error_io_test;
       Alcotest.test_case "pp_error_oob"                    `Quick pp_error_oob_test;
+    ];
+    "cooperation", [
+      Alcotest.test_case "read_page yields to concurrent timer"
+        `Quick read_page_yields_to_timer_test;
     ];
     "qcheck", qcheck_tests;
   ]
