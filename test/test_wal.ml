@@ -216,6 +216,47 @@ let test_append_overwrites_after_reset () =
       true (Wal.find_page w 2L <> None);
     Lwt.return_unit)
 
+(* Test that find_page_at respects the strict-less-than snapshot bound.
+   Three commits write page 7 in successive frames (frame_idx 0, 1, 2).
+   A reader captured at committed_frames=N should see frame N-1 at most. *)
+let test_find_page_at_snapshot () =
+  Lwt_main.run (
+    let* _, w = fresh_wal () in
+    let* _ = Wal.append_commit w [(7L, page_with '\xAA')] in
+    let* _ = Wal.append_commit w [(7L, page_with '\xBB')] in
+    let* _ = Wal.append_commit w [(7L, page_with '\xCC')] in
+    (* Three frames: idx 0, 1, 2. *)
+    Alcotest.(check (option int)) "snap=1 sees frame 0" (Some 0)
+      (Wal.find_page_at w 7L ~max_frame:1);
+    Alcotest.(check (option int)) "snap=2 sees frame 1" (Some 1)
+      (Wal.find_page_at w 7L ~max_frame:2);
+    Alcotest.(check (option int)) "snap=3 sees frame 2" (Some 2)
+      (Wal.find_page_at w 7L ~max_frame:3);
+    Alcotest.(check (option int)) "snap=0 sees nothing" None
+      (Wal.find_page_at w 7L ~max_frame:0);
+    Alcotest.(check (option int)) "absent page" None
+      (Wal.find_page_at w 99L ~max_frame:3);
+    Lwt.return_unit)
+
+(* Verify find_page still returns the globally latest frame. *)
+let test_find_page_still_latest () =
+  Lwt_main.run (
+    let* _, w = fresh_wal () in
+    let* _ = Wal.append_commit w [(3L, page_with 'X')] in
+    let* _ = Wal.append_commit w [(3L, page_with 'Y')] in
+    let* _ = Wal.append_commit w [(3L, page_with 'Z')] in
+    (* find_page must return frame 2 (the latest). *)
+    Alcotest.(check (option int)) "latest frame is 2" (Some 2)
+      (Wal.find_page w 3L);
+    let* read =
+      let* r = Wal.read_frame w 2 in
+      match r with
+      | Ok b -> Lwt.return b
+      | Error e -> Alcotest.failf "read_frame: %a" Wal.pp_error e
+    in
+    Alcotest.(check char) "latest data is Z" 'Z' (Cstruct.get_char read 0);
+    Lwt.return_unit)
+
 let () =
   Alcotest.run "wal" [
     "basic", [
@@ -231,5 +272,9 @@ let () =
     "reset", [
       Alcotest.test_case "clears index"            `Quick test_reset_clears_index;
       Alcotest.test_case "overwrites old frames"   `Quick test_append_overwrites_after_reset;
+    ];
+    "snapshot", [
+      Alcotest.test_case "find_page_at bounds"     `Quick test_find_page_at_snapshot;
+      Alcotest.test_case "find_page still latest"  `Quick test_find_page_still_latest;
     ];
   ]

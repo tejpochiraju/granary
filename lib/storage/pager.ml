@@ -12,6 +12,7 @@ let cache_capacity = 64
 
 type wal_callbacks = {
   wal_find_page    : int64 -> int option;
+  wal_find_page_at : int64 -> max_frame:int -> int option;
   wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
   wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
   wal_append_commit_no_sync :

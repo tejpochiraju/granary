@@ -35,7 +35,9 @@ type t = {
   salt : int64;
   seed : int64;
   mutable committed_frames : int;
-  index : (int64, int) Hashtbl.t;  (* page_id -> latest committed frame_idx *)
+  index : (int64, int list) Hashtbl.t;
+  (* page_id -> frame indexes (newest-first). Each commit's new frames are
+     prepended; lookup walks the list to find the newest idx <= snapshot. *)
   mutable sync_count : int;
   (* Number of successful device syncs since open. Exposed for #77
      group-commit testing so test_group_commit can prove the fsync
@@ -44,8 +46,31 @@ type t = {
 
 let committed_frames t = t.committed_frames
 let sync_count t = t.sync_count
-let find_page t pid = Hashtbl.find_opt t.index pid
-let iter_index t f = Hashtbl.iter f t.index
+
+let find_page t pid =
+  match Hashtbl.find_opt t.index pid with
+  | None | Some [] -> None
+  | Some (idx :: _) -> Some idx
+
+(* Snapshot-aware lookup: return the newest frame_idx for [pid] such
+   that [idx < max_frame]. Note the strict "<": [max_frame] is the
+   reader's [committed_frames] snapshot, which counts how many frames
+   are visible — frame indices 0..max_frame-1. *)
+let find_page_at t pid ~max_frame =
+  match Hashtbl.find_opt t.index pid with
+  | None -> None
+  | Some lst ->
+    let rec scan = function
+      | [] -> None
+      | idx :: rest -> if idx < max_frame then Some idx else scan rest
+    in
+    scan lst
+
+let iter_index t f =
+  Hashtbl.iter (fun pid lst ->
+    match lst with
+    | [] -> ()
+    | idx :: _ -> f pid idx) t.index
 
 (* ----------------------------------------------------------------- *)
 (* FNV-1a 64-bit checksum                                              *)
@@ -185,7 +210,9 @@ let recover_index t =
         Hashtbl.replace pending f.page_id !idx;
         if f.is_commit then begin
           (* commit: flush pending into the persistent index *)
-          Hashtbl.iter (fun k v -> Hashtbl.replace t.index k v) pending;
+          Hashtbl.iter (fun k v ->
+            let prev = Option.value ~default:[] (Hashtbl.find_opt t.index k) in
+            Hashtbl.replace t.index k (v :: prev)) pending;
           Hashtbl.reset pending;
           last_commit_idx := !idx;
         end;
@@ -300,7 +327,8 @@ let write_pages_at t ~base pages =
 let publish_pages t ~base pages =
   let n = List.length pages in
   List.iteri (fun i (page_id, _) ->
-    Hashtbl.replace t.index page_id (base + i)) pages;
+    let prev = Option.value ~default:[] (Hashtbl.find_opt t.index page_id) in
+    Hashtbl.replace t.index page_id ((base + i) :: prev)) pages;
   t.committed_frames <- base + n;
   let new_end =
     Int64.add (Int64.of_int header_size_bytes)

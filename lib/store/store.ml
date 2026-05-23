@@ -493,6 +493,8 @@ module Wal = Sqlocaml_storage.Wal
 let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
   let cb : Pager.wal_callbacks = {
     wal_find_page = (fun pid -> Wal.find_page wal pid);
+    wal_find_page_at = (fun pid ~max_frame ->
+      Wal.find_page_at wal pid ~max_frame);
     wal_read_frame = (fun idx ->
       let* r = Wal.read_frame wal idx in
       match r with

@@ -72,6 +72,12 @@ val sync_count : t -> int
 (** Most recent committed frame index for [page_id], or [None] if absent. *)
 val find_page : t -> int64 -> int option
 
+(** Snapshot-aware lookup: most recent frame index for [page_id] strictly
+    less than [max_frame]. Used by RO snapshots so a reader captured at
+    [committed_frames = max_frame] does not see frames written after.
+    Returns [None] if no frame for [page_id] satisfies the bound. *)
+val find_page_at : t -> int64 -> max_frame:int -> int option
+
 (** Read the page bytes at a given frame index. The caller must not modify
     the returned Cstruct; it is a fresh allocation per call. *)
 val read_frame : t -> int -> (Cstruct.t, error) result Lwt.t
