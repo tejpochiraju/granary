@@ -37,7 +37,8 @@ type t = {
   mutable committed_frames : int;
   index : (int64, int list) Hashtbl.t;
   (* page_id -> frame indexes (newest-first). Each commit's new frames are
-     prepended; lookup walks the list to find the newest idx <= snapshot. *)
+     prepended; [find_page_at] walks the list to find the newest idx that is
+     strictly less than the reader's [committed_frames] snapshot. *)
   mutable sync_count : int;
   (* Number of successful device syncs since open. Exposed for #77
      group-commit testing so test_group_commit can prove the fsync
