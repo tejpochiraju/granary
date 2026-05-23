@@ -161,6 +161,42 @@ let test_pragma_round_trip () =
     Lwt.return_unit)
 
 (* ----------------------------------------------------------------- *)
+(* Background autocheckpoint: writer must not block while checkpoint  *)
+(* runs asynchronously in the background.                              *)
+(* ----------------------------------------------------------------- *)
+
+let test_writer_not_blocked_by_autocheckpoint () =
+  (* After crossing threshold, the writer's commit must return promptly;
+     checkpoint runs in the background.  Sanity check: 10 inserts past
+     threshold complete in well under 1 second on a small DB. *)
+  let path = "/tmp/sqlocaml_phase38_actk_async.db" in
+  (try Unix.unlink path with _ -> ());
+  (try Unix.unlink (path ^ "-wal") with _ -> ());
+  let db = match run (D.open_file_wal ~path) with
+    | Ok d -> d | Error _ -> Alcotest.fail "open" in
+  let exec sql =
+    match run (D.execute db sql) with
+    | Ok () -> () | Error _ -> Alcotest.failf "exec failed: %s" sql in
+  exec "PRAGMA wal_autocheckpoint = 50";
+  exec "CREATE TABLE t (n INTEGER)";
+  for i = 0 to 60 do
+    exec (Printf.sprintf "INSERT INTO t VALUES (%d)" i)
+  done;
+  let t0 = Unix.gettimeofday () in
+  for i = 100 to 109 do
+    exec (Printf.sprintf "INSERT INTO t VALUES (%d)" i)
+  done;
+  let elapsed = Unix.gettimeofday () -. t0 in
+  Alcotest.(check bool)
+    (Printf.sprintf "10 inserts past threshold under 1s (was %.3fs)" elapsed)
+    true (elapsed < 1.0);
+  (* Give background checkpoint time to complete. *)
+  Unix.sleepf 0.5;
+  run (D.close db);
+  (try Unix.unlink path with _ -> ());
+  (try Unix.unlink (path ^ "-wal") with _ -> ())
+
+(* ----------------------------------------------------------------- *)
 
 let () =
   Alcotest.run "wal_autocheckpoint" [
@@ -169,5 +205,7 @@ let () =
       Alcotest.test_case "low threshold keeps WAL bounded" `Quick test_bounded_under_low_threshold;
       Alcotest.test_case "threshold = 0 disables"      `Quick test_zero_threshold_disables;
       Alcotest.test_case "PRAGMA round-trip"           `Quick test_pragma_round_trip;
+      Alcotest.test_case "writer not blocked by background autocheckpoint"
+                         `Quick test_writer_not_blocked_by_autocheckpoint;
     ];
   ]

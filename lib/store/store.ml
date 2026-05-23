@@ -108,6 +108,18 @@ type bt_state = {
   commit_queue : commit_queue;
   (* WAL-mode group commit (#77).  Used only when [wal] is [Some];
      allocated unconditionally to keep [bt_state] uniform. *)
+  active_reader_frames : (int, int) Hashtbl.t;
+  (* WAL committed_frames snapshot value -> refcount of RO snapshots
+     captured at that value.  Lets [min_active_reader_frames] compute
+     the lowest snapshot bound currently in flight in O(distinct
+     snapshots) which is bounded by the number of concurrent readers. *)
+  reader_done_cond : unit Lwt_condition.t;
+  (* Broadcast on every [ro_end] so a waiting checkpoint can re-check
+     [min_active_reader_frames] without busy-waiting. *)
+  mutable autockpt_in_flight : bool;
+  (* True iff a background autocheckpoint fiber is currently running.
+     Used to coalesce: if a commit crosses the threshold while a
+     checkpoint is already running, we skip rescheduling. *)
 }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -246,6 +258,13 @@ let min_active_reader_txn st =
     | None -> Some txn_id
     | Some m -> Some (Int64.min m txn_id)
   ) st.active_readers None
+
+let min_active_reader_frames (st : bt_state) : int option =
+  Hashtbl.fold (fun k _ acc ->
+    match acc with
+    | None -> Some k
+    | Some m -> Some (min m k)
+  ) st.active_reader_frames None
 
 (* Lookup-or-build the Btree handle for a tree_id using a snapshot's
    pinned meta root page rather than the live meta tree. *)
@@ -400,7 +419,10 @@ let open_file ~path : (t, error) result Lwt.t =
               active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
               wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue () }
+              commit_queue = create_commit_queue ();
+              active_reader_frames = Hashtbl.create 4;
+              reader_done_cond = Lwt_condition.create ();
+              autockpt_in_flight = false }
           in
           Lwt.return_ok
             { backend = Btree st; lock = Rwlock.create ();
@@ -424,7 +446,10 @@ let open_file ~path : (t, error) result Lwt.t =
             active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
               wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue () }
+              commit_queue = create_commit_queue ();
+              active_reader_frames = Hashtbl.create 4;
+              reader_done_cond = Lwt_condition.create ();
+              autockpt_in_flight = false }
         in
         Lwt.return_ok
           { backend = Btree st; lock = Rwlock.create ();
@@ -476,7 +501,10 @@ let open_block
             active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
               wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue () }
+              commit_queue = create_commit_queue ();
+              active_reader_frames = Hashtbl.create 4;
+              reader_done_cond = Lwt_condition.create ();
+              autockpt_in_flight = false }
         in
         Lwt.return_ok
           { backend = Btree st; lock = Rwlock.create ();
@@ -496,7 +524,10 @@ let open_block
         active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
               wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue () }
+              commit_queue = create_commit_queue ();
+              active_reader_frames = Hashtbl.create 4;
+              reader_done_cond = Lwt_condition.create ();
+              autockpt_in_flight = false }
     in
     Lwt.return_ok
       { backend = Btree st; lock = Rwlock.create ();
@@ -616,7 +647,10 @@ let open_block_wal
               wal = Some wal;
               wal_close = Some wal_close;
               wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue () }
+              commit_queue = create_commit_queue ();
+              active_reader_frames = Hashtbl.create 4;
+              reader_done_cond = Lwt_condition.create ();
+              autockpt_in_flight = false }
           in
           Lwt.return_ok
             { backend = Btree st; lock = Rwlock.create ();
@@ -774,6 +808,9 @@ let ro_begin t =
     let count = Option.value ~default:0
                   (Hashtbl.find_opt st.active_readers snap_txn_id) in
     Hashtbl.replace st.active_readers snap_txn_id (count + 1);
+    let frame_count = Option.value ~default:0
+                        (Hashtbl.find_opt st.active_reader_frames snap_frames) in
+    Hashtbl.replace st.active_reader_frames snap_frames (frame_count + 1);
     Lwt.return
       (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
             rs_snap_meta_root = snap_meta_root;
@@ -812,7 +849,13 @@ let ro_end (Ro snap : ro txn) =
      let tid = snap.rs_snap_txn_id in
      (match Hashtbl.find_opt st.active_readers tid with
       | None | Some 1 -> Hashtbl.remove st.active_readers tid
-      | Some n -> Hashtbl.replace st.active_readers tid (n - 1)));
+      | Some n -> Hashtbl.replace st.active_readers tid (n - 1));
+     (match Hashtbl.find_opt st.active_reader_frames snap.rs_snap_frames with
+      | None | Some 1 ->
+        Hashtbl.remove st.active_reader_frames snap.rs_snap_frames
+      | Some n ->
+        Hashtbl.replace st.active_reader_frames snap.rs_snap_frames (n - 1));
+     Lwt_condition.broadcast st.reader_done_cond ());
   if snap.rs_lock_taken then Rwlock.release_read snap.rs_store.lock;
   Lwt.return_unit
 
@@ -905,7 +948,16 @@ let write_freelist_pages pager : int64 Lwt.t =
 (** Body of [checkpoint] without mutex management. Caller MUST already
     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
     can invoke it via [maybe_autocheckpoint] below. *)
+let rec wait_for_readers_past (st : bt_state) ~target =
+  match min_active_reader_frames st with
+  | Some m when m < target ->
+    let* () = Lwt_condition.wait st.reader_done_cond in
+    wait_for_readers_past st ~target
+  | _ -> Lwt.return_unit
+
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
+  let target = Wal.committed_frames wal in
+  let* () = wait_for_readers_past st ~target in
   let pairs = ref [] in
   Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
   let rec write_each = function
@@ -1147,24 +1199,34 @@ let commit (Rw t : rw txn) : unit Lwt.t =
           (match role with
            | `Joiner -> Lwt.return_unit
            | `Drainer ->
-             (* Best-effort autocheckpoint when threshold crossed.
-                Skipped if the threshold check is cheap and would not
-                fire — avoids an unnecessary mutex round-trip in the
-                common case. *)
              if st.wal_autocheckpoint_threshold <= 0
                 || Wal.committed_frames
                      (match st.wal with Some w -> w | None -> assert false)
                    < st.wal_autocheckpoint_threshold
+                || st.autockpt_in_flight
              then Lwt.return_unit
-             else
-               Lwt.catch
-                 (fun () ->
-                   let* () = Rwlock.acquire_write t.lock in
-                   Lwt.finalize
-                     (fun () -> maybe_autocheckpoint st)
-                     (fun () ->
-                       Rwlock.release_write t.lock; Lwt.return_unit))
-                 (fun _ -> Lwt.return_unit)))
+             else begin
+               st.autockpt_in_flight <- true;
+               Lwt.async (fun () ->
+                 Lwt.finalize
+                   (fun () ->
+                     Lwt.catch
+                       (fun () ->
+                         let* () = Rwlock.acquire_write t.lock in
+                         Lwt.finalize
+                           (fun () ->
+                             match st.wal with
+                             | None -> Lwt.return_unit
+                             | Some wal -> checkpoint_unlocked st wal)
+                           (fun () ->
+                             Rwlock.release_write t.lock;
+                             Lwt.return_unit))
+                       (fun _ -> Lwt.return_unit))
+                   (fun () ->
+                     st.autockpt_in_flight <- false;
+                     Lwt.return_unit));
+               Lwt.return_unit
+             end))
         (fun exn ->
           unlock_once ();
           Lwt.fail exn)
