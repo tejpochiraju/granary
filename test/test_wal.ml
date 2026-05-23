@@ -236,6 +236,30 @@ let test_find_page_at_snapshot () =
       (Wal.find_page_at w 7L ~max_frame:0);
     Alcotest.(check (option int)) "absent page" None
       (Wal.find_page_at w 99L ~max_frame:3);
+    Alcotest.(check (option int)) "snap beyond committed sees latest"
+      (Some 2) (Wal.find_page_at w 7L ~max_frame:100);
+    Lwt.return_unit)
+
+(* Recovery path also builds the per-page frame history (newest-first).
+   Reopen a WAL with two commits to the same page and verify
+   find_page_at resolves each frame correctly after recovery. *)
+let test_find_page_at_after_recovery () =
+  Lwt_main.run (
+    let* d, w1 = fresh_wal () in
+    let* _ = Wal.append_commit w1 [(5L, page_with 'A')] in
+    let* _ = Wal.append_commit w1 [(5L, page_with 'B')] in
+    let* r =
+      Wal.open_ ~read_at:(read_at d) ~write_at:(write_at d) ~sync:sync_ok
+        ~size_bytes:(dev_size d)
+    in
+    let w2 = match r with
+      | Ok w -> w
+      | Error e -> Alcotest.failf "reopen: %a" Wal.pp_error e
+    in
+    Alcotest.(check (option int)) "snap=1 sees frame 0" (Some 0)
+      (Wal.find_page_at w2 5L ~max_frame:1);
+    Alcotest.(check (option int)) "snap=2 sees frame 1" (Some 1)
+      (Wal.find_page_at w2 5L ~max_frame:2);
     Lwt.return_unit)
 
 (* Verify find_page still returns the globally latest frame. *)
@@ -276,5 +300,7 @@ let () =
     "snapshot", [
       Alcotest.test_case "find_page_at bounds"     `Quick test_find_page_at_snapshot;
       Alcotest.test_case "find_page still latest"  `Quick test_find_page_still_latest;
+      Alcotest.test_case "find_page_at after recovery"
+                                                   `Quick test_find_page_at_after_recovery;
     ];
   ]
