@@ -27,6 +27,15 @@ val read_live : Pager.t -> (t, error) result Lwt.t
     [new_state] provides root_page, freelist_page, n_pages_total, schema_version. *)
 val commit : Pager.t -> prev_header:t -> new_state:t -> (unit, error) result Lwt.t
 
+(** Like {!commit} but defers the device sync to a later
+    [Pager.wal_sync].  Stages the next header into its inactive slot and
+    pushes all dirty pages through [Pager.flush_no_sync]; group-commit
+    callers coalesce the actual fsync across multiple writers.  On
+    non-WAL backends this falls through to the regular sync flush, so it
+    is safe to call regardless of backend. *)
+val commit_no_sync :
+  Pager.t -> prev_header:t -> new_state:t -> (unit, error) result Lwt.t
+
 (** Initialise a brand-new empty file: write both header pages with txn_id=0
     and zeroed root/freelist. Called once on new file creation.
     After init, a subsequent read_live returns the zeroed header. *)

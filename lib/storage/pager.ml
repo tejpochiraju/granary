@@ -14,6 +14,9 @@ type wal_callbacks = {
   wal_find_page    : int64 -> int option;
   wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
   wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+  wal_append_commit_no_sync :
+    (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+  wal_sync         : unit -> (unit, string) result Lwt.t;
 }
 
 type t = {
@@ -187,6 +190,58 @@ let free t ~page_id ~freed_at_txn_id =
     Freelist.add t.freelist
       ~page_id:(Int64.to_int32 page_id)
       ~freed_at_txn_id
+
+(* Internal: drive the WAL append callback [append] with the dirty
+   entries; on success clear the dirty set.  Used by both [flush] (sync)
+   and [flush_no_sync] (group commit) so the dirty-set management is
+   identical. *)
+let flush_via_wal t ~append =
+  let open Lwt.Syntax in
+  let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
+  if entries = [] then Lwt.return_ok ()
+  else
+    let* r = append entries in
+    match r with
+    | Error msg -> Lwt.return_error (Block_error msg)
+    | Ok () ->
+      Hashtbl.clear t.dirty;
+      Lwt.return_ok ()
+
+let flush_no_sync t =
+  match t.wal with
+  | Some cb -> flush_via_wal t ~append:cb.wal_append_commit_no_sync
+  | None ->
+    (* Non-WAL backends have no notion of deferred sync — fall through to
+       the regular [flush] which writes pages + syncs. *)
+    let entries =
+      Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty []
+    in
+    let open Lwt.Syntax in
+    let rec write_all = function
+      | [] ->
+        let* sync_result = t.sync () in
+        (match sync_result with
+         | Error msg -> Lwt.return_error (Block_error msg)
+         | Ok () ->
+           Hashtbl.clear t.dirty;
+           Lwt.return_ok ())
+      | (pid, buf) :: rest ->
+        let* result = t.write_page ~page_id:pid buf in
+        (match result with
+         | Error msg -> Lwt.return_error (Block_error msg)
+         | Ok ()     -> write_all rest)
+    in
+    write_all entries
+
+let wal_sync t =
+  match t.wal with
+  | Some cb ->
+    let open Lwt.Syntax in
+    let* r = cb.wal_sync () in
+    (match r with
+     | Error msg -> Lwt.return_error (Block_error msg)
+     | Ok () -> Lwt.return_ok ())
+  | None -> Lwt.return_ok ()
 
 let flush t =
   let open Lwt.Syntax in

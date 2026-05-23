@@ -58,6 +58,29 @@ type bt_savepoint = {
   sp_dirty       : Pager.dirty_snapshot;
 }
 
+(* Per-store commit queue for WAL-mode group commit (#77).  After a
+   writer has staged its WAL frames it releases [rw_mutex] and joins this
+   queue to await one shared fsync.  [drainer] is set to [true] by the
+   first arriving writer (acting as coordinator); subsequent writers
+   wait on [cond] until [epoch] advances past the value they observed at
+   arrival.  [pending] tracks the number of joiners currently waiting
+   on [cond] so the drainer can yield additional ticks while new
+   arrivals keep registering, widening the batch.  Cooperative Lwt
+   scheduling makes the [drainer]/[pending]/[epoch] transitions atomic
+   (no implicit yield between read and write). *)
+type commit_queue = {
+  mutable drainer : bool;
+  mutable pending : int;
+  cond            : unit Lwt_condition.t;
+  mutable epoch   : int;
+}
+
+let create_commit_queue () =
+  { drainer = false;
+    pending = 0;
+    cond = Lwt_condition.create ();
+    epoch = 0 }
+
 type bt_state = {
   close_fn             : unit -> unit Lwt.t;
   pager                : Pager.t;
@@ -80,6 +103,9 @@ type bt_state = {
      commit triggers an inline checkpoint (still under [rw_mutex]) so
      the WAL stays bounded. 0 disables auto-checkpoint. Per-connection,
      not persisted. *)
+  commit_queue : commit_queue;
+  (* WAL-mode group commit (#77).  Used only when [wal] is [Some];
+     allocated unconditionally to keep [bt_state] uniform. *)
 }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -353,7 +379,8 @@ let open_file ~path : (t, error) result Lwt.t =
               txn_freelist_snapshot = None;
               active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+              commit_queue = create_commit_queue () }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -376,7 +403,8 @@ let open_file ~path : (t, error) result Lwt.t =
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+              commit_queue = create_commit_queue () }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -427,7 +455,8 @@ let open_block
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+              commit_queue = create_commit_queue () }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -446,7 +475,8 @@ let open_block
         txn_freelist_snapshot = None;
         active_readers = Hashtbl.create 4;
               bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+              commit_queue = create_commit_queue () }
     in
     Lwt.return_ok
       { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -468,6 +498,16 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
       | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
     wal_append_commit = (fun pages ->
       let* r = Wal.append_commit wal pages in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
+    wal_append_commit_no_sync = (fun pages ->
+      let* r = Wal.append_commit_no_sync wal pages in
+      match r with
+      | Ok () -> Lwt.return_ok ()
+      | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
+    wal_sync = (fun () ->
+      let* r = Wal.flush_sync wal in
       match r with
       | Ok () -> Lwt.return_ok ()
       | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
@@ -553,7 +593,8 @@ let open_block_wal
               bt_savepoints = [];
               wal = Some wal;
               wal_close = Some wal_close;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+              commit_queue = create_commit_queue () }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -864,10 +905,135 @@ let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
         (fun () -> checkpoint_unlocked st wal)
         (fun _ -> Lwt.return_unit)
 
+(* Group-commit coordinator (#77).  One fiber per [commit_queue] runs
+   the actual fsync via [sync_fn]; concurrent writers wait on [q.cond]
+   for [q.epoch] to advance.  Returns the role this fiber played so the
+   caller can attach drainer-only side work (e.g. autocheckpoint).
+
+   Each joiner increments [pending] before awaiting [cond] (and
+   decrements on wake) so the drainer can detect concurrent arrivals.
+   The drainer yields via [Lwt.pause] once to let any ready-to-write
+   fibers reach the queue, then loops pausing while [pending] keeps
+   growing.  This widens the batch from "2 commits per fsync" (one
+   Lwt.pause yields one continuation) to "N concurrent writers per
+   fsync" while adding only one tick of latency to a lone writer.
+
+   Failure semantics: if [sync_fn] raises, the drainer fiber propagates
+   the exception to its own caller.  Joiners that woke from the same
+   broadcast return [`Joiner] without seeing the failure — but
+   [Unix.fsync] failures in WAL mode are treated as fatal by upstream
+   callers (Lwt exceptions propagate to [Lwt_main]), so the process
+   crashes before joiners can act on the spurious success.  A more
+   precise per-batch error channel is left for follow-up work; the
+   current design matches the prior inline-sync path's "fail_with"
+   behaviour. *)
+let group_commit_sync (q : commit_queue) (sync_fn : unit -> unit Lwt.t)
+    : [`Drainer | `Joiner] Lwt.t =
+  if q.drainer then begin
+    q.pending <- q.pending + 1;
+    let target = q.epoch + 1 in
+    Lwt.finalize
+      (fun () ->
+        let rec wait () =
+          if q.epoch >= target then Lwt.return `Joiner
+          else
+            let* () = Lwt_condition.wait q.cond in
+            wait ()
+        in
+        wait ())
+      (fun () -> q.pending <- q.pending - 1; Lwt.return_unit)
+  end else begin
+    q.drainer <- true;
+    (* Gather: one initial pause to let the next-in-line writer reach
+       the queue; then keep pausing while [pending] keeps growing.
+       Stops as soon as a pause completes without seeing any new
+       arrival — keeping per-commit overhead bounded for solo
+       writers. *)
+    let* () = Lwt.pause () in
+    let rec gather last_seen =
+      let now_seen = q.pending in
+      if now_seen > last_seen then
+        let* () = Lwt.pause () in
+        gather now_seen
+      else Lwt.return_unit
+    in
+    let* () = gather 0 in
+    let* () =
+      Lwt.finalize
+        (fun () -> sync_fn ())
+        (fun () ->
+          q.epoch <- q.epoch + 1;
+          q.drainer <- false;
+          Lwt_condition.broadcast q.cond ();
+          Lwt.return_unit)
+    in
+    Lwt.return `Drainer
+  end
+
+(* Prepare phase of [commit] for the Btree backend.  Pushes every tree's
+   latest root_page through the meta-tree, writes the freelist pages,
+   and invokes [~header_commit] (either {!Header.commit} for the inline-
+   sync path or {!Header.commit_no_sync} for group commit).  On success
+   advances [st.current_header] and resets per-txn state.  On failure
+   raises via [Lwt.fail_with] without touching the mutex. *)
+let commit_prepare_btree
+    ~(header_commit :
+        Pager.t ->
+        prev_header:Header.t ->
+        new_state:Header.t ->
+        (unit, Header.error) result Lwt.t)
+    (st : bt_state) : unit Lwt.t =
+  let* () = free_old_freelist_pages st.pager
+              ~first_page:st.current_header.freelist_page
+  in
+  let bindings =
+    Hashtbl.fold (fun tid bt acc -> (tid, bt) :: acc) st.trees []
+  in
+  let* () =
+    Lwt_list.iter_s (fun (tid, bt) ->
+      let key = encode_tree_id tid in
+      let v   = encode_root_page (Btree.root_page bt) in
+      let* r = Btree.put st.meta key v in
+      match r with
+      | Ok meta' -> st.meta <- meta'; Lwt.return_unit
+      | Error e -> Lwt.fail_with
+        (Format.asprintf "Store.commit: %a" pp_error (map_btree_err e))
+    ) bindings
+  in
+  let* freelist_first_page = write_freelist_pages st.pager in
+  let new_state : Header.t =
+    { txn_id         = 0L;  (* overwritten by header_commit *)
+      root_page      = Btree.root_page st.meta;
+      freelist_page  = freelist_first_page;
+      n_pages_total  = Pager.n_pages st.pager;
+      schema_version = st.schema_version }
+  in
+  let* r = header_commit st.pager
+             ~prev_header:st.current_header ~new_state
+  in
+  match r with
+  | Error e ->
+    Lwt.fail_with
+      (Format.asprintf "Store.commit: %a" pp_error (map_header_err e))
+  | Ok () ->
+    st.current_header <-
+      { new_state with
+        txn_id = Int64.add st.current_header.txn_id 1L };
+    st.txn_freelist_snapshot <- None;
+    st.bt_savepoints <- [];
+    Lwt.return_unit
+
 (* commit:
    - Mem backend: no I/O, just release the writer lock.
-   - Btree backend: flush all currently-open trees' root_pages into the
-     meta-tree, then write a new header pointing at the new meta root.
+   - Btree backend without WAL: flush all currently-open trees'
+     root_pages into the meta-tree, then write a new header pointing at
+     the new meta root, sync inline, autocheckpoint, release.
+   - Btree backend with WAL: same prepare phase but using
+     [Header.commit_no_sync] so the writer can release [rw_mutex]
+     before the fsync.  Writers then converge on a per-store
+     [commit_queue]; one drainer fsyncs and resolves all waiters.  Only
+     the drainer attempts the autocheckpoint (single check per fsync
+     covers the whole batch).
 
    Note: the Btree.create/put/del API returns a NEW Btree.t after every
    mutation (root_page may have changed).  We update [st.trees] each
@@ -875,60 +1041,71 @@ let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
    touched tree into the meta-tree (whose own root we then commit via
    the header alternating-pages protocol). *)
 let commit (Rw t : rw txn) : unit Lwt.t =
-  (match t.backend with
-   | Mem _ ->
-     t.mem_rw_snapshot <- None;
-     t.mem_savepoints <- [];
-     Lwt.return_unit
-   | Btree st ->
-     (* 1. Free old freelist pages from the previous commit *)
-     let* () = free_old_freelist_pages st.pager
-                 ~first_page:st.current_header.freelist_page
-     in
-     (* Persist every cached tree's root_page into the meta-tree.  We
-        iterate over a snapshot of the bindings to avoid mutation during
-        iteration. *)
-     let bindings =
-       Hashtbl.fold (fun tid bt acc -> (tid, bt) :: acc) st.trees []
-     in
-     let* () =
-       Lwt_list.iter_s (fun (tid, bt) ->
-         let key = encode_tree_id tid in
-         let v   = encode_root_page (Btree.root_page bt) in
-         let* r = Btree.put st.meta key v in
-         match r with
-         | Ok meta' -> st.meta <- meta'; Lwt.return_unit
-         | Error e -> Lwt.fail_with
-           (Format.asprintf "Store.commit: %a" pp_error (map_btree_err e))
-       ) bindings
-     in
-     (* Write updated freelist to new pages *)
-     let* freelist_first_page = write_freelist_pages st.pager in
-     let new_state : Header.t =
-       { txn_id         = 0L;  (* overwritten by Header.commit *)
-         root_page      = Btree.root_page st.meta;
-         freelist_page  = freelist_first_page;
-         n_pages_total  = Pager.n_pages st.pager;
-         schema_version = st.schema_version }
-     in
-     let* r = Header.commit st.pager
-                ~prev_header:st.current_header ~new_state
-     in
-     match r with
-     | Ok () ->
-       st.current_header <-
-         { new_state with
-           txn_id = Int64.add st.current_header.txn_id 1L };
-       st.txn_freelist_snapshot <- None;
-       st.bt_savepoints <- [];
-       maybe_autocheckpoint st
-     | Error e ->
-       Lwt.fail_with
-         (Format.asprintf "Store.commit: %a" pp_error (map_header_err e)))
-  |> fun work ->
-  Lwt.finalize
-    (fun () -> work)
-    (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit)
+  match t.backend with
+  | Mem _ ->
+    t.mem_rw_snapshot <- None;
+    t.mem_savepoints <- [];
+    Lwt_mutex.unlock t.rw_mutex;
+    Lwt.return_unit
+  | Btree st ->
+    match st.wal with
+    | None ->
+      Lwt.finalize
+        (fun () ->
+          let* () =
+            commit_prepare_btree ~header_commit:Header.commit st
+          in
+          maybe_autocheckpoint st)
+        (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit)
+    | Some _ ->
+      let unlocked = ref false in
+      let unlock_once () =
+        if not !unlocked then begin
+          unlocked := true;
+          Lwt_mutex.unlock t.rw_mutex
+        end
+      in
+      Lwt.catch
+        (fun () ->
+          let* () =
+            commit_prepare_btree
+              ~header_commit:Header.commit_no_sync st
+          in
+          unlock_once ();
+          let* role =
+            group_commit_sync st.commit_queue (fun () ->
+              let* r = Pager.wal_sync st.pager in
+              match r with
+              | Ok () -> Lwt.return_unit
+              | Error e ->
+                Lwt.fail_with
+                  (Format.asprintf "Store.commit: wal_sync: %a"
+                     Pager.pp_error e))
+          in
+          (match role with
+           | `Joiner -> Lwt.return_unit
+           | `Drainer ->
+             (* Best-effort autocheckpoint when threshold crossed.
+                Skipped if the threshold check is cheap and would not
+                fire — avoids an unnecessary mutex round-trip in the
+                common case. *)
+             if st.wal_autocheckpoint_threshold <= 0
+                || Wal.committed_frames
+                     (match st.wal with Some w -> w | None -> assert false)
+                   < st.wal_autocheckpoint_threshold
+             then Lwt.return_unit
+             else
+               Lwt.catch
+                 (fun () ->
+                   let* () = Lwt_mutex.lock t.rw_mutex in
+                   Lwt.finalize
+                     (fun () -> maybe_autocheckpoint st)
+                     (fun () ->
+                       Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit))
+                 (fun _ -> Lwt.return_unit)))
+        (fun exn ->
+          unlock_once ();
+          Lwt.fail exn)
 
 (* rollback:
    - Mem: restore the snapshot of tree contents taken at rw_begin, so that
@@ -1008,6 +1185,17 @@ let set_wal_autocheckpoint (t : t) (n : int) : unit =
   match t.backend with
   | Mem _ -> ()
   | Btree st -> st.wal_autocheckpoint_threshold <- max 0 n
+
+(* Number of fsyncs the WAL has performed since open.  Exposed for #77
+   group-commit testing: lets the test assert that N concurrent
+   autocommit fibers issue ≪ N fsyncs (proof of coalescing). *)
+let wal_sync_count (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st ->
+    (match st.wal with
+     | None -> 0
+     | Some w -> Sqlocaml_storage.Wal.sync_count w)
 
 (* ------------------------------------------------------------------ *)
 (* Savepoints (Mem backend only; B-tree deferred)                      *)

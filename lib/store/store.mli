@@ -184,6 +184,12 @@ val wal_autocheckpoint : t -> int
     clamped to 0). No-op on the in-memory backend. *)
 val set_wal_autocheckpoint : t -> int -> unit
 
+(** Number of fsyncs the WAL has performed since open.  Returns 0 for
+    non-WAL backends.  Exposed for #77 group-commit testing: a
+    well-behaved coordinator collapses N concurrent autocommit commits
+    into far fewer than N fsyncs. *)
+val wal_sync_count : t -> int
+
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int
 

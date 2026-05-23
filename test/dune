@@ -86,6 +86,10 @@
  (libraries sqlocaml sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
 
 (test
+ (name test_group_commit)
+ (libraries sqlocaml alcotest lwt.unix unix))
+
+(test
  (name test_overflow)
  (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
 

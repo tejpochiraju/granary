@@ -158,6 +158,8 @@ let close t =
   Hashtbl.clear t.attached;
   S.close t.store
 
+let wal_sync_count t = S.wal_sync_count t.store
+
 (* ------------------------------------------------------------------ *)
 (* VACUUM (#120)                                                       *)
 (* ------------------------------------------------------------------ *)

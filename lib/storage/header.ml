@@ -88,10 +88,11 @@ let read_live pager =
           In case of a tie (e.g. right after init) prefer page 0 (a). *)
        if Int64.compare b.txn_id a.txn_id > 0 then Ok b else Ok a)
 
-let commit pager ~prev_header ~new_state =
-  (* The active page holds txn_id = prev_header.txn_id.
-     By the alternating protocol: active page = txn_id mod 2,
-     so inactive page = (txn_id + 1) mod 2. *)
+(* Internal: write the next header into the inactive page slot.  Returns
+   the prepared header value (so callers can mirror it into in-memory
+   state).  Does NOT flush — callers choose [Pager.flush] (full sync) or
+   [Pager.flush_no_sync] (group commit). *)
+let stage_next_header pager ~prev_header ~new_state =
   let inactive_page =
     Int64.to_int (Int64.rem (Int64.add prev_header.txn_id 1L) 2L)
   in
@@ -99,7 +100,17 @@ let commit pager ~prev_header ~new_state =
   let h = { new_state with txn_id = next_txn_id } in
   let buf = build_page h in
   Pager.write pager (Int64.of_int inactive_page) buf;
+  h
+
+let commit pager ~prev_header ~new_state =
+  let _ = stage_next_header pager ~prev_header ~new_state in
   match%lwt Pager.flush pager with
+  | Error e -> Lwt.return (Error (of_pager_err e))
+  | Ok ()   -> Lwt.return (Ok ())
+
+let commit_no_sync pager ~prev_header ~new_state =
+  let _ = stage_next_header pager ~prev_header ~new_state in
+  match%lwt Pager.flush_no_sync pager with
   | Error e -> Lwt.return (Error (of_pager_err e))
   | Ok ()   -> Lwt.return (Ok ())
 

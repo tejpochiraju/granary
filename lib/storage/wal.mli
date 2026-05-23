@@ -64,6 +64,11 @@ val open_ :
 (** Total committed frames currently in the WAL. *)
 val committed_frames : t -> int
 
+(** Number of successful device syncs since this WAL was opened.
+    Exposed for #77 group-commit testing: tracks how many fsyncs the
+    coordinator has issued. *)
+val sync_count : t -> int
+
 (** Most recent committed frame index for [page_id], or [None] if absent. *)
 val find_page : t -> int64 -> int option
 
@@ -76,6 +81,20 @@ val read_frame : t -> int -> (Cstruct.t, error) result Lwt.t
     only then updates the in-memory index. If [sync] fails the index is
     left unchanged so the partial batch is invisible to readers. *)
 val append_commit : t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
+
+(** Append a batch of pages but skip the trailing [sync].  The in-memory
+    index and [committed_frames] are bumped immediately so concurrent
+    writers (still under the store's [rw_mutex]) can locate the newly
+    written frames and subsequent appends place their frames at the
+    correct base.  Durability is deferred to a separate {!flush_sync}
+    call by the group-commit coordinator.  Sync failure is treated as
+    fatal by upstream callers — see [Sqlocaml_store.Store.commit]. *)
+val append_commit_no_sync :
+  t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
+
+(** Invoke the underlying device sync.  Used by the group-commit
+    coordinator after one or more {!append_commit_no_sync} calls. *)
+val flush_sync : t -> (unit, error) result Lwt.t
 
 (** Reset the WAL: discards all committed frames and the in-memory index.
     Used by checkpointing to truncate the log after migrating its

@@ -37,6 +37,17 @@ val free : t -> page_id:int64 -> freed_at_txn_id:int64 -> unit
     Clears the dirty set after success. *)
 val flush : t -> (unit, error) result Lwt.t
 
+(** Like {!flush} but skips the trailing device sync when in WAL mode.
+    Used by the group-commit coordinator to write the batch's frames
+    without paying a per-writer fsync.  On non-WAL backends this is
+    identical to {!flush}. *)
+val flush_no_sync : t -> (unit, error) result Lwt.t
+
+(** Invoke the WAL device sync.  No-op when no WAL hook is installed.
+    Used by the group-commit coordinator after a sequence of
+    {!flush_no_sync} calls. *)
+val wal_sync : t -> (unit, error) result Lwt.t
+
 (** Current total page count (updated by [alloc]). *)
 val n_pages : t -> int64
 
@@ -75,6 +86,9 @@ type wal_callbacks = {
   wal_find_page    : int64 -> int option;
   wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
   wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+  wal_append_commit_no_sync :
+    (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
+  wal_sync         : unit -> (unit, string) result Lwt.t;
 }
 
 (** Install (or clear) the WAL hook. Pass [None] to revert to direct

@@ -48,6 +48,10 @@ val open_block :
 
 val close : t -> unit Lwt.t
 
+(** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
+    databases.  Exposed for #77 group-commit testing. *)
+val wal_sync_count : t -> int
+
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then
     atomically renames it over the original.  This drops free-list

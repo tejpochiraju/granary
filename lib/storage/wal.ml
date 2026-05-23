@@ -36,9 +36,14 @@ type t = {
   seed : int64;
   mutable committed_frames : int;
   index : (int64, int) Hashtbl.t;  (* page_id -> latest committed frame_idx *)
+  mutable sync_count : int;
+  (* Number of successful device syncs since open. Exposed for #77
+     group-commit testing so test_group_commit can prove the fsync
+     coalescing behaviour. *)
 }
 
 let committed_frames t = t.committed_frames
+let sync_count t = t.sync_count
 let find_page t pid = Hashtbl.find_opt t.index pid
 let iter_index t f = Hashtbl.iter f t.index
 
@@ -205,6 +210,7 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
         read_at; write_at; sync; size_bytes;
         salt; seed;
         committed_frames = 0;
+        sync_count = 0;
         index = Hashtbl.create 64;
       }
   end else begin
@@ -221,6 +227,7 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
            read_at; write_at; sync; size_bytes;
            salt; seed;
            committed_frames = 0;
+           sync_count = 0;
            index = Hashtbl.create 64;
          })
     | Ok (Some (salt, seed)) ->
@@ -228,6 +235,7 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
         read_at; write_at; sync; size_bytes;
         salt; seed;
         committed_frames = 0;
+        sync_count = 0;
         index = Hashtbl.create 64;
       } in
       let* r = recover_index t in
@@ -268,45 +276,77 @@ let write_frame t ~idx ~page_id ~is_commit ~page =
   let off = frame_offset idx in
   t.write_at ~offset:off buf
 
-let append_commit t pages =
+(* Internal: write [pages] starting at [base], without syncing. Returns
+   [n] (the number of pages written) on success.  Frames are emitted with
+   the last one carrying the commit marker. *)
+let write_pages_at t ~base pages =
+  let n = List.length pages in
+  let last = n - 1 in
+  let rec write_all i = function
+    | [] -> Lwt.return_ok n
+    | (page_id, page) :: rest ->
+      let is_commit = i = last in
+      let* r =
+        write_frame t ~idx:(base + i) ~page_id ~is_commit ~page
+      in
+      (match r with
+       | Error s -> Lwt.return_error (Block_error s)
+       | Ok () -> write_all (i + 1) rest)
+  in
+  write_all 0 pages
+
+(* Internal: publish (index update, committed_frames bump, size_bytes
+   high-water mark advance) for [pages] just written starting at [base]. *)
+let publish_pages t ~base pages =
+  let n = List.length pages in
+  List.iteri (fun i (page_id, _) ->
+    Hashtbl.replace t.index page_id (base + i)) pages;
+  t.committed_frames <- base + n;
+  let new_end =
+    Int64.add (Int64.of_int header_size_bytes)
+      (Int64.mul (Int64.of_int (base + n))
+         (Int64.of_int frame_size_bytes))
+  in
+  if Int64.compare new_end t.size_bytes > 0 then
+    t.size_bytes <- new_end
+
+let flush_sync t =
+  let* r = t.sync () in
+  match r with
+  | Error s -> Lwt.return_error (Block_error s)
+  | Ok () -> t.sync_count <- t.sync_count + 1; Lwt.return_ok ()
+
+let append_commit_no_sync t pages =
   match pages with
-  | [] -> Lwt.return_ok ()  (* nothing to do *)
+  | [] -> Lwt.return_ok ()
   | _ ->
-    let n = List.length pages in
     let base = t.committed_frames in
-    let last = n - 1 in
-    let rec write_all i = function
-      | [] ->
-        let* sr = t.sync () in
-        (match sr with
-         | Error s -> Lwt.return_error (Block_error s)
-         | Ok () -> Lwt.return_ok ())
-      | (page_id, page) :: rest ->
-        let is_commit = i = last in
-        let* r =
-          write_frame t ~idx:(base + i) ~page_id ~is_commit ~page
-        in
-        (match r with
-         | Error s -> Lwt.return_error (Block_error s)
-         | Ok () -> write_all (i + 1) rest)
-    in
-    let* r = write_all 0 pages in
+    let* r = write_pages_at t ~base pages in
     match r with
     | Error e -> Lwt.return_error e
-    | Ok () ->
-      (* Sync succeeded — publish: update index, committed_frames, and
-         the dynamic high-water mark used by [read_frame_raw]. *)
-      List.iteri (fun i (page_id, _) ->
-        Hashtbl.replace t.index page_id (base + i)) pages;
-      t.committed_frames <- base + n;
-      let new_end =
-        Int64.add (Int64.of_int header_size_bytes)
-          (Int64.mul (Int64.of_int (base + n))
-             (Int64.of_int frame_size_bytes))
-      in
-      if Int64.compare new_end t.size_bytes > 0 then
-        t.size_bytes <- new_end;
+    | Ok _ ->
+      (* Publish so subsequent writers (still under [rw_mutex]) and any
+         in-flight reads can locate the new frames.  Durability is
+         deferred to a later [flush_sync] by the group-commit coordinator;
+         a sync failure is treated as fatal by callers. *)
+      publish_pages t ~base pages;
       Lwt.return_ok ()
+
+let append_commit t pages =
+  match pages with
+  | [] -> Lwt.return_ok ()
+  | _ ->
+    let base = t.committed_frames in
+    let* r = write_pages_at t ~base pages in
+    match r with
+    | Error e -> Lwt.return_error e
+    | Ok _ ->
+      let* sr = flush_sync t in
+      match sr with
+      | Error e -> Lwt.return_error e
+      | Ok () ->
+        publish_pages t ~base pages;
+        Lwt.return_ok ()
 
 let reset t =
   Hashtbl.reset t.index;
