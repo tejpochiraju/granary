@@ -8334,9 +8334,9 @@ let test_phase35_deferred_resolved_by_delete () =
     let* () = exec_lwt "INSERT INTO dr_chi VALUES (10, 99)" in
     let* () = exec_lwt "DELETE FROM dr_chi WHERE id = 10" in
     let* () = exec_lwt "COMMIT" in
-    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM dr_chi" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM dr_chi" in
     Alcotest.(check int) "child empty"  0
-      (int_of_row (List.hd rows_1));
+      (int_of_row (List.hd rows));
     Lwt.return_unit)
 
 (* PRAGMA defer_foreign_keys = ON makes an IMMEDIATE constraint defer for the txn. *)
@@ -8395,9 +8395,9 @@ let test_phase35_multi_row_deferred () =
     let* () = exec_lwt "INSERT INTO m_par VALUES (2)" in
     let* () = exec_lwt "INSERT INTO m_par VALUES (3)" in
     let* () = exec_lwt "COMMIT" in
-    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM m_chi" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM m_chi" in
     Alcotest.(check int) "all children persisted" 3
-      (int_of_row (List.hd rows_1));
+      (int_of_row (List.hd rows));
     Lwt.return_unit)
 
 (* In autocommit mode, deferred FK still must enforce — behave like immediate. *)
@@ -8445,9 +8445,9 @@ let test_phase35_rollback_clears_pending () =
     (* After ROLLBACK, the pending check is gone — next statement should succeed
        even though the row that violated never got committed. *)
     let* () = exec_lwt "INSERT INTO rb_par VALUES (1)" in
-    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM rb_par" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM rb_par" in
     Alcotest.(check int) "parent inserted after rollback" 1
-      (int_of_row (List.hd rows_1));
+      (int_of_row (List.hd rows));
     Lwt.return_unit)
 
 (* DEFERRABLE INITIALLY IMMEDIATE is accepted but behaves IMMEDIATE. *)
@@ -8494,9 +8494,9 @@ let test_phase35_table_level_deferred () =
     let* () = exec_lwt "INSERT INTO tl_chi VALUES (1, 100)" in
     let* () = exec_lwt "INSERT INTO tl_par VALUES (100)" in
     let* () = exec_lwt "COMMIT" in
-    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM tl_chi" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM tl_chi" in
     Alcotest.(check int) "child inserted" 1
-      (int_of_row (List.hd rows_1));
+      (int_of_row (List.hd rows));
     Lwt.return_unit)
 
 (* Parent-side DELETE of referenced row: deferred RESTRICT permits temporary
