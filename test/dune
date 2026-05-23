@@ -125,3 +125,7 @@
  (name test_repl)
  (libraries alcotest unix)
  (deps ../bin/sqlocaml_repl.exe))
+
+(test
+ (name test_rwlock)
+ (libraries sqlocaml.store alcotest lwt.unix))
