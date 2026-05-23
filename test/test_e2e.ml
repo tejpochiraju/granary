@@ -40,6 +40,39 @@ let query_ok db sql =
   )
 
 (* ------------------------------------------------------------------ *)
+(* Lwt-monadic helper family (#161)                                    *)
+(*                                                                     *)
+(* Parallel non-nesting variants of [fresh_db], [exec], [query_ok],    *)
+(* [exec_err].  Use inside an outer [Lwt_main.run] block to avoid the  *)
+(* "Nested calls to Lwt_main.run are not allowed" abort that fires the *)
+(* moment the inner [Db.query] actually needs the scheduler (e.g. when *)
+(* a read cache-misses through Lwt_unix.pread — see #158, #161).       *)
+(* ------------------------------------------------------------------ *)
+
+let fresh_db_lwt () = Db.open_in_memory ()
+[@@warning "-32"]
+
+let exec_lwt db sql =
+  let* result = Db.execute db sql in
+  match result with
+  | Ok () -> Lwt.return_unit
+  | Error _ -> Alcotest.failf "exec_lwt: unexpected error for: %s" sql
+[@@warning "-32"]
+
+let query_ok_lwt db sql =
+  let* result = Db.query db sql in
+  match result with
+  | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
+  | Ok stream -> Lwt_stream.to_list stream
+
+let exec_err_lwt db sql =
+  let* result = Db.execute db sql in
+  match result with
+  | Ok ()    -> Alcotest.failf "exec_err_lwt: expected error for: %s" sql
+  | Error e  -> Lwt.return (fmt_err e)
+[@@warning "-32"]
+
+(* ------------------------------------------------------------------ *)
 (* Value helpers for clean assertions                                    *)
 (* ------------------------------------------------------------------ *)
 
@@ -8778,6 +8811,28 @@ let phase35_fk_deferrable_tests = [
     `Quick test_phase35_deferred_parent_delete_with_child_delete;
 ]
 
+(* ------------------------------------------------------------------ *)
+(* Helper tests (#161): the *_lwt family must exist and behave        *)
+(* identically to their sync counterparts at the outermost layer.     *)
+(* ------------------------------------------------------------------ *)
+
+let helper_query_ok_lwt_smoke () =
+  Lwt_main.run (
+    let* db = Db.open_in_memory () in
+    let* r1 = Db.execute db "CREATE TABLE t (x INTEGER)" in
+    (match r1 with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "create: %s" (fmt_err e));
+    let* r2 = Db.execute db "INSERT INTO t (x) VALUES (1), (2), (3)" in
+    (match r2 with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "insert: %s" (fmt_err e));
+    let* rows = query_ok_lwt db "SELECT x FROM t ORDER BY x" in
+    Alcotest.(check int) "row count" 3 (List.length rows);
+    let* () = Db.close db in
+    Lwt.return_unit
+  )
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -9452,4 +9507,7 @@ let () =
     "phase34_master_fts", phase34_master_fts_tests;
     "phase35_fk_deferrable", phase35_fk_deferrable_tests;
     "phase35_task3", phase35_task3_tests;
+    "helpers (#161)", [
+      Alcotest.test_case "query_ok_lwt smoke" `Quick helper_query_ok_lwt_smoke;
+    ];
   ]
