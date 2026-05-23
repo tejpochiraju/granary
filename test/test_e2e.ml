@@ -2572,7 +2572,7 @@ let test_fk_valid_insert () =
     let* () = exec "INSERT INTO fk_parent VALUES (1, 'alice')" in
     let* () = exec "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES fk_parent(id))" in
     let* () = exec "INSERT INTO fk_child VALUES (10, 1)" in
-    let rows = query_ok db "SELECT COUNT(*) FROM fk_child" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child" in
     Alcotest.(check int) "one row" 1
       (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
     Lwt.return_unit)
@@ -2614,7 +2614,7 @@ let test_fk_null_allowed () =
     let* () = exec "INSERT INTO fk_parent3 VALUES (1)" in
     let* () = exec "CREATE TABLE fk_child3 (id INTEGER, pid INTEGER REFERENCES fk_parent3(id))" in
     let* () = exec "INSERT INTO fk_child3 VALUES (10, NULL)" in
-    let rows = query_ok db "SELECT COUNT(*) FROM fk_child3" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child3" in
     Alcotest.(check int) "null fk ok" 1
       (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
     Lwt.return_unit)
@@ -8259,8 +8259,10 @@ let test_phase35_deferred_child_before_parent () =
     let* () = exec_lwt "INSERT INTO d_chi VALUES (10, 1)" in  (* parent not yet inserted *)
     let* () = exec_lwt "INSERT INTO d_par VALUES (1)" in
     let* () = exec_lwt "COMMIT" in
-    let n_par = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM d_par")) in
-    let n_chi = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM d_chi")) in
+    let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM d_par" in
+    let n_par = int_of_row (List.hd rows_par) in
+    let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM d_chi" in
+    let n_chi = int_of_row (List.hd rows_chi) in
     Alcotest.(check int) "parent count" 1 n_par;
     Alcotest.(check int) "child count"  1 n_chi;
     Lwt.return_unit)
@@ -8332,8 +8334,9 @@ let test_phase35_deferred_resolved_by_delete () =
     let* () = exec_lwt "INSERT INTO dr_chi VALUES (10, 99)" in
     let* () = exec_lwt "DELETE FROM dr_chi WHERE id = 10" in
     let* () = exec_lwt "COMMIT" in
+    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM dr_chi" in
     Alcotest.(check int) "child empty"  0
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM dr_chi")));
+      (int_of_row (List.hd rows_1));
     Lwt.return_unit)
 
 (* PRAGMA defer_foreign_keys = ON makes an IMMEDIATE constraint defer for the txn. *)
@@ -8356,12 +8359,14 @@ let test_phase35_pragma_defer_foreign_keys () =
     let* () = exec_lwt "INSERT INTO pd_chi VALUES (10, 1)" in  (* would fail without pragma *)
     let* () = exec_lwt "INSERT INTO pd_par VALUES (1)" in
     let* () = exec_lwt "COMMIT" in
+    let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi" in
     Alcotest.(check int) "child count" 1
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_chi")));
+      (int_of_row (List.hd rows_chi));
+    let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM pd_par" in
     Alcotest.(check int) "parent count" 1
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_par")));
+      (int_of_row (List.hd rows_par));
     (* Verify PRAGMA is reset to OFF after txn ends. *)
-    let rows = query_ok db "PRAGMA defer_foreign_keys" in
+    let* rows = query_ok_lwt db "PRAGMA defer_foreign_keys" in
     Alcotest.(check int) "pragma resets to 0 after txn" 0
       (int_of_row (List.hd rows));
     Lwt.return_unit)
@@ -8390,8 +8395,9 @@ let test_phase35_multi_row_deferred () =
     let* () = exec_lwt "INSERT INTO m_par VALUES (2)" in
     let* () = exec_lwt "INSERT INTO m_par VALUES (3)" in
     let* () = exec_lwt "COMMIT" in
+    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM m_chi" in
     Alcotest.(check int) "all children persisted" 3
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM m_chi")));
+      (int_of_row (List.hd rows_1));
     Lwt.return_unit)
 
 (* In autocommit mode, deferred FK still must enforce — behave like immediate. *)
@@ -8439,8 +8445,9 @@ let test_phase35_rollback_clears_pending () =
     (* After ROLLBACK, the pending check is gone — next statement should succeed
        even though the row that violated never got committed. *)
     let* () = exec_lwt "INSERT INTO rb_par VALUES (1)" in
+    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM rb_par" in
     Alcotest.(check int) "parent inserted after rollback" 1
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM rb_par")));
+      (int_of_row (List.hd rows_1));
     Lwt.return_unit)
 
 (* DEFERRABLE INITIALLY IMMEDIATE is accepted but behaves IMMEDIATE. *)
@@ -8487,8 +8494,9 @@ let test_phase35_table_level_deferred () =
     let* () = exec_lwt "INSERT INTO tl_chi VALUES (1, 100)" in
     let* () = exec_lwt "INSERT INTO tl_par VALUES (100)" in
     let* () = exec_lwt "COMMIT" in
+    let* rows_1 = query_ok_lwt db "SELECT COUNT(*) FROM tl_chi" in
     Alcotest.(check int) "child inserted" 1
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM tl_chi")));
+      (int_of_row (List.hd rows_1));
     Lwt.return_unit)
 
 (* Parent-side DELETE of referenced row: deferred RESTRICT permits temporary
@@ -8514,10 +8522,12 @@ let test_phase35_deferred_parent_delete_with_child_delete () =
     let* () = exec_lwt "DELETE FROM pd_par2 WHERE id = 1" in  (* would fail under immediate *)
     let* () = exec_lwt "DELETE FROM pd_chi2 WHERE id = 10" in
     let* () = exec_lwt "COMMIT" in
+    let* rows_par2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_par2" in
     Alcotest.(check int) "parent empty" 0
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_par2")));
+      (int_of_row (List.hd rows_par2));
+    let* rows_chi2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi2" in
     Alcotest.(check int) "child empty" 0
-      (int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM pd_chi2")));
+      (int_of_row (List.hd rows_chi2));
     Lwt.return_unit)
 
 (* Regression: Phase 35 Task 1 review blocker.  All other deferred-FK tests
@@ -8637,8 +8647,10 @@ let test_phase35_cascade_cycle_terminates () =
     let* () = exec_lwt "INSERT INTO cyc_b (id, a_id) VALUES (10, 1)" in
     let* () = exec_lwt "UPDATE cyc_a SET b_ref = 10 WHERE id = 1" in
     let* () = exec_lwt "DELETE FROM cyc_a WHERE id = 1" in
-    let n_a = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM cyc_a")) in
-    let n_b = int_of_row (List.hd (query_ok db "SELECT COUNT(*) FROM cyc_b")) in
+    let* rows_a = query_ok_lwt db "SELECT COUNT(*) FROM cyc_a" in
+    let n_a = int_of_row (List.hd rows_a) in
+    let* rows_b = query_ok_lwt db "SELECT COUNT(*) FROM cyc_b" in
+    let n_b = int_of_row (List.hd rows_b) in
     Alcotest.(check int) "cyc_a count after cycle delete" 0 n_a;
     Alcotest.(check int) "cyc_b count after cycle delete" 0 n_b;
     Lwt.return_unit)
@@ -8667,8 +8679,8 @@ let test_phase35_cascade_update_cycle_terminates () =
     (* Cascade-update the parent column; child must follow.  Cycle guard
        prevents infinite loops if the FK graph were cyclic. *)
     let* () = exec_lwt "UPDATE upd_a SET val = 200 WHERE id = 1" in
-    let v_b = int_of_row (List.hd
-      (query_ok db "SELECT a_val FROM upd_b WHERE id = 10")) in
+    let* rows_b = query_ok_lwt db "SELECT a_val FROM upd_b WHERE id = 10" in
+    let v_b = int_of_row (List.hd rows_b) in
     Alcotest.(check int) "upd_b.a_val cascaded" 200 v_b;
     Lwt.return_unit)
 
@@ -8685,7 +8697,7 @@ let test_phase35_ddl_quoting_table_with_space () =
        | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
       Lwt.return_unit
     in
-    let rows = query_ok db
+    let* rows = query_ok_lwt db
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='my table'" in
     Alcotest.(check int) "one row from sqlite_master" 1 (List.length rows);
     let sql = match rows with
@@ -8698,7 +8710,7 @@ let test_phase35_ddl_quoting_table_with_space () =
       (contains_pat "\"a col\"" sql);
     (* Round-trip: feed the SQL back to a fresh DB.  If quoting is wrong
        the parser will choke on the bare identifier. *)
-    let db2 = fresh_db () in
+    let* db2 = fresh_db_lwt () in
     let* r = Db.execute db2 sql in
     (match r with
      | Ok () -> ()
@@ -8718,7 +8730,7 @@ let test_phase35_ddl_quoting_normal_identifiers_unquoted () =
        | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
       Lwt.return_unit
     in
-    let rows = query_ok db
+    let* rows = query_ok_lwt db
       "SELECT sql FROM sqlite_master WHERE type='table' AND name='plain_t'" in
     let sql = match rows with
       | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
@@ -8746,7 +8758,7 @@ let test_phase35_ddl_quoting_index () =
     let* () = exec_lwt "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
     let* () = exec_lwt
       "CREATE INDEX \"weird idx\" ON \"weird tbl\" (\"col x\")" in
-    let rows = query_ok db
+    let* rows = query_ok_lwt db
       "SELECT sql FROM sqlite_master WHERE type='index' AND name='weird idx'" in
     let sql = match rows with
       | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
@@ -8758,7 +8770,7 @@ let test_phase35_ddl_quoting_index () =
       (contains_pat "\"weird tbl\"" sql);
     Alcotest.(check bool) "index col quoted"   true
       (contains_pat "\"col x\"" sql);
-    let db2 = fresh_db () in
+    let* db2 = fresh_db_lwt () in
     let* () =
       let* r = Db.execute db2 "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
       (match r with
