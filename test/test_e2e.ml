@@ -3912,10 +3912,10 @@ let test_upsert_preserves_non_conflict_rows () =
 let test_view_basic () =
   run (
     let* db = Db.open_in_memory () in
-    exec db "CREATE TABLE users (id INTEGER, name TEXT, active INTEGER)";
-    exec db "INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)";
-    exec db "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1";
-    let rows = query_ok db "SELECT name FROM active_users ORDER BY id" in
+    let* () = exec_lwt db "CREATE TABLE users (id INTEGER, name TEXT, active INTEGER)" in
+    let* () = exec_lwt db "INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)" in
+    let* () = exec_lwt db "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1" in
+    let* rows = query_ok_lwt db "SELECT name FROM active_users ORDER BY id" in
     Alcotest.(check int) "two active users" 2 (List.length rows);
     (match rows with
      | [r1; r2] ->
@@ -3927,10 +3927,10 @@ let test_view_basic () =
 let test_view_with_filter () =
   run (
     let* db = Db.open_in_memory () in
-    exec db "CREATE TABLE products (id INTEGER, name TEXT, price INTEGER)";
-    exec db "INSERT INTO products VALUES (1, 'A', 10), (2, 'B', 20), (3, 'C', 5)";
-    exec db "CREATE VIEW cheap AS SELECT id, name, price FROM products WHERE price < 15";
-    let rows = query_ok db "SELECT name FROM cheap WHERE price > 7 ORDER BY name" in
+    let* () = exec_lwt db "CREATE TABLE products (id INTEGER, name TEXT, price INTEGER)" in
+    let* () = exec_lwt db "INSERT INTO products VALUES (1, 'A', 10), (2, 'B', 20), (3, 'C', 5)" in
+    let* () = exec_lwt db "CREATE VIEW cheap AS SELECT id, name, price FROM products WHERE price < 15" in
+    let* rows = query_ok_lwt db "SELECT name FROM cheap WHERE price > 7 ORDER BY name" in
     Alcotest.(check int) "one result" 1 (List.length rows);
     (match rows with
      | [r] -> Alcotest.check value_testable "name=A" (Db.V_text "A") r.(0)
@@ -3940,10 +3940,10 @@ let test_view_with_filter () =
 let test_view_aggregation () =
   run (
     let* db = Db.open_in_memory () in
-    exec db "CREATE TABLE orders (customer TEXT, amount INTEGER)";
-    exec db "INSERT INTO orders VALUES ('Alice', 100), ('Alice', 200), ('Bob', 50)";
-    exec db "CREATE VIEW order_counts AS SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer";
-    let rows = query_ok db "SELECT customer, cnt FROM order_counts ORDER BY customer" in
+    let* () = exec_lwt db "CREATE TABLE orders (customer TEXT, amount INTEGER)" in
+    let* () = exec_lwt db "INSERT INTO orders VALUES ('Alice', 100), ('Alice', 200), ('Bob', 50)" in
+    let* () = exec_lwt db "CREATE VIEW order_counts AS SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer" in
+    let* rows = query_ok_lwt db "SELECT customer, cnt FROM order_counts ORDER BY customer" in
     Alcotest.(check int) "two customers" 2 (List.length rows);
     (match rows with
      | [ra; rb] ->
@@ -3955,12 +3955,12 @@ let test_view_aggregation () =
 let test_view_drop () =
   run (
     let* db = Db.open_in_memory () in
-    exec db "CREATE TABLE t (x INTEGER)";
-    exec db "INSERT INTO t VALUES (1)";
-    exec db "CREATE VIEW v AS SELECT x FROM t";
-    let rows1 = query_ok db "SELECT x FROM v" in
+    let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
+    let* () = exec_lwt db "INSERT INTO t VALUES (1)" in
+    let* () = exec_lwt db "CREATE VIEW v AS SELECT x FROM t" in
+    let* rows1 = query_ok_lwt db "SELECT x FROM v" in
     Alcotest.(check int) "one row before drop" 1 (List.length rows1);
-    exec db "DROP VIEW v";
+    let* () = exec_lwt db "DROP VIEW v" in
     let* result = Db.query db "SELECT x FROM v" in
     Alcotest.(check bool) "error after drop" true
       (match result with Error _ -> true | Ok _ -> false);
@@ -3969,10 +3969,10 @@ let test_view_drop () =
 let test_view_count () =
   run (
     let* db = Db.open_in_memory () in
-    exec db "CREATE TABLE t (x INTEGER)";
-    exec db "INSERT INTO t VALUES (1), (2), (3), (4), (5)";
-    exec db "CREATE VIEW big AS SELECT x FROM t WHERE x > 2";
-    let rows = query_ok db "SELECT COUNT(*) FROM big" in
+    let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
+    let* () = exec_lwt db "INSERT INTO t VALUES (1), (2), (3), (4), (5)" in
+    let* () = exec_lwt db "CREATE VIEW big AS SELECT x FROM t WHERE x > 2" in
+    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM big" in
     (match rows with
      | [r] -> Alcotest.check value_testable "count=3" (Db.V_int 3L) r.(0)
      | _ -> Alcotest.fail "expected one row");
@@ -3982,10 +3982,10 @@ let test_view_independent_per_db () =
   run (
     let* db1 = Db.open_in_memory () in
     let* db2 = Db.open_in_memory () in
-    exec db1 "CREATE TABLE t (x INTEGER)";
-    exec db1 "INSERT INTO t VALUES (42)";
-    exec db1 "CREATE VIEW v AS SELECT x FROM t";
-    exec db2 "CREATE TABLE t (x INTEGER)";
+    let* () = exec_lwt db1 "CREATE TABLE t (x INTEGER)" in
+    let* () = exec_lwt db1 "INSERT INTO t VALUES (42)" in
+    let* () = exec_lwt db1 "CREATE VIEW v AS SELECT x FROM t" in
+    let* () = exec_lwt db2 "CREATE TABLE t (x INTEGER)" in
     let* result = Db.query db2 "SELECT x FROM v" in
     Alcotest.(check bool) "db2 no view" true
       (match result with Error _ -> true | Ok _ -> false);
