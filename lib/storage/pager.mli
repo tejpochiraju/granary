@@ -18,9 +18,14 @@ val create :
   freelist:Freelist.t ->
   t
 
-(** Read a page. Returns cached copy if present; reads from BLOCK otherwise.
+(** Read a page.
+    [snapshot_frames] (default [None]): writer / non-WAL reader path —
+    consults the dirty set first, then the WAL's latest frame, then main
+    DB.  [Some n]: snapshot reader bounded to WAL frames strictly less
+    than [n]; never consults the dirty set.
+
     The returned Cstruct.t is a fresh copy — caller may modify it freely. *)
-val read : t -> int64 -> (Cstruct.t, error) result Lwt.t
+val read : ?snapshot_frames:int -> t -> int64 -> (Cstruct.t, error) result Lwt.t
 
 (** Mark a page as dirty with new contents. Buffered until [flush].
     Does not write to BLOCK immediately. The Cstruct.t is copied internally. *)

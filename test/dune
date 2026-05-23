@@ -129,3 +129,7 @@
 (test
  (name test_rwlock)
  (libraries sqlocaml.store alcotest lwt.unix))
+
+(test
+ (name test_pager_versioned_cache)
+ (libraries sqlocaml.storage alcotest lwt.unix))

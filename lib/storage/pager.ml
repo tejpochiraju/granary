@@ -10,6 +10,10 @@
 
 let cache_capacity = 64
 
+type cache_key = int64 * int   (* (page_id, version);  -1 = main DB *)
+
+let cache_key_main pid : cache_key = (pid, -1)
+
 type wal_callbacks = {
   wal_find_page    : int64 -> int option;
   wal_find_page_at : int64 -> max_frame:int -> int option;
@@ -25,9 +29,9 @@ type t = {
   write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
   sync       : unit -> (unit, string) result Lwt.t;
   resize     : n_pages:int64 -> (unit, string) result Lwt.t;
-  cache      : (int64, Cstruct.t) Hashtbl.t;
+  cache      : (cache_key, Cstruct.t) Hashtbl.t;
   dirty      : (int64, Cstruct.t) Hashtbl.t;
-  fifo       : int64 Queue.t;   (* insertion order for FIFO eviction *)
+  fifo       : cache_key Queue.t;   (* insertion order for FIFO eviction *)
   mutable n_pages       : int64;
   mutable freelist      : Freelist.t;
   mutable current_txn_id  : int64;
@@ -80,30 +84,30 @@ let maybe_evict t =
     let evicted = ref false in
     let temp = Queue.create () in
     while not !evicted && not (Queue.is_empty t.fifo) do
-      let pid = Queue.pop t.fifo in
-      if Hashtbl.mem t.dirty pid then
+      let key = Queue.pop t.fifo in
+      if Hashtbl.mem t.dirty (fst key) then
         (* dirty — put back at end so we don't lose track of it *)
-        Queue.push pid temp
+        Queue.push key temp
       else begin
-        Hashtbl.remove t.cache pid;
+        Hashtbl.remove t.cache key;
         evicted := true;
         (* push anything we moved to temp back into the real queue *)
-        Queue.iter (fun p -> Queue.push p t.fifo) temp;
+        Queue.iter (fun k -> Queue.push k t.fifo) temp;
         Queue.clear temp
       end
     done;
     (* If we couldn't evict (all cached pages are dirty), just keep them *)
     if not !evicted then
-      Queue.iter (fun p -> Queue.push p t.fifo) temp
+      Queue.iter (fun k -> Queue.push k t.fifo) temp
   end
 
 (** Add a page to the cache, evicting if necessary. *)
-let cache_add t page_id buf =
-  let already_cached = Hashtbl.mem t.cache page_id in
+let cache_add t key buf =
+  let already_cached = Hashtbl.mem t.cache key in
   maybe_evict t;
-  Hashtbl.replace t.cache page_id buf;
+  Hashtbl.replace t.cache key buf;
   if not already_cached then
-    Queue.push page_id t.fifo
+    Queue.push key t.fifo
 
 (** Make a deep copy of a Cstruct. *)
 let cstruct_dup src =
@@ -112,62 +116,87 @@ let cstruct_dup src =
   Cstruct.blit src 0 dst 0 len;
   dst
 
-let read t page_id =
-  (* Dirty (uncommitted current-txn writes) takes priority — it is
-     always more recent than anything elsewhere. *)
-  match Hashtbl.find_opt t.dirty page_id with
-  | Some buf ->
-    Lwt.return_ok (cstruct_dup buf)
+let read ?snapshot_frames t page_id =
+  let open Lwt.Syntax in
+  match snapshot_frames with
   | None ->
-    let open Lwt.Syntax in
-    (* The cache holds the latest committed-or-written version of any
-       page we've touched: [write] adds the new data, [from_wal] adds
-       the WAL frame contents on first miss, [flush_one_to_main] keeps
-       it fresh after checkpoint, [clear_dirty] purges entries backing
-       rolled-back writes, and [set_wal] resets it when WAL mode is
-       enabled (so pre-WAL-aware reads from main don't shadow newer
-       WAL frames). So a cache hit is authoritative and we don't need
-       to re-resolve through the WAL device on every probe — this
-       eliminates the per-read frame I/O + allocation that dominated
-       the WAL hot path. *)
-    (match Hashtbl.find_opt t.cache page_id with
+    (* Writer / no-snapshot path: dirty wins. *)
+    (match Hashtbl.find_opt t.dirty page_id with
      | Some buf -> Lwt.return_ok (cstruct_dup buf)
      | None ->
-       let from_wal () =
+       let resolve_via_wal () =
          match t.wal with
          | None -> Lwt.return_ok None
          | Some cb ->
-           (match cb.wal_find_page page_id with
-            | None -> Lwt.return_ok None
-            | Some frame_idx ->
-              let* r = cb.wal_read_frame frame_idx in
-              (match r with
-               | Error s -> Lwt.return_error (Block_error s)
-               | Ok page ->
-                 let copy = cstruct_dup page in
-                 cache_add t page_id (cstruct_dup copy);
-                 Lwt.return_ok (Some copy)))
+           match cb.wal_find_page page_id with
+           | None -> Lwt.return_ok None
+           | Some frame_idx ->
+             (* WAL frames are NOT cached in the shared pager cache because
+                frame indices are recycled after a WAL reset (checkpoint).
+                A cached (page_id, frame_idx) entry from before a reset
+                would be served stale after the WAL reuses that index.
+                The WAL device itself is the authoritative store for frames. *)
+             let* r = cb.wal_read_frame frame_idx in
+             (match r with
+              | Error s -> Lwt.return_error (Block_error s)
+              | Ok page -> Lwt.return_ok (Some page))
        in
-       let* wal_r = from_wal () in
+       let* wal_r = resolve_via_wal () in
        (match wal_r with
         | Error e -> Lwt.return_error e
         | Ok (Some page) -> Lwt.return_ok page
         | Ok None ->
+          let key = cache_key_main page_id in
+          (match Hashtbl.find_opt t.cache key with
+           | Some buf -> Lwt.return_ok (cstruct_dup buf)
+           | None ->
+             let buf = Cstruct.create Page.page_size in
+             let* result = t.read_page ~page_id buf in
+             match result with
+             | Error msg -> Lwt.return_error (Block_error msg)
+             | Ok () ->
+               cache_add t key (cstruct_dup buf);
+               Lwt.return_ok buf)))
+  | Some max_frame ->
+    (* Snapshot reader path: never consult [dirty]. *)
+    let resolve_via_wal () =
+      match t.wal with
+      | None -> Lwt.return_ok None
+      | Some cb ->
+        match cb.wal_find_page_at page_id ~max_frame with
+        | None -> Lwt.return_ok None
+        | Some frame_idx ->
+          (* WAL frames are not cached — see comment in the None branch above. *)
+          let* r = cb.wal_read_frame frame_idx in
+          (match r with
+           | Error s -> Lwt.return_error (Block_error s)
+           | Ok page -> Lwt.return_ok (Some page))
+    in
+    let* wal_r = resolve_via_wal () in
+    (match wal_r with
+     | Error e -> Lwt.return_error e
+     | Ok (Some page) -> Lwt.return_ok page
+     | Ok None ->
+       let key = cache_key_main page_id in
+       (match Hashtbl.find_opt t.cache key with
+        | Some buf -> Lwt.return_ok (cstruct_dup buf)
+        | None ->
           let buf = Cstruct.create Page.page_size in
           let* result = t.read_page ~page_id buf in
           match result with
           | Error msg -> Lwt.return_error (Block_error msg)
           | Ok () ->
-            let copy = cstruct_dup buf in
-            cache_add t page_id copy;
-            Lwt.return_ok (cstruct_dup copy)))
+            cache_add t key (cstruct_dup buf);
+            Lwt.return_ok buf))
 
 let write t page_id buf =
   let copy = cstruct_dup buf in
-  Hashtbl.replace t.dirty page_id copy;
-  (* Also update / add to the read cache so subsequent reads see the new data *)
-  let cache_copy = cstruct_dup buf in
-  cache_add t page_id cache_copy
+  Hashtbl.replace t.dirty page_id copy
+  (* Previously also injected into the shared cache here for
+     read-after-write inside the same txn.  Removed (#149): a concurrent
+     reader at an older snapshot would see uncommitted bytes.  The
+     [dirty] table already covers writer read-after-write — [read]
+     consults [dirty] first on the no-snapshot path. *)
 
 let alloc t =
   match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
@@ -230,7 +259,12 @@ let flush_no_sync t =
         let* result = t.write_page ~page_id:pid buf in
         (match result with
          | Error msg -> Lwt.return_error (Block_error msg)
-         | Ok ()     -> write_all rest)
+         | Ok () ->
+           (* Update main-key cache so post-flush reads don't serve stale data.
+              [write] no longer injects into the shared cache (#149), so we must
+              update here after the block write is committed. *)
+           cache_add t (cache_key_main pid) (cstruct_dup buf);
+           write_all rest)
     in
     write_all entries
 
@@ -272,7 +306,12 @@ let flush t =
         let* result = t.write_page ~page_id:pid buf in
         (match result with
          | Error msg -> Lwt.return_error (Block_error msg)
-         | Ok ()     -> write_all rest)
+         | Ok () ->
+           (* Update main-key cache so post-flush reads don't serve stale data.
+              [write] no longer injects into the shared cache (#149), so we must
+              update here after the block write is committed. *)
+           cache_add t (cache_key_main pid) (cstruct_dup buf);
+           write_all rest)
     in
     write_all entries
 
@@ -294,15 +333,12 @@ let clear_dirty t =
   let dirty_pids = Hashtbl.fold (fun pid _ acc -> pid :: acc) t.dirty [] in
   List.iter (fun pid ->
     Hashtbl.remove t.dirty pid;
-    Hashtbl.remove t.cache pid
+    Hashtbl.remove t.cache (cache_key_main pid)
   ) dirty_pids;
-  (* Rebuild FIFO queue without the removed page ids *)
-  let pids_set = Hashtbl.create (List.length dirty_pids) in
-  List.iter (fun pid -> Hashtbl.replace pids_set pid ()) dirty_pids;
   let old_fifo = Queue.copy t.fifo in
   Queue.clear t.fifo;
-  Queue.iter (fun pid ->
-    if not (Hashtbl.mem pids_set pid) then Queue.push pid t.fifo
+  Queue.iter (fun key ->
+    if Hashtbl.mem t.cache key then Queue.push key t.fifo
   ) old_fifo
 
 type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
@@ -318,7 +354,7 @@ let flush_one_to_main t ~page_id ~buf =
   let* r = t.write_page ~page_id buf in
   match r with
   | Ok () ->
-    Hashtbl.replace t.cache page_id (cstruct_dup buf);
+    cache_add t (cache_key_main page_id) (cstruct_dup buf);
     Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)
 
