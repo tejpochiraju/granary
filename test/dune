@@ -96,3 +96,15 @@
 (test
  (name test_trigger_atomicity)
  (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix))
+
+(test
+ (name test_multifiber_stress)
+ (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+
+(test
+ (name test_soak)
+ (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+
+(test
+ (name test_perf_bench)
+ (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
