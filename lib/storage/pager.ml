@@ -139,7 +139,9 @@ let read ?snapshot_frames t page_id =
              let* r = cb.wal_read_frame frame_idx in
              (match r with
               | Error s -> Lwt.return_error (Block_error s)
-              | Ok page -> Lwt.return_ok (Some page))
+              (* Pager's [.mli] promises a fresh Cstruct; enforce it here
+                 rather than relying on the WAL callback's contract. *)
+              | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
        in
        let* wal_r = resolve_via_wal () in
        (match wal_r with
@@ -170,7 +172,7 @@ let read ?snapshot_frames t page_id =
           let* r = cb.wal_read_frame frame_idx in
           (match r with
            | Error s -> Lwt.return_error (Block_error s)
-           | Ok page -> Lwt.return_ok (Some page))
+           | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
     in
     let* wal_r = resolve_via_wal () in
     (match wal_r with
