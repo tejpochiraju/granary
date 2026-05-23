@@ -136,7 +136,7 @@
 
 (test
  (name test_wal_reader_snapshot)
- (libraries sqlocaml alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.store alcotest lwt.unix unix))
 
 (test
  (name bench_wal_reader_scaling)
