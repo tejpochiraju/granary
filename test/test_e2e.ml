@@ -2643,7 +2643,7 @@ let fk_implicit_parent_col () =
       match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
     let* () = (let* r = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
       match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let rows = query_ok db "SELECT count(*) FROM orders" in
+    let* rows = query_ok_lwt db "SELECT count(*) FROM orders" in
     Alcotest.check value_testable "count" (Db.V_int 1L) (List.hd rows).(0);
     Lwt.return_unit)
 
