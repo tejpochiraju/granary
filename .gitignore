@@ -1,1 +1,8 @@
+_build/
 _coverage/
+_coverage_report/
+_cov_*.xml
+_cov_html/
+_runtest.log
+.claude/
+lib/sql/parser.conflicts
