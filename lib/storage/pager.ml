@@ -52,7 +52,17 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
     wal             = None;
   }
 
-let set_wal t cb = t.wal <- cb
+let set_wal t cb =
+  (* Any cache entries built before the WAL hook was attached came from
+     the main DB only. If a WAL frame exists for those pages it is more
+     recent — so clear the cache when transitioning into WAL mode so a
+     subsequent [read] re-resolves through the WAL index. *)
+  (match cb, t.wal with
+   | Some _, None ->
+     Hashtbl.reset t.cache;
+     Queue.clear t.fifo
+   | _ -> ());
+  t.wal <- cb
 let wal_mode t = t.wal <> None
 
 (** Evict the oldest cache entry if the cache is at capacity.
@@ -106,34 +116,39 @@ let read t page_id =
     Lwt.return_ok (cstruct_dup buf)
   | None ->
     let open Lwt.Syntax in
-    (* If WAL mode is on, check the WAL before the cache or main DB:
-       a committed WAL frame is always more recent than the main DB,
-       and may differ from a cache entry populated before the WAL
-       frame was appended (notably, the alternating-header pages). *)
-    let from_wal () =
-      match t.wal with
-      | None -> Lwt.return_ok None
-      | Some cb ->
-        (match cb.wal_find_page page_id with
+    (* The cache holds the latest committed-or-written version of any
+       page we've touched: [write] adds the new data, [from_wal] adds
+       the WAL frame contents on first miss, [flush_one_to_main] keeps
+       it fresh after checkpoint, [clear_dirty] purges entries backing
+       rolled-back writes, and [set_wal] resets it when WAL mode is
+       enabled (so pre-WAL-aware reads from main don't shadow newer
+       WAL frames). So a cache hit is authoritative and we don't need
+       to re-resolve through the WAL device on every probe — this
+       eliminates the per-read frame I/O + allocation that dominated
+       the WAL hot path. *)
+    (match Hashtbl.find_opt t.cache page_id with
+     | Some buf -> Lwt.return_ok (cstruct_dup buf)
+     | None ->
+       let from_wal () =
+         match t.wal with
          | None -> Lwt.return_ok None
-         | Some frame_idx ->
-           let* r = cb.wal_read_frame frame_idx in
-           (match r with
-            | Error s -> Lwt.return_error (Block_error s)
-            | Ok page ->
-              let copy = cstruct_dup page in
-              Hashtbl.replace t.cache page_id (cstruct_dup copy);
-              Lwt.return_ok (Some copy)))
-    in
-    let* wal_r = from_wal () in
-    (match wal_r with
-     | Error e -> Lwt.return_error e
-     | Ok (Some page) -> Lwt.return_ok page
-     | Ok None ->
-       (match Hashtbl.find_opt t.cache page_id with
-        | Some buf ->
-          Lwt.return_ok (cstruct_dup buf)
-        | None ->
+         | Some cb ->
+           (match cb.wal_find_page page_id with
+            | None -> Lwt.return_ok None
+            | Some frame_idx ->
+              let* r = cb.wal_read_frame frame_idx in
+              (match r with
+               | Error s -> Lwt.return_error (Block_error s)
+               | Ok page ->
+                 let copy = cstruct_dup page in
+                 cache_add t page_id (cstruct_dup copy);
+                 Lwt.return_ok (Some copy)))
+       in
+       let* wal_r = from_wal () in
+       (match wal_r with
+        | Error e -> Lwt.return_error e
+        | Ok (Some page) -> Lwt.return_ok page
+        | Ok None ->
           let buf = Cstruct.create Page.page_size in
           let* result = t.read_page ~page_id buf in
           match result with

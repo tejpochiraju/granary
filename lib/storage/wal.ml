@@ -118,11 +118,17 @@ let frame_offset idx =
   Int64.add (Int64.of_int header_size_bytes)
     (Int64.mul (Int64.of_int idx) (Int64.of_int frame_size_bytes))
 
-let read_frame_raw t idx =
+(* [verify=true] computes and checks the frame checksum (used during
+   recovery while we're still discovering what's durable). [verify=false]
+   skips the FNV loop and trusts the frame — safe for any frame inside
+   [0, committed_frames) because recovery already validated it and the
+   WAL is append-only after that. The byte-by-byte FNV over 4 KB is the
+   single biggest hot-path cost on WAL reads, so skipping it when sound
+   is the main win. *)
+let read_frame_raw ?(verify = true) t idx =
   let off = frame_offset idx in
   let last_byte = Int64.add off (Int64.of_int frame_size_bytes) in
   if Int64.compare last_byte t.size_bytes > 0 then
-    (* The frame would extend past the end of the WAL device. *)
     Lwt.return_ok None
   else
     let buf = Cstruct.create frame_size_bytes in
@@ -132,11 +138,16 @@ let read_frame_raw t idx =
     | Ok () ->
       let page_id = Cstruct.BE.get_uint64 buf 0 in
       let flags   = Cstruct.BE.get_uint64 buf 8 in
-      let ck_have = Cstruct.BE.get_uint64 buf 16 in
       let page = Cstruct.sub buf frame_meta_bytes page_size in
-      let ck_want = frame_checksum ~salt:t.salt ~seed:t.seed
-                      ~page_id ~flags ~page in
-      if Int64.equal ck_have ck_want then
+      let ok =
+        if verify then
+          let ck_have = Cstruct.BE.get_uint64 buf 16 in
+          let ck_want = frame_checksum ~salt:t.salt ~seed:t.seed
+                          ~page_id ~flags ~page in
+          Int64.equal ck_have ck_want
+        else true
+      in
+      if ok then
         let is_commit = Int64.logand flags 1L <> 0L in
         let page_copy = Cstruct.create page_size in
         Cstruct.blit page 0 page_copy 0 page_size;
@@ -233,7 +244,9 @@ let read_frame t idx =
   if idx < 0 || idx >= t.committed_frames then
     Lwt.return_error (Corrupt_frame idx)
   else
-    let* r = read_frame_raw t idx in
+    (* Skip checksum: frames < committed_frames were validated at recovery
+       and the WAL is append-only thereafter. *)
+    let* r = read_frame_raw ~verify:false t idx in
     match r with
     | Error e -> Lwt.return_error e
     | Ok None -> Lwt.return_error (Corrupt_frame idx)
