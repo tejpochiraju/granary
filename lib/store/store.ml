@@ -58,28 +58,30 @@ type bt_savepoint = {
   sp_dirty       : Pager.dirty_snapshot;
 }
 
-(* Per-store commit queue for WAL-mode group commit (#77).  After a
-   writer has staged its WAL frames it releases [rw_mutex] and joins this
-   queue to await one shared fsync.  [drainer] is set to [true] by the
-   first arriving writer (acting as coordinator); subsequent writers
-   wait on [cond] until [epoch] advances past the value they observed at
-   arrival.  [pending] tracks the number of joiners currently waiting
-   on [cond] so the drainer can yield additional ticks while new
-   arrivals keep registering, widening the batch.  Cooperative Lwt
-   scheduling makes the [drainer]/[pending]/[epoch] transitions atomic
-   (no implicit yield between read and write). *)
+(* Per-store commit queue for WAL-mode group commit (#77, #151).  After
+   a writer has staged its WAL frames it releases [rw_mutex] and joins
+   this queue to await one shared fsync.  [drainer] is set to [true] by
+   the first arriving writer (acting as coordinator); subsequent writers
+   register a resolver on [waiters] and block until the drainer wakes
+   them with the sync result.  [pending] tracks the number of waiters so
+   the drainer can yield additional ticks while new arrivals keep
+   registering, widening the batch.  Cooperative Lwt scheduling makes
+   the [drainer]/[pending]/[waiters] transitions atomic (no implicit
+   yield between read and write).
+
+   The per-batch resolvers carry [(unit, exn) result] so an fsync
+   failure in the drainer propagates to every joiner in the same batch
+   instead of being silently dropped by a unit-broadcast (#151). *)
 type commit_queue = {
   mutable drainer : bool;
   mutable pending : int;
-  cond            : unit Lwt_condition.t;
-  mutable epoch   : int;
+  mutable waiters : (unit, exn) result Lwt.u list;
 }
 
 let create_commit_queue () =
   { drainer = false;
     pending = 0;
-    cond = Lwt_condition.create ();
-    epoch = 0 }
+    waiters = [] }
 
 type bt_state = {
   close_fn             : unit -> unit Lwt.t;
@@ -905,43 +907,45 @@ let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
         (fun () -> checkpoint_unlocked st wal)
         (fun _ -> Lwt.return_unit)
 
-(* Group-commit coordinator (#77).  One fiber per [commit_queue] runs
-   the actual fsync via [sync_fn]; concurrent writers wait on [q.cond]
-   for [q.epoch] to advance.  Returns the role this fiber played so the
-   caller can attach drainer-only side work (e.g. autocheckpoint).
+(* Group-commit coordinator (#77, #151).  One fiber per [commit_queue]
+   runs the actual fsync via [sync_fn]; concurrent writers register a
+   per-batch resolver and block until the drainer wakes them with the
+   sync result.  Returns the role this fiber played so the caller can
+   attach drainer-only side work (e.g. autocheckpoint).
 
-   Each joiner increments [pending] before awaiting [cond] (and
-   decrements on wake) so the drainer can detect concurrent arrivals.
-   The drainer yields via [Lwt.pause] once to let any ready-to-write
-   fibers reach the queue, then loops pausing while [pending] keeps
-   growing.  This widens the batch from "2 commits per fsync" (one
-   Lwt.pause yields one continuation) to "N concurrent writers per
-   fsync" while adding only one tick of latency to a lone writer.
+   Each joiner pushes a [(unit, exn) result Lwt.u] resolver onto
+   [waiters] and increments [pending] so the drainer can detect
+   concurrent arrivals.  The drainer yields via [Lwt.pause] once to let
+   any ready-to-write fibers reach the queue, then loops pausing while
+   [pending] keeps growing.  This widens the batch from "2 commits per
+   fsync" (one Lwt.pause yields one continuation) to "N concurrent
+   writers per fsync" while adding only one tick of latency to a lone
+   writer.
 
-   Failure semantics: if [sync_fn] raises, the drainer fiber propagates
-   the exception to its own caller.  Joiners that woke from the same
-   broadcast return [`Joiner] without seeing the failure — but
-   [Unix.fsync] failures in WAL mode are treated as fatal by upstream
-   callers (Lwt exceptions propagate to [Lwt_main]), so the process
-   crashes before joiners can act on the spurious success.  A more
-   precise per-batch error channel is left for follow-up work; the
-   current design matches the prior inline-sync path's "fail_with"
-   behaviour. *)
+   Failure semantics (#151): if [sync_fn] raises, the drainer wakes
+   every joiner's resolver with [Error exn] (so each joiner re-raises
+   the same exception via [Lwt.fail]) and then re-raises to its own
+   caller.  All N writers in the current batch observe the failure;
+   none see a spurious [Ok].
+
+   Late joiners that arrive while [sync_fn] is in flight register on
+   the same [waiters] list (since [q.drainer] is still [true]) and so
+   ride along with the current sync's result — matching the pre-#151
+   broadcast behaviour.  Whether those late frames are physically
+   flushed by the in-flight fsync is timing-dependent at the kernel
+   level (POSIX only guarantees flushing of writes queued before the
+   fsync syscall); this is a pre-existing concern, not introduced by
+   the error-channel rework. *)
 let group_commit_sync (q : commit_queue) (sync_fn : unit -> unit Lwt.t)
     : [`Drainer | `Joiner] Lwt.t =
   if q.drainer then begin
+    let (p, u) = Lwt.wait () in
+    q.waiters <- u :: q.waiters;
     q.pending <- q.pending + 1;
-    let target = q.epoch + 1 in
-    Lwt.finalize
-      (fun () ->
-        let rec wait () =
-          if q.epoch >= target then Lwt.return `Joiner
-          else
-            let* () = Lwt_condition.wait q.cond in
-            wait ()
-        in
-        wait ())
-      (fun () -> q.pending <- q.pending - 1; Lwt.return_unit)
+    let* r = p in
+    match r with
+    | Ok () -> Lwt.return `Joiner
+    | Error exn -> Lwt.fail exn
   end else begin
     q.drainer <- true;
     (* Gather: one initial pause to let the next-in-line writer reach
@@ -958,16 +962,28 @@ let group_commit_sync (q : commit_queue) (sync_fn : unit -> unit Lwt.t)
       else Lwt.return_unit
     in
     let* () = gather 0 in
-    let* () =
-      Lwt.finalize
-        (fun () -> sync_fn ())
-        (fun () ->
-          q.epoch <- q.epoch + 1;
-          q.drainer <- false;
-          Lwt_condition.broadcast q.cond ();
-          Lwt.return_unit)
-    in
-    Lwt.return `Drainer
+    (* Run sync first, capturing success or failure; then atomically
+       snapshot the (possibly grown) waiter list, clear queue state for
+       the next batch, and wake each joiner with the same result.
+       Cooperative scheduling guarantees no yield between try_bind's
+       handler and the iter, so no joiner can register after the
+       snapshot. *)
+    Lwt.try_bind
+      sync_fn
+      (fun () ->
+        let waiters = q.waiters in
+        q.waiters <- [];
+        q.pending <- 0;
+        q.drainer <- false;
+        List.iter (fun u -> Lwt.wakeup_later u (Ok ())) waiters;
+        Lwt.return `Drainer)
+      (fun exn ->
+        let waiters = q.waiters in
+        q.waiters <- [];
+        q.pending <- 0;
+        q.drainer <- false;
+        List.iter (fun u -> Lwt.wakeup_later u (Error exn)) waiters;
+        Lwt.fail exn)
   end
 
 (* Prepare phase of [commit] for the Btree backend.  Pushes every tree's
