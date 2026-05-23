@@ -31,6 +31,11 @@ let release_read t =
   t.readers <- t.readers - 1;
   if t.readers = 0 then Lwt_condition.broadcast t.cond ()
 
+(* The decrement of [writers_waiting] and the recursive re-check are
+   atomic w.r.t. the cooperative Lwt scheduler: no other fiber can run
+   between them because nothing yields. So while [writer_pending] may
+   briefly return [false] between wakeup and re-entry on a non-cooperative
+   scheduler, under Lwt no reader can slip in during that window. *)
 let rec acquire_write t =
   if t.writer_active || t.readers > 0 then begin
     t.writers_waiting <- t.writers_waiting + 1;
