@@ -64,6 +64,7 @@ let query_ok_lwt db sql =
   match result with
   | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
   | Ok stream -> Lwt_stream.to_list stream
+[@@warning "-32"]
 
 let exec_err_lwt db sql =
   let* result = Db.execute db sql in
