@@ -30,8 +30,12 @@ val writer_pending : t -> bool
 
 (** True iff a writer is currently holding the lock (exclusive lock is
     active).  Unlike [writer_pending], this is false when a writer is
-    only waiting (queued) but has not yet acquired.  Used by [Store.ro_begin]
-    to detect cooperative re-entrancy: if the current fiber holds the
-    exclusive lock and calls [ro_begin], we must skip [acquire_read] to
-    avoid deadlock. *)
+    only waiting (queued) but has not yet acquired.  Used by
+    [Store.ro_begin] to bypass [acquire_read] when a writer is already
+    active: this covers both (a) intra-fiber re-entrancy (the writer's
+    own code path calls [ro_begin], where [acquire_read] would deadlock)
+    and (b) cross-fiber yield scenarios (another fiber's reader arriving
+    while the writer is paused mid-txn).  Bypass is safe in both cases
+    because RO snapshot reads consult [Wal.find_page_at ~max_frame] —
+    the writer's in-flight dirty pages are invisible to a snapshot. *)
 val writer_active : t -> bool

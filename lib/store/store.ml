@@ -740,12 +740,19 @@ let open_file_wal ~path : (t, error) result Lwt.t =
 
 let ro_begin t =
   let open Lwt.Syntax in
-  (* Skip the shared lock acquisition when the current fiber already holds
-     the exclusive write lock (cooperative re-entrancy).  Under Lwt, if
-     [writer_active] is set then only this fiber can be running; any attempt
-     to [acquire_read] would wait for [writer_active] to clear — deadlock.
-     The boolean is recorded in the snapshot so [ro_end] releases only when
-     we actually acquired the lock. *)
+  (* Skip the shared lock acquisition when a writer is already active.
+     Two scenarios both motivate the bypass:
+     (a) Intra-fiber re-entrancy: the writer's own code path calls
+         [ro_begin] (e.g. [Exec] opens a snapshot to buffer rows during
+         UPDATE/DELETE).  Without the bypass [acquire_read] would block
+         forever waiting for [writer_active] to clear.
+     (b) Cross-fiber yield: another fiber's [ro_begin] runs while the
+         writer is paused mid-txn.  Bypass is still safe because the
+         snapshot reads consult [Wal.find_page_at ~max_frame] — the
+         writer's dirty pages and uncommitted WAL frames are invisible
+         to a snapshot bounded by [committed_frames].
+     The boolean is recorded in the snapshot so [ro_end] releases only
+     when we actually acquired the lock. *)
   let lock_taken = not (Rwlock.writer_active t.lock) in
   let* () = if lock_taken then Rwlock.acquire_read t.lock else Lwt.return_unit in
   match t.backend with
