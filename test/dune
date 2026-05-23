@@ -145,3 +145,7 @@
 (test
  (name bench_wal_fsync_overlap)
  (libraries sqlocaml.store sqlocaml.block alcotest lwt.unix unix))
+
+(test
+ (name bench_slow_read_yield)
+ (libraries sqlocaml.store sqlocaml.block alcotest lwt.unix unix))
