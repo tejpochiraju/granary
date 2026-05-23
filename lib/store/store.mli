@@ -172,6 +172,18 @@ val wal_mode : t -> bool
     internally so it serialises with commits. *)
 val checkpoint : t -> unit Lwt.t
 
+(** Get the per-connection auto-checkpoint threshold (in WAL frames).
+    A value of 0 means auto-checkpoint is disabled. Returns 0 on the
+    in-memory backend. *)
+val wal_autocheckpoint : t -> int
+
+(** Set the per-connection auto-checkpoint threshold (in WAL frames).
+    When [n > 0] and the WAL reaches [n] committed frames, the next
+    writer's commit will inline a checkpoint before releasing the
+    write lock. [n = 0] disables auto-checkpoint (negative values are
+    clamped to 0). No-op on the in-memory backend. *)
+val set_wal_autocheckpoint : t -> int -> unit
+
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int
 

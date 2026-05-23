@@ -3736,6 +3736,9 @@ let op_name = function
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint      -> "Pragma(wal_checkpoint)"
+  | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
+  | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
+    Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
   | Plan.Op_vacuum                     -> "Vacuum"
   | Plan.Op_attach { schema; _ }       -> Printf.sprintf "Attach(%s)" schema
   | Plan.Op_detach { schema }          -> Printf.sprintf "Detach(%s)" schema
@@ -4158,6 +4161,9 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_wal_checkpoint ->
     let* () = S.checkpoint store in
     Lwt.return 0
+  | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
+    S.set_wal_autocheckpoint store (Int64.to_int n);
+    Lwt.return 0
   | Plan.Op_vacuum ->
     (* Intercepted by Db.execute before reaching exec; reaching this point
        means VACUUM was executed without a Db wrapper, which is not
@@ -4181,6 +4187,7 @@ let execute_with_count ?(mode = Auto)
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_pragma_get_defer_fk
+  | Plan.Op_pragma_get_wal_autocheckpoint
   | Plan.Op_changes | Plan.Op_last_insert_rowid | Plan.Op_total_changes ->
     failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
@@ -5682,6 +5689,9 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       | Some cat -> Cat.get_recursive_triggers cat
     in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
+  | Plan.Op_pragma_get_wal_autocheckpoint ->
+    let n = S.wal_autocheckpoint store in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
   | Plan.Op_pragma_get_defer_fk ->
     let v = match cat with
       | None     -> false
@@ -6071,6 +6081,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           | Plan.Op_pragma_set_fk _
           | Plan.Op_pragma_set_recursive_triggers _
           | Plan.Op_pragma_set_defer_fk _
+          | Plan.Op_pragma_set_wal_autocheckpoint _
           | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
           | Plan.Op_create_fts_table _ -> true
           | _ -> false
@@ -6108,6 +6119,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_fk _
   | Plan.Op_pragma_set_recursive_triggers _
   | Plan.Op_pragma_set_defer_fk _
+  | Plan.Op_pragma_set_wal_autocheckpoint _
   | Plan.Op_pragma_wal_checkpoint
   | Plan.Op_vacuum
   | Plan.Op_attach _ | Plan.Op_detach _

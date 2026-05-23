@@ -82,6 +82,10 @@
  (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
 
 (test
+ (name test_wal_autocheckpoint)
+ (libraries sqlocaml sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+
+(test
  (name test_overflow)
  (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
 

@@ -315,6 +315,10 @@ pragma_stmt:
         (try Ast.S_pragma (Ast.Pragma_user_version_set (Int64.of_string value))
          with Failure _ ->
            failwith (Printf.sprintf "PRAGMA user_version: expected integer, got %s" value))
+      | "wal_autocheckpoint" ->
+        (try Ast.S_pragma (Ast.Pragma_wal_autocheckpoint_set (Int64.of_string value))
+         with Failure _ ->
+           failwith (Printf.sprintf "PRAGMA wal_autocheckpoint: expected integer, got %s" value))
       | "foreign_keys" ->
         let on = match String.lowercase_ascii value with
           | "1" | "on" | "true" -> true
@@ -351,6 +355,7 @@ pragma_stmt:
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
       | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
+      | "wal_autocheckpoint" -> Ast.S_pragma Ast.Pragma_wal_autocheckpoint
       | "database_list"   -> Ast.S_pragma Ast.Pragma_database_list
       | "active_database" -> Ast.S_pragma Ast.Pragma_active_database
       | _                 -> Ast.S_pragma (Ast.Pragma_set (name, "")) }

@@ -409,6 +409,9 @@ and pragma_kind =
   | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
   | Pragma_integrity_check              (* PRAGMA integrity_check → errors or "ok" *)
   | Pragma_wal_checkpoint               (* PRAGMA wal_checkpoint — migrate WAL → main *)
+  | Pragma_wal_autocheckpoint           (* PRAGMA wal_autocheckpoint — read threshold *)
+  | Pragma_wal_autocheckpoint_set of int64
+      (* PRAGMA wal_autocheckpoint = N — set per-connection threshold (0 disables) *)
   | Pragma_database_list                (* PRAGMA database_list — list main + attached *)
   | Pragma_active_database              (* PRAGMA active_database — read current schema name *)
   | Pragma_active_database_set of string (* PRAGMA active_database = name → route subsequent stmts *)

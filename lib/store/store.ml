@@ -75,7 +75,14 @@ type bt_state = {
   (* When set, commits append to this WAL instead of writing to the main
      DB; reads route through it via the Pager hook. *)
   wal_close : (unit -> unit Lwt.t) option;
+  mutable wal_autocheckpoint_threshold : int;
+  (* When > 0 and committed WAL frames reach this number, the next
+     commit triggers an inline checkpoint (still under [rw_mutex]) so
+     the WAL stays bounded. 0 disables auto-checkpoint. Per-connection,
+     not persisted. *)
 }
+
+let default_wal_autocheckpoint_threshold = 1000
 
 type backend =
   | Mem  of (tree_id, Bytes.t BytesMap.t ref) Hashtbl.t
@@ -345,7 +352,8 @@ let open_file ~path : (t, error) result Lwt.t =
               schema_version = h.schema_version;
               txn_freelist_snapshot = None;
               active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None }
+              bt_savepoints = []; wal = None; wal_close = None;
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -367,7 +375,8 @@ let open_file ~path : (t, error) result Lwt.t =
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None }
+              bt_savepoints = []; wal = None; wal_close = None;
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -417,7 +426,8 @@ let open_block
             schema_version = h.schema_version;
             txn_freelist_snapshot = None;
             active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None }
+              bt_savepoints = []; wal = None; wal_close = None;
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
         in
         Lwt.return_ok
           { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -435,7 +445,8 @@ let open_block
         schema_version = h.schema_version;
         txn_freelist_snapshot = None;
         active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None }
+              bt_savepoints = []; wal = None; wal_close = None;
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
     in
     Lwt.return_ok
       { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -541,7 +552,8 @@ let open_block_wal
               active_readers = Hashtbl.create 4;
               bt_savepoints = [];
               wal = Some wal;
-              wal_close = Some wal_close }
+              wal_close = Some wal_close;
+              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold }
           in
           Lwt.return_ok
             { backend = Btree st; rw_mutex = Lwt_mutex.create ();
@@ -801,6 +813,57 @@ let write_freelist_pages pager : int64 Lwt.t =
     Lwt.return pid_arr.(0)
   end
 
+(** Body of [checkpoint] without mutex management. Caller MUST already
+    hold [t.rw_mutex] (e.g. during [commit]). Defined here so [commit]
+    can invoke it via [maybe_autocheckpoint] below. *)
+let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
+  let pairs = ref [] in
+  Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+  let rec write_each = function
+    | [] -> Lwt.return_unit
+    | (pid, idx) :: rest ->
+      let* r = Wal.read_frame wal idx in
+      (match r with
+       | Error e ->
+         Lwt.fail_with (Format.asprintf "checkpoint read: %a"
+                          Wal.pp_error e)
+       | Ok page ->
+         let* wr =
+           Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page
+         in
+         (match wr with
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "checkpoint write: %a"
+                 Pager.pp_error e)
+          | Ok () -> write_each rest))
+  in
+  let* () = write_each !pairs in
+  let* sr = Pager.flush_sync_main st.pager in
+  (match sr with
+   | Error e ->
+     Lwt.fail_with
+       (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
+   | Ok () ->
+     Wal.reset wal;
+     Lwt.return_unit)
+
+(** Called from [commit] while [rw_mutex] is still held. If the WAL has
+    grown past the per-connection threshold, migrate it inline so
+    subsequent commits start fresh. Best-effort: a checkpoint failure
+    is swallowed (the commit itself already succeeded). *)
+let maybe_autocheckpoint (st : bt_state) : unit Lwt.t =
+  match st.wal with
+  | None -> Lwt.return_unit
+  | Some wal ->
+    let thr = st.wal_autocheckpoint_threshold in
+    if thr <= 0 then Lwt.return_unit
+    else if Wal.committed_frames wal < thr then Lwt.return_unit
+    else
+      Lwt.catch
+        (fun () -> checkpoint_unlocked st wal)
+        (fun _ -> Lwt.return_unit)
+
 (* commit:
    - Mem backend: no I/O, just release the writer lock.
    - Btree backend: flush all currently-open trees' root_pages into the
@@ -858,7 +921,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
            txn_id = Int64.add st.current_header.txn_id 1L };
        st.txn_freelist_snapshot <- None;
        st.bt_savepoints <- [];
-       Lwt.return_unit
+       maybe_autocheckpoint st
      | Error e ->
        Lwt.fail_with
          (Format.asprintf "Store.commit: %a" pp_error (map_header_err e)))
@@ -933,49 +996,18 @@ let checkpoint (t : t) : unit Lwt.t =
      | Some wal ->
        let* () = Lwt_mutex.lock t.rw_mutex in
        Lwt.finalize
-         (fun () ->
-           (* Collect (page_id, frame_idx) pairs; we read frames directly
-              from the WAL (not via Pager.read) to avoid a redundant
-              cache hop and to keep the data path independent of the
-              hook. *)
-           let pairs = ref [] in
-           Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
-           let rec write_each = function
-             | [] -> Lwt.return_unit
-             | (pid, idx) :: rest ->
-               let* r = Wal.read_frame wal idx in
-               (match r with
-                | Error e ->
-                  Lwt.fail_with (Format.asprintf "checkpoint read: %a"
-                                   Wal.pp_error e)
-                | Ok page ->
-                  (* Write through the pager's underlying main-DB
-                     callback rather than Pager.write (which would mark
-                     the page dirty and re-route via WAL on flush). *)
-                  let* wr =
-                    (* Pager doesn't expose write_page; use the raw
-                       callback via a small helper. *)
-                    Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page
-                  in
-                  (match wr with
-                   | Error e ->
-                     Lwt.fail_with
-                       (Format.asprintf "checkpoint write: %a"
-                          Pager.pp_error e)
-                   | Ok () -> write_each rest))
-           in
-           let* () = write_each !pairs in
-           let* sr = Pager.flush_sync_main st.pager in
-           (match sr with
-            | Error e ->
-              Lwt.fail_with
-                (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
-            | Ok () ->
-              Wal.reset wal;
-              (* Drop cached entries so subsequent reads see the
-                 main-DB contents (the WAL index is now empty). *)
-              Lwt.return_unit))
+         (fun () -> checkpoint_unlocked st wal)
          (fun () -> Lwt_mutex.unlock t.rw_mutex; Lwt.return_unit))
+
+let wal_autocheckpoint (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> st.wal_autocheckpoint_threshold
+
+let set_wal_autocheckpoint (t : t) (n : int) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.wal_autocheckpoint_threshold <- max 0 n
 
 (* ------------------------------------------------------------------ *)
 (* Savepoints (Mem backend only; B-tree deferred)                      *)
