@@ -44,7 +44,7 @@
       SQLOCAML_BENCH_N_COMMITS      writer commits            (default 30)
       SQLOCAML_BENCH_N_READS        reader cursor walks       (default 8)
       SQLOCAML_BENCH_SEED_ROWS      initial tree size         (default 5000)
-      SQLOCAML_BENCH_MAX_WRITER_S   pass/fail upper bound (s) (default 1.0)
+      SQLOCAML_BENCH_MAX_WRITER_S   pass/fail upper bound (s) (default 3.0)
 *)
 
 open Lwt.Syntax
@@ -224,7 +224,7 @@ let main () =
   let n_commits    = getenv_int   "SQLOCAML_BENCH_N_COMMITS"      30 in
   let n_reads      = getenv_int   "SQLOCAML_BENCH_N_READS"        8 in
   let seed_rows    = getenv_int   "SQLOCAML_BENCH_SEED_ROWS"      5000 in
-  let max_writer_s = getenv_float "SQLOCAML_BENCH_MAX_WRITER_S"   1.0 in
+  let max_writer_s = getenv_float "SQLOCAML_BENCH_MAX_WRITER_S"   3.0 in
 
   let path = fresh_path () in
   let* () = seed_store ~path ~rows:seed_rows in
@@ -290,9 +290,15 @@ let main () =
      the writer would be parked behind the reader's
      [n_reads * pages_per_walk * read_delay] of sleep time and the wall
      would blow the bound.  With cooperative interleaving the writer runs
-     concurrently with the reader and finishes within [max_writer_s].
-     1.0 s is generous on purpose — pass-case observed wall is ~0.6 s on
-     local SSD, leaving headroom for CI / slower hardware. *)
+     concurrently with the reader.
+     3.0 s is intentionally generous — pass-case observed wall is
+     ~0.6 s standalone but balloons to ~1.4 s when this bench runs
+     concurrently with the rest of [dune runtest] (load-induced Lwt
+     scheduler jitter affects the writer's many small commits more
+     than the reader's few large walks).  A true serialisation
+     regression would push the writer wall well past 3 s (it would
+     equal reader_wall + writer's own slow-I/O work, both at full
+     scale on a 5000-row tree). *)
   Alcotest.(check bool)
     (Printf.sprintf
        "writer wall (%.3fs) bounded by %.3fs (reader yields during slow I/O)"
