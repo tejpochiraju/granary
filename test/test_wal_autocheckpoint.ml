@@ -190,8 +190,10 @@ let test_writer_not_blocked_by_autocheckpoint () =
   Alcotest.(check bool)
     (Printf.sprintf "10 inserts past threshold under 1s (was %.3fs)" elapsed)
     true (elapsed < 1.0);
-  (* Give background checkpoint time to complete. *)
-  Unix.sleepf 0.5;
+  (* Drive a single Lwt scheduler tick so any pending Lwt.async fiber
+     gets a chance to start.  D.close below also flushes the scheduler;
+     the assertion above already passed regardless. *)
+  run (Lwt.pause ());
   run (D.close db);
   (try Unix.unlink path with _ -> ());
   (try Unix.unlink (path ^ "-wal") with _ -> ())

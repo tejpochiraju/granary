@@ -948,6 +948,16 @@ let write_freelist_pages pager : int64 Lwt.t =
 (** Body of [checkpoint] without mutex management. Caller MUST already
     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
     can invoke it via [maybe_autocheckpoint] below. *)
+(* Block until every active RO snapshot's [committed_frames] bound is at
+   least [target].  Used by [checkpoint_unlocked] before [Wal.reset]
+   truncates the index — otherwise an in-flight reader's [find_page_at]
+   would resolve to a recycled frame index after the next writer's append.
+
+   No [~mutex] is passed to [Lwt_condition.wait]: under cooperative Lwt
+   the multiset check + wait register atomically (no yield between
+   [min_active_reader_frames] and the wait), so the standard POSIX
+   condvar mutex pairing isn't needed.  Would need revisiting under a
+   preemptive or effect-based multicore runtime. *)
 let rec wait_for_readers_past (st : bt_state) ~target =
   match min_active_reader_frames st with
   | Some m when m < target ->
