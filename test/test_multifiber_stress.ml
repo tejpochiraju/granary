@@ -225,6 +225,45 @@ let test_explicit_txn_isolation () =
   Alcotest.(check int) "final count after commit" 30 final;
   run (Db.close db)
 
+(** WAL-backed multi-fiber stress: 8 reader fibers each run 100 SELECTs
+    while a writer fiber inserts 200 rows through [Db.open_file_wal].
+    Exercises the snapshot-isolation path: each reader count must be
+    monotonically non-decreasing across successive queries. *)
+let test_wal_backend_concurrent_readers_writer () =
+  let path = "/tmp/sqlocaml_phase38_wal_mfs.db" in
+  (try Unix.unlink path with _ -> ());
+  (try Unix.unlink (path ^ "-wal") with _ -> ());
+  let db = match run (Db.open_file_wal ~path) with
+    | Ok d -> d
+    | Error _ -> Alcotest.fail "open_file_wal failed"
+  in
+  exec db "CREATE TABLE t (n INTEGER)";
+  let n_readers = 8 in
+  let n_writes = 200 in
+  let n_reads_each = 100 in
+  let open Lwt.Infix in
+  let writer =
+    let rec loop i =
+      if i >= n_writes then Lwt.return ()
+      else exec_lwt db (Printf.sprintf "INSERT INTO t (n) VALUES (%d)" i)
+           >>= fun () -> loop (i + 1)
+    in loop 0
+  in
+  let make_reader _ =
+    let rec loop seen i =
+      if i >= n_reads_each then Lwt.return ()
+      else query_count_lwt db "SELECT n FROM t" >>= fun c ->
+           if c < seen then Alcotest.failf "WAL reader regress %d -> %d" seen c;
+           Lwt.pause () >>= fun () -> loop c (i + 1)
+    in loop 0 0
+  in
+  run (Lwt.join (writer :: List.init n_readers make_reader));
+  let final = run (query_count_lwt db "SELECT n FROM t") in
+  Alcotest.(check int) "WAL final count" n_writes final;
+  run (Db.close db);
+  (try Unix.unlink path with _ -> ());
+  (try Unix.unlink (path ^ "-wal") with _ -> ())
+
 (** File-backed multi-fiber stress: same as the in-memory version but
     on the persistent backend.  Exercises the pager + WAL-less codepath
     under concurrency. *)
@@ -270,5 +309,6 @@ let () =
       Alcotest.test_case "mixed writer with aggregating readers" `Slow test_mixed_writer_with_aggregating_readers;
       Alcotest.test_case "explicit txn isolation under concurrency" `Slow test_explicit_txn_isolation;
       Alcotest.test_case "file backend concurrent" `Slow test_file_backend_concurrent;
+      Alcotest.test_case "WAL backend concurrent readers + writer" `Slow test_wal_backend_concurrent_readers_writer;
     ];
   ]
