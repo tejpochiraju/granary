@@ -3737,6 +3737,12 @@ let op_name = function
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
   | Plan.Op_pragma_wal_checkpoint      -> "Pragma(wal_checkpoint)"
   | Plan.Op_vacuum                     -> "Vacuum"
+  | Plan.Op_attach { schema; _ }       -> Printf.sprintf "Attach(%s)" schema
+  | Plan.Op_detach { schema }          -> Printf.sprintf "Detach(%s)" schema
+  | Plan.Op_database_list              -> "Pragma(database_list)"
+  | Plan.Op_active_database_get        -> "Pragma(active_database)"
+  | Plan.Op_active_database_set { schema } ->
+    Printf.sprintf "Pragma(active_database=%s)" schema
   | Plan.Op_no_op                      -> "NoOp"
   | Plan.Op_changes                    -> "Changes"
   | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
@@ -4158,6 +4164,12 @@ let execute_with_count ?(mode = Auto)
        supported. *)
     Lwt.fail_with
       "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
+  | Plan.Op_attach _ | Plan.Op_detach _
+  | Plan.Op_database_list | Plan.Op_active_database_get
+  | Plan.Op_active_database_set _ ->
+    (* Intercepted by Db.execute before reaching exec. *)
+    Lwt.fail_with
+      "ATTACH/DETACH/database_list/active_database must be executed via Db.execute"
   | Plan.Op_create_view _ | Plan.Op_drop_view _
   | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -6097,8 +6109,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_recursive_triggers _
   | Plan.Op_pragma_set_defer_fk _
   | Plan.Op_pragma_wal_checkpoint
-  | Plan.Op_vacuum ->
+  | Plan.Op_vacuum
+  | Plan.Op_attach _ | Plan.Op_detach _
+  | Plan.Op_active_database_set _ ->
     failwith "Exec.query: use Exec.execute for write operations"
+  | Plan.Op_database_list | Plan.Op_active_database_get ->
+    failwith "Exec.query: routed via Db.query (no Db handle)"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 

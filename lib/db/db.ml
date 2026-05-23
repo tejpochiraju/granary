@@ -20,6 +20,15 @@ type t = {
   file_path         : string option;
     (** Set when opened via [open_file] / [open_file_wal].  VACUUM needs
         this to rebuild the file in-place. *)
+  attached         : (string, t) Hashtbl.t;
+    (** Sub-handles registered via [ATTACH DATABASE 'path' AS schema]
+        (phase 40 / #64).  Keyed by schema name.  Always empty on
+        sub-handles themselves — only the top-level handle holds the map. *)
+  mutable active_schema : string;
+    (** Active schema for routing non-routing statements (phase 40 /
+        #64).  Defaults to ["main"].  Switched via [PRAGMA
+        active_database = name]; the named schema must exist in
+        [attached] or equal ["main"]. *)
 }
 
 type value = Row.value =
@@ -52,7 +61,8 @@ let open_in_memory ?clock () =
              triggers = Hashtbl.create 4;
              savepoint_names = []; auto_began = false;
              last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
-             trigger_depth = 0; file_path = None }
+             trigger_depth = 0; file_path = None;
+             attached = Hashtbl.create 1; active_schema = "main" }
 
 let load_views_into_hashtbl store views_tbl =
   let* pairs = Cat.load_all_views store in
@@ -101,7 +111,8 @@ let open_file ~path =
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
                  last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
-                 trigger_depth = 0; file_path = Some path })
+                 trigger_depth = 0; file_path = Some path;
+                 attached = Hashtbl.create 1; active_schema = "main" })
 
 let open_file_wal ~path =
   let* result = S.open_file_wal ~path in
@@ -118,7 +129,8 @@ let open_file_wal ~path =
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
                  last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
-                 trigger_depth = 0; file_path = Some path })
+                 trigger_depth = 0; file_path = Some path;
+                 attached = Hashtbl.create 1; active_schema = "main" })
 
 let open_block
     ~read_page ~write_page ~sync ~resize ~n_pages ~close
@@ -137,9 +149,14 @@ let open_block
     Lwt.return (Ok { store; catalog; clock = None; explicit_txn = None; views;
                  triggers; savepoint_names = []; auto_began = false;
                  last_changes = 0; last_insert_rowid = 0L; total_changes = 0;
-                 trigger_depth = 0; file_path = None })
+                 trigger_depth = 0; file_path = None;
+                 attached = Hashtbl.create 1; active_schema = "main" })
 
-let close t = S.close t.store
+let close t =
+  let attached_subs = Hashtbl.fold (fun _ sub acc -> sub :: acc) t.attached [] in
+  let* () = Lwt_list.iter_s (fun sub -> S.close sub.store) attached_subs in
+  Hashtbl.clear t.attached;
+  S.close t.store
 
 (* ------------------------------------------------------------------ *)
 (* VACUUM (#120)                                                       *)
@@ -245,6 +262,46 @@ let compile t sql =
     match bound with
     | Error e -> Lwt.return (Error (Sema e))
     | Ok b    -> Lwt.return (Ok (Sql.Planner.plan ~cat:t.catalog b))
+
+(* ------------------------------------------------------------------ *)
+(* Multi-database routing (phase 40 / #64)                              *)
+(* ------------------------------------------------------------------ *)
+
+(** Pick the handle [sql]'s plan should execute against, given [top]'s
+    active schema.  Routing-affecting statements (ATTACH/DETACH and the
+    new database_list/active_database PRAGMAs) always run on [top]
+    itself so they can read and mutate the top-level routing state;
+    everything else runs on the sub-handle under [top.active_schema]. *)
+let resolve_target_ast (top : t) (ast : Sql.Ast.stmt) : t =
+  let routes_to_top = match ast with
+    | Sql.Ast.S_attach _ | Sql.Ast.S_detach _ -> true
+    | Sql.Ast.S_pragma Sql.Ast.Pragma_database_list -> true
+    | Sql.Ast.S_pragma Sql.Ast.Pragma_active_database -> true
+    | Sql.Ast.S_pragma (Sql.Ast.Pragma_active_database_set _) -> true
+    | _ -> false
+  in
+  if routes_to_top || String.equal top.active_schema "main" then top
+  else
+    match Hashtbl.find_opt top.attached top.active_schema with
+    | Some sub -> sub
+    | None     -> top
+
+(** Parse, route, bind, plan.  Returns the compiled op alongside the
+    handle it was bound against — callers must use that handle for any
+    downstream execution / state mutation. *)
+let compile_routed (top : t) (sql : string)
+    : (Sql.Plan.op, error) result Lwt.t * t =
+  match parse sql with
+  | Error e -> (Lwt.return (Error e), top)
+  | Ok ast  ->
+    let target = resolve_target_ast top ast in
+    let promise =
+      let* bound = Sql.Sema.bind ~views:target.views target.catalog ast in
+      match bound with
+      | Error e -> Lwt.return (Error (Sema e))
+      | Ok b    -> Lwt.return (Ok (Sql.Planner.plan ~cat:target.catalog b))
+    in
+    (promise, target)
 
 (* Prepared statement: holds a compiled plan for repeated execution. *)
 type stmt = {
@@ -928,8 +985,9 @@ let execute_instead_of t view_name ast =
    [fire_trigger_stmt] / [make_trigger_hook] recursive group above so that
    nested trigger bodies can install REPLACE/UPSERT secondary hooks. *)
 
-let execute t sql =
-  let* op = compile t sql in
+let execute top sql =
+  let (op_promise, t) = compile_routed top sql in
+  let* op = op_promise in
   match op with
   | Error (Sema (Sql.Sema.Unknown_table view_name))
     when Hashtbl.mem t.views view_name ->
@@ -943,6 +1001,43 @@ let execute t sql =
   | Ok Sql.Plan.Op_savepoint name   -> savepoint_txn t name
   | Ok Sql.Plan.Op_release name     -> release_savepoint t name
   | Ok Sql.Plan.Op_rollback_to name -> rollback_to_savepoint t name
+  | Ok (Sql.Plan.Op_attach { path; schema }) ->
+    if String.equal schema "main" then
+      Lwt.return (Error (Runtime "ATTACH: 'main' is reserved"))
+    else if Hashtbl.mem top.attached schema then
+      Lwt.return (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
+    else begin
+      let* result = open_file ~path in
+      match result with
+      | Error e -> Lwt.return (Error e)
+      | Ok sub_db ->
+        Hashtbl.add top.attached schema sub_db;
+        Lwt.return (Ok ())
+    end
+  | Ok (Sql.Plan.Op_detach { schema }) ->
+    if String.equal schema "main" then
+      Lwt.return (Error (Runtime "DETACH: cannot detach 'main'"))
+    else begin
+      match Hashtbl.find_opt top.attached schema with
+      | None -> Lwt.return (Error (Runtime (Printf.sprintf "DETACH: no such schema '%s'" schema)))
+      | Some sub ->
+        Hashtbl.remove top.attached schema;
+        if String.equal top.active_schema schema then top.active_schema <- "main";
+        let* () = close sub in
+        Lwt.return (Ok ())
+    end
+  | Ok (Sql.Plan.Op_active_database_set { schema }) ->
+    if String.equal schema "main" || Hashtbl.mem top.attached schema then begin
+      top.active_schema <- schema;
+      Lwt.return (Ok ())
+    end else
+      Lwt.return (Error (Runtime (Printf.sprintf "active_database: no such schema '%s'" schema)))
+  | Ok Sql.Plan.Op_database_list ->
+    (* No rows produced via execute; use [query]/[Db.query] to read. *)
+    Lwt.return (Ok ())
+  | Ok Sql.Plan.Op_active_database_get ->
+    (* No rows produced via execute; use [query]/[Db.query] to read. *)
+    Lwt.return (Ok ())
   | Ok Sql.Plan.Op_create_view { name; query } ->
     (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.replace t.views name query;
@@ -1039,8 +1134,14 @@ let execute t sql =
             Lwt.return (Error (Runtime msg))
           | exn         -> Lwt.fail exn))
 
-let execute_change_count t sql =
-  let* op = compile t sql in
+let execute_change_count top sql =
+  let (op_promise, t) = compile_routed top sql in
+  let* op = op_promise in
+  let count_of_unit r =
+    match r with
+    | Ok ()   -> Lwt.return (Ok 0)
+    | Error e -> Lwt.return (Error e)
+  in
   match op with
   | Error (Sema (Sql.Sema.Unknown_table view_name))
     when Hashtbl.mem t.views view_name ->
@@ -1052,22 +1153,56 @@ let execute_change_count t sql =
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_begin    ->
     let* r = begin_txn t in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
   | Ok Sql.Plan.Op_commit   ->
     let* r = commit_txn t in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
   | Ok Sql.Plan.Op_rollback ->
     let* r = rollback_txn t in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
   | Ok Sql.Plan.Op_savepoint name ->
     let* r = savepoint_txn t name in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
   | Ok Sql.Plan.Op_release name ->
     let* r = release_savepoint t name in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
   | Ok Sql.Plan.Op_rollback_to name ->
     let* r = rollback_to_savepoint t name in
-    (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e))
+    count_of_unit r
+  | Ok (Sql.Plan.Op_attach { path; schema }) ->
+    if String.equal schema "main" then
+      Lwt.return (Error (Runtime "ATTACH: 'main' is reserved"))
+    else if Hashtbl.mem top.attached schema then
+      Lwt.return (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
+    else begin
+      let* result = open_file ~path in
+      match result with
+      | Error e -> Lwt.return (Error e)
+      | Ok sub_db ->
+        Hashtbl.add top.attached schema sub_db;
+        Lwt.return (Ok 0)
+    end
+  | Ok (Sql.Plan.Op_detach { schema }) ->
+    if String.equal schema "main" then
+      Lwt.return (Error (Runtime "DETACH: cannot detach 'main'"))
+    else begin
+      match Hashtbl.find_opt top.attached schema with
+      | None -> Lwt.return (Error (Runtime (Printf.sprintf "DETACH: no such schema '%s'" schema)))
+      | Some sub ->
+        Hashtbl.remove top.attached schema;
+        if String.equal top.active_schema schema then top.active_schema <- "main";
+        let* () = close sub in
+        Lwt.return (Ok 0)
+    end
+  | Ok (Sql.Plan.Op_active_database_set { schema }) ->
+    if String.equal schema "main" || Hashtbl.mem top.attached schema then begin
+      top.active_schema <- schema;
+      Lwt.return (Ok 0)
+    end else
+      Lwt.return (Error (Runtime (Printf.sprintf "active_database: no such schema '%s'" schema)))
+  | Ok Sql.Plan.Op_database_list
+  | Ok Sql.Plan.Op_active_database_get ->
+    Lwt.return (Ok 0)
   | Ok Sql.Plan.Op_create_view { name; query } ->
     (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Hashtbl.replace t.views name query;
@@ -1147,8 +1282,9 @@ let execute_change_count t sql =
             Lwt.return (Error (Runtime msg))
           | exn         -> Lwt.fail exn))
 
-let query t sql =
-  let* op = compile t sql in
+let query top sql =
+  let (op_promise, t) = compile_routed top sql in
+  let* op = op_promise in
   match op with
   | Error e -> Lwt.return (Error e)
   | Ok Sql.Plan.Op_changes ->
@@ -1160,6 +1296,29 @@ let query t sql =
   | Ok Sql.Plan.Op_total_changes ->
     Lwt.return (Ok (Lwt_stream.of_list
       [ [| Row.V_int (Int64.of_int t.total_changes) |] ]))
+  | Ok Sql.Plan.Op_database_list ->
+    let path_str p = Option.value p ~default:"" in
+    let main_row =
+      [| Row.V_int 0L; Row.V_text "main"; Row.V_text (path_str top.file_path) |]
+    in
+    let _, rev_extra =
+      Hashtbl.fold (fun name sub (i, acc) ->
+        let row =
+          [| Row.V_int (Int64.of_int i);
+             Row.V_text name;
+             Row.V_text (path_str sub.file_path) |]
+        in
+        (i + 1, row :: acc)
+      ) top.attached (1, [])
+    in
+    Lwt.return (Ok (Lwt_stream.of_list (main_row :: List.rev rev_extra)))
+  | Ok Sql.Plan.Op_active_database_get ->
+    Lwt.return (Ok (Lwt_stream.of_list [ [| Row.V_text top.active_schema |] ]))
+  | Ok (Sql.Plan.Op_attach _ | Sql.Plan.Op_detach _
+       | Sql.Plan.Op_active_database_set _) ->
+    Lwt.return
+      (Error (Runtime
+        "ATTACH/DETACH/active_database = ... is a write op; use Db.execute"))
   | Ok op   ->
     let mode = match t.explicit_txn with
       | None    -> Sql.Exec.Auto
@@ -1175,10 +1334,11 @@ let query t sql =
 (* Prepared statement API                                               *)
 (* ------------------------------------------------------------------ *)
 
-let prepare t sql =
+let prepare top sql =
   match parse sql with
   | Error e -> Lwt.return (Error e)
   | Ok ast  ->
+    let t = resolve_target_ast top ast in
     let* bound = Sql.Sema.bind_returning_params ~views:t.views t.catalog ast in
     (match bound with
      | Error e         -> Lwt.return (Error (Sema e))

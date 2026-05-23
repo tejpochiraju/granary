@@ -79,6 +79,7 @@
 %token TOTAL_CHANGES SQLITE_VERSION
 %token FOR EACH ROW
 %token WITHOUT ROWID VACUUM
+%token ATTACH DETACH DATABASE
 %token QUESTION
 %token <int>    IPARAM
 %token <string> NAMED_PARAM
@@ -267,9 +268,24 @@ stmt:
   | s = alter_table       { s }
   | s = explain_stmt      { s }
   | s = vacuum_stmt       { s }
+  | s = attach_stmt       { s }
+  | s = detach_stmt       { s }
 
 vacuum_stmt:
   | VACUUM { Ast.S_vacuum }
+
+attach_stmt:
+  | ATTACH DATABASE p = STRING_LIT AS s = any_ident
+    { Ast.S_attach { path = p; schema = s } }
+  (* Some dialects omit the DATABASE keyword. *)
+  | ATTACH p = STRING_LIT AS s = any_ident
+    { Ast.S_attach { path = p; schema = s } }
+
+detach_stmt:
+  | DETACH DATABASE s = any_ident
+    { Ast.S_detach { schema = s } }
+  | DETACH s = any_ident
+    { Ast.S_detach { schema = s } }
 
 with_cte:
   | WITH name = any_ident AS LPAREN def = compound_select RPAREN query = compound_select
@@ -321,6 +337,8 @@ pragma_stmt:
                    "PRAGMA defer_foreign_keys = %s: expected 0/1/on/off" value)
         in
         Ast.S_pragma (Ast.Pragma_defer_foreign_keys_set on)
+      | "active_database" ->
+        Ast.S_pragma (Ast.Pragma_active_database_set value)
       | _ -> Ast.S_pragma (Ast.Pragma_set (name, value)) }
 
   (* Bare getter form: PRAGMA name — new in Phase 26 *)
@@ -333,12 +351,15 @@ pragma_stmt:
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
       | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
+      | "database_list"   -> Ast.S_pragma Ast.Pragma_database_list
+      | "active_database" -> Ast.S_pragma Ast.Pragma_active_database
       | _                 -> Ast.S_pragma (Ast.Pragma_set (name, "")) }
 
 pragma_value:
   | v = IDENT              { v }
   | ON                     { "on" }
   | n = INT_LIT            { Int64.to_string n }
+  | s = STRING_LIT         { s }
 
 drop_table:
   | DROP TABLE name = any_ident

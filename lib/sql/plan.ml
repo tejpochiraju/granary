@@ -240,6 +240,19 @@ type op =
     (** Migrate WAL contents to main DB and reset; no-op outside WAL mode. *)
   | Op_vacuum
     (** Compact-rebuild the database file (phase 37 / #120). *)
+  | Op_attach of { path : string; schema : string }
+    (** [ATTACH DATABASE 'path' AS schema] — phase 40 / #64.  Mutates
+        the executing [Db.t]'s [attached] map; never observed by exec.ml. *)
+  | Op_detach of { schema : string }
+    (** [DETACH DATABASE schema] — phase 40 / #64. *)
+  | Op_database_list
+    (** [PRAGMA database_list] — phase 40 / #64.  Yields one row per
+        schema: (seq INT, name TEXT, file TEXT). *)
+  | Op_active_database_get
+    (** [PRAGMA active_database] — phase 40 / #64. *)
+  | Op_active_database_set of { schema : string }
+    (** [PRAGMA active_database = schema] — phase 40 / #64.  Subsequent
+        non-routing statements route through [t.attached] under [schema]. *)
   | Op_distinct of {
       child : op;
     }

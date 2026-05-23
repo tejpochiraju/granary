@@ -381,6 +381,18 @@ and stmt =
     (** Compact-rebuild the database file in place (phase 37 / #120).
         Executed by [Db.vacuum]; surfaces a sema error if invoked on a
         non-file-backed database. *)
+  | S_attach of {
+      path   : string;   (** filesystem path to the database file *)
+      schema : string;   (** schema name under which to register *)
+    }
+    (** [ATTACH DATABASE 'path' AS schema] — phase 40 / #64.
+        Opens a sub-handle and registers it under [schema] for subsequent
+        statements addressed via [PRAGMA active_database = schema]. *)
+  | S_detach of {
+      schema : string;   (** schema name to detach *)
+    }
+    (** [DETACH DATABASE schema] — phase 40 / #64.  Closes and removes
+        a previously attached sub-handle. *)
 
 and pragma_kind =
   | Pragma_table_info       of string   (* PRAGMA table_info(tbl) *)
@@ -397,6 +409,9 @@ and pragma_kind =
   | Pragma_journal_mode                 (* PRAGMA journal_mode  → "delete" *)
   | Pragma_integrity_check              (* PRAGMA integrity_check → errors or "ok" *)
   | Pragma_wal_checkpoint               (* PRAGMA wal_checkpoint — migrate WAL → main *)
+  | Pragma_database_list                (* PRAGMA database_list — list main + attached *)
+  | Pragma_active_database              (* PRAGMA active_database — read current schema name *)
+  | Pragma_active_database_set of string (* PRAGMA active_database = name → route subsequent stmts *)
   | Pragma_set of string * string       (* fallback no-op setter *)
 
 and column_def = {

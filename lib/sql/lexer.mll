@@ -242,6 +242,9 @@ rule token = parse
       | "WITHOUT"            -> WITHOUT
       | "ROWID"              -> ROWID
       | "VACUUM"             -> VACUUM
+      | "ATTACH"             -> ATTACH
+      | "DETACH"             -> DETACH
+      | "DATABASE"           -> DATABASE
       | _              -> IDENT id
     }
   | eof                     { EOF }

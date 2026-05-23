@@ -258,6 +258,8 @@ type bound_stmt =
       analyze : bool;
       inner   : bound_stmt;
     }
+  | BS_attach of { path : string; schema : string }
+  | BS_detach of { schema : string }
 
 type error =
   | Unknown_table       of string

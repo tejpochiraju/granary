@@ -681,6 +681,15 @@ let rec plan ?cat = function
      | Ast.Pragma_wal_checkpoint ->
        Plan.Op_pragma_wal_checkpoint
 
+     | Ast.Pragma_database_list ->
+       Plan.Op_database_list
+
+     | Ast.Pragma_active_database ->
+       Plan.Op_active_database_get
+
+     | Ast.Pragma_active_database_set s ->
+       Plan.Op_active_database_set { schema = s }
+
      | _ ->
        let rows = match kind with
          | Ast.Pragma_table_info table_name ->
@@ -744,7 +753,9 @@ let rec plan ?cat = function
          | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _
          | Ast.Pragma_recursive_triggers | Ast.Pragma_recursive_triggers_set _
          | Ast.Pragma_defer_foreign_keys | Ast.Pragma_defer_foreign_keys_set _
-         | Ast.Pragma_wal_checkpoint ->
+         | Ast.Pragma_wal_checkpoint
+         | Ast.Pragma_database_list | Ast.Pragma_active_database
+         | Ast.Pragma_active_database_set _ ->
            assert false   (* handled by outer match above *)
        in
        Plan.Op_pragma_rows { rows })
@@ -767,3 +778,5 @@ let rec plan ?cat = function
   | Sema.BS_explain { analyze; inner } ->
     Plan.Op_explain { analyze; inner = plan ?cat inner }
   | Sema.BS_vacuum -> Plan.Op_vacuum
+  | Sema.BS_attach { path; schema } -> Plan.Op_attach { path; schema }
+  | Sema.BS_detach { schema } -> Plan.Op_detach { schema }

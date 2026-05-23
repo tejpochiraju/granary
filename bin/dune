@@ -1,4 +1,4 @@
-(executable
- (name sqlocaml_cli)
+(executables
+ (names sqlocaml_cli sqlocaml_repl)
  (libraries sqlocaml lwt lwt.unix)
  (preprocess (pps lwt_ppx)))

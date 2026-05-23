@@ -108,3 +108,12 @@
 (test
  (name test_perf_bench)
  (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+
+(test
+ (name test_attach)
+ (libraries sqlocaml alcotest lwt.unix unix))
+
+(test
+ (name test_repl)
+ (libraries alcotest unix)
+ (deps ../bin/sqlocaml_repl.exe))

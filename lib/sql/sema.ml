@@ -250,6 +250,8 @@ type bound_stmt =
       analyze : bool;
       inner   : bound_stmt;
     }
+  | BS_attach of { path : string; schema : string }
+  | BS_detach of { schema : string }
 
 type error =
   | Unknown_table       of string
@@ -2718,6 +2720,10 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        Lwt.return (Ok (BS_create_fts_table { name; columns })))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
   | Ast.S_vacuum -> Lwt.return (Ok BS_vacuum)
+  | Ast.S_attach { path; schema } ->
+    Lwt.return (Ok (BS_attach { path; schema }))
+  | Ast.S_detach { schema } ->
+    Lwt.return (Ok (BS_detach { schema }))
   | Ast.S_const_select { exprs } ->
     (* FROM-less SELECT: bind each expression without any table context.
        We use a dummy empty table_meta for the resolver. *)
