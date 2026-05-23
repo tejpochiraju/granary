@@ -528,8 +528,13 @@ let max_trigger_depth = 32
 (** Compile and execute one pre-substituted trigger body statement within the
     db context.  This installs hooks for the nested DML so triggers fired from
     within a trigger body can themselves fire further triggers, up to
-    [max_trigger_depth] levels deep. *)
-let rec fire_trigger_stmt t stmt =
+    [max_trigger_depth] levels deep.
+
+    [?tx] is the active write tx of the parent DML.  Phase 38: when provided,
+    nested trigger DML runs with [In_txn tx] so triggers share the parent's
+    transaction (atomic rollback on failure, no nested deadlock).  When [None],
+    falls back to [t.explicit_txn] then [Auto]. *)
+let rec fire_trigger_stmt ?(tx : S.rw S.txn option = None) t stmt =
   if t.trigger_depth >= max_trigger_depth then
     Lwt.fail_with (Printf.sprintf
       "trigger recursion limit (%d) exceeded" max_trigger_depth)
@@ -552,9 +557,12 @@ let rec fire_trigger_stmt t stmt =
         Lwt.fail_with (Format.asprintf "trigger sema: %a" Sql.Sema.pp_error e)
       | Ok b ->
         let op = Sql.Planner.plan ~cat:t.catalog b in
-        let mode = match t.explicit_txn with
-          | None    -> Sql.Exec.Auto
+        let mode = match tx with
           | Some tx -> Sql.Exec.In_txn tx
+          | None ->
+            (match t.explicit_txn with
+             | None     -> Sql.Exec.Auto
+             | Some etx -> Sql.Exec.In_txn etx)
         in
         (* Build hooks for the nested op so further triggers fire. *)
         let table_meta_opt, event_opt = match op with
@@ -574,18 +582,20 @@ let rec fire_trigger_stmt t stmt =
              make_trigger_hook t tm ~timing:`After  ~event:ev)
           | _ -> (None, None)
         in
-        (* For INSERT-ish ops, also install the REPLACE-displaced-DELETE and
-           UPSERT-DO-UPDATE hooks so nested INSERT OR REPLACE / UPSERT bodies
+        (* For INSERT-ish ops, also install the REPLACE/UPSERT-displaced
+           BEFORE/AFTER hooks so nested INSERT OR REPLACE / UPSERT bodies
            fire DELETE/UPDATE triggers on conflict-displaced rows. *)
-        let on_replace_delete, on_upsert_update =
+        let (on_replace_delete_before, on_replace_delete,
+             on_upsert_update_before, on_upsert_update) =
           match op with
           | Sql.Plan.Op_insert _ | Sql.Plan.Op_insert_select _ ->
             insert_replace_upsert_hooks t op
-          | _ -> (None, None)
+          | _ -> (None, None, None, None)
         in
         Sql.Exec.execute
           ~before_hook ~after_hook
-          ~on_replace_delete ~on_upsert_update
+          ~on_replace_delete_before ~on_replace_delete
+          ~on_upsert_update_before ~on_upsert_update
           ~mode ~clock:t.clock
           t.store t.catalog op
     ) finally
@@ -593,10 +603,13 @@ let rec fire_trigger_stmt t stmt =
 
 (** Build a DML hook for exec.ml that fires triggers.
     Returns None if no triggers exist for the given table/timing/event (fast path).
-    Scans the trigger hashtable exactly once to collect matching triggers. *)
-(* Atomicity note: AFTER triggers fire after the DML transaction commits.
-   If an AFTER trigger body fails, the committed DML row is NOT rolled back.
-   This differs from SQLite's semantics where all-or-nothing applies. *)
+    Scans the trigger hashtable exactly once to collect matching triggers.
+
+    Phase 38 (#138/#139): the hook receives [~tx], the parent DML's active
+    write txn.  Trigger nested DML runs with [In_txn tx] so triggers share
+    the parent transaction.  This delivers atomic rollback when a trigger
+    body raises and removes the nested-trigger deadlock that previously
+    forced AFTER firing outside the parent txn. *)
 and make_trigger_hook t table_meta ~timing ~event =
   let matching =
     Hashtbl.fold (fun _name ast acc ->
@@ -609,7 +622,7 @@ and make_trigger_hook t table_meta ~timing ~event =
     ) t.triggers []
   in
   if matching = [] then None
-  else Some (fun ~new_row ~old_row ->
+  else Some (fun ~tx ~new_row ~old_row ->
     let schema = table_meta.Cat.columns in
     Lwt_list.iter_s (fun m ->
       let* should_fire = match m.trig_when with
@@ -624,8 +637,9 @@ and make_trigger_hook t table_meta ~timing ~event =
                "trigger WHEN clause binding error: %a" Sql.Sema.pp_error e)
            | Ok bw ->
              let op = Sql.Planner.plan ~cat:t.catalog bw in
-             let mode = match t.explicit_txn with
-               | None -> Sql.Exec.Auto | Some tx -> Sql.Exec.In_txn tx in
+             (* WHEN clause query runs inside the parent txn so it sees the
+                in-flight writes (matches SQLite semantics for AFTER WHEN). *)
+             let mode = Sql.Exec.In_txn tx in
              let* stream = Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op in
              let* rows = Lwt_stream.to_list stream in
              Lwt.return (match rows with
@@ -637,7 +651,7 @@ and make_trigger_hook t table_meta ~timing ~event =
       else
         Lwt_list.iter_s (fun stmt ->
           let substituted = subst_new_old ~schema ~new_row ~old_row stmt in
-          fire_trigger_stmt t substituted
+          fire_trigger_stmt ~tx:(Some tx) t substituted
         ) m.trig_body
     ) matching
   )
@@ -646,7 +660,10 @@ and make_trigger_hook t table_meta ~timing ~event =
     an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a
     UNIQUE index (DELETE triggers on the displaced row) or when the UPSERT
     [DO UPDATE] branch runs (UPDATE triggers on the updated row).
-    Returns [(None, None)] for ops that are not insert-like.
+
+    Phase 38 (#139): returns BOTH BEFORE and AFTER hooks for both displaced
+    cases.  All four fire inside the parent txn.  Returns all-[None] for
+    ops that are not insert-like.
 
     Part of the [fire_trigger_stmt] recursive group so that nested trigger
     bodies that perform INSERT OR REPLACE / UPSERT also fire DELETE/UPDATE
@@ -658,21 +675,34 @@ and insert_replace_upsert_hooks t op =
     | _ -> None
   in
   match table_meta_opt with
-  | None -> (None, None)
+  | None -> (None, None, None, None)
   | Some tm ->
-    let delete_hook = make_trigger_hook t tm ~timing:`After ~event:`Delete in
-    let update_hook = make_trigger_hook t tm ~timing:`After ~event:`Update in
+    let delete_before_hook = make_trigger_hook t tm ~timing:`Before ~event:`Delete in
+    let delete_after_hook  = make_trigger_hook t tm ~timing:`After  ~event:`Delete in
+    let update_before_hook = make_trigger_hook t tm ~timing:`Before ~event:`Update in
+    let update_after_hook  = make_trigger_hook t tm ~timing:`After  ~event:`Update in
+    let on_replace_delete_before =
+      Option.map (fun hook -> fun ~tx ~old_row ->
+        hook ~tx ~new_row:None ~old_row:(Some old_row)
+      ) delete_before_hook
+    in
     let on_replace_delete =
-      Option.map (fun hook -> fun ~old_row ->
-        hook ~new_row:None ~old_row:(Some old_row)
-      ) delete_hook
+      Option.map (fun hook -> fun ~tx ~old_row ->
+        hook ~tx ~new_row:None ~old_row:(Some old_row)
+      ) delete_after_hook
+    in
+    let on_upsert_update_before =
+      Option.map (fun hook -> fun ~tx ~old_row ~new_row ->
+        hook ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
+      ) update_before_hook
     in
     let on_upsert_update =
-      Option.map (fun hook -> fun ~old_row ~new_row ->
-        hook ~new_row:(Some new_row) ~old_row:(Some old_row)
-      ) update_hook
+      Option.map (fun hook -> fun ~tx ~old_row ~new_row ->
+        hook ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
+      ) update_after_hook
     in
-    (on_replace_delete, on_upsert_update)
+    (on_replace_delete_before, on_replace_delete,
+     on_upsert_update_before, on_upsert_update)
 
 (** Extract column names from a view query's projection, in order.
     Returns [] if the projection cannot be resolved to simple column names. *)
@@ -972,10 +1002,13 @@ let execute t sql =
       | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
       | _ -> None
     in
-    let (on_replace_delete, on_upsert_update) = insert_replace_upsert_hooks t op in
+    let (on_replace_delete_before, on_replace_delete,
+         on_upsert_update_before, on_upsert_update) =
+      insert_replace_upsert_hooks t op in
     (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
              ~before_hook ~after_hook
-             ~on_replace_delete ~on_upsert_update
+             ~on_replace_delete_before ~on_replace_delete
+             ~on_upsert_update_before ~on_upsert_update
              t.store t.catalog op with
      | exception Failure msg ->
        (* Discard any pending deferred FK checks queued by the failed
@@ -1079,10 +1112,13 @@ let execute_change_count t sql =
       | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
       | _ -> None
     in
-    let (on_replace_delete, on_upsert_update) = insert_replace_upsert_hooks t op in
+    let (on_replace_delete_before, on_replace_delete,
+         on_upsert_update_before, on_upsert_update) =
+      insert_replace_upsert_hooks t op in
     (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
              ~before_hook ~after_hook
-             ~on_replace_delete ~on_upsert_update
+             ~on_replace_delete_before ~on_replace_delete
+             ~on_upsert_update_before ~on_upsert_update
              t.store t.catalog op with
      | exception Failure msg ->
        Cat.clear_pending_fk_checks t.catalog;
@@ -1186,7 +1222,8 @@ let run st ~params =
        make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
     | _ -> (None, None)
   in
-  let (on_replace_delete, on_upsert_update) =
+  let (on_replace_delete_before, on_replace_delete,
+       on_upsert_update_before, on_upsert_update) =
     insert_replace_upsert_hooks t st.plan
   in
   let insert_table_name = match st.plan with
@@ -1198,7 +1235,8 @@ let run st ~params =
     (fun () ->
       let* n = Sql.Exec.execute_with_count ~mode ~clock:t.clock ~params:params_arr
                  ~before_hook ~after_hook
-                 ~on_replace_delete ~on_upsert_update
+                 ~on_replace_delete_before ~on_replace_delete
+                 ~on_upsert_update_before ~on_upsert_update
                  t.store t.catalog st.plan in
       t.last_changes <- n;
       t.total_changes <- t.total_changes + n;

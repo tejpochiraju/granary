@@ -92,3 +92,7 @@
 (test
  (name test_vacuum)
  (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+
+(test
+ (name test_trigger_atomicity)
+ (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix))

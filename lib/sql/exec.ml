@@ -2038,10 +2038,12 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     ?(on_conflict : Ast.conflict_action option = None)
     ?(upsert_update : (string list * (int * Plan.expr) list) option = None)
     ?(prebuilt_row : Row.t option = None)
-    ?(before_hook : (new_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (new_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
   let n   = List.length table_meta.columns in
@@ -2122,15 +2124,20 @@ let execute_insert ?(mode = Auto) ?(params = [||])
              end)
       ) fks
   in
-  (* Fire BEFORE INSERT triggers *)
-  let* () = match before_hook with None -> Lwt.return_unit | Some f -> f ~new_row:(Array.copy row) in
   (* When an explicit transaction is already held, we must NOT call
      Cat.next_rowid (which opens its own RW txn and deadlocks on the
      mutex).  Instead acquire/reuse the txn first, then update the
-     rowid counter within that same txn. *)
+     rowid counter within that same txn.
+     Phase 38: BEFORE INSERT now fires inside the parent txn so its
+     nested DML can share the parent tx (no deadlock) and so its writes
+     are rolled back atomically with the parent on failure. *)
   let* (tx, owned) = acquire_txn store mode in
   Lwt.catch
     (fun () ->
+      (* Fire BEFORE INSERT triggers (inside parent txn). *)
+      let* () = match before_hook with
+        | None -> Lwt.return_unit
+        | Some f -> f ~tx ~new_row:(Array.copy row) in
       (* For WITHOUT ROWID tables (phase 37 #122), the INTEGER PRIMARY KEY
          column's value becomes the rowid — no auto-allocation.  The PK
          must be present and non-NULL. *)
@@ -2232,6 +2239,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            compute_stored_generated_cols clock params table_meta new_row;
            eval_check_constraints clock params table_meta new_row;
            let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
+           (* Phase 38 (#139): fire BEFORE UPDATE on the conflict row inside
+              the parent txn, before any writes.  Trigger nested DML shares
+              [tx] via the threaded ~tx parameter, so no deadlock and no
+              mid-statement commit. *)
+           let* () = match on_upsert_update_before with
+             | None -> Lwt.return_unit
+             | Some f -> f ~tx ~old_row ~new_row
+           in
            (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row
               before extracting index keys. [old_row] was decoded via
               [decode_with_virtual] so its VIRTUAL cells are already set. *)
@@ -2252,15 +2267,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
            let new_bytes = Row.encode table_meta.columns new_row in
            let* () = S.del tx table_meta.tree_id old_key in
            let* () = S.put tx table_meta.tree_id old_key new_bytes in
-           let* () = release_txn tx owned in
-           (* UPSERT DO UPDATE branch: SQLite fires only AFTER UPDATE triggers,
-              NOT AFTER INSERT.  Suppress [after_hook] for this row and fire
-              [on_upsert_update] exclusively, preserving the per-row invariant
-              that exactly one of (INSERT after_hook, on_upsert_update) runs. *)
+           (* Phase 38 (#138): UPSERT DO UPDATE branch: SQLite fires only
+              AFTER UPDATE triggers, NOT AFTER INSERT.  Fire AFTER UPDATE
+              inside the parent txn so failures roll back the whole DML. *)
            let* () = match on_upsert_update with
              | None -> Lwt.return_unit
-             | Some f -> f ~old_row ~new_row
+             | Some f -> f ~tx ~old_row ~new_row
            in
+           let* () = release_txn tx owned in
            Lwt.return true)
       | _ ->
         (* Normal path: skip, replace, or plain insert *)
@@ -2269,10 +2283,11 @@ let execute_insert ?(mode = Auto) ?(params = [||])
           let* () = if owned then S.rollback tx else Lwt.return_unit in
           Lwt.return false
         end else begin
-          (* REPLACE: delete all conflicting rows first.  Capture the
-             displaced rows so DELETE triggers can fire on them AFTER the
-             enclosing txn is released — firing while still in-txn would
-             deadlock when the trigger body acquires its own RW txn. *)
+          (* REPLACE: delete all conflicting rows first.  Phase 38 (#138/#139):
+             BEFORE-DELETE triggers fire on each displaced row inside the
+             parent txn before the del; AFTER-DELETE triggers and the
+             INSERT AFTER hook also fire inside the txn before release_txn,
+             so any trigger failure rolls back the entire DML. *)
           let displaced_rows : Row.t list ref = ref [] in
           let* () = Lwt_list.iter_s (fun old_rowid ->
             let old_key = Rowid.encode old_rowid in
@@ -2282,6 +2297,12 @@ let execute_insert ?(mode = Auto) ?(params = [||])
             | Some old_bytes ->
               let old_row = decode_with_virtual clock params table_meta old_bytes in
               displaced_rows := old_row :: !displaced_rows;
+              (* Phase 38 (#139): fire BEFORE DELETE on the displaced row
+                 inside the parent txn before the row is removed. *)
+              let* () = match on_replace_delete_before with
+                | None   -> Lwt.return_unit
+                | Some f -> f ~tx ~old_row
+              in
               let* () = S.del tx table_meta.tree_id old_key in
               Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
                 if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
@@ -2310,14 +2331,14 @@ let execute_insert ?(mode = Auto) ?(params = [||])
               S.put tx idx.idx_tree_id ikey Bytes.empty
             end
           ) idxs in
-          let* () = release_txn tx owned in
-          (* Fire DELETE triggers on each displaced row after release. *)
+          (* Phase 38 (#138): AFTER triggers fire inside the parent txn. *)
           let* () = match on_replace_delete with
             | None   -> Lwt.return_unit
             | Some f ->
-              Lwt_list.iter_s (fun old_row -> f ~old_row) (List.rev !displaced_rows)
+              Lwt_list.iter_s (fun old_row -> f ~tx ~old_row) (List.rev !displaced_rows)
           in
-          let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~new_row:row in
+          let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~tx ~new_row:row in
+          let* () = release_txn tx owned in
           Lwt.return true
         end)
     (fun exn ->
@@ -2966,8 +2987,8 @@ and cascade_update_col_in_tx tx (cat : Cat.t)
     number of rows whose contents were modified. *)
 let execute_update ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
-    ?(before_hook : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t)
     (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
@@ -3108,21 +3129,24 @@ let execute_update ?(mode = Auto) ?(params = [||])
           ) child_refs
         ) matches
     in
-    (* Fire BEFORE UPDATE triggers (per row) *)
-    let* () = match before_hook with
-      | None -> Lwt.return_unit
-      | Some f ->
-        Lwt_list.iter_s (fun (_rowid, old_row) ->
-          let new_row = Array.copy old_row in
-          List.iter (fun (i, expr) ->
-            new_row.(i) <- eval_expr clock params old_row expr
-          ) assignments;
-          f ~old_row ~new_row
-        ) matches
-    in
+    (* Phase 38: BEFORE UPDATE now fires inside the parent txn so its
+       nested DML shares the parent tx (atomic rollback on failure;
+       no nested-trigger deadlock). *)
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
+        (* Fire BEFORE UPDATE triggers (per row, inside parent txn) *)
+        let* () = match before_hook with
+          | None -> Lwt.return_unit
+          | Some f ->
+            Lwt_list.iter_s (fun (_rowid, old_row) ->
+              let new_row = Array.copy old_row in
+              List.iter (fun (i, expr) ->
+                new_row.(i) <- eval_expr clock params old_row expr
+              ) assignments;
+              f ~tx ~old_row ~new_row
+            ) matches
+        in
         (* First pass: validate UNIQUE constraints for every target row,
            considering the FULL set of new values (each updated row may
            conflict with another updated row). *)
@@ -3310,8 +3334,9 @@ let execute_update ?(mode = Auto) ?(params = [||])
             S.put tx table_meta.tree_id key new_bytes
           ) matches
         in
-        let* () = release_txn tx owned in
-        (* After-hook new_row is recomputed from the pre-write snapshot; for
+        (* Phase 38 (#138): fire AFTER UPDATE inside the parent txn so
+           trigger failures roll back the whole DML.
+           After-hook new_row is recomputed from the pre-write snapshot; for
            non-deterministic expressions (e.g. random(), now()) the value seen
            by the trigger may differ from the committed row. *)
         let* () = match after_hook with
@@ -3322,9 +3347,10 @@ let execute_update ?(mode = Auto) ?(params = [||])
               List.iter (fun (i, expr) ->
                 new_row.(i) <- eval_expr clock params old_row expr
               ) assignments;
-              f ~old_row ~new_row
+              f ~tx ~old_row ~new_row
             ) matches
         in
+        let* () = release_txn tx owned in
         Lwt.return n)
       (fun exn ->
         (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -3337,8 +3363,8 @@ let execute_update ?(mode = Auto) ?(params = [||])
     row itself from the table tree.  Returns the number of rows deleted. *)
 let execute_delete ?(mode = Auto) ?(params = [||])
     ?(clock : (unit -> float) option = None)
-    ?(before_hook : (old_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (old_row:Row.t -> unit Lwt.t) option = None)
+    ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(after_hook  : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t)
     (cat : Cat.t)
     ~(table_meta : Cat.table_meta)
@@ -3470,14 +3496,16 @@ let execute_delete ?(mode = Auto) ?(params = [||])
           ) child_refs
         ) matches
     in
-    (* Fire BEFORE DELETE triggers (per row) *)
-    let* () = match before_hook with
-      | None -> Lwt.return_unit
-      | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~old_row) matches
-    in
+    (* Phase 38: BEFORE DELETE now fires inside the parent txn so nested
+       DML shares the tx and trigger failures roll back the DELETE. *)
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
+        (* Fire BEFORE DELETE triggers (per row, inside parent txn) *)
+        let* () = match before_hook with
+          | None -> Lwt.return_unit
+          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
+        in
         let* () =
           Lwt_list.iter_s (fun (rowid, row) ->
             (* Phase 35 task 3a: seed per-row visited set with the parent
@@ -3597,12 +3625,13 @@ let execute_delete ?(mode = Auto) ?(params = [||])
             S.del tx table_meta.tree_id rowid_key
           ) matches
         in
-        let* () = release_txn tx owned in
-        (* Fire AFTER DELETE triggers (per row) *)
+        (* Phase 38 (#138): fire AFTER DELETE inside the parent txn so
+           trigger failures roll back the DELETE. *)
         let* () = match after_hook with
           | None -> Lwt.return_unit
-          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~old_row) matches
+          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
         in
+        let* () = release_txn tx owned in
         Lwt.return n)
       (fun exn ->
         (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -3766,10 +3795,12 @@ let to_stream_ref : ((unit -> float) option -> Row.value array -> S.t -> ?mode:t
 let execute_with_count ?(mode = Auto)
     ?(clock : (unit -> float) option = None)
     ?(params = [||])
-    ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t) (op : Plan.op)
   : int Lwt.t =
   match op with
@@ -3806,19 +3837,20 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     end
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
-    let bh = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) before_hook in
-    let ah = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) after_hook in
+    let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
+    let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
     Lwt_list.fold_left_s (fun count row_vals ->
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
                         ~before_hook:bh ~after_hook:ah
-                        ~on_replace_delete ~on_upsert_update
+                        ~on_replace_delete_before ~on_replace_delete
+                        ~on_upsert_update_before ~on_upsert_update
                         store cat ~table_meta ~ordinals ~values:row_vals in
       Lwt.return (count + if inserted then 1 else 0)
     ) 0 values
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
     let n_cols = List.length table_meta.Cat.columns in
-    let bh = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) before_hook in
-    let ah = Option.map (fun f ~new_row -> f ~new_row:(Some new_row) ~old_row:None) after_hook in
+    let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
+    let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
     let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
     let* src_rows = Lwt_stream.to_list stream in
     Lwt_list.fold_left_s (fun count src_row ->
@@ -3829,7 +3861,8 @@ let execute_with_count ?(mode = Auto)
       ) ordinals;
       let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
                         ~before_hook:bh ~after_hook:ah
-                        ~on_replace_delete ~on_upsert_update
+                        ~on_replace_delete_before ~on_replace_delete
+                        ~on_upsert_update_before ~on_upsert_update
                         store cat ~table_meta ~ordinals ~values:[]
                         ~prebuilt_row:(Some row_arr) in
       Lwt.return (count + if inserted then 1 else 0)
@@ -3848,20 +3881,20 @@ let execute_with_count ?(mode = Auto)
       Lwt.return 0
     end
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
-    let bh = Option.map (fun f ~old_row ~new_row ->
-      f ~new_row:(Some new_row) ~old_row:(Some old_row)
+    let bh = Option.map (fun f ~tx ~old_row ~new_row ->
+      f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
     ) before_hook in
-    let ah = Option.map (fun f ~old_row ~new_row ->
-      f ~new_row:(Some new_row) ~old_row:(Some old_row)
+    let ah = Option.map (fun f ~tx ~old_row ~new_row ->
+      f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
     ) after_hook in
     execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
       store cat ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
-    let bh = Option.map (fun f ~old_row ->
-      f ~new_row:None ~old_row:(Some old_row)
+    let bh = Option.map (fun f ~tx ~old_row ->
+      f ~tx ~new_row:None ~old_row:(Some old_row)
     ) before_hook in
-    let ah = Option.map (fun f ~old_row ->
-      f ~new_row:None ~old_row:(Some old_row)
+    let ah = Option.map (fun f ~tx ~old_row ->
+      f ~tx ~new_row:None ~old_row:(Some old_row)
     ) after_hook in
     execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
       store cat ~table_meta ~where ~order ~limit ~offset ~indexes
@@ -4150,13 +4183,16 @@ let execute_with_count ?(mode = Auto)
 let execute ?(mode = Auto)
     ?(clock : (unit -> float) option = None)
     ?(params = [||])
-    ?(before_hook : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(after_hook  : (new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
+    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
+    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
   let* _n = execute_with_count ~mode ~clock ~params ~before_hook ~after_hook
-              ~on_replace_delete ~on_upsert_update store cat op in
+              ~on_replace_delete_before ~on_replace_delete
+              ~on_upsert_update_before ~on_upsert_update store cat op in
   Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)

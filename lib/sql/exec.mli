@@ -12,14 +12,24 @@ val execute :
   ?mode:txn_mode ->
   ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
-  ?before_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+  ?before_hook:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                new_row:Sqlocaml_encoding.Row.t option ->
                 old_row:Sqlocaml_encoding.Row.t option ->
                 unit Lwt.t) option ->
-  ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+  ?after_hook:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+               new_row:Sqlocaml_encoding.Row.t option ->
                old_row:Sqlocaml_encoding.Row.t option ->
                unit Lwt.t) option ->
-  ?on_replace_delete:(old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
-  ?on_upsert_update:(old_row:Sqlocaml_encoding.Row.t ->
+  ?on_replace_delete_before:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                             old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_replace_delete:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                      old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_upsert_update_before:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                            old_row:Sqlocaml_encoding.Row.t ->
+                            new_row:Sqlocaml_encoding.Row.t ->
+                            unit Lwt.t) option ->
+  ?on_upsert_update:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                     old_row:Sqlocaml_encoding.Row.t ->
                      new_row:Sqlocaml_encoding.Row.t ->
                      unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
@@ -36,14 +46,24 @@ val execute_with_count :
   ?mode:txn_mode ->
   ?clock:(unit -> float) option ->
   ?params:Sqlocaml_encoding.Row.value array ->
-  ?before_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+  ?before_hook:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                new_row:Sqlocaml_encoding.Row.t option ->
                 old_row:Sqlocaml_encoding.Row.t option ->
                 unit Lwt.t) option ->
-  ?after_hook:(new_row:Sqlocaml_encoding.Row.t option ->
+  ?after_hook:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+               new_row:Sqlocaml_encoding.Row.t option ->
                old_row:Sqlocaml_encoding.Row.t option ->
                unit Lwt.t) option ->
-  ?on_replace_delete:(old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
-  ?on_upsert_update:(old_row:Sqlocaml_encoding.Row.t ->
+  ?on_replace_delete_before:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                             old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_replace_delete:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                      old_row:Sqlocaml_encoding.Row.t -> unit Lwt.t) option ->
+  ?on_upsert_update_before:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                            old_row:Sqlocaml_encoding.Row.t ->
+                            new_row:Sqlocaml_encoding.Row.t ->
+                            unit Lwt.t) option ->
+  ?on_upsert_update:(tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
+                     old_row:Sqlocaml_encoding.Row.t ->
                      new_row:Sqlocaml_encoding.Row.t ->
                      unit Lwt.t) option ->
   Sqlocaml_store.Store.t ->
