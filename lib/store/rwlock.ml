@@ -1,4 +1,17 @@
-(* Shared/exclusive lock built on Lwt_condition.  Writer-priority. *)
+(* Writer-mutex + reader-counter built on Lwt_condition.
+
+   Semantics (intentionally NOT a classic shared/exclusive lock):
+   - Many readers run concurrently and never block.
+   - Writers serialise against other writers via [writer_active].
+   - Readers do NOT block writers.  Writers do NOT block readers.
+
+   Rationale for #149: snapshot isolation makes reader/writer
+   concurrency safe at the pager layer — the writer's dirty bytes and
+   uncommitted WAL frames are invisible to a snapshot bounded by
+   [committed_frames].  So the lock only needs to:
+     (a) serialise concurrent writers, and
+     (b) track active readers for the checkpoint coordinator (which
+         lives in [Store] — see [active_reader_frames]). *)
 
 open Lwt.Syntax
 
@@ -19,26 +32,21 @@ let readers t = t.readers
 let writer_pending t = t.writer_active || t.writers_waiting > 0
 let writer_active t = t.writer_active
 
-let rec acquire_read t =
-  if t.writer_active || t.writers_waiting > 0 then
-    let* () = Lwt_condition.wait t.cond in
-    acquire_read t
-  else begin
-    t.readers <- t.readers + 1;
-    Lwt.return_unit
-  end
+(* Readers never wait — the snapshot-isolation work upstream makes
+   concurrent reader/writer access safe at the data layer. *)
+let acquire_read t =
+  t.readers <- t.readers + 1;
+  Lwt.return_unit
 
 let release_read t =
   t.readers <- t.readers - 1;
   if t.readers = 0 then Lwt_condition.broadcast t.cond ()
 
-(* The decrement of [writers_waiting] and the recursive re-check are
-   atomic w.r.t. the cooperative Lwt scheduler: no other fiber can run
-   between them because nothing yields. So while [writer_pending] may
-   briefly return [false] between wakeup and re-entry on a non-cooperative
-   scheduler, under Lwt no reader can slip in during that window. *)
+(* Writers wait only on other writers, not on readers.  The decrement
+   of [writers_waiting] and the recursive re-check are atomic w.r.t.
+   the cooperative Lwt scheduler. *)
 let rec acquire_write t =
-  if t.writer_active || t.readers > 0 then begin
+  if t.writer_active then begin
     t.writers_waiting <- t.writers_waiting + 1;
     let* () = Lwt_condition.wait t.cond in
     t.writers_waiting <- t.writers_waiting - 1;

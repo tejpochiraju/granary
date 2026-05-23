@@ -147,11 +147,6 @@ type ro_snapshot = {
   rs_snap_trees     : (tree_id, Btree.t) Hashtbl.t;
   rs_snap_frames    : int;
   (* WAL committed_frames at ro_begin; 0 when no WAL is in effect. *)
-  rs_lock_taken     : bool;
-  (* True iff [ro_begin] acquired the shared read lock.  False when
-     [ro_begin] was called from within an active write transaction on
-     the same store (cooperative re-entrancy: the write lock is already
-     held by this fiber so the read lock is skipped to avoid deadlock). *)
 }
 
 type 'a txn =
@@ -773,30 +768,19 @@ let open_file_wal ~path : (t, error) result Lwt.t =
 (* ------------------------------------------------------------------ *)
 
 let ro_begin t =
-  let open Lwt.Syntax in
-  (* Skip the shared lock acquisition when a writer is already active.
-     Two scenarios both motivate the bypass:
-     (a) Intra-fiber re-entrancy: the writer's own code path calls
-         [ro_begin] (e.g. [Exec] opens a snapshot to buffer rows during
-         UPDATE/DELETE).  Without the bypass [acquire_read] would block
-         forever waiting for [writer_active] to clear.
-     (b) Cross-fiber yield: another fiber's [ro_begin] runs while the
-         writer is paused mid-txn.  Bypass is still safe because the
-         snapshot reads consult [Wal.find_page_at ~max_frame] — the
-         writer's dirty pages and uncommitted WAL frames are invisible
-         to a snapshot bounded by [committed_frames].
-     The boolean is recorded in the snapshot so [ro_end] releases only
-     when we actually acquired the lock. *)
-  let lock_taken = not (Rwlock.writer_active t.lock) in
-  let* () = if lock_taken then Rwlock.acquire_read t.lock else Lwt.return_unit in
+  (* [Rwlock.acquire_read] is a counter bump, not an exclusion: under
+     snapshot isolation readers and writers don't conflict, so the call
+     never blocks regardless of writer state.  It only matters for the
+     checkpoint coordinator that wants to know "are any RO snapshots
+     still in flight?" *)
+  let* () = Rwlock.acquire_read t.lock in
   match t.backend with
   | Mem _ ->
     Lwt.return
       (Ro { rs_store = t; rs_snap_txn_id = 0L;
             rs_snap_meta_root = 0L;
             rs_snap_trees = Hashtbl.create 1;
-            rs_snap_frames = 0;
-            rs_lock_taken = lock_taken })
+            rs_snap_frames = 0 })
   | Btree st ->
     let snap_txn_id    = st.current_header.txn_id in
     let snap_meta_root = st.current_header.root_page in
@@ -815,8 +799,7 @@ let ro_begin t =
       (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
             rs_snap_meta_root = snap_meta_root;
             rs_snap_trees = Hashtbl.create 4;
-            rs_snap_frames = snap_frames;
-            rs_lock_taken = lock_taken })
+            rs_snap_frames = snap_frames })
 
 let rw_begin t =
   let* () = Rwlock.acquire_write t.lock in
@@ -856,7 +839,7 @@ let ro_end (Ro snap : ro txn) =
       | Some n ->
         Hashtbl.replace st.active_reader_frames snap.rs_snap_frames (n - 1));
      Lwt_condition.broadcast st.reader_done_cond ());
-  if snap.rs_lock_taken then Rwlock.release_read snap.rs_store.lock;
+  Rwlock.release_read snap.rs_store.lock;
   Lwt.return_unit
 
 (* Free the previous freelist page chain back into the pager's in-memory
