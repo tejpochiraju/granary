@@ -205,6 +205,173 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
   | Plan.P_collate (e, c) -> Plan.P_collate (go e, c)
   | e' -> e'
 
+(* Choose the base access path for a single table: an index lookup when the
+   WHERE clause is [col = literal] and an index covers the column, else a seq
+   scan (optionally wrapped in a filter).  With joins, always a seq scan. *)
+let plan_base cat ~table_meta ~where ~has_joins =
+  if has_joins then make_scan table_meta
+  else
+    match where with
+    | None -> make_scan table_meta
+    | Some e ->
+      (match recognise_eq_col_lit e with
+       | Some (col_idx, lit_expr) ->
+         (match find_index_on_col cat table_meta col_idx with
+          | Some idx ->
+            let col_type = (List.nth table_meta.columns col_idx).Row.ty in
+            Plan.Op_index_lookup {
+              table_tree = table_meta.tree_id;
+              idx_tree   = idx.idx_tree_id;
+              col_idx;
+              col_type;
+              lookup_val = plan_expr lit_expr;
+              table_meta;
+            }
+          | None ->
+            Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta })
+       | None ->
+         Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta })
+
+(* Build ORDER BY sort keys, substituting window slots into the key
+   expressions when window functions are present. *)
+let plan_sort_keys ~order ~windows ~n_input_cols =
+  List.map (fun (bkey : Sema.bound_order_key) ->
+    let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+    let nulls = match bkey.nulls with
+      | Some `Nulls_first -> `Nulls_first
+      | Some `Nulls_last  -> `Nulls_last
+      | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+    in
+    let e = plan_expr bkey.key in
+    let e' = if windows = [] then e
+             else substitute_window_slots ~n_input_cols e in
+    (e', dir, nulls)
+  ) order
+
+(* Build the projection operator: aggregate, expression-project (with window
+   slot substitution), or plain ordinal project. *)
+let plan_projection ~is_aggregated ~after_sort ~group_by ~aggs ~having
+    ~agg_proj ~agg_windows ~expr_proj ~proj ~windows ~n_input_cols =
+  if is_aggregated then
+    Plan.Op_aggregate {
+      child = after_sort;
+      group_cols = group_by;
+      aggs = List.map sema_agg_to_plan aggs;
+      having = Option.map plan_expr having;
+      proj = List.map sema_agg_proj_to_plan agg_proj;
+      windows = List.map plan_window_item agg_windows;
+    }
+  else if expr_proj <> [] then
+    Plan.Op_expr_project {
+      exprs = List.map (fun (be, alias) ->
+        let e = plan_expr be in
+        let e' = if windows = [] then e
+                 else substitute_window_slots ~n_input_cols e in
+        (e', alias)
+      ) expr_proj;
+      child = after_sort;
+    }
+  else
+    Plan.Op_project { ordinals = proj; child = after_sort }
+
+(* Post-aggregation ORDER BY: ORDER BY col indices are in pre-aggregation
+   space, so remap each P_col to its position in the aggregated output. *)
+let plan_post_agg_sort ~group_by ~agg_proj ~order ~projected =
+  let plan_proj = List.map sema_agg_proj_to_plan agg_proj in
+  let find_idx pred lst =
+    let rec go k = function
+      | [] -> None
+      | x :: rest -> if pred x then Some k else go (k + 1) rest
+    in go 0 lst
+  in
+  let remap_e e =
+    match e with
+    | Plan.P_col i ->
+      (match find_idx (( = ) i) group_by with
+       | None -> e
+       | Some gc_pos ->
+         (match find_idx (function
+            | Plan.PI_group_col k -> k = gc_pos
+            | _ -> false) plan_proj with
+          | Some out_pos -> Plan.P_col out_pos
+          | None -> e))
+    | _ -> e
+  in
+  let keys = List.map (fun (bkey : Sema.bound_order_key) ->
+    let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+    let nulls = match bkey.nulls with
+      | Some `Nulls_first -> `Nulls_first
+      | Some `Nulls_last  -> `Nulls_last
+      | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+    in
+    let e = plan_expr bkey.key in
+    let e' = remap_e e in
+    (e', dir, nulls)
+  ) order in
+  if keys = [] then projected
+  else Plan.Op_sort { keys; child = projected }
+
+(* Apply DISTINCT then LIMIT/OFFSET to a planned SELECT body. *)
+let finalize_select ~distinct ~limit ~offset sorted =
+  let after_distinct =
+    if distinct then Plan.Op_distinct { child = sorted } else sorted
+  in
+  match limit with
+  | None   -> after_distinct
+  | Some n ->
+    let off = Option.value ~default:0 offset in
+    Plan.Op_limit { limit = n; offset = off; child = after_distinct }
+
+(* Catalog path: chain joins left-to-right via plan_join, then apply WHERE to
+   the combined row (single-table WHERE is already folded into [base]). *)
+let chain_joins cat ~(table_meta : Cat.table_meta) ~base ~joins ~where =
+  let (after_joins, _) =
+    List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
+      let joined = plan_join cat bj op n_left in
+      (joined, n_left + List.length bj.Sema.right_meta.Cat.columns)
+    ) (base, List.length table_meta.Cat.columns) joins
+  in
+  if joins <> [] then
+    (match where with
+     | None   -> after_joins
+     | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins })
+  else after_joins
+
+(* No-catalog path: chain joins as hash joins, recognising equi-join keys and
+   falling back to a cartesian product + filter. *)
+let chain_joins_no_cat ~(table_meta : Cat.table_meta) ~joins =
+  let base = make_scan table_meta in
+  fst (List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
+    let n_right_cols = List.length bj.right_meta.Cat.columns in
+    let right_offset = bj.right_col_offset in
+    let join_kind = match bj.kind with
+      | Ast.Inner -> `Inner | Ast.Left -> `Left
+    in
+    let joined =
+      (match recognise_eq_col_col bj.on with
+       | Some (a, b) when (a < n_left) && (b >= right_offset) ->
+         Plan.Op_hash_join {
+           left = op; right = make_scan bj.right_meta;
+           left_key = a; right_key = b - right_offset;
+           join_kind; right_col_offset = right_offset; n_right_cols;
+         }
+       | Some (a, b) when (b < n_left) && (a >= right_offset) ->
+         Plan.Op_hash_join {
+           left = op; right = make_scan bj.right_meta;
+           left_key = b; right_key = a - right_offset;
+           join_kind; right_col_offset = right_offset; n_right_cols;
+         }
+       | _ ->
+         let cart = Plan.Op_hash_join {
+           left = op; right = make_scan bj.right_meta;
+           left_key = -1; right_key = -1;
+           join_kind; right_col_offset = right_offset; n_right_cols;
+         } in
+         Plan.Op_filter { pred = plan_expr bj.on; child = cart })
+    in
+    (joined, n_left + n_right_cols)
+  ) (base, List.length table_meta.columns) joins)
+
 let plan_select cat
     ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~joins
     ~group_by ~aggs ~having ~agg_proj ~distinct ~windows ~agg_windows =
@@ -215,59 +382,8 @@ let plan_select cat
         acc + List.length bj.Sema.right_meta.Cat.columns
       ) 0 joins
   in
-  (* Try to use an index lookup if possible (single-table path). *)
-  let base =
-    if has_joins then
-      (* With JOINs, we always start from a seq scan of the left table
-         and let plan_join wrap it.  WHERE applies to the combined row
-         (handled below). *)
-      make_scan table_meta
-    else
-      (match where with
-       | None -> make_scan table_meta
-       | Some e ->
-         (match recognise_eq_col_lit e with
-          | Some (col_idx, lit_expr) ->
-            (match find_index_on_col cat table_meta col_idx with
-             | Some idx ->
-               let col_type =
-                 (List.nth table_meta.columns col_idx).Row.ty
-               in
-               Plan.Op_index_lookup {
-                 table_tree = table_meta.tree_id;
-                 idx_tree   = idx.idx_tree_id;
-                 col_idx;
-                 col_type;
-                 lookup_val = plan_expr lit_expr;
-                 table_meta;
-               }
-             | None ->
-               Plan.Op_filter {
-                 pred = plan_expr e;
-                 child = make_scan table_meta;
-               })
-          | None ->
-            Plan.Op_filter {
-              pred = plan_expr e;
-              child = make_scan table_meta;
-            }))
-  in
-  (* Chain all joins left to right *)
-  let (after_joins, _) =
-    List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
-      let joined = plan_join cat bj op n_left in
-      let n_left' = n_left + List.length bj.Sema.right_meta.Cat.columns in
-      (joined, n_left')
-    ) (base, List.length table_meta.columns) joins
-  in
-  let after_where =
-    if has_joins then
-      (match where with
-       | None   -> after_joins
-       | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins })
-    else
-      after_joins
-  in
+  let base = plan_base cat ~table_meta ~where ~has_joins in
+  let after_where = chain_joins cat ~table_meta ~base ~joins ~where in
   let is_aggregated = aggs <> [] || group_by <> [] in
   (* Insert Op_window after scan+filter+joins when windows are present. *)
   let after_window =
@@ -283,22 +399,8 @@ let plan_select cat
      addresses the original table schema (pre-projection row layout).
      For aggregate queries: sort AFTER aggregation because ORDER BY refers
      to the aggregated output row layout. *)
-  let make_sort_keys () =
-    List.map (fun (bkey : Sema.bound_order_key) ->
-      let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-      let nulls = match bkey.nulls with
-        | Some `Nulls_first -> `Nulls_first
-        | Some `Nulls_last  -> `Nulls_last
-        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-      in
-      let e = plan_expr bkey.key in
-      let e' = if windows = [] then e
-               else substitute_window_slots ~n_input_cols e in
-      (e', dir, nulls)
-    ) order
-  in
   let make_sort child =
-    let keys = make_sort_keys () in
+    let keys = plan_sort_keys ~order ~windows ~n_input_cols in
     if keys = [] then child
     else Plan.Op_sort { keys; child }
   in
@@ -307,78 +409,250 @@ let plan_select cat
     else make_sort after_window
   in
   let projected =
-    if is_aggregated then
-      Plan.Op_aggregate {
-        child = after_sort;
-        group_cols = group_by;
-        aggs = List.map sema_agg_to_plan aggs;
-        having = Option.map plan_expr having;
-        proj = List.map sema_agg_proj_to_plan agg_proj;
-        windows = List.map plan_window_item agg_windows;
-      }
-    else if expr_proj <> [] then
-      Plan.Op_expr_project {
-        exprs = List.map (fun (be, alias) ->
-          let e = plan_expr be in
-          let e' = if windows = [] then e
-                   else substitute_window_slots ~n_input_cols e in
-          (e', alias)
-        ) expr_proj;
-        child = after_sort;
-      }
-    else
-      Plan.Op_project { ordinals = proj; child = after_sort }
+    plan_projection ~is_aggregated ~after_sort ~group_by ~aggs ~having
+      ~agg_proj ~agg_windows ~expr_proj ~proj ~windows ~n_input_cols
   in
   (* Post-aggregation sort (only for aggregated queries). *)
   let sorted =
-    if is_aggregated then begin
-      (* For aggregated queries, ORDER BY col indices are in pre-aggregation space.
-         Translate P_col pre_idx to the post-agg output position. *)
-      let plan_proj = List.map sema_agg_proj_to_plan agg_proj in
-      let find_idx pred lst =
-        let rec go k = function
-          | [] -> None
-          | x :: rest -> if pred x then Some k else go (k + 1) rest
-        in go 0 lst
-      in
-      let remap_e e =
-        match e with
-        | Plan.P_col i ->
-          (match find_idx (( = ) i) group_by with
-           | None -> e
-           | Some gc_pos ->
-             (match find_idx (function
-                | Plan.PI_group_col k -> k = gc_pos
-                | _ -> false) plan_proj with
-              | Some out_pos -> Plan.P_col out_pos
-              | None -> e))
-        | _ -> e
-      in
-      let keys = List.map (fun (bkey : Sema.bound_order_key) ->
-        let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-        let nulls = match bkey.nulls with
-          | Some `Nulls_first -> `Nulls_first
-          | Some `Nulls_last  -> `Nulls_last
-          | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-        in
-        let e = plan_expr bkey.key in
-        let e' = remap_e e in
-        (e', dir, nulls)
-      ) order in
-      if keys = [] then projected
-      else Plan.Op_sort { keys; child = projected }
-    end
+    if is_aggregated then plan_post_agg_sort ~group_by ~agg_proj ~order ~projected
     else projected
   in
-  let after_distinct =
-    if distinct then Plan.Op_distinct { child = sorted }
-    else sorted
+  finalize_select ~distinct ~limit ~offset sorted
+
+(* ORDER BY sort keys without window-slot substitution (used by UPDATE,
+   DELETE, compound queries, and the no-catalog SELECT path). *)
+let plan_order_keys order =
+  List.map (fun (bk : Sema.bound_order_key) ->
+    let dir = match bk.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
+    let nulls = match bk.nulls with
+      | Some `Nulls_first -> `Nulls_first
+      | Some `Nulls_last  -> `Nulls_last
+      | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
+    in
+    (plan_expr bk.key, dir, nulls)
+  ) order
+
+(* Catalog indexes for a table, or [] when no catalog is available. *)
+let indexes_of cat (table_meta : Cat.table_meta) =
+  match cat with
+  | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
+  | None   -> []
+
+let plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update =
+  let plan_upsert = match upsert_update with
+    | None -> None
+    | Some (cols, assigns) ->
+      Some (cols, List.map (fun (i, e) -> (i, plan_expr e)) assigns)
   in
-  match limit with
-  | None   -> after_distinct
-  | Some n ->
-    let off = Option.value ~default:0 offset in
-    Plan.Op_limit { limit = n; offset = off; child = after_distinct }
+  Plan.Op_insert { table_meta; ordinals;
+                   values = List.map (List.map plan_expr) values;
+                   on_conflict;
+                   returning = List.map plan_expr returning;
+                   upsert_update = plan_upsert }
+
+let plan_create_index ~name ~table_meta ~col_sqls ~col_expr_flags
+    ~where_expr ~where_ast ~unique ~if_not_exists =
+  Plan.Op_create_index {
+    name;
+    table          = table_meta.Cat.name;
+    tree_id        = table_meta.Cat.tree_id;
+    col_sqls;
+    col_expr_flags;
+    where_expr     = Option.map plan_expr where_expr;
+    where_sql      = Option.map Ast.expr_to_sql where_ast;
+    unique;
+    columns        = table_meta.Cat.columns;
+    if_not_exists;
+  }
+
+let plan_update cat ~table_meta ~assignments ~where ~order ~limit ~offset ~returning =
+  Plan.Op_update {
+    table_meta;
+    assignments = List.map (fun (i, e) -> (i, plan_expr e)) assignments;
+    where       = Option.map plan_expr where;
+    order       = plan_order_keys order;
+    limit;
+    offset;
+    indexes     = indexes_of cat table_meta;
+    returning   = List.map plan_expr returning;
+  }
+
+let plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning =
+  Plan.Op_delete {
+    table_meta;
+    where     = Option.map plan_expr where;
+    order     = plan_order_keys order;
+    limit;
+    offset;
+    indexes   = indexes_of cat table_meta;
+    returning = List.map plan_expr returning;
+  }
+
+(* SELECT planning without a catalog: no index lookups and no index-based NLJ;
+   builds a hash-join + filter chain manually. *)
+let plan_select_no_cat
+    ~table_meta ~proj ~expr_proj ~where ~order ~limit ~offset ~joins
+    ~group_by ~aggs ~having ~agg_proj ~distinct ~windows ~agg_windows =
+  let after_joins = chain_joins_no_cat ~table_meta ~joins in
+  let filtered = match where with
+    | None   -> after_joins
+    | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins }
+  in
+  let n_input_cols_no_cat =
+    List.length table_meta.Cat.columns
+    + List.fold_left (fun acc (bj : Sema.bound_join) ->
+        acc + List.length bj.Sema.right_meta.Cat.columns
+      ) 0 joins
+  in
+  let after_window_no_cat =
+    if windows = [] then filtered
+    else
+      Plan.Op_window {
+        child        = filtered;
+        windows      = List.map plan_window_item windows;
+        n_input_cols = n_input_cols_no_cat;
+      }
+  in
+  let is_aggregated = aggs <> [] || group_by <> [] in
+  let make_sort child =
+    let keys = plan_order_keys order in
+    if keys = [] then child
+    else Plan.Op_sort { keys; child }
+  in
+  let after_sort =
+    if is_aggregated then after_window_no_cat
+    else make_sort after_window_no_cat
+  in
+  let projected =
+    plan_projection ~is_aggregated ~after_sort ~group_by ~aggs ~having
+      ~agg_proj ~agg_windows ~expr_proj ~proj ~windows
+      ~n_input_cols:n_input_cols_no_cat
+  in
+  let sorted =
+    if is_aggregated then make_sort projected
+    else projected
+  in
+  finalize_select ~distinct ~limit ~offset sorted
+
+(* PRAGMA table_info rows: one row per column (cid, name, type, notnull,
+   dflt_value, pk). *)
+let pragma_table_info_rows cat table_name =
+  match cat with
+  | None -> []
+  | Some c ->
+    (match Cat.find_table_cached c ~name:table_name with
+     | None -> []
+     | Some meta ->
+       List.mapi (fun i (col : Row.column) ->
+         [| Row.V_int (Int64.of_int i);
+            Row.V_text col.name;
+            Row.V_text (match col.ty with
+              | Row.Integer -> "INTEGER" | Row.Text -> "TEXT"
+              | Row.Real    -> "REAL"    | Row.Blob -> "BLOB");
+            Row.V_int (if col.not_null then 1L else 0L);
+            Row.V_null;  (* dflt_value — simplified *)
+            Row.V_int (if col.primary_key then 1L else 0L) |]
+       ) meta.columns)
+
+(* PRAGMA foreign_key_list rows, in SQLite column order: id, seq, table
+   (parent), from (local), to (parent col), on_update, on_delete, match. *)
+let pragma_fk_list_rows cat table_name =
+  let fks = match cat with
+    | None   -> []
+    | Some c ->
+      (match Cat.find_table_cached c ~name:table_name with
+       | None -> []
+       | Some meta -> meta.Cat.fk_constraints)
+  in
+  List.mapi (fun i (fk : Cat.fk_constraint) ->
+    [| Row.V_int (Int64.of_int i);
+       Row.V_int 0L;               (* seq: always 0 for single-col FKs *)
+       Row.V_text fk.Cat.fk_parent_table;
+       Row.V_text (String.concat "," fk.Cat.fk_local_cols);
+       Row.V_text (String.concat "," fk.Cat.fk_parent_cols);
+       Row.V_text (fk_action_str fk.Cat.fk_on_update);
+       Row.V_text (fk_action_str fk.Cat.fk_on_delete);
+       Row.V_text "NONE" |]        (* match: always NONE *)
+  ) fks
+
+(* Rows for the result-producing PRAGMAs (those not handled as Op_pragma_*
+   in [plan_pragma]). *)
+let plan_pragma_rows cat kind =
+  match kind with
+  | Ast.Pragma_table_info table_name -> pragma_table_info_rows cat table_name
+  | Ast.Pragma_index_list table_name ->
+    let idxs = match cat with
+      | None   -> []
+      | Some c -> Cat.indexes_for_table c ~table:table_name
+    in
+    List.mapi (fun i (idx : Cat.index_info) ->
+      [| Row.V_int (Int64.of_int i);
+         Row.V_text idx.idx_name;
+         Row.V_int (if idx.idx_unique then 1L else 0L) |]
+    ) idxs
+  | Ast.Pragma_foreign_key_list table_name -> pragma_fk_list_rows cat table_name
+  | Ast.Pragma_journal_mode -> [ [| Row.V_text "delete" |] ]
+  | Ast.Pragma_set _ -> []    (* no-op setter: return empty result *)
+  | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
+  | Ast.Pragma_integrity_check
+  | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _
+  | Ast.Pragma_recursive_triggers | Ast.Pragma_recursive_triggers_set _
+  | Ast.Pragma_defer_foreign_keys | Ast.Pragma_defer_foreign_keys_set _
+  | Ast.Pragma_wal_checkpoint
+  | Ast.Pragma_wal_autocheckpoint | Ast.Pragma_wal_autocheckpoint_set _
+  | Ast.Pragma_database_list | Ast.Pragma_active_database
+  | Ast.Pragma_active_database_set _ ->
+    assert false   (* handled by outer match in plan_pragma *)
+
+let plan_pragma cat kind =
+  match kind with
+  | Ast.Pragma_user_version ->
+    Plan.Op_pragma_get_user_version
+
+  | Ast.Pragma_user_version_set v ->
+    Plan.Op_pragma_set_user_version { version = v }
+
+  | Ast.Pragma_integrity_check ->
+    Plan.Op_pragma_integrity_check
+
+  | Ast.Pragma_foreign_keys ->
+    Plan.Op_pragma_get_fk
+
+  | Ast.Pragma_foreign_keys_set on ->
+    Plan.Op_pragma_set_fk { on }
+
+  | Ast.Pragma_recursive_triggers ->
+    Plan.Op_pragma_get_recursive_triggers
+
+  | Ast.Pragma_recursive_triggers_set on ->
+    Plan.Op_pragma_set_recursive_triggers { on }
+
+  | Ast.Pragma_defer_foreign_keys ->
+    Plan.Op_pragma_get_defer_fk
+
+  | Ast.Pragma_defer_foreign_keys_set on ->
+    Plan.Op_pragma_set_defer_fk { on }
+
+  | Ast.Pragma_wal_checkpoint ->
+    Plan.Op_pragma_wal_checkpoint
+
+  | Ast.Pragma_wal_autocheckpoint ->
+    Plan.Op_pragma_get_wal_autocheckpoint
+
+  | Ast.Pragma_wal_autocheckpoint_set n ->
+    Plan.Op_pragma_set_wal_autocheckpoint { n }
+
+  | Ast.Pragma_database_list ->
+    Plan.Op_database_list
+
+  | Ast.Pragma_active_database ->
+    Plan.Op_active_database_get
+
+  | Ast.Pragma_active_database_set s ->
+    Plan.Op_active_database_set { schema = s }
+
+  | _ ->
+    Plan.Op_pragma_rows { rows = plan_pragma_rows cat kind }
 
 let rec plan ?cat = function
   | Sema.BS_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
@@ -391,16 +665,7 @@ let rec plan ?cat = function
       on_conflict;
     }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update } ->
-    let plan_upsert = match upsert_update with
-      | None -> None
-      | Some (cols, assigns) ->
-        Some (cols, List.map (fun (i, e) -> (i, plan_expr e)) assigns)
-    in
-    Plan.Op_insert { table_meta; ordinals;
-                     values = List.map (List.map plan_expr) values;
-                     on_conflict;
-                     returning = List.map plan_expr returning;
-                     upsert_update = plan_upsert }
+    plan_insert ~table_meta ~ordinals ~values ~on_conflict ~returning ~upsert_update
   | Sema.BS_select { distinct; table_meta; proj; expr_proj; where; order; limit; offset;
                      joins; group_by; aggs; having; agg_proj; windows; agg_windows } ->
     (match cat with
@@ -409,187 +674,20 @@ let rec plan ?cat = function
          ~joins ~group_by ~aggs ~having ~agg_proj ~distinct ~windows ~agg_windows
      | None ->
        (* Backwards-compatible path: no catalog → no index lookup, and
-          (for JOIN) no index-based NLJ.  Build a hash-join + filter
-          chain manually. *)
-       let base = make_scan table_meta in
-       let (after_joins, _) =
-         List.fold_left (fun (op, n_left) (bj : Sema.bound_join) ->
-           let n_right_cols = List.length bj.right_meta.Cat.columns in
-           let right_offset = bj.right_col_offset in
-           let join_kind = match bj.kind with
-             | Ast.Inner -> `Inner | Ast.Left -> `Left
-           in
-           let joined =
-             (match recognise_eq_col_col bj.on with
-              | Some (a, b) when (a < n_left) && (b >= right_offset) ->
-                Plan.Op_hash_join {
-                  left = op;
-                  right = make_scan bj.right_meta;
-                  left_key = a; right_key = b - right_offset;
-                  join_kind; right_col_offset = right_offset; n_right_cols;
-                }
-              | Some (a, b) when (b < n_left) && (a >= right_offset) ->
-                Plan.Op_hash_join {
-                  left = op;
-                  right = make_scan bj.right_meta;
-                  left_key = b; right_key = a - right_offset;
-                  join_kind; right_col_offset = right_offset; n_right_cols;
-                }
-              | _ ->
-                let cart = Plan.Op_hash_join {
-                  left = op;
-                  right = make_scan bj.right_meta;
-                  left_key = -1; right_key = -1;
-                  join_kind; right_col_offset = right_offset; n_right_cols;
-                } in
-                Plan.Op_filter { pred = plan_expr bj.on; child = cart })
-           in
-           (joined, n_left + n_right_cols)
-         ) (base, List.length table_meta.columns) joins
-       in
-       let filtered = match where with
-         | None   -> after_joins
-         | Some e -> Plan.Op_filter { pred = plan_expr e; child = after_joins }
-       in
-       let n_input_cols_no_cat =
-         List.length table_meta.Cat.columns
-         + List.fold_left (fun acc (bj : Sema.bound_join) ->
-             acc + List.length bj.Sema.right_meta.Cat.columns
-           ) 0 joins
-       in
-       let after_window_no_cat =
-         if windows = [] then filtered
-         else
-           Plan.Op_window {
-             child        = filtered;
-             windows      = List.map plan_window_item windows;
-             n_input_cols = n_input_cols_no_cat;
-           }
-       in
-       let is_aggregated = aggs <> [] || group_by <> [] in
-       let make_sort_keys () =
-         List.map (fun (bkey : Sema.bound_order_key) ->
-           let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-           let nulls = match bkey.nulls with
-             | Some `Nulls_first -> `Nulls_first
-             | Some `Nulls_last  -> `Nulls_last
-             | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-           in
-           (plan_expr bkey.key, dir, nulls)
-         ) order
-       in
-       let make_sort child =
-         let keys = make_sort_keys () in
-         if keys = [] then child
-         else Plan.Op_sort { keys; child }
-       in
-       let after_sort =
-         if is_aggregated then after_window_no_cat
-         else make_sort after_window_no_cat
-       in
-       let projected =
-         if is_aggregated then
-           Plan.Op_aggregate {
-             child = after_sort;
-             group_cols = group_by;
-             aggs = List.map sema_agg_to_plan aggs;
-             having = Option.map plan_expr having;
-             proj = List.map sema_agg_proj_to_plan agg_proj;
-             windows = List.map plan_window_item agg_windows;
-           }
-         else if expr_proj <> [] then
-           Plan.Op_expr_project {
-             exprs = List.map (fun (be, alias) ->
-               let e = plan_expr be in
-               let e' = if windows = [] then e
-                        else substitute_window_slots ~n_input_cols:n_input_cols_no_cat e in
-               (e', alias)
-             ) expr_proj;
-             child = after_sort;
-           }
-         else
-           Plan.Op_project { ordinals = proj; child = after_sort }
-       in
-       let sorted =
-         if is_aggregated then make_sort projected
-         else projected
-       in
-       let after_distinct =
-         if distinct then Plan.Op_distinct { child = sorted }
-         else sorted
-       in
-       match limit with
-       | None   -> after_distinct
-       | Some n ->
-         let off = Option.value ~default:0 offset in
-         Plan.Op_limit { limit = n; offset = off; child = after_distinct })
+          (for JOIN) no index-based NLJ. *)
+       plan_select_no_cat ~table_meta ~proj ~expr_proj ~where ~order ~limit
+         ~offset ~joins ~group_by ~aggs ~having ~agg_proj ~distinct ~windows
+         ~agg_windows)
   | Sema.BS_create_index { name; table_meta; col_sqls; col_expr_flags;
                            where_expr; where_ast; unique; if_not_exists } ->
-    Plan.Op_create_index {
-      name;
-      table          = table_meta.Cat.name;
-      tree_id        = table_meta.Cat.tree_id;
-      col_sqls;
-      col_expr_flags;
-      where_expr     = Option.map plan_expr where_expr;
-      where_sql      = Option.map Ast.expr_to_sql where_ast;
-      unique;
-      columns        = table_meta.Cat.columns;
-      if_not_exists;
-    }
+    plan_create_index ~name ~table_meta ~col_sqls ~col_expr_flags
+      ~where_expr ~where_ast ~unique ~if_not_exists
   | Sema.BS_update { table_meta; assignments; where; order; limit; offset; returning } ->
-    let indexes = match cat with
-      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
-      | None   -> []
-    in
-    let plan_order = List.map (fun (bk : Sema.bound_order_key) ->
-      let dir = match bk.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-      let nulls = match bk.nulls with
-        | Some `Nulls_first -> `Nulls_first
-        | Some `Nulls_last  -> `Nulls_last
-        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-      in
-      (plan_expr bk.key, dir, nulls)
-    ) order in
-    Plan.Op_update {
-      table_meta;
-      assignments = List.map (fun (i, e) -> (i, plan_expr e)) assignments;
-      where       = Option.map plan_expr where;
-      order       = plan_order;
-      limit;
-      offset;
-      indexes;
-      returning   = List.map plan_expr returning;
-    }
+    plan_update cat ~table_meta ~assignments ~where ~order ~limit ~offset ~returning
   | Sema.BS_delete { table_meta; where; order; limit; offset; returning } ->
-    let indexes = match cat with
-      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
-      | None   -> []
-    in
-    let plan_order = List.map (fun (bk : Sema.bound_order_key) ->
-      let dir = match bk.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-      let nulls = match bk.nulls with
-        | Some `Nulls_first -> `Nulls_first
-        | Some `Nulls_last  -> `Nulls_last
-        | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-      in
-      (plan_expr bk.key, dir, nulls)
-    ) order in
-    Plan.Op_delete {
-      table_meta;
-      where     = Option.map plan_expr where;
-      order     = plan_order;
-      limit;
-      offset;
-      indexes;
-      returning = List.map plan_expr returning;
-    }
+    plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning
   | Sema.BS_drop_table { table_meta; _ } ->
-    let indexes = match cat with
-      | Some c -> Cat.indexes_for_table c ~table:table_meta.Cat.name
-      | None   -> []
-    in
-    Plan.Op_drop_table { table_meta; indexes }
+    Plan.Op_drop_table { table_meta; indexes = indexes_of cat table_meta }
   | Sema.BS_drop_index { idx_info; _ } ->
     Plan.Op_drop_index { idx_info }
   | Sema.BS_alter_table { table_meta; action } ->
@@ -612,33 +710,7 @@ let rec plan ?cat = function
   | Sema.BS_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
     Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets }
   | Sema.BS_compound { op; left; right; order; limit; offset } ->
-    let l = plan ?cat left in
-    let r = plan ?cat right in
-    let base = match op with
-     | Ast.Union     -> Plan.Op_union     { all = false; left = l; right = r }
-     | Ast.Union_all -> Plan.Op_union     { all = true;  left = l; right = r }
-     | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
-     | Ast.Except    -> Plan.Op_except    { left = l; right = r }
-    in
-    let sorted =
-      if order = [] then base
-      else
-        let keys = List.map (fun (bkey : Sema.bound_order_key) ->
-          let dir = match bkey.dir with Ast.Asc -> `Asc | Ast.Desc -> `Desc in
-          let nulls = match bkey.nulls with
-            | Some `Nulls_first -> `Nulls_first
-            | Some `Nulls_last  -> `Nulls_last
-            | None -> (match dir with `Asc -> `Nulls_first | `Desc -> `Nulls_last)
-          in
-          (plan_expr bkey.key, dir, nulls)
-        ) order in
-        Plan.Op_sort { keys; child = base }
-    in
-    (match limit with
-     | None -> sorted
-     | Some n ->
-       let off = Option.value ~default:0 offset in
-       Plan.Op_limit { limit = n; offset = off; child = sorted })
+    plan_compound ?cat ~op ~left ~right ~order ~limit ~offset ()
   | Sema.BS_const_select { exprs } ->
     (match exprs with
      | [(Sema.BE_func (Ast.Fn_changes, []), _)] ->
@@ -649,123 +721,7 @@ let rec plan ?cat = function
        Plan.Op_total_changes
      | _ ->
        Plan.Op_const_select { exprs = List.map (fun (e, alias) -> (plan_expr e, alias)) exprs })
-  | Sema.BS_pragma { kind } ->
-    (match kind with
-     | Ast.Pragma_user_version ->
-       Plan.Op_pragma_get_user_version
-
-     | Ast.Pragma_user_version_set v ->
-       Plan.Op_pragma_set_user_version { version = v }
-
-     | Ast.Pragma_integrity_check ->
-       Plan.Op_pragma_integrity_check
-
-     | Ast.Pragma_foreign_keys ->
-       Plan.Op_pragma_get_fk
-
-     | Ast.Pragma_foreign_keys_set on ->
-       Plan.Op_pragma_set_fk { on }
-
-     | Ast.Pragma_recursive_triggers ->
-       Plan.Op_pragma_get_recursive_triggers
-
-     | Ast.Pragma_recursive_triggers_set on ->
-       Plan.Op_pragma_set_recursive_triggers { on }
-
-     | Ast.Pragma_defer_foreign_keys ->
-       Plan.Op_pragma_get_defer_fk
-
-     | Ast.Pragma_defer_foreign_keys_set on ->
-       Plan.Op_pragma_set_defer_fk { on }
-
-     | Ast.Pragma_wal_checkpoint ->
-       Plan.Op_pragma_wal_checkpoint
-
-     | Ast.Pragma_wal_autocheckpoint ->
-       Plan.Op_pragma_get_wal_autocheckpoint
-
-     | Ast.Pragma_wal_autocheckpoint_set n ->
-       Plan.Op_pragma_set_wal_autocheckpoint { n }
-
-     | Ast.Pragma_database_list ->
-       Plan.Op_database_list
-
-     | Ast.Pragma_active_database ->
-       Plan.Op_active_database_get
-
-     | Ast.Pragma_active_database_set s ->
-       Plan.Op_active_database_set { schema = s }
-
-     | _ ->
-       let rows = match kind with
-         | Ast.Pragma_table_info table_name ->
-           (match cat with
-            | None -> []
-            | Some c ->
-              (match Cat.find_table_cached c ~name:table_name with
-               | None -> []
-               | Some meta ->
-                 List.mapi (fun i (col : Row.column) ->
-                   [| Row.V_int (Int64.of_int i);
-                      Row.V_text col.name;
-                      Row.V_text (match col.ty with
-                        | Row.Integer -> "INTEGER" | Row.Text -> "TEXT"
-                        | Row.Real    -> "REAL"    | Row.Blob -> "BLOB");
-                      Row.V_int (if col.not_null then 1L else 0L);
-                      Row.V_null;  (* dflt_value — simplified *)
-                      Row.V_int (if col.primary_key then 1L else 0L) |]
-                 ) meta.columns))
-
-         | Ast.Pragma_index_list table_name ->
-           let idxs = match cat with
-             | None   -> []
-             | Some c -> Cat.indexes_for_table c ~table:table_name
-           in
-           List.mapi (fun i (idx : Cat.index_info) ->
-             [| Row.V_int (Int64.of_int i);
-                Row.V_text idx.idx_name;
-                Row.V_int (if idx.idx_unique then 1L else 0L) |]
-           ) idxs
-
-         | Ast.Pragma_foreign_key_list table_name ->
-           let fks = match cat with
-             | None   -> []
-             | Some c ->
-               (match Cat.find_table_cached c ~name:table_name with
-                | None -> []
-                | Some meta -> meta.Cat.fk_constraints)
-           in
-           (* SQLite column order: id, seq, table (parent), from (local), to (parent col),
-              on_update, on_delete, match *)
-           List.mapi (fun i (fk : Cat.fk_constraint) ->
-             [| Row.V_int (Int64.of_int i);
-                Row.V_int 0L;               (* seq: always 0 for single-col FKs *)
-                Row.V_text fk.Cat.fk_parent_table;
-                Row.V_text (String.concat "," fk.Cat.fk_local_cols);
-                Row.V_text (String.concat "," fk.Cat.fk_parent_cols);
-                Row.V_text (fk_action_str fk.Cat.fk_on_update);
-                Row.V_text (fk_action_str fk.Cat.fk_on_delete);
-                Row.V_text "NONE" |]        (* match: always NONE *)
-           ) fks
-
-         | Ast.Pragma_journal_mode ->
-           [ [| Row.V_text "delete" |] ]
-
-         | Ast.Pragma_set _ ->
-           []    (* no-op setter: return empty result *)
-
-         | Ast.Pragma_user_version | Ast.Pragma_user_version_set _
-         | Ast.Pragma_integrity_check
-         | Ast.Pragma_foreign_keys | Ast.Pragma_foreign_keys_set _
-         | Ast.Pragma_recursive_triggers | Ast.Pragma_recursive_triggers_set _
-         | Ast.Pragma_defer_foreign_keys | Ast.Pragma_defer_foreign_keys_set _
-         | Ast.Pragma_wal_checkpoint
-         | Ast.Pragma_wal_autocheckpoint | Ast.Pragma_wal_autocheckpoint_set _
-         | Ast.Pragma_database_list | Ast.Pragma_active_database
-         | Ast.Pragma_active_database_set _ ->
-           assert false   (* handled by outer match above *)
-       in
-       Plan.Op_pragma_rows { rows })
+  | Sema.BS_pragma { kind } -> plan_pragma cat kind
   | Sema.BS_with_cte { name; def; query; recursive } ->
     Plan.Op_with_cte {
       cte_name  = name;
@@ -787,6 +743,27 @@ let rec plan ?cat = function
   | Sema.BS_vacuum -> Plan.Op_vacuum
   | Sema.BS_attach { path; schema } -> Plan.Op_attach { path; schema }
   | Sema.BS_detach { schema } -> Plan.Op_detach { schema }
+
+(* Plan a set operation (UNION/INTERSECT/EXCEPT), recursively planning each
+   side, then applying ORDER BY / LIMIT.  Part of [plan]'s recursive group. *)
+and plan_compound ?cat ~op ~left ~right ~order ~limit ~offset () =
+  let l = plan ?cat left in
+  let r = plan ?cat right in
+  let base = match op with
+   | Ast.Union     -> Plan.Op_union     { all = false; left = l; right = r }
+   | Ast.Union_all -> Plan.Op_union     { all = true;  left = l; right = r }
+   | Ast.Intersect -> Plan.Op_intersect { left = l; right = r }
+   | Ast.Except    -> Plan.Op_except    { left = l; right = r }
+  in
+  let sorted =
+    if order = [] then base
+    else Plan.Op_sort { keys = plan_order_keys order; child = base }
+  in
+  (match limit with
+   | None -> sorted
+   | Some n ->
+     let off = Option.value ~default:0 offset in
+     Plan.Op_limit { limit = n; offset = off; child = sorted })
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
