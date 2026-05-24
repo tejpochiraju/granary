@@ -45,3 +45,40 @@ jobs:
             result=$("$exe" 2>&1 | tail -1)
             echo "$name: $result"
           done
+
+  lint:
+    runs-on: ubuntu-latest
+    # Warn-first (#153): report merlint findings without blocking the build.
+    # Flip to false once the tracked follow-ups land the curated set at zero.
+    continue-on-error: true
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q pkg-config libgmp-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.4-lint-${{ hashFiles('sqlocaml.opam') }}
+          restore-keys: opam-5.4-lint-
+
+      - name: Install opam packages + merlint
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix
+          # merlint is git-only (no opam release); pin the known-good commit.
+          opam pin add -y -k git merlint \
+            "https://github.com/samoht/merlint.git#d5548822dea1ad3b845eabd4b569946a05e42423"
+
+      - name: Build (so merlint has artifacts for type analysis)
+        run: opam exec -- dune build
+
+      - name: Run merlint
+        run: opam exec -- merlint --color=never

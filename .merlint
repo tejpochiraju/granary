@@ -1,0 +1,23 @@
+# merlint configuration (#153).
+#
+# Warn-first adoption: CI reports findings but does not block the build yet.
+# The excluded rules below conflict with deliberate project conventions; every
+# other rule stays enabled. See MERLINT.md for the full rationale and the
+# tracked follow-ups (catch-all audit, long-function refactor).
+#
+# Excluded rules and why:
+#   E205 - we use Printf/Format throughout, not the Fmt module.
+#   E320 - long, descriptive identifiers (e.g. fk_child_has_ref_multi_in_tx)
+#          are intentional and aid readability over terse names.
+#   E410 - our doc-comment shape differs from merlint's preferred odoc style.
+#   E600/E605/E606/E610 - test-layout rules. Our suite is behavior-oriented
+#          (a single test file exercises many library modules) and lives flat
+#          under test/; it is not a 1:1 mirror of lib/ modules. These fire on
+#          every test file (and E605 on lib modules) by design, not as defects.
+#
+# Patterns are unquoted: merlint's config parser does not strip surrounding
+# quotes, so "**/*.ml*" would be taken literally.
+
+rules:
+  - files: **/*.ml*
+    exclude: [E205, E320, E410, E600, E605, E606, E610]
