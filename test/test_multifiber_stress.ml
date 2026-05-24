@@ -14,7 +14,12 @@
     are small enough to run in CI but large enough to expose obvious
     races. *)
 
-module Db = Sqlocaml.Db
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
 
 let run = Lwt_main.run
 let fresh_mem_db () = run (Db.open_in_memory ())

@@ -1,7 +1,13 @@
 (** Multi-backend SQL conformance: Mem + Unix_file + Mirage_block produce identical results. *)
 
 open Lwt.Syntax
-module DB = Sqlocaml.Db
+
+module DB = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
+
 module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
 
 (* ------------------------------------------------------------------ *)

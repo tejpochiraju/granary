@@ -5,7 +5,14 @@
     transparency; SAVEPOINT rollback discards a partial chain. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file = Sqlocaml_unix.Store.open_file
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+end
+
 module Page = Sqlocaml_storage.Page
 
 let bs s = Bytes.of_string s

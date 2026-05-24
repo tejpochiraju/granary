@@ -1,7 +1,7 @@
 (** In-memory BLOCK device: a fixed-size, page-addressed buffer.
 
     Implements the same page-read/write/sync/resize interface as the Unix-file
-    backend ({!Sqlocaml_block.Unix_file}) but keeps all pages in memory, for
+    backend ([Sqlocaml_unix.Unix_file]) but keeps all pages in memory, for
     tests and ephemeral databases. [sync] is a no-op. *)
 
 type t

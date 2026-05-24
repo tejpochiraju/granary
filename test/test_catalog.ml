@@ -1,5 +1,11 @@
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file = Sqlocaml_unix.Store.open_file
+end
+
 module C = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint

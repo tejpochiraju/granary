@@ -18,8 +18,9 @@ type t =
   ; mutable total_changes : int (** total rows affected by DML since connection opened *)
   ; mutable trigger_depth : int (** recursion depth for nested trigger firing *)
   ; file_path : string option
-    (** Set when opened via [open_file] / [open_file_wal].  VACUUM needs
-        this to rebuild the file in-place. *)
+    (** Set to the on-disk path for file-backed handles (opened via the
+        [sqlocaml.unix] driver or ATTACH).  VACUUM needs this to rebuild the
+        file in place; [None] for in-memory / arbitrary block devices. *)
   ; attached : (string, t) Hashtbl.t
     (** Sub-handles registered via [ATTACH DATABASE 'path' AS schema]
         (phase 40 / #64).  Keyed by schema name.  Always empty on
@@ -65,6 +66,19 @@ type error =
   | Parse of string
   | Sema of Sql.Sema.error
   | Runtime of string
+
+(* File operations the SQL engine needs for ATTACH and VACUUM, injected by a
+   platform driver (e.g. [sqlocaml.unix]) through [set_file_provider].  The
+   core itself carries no OS/filesystem dependency (#170); when no provider is
+   installed, ATTACH and VACUUM fail with a clear error. *)
+type file_provider =
+  { open_store : path:string -> (S.t, S.error) result Lwt.t
+  ; remove_file : string -> unit
+  ; rename_file : string -> string -> unit
+  }
+
+let file_provider_ref : file_provider option ref = ref None
+let set_file_provider p = file_provider_ref := Some p
 
 let open_in_memory ?clock () =
   let store = S.create () in
@@ -126,102 +140,52 @@ let load_triggers_into_hashtbl store trig_tbl =
   Lwt.return_unit
 ;;
 
-let open_file ~path =
-  let* result = S.open_file ~path in
-  match result with
-  | Error e ->
-    let msg = Format.asprintf "%a" S.pp_error e in
-    Lwt.return (Error (Runtime msg))
-  | Ok store ->
-    let* catalog = Cat.open_ store in
-    let views = Hashtbl.create 4 in
-    let* () = load_views_into_hashtbl store views in
-    let triggers = Hashtbl.create 4 in
-    let* () = load_triggers_into_hashtbl store triggers in
-    Lwt.return
-      (Ok
-         { store
-         ; catalog
-         ; clock = None
-         ; explicit_txn = None
-         ; views
-         ; triggers
-         ; savepoint_names = []
-         ; auto_began = false
-         ; last_changes = 0
-         ; last_insert_rowid = 0L
-         ; total_changes = 0
-         ; trigger_depth = 0
-         ; file_path = Some path
-         ; attached = Hashtbl.create 1
-         ; active_schema = "main"
-         })
-;;
-
-let open_file_wal ~path =
-  let* result = S.open_file_wal ~path in
-  match result with
-  | Error e ->
-    let msg = Format.asprintf "%a" S.pp_error e in
-    Lwt.return (Error (Runtime msg))
-  | Ok store ->
-    let* catalog = Cat.open_ store in
-    let views = Hashtbl.create 4 in
-    let* () = load_views_into_hashtbl store views in
-    let triggers = Hashtbl.create 4 in
-    let* () = load_triggers_into_hashtbl store triggers in
-    Lwt.return
-      (Ok
-         { store
-         ; catalog
-         ; clock = None
-         ; explicit_txn = None
-         ; views
-         ; triggers
-         ; savepoint_names = []
-         ; auto_began = false
-         ; last_changes = 0
-         ; last_insert_rowid = 0L
-         ; total_changes = 0
-         ; trigger_depth = 0
-         ; file_path = Some path
-         ; attached = Hashtbl.create 1
-         ; active_schema = "main"
-         })
+(* Wrap an already-open store as a [Db.t]: load the catalog, views, and
+   triggers.  [file_path] is recorded so VACUUM can rebuild the file in place
+   (Some for file-backed handles, None for in-memory / arbitrary devices). *)
+let of_store ?clock ?file_path store =
+  let* catalog = Cat.open_ store in
+  let views = Hashtbl.create 4 in
+  let* () = load_views_into_hashtbl store views in
+  let triggers = Hashtbl.create 4 in
+  let* () = load_triggers_into_hashtbl store triggers in
+  Lwt.return
+    { store
+    ; catalog
+    ; clock
+    ; explicit_txn = None
+    ; views
+    ; triggers
+    ; savepoint_names = []
+    ; auto_began = false
+    ; last_changes = 0
+    ; last_insert_rowid = 0L
+    ; total_changes = 0
+    ; trigger_depth = 0
+    ; file_path
+    ; attached = Hashtbl.create 1
+    ; active_schema = "main"
+    }
 ;;
 
 let open_block ~read_page ~write_page ~sync ~resize ~n_pages ~close
   : (t, error) result Lwt.t
   =
-  let* result = S.open_block ~read_page ~write_page ~sync ~resize ~n_pages ~close in
+  let* result =
+    S.open_block
+      ~init_if_corrupt:true
+      ~read_page
+      ~write_page
+      ~sync
+      ~resize
+      ~n_pages
+      ~close
+  in
   match result with
-  | Error e ->
-    let msg = Format.asprintf "%a" S.pp_error e in
-    Lwt.return (Error (Runtime msg))
+  | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
   | Ok store ->
-    let* catalog = Cat.open_ store in
-    let views = Hashtbl.create 4 in
-    let* () = load_views_into_hashtbl store views in
-    let triggers = Hashtbl.create 4 in
-    let* () = load_triggers_into_hashtbl store triggers in
-    Lwt.return
-      (Ok
-         { store
-         ; catalog
-         ; clock = None
-         ; explicit_txn = None
-         ; views
-         ; triggers
-         ; savepoint_names = []
-         ; auto_began = false
-         ; last_changes = 0
-         ; last_insert_rowid = 0L
-         ; total_changes = 0
-         ; trigger_depth = 0
-         ; file_path = None
-         ; attached = Hashtbl.create 1
-         ; active_schema = "main"
-         })
+    let* db = of_store store in
+    Lwt.return (Ok db)
 ;;
 
 let close t =
@@ -290,39 +254,42 @@ let vacuum t : unit Lwt.t =
     if t.explicit_txn <> None
     then Lwt.fail_with "VACUUM cannot run inside an explicit transaction"
     else (
-      let tmp_path = path ^ ".vacuum-tmp" in
-      (try Unix.unlink tmp_path with
-       | Unix.Unix_error _ -> ());
-      (try Unix.unlink (tmp_path ^ "-wal") with
-       | Unix.Unix_error _ -> ());
-      let* dst_r = S.open_file ~path:tmp_path in
-      match dst_r with
-      | Error e ->
-        let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
-        Lwt.fail_with msg
-      | Ok dst ->
-        let* tids = S.list_tree_ids t.store in
-        let* () = copy_all_trees ~src:t.store ~dst ~tids in
-        let* () = S.close dst in
-        let* () = S.close t.store in
-        (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
-        (try Unix.unlink (path ^ "-wal") with
-         | Unix.Unix_error _ -> ());
-        Unix.rename tmp_path path;
-        let* new_store_r = S.open_file ~path in
-        (match new_store_r with
+      match !file_provider_ref with
+      | None ->
+        Lwt.fail_with
+          "VACUUM requires a file provider; link sqlocaml.unix and call \
+           Db.set_file_provider"
+      | Some prov ->
+        let tmp_path = path ^ ".vacuum-tmp" in
+        prov.remove_file tmp_path;
+        prov.remove_file (tmp_path ^ "-wal");
+        let* dst_r = prov.open_store ~path:tmp_path in
+        (match dst_r with
          | Error e ->
-           let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
+           let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
            Lwt.fail_with msg
-         | Ok new_store ->
-           let* new_catalog = Cat.open_ new_store in
-           t.store <- new_store;
-           t.catalog <- new_catalog;
-           Hashtbl.clear t.views;
-           let* () = load_views_into_hashtbl new_store t.views in
-           Hashtbl.clear t.triggers;
-           let* () = load_triggers_into_hashtbl new_store t.triggers in
-           Lwt.return_unit))
+         | Ok dst ->
+           let* tids = S.list_tree_ids t.store in
+           let* () = copy_all_trees ~src:t.store ~dst ~tids in
+           let* () = S.close dst in
+           let* () = S.close t.store in
+           (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
+           prov.remove_file (path ^ "-wal");
+           prov.rename_file tmp_path path;
+           let* new_store_r = prov.open_store ~path in
+           (match new_store_r with
+            | Error e ->
+              let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
+              Lwt.fail_with msg
+            | Ok new_store ->
+              let* new_catalog = Cat.open_ new_store in
+              t.store <- new_store;
+              t.catalog <- new_catalog;
+              Hashtbl.clear t.views;
+              let* () = load_views_into_hashtbl new_store t.views in
+              Hashtbl.clear t.triggers;
+              let* () = load_triggers_into_hashtbl new_store t.triggers in
+              Lwt.return_unit)))
 ;;
 
 let parse sql =
@@ -1231,13 +1198,22 @@ let execute_control_op top t sql op =
        then
          Lwt.return
            (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
-       else
-         let* result = open_file ~path in
-         match result with
-         | Error e -> Lwt.return (Error e)
-         | Ok sub_db ->
-           Hashtbl.add top.attached schema sub_db;
-           Lwt.return (Ok ()))
+       else (
+         match !file_provider_ref with
+         | None ->
+           Lwt.return
+             (Error
+                (Runtime
+                   "ATTACH requires a file provider; link sqlocaml.unix and call \
+                    Db.set_file_provider"))
+         | Some prov ->
+           let* result = prov.open_store ~path in
+           (match result with
+            | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
+            | Ok store ->
+              let* sub_db = of_store ~file_path:path store in
+              Hashtbl.add top.attached schema sub_db;
+              Lwt.return (Ok ()))))
   | Sql.Plan.Op_detach { schema } ->
     Some
       (if String.equal schema "main"

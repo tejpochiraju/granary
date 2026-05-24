@@ -35,7 +35,7 @@
 
 open Lwt.Syntax
 module S = Sqlocaml_store.Store
-module UF = Sqlocaml_block.Unix_file
+module UF = Sqlocaml_unix.Unix_file
 
 let run = Lwt_main.run
 let bs = Bytes.of_string

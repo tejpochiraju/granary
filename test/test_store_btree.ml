@@ -6,7 +6,13 @@
     additional B+-tree-specific size limits. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file = Sqlocaml_unix.Store.open_file
+end
+
 module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
 
 (* ------------------------------------------------------------------ *)
@@ -68,6 +74,7 @@ let with_block_store path f =
      let* adapter = MB.connect dev in
      let* result =
        S.open_block
+         ~init_if_corrupt:true
          ~read_page:(MB.read_page adapter)
          ~write_page:(MB.write_page adapter)
          ~sync:(MB.sync adapter)

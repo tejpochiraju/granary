@@ -6,8 +6,10 @@
     - [create ()] — in-memory [Bytes_map] (no size limits on keys/values).
       This is the legacy Phase 0 backend, retained for tests and
       ephemeral use cases that exceed B+-tree leaf-cell size limits.
-    - [open_file ~path] — CoW B+-tree over a Unix_file BLOCK device.
-      Persistent across reopen. Keys ≤ 512 bytes, values ≤ 1024 bytes. *)
+    - [open_block ~...] — CoW B+-tree over any BLOCK device, given as I/O
+      callbacks. Persistent across reopen. Keys ≤ 512 bytes, values ≤ 1024
+      bytes. Unix-file convenience constructors live in the [sqlocaml.unix]
+      driver library so this core stays platform-agnostic (#170). *)
 
 type t
 
@@ -41,18 +43,19 @@ val pp_error : Format.formatter -> error -> unit
 (** Open a fresh in-memory store with no trees. *)
 val create : unit -> t
 
-(** Open a B+-tree backed store over a Unix file.  Creates the file if
-    absent.  If the file is non-empty it must be a valid sqlocaml database
-    written by a previous [open_file]/[commit] sequence. *)
-val open_file : path:string -> (t, error) result Lwt.t
-
 (** Open a B+-tree backed store from any block device, given as I/O callbacks.
     Probes pages 0 and 1 for valid headers; if both are corrupt, treats the
     device as fresh and initialises it.  Pass [~n_pages:0L] for Mirage adapters
     (which bound-check internally against device capacity).
-    [~close] is called by [Store.close]. *)
+    [~close] is called by [Store.close].
+
+    [init_if_corrupt] controls the both-headers-corrupt case: when [true] the
+    device is treated as fresh and initialised (correct for zeroed block
+    devices); when [false] it returns [Header_error] instead, so an
+    existing-but-corrupt file is not silently clobbered. *)
 val open_block
-  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  :  init_if_corrupt:bool
+  -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
@@ -77,10 +80,6 @@ val open_block_wal
   -> close:(unit -> unit Lwt.t)
   -> wal_close:(unit -> unit Lwt.t)
   -> (t, error) result Lwt.t
-
-(** Convenience wrapper: open WAL-mode store using two Unix files,
-    [path] for the main DB and [path ^ "-wal"] for the WAL. *)
-val open_file_wal : path:string -> (t, error) result Lwt.t
 
 (** Close the store. After this, any use of the store or its txns is
     undefined. *)
@@ -174,7 +173,7 @@ val cursor_next : cursor -> (bytes * bytes) option
 val cursor_value : cursor -> bytes option
 
 (** True if the store is operating in WAL mode (opened via
-    [open_block_wal] / [open_file_wal]). *)
+    [open_block_wal]). *)
 val wal_mode : t -> bool
 
 (** Migrate every page in the WAL index to the main DB, sync, then

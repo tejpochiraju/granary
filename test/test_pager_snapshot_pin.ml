@@ -60,8 +60,14 @@ let make_dev () =
 let open_store () =
   let read_page, write_page, sync, resize, reads = make_dev () in
   let* r =
-    S.open_block ~read_page ~write_page ~sync ~resize ~n_pages:0L ~close:(fun () ->
-      Lwt.return_unit)
+    S.open_block
+      ~init_if_corrupt:true
+      ~read_page
+      ~write_page
+      ~sync
+      ~resize
+      ~n_pages:0L
+      ~close:(fun () -> Lwt.return_unit)
   in
   match r with
   | Ok st -> Lwt.return (st, reads)

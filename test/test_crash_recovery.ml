@@ -8,8 +8,14 @@
     [Error _] — never a panic. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module FI = Sqlocaml_block.Fault_inject
+
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
+
+module FI = Sqlocaml_unix.Fault_inject
 
 let counter = ref 0
 

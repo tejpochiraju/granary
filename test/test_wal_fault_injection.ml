@@ -7,7 +7,13 @@
     partial-batch state ever leaks through. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+end
+
 module Wal = Sqlocaml_storage.Wal
 
 let bs s = Bytes.of_string s

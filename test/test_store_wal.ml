@@ -1,7 +1,12 @@
 (** End-to-end tests for WAL-mode Store. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+end
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -278,7 +283,7 @@ let test_pragma_wal_checkpoint_via_sql () =
   let module Db = Sqlocaml.Db in
   run
   @@ with_fresh ~f:(fun path ->
-    let* r = Db.open_file_wal ~path in
+    let* r = Sqlocaml_unix.open_file_wal ~path in
     let db =
       match r with
       | Ok db -> db

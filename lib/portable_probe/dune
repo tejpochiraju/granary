@@ -1,0 +1,6 @@
+; #170 acceptance check: a consumer of the sqlocaml core that declares no
+; unix / lwt.unix dependency.  If this builds, the core links without Unix.
+
+(library
+ (name sqlocaml_portable_probe)
+ (libraries sqlocaml lwt))

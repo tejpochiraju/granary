@@ -1,6 +1,10 @@
 (** Tests for SQL-level BEGIN / COMMIT / ROLLBACK (Phase 3). *)
 
-module Db = Sqlocaml.Db
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
 
 let run = Lwt_main.run
 let fresh_db () = run (Db.open_in_memory ())

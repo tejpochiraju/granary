@@ -6,7 +6,13 @@
     densely packed. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
+
 module Row = Sqlocaml_encoding.Row
 
 let run = Lwt_main.run

@@ -24,9 +24,15 @@
     after the join and survive a close+reopen. *)
 
 open Lwt.Syntax
-module D = Sqlocaml.Db
+
+module D = struct
+  include Sqlocaml.Db
+
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
+
 module S = Sqlocaml_store.Store
-module UF = Sqlocaml_block.Unix_file
+module UF = Sqlocaml_unix.Unix_file
 
 let run = Lwt_main.run
 let counter = ref 0

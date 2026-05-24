@@ -13,6 +13,10 @@
 
 module Db = Sqlocaml.Db
 
+(* ATTACH opens a file-backed sub-db, so the engine needs the Unix file
+   provider (the parent here is in-memory, so opening it does not install
+   it automatically). *)
+let () = Sqlocaml_unix.install ()
 let run = Lwt_main.run
 
 let exec db sql =

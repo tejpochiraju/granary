@@ -3,9 +3,12 @@
    - [Mem] — pure in-memory [Bytes_map]-per-tree (the Phase 0 backend).
      Used by [create ()].  No I/O, no size limits, no errors.
 
-   - [Btree] — CoW B+-tree over a Pager over a BLOCK device (Unix file).
-     Used by [open_file ~path].  Persists across reopen.  Inherits the
-     B+-tree leaf-cell size limits (512-byte keys, 1024-byte values).
+   - [Btree] — CoW B+-tree over a Pager over a BLOCK device, given as
+     I/O callbacks via [open_block]/[open_block_wal].  Persists across
+     reopen.  Inherits the B+-tree leaf-cell size limits (512-byte keys,
+     1024-byte values).  Unix-file convenience constructors live in the
+     [sqlocaml.unix] driver library, not here, so the core stays
+     platform-agnostic (#170).
 
    The two are wrapped in a sum type so callers see one [Store.t]. *)
 
@@ -15,7 +18,6 @@ module Pager = Sqlocaml_storage.Pager
 module Header = Sqlocaml_storage.Header
 module Freelist = Sqlocaml_storage.Freelist
 module Page = Sqlocaml_storage.Page
-module Unix_file = Sqlocaml_block.Unix_file
 module Varint = Sqlocaml_encoding.Varint
 module Bytes_map = Map.Make (Bytes)
 
@@ -328,7 +330,7 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Freelist page I/O helpers (forward-declared here; used by open_file  *)
+(* Freelist page I/O helpers (forward-declared here; used by open_block *)
 (* and commit below)                                                    *)
 (* ------------------------------------------------------------------ *)
 
@@ -362,7 +364,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* create / open_file / close                                           *)
+(* create / open_block / close                                          *)
 (* ------------------------------------------------------------------ *)
 
 let create () : t =
@@ -373,47 +375,10 @@ let create () : t =
   }
 ;;
 
-let map_unix_err (e : Unix_file.error) : error =
-  match e with
-  | Unix_file.Io s -> Block_error s
-  | Unix_file.Out_of_bounds { page_id; n_pages } ->
-    Block_error (Format.asprintf "out of bounds page_id=%Ld n_pages=%Ld" page_id n_pages)
-;;
-
 let map_header_err (e : Header.error) : error =
   match e with
   | Header.Io s -> Header_error s
   | Header.Both_headers_corrupt -> Header_error "both header pages corrupt"
-;;
-
-(* Build a Pager that delegates to a Unix_file. *)
-let pager_of_unix_file (f : Unix_file.t) ~freelist : Pager.t =
-  let read_page ~page_id buf =
-    let%lwt r = Unix_file.read_page f ~page_id buf in
-    match r with
-    | Ok () -> Lwt.return_ok ()
-    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-  in
-  let write_page ~page_id buf =
-    let%lwt r = Unix_file.write_page f ~page_id buf in
-    match r with
-    | Ok () -> Lwt.return_ok ()
-    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-  in
-  let sync () =
-    let%lwt r = Unix_file.sync f in
-    match r with
-    | Ok () -> Lwt.return_ok ()
-    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-  in
-  let resize ~n_pages =
-    let%lwt r = Unix_file.resize f ~n_pages in
-    match r with
-    | Ok () -> Lwt.return_ok ()
-    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-  in
-  let n_pages = Unix_file.n_pages f in
-  Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist
 ;;
 
 (* Build a fully-initialised [t] wrapping a B-tree-backed [bt_state] from the
@@ -454,55 +419,6 @@ let make_btree_store
   }
 ;;
 
-let open_file ~path : (t, error) result Lwt.t =
-  let%lwt fr = Unix_file.open_ ~path in
-  match fr with
-  | Error e -> Lwt.return_error (map_unix_err e)
-  | Ok file ->
-    let n_pages = Unix_file.n_pages file in
-    if Int64.compare n_pages 0L = 0
-    then (
-      (* Fresh file — pre-resize to 2 pages so Header.init can write the
-         two alternating header pages, then initialise them.  We MUST create
-         the pager AFTER the resize so it knows n_pages=2; otherwise
-         [Pager.alloc] would re-allocate page 0. *)
-      let%lwt rr = Unix_file.resize file ~n_pages:2L in
-      match rr with
-      | Error e ->
-        let%lwt _ = Unix_file.close file in
-        Lwt.return_error (map_unix_err e)
-      | Ok () ->
-        let pager = pager_of_unix_file file ~freelist:Freelist.empty in
-        let%lwt ir = Header.init pager in
-        (match ir with
-         | Error e -> Lwt.return_error (map_header_err e)
-         | Ok () ->
-           let%lwt hr = Header.read_live pager in
-           (match hr with
-            | Error e -> Lwt.return_error (map_header_err e)
-            | Ok h ->
-              let meta = Btree.create pager ~root_page:0L in
-              let close_fn () =
-                let%lwt _ = Unix_file.close file in
-                Lwt.return_unit
-              in
-              Lwt.return_ok (make_btree_store ~close_fn ~pager ~meta ~h ()))))
-    else (
-      let pager = pager_of_unix_file file ~freelist:Freelist.empty in
-      let%lwt hr = Header.read_live pager in
-      match hr with
-      | Error e -> Lwt.return_error (map_header_err e)
-      | Ok h ->
-        let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
-        Pager.set_freelist pager fl;
-        let meta = Btree.create pager ~root_page:h.root_page in
-        let close_fn () =
-          let%lwt _ = Unix_file.close file in
-          Lwt.return_unit
-        in
-        Lwt.return_ok (make_btree_store ~close_fn ~pager ~meta ~h ()))
-;;
-
 let close (t : t) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
@@ -516,6 +432,7 @@ let close (t : t) : unit Lwt.t =
 ;;
 
 let open_block
+      ~(init_if_corrupt : bool)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(sync : unit -> (unit, string) result Lwt.t)
@@ -529,8 +446,10 @@ let open_block
   in
   let%lwt hr = Header.read_live pager in
   match hr with
-  | Error Header.Both_headers_corrupt ->
-    (* Fresh device — initialise headers *)
+  | Error Header.Both_headers_corrupt when init_if_corrupt ->
+    (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
+       so an existing-but-corrupt device surfaces [Header_error] instead of
+       being silently re-initialised (a Unix-file open must not clobber). *)
     let%lwt ir = Header.init pager in
     (match ir with
      | Error e -> Lwt.return_error (map_header_err e)
@@ -673,133 +592,6 @@ let open_block_wal
        install_wal_hook pager wal;
        (* Step 4: re-read the header (now WAL-aware) and build the store. *)
        finish_wal_open ~close ~wal_close ~pager ~wal ~was_fresh)
-;;
-
-(* ------------------------------------------------------------------ *)
-(* WAL convenience: open a main DB + WAL on the same path prefix.       *)
-(* The main DB lives at [path] and the WAL at [path ^ "-wal"].          *)
-(* ------------------------------------------------------------------ *)
-
-let unix_file_read_at file ~offset (out : Cstruct.t) =
-  let len = Cstruct.length out in
-  try
-    let _ = Unix.lseek file (Int64.to_int offset) Unix.SEEK_SET in
-    let tmp = Bytes.create len in
-    let rec loop o r =
-      if r = 0
-      then ()
-      else (
-        let n = Unix.read file tmp o r in
-        if n = 0
-        then
-          (* read past EOF — return zeros for the remainder *)
-          Bytes.fill tmp o r '\x00'
-        else loop (o + n) (r - n))
-    in
-    loop 0 len;
-    Cstruct.blit_from_bytes tmp 0 out 0 len;
-    Lwt.return (Ok ())
-  with
-  | Unix.Unix_error (e, _, _) -> Lwt.return (Error (Unix.error_message e))
-;;
-
-let unix_file_write_at file ~offset (src : Cstruct.t) =
-  let len = Cstruct.length src in
-  try
-    let _ = Unix.lseek file (Int64.to_int offset) Unix.SEEK_SET in
-    let tmp = Bytes.create len in
-    Cstruct.blit_to_bytes src 0 tmp 0 len;
-    let rec loop o r =
-      if r = 0
-      then ()
-      else (
-        let n = Unix.write file tmp o r in
-        if n = 0 then failwith "short write" else loop (o + n) (r - n))
-    in
-    loop 0 len;
-    Lwt.return (Ok ())
-  with
-  | Unix.Unix_error (e, _, _) -> Lwt.return (Error (Unix.error_message e))
-;;
-
-(* The four pager block-IO callbacks backed by a [Unix_file.t], each mapping
-   the file's typed error to the [string] error the pager expects. *)
-let unix_file_pager_ops file =
-  let wrap = function
-    | Ok () -> Lwt.return_ok ()
-    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-  in
-  let read_page ~page_id buf =
-    let%lwt r = Unix_file.read_page file ~page_id buf in
-    wrap r
-  in
-  let write_page ~page_id buf =
-    let%lwt r = Unix_file.write_page file ~page_id buf in
-    wrap r
-  in
-  let sync () =
-    let%lwt r = Unix_file.sync file in
-    wrap r
-  in
-  let resize ~n_pages =
-    let%lwt r = Unix_file.resize file ~n_pages in
-    wrap r
-  in
-  read_page, write_page, sync, resize
-;;
-
-let open_file_wal ~path : (t, error) result Lwt.t =
-  let%lwt fr = Unix_file.open_ ~path in
-  match fr with
-  | Error e -> Lwt.return_error (map_unix_err e)
-  | Ok file ->
-    let wal_path = path ^ "-wal" in
-    let wal_fd =
-      try Unix.openfile wal_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 with
-      | Unix.Unix_error _ -> Unix.openfile wal_path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644
-    in
-    let wal_size_bytes = Int64.of_int (Unix.lseek wal_fd 0 Unix.SEEK_END) in
-    let read_page, write_page, sync, resize = unix_file_pager_ops file in
-    let n_pages = Unix_file.n_pages file in
-    (* Fresh main DB: pre-resize to 2 pages for the alternating headers. *)
-    let%lwt () =
-      if Int64.equal n_pages 0L
-      then (
-        let%lwt _ = Unix_file.resize file ~n_pages:2L in
-        Lwt.return_unit)
-      else Lwt.return_unit
-    in
-    let n_pages = Unix_file.n_pages file in
-    let wal_read_at = unix_file_read_at wal_fd in
-    let wal_write_at = unix_file_write_at wal_fd in
-    let wal_sync () =
-      try
-        Unix.fsync wal_fd;
-        Lwt.return_ok ()
-      with
-      | Unix.Unix_error (e, _, _) -> Lwt.return_error (Unix.error_message e)
-    in
-    let close () =
-      let%lwt _ = Unix_file.close file in
-      Lwt.return_unit
-    in
-    let wal_close () =
-      (try Unix.close wal_fd with
-       | Unix.Unix_error _ -> ());
-      Lwt.return_unit
-    in
-    open_block_wal
-      ~read_page
-      ~write_page
-      ~sync
-      ~resize
-      ~n_pages
-      ~wal_read_at
-      ~wal_write_at
-      ~wal_sync
-      ~wal_size_bytes
-      ~close
-      ~wal_close
 ;;
 
 (* ------------------------------------------------------------------ *)

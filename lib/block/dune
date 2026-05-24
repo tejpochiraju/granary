@@ -1,8 +1,8 @@
 (library
  (name sqlocaml_block)
  (public_name sqlocaml.block)
- (modules block mem unix_file fault_inject)
- (libraries lwt lwt.unix unix cstruct)
+ (modules block mem)
+ (libraries lwt cstruct)
  (instrumentation
   (backend bisect_ppx)))
 

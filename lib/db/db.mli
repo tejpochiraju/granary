@@ -25,21 +25,15 @@ type error =
     ['now'].  Omit for MirageOS-friendly cores that have no Unix dependency. *)
 val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
 
-(** Open a persistent B+-tree-backed database at the given file path.
-    Creates the file if absent; reopens an existing database otherwise. *)
-val open_file : path:string -> (t, error) result Lwt.t
-
-(** Open a persistent B+-tree-backed database in WAL mode. The main DB
-    is [path] and the WAL is [path ^ "-wal"]. Crash recovery on the WAL
-    runs automatically at open. Use [PRAGMA wal_checkpoint] to migrate
-    WAL contents back to the main DB. *)
-val open_file_wal : path:string -> (t, error) result Lwt.t
-
 (** Open a SQL engine on any block device given as I/O callbacks.
     Use with [Sqlocaml_mirage_block.Mirage_backend.Make(B)] to build
     the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]
     for Mirage adapters; the adapter handles device-capacity bounds
-    internally.  [~close] is called by [Db.close]. *)
+    internally.  [~close] is called by [Db.close].
+
+    This is the platform-agnostic entry point.  Unix file convenience
+    constructors ([open_file] / [open_file_wal]) live in the [sqlocaml.unix]
+    driver library so this core carries no [unix] dependency (#170). *)
 val open_block
   :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -48,6 +42,31 @@ val open_block
   -> n_pages:int64
   -> close:(unit -> unit Lwt.t)
   -> (t, error) result Lwt.t
+
+(** Wrap an already-open {!Sqlocaml_store.Store.t} as a database handle,
+    loading its catalog, views, and triggers.  [file_path] records the
+    on-disk path for file-backed handles so VACUUM can rebuild in place;
+    omit it for in-memory / arbitrary block devices.  Used by the
+    [sqlocaml.unix] driver and by ATTACH. *)
+val of_store
+  :  ?clock:(unit -> float)
+  -> ?file_path:string
+  -> Sqlocaml_store.Store.t
+  -> t Lwt.t
+
+(** File operations the engine needs for ATTACH and VACUUM.  The core has no
+    OS/filesystem dependency (#170); a platform driver (e.g. [sqlocaml.unix])
+    supplies these via {!set_file_provider}.  Without a provider, ATTACH and
+    VACUUM fail with a clear error. *)
+type file_provider =
+  { open_store :
+      path:string -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
+  ; remove_file : string -> unit (** best-effort unlink; ignore if absent *)
+  ; rename_file : string -> string -> unit (** atomic rename over the target *)
+  }
+
+(** Install the process-wide file provider used by ATTACH and VACUUM. *)
+val set_file_provider : file_provider -> unit
 
 (** Close the database, flushing and releasing the underlying store. *)
 val close : t -> unit Lwt.t
@@ -61,9 +80,10 @@ val wal_sync_count : t -> int
     atomically renames it over the original.  This drops free-list
     pages and re-packs everything densely.
 
-    Only works on file-backed databases (opened via [open_file] or
-    [open_file_wal]); in-memory and arbitrary-block-device handles
-    raise [Failure].
+    Only works on file-backed databases (opened via the [sqlocaml.unix]
+    driver); in-memory and arbitrary-block-device handles raise [Failure],
+    as does any handle when no file provider is installed (see
+    {!set_file_provider}).
 
     Must not be called inside an explicit transaction.  Any open
     prepared statements created from the previous file will continue

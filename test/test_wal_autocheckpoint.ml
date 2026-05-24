@@ -9,8 +9,18 @@
       (correctness regression guard). *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module D = Sqlocaml.Db
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+end
+
+module D = struct
+  include Sqlocaml.Db
+
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
 
 let run = Lwt_main.run
 let counter = ref 0

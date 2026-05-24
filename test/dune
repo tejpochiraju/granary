@@ -35,6 +35,7 @@
   sqlocaml.catalog
   sqlocaml.sql
   sqlocaml.storage
+  sqlocaml.unix
   lwt.unix
   unix))
 
@@ -48,6 +49,7 @@
   sqlocaml.catalog
   sqlocaml.sql
   sqlocaml.storage
+  sqlocaml.unix
   sqlocaml.mirage_block
   mirage-block-unix
   alcotest
@@ -69,7 +71,13 @@
 
 (test
  (name test_txn)
- (libraries sqlocaml sqlocaml.sql sqlocaml.encoding alcotest lwt.unix))
+ (libraries
+  sqlocaml
+  sqlocaml.sql
+  sqlocaml.encoding
+  sqlocaml.unix
+  alcotest
+  lwt.unix))
 
 (test
  (name test_mirage_backend)
@@ -81,7 +89,7 @@
 
 (test
  (name test_fts)
- (libraries sqlocaml alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_sqlite_compare)
@@ -99,6 +107,7 @@
   sqlocaml.catalog
   sqlocaml.sql
   sqlocaml.storage
+  sqlocaml.unix
   sqlocaml.mirage_block
   mirage-block-unix
   lwt.unix
@@ -114,6 +123,7 @@
   sqlocaml.catalog
   sqlocaml.sql
   sqlocaml.storage
+  sqlocaml.unix
   sqlocaml.mirage_block
   mirage-block-unix
   alcotest
@@ -123,7 +133,7 @@
 
 (test
  (name test_sqlite_corpus)
- (libraries sqlocaml alcotest lwt.unix unix)
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix)
  (deps
   (source_tree sqlite_corpus)))
 
@@ -133,7 +143,7 @@
 
 (test
  (name test_crash_recovery)
- (libraries sqlocaml sqlocaml.block alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.block sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_wal)
@@ -146,6 +156,7 @@
   sqlocaml.store
   sqlocaml.storage
   sqlocaml.catalog
+  sqlocaml.unix
   alcotest
   lwt.unix
   unix))
@@ -155,6 +166,7 @@
  (libraries
   sqlocaml.store
   sqlocaml.storage
+  sqlocaml.unix
   alcotest
   qcheck-core
   qcheck-alcotest
@@ -163,27 +175,53 @@
 
 (test
  (name test_wal_fault_injection)
- (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+ (libraries
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_wal_autocheckpoint)
- (libraries sqlocaml sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_group_commit)
- (libraries sqlocaml sqlocaml.store alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.store sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_overflow)
- (libraries sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+ (libraries
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_without_rowid)
- (libraries sqlocaml sqlocaml.store sqlocaml.encoding alcotest lwt.unix unix))
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.encoding
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_vacuum)
- (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_trigger_atomicity)
@@ -191,19 +229,19 @@
 
 (test
  (name test_multifiber_stress)
- (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_soak)
- (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_perf_bench)
- (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_attach)
- (libraries sqlocaml alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_repl)
@@ -224,16 +262,28 @@
 
 (test
  (name test_wal_reader_snapshot)
- (libraries sqlocaml sqlocaml.store alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.store sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name bench_wal_reader_scaling)
- (libraries sqlocaml alcotest lwt.unix unix))
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name bench_wal_fsync_overlap)
- (libraries sqlocaml.store sqlocaml.block alcotest lwt.unix unix))
+ (libraries
+  sqlocaml.store
+  sqlocaml.block
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name bench_slow_read_yield)
- (libraries sqlocaml.store sqlocaml.block alcotest lwt.unix unix))
+ (libraries
+  sqlocaml.store
+  sqlocaml.block
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))

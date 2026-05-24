@@ -19,7 +19,12 @@
     matches the SQLite practice of reporting numbers via stderr rather
     than encoding them in the test exit status. *)
 
-module Db = Sqlocaml.Db
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
 
 let run = Lwt_main.run
 

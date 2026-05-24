@@ -15,8 +15,17 @@
       [ro_begin] time — this is the actual snapshot-isolation
       invariant the #149 plumbing delivers. *)
 
-module Db = Sqlocaml.Db
-module S = Sqlocaml_store.Store
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
+
+module S = struct
+  include Sqlocaml_store.Store
+
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+end
 
 let run = Lwt_main.run
 let bs = Bytes.of_string

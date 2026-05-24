@@ -1,5 +1,10 @@
 open Lwt.Syntax
-module D = Sqlocaml.Db
+
+module D = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
 
 let run f = Lwt_main.run (f ())
 

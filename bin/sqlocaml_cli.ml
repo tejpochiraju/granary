@@ -98,6 +98,8 @@ let read_stdin () =
 ;;
 
 let () =
+  (* Enable Unix file operations (ATTACH / VACUUM) for this process. *)
+  Sqlocaml_unix.install ();
   let args = Array.to_list Sys.argv |> List.tl in
   let db_path, sql_source =
     match args with
@@ -115,7 +117,7 @@ let () =
        if db_path = ":memory:"
        then Db.open_in_memory ()
        else
-         let* result = Db.open_file ~path:db_path in
+         let* result = Sqlocaml_unix.open_file ~path:db_path in
          match result with
          | Ok db -> Lwt.return db
          | Error e ->

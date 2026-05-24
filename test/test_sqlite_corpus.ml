@@ -2,7 +2,12 @@
     backends, comparing observed SELECT rows to inline `-- expect:` markers. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
 
 (* ------------------------------------------------------------------ *)
 (* Parser for the .sql + -- expect: format                               *)

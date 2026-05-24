@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module UF = Sqlocaml_block.Unix_file
+module UF = Sqlocaml_unix.Unix_file
 
 let page_size = UF.page_size
 

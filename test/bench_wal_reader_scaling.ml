@@ -11,7 +11,11 @@
       SQLOCAML_BENCH_PARALLEL_MAX (default 2.0)
 *)
 
-module Db = Sqlocaml.Db
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file_wal = Sqlocaml_unix.open_file_wal
+end
 
 let run = Lwt_main.run
 

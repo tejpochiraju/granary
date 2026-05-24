@@ -17,7 +17,11 @@
     The model is a [(int, int) Hashtbl] keyed by id.  After each
     randomized op we compare the model's contents to the db. *)
 
-module Db = Sqlocaml.Db
+module Db = struct
+  include Sqlocaml.Db
+
+  let open_file = Sqlocaml_unix.open_file
+end
 
 let run = Lwt_main.run
 

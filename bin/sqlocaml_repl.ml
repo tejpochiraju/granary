@@ -119,7 +119,7 @@ let open_db ~path =
   then
     let* d = Db.open_in_memory () in
     Lwt.return (Ok d)
-  else Db.open_file ~path
+  else Sqlocaml_unix.open_file ~path
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -307,6 +307,8 @@ let read_one () =
 ;;
 
 let main () =
+  (* Enable Unix file operations (ATTACH / VACUUM / .open) for this process. *)
+  Sqlocaml_unix.install ();
   let path =
     match Array.to_list Sys.argv |> List.tl with
     | [] -> ":memory:"
