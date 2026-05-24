@@ -1939,6 +1939,266 @@ let fk_violation ~deferred (cat : Cat.t) ~kind ~table ~rowid ~msg
   end else
     Lwt.fail_with msg
 
+(* Immediate/deferred FK existence check for one [fk] of an INSERT row. *)
+let enforce_insert_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
+    (row : Row.t) (fk : Cat.fk_constraint) : unit Lwt.t =
+  let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
+  let local_idxs_opt = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
+  if List.exists Option.is_none local_idxs_opt then
+    Lwt.fail_with (Printf.sprintf "FOREIGN KEY: some local columns not found in table '%s'"
+      table_meta.Cat.name)
+  else
+  let local_idxs = List.filter_map Fun.id local_idxs_opt in
+  let local_vals = List.map (fun i -> row.(i)) local_idxs in
+  (* NULL in any FK column => skip enforcement *)
+  if any_null_val local_vals then Lwt.return_unit
+  else
+    (match Cat.find_table_cached cat ~name:fk.fk_parent_table with
+     | None ->
+       Lwt.fail_with (Printf.sprintf "FOREIGN KEY: parent table '%s' not found"
+                        fk.fk_parent_table)
+     | Some parent_meta ->
+       let parent_idxs_opt = find_col_idxs parent_meta.Cat.columns fk.fk_parent_cols in
+       let parent_idxs = List.filter_map Fun.id parent_idxs_opt in
+       if List.length parent_idxs <> List.length fk.fk_parent_cols then
+         Lwt.fail_with (Printf.sprintf
+           "FOREIGN KEY: column not found in parent table '%s'"
+           fk.fk_parent_table)
+       else begin
+         let child_col_idxs = local_idxs in
+         let table_name = table_meta.Cat.name in
+         let parent_meta_name = parent_meta.Cat.name in
+         let msg = Printf.sprintf
+           "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
+           fk.fk_parent_table (String.concat ", " fk.fk_parent_cols)
+         in
+         let* found = fk_parent_has_row store parent_meta
+                        ~parent_idxs ~parent_vals:local_vals in
+         if found then Lwt.return_unit
+         else
+           (* Deferred recheck threads the active write txn so it observes
+              uncommitted writes (a fresh ro_begin would miss them). *)
+           let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
+             match Cat.find_table_cached cat ~name:table_name,
+                   Cat.find_table_cached cat ~name:parent_meta_name with
+             | None, _ | _, None -> Lwt.return false
+             | Some child_now, Some parent_now ->
+               let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
+                                  ~child_col_idxs ~parent_vals:local_vals in
+               if not has_child then Lwt.return false
+               else
+                 let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
+                                     ~parent_idxs ~parent_vals:local_vals in
+                 Lwt.return (not has_parent)
+           } in
+           fk_violation ~deferred:is_deferred cat ~kind:`Insert
+             ~table:table_name ~rowid:0L ~msg ~recheck
+       end)
+
+(* Evaluate all FK constraints for an INSERT of [row] before any writes. *)
+let enforce_insert_fks store (cat : Cat.t) (table_meta : Cat.table_meta)
+    (row : Row.t) : unit Lwt.t =
+  let fks = table_meta.Cat.fk_constraints in
+  if fks = [] || not (Cat.get_fk_enforcement cat) then Lwt.return_unit
+  else Lwt_list.iter_s (enforce_insert_fk store cat table_meta row) fks
+
+(* Resolve the rowid for an INSERT: the INTEGER PRIMARY KEY for WITHOUT ROWID
+   tables (must be present, non-NULL, integer), else a freshly allocated one. *)
+let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
+    : int64 Lwt.t =
+  if table_meta.Cat.without_rowid then begin
+    match
+      List.find_index (fun (c : Row.column) -> c.primary_key) table_meta.Cat.columns
+    with
+    | None ->
+      Lwt.fail_with (Printf.sprintf
+        "WITHOUT ROWID table '%s' has no PRIMARY KEY column" table_meta.Cat.name)
+    | Some pk_idx ->
+      (match row.(pk_idx) with
+       | Row.V_int n -> Lwt.return n
+       | Row.V_null ->
+         Lwt.fail_with (Printf.sprintf
+           "WITHOUT ROWID table '%s': PRIMARY KEY column must not be NULL"
+           table_meta.Cat.name)
+       | _ ->
+         Lwt.fail_with (Printf.sprintf
+           "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
+           table_meta.Cat.name))
+  end
+  else Cat.next_rowid_in_txn cat ~name:table_meta.name tx
+
+(* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
+   delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
+   UNIQUE violation. *)
+let check_insert_unique tx (table_meta : Cat.table_meta)
+    ~clock ~params ~(row_for_idx : Row.t)
+    ~(on_conflict : Ast.conflict_action option)
+    ~(upsert_update : (string list * (int * Plan.expr) list) option)
+    (idxs : Cat.index_info list) : (bool * int64 list * int64 option) Lwt.t =
+  Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+    if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
+    else if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+    then Lwt.return (skip, dels, upsert_rid)
+    else begin
+      let iks    = List.map row_value_to_index_value
+                     (get_index_key_values clock params idx table_meta.columns row_for_idx) in
+      let prefix, plen = encode_index_key_prefix iks in
+      let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+      let* cur     = S.cursor_open tx idx.idx_tree_id in
+      let _        = S.cursor_seek cur seek_key in
+      let conflict_rowid_opt =
+        match S.cursor_next cur with
+        | None -> None
+        | Some (ikey, _) ->
+          if Bytes.length ikey >= plen &&
+             Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then
+            let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+            Some (Rowid.decode rid_bytes)
+          else None
+      in
+      S.cursor_close cur;
+      match conflict_rowid_opt with
+      | None -> Lwt.return (false, dels, upsert_rid)
+      | Some old_rowid ->
+        (match on_conflict, upsert_update with
+         | Some Ast.CA_ignore, _ ->
+           Lwt.return (true, dels, upsert_rid)  (* skip=true, stop checking *)
+         | Some Ast.CA_replace, _ ->
+           Lwt.return (false, old_rowid :: dels, upsert_rid)
+         | _, Some (conflict_cols, _) when
+             List.sort String.compare idx.idx_columns =
+             List.sort String.compare conflict_cols ->
+           Lwt.return (false, dels, Some old_rowid)
+         | _ ->
+           Lwt.fail_with (Printf.sprintf
+             "UNIQUE constraint violated: duplicate value in columns (%s)"
+             (String.concat ", " idx.idx_columns)))
+    end
+  ) (false, [], None) idxs
+
+(* Write [row]'s index entries (honoring each index's WHERE predicate). *)
+let insert_row_indexes tx (table_meta : Cat.table_meta) ~clock ~params
+    ~(row_for_idx : Row.t) ~rowid (idxs : Cat.index_info list) : unit Lwt.t =
+  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+    then Lwt.return_unit
+    else begin
+      let iks  = List.map row_value_to_index_value
+                   (get_index_key_values clock params idx table_meta.columns row_for_idx) in
+      let ikey = Index_key.encode iks ~rowid in
+      S.put tx idx.idx_tree_id ikey Bytes.empty
+    end
+  ) idxs
+
+(* REPLACE conflict resolution: delete each [to_delete] row and its index
+   entries (firing BEFORE DELETE); returns the displaced rows in original order. *)
+let delete_replace_conflicts tx (table_meta : Cat.table_meta)
+    ~clock ~params ~(idxs : Cat.index_info list) ~on_replace_delete_before
+    to_delete : Row.t list Lwt.t =
+  let displaced_rows : Row.t list ref = ref [] in
+  let* () = Lwt_list.iter_s (fun old_rowid ->
+    let old_key = Rowid.encode old_rowid in
+    let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+    match old_bytes_opt with
+    | None -> Lwt.return_unit
+    | Some old_bytes ->
+      let old_row = decode_with_virtual clock params table_meta old_bytes in
+      displaced_rows := old_row :: !displaced_rows;
+      let* () = match on_replace_delete_before with
+        | None   -> Lwt.return_unit
+        | Some f -> f ~tx ~old_row
+      in
+      let* () = S.del tx table_meta.tree_id old_key in
+      Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
+        if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
+        then Lwt.return_unit
+        else begin
+          let iks2     = List.map row_value_to_index_value
+                           (get_index_key_values clock params idx2 table_meta.columns old_row) in
+          let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
+          S.del tx idx2.idx_tree_id old_ikey
+        end
+      ) idxs
+  ) (List.sort_uniq compare to_delete) in
+  Lwt.return (List.rev !displaced_rows)
+
+(* UPSERT DO UPDATE: apply [assigns] to conflicting row [old_rowid], refresh
+   indexes, fire BEFORE/AFTER UPDATE hooks, commit if we own the txn. *)
+let execute_upsert_update tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~owned ~(row : Row.t)
+    ~(assigns : (int * Plan.expr) list) ~old_rowid
+    ~on_upsert_update_before ~on_upsert_update : bool Lwt.t =
+  let old_key = Rowid.encode old_rowid in
+  let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+  (match old_bytes_opt with
+   | None ->
+     let* () = if owned then S.rollback tx else Lwt.return_unit in
+     Lwt.return false
+   | Some old_bytes ->
+     let old_row = decode_with_virtual clock params table_meta old_bytes in
+     let new_row = Array.copy old_row in
+     List.iter (fun (col_ord, expr) ->
+       let e' = substitute_excluded row expr in
+       new_row.(col_ord) <- eval_expr clock params old_row e'
+     ) assigns;
+     compute_stored_generated_cols clock params table_meta new_row;
+     eval_check_constraints clock params table_meta new_row;
+     let* () = match on_upsert_update_before with
+       | None -> Lwt.return_unit
+       | Some f -> f ~tx ~old_row ~new_row
+     in
+     let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+     let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+       let old_matches = row_matches_index_where clock params idx table_meta.columns old_row in
+       let new_matches = row_matches_index_where clock params idx table_meta.columns new_row_for_idx in
+       let old_iks = List.map row_value_to_index_value
+                       (get_index_key_values clock params idx table_meta.columns old_row) in
+       let new_iks = List.map row_value_to_index_value
+                       (get_index_key_values clock params idx table_meta.columns new_row_for_idx) in
+       let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
+       let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
+       let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
+       if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+       else Lwt.return_unit
+     ) (Cat.indexes_for_table cat ~table:table_meta.name) in
+     let new_bytes = Row.encode table_meta.columns new_row in
+     let* () = S.del tx table_meta.tree_id old_key in
+     let* () = S.put tx table_meta.tree_id old_key new_bytes in
+     let* () = match on_upsert_update with
+       | None -> Lwt.return_unit
+       | Some f -> f ~tx ~old_row ~new_row
+     in
+     let* () = release_txn tx owned in
+     Lwt.return true)
+
+(* Plain INSERT path (no UPSERT match): honor IGNORE (skip), delete REPLACE
+   conflicts, write the new row + index entries, fire AFTER hooks, commit if owned. *)
+let execute_insert_write tx (table_meta : Cat.table_meta)
+    ~clock ~params ~owned ~(row : Row.t) ~(row_for_idx : Row.t) ~rowid
+    ~(idxs : Cat.index_info list) ~skip ~to_delete
+    ~on_replace_delete_before ~on_replace_delete ~after_hook : bool Lwt.t =
+  if skip then begin
+    (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
+    let* () = if owned then S.rollback tx else Lwt.return_unit in
+    Lwt.return false
+  end else begin
+    let* displaced_rows =
+      delete_replace_conflicts tx table_meta ~clock ~params ~idxs
+        ~on_replace_delete_before to_delete in
+    let key   = Rowid.encode rowid in
+    let bytes = Row.encode table_meta.columns row in
+    let* () = S.put tx table_meta.tree_id key bytes in
+    let* () = insert_row_indexes tx table_meta ~clock ~params ~row_for_idx ~rowid idxs in
+    let* () = match on_replace_delete with
+      | None   -> Lwt.return_unit
+      | Some f -> Lwt_list.iter_s (fun old_row -> f ~tx ~old_row) displaced_rows
+    in
+    let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~tx ~new_row:row in
+    let* () = release_txn tx owned in
+    Lwt.return true
+  end
+
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
@@ -1965,292 +2225,37 @@ let execute_insert ?(mode = Auto) ?(params = [||])
       r
   in
   compute_stored_generated_cols clock params table_meta row;
-  (* Evaluate CHECK constraints before any writes. *)
+  (* Evaluate CHECK and FK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
-  (* Evaluate FK constraints before any writes.
-     If the constraint is DEFERRED (or PRAGMA defer_foreign_keys is on),
-     queue the recheck for commit time instead of raising immediately. *)
-  let* () =
-    let fks = table_meta.Cat.fk_constraints in
-    if fks = [] || not (Cat.get_fk_enforcement cat) then Lwt.return_unit
-    else
-      Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-        let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-        (* Collect the local values for all FK columns *)
-        let local_idxs_opt = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
-        if List.exists Option.is_none local_idxs_opt then
-          Lwt.fail_with (Printf.sprintf "FOREIGN KEY: some local columns not found in table '%s'"
-            table_meta.Cat.name)
-        else
-        let local_idxs = List.filter_map Fun.id local_idxs_opt in
-        let local_vals = List.map (fun i -> row.(i)) local_idxs in
-        (* NULL in any FK column => skip enforcement *)
-        if any_null_val local_vals then Lwt.return_unit
-        else
-          (match Cat.find_table_cached cat ~name:fk.fk_parent_table with
-           | None ->
-             Lwt.fail_with (Printf.sprintf "FOREIGN KEY: parent table '%s' not found"
-                              fk.fk_parent_table)
-           | Some parent_meta ->
-             let parent_idxs_opt = find_col_idxs parent_meta.Cat.columns fk.fk_parent_cols in
-             let parent_idxs = List.filter_map Fun.id parent_idxs_opt in
-             if List.length parent_idxs <> List.length fk.fk_parent_cols then
-               Lwt.fail_with (Printf.sprintf
-                 "FOREIGN KEY: column not found in parent table '%s'"
-                 fk.fk_parent_table)
-             else begin
-               let child_col_idxs = local_idxs in
-               let table_name = table_meta.Cat.name in
-               let parent_meta_name = parent_meta.Cat.name in
-               let msg = Printf.sprintf
-                 "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
-                 fk.fk_parent_table (String.concat ", " fk.fk_parent_cols)
-               in
-               (* Existence check: parent row matches local_vals? *)
-               let* found = fk_parent_has_row store parent_meta
-                              ~parent_idxs ~parent_vals:local_vals in
-               if found then Lwt.return_unit
-               else
-                 (* Recheck closure for deferred path: at commit, the row may have
-                    been deleted (resolved) or the parent may have been inserted.
-                    The drain caller threads in the active write txn so the
-                    recheck observes uncommitted writes (B+-tree [ro_begin]
-                    would otherwise snapshot the pre-txn state). *)
-                 let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-                   match Cat.find_table_cached cat ~name:table_name,
-                         Cat.find_table_cached cat ~name:parent_meta_name with
-                   | None, _ | _, None -> Lwt.return false
-                   | Some child_now, Some parent_now ->
-                     let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                                        ~child_col_idxs ~parent_vals:local_vals in
-                     if not has_child then Lwt.return false
-                     else
-                       let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                                           ~parent_idxs ~parent_vals:local_vals in
-                       Lwt.return (not has_parent)
-                 } in
-                 fk_violation ~deferred:is_deferred cat ~kind:`Insert
-                   ~table:table_name ~rowid:0L ~msg ~recheck
-             end)
-      ) fks
-  in
+  let* () = enforce_insert_fks store cat table_meta row in
   (* When an explicit transaction is already held, we must NOT call
-     Cat.next_rowid (which opens its own RW txn and deadlocks on the
-     mutex).  Instead acquire/reuse the txn first, then update the
-     rowid counter within that same txn.
-     Phase 38: BEFORE INSERT now fires inside the parent txn so its
-     nested DML can share the parent tx (no deadlock) and so its writes
-     are rolled back atomically with the parent on failure. *)
+     Cat.next_rowid (which opens its own RW txn and deadlocks on the mutex):
+     acquire/reuse the txn first, then allocate the rowid within it.  BEFORE
+     INSERT fires inside the parent txn so its nested DML shares the tx and
+     its writes roll back atomically with the parent on failure. *)
   let* (tx, owned) = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      (* Fire BEFORE INSERT triggers (inside parent txn). *)
       let* () = match before_hook with
         | None -> Lwt.return_unit
         | Some f -> f ~tx ~new_row:(Array.copy row) in
-      (* For WITHOUT ROWID tables (phase 37 #122), the INTEGER PRIMARY KEY
-         column's value becomes the rowid — no auto-allocation.  The PK
-         must be present and non-NULL. *)
-      let* rowid =
-        if table_meta.Cat.without_rowid then begin
-          match
-            List.find_index
-              (fun (c : Row.column) -> c.primary_key)
-              table_meta.Cat.columns
-          with
-          | None ->
-            Lwt.fail_with (Printf.sprintf
-              "WITHOUT ROWID table '%s' has no PRIMARY KEY column"
-              table_meta.Cat.name)
-          | Some pk_idx ->
-            (match row.(pk_idx) with
-             | Row.V_int n -> Lwt.return n
-             | Row.V_null ->
-               Lwt.fail_with (Printf.sprintf
-                 "WITHOUT ROWID table '%s': PRIMARY KEY column must not be NULL"
-                 table_meta.Cat.name)
-             | _ ->
-               Lwt.fail_with (Printf.sprintf
-                 "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
-                 table_meta.Cat.name))
-        end
-        else Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
+      let* rowid = insert_rowid tx cat table_meta row in
       let idxs   = Cat.indexes_for_table cat ~table:table_meta.name in
-      (* Phase 1: check UNIQUE constraints BEFORE writing the row.
-         Collect skip flag, list of conflicting rowids to delete, and
-         the rowid to update in-place for UPSERT. *)
-      (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch
-         row before extracting index keys so that VIRTUAL cells contribute
-         the up-to-date value instead of NULL. *)
+      (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
+         before extracting index keys so VIRTUAL cells contribute their value. *)
       let row_for_idx = with_computed_virtuals clock params table_meta row in
       let* (skip, to_delete, upsert_rowid) =
-        Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
-          if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
-          else if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-          then Lwt.return (skip, dels, upsert_rid)
-          else begin
-            let iks    = List.map row_value_to_index_value
-                           (get_index_key_values clock params idx table_meta.columns row_for_idx) in
-            let prefix =
-              let buf = Buffer.create 32 in
-              List.iter (fun ikv -> Buffer.add_bytes buf (Index_key.encode_value ikv)) iks;
-              Buffer.to_bytes buf
-            in
-            let plen     = Bytes.length prefix in
-            let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-            let* cur     = S.cursor_open tx idx.idx_tree_id in
-            let _        = S.cursor_seek cur seek_key in
-            let conflict_rowid_opt =
-              match S.cursor_next cur with
-              | None -> None
-              | Some (ikey, _) ->
-                if Bytes.length ikey >= plen &&
-                   Bytes.equal (Bytes.sub ikey 0 plen) prefix
-                then
-                  let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-                  Some (Rowid.decode rid_bytes)
-                else None
-            in
-            S.cursor_close cur;
-            match conflict_rowid_opt with
-            | None -> Lwt.return (false, dels, upsert_rid)
-            | Some old_rowid ->
-              (match on_conflict, upsert_update with
-               | Some Ast.CA_ignore, _ ->
-                 Lwt.return (true, dels, upsert_rid)  (* skip=true, stop checking *)
-               | Some Ast.CA_replace, _ ->
-                 Lwt.return (false, old_rowid :: dels, upsert_rid)
-               | _, Some (conflict_cols, _) when
-                   List.sort String.compare idx.idx_columns =
-                   List.sort String.compare conflict_cols ->
-                 Lwt.return (false, dels, Some old_rowid)
-               | _ ->
-                 Lwt.fail_with (Printf.sprintf
-                   "UNIQUE constraint violated: duplicate value in columns (%s)"
-                   (String.concat ", " idx.idx_columns)))
-          end
-        ) (false, [], None) idxs
+        check_insert_unique tx table_meta ~clock ~params ~row_for_idx
+          ~on_conflict ~upsert_update idxs
       in
       match upsert_update, upsert_rowid with
       | Some (_, assigns), Some old_rowid ->
-        let old_key = Rowid.encode old_rowid in
-        let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
-        (match old_bytes_opt with
-         | None ->
-           let* () = if owned then S.rollback tx else Lwt.return_unit in
-           Lwt.return false
-         | Some old_bytes ->
-           let old_row = decode_with_virtual clock params table_meta old_bytes in
-           let new_row = Array.copy old_row in
-           List.iter (fun (col_ord, expr) ->
-             let e' = substitute_excluded row expr in
-             new_row.(col_ord) <- eval_expr clock params old_row e'
-           ) assigns;
-           compute_stored_generated_cols clock params table_meta new_row;
-           eval_check_constraints clock params table_meta new_row;
-           let idxs2 = Cat.indexes_for_table cat ~table:table_meta.name in
-           (* Phase 38 (#139): fire BEFORE UPDATE on the conflict row inside
-              the parent txn, before any writes.  Trigger nested DML shares
-              [tx] via the threaded ~tx parameter, so no deadlock and no
-              mid-statement commit. *)
-           let* () = match on_upsert_update_before with
-             | None -> Lwt.return_unit
-             | Some f -> f ~tx ~old_row ~new_row
-           in
-           (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row
-              before extracting index keys. [old_row] was decoded via
-              [decode_with_virtual] so its VIRTUAL cells are already set. *)
-           let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-             let old_matches = row_matches_index_where clock params idx table_meta.columns old_row in
-             let new_matches = row_matches_index_where clock params idx table_meta.columns new_row_for_idx in
-             let old_iks = List.map row_value_to_index_value
-                             (get_index_key_values clock params idx table_meta.columns old_row) in
-             let new_iks = List.map row_value_to_index_value
-                             (get_index_key_values clock params idx table_meta.columns new_row_for_idx) in
-             let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
-             let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
-             let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
-             if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-             else Lwt.return_unit
-           ) idxs2 in
-           let new_bytes = Row.encode table_meta.columns new_row in
-           let* () = S.del tx table_meta.tree_id old_key in
-           let* () = S.put tx table_meta.tree_id old_key new_bytes in
-           (* Phase 38 (#138): UPSERT DO UPDATE branch: SQLite fires only
-              AFTER UPDATE triggers, NOT AFTER INSERT.  Fire AFTER UPDATE
-              inside the parent txn so failures roll back the whole DML. *)
-           let* () = match on_upsert_update with
-             | None -> Lwt.return_unit
-             | Some f -> f ~tx ~old_row ~new_row
-           in
-           let* () = release_txn tx owned in
-           Lwt.return true)
+        execute_upsert_update tx cat table_meta ~clock ~params ~owned ~row
+          ~assigns ~old_rowid ~on_upsert_update_before ~on_upsert_update
       | _ ->
-        (* Normal path: skip, replace, or plain insert *)
-        if skip then begin
-          (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
-          let* () = if owned then S.rollback tx else Lwt.return_unit in
-          Lwt.return false
-        end else begin
-          (* REPLACE: delete all conflicting rows first.  Phase 38 (#138/#139):
-             BEFORE-DELETE triggers fire on each displaced row inside the
-             parent txn before the del; AFTER-DELETE triggers and the
-             INSERT AFTER hook also fire inside the txn before release_txn,
-             so any trigger failure rolls back the entire DML. *)
-          let displaced_rows : Row.t list ref = ref [] in
-          let* () = Lwt_list.iter_s (fun old_rowid ->
-            let old_key = Rowid.encode old_rowid in
-            let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
-            match old_bytes_opt with
-            | None -> Lwt.return_unit
-            | Some old_bytes ->
-              let old_row = decode_with_virtual clock params table_meta old_bytes in
-              displaced_rows := old_row :: !displaced_rows;
-              (* Phase 38 (#139): fire BEFORE DELETE on the displaced row
-                 inside the parent txn before the row is removed. *)
-              let* () = match on_replace_delete_before with
-                | None   -> Lwt.return_unit
-                | Some f -> f ~tx ~old_row
-              in
-              let* () = S.del tx table_meta.tree_id old_key in
-              Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
-                if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
-                then Lwt.return_unit
-                else begin
-                  let iks2    = List.map row_value_to_index_value
-                                  (get_index_key_values clock params idx2 table_meta.columns old_row) in
-                  let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
-                  S.del tx idx2.idx_tree_id old_ikey
-                end
-              ) idxs
-          ) (List.sort_uniq compare to_delete) in
-          (* Phase 2: write new row and index entries *)
-          let key   = Rowid.encode rowid in
-          let bytes = Row.encode table_meta.columns row in
-          let* () = S.put tx table_meta.tree_id key bytes in
-          let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-            (* Phase 35 Task 2: reuse the virtuals-populated scratch row
-               (computed once above for the UNIQUE check pass). *)
-            if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-            then Lwt.return_unit
-            else begin
-              let iks    = List.map row_value_to_index_value
-                             (get_index_key_values clock params idx table_meta.columns row_for_idx) in
-              let ikey   = Index_key.encode iks ~rowid in
-              S.put tx idx.idx_tree_id ikey Bytes.empty
-            end
-          ) idxs in
-          (* Phase 38 (#138): AFTER triggers fire inside the parent txn. *)
-          let* () = match on_replace_delete with
-            | None   -> Lwt.return_unit
-            | Some f ->
-              Lwt_list.iter_s (fun old_row -> f ~tx ~old_row) (List.rev !displaced_rows)
-          in
-          let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~tx ~new_row:row in
-          let* () = release_txn tx owned in
-          Lwt.return true
-        end)
+        execute_insert_write tx table_meta ~clock ~params ~owned ~row
+          ~row_for_idx ~rowid ~idxs ~skip ~to_delete
+          ~on_replace_delete_before ~on_replace_delete ~after_hook)
     (fun exn ->
       (* On any exception: rollback if we own the txn, then re-raise. *)
       let* () = if owned then S.rollback tx else Lwt.return_unit in
