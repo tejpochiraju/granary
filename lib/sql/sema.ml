@@ -821,6 +821,151 @@ let rec expr_has_window = function
    paths now compute virtuals into a scratch row before key/expression
    evaluation; see [with_computed_virtuals] in lib/sql/exec.ml. *)
 
+(* CHECK expressions must be serializable to SQL and re-evaluable; reject
+   forms (aggregates, subqueries, params, windows, FTS) that cannot be. *)
+let rec check_expr_unsupported = function
+  | Ast.E_agg _
+  | Ast.E_match _
+  | Ast.E_subquery _
+  | Ast.E_exists _
+  | Ast.E_in_select _
+  | Ast.E_param _   -> true
+  | Ast.E_binop (_, a, b) -> check_expr_unsupported a || check_expr_unsupported b
+  | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e
+  | Ast.E_neg e | Ast.E_bitnot e -> check_expr_unsupported e
+  | Ast.E_between (x, lo, hi) ->
+    check_expr_unsupported x || check_expr_unsupported lo || check_expr_unsupported hi
+  | Ast.E_in (x, vals) ->
+    check_expr_unsupported x || List.exists check_expr_unsupported vals
+  | Ast.E_func (_, args) -> List.exists check_expr_unsupported args
+  | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
+  | Ast.E_case { scrutinee; branches; else_ } ->
+    (match scrutinee with Some e -> check_expr_unsupported e | None -> false)
+    || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
+    || (match else_ with Some e -> check_expr_unsupported e | None -> false)
+  | Ast.E_cast _ -> false
+  | Ast.E_collate (e, _) -> check_expr_unsupported e
+  | Ast.E_window _ -> true
+  | Ast.E_fts_snippet _ -> true
+
+(* Convert an AST column definition into a storage column descriptor. *)
+let column_of_def (c : Ast.column_def) : Row.column =
+  let ast_lit_to_dv : Ast.literal -> Row.default_value = function
+    | Ast.L_int  n -> Row.DV_int n
+    | Ast.L_text s -> Row.DV_text s
+    | Ast.L_null   -> Row.DV_null
+    | Ast.L_real f -> Row.DV_real f
+    | Ast.L_blob b -> Row.DV_blob b
+    | Ast.L_current_timestamp -> Row.DV_current_timestamp
+    | Ast.L_current_date      -> Row.DV_current_date
+    | Ast.L_current_time      -> Row.DV_current_time
+  in
+  Row.{ name        = c.name;
+        ty          = (match c.ty with
+                       | Ast.Ty_int  -> Row.Integer
+                       | Ast.Ty_text -> Row.Text
+                       | Ast.Ty_real -> Row.Real
+                       | Ast.Ty_blob -> Row.Blob);
+        not_null    = c.not_null || c.primary_key;
+        primary_key = c.primary_key;
+        default     = Option.map ast_lit_to_dv c.default;
+        check_sql   = Option.map Ast.expr_to_sql c.check;
+        generated_as = Option.map (fun (e, s) ->
+          (Ast.expr_to_sql e, s = `Stored)) c.generated_as }
+
+(* Auto-generated UNIQUE/PK index specs from table- and column-level
+   constraints (table-level first, then column-level PRIMARY KEY). *)
+let auto_unique_indexes ~name ~constraints ~columns =
+  let tbl_uniq_idxs = List.filter_map (fun (i, tc) ->
+    match tc with
+    | Ast.TC_unique cols ->
+      Some (Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i, cols)
+    | Ast.TC_primary_key cols ->
+      Some (Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i, cols)
+    | Ast.TC_foreign_key _ -> None
+  ) (List.mapi (fun i tc -> (i, tc)) constraints) in
+  let col_pk_idxs = List.filter_map (fun (c : Ast.column_def) ->
+    if c.primary_key then Some (Printf.sprintf "__pk_%s_%s" name c.name, [c.name])
+    else None
+  ) columns in
+  tbl_uniq_idxs @ col_pk_idxs
+
+(* Mark row columns named by a table-level PRIMARY KEY (col) as primary_key. *)
+let mark_table_pk constraints row_cols =
+  List.fold_left (fun cols c ->
+    match c with
+    | Ast.TC_primary_key [pk_col] ->
+      List.map (fun (col : Row.column) ->
+        if String.equal col.name pk_col then { col with primary_key = true } else col
+      ) cols
+    | _ -> cols
+  ) row_cols constraints
+
+(* Collect FK constraints from column-level REFERENCES and table-level FOREIGN
+   KEY clauses (column-level first).  Empty parent_col infers parent's PK. *)
+let extract_fk_constraints cat ~columns ~constraints =
+  let col_fks_result =
+    List.fold_left (fun acc (cd : Ast.column_def) ->
+      match acc with
+      | Error _ as e -> e
+      | Ok fks ->
+        (match cd.Ast.fk_ref with
+         | None -> Ok fks
+         | Some (parent_table, "", od, ou, def) ->
+           (match Cat.find_table_cached cat ~name:parent_table with
+            | None ->
+              Error (Unsupported (Printf.sprintf
+                "FOREIGN KEY on '%s': parent table '%s' not found"
+                cd.Ast.name parent_table))
+            | Some parent_meta ->
+              (match List.find_opt (fun (c : Row.column) -> c.primary_key)
+                                   parent_meta.Cat.columns with
+               | None ->
+                 Error (Unsupported (Printf.sprintf
+                   "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer column"
+                   cd.Ast.name parent_table))
+               | Some pk_col ->
+                 Ok (fks @ [([cd.Ast.name], parent_table, [pk_col.name], od, ou, def)])))
+         | Some (parent_table, parent_col, od, ou, def) ->
+           Ok (fks @ [([cd.Ast.name], parent_table, [parent_col], od, ou, def)]))
+    ) (Ok []) columns
+  in
+  match col_fks_result with
+  | Error e -> Error e
+  | Ok col_fks ->
+    let tbl_fks_result =
+      List.fold_left (fun acc c ->
+        match acc with
+        | Error _ as e -> e
+        | Ok fks ->
+          (match c with
+           | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update; deferrable } ->
+             Ok (fks @ [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)])
+           | _ -> Ok fks)
+      ) (Ok []) constraints
+    in
+    (match tbl_fks_result with
+     | Error e -> Error e
+     | Ok tbl_fks -> Ok (col_fks @ tbl_fks))
+
+(* WITHOUT ROWID requires exactly one INTEGER PRIMARY KEY column (phase 37). *)
+let validate_without_rowid ~name ~without_rowid row_cols =
+  if not without_rowid then Ok ()
+  else
+    match List.filter (fun (c : Row.column) -> c.primary_key) row_cols with
+    | [] ->
+      Error (Unsupported (Printf.sprintf
+        "WITHOUT ROWID table '%s' requires a PRIMARY KEY column" name))
+    | _ :: _ :: _ ->
+      Error (Unsupported (Printf.sprintf
+        "WITHOUT ROWID table '%s' must have exactly one PRIMARY KEY column \
+         (composite PKs not supported in phase 37)" name))
+    | [pk] when pk.ty <> Row.Integer ->
+      Error (Unsupported (Printf.sprintf
+        "WITHOUT ROWID table '%s': PRIMARY KEY column '%s' must be INTEGER \
+         in phase 37" name pk.name))
+    | [_] -> Ok ()
+
 let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
   let* existing = Cat.find_table cat ~name in
   match existing with
@@ -828,180 +973,24 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
   | Some _ (* if_not_exists = true: silently succeed *) ->
     Lwt.return (Ok (BS_create_table { name; columns = []; uniq_idxs = []; if_not_exists = true; fk_constraints = []; without_rowid }))
   | None ->
-    (* Validate CHECK expressions — reject forms that can't be serialized *)
-    let rec check_expr_unsupported = function
-      | Ast.E_agg _
-      | Ast.E_match _
-      | Ast.E_subquery _
-      | Ast.E_exists _
-      | Ast.E_in_select _
-      | Ast.E_param _   -> true
-      | Ast.E_binop (_, a, b) -> check_expr_unsupported a || check_expr_unsupported b
-      | Ast.E_not e | Ast.E_is_null e | Ast.E_is_not_null e
-      | Ast.E_neg e | Ast.E_bitnot e -> check_expr_unsupported e
-      | Ast.E_between (x, lo, hi) ->
-        check_expr_unsupported x || check_expr_unsupported lo || check_expr_unsupported hi
-      | Ast.E_in (x, vals) ->
-        check_expr_unsupported x || List.exists check_expr_unsupported vals
-      | Ast.E_func (_, args) -> List.exists check_expr_unsupported args
-      | Ast.E_lit _ | Ast.E_col _ | Ast.E_tbl_col _ -> false
-      | Ast.E_case { scrutinee; branches; else_ } ->
-        (match scrutinee with Some e -> check_expr_unsupported e | None -> false)
-        || List.exists (fun (c, r) -> check_expr_unsupported c || check_expr_unsupported r) branches
-        || (match else_ with Some e -> check_expr_unsupported e | None -> false)
-      | Ast.E_cast _ -> false
-      | Ast.E_collate (e, _) -> check_expr_unsupported e
-      | Ast.E_window _ -> true
-      | Ast.E_fts_snippet _ -> true
-    in
     let unsupported_check = List.find_opt (fun (c : Ast.column_def) ->
-      match c.check with
-      | None -> false
-      | Some e -> check_expr_unsupported e
-    ) columns in
+      match c.check with None -> false | Some e -> check_expr_unsupported e) columns in
     match unsupported_check with
     | Some col ->
-      Lwt.return (Error (Unsupported
-        (Printf.sprintf "CHECK constraint on column '%s' contains unsupported expression form (aggregates, subqueries, and parameters are not allowed)" col.name)))
+      Lwt.return (Error (Unsupported (Printf.sprintf
+        "CHECK constraint on column '%s' contains unsupported expression form (aggregates, subqueries, and parameters are not allowed)" col.name)))
     | None ->
-    (* Phase 35 Task 2: CHECK constraints may reference VIRTUAL generated
-       columns. The exec.ml CHECK evaluation site computes virtuals into a
-       scratch row before evaluating the constraint, so they see the
-       up-to-date value rather than V_null. *)
-      let ast_lit_to_dv : Ast.literal -> Row.default_value = function
-        | Ast.L_int  n -> Row.DV_int n
-        | Ast.L_text s -> Row.DV_text s
-        | Ast.L_null   -> Row.DV_null
-        | Ast.L_real f -> Row.DV_real f
-        | Ast.L_blob b -> Row.DV_blob b
-        | Ast.L_current_timestamp -> Row.DV_current_timestamp
-        | Ast.L_current_date      -> Row.DV_current_date
-        | Ast.L_current_time      -> Row.DV_current_time
-      in
-      let row_cols = List.map (fun (c : Ast.column_def) ->
-        Row.{ name        = c.name;
-              ty          = (match c.ty with
-                             | Ast.Ty_int  -> Row.Integer
-                             | Ast.Ty_text -> Row.Text
-                             | Ast.Ty_real -> Row.Real
-                             | Ast.Ty_blob -> Row.Blob);
-              not_null    = c.not_null || c.primary_key;
-              primary_key = c.primary_key;
-              default     = Option.map ast_lit_to_dv c.default;
-              check_sql   = Option.map Ast.expr_to_sql c.check;
-              generated_as = Option.map (fun (e, s) ->
-                (Ast.expr_to_sql e, s = `Stored)) c.generated_as }
-      ) columns in
-      (* Generate auto-UNIQUE index specs for table-level constraints *)
-      let tbl_uniq_idxs = List.filter_map (fun (i, tc) ->
-        match tc with
-        | Ast.TC_unique cols ->
-          let idx_name = Printf.sprintf "__uniq_%s_%s_%d"
-              name (String.concat "_" cols) i in
-          Some (idx_name, cols)
-        | Ast.TC_primary_key cols ->
-          let idx_name = Printf.sprintf "__pk_%s_%s_%d"
-              name (String.concat "_" cols) i in
-          Some (idx_name, cols)
-        | Ast.TC_foreign_key _ -> None
-      ) (List.mapi (fun i tc -> (i, tc)) constraints) in
-      (* Column-level PRIMARY KEY: also emit a unique index *)
-      let col_pk_idxs = List.filter_map (fun (c : Ast.column_def) ->
-        if c.primary_key then
-          let idx_name = Printf.sprintf "__pk_%s_%s" name c.name in
-          Some (idx_name, [c.name])
-        else None
-      ) columns in
-      let uniq_idxs = tbl_uniq_idxs @ col_pk_idxs in
-      (* Mark columns that are declared primary key via table-level PRIMARY KEY (col) *)
-      let row_cols =
-        List.fold_left (fun cols c ->
-          match c with
-          | Ast.TC_primary_key [pk_col] ->
-            List.map (fun (col : Row.column) ->
-              if String.equal col.name pk_col then { col with primary_key = true }
-              else col
-            ) cols
-          | _ -> cols
-        ) row_cols constraints
-      in
-      (* Extract FK constraints from column-level REFERENCES.
-         When parent_col is empty, infer from the parent table's PRIMARY KEY. *)
-      let col_fks_result =
-        List.fold_left (fun acc (cd : Ast.column_def) ->
-          match acc with
-          | Error _ as e -> e
-          | Ok fks ->
-            (match cd.Ast.fk_ref with
-             | None -> Ok fks
-             | Some (parent_table, "", od, ou, def) ->
-               (match Cat.find_table_cached cat ~name:parent_table with
-                | None ->
-                  Error (Unsupported (Printf.sprintf
-                    "FOREIGN KEY on '%s': parent table '%s' not found"
-                    cd.Ast.name parent_table))
-                | Some parent_meta ->
-                  (match List.find_opt (fun (c : Row.column) -> c.primary_key)
-                                       parent_meta.Cat.columns with
-                   | None ->
-                     Error (Unsupported (Printf.sprintf
-                       "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer column"
-                       cd.Ast.name parent_table))
-                   | Some pk_col ->
-                     Ok (fks @ [([cd.Ast.name], parent_table, [pk_col.name], od, ou, def)])))
-             | Some (parent_table, parent_col, od, ou, def) ->
-               Ok (fks @ [([cd.Ast.name], parent_table, [parent_col], od, ou, def)]))
-        ) (Ok []) columns
-      in
-      (match col_fks_result with
+      let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
+      let uniq_idxs = auto_unique_indexes ~name ~constraints ~columns in
+      (match extract_fk_constraints cat ~columns ~constraints with
        | Error e -> Lwt.return (Error e)
-       | Ok col_fks ->
-      (* Extract FK constraints from table-level FOREIGN KEY *)
-      let tbl_fks_result =
-        List.fold_left (fun acc c ->
-          match acc with
-          | Error _ as e -> e
-          | Ok fks ->
-            (match c with
-             | Ast.TC_foreign_key { local_cols; parent_table; parent_cols; on_delete; on_update; deferrable } ->
-               Ok (fks @ [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)])
-             | _ -> Ok fks)
-        ) (Ok []) constraints
-      in
-      (match tbl_fks_result with
-       | Error e -> Lwt.return (Error e)
-       | Ok tbl_fks ->
-      let fk_constraints = col_fks @ tbl_fks in
-      (* WITHOUT ROWID validation: require exactly one INTEGER PRIMARY KEY
-         column.  More general PK shapes (TEXT, composite) require deep
-         changes to the rowid-keyed storage path and are deferred. *)
-      let validate_without_rowid () =
-        if not without_rowid then Ok ()
-        else begin
-          let pk_cols =
-            List.filter (fun (c : Row.column) -> c.primary_key) row_cols
-          in
-          match pk_cols with
-          | [] ->
-            Error (Unsupported (Printf.sprintf
-              "WITHOUT ROWID table '%s' requires a PRIMARY KEY column" name))
-          | _ :: _ :: _ ->
-            Error (Unsupported (Printf.sprintf
-              "WITHOUT ROWID table '%s' must have exactly one PRIMARY KEY column \
-               (composite PKs not supported in phase 37)" name))
-          | [pk] when pk.ty <> Row.Integer ->
-            Error (Unsupported (Printf.sprintf
-              "WITHOUT ROWID table '%s': PRIMARY KEY column '%s' must be INTEGER \
-               in phase 37" name pk.name))
-          | [_] -> Ok ()
-        end
-      in
-      (match validate_without_rowid () with
-       | Error e -> Lwt.return (Error e)
-       | Ok () ->
-         Lwt.return (Ok (BS_create_table {
-           name; columns = row_cols; uniq_idxs;
-           if_not_exists; fk_constraints; without_rowid })))))
+       | Ok fk_constraints ->
+         (match validate_without_rowid ~name ~without_rowid row_cols with
+          | Error e -> Lwt.return (Error e)
+          | Ok () ->
+            Lwt.return (Ok (BS_create_table {
+              name; columns = row_cols; uniq_idxs;
+              if_not_exists; fk_constraints; without_rowid }))))
 
 (* ------------------------------------------------------------------ *)
 (* INSERT                                                               *)
@@ -1093,114 +1082,138 @@ let bind_upsert_assignments ~param_counter ~named_params (meta : Cat.table_meta)
           | Ok be   -> Ok (bound_list @ [(i, be)])))
   ) (Ok []) assigns
 
+(* Bind each supplied INSERT value into a column-ordinal -> bound_expr map,
+   rejecting writes to generated columns and type mismatches.  Params skip the
+   bind-time type check (validated at runtime). *)
+let bind_explicit_insert_cols ~param_counter ~named_params ~(meta : Cat.table_meta)
+    ~table ~columns row_vals =
+  (* Bind a single VALUES expr without column context. *)
+  let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
+    match e with
+    | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
+      bind_expr ~param_counter ~named_params meta e
+    | _ ->
+      Error (Unsupported "complex expression in INSERT VALUES")
+  in
+  List.fold_left2 (fun acc col_name expr_ast ->
+    match acc with
+    | Error _ -> acc
+    | Ok map ->
+      (match col_index meta.columns col_name with
+       | None ->
+         Error (Unknown_column { table; column = col_name })
+       | Some i ->
+         let col = List.nth meta.columns i in
+         if col.Row.generated_as <> None then
+           Error (Unsupported (Printf.sprintf
+             "cannot INSERT into generated column '%s'"
+             col.Row.name))
+         else
+         (match bind_value_expr expr_ast with
+          | Error e -> Error e
+          | Ok bexpr ->
+            (match bexpr with
+             | BE_param _ -> Ok (map @ [(i, bexpr)])
+             | BE_lit lit ->
+               let col = List.nth meta.columns i in
+               (match lit_ty lit with
+                | None   -> Ok (map @ [(i, bexpr)])   (* NULL: skip type check *)
+                | Some t ->
+                  if ty_equal t col.ty then Ok (map @ [(i, bexpr)])
+                  else Error (Type_mismatch { expected = col.ty; got = t }))
+             | _ -> Ok (map @ [(i, bexpr)]))))
+  ) (Ok []) columns row_vals
+
+(* Bind a single VALUES row: returns (ordinals, full_vals) covering every
+   table column, applying DEFAULT/NULL for omitted columns and enforcing
+   arity and NOT NULL rules. *)
+let bind_insert_row ~param_counter ~named_params ~(meta : Cat.table_meta)
+    ~table ~columns row_vals =
+  let n_cols = List.length columns in
+  let n_vals = List.length row_vals in
+  if n_cols <> n_vals then
+    Error (Arity_mismatch { expected = n_cols; got = n_vals })
+  else
+    (match bind_explicit_insert_cols ~param_counter ~named_params ~meta ~table ~columns row_vals with
+     | Error e -> Error e
+     | Ok explicit_map ->
+       (* Build one entry per table column, applying DEFAULT for omitted ones. *)
+       let n_table_cols = List.length meta.columns in
+       let full_pairs =
+         List.init n_table_cols (fun i ->
+           let col = List.nth meta.columns i in
+           match List.assoc_opt i explicit_map with
+           | Some bexpr -> (i, bexpr)
+           | None ->
+             let bexpr = match col.Row.default with
+               | Some dv -> dv_to_bound_expr dv
+               | None    -> BE_lit Ast.L_null
+             in
+             (i, bexpr))
+       in
+       (* NOT NULL enforcement (params checked at runtime, not here). *)
+       let nn_result =
+         List.fold_left (fun acc (i, bexpr) ->
+           match acc with
+           | Error _ -> acc
+           | Ok () ->
+             let col = List.nth meta.columns i in
+             (match bexpr with
+              | BE_lit Ast.L_null when col.Row.not_null ->
+                Error (Not_null_violation col.Row.name)
+              | _ -> Ok ())
+         ) (Ok ()) full_pairs
+       in
+       (match nn_result with
+        | Error e -> Error e
+        | Ok () ->
+          let ordinals = List.map fst full_pairs in
+          let full_vals = List.map snd full_pairs in
+          Ok (ordinals, full_vals)))
+
+(* Assemble a bound INSERT from already-bound rows: bind RETURNING and any
+   UPSERT assignments, then build BS_insert. *)
+let finalize_insert ~param_counter ~named_params ~(meta : Cat.table_meta)
+    ~on_conflict ~returning ~upsert_update ~ordinals ~all_vals =
+  match bind_returning_exprs ~param_counter ~named_params meta returning with
+  | Error e -> Lwt.return (Error e)
+  | Ok ret_bound ->
+    let upsert_result =
+      match upsert_update with
+      | None -> Ok None
+      | Some Ast.{ conflict_cols; assignments } ->
+        (match bind_upsert_assignments ~param_counter ~named_params meta assignments with
+         | Error e -> Error e
+         | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
+    in
+    (match upsert_result with
+     | Error e -> Lwt.return (Error e)
+     | Ok bound_upsert ->
+       Lwt.return (Ok (BS_insert {
+         table_meta    = meta;
+         ordinals;
+         values        = all_vals;
+         on_conflict;
+         returning     = ret_bound;
+         upsert_update = bound_upsert;
+       })))
+
 let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None ->
-    (* Not a regular table — check if it's an FTS table.
-       For multi-row FTS INSERT (not tested), flatten all rows. *)
+    (* Not a regular table — treat as an FTS table; flatten multi-row VALUES. *)
     bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values:(List.concat values)
   | Some meta ->
     let columns =
       if columns = [] then List.map (fun c -> c.Row.name) meta.columns
       else columns
     in
-    (* bind_one_row: bind a single row of VALUES exprs.
-       Returns Ok (ordinals, full_vals) or Error. *)
-    let bind_one_row row_vals =
-      let n_cols = List.length columns in
-      let n_vals = List.length row_vals in
-      if n_cols <> n_vals then
-        Error (Arity_mismatch { expected = n_cols; got = n_vals })
-      else
-        (* 1. Bind each expr and build a map from column ordinal -> bound_expr. *)
-        let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
-          match e with
-          | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
-            (* Literals, negated literals, and params: bind without column context. *)
-            bind_expr ~param_counter ~named_params meta e
-          | _ ->
-            (* Column references in VALUES make no sense — reject. *)
-            Error (Unsupported "complex expression in INSERT VALUES")
-        in
-        let explicit_result =
-          List.fold_left2 (fun acc col_name expr_ast ->
-            match acc with
-            | Error _ -> acc
-            | Ok map ->
-              (match col_index meta.columns col_name with
-               | None ->
-                 Error (Unknown_column { table; column = col_name })
-               | Some i ->
-                 let col = List.nth meta.columns i in
-                 if col.Row.generated_as <> None then
-                   Error (Unsupported (Printf.sprintf
-                     "cannot INSERT into generated column '%s'"
-                     col.Row.name))
-                 else
-                 (match bind_value_expr expr_ast with
-                  | Error e -> Error e
-                  | Ok bexpr ->
-                    (* Skip type check for params (unknown at bind time). *)
-                    (match bexpr with
-                     | BE_param _ -> Ok (map @ [(i, bexpr)])
-                     | BE_lit lit ->
-                       let col = List.nth meta.columns i in
-                       (match lit_ty lit with
-                        | None   -> Ok (map @ [(i, bexpr)])   (* NULL: skip type check *)
-                        | Some t ->
-                          if ty_equal t col.ty then Ok (map @ [(i, bexpr)])
-                          else Error (Type_mismatch { expected = col.ty; got = t }))
-                     | _ -> Ok (map @ [(i, bexpr)]))))
-          ) (Ok []) columns row_vals
-        in
-        (match explicit_result with
-         | Error e -> Error e
-         | Ok explicit_map ->
-           (* 2. Build the full value list (one entry per table column),
-                 applying DEFAULT for omitted columns. *)
-           let n_table_cols = List.length meta.columns in
-           let per_col_results =
-             List.init n_table_cols (fun i ->
-               let col = List.nth meta.columns i in
-               match List.assoc_opt i explicit_map with
-               | Some bexpr -> (i, bexpr)
-               | None ->
-                 (* Not explicitly supplied: use DEFAULT if present, else NULL. *)
-                 let bexpr = match col.Row.default with
-                   | Some dv -> dv_to_bound_expr dv
-                   | None    -> BE_lit Ast.L_null
-                 in
-                 (i, bexpr))
-           in
-           let full_pairs = per_col_results in
-           (* 3. NOT NULL enforcement: reject if any NOT NULL column has a NULL literal.
-                 Params are unchecked at bind time (checked at runtime). *)
-           let nn_result =
-             List.fold_left (fun acc (i, bexpr) ->
-               match acc with
-               | Error _ -> acc
-               | Ok () ->
-                 let col = List.nth meta.columns i in
-                 (match bexpr with
-                  | BE_lit Ast.L_null when col.Row.not_null ->
-                    Error (Not_null_violation col.Row.name)
-                  | _ -> Ok ())
-             ) (Ok ()) full_pairs
-           in
-           (match nn_result with
-            | Error e -> Error e
-            | Ok () ->
-              let ordinals = List.map fst full_pairs in
-              let full_vals = List.map snd full_pairs in
-              Ok (ordinals, full_vals)))
-    in
-    (* Bind every row *)
     let rows_result = List.fold_left (fun acc row ->
       match acc with
       | Error e -> Error e
       | Ok bound_rows ->
-        (match bind_one_row row with
+        (match bind_insert_row ~param_counter ~named_params ~meta ~table ~columns row with
          | Error e -> Error e
          | Ok (ords, vals) -> Ok (bound_rows @ [(ords, vals)]))
     ) (Ok []) values in
@@ -1209,28 +1222,8 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
      | Ok [] -> Lwt.return (Error (Unsupported "INSERT with empty VALUES list"))
      | Ok ((ordinals, _) :: _ as bound_rows) ->
        let all_vals = List.map snd bound_rows in
-       (match bind_returning_exprs ~param_counter ~named_params meta returning with
-        | Error e -> Lwt.return (Error e)
-        | Ok ret_bound ->
-          let upsert_result =
-            match upsert_update with
-            | None -> Ok None
-            | Some Ast.{ conflict_cols; assignments } ->
-              (match bind_upsert_assignments ~param_counter ~named_params meta assignments with
-               | Error e -> Error e
-               | Ok bound_assigns -> Ok (Some (conflict_cols, bound_assigns)))
-          in
-          (match upsert_result with
-           | Error e -> Lwt.return (Error e)
-           | Ok bound_upsert ->
-             Lwt.return (Ok (BS_insert {
-               table_meta    = meta;
-               ordinals;
-               values        = all_vals;
-               on_conflict;
-               returning     = ret_bound;
-               upsert_update = bound_upsert;
-             })))))
+       finalize_insert ~param_counter ~named_params ~meta ~on_conflict ~returning
+         ~upsert_update ~ordinals ~all_vals)
 
 (* ------------------------------------------------------------------ *)
 (* SELECT                                                               *)
@@ -2100,27 +2093,12 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
         | Ok (where_expr, where_ast) ->
           (match Cat.find_index cat ~name with
            | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-           | Some _ (* if_not_exists = true: silently succeed *) ->
+           | _ ->
+             (* Some _ reaches here only with if_not_exists=true (silent
+                success); None creates.  Both carry the param's if_not_exists. *)
              Lwt.return (Ok (BS_create_index {
-               name;
-               table_meta = meta;
-               col_sqls;
-               col_expr_flags;
-               where_expr;
-               where_ast;
-               unique;
-               if_not_exists = true;
-             }))
-           | None ->
-             Lwt.return (Ok (BS_create_index {
-               name;
-               table_meta = meta;
-               col_sqls;
-               col_expr_flags;
-               where_expr;
-               where_ast;
-               unique;
-               if_not_exists;
+               name; table_meta = meta; col_sqls; col_expr_flags;
+               where_expr; where_ast; unique; if_not_exists;
              })))))
 
 (* ------------------------------------------------------------------ *)
@@ -2137,42 +2115,46 @@ let bind_order_keys ~param_counter ~named_params (meta : Cat.table_meta) (oks : 
        | Ok be   -> Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls }]))
   ) (Ok []) oks
 
+(* Bind UPDATE SET assignments: resolve each column ordinal, bind the RHS,
+   reject writes to generated columns, static NOT NULL on a literal NULL, and
+   type-mismatch.  Returns the (ordinal, bound_expr) list. *)
+let bind_update_assignments ~param_counter ~named_params ~(meta : Cat.table_meta)
+    ~table assignments =
+  List.fold_left (fun acc (col_name, expr_ast) ->
+    match acc with
+    | Error _ -> acc
+    | Ok bound_list ->
+      (match col_index meta.columns col_name with
+       | None ->
+         Error (Unknown_column { table; column = col_name })
+       | Some i ->
+         let col = List.nth meta.columns i in
+         if col.Row.generated_as <> None then
+           Error (Unsupported (Printf.sprintf
+             "cannot UPDATE generated column '%s'"
+             col.Row.name))
+         else
+         (* Static NOT NULL check for literal NULL assignments. *)
+         if col.Row.not_null && expr_ast = Ast.E_lit Ast.L_null then
+           Error (Not_null_violation col.Row.name)
+         else
+         (match bind_expr ~param_counter ~named_params meta expr_ast with
+          | Error e -> Error e
+          | Ok bexpr ->
+            (match infer_type meta.columns bexpr with
+             | None    -> Ok (bound_list @ [(i, bexpr)])
+             | Some t  ->
+               if ty_equal t col.ty then Ok (bound_list @ [(i, bexpr)])
+               else Error (Type_mismatch { expected = col.ty; got = t }))))
+  ) (Ok []) assignments
+
 let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~order ~limit ~offset ~returning =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some meta ->
-    (* Bind each assignment: resolve column ordinal, bind the expression,
-       and check that the inferred expression type matches the column.
-       Also reject SET col = NULL on a NOT NULL column (static check). *)
     let assign_result =
-      List.fold_left (fun acc (col_name, expr_ast) ->
-        match acc with
-        | Error _ -> acc
-        | Ok bound_list ->
-          (match col_index meta.columns col_name with
-           | None ->
-             Error (Unknown_column { table; column = col_name })
-           | Some i ->
-             let col = List.nth meta.columns i in
-             if col.Row.generated_as <> None then
-               Error (Unsupported (Printf.sprintf
-                 "cannot UPDATE generated column '%s'"
-                 col.Row.name))
-             else
-             (* Static NOT NULL check for literal NULL assignments. *)
-             if col.Row.not_null && expr_ast = Ast.E_lit Ast.L_null then
-               Error (Not_null_violation col.Row.name)
-             else
-             (match bind_expr ~param_counter ~named_params meta expr_ast with
-              | Error e -> Error e
-              | Ok bexpr ->
-                (match infer_type meta.columns bexpr with
-                 | None    -> Ok (bound_list @ [(i, bexpr)])
-                 | Some t  ->
-                   if ty_equal t col.ty then Ok (bound_list @ [(i, bexpr)])
-                   else Error (Type_mismatch { expected = col.ty; got = t }))))
-      ) (Ok []) assignments
+      bind_update_assignments ~param_counter ~named_params ~meta ~table assignments
     in
     (match assign_result with
      | Error e -> Lwt.return (Error e)
@@ -2207,13 +2189,9 @@ let bind_update cat ~param_counter ~named_params ~table ~assignments ~where ~ord
               | Error e -> Lwt.return (Error e)
               | Ok ret_bound ->
                 Lwt.return (Ok (BS_update {
-                  table_meta  = meta;
-                  assignments = bound_assigns;
-                  where       = bound_where;
-                  order       = bound_order;
-                  limit;
-                  offset;
-                  returning   = ret_bound;
+                  table_meta = meta; assignments = bound_assigns;
+                  where = bound_where; order = bound_order; limit; offset;
+                  returning = ret_bound;
                 }))))))
 
 (* ------------------------------------------------------------------ *)
@@ -2287,6 +2265,49 @@ let bind_delete cat ~param_counter ~named_params ~table ~where ~order ~limit ~of
 (* ALTER TABLE                                                          *)
 (* ------------------------------------------------------------------ *)
 
+(* Validate an ALTER TABLE ADD COLUMN: reject duplicate columns, NOT NULL
+   without a usable DEFAULT, and unresolved REFERENCES targets. *)
+let bind_add_column cat ~(table_meta : Cat.table_meta) ~action
+    (col_def : Ast.column_def) =
+  let col_name = col_def.Ast.name in
+  let exists = List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns in
+  if exists then Lwt.return (Error (Already_exists col_name))
+  else if col_def.Ast.not_null && (col_def.Ast.default = None ||
+                                    col_def.Ast.default = Some Ast.L_null) then
+    Lwt.return (Error (Unsupported
+      "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))
+  else
+    (match col_def.Ast.fk_ref with
+     | None -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
+     | Some (parent_table, parent_col, on_delete, on_update, deferrable) ->
+       (* The exec layer recovers on_delete/on_update/deferrable directly from
+          col_def.fk_ref, so BS_alter_table only carries [action] verbatim;
+          reference each field once so a future migration into the bound
+          representation can't silently drop a flag. *)
+       let _ = (on_delete, on_update, deferrable) in
+       (match Cat.find_table_cached cat ~name:parent_table with
+        | None ->
+          Lwt.return (Error (Unsupported
+            (Printf.sprintf "REFERENCES: table '%s' does not exist" parent_table)))
+        | Some parent_meta ->
+          let actual_parent_col =
+            if parent_col = "" then
+              (match List.find_opt (fun (c : Row.column) -> c.primary_key) parent_meta.Cat.columns with
+               | None -> None
+               | Some pk -> Some pk.Row.name)
+            else
+              (if List.exists (fun (c : Row.column) -> String.equal c.name parent_col) parent_meta.Cat.columns
+               then Some parent_col
+               else None)
+          in
+          match actual_parent_col with
+          | None ->
+            Lwt.return (Error (Unsupported
+              (Printf.sprintf "REFERENCES: column '%s' not found in '%s'"
+                 parent_col parent_table)))
+          | Some _ ->
+            Lwt.return (Ok (BS_alter_table { table_meta; action }))))
+
 let bind_alter_table cat ~table ~action =
   let* meta_opt = Cat.find_table cat ~name:table in
   match meta_opt with
@@ -2294,48 +2315,7 @@ let bind_alter_table cat ~table ~action =
   | Some table_meta ->
     (match action with
      | Ast.AA_add_column col_def ->
-       let col_name = col_def.Ast.name in
-       let exists = List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns in
-       if exists then Lwt.return (Error (Already_exists col_name))
-       else if col_def.Ast.not_null && (col_def.Ast.default = None ||
-                                         col_def.Ast.default = Some Ast.L_null) then
-         Lwt.return (Error (Unsupported
-           "ADD COLUMN with NOT NULL requires a non-NULL DEFAULT"))
-       else
-         (match col_def.Ast.fk_ref with
-          | None -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
-          | Some (parent_table, parent_col, on_delete, on_update, deferrable) ->
-            (* Bind every FK field explicitly so the sema-time view of the
-               constraint is faithful.  The exec layer currently recovers
-               [on_delete/on_update/deferrable] directly from [col_def.fk_ref]
-               (see [exec.ml] AA_add_column), so [BS_alter_table] only needs to
-               carry [action] verbatim — but if a future refactor migrates that
-               state into the bound representation we want to spot any flag
-               being silently dropped here.  Reference each field once to make
-               the dependency explicit. *)
-            let _ = (on_delete, on_update, deferrable) in
-            (match Cat.find_table_cached cat ~name:parent_table with
-             | None ->
-               Lwt.return (Error (Unsupported
-                 (Printf.sprintf "REFERENCES: table '%s' does not exist" parent_table)))
-             | Some parent_meta ->
-               let actual_parent_col =
-                 if parent_col = "" then
-                   (match List.find_opt (fun (c : Row.column) -> c.primary_key) parent_meta.Cat.columns with
-                    | None -> None
-                    | Some pk -> Some pk.Row.name)
-                 else
-                   (if List.exists (fun (c : Row.column) -> String.equal c.name parent_col) parent_meta.Cat.columns
-                    then Some parent_col
-                    else None)
-               in
-               match actual_parent_col with
-               | None ->
-                 Lwt.return (Error (Unsupported
-                   (Printf.sprintf "REFERENCES: column '%s' not found in '%s'"
-                      parent_col parent_table)))
-               | Some _ ->
-                 Lwt.return (Ok (BS_alter_table { table_meta; action }))))
+       bind_add_column cat ~table_meta ~action col_def
      | Ast.AA_rename_table _ ->
        Lwt.return (Ok (BS_alter_table { table_meta; action }))
      | Ast.AA_rename_column (old_col, _new_col) ->
