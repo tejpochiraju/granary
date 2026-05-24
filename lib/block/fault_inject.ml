@@ -87,3 +87,7 @@ let open_with_faults ~path ~size_bytes ~config =
       | Error _ -> Lwt.return_unit
     in
     Lwt.return (t, read, write, sync, resize, n_pages_init, close)
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

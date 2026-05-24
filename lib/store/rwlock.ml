@@ -67,3 +67,7 @@ let with_read t f =
 let with_write t f =
   let* () = acquire_write t in
   Lwt.finalize f (fun () -> release_write t; Lwt.return_unit)
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

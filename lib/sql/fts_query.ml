@@ -105,3 +105,7 @@ let rec collect_terms = function
   | FQ_and qs     -> List.concat_map collect_terms qs
   | FQ_or  qs     -> List.concat_map collect_terms qs
   | FQ_not _      -> []  (* negated terms don't need posting lists *)
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

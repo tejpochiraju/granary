@@ -387,3 +387,7 @@ let path_remove v path =
          | _ -> v)
     in
     go v steps
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

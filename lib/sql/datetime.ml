@@ -203,3 +203,7 @@ let strftime fmt dt =
     end
   done;
   Buffer.contents buf
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

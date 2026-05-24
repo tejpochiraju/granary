@@ -6165,3 +6165,7 @@ let () = to_stream_ref := to_stream
 let query ?(mode = Auto) ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) :
     Row.t Lwt_stream.t Lwt.t =
   to_stream clock params store ~mode ~cat:(Some cat) op
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

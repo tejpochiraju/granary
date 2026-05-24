@@ -9,3 +9,7 @@ module type S = sig
   val sync       : t -> (unit, error) result Lwt.t
   val resize     : t -> n_pages:int64 -> (unit, error) result Lwt.t
 end
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

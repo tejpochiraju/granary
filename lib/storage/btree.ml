@@ -1169,3 +1169,7 @@ let cursor_seek c key :
   end
 
 let cursor_close _ = ()
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

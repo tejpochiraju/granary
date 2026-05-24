@@ -380,3 +380,7 @@ let append_commit t pages =
 let reset t =
   Hashtbl.reset t.index;
   t.committed_frames <- 0
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

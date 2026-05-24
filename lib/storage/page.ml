@@ -335,3 +335,7 @@ let write_overflow buf ~next_pid ~payload ~payload_off ~payload_len =
   write_common buf common;
   Cstruct.BE.set_uint16 buf data_offset payload_len;
   Cstruct.blit_from_bytes payload payload_off buf (data_offset + 2) payload_len
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

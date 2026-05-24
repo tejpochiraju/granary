@@ -1441,3 +1441,7 @@ let pp_error fmt = function
   | Parse msg -> Format.fprintf fmt "parse error: %s" msg
   | Sema  e   -> Format.fprintf fmt "sema error: %a" Sql.Sema.pp_error e
   | Runtime m -> Format.fprintf fmt "runtime error: %s" m
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

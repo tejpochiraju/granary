@@ -70,3 +70,7 @@ let tokenize_string ~col text =
 
 let tokenize col_texts =
   List.concat_map (fun (col, text) -> tokenize_string ~col text) col_texts
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

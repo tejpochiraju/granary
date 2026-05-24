@@ -273,3 +273,7 @@ let decode buf =
         Ok (List.rev !cols, rowid)
       end
   end
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

@@ -538,3 +538,7 @@ let rec expr_to_sql = function
       table col_idx start_tag end_tag ellipsis n_tokens
   | E_agg _ | E_match _ | E_subquery _ | E_exists _ | E_in_select _ | E_window _ ->
     failwith "expr_to_sql: unsupported expression form"
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

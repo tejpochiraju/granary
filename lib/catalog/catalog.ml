@@ -1198,3 +1198,7 @@ let clear_pending_fk_checks t =
 let pending_fk_check_count t = List.length t.pending_fk_checks
 
 let store t = t.store
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

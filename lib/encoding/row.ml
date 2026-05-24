@@ -177,3 +177,7 @@ let decode schema encoded =
     end
   ) schema;
   result
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

@@ -29,3 +29,6 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+x-ai-disclosure: "ai-generated"
+x-ai-model: "claude-opus-4-7"
+x-ai-provider: "Anthropic"

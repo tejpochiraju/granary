@@ -177,3 +177,7 @@ let resize t ~n_pages =
       | Unix.Unix_error (e, _, _) ->
         Lwt.return_error (Io (Unix.error_message e))
       | exn -> Lwt.fail exn)
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

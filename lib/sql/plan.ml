@@ -332,3 +332,7 @@ and agg_spec = {
   func    : Ast.agg_func;
   col_ord : int option;     (** [None] means COUNT-star *)
 }
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

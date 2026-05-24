@@ -429,3 +429,7 @@ let flush_sync_main t =
   match r with
   | Ok () -> Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

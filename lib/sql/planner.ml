@@ -787,3 +787,7 @@ let rec plan ?cat = function
   | Sema.BS_vacuum -> Plan.Op_vacuum
   | Sema.BS_attach { path; schema } -> Plan.Op_attach { path; schema }
   | Sema.BS_detach { schema } -> Plan.Op_detach { schema }
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

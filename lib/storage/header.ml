@@ -129,3 +129,7 @@ let init pager =
   match%lwt Pager.flush pager with
   | Error e -> Lwt.return (Error (of_pager_err e))
   | Ok ()   -> Lwt.return (Ok ())
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

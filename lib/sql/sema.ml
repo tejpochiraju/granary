@@ -2875,3 +2875,7 @@ let bind_returning_params ?(views : (string, Ast.stmt) Hashtbl.t = Hashtbl.creat
   | Ok bs   ->
     let pairs = Hashtbl.fold (fun k v acc -> (k, v) :: acc) named_params [] in
     Lwt.return (Ok (bs, pairs))
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

@@ -1666,3 +1666,7 @@ let list_tree_ids t : tree_id list Lwt.t =
       let* result = loop [] in
       Btree.cursor_close cur;
       Lwt.return result
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

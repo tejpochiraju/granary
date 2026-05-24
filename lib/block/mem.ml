@@ -54,3 +54,7 @@ let resize t ~n_pages =
     t.pages <- Array.sub t.pages 0 n;
   t.n_pages <- n_pages;
   Lwt.return (Ok ())
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

@@ -61,3 +61,7 @@ module Make (B : Mirage_block.S) = struct
 
   let close t = B.disconnect t.dev
 end
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

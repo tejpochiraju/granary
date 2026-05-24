@@ -33,3 +33,7 @@ let encode_int64 buf n = encode_uint64 buf (zigzag_encode n)
 let decode_int64 buf off =
   let u, off = decode_uint64 buf off in
   zigzag_decode u, off
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]

@@ -55,3 +55,7 @@ let reusable_count (t : t) ~min_safe_txn_id : int =
        else acc)
     0
     t
+
+[@@@ai_disclosure "ai-generated"]
+[@@@ai_model "claude-opus-4-7"]
+[@@@ai_provider "Anthropic"]
