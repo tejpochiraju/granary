@@ -380,6 +380,28 @@ let pager_of_unix_file (f : Unix_file.t) ~freelist : Pager.t =
   let n_pages = Unix_file.n_pages f in
   Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist
 
+(* Build a fully-initialised [t] wrapping a B-tree-backed [bt_state] from the
+   given pager/meta/header.  [wal]/[wal_close] default to None (plain opens);
+   WAL opens pass [Some _]. *)
+let make_btree_store ?(wal = None) ?(wal_close = None)
+    ~close_fn ~pager ~meta ~(h : Header.t) () =
+  let st =
+    { close_fn; pager; meta;
+      trees = Hashtbl.create 16;
+      current_header = h;
+      schema_version = h.schema_version;
+      txn_freelist_snapshot = None;
+      active_readers = Hashtbl.create 4;
+      bt_savepoints = []; wal; wal_close;
+      wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
+      commit_queue = create_commit_queue ();
+      active_reader_frames = Hashtbl.create 4;
+      reader_done_cond = Lwt_condition.create ();
+      autockpt_in_flight = false }
+  in
+  { backend = Btree st; lock = Rwlock.create ();
+    mem_rw_snapshot = None; mem_savepoints = [] }
+
 let open_file ~path : (t, error) result Lwt.t =
   let%lwt fr = Unix_file.open_ ~path in
   match fr with
@@ -388,10 +410,9 @@ let open_file ~path : (t, error) result Lwt.t =
     let n_pages = Unix_file.n_pages file in
     if Int64.compare n_pages 0L = 0 then begin
       (* Fresh file — pre-resize to 2 pages so Header.init can write the
-         two alternating header pages, then initialise them.  After
-         Header.init the live header has txn_id=0, root_page=0, etc.
-         We MUST create the pager AFTER the resize so it knows n_pages=2;
-         otherwise [Pager.alloc] would re-allocate page 0. *)
+         two alternating header pages, then initialise them.  We MUST create
+         the pager AFTER the resize so it knows n_pages=2; otherwise
+         [Pager.alloc] would re-allocate page 0. *)
       let%lwt rr = Unix_file.resize file ~n_pages:2L in
       match rr with
       | Error e ->
@@ -409,23 +430,7 @@ let open_file ~path : (t, error) result Lwt.t =
         | Ok h ->
           let meta = Btree.create pager ~root_page:0L in
           let close_fn () = let%lwt _ = Unix_file.close file in Lwt.return_unit in
-          let st =
-            { close_fn; pager; meta;
-              trees = Hashtbl.create 16;
-              current_header = h;
-              schema_version = h.schema_version;
-              txn_freelist_snapshot = None;
-              active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue ();
-              active_reader_frames = Hashtbl.create 4;
-              reader_done_cond = Lwt_condition.create ();
-              autockpt_in_flight = false }
-          in
-          Lwt.return_ok
-            { backend = Btree st; lock = Rwlock.create ();
-              mem_rw_snapshot = None; mem_savepoints = [] }
+          Lwt.return_ok (make_btree_store ~close_fn ~pager ~meta ~h ())
     end else begin
       let pager = pager_of_unix_file file ~freelist:Freelist.empty in
       let%lwt hr = Header.read_live pager in
@@ -436,23 +441,7 @@ let open_file ~path : (t, error) result Lwt.t =
         Pager.set_freelist pager fl;
         let meta = Btree.create pager ~root_page:h.root_page in
         let close_fn () = let%lwt _ = Unix_file.close file in Lwt.return_unit in
-        let st =
-          { close_fn; pager; meta;
-            trees = Hashtbl.create 16;
-            current_header = h;
-            schema_version = h.schema_version;
-            txn_freelist_snapshot = None;
-            active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue ();
-              active_reader_frames = Hashtbl.create 4;
-              reader_done_cond = Lwt_condition.create ();
-              autockpt_in_flight = false }
-        in
-        Lwt.return_ok
-          { backend = Btree st; lock = Rwlock.create ();
-            mem_rw_snapshot = None; mem_savepoints = [] }
+        Lwt.return_ok (make_btree_store ~close_fn ~pager ~meta ~h ())
     end
 
 let close (t : t) : unit Lwt.t =
@@ -491,46 +480,14 @@ let open_block
       | Error e -> Lwt.return_error (map_header_err e)
       | Ok h ->
         let meta = Btree.create pager ~root_page:0L in
-        let st =
-          { close_fn = close; pager; meta;
-            trees = Hashtbl.create 16;
-            current_header = h;
-            schema_version = h.schema_version;
-            txn_freelist_snapshot = None;
-            active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue ();
-              active_reader_frames = Hashtbl.create 4;
-              reader_done_cond = Lwt_condition.create ();
-              autockpt_in_flight = false }
-        in
-        Lwt.return_ok
-          { backend = Btree st; lock = Rwlock.create ();
-            mem_rw_snapshot = None; mem_savepoints = [] }))
+        Lwt.return_ok (make_btree_store ~close_fn:close ~pager ~meta ~h ())))
   | Error e -> Lwt.return_error (map_header_err e)
   | Ok h ->
     Pager.set_n_pages pager h.n_pages_total;
     let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
     Pager.set_freelist pager fl;
     let meta = Btree.create pager ~root_page:h.root_page in
-    let st =
-      { close_fn = close; pager; meta;
-        trees = Hashtbl.create 16;
-        current_header = h;
-        schema_version = h.schema_version;
-        txn_freelist_snapshot = None;
-        active_readers = Hashtbl.create 4;
-              bt_savepoints = []; wal = None; wal_close = None;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue ();
-              active_reader_frames = Hashtbl.create 4;
-              reader_done_cond = Lwt_condition.create ();
-              autockpt_in_flight = false }
-    in
-    Lwt.return_ok
-      { backend = Btree st; lock = Rwlock.create ();
-        mem_rw_snapshot = None; mem_savepoints = [] }
+    Lwt.return_ok (make_btree_store ~close_fn:close ~pager ~meta ~h ())
 
 (* ------------------------------------------------------------------ *)
 (* WAL-mode opens                                                       *)
@@ -565,6 +522,30 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
       | Error e -> Lwt.return_error (Format.asprintf "%a" Wal.pp_error e));
   } in
   Pager.set_wal pager (Some cb)
+
+(* After the WAL hook is installed, re-read the (now WAL-aware) header,
+   reconcile [n_pages] for a freshly-initialised DB, load the freelist, and
+   build the WAL-backed store. *)
+let finish_wal_open ~close ~wal_close ~pager ~wal ~was_fresh =
+  let%lwt hr2 = Header.read_live pager in
+  match hr2 with
+  | Error e -> Lwt.return_error (map_header_err e)
+  | Ok h ->
+    (* If the header n_pages_total is below the pager's current allocation,
+       prefer the pager's value (freshly-init'd headers carry
+       n_pages_total = 0). *)
+    let chosen_n_pages =
+      if was_fresh
+      then Int64.max h.n_pages_total (Pager.n_pages pager)
+      else h.n_pages_total
+    in
+    Pager.set_n_pages pager chosen_n_pages;
+    let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+    Pager.set_freelist pager fl;
+    let meta = Btree.create pager ~root_page:h.root_page in
+    Lwt.return_ok
+      (make_btree_store ~wal:(Some wal) ~wal_close:(Some wal_close)
+         ~close_fn:close ~pager ~meta ~h ())
 
 let open_block_wal
     ~(read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -614,46 +595,8 @@ let open_block_wal
      | Ok wal ->
        (* Step 3: install the hook so subsequent reads consult the WAL. *)
        install_wal_hook pager wal;
-       (* Step 4: re-read the header — now WAL-aware. This returns the
-          latest committed header (from WAL) if any, or the main-DB
-          header otherwise. *)
-       let%lwt hr2 = Header.read_live pager in
-       (match hr2 with
-        | Error e -> Lwt.return_error (map_header_err e)
-        | Ok h ->
-          (* If the header n_pages_total is below the pager's current
-             allocation, prefer the pager's value (the freshly-init'd
-             headers carry n_pages_total = 0). *)
-          let chosen_n_pages =
-            if was_fresh
-            then Int64.max h.n_pages_total (Pager.n_pages pager)
-            else h.n_pages_total
-          in
-          Pager.set_n_pages pager chosen_n_pages;
-          let%lwt fl =
-            read_freelist_pages pager ~first_page:h.freelist_page
-          in
-          Pager.set_freelist pager fl;
-          let meta = Btree.create pager ~root_page:h.root_page in
-          let st =
-            { close_fn = close; pager; meta;
-              trees = Hashtbl.create 16;
-              current_header = h;
-              schema_version = h.schema_version;
-              txn_freelist_snapshot = None;
-              active_readers = Hashtbl.create 4;
-              bt_savepoints = [];
-              wal = Some wal;
-              wal_close = Some wal_close;
-              wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold;
-              commit_queue = create_commit_queue ();
-              active_reader_frames = Hashtbl.create 4;
-              reader_done_cond = Lwt_condition.create ();
-              autockpt_in_flight = false }
-          in
-          Lwt.return_ok
-            { backend = Btree st; lock = Rwlock.create ();
-              mem_rw_snapshot = None; mem_savepoints = [] }))
+       (* Step 4: re-read the header (now WAL-aware) and build the store. *)
+       finish_wal_open ~close ~wal_close ~pager ~wal ~was_fresh)
 
 (* ------------------------------------------------------------------ *)
 (* WAL convenience: open a main DB + WAL on the same path prefix.       *)
@@ -697,6 +640,23 @@ let unix_file_write_at file ~offset (src : Cstruct.t) =
     Lwt.return (Ok ())
   with Unix.Unix_error (e, _, _) -> Lwt.return (Error (Unix.error_message e))
 
+(* The four pager block-IO callbacks backed by a [Unix_file.t], each mapping
+   the file's typed error to the [string] error the pager expects. *)
+let unix_file_pager_ops file =
+  let wrap = function
+    | Ok () -> Lwt.return_ok ()
+    | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+  in
+  let read_page ~page_id buf =
+    let%lwt r = Unix_file.read_page file ~page_id buf in wrap r
+  in
+  let write_page ~page_id buf =
+    let%lwt r = Unix_file.write_page file ~page_id buf in wrap r
+  in
+  let sync () = let%lwt r = Unix_file.sync file in wrap r in
+  let resize ~n_pages = let%lwt r = Unix_file.resize file ~n_pages in wrap r in
+  (read_page, write_page, sync, resize)
+
 let open_file_wal ~path : (t, error) result Lwt.t =
   let%lwt fr = Unix_file.open_ ~path in
   match fr with
@@ -711,34 +671,7 @@ let open_file_wal ~path : (t, error) result Lwt.t =
     let wal_size_bytes =
       Int64.of_int (Unix.lseek wal_fd 0 Unix.SEEK_END)
     in
-    let read_page ~page_id buf =
-      let%lwt r = Unix_file.read_page file ~page_id buf in
-      match r with
-      | Ok () -> Lwt.return_ok ()
-      | Error e ->
-        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-    in
-    let write_page ~page_id buf =
-      let%lwt r = Unix_file.write_page file ~page_id buf in
-      match r with
-      | Ok () -> Lwt.return_ok ()
-      | Error e ->
-        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-    in
-    let sync () =
-      let%lwt r = Unix_file.sync file in
-      match r with
-      | Ok () -> Lwt.return_ok ()
-      | Error e ->
-        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-    in
-    let resize ~n_pages =
-      let%lwt r = Unix_file.resize file ~n_pages in
-      match r with
-      | Ok () -> Lwt.return_ok ()
-      | Error e ->
-        Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
-    in
+    let (read_page, write_page, sync, resize) = unix_file_pager_ops file in
     let n_pages = Unix_file.n_pages file in
     (* Fresh main DB: pre-resize to 2 pages for the alternating headers. *)
     let%lwt () =
@@ -881,6 +814,20 @@ let free_old_freelist_pages pager ~first_page =
 
 (* Serialize the current pager freelist to a new page chain.
    Returns the first page id (0L if the freelist is empty). *)
+(* Build and write a single freelist page holding [chunk] (possibly empty),
+   chaining to [next]. *)
+let write_one_freelist_page pager ~pid ~next ~chunk =
+  let buf = Cstruct.create Page.page_size in
+  Cstruct.memset buf 0;
+  Page.write_common buf
+    { Page.kind = Page.Freelist; flags = 0;
+      n_keys = List.length chunk;
+      right_page = Int64.to_int32 next; crc32 = 0l };
+  List.iteri (fun j (page_id, freed_at_txn_id) ->
+    Page.freelist_set_entry buf ~index:j ~page_id ~freed_at_txn_id
+  ) chunk;
+  Pager.write pager pid buf
+
 let write_freelist_pages pager : int64 Lwt.t =
   let entries_before = Freelist.to_list (Pager.freelist pager) in
   let n_entries = List.length entries_before in
@@ -912,31 +859,16 @@ let write_freelist_pages pager : int64 Lwt.t =
     let chunks = chunkify final_entries in
     let n_chunks = List.length chunks in
     let pid_arr = Array.of_list page_ids in
+    let next_of i =
+      if i + 1 < Array.length pid_arr then pid_arr.(i+1) else 0L
+    in
     (* Write each chunk to a freelist page *)
     List.iteri (fun i chunk ->
-      let pid  = pid_arr.(i) in
-      let next = if i + 1 < Array.length pid_arr then pid_arr.(i+1) else 0L in
-      let buf  = Cstruct.create Page.page_size in
-      Cstruct.memset buf 0;
-      Page.write_common buf
-        { Page.kind = Page.Freelist; flags = 0;
-          n_keys = List.length chunk;
-          right_page = Int64.to_int32 next; crc32 = 0l };
-      List.iteri (fun j (page_id, freed_at_txn_id) ->
-        Page.freelist_set_entry buf ~index:j ~page_id ~freed_at_txn_id
-      ) chunk;
-      Pager.write pager pid buf
+      write_one_freelist_page pager ~pid:pid_arr.(i) ~next:(next_of i) ~chunk
     ) chunks;
     (* Any extra allocated pages (n_fl_pages > n_chunks) get empty freelist pages *)
     for i = n_chunks to n_fl_pages - 1 do
-      let pid  = pid_arr.(i) in
-      let next = if i + 1 < Array.length pid_arr then pid_arr.(i+1) else 0L in
-      let buf  = Cstruct.create Page.page_size in
-      Cstruct.memset buf 0;
-      Page.write_common buf
-        { Page.kind = Page.Freelist; flags = 0; n_keys = 0;
-          right_page = Int64.to_int32 next; crc32 = 0l };
-      Pager.write pager pid buf
+      write_one_freelist_page pager ~pid:pid_arr.(i) ~next:(next_of i) ~chunk:[]
     done;
     Lwt.return pid_arr.(0)
   end
@@ -1160,6 +1092,71 @@ let commit_prepare_btree
    time; here we additionally persist the latest root_page for each
    touched tree into the meta-tree (whose own root we then commit via
    the header alternating-pages protocol). *)
+(* After a WAL group-commit, the drainer kicks off an async autocheckpoint if
+   the WAL has grown past the threshold and none is already in flight. *)
+let maybe_autockpt_after_commit t st =
+  if st.wal_autocheckpoint_threshold <= 0
+     || Wal.committed_frames
+          (match st.wal with Some w -> w | None -> assert false)
+        < st.wal_autocheckpoint_threshold
+     || st.autockpt_in_flight
+  then Lwt.return_unit
+  else begin
+    st.autockpt_in_flight <- true;
+    Lwt.async (fun () ->
+      Lwt.finalize
+        (fun () ->
+          Lwt.catch
+            (fun () ->
+              let* () = Rwlock.acquire_write t.lock in
+              Lwt.finalize
+                (fun () ->
+                  match st.wal with
+                  | None -> Lwt.return_unit
+                  | Some wal -> checkpoint_unlocked st wal)
+                (fun () ->
+                  Rwlock.release_write t.lock;
+                  Lwt.return_unit))
+            (fun _ -> Lwt.return_unit))
+        (fun () ->
+          st.autockpt_in_flight <- false;
+          Lwt.return_unit));
+    Lwt.return_unit
+  end
+
+(* WAL-mode commit: prepare the btree (no sync), release the write lock early,
+   then group-commit-sync the WAL.  The elected drainer may autocheckpoint. *)
+let commit_wal t st =
+  let unlocked = ref false in
+  let unlock_once () =
+    if not !unlocked then begin
+      unlocked := true;
+      Rwlock.release_write t.lock
+    end
+  in
+  Lwt.catch
+    (fun () ->
+      let* () =
+        commit_prepare_btree ~header_commit:Header.commit_no_sync st
+      in
+      unlock_once ();
+      let* role =
+        group_commit_sync st.commit_queue (fun () ->
+          let* r = Pager.wal_sync st.pager in
+          match r with
+          | Ok () -> Lwt.return_unit
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.commit: wal_sync: %a"
+                 Pager.pp_error e))
+      in
+      (match role with
+       | `Joiner -> Lwt.return_unit
+       | `Drainer -> maybe_autockpt_after_commit t st))
+    (fun exn ->
+      unlock_once ();
+      Lwt.fail exn)
+
 let commit (Rw t : rw txn) : unit Lwt.t =
   match t.backend with
   | Mem _ ->
@@ -1177,65 +1174,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
           in
           maybe_autocheckpoint st)
         (fun () -> Rwlock.release_write t.lock; Lwt.return_unit)
-    | Some _ ->
-      let unlocked = ref false in
-      let unlock_once () =
-        if not !unlocked then begin
-          unlocked := true;
-          Rwlock.release_write t.lock
-        end
-      in
-      Lwt.catch
-        (fun () ->
-          let* () =
-            commit_prepare_btree
-              ~header_commit:Header.commit_no_sync st
-          in
-          unlock_once ();
-          let* role =
-            group_commit_sync st.commit_queue (fun () ->
-              let* r = Pager.wal_sync st.pager in
-              match r with
-              | Ok () -> Lwt.return_unit
-              | Error e ->
-                Lwt.fail_with
-                  (Format.asprintf "Store.commit: wal_sync: %a"
-                     Pager.pp_error e))
-          in
-          (match role with
-           | `Joiner -> Lwt.return_unit
-           | `Drainer ->
-             if st.wal_autocheckpoint_threshold <= 0
-                || Wal.committed_frames
-                     (match st.wal with Some w -> w | None -> assert false)
-                   < st.wal_autocheckpoint_threshold
-                || st.autockpt_in_flight
-             then Lwt.return_unit
-             else begin
-               st.autockpt_in_flight <- true;
-               Lwt.async (fun () ->
-                 Lwt.finalize
-                   (fun () ->
-                     Lwt.catch
-                       (fun () ->
-                         let* () = Rwlock.acquire_write t.lock in
-                         Lwt.finalize
-                           (fun () ->
-                             match st.wal with
-                             | None -> Lwt.return_unit
-                             | Some wal -> checkpoint_unlocked st wal)
-                           (fun () ->
-                             Rwlock.release_write t.lock;
-                             Lwt.return_unit))
-                       (fun _ -> Lwt.return_unit))
-                   (fun () ->
-                     st.autockpt_in_flight <- false;
-                     Lwt.return_unit));
-               Lwt.return_unit
-             end))
-        (fun exn ->
-          unlock_once ();
-          Lwt.fail exn)
+    | Some _ -> commit_wal t st
 
 (* rollback:
    - Mem: restore the snapshot of tree contents taken at rw_begin, so that
