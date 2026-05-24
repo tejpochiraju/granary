@@ -24,8 +24,23 @@ val create :
     DB.  [Some n]: snapshot reader bounded to WAL frames strictly less
     than [n]; never consults the dirty set.
 
+    [pin_set] (default [None]): when provided, every main-DB-cached page
+    returned through this call is pinned for the owning RO snapshot (#159)
+    — recorded in [pin_set] and refcounted internally so eviction skips it
+    until the snapshot releases it via {!unpin_all}.  Pages served from a
+    WAL frame are not cached and so are never pinned.  Subject to a budget
+    that always leaves a reserve of evictable slots.
+
     The returned Cstruct.t is a fresh copy — caller may modify it freely. *)
-val read : ?snapshot_frames:int -> t -> int64 -> (Cstruct.t, error) result Lwt.t
+val read :
+  ?snapshot_frames:int ->
+  ?pin_set:(int64, unit) Hashtbl.t ->
+  t -> int64 -> (Cstruct.t, error) result Lwt.t
+
+(** Release every page pinned into [pin_set] by a snapshot's reads.
+    Decrements the shared pin refcount per page; pages reaching zero
+    become evictable again.  Called from [Store.ro_end]. *)
+val unpin_all : t -> (int64, unit) Hashtbl.t -> unit
 
 (** Mark a page as dirty with new contents. Buffered until [flush].
     Does not write to BLOCK immediately. The Cstruct.t is copied internally. *)

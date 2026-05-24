@@ -20,8 +20,15 @@ val pp_error : Format.formatter -> error -> unit
 (** Create a tree view.  [root_page=0L] means an empty tree (no root yet).
     [snapshot_frames]: when [Some n], reads resolve against WAL frames < n
     (RO-snapshot semantics); when [None] (default), reads consult the writer's
-    dirty set and latest WAL. *)
-val create : ?snapshot_frames:int -> Pager.t -> root_page:int64 -> t
+    dirty set and latest WAL.
+    [pin_set]: when provided (RO snapshots only), reads through this view pin
+    the pages they materialise into the given set (#159) so concurrent writer
+    CoW churn can't evict the reader's working set; released via
+    [Pager.unpin_all]. *)
+val create :
+  ?snapshot_frames:int ->
+  ?pin_set:(int64, unit) Hashtbl.t ->
+  Pager.t -> root_page:int64 -> t
 
 (** The current root page id.  Changes after each mutation.
     [0L] means an empty tree. *)

@@ -147,6 +147,10 @@ type ro_snapshot = {
   rs_snap_trees     : (tree_id, Btree.t) Hashtbl.t;
   rs_snap_frames    : int;
   (* WAL committed_frames at ro_begin; 0 when no WAL is in effect. *)
+  rs_pinned         : (int64, unit) Hashtbl.t;
+  (* Page ids this snapshot has pinned in the Pager cache (#159).  Every
+     snapshot read records the pages it materialises here; [ro_end]
+     releases them via [Pager.unpin_all].  Unused for the Mem backend. *)
 }
 
 type 'a txn =
@@ -271,7 +275,7 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
     let snap_frames = if snap.rs_snap_frames = 0 then None
                       else Some snap.rs_snap_frames in
     let snap_meta =
-      Btree.create ?snapshot_frames:snap_frames
+      Btree.create ?snapshot_frames:snap_frames ~pin_set:snap.rs_pinned
         st.pager ~root_page:snap.rs_snap_meta_root
     in
     let key = encode_tree_id tid in
@@ -280,7 +284,7 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
     | Error e -> Lwt.return_error (map_btree_err e)
     | Ok None ->
       let bt =
-        Btree.create ?snapshot_frames:snap_frames
+        Btree.create ?snapshot_frames:snap_frames ~pin_set:snap.rs_pinned
           st.pager ~root_page:0L
       in
       Hashtbl.replace snap.rs_snap_trees tid bt;
@@ -288,7 +292,7 @@ let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
     | Ok (Some v) ->
       let root_page = decode_root_page v in
       let bt =
-        Btree.create ?snapshot_frames:snap_frames
+        Btree.create ?snapshot_frames:snap_frames ~pin_set:snap.rs_pinned
           st.pager ~root_page
       in
       Hashtbl.replace snap.rs_snap_trees tid bt;
@@ -780,7 +784,8 @@ let ro_begin t =
       (Ro { rs_store = t; rs_snap_txn_id = 0L;
             rs_snap_meta_root = 0L;
             rs_snap_trees = Hashtbl.create 1;
-            rs_snap_frames = 0 })
+            rs_snap_frames = 0;
+            rs_pinned = Hashtbl.create 1 })
   | Btree st ->
     let snap_txn_id    = st.current_header.txn_id in
     let snap_meta_root = st.current_header.root_page in
@@ -799,7 +804,8 @@ let ro_begin t =
       (Ro { rs_store = t; rs_snap_txn_id = snap_txn_id;
             rs_snap_meta_root = snap_meta_root;
             rs_snap_trees = Hashtbl.create 4;
-            rs_snap_frames = snap_frames })
+            rs_snap_frames = snap_frames;
+            rs_pinned = Hashtbl.create 64 })
 
 let rw_begin t =
   let* () = Rwlock.acquire_write t.lock in
@@ -838,6 +844,9 @@ let ro_end (Ro snap : ro txn) =
         Hashtbl.remove st.active_reader_frames snap.rs_snap_frames
       | Some n ->
         Hashtbl.replace st.active_reader_frames snap.rs_snap_frames (n - 1));
+     (* Release the pages this snapshot pinned (#159) so they become
+        evictable again. *)
+     Pager.unpin_all st.pager snap.rs_pinned;
      Lwt_condition.broadcast st.reader_done_cond ());
   Rwlock.release_read snap.rs_store.lock;
   Lwt.return_unit

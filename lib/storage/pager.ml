@@ -1,14 +1,27 @@
 (** Pager: page cache + allocator over a BLOCK backend.
 
     Maintains:
-    - A bounded FIFO cache of up to 64 pages (read from BLOCK).
+    - A bounded FIFO cache of pages (read from BLOCK).  Capacity defaults to
+      [default_cache_capacity] and is overridable via [SQLOCAML_PAGE_CACHE].
     - A dirty table of pages modified since the last flush.
+    - A pin table (#159): pages referenced by a live RO snapshot are pinned
+      so the writer's CoW churn can't FIFO out a reader's working set.
     - An in-memory freelist for page allocation.
 
-    Dirty pages are never evicted from the cache; they are written to BLOCK only
-    on [flush]. *)
+    Dirty and pinned pages are never evicted from the cache; dirty pages are
+    written to BLOCK only on [flush]. *)
 
-let cache_capacity = 64
+(* Default if [SQLOCAML_PAGE_CACHE] is unset/invalid.  Bumped from the
+   original 64 (#159): a bigger cache lets a reader's working set and a
+   writer's CoW churn coexist without immediate eviction pressure. *)
+let default_cache_capacity = 1024
+
+let cache_capacity_from_env () =
+  match Sys.getenv_opt "SQLOCAML_PAGE_CACHE" with
+  | Some s -> (match int_of_string_opt s with
+               | Some n when n > 0 -> n
+               | _ -> default_cache_capacity)
+  | None -> default_cache_capacity
 
 type cache_key = int64 * int   (* (page_id, version);  -1 = main DB *)
 
@@ -32,6 +45,11 @@ type t = {
   cache      : (cache_key, Cstruct.t) Hashtbl.t;
   dirty      : (int64, Cstruct.t) Hashtbl.t;
   fifo       : cache_key Queue.t;   (* insertion order for FIFO eviction *)
+  cache_capacity : int;
+  pinned     : (cache_key, int) Hashtbl.t;
+  (* Refcount per cache key of live RO snapshots that have materialised it
+     (#159).  [maybe_evict] never drops a key with refcount > 0.  Multiple
+     concurrent snapshots referencing the same page share the count. *)
   mutable n_pages       : int64;
   mutable freelist      : Freelist.t;
   mutable current_txn_id  : int64;
@@ -53,6 +71,8 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
     cache           = Hashtbl.create 64;
     dirty           = Hashtbl.create 16;
     fifo            = Queue.create ();
+    cache_capacity  = cache_capacity_from_env ();
+    pinned          = Hashtbl.create 16;
     n_pages;
     freelist;
     current_txn_id  = 0L;
@@ -74,19 +94,20 @@ let set_wal t cb =
 let wal_mode t = t.wal <> None
 
 (** Evict the oldest cache entry if the cache is at capacity.
-    Never evicts dirty pages. *)
+    Never evicts dirty or pinned (#159) pages. *)
 let maybe_evict t =
   (* Keep trying to evict until we find a clean page or the cache is small enough *)
   let cache_size = Hashtbl.length t.cache in
-  if cache_size < cache_capacity then ()
+  if cache_size < t.cache_capacity then ()
   else begin
-    (* Scan the FIFO queue front-to-back looking for a non-dirty page *)
+    (* Scan the FIFO queue front-to-back looking for an evictable page
+       (neither dirty nor pinned). *)
     let evicted = ref false in
     let temp = Queue.create () in
     while not !evicted && not (Queue.is_empty t.fifo) do
       let key = Queue.pop t.fifo in
-      if Hashtbl.mem t.dirty (fst key) then
-        (* dirty — put back at end so we don't lose track of it *)
+      if Hashtbl.mem t.dirty (fst key) || Hashtbl.mem t.pinned key then
+        (* dirty or pinned — put back at end so we don't lose track of it *)
         Queue.push key temp
       else begin
         Hashtbl.remove t.cache key;
@@ -96,10 +117,41 @@ let maybe_evict t =
         Queue.clear temp
       end
     done;
-    (* If we couldn't evict (all cached pages are dirty), just keep them *)
+    (* If we couldn't evict (all cached pages are dirty/pinned), keep them. *)
     if not !evicted then
       Queue.iter (fun k -> Queue.push k t.fifo) temp
   end
+
+(* Largest number of distinct pages a set of live snapshots may pin.  We
+   always keep a reserve of evictable slots so [maybe_evict] can make
+   progress and the cache stays bounded even under a giant scan. *)
+let max_pinned t = t.cache_capacity - (max 8 (t.cache_capacity / 8))
+
+(* Pin [page_id] for the snapshot whose pin set is [s], if budget allows.
+   Idempotent per snapshot: a page already in [s] is not double-counted.
+   When the pin budget is exhausted the page is simply left unpinned (it is
+   still cached normally and may be evicted). *)
+let pin_page t pin_set page_id =
+  match pin_set with
+  | None -> ()
+  | Some s ->
+    if not (Hashtbl.mem s page_id) && Hashtbl.length t.pinned < max_pinned t
+    then begin
+      Hashtbl.replace s page_id ();
+      let key = cache_key_main page_id in
+      let c = Option.value ~default:0 (Hashtbl.find_opt t.pinned key) in
+      Hashtbl.replace t.pinned key (c + 1)
+    end
+
+(** Release every pin held by a snapshot (called from [Store.ro_end]).
+    Decrements the shared refcount for each page the snapshot pinned. *)
+let unpin_all t pin_set =
+  Hashtbl.iter (fun page_id () ->
+    let key = cache_key_main page_id in
+    match Hashtbl.find_opt t.pinned key with
+    | None | Some 1 -> Hashtbl.remove t.pinned key
+    | Some n -> Hashtbl.replace t.pinned key (n - 1)
+  ) pin_set
 
 (** Add a page to the cache, evicting if necessary. *)
 let cache_add t key buf =
@@ -116,7 +168,7 @@ let cstruct_dup src =
   Cstruct.blit src 0 dst 0 len;
   dst
 
-let read ?snapshot_frames t page_id =
+let read ?snapshot_frames ?pin_set t page_id =
   let open Lwt.Syntax in
   match snapshot_frames with
   | None ->
@@ -150,7 +202,9 @@ let read ?snapshot_frames t page_id =
         | Ok None ->
           let key = cache_key_main page_id in
           (match Hashtbl.find_opt t.cache key with
-           | Some buf -> Lwt.return_ok (cstruct_dup buf)
+           | Some buf ->
+             pin_page t pin_set page_id;
+             Lwt.return_ok (cstruct_dup buf)
            | None ->
              let buf = Cstruct.create Page.page_size in
              let* result = t.read_page ~page_id buf in
@@ -158,6 +212,7 @@ let read ?snapshot_frames t page_id =
              | Error msg -> Lwt.return_error (Block_error msg)
              | Ok () ->
                cache_add t key (cstruct_dup buf);
+               pin_page t pin_set page_id;
                Lwt.return_ok buf)))
   | Some max_frame ->
     (* Snapshot reader path: never consult [dirty]. *)
@@ -181,7 +236,9 @@ let read ?snapshot_frames t page_id =
      | Ok None ->
        let key = cache_key_main page_id in
        (match Hashtbl.find_opt t.cache key with
-        | Some buf -> Lwt.return_ok (cstruct_dup buf)
+        | Some buf ->
+          pin_page t pin_set page_id;
+          Lwt.return_ok (cstruct_dup buf)
         | None ->
           let buf = Cstruct.create Page.page_size in
           let* result = t.read_page ~page_id buf in
@@ -189,6 +246,7 @@ let read ?snapshot_frames t page_id =
           | Error msg -> Lwt.return_error (Block_error msg)
           | Ok () ->
             cache_add t key (cstruct_dup buf);
+            pin_page t pin_set page_id;
             Lwt.return_ok buf))
 
 let write t page_id buf =

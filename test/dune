@@ -135,6 +135,10 @@
  (libraries sqlocaml.storage alcotest lwt.unix))
 
 (test
+ (name test_pager_snapshot_pin)
+ (libraries sqlocaml.store alcotest lwt.unix unix))
+
+(test
  (name test_wal_reader_snapshot)
  (libraries sqlocaml sqlocaml.store alcotest lwt.unix unix))
 

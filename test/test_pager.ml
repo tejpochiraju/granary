@@ -2,6 +2,12 @@
 
 open Sqlocaml_storage
 
+(* These unit tests were written against the original 64-page cache and
+   assert on exact eviction thresholds.  #159 raised the default capacity to
+   1024, so pin it back to 64 for this executable to keep those assertions
+   deterministic. *)
+let () = Unix.putenv "SQLOCAML_PAGE_CACHE" "64"
+
 (* ------------------------------------------------------------------ *)
 (* Mock BLOCK backend                                                   *)
 (* ------------------------------------------------------------------ *)

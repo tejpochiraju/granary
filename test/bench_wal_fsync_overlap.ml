@@ -156,14 +156,15 @@ let open_slow_wal ~path ~delay =
   | Ok s -> Lwt.return s
   | Error e -> Alcotest.failf "open_block_wal: %a" S.pp_error e
 
-(* Reader walks [tid_read]; the writer commits into [tid_write].  Keeping
-   the trees disjoint avoids CoW of the reader's tree pages on every
-   writer commit — without that, page-cache pressure from the
-   writer's CoW path swamps any fsync-overlap win we'd otherwise see
-   (the cache is only ~64 pages, so concurrent commits churn the
-   reader's working set). *)
-let tid_read  = 16
-let tid_write = 99
+(* Reader walks [tid_read]; the writer commits into [tid_write].
+   Historically these had to be disjoint trees: the writer's CoW path
+   evicted the reader's working set from the small page cache on every
+   commit, and the per-page re-fetch swamped any fsync-overlap win.
+   Since #159 a held RO snapshot pins its pages, so the shared-tree
+   config (tid_read = tid_write) clears the floor too — [test_fsync_overlap]
+   exercises both.  Mutable so the two configs can reuse the workloads. *)
+let tid_read  = ref 16
+let tid_write = ref 99
 
 let cleanup path =
   (try Unix.unlink path with _ -> ());
@@ -173,7 +174,7 @@ let cleanup path =
    discarded; only the time spent walking matters for the bench. *)
 let walk_count : type a. a S.txn -> int Lwt.t =
  fun tx ->
-  let* cur = S.cursor_open tx tid_read in
+  let* cur = S.cursor_open tx !tid_read in
   let _ = S.cursor_first cur in
   let rec loop n =
     match S.cursor_next cur with
@@ -190,7 +191,7 @@ let seed st n =
     if i >= n then Lwt.return_unit
     else
       let* () =
-        S.put tx tid_read
+        S.put tx !tid_read
           (bs (Printf.sprintf "k%06d" i))
           (bs (Printf.sprintf "v%06d" i))
       in
@@ -209,7 +210,7 @@ let writer_workload st ~n_commits ~tag =
     else
       let* tx = S.rw_begin st in
       let* () =
-        S.put tx tid_write
+        S.put tx !tid_write
           (bs (Printf.sprintf "%s%06d" tag i))
           (bs (Printf.sprintf "%sv%06d" tag i))
       in
@@ -319,26 +320,40 @@ let test_fsync_overlap () =
   let min_speedup = getenv_float "SQLOCAML_BENCH_MIN_SPEEDUP"   1.2  in
   let delay = float_of_int delay_ms /. 1000.0 in
 
-  let base =
-    run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops
+  (* Run baseline vs parallel under the currently-configured tid pair and
+     assert the overlap win clears the floor.  Called once per config. *)
+  let measure label =
+    let base =
+      run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops
+    in
+    let par  =
+      run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops
+    in
+    let speedup = base.wall /. par.wall in
+    Printf.printf
+      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d \
+       seed=%d\n  baseline=%.3fs (writer=%.3fs, readers=%.3fs) \
+       parallel=%.3fs (writer_done=%.3fs reader_done=%.3fs) \
+       speedup=%.2fx (min %.2fx)\n%!"
+      label delay_ms n_commits n_readers read_ops n_seed
+      base.wall base.writer_phase base.reader_phase
+      par.wall par.writer_phase par.reader_phase
+      speedup min_speedup;
+    cleanup path;
+    Alcotest.(check bool)
+      (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label speedup min_speedup)
+      true (speedup >= min_speedup)
   in
-  let par  =
-    run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops
-  in
-  let speedup = base.wall /. par.wall in
-  Printf.printf
-    "fsync-overlap bench: delay=%dms commits=%d readers=%d read_ops=%d \
-     seed=%d\n  baseline=%.3fs (writer=%.3fs, readers=%.3fs) \
-     parallel=%.3fs (writer_done=%.3fs reader_done=%.3fs) \
-     speedup=%.2fx (min %.2fx)\n%!"
-    delay_ms n_commits n_readers read_ops n_seed
-    base.wall base.writer_phase base.reader_phase
-    par.wall par.writer_phase par.reader_phase
-    speedup min_speedup;
-  cleanup path;
-  Alcotest.(check bool)
-    (Printf.sprintf "speedup %.2fx >= %.2fx" speedup min_speedup)
-    true (speedup >= min_speedup)
+
+  (* Config A: shared tree (reader and writer on the SAME tree).  This is
+     the #159 regression case — every writer commit CoW-paths the reader's
+     tree, so only snapshot page-pinning keeps the reader's working set
+     resident and the fsync-overlap win measurable. *)
+  tid_read := 16; tid_write := 16;
+  measure "shared tid";
+  (* Config B: disjoint trees (the original config). *)
+  tid_read := 16; tid_write := 99;
+  measure "disjoint tid"
 
 let () =
   Alcotest.run "wal_fsync_overlap" [
