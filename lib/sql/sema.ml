@@ -340,6 +340,98 @@ let resolve_param ~param_counter ~named_params = function
        Hashtbl.add named_params name i;
        i)
 
+(** Arity check for a scalar function call.  Shared by the three expression
+    binders ([bind_expr], [bind_expr_join], [bind_expr_agg]). *)
+let scalar_func_arity_ok (func : Ast.scalar_func) (n : int) : bool =
+  match func with
+  | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
+  | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
+  | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
+  | Ast.Fn_coalesce -> n >= 1
+  | Ast.Fn_substr -> n = 2 || n = 3
+  | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
+  | Ast.Fn_replace -> n = 3
+  | Ast.Fn_round -> n = 1 || n = 2
+  | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
+  | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
+  | Ast.Fn_strftime -> n >= 2
+  | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
+  | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
+  | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
+  | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
+  | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
+  | Ast.Fn_log -> n = 1 || n = 2
+  | Ast.Fn_trunc -> n = 1 || n = 2
+  | Ast.Fn_pi -> n = 0
+  | Ast.Fn_json_extract -> n = 2
+  | Ast.Fn_json_object -> n mod 2 = 0
+  | Ast.Fn_json_array -> true
+  | Ast.Fn_json_type -> n = 1 || n = 2
+  | Ast.Fn_json_valid -> n = 1
+  | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
+  | Ast.Fn_json_remove -> n >= 2
+  | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
+  | Ast.Fn_char -> true
+  | Ast.Fn_printf -> n >= 1
+  | Ast.Fn_random -> n = 0
+  | Ast.Fn_randomblob -> n = 1
+  | Ast.Fn_changes -> n = 0
+  | Ast.Fn_last_insert_rowid -> n = 0
+  | Ast.Fn_total_changes -> n = 0
+  | Ast.Fn_sqlite_version -> n = 0
+
+(** Bind a scalar-function call given a [bind] callback for its arguments.
+    Shared by the three expression binders. *)
+let bind_func ~bind (func : Ast.scalar_func) (args : Ast.expr list) =
+  let bound = List.map bind args in
+  let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+  match errors with
+  | e :: _ -> Error e
+  | [] ->
+    let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+    let n = List.length ok_args in
+    if not (scalar_func_arity_ok func n) then
+      Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
+    else
+      Ok (BE_func (func, ok_args))
+
+(** Bind a CASE expression given a [bind] callback for its sub-expressions.
+    Shared by the three expression binders. *)
+let bind_case ~bind ~scrutinee ~branches ~else_ =
+  let scrutinee_result =
+    match scrutinee with
+    | None   -> Ok None
+    | Some e -> (match bind e with Ok be -> Ok (Some be) | Error e -> Error e)
+  in
+  match scrutinee_result with
+  | Error e -> Error e
+  | Ok bound_scr ->
+    let branch_results =
+      List.map (fun (cond, res) ->
+        match bind cond, bind res with
+        | Ok bc, Ok br -> Ok (bc, br)
+        | Error e, _   -> Error e
+        | _, Error e   -> Error e
+      ) branches
+    in
+    let branch_errors = List.filter_map
+      (function Error e -> Some e | Ok _ -> None) branch_results in
+    (match branch_errors with
+     | e :: _ -> Error e
+     | [] ->
+       let bound_branches =
+         List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
+       in
+       let else_result =
+         match else_ with
+         | None   -> Ok None
+         | Some e -> (match bind e with Ok be -> Ok (Some be) | Error e -> Error e)
+       in
+       (match else_result with
+        | Error e -> Error e
+        | Ok bound_else ->
+          Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else })))
+
 let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = function
   | Ast.E_lit l -> Ok (BE_lit l)
   | Ast.E_col name ->
@@ -402,54 +494,7 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    let bound = List.map (bind_expr ~param_counter ~named_params meta) args in
-    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
-    (match errors with
-     | e :: _ -> Error e
-     | [] ->
-       let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-       let n = List.length ok_args in
-       let arity_ok = match func with
-         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
-         | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
-         | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
-         | Ast.Fn_coalesce -> n >= 1
-         | Ast.Fn_substr -> n = 2 || n = 3
-         | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
-         | Ast.Fn_replace -> n = 3
-         | Ast.Fn_round -> n = 1 || n = 2
-         | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
-         | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
-         | Ast.Fn_strftime -> n >= 2
-         | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
-         | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
-         | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
-         | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
-         | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
-         | Ast.Fn_log -> n = 1 || n = 2
-         | Ast.Fn_trunc -> n = 1 || n = 2
-         | Ast.Fn_pi -> n = 0
-         | Ast.Fn_json_extract -> n = 2
-         | Ast.Fn_json_object -> n mod 2 = 0
-         | Ast.Fn_json_array -> true
-         | Ast.Fn_json_type -> n = 1 || n = 2
-         | Ast.Fn_json_valid -> n = 1
-         | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
-         | Ast.Fn_json_remove -> n >= 2
-         | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
-         | Ast.Fn_char -> true
-         | Ast.Fn_printf -> n >= 1
-         | Ast.Fn_random -> n = 0
-         | Ast.Fn_randomblob -> n = 1
-         | Ast.Fn_changes -> n = 0
-         | Ast.Fn_last_insert_rowid -> n = 0
-         | Ast.Fn_total_changes -> n = 0
-         | Ast.Fn_sqlite_version -> n = 0
-       in
-       if not arity_ok then
-         Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
-       else
-         Ok (BE_func (func, ok_args)))
+    bind_func ~bind:(bind_expr ~param_counter ~named_params meta) func args
   | Ast.E_match _ ->
     Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
   | Ast.E_subquery inner ->
@@ -461,46 +506,7 @@ let rec bind_expr ~param_counter ~named_params (meta : Cat.table_meta) = functio
      | Error e -> Error e
      | Ok bx   -> Ok (BE_in_select (bx, inner)))
   | Ast.E_case { scrutinee; branches; else_ } ->
-    let scrutinee_result =
-      match scrutinee with
-      | None   -> Ok None
-      | Some e ->
-        (match bind_expr ~param_counter ~named_params meta e with
-         | Ok be   -> Ok (Some be)
-         | Error e -> Error e)
-    in
-    (match scrutinee_result with
-     | Error e -> Error e
-     | Ok bound_scr ->
-       let branch_results =
-         List.map (fun (cond, res) ->
-           match bind_expr ~param_counter ~named_params meta cond,
-                 bind_expr ~param_counter ~named_params meta res with
-           | Ok bc, Ok br -> Ok (bc, br)
-           | Error e, _   -> Error e
-           | _, Error e   -> Error e
-         ) branches
-       in
-       let branch_errors = List.filter_map
-         (function Error e -> Some e | Ok _ -> None) branch_results in
-       (match branch_errors with
-        | e :: _ -> Error e
-        | [] ->
-          let bound_branches =
-            List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
-          in
-          let else_result =
-            match else_ with
-            | None   -> Ok None
-            | Some e ->
-              (match bind_expr ~param_counter ~named_params meta e with
-               | Ok be   -> Ok (Some be)
-               | Error e -> Error e)
-          in
-          (match else_result with
-           | Error e -> Error e
-           | Ok bound_else ->
-             Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+    bind_case ~bind:(bind_expr ~param_counter ~named_params meta) ~scrutinee ~branches ~else_
   | Ast.E_cast (e, ty) ->
     (match bind_expr ~param_counter ~named_params meta e with
      | Ok be   -> Ok (BE_cast (be, ty))
@@ -590,54 +596,7 @@ let rec bind_expr_join
   | Ast.E_agg _ ->
     Error (Unsupported "aggregate in WHERE")
   | Ast.E_func (func, args) ->
-    let bound = List.map (bind_expr_join ~param_counter ~named_params ~tables) args in
-    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
-    (match errors with
-     | e :: _ -> Error e
-     | [] ->
-       let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-       let n = List.length ok_args in
-       let arity_ok = match func with
-         | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
-         | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
-         | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
-         | Ast.Fn_coalesce -> n >= 1
-         | Ast.Fn_substr -> n = 2 || n = 3
-         | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
-         | Ast.Fn_replace -> n = 3
-         | Ast.Fn_round -> n = 1 || n = 2
-         | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
-         | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
-         | Ast.Fn_strftime -> n >= 2
-         | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
-         | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
-         | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
-         | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
-         | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
-         | Ast.Fn_log -> n = 1 || n = 2
-         | Ast.Fn_trunc -> n = 1 || n = 2
-         | Ast.Fn_pi -> n = 0
-         | Ast.Fn_json_extract -> n = 2
-         | Ast.Fn_json_object -> n mod 2 = 0
-         | Ast.Fn_json_array -> true
-         | Ast.Fn_json_type -> n = 1 || n = 2
-         | Ast.Fn_json_valid -> n = 1
-         | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
-         | Ast.Fn_json_remove -> n >= 2
-         | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
-         | Ast.Fn_char -> true
-         | Ast.Fn_printf -> n >= 1
-         | Ast.Fn_random -> n = 0
-         | Ast.Fn_randomblob -> n = 1
-         | Ast.Fn_changes -> n = 0
-         | Ast.Fn_last_insert_rowid -> n = 0
-         | Ast.Fn_total_changes -> n = 0
-         | Ast.Fn_sqlite_version -> n = 0
-       in
-       if not arity_ok then
-         Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
-       else
-         Ok (BE_func (func, ok_args)))
+    bind_func ~bind:(bind_expr_join ~param_counter ~named_params ~tables) func args
   | Ast.E_match _ ->
     Error (Unsupported "MATCH in JOIN context")
   | Ast.E_subquery inner ->
@@ -649,46 +608,7 @@ let rec bind_expr_join
      | Error e -> Error e
      | Ok bx   -> Ok (BE_in_select (bx, inner)))
   | Ast.E_case { scrutinee; branches; else_ } ->
-    let scrutinee_result =
-      match scrutinee with
-      | None   -> Ok None
-      | Some e ->
-        (match bind_expr_join ~param_counter ~named_params ~tables e with
-         | Ok be   -> Ok (Some be)
-         | Error e -> Error e)
-    in
-    (match scrutinee_result with
-     | Error e -> Error e
-     | Ok bound_scr ->
-       let branch_results =
-         List.map (fun (cond, res) ->
-           match bind_expr_join ~param_counter ~named_params ~tables cond,
-                 bind_expr_join ~param_counter ~named_params ~tables res with
-           | Ok bc, Ok br -> Ok (bc, br)
-           | Error e, _   -> Error e
-           | _, Error e   -> Error e
-         ) branches
-       in
-       let branch_errors = List.filter_map
-         (function Error e -> Some e | Ok _ -> None) branch_results in
-       (match branch_errors with
-        | e :: _ -> Error e
-        | [] ->
-          let bound_branches =
-            List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
-          in
-          let else_result =
-            match else_ with
-            | None   -> Ok None
-            | Some e ->
-              (match bind_expr_join ~param_counter ~named_params ~tables e with
-               | Ok be   -> Ok (Some be)
-               | Error e -> Error e)
-          in
-          (match else_result with
-           | Error e -> Error e
-           | Ok bound_else ->
-             Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+    bind_case ~bind:(bind_expr_join ~param_counter ~named_params ~tables) ~scrutinee ~branches ~else_
   | Ast.E_cast (e, ty) ->
     (match bind_expr_join ~param_counter ~named_params ~tables e with
      | Ok be   -> Ok (BE_cast (be, ty))
@@ -723,6 +643,27 @@ type col_resolver = {
   resolve_agg_arg       : string -> (int, error) result;
   resolve_agg_arg_qual  : string -> string -> (int, error) result;
 }
+
+(** Resolve the column ordinal of an aggregate-function argument (the input-row
+    column the aggregate consumes).  [None] is the COUNT-star case. *)
+let agg_col_ord ~(resolver : col_resolver) (func : Ast.agg_func)
+    (arg_opt : Ast.expr option) : (int option, error) result =
+  match arg_opt with
+  | None ->
+    (* COUNT-star — only legal here for Agg_count *)
+    (match func with
+     | Ast.Agg_count -> Ok None
+     | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+  | Some (Ast.E_col name) ->
+    (match resolver.resolve_agg_arg name with
+     | Error e -> Error e
+     | Ok i    -> Ok (Some i))
+  | Some (Ast.E_tbl_col (t, c)) ->
+    (match resolver.resolve_agg_arg_qual t c with
+     | Error e -> Error e
+     | Ok i    -> Ok (Some i))
+  | Some _ ->
+    Error (Unsupported "aggregate argument must be a column reference")
 
 (** Bind expression, collecting aggregates.  Aggregates become
     [BE_col (offset + slot)] referring to the aggregate output row.
@@ -783,116 +724,19 @@ let bind_expr_agg
     | Ast.E_param p ->
       Ok (BE_param (resolve_param ~param_counter ~named_params p))
     | Ast.E_agg (func, arg_opt) ->
-      let col_ord_result : (int option, error) result =
-        match arg_opt with
-        | None ->
-          (* COUNT-star — only legal here for Agg_count *)
-          (match func with
-           | Ast.Agg_count -> Ok None
-           | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
-        | Some (Ast.E_col name) ->
-          (match resolver.resolve_agg_arg name with
-           | Error e -> Error e
-           | Ok i    -> Ok (Some i))
-        | Some (Ast.E_tbl_col (t, c)) ->
-          (match resolver.resolve_agg_arg_qual t c with
-           | Error e -> Error e
-           | Ok i    -> Ok (Some i))
-        | Some _ ->
-          Error (Unsupported "aggregate argument must be a column reference")
-      in
-      (match col_ord_result with
+      (match agg_col_ord ~resolver func arg_opt with
        | Error e -> Error e
        | Ok col_ord ->
          let slot = add_agg { func; col_ord } in
          Ok (BE_col (offset + slot)))
     | Ast.E_func (func, args) ->
-      let bound = List.map go args in
-      let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
-      (match errors with
-       | e :: _ -> Error e
-       | [] ->
-         let ok_args = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-         let n = List.length ok_args in
-         let arity_ok = match func with
-           | Ast.Fn_length | Ast.Fn_lower | Ast.Fn_upper
-           | Ast.Fn_abs    | Ast.Fn_typeof -> n = 1
-           | Ast.Fn_ifnull | Ast.Fn_instr -> n = 2
-           | Ast.Fn_coalesce -> n >= 1
-           | Ast.Fn_substr -> n = 2 || n = 3
-           | Ast.Fn_trim | Ast.Fn_ltrim | Ast.Fn_rtrim -> n = 1 || n = 2
-           | Ast.Fn_replace -> n = 3
-           | Ast.Fn_round -> n = 1 || n = 2
-           | Ast.Fn_date | Ast.Fn_time | Ast.Fn_datetime
-           | Ast.Fn_julianday | Ast.Fn_unixepoch -> n >= 1
-           | Ast.Fn_strftime -> n >= 2
-           | Ast.Fn_ceil | Ast.Fn_floor | Ast.Fn_sqrt | Ast.Fn_exp
-           | Ast.Fn_ln | Ast.Fn_sign | Ast.Fn_sin | Ast.Fn_cos | Ast.Fn_tan
-           | Ast.Fn_asin | Ast.Fn_acos | Ast.Fn_atan
-           | Ast.Fn_degrees | Ast.Fn_radians | Ast.Fn_log2 | Ast.Fn_log10 -> n = 1
-           | Ast.Fn_pow | Ast.Fn_atan2 -> n = 2
-           | Ast.Fn_log -> n = 1 || n = 2
-           | Ast.Fn_trunc -> n = 1 || n = 2
-           | Ast.Fn_pi -> n = 0
-           | Ast.Fn_json_extract -> n = 2
-           | Ast.Fn_json_object -> n mod 2 = 0
-           | Ast.Fn_json_array -> true
-           | Ast.Fn_json_type -> n = 1 || n = 2
-           | Ast.Fn_json_valid -> n = 1
-           | Ast.Fn_json_set | Ast.Fn_json_insert | Ast.Fn_json_replace -> n >= 3 && (n - 1) mod 2 = 0
-           | Ast.Fn_json_remove -> n >= 2
-           | Ast.Fn_hex | Ast.Fn_unicode | Ast.Fn_zeroblob -> n = 1
-           | Ast.Fn_char -> true
-           | Ast.Fn_printf -> n >= 1
-           | Ast.Fn_random -> n = 0
-           | Ast.Fn_randomblob -> n = 1
-           | Ast.Fn_changes -> n = 0
-           | Ast.Fn_last_insert_rowid -> n = 0
-           | Ast.Fn_total_changes -> n = 0
-           | Ast.Fn_sqlite_version -> n = 0
-         in
-         if not arity_ok then
-           Error (Arity_mismatch { expected = (match func with Ast.Fn_ifnull -> 2 | _ -> 1); got = n })
-         else
-           Ok (BE_func (func, ok_args)))
+      bind_func ~bind:go func args
     | Ast.E_match _ ->
       Error (Unsupported "MATCH is only valid as a top-level WHERE clause on FTS tables")
     | Ast.E_subquery _ | Ast.E_exists _ | Ast.E_in_select _ ->
       Error (Unsupported "subqueries are not supported in aggregate expressions")
     | Ast.E_case { scrutinee; branches; else_ } ->
-      let scrutinee_result =
-        match scrutinee with
-        | None   -> Ok None
-        | Some e -> (match go e with Ok be -> Ok (Some be) | Error e -> Error e)
-      in
-      (match scrutinee_result with
-       | Error e -> Error e
-       | Ok bound_scr ->
-         let branch_results =
-           List.map (fun (cond, res) ->
-             match go cond, go res with
-             | Ok bc, Ok br -> Ok (bc, br)
-             | Error e, _   -> Error e
-             | _, Error e   -> Error e
-           ) branches
-         in
-         let branch_errors = List.filter_map
-           (function Error e -> Some e | Ok _ -> None) branch_results in
-         (match branch_errors with
-          | e :: _ -> Error e
-          | [] ->
-            let bound_branches =
-              List.filter_map (function Ok p -> Some p | Error _ -> None) branch_results
-            in
-            let else_result =
-              match else_ with
-              | None   -> Ok None
-              | Some e -> (match go e with Ok be -> Ok (Some be) | Error e -> Error e)
-            in
-            (match else_result with
-             | Error e -> Error e
-             | Ok bound_else ->
-               Ok (BE_case { scrutinee = bound_scr; branches = bound_branches; else_ = bound_else }))))
+      bind_case ~bind:go ~scrutinee ~branches ~else_
     | Ast.E_cast (e, ty) ->
       (match go e with Ok be -> Ok (BE_cast (be, ty)) | Error e -> Error e)
     | Ast.E_collate (e, c) ->
