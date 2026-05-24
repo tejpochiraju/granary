@@ -20,7 +20,7 @@ val parse : ?now:(unit -> float) -> string -> (dt, string) result
 val to_date      : dt -> string   (** "YYYY-MM-DD" *)
 val to_time      : dt -> string   (** "HH:MM:SS" *)
 val to_datetime  : dt -> string   (** "YYYY-MM-DD HH:MM:SS" *)
-val to_julianday : dt -> float
-val to_unixepoch : dt -> int64
+val to_julianday : dt -> float   (** Julian day number. *)
+val to_unixepoch : dt -> int64    (** Seconds since the Unix epoch. *)
 val strftime     : string -> dt -> string
 (** [strftime fmt dt] formats [dt] using [fmt]. Supported: %Y %m %d %H %M %S %f %j %s %% *)

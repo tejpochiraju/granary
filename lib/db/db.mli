@@ -46,6 +46,7 @@ val open_block :
   close      : (unit -> unit Lwt.t) ->
   (t, error) result Lwt.t
 
+(** Close the database, flushing and releasing the underlying store. *)
 val close : t -> unit Lwt.t
 
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL

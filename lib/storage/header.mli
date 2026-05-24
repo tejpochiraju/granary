@@ -12,6 +12,7 @@ type t = {
 
 type error = Io of string | Both_headers_corrupt
 
+(** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
 (** Read both headers (pages 0 and 1) from the pager.

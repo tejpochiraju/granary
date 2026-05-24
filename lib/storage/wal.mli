@@ -40,8 +40,11 @@ type frame = {
   page      : Cstruct.t;  (** 4096 bytes *)
 }
 
-val frame_size_bytes : int  (** = 4120 *)
-val header_size_bytes : int  (** = 24 *)
+(** Size of one WAL frame on disk in bytes (24-byte frame header + 4096-byte page = 4120). *)
+val frame_size_bytes : int
+
+(** Size of a WAL frame header in bytes (24). *)
+val header_size_bytes : int
 
 type error =
   | Block_error of string

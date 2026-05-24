@@ -8,6 +8,10 @@ type txn_mode =
   | Auto
   | In_txn of Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
 
+(** Execute a write operation ([Plan.op]) against the store and catalog.
+    Runs in its own autocommit RW transaction unless [?mode] supplies an
+    enclosing one; the optional hooks observe row changes for triggers and
+    REPLACE/UPSERT bookkeeping. *)
 val execute :
   ?mode:txn_mode ->
   ?clock:(unit -> float) option ->

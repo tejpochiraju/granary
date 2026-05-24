@@ -17,6 +17,7 @@
 
 type t
 
+(** Create a fresh lock with no readers and no active writer. *)
 val create : unit -> t
 
 (** [acquire_read] increments the reader counter and returns
@@ -31,6 +32,7 @@ val release_read  : t -> unit
     block on active readers. *)
 val acquire_write : t -> unit Lwt.t
 
+(** [release_write] releases the writer lock, waking the next waiter. *)
 val release_write : t -> unit
 
 (** Acquire shared (reader) access for the duration of [f]. *)

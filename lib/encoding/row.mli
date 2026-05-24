@@ -42,6 +42,13 @@ type value =
 
 type t = value array
 
+(** Structural equality of two rows. *)
 val equal : t -> t -> bool
+
+(** [encode schema row] serialises [row] to its on-disk byte representation
+    according to [schema]. *)
 val encode : schema -> t -> bytes
+
+(** [decode schema bytes] reconstructs a row from its on-disk representation
+    according to [schema]. *)
 val decode : schema -> bytes -> t

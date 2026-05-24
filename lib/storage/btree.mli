@@ -15,6 +15,7 @@ type error =
   | Value_too_large of int
   | Tree_corrupt of string
 
+(** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
 (** Create a tree view.  [root_page=0L] means an empty tree (no root yet).

@@ -4,6 +4,7 @@
 type t
 type error = Block_error of string | Corruption of string
 
+(** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
 (** Create a pager over an open Unix_file or Mem block device.

@@ -5,6 +5,7 @@
 
 type t
 
+(** The empty freelist (no freed pages). *)
 val empty : t
 
 (** Add a page to the free set.

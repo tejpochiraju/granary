@@ -276,12 +276,17 @@ type error =
 
 val pp_error : Format.formatter -> error -> unit
 
+(** Resolve and type-check a parsed {!Ast.stmt} against the catalog,
+    producing a {!bound_stmt} or a semantic [error].  [?views] supplies
+    view definitions so references to views resolve. *)
 val bind :
   ?views:(string, Ast.stmt) Hashtbl.t ->
   Sqlocaml_catalog.Catalog.t ->
   Ast.stmt ->
   (bound_stmt, error) result Lwt.t
 
+(** Like {!bind} but also returns the named-parameter-to-index mapping
+    discovered in the statement (for [:name]/[@name] placeholders). *)
 val bind_returning_params :
   ?views:(string, Ast.stmt) Hashtbl.t ->
   Sqlocaml_catalog.Catalog.t ->

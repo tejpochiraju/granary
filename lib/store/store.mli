@@ -31,6 +31,7 @@ type error =
   | Value_too_large of int
   | Header_error of string
 
+(** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
 (** Open a fresh in-memory store with no trees. *)
