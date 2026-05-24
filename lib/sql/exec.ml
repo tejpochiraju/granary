@@ -929,7 +929,7 @@ and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : 
               | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
               | Row.V_real f -> Buffer.add_string buf (string_of_int (int_of_float f))
               | Row.V_text s -> (try Buffer.add_string buf (string_of_int (int_of_string s))
-                                 with _ -> ())
+                                 with Failure _ -> ())
               | _ -> ())
            | 'f' ->
              (match get_arg () with
@@ -1208,7 +1208,7 @@ let compile_check_expr (table_name : string) (col_idx : int)
     let lexbuf = Lexing.from_string check_sql in
     let ast_expr =
       try Parser.expr_only Lexer.token lexbuf
-      with _ ->
+      with Parser.Error | Failure _ ->
         failwith (Printf.sprintf "CHECK constraint parse error for %s.col%d: %s"
           table_name col_idx check_sql)
     in
@@ -1230,7 +1230,7 @@ let compile_generated_expr (table_name : string) (col_idx : int)
     let lexbuf = Lexing.from_string expr_sql in
     let ast_expr =
       try Parser.expr_only Lexer.token lexbuf
-      with _ -> failwith (Printf.sprintf
+      with Parser.Error | Failure _ -> failwith (Printf.sprintf
         "generated column expr parse error for %s.col%d: %s" table_name col_idx expr_sql)
     in
     let plan_expr = ast_expr_to_plan_check columns ast_expr in
@@ -1366,7 +1366,7 @@ let compile_index_where (idx : Cat.index_info) (columns : Row.column list) : Pla
       let lexbuf = Lexing.from_string sql in
       let ast_expr =
         try Parser.expr_only Lexer.token lexbuf
-        with _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx.idx_name sql)
+        with Parser.Error | Failure _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx.idx_name sql)
       in
       let plan_expr = ast_expr_to_plan_check columns ast_expr in
       Hashtbl.add index_where_cache key plan_expr;
@@ -1399,7 +1399,7 @@ let compile_index_col_expr (idx : Cat.index_info) (i : int) (columns : Row.colum
     let lexbuf = Lexing.from_string expr_sql in
     let ast_expr =
       try Parser.expr_only Lexer.token lexbuf
-      with _ -> failwith (Printf.sprintf
+      with Parser.Error | Failure _ -> failwith (Printf.sprintf
         "index expr parse error for %s[%d]: %s" idx.idx_name i expr_sql)
     in
     let plan_e = ast_expr_to_plan_check columns ast_expr in
@@ -4580,7 +4580,7 @@ let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.
     (try
        let i = find_col_idx_by_name meta.Cat.columns col in
        Ast.E_lit (value_to_literal row.(i))
-     with _ -> e)
+     with Failure _ -> e)
   | Ast.E_binop (op, a, b)         -> Ast.E_binop (op, go a, go b)
   | Ast.E_not a                    -> Ast.E_not (go a)
   | Ast.E_is_null a                -> Ast.E_is_null (go a)

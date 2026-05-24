@@ -70,7 +70,7 @@ let parse_date_part s =
       let d = parse_int2 s 8 in
       if s.[4] <> '-' || s.[7] <> '-' then None
       else Some (y, m, d)
-  with _ -> None
+  with Failure _ | Invalid_argument _ -> None
 
 let parse_time_part s =
   try
@@ -86,7 +86,7 @@ let parse_time_part s =
         let sec = float_of_string sec_str in
         Some (h, mi, sec)
       end
-  with _ -> None
+  with Failure _ | Invalid_argument _ -> None
 
 let parse ?(now : (unit -> float) option) ts =
   let ts = String.trim ts in

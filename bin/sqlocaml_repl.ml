@@ -243,7 +243,7 @@ let read_one () =
   let buf = Buffer.create 256 in
   let rec loop primary =
     print_string (if primary then primary_prompt else continue_prompt);
-    let () = try flush stdout with _ -> () in
+    let () = try flush stdout with Sys_error _ -> () in
     match input_line stdin with
     | exception End_of_file ->
       if Buffer.length buf = 0 then None

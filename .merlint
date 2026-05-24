@@ -15,9 +15,22 @@
 #          under test/; it is not a 1:1 mirror of lib/ modules. These fire on
 #          every test file (and E605 on lib modules) by design, not as defects.
 #
+# Scoped to test/ only (#167):
+#   E105 - catch-all exception handlers. In tests these are idiomatic best-effort
+#          cleanup (temp-file teardown `(try Unix.unlink p with _ -> ())`,
+#          Fun.protect finalizers, env-var parse fallbacks); a swallowed error in
+#          test scaffolding just skips cleanup. E105 stays ENABLED for lib/ and
+#          bin/, where the 12 production sites were narrowed to precise exceptions
+#          (Unix.Unix_error / Failure / Parser.Error / Invalid_argument).
+#
+# Multiple file blocks union (rule_config.should_exclude is List.exists), so the
+# test/ block layers E105 on top of the global exclusions for test files.
+#
 # Patterns are unquoted: merlint's config parser does not strip surrounding
 # quotes, so "**/*.ml*" would be taken literally.
 
 rules:
   - files: **/*.ml*
     exclude: [E205, E320, E410, E600, E605, E606, E610]
+  - files: test/*.ml*
+    exclude: [E105]

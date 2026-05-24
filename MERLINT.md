@@ -43,13 +43,25 @@ conventions, not defects:
 
 Excluding these takes the raw report from ~4077 to ~504 findings.
 
-## Enabled rules: current findings (~504)
+### Scoped exclusion: E105 in `test/` only (#167)
+
+`E105` (catch-all exception handler) stays **enabled for `lib/` and `bin/`** but is
+excluded for `test/*.ml*`. In tests, catch-all handlers are idiomatic best-effort
+cleanup — temp-file teardown (`(try Unix.unlink p with _ -> ())`), `Fun.protect`
+finalizers, env-var parse fallbacks — where a swallowed error merely skips cleanup.
+The 12 production sites were instead **narrowed** to the precise exception they
+intend to absorb (`Unix.Unix_error`, `Failure`, `Parser.Error`, `Invalid_argument`),
+so unexpected errors now propagate. With production narrowed and `test/` excluded,
+E105 reaches a documented zero and is ready to enforce. This drops the curated
+report to ~378 findings.
+
+## Enabled rules: current findings (~378)
 
 All other rules stay on. The notable remaining findings, none yet enforced:
 
 | Rule | Name | Count | Disposition |
 |------|------|-------|-------------|
-| E105 | Catch-all Exception Handler | 126 | Tracked follow-up — mixed (many are intentional best-effort `(try … with _ -> ())` cleanups; needs an audit to separate those from error-swallowing). |
+| E105 | Catch-all Exception Handler | 0 | Resolved (#167) — 12 production sites narrowed; `test/` scaffolding excluded. Enforceable. |
 | E331 | Redundant Function Prefixes | 89 | Open. |
 | E005 | Long Functions | 56 | Tracked follow-up — a substantial refactor (e.g. `to_stream` is 1058 lines). |
 | E405 | Missing Value Documentation | 41 | Open. |

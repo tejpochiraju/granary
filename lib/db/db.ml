@@ -216,8 +216,8 @@ let vacuum t : unit Lwt.t =
       Lwt.fail_with "VACUUM cannot run inside an explicit transaction"
     else begin
       let tmp_path = path ^ ".vacuum-tmp" in
-      (try Unix.unlink tmp_path with _ -> ());
-      (try Unix.unlink (tmp_path ^ "-wal") with _ -> ());
+      (try Unix.unlink tmp_path with Unix.Unix_error _ -> ());
+      (try Unix.unlink (tmp_path ^ "-wal") with Unix.Unix_error _ -> ());
       let* dst_r = S.open_file ~path:tmp_path in
       match dst_r with
       | Error e ->
@@ -229,7 +229,7 @@ let vacuum t : unit Lwt.t =
         let* () = S.close dst in
         let* () = S.close t.store in
         (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
-        (try Unix.unlink (path ^ "-wal") with _ -> ());
+        (try Unix.unlink (path ^ "-wal") with Unix.Unix_error _ -> ());
         Unix.rename tmp_path path;
         let* new_store_r = S.open_file ~path in
         match new_store_r with
