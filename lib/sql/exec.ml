@@ -1610,6 +1610,39 @@ let fts_prefix_posting_list tx ~index_tree prefix_str =
   Lwt.return (Hashtbl.fold (fun rowid positions acc -> (rowid, positions) :: acc) by_rowid [])
 
 (** Execute an FTS query, returning [(rowid, positions)] for matching documents. *)
+(* FTS phrase match: all [words] must appear consecutively in the same column.
+   For each candidate doc, check there is a start position p and column c with
+   word[i] at (col=c, pos=p+i) for all i. *)
+let fts_phrase_match tx ~index_tree words =
+  match words with
+  | [] -> Lwt.return []
+  | first :: rest ->
+    let* first_pl = fts_posting_list tx ~index_tree first in
+    let* rest_pls = Lwt_list.map_s (fts_posting_list tx ~index_tree) rest in
+    (* Keep only docs present in every posting list. *)
+    let intersect_ids acc pl =
+      let ids = List.map fst pl in
+      List.filter (fun (r, _) -> List.mem r ids) acc
+    in
+    let candidates = List.fold_left intersect_ids first_pl rest_pls in
+    (* Build an array of per-term posting lists for position checking. *)
+    let all_pls = Array.of_list (first_pl :: rest_pls) in
+    let n = Array.length all_pls in
+    (* Check whether doc with [rowid] contains the phrase. *)
+    let phrase_matches rowid =
+      let term_positions = Array.map (fun pl ->
+        match List.assoc_opt rowid pl with
+        | None -> []
+        | Some pos -> pos) all_pls in
+      List.exists (fun (c0, p0) ->
+        let rec check i =
+          if i >= n then true
+          else List.mem (c0, p0 + i) term_positions.(i) && check (i + 1)
+        in check 1) term_positions.(0)
+    in
+    let matched = List.filter (fun (r, _) -> phrase_matches r) candidates in
+    Lwt.return matched
+
 let rec fts_execute_query tx ~index_tree query =
   match query with
   | Fts_query.FQ_term (Fts_query.FT_exact term) ->
@@ -1617,39 +1650,7 @@ let rec fts_execute_query tx ~index_tree query =
   | Fts_query.FQ_term (Fts_query.FT_prefix prefix) ->
     fts_prefix_posting_list tx ~index_tree prefix
   | Fts_query.FQ_term (Fts_query.FT_phrase words) ->
-    (* Phrase: all words must appear consecutively in the same column.
-       For each candidate document, check that there exists a starting position p
-       and column c such that word[i] occurs at (col=c, pos=p+i) for all i. *)
-    (match words with
-     | [] -> Lwt.return []
-     | first :: rest ->
-       let* first_pl = fts_posting_list tx ~index_tree first in
-       let* rest_pls = Lwt_list.map_s (fts_posting_list tx ~index_tree) rest in
-       (* Keep only docs present in every posting list. *)
-       let intersect_ids acc pl =
-         let ids = List.map fst pl in
-         List.filter (fun (r, _) -> List.mem r ids) acc
-       in
-       let candidates = List.fold_left intersect_ids first_pl rest_pls in
-       (* Build an array of per-term posting lists for position checking. *)
-       let all_pls = Array.of_list (first_pl :: rest_pls) in
-       let n = Array.length all_pls in
-       (* Check whether doc with [rowid] contains the phrase. *)
-       let phrase_matches rowid =
-         (* Collect positions for each word in this doc. *)
-         let term_positions = Array.map (fun pl ->
-           match List.assoc_opt rowid pl with
-           | None -> []
-           | Some pos -> pos) all_pls in
-         (* For each (col, pos) of the first word, test adjacency of the rest. *)
-         List.exists (fun (c0, p0) ->
-           let rec check i =
-             if i >= n then true
-             else List.mem (c0, p0 + i) term_positions.(i) && check (i + 1)
-           in check 1) term_positions.(0)
-       in
-       let matched = List.filter (fun (r, _) -> phrase_matches r) candidates in
-       Lwt.return matched)
+    fts_phrase_match tx ~index_tree words
   | Fts_query.FQ_and qs ->
     let positive = List.filter (function Fts_query.FQ_not _ -> false | _ -> true) qs in
     let negated  = List.filter_map (function Fts_query.FQ_not q -> Some q | _ -> None) qs in
@@ -2199,6 +2200,18 @@ let execute_insert_write tx (table_meta : Cat.table_meta)
     Lwt.return true
   end
 
+(* Build the row to insert: use [prebuilt_row] if given, else evaluate each
+   (ordinal, expr) into a fresh NULL-filled row of the table's width. *)
+let build_insert_row ~clock ~params ~prebuilt_row ~ordinals ~values
+    (table_meta : Cat.table_meta) : Row.t =
+  match prebuilt_row with
+  | Some r -> r
+  | None ->
+    let n = List.length table_meta.columns in
+    let r = Array.make n Row.V_null in
+    List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
+    r
+
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
@@ -2216,14 +2229,7 @@ let execute_insert ?(mode = Auto) ?(params = [||])
     ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
     (store : S.t) (cat : Cat.t)
     ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
-  let n   = List.length table_meta.columns in
-  let row = match prebuilt_row with
-    | Some r -> r
-    | None ->
-      let r = Array.make n Row.V_null in
-      List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
-      r
-  in
+  let row = build_insert_row ~clock ~params ~prebuilt_row ~ordinals ~values table_meta in
   compute_stored_generated_cols clock params table_meta row;
   (* Evaluate CHECK and FK constraints before any writes. *)
   eval_check_constraints clock params table_meta row;
@@ -2558,6 +2564,33 @@ let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
   let new_bytes = Row.encode schema new_row in
   S.put tx meta.Cat.tree_id rowid_key new_bytes
 
+(* Build the commit-time recheck for a deferred FK violation: it still stands
+   iff a child row references [parent_vals] AND no parent row has them.
+   Re-resolves column indices against the current schema. *)
+let make_fk_recheck (cat : Cat.t) ~child_name ~parent_name ~child_cols ~parent_cols
+    ~parent_vals : Cat.pending_fk_recheck =
+  { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
+    match Cat.find_table_cached cat ~name:child_name,
+          Cat.find_table_cached cat ~name:parent_name with
+    | None, _ | _, None -> Lwt.return false
+    | Some child_now, Some parent_now ->
+      let cci = List.filter_map
+        (find_col_idx_by_name_opt child_now.Cat.columns) child_cols in
+      let pci = List.filter_map
+        (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols in
+      if List.length cci <> List.length child_cols
+         || List.length pci <> List.length parent_cols
+      then Lwt.return false
+      else
+        let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
+                           ~child_col_idxs:cci ~parent_vals in
+        if not has_child then Lwt.return false
+        else
+          let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
+                              ~parent_idxs:pci ~parent_vals in
+          Lwt.return (not has_parent)
+  }
+
 (* The DEFAULT value for [col] as a Row.value, resolving CURRENT_* sentinels
    via the clock.  Shared by the ON DELETE / ON UPDATE SET DEFAULT cascades. *)
 let fk_default_value clock params (col : Row.column) : Row.value =
@@ -2857,6 +2890,290 @@ and cascade_update_set_default tx cat visited clock params (child_meta : Cat.tab
       ) child_rows
   end
 
+(* Apply SET NULL to each [child_col_idxs] of every row in [child_rows],
+   rejecting NOT NULL columns; routes through cascade_update_col_in_tx so the
+   write propagates further ON UPDATE chains.  [op_label] is "ON UPDATE" /
+   "ON DELETE" for the error message. *)
+let cascade_apply_set_null tx (cat : Cat.t) ~clock ~params ~visited ~op_label
+    (child_meta : Cat.table_meta) ~child_col_idxs child_rows : unit Lwt.t =
+  if child_rows = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun child_col_idx ->
+      let col = List.nth child_meta.Cat.columns child_col_idx in
+      if col.Row.not_null then
+        Lwt.fail_with (Printf.sprintf
+          "FOREIGN KEY constraint failed: %s SET NULL on NOT NULL column '%s.%s'"
+          op_label child_meta.Cat.name col.Row.name)
+      else
+        Lwt_list.iter_s (fun (crid, crow) ->
+          cascade_update_col_in_tx tx cat ~visited clock params child_meta
+            ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:Row.V_null
+        ) child_rows
+    ) child_col_idxs
+
+(* Apply SET DEFAULT to each [child_col_idxs] of every row in [child_rows]. *)
+let cascade_apply_set_default tx (cat : Cat.t) ~clock ~params ~visited ~op_label
+    (child_meta : Cat.table_meta) ~child_col_idxs child_rows : unit Lwt.t =
+  if child_rows = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun child_col_idx ->
+      let col = List.nth child_meta.Cat.columns child_col_idx in
+      let default_val = fk_default_value clock params col in
+      if col.Row.not_null && default_val = Row.V_null then
+        Lwt.fail_with (Printf.sprintf
+          "FOREIGN KEY constraint failed: %s SET DEFAULT on NOT NULL column '%s.%s' with no default"
+          op_label child_meta.Cat.name col.Row.name)
+      else
+        Lwt_list.iter_s (fun (crid, crow) ->
+          cascade_update_col_in_tx tx cat ~visited clock params child_meta
+            ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:default_val
+        ) child_rows
+    ) child_col_idxs
+
+(* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
+   under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
+let drain_matching_rows store (table_meta : Cat.table_meta) ~clock ~params
+    ~(where : Plan.expr option) : (int64 * Row.t) list Lwt.t =
+  S.with_ro store @@ fun tx_ro ->
+  let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+  let _sr    = S.cursor_first cur in
+  let buf    = ref [] in
+  let rec drain () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (kbytes, vbytes) ->
+      let rowid = Rowid.decode kbytes in
+      let row   = decode_with_virtual clock params table_meta vbytes in
+      let keep  = match where with
+        | None      -> true
+        | Some pred -> value_truthy (eval_expr clock params row pred)
+      in
+      if keep then buf := (rowid, row) :: !buf;
+      drain ()
+  in
+  drain ();
+  S.cursor_close cur;
+  Lwt.return (List.rev !buf)
+
+(* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)
+let apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches =
+  let sorted =
+    if order = [] then matches
+    else
+      List.sort (fun (_, ra) (_, rb) ->
+        let rec cmp = function
+          | [] -> 0
+          | (e, dir, nulls) :: rest ->
+            let va = eval_expr clock params ra e in
+            let vb = eval_expr clock params rb e in
+            let c = compare_with_nulls dir nulls va vb in
+            if c <> 0 then c else cmp rest
+        in cmp order
+      ) matches
+  in
+  let after_offset = match offset with
+    | None | Some 0 -> sorted
+    | Some n -> list_drop n sorted
+  in
+  match limit with
+  | None -> after_offset
+  | Some n -> list_take n after_offset
+
+(* Build the post-UPDATE row: copy [old_row] and apply each (i, expr) in
+   [assignments], evaluating expr against the OLD row. *)
+let apply_assignments ~clock ~params assignments (old_row : Row.t) : Row.t =
+  let new_row = Array.copy old_row in
+  List.iter (fun (i, expr) -> new_row.(i) <- eval_expr clock params old_row expr) assignments;
+  new_row
+
+(* Pre-write RESTRICT/NO ACTION FK check for one UPDATE row's [fk]: if the
+   parent key changes and is still referenced, raise (or queue deferred). *)
+let precheck_update_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~rowid_outer ~(old_row : Row.t) ~(new_row : Row.t)
+    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
+  match fk.fk_on_update with
+  | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
+  | Cat.FA_restrict | Cat.FA_no_action ->
+    let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
+    let parent_col_idxs = List.map
+      (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+    let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
+    let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
+    let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
+    if unchanged then Lwt.return_unit
+    else if any_null_val old_vals then Lwt.return_unit
+    else begin
+      let child_col_idxs = List.map
+        (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+      let* has_ref = fk_child_has_ref_multi cat store child_meta
+        ~child_col_idxs ~parent_vals:old_vals in
+      if has_ref then
+        let msg = Printf.sprintf
+          "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
+          table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
+          child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+        in
+        let recheck = make_fk_recheck cat
+          ~child_name:child_meta.Cat.name ~parent_name:table_meta.Cat.name
+          ~child_cols:fk.fk_local_cols ~parent_cols:fk.fk_parent_cols
+          ~parent_vals:old_vals in
+        fk_violation ~deferred:is_deferred cat ~kind:`Update
+          ~table:table_meta.Cat.name ~rowid:rowid_outer ~msg ~recheck
+      else Lwt.return_unit
+    end
+
+(* Pre-write FK RESTRICT check across all matched UPDATE rows. *)
+let precheck_update_fk_restrict store (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~assignments ~child_refs matches : unit Lwt.t =
+  if child_refs = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun (rowid_outer, old_row) ->
+      let new_row = apply_assignments ~clock ~params assignments old_row in
+      Lwt_list.iter_s (fun (child_meta, fks) ->
+        Lwt_list.iter_s (precheck_update_fk store cat table_meta
+                           ~rowid_outer ~old_row ~new_row child_meta) fks
+      ) child_refs
+    ) matches
+
+(* First UPDATE pass: validate UNIQUE for every target row against the full
+   set of new values (an updated row may collide with another updated row). *)
+let validate_update_unique tx (table_meta : Cat.table_meta)
+    ~clock ~params ~indexes ~assignments matches : unit Lwt.t =
+  let schema = table_meta.Cat.columns in
+  Lwt_list.iter_s (fun (rowid, old_row) ->
+    let new_row = apply_assignments ~clock ~params assignments old_row in
+    compute_stored_generated_cols clock params table_meta new_row;
+    eval_check_constraints clock params table_meta new_row;
+    let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+    Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+      if not idx.idx_unique then Lwt.return_unit
+      else if not (row_matches_index_where clock params idx schema new_row_for_idx)
+      then Lwt.return_unit
+      else begin
+        let old_vs = get_index_key_values clock params idx schema old_row in
+        let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
+        let values_equal a b = match a, b with
+          | Row.V_null, Row.V_null     -> true
+          | Row.V_int  x, Row.V_int  y -> Int64.equal x y
+          | Row.V_text x, Row.V_text y -> String.equal x y
+          | Row.V_real x, Row.V_real y -> Float.equal x y
+          | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
+          | _                           -> false
+        in
+        let unchanged = List.for_all2 values_equal old_vs new_vs in
+        if unchanged then Lwt.return_unit
+        else
+          let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
+          if dup then
+            Lwt.fail_with (Printf.sprintf
+              "UNIQUE constraint violated: duplicate value in columns (%s)"
+              (String.concat ", " idx.idx_columns))
+          else Lwt.return_unit
+      end
+    ) indexes
+  ) matches
+
+(* Delete [row]'s old index entries and insert the new ones for an UPDATE. *)
+let reindex_row tx (table_meta : Cat.table_meta) ~clock ~params
+    ~(old_row : Row.t) ~(new_row : Row.t) ~rowid indexes : unit Lwt.t =
+  let schema = table_meta.Cat.columns in
+  let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
+  let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    let old_matches = row_matches_index_where clock params idx schema old_row_for_idx in
+    let new_matches = row_matches_index_where clock params idx schema new_row_for_idx in
+    let old_iks = List.map row_value_to_index_value
+                    (get_index_key_values clock params idx schema old_row_for_idx) in
+    let new_iks = List.map row_value_to_index_value
+                    (get_index_key_values clock params idx schema new_row_for_idx) in
+    let old_ikey = Index_key.encode old_iks ~rowid in
+    let new_ikey = Index_key.encode new_iks ~rowid in
+    let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
+    if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+    else Lwt.return_unit
+  ) indexes
+
+(* Apply the ON UPDATE cascade of one [fk] for a parent row changing
+   [old_row] -> [new_row], within the RW txn (RESTRICT handled in precheck). *)
+let apply_update_cascade_fk tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~visited ~(old_row : Row.t) ~(new_row : Row.t)
+    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
+  let parent_col_idxs = List.map
+    (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+  let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
+  let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
+  let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
+  if unchanged then Lwt.return_unit
+  else if any_null_val old_vals then Lwt.return_unit
+  else begin
+    let child_col_idxs = List.map
+      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+    match fk.fk_on_update with
+    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
+    | Cat.FA_cascade ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals:old_vals in
+      (* For cascade, use the first child col (single-col FK compat) *)
+      let child_col_idx = List.hd child_col_idxs in
+      let new_val_single = List.hd new_vals in
+      Lwt_list.iter_s (fun (crid, crow) ->
+        cascade_update_col_in_tx tx cat ~visited clock params child_meta
+          ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:new_val_single
+      ) child_rows
+    | Cat.FA_set_null ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals:old_vals in
+      cascade_apply_set_null tx cat ~clock ~params ~visited ~op_label:"ON UPDATE"
+        child_meta ~child_col_idxs child_rows
+    | Cat.FA_set_default ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals:old_vals in
+      cascade_apply_set_default tx cat ~clock ~params ~visited ~op_label:"ON UPDATE"
+        child_meta ~child_col_idxs child_rows
+  end
+
+(* Apply all ON UPDATE cascades for a parent row changing old_row -> new_row. *)
+let apply_update_cascades tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~visited ~child_refs ~(old_row : Row.t) ~(new_row : Row.t)
+    : unit Lwt.t =
+  if child_refs = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun (child_meta, fks) ->
+      Lwt_list.iter_s (apply_update_cascade_fk tx cat table_meta
+                         ~clock ~params ~visited ~old_row ~new_row child_meta) fks
+    ) child_refs
+
+(* Apply one matched UPDATE row: compute new row, run ON UPDATE cascades,
+   reindex, and overwrite the row in the table tree. *)
+let apply_update_row tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~child_refs ~indexes ~assignments (rowid, old_row) : unit Lwt.t =
+  let new_row = apply_assignments ~clock ~params assignments old_row in
+  compute_stored_generated_cols clock params table_meta new_row;
+  (* Phase 35 task 3a: per-row visited set seeded with parent rowid, so
+     cyclic ON UPDATE cascades terminate. *)
+  let visited = Hashtbl.create 16 in
+  Hashtbl.add visited (table_meta.Cat.name, rowid) ();
+  let* () = apply_update_cascades tx cat table_meta ~clock ~params ~visited
+              ~child_refs ~old_row ~new_row in
+  let key = Rowid.encode rowid in
+  let* () = reindex_row tx table_meta ~clock ~params ~old_row ~new_row ~rowid indexes in
+  let new_bytes = Row.encode table_meta.Cat.columns new_row in
+  let* () = S.del tx table_meta.tree_id key in
+  S.put tx table_meta.tree_id key new_bytes
+
+(* Fire an UPDATE row-hook (BEFORE/AFTER) for each matched row, recomputing
+   the post-UPDATE row from the pre-write snapshot.  For non-deterministic
+   expressions (random(), now()) the value the trigger sees may differ from
+   the committed row. *)
+let run_update_hook ~clock ~params ~assignments ~tx hook matches : unit Lwt.t =
+  match hook with
+  | None -> Lwt.return_unit
+  | Some f ->
+    Lwt_list.iter_s (fun (_rowid, old_row) ->
+      let new_row = apply_assignments ~clock ~params assignments old_row in
+      f ~tx ~old_row ~new_row
+    ) matches
+
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
@@ -2875,365 +3192,152 @@ let execute_update ?(mode = Auto) ?(params = [||])
     ~(offset : int option)
     ~(indexes : Cat.index_info list)
   : int Lwt.t =
-  let schema = table_meta.Cat.columns in
-  (* Drain matching rows into a list under an RO snapshot first to
-     avoid cursor invalidation when we issue puts/dels below. *)
-  let* matches =
-    S.with_ro store @@ fun tx_ro ->
-    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-    let _sr    = S.cursor_first cur in
-    let buf    = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (kbytes, vbytes) ->
-        let rowid = Rowid.decode kbytes in
-        let row   = decode_with_virtual clock params table_meta vbytes in
-        let keep  = match where with
-          | None      -> true
-          | Some pred -> value_truthy (eval_expr clock params row pred)
-        in
-        if keep then buf := (rowid, row) :: !buf;
-        drain ()
-    in
-    drain ();
-    S.cursor_close cur;
-    Lwt.return (List.rev !buf)
-  in
-  (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
-  let matches =
-    let sorted =
-      if order = [] then matches
-      else
-        List.sort (fun (_, ra) (_, rb) ->
-          let rec cmp = function
-            | [] -> 0
-            | (e, dir, nulls) :: rest ->
-              let va = eval_expr clock params ra e in
-              let vb = eval_expr clock params rb e in
-              let c = compare_with_nulls dir nulls va vb in
-              if c <> 0 then c else cmp rest
-          in cmp order
-        ) matches
-    in
-    let after_offset = match offset with
-      | None | Some 0 -> sorted
-      | Some n -> list_drop n sorted
-    in
-    match limit with
-    | None -> after_offset
-    | Some n -> list_take n after_offset
-  in
+  let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
+  let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
-    (* FK pre-check: fail for RESTRICT/NO_ACTION when referenced key changes.
-       CASCADE/SET_NULL/SET_DEFAULT applied inside the RW transaction below. *)
     let* child_refs =
       if Cat.get_fk_enforcement cat then
         build_child_refs cat ~parent_table_name:table_meta.Cat.name
       else Lwt.return []
     in
-    let* () =
-      if child_refs = [] then Lwt.return_unit
-      else
-        Lwt_list.iter_s (fun (rowid_outer, old_row) ->
-          let new_row = Array.copy old_row in
-          List.iter (fun (i, expr) ->
-            new_row.(i) <- eval_expr clock params old_row expr
-          ) assignments;
-          Lwt_list.iter_s (fun (child_meta, fks) ->
-            Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-              match fk.fk_on_update with
-              | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
-              | Cat.FA_restrict | Cat.FA_no_action ->
-                let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-                let parent_col_idxs = List.map
-                  (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
-                  fk.fk_parent_cols
-                in
-                let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
-                let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
-                let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
-                if unchanged then Lwt.return_unit
-                else if any_null_val old_vals then Lwt.return_unit
-                else begin
-                  let child_col_idxs = List.map
-                    (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
-                    fk.fk_local_cols
-                  in
-                  let* has_ref = fk_child_has_ref_multi cat store child_meta
-                    ~child_col_idxs ~parent_vals:old_vals in
-                  if has_ref then
-                    let msg = Printf.sprintf
-                      "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
-                      table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-                      child_meta.Cat.name (String.concat "," fk.fk_local_cols)
-                    in
-                    let parent_meta_name = table_meta.Cat.name in
-                    let child_meta_name = child_meta.Cat.name in
-                    let parent_cols_copy = fk.fk_parent_cols in
-                    let child_cols_copy = fk.fk_local_cols in
-                    let captured_old_vals = old_vals in
-                    let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-                      match Cat.find_table_cached cat ~name:child_meta_name,
-                            Cat.find_table_cached cat ~name:parent_meta_name with
-                      | None, _ | _, None -> Lwt.return false
-                      | Some child_now, Some parent_now ->
-                        let cci = List.filter_map
-                          (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
-                        let pci = List.filter_map
-                          (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
-                        if List.length cci <> List.length child_cols_copy
-                           || List.length pci <> List.length parent_cols_copy
-                        then Lwt.return false
-                        else
-                          let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                                             ~child_col_idxs:cci
-                                             ~parent_vals:captured_old_vals in
-                          if not has_child then Lwt.return false
-                          else
-                            let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                                                ~parent_idxs:pci
-                                                ~parent_vals:captured_old_vals in
-                            Lwt.return (not has_parent)
-                    } in
-                    fk_violation ~deferred:is_deferred cat ~kind:`Update
-                      ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
-                  else Lwt.return_unit
-                end
-            ) fks
-          ) child_refs
-        ) matches
-    in
-    (* Phase 38: BEFORE UPDATE now fires inside the parent txn so its
-       nested DML shares the parent tx (atomic rollback on failure;
-       no nested-trigger deadlock). *)
+    (* FK pre-check: fail for RESTRICT/NO_ACTION when a referenced key changes.
+       CASCADE/SET_NULL/SET_DEFAULT are applied inside the RW transaction below. *)
+    let* () = precheck_update_fk_restrict store cat table_meta
+                ~clock ~params ~assignments ~child_refs matches in
+    (* Phase 38: BEFORE/AFTER UPDATE fire inside the parent txn so nested DML
+       shares it (atomic rollback on failure; no nested-trigger deadlock). *)
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        (* Fire BEFORE UPDATE triggers (per row, inside parent txn) *)
-        let* () = match before_hook with
-          | None -> Lwt.return_unit
-          | Some f ->
-            Lwt_list.iter_s (fun (_rowid, old_row) ->
-              let new_row = Array.copy old_row in
-              List.iter (fun (i, expr) ->
-                new_row.(i) <- eval_expr clock params old_row expr
-              ) assignments;
-              f ~tx ~old_row ~new_row
-            ) matches
-        in
-        (* First pass: validate UNIQUE constraints for every target row,
-           considering the FULL set of new values (each updated row may
-           conflict with another updated row). *)
-        let* () =
-          Lwt_list.iter_s (fun (rowid, old_row) ->
-            let new_row = Array.copy old_row in
-            List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr clock params old_row expr
-            ) assignments;
-            compute_stored_generated_cols clock params table_meta new_row;
-            (* Evaluate CHECK constraints on the new row before writes. *)
-            eval_check_constraints clock params table_meta new_row;
-            (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row
-               before checking UNIQUE on indexes that may include them. *)
-            let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-            Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              if not idx.idx_unique then Lwt.return_unit
-              else if not (row_matches_index_where clock params idx schema new_row_for_idx)
-              then Lwt.return_unit
-              else begin
-                (* Only check if any of the indexed values actually changed *)
-                let old_vs = get_index_key_values clock params idx schema old_row in
-                let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
-                let values_equal a b = match a, b with
-                  | Row.V_null, Row.V_null     -> true
-                  | Row.V_int  x, Row.V_int  y -> Int64.equal x y
-                  | Row.V_text x, Row.V_text y -> String.equal x y
-                  | Row.V_real x, Row.V_real y -> Float.equal x y
-                  | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
-                  | _                           -> false
-                in
-                let unchanged =
-                  List.for_all2 values_equal old_vs new_vs
-                in
-                if unchanged then Lwt.return_unit
-                else
-                  let* dup = unique_violation_on_update tx idx new_vs ~rowid
-                               ~new_row ~schema in
-                  if dup then
-                    Lwt.fail_with (Printf.sprintf
-                      "UNIQUE constraint violated: duplicate value in columns (%s)"
-                      (String.concat ", " idx.idx_columns))
-                  else Lwt.return_unit
-              end
-            ) indexes
-          ) matches
-        in
-        (* Second pass: actually apply the updates. *)
-        let* () =
-          Lwt_list.iter_s (fun (rowid, old_row) ->
-            let new_row = Array.copy old_row in
-            List.iter (fun (i, expr) ->
-              new_row.(i) <- eval_expr clock params old_row expr
-            ) assignments;
-            compute_stored_generated_cols clock params table_meta new_row;
-            (* Phase 35 task 3a: per-row visited set seeded with parent
-               rowid, so cyclic ON UPDATE cascades terminate. *)
-            let visited = Hashtbl.create 16 in
-            Hashtbl.add visited (table_meta.Cat.name, rowid) ();
-            (* Apply FK cascade UPDATE actions (CASCADE / SET NULL / SET DEFAULT). *)
-            let* () =
-              if child_refs = [] then Lwt.return_unit
-              else
-                Lwt_list.iter_s (fun (child_meta, fks) ->
-                  Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-                    let parent_col_idxs = List.map
-                      (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
-                      fk.fk_parent_cols
-                    in
-                    let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
-                    let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
-                    let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
-                    if unchanged then Lwt.return_unit
-                    else if any_null_val old_vals then Lwt.return_unit
-                    else begin
-                      let child_col_idxs = List.map
-                        (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
-                        fk.fk_local_cols
-                      in
-                      (match fk.fk_on_update with
-                       | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
-                       | Cat.FA_cascade ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals:old_vals in
-                         (* For cascade, use the first child col (single-col FK compat) *)
-                         let child_col_idx = List.hd child_col_idxs in
-                         let new_val_single = List.hd new_vals in
-                         Lwt_list.iter_s (fun (crid, crow) ->
-                           cascade_update_col_in_tx tx cat ~visited clock params child_meta
-                             ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:new_val_single
-                         ) child_rows
-                       | Cat.FA_set_null ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals:old_vals in
-                         if child_rows = [] then Lwt.return_unit
-                         else begin
-                           let* () = Lwt_list.iter_s (fun child_col_idx ->
-                             let col = List.nth child_meta.Cat.columns child_col_idx in
-                             if col.Row.not_null then
-                               Lwt.fail_with (Printf.sprintf
-                                 "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
-                                 child_meta.Cat.name col.Row.name)
-                             else
-                               (* Route through cascade_update_col_in_tx so the
-                                  SET NULL itself propagates down any further
-                                  ON UPDATE FK chains on the just-written
-                                  column.  Phase 35 task 3a: cycle detection
-                                  via [~visited]. *)
-                               Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
-                                   ~rowid:crid ~row:crow
-                                   ~col_idx:child_col_idx ~new_val:Row.V_null
-                               ) child_rows
-                           ) child_col_idxs in
-                           Lwt.return_unit
-                         end
-                       | Cat.FA_set_default ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals:old_vals in
-                         if child_rows = [] then Lwt.return_unit
-                         else begin
-                           let* () = Lwt_list.iter_s (fun child_col_idx ->
-                             let col = List.nth child_meta.Cat.columns child_col_idx in
-                             let default_val = match col.Row.default with
-                               | None               -> Row.V_null
-                               | Some Row.DV_int  n -> Row.V_int  n
-                               | Some Row.DV_text s -> Row.V_text s
-                               | Some Row.DV_real f -> Row.V_real f
-                               | Some Row.DV_blob b -> Row.V_blob b
-                               | Some Row.DV_null   -> Row.V_null
-                               | Some Row.DV_current_timestamp ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_datetime, [Plan.P_lit (Ast.L_text "now")]))
-                               | Some Row.DV_current_date ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_date, [Plan.P_lit (Ast.L_text "now")]))
-                               | Some Row.DV_current_time ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_time, [Plan.P_lit (Ast.L_text "now")]))
-                             in
-                             if col.Row.not_null && default_val = Row.V_null then
-                               Lwt.fail_with (Printf.sprintf
-                                 "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
-                                 child_meta.Cat.name col.Row.name)
-                             else
-                               (* Route through cascade_update_col_in_tx (see
-                                  SET NULL arm above; cycle detection via
-                                  [~visited]). *)
-                               Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
-                                   ~rowid:crid ~row:crow
-                                   ~col_idx:child_col_idx ~new_val:default_val
-                               ) child_rows
-                           ) child_col_idxs in
-                           Lwt.return_unit
-                         end)
-                    end
-                  ) fks
-                ) child_refs
-            in
-            let key = Rowid.encode rowid in
-            (* Phase 35 Task 2: populate VIRTUAL gen cols on both rows
-               before extracting index keys. *)
-            let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
-            let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-            (* Update index entries: delete old, insert new. *)
-            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              let old_matches = row_matches_index_where clock params idx schema old_row_for_idx in
-              let new_matches = row_matches_index_where clock params idx schema new_row_for_idx in
-              let old_iks = List.map row_value_to_index_value
-                              (get_index_key_values clock params idx schema old_row_for_idx) in
-              let new_iks = List.map row_value_to_index_value
-                              (get_index_key_values clock params idx schema new_row_for_idx) in
-              let old_ikey = Index_key.encode old_iks ~rowid in
-              let new_ikey = Index_key.encode new_iks ~rowid in
-              let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
-              if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-              else Lwt.return_unit
-            ) indexes in
-            (* Update the row in the table tree.  We could just S.put on
-               the same key (overwriting), but the task spec asks for an
-               explicit del+put to mirror the index-update pattern. *)
-            let new_bytes = Row.encode schema new_row in
-            let* () = S.del tx table_meta.tree_id key in
-            S.put tx table_meta.tree_id key new_bytes
-          ) matches
-        in
-        (* Phase 38 (#138): fire AFTER UPDATE inside the parent txn so
-           trigger failures roll back the whole DML.
-           After-hook new_row is recomputed from the pre-write snapshot; for
-           non-deterministic expressions (e.g. random(), now()) the value seen
-           by the trigger may differ from the committed row. *)
-        let* () = match after_hook with
-          | None -> Lwt.return_unit
-          | Some f ->
-            Lwt_list.iter_s (fun (_rowid, old_row) ->
-              let new_row = Array.copy old_row in
-              List.iter (fun (i, expr) ->
-                new_row.(i) <- eval_expr clock params old_row expr
-              ) assignments;
-              f ~tx ~old_row ~new_row
-            ) matches
-        in
+        let* () = run_update_hook ~clock ~params ~assignments ~tx before_hook matches in
+        let* () = validate_update_unique tx table_meta ~clock ~params
+                    ~indexes ~assignments matches in
+        let* () = Lwt_list.iter_s
+                    (apply_update_row tx cat table_meta ~clock ~params
+                       ~child_refs ~indexes ~assignments) matches in
+        let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
         let* () = release_txn tx owned in
         Lwt.return n)
       (fun exn ->
-        (* On any exception: rollback if we own the txn, then re-raise. *)
         let* () = if owned then S.rollback tx else Lwt.return_unit in
         Lwt.fail exn)
   end
+
+(* Pre-write RESTRICT/NO ACTION FK check for one DELETE row's [fk]: if a
+   child still references the row being deleted, raise (or queue deferred). *)
+let precheck_delete_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~rowid_outer ~(row : Row.t) (child_meta : Cat.table_meta)
+    (fk : Cat.fk_constraint) : unit Lwt.t =
+  match fk.fk_on_delete with
+  | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
+  | Cat.FA_restrict | Cat.FA_no_action ->
+    let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
+    let parent_col_idxs = List.map
+      (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+    let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
+    if any_null_val parent_vals then Lwt.return_unit
+    else begin
+      let child_col_idxs = List.map
+        (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+      let* has_ref = fk_child_has_ref_multi cat store child_meta
+        ~child_col_idxs ~parent_vals in
+      if has_ref then
+        let msg = Printf.sprintf
+          "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
+          table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
+          child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+        in
+        let recheck = make_fk_recheck cat
+          ~child_name:child_meta.Cat.name ~parent_name:table_meta.Cat.name
+          ~child_cols:fk.fk_local_cols ~parent_cols:fk.fk_parent_cols
+          ~parent_vals in
+        fk_violation ~deferred:is_deferred cat ~kind:`Delete
+          ~table:table_meta.Cat.name ~rowid:rowid_outer ~msg ~recheck
+      else Lwt.return_unit
+    end
+
+(* Pre-write FK RESTRICT check across all matched DELETE rows. *)
+let precheck_delete_fk_restrict store (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~child_refs matches : unit Lwt.t =
+  if child_refs = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun (rowid_outer, row) ->
+      Lwt_list.iter_s (fun (child_meta, fks) ->
+        Lwt_list.iter_s (precheck_delete_fk store cat table_meta
+                           ~rowid_outer ~row child_meta) fks
+      ) child_refs
+    ) matches
+
+(* Apply the ON DELETE cascade of one [fk] for parent [row] being deleted,
+   within the RW txn (RESTRICT handled in precheck). *)
+let apply_delete_cascade_fk tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~visited ~(row : Row.t)
+    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
+  let parent_col_idxs = List.map
+    (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+  let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
+  if any_null_val parent_vals then Lwt.return_unit
+  else begin
+    let child_col_idxs = List.map
+      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+    match fk.fk_on_delete with
+    | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
+    | Cat.FA_cascade ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals in
+      Lwt_list.iter_s (fun (crid, crow) ->
+        cascade_delete_row_in_tx tx cat ~visited clock params child_meta ~rowid:crid ~row:crow
+      ) child_rows
+    | Cat.FA_set_null ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals in
+      cascade_apply_set_null tx cat ~clock ~params ~visited ~op_label:"ON DELETE"
+        child_meta ~child_col_idxs child_rows
+    | Cat.FA_set_default ->
+      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
+        ~child_col_idxs ~parent_vals in
+      cascade_apply_set_default tx cat ~clock ~params ~visited ~op_label:"ON DELETE"
+        child_meta ~child_col_idxs child_rows
+  end
+
+(* Apply all ON DELETE cascades for parent [row] being deleted. *)
+let apply_delete_cascades tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~visited ~child_refs ~(row : Row.t) : unit Lwt.t =
+  if child_refs = [] then Lwt.return_unit
+  else
+    Lwt_list.iter_s (fun (child_meta, fks) ->
+      Lwt_list.iter_s (apply_delete_cascade_fk tx cat table_meta
+                         ~clock ~params ~visited ~row child_meta) fks
+    ) child_refs
+
+(* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
+let delete_row_indexes tx (table_meta : Cat.table_meta) ~clock ~params
+    ~(row : Row.t) ~rowid indexes : unit Lwt.t =
+  let schema = table_meta.Cat.columns in
+  let row_for_idx = with_computed_virtuals clock params table_meta row in
+  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+    if not (row_matches_index_where clock params idx schema row_for_idx)
+    then Lwt.return_unit
+    else begin
+      let iks      = List.map row_value_to_index_value
+                       (get_index_key_values clock params idx schema row_for_idx) in
+      let old_ikey = Index_key.encode iks ~rowid in
+      S.del tx idx.idx_tree_id old_ikey
+    end
+  ) indexes
+
+(* Delete one matched row: run ON DELETE cascades, remove index entries, then
+   remove the row.  Visited set seeded with this row so cyclic cascades stop. *)
+let apply_delete_row tx (cat : Cat.t) (table_meta : Cat.table_meta)
+    ~clock ~params ~child_refs ~indexes (rowid, row) : unit Lwt.t =
+  let visited = Hashtbl.create 16 in
+  Hashtbl.add visited (table_meta.Cat.name, rowid) ();
+  let* () = apply_delete_cascades tx cat table_meta ~clock ~params ~visited ~child_refs ~row in
+  let rowid_key = Rowid.encode rowid in
+  let* () = delete_row_indexes tx table_meta ~clock ~params ~row ~rowid indexes in
+  S.del tx table_meta.tree_id rowid_key
 
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
     then for each matching (rowid, row) remove index entries and the
@@ -3251,260 +3355,31 @@ let execute_delete ?(mode = Auto) ?(params = [||])
     ~(offset : int option)
     ~(indexes : Cat.index_info list)
   : int Lwt.t =
-  let schema = table_meta.Cat.columns in
-  (* Drain matching rows under an RO snapshot. *)
-  let* matches =
-    S.with_ro store @@ fun tx_ro ->
-    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-    let _sr    = S.cursor_first cur in
-    let buf    = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (kbytes, vbytes) ->
-        let rowid = Rowid.decode kbytes in
-        let row   = decode_with_virtual clock params table_meta vbytes in
-        let keep  = match where with
-          | None      -> true
-          | Some pred -> value_truthy (eval_expr clock params row pred)
-        in
-        if keep then buf := (rowid, row) :: !buf;
-        drain ()
-    in
-    drain ();
-    S.cursor_close cur;
-    Lwt.return (List.rev !buf)
-  in
-  (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
-  let matches =
-    let sorted =
-      if order = [] then matches
-      else
-        List.sort (fun (_, ra) (_, rb) ->
-          let rec cmp = function
-            | [] -> 0
-            | (e, dir, nulls) :: rest ->
-              let va = eval_expr clock params ra e in
-              let vb = eval_expr clock params rb e in
-              let c = compare_with_nulls dir nulls va vb in
-              if c <> 0 then c else cmp rest
-          in cmp order
-        ) matches
-    in
-    let after_offset = match offset with
-      | None | Some 0 -> sorted
-      | Some n -> list_drop n sorted
-    in
-    match limit with
-    | None -> after_offset
-    | Some n -> list_take n after_offset
-  in
+  let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
+  let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
   if n = 0 then Lwt.return 0
   else begin
-    (* FK pre-check: fail immediately for RESTRICT/NO_ACTION.
-       CASCADE/SET_NULL/SET_DEFAULT are applied inside the RW transaction below. *)
+    (* FK pre-check: fail for RESTRICT/NO_ACTION; CASCADE/SET_NULL/SET_DEFAULT
+       are applied inside the RW transaction below. *)
     let* child_refs =
       if Cat.get_fk_enforcement cat then
         build_child_refs cat ~parent_table_name:table_meta.Cat.name
       else Lwt.return []
     in
-    let* () =
-      if child_refs = [] then Lwt.return_unit
-      else
-        Lwt_list.iter_s (fun (rowid_outer, row) ->
-          Lwt_list.iter_s (fun (child_meta, fks) ->
-            Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-              match fk.fk_on_delete with
-              | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
-              | Cat.FA_restrict | Cat.FA_no_action ->
-                let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-                let parent_col_idxs = List.map
-                  (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
-                  fk.fk_parent_cols
-                in
-                let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
-                if any_null_val parent_vals then Lwt.return_unit
-                else begin
-                  let child_col_idxs = List.map
-                    (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
-                    fk.fk_local_cols
-                  in
-                  let* has_ref = fk_child_has_ref_multi cat store child_meta
-                    ~child_col_idxs ~parent_vals in
-                  if has_ref then
-                    let msg = Printf.sprintf
-                      "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
-                      table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-                      child_meta.Cat.name (String.concat "," fk.fk_local_cols)
-                    in
-                    let parent_meta_name = table_meta.Cat.name in
-                    let child_meta_name = child_meta.Cat.name in
-                    let parent_cols_copy = fk.fk_parent_cols in
-                    let child_cols_copy = fk.fk_local_cols in
-                    let captured_pv = parent_vals in
-                    let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-                      match Cat.find_table_cached cat ~name:child_meta_name,
-                            Cat.find_table_cached cat ~name:parent_meta_name with
-                      | None, _ | _, None -> Lwt.return false
-                      | Some child_now, Some parent_now ->
-                        let cci = List.filter_map
-                          (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
-                        let pci = List.filter_map
-                          (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
-                        if List.length cci <> List.length child_cols_copy
-                           || List.length pci <> List.length parent_cols_copy
-                        then Lwt.return false
-                        else
-                          let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                                             ~child_col_idxs:cci
-                                             ~parent_vals:captured_pv in
-                          if not has_child then Lwt.return false
-                          else
-                            let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                                                ~parent_idxs:pci
-                                                ~parent_vals:captured_pv in
-                            Lwt.return (not has_parent)
-                    } in
-                    fk_violation ~deferred:is_deferred cat ~kind:`Delete
-                      ~table:parent_meta_name ~rowid:rowid_outer ~msg ~recheck
-                  else Lwt.return_unit
-                end
-            ) fks
-          ) child_refs
-        ) matches
-    in
-    (* Phase 38: BEFORE DELETE now fires inside the parent txn so nested
-       DML shares the tx and trigger failures roll back the DELETE. *)
+    let* () = precheck_delete_fk_restrict store cat table_meta ~child_refs matches in
+    (* Phase 38: BEFORE/AFTER DELETE fire inside the parent txn so nested DML
+       shares it and trigger failures roll back the DELETE. *)
     let* (tx, owned) = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        (* Fire BEFORE DELETE triggers (per row, inside parent txn) *)
         let* () = match before_hook with
           | None -> Lwt.return_unit
           | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
         in
-        let* () =
-          Lwt_list.iter_s (fun (rowid, row) ->
-            (* Phase 35 task 3a: seed per-row visited set with the parent
-               (this row) so cycles routing back through this rowid stop. *)
-            let visited = Hashtbl.create 16 in
-            Hashtbl.add visited (table_meta.Cat.name, rowid) ();
-            (* Apply FK cascade actions (CASCADE / SET NULL / SET DEFAULT) within same tx. *)
-            let* () =
-              if child_refs = [] then Lwt.return_unit
-              else
-                Lwt_list.iter_s (fun (child_meta, fks) ->
-                  Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-                    let parent_col_idxs = List.map
-                      (fun c -> find_col_idx_by_name table_meta.Cat.columns c)
-                      fk.fk_parent_cols
-                    in
-                    let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
-                    if any_null_val parent_vals then Lwt.return_unit
-                    else begin
-                      let child_col_idxs = List.map
-                        (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
-                        fk.fk_local_cols
-                      in
-                      (match fk.fk_on_delete with
-                       | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
-                       | Cat.FA_cascade ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals in
-                         Lwt_list.iter_s (fun (crid, crow) ->
-                           cascade_delete_row_in_tx tx cat ~visited clock params child_meta ~rowid:crid ~row:crow
-                         ) child_rows
-                       | Cat.FA_set_null ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals in
-                         if child_rows = [] then Lwt.return_unit
-                         else begin
-                           let* () = Lwt_list.iter_s (fun child_col_idx ->
-                             let col = List.nth child_meta.Cat.columns child_col_idx in
-                             if col.Row.not_null then
-                               Lwt.fail_with (Printf.sprintf
-                                 "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
-                                 child_meta.Cat.name col.Row.name)
-                             else
-                               (* Route through cascade_update_col_in_tx so the
-                                  SET NULL itself propagates down any further
-                                  ON UPDATE FK chains on the just-written
-                                  column.  Phase 35 task 3a: cycle detection
-                                  via [~visited]. *)
-                               Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
-                                   ~rowid:crid ~row:crow
-                                   ~col_idx:child_col_idx ~new_val:Row.V_null
-                               ) child_rows
-                           ) child_col_idxs in
-                           Lwt.return_unit
-                         end
-                       | Cat.FA_set_default ->
-                         let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-                           ~child_col_idxs ~parent_vals in
-                         if child_rows = [] then Lwt.return_unit
-                         else begin
-                           let* () = Lwt_list.iter_s (fun child_col_idx ->
-                             let col = List.nth child_meta.Cat.columns child_col_idx in
-                             let default_val = match col.Row.default with
-                               | None               -> Row.V_null
-                               | Some Row.DV_int  n -> Row.V_int  n
-                               | Some Row.DV_text s -> Row.V_text s
-                               | Some Row.DV_real f -> Row.V_real f
-                               | Some Row.DV_blob b -> Row.V_blob b
-                               | Some Row.DV_null   -> Row.V_null
-                               | Some Row.DV_current_timestamp ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_datetime, [Plan.P_lit (Ast.L_text "now")]))
-                               | Some Row.DV_current_date ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_date, [Plan.P_lit (Ast.L_text "now")]))
-                               | Some Row.DV_current_time ->
-                                 eval_expr clock params [||]
-                                   (Plan.P_func (Ast.Fn_time, [Plan.P_lit (Ast.L_text "now")]))
-                             in
-                             if col.Row.not_null && default_val = Row.V_null then
-                               Lwt.fail_with (Printf.sprintf
-                                 "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
-                                 child_meta.Cat.name col.Row.name)
-                             else
-                               (* Route through cascade_update_col_in_tx (see
-                                  SET NULL arm above; cycle detection via
-                                  [~visited]). *)
-                               Lwt_list.iter_s (fun (crid, crow) ->
-                                 cascade_update_col_in_tx tx cat ~visited clock params child_meta
-                                   ~rowid:crid ~row:crow
-                                   ~col_idx:child_col_idx ~new_val:default_val
-                               ) child_rows
-                           ) child_col_idxs in
-                           Lwt.return_unit
-                         end)
-                    end
-                  ) fks
-                ) child_refs
-            in
-            let rowid_key = Rowid.encode rowid in
-            (* Phase 35 Task 2: populate VIRTUAL gen cols before extracting
-               index keys so DELETE drops the right index entries. *)
-            let row_for_idx = with_computed_virtuals clock params table_meta row in
-            (* Remove index entries for this row. *)
-            let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-              if not (row_matches_index_where clock params idx schema row_for_idx)
-              then Lwt.return_unit
-              else begin
-                let iks = List.map row_value_to_index_value
-                            (get_index_key_values clock params idx schema row_for_idx) in
-                let old_ikey = Index_key.encode iks ~rowid in
-                S.del tx idx.idx_tree_id old_ikey
-              end
-            ) indexes in
-            (* Remove the row from the table tree. *)
-            S.del tx table_meta.tree_id rowid_key
-          ) matches
-        in
-        (* Phase 38 (#138): fire AFTER DELETE inside the parent txn so
-           trigger failures roll back the DELETE. *)
+        let* () = Lwt_list.iter_s
+                    (apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes)
+                    matches in
         let* () = match after_hook with
           | None -> Lwt.return_unit
           | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
@@ -3512,7 +3387,6 @@ let execute_delete ?(mode = Auto) ?(params = [||])
         let* () = release_txn tx owned in
         Lwt.return n)
       (fun exn ->
-        (* On any exception: rollback if we own the txn, then re-raise. *)
         let* () = if owned then S.rollback tx else Lwt.return_unit in
         Lwt.fail exn)
   end
