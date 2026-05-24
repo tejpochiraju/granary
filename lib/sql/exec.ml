@@ -4158,140 +4158,136 @@ let fts_snippet_score
       - Prepend [ellipsis] unless window starts at token 0.
       - Append [ellipsis] unless window covers through the last token.
     [query_terms] is a list of snippet phrases. *)
+(* Greedy scan for snippet phrase matches: at each token take the first phrase
+   that matches, skipping past its length. Returns [(phrase_idx,pos,len)] list. *)
+let snippet_build_instances ~phrases ~tokens ~n_toks =
+  let acc = ref [] in
+  let i = ref 0 in
+  while !i < n_toks do
+    match token_phrase_match ~phrases ~tokens !i with
+    | None         -> incr i
+    | Some (ip, len) ->
+      acc := (ip, tokens.(!i).Fts_tokenizer.pos, len) :: !acc;
+      i := !i + len
+  done;
+  List.rev !acc
+
+(* No-match snippet: SQLite anchors at sentence start 0 and emits the first
+   n_token tokens (no leading ellipsis; trailing ellipsis if doc is longer). *)
+let snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec =
+  if n_toks = 0 then ""
+  else begin
+    let win_end_excl = min n_toks n_token in
+    let last_tok = tokens.(win_end_excl - 1) in
+    let prefix_text = String.sub col_text 0 last_tok.Fts_tokenizer.end_byte in
+    if win_end_excl >= n_toks then prefix_text
+    else prefix_text ^ spec.Plan.ellipsis
+  end
+
+(* Choose the best snippet window start: score each instance position and each
+   preceding sentence start (with a sentence-alignment bonus). *)
+let snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks =
+  let a_seen = Array.make (max 1 n_phrases) false in
+  let sentence_starts = fts_sentence_starts ~col_text ~tokens in
+  let best_score = ref 0 in
+  let best_start = ref 0 in
+  let consider score start_pos =
+    if score > !best_score then begin best_score := score; best_start := start_pos end
+  in
+  List.iter (fun (_ip, io, _len) ->
+    (* Non-sentence-aligned: window anchored at this instance, centered. *)
+    Array.fill a_seen 0 n_phrases false;
+    let (score, i_adj) =
+      fts_snippet_score ~instances ~a_seen ~i_pos:io ~n_token ~n_docsize:n_toks in
+    consider score i_adj;
+    (* Sentence-aligned: latest sentence start strictly before io. *)
+    if n_toks > n_token then begin
+      let n_sent = Array.length sentence_starts in
+      let jj = ref 0 in
+      while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
+      let s_start = sentence_starts.(!jj) in
+      if s_start < io then begin
+        Array.fill a_seen 0 n_phrases false;
+        let (score, _) =
+          fts_snippet_score ~instances ~a_seen ~i_pos:s_start ~n_token ~n_docsize:n_toks in
+        let bonus = if s_start = 0 then 120 else 100 in
+        consider (score + bonus) s_start
+      end
+    end
+  ) instances;
+  !best_start
+
+(* Reconstruct the snippet text for the chosen window, wrapping matched phrase
+   instances in start/end tags and emitting leading/trailing ellipses. *)
+let snippet_render ~col_text ~tokens ~token_instance_at ~i_best_start ~n_token
+    ~n_toks ~spec =
+  let i_range_end = i_best_start + n_token - 1 in
+  let buf = Buffer.create 128 in
+  if i_best_start > 0 then Buffer.add_string buf spec.Plan.ellipsis;
+  if n_toks > 0 then begin
+    let first_in_range = i_best_start in
+    let last_in_range  = min (n_toks - 1) i_range_end in
+    let prev_end = ref tokens.(first_in_range).Fts_tokenizer.start_byte in
+    let prev_inst = ref (-1) in
+    for i = first_in_range to last_in_range do
+      let tok = tokens.(i) in
+      let inst = token_instance_at.(i) in
+      let gap_len = tok.Fts_tokenizer.start_byte - !prev_end in
+      let gap =
+        if gap_len > 0 then String.sub col_text !prev_end gap_len else ""
+      in
+      if !prev_inst <> inst then begin
+        (* Close the previous wrap, emit gap outside, open a new wrap if
+           entering a phrase instance. *)
+        if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
+        Buffer.add_string buf gap;
+        if inst >= 0 then Buffer.add_string buf spec.Plan.start_tag
+      end else
+        (* Same wrap state — gap belongs to it (e.g. space inside <b>..</b>). *)
+        Buffer.add_string buf gap;
+      Buffer.add_string buf
+        (String.sub col_text tok.Fts_tokenizer.start_byte
+           (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte));
+      prev_end := tok.Fts_tokenizer.end_byte;
+      prev_inst := inst
+    done;
+    if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
+    (* Trailing: append the rest of the source if the window reaches the last
+       token, else a trailing ellipsis. *)
+    if i_range_end >= n_toks - 1 then begin
+      let last_end = tokens.(last_in_range).Fts_tokenizer.end_byte in
+      if last_end < String.length col_text then
+        Buffer.add_string buf
+          (String.sub col_text last_end (String.length col_text - last_end))
+    end else
+      Buffer.add_string buf spec.Plan.ellipsis
+  end;
+  Buffer.contents buf
+
 let compute_snippet
     ~col_text
     ~(query_terms : snippet_phrase list)
     ~(spec : Plan.snippet_spec) =
-  let tokens_list = Fts_tokenizer.tokenize_string ~col:0 col_text in
-  let tokens = Array.of_list tokens_list in
+  let tokens = Array.of_list (Fts_tokenizer.tokenize_string ~col:0 col_text) in
   let n_toks = Array.length tokens in
   let phrases = Array.of_list query_terms in
   let n_phrases = Array.length phrases in
   let n_token = max 1 spec.Plan.n_tokens in
-  (* Build instance list: [(phrase_idx, position, length)] for each
-     matching token start, in token order. Greedy: at each position we
-     take the first phrase that matches and skip past its full length so
-     a multi-token phrase doesn't double-count its constituents. *)
-  let instances =
-    let acc = ref [] in
-    let i = ref 0 in
-    while !i < n_toks do
-      match token_phrase_match ~phrases ~tokens !i with
-      | None         -> incr i
-      | Some (ip, len) ->
-        acc := (ip, tokens.(!i).Fts_tokenizer.pos, len) :: !acc;
-        i := !i + len
-    done;
-    List.rev !acc
-  in
-  (* Mark each token position with the index of its covering instance
-     (not phrase index — instance index, so adjacent occurrences of the
-     same phrase emit separate wraps as SQLite does). -1 = unmatched. *)
+  let instances = snippet_build_instances ~phrases ~tokens ~n_toks in
+  (* Mark each token position with its covering instance index (-1 = none),
+     so adjacent occurrences of the same phrase emit separate wraps. *)
   let token_instance_at = Array.make (max 1 n_toks) (-1) in
   List.iteri (fun inst_idx (_ip, io, len) ->
     for k = 0 to len - 1 do
       if io + k < n_toks then token_instance_at.(io + k) <- inst_idx
     done
   ) instances;
-  if instances = [] || n_phrases = 0 then begin
-    (* No matches: SQLite's snippet() degrades to highlighting nothing, but
-       its window selection still anchors at sentence start 0 with score 120
-       and emits the first n_token tokens (no leading ellipsis, trailing
-       ellipsis if doc longer than window).  Replicate that. *)
-    if n_toks = 0 then ""
-    else begin
-      let win_end_excl = min n_toks n_token in
-      let last_tok = tokens.(win_end_excl - 1) in
-      let prefix_text = String.sub col_text 0 last_tok.Fts_tokenizer.end_byte in
-      if win_end_excl >= n_toks then prefix_text
-      else prefix_text ^ spec.Plan.ellipsis
-    end
-  end else begin
-    let a_seen = Array.make (max 1 n_phrases) false in
-    let sentence_starts = fts_sentence_starts ~col_text ~tokens in
-    let best_score = ref 0 in
-    let best_start = ref 0 in
-    let consider score start_pos =
-      if score > !best_score then begin
-        best_score := score;
-        best_start := start_pos
-      end
-    in
-    List.iter (fun (_ip, io, _len) ->
-      (* Non-sentence-aligned: window anchored at this instance, centered. *)
-      Array.fill a_seen 0 n_phrases false;
-      let (score, i_adj) =
-        fts_snippet_score ~instances ~a_seen
-          ~i_pos:io ~n_token ~n_docsize:n_toks
-      in
-      consider score i_adj;
-      (* Sentence-aligned: find latest sentence start strictly before io. *)
-      if n_toks > n_token then begin
-        let n_sent = Array.length sentence_starts in
-        let jj = ref 0 in
-        while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
-        let s_start = sentence_starts.(!jj) in
-        if s_start < io then begin
-          Array.fill a_seen 0 n_phrases false;
-          let (score, _) =
-            fts_snippet_score ~instances ~a_seen
-              ~i_pos:s_start ~n_token ~n_docsize:n_toks
-          in
-          let bonus = if s_start = 0 then 120 else 100 in
-          consider (score + bonus) s_start
-        end
-      end
-    ) instances;
-    let i_best_start = !best_start in
-    let i_range_end  = i_best_start + n_token - 1 in
-    (* Reconstruct text. *)
-    let buf = Buffer.create 128 in
-    if i_best_start > 0 then Buffer.add_string buf spec.Plan.ellipsis;
-    (* Find first token at or after i_best_start (which by construction is
-       just tokens.(i_best_start) for our model where positions are dense). *)
-    if n_toks > 0 then begin
-      let first_in_range = i_best_start in
-      let last_in_range  = min (n_toks - 1) i_range_end in
-      let prev_end = ref tokens.(first_in_range).Fts_tokenizer.start_byte in
-      let prev_inst = ref (-1) in
-      for i = first_in_range to last_in_range do
-        let tok = tokens.(i) in
-        let inst = token_instance_at.(i) in
-        let gap_len = tok.Fts_tokenizer.start_byte - !prev_end in
-        let gap =
-          if gap_len > 0 then String.sub col_text !prev_end gap_len else ""
-        in
-        if !prev_inst <> inst then begin
-          (* Close the previous instance's wrap if any, emit gap outside,
-             then open a new wrap if entering a phrase instance. SQLite
-             treats whitespace between tokens of the same phrase as
-             internal to the wrap — kept in [gap] handling below. *)
-          if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
-          Buffer.add_string buf gap;
-          if inst >= 0 then Buffer.add_string buf spec.Plan.start_tag
-        end else
-          (* Same wrap state (both inside or both outside) — gap belongs
-             to the current state, e.g. the space inside <b>quick brown</b>. *)
-          Buffer.add_string buf gap;
-        Buffer.add_string buf
-          (String.sub col_text tok.Fts_tokenizer.start_byte
-             (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte));
-        prev_end := tok.Fts_tokenizer.end_byte;
-        prev_inst := inst
-      done;
-      if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
-      (* Trailing handling: if the claimed range_end reaches or exceeds the
-         last token, append the rest of the source text; else append ellipsis. *)
-      if i_range_end >= n_toks - 1 then begin
-        let last_end = tokens.(last_in_range).Fts_tokenizer.end_byte in
-        if last_end < String.length col_text then
-          Buffer.add_string buf
-            (String.sub col_text last_end (String.length col_text - last_end))
-      end else
-        Buffer.add_string buf spec.Plan.ellipsis
-    end;
-    Buffer.contents buf
-  end
+  if instances = [] || n_phrases = 0 then
+    snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec
+  else
+    let i_best_start =
+      snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks in
+    snippet_render ~col_text ~tokens ~token_instance_at ~i_best_start ~n_token ~n_toks ~spec
 
 (* ------------------------------------------------------------------ *)
 (* substitute_cte: replace Op_cte_scan nodes with Op_pragma_rows       *)
@@ -4432,50 +4428,11 @@ let rec pre_eval_subquery
     (e : Plan.expr) : Plan.expr Lwt.t =
   match e with
   | Plan.P_subquery inner_ast ->
-    (match cat_opt with
-     | None -> Lwt.return (Plan.P_lit Ast.L_null)
-     | Some cat ->
-       let* bound_r = Sema.bind cat inner_ast in
-       (match bound_r with
-        | Error _ -> Lwt.return e
-        | Ok bound ->
-          let op = Planner.plan ~cat bound in
-          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
-          let* rows = Lwt_stream.to_list stream in
-          let v = match rows with
-            | [] -> Ast.L_null
-            | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
-            | _ -> Ast.L_null
-          in
-          Lwt.return (Plan.P_lit v)))
+    eval_scalar_subquery clock store params cat_opt e inner_ast
   | Plan.P_exists inner_ast ->
-    (match cat_opt with
-     | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
-     | Some cat ->
-       let* bound_r = Sema.bind cat inner_ast in
-       (match bound_r with
-        | Error _ -> Lwt.return e
-        | Ok bound ->
-          let op = Planner.plan ~cat bound in
-          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
-          let* first = Lwt_stream.get stream in
-          Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L)))))
+    eval_exists_subquery clock store params cat_opt e inner_ast
   | Plan.P_in_select (x, inner_ast) ->
-    (match cat_opt with
-     | None -> Lwt.return (Plan.P_in (x, []))
-     | Some cat ->
-       let* bound_r = Sema.bind cat inner_ast in
-       (match bound_r with
-        | Error _ -> Lwt.return e
-        | Ok bound ->
-          let op = Planner.plan ~cat bound in
-          let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
-          let* rows = Lwt_stream.to_list stream in
-          let vals = List.filter_map (fun row ->
-            if Array.length row >= 1 then Some (Plan.P_lit (value_to_literal row.(0)))
-            else None) rows in
-          let* x' = pre_eval_subquery clock store params cat_opt x in
-          Lwt.return (Plan.P_in (x', vals))))
+    eval_in_select clock store params cat_opt e x inner_ast
   | Plan.P_binop (op, a, b) ->
     let* a' = pre_eval_subquery clock store params cat_opt a in
     let* b' = pre_eval_subquery clock store params cat_opt b in
@@ -4536,6 +4493,61 @@ let rec pre_eval_subquery
     Lwt.return (Plan.P_collate (e', c))
   | _ -> Lwt.return e
 
+(* Scalar subquery: run [inner_ast], yield its first column's first value as a
+   literal (NULL if empty); returns [e] unchanged if it fails to bind. *)
+and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
+    : Plan.expr Lwt.t =
+  match cat_opt with
+  | None -> Lwt.return (Plan.P_lit Ast.L_null)
+  | Some cat ->
+    let* bound_r = Sema.bind cat inner_ast in
+    (match bound_r with
+     | Error _ -> Lwt.return e
+     | Ok bound ->
+       let op = Planner.plan ~cat bound in
+       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       let* rows = Lwt_stream.to_list stream in
+       let v = match rows with
+         | [] -> Ast.L_null
+         | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
+         | _ -> Ast.L_null
+       in
+       Lwt.return (Plan.P_lit v))
+
+(* EXISTS subquery: 1 if [inner_ast] yields any row, else 0. *)
+and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
+    : Plan.expr Lwt.t =
+  match cat_opt with
+  | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
+  | Some cat ->
+    let* bound_r = Sema.bind cat inner_ast in
+    (match bound_r with
+     | Error _ -> Lwt.return e
+     | Ok bound ->
+       let op = Planner.plan ~cat bound in
+       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       let* first = Lwt_stream.get stream in
+       Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L))))
+
+(* IN (subquery): materialize [inner_ast]'s first column into the IN value list. *)
+and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
+    : Plan.expr Lwt.t =
+  match cat_opt with
+  | None -> Lwt.return (Plan.P_in (x, []))
+  | Some cat ->
+    let* bound_r = Sema.bind cat inner_ast in
+    (match bound_r with
+     | Error _ -> Lwt.return e
+     | Ok bound ->
+       let op = Planner.plan ~cat bound in
+       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       let* rows = Lwt_stream.to_list stream in
+       let vals = List.filter_map (fun row ->
+         if Array.length row >= 1 then Some (Plan.P_lit (value_to_literal row.(0)))
+         else None) rows in
+       let* x' = pre_eval_subquery clock store params cat_opt x in
+       Lwt.return (Plan.P_in (x', vals)))
+
 (* ------------------------------------------------------------------ *)
 (* Window function helpers                                              *)
 (* ------------------------------------------------------------------ *)
@@ -4576,6 +4588,261 @@ and sort_partition_by clock params
       in cmp order_by
     ) indexed_rows
 
+and win_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let cur_rank = ref 1 in
+  for pos = 0 to n - 1 do
+    if pos > 0 then begin
+      let order_changed = List.exists (fun (e, dir, nulls) ->
+        compare_with_nulls dir nulls
+          (eval_expr clock params sorted_rows.(pos)   e)
+          (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+      ) wplan.Plan.order_by in
+      if order_changed then cur_rank := pos + 1
+    end;
+    results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
+  done
+
+and win_dense_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let cur_rank = ref 1 in
+  for pos = 0 to n - 1 do
+    if pos > 0 then begin
+      let order_changed = List.exists (fun (e, dir, nulls) ->
+        compare_with_nulls dir nulls
+          (eval_expr clock params sorted_rows.(pos)   e)
+          (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+      ) wplan.Plan.order_by in
+      if order_changed then incr cur_rank
+    end;
+    results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
+  done
+
+and win_ntile clock params (wplan : Plan.window_plan_item) _sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let n_buckets =
+    match wplan.Plan.args with
+    | [e] -> (match eval_expr clock params [||] e with
+              | Row.V_int k -> Int64.to_int k
+              | _ -> 1)
+    | _ -> 1
+  in
+  let n_buckets = max 1 n_buckets in
+  for pos = 0 to n - 1 do
+    let bucket = (pos * n_buckets / n) + 1 in
+    results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int bucket)
+  done
+
+and win_lag_lead clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let is_lag = (wplan.Plan.func = Ast.WF_lag) in
+  let offset =
+    match wplan.Plan.args with
+    | _ :: e :: _ -> (match eval_expr clock params [||] e with
+                      | Row.V_int k -> Int64.to_int k
+                      | _ -> 1)
+    | _ -> 1
+  in
+  let default_expr =
+    match wplan.Plan.args with _ :: _ :: e :: _ -> Some e | _ -> None
+  in
+  for pos = 0 to n - 1 do
+    let src_pos = if is_lag then pos - offset else pos + offset in
+    let v =
+      if src_pos >= 0 && src_pos < n then
+        (match wplan.Plan.args with
+         | e :: _ -> eval_expr clock params sorted_rows.(src_pos) e
+         | []     -> Row.V_null)
+      else
+        (match default_expr with
+         | Some e -> eval_expr clock params sorted_rows.(pos) e
+         | None   -> Row.V_null)
+    in
+    results.(sorted_orig_idxs.(pos)) <- v
+  done
+
+and win_first_value clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let arg_expr =
+    match wplan.Plan.args with
+    | e :: _ -> e
+    | [] -> failwith "FIRST_VALUE requires one argument"
+  in
+  let first_val =
+    if n > 0 then eval_expr clock params sorted_rows.(0) arg_expr
+    else Row.V_null
+  in
+  for pos = 0 to n - 1 do
+    results.(sorted_orig_idxs.(pos)) <- first_val
+  done
+
+and win_nth_value clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  let arg_expr =
+    match wplan.Plan.args with
+    | e :: _ -> e
+    | [] -> failwith "NTH_VALUE requires at least one argument"
+  in
+  let n_arg =
+    match wplan.Plan.args with
+    | _ :: e :: _ -> (match eval_expr clock params [||] e with
+                      | Row.V_int k -> Int64.to_int k
+                      | _ -> 1)
+    | _ -> 1
+  in
+  for pos = 0 to n - 1 do
+    let v =
+      if n_arg >= 1 && n_arg <= pos + 1 then
+        eval_expr clock params sorted_rows.(n_arg - 1) arg_expr
+      else
+        Row.V_null
+    in
+    results.(sorted_orig_idxs.(pos)) <- v
+  done
+
+and win_percent_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  (* PERCENT_RANK = peer_group_start / (n - 1).  Positional adjacency in the
+     already-direction-sorted array, so DESC works without knowing direction. *)
+  if n = 0 then ()
+  else begin
+    let peer_start = ref 0 in
+    for pos = 0 to n - 1 do
+      if pos > 0 then begin
+        let order_changed = List.exists (fun (e, dir, nulls) ->
+          compare_with_nulls dir nulls
+            (eval_expr clock params sorted_rows.(pos)   e)
+            (eval_expr clock params sorted_rows.(pos-1) e) <> 0
+        ) wplan.Plan.order_by in
+        if order_changed then peer_start := pos
+      end;
+      let pct = if n <= 1 then 0.0
+                else Float.of_int !peer_start /. Float.of_int (n - 1) in
+      results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
+    done
+  end
+
+and win_cume_dist clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n =
+  (* CUME_DIST = (last position in peer group + 1) / n.  Positional adjacency
+     in the already-direction-sorted array, so DESC works correctly. *)
+  if n = 0 then ()
+  else begin
+    let pos = ref 0 in
+    while !pos < n do
+      let peer_end = ref !pos in
+      while !peer_end + 1 < n &&
+            List.for_all (fun (e, dir, nulls) ->
+              compare_with_nulls dir nulls
+                (eval_expr clock params sorted_rows.(!peer_end + 1) e)
+                (eval_expr clock params sorted_rows.(!peer_end)     e) = 0
+            ) wplan.Plan.order_by
+      do
+        incr peer_end
+      done;
+      let cd = Float.of_int (!peer_end + 1) /. Float.of_int n in
+      for i = !pos to !peer_end do
+        results.(sorted_orig_idxs.(i)) <- Row.V_real cd
+      done;
+      pos := !peer_end + 1
+    done
+  end
+
+(* Compute one aggregate-window value over the rows in [indices]. *)
+and win_agg_over_frame agg_func (arg_expr : Plan.expr option)
+    (arg_vals : Row.value array) indices : Row.value =
+  match agg_func with
+  | Ast.Agg_count ->
+    let cnt =
+      if arg_expr = None then List.length indices
+      else List.length (List.filter (fun i -> not (arg_vals.(i) = Row.V_null)) indices)
+    in
+    Row.V_int (Int64.of_int cnt)
+  | Ast.Agg_sum ->
+    List.fold_left (fun acc i ->
+      match acc, arg_vals.(i) with
+      | _, Row.V_null                       -> acc
+      | Row.V_null, v                       -> v
+      | Row.V_int  a, Row.V_int  b          -> Row.V_int  (Int64.add a b)
+      | Row.V_real a, Row.V_real b          -> Row.V_real (a +. b)
+      | Row.V_int  a, Row.V_real b          -> Row.V_real (Int64.to_float a +. b)
+      | Row.V_real a, Row.V_int  b          -> Row.V_real (a +. Int64.to_float b)
+      | _, _                                -> acc
+    ) Row.V_null indices
+  | Ast.Agg_avg ->
+    let vals = List.filter_map (fun i ->
+      match arg_vals.(i) with
+      | Row.V_int  n -> Some (Int64.to_float n)
+      | Row.V_real f -> Some f
+      | _            -> None
+    ) indices in
+    if vals = [] then Row.V_null
+    else Row.V_real (List.fold_left ( +. ) 0.0 vals /. float_of_int (List.length vals))
+  | Ast.Agg_min ->
+    List.fold_left (fun acc i ->
+      match arg_vals.(i) with
+      | Row.V_null -> acc
+      | v -> (match acc with
+        | Row.V_null -> v
+        | acc_v -> if compare_values v acc_v < 0 then v else acc_v)
+    ) Row.V_null indices
+  | Ast.Agg_max ->
+    List.fold_left (fun acc i ->
+      match arg_vals.(i) with
+      | Row.V_null -> acc
+      | v -> (match acc with
+        | Row.V_null -> v
+        | acc_v -> if compare_values v acc_v > 0 then v else acc_v)
+    ) Row.V_null indices
+  | Ast.Agg_group_concat sep ->
+    let separator = Option.value sep ~default:"," in
+    let parts = List.filter_map (fun i ->
+      match arg_vals.(i) with
+      | Row.V_null -> None
+      | Row.V_int  n -> Some (Int64.to_string n)
+      | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+      | Row.V_text s -> Some s
+      | Row.V_blob _ -> Some ""
+    ) indices in
+    if parts = [] then Row.V_null
+    else Row.V_text (String.concat separator parts)
+
+and win_aggregate clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
+    (results : Row.value array) n agg_func =
+  let has_order = wplan.Plan.order_by <> [] in
+  let arg_expr = match wplan.Plan.args with e :: _ -> Some e | [] -> None in
+  let arg_vals = Array.init n (fun pos ->
+    match arg_expr with
+    | Some e -> eval_expr clock params sorted_rows.(pos) e
+    | None   -> Row.V_null
+  ) in
+  let resolve_bound bound pos =
+    match bound with
+    | Ast.FB_unbounded_preceding -> 0
+    | Ast.FB_preceding k         -> max 0 (pos - k)
+    | Ast.FB_current_row         -> pos
+    | Ast.FB_following k         -> min (n - 1) (pos + k)
+    | Ast.FB_unbounded_following -> n - 1
+  in
+  for pos = 0 to n - 1 do
+    let (frame_start, frame_end) = match wplan.Plan.frame with
+      | None ->
+        (* Default: UNBOUNDED PRECEDING AND CURRENT ROW with ORDER BY, else
+           UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING. *)
+        let fe = if has_order then pos else n - 1 in
+        (0, fe)
+      | Some spec ->
+        (* RANGE numeric bounds approximated as ROWS — full value-based RANGE
+           semantics not implemented. *)
+        (resolve_bound spec.Ast.start pos, resolve_bound spec.Ast.end_ pos)
+    in
+    let frame_start = max 0 frame_start in
+    let frame_end   = min (n - 1) frame_end in
+    let indices = if frame_start > frame_end then []
+                  else List.init (frame_end - frame_start + 1) (fun i -> frame_start + i) in
+    results.(sorted_orig_idxs.(pos)) <- win_agg_over_frame agg_func arg_expr arg_vals indices
+  done
+
 and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
     (sorted_indexed : (int * Row.t) list) (n_total : int) : Row.value array =
   let results = Array.make n_total Row.V_null in
@@ -4587,90 +4854,11 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
      for pos = 0 to n - 1 do
        results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int (pos + 1))
      done
-
-   | Ast.WF_rank ->
-     let cur_rank = ref 1 in
-     for pos = 0 to n - 1 do
-       if pos > 0 then begin
-         let order_changed = List.exists (fun (e, dir, nulls) ->
-           compare_with_nulls dir nulls
-             (eval_expr clock params sorted_rows.(pos)   e)
-             (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-         ) wplan.Plan.order_by in
-         if order_changed then cur_rank := pos + 1
-       end;
-       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
-     done
-
-   | Ast.WF_dense_rank ->
-     let cur_rank = ref 1 in
-     for pos = 0 to n - 1 do
-       if pos > 0 then begin
-         let order_changed = List.exists (fun (e, dir, nulls) ->
-           compare_with_nulls dir nulls
-             (eval_expr clock params sorted_rows.(pos)   e)
-             (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-         ) wplan.Plan.order_by in
-         if order_changed then incr cur_rank
-       end;
-       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
-     done
-
-   | Ast.WF_ntile ->
-     let n_buckets =
-       match wplan.Plan.args with
-       | [e] -> (match eval_expr clock params [||] e with
-                 | Row.V_int k -> Int64.to_int k
-                 | _ -> 1)
-       | _ -> 1
-     in
-     let n_buckets = max 1 n_buckets in
-     for pos = 0 to n - 1 do
-       let bucket = (pos * n_buckets / n) + 1 in
-       results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int bucket)
-     done
-
-   | Ast.WF_lag | Ast.WF_lead ->
-     let is_lag = (wplan.Plan.func = Ast.WF_lag) in
-     let offset =
-       match wplan.Plan.args with
-       | _ :: e :: _ -> (match eval_expr clock params [||] e with
-                         | Row.V_int k -> Int64.to_int k
-                         | _ -> 1)
-       | _ -> 1
-     in
-     let default_expr =
-       match wplan.Plan.args with _ :: _ :: e :: _ -> Some e | _ -> None
-     in
-     for pos = 0 to n - 1 do
-       let src_pos = if is_lag then pos - offset else pos + offset in
-       let v =
-         if src_pos >= 0 && src_pos < n then
-           (match wplan.Plan.args with
-            | e :: _ -> eval_expr clock params sorted_rows.(src_pos) e
-            | []     -> Row.V_null)
-         else
-           (match default_expr with
-            | Some e -> eval_expr clock params sorted_rows.(pos) e
-            | None   -> Row.V_null)
-       in
-       results.(sorted_orig_idxs.(pos)) <- v
-     done
-
-   | Ast.WF_first_value ->
-     let arg_expr =
-       match wplan.Plan.args with
-       | e :: _ -> e
-       | [] -> failwith "FIRST_VALUE requires one argument"
-     in
-     let first_val =
-       if n > 0 then eval_expr clock params sorted_rows.(0) arg_expr
-       else Row.V_null
-     in
-     for pos = 0 to n - 1 do
-       results.(sorted_orig_idxs.(pos)) <- first_val
-     done
-
+   | Ast.WF_rank -> win_rank clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_dense_rank -> win_dense_rank clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_ntile -> win_ntile clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_lag | Ast.WF_lead -> win_lag_lead clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_first_value -> win_first_value clock params wplan sorted_rows sorted_orig_idxs results n
    | Ast.WF_last_value ->
      let arg_expr =
        match wplan.Plan.args with
@@ -4681,170 +4869,10 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        results.(sorted_orig_idxs.(pos)) <-
          eval_expr clock params sorted_rows.(pos) arg_expr
      done
-
-   | Ast.WF_nth_value ->
-     let arg_expr =
-       match wplan.Plan.args with
-       | e :: _ -> e
-       | [] -> failwith "NTH_VALUE requires at least one argument"
-     in
-     let n_arg =
-       match wplan.Plan.args with
-       | _ :: e :: _ -> (match eval_expr clock params [||] e with
-                         | Row.V_int k -> Int64.to_int k
-                         | _ -> 1)
-       | _ -> 1
-     in
-     for pos = 0 to n - 1 do
-       let v =
-         if n_arg >= 1 && n_arg <= pos + 1 then
-           eval_expr clock params sorted_rows.(n_arg - 1) arg_expr
-         else
-           Row.V_null
-       in
-       results.(sorted_orig_idxs.(pos)) <- v
-     done
-
-   | Ast.WF_percent_rank ->
-     (* PERCENT_RANK = peer_group_start / (n - 1).
-        Use positional adjacency in the already-direction-sorted array so that
-        DESC order works correctly without needing to know the sort direction. *)
-     if n = 0 then ()
-     else begin
-       let peer_start = ref 0 in
-       for pos = 0 to n - 1 do
-         if pos > 0 then begin
-           let order_changed = List.exists (fun (e, dir, nulls) ->
-             compare_with_nulls dir nulls
-               (eval_expr clock params sorted_rows.(pos)   e)
-               (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-           ) wplan.Plan.order_by in
-           if order_changed then peer_start := pos
-         end;
-         let pct = if n <= 1 then 0.0
-                   else Float.of_int !peer_start /. Float.of_int (n - 1) in
-         results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
-       done
-     end
-
-   | Ast.WF_cume_dist ->
-     (* CUME_DIST = (last position in peer group + 1) / n.
-        Use positional adjacency in the already-direction-sorted array so that
-        DESC order works correctly without needing to know the sort direction. *)
-     if n = 0 then ()
-     else begin
-       let pos = ref 0 in
-       while !pos < n do
-         (* Find the end of the current peer group *)
-         let peer_end = ref !pos in
-         while !peer_end + 1 < n &&
-               List.for_all (fun (e, dir, nulls) ->
-                 compare_with_nulls dir nulls
-                   (eval_expr clock params sorted_rows.(!peer_end + 1) e)
-                   (eval_expr clock params sorted_rows.(!peer_end)     e) = 0
-               ) wplan.Plan.order_by
-         do
-           incr peer_end
-         done;
-         let cd = Float.of_int (!peer_end + 1) /. Float.of_int n in
-         for i = !pos to !peer_end do
-           results.(sorted_orig_idxs.(i)) <- Row.V_real cd
-         done;
-         pos := !peer_end + 1
-       done
-     end
-
-   | Ast.WF_agg agg_func ->
-     let has_order = wplan.Plan.order_by <> [] in
-     let arg_expr = match wplan.Plan.args with e :: _ -> Some e | [] -> None in
-     let arg_vals = Array.init n (fun pos ->
-       match arg_expr with
-       | Some e -> eval_expr clock params sorted_rows.(pos) e
-       | None   -> Row.V_null
-     ) in
-     let resolve_bound bound pos =
-       match bound with
-       | Ast.FB_unbounded_preceding -> 0
-       | Ast.FB_preceding k         -> max 0 (pos - k)
-       | Ast.FB_current_row         -> pos
-       | Ast.FB_following k         -> min (n - 1) (pos + k)
-       | Ast.FB_unbounded_following -> n - 1
-     in
-     for pos = 0 to n - 1 do
-       let (frame_start, frame_end) = match wplan.Plan.frame with
-         | None ->
-           (* Default: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW when ORDER BY
-              present, RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING otherwise *)
-           let fe = if has_order then pos else n - 1 in
-           (0, fe)
-         | Some spec ->
-           (* RANGE with numeric bounds approximated as ROWS — full value-based RANGE
-              semantics not implemented *)
-           (resolve_bound spec.Ast.start pos, resolve_bound spec.Ast.end_ pos)
-       in
-       let frame_start = max 0 frame_start in
-       let frame_end   = min (n - 1) frame_end in
-       let indices = if frame_start > frame_end then []
-                     else List.init (frame_end - frame_start + 1) (fun i -> frame_start + i) in
-       let result = match agg_func with
-         | Ast.Agg_count ->
-           let cnt =
-             if arg_expr = None then List.length indices
-             else List.length (List.filter (fun i ->
-               not (arg_vals.(i) = Row.V_null)) indices)
-           in
-           Row.V_int (Int64.of_int cnt)
-         | Ast.Agg_sum ->
-           List.fold_left (fun acc i ->
-             match acc, arg_vals.(i) with
-             | _, Row.V_null                       -> acc
-             | Row.V_null, v                       -> v
-             | Row.V_int  a, Row.V_int  b          -> Row.V_int  (Int64.add a b)
-             | Row.V_real a, Row.V_real b          -> Row.V_real (a +. b)
-             | Row.V_int  a, Row.V_real b          -> Row.V_real (Int64.to_float a +. b)
-             | Row.V_real a, Row.V_int  b          -> Row.V_real (a +. Int64.to_float b)
-             | _, _                                -> acc
-           ) Row.V_null indices
-         | Ast.Agg_avg ->
-           let vals = List.filter_map (fun i ->
-             match arg_vals.(i) with
-             | Row.V_int  n -> Some (Int64.to_float n)
-             | Row.V_real f -> Some f
-             | _            -> None
-           ) indices in
-           if vals = [] then Row.V_null
-           else Row.V_real (List.fold_left ( +. ) 0.0 vals /. float_of_int (List.length vals))
-         | Ast.Agg_min ->
-           List.fold_left (fun acc i ->
-             match arg_vals.(i) with
-             | Row.V_null -> acc
-             | v -> (match acc with
-               | Row.V_null -> v
-               | acc_v -> if compare_values v acc_v < 0 then v else acc_v)
-           ) Row.V_null indices
-         | Ast.Agg_max ->
-           List.fold_left (fun acc i ->
-             match arg_vals.(i) with
-             | Row.V_null -> acc
-             | v -> (match acc with
-               | Row.V_null -> v
-               | acc_v -> if compare_values v acc_v > 0 then v else acc_v)
-           ) Row.V_null indices
-         | Ast.Agg_group_concat sep ->
-           let separator = Option.value sep ~default:"," in
-           let parts = List.filter_map (fun i ->
-             match arg_vals.(i) with
-             | Row.V_null -> None
-             | Row.V_int  n -> Some (Int64.to_string n)
-             | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-             | Row.V_text s -> Some s
-             | Row.V_blob _ -> Some ""
-           ) indices in
-           if parts = [] then Row.V_null
-           else Row.V_text (String.concat separator parts)
-       in
-       results.(sorted_orig_idxs.(pos)) <- result
-     done
+   | Ast.WF_nth_value -> win_nth_value clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_percent_rank -> win_percent_rank clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_cume_dist -> win_cume_dist clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_agg agg_func -> win_aggregate clock params wplan sorted_rows sorted_orig_idxs results n agg_func
   );
   results
 
