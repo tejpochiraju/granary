@@ -126,6 +126,39 @@ let encode schema row =
   ) schema;
   Buffer.to_bytes buf
 
+(* Decode one stored column value at [off]; returns (value, next_off). *)
+let decode_col_value encoded off col =
+  match col.ty with
+  | Integer ->
+    let v, off' = Varint.decode_int64 encoded off in
+    (V_int v, off')
+  | Text ->
+    let len, off' = Varint.decode_uint64 encoded off in
+    let len = Int64.to_int len in
+    (V_text (Bytes.sub_string encoded off' len), off' + len)
+  | Real ->
+    (* 8-byte little-endian IEEE-754 float64 *)
+    let bits = ref Int64.zero in
+    for k = 0 to 7 do
+      let byte = Int64.of_int (Bytes.get_uint8 encoded (off + k)) in
+      bits := Int64.logor !bits (Int64.shift_left byte (k * 8))
+    done;
+    (V_real (Int64.float_of_bits !bits), off + 8)
+  | Blob ->
+    let len, off' = Varint.decode_uint64 encoded off in
+    let len = Int64.to_int len in
+    (V_blob (Bytes.sub encoded off' len), off' + len)
+
+(* Value for a column absent from the encoding: its DEFAULT, else NULL. *)
+let default_col_value col =
+  match col.default with
+  | Some (DV_int  n) -> V_int  n
+  | Some (DV_text s) -> V_text s
+  | Some (DV_real f) -> V_real f
+  | Some (DV_blob b) -> V_blob b
+  | Some DV_null | None -> V_null
+  | Some DV_current_timestamp | Some DV_current_date | Some DV_current_time -> V_null
+
 let decode schema encoded =
   let n = List.length schema in
   (* 1. read column count *)
@@ -144,43 +177,14 @@ let decode schema encoded =
     if i < n_encoded then begin
       let byte_idx = i / 8 and bit_idx = i mod 8 in
       let is_null = (Bytes.get_uint8 bitmap byte_idx lsr bit_idx) land 1 = 1 in
-      if not is_null then
-        match col.ty with
-        | Integer ->
-          let v, off' = Varint.decode_int64 encoded !off in
-          result.(i) <- V_int v;
-          off := off'
-        | Text ->
-          let len, off' = Varint.decode_uint64 encoded !off in
-          let len = Int64.to_int len in
-          let s = Bytes.sub_string encoded off' len in
-          result.(i) <- V_text s;
-          off := off' + len
-        | Real ->
-          (* 8-byte little-endian IEEE-754 float64 *)
-          let bits = ref Int64.zero in
-          for k = 0 to 7 do
-            let byte = Int64.of_int (Bytes.get_uint8 encoded (!off + k)) in
-            bits := Int64.logor !bits (Int64.shift_left byte (k * 8))
-          done;
-          result.(i) <- V_real (Int64.float_of_bits !bits);
-          off := !off + 8
-        | Blob ->
-          let len, off' = Varint.decode_uint64 encoded !off in
-          let len = Int64.to_int len in
-          let b = Bytes.sub encoded off' len in
-          result.(i) <- V_blob b;
-          off := off' + len
-    end else begin
+      if not is_null then begin
+        let v, off' = decode_col_value encoded !off col in
+        result.(i) <- v;
+        off := off'
+      end
+    end else
       (* Column i >= n_encoded: fill with schema default or NULL *)
-      result.(i) <- (match col.default with
-        | Some (DV_int  n) -> V_int  n
-        | Some (DV_text s) -> V_text s
-        | Some (DV_real f) -> V_real f
-        | Some (DV_blob b) -> V_blob b
-        | Some DV_null | None -> V_null
-        | Some DV_current_timestamp | Some DV_current_date | Some DV_current_time -> V_null)
-    end
+      result.(i) <- default_col_value col
   ) schema;
   result
 

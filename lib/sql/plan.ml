@@ -210,7 +210,7 @@ type op =
     }
   | Op_fts_match_scan of {
       fts_meta     : Cat.fts_table_meta;
-      query        : Fts_query.fts_query;
+      query        : Fts_query.t;
       proj         : int list;
       include_rank : bool;  (** if true, append BM25 score as last projected column *)
       snippets     : snippet_spec list;

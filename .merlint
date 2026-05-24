@@ -35,6 +35,15 @@
 #   E332 - "prefer 'v' constructor": wants Pager.create->Pager.v, Mem.create->
 #          Mem.v, etc. We use `create` consistently across modules (same stance
 #          as the E205 Fmt opinion).
+#   E330 - "redundant module name". The genuinely-redundant cases were fixed in
+#          code (Fts_query.fts_query type -> Fts_query.t; Store.store_of ->
+#          txn_store). What remains is intentional domain naming: `page_size`
+#          (Page/Wal/Mem/Unix_file/Mirage all expose `val page_size : int` as
+#          part of the BLOCK device interface — it mirrors SQLite's own term and
+#          renaming its ~140 cross-module references to `size` would both lose
+#          clarity and diverge the backends), and `Wal.wal_magic` (the magic
+#          constant; bare `magic` collides with the per-read local). Excluded
+#          for these deliberate constants.
 #
 # Scoped to test/ only (#167, #168):
 #   E105 - catch-all exception handlers. In tests these are idiomatic best-effort
@@ -57,6 +66,6 @@
 
 rules:
   - files: **/*.ml*
-    exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332]
+    exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332, E330]
   - files: test/*.ml*
     exclude: [E105, E005]

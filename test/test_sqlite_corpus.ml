@@ -32,6 +32,50 @@ let trim_stmt s =
   then String.trim (String.sub s 0 (String.length s - 1))
   else s
 
+(* A SELECT seen with no "-- expect:" before the next statement is run as Exec. *)
+let flush_pending ~steps ~pending_select () =
+  match !pending_select with
+  | None -> ()
+  | Some q ->
+    steps := Exec q :: !steps;
+    pending_select := None
+
+let handle_stmt ~steps ~pending_select stmt =
+  let stmt = trim_stmt stmt in
+  if stmt = "" then ()
+  else begin
+    flush_pending ~steps ~pending_select ();
+    let upper = String.uppercase_ascii (String.sub stmt 0 (min 6 (String.length stmt))) in
+    if String.length upper >= 6 && (String.sub upper 0 6 = "SELECT" || String.sub upper 0 4 = "WITH") then
+      pending_select := Some stmt
+    else
+      steps := Exec stmt :: !steps
+  end
+
+let handle_line ~buf ~steps ~pending_select ~path line =
+  let line = String.trim line in
+  if line = "" then ()
+  else if String.length line >= 9 && String.sub line 0 9 = "-- expect" then begin
+    let colon = try String.index line ':' with Not_found -> -1 in
+    let expected_str =
+      if colon = -1 then ""
+      else String.trim (String.sub line (colon + 1) (String.length line - colon - 1)) in
+    let rows = split_rows expected_str in
+    (match !pending_select with
+     | None -> failwith ("expect: with no preceding SELECT in " ^ path)
+     | Some q -> steps := Query (q, rows) :: !steps);
+    pending_select := None
+  end
+  else if String.length line >= 2 && String.sub line 0 2 = "--" then ()
+  else begin
+    Buffer.add_string buf line;
+    Buffer.add_char buf ' ';
+    if String.length line > 0 && line.[String.length line - 1] = ';' then begin
+      handle_stmt ~steps ~pending_select (Buffer.contents buf);
+      Buffer.clear buf
+    end
+  end
+
 let parse_file path =
   let ic = open_in path in
   let buf = Buffer.create 128 in
@@ -43,52 +87,9 @@ let parse_file path =
   with End_of_file -> ());
   close_in ic;
   let lines = List.rev !lines in
-  let flush_pending () =
-    match !pending_select with
-    | None -> ()
-    | Some q ->
-      (* no expect: encountered before next statement; treat as Exec *)
-      steps := Exec q :: !steps;
-      pending_select := None
-  in
-  let handle_stmt stmt =
-    let stmt = trim_stmt stmt in
-    if stmt = "" then ()
-    else begin
-      flush_pending ();
-      let upper = String.uppercase_ascii (String.sub stmt 0 (min 6 (String.length stmt))) in
-      if String.length upper >= 6 && (String.sub upper 0 6 = "SELECT" || String.sub upper 0 4 = "WITH") then
-        pending_select := Some stmt
-      else
-        steps := Exec stmt :: !steps
-    end
-  in
-  List.iter (fun line ->
-    let line = String.trim line in
-    if line = "" then ()
-    else if String.length line >= 9 && String.sub line 0 9 = "-- expect" then begin
-      let colon = try String.index line ':' with Not_found -> -1 in
-      let expected_str =
-        if colon = -1 then ""
-        else String.trim (String.sub line (colon + 1) (String.length line - colon - 1)) in
-      let rows = split_rows expected_str in
-      (match !pending_select with
-       | None -> failwith ("expect: with no preceding SELECT in " ^ path)
-       | Some q -> steps := Query (q, rows) :: !steps);
-      pending_select := None
-    end
-    else if String.length line >= 2 && String.sub line 0 2 = "--" then ()
-    else begin
-      Buffer.add_string buf line;
-      Buffer.add_char buf ' ';
-      if String.length line > 0 && line.[String.length line - 1] = ';' then begin
-        handle_stmt (Buffer.contents buf);
-        Buffer.clear buf
-      end
-    end
-  ) lines;
-  if Buffer.length buf > 0 then handle_stmt (Buffer.contents buf);
-  flush_pending ();
+  List.iter (handle_line ~buf ~steps ~pending_select ~path) lines;
+  if Buffer.length buf > 0 then handle_stmt ~steps ~pending_select (Buffer.contents buf);
+  flush_pending ~steps ~pending_select ();
   List.rev !steps
 
 let row_to_string row =

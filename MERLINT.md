@@ -44,8 +44,9 @@ conventions, not defects:
 | E331 | Redundant Function Prefixes | Naming opinion (#153): wants `create_table`→`table`, `find_index`→`index`. Our `create_*`/`find_*`/`get_*` names mirror the SQL DDL they implement (same rationale as E320). |
 | E325 | Function Naming Convention | Naming opinion (#153): wants `find_table`→`get_table`, directly contradicting E331 (`find_table`→`table`) on the same definitions. Our `find_*` (returns option) convention is deliberate. |
 | E332 | Prefer 'v' Constructor | Naming opinion (#153): wants `Pager.create`→`Pager.v` etc. We use `create` consistently (same stance as the E205 `Fmt` opinion). |
+| E330 | Redundant Module Name | Naming opinion (#153). The genuine cases were fixed in code (`Fts_query.fts_query`→`Fts_query.t`; `Store.store_of`→`txn_store`); what remains is intentional domain naming — `page_size` (part of the BLOCK device interface across all backends; mirrors SQLite's term; ~140 cross-module refs) and `Wal.wal_magic`. |
 
-Excluding these takes the raw report from ~4077 to ~265 findings.
+Excluding these takes the raw report from ~4077 to ~16 findings.
 
 ### Scoped exclusion: E105 in `test/` only (#167)
 
@@ -76,25 +77,26 @@ incl. the 1058-line `to_stream`), `sema.ml` (11, incl. the 669-line
 (`fault_inject`/`index_key`/`row`/`json`/`pager`). E005 is now enforceable for
 `lib/` + `bin/`.
 
-## Enabled rules: current findings (~87)
+## Enabled rules: current findings (16)
 
-All other rules stay on. The notable remaining findings, none yet enforced:
+All other rules stay on. Status after the #153 ratchet:
 
 | Rule | Name | Count | Disposition |
 |------|------|-------|-------------|
 | E105 | Catch-all Exception Handler | 0 | Resolved (#167) — 12 production sites narrowed; `test/` scaffolding excluded. Enforceable. |
 | E005 | Long Functions | 0 | Resolved (#168) — all `lib/` + `bin/` functions decomposed into named helpers; `test/` excluded. Enforceable. |
-| E405 | Missing Value Documentation | 41 | Open — being driven to zero under #153. |
+| E300 | Variant Naming | 0 | Resolved (#153) — `BytesMap`→`Bytes_map`. |
+| E310 | Value Naming | 0 | Resolved (#153) — `test_parse_datetime_T`→`_t`. |
+| E335 | Used Underscore-Prefixed Binding | 0 | Resolved (#153) — dropped a dead param + the used `_stream`. |
+| E400 | Missing MLI Documentation | 0 | Resolved (#153) — module headers added to json/parallel/row/mem. |
+| E405 | Missing Value Documentation | 0 | Resolved (#153) — all public `.mli` values documented. |
+| E415 | Missing Pretty Printer | 0 | Resolved (#153) — `pp` added to all opaque `t` types. |
+| E330 | Redundant Module Name | 0 | Resolved (#153) — genuine cases fixed (`fts_query`→`t`, `store_of`→`txn_store`); intentional domain constants excluded. |
+| E010 | Deep Nesting | 0 | Resolved (#153) — helpers extracted in `row.decode`, `exec` snippet/update, test `run_case`. |
+| E001 | High Cyclomatic Complexity | 0 | Resolved (#153) — `parse_file` split into top-level helpers. |
 | E110 | Silenced Warning | 13 | Open — `[@@warning "-32"]`/`-69` on API/test bindings. |
-| E415 | Missing Pretty Printer | 9 | Open — adding `pp` to opaque `t` types. |
-| E330 | Redundant Module Name | 6 | Open — `fts_query`/`store_of` fixable; `page_size`/`wal_magic` under review. |
-| E010 | Deep Nesting | 4 | Open. |
-| E335 | Used Underscore-Prefixed Binding | 4 | Open. |
-| E400 | Missing MLI Documentation | 4 | Open. |
-| E505 | Missing MLI File | 2 | Open — `lib/sql/ast.ml`, `lib/sql/plan.ml`; large interface task, deferred to a follow-up. |
-| E001 | High Cyclomatic Complexity | 1 | Open — `test/test_sqlite_corpus.ml:parse_file`. |
+| E505 | Missing MLI File | 2 | Open — `lib/sql/ast.ml`, `lib/sql/plan.ml`; large interface-authoring task, deferred to a follow-up. |
 | E500 | Missing `.ocamlformat` | 1 | Open. |
-| E300 / E310 | Variant / Value naming | 1 each | Open. |
 
 No `Obj.magic` exists anywhere in the codebase — the linter's other headline
 concern is already clean.

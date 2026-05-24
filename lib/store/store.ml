@@ -1387,7 +1387,7 @@ let savepoint_rollback (Rw t : rw txn) name =
 (* get / put / del                                                      *)
 (* ------------------------------------------------------------------ *)
 
-let store_of : type a. a txn -> t = function
+let txn_store : type a. a txn -> t = function
   | Ro snap -> snap.rs_store
   | Rw s    -> s
 
@@ -1497,7 +1497,7 @@ let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
             Btree.cursor_close c;
             Lwt.return { all = entries; remaining = []; ready = false }))
     | Rw _ ->
-      let t = store_of tx in
+      let t = txn_store tx in
       (match t.backend with
        | Mem trees ->
          let entries = Bytes_map.bindings !(mem_tree trees tid) in

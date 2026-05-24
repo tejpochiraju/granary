@@ -3037,6 +3037,36 @@ let precheck_update_fk_restrict store (cat : Cat.t) (table_meta : Cat.table_meta
 
 (* First UPDATE pass: validate UNIQUE for every target row against the full
    set of new values (an updated row may collide with another updated row). *)
+(* Check one unique index for an UPDATE that turns [old_row] into [new_row]
+   (with virtuals computed in [new_row_for_idx]); fails the Lwt thread on a
+   duplicate. *)
+let check_index_unique_on_update tx (idx : Cat.index_info)
+    ~clock ~params ~schema ~old_row ~new_row ~new_row_for_idx ~rowid : unit Lwt.t =
+  if not idx.idx_unique then Lwt.return_unit
+  else if not (row_matches_index_where clock params idx schema new_row_for_idx)
+  then Lwt.return_unit
+  else begin
+    let old_vs = get_index_key_values clock params idx schema old_row in
+    let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
+    let values_equal a b = match a, b with
+      | Row.V_null, Row.V_null     -> true
+      | Row.V_int  x, Row.V_int  y -> Int64.equal x y
+      | Row.V_text x, Row.V_text y -> String.equal x y
+      | Row.V_real x, Row.V_real y -> Float.equal x y
+      | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
+      | _                           -> false
+    in
+    let unchanged = List.for_all2 values_equal old_vs new_vs in
+    if unchanged then Lwt.return_unit
+    else
+      let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
+      if dup then
+        Lwt.fail_with (Printf.sprintf
+          "UNIQUE constraint violated: duplicate value in columns (%s)"
+          (String.concat ", " idx.idx_columns))
+      else Lwt.return_unit
+  end
+
 let validate_update_unique tx (table_meta : Cat.table_meta)
     ~clock ~params ~indexes ~assignments matches : unit Lwt.t =
   let schema = table_meta.Cat.columns in
@@ -3046,30 +3076,8 @@ let validate_update_unique tx (table_meta : Cat.table_meta)
     eval_check_constraints clock params table_meta new_row;
     let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
     Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-      if not idx.idx_unique then Lwt.return_unit
-      else if not (row_matches_index_where clock params idx schema new_row_for_idx)
-      then Lwt.return_unit
-      else begin
-        let old_vs = get_index_key_values clock params idx schema old_row in
-        let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
-        let values_equal a b = match a, b with
-          | Row.V_null, Row.V_null     -> true
-          | Row.V_int  x, Row.V_int  y -> Int64.equal x y
-          | Row.V_text x, Row.V_text y -> String.equal x y
-          | Row.V_real x, Row.V_real y -> Float.equal x y
-          | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
-          | _                           -> false
-        in
-        let unchanged = List.for_all2 values_equal old_vs new_vs in
-        if unchanged then Lwt.return_unit
-        else
-          let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
-          if dup then
-            Lwt.fail_with (Printf.sprintf
-              "UNIQUE constraint violated: duplicate value in columns (%s)"
-              (String.concat ", " idx.idx_columns))
-          else Lwt.return_unit
-      end
+      check_index_unique_on_update tx idx
+        ~clock ~params ~schema ~old_row ~new_row ~new_row_for_idx ~rowid
     ) indexes
   ) matches
 
@@ -4234,6 +4242,32 @@ let snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec =
 
 (* Choose the best snippet window start: score each instance position and each
    preceding sentence start (with a sentence-alignment bonus). *)
+(* Score the candidate windows anchored at instance offset [io] — both the
+   centered window and (when the column is longer than one window) the latest
+   sentence start before [io], with a sentence-alignment bonus — feeding each
+   to [consider]. *)
+let snippet_score_instance ~consider ~instances ~a_seen ~sentence_starts
+    ~n_phrases ~n_token ~n_toks io =
+  (* Non-sentence-aligned: window anchored at this instance, centered. *)
+  Array.fill a_seen 0 n_phrases false;
+  let (score, i_adj) =
+    fts_snippet_score ~instances ~a_seen ~i_pos:io ~n_token ~n_docsize:n_toks in
+  consider score i_adj;
+  (* Sentence-aligned: latest sentence start strictly before io. *)
+  if n_toks > n_token then begin
+    let n_sent = Array.length sentence_starts in
+    let jj = ref 0 in
+    while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
+    let s_start = sentence_starts.(!jj) in
+    if s_start < io then begin
+      Array.fill a_seen 0 n_phrases false;
+      let (score, _) =
+        fts_snippet_score ~instances ~a_seen ~i_pos:s_start ~n_token ~n_docsize:n_toks in
+      let bonus = if s_start = 0 then 120 else 100 in
+      consider (score + bonus) s_start
+    end
+  end
+
 let snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks =
   let a_seen = Array.make (max 1 n_phrases) false in
   let sentence_starts = fts_sentence_starts ~col_text ~tokens in
@@ -4243,26 +4277,9 @@ let snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks
     if score > !best_score then begin best_score := score; best_start := start_pos end
   in
   List.iter (fun (_ip, io, _len) ->
-    (* Non-sentence-aligned: window anchored at this instance, centered. *)
-    Array.fill a_seen 0 n_phrases false;
-    let (score, i_adj) =
-      fts_snippet_score ~instances ~a_seen ~i_pos:io ~n_token ~n_docsize:n_toks in
-    consider score i_adj;
-    (* Sentence-aligned: latest sentence start strictly before io. *)
-    if n_toks > n_token then begin
-      let n_sent = Array.length sentence_starts in
-      let jj = ref 0 in
-      while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
-      let s_start = sentence_starts.(!jj) in
-      if s_start < io then begin
-        Array.fill a_seen 0 n_phrases false;
-        let (score, _) =
-          fts_snippet_score ~instances ~a_seen ~i_pos:s_start ~n_token ~n_docsize:n_toks in
-        let bonus = if s_start = 0 then 120 else 100 in
-        consider (score + bonus) s_start
-      end
-    end
-  ) instances;
+    snippet_score_instance ~consider ~instances ~a_seen ~sentence_starts
+      ~n_phrases ~n_token ~n_toks io)
+    instances;
   !best_start
 
 (* Reconstruct the snippet text for the chosen window, wrapping matched phrase

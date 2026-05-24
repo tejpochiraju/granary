@@ -17,14 +17,17 @@ type fts_term =
   | FT_prefix of string         (** prefix: "foo*" stored as "foo" *)
   | FT_phrase of string list    (** phrase: consecutive terms *)
 
-type fts_query =
-  | FQ_and  of fts_query list   (** all must match (default for spaces) *)
-  | FQ_or   of fts_query list   (** any must match *)
-  | FQ_not  of fts_query        (** must NOT match; used inside FQ_and *)
+type t =
+  | FQ_and  of t list   (** all must match (default for spaces) *)
+  | FQ_or   of t list   (** any must match *)
+  | FQ_not  of t        (** must NOT match; used inside FQ_and *)
   | FQ_term of fts_term
 
 (** Parse a raw MATCH query string. Returns [Error msg] on malformed input. *)
-val parse : string -> (fts_query, string) result
+val parse : string -> (t, string) result
 
 (** Collect all positive (non-negated) terms from a query, for posting-list lookups. *)
-val collect_terms : fts_query -> fts_term list
+val collect_terms : t -> fts_term list
+
+(** Pretty-print a query tree in a parenthesised AND/OR/NOT form. *)
+val pp : Format.formatter -> t -> unit

@@ -3,10 +3,10 @@ type fts_term =
   | FT_prefix of string
   | FT_phrase of string list
 
-type fts_query =
-  | FQ_and  of fts_query list
-  | FQ_or   of fts_query list
-  | FQ_not  of fts_query
+type t =
+  | FQ_and  of t list
+  | FQ_or   of t list
+  | FQ_not  of t
   | FQ_term of fts_term
 
 (* Lex the query string into raw tokens *)
@@ -105,6 +105,20 @@ let rec collect_terms = function
   | FQ_and qs     -> List.concat_map collect_terms qs
   | FQ_or  qs     -> List.concat_map collect_terms qs
   | FQ_not _      -> []  (* negated terms don't need posting lists *)
+
+let pp_term fmt = function
+  | FT_exact s   -> Format.pp_print_string fmt s
+  | FT_prefix s  -> Format.fprintf fmt "%s*" s
+  | FT_phrase ws -> Format.fprintf fmt "\"%s\"" (String.concat " " ws)
+
+let rec pp fmt = function
+  | FQ_term t -> pp_term fmt t
+  | FQ_not q  -> Format.fprintf fmt "(NOT %a)" pp q
+  | FQ_and qs -> Format.fprintf fmt "(AND %a)" pp_list qs
+  | FQ_or  qs -> Format.fprintf fmt "(OR %a)" pp_list qs
+and pp_list fmt qs =
+  Format.pp_print_list
+    ~pp_sep:(fun fmt () -> Format.pp_print_char fmt ' ') pp fmt qs
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

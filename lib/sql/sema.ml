@@ -44,7 +44,7 @@ type bound_expr =
   | BE_in          of bound_expr * bound_expr list
   | BE_func        of Ast.scalar_func * bound_expr list
   | BE_param       of int
-  | BE_match       of Cat.fts_table_meta * Fts_query.fts_query
+  | BE_match       of Cat.fts_table_meta * Fts_query.t
   | BE_subquery  of Ast.stmt
   | BE_exists    of Ast.stmt
   | BE_in_select of bound_expr * Ast.stmt
@@ -202,7 +202,7 @@ type bound_stmt =
     }
   | BS_fts_match_scan of {
       fts_meta     : Cat.fts_table_meta;
-      query        : Fts_query.fts_query;
+      query        : Fts_query.t;
       proj         : int list;
       include_rank : bool;
       snippets     : Plan.snippet_spec list;

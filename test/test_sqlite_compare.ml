@@ -99,6 +99,11 @@ type test_case = {
 
 (* ── comparison runner ─────────────────────────────────────────── *)
 
+let fmt_rows rows =
+  if rows = [] then "  (empty)"
+  else String.concat "\n"
+    (List.map (fun r -> "  [" ^ String.concat " | " r ^ "]") rows)
+
 let run_case tc =
   let db_path = fresh_db_path () in
   Fun.protect
@@ -110,15 +115,9 @@ let run_case tc =
       let sort rows = List.sort compare rows in
       let a = if tc.unordered then sort sqlite_rows   else sqlite_rows   in
       let b = if tc.unordered then sort sqlocaml_rows else sqlocaml_rows in
-      if a <> b then begin
-        let fmt rows =
-          if rows = [] then "  (empty)"
-          else String.concat "\n" (List.map (fun r ->
-            "  [" ^ String.concat " | " r ^ "]") rows)
-        in
+      if a <> b then
         Alcotest.failf "%s:\n\nSQLite:\n%s\n\nSqlocaml:\n%s"
-          tc.name (fmt a) (fmt b)
-      end)
+          tc.name (fmt_rows a) (fmt_rows b))
 
 let make_test tc =
   Alcotest.test_case tc.name `Quick (fun () ->
