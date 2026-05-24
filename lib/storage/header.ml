@@ -10,15 +10,28 @@ type t =
   ; freelist_page : int64
   ; n_pages_total : int64
   ; schema_version : int64
+  ; format_version : int32
+    (** On-disk format version (#174).  Preserved across commits; only a fresh
+        [init] stamps [current_format_version].  Opening a header whose version
+        exceeds [max_supported_format_version] fails with [Unsupported_format]. *)
   }
+
+(* On-disk format versions:
+   - v1: original layout, no schema fingerprints / mirror / page stamps.
+   - v2: #174 — schema fingerprints, redundant catalog mirror, per-page
+     fingerprint stamp in the reserved header bytes. *)
+let current_format_version = 2l
+let max_supported_format_version = 2l
 
 type error =
   | Io of string
   | Both_headers_corrupt
+  | Unsupported_format of int32
 
 let pp_error fmt = function
   | Io msg -> Format.fprintf fmt "Io: %s" msg
   | Both_headers_corrupt -> Format.pp_print_string fmt "Both_headers_corrupt"
+  | Unsupported_format v -> Format.fprintf fmt "Unsupported_format: %ld" v
 ;;
 
 let pp fmt t =
@@ -50,7 +63,7 @@ let build_page (h : t) =
     ; n_pages_total = h.n_pages_total
     ; schema_version = h.schema_version
     ; page_size = Int32.of_int Page.page_size
-    ; format_version = 1l
+    ; format_version = h.format_version
     };
   Page.seal buf;
   buf
@@ -76,6 +89,7 @@ let decode_page buf =
           ; freelist_page = f.Page.freelist_page
           ; n_pages_total = f.Page.n_pages_total
           ; schema_version = f.Page.schema_version
+          ; format_version = f.Page.format_version
           }))
 ;;
 
@@ -96,15 +110,25 @@ let read_live pager =
     | Error _ -> None
     | Ok buf -> decode_page buf
   in
+  let chosen =
+    match h0, h1 with
+    | None, None -> Error Both_headers_corrupt
+    | Some h, None -> Ok h
+    | None, Some h -> Ok h
+    | Some a, Some b ->
+      (* Both valid — pick the one with the higher txn_id.
+         In case of a tie (e.g. right after init) prefer page 0 (a). *)
+      if Int64.compare b.txn_id a.txn_id > 0 then Ok b else Ok a
+  in
   Lwt.return
-    (match h0, h1 with
-     | None, None -> Error Both_headers_corrupt
-     | Some h, None -> Ok h
-     | None, Some h -> Ok h
-     | Some a, Some b ->
-       (* Both valid — pick the one with the higher txn_id.
-          In case of a tie (e.g. right after init) prefer page 0 (a). *)
-       if Int64.compare b.txn_id a.txn_id > 0 then Ok b else Ok a)
+    (match chosen with
+     | (Error _ : (t, error) result) as e -> e
+     | Ok h ->
+       (* Forward-compatibility gate (#174): refuse a database written by a
+          newer binary rather than misreading its layout. *)
+       if Int32.compare h.format_version max_supported_format_version > 0
+       then Error (Unsupported_format h.format_version)
+       else Ok h)
 ;;
 
 (* Internal: write the next header into the inactive page slot.  Returns
@@ -141,6 +165,7 @@ let init pager =
     ; freelist_page = 0L
     ; n_pages_total = 0L
     ; schema_version = 0L
+    ; format_version = current_format_version
     }
   in
   let buf0 = build_page zero in

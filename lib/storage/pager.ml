@@ -56,6 +56,11 @@ type t =
   ; mutable current_txn_id : int64
   ; mutable alloc_min_safe : int64
   ; mutable wal : wal_callbacks option
+  ; mutable write_tag : int32
+    (** #174: schema-fingerprint stamp to write into the reserved header bytes
+        of the next Branch/Leaf page built.  Set per tree-operation by the
+        store; 0 for system/untagged trees.  Safe as shared state because
+        writes are serialised under the single RW transaction. *)
   }
 
 type error =
@@ -92,8 +97,14 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; current_txn_id = 0L
   ; alloc_min_safe = 0L
   ; wal = None
+  ; write_tag = 0l
   }
 ;;
+
+(* #174: set the schema-fingerprint stamp for subsequently-built Branch/Leaf
+   pages.  Reset to 0 before writing system-tree (e.g. meta) pages. *)
+let set_write_tag t (tag : int32) = t.write_tag <- tag
+let write_tag t = t.write_tag
 
 let set_wal t cb =
   (* Any cache entries built before the WAL hook was attached came from

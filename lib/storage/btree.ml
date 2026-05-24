@@ -334,6 +334,8 @@ let build_and_write_leaf pager ~page_id ~entries ~right_page : (unit, error) res
     }
   in
   Page.write_common buf common;
+  (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
+  Page.write_tag buf (Pager.write_tag pager);
   Page.seal buf;
   Pager.write pager page_id buf;
   return_ok ()
@@ -362,6 +364,8 @@ let build_and_write_branch pager ~page_id ~entries ~right_page
     }
   in
   Page.write_common buf common;
+  (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
+  Page.write_tag buf (Pager.write_tag pager);
   Page.seal buf;
   Pager.write pager page_id buf;
   return_ok ()

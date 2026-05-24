@@ -131,6 +131,14 @@ val set_wal : t -> wal_callbacks option -> unit
 (** True iff a WAL hook is currently installed. *)
 val wal_mode : t -> bool
 
+(** #174: set the schema-fingerprint stamp written into the reserved header
+    bytes of subsequently-built Branch/Leaf pages.  The store sets this per
+    tree-operation (0 for system/untagged trees). *)
+val set_write_tag : t -> int32 -> unit
+
+(** Current schema-fingerprint stamp (#174); read by the page builders. *)
+val write_tag : t -> int32
+
 (** Write a single page directly to the main-DB callback, bypassing the
     WAL hook. Used by checkpointing. Does not sync. *)
 val flush_one_to_main : t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t

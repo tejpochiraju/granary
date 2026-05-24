@@ -124,6 +124,14 @@ let seal buf =
   Cstruct.BE.set_uint32 buf 8 crc
 ;;
 
+(* #174: per-tree schema-fingerprint stamp.  It lives in the 4 reserved bytes
+   at offset 12 of the common header (zeroed by [write_common]).  Write it
+   AFTER [write_common] and BEFORE [seal] — the CRC covers bytes 12..15, so the
+   stamp is integrity-protected and any tamper is caught on read. *)
+let tag_offset = 12
+let write_tag buf (tag : int32) = Cstruct.BE.set_uint32 buf tag_offset tag
+let read_tag buf : int32 = Cstruct.BE.get_uint32 buf tag_offset
+
 (* ------------------------------------------------------------------ *)
 (* Header page fields (kind = Header, bytes 16–63)                    *)
 (* ------------------------------------------------------------------ *)

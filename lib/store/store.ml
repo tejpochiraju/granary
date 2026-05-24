@@ -85,6 +85,11 @@ type bt_state =
   ; pager : Pager.t
   ; mutable meta : Btree.t
   ; trees : (tree_id, Btree.t) Hashtbl.t
+  ; tree_tags : (tree_id, int32) Hashtbl.t
+    (** #174: per-tree page-header stamp (low 32 bits of the schema
+        fingerprint), set by the catalog via {!set_tree_tag}.  Pages written
+        for a tree carry its tag in the reserved header bytes; untagged trees
+        (default) carry 0. *)
   ; mutable current_header : Header.t
   ; schema_version : int64
   ; mutable txn_freelist_snapshot : Freelist.t option
@@ -255,6 +260,11 @@ let bt_get_tree st (tid : tree_id) : (Btree.t, error) result Lwt.t =
        Lwt.return_ok bt)
 ;;
 
+(* #174: the page-header stamp for [tid] (0 when untagged). *)
+let tree_tag st (tid : tree_id) : int32 =
+  Option.value ~default:0l (Hashtbl.find_opt st.tree_tags tid)
+;;
+
 (* Convert a result with [error] payload to an Lwt-failing version.  The
    public [get/put/del/cursor_open] signatures don't return [result], so
    B+-tree errors are surfaced as Lwt exceptions. *)
@@ -379,6 +389,8 @@ let map_header_err (e : Header.error) : error =
   match e with
   | Header.Io s -> Header_error s
   | Header.Both_headers_corrupt -> Header_error "both header pages corrupt"
+  | Header.Unsupported_format v ->
+    Header_error (Printf.sprintf "unsupported on-disk format_version %ld" v)
 ;;
 
 (* Build a fully-initialised [t] wrapping a B-tree-backed [bt_state] from the
@@ -398,6 +410,7 @@ let make_btree_store
     ; pager
     ; meta
     ; trees = Hashtbl.create 16
+    ; tree_tags = Hashtbl.create 16
     ; current_header = h
     ; schema_version = h.schema_version
     ; txn_freelist_snapshot = None
@@ -948,6 +961,8 @@ let commit_prepare_btree
     free_old_freelist_pages st.pager ~first_page:st.current_header.freelist_page
   in
   let bindings = Hashtbl.fold (fun tid bt acc -> (tid, bt) :: acc) st.trees [] in
+  (* #174: meta-tree pages are system pages — never stamped with a tree tag. *)
+  Pager.set_write_tag st.pager 0l;
   let* () =
     Lwt_list.iter_s
       (fun (tid, bt) ->
@@ -970,6 +985,9 @@ let commit_prepare_btree
     ; freelist_page = freelist_first_page
     ; n_pages_total = Pager.n_pages st.pager
     ; schema_version = st.schema_version
+    ; (* Preserve the on-disk format version this db was opened with (#174);
+         never silently upgrade or downgrade it here. *)
+      format_version = st.current_header.format_version
     }
   in
   let* r = header_commit st.pager ~prev_header:st.current_header ~new_state in
@@ -1346,6 +1364,7 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
   | Btree st ->
     let* r = bt_get_tree st tid in
     let* bt = unwrap_error r in
+    Pager.set_write_tag st.pager (tree_tag st tid);
     let* p = Btree.put bt key value in
     (match p with
      | Ok bt' ->
@@ -1364,6 +1383,7 @@ let del (Rw t : rw txn) tid key : unit Lwt.t =
   | Btree st ->
     let* r = bt_get_tree st tid in
     let* bt = unwrap_error r in
+    Pager.set_write_tag st.pager (tree_tag st tid);
     let* d = Btree.del bt key in
     (match d with
      | Ok bt' ->
@@ -1371,6 +1391,16 @@ let del (Rw t : rw txn) tid key : unit Lwt.t =
        Lwt.return_unit
      | Error e ->
        Lwt.fail_with (Format.asprintf "Store.del: %a" pp_error (map_btree_err e)))
+;;
+
+(* #174: register the page-header stamp (low 32 bits of the schema
+   fingerprint) for [tid].  Subsequently-written Branch/Leaf pages of that tree
+   carry the tag in their reserved header bytes.  No-op on the in-memory
+   backend (no pages). *)
+let set_tree_tag (t : t) (tid : tree_id) (tag : int32) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> Hashtbl.replace st.tree_tags tid tag
 ;;
 
 (* ------------------------------------------------------------------ *)

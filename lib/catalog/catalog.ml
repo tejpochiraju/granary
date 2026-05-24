@@ -1,6 +1,7 @@
 module S = Sqlocaml_store.Store
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint
+module Schema_fingerprint = Sqlocaml_encoding.Schema_fingerprint
 
 type fk_action =
   | FA_no_action
@@ -17,6 +18,12 @@ let sys_meta_tid : S.tree_id = 3
 let sys_fts_tid : S.tree_id = 4
 let sys_views_tid : S.tree_id = 5
 let sys_triggers_tid : S.tree_id = 6
+
+(* #174: redundant catalog mirror.  A second, self-describing copy of every
+   table's schema keyed by tree_id, so a single damaged primary-catalog page
+   does not lose the schema for every table.  Also the canonical
+   reference-fingerprint store used for drift detection on open. *)
+let sys_mirror_tid : S.tree_id = 7
 
 (* Rowid counter key suffix for FTS tables: name ++ "\x00rowid" *)
 let sys_fts_rowid_suffix = Bytes.of_string "\x00rowid"
@@ -571,19 +578,28 @@ let load_all_tables store =
     match S.cursor_next cur with
     | None -> Lwt.return_unit
     | Some (k, v) ->
-      let name = Bytes.to_string k in
-      let tid, next_rowid, without_rowid = decode_table_value v in
-      let%lwt cols = load_columns tx name in
-      Hashtbl.replace
-        tbl
-        name
-        { name
-        ; tree_id = tid
-        ; columns = cols
-        ; next_rowid
-        ; fk_constraints = []
-        ; without_rowid
-        };
+      let%lwt () =
+        Lwt.catch
+          (fun () ->
+             let name = Bytes.to_string k in
+             let tid, next_rowid, without_rowid = decode_table_value v in
+             let%lwt cols = load_columns tx name in
+             Hashtbl.replace
+               tbl
+               name
+               { name
+               ; tree_id = tid
+               ; columns = cols
+               ; next_rowid
+               ; fk_constraints = []
+               ; without_rowid
+               };
+             Lwt.return_unit)
+          (fun _exn ->
+             (* Corrupt primary catalog row/columns (#174): skip it here; the
+                table is reconstructed from the redundant mirror in [open_]. *)
+             Lwt.return_unit)
+      in
       walk_tables ()
   in
   let%lwt () = walk_tables () in
@@ -798,6 +814,130 @@ let decode_fks bytes =
       (String.split_on_char '\n' s)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Schema fingerprint + redundant catalog mirror helpers (#174)         *)
+(* Defined here, ahead of all DDL and [open_], which use them.          *)
+(* ------------------------------------------------------------------ *)
+
+(* Schema fingerprint: a stable hash of a table's shape (columns +
+   without_rowid).  Computed from the in-memory cache, so it always reflects
+   the current schema after any DDL. *)
+let fingerprint_of_meta (m : table_meta) =
+  Schema_fingerprint.compute ~columns:m.columns ~without_rowid:m.without_rowid
+;;
+
+(* #174: register the table's page-header stamp (low 32 bits of its
+   fingerprint) with the store, so its B+-tree pages self-identify their
+   schema.  Skips the ephemeral CTE sentinel (tree_id = -1). *)
+let register_tag store (m : table_meta) =
+  if m.tree_id >= 0
+  then S.set_tree_tag store m.tree_id (Schema_fingerprint.low32 (fingerprint_of_meta m))
+;;
+
+(* The mirror is keyed by tree_id (fixed 8-byte BE) and stores a fully
+   self-describing schema blob — name, tree_id, WITHOUT ROWID, fingerprint,
+   every column (via the same [encode_column] used by the primary), and FK
+   constraints.  It carries no volatile state (no [next_rowid]) so it only
+   changes on DDL, not on every insert. *)
+let mirror_version = 1
+
+let mirror_key (tid : S.tree_id) =
+  let b = Bytes.create 8 in
+  Bytes.set_int64_be b 0 (Int64.of_int tid);
+  b
+;;
+
+let encode_mirror_entry (m : table_meta) =
+  let buf = Buffer.create 128 in
+  Varint.encode_uint64 buf (Int64.of_int mirror_version);
+  Varint.encode_uint64 buf (Int64.of_int (String.length m.name));
+  Buffer.add_string buf m.name;
+  Varint.encode_uint64 buf (Int64.of_int m.tree_id);
+  Buffer.add_uint8 buf (if m.without_rowid then 1 else 0);
+  let fpb = Bytes.create 8 in
+  Bytes.set_int64_be fpb 0 (fingerprint_of_meta m);
+  Buffer.add_bytes buf fpb;
+  Varint.encode_uint64 buf (Int64.of_int (List.length m.columns));
+  List.iter
+    (fun col ->
+       let cb = encode_column col in
+       Varint.encode_uint64 buf (Int64.of_int (Bytes.length cb));
+       Buffer.add_bytes buf cb)
+    m.columns;
+  let fkb = encode_fks m.fk_constraints in
+  Varint.encode_uint64 buf (Int64.of_int (Bytes.length fkb));
+  Buffer.add_bytes buf fkb;
+  Buffer.to_bytes buf
+;;
+
+(* Decode a mirror entry into a [table_meta] (with [next_rowid = 1L]; the
+   mirror does not persist the rowid counter — recovery is schema-only) and
+   the stored fingerprint. *)
+let decode_mirror_entry bytes : table_meta * int64 =
+  let _ver, off = Varint.decode_uint64 bytes 0 in
+  let nlen, off = Varint.decode_uint64 bytes off in
+  let nlen = Int64.to_int nlen in
+  let name = Bytes.sub_string bytes off nlen in
+  let off = off + nlen in
+  let tid, off = Varint.decode_uint64 bytes off in
+  let without_rowid = Bytes.get_uint8 bytes off <> 0 in
+  let off = off + 1 in
+  let fp = Bytes.get_int64_be bytes off in
+  let off = ref (off + 8) in
+  let ncols, o = Varint.decode_uint64 bytes !off in
+  off := o;
+  let columns =
+    List.init (Int64.to_int ncols) (fun _ ->
+      let clen, o = Varint.decode_uint64 bytes !off in
+      let clen = Int64.to_int clen in
+      let col = decode_column (Bytes.sub bytes o clen) in
+      off := o + clen;
+      col)
+  in
+  let fklen, o = Varint.decode_uint64 bytes !off in
+  let fkb = Bytes.sub bytes o (Int64.to_int fklen) in
+  let fk_constraints = decode_fks fkb in
+  ( { name
+    ; tree_id = Int64.to_int tid
+    ; columns
+    ; next_rowid = 1L
+    ; fk_constraints
+    ; without_rowid
+    }
+  , fp )
+;;
+
+(* Write/replace a table's mirror entry inside an already-open RW txn. *)
+let put_mirror_tx tx (m : table_meta) =
+  S.put tx sys_mirror_tid (mirror_key m.tree_id) (encode_mirror_entry m)
+;;
+
+(* Remove a table's mirror entry inside an already-open RW txn. *)
+let del_mirror_tx tx (tid : S.tree_id) = S.del tx sys_mirror_tid (mirror_key tid)
+
+(* Decode every mirror entry into a [table_meta]; skip corrupt entries. *)
+let load_mirror_entries store =
+  S.with_ro store
+  @@ fun tx ->
+  let%lwt cur = S.cursor_open tx sys_mirror_tid in
+  let _sr = S.cursor_first cur in
+  let acc = ref [] in
+  let rec walk () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (_k, v) ->
+      (try
+         let m, _fp = decode_mirror_entry v in
+         acc := m :: !acc
+       with
+       | Invalid_argument _ | Failure _ -> ());
+      walk ()
+  in
+  walk ();
+  S.cursor_close cur;
+  Lwt.return (List.rev !acc)
+;;
+
 let load_fk_constraints_raw store table_name =
   let key = fk_meta_key table_name in
   S.with_ro store
@@ -816,6 +956,13 @@ let save_fk_constraints t ~table_name ~fks =
     if fks = []
     then S.del tx sys_meta_tid key
     else S.put tx sys_meta_tid key (encode_fks fks)
+  in
+  (* Keep the mirror's FK list current so a mirror reconstruction restores
+     constraints, not just columns. *)
+  let%lwt () =
+    match Hashtbl.find_opt t.cache table_name with
+    | Some m -> put_mirror_tx tx { m with fk_constraints = fks }
+    | None -> Lwt.return_unit
   in
   S.commit tx
 ;;
@@ -846,6 +993,41 @@ let open_ store =
          Lwt.return_unit)
       names
   in
+  (* #174: reconstruct any table missing from the primary catalog (its
+     _sys_tables row or column entries were lost or failed to decode) from the
+     redundant mirror.  Tables loaded fine from the primary are left untouched
+     here; the mirror only fills gaps.  Reconstructed entries carry the
+     mirror's own columns and FK constraints (the primary FK load above ran
+     only over primary tables). *)
+  let%lwt mirror = load_mirror_entries store in
+  let present_tids =
+    Hashtbl.fold (fun _ (m : table_meta) acc -> m.tree_id :: acc) cache []
+  in
+  List.iter
+    (fun (m : table_meta) ->
+       if not (List.mem m.tree_id present_tids) then Hashtbl.replace cache m.name m)
+    mirror;
+  (* #174: schema-drift check on open.  For tables present in BOTH the primary
+     and the mirror, a fingerprint mismatch means one copy is corrupt or drifted
+     — warn (but stay openable so recovery tooling can still run).  Reconstructed
+     tables match the mirror by construction, so they never trip this. *)
+  List.iter
+    (fun (m : table_meta) ->
+       match Hashtbl.find_opt cache m.name with
+       | Some primary
+         when primary.tree_id = m.tree_id
+              && not (Int64.equal (fingerprint_of_meta primary) (fingerprint_of_meta m))
+         ->
+         Printf.eprintf
+           "warning: schema fingerprint mismatch for table %s — primary and redundant \
+            catalog disagree (possible corruption, #174)\n\
+            %!"
+           m.name
+       | _ -> ())
+    mirror;
+  (* #174: register every table's page-header stamp so subsequent writes
+     stamp the tree's schema fingerprint. *)
+  Hashtbl.iter (fun _ (m : table_meta) -> register_tag store m) cache;
   Lwt.return
     { store
     ; cache
@@ -879,13 +1061,84 @@ let create_table t ~name ~columns ~without_rowid =
       (fun i col -> S.put tx sys_columns_tid (column_key name i) (encode_column col))
       columns
   in
+  let%lwt () = put_mirror_tx tx m in
   let%lwt () = S.commit tx in
   Hashtbl.replace t.cache name m;
+  register_tag t.store m;
   Lwt.return tid
 ;;
 
 let find_table t ~name = Lwt.return (Hashtbl.find_opt t.cache name)
 let find_table_cached t ~name = Hashtbl.find_opt t.cache name
+
+let table_fingerprint t ~name =
+  Option.map fingerprint_of_meta (Hashtbl.find_opt t.cache name)
+;;
+
+let fingerprints_by_tree_id t =
+  Hashtbl.fold
+    (fun _ (m : table_meta) acc ->
+       (* Skip the ephemeral CTE sentinel (tree_id = -1): no real on-disk tree. *)
+       if m.tree_id >= 0 then (m.tree_id, fingerprint_of_meta m) :: acc else acc)
+    t.cache
+    []
+;;
+
+(* All [(tree_id, fingerprint)] pairs recorded in the mirror. *)
+let mirror_fingerprints t =
+  S.with_ro t.store
+  @@ fun tx ->
+  let%lwt cur = S.cursor_open tx sys_mirror_tid in
+  let _sr = S.cursor_first cur in
+  let acc = ref [] in
+  let rec walk () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (_k, v) ->
+      (try
+         let m, fp = decode_mirror_entry v in
+         acc := (m.tree_id, fp) :: !acc
+       with
+       | Invalid_argument _ | Failure _ -> ());
+      walk ()
+  in
+  walk ();
+  S.cursor_close cur;
+  Lwt.return !acc
+;;
+
+type schema_discrepancy =
+  | Fingerprint_mismatch of
+      { tree_id : S.tree_id
+      ; primary : int64
+      ; mirror : int64
+      }
+  | Missing_in_mirror of S.tree_id
+  | Missing_in_primary of S.tree_id
+
+let verify_against_mirror t =
+  let%lwt mirror = mirror_fingerprints t in
+  let primary = fingerprints_by_tree_id t in
+  let findings = ref [] in
+  List.iter
+    (fun (tid, pfp) ->
+       match List.assoc_opt tid mirror with
+       | None -> findings := Missing_in_mirror tid :: !findings
+       | Some mfp ->
+         if not (Int64.equal pfp mfp)
+         then
+           findings
+           := Fingerprint_mismatch { tree_id = tid; primary = pfp; mirror = mfp }
+              :: !findings)
+    primary;
+  List.iter
+    (fun (tid, _) ->
+       if not (List.mem_assoc tid primary)
+       then findings := Missing_in_primary tid :: !findings)
+    mirror;
+  Lwt.return (List.rev !findings)
+;;
+
 let register_ephemeral t (meta : table_meta) = Hashtbl.replace t.cache meta.name meta
 let unregister_ephemeral t ~name = Hashtbl.remove t.cache name
 let list_tables t = Lwt.return (Hashtbl.fold (fun _ v acc -> v :: acc) t.cache [])
@@ -969,13 +1222,16 @@ let add_column t ~table_name ~(column : Row.column) =
     then Lwt.return (Error (Printf.sprintf "column already exists: %s" column.Row.name))
     else (
       let new_cols = meta.columns @ [ column ] in
+      let new_meta = { meta with columns = new_cols } in
       let ordinal = List.length meta.columns in
       let col_k = column_key table_name ordinal in
       let col_v = encode_column column in
       let%lwt tx = S.rw_begin t.store in
       let%lwt () = S.put tx sys_columns_tid col_k col_v in
+      let%lwt () = put_mirror_tx tx new_meta in
       let%lwt () = S.commit tx in
-      Hashtbl.replace t.cache table_name { meta with columns = new_cols };
+      Hashtbl.replace t.cache table_name new_meta;
+      register_tag t.store new_meta;
       Lwt.return (Ok ()))
 ;;
 
@@ -1088,6 +1344,12 @@ let drop_index t tx ~name =
 ;;
 
 let drop_table t tx ~name =
+  (* 0. Remove the mirror entry (keyed by tree_id), if we know the tree_id. *)
+  let%lwt () =
+    match Hashtbl.find_opt t.cache name with
+    | Some m -> del_mirror_tx tx m.tree_id
+    | None -> Lwt.return_unit
+  in
   (* 1. Remove table entry from _sys_tables. *)
   let%lwt () = S.del tx sys_tables_tid (Bytes.of_string name) in
   (* 2. Remove all column entries from _sys_columns. *)
@@ -1163,6 +1425,9 @@ let finish_rename t tx ~old_name ~new_name ~meta =
          S.put tx sys_indexes_tid k (encode_index_value new_info))
       idx_updates
   in
+  (* Refresh the mirror entry (keyed by the unchanged tree_id) with the new
+     name; the schema shape — hence the fingerprint — is unchanged. *)
+  let%lwt () = put_mirror_tx tx { meta with name = new_name } in
   let%lwt () = S.commit tx in
   (* Update in-memory cache *)
   Hashtbl.remove t.cache old_name;
@@ -1221,13 +1486,16 @@ let rename_column t ~table_name ~old_col ~new_col =
           let old_col_rec = decode_column old_bytes in
           let new_col_rec = { old_col_rec with Row.name = new_col } in
           let%lwt () = S.put tx sys_columns_tid col_k (encode_column new_col_rec) in
-          let%lwt () = S.commit tx in
           let new_columns =
             List.mapi
               (fun j c -> if j = i then { c with Row.name = new_col } else c)
               meta.columns
           in
-          Hashtbl.replace t.cache table_name { meta with columns = new_columns };
+          let new_meta = { meta with columns = new_columns } in
+          let%lwt () = put_mirror_tx tx new_meta in
+          let%lwt () = S.commit tx in
+          Hashtbl.replace t.cache table_name new_meta;
+          register_tag t.store new_meta;
           Lwt.return (Ok ())))
 ;;
 
@@ -1265,9 +1533,12 @@ let drop_column t ~table_name ~col_name =
          in
          shift (drop_idx + 1)
        in
-       let%lwt () = S.commit tx in
        let new_columns = List.filteri (fun i _ -> i <> drop_idx) meta.columns in
-       Hashtbl.replace t.cache table_name { meta with columns = new_columns };
+       let new_meta = { meta with columns = new_columns } in
+       let%lwt () = put_mirror_tx tx new_meta in
+       let%lwt () = S.commit tx in
+       Hashtbl.replace t.cache table_name new_meta;
+       register_tag t.store new_meta;
        Lwt.return (Ok ()))
 ;;
 

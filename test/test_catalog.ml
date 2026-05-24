@@ -9,6 +9,7 @@ end
 module C = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint
+module SF = Sqlocaml_encoding.Schema_fingerprint
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -683,11 +684,15 @@ let corrupt_default_tag () =
      let* () = S.put tx 1 col_key bad_val in
      (* sys_columns_tid = 1 *)
      S.commit tx);
-  try
-    let _ = Lwt_main.run (C.open_ store) in
-    Alcotest.fail "expected Failure for corrupt default tag"
-  with
-  | Failure _ -> ()
+  (* #174: the corrupt primary column entry is recovered from the mirror. *)
+  let cat2 = Lwt_main.run (C.open_ store) in
+  match Lwt_main.run (C.find_table cat2 ~name:"t") with
+  | None ->
+    Alcotest.fail "t should be recovered from the mirror after default-tag corruption"
+  | Some m ->
+    Alcotest.(check int) "recovered column count" 1 (List.length m.C.columns);
+    let c = List.nth m.C.columns 0 in
+    Alcotest.(check bool) "recovered default is None" true (c.Row.default = None)
 ;;
 
 let test_default_int_roundtrip () =
@@ -822,13 +827,17 @@ let corrupt_column_type_tag () =
      let* () = S.put tx 1 col_key bad_val in
      (* sys_columns_tid = 1 *)
      S.commit tx);
-  (* Now open_ a fresh catalog — load_columns will hit type_of_tag with 0 → failwith *)
-  try
-    let _ = Lwt_main.run (C.open_ store) in
-    Alcotest.fail "expected Failure for corrupt type tag"
-  with
-  | Failure msg ->
-    Alcotest.(check bool) "error message non-empty" true (String.length msg > 0)
+  (* With the redundant mirror (#174), a corrupt primary column entry no longer
+     crashes open_: the unreadable primary row is skipped and the table is
+     transparently reconstructed from the mirror with its original schema. *)
+  let cat2 = Lwt_main.run (C.open_ store) in
+  match Lwt_main.run (C.find_table cat2 ~name:"users") with
+  | None ->
+    Alcotest.fail "users should be recovered from the mirror after column corruption"
+  | Some m ->
+    Alcotest.(check int) "recovered column count" 1 (List.length m.C.columns);
+    let c = List.nth m.C.columns 0 in
+    Alcotest.(check bool) "recovered column type is Integer" true (c.Row.ty = Row.Integer)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1380,6 +1389,253 @@ let test_decode_column_no_check_sql () =
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
+(* ------------------------------------------------------------------ *)
+(* Group: schema fingerprint (#174)                                     *)
+(* ------------------------------------------------------------------ *)
+
+let test_fingerprint_matches_compute () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let cols = [ int_col "id"; txt_col "name" ] in
+     let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let expected = SF.compute ~columns:cols ~without_rowid:false in
+     Alcotest.(check (option int64))
+       "fingerprint matches Schema_fingerprint.compute"
+       (Some expected)
+       (C.table_fingerprint cat ~name:"users");
+     Lwt.return_unit)
+;;
+
+let test_fingerprint_missing () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     Alcotest.(check (option int64))
+       "missing table -> None"
+       None
+       (C.table_fingerprint cat ~name:"ghost");
+     Lwt.return_unit)
+;;
+
+let test_fingerprint_distinct_schemas () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table cat ~name:"a" ~columns:[ int_col "x" ] ~without_rowid:false
+     in
+     let* _ =
+       C.create_table cat ~name:"b" ~columns:[ txt_col "x" ] ~without_rowid:false
+     in
+     Alcotest.(check bool)
+       "different column types -> different fingerprints"
+       false
+       (C.table_fingerprint cat ~name:"a" = C.table_fingerprint cat ~name:"b");
+     Lwt.return_unit)
+;;
+
+let test_fingerprints_by_tree_id () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let cols = [ int_col "id" ] in
+     let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let expected = SF.compute ~columns:cols ~without_rowid:false in
+     (match List.assoc_opt tid (C.fingerprints_by_tree_id cat) with
+      | Some fp -> Alcotest.(check int64) "registry maps tree_id -> fp" expected fp
+      | None -> Alcotest.fail "tree_id absent from fingerprint registry");
+     Lwt.return_unit)
+;;
+
+let test_fingerprint_changes_on_add_column () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table cat ~name:"users" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     let before = C.table_fingerprint cat ~name:"users" in
+     let* r = C.add_column cat ~table_name:"users" ~column:(txt_col "name") in
+     (match r with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "add_column: %s" e);
+     let after = C.table_fingerprint cat ~name:"users" in
+     Alcotest.(check bool) "fingerprint changed after add_column" false (before = after);
+     let expected =
+       SF.compute ~columns:[ int_col "id"; txt_col "name" ] ~without_rowid:false
+     in
+     Alcotest.(check (option int64)) "matches new schema shape" (Some expected) after;
+     Lwt.return_unit)
+;;
+
+let test_fingerprint_without_rowid () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let cols = [ int_col "id" ] in
+     let* _ = C.create_table cat ~name:"t" ~columns:cols ~without_rowid:true in
+     let expected = SF.compute ~columns:cols ~without_rowid:true in
+     Alcotest.(check (option int64))
+       "without_rowid included in fingerprint"
+       (Some expected)
+       (C.table_fingerprint cat ~name:"t");
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Group: redundant catalog mirror (#174)                               *)
+(* ------------------------------------------------------------------ *)
+
+(* The _sys_tables primary row is deleted to simulate a damaged primary
+   catalog; reopening must reconstruct the table from the mirror. *)
+let test_mirror_recovers_lost_primary_row () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let cols = [ int_col "id"; txt_col "name" ] in
+     let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     (* Lose the primary _sys_tables row (system tree 0). *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "users") in
+     let* () = S.commit tx in
+     (* Reopen the catalog over the same store. *)
+     let* cat2 = C.open_ store in
+     let* found = C.find_table cat2 ~name:"users" in
+     (match found with
+      | None -> Alcotest.fail "table not recovered from mirror after primary row loss"
+      | Some m ->
+        Alcotest.(check int) "recovered tree_id" tid m.tree_id;
+        Alcotest.(check int) "recovered column count" 2 (List.length m.columns);
+        Alcotest.(check bool) "recovered without_rowid" false m.without_rowid;
+        Alcotest.(check (option int64))
+          "recovered fingerprint matches original"
+          (Some (SF.compute ~columns:cols ~without_rowid:false))
+          (C.table_fingerprint cat2 ~name:"users"));
+     Lwt.return_unit)
+;;
+
+let test_mirror_fingerprints_match_primary () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table cat ~name:"a" ~columns:[ int_col "x" ] ~without_rowid:false
+     in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"b"
+         ~columns:[ txt_col "y"; int_col "z" ]
+         ~without_rowid:false
+     in
+     let* mirror = C.mirror_fingerprints cat in
+     List.iter
+       (fun (tid, fp) ->
+          match List.assoc_opt tid mirror with
+          | Some mfp -> Alcotest.(check int64) "mirror fp matches primary" fp mfp
+          | None -> Alcotest.failf "tree_id %d missing from mirror" tid)
+       (C.fingerprints_by_tree_id cat);
+     Lwt.return_unit)
+;;
+
+let test_mirror_drop_removes_entry () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* tid =
+       C.create_table cat ~name:"t" ~columns:[ int_col "x" ] ~without_rowid:false
+     in
+     let* tx = S.rw_begin store in
+     let* () = C.drop_table cat tx ~name:"t" in
+     let* () = S.commit tx in
+     let* mirror = C.mirror_fingerprints cat in
+     Alcotest.(check bool)
+       "mirror entry removed on drop_table"
+       false
+       (List.mem_assoc tid mirror);
+     Lwt.return_unit)
+;;
+
+let test_mirror_reflects_add_column () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* tid =
+       C.create_table cat ~name:"t" ~columns:[ int_col "x" ] ~without_rowid:false
+     in
+     let* r = C.add_column cat ~table_name:"t" ~column:(txt_col "y") in
+     (match r with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "add_column: %s" e);
+     let* mirror = C.mirror_fingerprints cat in
+     let expected =
+       SF.compute ~columns:[ int_col "x"; txt_col "y" ] ~without_rowid:false
+     in
+     (match List.assoc_opt tid mirror with
+      | Some mfp ->
+        Alcotest.(check int64) "mirror fp updated after add_column" expected mfp
+      | None -> Alcotest.fail "tree_id missing from mirror");
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Group: schema-drift detection (#174)                                 *)
+(* ------------------------------------------------------------------ *)
+
+let test_drift_clean_db_no_discrepancies () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table cat ~name:"a" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     let* _ =
+       C.create_table cat ~name:"b" ~columns:[ txt_col "n" ] ~without_rowid:false
+     in
+     let* discrepancies = C.verify_against_mirror cat in
+     Alcotest.(check int) "no discrepancies on a clean db" 0 (List.length discrepancies);
+     Lwt.return_unit)
+;;
+
+let test_drift_detects_primary_mirror_mismatch () =
+  let store = S.create () in
+  run
+    (let* cat = C.open_ store in
+     let* _ =
+       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     (* Tamper the PRIMARY column entry so "id" decodes as Text instead of
+        Integer (still a valid column, so it loads).  The mirror still records
+        Integer, so the two copies disagree. *)
+     let col_key =
+       let tn = Bytes.of_string "t" in
+       let ord = Bytes.make 8 '\x00' in
+       Bytes.cat (Bytes.cat tn (Bytes.of_string "\x00")) ord
+     in
+     let altered =
+       let buf = Buffer.create 8 in
+       Varint.encode_uint64 buf 2L (* type tag = Text *);
+       Varint.encode_uint64 buf 2L (* name len *);
+       Buffer.add_string buf "id";
+       Buffer.to_bytes buf
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx 1 col_key altered in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     let* discrepancies = C.verify_against_mirror cat2 in
+     Alcotest.(check bool)
+       "fingerprint mismatch detected between primary and mirror"
+       true
+       (List.exists
+          (function
+            | C.Fingerprint_mismatch _ -> true
+            | _ -> false)
+          discrepancies);
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "catalog"
@@ -1490,6 +1746,39 @@ let () =
             "drop_index_empty_sys_indexes"
             `Quick
             test_drop_index_empty_sys_indexes
+        ] )
+    ; ( "fingerprint"
+      , [ Alcotest.test_case "matches_compute" `Quick test_fingerprint_matches_compute
+        ; Alcotest.test_case "missing_table" `Quick test_fingerprint_missing
+        ; Alcotest.test_case "distinct_schemas" `Quick test_fingerprint_distinct_schemas
+        ; Alcotest.test_case "by_tree_id" `Quick test_fingerprints_by_tree_id
+        ; Alcotest.test_case
+            "changes_on_add_column"
+            `Quick
+            test_fingerprint_changes_on_add_column
+        ; Alcotest.test_case "without_rowid" `Quick test_fingerprint_without_rowid
+        ] )
+    ; ( "mirror"
+      , [ Alcotest.test_case
+            "recovers_lost_primary_row"
+            `Quick
+            test_mirror_recovers_lost_primary_row
+        ; Alcotest.test_case
+            "fingerprints_match_primary"
+            `Quick
+            test_mirror_fingerprints_match_primary
+        ; Alcotest.test_case "drop_removes_entry" `Quick test_mirror_drop_removes_entry
+        ; Alcotest.test_case "reflects_add_column" `Quick test_mirror_reflects_add_column
+        ] )
+    ; ( "drift"
+      , [ Alcotest.test_case
+            "clean_db_no_discrepancies"
+            `Quick
+            test_drift_clean_db_no_discrepancies
+        ; Alcotest.test_case
+            "detects_primary_mirror_mismatch"
+            `Quick
+            test_drift_detects_primary_mirror_mismatch
         ] )
     ]
 ;;

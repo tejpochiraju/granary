@@ -5,6 +5,7 @@
   test_varint
   test_rowid
   test_row
+  test_schema_fingerprint
   test_store
   test_catalog
   test_lexer
@@ -15,6 +16,7 @@
   test_e2e
   test_unix_file
   test_page
+  test_page_tag
   test_freelist
   test_pager
   test_header

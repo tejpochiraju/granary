@@ -51,6 +51,14 @@ val verify_crc : Cstruct.t -> bool
     Call after all other fields are written. *)
 val seal : Cstruct.t -> unit
 
+(** Write the per-tree schema-fingerprint stamp (#174) into the reserved
+    bytes 12–15.  Call AFTER {!write_common} and BEFORE {!seal} so the CRC
+    covers it.  0 means "no stamp" (system trees, legacy pages). *)
+val write_tag : Cstruct.t -> int32 -> unit
+
+(** Read the per-tree schema-fingerprint stamp from bytes 12–15 (#174). *)
+val read_tag : Cstruct.t -> int32
+
 (** Header page fields (kind = [Header]; bytes 16–63). *)
 type header_fields =
   { txn_id : int64 (** int64 BE; higher = more recent *)

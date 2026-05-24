@@ -86,6 +86,7 @@ let zero_header =
     ; freelist_page = 0L
     ; n_pages_total = 0L
     ; schema_version = 0L
+    ; format_version = Header.current_format_version
     }
 ;;
 
@@ -95,9 +96,17 @@ let make_state
       ?(freelist_page = 0L)
       ?(n_pages_total = 0L)
       ?(schema_version = 0L)
+      ?(format_version = Header.current_format_version)
       ()
   =
-  Header.{ txn_id = 0L; root_page; freelist_page; n_pages_total; schema_version }
+  Header.
+    { txn_id = 0L
+    ; root_page
+    ; freelist_page
+    ; n_pages_total
+    ; schema_version
+    ; format_version
+    }
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -282,6 +291,58 @@ let test_non_header_kind_treated_as_corrupt () =
         | Ok h -> Alcotest.(check int64) "uses page 1 (txn_id=1)" 1L h.Header.txn_id))
 ;;
 
+(* #174: init stamps the current on-disk format_version, and read_live
+   surfaces it. *)
+let test_init_writes_current_format_version () =
+  let pager, _mb = make_pager () in
+  match run (Header.init pager) with
+  | Error e -> Alcotest.failf "init failed: %a" Header.pp_error e
+  | Ok () ->
+    (match run (Header.read_live pager) with
+     | Error e -> Alcotest.failf "read_live: %a" Header.pp_error e
+     | Ok h ->
+       Alcotest.(check int32)
+         "format_version = current"
+         Header.current_format_version
+         h.Header.format_version)
+;;
+
+(* #174: a header stamped with a newer-than-supported format_version is
+   rejected on open with a distinct Unsupported_format error (not silently
+   misread). *)
+let test_unsupported_format_rejected () =
+  let _pager, mb = make_pager () in
+  let bad_version = Int32.add Header.max_supported_format_version 1l in
+  let build_bad () =
+    let buf = Cstruct.create Page.page_size in
+    Page.write_common
+      buf
+      { Page.kind = Page.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l };
+    Page.write_header_fields
+      buf
+      { Page.txn_id = 1L
+      ; root_page = 0L
+      ; freelist_page = 0L
+      ; n_pages_total = 0L
+      ; schema_version = 0L
+      ; page_size = Int32.of_int Page.page_size
+      ; format_version = bad_version
+      };
+    Page.seal buf;
+    let bytes = Bytes.create Page.page_size in
+    Cstruct.blit_to_bytes buf 0 bytes 0 Page.page_size;
+    bytes
+  in
+  Hashtbl.replace mb.store 0L (build_bad ());
+  Hashtbl.replace mb.store 1L (build_bad ());
+  let pager2 = fresh_pager_over mb () in
+  match run (Header.read_live pager2) with
+  | Error (Header.Unsupported_format v) ->
+    Alcotest.(check int32) "reports the offending version" bad_version v
+  | Ok _ -> Alcotest.fail "expected Unsupported_format"
+  | Error e -> Alcotest.failf "wrong error: %a" Header.pp_error e
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Error-path coverage                                                 *)
 (* ------------------------------------------------------------------ *)
@@ -363,6 +424,7 @@ let test_commit_flush_error () =
       ; freelist_page = 0L
       ; n_pages_total = 3L
       ; schema_version = 0L
+      ; format_version = Header.current_format_version
       }
   in
   match run (Header.commit pager ~prev_header:zero_header ~new_state) with
@@ -453,6 +515,7 @@ let prop_commit_sequence =
                  ; freelist_page = 0L
                  ; n_pages_total = Int64.of_int (i + 2)
                  ; schema_version = 0L
+                 ; format_version = Header.current_format_version
                  }
              in
              match run (Header.commit pager ~prev_header:prev_h ~new_state) with
@@ -497,6 +560,14 @@ let () =
             "non-Header kind treated as corrupt"
             `Quick
             test_non_header_kind_treated_as_corrupt
+        ; Alcotest.test_case
+            "init writes current format_version"
+            `Quick
+            test_init_writes_current_format_version
+        ; Alcotest.test_case
+            "unsupported format_version rejected"
+            `Quick
+            test_unsupported_format_rejected
         ] )
     ; ( "errors"
       , [ Alcotest.test_case "pp_error Io" `Quick test_pp_error_io

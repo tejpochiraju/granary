@@ -8,11 +8,24 @@ type t =
   ; freelist_page : int64
   ; n_pages_total : int64
   ; schema_version : int64
+  ; format_version : int32
+    (** On-disk format version (#174).  Preserved across commits; only a fresh
+        [init] stamps [current_format_version]. *)
   }
+
+(** On-disk format version this build writes for freshly-initialised
+    databases.  v1 = pre-#174 (no fingerprints); v2 = #174 (schema
+    fingerprints, redundant catalog mirror, per-page fingerprint stamp). *)
+val current_format_version : int32
+
+(** Highest on-disk format version this build can open.  [read_live] fails
+    with [Unsupported_format] for any database stamped above this. *)
+val max_supported_format_version : int32
 
 type error =
   | Io of string
   | Both_headers_corrupt
+  | Unsupported_format of int32 (** on-disk format_version exceeds support *)
 
 (** Pretty-print all header fields. *)
 val pp : Format.formatter -> t -> unit

@@ -1,6 +1,8 @@
 (** In-memory catalog backed by system trees in the Store.
     System tree allocation: 0=_sys_tables, 1=_sys_columns, 2=_sys_indexes,
-    3=_sys_meta, 4=_sys_fts_tables, 5=_sys_views, 6=_sys_triggers.  User tables and indexes use tree_ids >= 16. *)
+    3=_sys_meta, 4=_sys_fts_tables, 5=_sys_views, 6=_sys_triggers,
+    7=_sys_catalog_mirror (#174 redundant schema copy).  User tables and
+    indexes use tree_ids >= 16. *)
 
 type t
 
@@ -112,6 +114,43 @@ val find_table : t -> name:string -> table_meta option Lwt.t
 (** Synchronous in-memory lookup (no Lwt). Always up to date since the cache
     is updated on every DDL operation. *)
 val find_table_cached : t -> name:string -> table_meta option
+
+(** Schema fingerprint (#174) of a table: a stable 64-bit hash of its shape
+    (columns + WITHOUT ROWID), computed from the in-memory cache via
+    {!Sqlocaml_encoding.Schema_fingerprint}.  [None] if no such table.  Stable
+    across table renames; used for drift detection on open, the redundant
+    catalog mirror, per-page fingerprint stamps, and replication schema
+    matching (#92 / #172). *)
+val table_fingerprint : t -> name:string -> int64 option
+
+(** [(tree_id, fingerprint)] for every persistent table currently in the
+    catalog (ephemeral CTE entries are excluded).  Used to register per-tree
+    page-header stamps with the store (#174). *)
+val fingerprints_by_tree_id : t -> (Sqlocaml_store.Store.tree_id * int64) list
+
+(** [(tree_id, fingerprint)] recorded in the redundant catalog mirror (#174).
+    On a healthy database this agrees with {!fingerprints_by_tree_id}; a
+    divergence indicates schema drift or corruption in one of the two copies. *)
+val mirror_fingerprints : t -> (Sqlocaml_store.Store.tree_id * int64) list Lwt.t
+
+(** A disagreement between the primary catalog and the redundant mirror (#174). *)
+type schema_discrepancy =
+  | Fingerprint_mismatch of
+      { tree_id : Sqlocaml_store.Store.tree_id
+      ; primary : int64 (** fingerprint computed from the primary catalog *)
+      ; mirror : int64 (** fingerprint recorded in the mirror *)
+      }
+  | Missing_in_mirror of Sqlocaml_store.Store.tree_id
+  (** a table present in the primary catalog has no mirror entry *)
+  | Missing_in_primary of Sqlocaml_store.Store.tree_id
+  (** the mirror records a table the primary catalog does not have *)
+
+(** Cross-check the primary catalog against the redundant mirror and report
+    every disagreement (#174).  An empty list means the two copies agree.  A
+    non-empty list signals schema drift or corruption; [open_] also logs a
+    warning for any {!Fingerprint_mismatch} it finds, but stays openable so
+    recovery tooling can run. *)
+val verify_against_mirror : t -> schema_discrepancy list Lwt.t
 
 (** Temporarily register an ephemeral (CTE) table entry in the in-memory cache.
     tree_id = -1 is the sentinel for CTE virtual tables. *)

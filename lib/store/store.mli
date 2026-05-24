@@ -85,6 +85,13 @@ val open_block_wal
     undefined. *)
 val close : t -> unit Lwt.t
 
+(** [set_tree_tag t tid tag] registers the per-tree page-header stamp (#174):
+    the low 32 bits of [tid]'s schema fingerprint.  Branch/Leaf pages written
+    for [tid] thereafter carry [tag] in their reserved header bytes (12–15), so
+    an orphaned page self-identifies its schema during recovery.  No-op on the
+    in-memory backend. *)
+val set_tree_tag : t -> tree_id -> int32 -> unit
+
 (** Begin a read-only transaction. Multiple RO txns may run concurrently. *)
 val ro_begin : t -> ro txn Lwt.t
 
