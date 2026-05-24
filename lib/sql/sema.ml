@@ -1229,6 +1229,66 @@ let bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_con
 (* SELECT                                                               *)
 (* ------------------------------------------------------------------ *)
 
+(* Column ordinal of [name] within an FTS table's real columns. *)
+let fts_col_index (fts_meta : Cat.fts_table_meta) name =
+  let rec find i = function
+    | [] -> None
+    | c :: _ when String.equal c name -> Some i
+    | _ :: rest -> find (i + 1) rest
+  in
+  find 0 fts_meta.Cat.fts_columns
+
+(* Fold an FTS SELECT expression projection into (ordinals, include_rank,
+   snippet specs).  Only column references and snippet() are allowed; the
+   virtual `rank` column sets include_rank instead of contributing an ordinal. *)
+let fts_proj_fold (fts_meta : Cat.fts_table_meta) exprs =
+  List.fold_left (fun acc (e, _alias) ->
+    match acc with
+    | Error _ as err -> err
+    | Ok (ords, has_rank, snips) ->
+      (match e with
+       | Ast.E_col col_name ->
+         if String.equal (String.lowercase_ascii col_name) "rank" then
+           Ok (ords, true, snips)
+         else
+           (match fts_col_index fts_meta col_name with
+            | None ->
+              Error (Unknown_column {
+                table = fts_meta.Cat.fts_name; column = col_name })
+            | Some i -> Ok (ords @ [i], has_rank, snips))
+       | Ast.E_fts_snippet { table; col_idx; start_tag; end_tag; ellipsis; n_tokens } ->
+         if not (String.equal (String.lowercase_ascii table)
+                   (String.lowercase_ascii fts_meta.Cat.fts_name)) then
+           Error (Unknown_table table)
+         else
+           Ok (ords, has_rank,
+               snips @ [Plan.{ col_idx; start_tag; end_tag; ellipsis; n_tokens }])
+       | _ ->
+         Error (Unsupported
+           "only column references and snippet() are supported in FTS SELECT"))
+  ) (Ok ([], false, [])) exprs
+
+(* Build a BS_fts_match_scan from a parsed query and a SELECT projection. *)
+let bind_fts_match_scan (fts_meta : Cat.fts_table_meta) ~query proj =
+  match proj with
+  | `All ->
+    let all_real_ords = List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns in
+    Ok (BS_fts_match_scan {
+      fts_meta; query; proj = all_real_ords; include_rank = false; snippets = [] })
+  | `Cols names ->
+    let has_rank = List.exists (String.equal "rank") names in
+    let real_ords = List.filter_map (fun name ->
+      if String.equal name "rank" then None else fts_col_index fts_meta name
+    ) names in
+    Ok (BS_fts_match_scan {
+      fts_meta; query; proj = real_ords; include_rank = has_rank; snippets = [] })
+  | `Exprs exprs ->
+    (match fts_proj_fold fts_meta exprs with
+     | Error e -> Error e
+     | Ok (col_ords, include_rank, snippets) ->
+       Ok (BS_fts_match_scan {
+         fts_meta; query; proj = col_ords; include_rank; snippets }))
+
 let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
   match Cat.find_fts cat table with
   | None -> Lwt.return (Error (Unknown_table table))
@@ -1241,74 +1301,7 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
        else
          (match Fts_query.parse query_str with
           | Error msg -> Lwt.return (Error (Unsupported ("FTS query parse error: " ^ msg)))
-          | Ok q ->
-            (* Compute column ordinals and detect the virtual `rank` column.
-               `rank` is not a real column — it triggers include_rank=true and
-               is NOT added to proj (the executor appends it as the last value). *)
-            let all_real_ords = List.mapi (fun i _ -> i) fts_meta.Cat.fts_columns in
-            (match proj with
-             | `All ->
-               Lwt.return (Ok (BS_fts_match_scan {
-                 fts_meta; query = q;
-                 proj = all_real_ords; include_rank = false; snippets = [];
-               }))
-             | `Cols names ->
-               let has_rank = List.exists (String.equal "rank") names in
-               let real_ords = List.filter_map (fun name ->
-                 if String.equal name "rank" then None
-                 else
-                   let rec find i = function
-                     | [] -> None
-                     | c :: _ when String.equal c name -> Some i
-                     | _ :: rest -> find (i + 1) rest
-                   in
-                   find 0 fts_meta.Cat.fts_columns
-               ) names in
-               Lwt.return (Ok (BS_fts_match_scan {
-                 fts_meta; query = q;
-                 proj = real_ords; include_rank = has_rank; snippets = [];
-               }))
-             | `Exprs exprs ->
-               let process_result =
-                 List.fold_left (fun acc (e, _alias) ->
-                   match acc with
-                   | Error _ as err -> err
-                   | Ok (ords, has_rank, snips) ->
-                     (match e with
-                      | Ast.E_col col_name ->
-                        if String.equal (String.lowercase_ascii col_name) "rank" then
-                          Ok (ords, true, snips)
-                        else
-                          (let rec find i = function
-                             | [] -> None
-                             | c :: _ when String.equal c col_name -> Some i
-                             | _ :: rest -> find (i + 1) rest
-                           in
-                           match find 0 fts_meta.Cat.fts_columns with
-                           | None ->
-                             Error (Unknown_column {
-                               table = fts_meta.Cat.fts_name; column = col_name
-                             })
-                           | Some i -> Ok (ords @ [i], has_rank, snips))
-                      | Ast.E_fts_snippet { table; col_idx; start_tag; end_tag; ellipsis; n_tokens } ->
-                        let tbl_lower = String.lowercase_ascii table in
-                        let fts_lower = String.lowercase_ascii fts_meta.Cat.fts_name in
-                        if not (String.equal tbl_lower fts_lower) then
-                          Error (Unknown_table table)
-                        else
-                          let spec = Plan.{ col_idx; start_tag; end_tag; ellipsis; n_tokens } in
-                          Ok (ords, has_rank, snips @ [spec])
-                      | _ ->
-                        Error (Unsupported
-                          "only column references and snippet() are supported in FTS SELECT"))
-                 ) (Ok ([], false, [])) exprs
-               in
-               (match process_result with
-                | Error e -> Lwt.return (Error e)
-                | Ok (col_ords, include_rank, snippets) ->
-                  Lwt.return (Ok (BS_fts_match_scan {
-                    fts_meta; query = q; proj = col_ords; include_rank; snippets;
-                  })))))
+          | Ok q -> Lwt.return (bind_fts_match_scan fts_meta ~query:q proj))
      | _ ->
        let synth_meta = fts_as_table_meta fts_meta in
        let where_result =
@@ -1322,10 +1315,645 @@ let bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj =
        (match where_result with
         | Error e -> Lwt.return (Error e)
         | Ok bound_where ->
-          Lwt.return (Ok (BS_fts_seq_scan {
-            fts_meta;
-            where = bound_where;
-          }))))
+          Lwt.return (Ok (BS_fts_seq_scan { fts_meta; where = bound_where }))))
+
+(* Result-bind that short-circuits to an Lwt-wrapped error.  Flattens the
+   error-handling cascade in the SELECT binder. *)
+let ( let$ ) (r : ('a, error) result) (f : 'a -> ('b, error) result Lwt.t)
+  : ('b, error) result Lwt.t =
+  match r with Error e -> Lwt.return (Error e) | Ok x -> f x
+
+(* Position of [v] in [lst], if present. *)
+let select_find_pos lst v =
+  let rec go i = function
+    | [] -> None
+    | x :: _ when x = v -> Some i
+    | _ :: rest -> go (i + 1) rest
+  in go 0 lst
+
+(* Combined-row column lookup with full error reporting (Ambiguous/Unknown),
+   used for projection and ORDER BY name resolution. *)
+let select_proj_lookup ~(tables : (Cat.table_meta * int * string option) list)
+    ~(meta : Cat.table_meta) name : (int, error) result =
+  let hits = List.filter_map (fun (tm, base, _alias) ->
+    match col_index tm.Cat.columns name with
+    | Some i -> Some (base + i) | None -> None
+  ) tables in
+  (match hits with
+   | [i]    -> Ok i
+   | []     -> Error (Unknown_column { table = meta.Cat.name; column = name })
+   | _ :: _ -> Error (Ambiguous_column name))
+
+(* Qualified (table.col / alias.col) lookup against the combined row. *)
+let select_qual_lookup ~(tables : (Cat.table_meta * int * string option) list) t c : (int, error) result =
+  match List.find_opt (fun (tm, _, alias_opt) ->
+    String.equal tm.Cat.name t ||
+    (match alias_opt with Some a -> String.equal t a | None -> false)
+  ) tables with
+  | None -> Error (Unknown_table t)
+  | Some (tm, base, _) ->
+    (match col_index tm.Cat.columns c with
+     | Some i -> Ok (base + i)
+     | None   -> Error (Unknown_column { table = t; column = c }))
+
+(* Bind GROUP BY column names to combined-row ordinals. *)
+let bind_select_group_cols ~(tables : (Cat.table_meta * int * string option) list)
+    ~(meta : Cat.table_meta) group_by : (int list, error) result =
+  let result = List.fold_left (fun acc col_name ->
+    match acc with
+    | Error _ as e -> e
+    | Ok indices ->
+      (match (select_proj_lookup ~tables ~meta) col_name with
+       | Ok i -> Ok (i :: indices)  (* prepend, reverse later *)
+       | Error _ ->
+         (* try qualified lookup across all tables *)
+         let found = List.find_map (fun (tm, _, _) ->
+           match (select_qual_lookup ~tables) tm.Cat.name col_name with
+           | Ok i -> Some i
+           | Error _ -> None
+         ) tables in
+         (match found with
+          | Some i -> Ok (i :: indices)
+          | None -> Error (Unknown_column { table = ""; column = col_name })))
+  ) (Ok []) group_by
+  in
+  (match result with Ok indices -> Ok (List.rev indices) | Error _ as e -> e)
+
+
+(* Bind the projection of an ordinary (non-aggregated) SELECT, handling
+   window functions via bind_ww.  Returns the projection 6-tuple. *)
+(* Window-aware projection binder: like the plain binder but threads
+   E_window nodes into [windows_queue], returning a BE_window_slot. *)
+let rec bind_proj_ww ~bind_one ~windows_queue e =
+  if not (expr_has_window e) then Lwt.return (bind_one e)
+  else match e with
+    | Ast.E_window { func; args; window } ->
+      bind_ww_window ~bind_one ~windows_queue func args window
+    | Ast.E_binop (op, a, b) ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      let* bb = bind_proj_ww ~bind_one ~windows_queue b in
+      (match ba, bb with
+       | Ok ba', Ok bb' ->
+         Lwt.return (Ok (BE_binop (ast_binop_to_sema op, ba', bb')))
+       | Error er, _ | _, Error er -> Lwt.return (Error er))
+    | Ast.E_not a ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      Lwt.return (Result.map (fun x -> BE_not x) ba)
+    | Ast.E_neg a ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      Lwt.return (Result.map (fun x -> BE_neg x) ba)
+    | Ast.E_is_null a ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      Lwt.return (Result.map (fun x -> BE_is_null x) ba)
+    | Ast.E_is_not_null a ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      Lwt.return (Result.map (fun x -> BE_is_not_null x) ba)
+    | Ast.E_bitnot a ->
+      let* ba = bind_proj_ww ~bind_one ~windows_queue a in
+      Lwt.return (Result.map (fun x -> BE_bitnot x) ba)
+    | Ast.E_between (x, lo, hi) ->
+      let* bx  = bind_proj_ww ~bind_one ~windows_queue x  in
+      let* blo = bind_proj_ww ~bind_one ~windows_queue lo in
+      let* bhi = bind_proj_ww ~bind_one ~windows_queue hi in
+      (match bx, blo, bhi with
+       | Ok x', Ok lo', Ok hi' ->
+         Lwt.return (Ok (BE_between (x', lo', hi')))
+       | Error er, _, _ | _, Error er, _ | _, _, Error er ->
+         Lwt.return (Error er))
+    | Ast.E_case { scrutinee; branches; else_ } ->
+      bind_ww_case ~bind_one ~windows_queue scrutinee branches else_
+    | Ast.E_func (f, fargs) ->
+      let* bargs = Lwt_list.fold_left_s (fun acc a ->
+          match acc with
+          | Error er -> Lwt.return (Error er)
+          | Ok bs ->
+            let* r = bind_proj_ww ~bind_one ~windows_queue a in
+            Lwt.return (Result.map (fun b -> bs @ [b]) r)
+        ) (Ok []) fargs in
+      Lwt.return (Result.map (fun ba -> BE_func (f, ba)) bargs)
+    | Ast.E_cast (e, ty) ->
+      let* be = bind_proj_ww ~bind_one ~windows_queue e in
+      Lwt.return (Result.map (fun x -> BE_cast (x, ty)) be)
+    | Ast.E_collate (e, c) ->
+      let* be = bind_proj_ww ~bind_one ~windows_queue e in
+      Lwt.return (Result.map (fun x -> BE_collate (x, c)) be)
+    | _ -> Lwt.return (bind_one e)
+
+and bind_ww_window ~bind_one ~windows_queue func args window =
+  (* Validate frame spec: only aggregate window functions support frames *)
+  (match window.Ast.frame with
+   | Some _ when (match func with Ast.WF_agg _ -> false | _ -> true) ->
+     Lwt.return (Error (Unsupported "ROWS/RANGE frame spec is only supported for aggregate window functions"))
+   | _ ->
+  let slot = Queue.length windows_queue in
+  let bind_list es =
+    List.fold_left (fun acc_r ex ->
+      match acc_r with
+      | Error _ as err -> err
+      | Ok acc ->
+        match bind_one ex with
+        | Error er -> Error er
+        | Ok be    -> Ok (acc @ [be])
+    ) (Ok []) es
+  in
+  let bind_ok_list es =
+    List.fold_left (fun acc_r (ok : Ast.order_key) ->
+      match acc_r with
+      | Error _ as err -> err
+      | Ok acc ->
+        match bind_one ok.Ast.expr with
+        | Error er -> Error er
+        | Ok be    -> Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls }])
+    ) (Ok []) es
+  in
+  (match bind_list args with
+   | Error er -> Lwt.return (Error er)
+   | Ok bound_args ->
+     match bind_list window.Ast.partition_by with
+     | Error er -> Lwt.return (Error er)
+     | Ok bound_pb ->
+       match bind_ok_list window.Ast.order_by with
+       | Error er -> Lwt.return (Error er)
+       | Ok bound_ob ->
+         let ws = { func; args = bound_args;
+                    partition_by = bound_pb;
+                    order_by = bound_ob;
+                    frame = window.Ast.frame } in
+         Queue.push ws windows_queue;
+         Lwt.return (Ok (BE_window_slot slot))))
+
+and bind_ww_case ~bind_one ~windows_queue scrutinee branches else_ =
+  let* bscr = (match scrutinee with
+    | None   -> Lwt.return (Ok None)
+    | Some e ->
+      let* r = bind_proj_ww ~bind_one ~windows_queue e in
+      Lwt.return (Result.map Option.some r)) in
+  let* bbranches = Lwt_list.fold_left_s (fun acc (c, r) ->
+      match acc with
+      | Error er -> Lwt.return (Error er)
+      | Ok bs ->
+        let* bc = bind_proj_ww ~bind_one ~windows_queue c in
+        let* br = bind_proj_ww ~bind_one ~windows_queue r in
+        (match bc, br with
+         | Ok c', Ok r' -> Lwt.return (Ok (bs @ [(c', r')]))
+         | Error er, _ | _, Error er -> Lwt.return (Error er))
+    ) (Ok []) branches in
+  let* belse_ = (match else_ with
+    | None   -> Lwt.return (Ok None)
+    | Some e ->
+      let* r = bind_proj_ww ~bind_one ~windows_queue e in
+      Lwt.return (Result.map Option.some r)) in
+  (match bscr, bbranches, belse_ with
+   | Ok scr, Ok brs, Ok el ->
+     Lwt.return (Ok (BE_case { scrutinee = scr;
+                               branches = brs;
+                               else_ = el }))
+   | Error er, _, _ | _, Error er, _ | _, _, Error er ->
+     Lwt.return (Error er))
+
+(* Bind the projection of an ordinary (non-aggregated) SELECT, handling
+   window functions via bind_proj_ww.  Returns the projection 6-tuple. *)
+let bind_unaggregated_proj ~param_counter ~named_params
+    ~(tables : (Cat.table_meta * int * string option) list) ~(meta : Cat.table_meta) proj =
+  (* Alias-aware multi-table binder, used even for single-table queries so
+     qualified refs resolve only against in-scope tables/aliases. *)
+  let bind_one e = bind_expr_join ~param_counter ~named_params ~tables e in
+  let windows_queue : window_sema Queue.t = Queue.create () in
+  let ords_result_lwt =
+    match proj with
+    | `All ->
+      let all_ords = List.concat_map (fun (tm, base, _alias) ->
+        List.mapi (fun i _ -> base + i) tm.Cat.columns
+      ) tables in
+      Lwt.return (Ok (`Ords all_ords))
+    | `Cols names ->
+      Lwt.return (List.fold_left (fun acc name ->
+        match acc with
+        | Error _ -> acc
+        | Ok (`Exprs _) -> acc
+        | Ok (`Ords ords) ->
+          (match select_proj_lookup ~tables ~meta name with
+           | Error e -> Error e
+           | Ok i    -> Ok (`Ords (ords @ [i])))
+      ) (Ok (`Ords [])) names)
+    | `Exprs es ->
+      (* Arbitrary expr projection; bind_proj_ww handles E_window nodes. *)
+      let* bound_list =
+        Lwt_list.map_s (fun (e, alias) ->
+          let* r = bind_proj_ww ~bind_one ~windows_queue e in
+          Lwt.return (match r with
+            | Ok be   -> Ok (be, alias)
+            | Error e -> Error e)
+        ) es
+      in
+      let errors = List.filter_map
+        (function Error e -> Some e | Ok _ -> None) bound_list in
+      (match errors with
+       | e :: _ -> Lwt.return (Error e)
+       | [] ->
+         Lwt.return (Ok (`Exprs (List.filter_map
+           (function Ok p -> Some p | Error _ -> None) bound_list))))
+  in
+  let* ords_result = ords_result_lwt in
+  let windows_list = Queue.fold (fun acc w -> acc @ [w]) [] windows_queue in
+  (match ords_result with
+   | Error e -> Lwt.return (Error e)
+   | Ok (`Ords o)    -> Lwt.return (Ok (o, [], [], [], windows_list, []))
+   | Ok (`Exprs bes) -> Lwt.return (Ok ([], [], [], bes, windows_list, [])))
+
+
+(* Bind the projection of an aggregated SELECT: builds agg_proj items,
+   aggregate specs, and post-aggregate window functions. *)
+(* Bind a window-function argument in post-aggregate context: GROUP BY
+   columns and aggregate slots are the only legal column references. *)
+let bind_post_agg ~(tables : (Cat.table_meta * int * string option) list) ~meta ~group_cols
+    ~offset_for_aggs ~(acc_aggs : agg_spec list ref) e =
+  let rec go = function
+    | Ast.E_lit l -> Ok (BE_lit l)
+    | Ast.E_col name ->
+      (match (select_proj_lookup ~tables ~meta) name with
+       | Error e -> Error e
+       | Ok i ->
+         match select_find_pos group_cols i with
+         | Some pos -> Ok (BE_col pos)
+         | None -> Error (Unsupported (Printf.sprintf
+             "column '%s' must appear in GROUP BY to be referenced in a window function in this context" name)))
+    | Ast.E_tbl_col (t, c) ->
+      (match (select_qual_lookup ~tables) t c with
+       | Error e -> Error e
+       | Ok i ->
+         match select_find_pos group_cols i with
+         | Some pos -> Ok (BE_col pos)
+         | None -> Error (Unsupported (Printf.sprintf
+             "column '%s.%s' must appear in GROUP BY to be referenced in a window function in this context" t c)))
+    | Ast.E_agg (func, arg_opt) ->
+      let col_ord_result : (int option, error) result =
+        match arg_opt with
+        | None -> (match func with
+                   | Ast.Agg_count -> Ok None
+                   | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+        | Some (Ast.E_col name) ->
+          (match (select_proj_lookup ~tables ~meta) name with
+           | Error e -> Error e | Ok i -> Ok (Some i))
+        | Some (Ast.E_tbl_col (t, c)) ->
+          (match (select_qual_lookup ~tables) t c with
+           | Error e -> Error e | Ok i -> Ok (Some i))
+        | Some _ ->
+          Error (Unsupported "aggregate argument in window function must be a column reference")
+      in
+      (match col_ord_result with
+       | Error e -> Error e
+       | Ok co ->
+         let spec = { func; col_ord = co } in
+         let rec find_slot i = function
+           | [] ->
+             acc_aggs := !acc_aggs @ [spec];
+             List.length !acc_aggs - 1
+           | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
+           | _ :: rest -> find_slot (i + 1) rest
+         in
+         let slot = find_slot 0 !acc_aggs in
+         Ok (BE_col (offset_for_aggs + slot)))
+    | Ast.E_neg e -> (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
+    | Ast.E_not e -> (match go e with Ok be -> Ok (BE_not be) | Error e -> Error e)
+    | Ast.E_binop (op, a, b) ->
+      (match go a, go b with
+       | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
+       | Error e, _ | _, Error e -> Error e)
+    | Ast.E_window _ -> Error (Unsupported "nested window functions not supported")
+    | _ -> Error (Unsupported "only GROUP BY columns and aggregate expressions are supported in window function arguments in this context")
+  in go e
+
+
+(* Bind a window function appearing in an aggregated projection, pushing it
+   onto [agg_windows_queue] and returning an AP_window_slot. *)
+let project_window ~(tables : (Cat.table_meta * int * string option) list) ~meta ~group_cols ~offset_for_aggs
+    ~(acc_aggs : agg_spec list ref) ~agg_windows_queue func args window
+    : (agg_proj_item, error) result =
+  let bind_list es =
+    List.fold_left (fun acc_r ex ->
+      match acc_r with
+      | Error _ as err -> err
+      | Ok acc ->
+        match bind_post_agg ~tables ~meta ~group_cols ~offset_for_aggs ~acc_aggs ex with
+        | Error er -> Error er
+        | Ok be    -> Ok (acc @ [be])
+    ) (Ok []) es
+  in
+  let bind_ok_list (oks : Ast.order_key list) =
+    List.fold_left (fun acc_r ok ->
+      match acc_r with
+      | Error _ as err -> err
+      | Ok acc ->
+        match bind_post_agg ~tables ~meta ~group_cols ~offset_for_aggs ~acc_aggs ok.Ast.expr with
+        | Error er -> Error er
+        | Ok be    ->
+          let nulls = ok.Ast.nulls in
+          Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls }])
+    ) (Ok []) oks
+  in
+  (match bind_list args with
+   | Error er -> Error er
+   | Ok bound_args ->
+     match bind_list window.Ast.partition_by with
+     | Error er -> Error er
+     | Ok bound_pb ->
+       match bind_ok_list window.Ast.order_by with
+       | Error er -> Error er
+       | Ok bound_ob ->
+         let slot = Queue.length agg_windows_queue in
+         Queue.push
+           { func; args = bound_args;
+             partition_by = bound_pb;
+             order_by = bound_ob;
+             frame = window.Ast.frame }
+           agg_windows_queue;
+         Ok (AP_window_slot slot))
+
+
+(* Bind an aggregate call in an aggregated projection (with SUM/AVG numeric
+   type check), registering it via [add_agg] and returning AP_agg_slot. *)
+let project_agg ~(tables : (Cat.table_meta * int * string option) list) ~meta ~add_agg func arg_opt
+    : (agg_proj_item, error) result =
+  (* SUM/AVG type check. *)
+  let validate_numeric col_ord =
+    let cols = List.concat_map (fun (tm, _, _) -> tm.Cat.columns) tables in
+    let col = List.nth cols col_ord in
+    match col.Row.ty with
+    | Row.Integer | Row.Real -> Ok ()
+    | _ -> Error (Type_mismatch { expected = Row.Real; got = col.ty })
+  in
+  let col_ord_result : (int option, error) result =
+    match arg_opt with
+    | None ->
+      (match func with
+       | Ast.Agg_count -> Ok None
+       | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+    | Some (Ast.E_col name) ->
+      (match (select_proj_lookup ~tables ~meta) name with
+       | Error e -> Error e
+       | Ok i -> Ok (Some i))
+    | Some (Ast.E_tbl_col (t, c)) ->
+      (match (select_qual_lookup ~tables) t c with
+       | Error e -> Error e
+       | Ok i -> Ok (Some i))
+    | Some _ ->
+      Error (Unsupported "aggregate argument must be a column reference")
+  in
+  (match col_ord_result with
+   | Error e -> Error e
+   | Ok co ->
+     let type_check =
+       match func, co with
+       | (Ast.Agg_sum | Ast.Agg_avg), Some i -> validate_numeric i
+       | _ -> Ok ()
+     in
+     (match type_check with
+      | Error e -> Error e
+      | Ok () ->
+        let slot = add_agg { func; col_ord = co } in
+        Ok (AP_agg_slot slot)))
+
+
+(* Bind one explicit projection item of an aggregated SELECT. *)
+let project_agg_item ~(tables : (Cat.table_meta * int * string option) list) ~meta ~group_cols
+    ~offset_for_aggs ~add_agg ~acc_aggs ~agg_windows_queue
+    (e : Ast.expr) : (agg_proj_item, error) result =
+  match e with
+  | Ast.E_col name ->
+    (match select_proj_lookup ~tables ~meta name with
+     | Error e -> Error e
+     | Ok i ->
+       (* Must appear in GROUP BY. *)
+       (match select_find_pos group_cols i with
+        | Some pos -> Ok (AP_group_col pos)
+        | None -> Error (Unsupported (Printf.sprintf
+                       "column '%s' must appear in GROUP BY clause" name))))
+  | Ast.E_tbl_col (t, c) ->
+    (match select_qual_lookup ~tables t c with
+     | Error e -> Error e
+     | Ok i ->
+       (match select_find_pos group_cols i with
+        | Some pos -> Ok (AP_group_col pos)
+        | None -> Error (Unsupported (Printf.sprintf
+                       "column '%s.%s' must appear in GROUP BY clause" t c))))
+  | Ast.E_agg (func, arg_opt) ->
+    project_agg ~tables ~meta ~add_agg func arg_opt
+  | Ast.E_window { func; args; window } ->
+    project_window ~tables ~meta ~group_cols ~offset_for_aggs ~acc_aggs
+      ~agg_windows_queue func args window
+  | _ ->
+    Error (Unsupported "complex expression in aggregated projection not supported")
+
+(* Bind the projection of an aggregated SELECT: builds agg_proj items,
+   aggregate specs, and post-aggregate window functions. *)
+let bind_aggregated_proj ~(tables : (Cat.table_meta * int * string option) list) ~(meta : Cat.table_meta)
+    ~group_cols ~offset_for_aggs ~is_aggregated proj =
+  let acc_aggs : agg_spec list ref = ref [] in
+  let agg_windows_queue : window_sema Queue.t = Queue.create () in
+  let add_agg spec =
+    let idx = List.length !acc_aggs in
+    acc_aggs := !acc_aggs @ [spec];
+    idx
+  in
+  let exprs_to_project : Ast.expr list =
+    match proj with
+    | `All -> []   (* aggregated `*` needs explicit columns; rejected below *)
+    | `Cols names -> List.map (fun n -> Ast.E_col n) names
+    | `Exprs es -> List.map fst es
+  in
+  if exprs_to_project = [] && proj = `All && is_aggregated then
+    Lwt.return (Error (Unsupported "SELECT * with aggregates requires explicit columns"))
+  else
+    let agg_proj_result =
+      List.fold_left (fun acc e ->
+        match acc with
+        | Error _ -> acc
+        | Ok items ->
+          (match project_agg_item ~tables ~meta ~group_cols ~offset_for_aggs
+                   ~add_agg ~acc_aggs ~agg_windows_queue e with
+           | Error e -> Error e
+           | Ok item -> Ok (items @ [item]))
+      ) (Ok []) exprs_to_project
+    in
+    let agg_wins = Queue.fold (fun acc w -> acc @ [w]) [] agg_windows_queue in
+    Lwt.return (match agg_proj_result with
+     | Error e -> Error e
+     | Ok items -> Ok ([], items, !acc_aggs, [], [], agg_wins))
+
+
+(* Bind each JOIN ON predicate against the tables visible so far. *)
+let bind_select_joins ~param_counter ~named_params ~(meta : Cat.table_meta)
+    ~table_alias ~n_left
+    (joined_pairs : (Ast.join_clause * Cat.table_meta) list)
+    : (bound_join list, error) result =
+  let rec go acc tbl_acc offset = function
+    | [] -> Ok (List.rev acc)
+    | ((jc : Ast.join_clause), rm) :: rest ->
+      let tables_so_far = tbl_acc @ [(rm, offset, jc.Ast.alias)] in
+      (match bind_expr_join ~param_counter ~named_params
+               ~tables:tables_so_far jc.Ast.on with
+       | Error e -> Error e
+       | Ok be   ->
+         let bj = { kind = jc.Ast.kind; right_meta = rm;
+                    on = be; right_col_offset = offset } in
+         go (bj :: acc) tables_so_far (offset + List.length rm.Cat.columns) rest)
+  in
+  go [] [(meta, 0, table_alias)] n_left joined_pairs
+
+
+(* Bind the HAVING clause in aggregate-output context; collects HAVING
+   aggregates (appended after the projection aggregates). *)
+let bind_select_having ~param_counter ~named_params ~(tables : (Cat.table_meta * int * string option) list)
+    ~(meta : Cat.table_meta) ~group_cols ~offset_for_aggs ~proj_aggs
+    ~is_aggregated having : (bound_expr option * agg_spec list, error) result =
+  match having with
+  | None -> Ok (None, [])
+  | Some e ->
+    if not is_aggregated then
+      Error (Unsupported "HAVING requires GROUP BY or aggregate")
+    else begin
+      (* Use a resolver that, for plain column refs,
+         requires the column to appear in GROUP BY
+         (resolves to its position in group_cols), else error. *)
+      let having_resolver_unqual name =
+        match (select_proj_lookup ~tables ~meta) name with
+        | Error e -> Error e
+        | Ok i ->
+          (match select_find_pos group_cols i with
+           | Some pos -> Ok pos
+           | None -> Error (Unsupported (Printf.sprintf
+                          "HAVING references non-grouped column '%s'" name)))
+      in
+      let having_resolver_qual t c =
+        match (select_qual_lookup ~tables) t c with
+        | Error e -> Error e
+        | Ok i ->
+          (match select_find_pos group_cols i with
+           | Some pos -> Ok pos
+           | None -> Error (Unsupported (Printf.sprintf
+                          "HAVING references non-grouped column '%s.%s'" t c)))
+      in
+      let having_resolver = {
+        resolve_unqual = having_resolver_unqual;
+        resolve_qual = having_resolver_qual;
+        (* Inside aggregate args in HAVING, any table column is allowed *)
+        resolve_agg_arg      = (select_proj_lookup ~tables ~meta);
+        resolve_agg_arg_qual = (select_qual_lookup ~tables);
+      } in
+      (* Append HAVING aggregates AFTER the projection
+         aggregates: in BE_col offset = offset_for_aggs +
+         (List.length proj_aggs). *)
+      let having_offset =
+        offset_for_aggs + List.length proj_aggs
+      in
+      match bind_expr_agg ~param_counter ~named_params ~resolver:having_resolver
+              ~offset:having_offset e with
+      | Error e -> Error e
+      | Ok (be, hagg) -> Ok (Some be, hagg)
+    end
+
+
+(* Bind ORDER BY keys, resolving projection aliases as a fallback. *)
+let bind_select_order ~param_counter ~named_params ~(tables : (Cat.table_meta * int * string option) list)
+    ~(proj_exprs : (bound_expr * string option) list) order =
+  let alias_map : (string * bound_expr) list =
+    List.filter_map (fun (be, alias_opt) ->
+      Option.map (fun a -> (a, be)) alias_opt
+    ) proj_exprs
+  in
+  let bind_order_expr e =
+    let base_result =
+      (* Alias-aware binder for both single-table and joined
+         queries; see comment in [bind_one] above. *)
+      bind_expr_join ~param_counter ~named_params ~tables e
+    in
+    match base_result with
+    | Ok _ -> base_result
+    | Error _ ->
+      (match e with
+       | Ast.E_col name ->
+         (match List.assoc_opt name alias_map with
+          | Some be -> Ok be
+          | None    -> base_result)
+       | _ -> base_result)
+  in
+    List.fold_left (fun acc (ok : Ast.order_key) ->
+      match acc with
+      | Error _ -> acc
+      | Ok keys ->
+        (match bind_order_expr ok.Ast.expr with
+         | Error e -> Error e
+         | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir; nulls = ok.Ast.nulls }]))
+    ) (Ok []) order
+
+
+(* Validate LIMIT/OFFSET are non-negative. *)
+let validate_limit_offset ~limit ~offset =
+  match limit with
+  | Some n when n < 0 -> Error (Invalid_limit "LIMIT must be non-negative")
+  | _ ->
+    (match offset with
+     | Some n when n < 0 -> Error (Invalid_limit "OFFSET must be non-negative")
+     | _ -> Ok (limit, offset))
+
+(* SELECT binding once the primary table is resolved: GROUP BY, projection,
+   joins, WHERE, HAVING, ORDER BY, LIMIT/OFFSET, then assemble BS_select. *)
+let bind_select_resolved ~param_counter ~named_params ~distinct ~proj ~where
+    ~group_by ~having ~order ~limit ~offset ~(meta : Cat.table_meta) ~table_alias
+    ~n_left ~tables ~joined_pairs =
+  let is_aggregated =
+    (match proj with
+     | `All | `Cols _ -> false
+     | `Exprs es -> List.exists (fun (e, _) -> expr_has_agg e) es)
+    || (match having with None -> false | Some e -> expr_has_agg e)
+    || group_by <> []
+  in
+  let$ group_cols = bind_select_group_cols ~tables ~meta group_by in
+  let offset_for_aggs = List.length group_cols in
+  let* proj_result =
+    if not is_aggregated then
+      bind_unaggregated_proj ~param_counter ~named_params ~tables ~meta proj
+    else
+      bind_aggregated_proj ~tables ~meta ~group_cols ~offset_for_aggs
+        ~is_aggregated proj
+  in
+  let$ (proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows, agg_wins) =
+    proj_result in
+  let$ bound_joins =
+    bind_select_joins ~param_counter ~named_params ~meta ~table_alias ~n_left
+      joined_pairs in
+  let$ bound_where =
+    (match where with
+     | None   -> Ok None
+     | Some e ->
+       (match bind_expr_join ~param_counter ~named_params ~tables e with
+        | Ok be   -> Ok (Some be)
+        | Error e -> Error e)) in
+  let$ (bound_having, having_aggs) =
+    bind_select_having ~param_counter ~named_params ~tables ~meta ~group_cols
+      ~offset_for_aggs ~proj_aggs ~is_aggregated having in
+  let all_aggs = proj_aggs @ having_aggs in
+  let$ bound_order =
+    bind_select_order ~param_counter ~named_params ~tables ~proj_exprs order in
+  let$ (valid_limit, valid_offset) = validate_limit_offset ~limit ~offset in
+  Lwt.return (Ok (BS_select {
+    distinct;
+    table_meta = meta;
+    proj       = proj_ords;
+    expr_proj  = proj_exprs;
+    where      = bound_where;
+    order      = bound_order;
+    limit      = valid_limit;
+    offset     = valid_offset;
+    joins      = bound_joins;
+    group_by   = group_cols;
+    aggs       = all_aggs;
+    having     = bound_having;
+    agg_proj    = agg_proj_items;
+    windows     = proj_windows;
+    agg_windows = agg_wins;
+  }))
 
 let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_alias ~joins ~where ~group_by ~having ~order ~limit ~offset =
   let* meta_opt =
@@ -1338,17 +1966,15 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
   in
   match meta_opt with
   | None ->
-    (* Not a regular table — check if it's an FTS table (only plain SELECT supported) *)
+    (* Not a regular table — check if it's an FTS table (only plain SELECT). *)
     (match joins, group_by, having, order, limit, offset with
      | [], [], None, [], None, None ->
        bind_fts_seq_scan cat ~param_counter ~named_params ~table ~where ~proj
      | _ ->
-       (* FTS does not yet support JOINs, GROUP BY, HAVING, ORDER BY, LIMIT, OFFSET *)
        (match Cat.find_fts cat table with
         | None -> Lwt.return (Error (Unknown_table table))
         | Some _ -> Lwt.return (Error (Unsupported "FTS tables do not support this query form"))))
   | Some meta ->
-    (* Resolve all join table metas in order *)
     let* joined_pairs_result =
       Lwt_list.fold_left_s (fun acc (jc : Ast.join_clause) ->
         match acc with
@@ -1360,642 +1986,18 @@ let bind_select cat ~param_counter ~named_params ~distinct ~proj ~table ~table_a
            | Some rm -> Lwt.return (Ok (pairs @ [(jc, rm)])))
       ) (Ok []) joins
     in
-    (match joined_pairs_result with
-     | Error e -> Lwt.return (Error e)
-     | Ok joined_pairs ->
-       let n_left = List.length meta.columns in
-       (* tables: [(primary_meta, 0, alias); (rm0, n_left, alias0); ...] *)
-       let (tables, _) =
-         List.fold_left (fun (acc, off) ((jc : Ast.join_clause), rm) ->
-           let n = List.length rm.Cat.columns in
-           (acc @ [(rm, off, jc.Ast.alias)], off + n)
-         ) ([(meta, 0, table_alias)], n_left) joined_pairs
-       in
-       (* Combined-row column lookup with full error reporting (Ambiguous,
-          Unknown).  Used for proj and ORDER BY name resolution. *)
-       let proj_lookup name : (int, error) result =
-         let hits = List.filter_map (fun (tm, base, _alias) ->
-           match col_index tm.Cat.columns name with
-           | Some i -> Some (base + i) | None -> None
-         ) tables in
-         (match hits with
-          | [i]    -> Ok i
-          | []     -> Error (Unknown_column { table = meta.Cat.name; column = name })
-          | _ :: _ -> Error (Ambiguous_column name))
-       in
-       let qual_lookup t c : (int, error) result =
-         match List.find_opt (fun (tm, _, alias_opt) ->
-           String.equal tm.Cat.name t ||
-           (match alias_opt with Some a -> String.equal t a | None -> false)
-         ) tables with
-         | None -> Error (Unknown_table t)
-         | Some (tm, base, _) ->
-           (match col_index tm.Cat.columns c with
-            | Some i -> Ok (base + i)
-            | None   -> Error (Unknown_column { table = t; column = c }))
-       in
-       (* Detect whether this is an aggregated query: any aggregate in
-          projection or HAVING, or GROUP BY present. *)
-       let proj_has_agg =
-         match proj with
-         | `All | `Cols _ -> false
-         | `Exprs es -> List.exists (fun (e, _) -> expr_has_agg e) es
-       in
-       let having_has_agg =
-         match having with
-         | None -> false
-         | Some e -> expr_has_agg e
-       in
-       let group_by_present = group_by <> [] in
-       let is_aggregated =
-         proj_has_agg || having_has_agg || group_by_present
-       in
-       (* Bind GROUP BY columns — any number supported. *)
-       let find_pos lst v =
-         let rec go i = function
-           | [] -> None
-           | x :: _ when x = v -> Some i
-           | _ :: rest -> go (i + 1) rest
-         in go 0 lst
-       in
-       let group_cols_result : (int list, error) result =
-         let result = List.fold_left (fun acc col_name ->
-           match acc with
-           | Error _ as e -> e
-           | Ok indices ->
-             (match proj_lookup col_name with
-              | Ok i -> Ok (i :: indices)  (* prepend, reverse later *)
-              | Error _ ->
-                (* try qualified lookup across all tables *)
-                let found = List.find_map (fun (tm, _, _) ->
-                  match qual_lookup tm.Cat.name col_name with
-                  | Ok i -> Some i
-                  | Error _ -> None
-                ) tables in
-                (match found with
-                 | Some i -> Ok (i :: indices)
-                 | None -> Error (Unknown_column { table = ""; column = col_name })))
-         ) (Ok []) group_by
-         in
-         (match result with Ok indices -> Ok (List.rev indices) | Error _ as e -> e)
-       in
-       (match group_cols_result with
-        | Error e -> Lwt.return (Error e)
-        | Ok group_cols ->
-       let offset_for_aggs = List.length group_cols in
-       (* Build proj/agg_proj.
-          The result tuple is (col_ordinals, agg_proj, agg_specs, expr_proj, windows, agg_windows).
-          [expr_proj] is non-empty only for scalar-function projections
-          (Phase 5); [col_ordinals] is empty in that case.
-          [windows] is non-empty only for window-function projections (Phase 14).
-          [agg_windows] is non-empty only for window functions in aggregated context. *)
-       let* proj_result :
-           (int list * agg_proj_item list * agg_spec list * (bound_expr * string option) list
-            * window_sema list * window_sema list,
-            error) result =
-         if not is_aggregated then
-           (* Ordinary SELECT — keep behaviour identical to pre-Task-6,
-              but also handle E_window via bind_ww. *)
-           let bind_one e =
-             (* Always go through the alias-aware multi-table binder, even
-                for single-table queries — this ensures qualified column
-                refs like [a.id] only resolve when [a] is an in-scope table
-                or alias. Foreign qualifiers (e.g. correlated references
-                to an outer query) correctly fail with Unknown_table. *)
-             bind_expr_join ~param_counter ~named_params ~tables e
-           in
-           let windows_queue : window_sema Queue.t = Queue.create () in
-           let rec bind_ww e =
-             if not (expr_has_window e) then Lwt.return (bind_one e)
-             else match e with
-               | Ast.E_window { func; args; window } ->
-                 (* Validate frame spec: only aggregate window functions support frames *)
-                 (match window.Ast.frame with
-                  | Some _ when (match func with Ast.WF_agg _ -> false | _ -> true) ->
-                    Lwt.return (Error (Unsupported "ROWS/RANGE frame spec is only supported for aggregate window functions"))
-                  | _ ->
-                 let slot = Queue.length windows_queue in
-                 let bind_list es =
-                   List.fold_left (fun acc_r ex ->
-                     match acc_r with
-                     | Error _ as err -> err
-                     | Ok acc ->
-                       match bind_one ex with
-                       | Error er -> Error er
-                       | Ok be    -> Ok (acc @ [be])
-                   ) (Ok []) es
-                 in
-                 let bind_ok_list es =
-                   List.fold_left (fun acc_r (ok : Ast.order_key) ->
-                     match acc_r with
-                     | Error _ as err -> err
-                     | Ok acc ->
-                       match bind_one ok.Ast.expr with
-                       | Error er -> Error er
-                       | Ok be    -> Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls = ok.Ast.nulls }])
-                   ) (Ok []) es
-                 in
-                 (match bind_list args with
-                  | Error er -> Lwt.return (Error er)
-                  | Ok bound_args ->
-                    match bind_list window.Ast.partition_by with
-                    | Error er -> Lwt.return (Error er)
-                    | Ok bound_pb ->
-                      match bind_ok_list window.Ast.order_by with
-                      | Error er -> Lwt.return (Error er)
-                      | Ok bound_ob ->
-                        let ws = { func; args = bound_args;
-                                   partition_by = bound_pb;
-                                   order_by = bound_ob;
-                                   frame = window.Ast.frame } in
-                        Queue.push ws windows_queue;
-                        Lwt.return (Ok (BE_window_slot slot))))
-               | Ast.E_binop (op, a, b) ->
-                 let* ba = bind_ww a in
-                 let* bb = bind_ww b in
-                 (match ba, bb with
-                  | Ok ba', Ok bb' ->
-                    Lwt.return (Ok (BE_binop (ast_binop_to_sema op, ba', bb')))
-                  | Error er, _ | _, Error er -> Lwt.return (Error er))
-               | Ast.E_not a ->
-                 let* ba = bind_ww a in
-                 Lwt.return (Result.map (fun x -> BE_not x) ba)
-               | Ast.E_neg a ->
-                 let* ba = bind_ww a in
-                 Lwt.return (Result.map (fun x -> BE_neg x) ba)
-               | Ast.E_is_null a ->
-                 let* ba = bind_ww a in
-                 Lwt.return (Result.map (fun x -> BE_is_null x) ba)
-               | Ast.E_is_not_null a ->
-                 let* ba = bind_ww a in
-                 Lwt.return (Result.map (fun x -> BE_is_not_null x) ba)
-               | Ast.E_bitnot a ->
-                 let* ba = bind_ww a in
-                 Lwt.return (Result.map (fun x -> BE_bitnot x) ba)
-               | Ast.E_between (x, lo, hi) ->
-                 let* bx  = bind_ww x  in
-                 let* blo = bind_ww lo in
-                 let* bhi = bind_ww hi in
-                 (match bx, blo, bhi with
-                  | Ok x', Ok lo', Ok hi' ->
-                    Lwt.return (Ok (BE_between (x', lo', hi')))
-                  | Error er, _, _ | _, Error er, _ | _, _, Error er ->
-                    Lwt.return (Error er))
-               | Ast.E_case { scrutinee; branches; else_ } ->
-                 let* bscr = (match scrutinee with
-                   | None   -> Lwt.return (Ok None)
-                   | Some e ->
-                     let* r = bind_ww e in
-                     Lwt.return (Result.map Option.some r)) in
-                 let* bbranches = Lwt_list.fold_left_s (fun acc (c, r) ->
-                     match acc with
-                     | Error er -> Lwt.return (Error er)
-                     | Ok bs ->
-                       let* bc = bind_ww c in
-                       let* br = bind_ww r in
-                       (match bc, br with
-                        | Ok c', Ok r' -> Lwt.return (Ok (bs @ [(c', r')]))
-                        | Error er, _ | _, Error er -> Lwt.return (Error er))
-                   ) (Ok []) branches in
-                 let* belse_ = (match else_ with
-                   | None   -> Lwt.return (Ok None)
-                   | Some e ->
-                     let* r = bind_ww e in
-                     Lwt.return (Result.map Option.some r)) in
-                 (match bscr, bbranches, belse_ with
-                  | Ok scr, Ok brs, Ok el ->
-                    Lwt.return (Ok (BE_case { scrutinee = scr;
-                                              branches = brs;
-                                              else_ = el }))
-                  | Error er, _, _ | _, Error er, _ | _, _, Error er ->
-                    Lwt.return (Error er))
-               | Ast.E_func (f, fargs) ->
-                 let* bargs = Lwt_list.fold_left_s (fun acc a ->
-                     match acc with
-                     | Error er -> Lwt.return (Error er)
-                     | Ok bs ->
-                       let* r = bind_ww a in
-                       Lwt.return (Result.map (fun b -> bs @ [b]) r)
-                   ) (Ok []) fargs in
-                 Lwt.return (Result.map (fun ba -> BE_func (f, ba)) bargs)
-               | Ast.E_cast (e, ty) ->
-                 let* be = bind_ww e in
-                 Lwt.return (Result.map (fun x -> BE_cast (x, ty)) be)
-               | Ast.E_collate (e, c) ->
-                 let* be = bind_ww e in
-                 Lwt.return (Result.map (fun x -> BE_collate (x, c)) be)
-               | _ -> Lwt.return (bind_one e)
-           in
-           let ords_result_lwt =
-             match proj with
-             | `All ->
-               let all_ords = List.concat_map (fun (tm, base, _alias) ->
-                 List.mapi (fun i _ -> base + i) tm.Cat.columns
-               ) tables in
-               Lwt.return (Ok (`Ords all_ords))
-             | `Cols names ->
-               Lwt.return (List.fold_left (fun acc name ->
-                 match acc with
-                 | Error _ -> acc
-                 | Ok (`Exprs _) -> acc
-                 | Ok (`Ords ords) ->
-                   (match proj_lookup name with
-                    | Error e -> Error e
-                    | Ok i    -> Ok (`Ords (ords @ [i])))
-               ) (Ok (`Ords [])) names)
-             | `Exprs es ->
-               (* Phase 5 / Phase 11 / Phase 14: arbitrary expr projection.
-                  Use bind_ww so that E_window nodes are handled. *)
-               let* bound_list =
-                 Lwt_list.map_s (fun (e, alias) ->
-                   let* r = bind_ww e in
-                   Lwt.return (match r with
-                     | Ok be   -> Ok (be, alias)
-                     | Error e -> Error e)
-                 ) es
-               in
-               let errors = List.filter_map
-                 (function Error e -> Some e | Ok _ -> None) bound_list in
-               (match errors with
-                | e :: _ -> Lwt.return (Error e)
-                | [] ->
-                  Lwt.return (Ok (`Exprs (List.filter_map
-                    (function Ok p -> Some p | Error _ -> None) bound_list))))
-           in
-           let* ords_result = ords_result_lwt in
-           let windows_list = Queue.fold (fun acc w -> acc @ [w]) [] windows_queue in
-           (match ords_result with
-            | Error e -> Lwt.return (Error e)
-            | Ok (`Ords o)    -> Lwt.return (Ok (o, [], [], [], windows_list, []))
-            | Ok (`Exprs bes) -> Lwt.return (Ok ([], [], [], bes, windows_list, [])))
-         else begin
-           (* Aggregated SELECT — build agg_proj and aggs list. *)
-           (* Helper: walk an expression that is an explicit projection
-              item.  For a bare column reference, produce a non-agg slot;
-              for an aggregate, produce an AP_agg_slot. *)
-           let acc_aggs = ref [] in
-           let agg_windows_queue : window_sema Queue.t = Queue.create () in
-           let add_agg spec =
-             let idx = List.length !acc_aggs in
-             acc_aggs := !acc_aggs @ [spec];
-             idx
-           in
-           let project_one (e : Ast.expr) : (agg_proj_item, error) result =
-             match e with
-             | Ast.E_col name ->
-               (match proj_lookup name with
-                | Error e -> Error e
-                | Ok i ->
-                  (* Must appear in GROUP BY. *)
-                  (match find_pos group_cols i with
-                   | Some pos -> Ok (AP_group_col pos)
-                   | None -> Error (Unsupported (Printf.sprintf
-                                  "column '%s' must appear in GROUP BY clause" name))))
-             | Ast.E_tbl_col (t, c) ->
-               (match qual_lookup t c with
-                | Error e -> Error e
-                | Ok i ->
-                  (match find_pos group_cols i with
-                   | Some pos -> Ok (AP_group_col pos)
-                   | None -> Error (Unsupported (Printf.sprintf
-                                  "column '%s.%s' must appear in GROUP BY clause" t c))))
-             | Ast.E_agg (func, arg_opt) ->
-               (* SUM/AVG type check. *)
-               let validate_numeric col_ord =
-                 let cols = List.concat_map (fun (tm, _, _) -> tm.Cat.columns) tables in
-                 let col = List.nth cols col_ord in
-                 match col.Row.ty with
-                 | Row.Integer | Row.Real -> Ok ()
-                 | _ -> Error (Type_mismatch { expected = Row.Real; got = col.ty })
-               in
-               let col_ord_result : (int option, error) result =
-                 match arg_opt with
-                 | None ->
-                   (match func with
-                    | Ast.Agg_count -> Ok None
-                    | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
-                 | Some (Ast.E_col name) ->
-                   (match proj_lookup name with
-                    | Error e -> Error e
-                    | Ok i -> Ok (Some i))
-                 | Some (Ast.E_tbl_col (t, c)) ->
-                   (match qual_lookup t c with
-                    | Error e -> Error e
-                    | Ok i -> Ok (Some i))
-                 | Some _ ->
-                   Error (Unsupported "aggregate argument must be a column reference")
-               in
-               (match col_ord_result with
-                | Error e -> Error e
-                | Ok co ->
-                  let type_check =
-                    match func, co with
-                    | (Ast.Agg_sum | Ast.Agg_avg), Some i -> validate_numeric i
-                    | _ -> Ok ()
-                  in
-                  (match type_check with
-                   | Error e -> Error e
-                   | Ok () ->
-                     let slot = add_agg { func; col_ord = co } in
-                     Ok (AP_agg_slot slot)))
-             | Ast.E_window { func; args; window } ->
-               (* Window function in aggregated projection: bind args in
-                  post-agg context (GROUP BY cols and agg slots allowed). *)
-               let bind_post_agg e =
-                 let rec go = function
-                   | Ast.E_lit l -> Ok (BE_lit l)
-                   | Ast.E_col name ->
-                     (match proj_lookup name with
-                      | Error e -> Error e
-                      | Ok i ->
-                        match find_pos group_cols i with
-                        | Some pos -> Ok (BE_col pos)
-                        | None -> Error (Unsupported (Printf.sprintf
-                            "column '%s' must appear in GROUP BY to be referenced in a window function in this context" name)))
-                   | Ast.E_tbl_col (t, c) ->
-                     (match qual_lookup t c with
-                      | Error e -> Error e
-                      | Ok i ->
-                        match find_pos group_cols i with
-                        | Some pos -> Ok (BE_col pos)
-                        | None -> Error (Unsupported (Printf.sprintf
-                            "column '%s.%s' must appear in GROUP BY to be referenced in a window function in this context" t c)))
-                   | Ast.E_agg (func, arg_opt) ->
-                     let col_ord_result : (int option, error) result =
-                       match arg_opt with
-                       | None -> (match func with
-                                  | Ast.Agg_count -> Ok None
-                                  | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
-                       | Some (Ast.E_col name) ->
-                         (match proj_lookup name with
-                          | Error e -> Error e | Ok i -> Ok (Some i))
-                       | Some (Ast.E_tbl_col (t, c)) ->
-                         (match qual_lookup t c with
-                          | Error e -> Error e | Ok i -> Ok (Some i))
-                       | Some _ ->
-                         Error (Unsupported "aggregate argument in window function must be a column reference")
-                     in
-                     (match col_ord_result with
-                      | Error e -> Error e
-                      | Ok co ->
-                        let spec = { func; col_ord = co } in
-                        let rec find_slot i = function
-                          | [] ->
-                            acc_aggs := !acc_aggs @ [spec];
-                            List.length !acc_aggs - 1
-                          | s :: _ when s.func = spec.func && s.col_ord = spec.col_ord -> i
-                          | _ :: rest -> find_slot (i + 1) rest
-                        in
-                        let slot = find_slot 0 !acc_aggs in
-                        Ok (BE_col (offset_for_aggs + slot)))
-                   | Ast.E_neg e -> (match go e with Ok be -> Ok (BE_neg be) | Error e -> Error e)
-                   | Ast.E_not e -> (match go e with Ok be -> Ok (BE_not be) | Error e -> Error e)
-                   | Ast.E_binop (op, a, b) ->
-                     (match go a, go b with
-                      | Ok ba, Ok bb -> Ok (BE_binop (ast_binop_to_sema op, ba, bb))
-                      | Error e, _ | _, Error e -> Error e)
-                   | Ast.E_window _ -> Error (Unsupported "nested window functions not supported")
-                   | _ -> Error (Unsupported "only GROUP BY columns and aggregate expressions are supported in window function arguments in this context")
-                 in go e
-               in
-               let bind_list es =
-                 List.fold_left (fun acc_r ex ->
-                   match acc_r with
-                   | Error _ as err -> err
-                   | Ok acc ->
-                     match bind_post_agg ex with
-                     | Error er -> Error er
-                     | Ok be    -> Ok (acc @ [be])
-                 ) (Ok []) es
-               in
-               let bind_ok_list (oks : Ast.order_key list) =
-                 List.fold_left (fun acc_r ok ->
-                   match acc_r with
-                   | Error _ as err -> err
-                   | Ok acc ->
-                     match bind_post_agg ok.Ast.expr with
-                     | Error er -> Error er
-                     | Ok be    ->
-                       let nulls = ok.Ast.nulls in
-                       Ok (acc @ [{ key = be; dir = ok.Ast.dir; nulls }])
-                 ) (Ok []) oks
-               in
-               (match bind_list args with
-                | Error er -> Error er
-                | Ok bound_args ->
-                  match bind_list window.Ast.partition_by with
-                  | Error er -> Error er
-                  | Ok bound_pb ->
-                    match bind_ok_list window.Ast.order_by with
-                    | Error er -> Error er
-                    | Ok bound_ob ->
-                      let slot = Queue.length agg_windows_queue in
-                      Queue.push
-                        { func; args = bound_args;
-                          partition_by = bound_pb;
-                          order_by = bound_ob;
-                          frame = window.Ast.frame }
-                        agg_windows_queue;
-                      Ok (AP_window_slot slot))
-             | _ ->
-               Error (Unsupported "complex expression in aggregated projection not supported")
-           in
-           let exprs_to_project : Ast.expr list =
-             match proj with
-             | `All ->
-               (* In aggregated context, `*` is interpreted as either:
-                  - the group column alone (if GROUP BY present and no
-                    aggregates in HAVING — rare), or
-                  - error if there are no aggregates.
-                  This is non-standard SQL behaviour but for Phase 2 we
-                  only accept aggregated `*` if there's a GROUP BY. *)
-               (match group_cols with
-                | _ :: _ -> [] (* unused — won't reach here *)
-                | [] -> [])
-             | `Cols names -> List.map (fun n -> Ast.E_col n) names
-             | `Exprs es -> List.map fst es
-           in
-           if exprs_to_project = [] && proj = `All && is_aggregated then
-             Lwt.return (Error (Unsupported "SELECT * with aggregates requires explicit columns"))
-           else
-             let agg_proj_result =
-               List.fold_left (fun acc e ->
-                 match acc with
-                 | Error _ -> acc
-                 | Ok items ->
-                   (match project_one e with
-                    | Error e -> Error e
-                    | Ok item -> Ok (items @ [item]))
-               ) (Ok []) exprs_to_project
-             in
-             let agg_wins = Queue.fold (fun acc w -> acc @ [w]) [] agg_windows_queue in
-             Lwt.return (match agg_proj_result with
-              | Error e -> Error e
-              | Ok items -> Ok ([], items, !acc_aggs, [], [], agg_wins))
-         end
-       in
-       (match proj_result with
-        | Error e -> Lwt.return (Error e)
-        | Ok (proj_ords, agg_proj_items, proj_aggs, proj_exprs, proj_windows, agg_wins) ->
-          (* Bind each join ON predicate against tables visible so far *)
-          let bind_joins_result : (bound_join list, error) result =
-            let rec go acc tbl_acc offset = function
-              | [] -> Ok (List.rev acc)
-              | ((jc : Ast.join_clause), rm) :: rest ->
-                let tables_so_far = tbl_acc @ [(rm, offset, jc.Ast.alias)] in
-                (match bind_expr_join ~param_counter ~named_params
-                         ~tables:tables_so_far jc.Ast.on with
-                 | Error e -> Error e
-                 | Ok be   ->
-                   let bj = { kind = jc.Ast.kind; right_meta = rm;
-                              on = be; right_col_offset = offset } in
-                   go (bj :: acc) tables_so_far (offset + List.length rm.Cat.columns) rest)
-            in
-            go [] [(meta, 0, table_alias)] n_left joined_pairs
-          in
-          (match bind_joins_result with
-           | Error e -> Lwt.return (Error e)
-           | Ok bound_joins ->
-             let bind_combined e =
-               (* Alias-aware binder for both single-table and joined
-                  queries; see comment in [bind_one] above. *)
-               bind_expr_join ~param_counter ~named_params ~tables e
-             in
-             let where_result =
-               match where with
-               | None   -> Ok None
-               | Some e ->
-                 (match bind_combined e with
-                  | Ok be   -> Ok (Some be)
-                  | Error e -> Error e)
-             in
-             (match where_result with
-              | Error e -> Lwt.return (Error e)
-              | Ok bound_where ->
-                (* HAVING is bound in the agg-output context.  Aggregates
-                   inside HAVING collect into [having_aggs] which are
-                   appended after [proj_aggs]. *)
-                let having_result : (bound_expr option * agg_spec list, error) result =
-                  match having with
-                  | None -> Ok (None, [])
-                  | Some e ->
-                    if not is_aggregated then
-                      Error (Unsupported "HAVING requires GROUP BY or aggregate")
-                    else begin
-                      (* Use a resolver that, for plain column refs,
-                         requires the column to appear in GROUP BY
-                         (resolves to its position in group_cols), else error. *)
-                      let having_resolver_unqual name =
-                        match proj_lookup name with
-                        | Error e -> Error e
-                        | Ok i ->
-                          (match find_pos group_cols i with
-                           | Some pos -> Ok pos
-                           | None -> Error (Unsupported (Printf.sprintf
-                                          "HAVING references non-grouped column '%s'" name)))
-                      in
-                      let having_resolver_qual t c =
-                        match qual_lookup t c with
-                        | Error e -> Error e
-                        | Ok i ->
-                          (match find_pos group_cols i with
-                           | Some pos -> Ok pos
-                           | None -> Error (Unsupported (Printf.sprintf
-                                          "HAVING references non-grouped column '%s.%s'" t c)))
-                      in
-                      let having_resolver = {
-                        resolve_unqual = having_resolver_unqual;
-                        resolve_qual = having_resolver_qual;
-                        (* Inside aggregate args in HAVING, any table column is allowed *)
-                        resolve_agg_arg      = proj_lookup;
-                        resolve_agg_arg_qual = qual_lookup;
-                      } in
-                      (* Append HAVING aggregates AFTER the projection
-                         aggregates: in BE_col offset = offset_for_aggs +
-                         (List.length proj_aggs). *)
-                      let having_offset =
-                        offset_for_aggs + List.length proj_aggs
-                      in
-                      match bind_expr_agg ~param_counter ~named_params ~resolver:having_resolver
-                              ~offset:having_offset e with
-                      | Error e -> Error e
-                      | Ok (be, hagg) -> Ok (Some be, hagg)
-                    end
-                in
-                (match having_result with
-                 | Error e -> Lwt.return (Error e)
-                 | Ok (bound_having, having_aggs) ->
-                let all_aggs = proj_aggs @ having_aggs in
-                (* alias_map: name → bound_expr for ORDER BY alias resolution *)
-                let alias_map : (string * bound_expr) list =
-                  List.filter_map (fun (be, alias_opt) ->
-                    Option.map (fun a -> (a, be)) alias_opt
-                  ) proj_exprs
-                in
-                let bind_order_expr e =
-                  let base_result =
-                    (* Alias-aware binder for both single-table and joined
-                       queries; see comment in [bind_one] above. *)
-                    bind_expr_join ~param_counter ~named_params ~tables e
-                  in
-                  match base_result with
-                  | Ok _ -> base_result
-                  | Error _ ->
-                    (match e with
-                     | Ast.E_col name ->
-                       (match List.assoc_opt name alias_map with
-                        | Some be -> Ok be
-                        | None    -> base_result)
-                     | _ -> base_result)
-                in
-                let order_result =
-                  List.fold_left (fun acc (ok : Ast.order_key) ->
-                    match acc with
-                    | Error _ -> acc
-                    | Ok keys ->
-                      (match bind_order_expr ok.Ast.expr with
-                       | Error e -> Error e
-                       | Ok key  -> Ok (keys @ [{ key; dir = ok.Ast.dir; nulls = ok.Ast.nulls }]))
-                  ) (Ok []) order
-                in
-                (match order_result with
-                 | Error e -> Lwt.return (Error e)
-                 | Ok bound_order ->
-                   let limit_result =
-                     match limit with
-                     | Some n when n < 0 ->
-                       Error (Invalid_limit "LIMIT must be non-negative")
-                     | _ -> Ok limit
-                   in
-                   (match limit_result with
-                    | Error e -> Lwt.return (Error e)
-                    | Ok valid_limit ->
-                      let offset_result =
-                        match offset with
-                        | Some n when n < 0 ->
-                          Error (Invalid_limit "OFFSET must be non-negative")
-                        | _ -> Ok offset
-                      in
-                      (match offset_result with
-                       | Error e -> Lwt.return (Error e)
-                       | Ok valid_offset ->
-                         Lwt.return (Ok (BS_select {
-                           distinct;
-                           table_meta = meta;
-                           proj       = proj_ords;
-                           expr_proj  = proj_exprs;
-                           where      = bound_where;
-                           order      = bound_order;
-                           limit      = valid_limit;
-                           offset     = valid_offset;
-                           joins      = bound_joins;
-                           group_by   = group_cols;
-                           aggs       = all_aggs;
-                           having     = bound_having;
-                           agg_proj    = agg_proj_items;
-                           windows     = proj_windows;
-                           agg_windows = agg_wins;
-                         })))))))))))
+    let$ joined_pairs = joined_pairs_result in
+    let n_left = List.length meta.columns in
+    (* tables: [(primary_meta, 0, alias); (rm0, n_left, alias0); ...] *)
+    let (tables, _) =
+      List.fold_left (fun (acc, off) ((jc : Ast.join_clause), rm) ->
+        let n = List.length rm.Cat.columns in
+        (acc @ [(rm, off, jc.Ast.alias)], off + n)
+      ) ([(meta, 0, table_alias)], n_left) joined_pairs
+    in
+    bind_select_resolved ~param_counter ~named_params ~distinct ~proj ~where
+      ~group_by ~having ~order ~limit ~offset ~meta ~table_alias ~n_left ~tables
+      ~joined_pairs
 
 (* ------------------------------------------------------------------ *)
 (* Best-effort type inference for bound expressions.                    *)
@@ -2465,44 +2467,62 @@ let rec col_names_of_ast_stmt = function
     ) exprs
   | _ -> []
 
+(* FROM-less SELECT: bind each projection expr with no table context. *)
+let bind_const_select ~param_counter ~named_params exprs =
+  let dummy_meta : Cat.table_meta = {
+    Cat.name           = "__const__";
+    Cat.tree_id        = 0;
+    Cat.columns        = [];
+    Cat.next_rowid     = 0L;
+    Cat.fk_constraints = [];
+    Cat.without_rowid  = false;
+  } in
+  let bound = List.map (fun (expr, alias) ->
+    match bind_expr ~param_counter ~named_params dummy_meta expr with
+    | Error e -> Error e
+    | Ok be   -> Ok (be, alias)
+  ) exprs in
+  let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
+  match errors with
+  | e :: _ -> Lwt.return (Error e)
+  | [] ->
+    let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
+    Lwt.return (Ok (BS_const_select { exprs = ok_exprs }))
+
+(* Build the ephemeral table_meta for a CTE from its base query's columns
+   (AST names preferred to preserve aliases, falling back to bound names). *)
+let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
+  let ast_names = col_names_of_ast_stmt col_source_ast in
+  let bound_names = col_names_of_bound_stmt col_source in
+  let n_cols = List.length bound_names in
+  let col_names = List.init n_cols (fun i ->
+    if i < List.length ast_names then List.nth ast_names i
+    else List.nth bound_names i)
+  in
+  let cte_cols = List.map (fun col_name ->
+    { Row.name         = col_name;
+      Row.ty           = Row.Integer;
+      Row.not_null     = false;
+      Row.primary_key  = false;
+      Row.default      = None;
+      Row.check_sql    = None;
+      Row.generated_as = None;
+    }) col_names in
+  {
+    Cat.name           = name;
+    Cat.tree_id        = -1;
+    Cat.columns        = cte_cols;
+    Cat.next_rowid     = 0L;
+    Cat.fk_constraints = [];
+    Cat.without_rowid  = false;
+  }
+
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
   match stmt with
   | Ast.S_create_table { name; columns; constraints; if_not_exists; without_rowid } -> bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } -> bind_insert cat ~param_counter ~named_params ~table ~columns ~values ~on_conflict ~returning ~upsert_update
   | Ast.S_insert_select { table; columns; on_conflict; select } ->
-    let* table_meta_opt = Cat.find_table cat ~name:table in
-    (match table_meta_opt with
-     | None -> Lwt.return (Error (Unknown_table table))
-     | Some table_meta ->
-       let ordinals_result =
-         if columns = [] then
-           Ok (List.filter_map Fun.id
-               (List.mapi (fun i (c : Row.column) ->
-                 match c.generated_as with
-                 | Some _ -> None
-                 | None   -> Some i
-               ) table_meta.Cat.columns))
-         else
-           List.fold_left (fun acc col_name ->
-             match acc with
-             | Error _ as e -> e
-             | Ok ords ->
-               let rec fi i = function
-                 | [] -> Error (Unknown_column { table = table_meta.Cat.name; column = col_name })
-                 | (c : Row.column) :: _ when String.equal c.name col_name ->
-                   Ok (ords @ [i])
-                 | _ :: rest -> fi (i + 1) rest
-               in fi 0 table_meta.Cat.columns
-           ) (Ok []) columns
-       in
-       (match ordinals_result with
-        | Error e -> Lwt.return (Error e)
-        | Ok ordinals ->
-          let* source_result = bind_internal ~views ~named_params ~param_counter cat select in
-          (match source_result with
-           | Error e -> Lwt.return (Error e)
-           | Ok source ->
-             Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict })))))
+    bind_insert_select ~views ~named_params ~param_counter cat ~table ~columns ~on_conflict ~select
   | Ast.S_select { distinct; proj; table; table_alias; joins; where; group_by; having; order; limit; offset } as sel ->
     let* meta_opt = Cat.find_table cat ~name:table in
     (match meta_opt with
@@ -2549,93 +2569,9 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   | Ast.S_detach { schema } ->
     Lwt.return (Ok (BS_detach { schema }))
   | Ast.S_const_select { exprs } ->
-    (* FROM-less SELECT: bind each expression without any table context.
-       We use a dummy empty table_meta for the resolver. *)
-    let dummy_meta : Cat.table_meta = {
-      Cat.name           = "__const__";
-      Cat.tree_id        = 0;
-      Cat.columns        = [];
-      Cat.next_rowid     = 0L;
-      Cat.fk_constraints = [];
-      Cat.without_rowid  = false;
-    } in
-    let bound = List.map (fun (expr, alias) ->
-      match bind_expr ~param_counter ~named_params dummy_meta expr with
-      | Error e -> Error e
-      | Ok be   -> Ok (be, alias)
-    ) exprs in
-    let errors = List.filter_map (function Error e -> Some e | Ok _ -> None) bound in
-    (match errors with
-     | e :: _ -> Lwt.return (Error e)
-     | [] ->
-       let ok_exprs = List.filter_map (function Ok e -> Some e | Error _ -> None) bound in
-       Lwt.return (Ok (BS_const_select { exprs = ok_exprs })))
+    bind_const_select ~param_counter ~named_params exprs
   | Ast.S_with_cte { name; def; query; recursive } ->
-    (* For recursive CTEs the def is UNION ALL [base; recursive_arm].
-       The recursive arm references the CTE by name, which must be in the
-       catalog before we can bind the recursive arm.  Strategy:
-         1. Bind just the base (left branch) to derive column names.
-         2. Register the CTE as an ephemeral table.
-         3. Bind the full def (now the recursive arm can resolve the name).
-       For non-recursive CTEs the base-only pre-pass is not needed; we bind
-       the full def in one shot as before. *)
-    let base_ast = match recursive, def with
-      | true, Ast.S_compound { left; _ } -> Some left
-      | _ -> None
-    in
-    let col_source_ast = match base_ast with Some b -> b | None -> def in
-    let* col_source_r = bind_internal ~views ~named_params ~param_counter cat col_source_ast in
-    (match col_source_r with
-     | Error e -> Lwt.return (Error e)
-     | Ok col_source ->
-       (* Derive column names: prefer AST-level names (which preserve aliases
-          for aggregated projections) and fall back to bound-stmt names. *)
-       let ast_names = col_names_of_ast_stmt col_source_ast in
-       let bound_names = col_names_of_bound_stmt col_source in
-       (* Use AST names when available (non-empty), filling gaps from bound names. *)
-       let n_cols = List.length bound_names in
-       let col_names = List.init n_cols (fun i ->
-         if i < List.length ast_names then List.nth ast_names i
-         else List.nth bound_names i)
-       in
-       let cte_cols = List.map (fun col_name ->
-         { Row.name         = col_name;
-           Row.ty           = Row.Integer;
-           Row.not_null     = false;
-           Row.primary_key  = false;
-           Row.default      = None;
-           Row.check_sql    = None;
-           Row.generated_as = None;
-         }) col_names in
-       let cte_meta : Cat.table_meta = {
-         Cat.name           = name;
-         Cat.tree_id        = -1;
-         Cat.columns        = cte_cols;
-         Cat.next_rowid     = 0L;
-         Cat.fk_constraints = [];
-         Cat.without_rowid  = false;
-       } in
-       Cat.register_ephemeral cat cte_meta;
-       (* For non-recursive CTEs col_source already is the fully-bound def —
-          reuse it directly.  For recursive CTEs we must bind the full def now
-          that the CTE name is in scope (so the recursive arm can resolve it). *)
-       let* def_r =
-         if recursive then
-           bind_internal ~views ~named_params ~param_counter cat def
-         else
-           Lwt.return (Ok col_source)
-       in
-       (match def_r with
-        | Error e ->
-          Cat.unregister_ephemeral cat ~name;
-          Lwt.return (Error e)
-        | Ok bound_def ->
-          let* query_r = bind_internal ~views ~named_params ~param_counter cat query in
-          Cat.unregister_ephemeral cat ~name;
-          (match query_r with
-           | Error e -> Lwt.return (Error e)
-           | Ok bound_query ->
-             Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query; recursive })))))
+    bind_with_cte ~views ~named_params ~param_counter cat ~name ~def ~query ~recursive
   | Ast.S_create_view { name; query } ->
     let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
     (match bound_r with
@@ -2653,37 +2589,108 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
      | Error e -> Lwt.return (Error e)
      | Ok inner -> Lwt.return (Ok (BS_explain { analyze; inner })))
   | Ast.S_compound { op; left; right; order; limit; offset } ->
-    let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in
-    let* right_r = bind_internal ~views ~named_params ~param_counter cat right in
-    (match left_r, right_r with
-     | Ok l, Ok r   ->
-       let n_left  = compound_col_count l in
-       let n_right = compound_col_count r in
-       if n_left <> n_right then
-         Lwt.return (Error (Arity_mismatch { expected = n_left; got = n_right }))
+    bind_compound ~views ~named_params ~param_counter cat ~op ~left ~right ~order ~limit ~offset
+
+and bind_insert_select ~views ~named_params ~param_counter cat ~table ~columns ~on_conflict ~select =
+  let* table_meta_opt = Cat.find_table cat ~name:table in
+  (match table_meta_opt with
+   | None -> Lwt.return (Error (Unknown_table table))
+   | Some table_meta ->
+     let ordinals_result =
+       if columns = [] then
+         Ok (List.filter_map Fun.id
+             (List.mapi (fun i (c : Row.column) ->
+               match c.generated_as with
+               | Some _ -> None
+               | None   -> Some i
+             ) table_meta.Cat.columns))
        else
-         (* Bind the compound-level ORDER BY against the leftmost arm's
-            table_meta — column names in a compound come from the leftmost
-            select per SQL convention. *)
-         let bound_order =
-           if order = [] then Ok []
-           else
-             match leftmost_table_meta l with
-             | Some meta ->
-               bind_order_keys ~param_counter ~named_params meta order
-             | None ->
-               (* No underlying table (e.g. const_select compound):
-                  treat as no order key. *)
-               Ok []
-         in
-         (match bound_order with
-          | Error e -> Lwt.return (Error e)
-          | Ok bo   ->
-            Lwt.return (Ok (BS_compound {
-              op; left = l; right = r;
-              order = bo; limit; offset })))
-     | Error e, _
-     | _, Error e   -> Lwt.return (Error e))
+         List.fold_left (fun acc col_name ->
+           match acc with
+           | Error _ as e -> e
+           | Ok ords ->
+             let rec fi i = function
+               | [] -> Error (Unknown_column { table = table_meta.Cat.name; column = col_name })
+               | (c : Row.column) :: _ when String.equal c.name col_name ->
+                 Ok (ords @ [i])
+               | _ :: rest -> fi (i + 1) rest
+             in fi 0 table_meta.Cat.columns
+         ) (Ok []) columns
+     in
+     (match ordinals_result with
+      | Error e -> Lwt.return (Error e)
+      | Ok ordinals ->
+        let* source_result = bind_internal ~views ~named_params ~param_counter cat select in
+        (match source_result with
+         | Error e -> Lwt.return (Error e)
+         | Ok source ->
+           Lwt.return (Ok (BS_insert_select { table_meta; ordinals; source; on_conflict })))))
+
+and bind_with_cte ~views ~named_params ~param_counter cat ~name ~def ~query ~recursive =
+  (* For recursive CTEs the def is UNION ALL [base; recursive_arm]; the
+     recursive arm references the CTE by name, so the CTE must be registered
+     before binding it.  Bind the base first to derive columns, register, then
+     bind the full def.  Non-recursive CTEs bind in one shot. *)
+  let base_ast = match recursive, def with
+    | true, Ast.S_compound { left; _ } -> Some left
+    | _ -> None
+  in
+  let col_source_ast = match base_ast with Some b -> b | None -> def in
+  let* col_source_r = bind_internal ~views ~named_params ~param_counter cat col_source_ast in
+  (match col_source_r with
+   | Error e -> Lwt.return (Error e)
+   | Ok col_source ->
+     let cte_meta = derive_cte_meta ~name col_source_ast col_source in
+     Cat.register_ephemeral cat cte_meta;
+     let* def_r =
+       if recursive then
+         bind_internal ~views ~named_params ~param_counter cat def
+       else
+         Lwt.return (Ok col_source)
+     in
+     (match def_r with
+      | Error e ->
+        Cat.unregister_ephemeral cat ~name;
+        Lwt.return (Error e)
+      | Ok bound_def ->
+        let* query_r = bind_internal ~views ~named_params ~param_counter cat query in
+        Cat.unregister_ephemeral cat ~name;
+        (match query_r with
+         | Error e -> Lwt.return (Error e)
+         | Ok bound_query ->
+           Lwt.return (Ok (BS_with_cte { name; def = bound_def; query = bound_query; recursive })))))
+
+and bind_compound ~views ~named_params ~param_counter cat ~op ~left ~right ~order ~limit ~offset =
+  let* left_r  = bind_internal ~views ~named_params ~param_counter cat left  in
+  let* right_r = bind_internal ~views ~named_params ~param_counter cat right in
+  (match left_r, right_r with
+   | Ok l, Ok r   ->
+     let n_left  = compound_col_count l in
+     let n_right = compound_col_count r in
+     if n_left <> n_right then
+       Lwt.return (Error (Arity_mismatch { expected = n_left; got = n_right }))
+     else
+       (* Bind the compound-level ORDER BY against the leftmost arm's
+          table_meta — column names in a compound come from the leftmost
+          select per SQL convention. *)
+       let bound_order =
+         if order = [] then Ok []
+         else
+           match leftmost_table_meta l with
+           | Some meta ->
+             bind_order_keys ~param_counter ~named_params meta order
+           | None ->
+             (* No underlying table (e.g. const_select compound). *)
+             Ok []
+       in
+       (match bound_order with
+        | Error e -> Lwt.return (Error e)
+        | Ok bo   ->
+          Lwt.return (Ok (BS_compound {
+            op; left = l; right = r;
+            order = bo; limit; offset })))
+   | Error e, _
+   | _, Error e   -> Lwt.return (Error e))
 
 let bind ?(views : (string, Ast.stmt) Hashtbl.t = Hashtbl.create 0) cat ast =
   let named_params : (string, int) Hashtbl.t = Hashtbl.create 4 in
