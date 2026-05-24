@@ -449,9 +449,8 @@ let decode_fts_value fts_name bytes =
 (* ------------------------------------------------------------------ *)
 
 let read_uint64_key store key default =
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt v = S.get tx sys_meta_tid key in
-  let%lwt () = S.ro_end tx in
   match v with
   | Some b ->
     let n, _ = Varint.decode_uint64 b 0 in
@@ -510,7 +509,7 @@ let load_columns tx table_name =
 
 let load_all_tables store =
   let tbl = Hashtbl.create 16 in
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt cur = S.cursor_open tx sys_tables_tid in
   let _sr = S.cursor_first cur in
   let rec walk_tables () =
@@ -532,12 +531,11 @@ let load_all_tables store =
   in
   let%lwt () = walk_tables () in
   S.cursor_close cur;
-  let%lwt () = S.ro_end tx in
   Lwt.return tbl
 
 let load_all_indexes store =
   let tbl = Hashtbl.create 8 in
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt cur = S.cursor_open tx sys_indexes_tid in
   let _sr = S.cursor_first cur in
   let rec walk () =
@@ -550,7 +548,6 @@ let load_all_indexes store =
   in
   let%lwt () = walk () in
   S.cursor_close cur;
-  let%lwt () = S.ro_end tx in
   Lwt.return tbl
 
 let is_fts_rowid_key k =
@@ -560,7 +557,7 @@ let is_fts_rowid_key k =
 
 let load_all_fts store =
   let tbl = Hashtbl.create 4 in
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt cur = S.cursor_open tx sys_fts_tid in
   let _sr = S.cursor_first cur in
   let rec walk () =
@@ -584,7 +581,6 @@ let load_all_fts store =
   in
   let%lwt () = walk () in
   S.cursor_close cur;
-  let%lwt () = S.ro_end tx in
   Lwt.return tbl
 
 (* ------------------------------------------------------------------ *)
@@ -592,7 +588,7 @@ let load_all_fts store =
 (* ------------------------------------------------------------------ *)
 
 let load_all_views store =
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt cur = S.cursor_open tx sys_views_tid in
   let _sr = S.cursor_first cur in
   let pairs = ref [] in
@@ -605,7 +601,6 @@ let load_all_views store =
   in
   walk ();
   S.cursor_close cur;
-  let%lwt () = S.ro_end tx in
   Lwt.return (List.rev !pairs)
 
 let persist_view store ~name ~sql =
@@ -623,7 +618,7 @@ let remove_view store ~name =
 (* ------------------------------------------------------------------ *)
 
 let load_all_triggers store =
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt cur = S.cursor_open tx sys_triggers_tid in
   let _sr = S.cursor_first cur in
   let pairs = ref [] in
@@ -636,7 +631,6 @@ let load_all_triggers store =
   in
   walk ();
   S.cursor_close cur;
-  let%lwt () = S.ro_end tx in
   Lwt.return (List.rev !pairs)
 
 let persist_trigger store ~name ~sql =
@@ -718,9 +712,8 @@ let decode_fks bytes =
 
 let load_fk_constraints_raw store table_name =
   let key = fk_meta_key table_name in
-  let%lwt tx = S.ro_begin store in
+  S.with_ro store @@ fun tx ->
   let%lwt v = S.get tx sys_meta_tid key in
-  let%lwt () = S.ro_end tx in
   Lwt.return (match v with None -> [] | Some b -> decode_fks b)
 
 let save_fk_constraints t ~table_name ~fks =
@@ -1037,26 +1030,28 @@ let rename_table t ~old_name ~new_name =
        | Error msg -> Lwt.return (Error msg)
        | Ok () ->
          (* Re-write sys_indexes entries that reference old_name *)
-         let%lwt tx_ro_idx = S.ro_begin t.store in
-         let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
-         let _sr = S.cursor_first cur in
-         let idx_updates = ref [] in
-         let rec scan_idxs () =
-           match S.cursor_next cur with
-           | None -> ()
-           | Some (k, v) ->
-             let info = decode_index_value v in
-             if String.equal info.idx_table old_name then
-               idx_updates := (k, info) :: !idx_updates;
-             scan_idxs ()
+         let%lwt idx_updates =
+           S.with_ro t.store @@ fun tx_ro_idx ->
+           let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
+           let _sr = S.cursor_first cur in
+           let idx_updates = ref [] in
+           let rec scan_idxs () =
+             match S.cursor_next cur with
+             | None -> ()
+             | Some (k, v) ->
+               let info = decode_index_value v in
+               if String.equal info.idx_table old_name then
+                 idx_updates := (k, info) :: !idx_updates;
+               scan_idxs ()
+           in
+           scan_idxs ();
+           S.cursor_close cur;
+           Lwt.return !idx_updates
          in
-         scan_idxs ();
-         S.cursor_close cur;
-         let%lwt () = S.ro_end tx_ro_idx in
          let%lwt () = Lwt_list.iter_s (fun (k, (info : index_info)) ->
            let new_info = { info with idx_table = new_name } in
            S.put tx sys_indexes_tid k (encode_index_value new_info)
-         ) !idx_updates in
+         ) idx_updates in
          let%lwt () = S.commit tx in
          (* Update in-memory cache *)
          Hashtbl.remove  t.cache old_name;

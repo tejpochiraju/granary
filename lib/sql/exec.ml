@@ -1913,7 +1913,7 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     let ivs = List.map row_value_to_index_value parent_vals in
     let prefix, plen = encode_index_key_prefix ivs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* ro_tx = S.ro_begin store in
+    S.with_ro store @@ fun ro_tx ->
     let* cur   = S.cursor_open ro_tx idx.Cat.idx_tree_id in
     let _sr    = S.cursor_seek cur seek_key in
     let found  = ref false in
@@ -1950,11 +1950,10 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     in
     let* () = walk () in
     S.cursor_close cur;
-    let* () = S.ro_end ro_tx in
     Lwt.return !found
   | _ ->
     (* Fallback: full table scan. *)
-    let* ro_tx = S.ro_begin store in
+    S.with_ro store @@ fun ro_tx ->
     let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
     let _sr    = S.cursor_first cur in
     let found  = ref false in
@@ -1972,7 +1971,6 @@ let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
     in
     scan ();
     S.cursor_close cur;
-    let* () = S.ro_end ro_tx in
     Lwt.return !found
 
 (** Internal: scan [parent_meta] within an already-open transaction (RO or
@@ -2005,10 +2003,9 @@ let fk_parent_has_row_in_tx tx (parent_meta : Cat.table_meta)
     (immediate FK enforcement); opens and closes its own RO snapshot. *)
 let fk_parent_has_row store (parent_meta : Cat.table_meta)
     ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
-  let* ro_tx = S.ro_begin store in
+  S.with_ro store @@ fun ro_tx ->
   let* found = fk_parent_has_row_in_tx ro_tx parent_meta
                  ~parent_idxs ~parent_vals in
-  let* () = S.ro_end ro_tx in
   Lwt.return found
 
 (** Helper for FK enforcement: routes a violation either to the pending
@@ -2470,7 +2467,7 @@ let build_child_refs cat ~parent_table_name =
 (** Scan [child_meta] for any row where [child_col_idx] equals [parent_val].
     Opens and closes its own RO snapshot. *)
 let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
-  let* ro_tx = S.ro_begin store in
+  S.with_ro store @@ fun ro_tx ->
   let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
   let _sr    = S.cursor_first cur in
   let found  = ref false in
@@ -2486,7 +2483,6 @@ let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent
   in
   scan ();
   S.cursor_close cur;
-  let* () = S.ro_end ro_tx in
   Lwt.return !found
 [@@warning "-32"]
 
@@ -3002,27 +2998,28 @@ let execute_update ?(mode = Auto) ?(params = [||])
   let schema = table_meta.Cat.columns in
   (* Drain matching rows into a list under an RO snapshot first to
      avoid cursor invalidation when we issue puts/dels below. *)
-  let* tx_ro = S.ro_begin store in
-  let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
-  let rec drain () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (kbytes, vbytes) ->
-      let rowid = Rowid.decode kbytes in
-      let row   = decode_with_virtual clock params table_meta vbytes in
-      let keep  = match where with
-        | None      -> true
-        | Some pred -> value_truthy (eval_expr clock params row pred)
-      in
-      if keep then buf := (rowid, row) :: !buf;
-      drain ()
+  let* matches =
+    S.with_ro store @@ fun tx_ro ->
+    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let row   = decode_with_virtual clock params table_meta vbytes in
+        let keep  = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if keep then buf := (rowid, row) :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
   in
-  drain ();
-  S.cursor_close cur;
-  let* () = S.ro_end tx_ro in
-  let matches = List.rev !buf in
   (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
   let matches =
     let sorted =
@@ -3376,27 +3373,28 @@ let execute_delete ?(mode = Auto) ?(params = [||])
   : int Lwt.t =
   let schema = table_meta.Cat.columns in
   (* Drain matching rows under an RO snapshot. *)
-  let* tx_ro = S.ro_begin store in
-  let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
-  let rec drain () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (kbytes, vbytes) ->
-      let rowid = Rowid.decode kbytes in
-      let row   = decode_with_virtual clock params table_meta vbytes in
-      let keep  = match where with
-        | None      -> true
-        | Some pred -> value_truthy (eval_expr clock params row pred)
-      in
-      if keep then buf := (rowid, row) :: !buf;
-      drain ()
+  let* matches =
+    S.with_ro store @@ fun tx_ro ->
+    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+    let _sr    = S.cursor_first cur in
+    let buf    = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let row   = decode_with_virtual clock params table_meta vbytes in
+        let keep  = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if keep then buf := (rowid, row) :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
   in
-  drain ();
-  S.cursor_close cur;
-  let* () = S.ro_end tx_ro in
-  let matches = List.rev !buf in
   (* Apply ORDER BY sort, then OFFSET, then LIMIT *)
   let matches =
     let sorted =
@@ -3955,28 +3953,29 @@ let execute_with_count ?(mode = Auto)
         Lwt.fail exn)
   | Plan.Op_fts_delete { fts_meta; where } ->
     (* Drain matching rows under an RO snapshot *)
-    let* tx_ro = S.ro_begin store in
-    let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
-    let _sr = S.cursor_first cur in
-    let buf = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (kbytes, vbytes) ->
-        let rowid = Rowid.decode kbytes in
-        let texts = fts_decode_content vbytes in
-        let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        let keep = match where with
-          | None      -> true
-          | Some pred -> value_truthy (eval_expr clock params row pred)
-        in
-        if keep then buf := (rowid, kbytes, texts) :: !buf;
-        drain ()
+    let* matches =
+      S.with_ro store @@ fun tx_ro ->
+      let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
+      let _sr = S.cursor_first cur in
+      let buf = ref [] in
+      let rec drain () =
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (kbytes, vbytes) ->
+          let rowid = Rowid.decode kbytes in
+          let texts = fts_decode_content vbytes in
+          let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+          let keep = match where with
+            | None      -> true
+            | Some pred -> value_truthy (eval_expr clock params row pred)
+          in
+          if keep then buf := (rowid, kbytes, texts) :: !buf;
+          drain ()
+      in
+      drain ();
+      S.cursor_close cur;
+      Lwt.return (List.rev !buf)
     in
-    drain ();
-    S.cursor_close cur;
-    let* () = S.ro_end tx_ro in
-    let matches = List.rev !buf in
     let n = List.length matches in
     if n = 0 then Lwt.return 0
     else begin
@@ -4103,28 +4102,30 @@ let execute_with_count ?(mode = Auto)
          end
        in
        (* Migrate data rows: scan → decode → re-encode without col_idx *)
-       let* tx_ro = S.ro_begin store in
-       let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
-       let _sr = S.cursor_first cur in
-       let rows = ref [] in
-       let rec drain () =
-         match S.cursor_next cur with
-         | None -> ()
-         | Some (k, v) ->
-           let old_row = decode_with_virtual None [||] table_meta v in
-           let new_row = Array.of_list
-             (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
-           rows := (Bytes.copy k, new_row) :: !rows;
-           drain ()
+       let* rows =
+         S.with_ro store @@ fun tx_ro ->
+         let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
+         let _sr = S.cursor_first cur in
+         let rows = ref [] in
+         let rec drain () =
+           match S.cursor_next cur with
+           | None -> ()
+           | Some (k, v) ->
+             let old_row = decode_with_virtual None [||] table_meta v in
+             let new_row = Array.of_list
+               (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
+             rows := (Bytes.copy k, new_row) :: !rows;
+             drain ()
+         in
+         drain ();
+         S.cursor_close cur;
+         Lwt.return !rows
        in
-       drain ();
-       S.cursor_close cur;
-       let* () = S.ro_end tx_ro in
        let* tx = S.rw_begin store in
        let* () = Lwt_list.iter_s (fun (k, new_row) ->
          let new_bytes = Row.encode new_columns new_row in
          S.put tx table_meta.Cat.tree_id k new_bytes
-       ) !rows in
+       ) rows in
        let* () = S.commit tx in
        let* result = Cat.drop_column cat ~table_name ~col_name in
        (match result with
@@ -5101,15 +5102,25 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     (* cursor_first positions the cursor; cursor_next returns the first entry
        on the first call when ready=true (per store.mli contract). *)
     let _sr = S.cursor_first cur in
+    (* Snapshot lifetime is tied to the stream: end it on exhaustion OR when a
+       read raises mid-scan, so a corrupt page can't leak the read lock,
+       active-reader refcount, or pinned pages (#164).  [finish] is idempotent. *)
+    let ended = ref false in
+    let finish () =
+      if !ended then Lwt.return_unit
+      else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    in
     let stream = Lwt_stream.from (fun () ->
-      match S.cursor_next cur with
-      | None ->
-        S.cursor_close cur;
-        let%lwt () = S.ro_end tx in
-        Lwt.return_none
-      | Some (_key, vbytes) ->
-        let row = decode_with_virtual clock params table_meta vbytes in
-        Lwt.return_some row
+      Lwt.catch
+        (fun () ->
+          match S.cursor_next cur with
+          | None ->
+            let%lwt () = finish () in
+            Lwt.return_none
+          | Some (_key, vbytes) ->
+            let row = decode_with_virtual clock params table_meta vbytes in
+            Lwt.return_some row)
+        (fun exn -> let%lwt () = finish () in Lwt.fail exn)
     ) in
     Lwt.return stream
   | Plan.Op_filter { pred; child } ->
@@ -5229,15 +5240,21 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* cur = S.cursor_open tx idx_tree in
     let _sr = S.cursor_seek cur seek_key in
     let exhausted = ref false in
+    (* End the snapshot on exhaustion OR a mid-scan read error (#164).
+       [finish] is idempotent. *)
+    let ended = ref false in
+    let finish () =
+      if !ended then Lwt.return_unit
+      else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    in
     let stream = Lwt_stream.from (fun () ->
       if !exhausted then Lwt.return_none
-      else begin
+      else Lwt.catch (fun () -> begin
         let rec next () =
           match S.cursor_next cur with
           | None ->
             exhausted := true;
-            S.cursor_close cur;
-            let%lwt () = S.ro_end tx in
+            let%lwt () = finish () in
             Lwt.return_none
           | Some (ikey, _ival) ->
             (* Check value-prefix match. *)
@@ -5258,13 +5275,13 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
                 Lwt.return_some row
             end else begin
               exhausted := true;
-              S.cursor_close cur;
-              let%lwt () = S.ro_end tx in
+              let%lwt () = finish () in
               Lwt.return_none
             end
         in
         next ()
-      end
+      end)
+        (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)
     ) in
     Lwt.return stream
   | Plan.Op_nested_loop_join {
@@ -5275,7 +5292,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
        index tree for the join key and collect matching right rows. *)
     let* left_stream = to_stream clock params store ~mode ~cat left in
     let* left_rows = Lwt_stream.to_list left_stream in
-    let* tx = S.ro_begin store in
+    S.with_ro store @@ fun tx ->
     let out = ref [] in
     let is_left_join = (join_kind = `Left) in
     let* () =
@@ -5331,7 +5348,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
         end
       ) left_rows
     in
-    let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list (List.rev !out))
   | Plan.Op_hash_join {
       left; right; left_key; right_key; join_kind;
@@ -5573,14 +5589,20 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
     let _sr = S.cursor_first cur in
     let exhausted = ref false in
+    (* End the snapshot on exhaustion OR a mid-scan read error (#164).
+       [finish] is idempotent. *)
+    let ended = ref false in
+    let finish () =
+      if !ended then Lwt.return_unit
+      else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    in
     let rec read_next () =
       if !exhausted then Lwt.return_none
       else
         match S.cursor_next cur with
         | None ->
           exhausted := true;
-          S.cursor_close cur;
-          let%lwt () = S.ro_end tx in
+          let%lwt () = finish () in
           Lwt.return_none
         | Some (_key, val_bytes) ->
           let texts = fts_decode_content val_bytes in
@@ -5592,9 +5614,11 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           if emit then Lwt.return_some row
           else read_next ()
     in
-    Lwt.return (Lwt_stream.from read_next)
+    Lwt.return (Lwt_stream.from (fun () ->
+      Lwt.catch read_next
+        (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)))
   | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
-    let* tx = S.ro_begin store in
+    S.with_ro store @@ fun tx ->
     let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
     (* Compute BM25 scores when rank is requested *)
     let* scored_matches =
@@ -5668,14 +5692,12 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
           @ snippet_vals
         in
         Lwt.return (Some (Array.of_list row_values))) sorted in
-    let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_rows { rows } ->
     Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
-    let* tx = S.ro_begin store in
+    S.with_ro store @@ fun tx ->
     let* v  = Cat.read_user_version_tx tx in
-    let* () = S.ro_end tx in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int v |] ])
   | Plan.Op_pragma_get_fk ->
     let v = match cat with
@@ -5719,7 +5741,7 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
       S.cursor_close cur;
       Lwt.return !count
     in
-    let* tx = S.ro_begin store in
+    S.with_ro store @@ fun tx ->
     let* () =
       Lwt_list.iter_s (fun (meta : Cat.table_meta) ->
         let* row_count = count_entries tx meta.tree_id in
@@ -5735,7 +5757,6 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
         ) idxs
       ) tables
     in
-    let* () = S.ro_end tx in
     let result = List.rev !errors in
     let rows =
       if result = [] then [ [| Row.V_text "ok" |] ]
@@ -5861,27 +5882,28 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
-    let* tx_ro = S.ro_begin store in
-    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-    let _sr    = S.cursor_first cur in
-    let buf    = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (kbytes, vbytes) ->
-        let rowid = Rowid.decode kbytes in
-        let row = decode_with_virtual clock params table_meta vbytes in
-        let keep = match where with
-          | None      -> true
-          | Some pred -> value_truthy (eval_expr clock params row pred)
-        in
-        if keep then buf := (rowid, row) :: !buf;
-        drain ()
+    let* matched =
+      S.with_ro store @@ fun tx_ro ->
+      let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+      let _sr    = S.cursor_first cur in
+      let buf    = ref [] in
+      let rec drain () =
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (kbytes, vbytes) ->
+          let rowid = Rowid.decode kbytes in
+          let row = decode_with_virtual clock params table_meta vbytes in
+          let keep = match where with
+            | None      -> true
+            | Some pred -> value_truthy (eval_expr clock params row pred)
+          in
+          if keep then buf := (rowid, row) :: !buf;
+          drain ()
+      in
+      drain ();
+      S.cursor_close cur;
+      Lwt.return (List.rev !buf)
     in
-    drain ();
-    S.cursor_close cur;
-    let* () = S.ro_end tx_ro in
-    let matched = List.rev !buf in
     (* Apply ORDER BY, OFFSET, LIMIT *)
     let matched =
       let sorted =
@@ -5925,26 +5947,27 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)
-    let* tx_ro = S.ro_begin store in
-    let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-    let _sr    = S.cursor_first cur in
-    let buf    = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (_kbytes, vbytes) ->
-        let row = decode_with_virtual clock params table_meta vbytes in
-        let keep = match where with
-          | None      -> true
-          | Some pred -> value_truthy (eval_expr clock params row pred)
-        in
-        if keep then buf := row :: !buf;
-        drain ()
+    let* matched =
+      S.with_ro store @@ fun tx_ro ->
+      let* cur   = S.cursor_open tx_ro table_meta.tree_id in
+      let _sr    = S.cursor_first cur in
+      let buf    = ref [] in
+      let rec drain () =
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (_kbytes, vbytes) ->
+          let row = decode_with_virtual clock params table_meta vbytes in
+          let keep = match where with
+            | None      -> true
+            | Some pred -> value_truthy (eval_expr clock params row pred)
+          in
+          if keep then buf := row :: !buf;
+          drain ()
+      in
+      drain ();
+      S.cursor_close cur;
+      Lwt.return (List.rev !buf)
     in
-    drain ();
-    S.cursor_close cur;
-    let* () = S.ro_end tx_ro in
-    let matched = List.rev !buf in
     (* Apply ORDER BY, OFFSET, LIMIT *)
     let matched =
       let sorted =

@@ -851,6 +851,10 @@ let ro_end (Ro snap : ro txn) =
   Rwlock.release_read snap.rs_store.lock;
   Lwt.return_unit
 
+let with_ro t f =
+  let* tx = ro_begin t in
+  Lwt.finalize (fun () -> f tx) (fun () -> ro_end tx)
+
 (* Free the previous freelist page chain back into the pager's in-memory
    freelist (stamped with the current txn_id). *)
 let free_old_freelist_pages pager ~first_page =
@@ -1322,6 +1326,20 @@ let wal_sync_count (t : t) : int =
     (match st.wal with
      | None -> 0
      | Some w -> Sqlocaml_storage.Wal.sync_count w)
+
+(* Diagnostic/testing accessors for #164: observe that ending a snapshot
+   releases its bookkeeping even when its reader closure raised. *)
+let active_reader_count (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> Hashtbl.fold (fun _ c acc -> acc + c) st.active_readers 0
+
+let pinned_page_count (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> Pager.pinned_count st.pager
+
+let live_read_locks (t : t) : int = Rwlock.readers t.lock
 
 (* ------------------------------------------------------------------ *)
 (* Savepoints (Mem backend only; B-tree deferred)                      *)

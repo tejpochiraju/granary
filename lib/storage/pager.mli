@@ -84,6 +84,10 @@ val get_txn_id : t -> int64
     A freed page is reusable iff freed_at_txn_id < alloc_min_safe. *)
 val set_alloc_min_safe : t -> int64 -> unit
 
+(** Number of distinct pages currently pinned by live RO snapshots (#159).
+    Diagnostic/testing only. *)
+val pinned_count : t -> int
+
 (** Replace the in-memory freelist (used after deserializing from disk). *)
 val set_freelist : t -> Freelist.t -> unit
 

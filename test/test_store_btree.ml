@@ -1270,6 +1270,47 @@ let test_ro_refcount () =
       (Option.map Bytes.to_string v);
     run (S.close store))
 
+(* #164: [with_ro] must release the read lock, the active-reader refcount,
+   and the snapshot's pinned pages even when the reader closure raises
+   mid-snapshot.  With a bare ro_begin/ro_end pair the ro_end is skipped on
+   the error path and all three leak (freelist reuse stalls, the read lock
+   never drops, and #159 cache pins stay forever). *)
+let test_with_ro_releases_on_exception () =
+  run (with_fresh_db ~f:(fun path ->
+    let* r = S.open_file ~path in
+    let s = ok_store r in
+    (* Seed rows so an RO walk touches real pages and takes pins. *)
+    let* tx = S.rw_begin s in
+    let rec seed i =
+      if i >= 200 then Lwt.return_unit
+      else
+        let k = bs (Printf.sprintf "key%05d" i) in
+        let* () = S.put tx 0 k (bs (string_of_int i)) in
+        seed (i + 1)
+    in
+    let* () = seed 0 in
+    let* () = S.commit tx in
+    Alcotest.(check int) "no readers before"    0 (S.active_reader_count s);
+    Alcotest.(check int) "no pins before"        0 (S.pinned_page_count s);
+    Alcotest.(check int) "no read locks before"  0 (S.live_read_locks s);
+    (* A reader that does a real read (taking pins) then raises. *)
+    let* () =
+      Lwt.catch
+        (fun () ->
+          S.with_ro s (fun tx ->
+            let* _ = S.get tx 0 (bs "key00100") in
+            Lwt.fail (Failure "boom mid-snapshot")))
+        (fun _ -> Lwt.return_unit)
+    in
+    Alcotest.(check int) "active readers released after exception" 0
+      (S.active_reader_count s);
+    Alcotest.(check int) "pins released after exception" 0
+      (S.pinned_page_count s);
+    Alcotest.(check int) "read lock released after exception" 0
+      (S.live_read_locks s);
+    let* () = S.close s in
+    Lwt.return_unit))
+
 (* ------------------------------------------------------------------ *)
 (* open_block tests                                                     *)
 (* ------------------------------------------------------------------ *)
@@ -1484,6 +1525,7 @@ let () =
       Alcotest.test_case "multiple_active_readers"   `Quick test_multiple_active_readers;
       Alcotest.test_case "ro_cache_hit"              `Quick test_ro_cache_hit;
       Alcotest.test_case "ro_refcount"               `Quick test_ro_refcount;
+      Alcotest.test_case "with_ro_releases_on_exception" `Quick test_with_ro_releases_on_exception;
     ];
     "qcheck", qcheck_tests;
     "open_block", [

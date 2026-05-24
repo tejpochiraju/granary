@@ -172,7 +172,7 @@ let wal_sync_count t = S.wal_sync_count t.store
    (alloc_min_safe is pinned at rw_begin). *)
 let copy_all_trees ~src ~dst ~tids =
   let batch_size = 16 in
-  let* tx_ro = S.ro_begin src in
+  S.with_ro src @@ fun tx_ro ->
   let* () =
     Lwt_list.iter_s (fun tid ->
       let* cur = S.cursor_open tx_ro tid in
@@ -200,7 +200,7 @@ let copy_all_trees ~src ~dst ~tids =
       Lwt.return_unit
     ) tids
   in
-  S.ro_end tx_ro
+  Lwt.return_unit
 
 (* Compact rebuild: copy every tree from [src] into a fresh [dst] file at
    [tmp_path], then atomically rename it over [path].  After this the

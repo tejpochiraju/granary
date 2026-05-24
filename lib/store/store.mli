@@ -113,6 +113,12 @@ val savepoint_rollback : rw txn -> string -> unit Lwt.t
 (** End a read-only transaction. *)
 val ro_end   : ro txn -> unit Lwt.t
 
+(** [with_ro t f] runs [f] over a fresh RO snapshot and ends the snapshot
+    when [f] finishes — including if [f] raises. Use this instead of a bare
+    [ro_begin]/[ro_end] pair so an error mid-read cannot leak the read lock,
+    the active-reader refcount, or the snapshot's pinned pages (#164). *)
+val with_ro : t -> (ro txn -> 'a Lwt.t) -> 'a Lwt.t
+
 (** Look up a key in a tree. Works in both RO and RW transactions. *)
 val get : _ txn -> tree_id -> bytes -> bytes option Lwt.t
 
@@ -189,6 +195,18 @@ val set_wal_autocheckpoint : t -> int -> unit
     well-behaved coordinator collapses N concurrent autocommit commits
     into far fewer than N fsyncs. *)
 val wal_sync_count : t -> int
+
+(** Total active RO-snapshot refcount across all snapshot txn_ids. Returns 0
+    when no reader is live. Diagnostic/testing only (#164). *)
+val active_reader_count : t -> int
+
+(** Number of distinct pages currently pinned by live RO snapshots (#159).
+    Diagnostic/testing only (#164). *)
+val pinned_page_count : t -> int
+
+(** Number of currently-held read locks on the store. Diagnostic/testing
+    only (#164). *)
+val live_read_locks : t -> int
 
 (** Number of entries in the in-memory freelist (diagnostics / testing). *)
 val freelist_size : t -> int
