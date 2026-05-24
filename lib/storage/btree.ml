@@ -750,6 +750,62 @@ let prepare_stored_value pager (value : bytes) :
     | Ok (head_pid, total_size) ->
       return_ok (encode_overflow_marker ~head_pid ~total_size)
 
+(* Write [new_entries] back into a leaf (splitting if needed) and propagate
+   any split up the [path] to the root, growing a new root branch when the
+   root itself splits.  Shared by [put] and [del]. *)
+let write_leaf_and_propagate t ~path ~new_entries ~right_page =
+  let* w = write_leaf_maybe_split t.pager new_entries ~right_page in
+  match w with
+  | Error e -> return_error e
+  | Ok wr ->
+    let* up = propagate_up t.pager (List.rev path) wr in
+    match up with
+    | Error e -> return_error e
+    | Ok (One_page new_root) ->
+      return_ok { t with root_page = new_root }
+    | Ok (Split (left_pid, split_key, right_pid)) ->
+      let* alloc_r = Pager.alloc t.pager in
+      bind_pager alloc_r (fun new_root_pid ->
+          let* w2 = build_and_write_branch t.pager
+              ~page_id:new_root_pid
+              ~entries:[(split_key, left_pid)]
+              ~right_page:right_pid in
+          match w2 with
+          | Error e -> return_error e
+          | Ok () ->
+            return_ok { t with root_page = new_root_pid })
+
+(* Empty tree → create a single leaf page holding [(key, stored_value)]. *)
+let put_into_empty_tree t key stored_value =
+  let* alloc_r = Pager.alloc t.pager in
+  bind_pager alloc_r (fun new_pid ->
+      let* w = build_and_write_leaf t.pager ~page_id:new_pid
+          ~entries:[(key, stored_value)] ~right_page:0L in
+      match w with
+      | Error e -> return_error e
+      | Ok () -> return_ok { t with root_page = new_pid })
+
+(* Non-empty tree → find the target leaf, insert-or-replace, write back. *)
+let put_into_leaf t key stored_value =
+  let* path_r = find_leaf t key in
+  match path_r with
+  | Error e -> return_error e
+  | Ok (path, leaf_pid) ->
+    let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid in
+    bind_pager leaf_r (fun leaf_buf ->
+        let leaf_common = Page.read_common leaf_buf in
+        let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
+        let leaf_right = page_id_of_int32 leaf_common.right_page in
+        let plain_entries =
+          List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
+        in
+        let new_entries =
+          leaf_insert_or_replace plain_entries key stored_value
+        in
+        Pager.free t.pager ~page_id:leaf_pid
+          ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+        write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right)
+
 let put t key value : (t, error) result Lwt.t =
   let key_len = Bytes.length key in
   let val_len = Bytes.length value in
@@ -777,55 +833,10 @@ let put t key value : (t, error) result Lwt.t =
         match prep_r with
         | Error e -> return_error e
         | Ok stored_value ->
-          if Int64.compare t.root_page 0L = 0 then begin
-            (* Empty tree → create a single leaf page. *)
-            let* alloc_r = Pager.alloc t.pager in
-            bind_pager alloc_r (fun new_pid ->
-                let* w = build_and_write_leaf t.pager ~page_id:new_pid
-                    ~entries:[(key, stored_value)] ~right_page:0L in
-                match w with
-                | Error e -> return_error e
-                | Ok () -> return_ok { t with root_page = new_pid })
-          end else begin
-            let* path_r = find_leaf t key in
-            match path_r with
-            | Error e -> return_error e
-            | Ok (path, leaf_pid) ->
-              let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid in
-              bind_pager leaf_r (fun leaf_buf ->
-                  let leaf_common = Page.read_common leaf_buf in
-                  let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
-                  let leaf_right = page_id_of_int32 leaf_common.right_page in
-                  let plain_entries =
-                    List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
-                  in
-                  let new_entries =
-                    leaf_insert_or_replace plain_entries key stored_value
-                  in
-                  Pager.free t.pager ~page_id:leaf_pid
-                    ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-                  let* w = write_leaf_maybe_split t.pager new_entries
-                      ~right_page:leaf_right in
-                  match w with
-                  | Error e -> return_error e
-                  | Ok wr ->
-                    let* up = propagate_up t.pager (List.rev path) wr in
-                    match up with
-                    | Error e -> return_error e
-                    | Ok (One_page new_root) ->
-                      return_ok { t with root_page = new_root }
-                    | Ok (Split (left_pid, split_key, right_pid)) ->
-                      let* alloc_r = Pager.alloc t.pager in
-                      bind_pager alloc_r (fun new_root_pid ->
-                          let* w2 = build_and_write_branch t.pager
-                              ~page_id:new_root_pid
-                              ~entries:[(split_key, left_pid)]
-                              ~right_page:right_pid in
-                          match w2 with
-                          | Error e -> return_error e
-                          | Ok () ->
-                            return_ok { t with root_page = new_root_pid }))
-          end
+          if Int64.compare t.root_page 0L = 0 then
+            put_into_empty_tree t key stored_value
+          else
+            put_into_leaf t key stored_value
 
 (* ------------------------------------------------------------------ *)
 (* DEL                                                                  *)
@@ -844,6 +855,44 @@ let leaf_remove key entries =
   in
   loop [] entries
 
+(* Read the target leaf, free any overflow chain under [key], remove the
+   key, and write the leaf back (handling the root-becomes-empty case). *)
+let del_from_leaf t key ~path ~leaf_pid =
+  let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid in
+  bind_pager leaf_r (fun leaf_buf ->
+      let leaf_common = Page.read_common leaf_buf in
+      let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
+      let leaf_right = page_id_of_int32 leaf_common.right_page in
+      let plain_entries =
+        List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
+      in
+      (* If we're about to remove an entry whose stored value is an
+         overflow marker, free its chain first. *)
+      let stored_for_key =
+        List.find_map
+          (fun (k, v) -> if Bytes.equal k key then Some v else None)
+          plain_entries
+      in
+      let* free_r = match stored_for_key with
+        | None -> return_ok ()
+        | Some v -> maybe_free_overflow_of t.pager v
+      in
+      match free_r with
+      | Error e -> return_error e
+      | Ok () ->
+      let (new_entries, removed) = leaf_remove key plain_entries in
+      if not removed then return_ok t
+      else begin
+        (* Special case: root is a single empty leaf → set root to 0L. *)
+        if path = [] && new_entries = [] then begin
+          Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+          return_ok { t with root_page = 0L }
+        end else begin
+          Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+          write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right
+        end
+      end)
+
 let del t key : (t, error) result Lwt.t =
   let key_len = Bytes.length key in
   if key_len > max_key_size then return_ok t
@@ -852,63 +901,7 @@ let del t key : (t, error) result Lwt.t =
     let* path_r = find_leaf t key in
     match path_r with
     | Error e -> return_error e
-    | Ok (path, leaf_pid) ->
-      let* leaf_r = Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid in
-      bind_pager leaf_r (fun leaf_buf ->
-          let leaf_common = Page.read_common leaf_buf in
-          let (entries, _) = decode_leaf_entries leaf_buf leaf_common in
-          let leaf_right = page_id_of_int32 leaf_common.right_page in
-          let plain_entries =
-            List.map (fun (e : Page.leaf_entry) -> (e.key, e.value)) entries
-          in
-          (* If we're about to remove an entry whose stored value is an
-             overflow marker, free its chain first. *)
-          let stored_for_key =
-            List.find_map
-              (fun (k, v) -> if Bytes.equal k key then Some v else None)
-              plain_entries
-          in
-          let* free_r = match stored_for_key with
-            | None -> return_ok ()
-            | Some v -> maybe_free_overflow_of t.pager v
-          in
-          match free_r with
-          | Error e -> return_error e
-          | Ok () ->
-          let (new_entries, removed) = leaf_remove key plain_entries in
-          if not removed then return_ok t
-          else begin
-            (* Special case: root is a single empty leaf → set root to 0L. *)
-            if path = [] && new_entries = [] then begin
-              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-              return_ok { t with root_page = 0L }
-            end else begin
-              Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-              let* w = write_leaf_maybe_split t.pager new_entries
-                  ~right_page:leaf_right in
-              match w with
-              | Error e -> return_error e
-              | Ok wr ->
-                let* up = propagate_up t.pager (List.rev path) wr in
-                match up with
-                | Error e -> return_error e
-                | Ok (One_page new_root) ->
-                  return_ok { t with root_page = new_root }
-                | Ok (Split (left_pid, split_key, right_pid)) ->
-                  (* Extremely unlikely: deletion caused a split (entries
-                     decreased so no split — but defensive case). *)
-                  let* alloc_r = Pager.alloc t.pager in
-                  bind_pager alloc_r (fun new_root_pid ->
-                      let* w2 = build_and_write_branch t.pager
-                          ~page_id:new_root_pid
-                          ~entries:[(split_key, left_pid)]
-                          ~right_page:right_pid in
-                      match w2 with
-                      | Error e -> return_error e
-                      | Ok () ->
-                        return_ok { t with root_page = new_root_pid })
-            end
-          end)
+    | Ok (path, leaf_pid) -> del_from_leaf t key ~path ~leaf_pid
   end
 
 (* ------------------------------------------------------------------ *)
@@ -1112,6 +1105,44 @@ let descend_with_path_for_key ?snapshot_frames ?pin_set pager page_id key :
    first entry >= key.  If past the end of the leaf, advance to the next
    leaf via path-based traversal.  Cursor invariant after seek: cursor.offset
    points at the entry the first [cursor_next] should return. *)
+(* Scan forward from the cursor's current position for [key], advancing
+   across leaves.  Returns `Found at an exact match, else `Not_found_after. *)
+let rec cursor_scan_for_key c key =
+  if c.finished then return_ok (`Not_found_after key)
+  else
+    let* rr =
+      Pager.read ?snapshot_frames:c.c_snapshot_frames ?pin_set:c.c_pin_set
+        c.c_pager c.leaf_page
+    in
+    bind_pager rr (fun buf ->
+        let common = Page.read_common buf in
+        let (_entries, end_offset) = decode_leaf_entries buf common in
+        if c.offset >= end_offset then begin
+          let* a = advance_to_next_leaf c in
+          match a with
+          | Error e -> return_error e
+          | Ok false -> return_ok (`Not_found_after key)
+          | Ok true -> cursor_scan_for_key c key
+        end else begin
+          match Page.leaf_entry_at buf ~offset:c.offset with
+          | `End ->
+            let* a = advance_to_next_leaf c in
+            (match a with
+             | Error e -> return_error e
+             | Ok false -> return_ok (`Not_found_after key)
+             | Ok true -> cursor_scan_for_key c key)
+          | `Entry e ->
+            let cmp = Bytes.compare e.key key in
+            if cmp = 0 then
+              return_ok `Found
+            else if cmp > 0 then
+              return_ok (`Not_found_after key)
+            else begin
+              c.offset <- e.next_offset;
+              cursor_scan_for_key c key
+            end
+        end)
+
 let cursor_seek c key :
   ([ `Found | `Not_found_after of bytes ], error) result Lwt.t =
   if Int64.compare c.c_root 0L = 0 then begin
@@ -1129,43 +1160,7 @@ let cursor_seek c key :
       c.leaf_page <- leaf_pid;
       c.offset <- Page.data_offset;
       c.finished <- false;
-      let rec scan () =
-        if c.finished then return_ok (`Not_found_after key)
-        else
-          let* rr =
-            Pager.read ?snapshot_frames:c.c_snapshot_frames ?pin_set:c.c_pin_set
-              c.c_pager c.leaf_page
-          in
-          bind_pager rr (fun buf ->
-              let common = Page.read_common buf in
-              let (_entries, end_offset) = decode_leaf_entries buf common in
-              if c.offset >= end_offset then begin
-                let* a = advance_to_next_leaf c in
-                match a with
-                | Error e -> return_error e
-                | Ok false -> return_ok (`Not_found_after key)
-                | Ok true -> scan ()
-              end else begin
-                match Page.leaf_entry_at buf ~offset:c.offset with
-                | `End ->
-                  let* a = advance_to_next_leaf c in
-                  (match a with
-                   | Error e -> return_error e
-                   | Ok false -> return_ok (`Not_found_after key)
-                   | Ok true -> scan ())
-                | `Entry e ->
-                  let cmp = Bytes.compare e.key key in
-                  if cmp = 0 then
-                    return_ok `Found
-                  else if cmp > 0 then
-                    return_ok (`Not_found_after key)
-                  else begin
-                    c.offset <- e.next_offset;
-                    scan ()
-                  end
-              end)
-      in
-      scan ()
+      cursor_scan_for_key c key
   end
 
 let cursor_close _ = ()
