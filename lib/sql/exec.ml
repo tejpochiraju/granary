@@ -3553,6 +3553,351 @@ let to_stream_ref : ((unit -> float) option -> Row.value array -> S.t -> ?mode:t
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
+(* Op_create_table: register the table, its UNIQUE indexes, and FK constraints. *)
+let execute_create_table_op (cat : Cat.t) ~name ~columns ~uniq_idxs ~if_not_exists
+    ~fk_constraints ~without_rowid : int Lwt.t =
+  if if_not_exists && Cat.table_exists cat ~name then
+    Lwt.return 0
+  else begin
+    let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
+    let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
+      let* result = Cat.create_index cat ~name:idx_name ~table:name
+          ~columns:col_names ~unique:true
+          ~expr_flags:(List.map (fun _ -> false) col_names)
+          ~where_sql:None in
+      match result with
+      | Error msg -> Lwt.fail_with msg
+      | Ok _      -> Lwt.return_unit
+    ) uniq_idxs in
+    let* () =
+      if fk_constraints = [] then Lwt.return_unit
+      else begin
+        let fk_list = List.map (fun (lcs, pt, pcs, od, ou, def) ->
+          Cat.{ fk_local_cols = lcs; fk_parent_table = pt; fk_parent_cols = pcs;
+                fk_on_delete = od; fk_on_update = ou; fk_deferrable = def }
+        ) fk_constraints in
+        let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
+        Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
+        Lwt.return_unit
+      end
+    in
+    Lwt.return 0
+  end
+
+(* Op_insert: insert each VALUES row, counting successful inserts. *)
+let execute_insert_values store (cat : Cat.t) ~mode ~params ~clock ~before_hook
+    ~after_hook ~on_replace_delete_before ~on_replace_delete
+    ~on_upsert_update_before ~on_upsert_update
+    ~table_meta ~ordinals ~values ~on_conflict ~upsert_update : int Lwt.t =
+  let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
+  let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
+  Lwt_list.fold_left_s (fun count row_vals ->
+    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
+                      ~before_hook:bh ~after_hook:ah
+                      ~on_replace_delete_before ~on_replace_delete
+                      ~on_upsert_update_before ~on_upsert_update
+                      store cat ~table_meta ~ordinals ~values:row_vals in
+    Lwt.return (count + if inserted then 1 else 0)
+  ) 0 values
+
+(* Op_insert_select: insert one row per source-stream row. *)
+let execute_insert_select_op store (cat : Cat.t) ~mode ~params ~clock ~before_hook
+    ~after_hook ~on_replace_delete_before ~on_replace_delete
+    ~on_upsert_update_before ~on_upsert_update
+    ~(table_meta : Cat.table_meta) ~ordinals ~source ~on_conflict : int Lwt.t =
+  let n_cols = List.length table_meta.Cat.columns in
+  let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
+  let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
+  let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
+  let* src_rows = Lwt_stream.to_list stream in
+  Lwt_list.fold_left_s (fun count src_row ->
+    let row_arr = Array.make n_cols Row.V_null in
+    List.iteri (fun i ord ->
+      if i < Array.length src_row then row_arr.(ord) <- src_row.(i)
+    ) ordinals;
+    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
+                      ~before_hook:bh ~after_hook:ah
+                      ~on_replace_delete_before ~on_replace_delete
+                      ~on_upsert_update_before ~on_upsert_update
+                      store cat ~table_meta ~ordinals ~values:[]
+                      ~prebuilt_row:(Some row_arr) in
+    Lwt.return (count + if inserted then 1 else 0)
+  ) 0 src_rows
+
+(* Op_update dispatch: adapt the new/old-row hooks and delegate to execute_update. *)
+let execute_update_op store cat ~mode ~params ~clock ~before_hook ~after_hook
+    ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes : int Lwt.t =
+  let bh = Option.map (fun f ~tx ~old_row ~new_row ->
+    f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)) before_hook in
+  let ah = Option.map (fun f ~tx ~old_row ~new_row ->
+    f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)) after_hook in
+  execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
+    store cat ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
+
+(* Op_delete dispatch: adapt the old-row hooks and delegate to execute_delete. *)
+let execute_delete_op store cat ~mode ~params ~clock ~before_hook ~after_hook
+    ~table_meta ~where ~order ~limit ~offset ~indexes : int Lwt.t =
+  let bh = Option.map (fun f ~tx ~old_row ->
+    f ~tx ~new_row:None ~old_row:(Some old_row)) before_hook in
+  let ah = Option.map (fun f ~tx ~old_row ->
+    f ~tx ~new_row:None ~old_row:(Some old_row)) after_hook in
+  execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
+    store cat ~table_meta ~where ~order ~limit ~offset ~indexes
+
+(* Op_drop_table: drop the table and invalidate its cached CHECK / generated
+   expressions. *)
+let execute_drop_table_op store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
+    ~indexes : int Lwt.t =
+  let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
+  Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
+    if String.equal tbl table_meta.name then None else Some v) check_expr_cache;
+  Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
+    if String.equal tbl table_meta.name then None else Some v) generated_expr_cache;
+  Lwt.return 0
+
+(* Op_fts_insert: allocate a rowid, store the content row, and index it. *)
+let execute_fts_insert store (cat : Cat.t) ~mode ~clock ~params
+    (fts_meta : Cat.fts_table_meta) ~col_names ~col_values : int Lwt.t =
+  let* (tx, owned) = acquire_txn store mode in
+  Lwt.catch
+    (fun () ->
+      let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
+      let key = Rowid.encode rowid in
+      let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
+      let n_cols = List.length fts_meta.Cat.fts_columns in
+      let texts = Array.make n_cols "" in
+      List.iter2 (fun col_name v ->
+        match list_find_index (String.equal col_name) fts_meta.Cat.fts_columns with
+        | None -> ()
+        | Some (i, _) -> texts.(i) <- (match v with Row.V_text s -> s | _ -> "")
+      ) col_names vals;
+      let text_list = Array.to_list texts in
+      let* () = S.put tx fts_meta.Cat.fts_content_tree key
+                  (fts_encode_content text_list) in
+      let col_texts = List.mapi (fun i t -> (i, t)) text_list in
+      let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
+      let* () = release_txn tx owned in
+      Lwt.return 1)
+    (fun exn ->
+      let* () = if owned then S.rollback tx else Lwt.return_unit in
+      Lwt.fail exn)
+
+(* Op_fts_delete: drain matching content rows, then delete + de-index them. *)
+let execute_fts_delete store (cat : Cat.t) ~mode ~clock ~params
+    (fts_meta : Cat.fts_table_meta) ~where : int Lwt.t =
+  ignore cat;
+  let* matches =
+    S.with_ro store @@ fun tx_ro ->
+    let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
+    let _sr = S.cursor_first cur in
+    let buf = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let texts = fts_decode_content vbytes in
+        let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+        let keep = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if keep then buf := (rowid, kbytes, texts) :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
+  in
+  let n = List.length matches in
+  if n = 0 then Lwt.return 0
+  else begin
+    let* (tx, owned) = acquire_txn store mode in
+    Lwt.catch
+      (fun () ->
+        let* () =
+          Lwt_list.iter_s (fun (rowid, key, texts) ->
+            let col_texts = List.mapi (fun i t -> (i, t)) texts in
+            let* () = S.del tx fts_meta.Cat.fts_content_tree key in
+            fts_deindex_document tx ~fts_meta ~rowid ~col_texts
+          ) matches
+        in
+        let* () = release_txn tx owned in
+        Lwt.return n)
+      (fun exn ->
+        let* () = if owned then S.rollback tx else Lwt.return_unit in
+        Lwt.fail exn)
+  end
+
+(* Drop cached CHECK and generated-column expressions for [table_name]
+   (used after DROP COLUMN, which can invalidate them). *)
+let clear_table_expr_caches table_name =
+  let clear cache =
+    let to_clear = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
+      if String.equal tn table_name then (tn, idx, sql) :: acc else acc) cache [] in
+    List.iter (Hashtbl.remove cache) to_clear
+  in
+  clear check_expr_cache;
+  clear generated_expr_cache
+
+(* Convert an AST column definition into a catalog [Row.column]. *)
+let column_of_col_def col_def : Row.column =
+  {
+    Row.name        = col_def.Ast.name;
+    Row.ty          = (match col_def.Ast.ty with
+                       | Ast.Ty_int  -> Row.Integer
+                       | Ast.Ty_text -> Row.Text
+                       | Ast.Ty_real -> Row.Real
+                       | Ast.Ty_blob -> Row.Blob);
+    Row.not_null    = col_def.Ast.not_null;
+    Row.primary_key = col_def.Ast.primary_key;
+    Row.default     = (match col_def.Ast.default with
+                       | None              -> None
+                       | Some Ast.L_null   -> Some Row.DV_null
+                       | Some (Ast.L_int  n) -> Some (Row.DV_int  n)
+                       | Some (Ast.L_text s) -> Some (Row.DV_text s)
+                       | Some (Ast.L_real f) -> Some (Row.DV_real f)
+                       | Some (Ast.L_blob b) -> Some (Row.DV_blob b)
+                       | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
+                       | Some Ast.L_current_date      -> Some Row.DV_current_date
+                       | Some Ast.L_current_time      -> Some Row.DV_current_time);
+    Row.check_sql    = Option.map Ast.expr_to_sql col_def.Ast.check;
+    Row.generated_as = Option.map (fun (e, s) ->
+      (Ast.expr_to_sql e, s = `Stored)) col_def.Ast.generated_as;
+  }
+
+(* ALTER TABLE ADD COLUMN: add [col_def] to the catalog and persist any inline
+   FK reference it declares. *)
+let alter_add_column (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def : int Lwt.t =
+  let col = column_of_col_def col_def in
+  let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
+  (match result with
+   | Error msg -> Lwt.fail_with msg
+   | Ok () ->
+     (match col_def.Ast.fk_ref with
+      | None -> Lwt.return 0
+      | Some (parent_table, parent_col, ast_od, ast_ou, ast_def) ->
+        let inferred_parent_col =
+          if parent_col = "" then
+            (match Cat.find_table_cached cat ~name:parent_table with
+             | None -> parent_col
+             | Some pm ->
+               (match List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns with
+                | None -> parent_col
+                | Some pk -> pk.Row.name))
+          else parent_col
+        in
+        let new_fk : Cat.fk_constraint = {
+          Cat.fk_local_cols   = [col_def.Ast.name];
+          Cat.fk_parent_table = parent_table;
+          Cat.fk_parent_cols  = [inferred_parent_col];
+          Cat.fk_on_delete    = ast_od;
+          Cat.fk_on_update    = ast_ou;
+          Cat.fk_deferrable   = ast_def;
+        } in
+        let existing_fks =
+          match Cat.find_table_cached cat ~name:table_meta.Cat.name with
+          | None -> []
+          | Some m -> m.Cat.fk_constraints
+        in
+        let new_fks = existing_fks @ [new_fk] in
+        let* () = Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks in
+        Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
+        Lwt.return 0))
+
+(* ALTER TABLE DROP COLUMN: drop dependent indexes, migrate rows to the new
+   shape, drop the catalog column, and invalidate cached expressions. *)
+let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name
+    : int Lwt.t =
+  let table_name = table_meta.Cat.name in
+  let col_idx = find_col_idx_by_name table_meta.Cat.columns col_name in
+  let new_columns = List.filteri (fun i _ -> i <> col_idx) table_meta.Cat.columns in
+  let idxs_on_col = List.filter (fun (idx : Cat.index_info) ->
+    List.mem col_name idx.Cat.idx_columns)
+    (Cat.indexes_for_table cat ~table:table_name) in
+  let* () = if idxs_on_col = [] then Lwt.return_unit
+    else begin
+      let* tx_idx = S.rw_begin store in
+      let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+        Cat.drop_index cat tx_idx ~name:idx.idx_name) idxs_on_col in
+      S.commit tx_idx
+    end
+  in
+  let* rows =
+    S.with_ro store @@ fun tx_ro ->
+    let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
+    let _sr = S.cursor_first cur in
+    let rows = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, v) ->
+        let old_row = decode_with_virtual None [||] table_meta v in
+        let new_row = Array.of_list
+          (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
+        rows := (Bytes.copy k, new_row) :: !rows;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Lwt.return !rows
+  in
+  let* tx = S.rw_begin store in
+  let* () = Lwt_list.iter_s (fun (k, new_row) ->
+    let new_bytes = Row.encode new_columns new_row in
+    S.put tx table_meta.Cat.tree_id k new_bytes) rows in
+  let* () = S.commit tx in
+  let* result = Cat.drop_column cat ~table_name ~col_name in
+  (match result with
+   | Error msg -> Lwt.fail_with msg
+   | Ok ()     -> clear_table_expr_caches table_name; Lwt.return 0)
+
+(* ALTER TABLE RENAME TABLE: rename in the catalog and remap cached CHECK /
+   generated-column entries from the old name to the new one. *)
+let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name
+    : int Lwt.t =
+  let* result = Cat.rename_table cat ~old_name:table_meta.Cat.name ~new_name in
+  (match result with
+   | Error msg -> Lwt.fail_with msg
+   | Ok ()     ->
+     let remap tbl_cache =
+       let to_add = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
+         if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
+         else acc) tbl_cache [] in
+       List.iter (fun (_, idx, sql, _) ->
+         Hashtbl.remove tbl_cache (table_meta.Cat.name, idx, sql)) to_add;
+       List.iter (fun (new_t, idx, sql, v) ->
+         Hashtbl.add tbl_cache (new_t, idx, sql) v) to_add
+     in
+     remap check_expr_cache;
+     remap generated_expr_cache;
+     Lwt.return 0)
+
+(* Op_alter_table: dispatch on the ALTER action. *)
+let execute_alter_table store (cat : Cat.t) ~(table_meta : Cat.table_meta) action
+    : int Lwt.t =
+  match action with
+  | Ast.AA_add_column col_def -> alter_add_column cat ~table_meta col_def
+  | Ast.AA_rename_table new_name -> alter_rename_table cat ~table_meta new_name
+  | Ast.AA_rename_column (old_col, new_col) ->
+    let* result = Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col in
+    (match result with Error msg -> Lwt.fail_with msg | Ok () -> Lwt.return 0)
+  | Ast.AA_drop_column col_name -> alter_drop_column store cat ~table_meta col_name
+
+(* Op_create_index: create the index unless IF NOT EXISTS finds it present. *)
+let execute_create_index_op store (cat : Cat.t) ~mode ~name ~table ~tree_id
+    ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns
+    ~if_not_exists : int Lwt.t =
+  if if_not_exists && Cat.index_exists cat ~name then Lwt.return 0
+  else begin
+    let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
+                ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns in
+    Lwt.return 0
+  end
+
+(** [execute_with_count] returns the rows-affected count.  For most
+    write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
+    number of rows whose contents were modified. *)
 let execute_with_count ?(mode = Auto)
     ?(clock : (unit -> float) option = None)
     ?(params = [||])
@@ -3566,110 +3911,30 @@ let execute_with_count ?(mode = Auto)
   : int Lwt.t =
   match op with
   | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
-    (* Note: create_table acquires its own RW txn internally via catalog.
-       This means CREATE TABLE is NOT atomic within an explicit BEGIN/COMMIT block —
-       it commits immediately regardless of mode. Phase 4 work to fix. *)
-    if if_not_exists && Cat.table_exists cat ~name then
-      Lwt.return 0
-    else begin
-      let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
-      let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
-        let* result = Cat.create_index cat ~name:idx_name ~table:name
-            ~columns:col_names ~unique:true
-            ~expr_flags:(List.map (fun _ -> false) col_names)
-            ~where_sql:None in
-        match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok _      -> Lwt.return_unit
-      ) uniq_idxs in
-      (* Persist FK constraints if any *)
-      let* () =
-        if fk_constraints = [] then Lwt.return_unit
-        else begin
-          let fk_list = List.map (fun (lcs, pt, pcs, od, ou, def) ->
-            Cat.{ fk_local_cols = lcs; fk_parent_table = pt; fk_parent_cols = pcs;
-                  fk_on_delete = od; fk_on_update = ou; fk_deferrable = def }
-          ) fk_constraints in
-          let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
-          Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
-          Lwt.return_unit
-        end
-      in
-      Lwt.return 0
-    end
+    execute_create_table_op cat ~name ~columns ~uniq_idxs ~if_not_exists
+      ~fk_constraints ~without_rowid
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
-    let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
-    let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
-    Lwt_list.fold_left_s (fun count row_vals ->
-      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
-                        ~before_hook:bh ~after_hook:ah
-                        ~on_replace_delete_before ~on_replace_delete
-                        ~on_upsert_update_before ~on_upsert_update
-                        store cat ~table_meta ~ordinals ~values:row_vals in
-      Lwt.return (count + if inserted then 1 else 0)
-    ) 0 values
+    execute_insert_values store cat ~mode ~params ~clock ~before_hook ~after_hook
+      ~on_replace_delete_before ~on_replace_delete
+      ~on_upsert_update_before ~on_upsert_update
+      ~table_meta ~ordinals ~values ~on_conflict ~upsert_update
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
-    let n_cols = List.length table_meta.Cat.columns in
-    let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
-    let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
-    let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
-    let* src_rows = Lwt_stream.to_list stream in
-    Lwt_list.fold_left_s (fun count src_row ->
-      let row_arr = Array.make n_cols Row.V_null in
-      List.iteri (fun i ord ->
-        if i < Array.length src_row then
-          row_arr.(ord) <- src_row.(i)
-      ) ordinals;
-      let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
-                        ~before_hook:bh ~after_hook:ah
-                        ~on_replace_delete_before ~on_replace_delete
-                        ~on_upsert_update_before ~on_upsert_update
-                        store cat ~table_meta ~ordinals ~values:[]
-                        ~prebuilt_row:(Some row_arr) in
-      Lwt.return (count + if inserted then 1 else 0)
-    ) 0 src_rows
+    execute_insert_select_op store cat ~mode ~params ~clock ~before_hook ~after_hook
+      ~on_replace_delete_before ~on_replace_delete
+      ~on_upsert_update_before ~on_upsert_update
+      ~table_meta ~ordinals ~source ~on_conflict
   | Plan.Op_create_index { name; table; tree_id; col_sqls; col_expr_flags;
                            where_expr; where_sql; unique; columns; if_not_exists } ->
-    (* Note: create_index calls catalog functions that acquire their own RW txn.
-       Like CREATE TABLE, CREATE INDEX is NOT atomic within an explicit BEGIN/COMMIT
-       block — it commits immediately. Phase 4 work to fix. *)
-    if if_not_exists && Cat.index_exists cat ~name then
-      Lwt.return 0
-    else begin
-      let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                  ~col_sqls ~col_expr_flags
-                  ~where_expr ~where_sql ~unique ~columns in
-      Lwt.return 0
-    end
+    execute_create_index_op store cat ~mode ~name ~table ~tree_id
+      ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns ~if_not_exists
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
-    let bh = Option.map (fun f ~tx ~old_row ~new_row ->
-      f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
-    ) before_hook in
-    let ah = Option.map (fun f ~tx ~old_row ~new_row ->
-      f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)
-    ) after_hook in
-    execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-      store cat ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
+    execute_update_op store cat ~mode ~params ~clock ~before_hook ~after_hook
+      ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
-    let bh = Option.map (fun f ~tx ~old_row ->
-      f ~tx ~new_row:None ~old_row:(Some old_row)
-    ) before_hook in
-    let ah = Option.map (fun f ~tx ~old_row ->
-      f ~tx ~new_row:None ~old_row:(Some old_row)
-    ) after_hook in
-    execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-      store cat ~table_meta ~where ~order ~limit ~offset ~indexes
+    execute_delete_op store cat ~mode ~params ~clock ~before_hook ~after_hook
+      ~table_meta ~where ~order ~limit ~offset ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
-    let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
-    (* Invalidate cached CHECK expressions for the dropped table *)
-    Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
-      if String.equal tbl table_meta.name then None else Some v
-    ) check_expr_cache;
-    (* Invalidate cached generated-column expressions for the dropped table *)
-    Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
-      if String.equal tbl table_meta.name then None else Some v
-    ) generated_expr_cache;
-    Lwt.return 0
+    execute_drop_table_op store cat ~mode ~table_meta ~indexes
   | Plan.Op_drop_index { idx_info } ->
     let* () = execute_drop_index ~mode store cat ~idx_info in
     Lwt.return 0
@@ -3677,224 +3942,11 @@ let execute_with_count ?(mode = Auto)
     let* _ = Cat.create_fts_table cat ~name ~columns in
     Lwt.return 0
   | Plan.Op_fts_insert { fts_meta; col_names; col_values } ->
-    let* (tx, owned) = acquire_txn store mode in
-    Lwt.catch
-      (fun () ->
-        let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
-        let key = Rowid.encode rowid in
-        (* Evaluate expressions to get text values *)
-        let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
-        (* Map to FTS column order *)
-        let n_cols = List.length fts_meta.Cat.fts_columns in
-        let texts = Array.make n_cols "" in
-        List.iter2 (fun col_name v ->
-          match list_find_index (String.equal col_name) fts_meta.Cat.fts_columns with
-          | None -> ()
-          | Some (i, _) ->
-            texts.(i) <- (match v with Row.V_text s -> s | _ -> "")
-        ) col_names vals;
-        let text_list = Array.to_list texts in
-        (* Store content row *)
-        let* () = S.put tx fts_meta.Cat.fts_content_tree key
-                    (fts_encode_content text_list) in
-        (* Index *)
-        let col_texts = List.mapi (fun i t -> (i, t)) text_list in
-        let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
-        let* () = release_txn tx owned in
-        Lwt.return 1)
-      (fun exn ->
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.fail exn)
+    execute_fts_insert store cat ~mode ~clock ~params fts_meta ~col_names ~col_values
   | Plan.Op_fts_delete { fts_meta; where } ->
-    (* Drain matching rows under an RO snapshot *)
-    let* matches =
-      S.with_ro store @@ fun tx_ro ->
-      let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
-      let _sr = S.cursor_first cur in
-      let buf = ref [] in
-      let rec drain () =
-        match S.cursor_next cur with
-        | None -> ()
-        | Some (kbytes, vbytes) ->
-          let rowid = Rowid.decode kbytes in
-          let texts = fts_decode_content vbytes in
-          let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-          let keep = match where with
-            | None      -> true
-            | Some pred -> value_truthy (eval_expr clock params row pred)
-          in
-          if keep then buf := (rowid, kbytes, texts) :: !buf;
-          drain ()
-      in
-      drain ();
-      S.cursor_close cur;
-      Lwt.return (List.rev !buf)
-    in
-    let n = List.length matches in
-    if n = 0 then Lwt.return 0
-    else begin
-      let* (tx, owned) = acquire_txn store mode in
-      Lwt.catch
-        (fun () ->
-          let* () =
-            Lwt_list.iter_s (fun (rowid, key, texts) ->
-              let col_texts = List.mapi (fun i t -> (i, t)) texts in
-              let* () = S.del tx fts_meta.Cat.fts_content_tree key in
-              fts_deindex_document tx ~fts_meta ~rowid ~col_texts
-            ) matches
-          in
-          let* () = release_txn tx owned in
-          Lwt.return n)
-        (fun exn ->
-          let* () = if owned then S.rollback tx else Lwt.return_unit in
-          Lwt.fail exn)
-    end
+    execute_fts_delete store cat ~mode ~clock ~params fts_meta ~where
   | Plan.Op_alter_table { table_meta; action } ->
-    (match action with
-     | Ast.AA_add_column col_def ->
-       let col : Row.column = {
-         Row.name        = col_def.Ast.name;
-         Row.ty          = (match col_def.Ast.ty with
-                            | Ast.Ty_int  -> Row.Integer
-                            | Ast.Ty_text -> Row.Text
-                            | Ast.Ty_real -> Row.Real
-                            | Ast.Ty_blob -> Row.Blob);
-         Row.not_null    = col_def.Ast.not_null;
-         Row.primary_key = col_def.Ast.primary_key;
-         Row.default     = (match col_def.Ast.default with
-                            | None              -> None
-                            | Some Ast.L_null   -> Some Row.DV_null
-                            | Some (Ast.L_int  n) -> Some (Row.DV_int  n)
-                            | Some (Ast.L_text s) -> Some (Row.DV_text s)
-                            | Some (Ast.L_real f) -> Some (Row.DV_real f)
-                            | Some (Ast.L_blob b) -> Some (Row.DV_blob b)
-                            | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
-                            | Some Ast.L_current_date      -> Some Row.DV_current_date
-                            | Some Ast.L_current_time      -> Some Row.DV_current_time);
-         Row.check_sql    = Option.map Ast.expr_to_sql col_def.Ast.check;
-         Row.generated_as = Option.map (fun (e, s) ->
-           (Ast.expr_to_sql e, s = `Stored)) col_def.Ast.generated_as;
-       } in
-       let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
-       (match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok () ->
-          (match col_def.Ast.fk_ref with
-           | None -> Lwt.return 0
-           | Some (parent_table, parent_col, ast_od, ast_ou, ast_def) ->
-             let inferred_parent_col =
-               if parent_col = "" then
-                 (match Cat.find_table_cached cat ~name:parent_table with
-                  | None -> parent_col
-                  | Some pm ->
-                    (match List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns with
-                     | None -> parent_col
-                     | Some pk -> pk.Row.name))
-               else parent_col
-             in
-             let new_fk : Cat.fk_constraint = {
-               Cat.fk_local_cols   = [col_def.Ast.name];
-               Cat.fk_parent_table = parent_table;
-               Cat.fk_parent_cols  = [inferred_parent_col];
-               Cat.fk_on_delete    = ast_od;
-               Cat.fk_on_update    = ast_ou;
-               Cat.fk_deferrable   = ast_def;
-             } in
-             let existing_fks =
-               match Cat.find_table_cached cat ~name:table_meta.Cat.name with
-               | None -> []
-               | Some m -> m.Cat.fk_constraints
-             in
-             let new_fks = existing_fks @ [new_fk] in
-             let* () = Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks in
-             Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
-             Lwt.return 0))
-     | Ast.AA_rename_table new_name ->
-       let* result = Cat.rename_table cat
-           ~old_name:table_meta.Cat.name ~new_name in
-       (match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok ()     ->
-          (* Remap cached CHECK entries from old_name to new_name *)
-          let to_add = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
-            if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
-            else acc) check_expr_cache [] in
-          List.iter (fun (_, idx, sql, _) ->
-            Hashtbl.remove check_expr_cache (table_meta.Cat.name, idx, sql)) to_add;
-          List.iter (fun (new_t, idx, sql, v) ->
-            Hashtbl.add check_expr_cache (new_t, idx, sql) v) to_add;
-          (* Remap cached generated-column entries from old_name to new_name *)
-          let to_add_gen = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
-            if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
-            else acc) generated_expr_cache [] in
-          List.iter (fun (_, idx, sql, _) ->
-            Hashtbl.remove generated_expr_cache (table_meta.Cat.name, idx, sql)) to_add_gen;
-          List.iter (fun (new_t, idx, sql, v) ->
-            Hashtbl.add generated_expr_cache (new_t, idx, sql) v) to_add_gen;
-          Lwt.return 0)
-     | Ast.AA_rename_column (old_col, new_col) ->
-       let* result = Cat.rename_column cat
-           ~table_name:table_meta.Cat.name ~old_col ~new_col in
-       (match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok ()     -> Lwt.return 0)
-     | Ast.AA_drop_column col_name ->
-       let table_name = table_meta.Cat.name in
-       let col_idx = find_col_idx_by_name table_meta.Cat.columns col_name in
-       let new_columns = List.filteri (fun i _ -> i <> col_idx) table_meta.Cat.columns in
-       (* Drop indexes referencing the dropped column *)
-       let idxs_on_col = List.filter (fun (idx : Cat.index_info) ->
-         List.mem col_name idx.Cat.idx_columns)
-         (Cat.indexes_for_table cat ~table:table_name) in
-       let* () = if idxs_on_col = [] then Lwt.return_unit
-         else begin
-           let* tx_idx = S.rw_begin store in
-           let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-             Cat.drop_index cat tx_idx ~name:idx.idx_name
-           ) idxs_on_col in
-           S.commit tx_idx
-         end
-       in
-       (* Migrate data rows: scan → decode → re-encode without col_idx *)
-       let* rows =
-         S.with_ro store @@ fun tx_ro ->
-         let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
-         let _sr = S.cursor_first cur in
-         let rows = ref [] in
-         let rec drain () =
-           match S.cursor_next cur with
-           | None -> ()
-           | Some (k, v) ->
-             let old_row = decode_with_virtual None [||] table_meta v in
-             let new_row = Array.of_list
-               (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
-             rows := (Bytes.copy k, new_row) :: !rows;
-             drain ()
-         in
-         drain ();
-         S.cursor_close cur;
-         Lwt.return !rows
-       in
-       let* tx = S.rw_begin store in
-       let* () = Lwt_list.iter_s (fun (k, new_row) ->
-         let new_bytes = Row.encode new_columns new_row in
-         S.put tx table_meta.Cat.tree_id k new_bytes
-       ) rows in
-       let* () = S.commit tx in
-       let* result = Cat.drop_column cat ~table_name ~col_name in
-       (match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok ()     ->
-          (* Invalidate cached CHECK and generated-column expressions for this table *)
-          let to_clear_chk = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
-            if String.equal tn table_name then (tn, idx, sql) :: acc else acc
-          ) check_expr_cache [] in
-          List.iter (Hashtbl.remove check_expr_cache) to_clear_chk;
-          let to_clear_gen = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
-            if String.equal tn table_name then (tn, idx, sql) :: acc else acc
-          ) generated_expr_cache [] in
-          List.iter (Hashtbl.remove generated_expr_cache) to_clear_gen;
-          Lwt.return 0))
+    execute_alter_table store cat ~table_meta action
   | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
   | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
     failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
@@ -3920,15 +3972,11 @@ let execute_with_count ?(mode = Auto)
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
   | Plan.Op_vacuum ->
-    (* Intercepted by Db.execute before reaching exec; reaching this point
-       means VACUUM was executed without a Db wrapper, which is not
-       supported. *)
     Lwt.fail_with
       "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
   | Plan.Op_attach _ | Plan.Op_detach _
   | Plan.Op_database_list | Plan.Op_active_database_get
   | Plan.Op_active_database_set _ ->
-    (* Intercepted by Db.execute before reaching exec. *)
     Lwt.fail_with
       "ATTACH/DETACH/database_list/active_database must be executed via Db.execute"
   | Plan.Op_create_view _ | Plan.Op_drop_view _
