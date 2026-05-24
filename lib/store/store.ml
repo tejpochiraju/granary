@@ -140,6 +140,10 @@ type t = {
   mutable mem_savepoints  : (string * (tree_id * Bytes.t Bytes_map.t) list) list;
 }
 
+let pp fmt t =
+  Format.fprintf fmt "Store.t { backend = %s }"
+    (match t.backend with Mem _ -> "Mem" | Btree _ -> "Btree")
+
 type ro_snapshot = {
   rs_store          : t;
   rs_snap_txn_id    : int64;

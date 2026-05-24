@@ -48,6 +48,10 @@ type t = {
 let committed_frames t = t.committed_frames
 let sync_count t = t.sync_count
 
+let pp fmt t =
+  Format.fprintf fmt "@[<hv>Wal.t { committed_frames = %d;@ size_bytes = %Ld }@]"
+    t.committed_frames t.size_bytes
+
 let find_page t pid =
   match Hashtbl.find_opt t.index pid with
   | None | Some [] -> None

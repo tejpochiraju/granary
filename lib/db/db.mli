@@ -2,6 +2,9 @@
 
 type t
 
+(** Pretty-print a summary: path, active schema, savepoint depth, total changes. *)
+val pp : Format.formatter -> t -> unit
+
 (** Re-export value type for convenience. *)
 type value = Sqlocaml_encoding.Row.value =
   | V_int  of int64

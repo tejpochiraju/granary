@@ -59,6 +59,11 @@ let create ?snapshot_frames ?pin_set pager ~root_page =
   { pager; root_page; snapshot_frames; pin_set }
 let root_page t = t.root_page
 
+let pp fmt t =
+  Format.fprintf fmt "@[<hv>Btree.t { root_page = %Ld;@ snapshot_frames = %s }@]"
+    t.root_page
+    (match t.snapshot_frames with Some n -> string_of_int n | None -> "none")
+
 (* ------------------------------------------------------------------ *)
 (* Lwt helpers                                                          *)
 (* ------------------------------------------------------------------ *)

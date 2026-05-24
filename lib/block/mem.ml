@@ -13,6 +13,8 @@ type t = {
   mutable n_pages : int64;
 }
 
+let pp fmt t = Format.fprintf fmt "Mem.t { n_pages = %Ld }" t.n_pages
+
 let create ~n_pages =
   let n = Int64.to_int n_pages in
   let pages = Array.init n (fun _ -> Bytes.make page_size '\x00') in

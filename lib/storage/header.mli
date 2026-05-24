@@ -12,6 +12,9 @@ type t = {
 
 type error = Io of string | Both_headers_corrupt
 
+(** Pretty-print all header fields. *)
+val pp : Format.formatter -> t -> unit
+
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 

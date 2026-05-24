@@ -5,6 +5,9 @@
 
 type t
 
+(** Pretty-print the freelist's entry count. *)
+val pp : Format.formatter -> t -> unit
+
 (** The empty freelist (no freed pages). *)
 val empty : t
 

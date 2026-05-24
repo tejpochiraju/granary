@@ -15,6 +15,9 @@ type error =
   | Value_too_large of int
   | Tree_corrupt of string
 
+(** Pretty-print the tree's root page and snapshot frame bound. *)
+val pp : Format.formatter -> t -> unit
+
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 

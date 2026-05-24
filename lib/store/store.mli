@@ -11,6 +11,9 @@
 
 type t
 
+(** Pretty-print the store's backend kind (Mem or Btree). *)
+val pp : Format.formatter -> t -> unit
+
 (** Phantom types for transaction modes. *)
 type ro
 type rw

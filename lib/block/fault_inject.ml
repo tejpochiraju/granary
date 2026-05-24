@@ -18,6 +18,9 @@ type t = {
 let writes_completed t = t.writes
 let faulted t = t.faulted
 
+let pp fmt t =
+  Format.fprintf fmt "@[<hv>{ writes = %d;@ faulted = %b }@]" t.writes t.faulted
+
 (* Convert a Unix_file.error into the (unit, string) shape that
    Db.open_block's callbacks expect. *)
 let convert_unit_result = function

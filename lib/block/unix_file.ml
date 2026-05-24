@@ -27,6 +27,8 @@ type t = {
 
 let n_pages t = t.n_pages
 
+let pp fmt t = Format.fprintf fmt "Unix_file.t { n_pages = %Ld }" t.n_pages
+
 let in_bounds t page_id =
   Int64.compare page_id 0L >= 0
   && Int64.compare page_id t.n_pages < 0

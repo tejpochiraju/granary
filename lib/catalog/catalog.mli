@@ -4,6 +4,9 @@
 
 type t
 
+(** Pretty-print a summary: table/index/FTS counts and FK-enforcement flag. *)
+val pp : Format.formatter -> t -> unit
+
 type fk_action =
   | FA_no_action
   | FA_restrict

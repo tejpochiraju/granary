@@ -10,6 +10,8 @@ type t = (int32 * int64) list
 
 let empty : t = []
 
+let pp fmt t = Format.fprintf fmt "Freelist.t { entries = %d }" (List.length t)
+
 let add (t : t) ~page_id ~freed_at_txn_id : t =
   (page_id, freed_at_txn_id) :: t
 

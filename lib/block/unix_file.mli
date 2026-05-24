@@ -5,6 +5,9 @@
 type t
 type error = Io of string | Out_of_bounds of { page_id: int64; n_pages: int64 }
 
+(** Pretty-print the file's page count. *)
+val pp : Format.formatter -> t -> unit
+
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 

@@ -13,6 +13,9 @@
 
 type t
 
+(** Pretty-print a wrapper's write count and fault state. *)
+val pp : Format.formatter -> t -> unit
+
 type config = {
   fail_after_writes : int option;
   fail_on_sync      : bool;

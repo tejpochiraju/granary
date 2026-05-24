@@ -4,6 +4,9 @@
 type t
 type error = Block_error of string | Corruption of string
 
+(** Pretty-print page count, cache/dirty sizes and current txn id. *)
+val pp : Format.formatter -> t -> unit
+
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 

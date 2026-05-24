@@ -63,6 +63,11 @@ let pp_error fmt = function
   | Block_error msg -> Format.fprintf fmt "Block_error: %s" msg
   | Corruption msg  -> Format.fprintf fmt "Corruption: %s" msg
 
+let pp fmt t =
+  Format.fprintf fmt
+    "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld }@]"
+    t.n_pages (Hashtbl.length t.cache) (Hashtbl.length t.dirty) t.current_txn_id
+
 let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   { read_page;
     write_page;

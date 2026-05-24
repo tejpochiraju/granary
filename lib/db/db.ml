@@ -31,6 +31,12 @@ type t = {
         [attached] or equal ["main"]. *)
 }
 
+let pp fmt t =
+  Format.fprintf fmt
+    "@[<hv>Db.t { path = %s;@ schema = %s;@ savepoints = %d;@ total_changes = %d }@]"
+    (match t.file_path with Some p -> p | None -> ":memory:")
+    t.active_schema (List.length t.savepoint_names) t.total_changes
+
 type value = Row.value =
   | V_int  of int64
   | V_text of string

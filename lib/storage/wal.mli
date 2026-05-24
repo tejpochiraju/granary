@@ -33,6 +33,9 @@
 
 type t
 
+(** Pretty-print committed-frame count and current WAL size in bytes. *)
+val pp : Format.formatter -> t -> unit
+
 type frame = {
   frame_idx : int;        (** 0-based index in WAL *)
   page_id   : int64;

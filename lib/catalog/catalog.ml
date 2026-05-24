@@ -113,6 +113,12 @@ type t = {
         reverse insertion order; drain reverses again before returning. *)
 }
 
+let pp fmt t =
+  Format.fprintf fmt
+    "@[<hv>Catalog.t { tables = %d;@ indexes = %d;@ fts = %d;@ fk_enforcement = %b }@]"
+    (Hashtbl.length t.cache) (Hashtbl.length t.indexes)
+    (Hashtbl.length t.fts) t.fk_enforcement
+
 (* ------------------------------------------------------------------ *)
 (* Encoding helpers                                                     *)
 (* ------------------------------------------------------------------ *)

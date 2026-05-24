@@ -18,6 +18,12 @@ let pp_error fmt = function
   | Io msg             -> Format.fprintf fmt "Io: %s" msg
   | Both_headers_corrupt -> Format.pp_print_string fmt "Both_headers_corrupt"
 
+let pp fmt t =
+  Format.fprintf fmt
+    "@[<hv>{ txn_id = %Ld;@ root_page = %Ld;@ freelist_page = %Ld;@ \
+     n_pages_total = %Ld;@ schema_version = %Ld }@]"
+    t.txn_id t.root_page t.freelist_page t.n_pages_total t.schema_version
+
 (* Convert a Pager error to our error type. *)
 let of_pager_err e = Io (Format.asprintf "%a" Pager.pp_error e)
 
