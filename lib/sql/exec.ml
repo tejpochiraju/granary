@@ -401,6 +401,478 @@ let sql_of_json : Json.value -> Row.value = function
   | Json.J_array _  as v -> Row.V_text (Json.to_string v)
   | Json.J_object _ as v -> Row.V_text (Json.to_string v)
 
+(* ── Scalar-function evaluation, split by category (#168) ──────────
+   [eval_func] dispatches to the [eval_*_func] helpers below; each returns
+   [Some v] for the functions it owns and [None] otherwise, so [eval_func]
+   can chain them and fall through to the arity-error case.  Verbose
+   per-function bodies are themselves factored into small named helpers. *)
+
+let hex_encode_str s =
+  let buf = Buffer.create (String.length s * 2) in
+  String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
+  Buffer.contents buf
+
+(* UTF-8 encode each in-range integer codepoint, mirroring SQLite's char(). *)
+let char_encode args =
+  let buf = Buffer.create 16 in
+  List.iter (fun v ->
+    match v with
+    | Row.V_int n when n >= 1L && n <= 0x10FFFFL ->
+      let cp = Int64.to_int n in
+      if cp < 0x80 then
+        Buffer.add_char buf (Char.chr cp)
+      else if cp < 0x800 then begin
+        Buffer.add_char buf (Char.chr (0xC0 lor (cp lsr 6)));
+        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+      end else if cp < 0x10000 then begin
+        Buffer.add_char buf (Char.chr (0xE0 lor (cp lsr 12)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+      end else begin
+        Buffer.add_char buf (Char.chr (0xF0 lor (cp lsr 18)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
+      end
+    | _ -> ()
+  ) args;
+  Buffer.contents buf
+
+(* Decode the codepoint of the first UTF-8 character of [s] (s non-empty). *)
+let unicode_codepoint s =
+  let b0 = Char.code s.[0] in
+  if b0 < 0x80 then b0
+  else if b0 < 0xE0 && String.length s >= 2 then
+    ((b0 land 0x1F) lsl 6) lor (Char.code s.[1] land 0x3F)
+  else if b0 < 0xF0 && String.length s >= 3 then
+    ((b0 land 0x0F) lsl 12)
+    lor ((Char.code s.[1] land 0x3F) lsl 6)
+    lor (Char.code s.[2] land 0x3F)
+  else if b0 >= 0xF0 && String.length s >= 4 then
+    ((b0 land 0x07) lsl 18)
+    lor ((Char.code s.[1] land 0x3F) lsl 12)
+    lor ((Char.code s.[2] land 0x3F) lsl 6)
+    lor (Char.code s.[3] land 0x3F)
+  else b0
+
+(* Emit one printf conversion [spec] (the char after '%') to [buf], pulling
+   the next argument via [get_arg]. *)
+let printf_emit buf spec (get_arg : unit -> Row.value) =
+  match spec with
+  | '%' -> Buffer.add_char buf '%'
+  | 'd' | 'i' ->
+    (match get_arg () with
+     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+     | Row.V_real f -> Buffer.add_string buf (string_of_int (int_of_float f))
+     | Row.V_text s -> (try Buffer.add_string buf (string_of_int (int_of_string s))
+                        with Failure _ -> ())
+     | _ -> ())
+  | 'f' ->
+    (match get_arg () with
+     | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%f" f)
+     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%f" (Int64.to_float n2))
+     | _ -> ())
+  | 'e' ->
+    (match get_arg () with
+     | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%e" f)
+     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%e" (Int64.to_float n2))
+     | _ -> ())
+  | 'g' ->
+    (match get_arg () with
+     | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%g" (Int64.to_float n2))
+     | _ -> ())
+  | 's' ->
+    (match get_arg () with
+     | Row.V_text s -> Buffer.add_string buf s
+     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+     | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+     | Row.V_null   -> Buffer.add_string buf "NULL"
+     | Row.V_blob _ -> Buffer.add_string buf "")
+  | 'q' ->
+    (match get_arg () with
+     | Row.V_text s ->
+       String.iter (fun c ->
+         if c = '\'' then Buffer.add_string buf "''"
+         else Buffer.add_char buf c) s
+     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+     | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
+     | Row.V_null   -> Buffer.add_string buf "NULL"
+     | Row.V_blob _ -> ())
+  | c ->
+    Buffer.add_char buf '%';
+    Buffer.add_char buf c
+
+(* SQLite printf()/format(): a small subset of C printf conversions. *)
+let printf_format fmt rest =
+  let args_arr = Array.of_list rest in
+  let arg_idx = ref 0 in
+  let get_arg () =
+    let v = if !arg_idx < Array.length args_arr
+            then args_arr.(!arg_idx)
+            else Row.V_null in
+    incr arg_idx; v
+  in
+  let buf = Buffer.create 64 in
+  let n = String.length fmt in
+  let i = ref 0 in
+  while !i < n do
+    if fmt.[!i] = '%' then begin
+      incr i;
+      if !i < n then begin printf_emit buf fmt.[!i] get_arg; incr i end
+    end else begin
+      Buffer.add_char buf fmt.[!i];
+      incr i
+    end
+  done;
+  Buffer.contents buf
+
+let eval_str_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
+  match func, args with
+  | Ast.Fn_length, [Row.V_text s] -> Some (Row.V_int (Int64.of_int (String.length s)))
+  | Ast.Fn_length, [Row.V_blob b] -> Some (Row.V_int (Int64.of_int (Bytes.length b)))
+  | Ast.Fn_length, [Row.V_null]   -> Some Row.V_null
+  | Ast.Fn_length, [_]            -> Some Row.V_null  (* non-text/blob: return null like SQLite *)
+  | Ast.Fn_lower,  [Row.V_text s] -> Some (Row.V_text (String.lowercase_ascii s))
+  | Ast.Fn_lower,  [Row.V_null]   -> Some Row.V_null
+  | Ast.Fn_lower,  [_]            -> Some Row.V_null
+  | Ast.Fn_upper,  [Row.V_text s] -> Some (Row.V_text (String.uppercase_ascii s))
+  | Ast.Fn_upper,  [Row.V_null]   -> Some Row.V_null
+  | Ast.Fn_upper,  [_]            -> Some Row.V_null
+  | Ast.Fn_substr, (Row.V_text s :: rest) ->
+    Some (match rest with
+     | [Row.V_int start] ->
+       let i = max 0 (Int64.to_int start - 1) in
+       if i >= String.length s then Row.V_text ""
+       else Row.V_text (String.sub s i (String.length s - i))
+     | [Row.V_int start; Row.V_int len] ->
+       let i = max 0 (Int64.to_int start - 1) in
+       let l = Int64.to_int len in
+       if i >= String.length s || l <= 0 then Row.V_text ""
+       else Row.V_text (String.sub s i (min l (String.length s - i)))
+     | _ -> Row.V_null)
+  | Ast.Fn_substr, (Row.V_null :: _) -> Some Row.V_null
+  | Ast.Fn_trim,  [Row.V_text s]                        -> Some (Row.V_text (str_trim_spaces s))
+  | Ast.Fn_trim,  [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_trim_chars s chars))
+  | Ast.Fn_trim,  [_; Row.V_null]                       -> Some Row.V_null
+  | Ast.Fn_trim,  (Row.V_null :: _)                     -> Some Row.V_null
+  | Ast.Fn_ltrim, [Row.V_text s]                        -> Some (Row.V_text (str_ltrim_spaces s))
+  | Ast.Fn_ltrim, [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_ltrim_chars s chars))
+  | Ast.Fn_ltrim, [_; Row.V_null]                       -> Some Row.V_null
+  | Ast.Fn_ltrim, (Row.V_null :: _)                     -> Some Row.V_null
+  | Ast.Fn_rtrim, [Row.V_text s]                        -> Some (Row.V_text (str_rtrim_spaces s))
+  | Ast.Fn_rtrim, [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_rtrim_chars s chars))
+  | Ast.Fn_rtrim, [_; Row.V_null]                       -> Some Row.V_null
+  | Ast.Fn_rtrim, (Row.V_null :: _)                     -> Some Row.V_null
+  | Ast.Fn_replace, [Row.V_text s; Row.V_text old; Row.V_text rep] ->
+    Some (Row.V_text (str_replace s old rep))
+  | Ast.Fn_replace, [_; Row.V_null; _] -> Some Row.V_null
+  | Ast.Fn_replace, [_; _; Row.V_null] -> Some Row.V_null
+  | Ast.Fn_replace, (Row.V_null :: _) -> Some Row.V_null
+  | Ast.Fn_instr, [Row.V_text s; Row.V_text sub] ->
+    Some (Row.V_int (Int64.of_int (str_instr s sub)))
+  | Ast.Fn_instr, (Row.V_null :: _) | Ast.Fn_instr, [_; Row.V_null] -> Some Row.V_null
+  | Ast.Fn_hex, [Row.V_blob b] -> Some (Row.V_text (hex_encode_str (Bytes.to_string b)))
+  | Ast.Fn_hex, [Row.V_text s] -> Some (Row.V_text (hex_encode_str s))
+  | Ast.Fn_hex, [Row.V_int n]  -> Some (Row.V_text (hex_encode_str (Int64.to_string n)))
+  | Ast.Fn_hex, [Row.V_null]   -> Some (Row.V_text "")
+  | Ast.Fn_char, args -> Some (Row.V_text (char_encode args))
+  | Ast.Fn_unicode, [Row.V_text s] when String.length s > 0 ->
+    Some (Row.V_int (Int64.of_int (unicode_codepoint s)))
+  | Ast.Fn_unicode, [Row.V_text _] -> Some Row.V_null
+  | Ast.Fn_unicode, [Row.V_null]   -> Some Row.V_null
+  | Ast.Fn_printf, (Row.V_text fmt :: rest) -> Some (Row.V_text (printf_format fmt rest))
+  | Ast.Fn_printf, _ -> Some Row.V_null
+  | _ -> None
+
+let eval_math_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
+  let to_float_opt = function
+    | Row.V_real f -> Some f
+    | Row.V_int n  -> Some (Int64.to_float n)
+    | _            -> None
+  in
+  match func, args with
+  | Ast.Fn_abs,    [Row.V_int  n] -> Some (Row.V_int  (Int64.abs n))
+  | Ast.Fn_abs,    [Row.V_real f] -> Some (Row.V_real (Float.abs f))
+  | Ast.Fn_abs,    [Row.V_null]   -> Some Row.V_null
+  | Ast.Fn_abs,    [_]            -> Some Row.V_null
+  | Ast.Fn_round, [Row.V_real f] -> Some (Row.V_real (Float.round f))
+  | Ast.Fn_round, [Row.V_int n] -> Some (Row.V_real (Int64.to_float n))
+  | Ast.Fn_round, [Row.V_real f; Row.V_int d] ->
+    let factor = 10. ** Int64.to_float d in
+    Some (Row.V_real (Float.round (f *. factor) /. factor))
+  | Ast.Fn_round, [Row.V_int n; Row.V_int _] -> Some (Row.V_real (Int64.to_float n))
+  | Ast.Fn_round, [_; Row.V_null] -> Some Row.V_null
+  | Ast.Fn_round, (Row.V_null :: _) -> Some Row.V_null
+  | Ast.Fn_ceil, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.ceil f) | None -> Row.V_null)
+  | Ast.Fn_floor, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.floor f) | None -> Row.V_null)
+  | Ast.Fn_sqrt, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.sqrt f) | None -> Row.V_null)
+  | Ast.Fn_pow, [b; e] ->
+    Some (match to_float_opt b, to_float_opt e with
+     | Some bf, Some ef -> Row.V_real (bf ** ef)
+     | _ -> Row.V_null)
+  | Ast.Fn_exp, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.exp f) | None -> Row.V_null)
+  | Ast.Fn_ln, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
+  | Ast.Fn_log, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
+  | Ast.Fn_log, [b; x] ->
+    Some (match to_float_opt b, to_float_opt x with
+     | Some bf, Some xf -> Row.V_real (Float.log xf /. Float.log bf)
+     | _ -> Row.V_null)
+  | Ast.Fn_log2, [v] ->
+    Some (match to_float_opt v with
+     | Some f -> Row.V_real (Float.log f /. Float.log 2.0)
+     | None -> Row.V_null)
+  | Ast.Fn_log10, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.log10 f) | None -> Row.V_null)
+  | Ast.Fn_sign, [v] ->
+    Some (match to_float_opt v with
+     | Some f -> Row.V_int (if f > 0.0 then 1L else if f < 0.0 then (-1L) else 0L)
+     | None -> Row.V_null)
+  | Ast.Fn_trunc, [v] ->
+    Some (match to_float_opt v with
+     | Some f -> Row.V_real (if f >= 0.0 then Float.floor f else Float.ceil f)
+     | None -> Row.V_null)
+  | Ast.Fn_trunc, [v; d] ->
+    Some (match to_float_opt v, to_float_opt d with
+     | Some f, Some df ->
+       let factor = 10.0 ** (Float.round df) in
+       let fx = f *. factor in
+       Row.V_real ((if fx >= 0.0 then Float.floor fx else Float.ceil fx) /. factor)
+     | _ -> Row.V_null)
+  | Ast.Fn_pi, [] -> Some (Row.V_real Float.pi)
+  | Ast.Fn_sin, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.sin f) | None -> Row.V_null)
+  | Ast.Fn_cos, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.cos f) | None -> Row.V_null)
+  | Ast.Fn_tan, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.tan f) | None -> Row.V_null)
+  | Ast.Fn_asin, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.asin f) | None -> Row.V_null)
+  | Ast.Fn_acos, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.acos f) | None -> Row.V_null)
+  | Ast.Fn_atan, [v] ->
+    Some (match to_float_opt v with Some f -> Row.V_real (Float.atan f) | None -> Row.V_null)
+  | Ast.Fn_atan2, [y; x] ->
+    Some (match to_float_opt y, to_float_opt x with
+     | Some yf, Some xf -> Row.V_real (Float.atan2 yf xf)
+     | _ -> Row.V_null)
+  | Ast.Fn_degrees, [v] ->
+    Some (match to_float_opt v with
+     | Some f -> Row.V_real (f *. 180.0 /. Float.pi)
+     | None -> Row.V_null)
+  | Ast.Fn_radians, [v] ->
+    Some (match to_float_opt v with
+     | Some f -> Row.V_real (f *. Float.pi /. 180.0)
+     | None -> Row.V_null)
+  | _ -> None
+
+(* date/time/datetime/julianday/unixepoch share arg-shape handling; only the
+   final conversion differs. *)
+let eval_datetime_unary clock args (conv : Datetime.dt -> Row.value) : Row.value =
+  match args with
+  | [] | [Row.V_null] -> Row.V_null
+  | Row.V_null :: _ -> Row.V_null
+  | Row.V_text ts :: rest ->
+    if rest <> [] then Row.V_null
+    else (match Datetime.parse ?now:clock ts with
+      | Error _ -> Row.V_null
+      | Ok dt   -> conv dt)
+  | _ -> Row.V_null
+
+let eval_datetime_func clock (func : Ast.scalar_func) (args : Row.value list)
+    : Row.value option =
+  match func with
+  | Ast.Fn_date -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_date dt)))
+  | Ast.Fn_time -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_time dt)))
+  | Ast.Fn_datetime -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_datetime dt)))
+  | Ast.Fn_julianday -> Some (eval_datetime_unary clock args (fun dt -> Row.V_real (Datetime.to_julianday dt)))
+  | Ast.Fn_unixepoch -> Some (eval_datetime_unary clock args (fun dt -> Row.V_int (Datetime.to_unixepoch dt)))
+  | Ast.Fn_strftime ->
+    Some (match args with
+     | Row.V_text fmt :: Row.V_text ts :: rest ->
+       if rest <> [] then Row.V_null
+       else (match Datetime.parse ?now:clock ts with
+         | Error _ -> Row.V_null
+         | Ok dt   -> Row.V_text (Datetime.strftime fmt dt))
+     | _ -> Row.V_null)
+  | _ -> None
+
+(* json_set/insert/replace differ only in the per-path Json.path_* operation. *)
+let json_modify (path_op : Json.value -> string -> Json.value -> Json.value)
+    json_v rest : Row.value =
+  let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
+  match Json.parse json_s with
+  | Error _ -> Row.V_null
+  | Ok jv ->
+    let rec apply jv = function
+      | path_v :: val_v :: rest ->
+        let path = (match path_v with Row.V_text s -> s | _ -> "") in
+        apply (path_op jv path (json_of_sql val_v)) rest
+      | _ -> jv
+    in
+    Row.V_text (Json.to_string (apply jv rest))
+
+let eval_json_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
+  match func, args with
+  | Ast.Fn_json_extract, [json_v; path_v] ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
+    let path_s = (match path_v with Row.V_text s -> s | _ -> "") in
+    Some (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv   ->
+       (match Json.path_get jv path_s with
+        | None   -> Row.V_null
+        | Some v -> sql_of_json v))
+  | Ast.Fn_json_object, pairs ->
+    if List.length pairs mod 2 <> 0 then Some Row.V_null
+    else
+      let rec make_pairs = function
+        | []          -> []
+        | k :: v :: rest ->
+          let key = (match k with Row.V_text s -> s | _ -> "") in
+          (key, json_of_sql v) :: make_pairs rest
+        | [_]         -> assert false
+      in
+      Some (Row.V_text (Json.to_string (Json.J_object (make_pairs pairs))))
+  | Ast.Fn_json_array, elems ->
+    Some (Row.V_text (Json.to_string (Json.J_array (List.map json_of_sql elems))))
+  | Ast.Fn_json_type, [json_v] ->
+    Some (match json_v with
+     | Row.V_text s ->
+       (match Json.parse s with
+        | Error _ -> Row.V_null
+        | Ok jv   -> Row.V_text (Json.type_name jv))
+     | _ -> Row.V_null)
+  | Ast.Fn_json_type, [json_v; path_v] ->
+    Some (match json_v, path_v with
+     | Row.V_text s, Row.V_text path ->
+       (match Json.parse s with
+        | Error _ -> Row.V_null
+        | Ok jv   ->
+          (match Json.path_get jv path with
+           | None    -> Row.V_null
+           | Some sub -> Row.V_text (Json.type_name sub)))
+     | _ -> Row.V_null)
+  | Ast.Fn_json_valid, [json_v] ->
+    Some (match json_v with
+     | Row.V_null -> Row.V_null
+     | Row.V_text s ->
+       (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
+     | _ -> Row.V_int 0L)
+  | Ast.Fn_json_set, json_v :: rest -> Some (json_modify Json.path_set json_v rest)
+  | Ast.Fn_json_insert, json_v :: rest -> Some (json_modify Json.path_insert json_v rest)
+  | Ast.Fn_json_replace, json_v :: rest -> Some (json_modify Json.path_replace json_v rest)
+  | Ast.Fn_json_remove, json_v :: paths ->
+    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
+    Some (match Json.parse json_s with
+     | Error _ -> Row.V_null
+     | Ok jv ->
+       let result = List.fold_left (fun acc path_v ->
+         let path = (match path_v with Row.V_text s -> s | _ -> "") in
+         Json.path_remove acc path
+       ) jv paths in
+       Row.V_text (Json.to_string result))
+  | _ -> None
+
+let eval_misc_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
+  match func, args with
+  | Ast.Fn_coalesce, vs ->
+    Some (match List.find_opt (fun v -> v <> Row.V_null) vs with
+     | Some v -> v | None -> Row.V_null)
+  | Ast.Fn_ifnull, [a; b] -> Some (match a with Row.V_null -> b | v -> v)
+  | Ast.Fn_typeof, [v] ->
+    Some (Row.V_text (match v with
+      | Row.V_int  _ -> "integer"
+      | Row.V_real _ -> "real"
+      | Row.V_text _ -> "text"
+      | Row.V_blob _ -> "blob"
+      | Row.V_null   -> "null"))
+  | Ast.Fn_zeroblob, [Row.V_int n] when n >= 0L ->
+    Some (Row.V_blob (Bytes.make (Int64.to_int n) '\000'))
+  | Ast.Fn_zeroblob, _ -> Some Row.V_null
+  | Ast.Fn_random, [] ->
+    let b0 = Int64.of_int (Random.bits ()) in
+    let b1 = Int64.of_int (Random.bits ()) in
+    let b2 = Int64.of_int (Random.bits ()) in
+    let sign = if Random.bool () then Int64.min_int else 0L in
+    let v =
+      Int64.logor sign
+        (Int64.logor
+          (Int64.shift_left b2 60)
+          (Int64.logor (Int64.shift_left b1 30) b0))
+    in
+    Some (Row.V_int v)
+  | Ast.Fn_random, _ -> Some Row.V_null
+  (* SQLite always generates at least 1 byte, even for n <= 0.
+     Clamp to [1, Sys.max_string_length] to avoid allocation errors. *)
+  | Ast.Fn_randomblob, [Row.V_int n] ->
+    let sz = max 1 (if n < 0L || n > Int64.of_int Sys.max_string_length
+                    then 1 else Int64.to_int n) in
+    Some (Row.V_blob (Bytes.init sz (fun _ -> Char.chr (Random.int 256))))
+  | Ast.Fn_randomblob, _ -> Some Row.V_null
+  | Ast.Fn_changes, [] -> Some (Row.V_int 0L)
+  | Ast.Fn_changes, _  -> Some Row.V_null
+  | Ast.Fn_last_insert_rowid, [] -> Some (Row.V_int 0L)
+  | Ast.Fn_last_insert_rowid, _  -> Some Row.V_null
+  | Ast.Fn_total_changes, [] -> Some (Row.V_int 0L)
+  | Ast.Fn_total_changes, _  -> Some Row.V_null
+  | Ast.Fn_sqlite_version, [] -> Some (Row.V_text "3.45.0-sqlocaml")
+  | Ast.Fn_sqlite_version, _  -> Some Row.V_null
+  | _ -> None
+
+(* CAST evaluation; [v] is the already-evaluated operand. NULL casts to NULL. *)
+let eval_cast (v : Row.value) (ty : Ast.ty) : Row.value =
+  match v with
+  | Row.V_null -> Row.V_null
+  | _ ->
+    (match ty with
+     | Ast.Ty_int ->
+       (match v with
+        | Row.V_int n  -> Row.V_int n
+        | Row.V_real f -> Row.V_int (Int64.of_float f)
+        | Row.V_text s -> Row.V_int (parse_int_prefix s)
+        | Row.V_blob _ -> Row.V_int 0L
+        | Row.V_null   -> assert false)
+     | Ast.Ty_real ->
+       (match v with
+        | Row.V_int n  -> Row.V_real (Int64.to_float n)
+        | Row.V_real f -> Row.V_real f
+        | Row.V_text s -> Row.V_real (parse_real_prefix s)
+        | Row.V_blob _ -> Row.V_real 0.0
+        | Row.V_null   -> assert false)
+     | Ast.Ty_text ->
+       (match v with
+        | Row.V_int n  -> Row.V_text (Int64.to_string n)
+        | Row.V_real f ->
+          (* SQLite appends ".0" when the %.15g result has no decimal point
+             or exponent, so that CAST(1.0 AS TEXT) → "1.0" not "1". *)
+          let s = Printf.sprintf "%.15g" f in
+          let needs_dot = not (String.contains s '.' || String.contains s 'e'
+                               || String.contains s 'E' || String.contains s 'n') in
+          Row.V_text (if needs_dot then s ^ ".0" else s)
+        | Row.V_text s -> Row.V_text s
+        | Row.V_blob b -> Row.V_text (Bytes.to_string b)
+        | Row.V_null   -> assert false)
+     | Ast.Ty_blob ->
+       (match v with
+        | Row.V_blob b -> Row.V_blob b
+        | Row.V_text s -> Row.V_blob (Bytes.of_string s)
+        | Row.V_int n  -> Row.V_blob (Bytes.of_string (Int64.to_string n))
+        | Row.V_real f -> Row.V_blob (Bytes.of_string (Printf.sprintf "%.15g" f))
+        | Row.V_null   -> assert false))
+
+(* Bitwise binops: result is NULL unless both operands are integers. *)
+let int_bitop lv rv f =
+  match lv, rv with
+  | Row.V_int a, Row.V_int b -> Row.V_int (f a b)
+  | _ -> Row.V_null
+
 let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
   match e with
   | Plan.P_lit l            -> lit_to_value l
@@ -428,22 +900,7 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
        let ge_lo = compare_values vx vlo >= 0 in
        let le_hi = compare_values vx vhi <= 0 in
        Row.V_int (if ge_lo && le_hi then 1L else 0L))
-  | Plan.P_in (x, vals) ->
-    let vx = eval_expr clock params row x in
-    if vx = Row.V_null then Row.V_null
-    else
-      let result = List.fold_left (fun acc ve ->
-        let v = eval_expr clock params row ve in
-        match acc with
-        | `Found -> `Found
-        | _ when v = Row.V_null -> `Maybe
-        | _ when compare_values vx v = 0 -> `Found
-        | acc -> acc
-      ) `Not_found vals in
-      (match result with
-       | `Found     -> Row.V_int 1L
-       | `Maybe     -> Row.V_null
-       | `Not_found -> Row.V_int 0L)
+  | Plan.P_in (x, vals) -> eval_in clock params row x vals
   | Plan.P_is_null e ->
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_int 1L
@@ -476,66 +933,8 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
   | Plan.P_func (func, args) ->
     eval_func clock func (List.map (eval_expr clock params row) args)
   | Plan.P_case { scrutinee; branches; else_ } ->
-    let scr_val = Option.map (eval_expr clock params row) scrutinee in
-    let rec find_match = function
-      | [] ->
-        (match else_ with
-         | None   -> Row.V_null
-         | Some e -> eval_expr clock params row e)
-      | (cond, result) :: rest ->
-        let matched = match scr_val with
-          | None ->
-            value_truthy (eval_expr clock params row cond)
-          | Some sv ->
-            let cv = eval_expr clock params row cond in
-            (match sv, cv with
-             | Row.V_null, _ | _, Row.V_null -> false
-             | _ -> compare_values sv cv = 0)
-        in
-        if matched then eval_expr clock params row result
-        else find_match rest
-    in
-    find_match branches
-  | Plan.P_cast (e, ty) ->
-    let v = eval_expr clock params row e in
-    (match v with
-     | Row.V_null -> Row.V_null
-     | _ ->
-       (match ty with
-        | Ast.Ty_int ->
-          (match v with
-           | Row.V_int n  -> Row.V_int n
-           | Row.V_real f -> Row.V_int (Int64.of_float f)
-           | Row.V_text s -> Row.V_int (parse_int_prefix s)
-           | Row.V_blob _ -> Row.V_int 0L
-           | Row.V_null   -> assert false)
-        | Ast.Ty_real ->
-          (match v with
-           | Row.V_int n  -> Row.V_real (Int64.to_float n)
-           | Row.V_real f -> Row.V_real f
-           | Row.V_text s -> Row.V_real (parse_real_prefix s)
-           | Row.V_blob _ -> Row.V_real 0.0
-           | Row.V_null   -> assert false)
-        | Ast.Ty_text ->
-          (match v with
-           | Row.V_int n  -> Row.V_text (Int64.to_string n)
-           | Row.V_real f ->
-             (* SQLite appends ".0" when the %.15g result has no decimal point
-                or exponent, so that CAST(1.0 AS TEXT) → "1.0" not "1". *)
-             let s = Printf.sprintf "%.15g" f in
-             let needs_dot = not (String.contains s '.' || String.contains s 'e'
-                                  || String.contains s 'E' || String.contains s 'n') in
-             Row.V_text (if needs_dot then s ^ ".0" else s)
-           | Row.V_text s -> Row.V_text s
-           | Row.V_blob b -> Row.V_text (Bytes.to_string b)
-           | Row.V_null   -> assert false)
-        | Ast.Ty_blob ->
-          (match v with
-           | Row.V_blob b -> Row.V_blob b
-           | Row.V_text s -> Row.V_blob (Bytes.of_string s)
-           | Row.V_int n  -> Row.V_blob (Bytes.of_string (Int64.to_string n))
-           | Row.V_real f -> Row.V_blob (Bytes.of_string (Printf.sprintf "%.15g" f))
-           | Row.V_null   -> assert false)))
+    eval_case_expr clock params row scrutinee branches else_
+  | Plan.P_cast (e, ty) -> eval_cast (eval_expr clock params row e) ty
   | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ ->
     (* These are replaced by pre_eval_subquery before row evaluation. *)
     Row.V_null
@@ -549,478 +948,52 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
   | Plan.P_collate (e, _) ->
     eval_expr clock params row e  (* Collate_binary and Collate_rtrim are identity *)
 
-and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
-  let to_float_opt = function
-    | Row.V_real f -> Some f
-    | Row.V_int n  -> Some (Int64.to_float n)
-    | _            -> None
-  in
-  match func, args with
-  | Ast.Fn_length, [Row.V_text s] -> Row.V_int (Int64.of_int (String.length s))
-  | Ast.Fn_length, [Row.V_blob b] -> Row.V_int (Int64.of_int (Bytes.length b))
-  | Ast.Fn_length, [Row.V_null]   -> Row.V_null
-  | Ast.Fn_length, [_]            -> Row.V_null  (* non-text/blob: return null like SQLite *)
-  | Ast.Fn_lower,  [Row.V_text s] -> Row.V_text (String.lowercase_ascii s)
-  | Ast.Fn_lower,  [Row.V_null]   -> Row.V_null
-  | Ast.Fn_lower,  [_]            -> Row.V_null
-  | Ast.Fn_upper,  [Row.V_text s] -> Row.V_text (String.uppercase_ascii s)
-  | Ast.Fn_upper,  [Row.V_null]   -> Row.V_null
-  | Ast.Fn_upper,  [_]            -> Row.V_null
-  | Ast.Fn_abs,    [Row.V_int  n] -> Row.V_int  (Int64.abs n)
-  | Ast.Fn_abs,    [Row.V_real f] -> Row.V_real (Float.abs f)
-  | Ast.Fn_abs,    [Row.V_null]   -> Row.V_null
-  | Ast.Fn_abs,    [_]            -> Row.V_null
-  | Ast.Fn_coalesce, vs           ->
-    (match List.find_opt (fun v -> v <> Row.V_null) vs with
-     | Some v -> v | None -> Row.V_null)
-  | Ast.Fn_ifnull, [a; b]         -> (match a with Row.V_null -> b | v -> v)
-  | Ast.Fn_substr, (Row.V_text s :: rest) ->
-    (match rest with
-     | [Row.V_int start] ->
-       let i = max 0 (Int64.to_int start - 1) in
-       if i >= String.length s then Row.V_text ""
-       else Row.V_text (String.sub s i (String.length s - i))
-     | [Row.V_int start; Row.V_int len] ->
-       let i = max 0 (Int64.to_int start - 1) in
-       let l = Int64.to_int len in
-       if i >= String.length s || l <= 0 then Row.V_text ""
-       else Row.V_text (String.sub s i (min l (String.length s - i)))
-     | _ -> Row.V_null)
-  | Ast.Fn_substr, (Row.V_null :: _) -> Row.V_null
-  | Ast.Fn_trim,  [Row.V_text s]                        -> Row.V_text (str_trim_spaces s)
-  | Ast.Fn_trim,  [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_trim_chars s chars)
-  | Ast.Fn_trim,  [_; Row.V_null]                       -> Row.V_null
-  | Ast.Fn_trim,  (Row.V_null :: _)                     -> Row.V_null
-  | Ast.Fn_ltrim, [Row.V_text s]                        -> Row.V_text (str_ltrim_spaces s)
-  | Ast.Fn_ltrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_ltrim_chars s chars)
-  | Ast.Fn_ltrim, [_; Row.V_null]                       -> Row.V_null
-  | Ast.Fn_ltrim, (Row.V_null :: _)                     -> Row.V_null
-  | Ast.Fn_rtrim, [Row.V_text s]                        -> Row.V_text (str_rtrim_spaces s)
-  | Ast.Fn_rtrim, [Row.V_text s; Row.V_text chars]      -> Row.V_text (str_rtrim_chars s chars)
-  | Ast.Fn_rtrim, [_; Row.V_null]                       -> Row.V_null
-  | Ast.Fn_rtrim, (Row.V_null :: _)                     -> Row.V_null
-  | Ast.Fn_replace, [Row.V_text s; Row.V_text old; Row.V_text rep] ->
-    Row.V_text (str_replace s old rep)
-  | Ast.Fn_replace, [_; Row.V_null; _] -> Row.V_null
-  | Ast.Fn_replace, [_; _; Row.V_null] -> Row.V_null
-  | Ast.Fn_replace, (Row.V_null :: _) -> Row.V_null
-  | Ast.Fn_instr, [Row.V_text s; Row.V_text sub] ->
-    Row.V_int (Int64.of_int (str_instr s sub))
-  | Ast.Fn_instr, (Row.V_null :: _) | Ast.Fn_instr, [_; Row.V_null] -> Row.V_null
-  | Ast.Fn_round, [Row.V_real f] ->
-    Row.V_real (Float.round f)
-  | Ast.Fn_round, [Row.V_int n] ->
-    Row.V_real (Int64.to_float n)
-  | Ast.Fn_round, [Row.V_real f; Row.V_int d] ->
-    let factor = 10. ** Int64.to_float d in
-    Row.V_real (Float.round (f *. factor) /. factor)
-  | Ast.Fn_round, [Row.V_int n; Row.V_int _] ->
-    Row.V_real (Int64.to_float n)
-  | Ast.Fn_round, [_; Row.V_null] -> Row.V_null
-  | Ast.Fn_round, (Row.V_null :: _) -> Row.V_null
-  | Ast.Fn_typeof, [v] ->
-    Row.V_text (match v with
-      | Row.V_int  _ -> "integer"
-      | Row.V_real _ -> "real"
-      | Row.V_text _ -> "text"
-      | Row.V_blob _ -> "blob"
-      | Row.V_null   -> "null")
-  | Ast.Fn_date, args ->
-    (match args with
-     | [] | [Row.V_null] -> Row.V_null
-     | Row.V_null :: _ -> Row.V_null
-     | Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_text (Datetime.to_date dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_time, args ->
-    (match args with
-     | [] | [Row.V_null] -> Row.V_null
-     | Row.V_null :: _ -> Row.V_null
-     | Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_text (Datetime.to_time dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_datetime, args ->
-    (match args with
-     | [] | [Row.V_null] -> Row.V_null
-     | Row.V_null :: _ -> Row.V_null
-     | Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_text (Datetime.to_datetime dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_julianday, args ->
-    (match args with
-     | [] | [Row.V_null] -> Row.V_null
-     | Row.V_null :: _ -> Row.V_null
-     | Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_real (Datetime.to_julianday dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_unixepoch, args ->
-    (match args with
-     | [] | [Row.V_null] -> Row.V_null
-     | Row.V_null :: _ -> Row.V_null
-     | Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_int (Datetime.to_unixepoch dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_strftime, args ->
-    (match args with
-     | Row.V_text fmt :: Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_text (Datetime.strftime fmt dt))
-     | _ -> Row.V_null)
-  | Ast.Fn_ceil, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.ceil f) | None -> Row.V_null)
-  | Ast.Fn_floor, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.floor f) | None -> Row.V_null)
-  | Ast.Fn_sqrt, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.sqrt f) | None -> Row.V_null)
-  | Ast.Fn_pow, [b; e] ->
-    (match to_float_opt b, to_float_opt e with
-     | Some bf, Some ef -> Row.V_real (bf ** ef)
-     | _ -> Row.V_null)
-  | Ast.Fn_exp, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.exp f) | None -> Row.V_null)
-  | Ast.Fn_ln, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
-  | Ast.Fn_log, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
-  | Ast.Fn_log, [b; x] ->
-    (match to_float_opt b, to_float_opt x with
-     | Some bf, Some xf -> Row.V_real (Float.log xf /. Float.log bf)
-     | _ -> Row.V_null)
-  | Ast.Fn_log2, [v] ->
-    (match to_float_opt v with
-     | Some f -> Row.V_real (Float.log f /. Float.log 2.0)
-     | None -> Row.V_null)
-  | Ast.Fn_log10, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.log10 f) | None -> Row.V_null)
-  | Ast.Fn_sign, [v] ->
-    (match to_float_opt v with
-     | Some f -> Row.V_int (if f > 0.0 then 1L else if f < 0.0 then (-1L) else 0L)
-     | None -> Row.V_null)
-  | Ast.Fn_trunc, [v] ->
-    (match to_float_opt v with
-     | Some f -> Row.V_real (if f >= 0.0 then Float.floor f else Float.ceil f)
-     | None -> Row.V_null)
-  | Ast.Fn_trunc, [v; d] ->
-    (match to_float_opt v, to_float_opt d with
-     | Some f, Some df ->
-       let factor = 10.0 ** (Float.round df) in
-       let fx = f *. factor in
-       Row.V_real ((if fx >= 0.0 then Float.floor fx else Float.ceil fx) /. factor)
-     | _ -> Row.V_null)
-  | Ast.Fn_pi, [] -> Row.V_real Float.pi
-  | Ast.Fn_sin, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.sin f) | None -> Row.V_null)
-  | Ast.Fn_cos, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.cos f) | None -> Row.V_null)
-  | Ast.Fn_tan, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.tan f) | None -> Row.V_null)
-  | Ast.Fn_asin, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.asin f) | None -> Row.V_null)
-  | Ast.Fn_acos, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.acos f) | None -> Row.V_null)
-  | Ast.Fn_atan, [v] ->
-    (match to_float_opt v with Some f -> Row.V_real (Float.atan f) | None -> Row.V_null)
-  | Ast.Fn_atan2, [y; x] ->
-    (match to_float_opt y, to_float_opt x with
-     | Some yf, Some xf -> Row.V_real (Float.atan2 yf xf)
-     | _ -> Row.V_null)
-  | Ast.Fn_degrees, [v] ->
-    (match to_float_opt v with
-     | Some f -> Row.V_real (f *. 180.0 /. Float.pi)
-     | None -> Row.V_null)
-  | Ast.Fn_radians, [v] ->
-    (match to_float_opt v with
-     | Some f -> Row.V_real (f *. Float.pi /. 180.0)
-     | None -> Row.V_null)
-  | Ast.Fn_json_extract, [json_v; path_v] ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    let path_s = (match path_v with Row.V_text s -> s | _ -> "") in
-    (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv   ->
-       (match Json.path_get jv path_s with
-        | None   -> Row.V_null
-        | Some v -> sql_of_json v))
-  | Ast.Fn_json_object, pairs ->
-    if List.length pairs mod 2 <> 0 then Row.V_null
-    else
-      let rec make_pairs = function
-        | []          -> []
-        | k :: v :: rest ->
-          let key = (match k with Row.V_text s -> s | _ -> "") in
-          (key, json_of_sql v) :: make_pairs rest
-        | [_]         -> assert false
+and eval_in clock params row x vals =
+  let vx = eval_expr clock params row x in
+  if vx = Row.V_null then Row.V_null
+  else
+    let result = List.fold_left (fun acc ve ->
+      let v = eval_expr clock params row ve in
+      match acc with
+      | `Found -> `Found
+      | _ when v = Row.V_null -> `Maybe
+      | _ when compare_values vx v = 0 -> `Found
+      | acc -> acc
+    ) `Not_found vals in
+    (match result with
+     | `Found     -> Row.V_int 1L
+     | `Maybe     -> Row.V_null
+     | `Not_found -> Row.V_int 0L)
+
+and eval_case_expr clock params row scrutinee branches else_ =
+  let scr_val = Option.map (eval_expr clock params row) scrutinee in
+  let rec find_match = function
+    | [] ->
+      (match else_ with
+       | None   -> Row.V_null
+       | Some e -> eval_expr clock params row e)
+    | (cond, result) :: rest ->
+      let matched = match scr_val with
+        | None ->
+          value_truthy (eval_expr clock params row cond)
+        | Some sv ->
+          let cv = eval_expr clock params row cond in
+          (match sv, cv with
+           | Row.V_null, _ | _, Row.V_null -> false
+           | _ -> compare_values sv cv = 0)
       in
-      Row.V_text (Json.to_string (Json.J_object (make_pairs pairs)))
-  | Ast.Fn_json_array, elems ->
-    Row.V_text (Json.to_string (Json.J_array (List.map json_of_sql elems)))
-  | Ast.Fn_json_type, [json_v] ->
-    (match json_v with
-     | Row.V_text s ->
-       (match Json.parse s with
-        | Error _ -> Row.V_null
-        | Ok jv   -> Row.V_text (Json.type_name jv))
-     | _ -> Row.V_null)
-  | Ast.Fn_json_type, [json_v; path_v] ->
-    (match json_v, path_v with
-     | Row.V_text s, Row.V_text path ->
-       (match Json.parse s with
-        | Error _ -> Row.V_null
-        | Ok jv   ->
-          (match Json.path_get jv path with
-           | None    -> Row.V_null
-           | Some sub -> Row.V_text (Json.type_name sub)))
-     | _ -> Row.V_null)
-  | Ast.Fn_json_valid, [json_v] ->
-    (match json_v with
-     | Row.V_null -> Row.V_null
-     | Row.V_text s ->
-       (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
-     | _ -> Row.V_int 0L)
-  | Ast.Fn_json_set, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv ->
-       let rec apply jv = function
-         | path_v :: val_v :: rest ->
-           let path = (match path_v with Row.V_text s -> s | _ -> "") in
-           apply (Json.path_set jv path (json_of_sql val_v)) rest
-         | _ -> jv
-       in
-       Row.V_text (Json.to_string (apply jv rest)))
-  | Ast.Fn_json_insert, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv ->
-       let rec apply jv = function
-         | path_v :: val_v :: rest ->
-           let path = (match path_v with Row.V_text s -> s | _ -> "") in
-           apply (Json.path_insert jv path (json_of_sql val_v)) rest
-         | _ -> jv
-       in
-       Row.V_text (Json.to_string (apply jv rest)))
-  | Ast.Fn_json_replace, json_v :: rest ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv ->
-       let rec apply jv = function
-         | path_v :: val_v :: rest ->
-           let path = (match path_v with Row.V_text s -> s | _ -> "") in
-           apply (Json.path_replace jv path (json_of_sql val_v)) rest
-         | _ -> jv
-       in
-       Row.V_text (Json.to_string (apply jv rest)))
-  | Ast.Fn_json_remove, json_v :: paths ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv ->
-       let result = List.fold_left (fun acc path_v ->
-         let path = (match path_v with Row.V_text s -> s | _ -> "") in
-         Json.path_remove acc path
-       ) jv paths in
-       Row.V_text (Json.to_string result))
-  (* ── HEX ──────────────────────────────────────────────────────── *)
-  | Ast.Fn_hex, [Row.V_blob b] ->
-    let buf = Buffer.create (Bytes.length b * 2) in
-    Bytes.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) b;
-    Row.V_text (Buffer.contents buf)
-  | Ast.Fn_hex, [Row.V_text s] ->
-    let buf = Buffer.create (String.length s * 2) in
-    String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
-    Row.V_text (Buffer.contents buf)
-  | Ast.Fn_hex, [Row.V_int n] ->
-    (* SQLite converts the integer to its decimal string representation, then hexes that *)
-    let s = Int64.to_string n in
-    let buf = Buffer.create (String.length s * 2) in
-    String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
-    Row.V_text (Buffer.contents buf)
-  | Ast.Fn_hex, [Row.V_null] -> Row.V_text ""
+      if matched then eval_expr clock params row result
+      else find_match rest
+  in
+  find_match branches
 
-  (* ── CHAR ──────────────────────────────────────────────────────── *)
-  | Ast.Fn_char, args ->
-    let buf = Buffer.create 16 in
-    List.iter (fun v ->
-      match v with
-      | Row.V_int n when n >= 1L && n <= 0x10FFFFL ->
-        let cp = Int64.to_int n in
-        if cp < 0x80 then
-          Buffer.add_char buf (Char.chr cp)
-        else if cp < 0x800 then begin
-          Buffer.add_char buf (Char.chr (0xC0 lor (cp lsr 6)));
-          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-        end else if cp < 0x10000 then begin
-          Buffer.add_char buf (Char.chr (0xE0 lor (cp lsr 12)));
-          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
-          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-        end else begin
-          Buffer.add_char buf (Char.chr (0xF0 lor (cp lsr 18)));
-          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
-          Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
-          Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-        end
-      | _ -> ()
-    ) args;
-    Row.V_text (Buffer.contents buf)
-
-  (* ── UNICODE ──────────────────────────────────────────────────── *)
-  | Ast.Fn_unicode, [Row.V_text s] when String.length s > 0 ->
-    let b0 = Char.code s.[0] in
-    let cp =
-      if b0 < 0x80 then b0
-      else if b0 < 0xE0 && String.length s >= 2 then
-        ((b0 land 0x1F) lsl 6) lor (Char.code s.[1] land 0x3F)
-      else if b0 < 0xF0 && String.length s >= 3 then
-        ((b0 land 0x0F) lsl 12)
-        lor ((Char.code s.[1] land 0x3F) lsl 6)
-        lor (Char.code s.[2] land 0x3F)
-      else if b0 >= 0xF0 && String.length s >= 4 then
-        ((b0 land 0x07) lsl 18)
-        lor ((Char.code s.[1] land 0x3F) lsl 12)
-        lor ((Char.code s.[2] land 0x3F) lsl 6)
-        lor (Char.code s.[3] land 0x3F)
-      else b0
-    in
-    Row.V_int (Int64.of_int cp)
-  | Ast.Fn_unicode, [Row.V_text _] -> Row.V_null
-  | Ast.Fn_unicode, [Row.V_null]   -> Row.V_null
-
-  (* ── PRINTF / FORMAT ──────────────────────────────────────────── *)
-  | Ast.Fn_printf, (Row.V_text fmt :: rest) ->
-    let args_arr = Array.of_list rest in
-    let arg_idx = ref 0 in
-    let buf = Buffer.create 64 in
-    let n = String.length fmt in
-    let i = ref 0 in
-    while !i < n do
-      if fmt.[!i] = '%' then begin
-        incr i;
-        if !i < n then begin
-          let get_arg () =
-            let v = if !arg_idx < Array.length args_arr
-                    then args_arr.(!arg_idx)
-                    else Row.V_null in
-            incr arg_idx; v
-          in
-          (match fmt.[!i] with
-           | '%' -> Buffer.add_char buf '%'
-           | 'd' | 'i' ->
-             (match get_arg () with
-              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
-              | Row.V_real f -> Buffer.add_string buf (string_of_int (int_of_float f))
-              | Row.V_text s -> (try Buffer.add_string buf (string_of_int (int_of_string s))
-                                 with Failure _ -> ())
-              | _ -> ())
-           | 'f' ->
-             (match get_arg () with
-              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%f" f)
-              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%f" (Int64.to_float n2))
-              | _ -> ())
-           | 'e' ->
-             (match get_arg () with
-              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%e" f)
-              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%e" (Int64.to_float n2))
-              | _ -> ())
-           | 'g' ->
-             (match get_arg () with
-              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-              | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%g" (Int64.to_float n2))
-              | _ -> ())
-           | 's' ->
-             (match get_arg () with
-              | Row.V_text s -> Buffer.add_string buf s
-              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
-              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-              | Row.V_null   -> Buffer.add_string buf "NULL"
-              | Row.V_blob _ -> Buffer.add_string buf "")
-           | 'q' ->
-             (match get_arg () with
-              | Row.V_text s ->
-                String.iter (fun c ->
-                  if c = '\'' then Buffer.add_string buf "''"
-                  else Buffer.add_char buf c) s
-              | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
-              | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-              | Row.V_null   -> Buffer.add_string buf "NULL"
-              | Row.V_blob _ -> ())
-           | c ->
-             Buffer.add_char buf '%';
-             Buffer.add_char buf c);
-          incr i
-        end
-      end else begin
-        Buffer.add_char buf fmt.[!i];
-        incr i
-      end
-    done;
-    Row.V_text (Buffer.contents buf)
-  | Ast.Fn_printf, _ -> Row.V_null
-
-  (* ── ZEROBLOB ──────────────────────────────────────────────────── *)
-  | Ast.Fn_zeroblob, [Row.V_int n] when n >= 0L ->
-    Row.V_blob (Bytes.make (Int64.to_int n) '\000')
-  | Ast.Fn_zeroblob, _ -> Row.V_null
-
-  (* ── RANDOM ──────────────────────────────────────────────────── *)
-  | Ast.Fn_random, [] ->
-    let b0 = Int64.of_int (Random.bits ()) in
-    let b1 = Int64.of_int (Random.bits ()) in
-    let b2 = Int64.of_int (Random.bits ()) in
-    let sign = if Random.bool () then Int64.min_int else 0L in
-    let v =
-      Int64.logor sign
-        (Int64.logor
-          (Int64.shift_left b2 60)
-          (Int64.logor (Int64.shift_left b1 30) b0))
-    in
-    Row.V_int v
-  | Ast.Fn_random, _ -> Row.V_null
-
-  (* ── RANDOMBLOB ──────────────────────────────────────────────── *)
-  (* SQLite always generates at least 1 byte, even for n <= 0.
-     Clamp to [1, Sys.max_string_length] to avoid allocation errors. *)
-  | Ast.Fn_randomblob, [Row.V_int n] ->
-    let sz = max 1 (if n < 0L || n > Int64.of_int Sys.max_string_length
-                    then 1 else Int64.to_int n) in
-    Row.V_blob (Bytes.init sz (fun _ -> Char.chr (Random.int 256)))
-  | Ast.Fn_randomblob, _ -> Row.V_null
-
-  (* ── CHANGES / LAST_INSERT_ROWID fallback ─────────────────────── *)
-  | Ast.Fn_changes, [] -> Row.V_int 0L
-  | Ast.Fn_changes, _  -> Row.V_null
-  | Ast.Fn_last_insert_rowid, [] -> Row.V_int 0L
-  | Ast.Fn_last_insert_rowid, _  -> Row.V_null
-
-  (* ── TOTAL_CHANGES fallback (intercepted in db.ml when at top level) ── *)
-  | Ast.Fn_total_changes, [] -> Row.V_int 0L
-  | Ast.Fn_total_changes, _  -> Row.V_null
-
-  (* ── SQLITE_VERSION (constant text; evaluated inline, no plan op) ─── *)
-  | Ast.Fn_sqlite_version, [] -> Row.V_text "3.45.0-sqlocaml"
-  | Ast.Fn_sqlite_version, _  -> Row.V_null
-
-  | _ ->
-    failwith (Printf.sprintf "scalar_func: unexpected argument count (arity check should have caught this)")
+and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
+  match eval_str_func func args with Some v -> v | None ->
+  match eval_math_func func args with Some v -> v | None ->
+  match eval_datetime_func clock func args with Some v -> v | None ->
+  match eval_json_func func args with Some v -> v | None ->
+  match eval_misc_func func args with Some v -> v | None ->
+  failwith "scalar_func: unexpected argument count (arity check should have caught this)"
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with
@@ -1084,30 +1057,16 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
      | Row.V_real a, Row.V_int b ->
        if b = 0L then Row.V_null else Row.V_real (mod_float a (Int64.to_float b))
      | _ -> Row.V_null)
-  | Plan.Bit_and ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int a, Row.V_int b -> Row.V_int (Int64.logand a b)
-     | _ -> Row.V_null)
-  | Plan.Bit_or ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int a, Row.V_int b -> Row.V_int (Int64.logor a b)
-     | _ -> Row.V_null)
-  | Plan.Lshift ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int a, Row.V_int b ->
-       let n = Int64.to_int b in
-       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_left a n)
-     | _ -> Row.V_null)
-  | Plan.Rshift ->
-    (match lv, rv with
-     | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int a, Row.V_int b ->
-       let n = Int64.to_int b in
-       Row.V_int (if n < 0 || n >= 64 then 0L else Int64.shift_right a n)
-     | _ -> Row.V_null)
+  | Plan.Bit_and -> int_bitop lv rv Int64.logand
+  | Plan.Bit_or  -> int_bitop lv rv Int64.logor
+  | Plan.Lshift  ->
+    int_bitop lv rv (fun a b ->
+      let n = Int64.to_int b in
+      if n < 0 || n >= 64 then 0L else Int64.shift_left a n)
+  | Plan.Rshift  ->
+    int_bitop lv rv (fun a b ->
+      let n = Int64.to_int b in
+      if n < 0 || n >= 64 then 0L else Int64.shift_right a n)
   | Plan.Like ->
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
