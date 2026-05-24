@@ -264,6 +264,27 @@ let encode_column (col : Row.column) =
      Buffer.add_string buf sql);
   Buffer.to_bytes buf
 
+let decode_check_sql bytes off =
+  if Bytes.length bytes - off <= 0 then (None, off)
+  else
+    let has_check, off2 = Varint.decode_uint64 bytes off in
+    if Int64.to_int has_check = 0 then (None, off2)
+    else
+      let sql_len, off3 = Varint.decode_uint64 bytes off2 in
+      let sql = Bytes.sub_string bytes off3 (Int64.to_int sql_len) in
+      (Some sql, off3 + Int64.to_int sql_len)
+
+let decode_generated_as bytes off =
+  if Bytes.length bytes - off <= 0 then None
+  else
+    let has_gen, off2 = Varint.decode_uint64 bytes off in
+    if Int64.to_int has_gen = 0 then None
+    else
+      let is_stored, off3 = Varint.decode_uint64 bytes off2 in
+      let sql_len, off4   = Varint.decode_uint64 bytes off3 in
+      let sql = Bytes.sub_string bytes off4 (Int64.to_int sql_len) in
+      Some (sql, Int64.to_int is_stored = 1)
+
 let decode_column bytes =
   let tag, off = Varint.decode_uint64 bytes 0 in
   let len, off = Varint.decode_uint64 bytes off in
@@ -284,31 +305,8 @@ let decode_column bytes =
       if Int64.to_int has_def = 0 then (None, off)
       else let dv, off' = decode_default_value bytes off in (Some dv, off')
     in
-    let bytes_left2 = Bytes.length bytes - off in
-    let check_sql, final_off =
-      if bytes_left2 <= 0 then (None, off)
-      else
-        let has_check, off2 = Varint.decode_uint64 bytes off in
-        if Int64.to_int has_check = 0 then (None, off2)
-        else
-          let sql_len, off3 = Varint.decode_uint64 bytes off2 in
-          let sql = Bytes.sub_string bytes off3 (Int64.to_int sql_len) in
-          let off4 = off3 + Int64.to_int sql_len in
-          (Some sql, off4)
-    in
-    let generated_as =
-      let remaining = Bytes.length bytes - final_off in
-      if remaining <= 0 then None
-      else
-        let has_gen, off2 = Varint.decode_uint64 bytes final_off in
-        if Int64.to_int has_gen = 0 then None
-        else
-          let is_stored, off3 = Varint.decode_uint64 bytes off2 in
-          let sql_len, off4   = Varint.decode_uint64 bytes off3 in
-          let sql = Bytes.sub_string bytes off4 (Int64.to_int sql_len) in
-          ignore (off4 + Int64.to_int sql_len);
-          Some (sql, Int64.to_int is_stored = 1)
-    in
+    let check_sql, final_off = decode_check_sql bytes off in
+    let generated_as = decode_generated_as bytes final_off in
     Row.{ name; ty = type_of_tag (Int64.to_int tag);
           not_null    = (Int64.to_int nn <> 0);
           primary_key = (Int64.to_int pk <> 0);
@@ -349,6 +347,41 @@ let encode_index_value (idx : index_info) =
      Buffer.add_string buf sql);
   Buffer.to_bytes buf
 
+let decode_index_ext_fields bytes off2 cols =
+  if off2 >= Bytes.length bytes then
+    (List.map (fun _ -> false) cols, None)   (* old format: no extended fields *)
+  else
+    let version, off3 = Varint.decode_uint64 bytes off2 in
+    (match Int64.to_int version with
+     | 1 ->
+       (* Version 1 (Task 1): only WHERE clause, no expr flags *)
+       let has_where, off4 = Varint.decode_uint64 bytes off3 in
+       let where_sql =
+         if Int64.to_int has_where = 0 then None
+         else
+           let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+           Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+       in
+       (List.map (fun _ -> false) cols, where_sql)
+     | 2 ->
+       (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
+       let off_ref = ref off3 in
+       let expr_flags = List.map (fun _ ->
+         let flag, next = Varint.decode_uint64 bytes !off_ref in
+         off_ref := next;
+         Int64.to_int flag = 1
+       ) cols in
+       let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
+       let where_sql =
+         if Int64.to_int has_where = 0 then None
+         else
+           let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+           Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
+       in
+       (expr_flags, where_sql)
+     | _ ->
+       (List.map (fun _ -> false) cols, None))
+
 let decode_index_value bytes =
   let name_len, off = Varint.decode_uint64 bytes 0 in
   let name_len = Int64.to_int name_len in
@@ -369,41 +402,7 @@ let decode_index_value bytes =
   ) in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
-  let idx_expr_flags, idx_where_sql =
-    if off2 >= Bytes.length bytes then
-      (List.map (fun _ -> false) cols, None)   (* old format: no extended fields *)
-    else
-      let version, off3 = Varint.decode_uint64 bytes off2 in
-      (match Int64.to_int version with
-       | 1 ->
-         (* Version 1 (Task 1): only WHERE clause, no expr flags *)
-         let has_where, off4 = Varint.decode_uint64 bytes off3 in
-         let where_sql =
-           if Int64.to_int has_where = 0 then None
-           else
-             let sql_len, off5 = Varint.decode_uint64 bytes off4 in
-             Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
-         in
-         (List.map (fun _ -> false) cols, where_sql)
-       | 2 ->
-         (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
-         let off_ref = ref off3 in
-         let expr_flags = List.map (fun _ ->
-           let flag, next = Varint.decode_uint64 bytes !off_ref in
-           off_ref := next;
-           Int64.to_int flag = 1
-         ) cols in
-         let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
-         let where_sql =
-           if Int64.to_int has_where = 0 then None
-           else
-             let sql_len, off5 = Varint.decode_uint64 bytes off4 in
-             Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len))
-         in
-         (expr_flags, where_sql)
-       | _ ->
-         (List.map (fun _ -> false) cols, None))
-  in
+  let idx_expr_flags, idx_where_sql = decode_index_ext_fields bytes off2 cols in
   { idx_name      = name;
     idx_table     = tbl;
     idx_columns   = cols;
@@ -993,6 +992,62 @@ let drop_table t tx ~name =
   Hashtbl.remove t.cache name;
   Lwt.return_unit
 
+let rekey_table_columns tx ~old_name ~new_name ~n_cols =
+  let rec loop i =
+    if i >= n_cols then Lwt.return (Ok ())
+    else
+      let old_k = column_key old_name i in
+      let new_k = column_key new_name i in
+      let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
+      (match bytes_opt with
+       | None ->
+         let%lwt () = S.rollback tx in
+         Lwt.return (Error (Printf.sprintf
+           "catalog corrupt: column %d missing for table %s" i old_name))
+       | Some bytes ->
+         let%lwt () = S.del tx sys_columns_tid old_k in
+         let%lwt () = S.put tx sys_columns_tid new_k bytes in
+         loop (i + 1))
+  in
+  loop 0
+
+let finish_rename t tx ~old_name ~new_name ~meta =
+  (* Re-write sys_indexes entries that reference old_name *)
+  let%lwt idx_updates =
+    S.with_ro t.store @@ fun tx_ro_idx ->
+    let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
+    let _sr = S.cursor_first cur in
+    let idx_updates = ref [] in
+    let rec scan_idxs () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, v) ->
+        let info = decode_index_value v in
+        if String.equal info.idx_table old_name then
+          idx_updates := (k, info) :: !idx_updates;
+        scan_idxs ()
+    in
+    scan_idxs ();
+    S.cursor_close cur;
+    Lwt.return !idx_updates
+  in
+  let%lwt () = Lwt_list.iter_s (fun (k, (info : index_info)) ->
+    let new_info = { info with idx_table = new_name } in
+    S.put tx sys_indexes_tid k (encode_index_value new_info)
+  ) idx_updates in
+  let%lwt () = S.commit tx in
+  (* Update in-memory cache *)
+  Hashtbl.remove  t.cache old_name;
+  Hashtbl.replace t.cache new_name { meta with name = new_name };
+  (* Update in-memory index entries that reference old table name *)
+  let to_update = Hashtbl.fold (fun k v acc ->
+    if String.equal v.idx_table old_name then (k, v) :: acc else acc
+  ) t.indexes [] in
+  List.iter (fun (k, v) ->
+    Hashtbl.replace t.indexes k { v with idx_table = new_name }
+  ) to_update;
+  Lwt.return (Ok ())
+
 let rename_table t ~old_name ~new_name =
   match Hashtbl.find_opt t.cache old_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
@@ -1008,62 +1063,12 @@ let rename_table t ~old_name ~new_name =
           (Bytes.of_string new_name)
           (encode_table_value meta) in
       (* Re-key all column entries; return Error if any entry is missing *)
-      let n_cols = List.length meta.columns in
-      let rec loop i =
-        if i >= n_cols then Lwt.return (Ok ())
-        else
-          let old_k = column_key old_name i in
-          let new_k = column_key new_name i in
-          let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
-          (match bytes_opt with
-           | None ->
-             let%lwt () = S.rollback tx in
-             Lwt.return (Error (Printf.sprintf
-               "catalog corrupt: column %d missing for table %s" i old_name))
-           | Some bytes ->
-             let%lwt () = S.del tx sys_columns_tid old_k in
-             let%lwt () = S.put tx sys_columns_tid new_k bytes in
-             loop (i + 1))
-      in
-      let%lwt col_result = loop 0 in
+      let%lwt col_result =
+        rekey_table_columns tx ~old_name ~new_name
+          ~n_cols:(List.length meta.columns) in
       (match col_result with
        | Error msg -> Lwt.return (Error msg)
-       | Ok () ->
-         (* Re-write sys_indexes entries that reference old_name *)
-         let%lwt idx_updates =
-           S.with_ro t.store @@ fun tx_ro_idx ->
-           let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
-           let _sr = S.cursor_first cur in
-           let idx_updates = ref [] in
-           let rec scan_idxs () =
-             match S.cursor_next cur with
-             | None -> ()
-             | Some (k, v) ->
-               let info = decode_index_value v in
-               if String.equal info.idx_table old_name then
-                 idx_updates := (k, info) :: !idx_updates;
-               scan_idxs ()
-           in
-           scan_idxs ();
-           S.cursor_close cur;
-           Lwt.return !idx_updates
-         in
-         let%lwt () = Lwt_list.iter_s (fun (k, (info : index_info)) ->
-           let new_info = { info with idx_table = new_name } in
-           S.put tx sys_indexes_tid k (encode_index_value new_info)
-         ) idx_updates in
-         let%lwt () = S.commit tx in
-         (* Update in-memory cache *)
-         Hashtbl.remove  t.cache old_name;
-         Hashtbl.replace t.cache new_name { meta with name = new_name };
-         (* Update in-memory index entries that reference old table name *)
-         let to_update = Hashtbl.fold (fun k v acc ->
-           if String.equal v.idx_table old_name then (k, v) :: acc else acc
-         ) t.indexes [] in
-         List.iter (fun (k, v) ->
-           Hashtbl.replace t.indexes k { v with idx_table = new_name }
-         ) to_update;
-         Lwt.return (Ok ()))
+       | Ok () -> finish_rename t tx ~old_name ~new_name ~meta)
     end
 
 let rename_column t ~table_name ~old_col ~new_col =
