@@ -24,7 +24,9 @@ overrides the file (e.g. `merlint -r E105` to look at one rule in isolation).
 The `lint` job in `.forgejo/workflows/ci.yml` runs merlint on every push/PR but
 is marked `continue-on-error: true` — it **reports** findings without failing
 the build. The intent is to ratchet the curated rule set down to zero via the
-follow-ups below, then flip `continue-on-error` to `false` to enforce.
+follow-ups below, then flip `continue-on-error` to `false` to enforce. After the
+#153 and #173 work, the only remaining finding is E500 (missing `.ocamlformat`),
+deferred to #171; once that lands the gate can flip to enforcing.
 
 ## Disabled rules and why
 
@@ -77,9 +79,23 @@ incl. the 1058-line `to_stream`), `sema.ml` (11, incl. the 669-line
 (`fault_inject`/`index_key`/`row`/`json`/`pager`). E005 is now enforceable for
 `lib/` + `bin/`.
 
-## Enabled rules: current findings (16)
+### Scoped exclusion: E110 in `test/` only (#173)
 
-All other rules stay on. Status after the #153 ratchet:
+`E110` (silenced warning) stays **enabled for `lib/` and `bin/`** but is excluded
+for `test/*.ml*`. In tests the suppressions are deliberate scaffolding:
+`[@warning "-69"]` on mock-pager record fields that are written but never read
+(`test_btree`), and `[@@warning "-32"]` on `*_lwt` helper variants retained
+during the monadic-test migration (#161). The 5 `lib/` sites were resolved
+directly: three were stale suppressions on bindings that are actually used
+(`Catalog.read_user_version_tx` / `write_user_version_tx`,
+`Exec.find_col_idx_by_name_opt`) so the attribute was dropped; two were
+genuinely-dead private functions (`Exec.fk_child_has_ref` single-col variant,
+`Exec.scan_child_rows_tx`) and were deleted. E110 is now enforceable for
+`lib/` + `bin/`.
+
+## Enabled rules: current findings (1)
+
+All other rules stay on. Status after the #153 and #173 work:
 
 | Rule | Name | Count | Disposition |
 |------|------|-------|-------------|
@@ -94,9 +110,9 @@ All other rules stay on. Status after the #153 ratchet:
 | E330 | Redundant Module Name | 0 | Resolved (#153) — genuine cases fixed (`fts_query`→`t`, `store_of`→`txn_store`); intentional domain constants excluded. |
 | E010 | Deep Nesting | 0 | Resolved (#153) — helpers extracted in `row.decode`, `exec` snippet/update, test `run_case`. |
 | E001 | High Cyclomatic Complexity | 0 | Resolved (#153) — `parse_file` split into top-level helpers. |
-| E110 | Silenced Warning | 13 | Open — `[@@warning "-32"]`/`-69` on API/test bindings. |
-| E505 | Missing MLI File | 2 | Open — `lib/sql/ast.ml`, `lib/sql/plan.ml`; large interface-authoring task, deferred to a follow-up. |
-| E500 | Missing `.ocamlformat` | 1 | Open. |
+| E110 | Silenced Warning | 0 | Resolved (#173) — 5 `lib/` sites fixed (3 stale suppressions dropped, 2 dead fns deleted); `test/` scaffolding excluded. Enforceable. |
+| E505 | Missing MLI File | 0 | Resolved (#173) — authored `lib/sql/ast.mli` (full AST surface) and `lib/sql/plan.mli` (query-plan IR). |
+| E500 | Missing `.ocamlformat` | 1 | Open — deferred to #171 (full ocamlformat adoption: profile=janestreet, version=0.29.0, tree-wide reformat + CI fmt check, for parity with `camel`). Sole remaining blocker to flipping the CI `lint` job to enforcing. |
 
 No `Obj.magic` exists anywhere in the codebase — the linter's other headline
 concern is already clean.
