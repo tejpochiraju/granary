@@ -48,6 +48,48 @@ let equal a b =
   Array.length a = Array.length b
   && Array.for_all2 value_equal a b
 
+(* Encode one column's value into [buf], enforcing that the value's runtime
+   type matches the column's declared type. NULLs encode nothing (the null
+   bitmap records them). *)
+let encode_col_value buf (col : column) v =
+  match v with
+  | V_null -> ()
+  | V_int n ->
+    (match col.ty with
+     | Integer -> Varint.encode_int64 buf n
+     | _ ->
+       invalid_arg (Printf.sprintf
+         "Row.encode: integer value in non-integer column '%s'" col.name))
+  | V_text s ->
+    (match col.ty with
+     | Text ->
+       Varint.encode_uint64 buf (Int64.of_int (String.length s));
+       Buffer.add_string buf s
+     | _ ->
+       invalid_arg (Printf.sprintf
+         "Row.encode: text value in non-text column '%s'" col.name))
+  | V_real f ->
+    (match col.ty with
+     | Real ->
+       (* 8-byte little-endian IEEE-754 float64 *)
+       let bits = Int64.bits_of_float f in
+       let tmp = Bytes.create 8 in
+       for k = 0 to 7 do
+         Bytes.set_uint8 tmp k (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (k * 8)) 0xFFL))
+       done;
+       Buffer.add_bytes buf tmp
+     | _ ->
+       invalid_arg (Printf.sprintf
+         "Row.encode: real value in non-real column '%s'" col.name))
+  | V_blob b ->
+    (match col.ty with
+     | Blob ->
+       Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+       Buffer.add_bytes buf b
+     | _ ->
+       invalid_arg (Printf.sprintf
+         "Row.encode: blob value in non-blob column '%s'" col.name))
+
 let encode schema row =
   let n = List.length schema in
   if Array.length row <> n then
@@ -80,43 +122,7 @@ let encode schema row =
   (* 3. non-null values in column order — skip VIRTUAL generated cols *)
   List.iteri (fun i col ->
     if is_virtual_col i then ()
-    else match row.(i) with
-    | V_null   -> ()
-    | V_int n ->
-      (match col.ty with
-       | Integer -> Varint.encode_int64 buf n
-       | _ ->
-         invalid_arg (Printf.sprintf
-           "Row.encode: integer value in non-integer column '%s'" col.name))
-    | V_text s ->
-      (match col.ty with
-       | Text ->
-         Varint.encode_uint64 buf (Int64.of_int (String.length s));
-         Buffer.add_string buf s
-       | _ ->
-         invalid_arg (Printf.sprintf
-           "Row.encode: text value in non-text column '%s'" col.name))
-    | V_real f ->
-      (match col.ty with
-       | Real ->
-         (* 8-byte little-endian IEEE-754 float64 *)
-         let bits = Int64.bits_of_float f in
-         let tmp = Bytes.create 8 in
-         for k = 0 to 7 do
-           Bytes.set_uint8 tmp k (Int64.to_int (Int64.logand (Int64.shift_right_logical bits (k * 8)) 0xFFL))
-         done;
-         Buffer.add_bytes buf tmp
-       | _ ->
-         invalid_arg (Printf.sprintf
-           "Row.encode: real value in non-real column '%s'" col.name))
-    | V_blob b ->
-      (match col.ty with
-       | Blob ->
-         Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
-         Buffer.add_bytes buf b
-       | _ ->
-         invalid_arg (Printf.sprintf
-           "Row.encode: blob value in non-blob column '%s'" col.name))
+    else encode_col_value buf col row.(i)
   ) schema;
   Buffer.to_bytes buf
 

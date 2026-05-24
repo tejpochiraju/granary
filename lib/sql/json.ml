@@ -277,72 +277,73 @@ let path_get v path =
 
 type set_mode = Set | Insert | Replace
 
+(* Walk [steps] into [v], applying [mode]/[new_val] at the addressed leaf.
+   Out-of-range / type-mismatched paths leave [v] unchanged. *)
+let rec path_modify_go mode new_val v steps =
+  match steps with
+  | [] -> assert false
+  | [Key k] ->
+    (match v with
+     | J_object kvs ->
+       let exists = List.mem_assoc k kvs in
+       (match mode with
+        | Set ->
+          if exists
+          then J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_val) else (k2,v2)) kvs)
+          else J_object (kvs @ [(k, new_val)])
+        | Insert ->
+          if exists then v else J_object (kvs @ [(k, new_val)])
+        | Replace ->
+          if not exists then v
+          else J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_val) else (k2,v2)) kvs))
+     | _ -> v)
+  | [Idx i] ->
+    (match v with
+     | J_array elems ->
+       let n = List.length elems in
+       let i = if i < 0 then n + i else i in
+       (match mode with
+        | Set ->
+          if i < 0 || i > n then v
+          else if i = n then J_array (elems @ [new_val])
+          else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
+        | Replace ->
+          if i < 0 || i >= n then v
+          else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
+        | Insert ->
+          if i < 0 || i > n then v
+          else
+            let arr    = Array.of_list elems in
+            let result = Array.make (n + 1) J_null in
+            Array.blit arr 0 result 0 i;
+            result.(i) <- new_val;
+            Array.blit arr i result (i + 1) (n - i);
+            J_array (Array.to_list result))
+     | _ -> v)
+  | Key k :: rest ->
+    (match v with
+     | J_object kvs ->
+       (match List.assoc_opt k kvs with
+        | Some sub ->
+          let new_sub = path_modify_go mode new_val sub rest in
+          J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_sub) else (k2,v2)) kvs)
+        | None -> v)
+     | _ -> v)
+  | Idx i :: rest ->
+    (match v with
+     | J_array elems ->
+       let n = List.length elems in
+       let i = if i < 0 then n + i else i in
+       if i < 0 || i >= n then v
+       else J_array (List.mapi (fun j e -> if j = i then path_modify_go mode new_val e rest else e) elems)
+     | _ -> v)
+
 let path_modify mode v path new_val =
   match parse_path path with
   | Error _ -> v
   | Ok [] ->
     (match mode with Set | Replace -> new_val | Insert -> v)
-  | Ok steps ->
-    let rec go v steps =
-      match steps with
-      | [] -> assert false
-      | [Key k] ->
-        (match v with
-         | J_object kvs ->
-           let exists = List.mem_assoc k kvs in
-           (match mode with
-            | Set ->
-              if exists
-              then J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_val) else (k2,v2)) kvs)
-              else J_object (kvs @ [(k, new_val)])
-            | Insert ->
-              if exists then v else J_object (kvs @ [(k, new_val)])
-            | Replace ->
-              if not exists then v
-              else J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_val) else (k2,v2)) kvs))
-         | _ -> v)
-      | [Idx i] ->
-        (match v with
-         | J_array elems ->
-           let n = List.length elems in
-           let i = if i < 0 then n + i else i in
-           (match mode with
-            | Set ->
-              if i < 0 || i > n then v
-              else if i = n then J_array (elems @ [new_val])
-              else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
-            | Replace ->
-              if i < 0 || i >= n then v
-              else J_array (List.mapi (fun j e -> if j = i then new_val else e) elems)
-            | Insert ->
-              if i < 0 || i > n then v
-              else
-                let arr    = Array.of_list elems in
-                let result = Array.make (n + 1) J_null in
-                Array.blit arr 0 result 0 i;
-                result.(i) <- new_val;
-                Array.blit arr i result (i + 1) (n - i);
-                J_array (Array.to_list result))
-         | _ -> v)
-      | Key k :: rest ->
-        (match v with
-         | J_object kvs ->
-           (match List.assoc_opt k kvs with
-            | Some sub ->
-              let new_sub = go sub rest in
-              J_object (List.map (fun (k2,v2) -> if k2=k then (k2,new_sub) else (k2,v2)) kvs)
-            | None -> v)
-         | _ -> v)
-      | Idx i :: rest ->
-        (match v with
-         | J_array elems ->
-           let n = List.length elems in
-           let i = if i < 0 then n + i else i in
-           if i < 0 || i >= n then v
-           else J_array (List.mapi (fun j e -> if j = i then go e rest else e) elems)
-         | _ -> v)
-    in
-    go v steps
+  | Ok steps -> path_modify_go mode new_val v steps
 
 let path_set     v path new_val = path_modify Set     v path new_val
 let path_insert  v path new_val = path_modify Insert  v path new_val

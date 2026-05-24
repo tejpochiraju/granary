@@ -168,86 +168,60 @@ let cstruct_dup src =
   Cstruct.blit src 0 dst 0 len;
   dst
 
+(* Resolve [page_id] from the WAL, if any.  [finder] picks the relevant frame
+   (latest, or latest <= a snapshot bound).  WAL frames are NOT cached: frame
+   indices are recycled after a WAL reset (checkpoint), so a cached
+   (page_id, frame_idx) entry could be served stale.  Returns a fresh Cstruct. *)
+let resolve_wal_page t finder =
+  let open Lwt.Syntax in
+  match t.wal with
+  | None -> Lwt.return_ok None
+  | Some cb ->
+    match finder cb with
+    | None -> Lwt.return_ok None
+    | Some frame_idx ->
+      let* r = cb.wal_read_frame frame_idx in
+      (match r with
+       | Error s -> Lwt.return_error (Block_error s)
+       | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
+
+(* Load [page_id] from the shared cache, or from the block device on a miss
+   (caching the result).  The returned Cstruct is fresh. *)
+let load_main_page t pin_set page_id =
+  let open Lwt.Syntax in
+  let key = cache_key_main page_id in
+  match Hashtbl.find_opt t.cache key with
+  | Some buf ->
+    pin_page t pin_set page_id;
+    Lwt.return_ok (cstruct_dup buf)
+  | None ->
+    let buf = Cstruct.create Page.page_size in
+    let* result = t.read_page ~page_id buf in
+    match result with
+    | Error msg -> Lwt.return_error (Block_error msg)
+    | Ok () ->
+      cache_add t key (cstruct_dup buf);
+      pin_page t pin_set page_id;
+      Lwt.return_ok buf
+
 let read ?snapshot_frames ?pin_set t page_id =
   let open Lwt.Syntax in
+  let load_after_wal finder =
+    let* wal_r = resolve_wal_page t finder in
+    match wal_r with
+    | Error e -> Lwt.return_error e
+    | Ok (Some page) -> Lwt.return_ok page
+    | Ok None -> load_main_page t pin_set page_id
+  in
   match snapshot_frames with
   | None ->
     (* Writer / no-snapshot path: dirty wins. *)
     (match Hashtbl.find_opt t.dirty page_id with
      | Some buf -> Lwt.return_ok (cstruct_dup buf)
-     | None ->
-       let resolve_via_wal () =
-         match t.wal with
-         | None -> Lwt.return_ok None
-         | Some cb ->
-           match cb.wal_find_page page_id with
-           | None -> Lwt.return_ok None
-           | Some frame_idx ->
-             (* WAL frames are NOT cached in the shared pager cache because
-                frame indices are recycled after a WAL reset (checkpoint).
-                A cached (page_id, frame_idx) entry from before a reset
-                would be served stale after the WAL reuses that index.
-                The WAL device itself is the authoritative store for frames. *)
-             let* r = cb.wal_read_frame frame_idx in
-             (match r with
-              | Error s -> Lwt.return_error (Block_error s)
-              (* Pager's [.mli] promises a fresh Cstruct; enforce it here
-                 rather than relying on the WAL callback's contract. *)
-              | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
-       in
-       let* wal_r = resolve_via_wal () in
-       (match wal_r with
-        | Error e -> Lwt.return_error e
-        | Ok (Some page) -> Lwt.return_ok page
-        | Ok None ->
-          let key = cache_key_main page_id in
-          (match Hashtbl.find_opt t.cache key with
-           | Some buf ->
-             pin_page t pin_set page_id;
-             Lwt.return_ok (cstruct_dup buf)
-           | None ->
-             let buf = Cstruct.create Page.page_size in
-             let* result = t.read_page ~page_id buf in
-             match result with
-             | Error msg -> Lwt.return_error (Block_error msg)
-             | Ok () ->
-               cache_add t key (cstruct_dup buf);
-               pin_page t pin_set page_id;
-               Lwt.return_ok buf)))
+     | None -> load_after_wal (fun cb -> cb.wal_find_page page_id))
   | Some max_frame ->
     (* Snapshot reader path: never consult [dirty]. *)
-    let resolve_via_wal () =
-      match t.wal with
-      | None -> Lwt.return_ok None
-      | Some cb ->
-        match cb.wal_find_page_at page_id ~max_frame with
-        | None -> Lwt.return_ok None
-        | Some frame_idx ->
-          (* WAL frames are not cached — see comment in the None branch above. *)
-          let* r = cb.wal_read_frame frame_idx in
-          (match r with
-           | Error s -> Lwt.return_error (Block_error s)
-           | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
-    in
-    let* wal_r = resolve_via_wal () in
-    (match wal_r with
-     | Error e -> Lwt.return_error e
-     | Ok (Some page) -> Lwt.return_ok page
-     | Ok None ->
-       let key = cache_key_main page_id in
-       (match Hashtbl.find_opt t.cache key with
-        | Some buf ->
-          pin_page t pin_set page_id;
-          Lwt.return_ok (cstruct_dup buf)
-        | None ->
-          let buf = Cstruct.create Page.page_size in
-          let* result = t.read_page ~page_id buf in
-          match result with
-          | Error msg -> Lwt.return_error (Block_error msg)
-          | Ok () ->
-            cache_add t key (cstruct_dup buf);
-            pin_page t pin_set page_id;
-            Lwt.return_ok buf))
+    load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
 
 let write t page_id buf =
   let copy = cstruct_dup buf in

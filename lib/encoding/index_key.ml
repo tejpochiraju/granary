@@ -191,6 +191,65 @@ let encode cols ~rowid =
 (* decode                                                               *)
 (* ------------------------------------------------------------------ *)
 
+(* Decode a single tagged column value at [!off], appending to [cols] and
+   advancing [off]; records a message in [err] on malformed input. *)
+let decode_index_col buf ~off ~cols ~err =
+  let len = Bytes.length buf in
+  let tag = Bytes.get_uint8 buf !off in
+  incr off;
+  match tag with
+  | 0x00 ->
+    cols := IK_null :: !cols
+
+  | 0x01 ->
+    (* 8 bytes big-endian, sign bit flipped *)
+    if !off + 8 > len then
+      err := Some "buffer too short for INTEGER"
+    else begin
+      let stored = read_be64 buf !off in
+      let n = Int64.logxor stored 0x8000_0000_0000_0000L in
+      cols := IK_int n :: !cols;
+      off := !off + 8
+    end
+
+  | 0x02 ->
+    (* 8 bytes; MSB=0 means was negative (flip all bits back),
+       MSB=1 means was positive (flip only sign bit back) *)
+    if !off + 8 > len then
+      err := Some "buffer too short for REAL"
+    else begin
+      let stored = read_be64 buf !off in
+      off := !off + 8;
+      let bits =
+        if Int64.shift_right_logical stored 63 = 0L then
+          (* was negative float: flip all bits back *)
+          Int64.lognot stored
+        else
+          (* was positive float: flip only sign bit back *)
+          Int64.logxor stored Int64.min_int
+      in
+      cols := IK_real (Int64.float_of_bits bits) :: !cols
+    end
+
+  | 0x03 ->
+    (* TEXT: escaped bytes + 0x00 0x00 terminator *)
+    (match decode_escaped_bytes buf !off with
+     | Error msg -> err := Some msg
+     | Ok (raw, next_off) ->
+       cols := IK_text (Bytes.to_string raw) :: !cols;
+       off := next_off)
+
+  | 0x04 ->
+    (* BLOB: escaped bytes + 0x00 0x00 terminator *)
+    (match decode_escaped_bytes buf !off with
+     | Error msg -> err := Some msg
+     | Ok (raw, next_off) ->
+       cols := IK_blob raw :: !cols;
+       off := next_off)
+
+  | t ->
+    err := Some (Printf.sprintf "unknown tag byte: 0x%02x" t)
+
 let decode buf =
   let len = Bytes.length buf in
   (* We need at least 8 bytes for the rowid *)
@@ -204,62 +263,8 @@ let decode buf =
     while !err = None && !off < len - 8 do
       if !off >= len then
         err := Some "unexpected end of buffer"
-      else begin
-        let tag = Bytes.get_uint8 buf !off in
-        incr off;
-        match tag with
-        | 0x00 ->
-          cols := IK_null :: !cols
-
-        | 0x01 ->
-          (* 8 bytes big-endian, sign bit flipped *)
-          if !off + 8 > len then
-            err := Some "buffer too short for INTEGER"
-          else begin
-            let stored = read_be64 buf !off in
-            let n = Int64.logxor stored 0x8000_0000_0000_0000L in
-            cols := IK_int n :: !cols;
-            off := !off + 8
-          end
-
-        | 0x02 ->
-          (* 8 bytes; MSB=0 means was negative (flip all bits back),
-             MSB=1 means was positive (flip only sign bit back) *)
-          if !off + 8 > len then
-            err := Some "buffer too short for REAL"
-          else begin
-            let stored = read_be64 buf !off in
-            off := !off + 8;
-            let bits =
-              if Int64.shift_right_logical stored 63 = 0L then
-                (* was negative float: flip all bits back *)
-                Int64.lognot stored
-              else
-                (* was positive float: flip only sign bit back *)
-                Int64.logxor stored Int64.min_int
-            in
-            cols := IK_real (Int64.float_of_bits bits) :: !cols
-          end
-
-        | 0x03 ->
-          (* TEXT: escaped bytes + 0x00 0x00 terminator *)
-          (match decode_escaped_bytes buf !off with
-           | Error msg -> err := Some msg
-           | Ok (raw, next_off) ->
-             cols := IK_text (Bytes.to_string raw) :: !cols;
-             off := next_off)
-
-        | 0x04 ->
-          (* BLOB: escaped bytes + 0x00 0x00 terminator *)
-          (match decode_escaped_bytes buf !off with
-           | Error msg -> err := Some msg
-           | Ok (raw, next_off) ->
-             cols := IK_blob raw :: !cols;
-             off := next_off)
-
-        | t ->
-          err := Some (Printf.sprintf "unknown tag byte: 0x%02x" t)
-      end
+      else
+        decode_index_col buf ~off ~cols ~err
     done;
     match !err with
     | Some msg -> Error msg

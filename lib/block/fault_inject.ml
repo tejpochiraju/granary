@@ -24,6 +24,40 @@ let convert_unit_result = function
   | Ok () -> Ok ()
   | Error e -> Error (Format.asprintf "%a" Unix_file.pp_error e)
 
+(* The fault-injecting write callback: refuses once faulted, trips the
+   sticky fault after [fail_after_writes] writes, else writes through. *)
+let make_faulted_write t uf ~page_id buf =
+  if t.faulted then
+    Lwt.return (Error "injected crash (sticky)")
+  else begin
+    match t.config.fail_after_writes with
+    | Some n when t.writes >= n ->
+      t.faulted <- true;
+      Lwt.return (Error "injected crash")
+    | _ ->
+      let* r = Unix_file.write_page uf ~page_id buf in
+      (match r with
+       | Ok () ->
+         t.writes <- t.writes + 1;
+         Lwt.return (Ok ())
+       | Error e ->
+         Lwt.return
+           (Error (Format.asprintf "%a" Unix_file.pp_error e)))
+  end
+
+(* The fault-injecting sync callback: refuses once faulted, optionally trips
+   the sticky fault on sync, else syncs through. *)
+let make_faulted_sync t uf () =
+  if t.faulted then
+    Lwt.return (Error "injected crash (sticky)")
+  else if t.config.fail_on_sync then begin
+    t.faulted <- true;
+    Lwt.return (Error "injected sync failure")
+  end else begin
+    let* r = Unix_file.sync uf in
+    Lwt.return (convert_unit_result r)
+  end
+
 let open_with_faults ~path ~size_bytes ~config =
   (* Ensure the file exists and is sized to [size_bytes] bytes
      before opening it with Unix_file (which expects an already-sized
@@ -44,36 +78,8 @@ let open_with_faults ~path ~size_bytes ~config =
       let* r = Unix_file.read_page uf ~page_id buf in
       Lwt.return (convert_unit_result r)
     in
-    let write ~page_id buf =
-      if t.faulted then
-        Lwt.return (Error "injected crash (sticky)")
-      else begin
-        match t.config.fail_after_writes with
-        | Some n when t.writes >= n ->
-          t.faulted <- true;
-          Lwt.return (Error "injected crash")
-        | _ ->
-          let* r = Unix_file.write_page uf ~page_id buf in
-          (match r with
-           | Ok () ->
-             t.writes <- t.writes + 1;
-             Lwt.return (Ok ())
-           | Error e ->
-             Lwt.return
-               (Error (Format.asprintf "%a" Unix_file.pp_error e)))
-      end
-    in
-    let sync () =
-      if t.faulted then
-        Lwt.return (Error "injected crash (sticky)")
-      else if t.config.fail_on_sync then begin
-        t.faulted <- true;
-        Lwt.return (Error "injected sync failure")
-      end else begin
-        let* r = Unix_file.sync uf in
-        Lwt.return (convert_unit_result r)
-      end
-    in
+    let write = make_faulted_write t uf in
+    let sync = make_faulted_sync t uf in
     let resize ~n_pages =
       let* r = Unix_file.resize uf ~n_pages in
       Lwt.return (convert_unit_result r)
