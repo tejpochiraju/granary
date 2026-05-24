@@ -1,9 +1,8 @@
 # merlint configuration (#153).
 #
-# Warn-first adoption: CI reports findings but does not block the build yet.
+# Enforcing (#173): the curated rule set is at zero, so CI blocks on any finding.
 # The excluded rules below conflict with deliberate project conventions; every
-# other rule stays enabled. See MERLINT.md for the full rationale and the
-# tracked follow-ups (catch-all audit, long-function refactor).
+# other rule stays enabled. See MERLINT.md for the full rationale.
 #
 # Excluded rules and why:
 #   E205 - we use Printf/Format throughout, not the Fmt module.
@@ -20,6 +19,17 @@
 #          to the source line. It is ppx output, not hand-written double-underscore
 #          module access; there are zero genuine `Module__Sub` uses in the tree.
 #          A pure tooling artifact, like the test-layout rules above.
+#
+#   E005 - long functions. Excluded (#171): adopting ocamlformat (profile
+#          janestreet) makes the formatter own vertical layout — one list/record
+#          item per line, ;; separators, blank lines between bindings — which
+#          re-inflated line counts past E005's thresholds for 73 functions that
+#          #168 had driven to zero under the old hand formatting. A line-count
+#          linter and an opinionated auto-formatter both governing layout is
+#          redundant: E005 would now measure formatting, not logic, and
+#          hand-decomposing to satisfy it fights the formatter (a margin/profile
+#          bump re-breaks it). The #168 structural decompositions remain in the
+#          code; only the line-count metric is retired.
 #
 # Naming-convention opinions we decline (#153) - merlint's preferred terse
 # style conflicts with this project's deliberate descriptive naming (same
@@ -45,18 +55,13 @@
 #          constant; bare `magic` collides with the per-read local). Excluded
 #          for these deliberate constants.
 #
-# Scoped to test/ only (#167, #168):
+# Scoped to test/ only (#167, #173):
 #   E105 - catch-all exception handlers. In tests these are idiomatic best-effort
 #          cleanup (temp-file teardown `(try Unix.unlink p with _ -> ())`,
 #          Fun.protect finalizers, env-var parse fallbacks); a swallowed error in
 #          test scaffolding just skips cleanup. E105 stays ENABLED for lib/ and
 #          bin/, where the 12 production sites were narrowed to precise exceptions
 #          (Unix.Unix_error / Failure / Parser.Error / Invalid_argument).
-#   E005 - long functions. merlint auto-skips functions in NESTED test dirs but
-#          our suite lives flat under test/ (dirname has no '/'), so long bench
-#          harnesses (open_slow_store, main, open_slow_wal) are not auto-skipped.
-#          Long test/bench setup is acceptable; E005 stays ENABLED for lib/+bin/,
-#          which is where the #168 refactor drives it down.
 #   E110 - silenced warnings (#173). In tests these are deliberate scaffolding:
 #          `[@warning "-69"]` on mock record fields that are written but never
 #          read (test_btree mock pagers), and `[@@warning "-32"]` on *_lwt helper
@@ -73,6 +78,6 @@
 
 rules:
   - files: **/*.ml*
-    exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332, E330]
+    exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332, E330, E005]
   - files: test/*.ml*
-    exclude: [E105, E005, E110]
+    exclude: [E105, E110]

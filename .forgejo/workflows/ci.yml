@@ -30,10 +30,13 @@ jobs:
       - name: Install opam packages
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix
+            mirage-block mirage-block-unix ocamlformat.0.29.0
 
       - name: Build
         run: opam exec -- dune build
+
+      - name: Check formatting (#171)
+        run: opam exec -- dune build @fmt
 
       - name: Test
         run: opam exec -- dune runtest
@@ -48,9 +51,10 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
-    # Warn-first (#153): report merlint findings without blocking the build.
-    # Flip to false once the tracked follow-ups land the curated set at zero.
-    continue-on-error: true
+    # Enforcing (#173): the curated merlint set is at zero, so findings now
+    # block the build. History: adopted warn-first in #153, ratcheted to zero
+    # via #167/#168/#173, flipped to blocking once #171 (ocamlformat) cleared
+    # the last finding (E500).
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
 
