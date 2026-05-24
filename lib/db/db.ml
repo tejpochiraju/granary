@@ -614,49 +614,7 @@ let rec fire_trigger_stmt ?(tx : S.rw S.txn option = None) t stmt =
       match bound with
       | Error e ->
         Lwt.fail_with (Format.asprintf "trigger sema: %a" Sql.Sema.pp_error e)
-      | Ok b ->
-        let op = Sql.Planner.plan ~cat:t.catalog b in
-        let mode = match tx with
-          | Some tx -> Sql.Exec.In_txn tx
-          | None ->
-            (match t.explicit_txn with
-             | None     -> Sql.Exec.Auto
-             | Some etx -> Sql.Exec.In_txn etx)
-        in
-        (* Build hooks for the nested op so further triggers fire. *)
-        let table_meta_opt, event_opt = match op with
-          | Sql.Plan.Op_insert { table_meta; _ }
-          | Sql.Plan.Op_insert_select { table_meta; _ } ->
-            (Some table_meta, Some `Insert)
-          | Sql.Plan.Op_update { table_meta; _ } ->
-            (Some table_meta, Some `Update)
-          | Sql.Plan.Op_delete { table_meta; _ } ->
-            (Some table_meta, Some `Delete)
-          | _ -> (None, None)
-        in
-        let before_hook, after_hook =
-          match table_meta_opt, event_opt with
-          | Some tm, Some ev ->
-            (make_trigger_hook t tm ~timing:`Before ~event:ev,
-             make_trigger_hook t tm ~timing:`After  ~event:ev)
-          | _ -> (None, None)
-        in
-        (* For INSERT-ish ops, also install the REPLACE/UPSERT-displaced
-           BEFORE/AFTER hooks so nested INSERT OR REPLACE / UPSERT bodies
-           fire DELETE/UPDATE triggers on conflict-displaced rows. *)
-        let (on_replace_delete_before, on_replace_delete,
-             on_upsert_update_before, on_upsert_update) =
-          match op with
-          | Sql.Plan.Op_insert _ | Sql.Plan.Op_insert_select _ ->
-            insert_replace_upsert_hooks t op
-          | _ -> (None, None, None, None)
-        in
-        Sql.Exec.execute
-          ~before_hook ~after_hook
-          ~on_replace_delete_before ~on_replace_delete
-          ~on_upsert_update_before ~on_upsert_update
-          ~mode ~clock:t.clock
-          t.store t.catalog op
+      | Ok b -> run_trigger_op t ~tx b
     ) finally
   end
 
@@ -763,6 +721,48 @@ and insert_replace_upsert_hooks t op =
     (on_replace_delete_before, on_replace_delete,
      on_upsert_update_before, on_upsert_update)
 
+(** Plan and execute a trigger-body statement [b], installing the nested
+    trigger + REPLACE/UPSERT hooks so further triggers fire. *)
+and run_trigger_op t ~tx b =
+  let op = Sql.Planner.plan ~cat:t.catalog b in
+  let mode = match tx with
+    | Some tx -> Sql.Exec.In_txn tx
+    | None ->
+      (match t.explicit_txn with
+       | None     -> Sql.Exec.Auto
+       | Some etx -> Sql.Exec.In_txn etx)
+  in
+  let table_meta_opt, event_opt = match op with
+    | Sql.Plan.Op_insert { table_meta; _ }
+    | Sql.Plan.Op_insert_select { table_meta; _ } ->
+      (Some table_meta, Some `Insert)
+    | Sql.Plan.Op_update { table_meta; _ } ->
+      (Some table_meta, Some `Update)
+    | Sql.Plan.Op_delete { table_meta; _ } ->
+      (Some table_meta, Some `Delete)
+    | _ -> (None, None)
+  in
+  let before_hook, after_hook =
+    match table_meta_opt, event_opt with
+    | Some tm, Some ev ->
+      (make_trigger_hook t tm ~timing:`Before ~event:ev,
+       make_trigger_hook t tm ~timing:`After  ~event:ev)
+    | _ -> (None, None)
+  in
+  let (on_replace_delete_before, on_replace_delete,
+       on_upsert_update_before, on_upsert_update) =
+    match op with
+    | Sql.Plan.Op_insert _ | Sql.Plan.Op_insert_select _ ->
+      insert_replace_upsert_hooks t op
+    | _ -> (None, None, None, None)
+  in
+  Sql.Exec.execute
+    ~before_hook ~after_hook
+    ~on_replace_delete_before ~on_replace_delete
+    ~on_upsert_update_before ~on_upsert_update
+    ~mode ~clock:t.clock
+    t.store t.catalog op
+
 (** Extract column names from a view query's projection, in order.
     Returns [] if the projection cannot be resolved to simple column names. *)
 let view_col_names view_query =
@@ -796,185 +796,190 @@ let make_col_schema names =
       Row.generated_as = None }
   ) names
 
-(** Execute INSTEAD OF triggers for a view write operation. *)
-let execute_instead_of t view_name ast =
-  let find_instead_of event =
-    Hashtbl.fold (fun _name trig_ast acc ->
-      match trigger_meta_of_ast _name trig_ast with
-      | Some m when
-          String.equal m.trig_table view_name &&
-          m.trig_timing = `Instead_of &&
-          m.trig_event = event -> m :: acc
-      | _ -> acc
-    ) t.triggers []
-  in
-  let eval_insert_ast_value = function
-    | Sql.Ast.E_lit (Sql.Ast.L_int n)  -> Row.V_int n
-    | Sql.Ast.E_lit (Sql.Ast.L_text s) -> Row.V_text s
-    | Sql.Ast.E_lit (Sql.Ast.L_real f) -> Row.V_real f
-    | Sql.Ast.E_lit (Sql.Ast.L_blob b) -> Row.V_blob b
-    | Sql.Ast.E_lit Sql.Ast.L_null     -> Row.V_null
-    | Sql.Ast.E_neg (Sql.Ast.E_lit (Sql.Ast.L_int n)) ->
-      Row.V_int (Int64.neg n)
-    | _ -> Row.V_null
-  in
-  match ast with
-  | Sql.Ast.S_insert { columns; values; _ } ->
-    let matching = find_instead_of `Insert in
-    if matching = [] then
-      Lwt.return (Error (Sema (Sql.Sema.Unsupported
-        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF INSERT trigger)"
-           view_name))))
-    else begin
-      (* When INSERT has no explicit column list, derive column names from the view's SELECT. *)
-      let effective_cols =
-        if columns <> [] then columns
-        else
-          match Hashtbl.find_opt t.views view_name with
-          | Some view_query -> view_col_names view_query
-          | None -> []
-      in
-      (* Validate column count matches values arity *)
-      let* () =
-        match values with
-        | [] -> Lwt.return_unit
-        | first_row :: _ ->
-          let n_vals = List.length first_row in
-          let n_cols = List.length effective_cols in
-          if effective_cols = [] then Lwt.return_unit  (* no columns = no schema, trigger may not use NEW.col *)
-          else if n_cols <> n_vals then
-            Lwt.fail_with (Printf.sprintf
-              "INSTEAD OF INSERT on view '%s': cannot derive column names for all values (view has computed expressions without aliases)"
-              view_name)
-          else Lwt.return_unit
-      in
-      let* () = Lwt_list.iter_s (fun value_exprs ->
-        let schema = make_col_schema effective_cols in
-        let new_vals = List.map eval_insert_ast_value value_exprs in
-        let new_row = Some (Array.of_list new_vals) in
-        Lwt_list.iter_s (fun m ->
-          let substituted_body = List.map (fun stmt ->
-            subst_new_old ~schema ~new_row ~old_row:None stmt
-          ) m.trig_body in
-          Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
-        ) matching
-      ) values in
-      Lwt.return (Ok ())
-    end
-  | Sql.Ast.S_delete _ ->
-    let matching = find_instead_of `Delete in
-    if matching = [] then
-      Lwt.return (Error (Sema (Sql.Sema.Unsupported
-        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF DELETE trigger)"
-           view_name))))
-    else begin
-      let schema = [] in
-      let* () = Lwt_list.iter_s (fun m ->
+(** Collect INSTEAD OF triggers on [view_name] matching the given event. *)
+let find_instead_of t view_name event =
+  Hashtbl.fold (fun _name trig_ast acc ->
+    match trigger_meta_of_ast _name trig_ast with
+    | Some m when
+        String.equal m.trig_table view_name &&
+        m.trig_timing = `Instead_of &&
+        m.trig_event = event -> m :: acc
+    | _ -> acc
+  ) t.triggers []
+
+(** Evaluate a literal INSERT/UPDATE value expression to a [Row.value];
+    non-literal expressions collapse to NULL (matches Phase 32 semantics). *)
+let eval_insert_ast_value = function
+  | Sql.Ast.E_lit (Sql.Ast.L_int n)  -> Row.V_int n
+  | Sql.Ast.E_lit (Sql.Ast.L_text s) -> Row.V_text s
+  | Sql.Ast.E_lit (Sql.Ast.L_real f) -> Row.V_real f
+  | Sql.Ast.E_lit (Sql.Ast.L_blob b) -> Row.V_blob b
+  | Sql.Ast.E_lit Sql.Ast.L_null     -> Row.V_null
+  | Sql.Ast.E_neg (Sql.Ast.E_lit (Sql.Ast.L_int n)) ->
+    Row.V_int (Int64.neg n)
+  | _ -> Row.V_null
+
+let instead_of_insert t view_name ~columns ~values =
+  let matching = find_instead_of t view_name `Insert in
+  if matching = [] then
+    Lwt.return (Error (Sema (Sql.Sema.Unsupported
+      (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF INSERT trigger)"
+         view_name))))
+  else begin
+    (* When INSERT has no explicit column list, derive column names from the view's SELECT. *)
+    let effective_cols =
+      if columns <> [] then columns
+      else
+        match Hashtbl.find_opt t.views view_name with
+        | Some view_query -> view_col_names view_query
+        | None -> []
+    in
+    (* Validate column count matches values arity *)
+    let* () =
+      match values with
+      | [] -> Lwt.return_unit
+      | first_row :: _ ->
+        let n_vals = List.length first_row in
+        let n_cols = List.length effective_cols in
+        if effective_cols = [] then Lwt.return_unit  (* no columns = no schema, trigger may not use NEW.col *)
+        else if n_cols <> n_vals then
+          Lwt.fail_with (Printf.sprintf
+            "INSTEAD OF INSERT on view '%s': cannot derive column names for all values (view has computed expressions without aliases)"
+            view_name)
+        else Lwt.return_unit
+    in
+    let* () = Lwt_list.iter_s (fun value_exprs ->
+      let schema = make_col_schema effective_cols in
+      let new_vals = List.map eval_insert_ast_value value_exprs in
+      let new_row = Some (Array.of_list new_vals) in
+      Lwt_list.iter_s (fun m ->
         let substituted_body = List.map (fun stmt ->
-          subst_new_old ~schema ~new_row:None ~old_row:None stmt
+          subst_new_old ~schema ~new_row ~old_row:None stmt
         ) m.trig_body in
         Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
-      ) matching in
-      Lwt.return (Ok ())
-    end
-  | Sql.Ast.S_update { assignments; where; _ } ->
-    let matching = find_instead_of `Update in
-    if matching = [] then
-      Lwt.return (Error (Sema (Sql.Sema.Unsupported
-        (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF UPDATE trigger)"
-           view_name))))
-    else begin
-      (* Build NEW row from assignment expressions.
-         Only literal values are substituted; complex expressions become NULL. *)
-      let assign_cols  = List.map fst assignments in
-      let assign_exprs = List.map snd assignments in
-      let new_schema   = make_col_schema assign_cols in
-      let new_vals     = List.map eval_insert_ast_value assign_exprs in
-      let new_row      = Some (Array.of_list new_vals) in
-      (* Populate OLD rows by selecting from the view under the WHERE clause.
-         Mirrors SQLite's INSTEAD OF UPDATE semantics.
+      ) matching
+    ) values in
+    Lwt.return (Ok ())
+  end
 
-         We distinguish three outcomes:
-         - [`Resolved rows]: OLD column names derivable AND the SELECT
-           succeeded; fire once per row (zero times if [rows = []]).
-         - [`Unresolved]: OLD column names not derivable, OR the WHERE
-           clause cannot be round-tripped via [expr_to_sql] (e.g. it
-           contains a subquery), OR the SELECT failed to compile/execute.
-           Fall back to Phase 32 behavior: fire once with OLD=NULL. *)
-      let view_query = Hashtbl.find_opt t.views view_name in
-      let old_col_names =
-        match view_query with
-        | Some vq -> view_col_names vq
-        | None    -> []
-      in
-      let old_schema = make_col_schema old_col_names in
-      let* outcome =
-        match view_query with
-        | None -> Lwt.return `Unresolved
-        | Some _ when old_col_names = [] ->
-          (* View projects unnamed expressions; OLD.col can't bind.
-             Preserve Phase 32 fallback: fire once with OLD=NULL. *)
-          Lwt.return `Unresolved
-        | Some _ ->
-          (* Re-serialize the WHERE clause to SQL.  [expr_to_sql] raises
-             Failure for subqueries, aggregates, blob literals, etc.; in
-             those cases we cannot determine OLD rows, so fall back to
-             firing once with OLD=NULL. *)
-          let where_sql_opt =
-            match where with
-            | None -> Some None
-            | Some w ->
-              (try Some (Some (Sql.Ast.expr_to_sql w))
-               with Failure _ -> None)
+let instead_of_delete t view_name =
+  let matching = find_instead_of t view_name `Delete in
+  if matching = [] then
+    Lwt.return (Error (Sema (Sql.Sema.Unsupported
+      (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF DELETE trigger)"
+         view_name))))
+  else begin
+    let schema = [] in
+    let* () = Lwt_list.iter_s (fun m ->
+      let substituted_body = List.map (fun stmt ->
+        subst_new_old ~schema ~new_row:None ~old_row:None stmt
+      ) m.trig_body in
+      Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+    ) matching in
+    Lwt.return (Ok ())
+  end
+
+(** Resolve the OLD rows for an INSTEAD OF UPDATE by re-selecting from the
+    view under [where].  Returns [`Resolved rows] when column names are
+    derivable and the SELECT succeeds, else [`Unresolved] (caller fires once
+    with OLD=NULL — the Phase 32 fallback). *)
+let resolve_instead_of_update_olds t view_name ~where ~old_col_names =
+  match Hashtbl.find_opt t.views view_name with
+  | None -> Lwt.return `Unresolved
+  | Some _ when old_col_names = [] ->
+    (* View projects unnamed expressions; OLD.col can't bind. *)
+    Lwt.return `Unresolved
+  | Some _ ->
+    (* Re-serialize the WHERE clause to SQL.  [expr_to_sql] raises Failure
+       for subqueries, aggregates, blob literals, etc.; in those cases we
+       cannot determine OLD rows, so fall back to firing once with OLD=NULL. *)
+    let where_sql_opt =
+      match where with
+      | None -> Some None
+      | Some w ->
+        (try Some (Some (Sql.Ast.expr_to_sql w))
+         with Failure _ -> None)
+    in
+    (match where_sql_opt with
+     | None -> Lwt.return `Unresolved
+     | Some where_sql ->
+       let select_sql =
+         match where_sql with
+         | None       -> Printf.sprintf "SELECT * FROM %s" view_name
+         | Some w_sql -> Printf.sprintf "SELECT * FROM %s WHERE %s"
+                           view_name w_sql
+       in
+       let* op = compile t select_sql in
+       (match op with
+        | Error _ -> Lwt.return `Unresolved
+        | Ok plan_op ->
+          let mode = match t.explicit_txn with
+            | None    -> Sql.Exec.Auto
+            | Some tx -> Sql.Exec.In_txn tx
           in
-          (match where_sql_opt with
-           | None -> Lwt.return `Unresolved
-           | Some where_sql ->
-             let select_sql =
-               match where_sql with
-               | None       -> Printf.sprintf "SELECT * FROM %s" view_name
-               | Some w_sql -> Printf.sprintf "SELECT * FROM %s WHERE %s"
-                                 view_name w_sql
-             in
-             let* op = compile t select_sql in
-             (match op with
-              | Error _ -> Lwt.return `Unresolved
-              | Ok plan_op ->
-                let mode = match t.explicit_txn with
-                  | None    -> Sql.Exec.Auto
-                  | Some tx -> Sql.Exec.In_txn tx
-                in
-                (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog plan_op with
-                 | exception Failure _ -> Lwt.return `Unresolved
-                 | lwt_stream ->
-                   Lwt.catch
-                     (fun () ->
-                       let* stream = lwt_stream in
-                       let* rows = Lwt_stream.to_list stream in
-                       Lwt.return (`Resolved rows))
-                     (fun _ -> Lwt.return `Unresolved))))
-      in
-      let process_one_old_row old_row_opt =
-        Lwt_list.iter_s (fun m ->
-          let substituted_body = List.map (fun stmt ->
-            (* Substitute NEW first using the assignment-column schema,
-               then OLD using the view's column schema.  Both passes are
-               disjoint: each only rewrites references whose alias matches
-               its schema. *)
-            let s1 = subst_new_old ~schema:new_schema ~new_row ~old_row:None stmt in
-            subst_new_old ~schema:old_schema ~new_row:None ~old_row:old_row_opt s1
-          ) m.trig_body in
-          Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
-        ) matching
-      in
-      let* () =
-        match outcome with
-        | `Unresolved      -> process_one_old_row None
-        | `Resolved rows   ->
-          Lwt_list.iter_s (fun r -> process_one_old_row (Some r)) rows
-      in
-      Lwt.return (Ok ())
-    end
+          (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog plan_op with
+           | exception Failure _ -> Lwt.return `Unresolved
+           | lwt_stream ->
+             Lwt.catch
+               (fun () ->
+                 let* stream = lwt_stream in
+                 let* rows = Lwt_stream.to_list stream in
+                 Lwt.return (`Resolved rows))
+               (fun _ -> Lwt.return `Unresolved))))
+
+let instead_of_update t view_name ~assignments ~where =
+  let matching = find_instead_of t view_name `Update in
+  if matching = [] then
+    Lwt.return (Error (Sema (Sql.Sema.Unsupported
+      (Printf.sprintf "view '%s' is not directly modifiable (no INSTEAD OF UPDATE trigger)"
+         view_name))))
+  else begin
+    (* Build NEW row from assignment expressions.
+       Only literal values are substituted; complex expressions become NULL. *)
+    let assign_cols  = List.map fst assignments in
+    let assign_exprs = List.map snd assignments in
+    let new_schema   = make_col_schema assign_cols in
+    let new_vals     = List.map eval_insert_ast_value assign_exprs in
+    let new_row      = Some (Array.of_list new_vals) in
+    let old_col_names =
+      match Hashtbl.find_opt t.views view_name with
+      | Some vq -> view_col_names vq
+      | None    -> []
+    in
+    let old_schema = make_col_schema old_col_names in
+    let* outcome =
+      resolve_instead_of_update_olds t view_name ~where ~old_col_names in
+    let process_one_old_row old_row_opt =
+      Lwt_list.iter_s (fun m ->
+        let substituted_body = List.map (fun stmt ->
+          (* Substitute NEW first using the assignment-column schema,
+             then OLD using the view's column schema.  Both passes are
+             disjoint: each only rewrites references whose alias matches
+             its schema. *)
+          let s1 = subst_new_old ~schema:new_schema ~new_row ~old_row:None stmt in
+          subst_new_old ~schema:old_schema ~new_row:None ~old_row:old_row_opt s1
+        ) m.trig_body in
+        Lwt_list.iter_s (fire_trigger_stmt t) substituted_body
+      ) matching
+    in
+    let* () =
+      match outcome with
+      | `Unresolved      -> process_one_old_row None
+      | `Resolved rows   ->
+        Lwt_list.iter_s (fun r -> process_one_old_row (Some r)) rows
+    in
+    Lwt.return (Ok ())
+  end
+
+(** Execute INSTEAD OF triggers for a view write operation. *)
+let execute_instead_of t view_name ast =
+  match ast with
+  | Sql.Ast.S_insert { columns; values; _ } ->
+    instead_of_insert t view_name ~columns ~values
+  | Sql.Ast.S_delete _ ->
+    instead_of_delete t view_name
+  | Sql.Ast.S_update { assignments; where; _ } ->
+    instead_of_update t view_name ~assignments ~where
   | _ ->
     Lwt.return (Error (Sema (Sql.Sema.Unsupported
       (Printf.sprintf "view '%s' is not directly modifiable" view_name))))
@@ -987,6 +992,174 @@ let execute_instead_of t view_name ast =
    [fire_trigger_stmt] / [make_trigger_hook] recursive group above so that
    nested trigger bodies can install REPLACE/UPSERT secondary hooks. *)
 
+(* Handle non-DML control / DDL ops (txn control, ATTACH/DETACH, schema
+   switch, CREATE/DROP VIEW/TRIGGER, VACUUM).  Returns [Some result] for ops
+   it owns and [None] for DML / catch-all ops the caller routes to
+   [execute_dml_op].  Shared by [execute] and [execute_change_count]; the
+   latter maps the [unit] result to a [0] change count. *)
+let execute_control_op top t sql op =
+  match op with
+  | Sql.Plan.Op_begin    -> Some (begin_txn t)
+  | Sql.Plan.Op_commit   -> Some (commit_txn t)
+  | Sql.Plan.Op_rollback -> Some (rollback_txn t)
+  | Sql.Plan.Op_savepoint name   -> Some (savepoint_txn t name)
+  | Sql.Plan.Op_release name     -> Some (release_savepoint t name)
+  | Sql.Plan.Op_rollback_to name -> Some (rollback_to_savepoint t name)
+  | Sql.Plan.Op_attach { path; schema } ->
+    Some (
+      if String.equal schema "main" then
+        Lwt.return (Error (Runtime "ATTACH: 'main' is reserved"))
+      else if Hashtbl.mem top.attached schema then
+        Lwt.return (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
+      else begin
+        let* result = open_file ~path in
+        match result with
+        | Error e -> Lwt.return (Error e)
+        | Ok sub_db ->
+          Hashtbl.add top.attached schema sub_db;
+          Lwt.return (Ok ())
+      end)
+  | Sql.Plan.Op_detach { schema } ->
+    Some (
+      if String.equal schema "main" then
+        Lwt.return (Error (Runtime "DETACH: cannot detach 'main'"))
+      else begin
+        match Hashtbl.find_opt top.attached schema with
+        | None -> Lwt.return (Error (Runtime (Printf.sprintf "DETACH: no such schema '%s'" schema)))
+        | Some sub ->
+          Hashtbl.remove top.attached schema;
+          if String.equal top.active_schema schema then top.active_schema <- "main";
+          let* () = close sub in
+          Lwt.return (Ok ())
+      end)
+  | Sql.Plan.Op_active_database_set { schema } ->
+    Some (
+      if String.equal schema "main" || Hashtbl.mem top.attached schema then begin
+        top.active_schema <- schema;
+        Lwt.return (Ok ())
+      end else
+        Lwt.return (Error (Runtime (Printf.sprintf "active_database: no such schema '%s'" schema))))
+  | Sql.Plan.Op_database_list ->
+    (* No rows produced via execute; use [query]/[Db.query] to read. *)
+    Some (Lwt.return (Ok ()))
+  | Sql.Plan.Op_active_database_get ->
+    (* No rows produced via execute; use [query]/[Db.query] to read. *)
+    Some (Lwt.return (Ok ()))
+  | Sql.Plan.Op_create_view { name; query } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
+    Some (
+      Hashtbl.replace t.views name query;
+      let* () = Cat.persist_view t.store ~name ~sql in
+      Lwt.return (Ok ()))
+  | Sql.Plan.Op_drop_view { name } ->
+    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
+    Some (
+      Hashtbl.remove t.views name;
+      let* () = Cat.remove_view t.store ~name in
+      Lwt.return (Ok ()))
+  | Sql.Plan.Op_create_trigger { name; timing; event; table; when_; body } ->
+    Some (
+      let ast = Sql.Ast.S_create_trigger { name; timing; event; table; when_; body } in
+      Hashtbl.replace t.triggers name ast;
+      let* () = Cat.persist_trigger t.store ~name ~sql in
+      Lwt.return (Ok ()))
+  | Sql.Plan.Op_drop_trigger { name } ->
+    Some (
+      Hashtbl.remove t.triggers name;
+      let* () = Cat.remove_trigger t.store ~name in
+      Lwt.return (Ok ()))
+  | Sql.Plan.Op_vacuum ->
+    Some (
+      Lwt.catch
+        (fun () ->
+          let* () = vacuum t in
+          Lwt.return (Ok ()))
+        (function
+         | Failure msg -> Lwt.return (Error (Runtime msg))
+         | e -> Lwt.return (Error (Runtime (Printexc.to_string e)))))
+  | _ -> None
+
+(* Build the trigger BEFORE/AFTER hooks, the REPLACE/UPSERT secondary hooks,
+   and the INSERT target table name for a DML op. *)
+let dml_hooks t op =
+  let (before_hook, after_hook) = match op with
+    | Sql.Plan.Op_insert { table_meta; _ }
+    | Sql.Plan.Op_insert_select { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
+    | Sql.Plan.Op_update { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Update,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Update)
+    | Sql.Plan.Op_delete { table_meta; _ } ->
+      (make_trigger_hook t table_meta ~timing:`Before ~event:`Delete,
+       make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
+    | _ -> (None, None)
+  in
+  let insert_table_name = match op with
+    | Sql.Plan.Op_insert { table_meta; _ }
+    | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
+    | _ -> None
+  in
+  let (rdb, rd, uub, uu) = insert_replace_upsert_hooks t op in
+  (before_hook, after_hook, insert_table_name, rdb, rd, uub, uu)
+
+(* Run a DML op via [execute_with_count], updating change counters and the
+   last-insert rowid, then draining deferred FK checks in autocommit mode.
+   [execute] discards the row count; [execute_change_count] returns it. *)
+let run_dml t op ~on_ok =
+  let mode = match t.explicit_txn with
+    | None    -> Sql.Exec.Auto
+    | Some tx -> Sql.Exec.In_txn tx
+  in
+  let (before_hook, after_hook, insert_table_name,
+       on_replace_delete_before, on_replace_delete,
+       on_upsert_update_before, on_upsert_update) = dml_hooks t op in
+  (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
+           ~before_hook ~after_hook
+           ~on_replace_delete_before ~on_replace_delete
+           ~on_upsert_update_before ~on_upsert_update
+           t.store t.catalog op with
+   | exception Failure msg ->
+     (* Discard any pending deferred FK checks queued by the failed
+        statement — the writes will be rolled back. *)
+     Cat.clear_pending_fk_checks t.catalog;
+     Lwt.return (Error (Runtime msg))
+   | lwt_op ->
+     Lwt.catch
+       (fun () ->
+         let* n = lwt_op in
+         t.last_changes <- n;
+         t.total_changes <- t.total_changes + n;
+         (match insert_table_name with
+          | Some tbl when n > 0 ->
+            (match Cat.find_table_cached t.catalog ~name:tbl with
+             | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+             | None -> ())
+          | _ -> ());
+         on_ok n)
+       (function
+        | Failure msg ->
+          Cat.clear_pending_fk_checks t.catalog;
+          Lwt.return (Error (Runtime msg))
+        | exn         -> Lwt.fail exn))
+
+let execute_dml_op t op =
+  (* Auto-commit mode: deferred FK checks behave like immediate.  The txn was
+     already committed inside [execute_with_count]; [drain_pending_fks_autocommit]
+     opens a fresh RO snapshot that observes the just-committed writes. *)
+  run_dml t op ~on_ok:(fun _n ->
+    if t.explicit_txn = None then drain_pending_fks_autocommit t
+    else Lwt.return (Ok ()))
+
+let execute_dml_op_count t op =
+  run_dml t op ~on_ok:(fun n ->
+    if t.explicit_txn = None then
+      let* r = drain_pending_fks_autocommit t in
+      (match r with
+       | Ok ()   -> Lwt.return (Ok n)
+       | Error e -> Lwt.return (Error e))
+    else Lwt.return (Ok n))
+
 let execute top sql =
   let (op_promise, t) = compile_routed top sql in
   let* op = op_promise in
@@ -997,150 +1170,15 @@ let execute top sql =
      | Error _ -> Lwt.return (Error (Parse "syntax error"))
      | Ok ast  -> execute_instead_of t view_name ast)
   | Error e -> Lwt.return (Error e)
-  | Ok Sql.Plan.Op_begin    -> begin_txn t
-  | Ok Sql.Plan.Op_commit   -> commit_txn t
-  | Ok Sql.Plan.Op_rollback -> rollback_txn t
-  | Ok Sql.Plan.Op_savepoint name   -> savepoint_txn t name
-  | Ok Sql.Plan.Op_release name     -> release_savepoint t name
-  | Ok Sql.Plan.Op_rollback_to name -> rollback_to_savepoint t name
-  | Ok (Sql.Plan.Op_attach { path; schema }) ->
-    if String.equal schema "main" then
-      Lwt.return (Error (Runtime "ATTACH: 'main' is reserved"))
-    else if Hashtbl.mem top.attached schema then
-      Lwt.return (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
-    else begin
-      let* result = open_file ~path in
-      match result with
-      | Error e -> Lwt.return (Error e)
-      | Ok sub_db ->
-        Hashtbl.add top.attached schema sub_db;
-        Lwt.return (Ok ())
-    end
-  | Ok (Sql.Plan.Op_detach { schema }) ->
-    if String.equal schema "main" then
-      Lwt.return (Error (Runtime "DETACH: cannot detach 'main'"))
-    else begin
-      match Hashtbl.find_opt top.attached schema with
-      | None -> Lwt.return (Error (Runtime (Printf.sprintf "DETACH: no such schema '%s'" schema)))
-      | Some sub ->
-        Hashtbl.remove top.attached schema;
-        if String.equal top.active_schema schema then top.active_schema <- "main";
-        let* () = close sub in
-        Lwt.return (Ok ())
-    end
-  | Ok (Sql.Plan.Op_active_database_set { schema }) ->
-    if String.equal schema "main" || Hashtbl.mem top.attached schema then begin
-      top.active_schema <- schema;
-      Lwt.return (Ok ())
-    end else
-      Lwt.return (Error (Runtime (Printf.sprintf "active_database: no such schema '%s'" schema)))
-  | Ok Sql.Plan.Op_database_list ->
-    (* No rows produced via execute; use [query]/[Db.query] to read. *)
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_active_database_get ->
-    (* No rows produced via execute; use [query]/[Db.query] to read. *)
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_create_view { name; query } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
-    Hashtbl.replace t.views name query;
-    let* () = Cat.persist_view t.store ~name ~sql in
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_drop_view { name } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
-    Hashtbl.remove t.views name;
-    let* () = Cat.remove_view t.store ~name in
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_create_trigger { name; timing; event; table; when_; body } ->
-    let ast = Sql.Ast.S_create_trigger { name; timing; event; table; when_; body } in
-    Hashtbl.replace t.triggers name ast;
-    let* () = Cat.persist_trigger t.store ~name ~sql in
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_drop_trigger { name } ->
-    Hashtbl.remove t.triggers name;
-    let* () = Cat.remove_trigger t.store ~name in
-    Lwt.return (Ok ())
-  | Ok Sql.Plan.Op_vacuum ->
-    Lwt.catch
-      (fun () ->
-        let* () = vacuum t in
-        Lwt.return (Ok ()))
-      (function
-       | Failure msg -> Lwt.return (Error (Runtime msg))
-       | e -> Lwt.return (Error (Runtime (Printexc.to_string e))))
   | Ok op ->
-    (* SELECT always uses snapshot reads inside exec.ml (ro_begin/ro_end),
-       so it reads committed state regardless of an active explicit txn.
-       For DML, pass In_txn when an explicit transaction is open so all
-       writes join the same atomic context.
-       Note on SELECT within explicit txn: SELECTs always read the last committed
-       state (snapshot isolation), not in-progress writes from the current txn.
-       This is a known Phase 3 limitation — read-your-own-writes deferred to Phase 4. *)
-    let mode = match t.explicit_txn with
-      | None    -> Sql.Exec.Auto
-      | Some tx -> Sql.Exec.In_txn tx
-    in
-    let (before_hook, after_hook) = match op with
-      | Sql.Plan.Op_insert { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
-      | Sql.Plan.Op_insert_select { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
-      | Sql.Plan.Op_update { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Update,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Update)
-      | Sql.Plan.Op_delete { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Delete,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
-      | _ -> (None, None)
-    in
-    let insert_table_name = match op with
-      | Sql.Plan.Op_insert { table_meta; _ }        -> Some table_meta.Cat.name
-      | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
-      | _ -> None
-    in
-    let (on_replace_delete_before, on_replace_delete,
-         on_upsert_update_before, on_upsert_update) =
-      insert_replace_upsert_hooks t op in
-    (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
-             ~before_hook ~after_hook
-             ~on_replace_delete_before ~on_replace_delete
-             ~on_upsert_update_before ~on_upsert_update
-             t.store t.catalog op with
-     | exception Failure msg ->
-       (* Discard any pending deferred FK checks queued by the failed
-          statement — the writes will be rolled back. *)
-       Cat.clear_pending_fk_checks t.catalog;
-       Lwt.return (Error (Runtime msg))
-     | lwt_op ->
-       Lwt.catch
-         (fun () ->
-           let* n = lwt_op in
-           t.last_changes <- n;
-           t.total_changes <- t.total_changes + n;
-           (match insert_table_name with
-            | Some tbl when n > 0 ->
-              (match Cat.find_table_cached t.catalog ~name:tbl with
-               | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
-               | None -> ())
-            | _ -> ());
-           (* Auto-commit mode: deferred FK checks behave like immediate.
-              The txn was already committed inside [execute_with_count];
-              [drain_pending_fks_autocommit] opens a fresh RO snapshot that
-              observes the just-committed writes. *)
-           if t.explicit_txn = None then drain_pending_fks_autocommit t
-           else Lwt.return (Ok ()))
-         (function
-          | Failure msg ->
-            Cat.clear_pending_fk_checks t.catalog;
-            Lwt.return (Error (Runtime msg))
-          | exn         -> Lwt.fail exn))
+    (match execute_control_op top t sql op with
+     | Some result -> result
+     | None        -> execute_dml_op t op)
 
 let execute_change_count top sql =
   let (op_promise, t) = compile_routed top sql in
   let* op = op_promise in
-  let count_of_unit r =
-    match r with
+  let count_of_unit = function
     | Ok ()   -> Lwt.return (Ok 0)
     | Error e -> Lwt.return (Error e)
   in
@@ -1151,138 +1189,14 @@ let execute_change_count top sql =
      | Error _ -> Lwt.return (Error (Parse "syntax error"))
      | Ok ast  ->
        let* r = execute_instead_of t view_name ast in
-       (match r with Ok () -> Lwt.return (Ok 0) | Error e -> Lwt.return (Error e)))
+       count_of_unit r)
   | Error e -> Lwt.return (Error e)
-  | Ok Sql.Plan.Op_begin    ->
-    let* r = begin_txn t in
-    count_of_unit r
-  | Ok Sql.Plan.Op_commit   ->
-    let* r = commit_txn t in
-    count_of_unit r
-  | Ok Sql.Plan.Op_rollback ->
-    let* r = rollback_txn t in
-    count_of_unit r
-  | Ok Sql.Plan.Op_savepoint name ->
-    let* r = savepoint_txn t name in
-    count_of_unit r
-  | Ok Sql.Plan.Op_release name ->
-    let* r = release_savepoint t name in
-    count_of_unit r
-  | Ok Sql.Plan.Op_rollback_to name ->
-    let* r = rollback_to_savepoint t name in
-    count_of_unit r
-  | Ok (Sql.Plan.Op_attach { path; schema }) ->
-    if String.equal schema "main" then
-      Lwt.return (Error (Runtime "ATTACH: 'main' is reserved"))
-    else if Hashtbl.mem top.attached schema then
-      Lwt.return (Error (Runtime (Printf.sprintf "ATTACH: schema '%s' already attached" schema)))
-    else begin
-      let* result = open_file ~path in
-      match result with
-      | Error e -> Lwt.return (Error e)
-      | Ok sub_db ->
-        Hashtbl.add top.attached schema sub_db;
-        Lwt.return (Ok 0)
-    end
-  | Ok (Sql.Plan.Op_detach { schema }) ->
-    if String.equal schema "main" then
-      Lwt.return (Error (Runtime "DETACH: cannot detach 'main'"))
-    else begin
-      match Hashtbl.find_opt top.attached schema with
-      | None -> Lwt.return (Error (Runtime (Printf.sprintf "DETACH: no such schema '%s'" schema)))
-      | Some sub ->
-        Hashtbl.remove top.attached schema;
-        if String.equal top.active_schema schema then top.active_schema <- "main";
-        let* () = close sub in
-        Lwt.return (Ok 0)
-    end
-  | Ok (Sql.Plan.Op_active_database_set { schema }) ->
-    if String.equal schema "main" || Hashtbl.mem top.attached schema then begin
-      top.active_schema <- schema;
-      Lwt.return (Ok 0)
-    end else
-      Lwt.return (Error (Runtime (Printf.sprintf "active_database: no such schema '%s'" schema)))
-  | Ok Sql.Plan.Op_database_list
-  | Ok Sql.Plan.Op_active_database_get ->
-    Lwt.return (Ok 0)
-  | Ok Sql.Plan.Op_create_view { name; query } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
-    Hashtbl.replace t.views name query;
-    let* () = Cat.persist_view t.store ~name ~sql in
-    Lwt.return (Ok 0)
-  | Ok Sql.Plan.Op_drop_view { name } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
-    Hashtbl.remove t.views name;
-    let* () = Cat.remove_view t.store ~name in
-    Lwt.return (Ok 0)
-  | Ok Sql.Plan.Op_create_trigger { name; timing; event; table; when_; body } ->
-    let ast = Sql.Ast.S_create_trigger { name; timing; event; table; when_; body } in
-    Hashtbl.replace t.triggers name ast;
-    let* () = Cat.persist_trigger t.store ~name ~sql in
-    Lwt.return (Ok 0)
-  | Ok Sql.Plan.Op_drop_trigger { name } ->
-    Hashtbl.remove t.triggers name;
-    let* () = Cat.remove_trigger t.store ~name in
-    Lwt.return (Ok 0)
   | Ok op ->
-    let mode = match t.explicit_txn with
-      | None    -> Sql.Exec.Auto
-      | Some tx -> Sql.Exec.In_txn tx
-    in
-    let (before_hook, after_hook) = match op with
-      | Sql.Plan.Op_insert { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
-      | Sql.Plan.Op_insert_select { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Insert,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Insert)
-      | Sql.Plan.Op_update { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Update,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Update)
-      | Sql.Plan.Op_delete { table_meta; _ } ->
-        (make_trigger_hook t table_meta ~timing:`Before ~event:`Delete,
-         make_trigger_hook t table_meta ~timing:`After  ~event:`Delete)
-      | _ -> (None, None)
-    in
-    let insert_table_name = match op with
-      | Sql.Plan.Op_insert { table_meta; _ }        -> Some table_meta.Cat.name
-      | Sql.Plan.Op_insert_select { table_meta; _ } -> Some table_meta.Cat.name
-      | _ -> None
-    in
-    let (on_replace_delete_before, on_replace_delete,
-         on_upsert_update_before, on_upsert_update) =
-      insert_replace_upsert_hooks t op in
-    (match Sql.Exec.execute_with_count ~mode ~clock:t.clock
-             ~before_hook ~after_hook
-             ~on_replace_delete_before ~on_replace_delete
-             ~on_upsert_update_before ~on_upsert_update
-             t.store t.catalog op with
-     | exception Failure msg ->
-       Cat.clear_pending_fk_checks t.catalog;
-       Lwt.return (Error (Runtime msg))
-     | lwt_op ->
-       Lwt.catch
-         (fun () ->
-           let* n = lwt_op in
-           t.last_changes <- n;
-           t.total_changes <- t.total_changes + n;
-           (match insert_table_name with
-            | Some tbl when n > 0 ->
-              (match Cat.find_table_cached t.catalog ~name:tbl with
-               | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
-               | None -> ())
-            | _ -> ());
-           if t.explicit_txn = None then
-             let* r = drain_pending_fks_autocommit t in
-             (match r with
-              | Ok ()   -> Lwt.return (Ok n)
-              | Error e -> Lwt.return (Error e))
-           else Lwt.return (Ok n))
-         (function
-          | Failure msg ->
-            Cat.clear_pending_fk_checks t.catalog;
-            Lwt.return (Error (Runtime msg))
-          | exn         -> Lwt.fail exn))
+    (match execute_control_op top t sql op with
+     | Some result ->
+       let* r = result in
+       count_of_unit r
+     | None -> execute_dml_op_count t op)
 
 let query top sql =
   let (op_promise, t) = compile_routed top sql in
