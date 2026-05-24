@@ -1759,7 +1759,6 @@ let find_col_idx_by_name_opt schema col_name =
     | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
     | _ :: rest -> fi (i + 1) rest
   in fi 0 schema
-[@@warning "-32"]
 
 (** Encode a multi-column index-key prefix (no rowid).  Used by FK enforcement
     to seek to the first entry whose leading key columns match a target value
@@ -2381,75 +2380,6 @@ let build_child_refs cat ~parent_table_name =
     ) child_meta.Cat.fk_constraints in
     if fks = [] then None else Some (child_meta, fks)
   ) all_tables)
-
-(** Scan [child_meta] for any row where [child_col_idx] equals [parent_val].
-    Opens and closes its own RO snapshot. *)
-let fk_child_has_ref store (child_meta : Cat.table_meta) ~child_col_idx ~(parent_val : Row.value) =
-  S.with_ro store @@ fun ro_tx ->
-  let* cur   = S.cursor_open ro_tx child_meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let found  = ref false in
-  let rec scan () =
-    if !found then ()
-    else match S.cursor_next cur with
-    | None -> ()
-    | Some (_k, vbytes) ->
-      let row = decode_with_virtual None [||] child_meta vbytes in
-      if compare_values row.(child_col_idx) parent_val = 0 then
-        found := true
-      else scan ()
-  in
-  scan ();
-  S.cursor_close cur;
-  Lwt.return !found
-[@@warning "-32"]
-
-(** Scan [child_meta] using an existing RW transaction for rows where
-    [child_col_idx] equals [parent_val]. Returns (rowid, row) list. *)
-let scan_child_rows_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
-    ~child_col_idx ~(parent_val : Row.value) =
-  match
-    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
-      ~col_idxs:[child_col_idx]
-  with
-  | Some idx when parent_val <> Row.V_null ->
-    let prefix, plen =
-      encode_index_key_prefix [row_value_to_index_value parent_val]
-    in
-    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
-    let _sr  = S.cursor_seek cur seek_key in
-    let buf  = ref [] in
-    let exhausted = ref false in
-    let rec walk () =
-      if !exhausted then Lwt.return_unit
-      else match S.cursor_next cur with
-      | None -> exhausted := true; Lwt.return_unit
-      | Some (ikey, _ival) ->
-        if Bytes.length ikey >= plen + 8 &&
-           Bytes.equal (Bytes.sub ikey 0 plen) prefix
-        then begin
-          let rowid = decode_index_key_rowid ikey in
-          let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
-          (match row_opt with
-           | None -> walk ()
-           | Some vbytes ->
-             let row = decode_with_virtual None [||] child_meta vbytes in
-             if compare_values row.(child_col_idx) parent_val = 0 then
-               buf := (rowid, row) :: !buf;
-             walk ())
-        end else begin
-          exhausted := true;
-          Lwt.return_unit
-        end
-    in
-    let* () = walk () in
-    S.cursor_close cur;
-    Lwt.return (List.rev !buf)
-  | _ ->
-    full_scan_collect tx child_meta (fun row ->
-      compare_values row.(child_col_idx) parent_val = 0)
-[@@warning "-32"]
 
 (** Scan [child_meta] using an existing RW transaction for rows where all
     [child_col_idxs] match [parent_vals] simultaneously.  When an index covers

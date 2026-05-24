@@ -36,7 +36,6 @@ let read_user_version_tx tx : int64 Lwt.t =
   Lwt.return (match v with
     | None   -> 0L
     | Some b -> Bytes.get_int64_be b 0)
-[@@warning "-32"]
 
 (** Write user_version inside an already-open RW transaction.
     Caller is responsible for commit. *)
@@ -44,7 +43,6 @@ let write_user_version_tx tx (v : int64) : unit Lwt.t =
   let b = Bytes.create 8 in
   Bytes.set_int64_be b 0 v;
   S.put tx sys_meta_tid user_version_key b
-[@@warning "-32"]
 
 type fk_constraint = {
   fk_local_cols   : string list;

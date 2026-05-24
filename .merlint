@@ -57,6 +57,13 @@
 #          harnesses (open_slow_store, main, open_slow_wal) are not auto-skipped.
 #          Long test/bench setup is acceptable; E005 stays ENABLED for lib/+bin/,
 #          which is where the #168 refactor drives it down.
+#   E110 - silenced warnings (#173). In tests these are deliberate scaffolding:
+#          `[@warning "-69"]` on mock record fields that are written but never
+#          read (test_btree mock pagers), and `[@@warning "-32"]` on *_lwt helper
+#          variants retained during the monadic-test migration (#161). E110 stays
+#          ENABLED for lib/+bin/, where the 5 production sites were resolved by
+#          dropping stale suppressions (the bindings were actually used) and
+#          deleting two genuinely-dead functions.
 #
 # Multiple file blocks union (rule_config.should_exclude is List.exists), so the
 # test/ block layers E105 on top of the global exclusions for test files.
@@ -68,4 +75,4 @@ rules:
   - files: **/*.ml*
     exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332, E330]
   - files: test/*.ml*
-    exclude: [E105, E005]
+    exclude: [E105, E005, E110]
