@@ -14,32 +14,35 @@ type fk_action =
   | FA_set_null
   | FA_set_default
 
-type fk_constraint = {
-  fk_local_cols   : string list;
-  fk_parent_table : string;
-  fk_parent_cols  : string list;
-  fk_on_delete    : fk_action;
-  fk_on_update    : fk_action;
-  fk_deferrable   : bool;  (** false = IMMEDIATE (default), true = INITIALLY DEFERRED *)
-}
+type fk_constraint =
+  { fk_local_cols : string list
+  ; fk_parent_table : string
+  ; fk_parent_cols : string list
+  ; fk_on_delete : fk_action
+  ; fk_on_update : fk_action
+  ; fk_deferrable : bool (** false = IMMEDIATE (default), true = INITIALLY DEFERRED *)
+  }
 
 (** Kind of pending FK check (matched against current row state at commit). *)
-type pending_fk_kind = [ `Insert | `Update | `Delete ]
+type pending_fk_kind =
+  [ `Insert
+  | `Update
+  | `Delete
+  ]
 
 (** Re-verification callback for a queued FK violation.  Universally
     polymorphic in the transaction mode so it accepts either the active
     write txn (deferred path inside an explicit transaction) or an RO
     snapshot opened after auto-commit. *)
-type pending_fk_recheck =
-  { recheck : 'm. 'm Sqlocaml_store.Store.txn -> bool Lwt.t }
+type pending_fk_recheck = { recheck : 'm. 'm Sqlocaml_store.Store.txn -> bool Lwt.t }
 
 (** A queued FK violation awaiting re-verification at commit. *)
-type pending_fk_check = {
-  pfk_kind    : pending_fk_kind;
-  pfk_table   : string;
-  pfk_rowid   : int64;
-  pfk_message : string;
-  pfk_recheck : pending_fk_recheck;
+type pending_fk_check =
+  { pfk_kind : pending_fk_kind
+  ; pfk_table : string
+  ; pfk_rowid : int64
+  ; pfk_message : string
+  ; pfk_recheck : pending_fk_recheck
     (** Re-run the FK check.  An open transaction (the active write txn
         about to be committed, or a fresh RO snapshot taken AFTER an
         auto-commit) is supplied so the recheck observes the live state —
@@ -49,35 +52,35 @@ type pending_fk_check = {
 
         Returns true if STILL violated; false if the violation has been
         resolved (e.g. parent row now exists, child row now deleted). *)
-}
+  }
 
-type table_meta = {
-  name            : string;
-  tree_id         : Sqlocaml_store.Store.tree_id;
-  columns         : Sqlocaml_encoding.Row.column list;
-  next_rowid      : int64;
-  fk_constraints  : fk_constraint list;
-  without_rowid   : bool;
+type table_meta =
+  { name : string
+  ; tree_id : Sqlocaml_store.Store.tree_id
+  ; columns : Sqlocaml_encoding.Row.column list
+  ; next_rowid : int64
+  ; fk_constraints : fk_constraint list
+  ; without_rowid : bool
     (** WITHOUT ROWID — the INTEGER PRIMARY KEY column's value is used
         as the row's storage key (no auto-allocated rowid).  Phase 37. *)
-}
+  }
 
-type index_info = {
-  idx_name      : string;
-  idx_table     : string;
-  idx_columns   : string list;      (* col names for plain; expr SQL for expression indexes *)
-  idx_unique    : bool;
-  idx_tree_id   : Sqlocaml_store.Store.tree_id;
-  idx_expr_flags: bool list;        (* true = expression index column, false = plain column *)
-  idx_where_sql : string option;
-}
+type index_info =
+  { idx_name : string
+  ; idx_table : string
+  ; idx_columns : string list (* col names for plain; expr SQL for expression indexes *)
+  ; idx_unique : bool
+  ; idx_tree_id : Sqlocaml_store.Store.tree_id
+  ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
+  ; idx_where_sql : string option
+  }
 
-type fts_table_meta = {
-  fts_name         : string;
-  fts_content_tree : Sqlocaml_store.Store.tree_id;
-  fts_index_tree   : Sqlocaml_store.Store.tree_id;
-  fts_columns      : string list;
-}
+type fts_table_meta =
+  { fts_name : string
+  ; fts_content_tree : Sqlocaml_store.Store.tree_id
+  ; fts_index_tree : Sqlocaml_store.Store.tree_id
+  ; fts_columns : string list
+  }
 
 (** Open (or initialise) a catalog on the given store.
     Loads all existing table metadata and index metadata from the store. *)
@@ -89,17 +92,19 @@ val read_user_version_tx : _ Sqlocaml_store.Store.txn -> int64 Lwt.t
 
 (** Write user_version to the sys_meta tree inside an already-open RW
     transaction.  Caller is responsible for the commit. *)
-val write_user_version_tx :
-  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 -> unit Lwt.t
+val write_user_version_tx
+  :  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> int64
+  -> unit Lwt.t
 
 (** Create a new table, returning its assigned tree_id.
     Raises [Failure] if a table with that name already exists. *)
-val create_table :
-  t ->
-  name:string ->
-  columns:Sqlocaml_encoding.Row.column list ->
-  without_rowid:bool ->
-  Sqlocaml_store.Store.tree_id Lwt.t
+val create_table
+  :  t
+  -> name:string
+  -> columns:Sqlocaml_encoding.Row.column list
+  -> without_rowid:bool
+  -> Sqlocaml_store.Store.tree_id Lwt.t
 
 (** Find a table by name. Returns [None] if not found. *)
 val find_table : t -> name:string -> table_meta option Lwt.t
@@ -125,8 +130,11 @@ val next_rowid : t -> name:string -> int64 Lwt.t
 (** Like [next_rowid] but operates within an already-held RW transaction.
     Does NOT commit; the caller owns the commit.  Use within explicit
     transactions to avoid deadlocking on the store's writer mutex. *)
-val next_rowid_in_txn :
-  t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t
+val next_rowid_in_txn
+  :  t
+  -> name:string
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> int64 Lwt.t
 
 (** Create a new index on a single column of an existing table.
     The new index gets its own [tree_id] (separate from the table tree).
@@ -139,15 +147,15 @@ val next_rowid_in_txn :
     - [`Error msg] if a table with [table] does not exist.
     - [`Error msg] if an index named [name] already exists.
     - [`Error msg] if any column in [columns] is not a column of [table]. *)
-val create_index :
-  t ->
-  name:string ->
-  table:string ->
-  columns:string list ->
-  unique:bool ->
-  expr_flags:bool list ->
-  where_sql:string option ->
-  (index_info, string) result Lwt.t
+val create_index
+  :  t
+  -> name:string
+  -> table:string
+  -> columns:string list
+  -> unique:bool
+  -> expr_flags:bool list
+  -> where_sql:string option
+  -> (index_info, string) result Lwt.t
 
 (** Return the list of indexes on the given table.  Order is unspecified. *)
 val indexes_for_table : t -> table:string -> index_info list
@@ -164,54 +172,59 @@ val find_index : t -> name:string -> index_info option
 
     The index may have more columns than [col_idxs]; only the leading prefix is
     required to match. *)
-val find_index_covering_cols :
-  t -> table_name:string -> col_idxs:int list -> index_info option
+val find_index_covering_cols
+  :  t
+  -> table_name:string
+  -> col_idxs:int list
+  -> index_info option
 
 (** Remove a table and all its indexes from the catalog.
     Removes entries from _sys_tables, _sys_columns, and _sys_indexes.
     The B+-tree pages for the table and its indexes are NOT reclaimed (Phase 3). *)
-val drop_table :
-  t ->
-  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
-  name:string ->
-  unit Lwt.t
+val drop_table
+  :  t
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> name:string
+  -> unit Lwt.t
 
 (** Remove an index from _sys_indexes.
     The B+-tree pages are NOT reclaimed (Phase 3). *)
-val drop_index :
-  t ->
-  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn ->
-  name:string ->
-  unit Lwt.t
+val drop_index
+  :  t
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> name:string
+  -> unit Lwt.t
 
 (** Add a new column to an existing table.
     Updates the catalog's persistent storage and in-memory cache.
     Returns [Error msg] if the table does not exist or the column already exists. *)
-val add_column :
-  t ->
-  table_name:string ->
-  column:Sqlocaml_encoding.Row.column ->
-  (unit, string) result Lwt.t
+val add_column
+  :  t
+  -> table_name:string
+  -> column:Sqlocaml_encoding.Row.column
+  -> (unit, string) result Lwt.t
 
 (** Rename a table.
     Updates _sys_tables, re-keys all _sys_columns entries, and refreshes the
     in-memory cache and any index entries that reference the old table name.
     Returns [Error msg] if [old_name] does not exist or [new_name] already exists. *)
-val rename_table :
-  t -> old_name:string -> new_name:string -> (unit, string) result Lwt.t
+val rename_table : t -> old_name:string -> new_name:string -> (unit, string) result Lwt.t
 
 (** Rename a column within a table.
     Updates the _sys_columns entry and refreshes the in-memory cache.
     Returns [Error msg] if the table or column does not exist. *)
-val rename_column :
-  t -> table_name:string -> old_col:string -> new_col:string -> (unit, string) result Lwt.t
+val rename_column
+  :  t
+  -> table_name:string
+  -> old_col:string
+  -> new_col:string
+  -> (unit, string) result Lwt.t
 
 (** Remove a column from an existing table.
     Re-keys all column entries with ordinal > drop_idx (shift down by 1).
     Does NOT migrate existing row data — caller (the executor) is responsible.
     Returns [Error msg] if the table or column does not exist. *)
-val drop_column :
-  t -> table_name:string -> col_name:string -> (unit, string) result Lwt.t
+val drop_column : t -> table_name:string -> col_name:string -> (unit, string) result Lwt.t
 
 (** True if a table with [name] exists in the catalog. *)
 val table_exists : t -> name:string -> bool
@@ -232,8 +245,11 @@ val create_fts_table : t -> name:string -> columns:string list -> fts_table_meta
 
 (** Allocate and return the next rowid for an FTS table within an already-held
     RW transaction.  Does NOT commit; the caller owns the commit. *)
-val next_fts_rowid_in_txn :
-  t -> name:string -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn -> int64 Lwt.t
+val next_fts_rowid_in_txn
+  :  t
+  -> name:string
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> int64 Lwt.t
 
 (** Persist FK constraints for a table to the sys_meta B-tree. *)
 val save_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> unit Lwt.t

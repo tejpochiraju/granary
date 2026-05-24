@@ -36,12 +36,12 @@ type t
 (** Pretty-print committed-frame count and current WAL size in bytes. *)
 val pp : Format.formatter -> t -> unit
 
-type frame = {
-  frame_idx : int;        (** 0-based index in WAL *)
-  page_id   : int64;
-  is_commit : bool;
-  page      : Cstruct.t;  (** 4096 bytes *)
-}
+type frame =
+  { frame_idx : int (** 0-based index in WAL *)
+  ; page_id : int64
+  ; is_commit : bool
+  ; page : Cstruct.t (** 4096 bytes *)
+  }
 
 (** Size of one WAL frame on disk in bytes (24-byte frame header + 4096-byte page = 4120). *)
 val frame_size_bytes : int
@@ -51,7 +51,7 @@ val header_size_bytes : int
 
 type error =
   | Block_error of string
-  | Corrupt_frame of int  (** frame_idx that failed checksum *)
+  | Corrupt_frame of int (** frame_idx that failed checksum *)
 
 val pp_error : Format.formatter -> error -> unit
 
@@ -60,12 +60,12 @@ val pp_error : Format.formatter -> error -> unit
     with a fresh salt and seed. Otherwise the header is read, and a
     forward scan recovers the index of every page in the last contiguous
     committed batch. A trailing partial batch is silently discarded. *)
-val open_ :
-  read_at  : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  write_at : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  sync     : (unit -> (unit, string) result Lwt.t) ->
-  size_bytes : int64 ->
-  (t, error) result Lwt.t
+val open_
+  :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> size_bytes:int64
+  -> (t, error) result Lwt.t
 
 (** Total committed frames currently in the WAL. *)
 val committed_frames : t -> int
@@ -101,8 +101,7 @@ val append_commit : t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
     correct base.  Durability is deferred to a separate {!flush_sync}
     call by the group-commit coordinator.  Sync failure is treated as
     fatal by upstream callers — see [Sqlocaml_store.Store.commit]. *)
-val append_commit_no_sync :
-  t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
+val append_commit_no_sync : t -> (int64 * Cstruct.t) list -> (unit, error) result Lwt.t
 
 (** Invoke the underlying device sync.  Used by the group-commit
     coordinator after one or more {!append_commit_no_sync} calls. *)

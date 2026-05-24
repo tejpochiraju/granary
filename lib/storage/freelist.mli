@@ -21,7 +21,7 @@ val add : t -> page_id:int32 -> freed_at_txn_id:int64 -> t
 val pop : t -> min_safe_txn_id:int64 -> (int32 * t) option
 
 (** All entries in the freelist — for serialisation to Freelist pages. *)
-val to_list : t -> (int32 * int64) list   (* (page_id, freed_at_txn_id) *)
+val to_list : t -> (int32 * int64) list (* (page_id, freed_at_txn_id) *)
 
 (** Reconstruct from a list (deserialised from Freelist pages). *)
 val of_list : (int32 * int64) list -> t

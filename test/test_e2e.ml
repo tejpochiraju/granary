@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module Db  = Sqlocaml.Db
+module Db = Sqlocaml.Db
 module Row = Sqlocaml_encoding.Row
 
 (* ------------------------------------------------------------------ *)
@@ -11,33 +11,32 @@ let run = Lwt_main.run
 (** Unwrap Error or fail. *)
 let err_or_fail label = function
   | Error e -> e
-  | Ok _    -> Alcotest.failf "%s: expected Error, got Ok" label
+  | Ok _ -> Alcotest.failf "%s: expected Error, got Ok" label
+;;
 
-let fmt_err e =
-  Format.asprintf "%a" Db.pp_error e
+let fmt_err e = Format.asprintf "%a" Db.pp_error e
 
 (** Fresh in-memory database. *)
 let fresh_db () = run (Db.open_in_memory ())
 
 (** run execute and assert success. *)
 let exec db sql =
-  run (
-    let* result = Db.execute db sql in
-    (match result with
-     | Ok () -> ()
-     | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
-    Lwt.return_unit
-  )
+  run
+    (let* result = Db.execute db sql in
+     (match result with
+      | Ok () -> ()
+      | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
+     Lwt.return_unit)
+;;
 
 (** run query, collect rows, assert Ok. *)
 let query_ok db sql =
-  run (
-    let* result = Db.query db sql in
-    match result with
-    | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
-    | Ok stream ->
-      Lwt_stream.to_list stream
-  )
+  run
+    (let* result = Db.query db sql in
+     match result with
+     | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
+     | Ok stream -> Lwt_stream.to_list stream)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Lwt-monadic helper family (#161)                                    *)
@@ -49,8 +48,7 @@ let query_ok db sql =
 (* a read cache-misses through Lwt_unix.pread — see #158, #161).       *)
 (* ------------------------------------------------------------------ *)
 
-let fresh_db_lwt () = Db.open_in_memory ()
-[@@warning "-32"]
+let fresh_db_lwt () = Db.open_in_memory () [@@warning "-32"]
 
 let exec_lwt db sql =
   let* result = Db.execute db sql in
@@ -58,6 +56,7 @@ let exec_lwt db sql =
   | Ok () -> Lwt.return_unit
   | Error _ -> Alcotest.failf "exec_lwt: unexpected error for: %s" sql
 [@@warning "-32"]
+;;
 
 let query_ok_lwt db sql =
   let* result = Db.query db sql in
@@ -65,50 +64,57 @@ let query_ok_lwt db sql =
   | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
   | Ok stream -> Lwt_stream.to_list stream
 [@@warning "-32"]
+;;
 
 let exec_err_lwt db sql =
   let* result = Db.execute db sql in
   match result with
-  | Ok ()    -> Alcotest.failf "exec_err_lwt: expected error for: %s" sql
-  | Error e  -> Lwt.return (fmt_err e)
+  | Ok () -> Alcotest.failf "exec_err_lwt: expected error for: %s" sql
+  | Error e -> Lwt.return (fmt_err e)
 [@@warning "-32"]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Value helpers for clean assertions                                    *)
 (* ------------------------------------------------------------------ *)
 
 let value_testable : Db.value Alcotest.testable =
-  let pp ppf v = match v with
-    | Db.V_int  n -> Format.fprintf ppf "V_int(%Ld)" n
+  let pp ppf v =
+    match v with
+    | Db.V_int n -> Format.fprintf ppf "V_int(%Ld)" n
     | Db.V_text s -> Format.fprintf ppf "V_text(%S)" s
-    | Db.V_null   -> Format.fprintf ppf "V_null"
+    | Db.V_null -> Format.fprintf ppf "V_null"
     | Db.V_real f -> Format.fprintf ppf "V_real(%h)" f
     | Db.V_blob b -> Format.fprintf ppf "V_blob(%d bytes)" (Bytes.length b)
   in
-  let eq a b = match a, b with
-    | Db.V_int  x, Db.V_int  y -> Int64.equal x y
+  let eq a b =
+    match a, b with
+    | Db.V_int x, Db.V_int y -> Int64.equal x y
     | Db.V_text x, Db.V_text y -> String.equal x y
-    | Db.V_null,   Db.V_null   -> true
+    | Db.V_null, Db.V_null -> true
     | Db.V_real x, Db.V_real y -> Float.equal x y
     | Db.V_blob x, Db.V_blob y -> Bytes.equal x y
-    | _,           _           -> false
+    | _, _ -> false
   in
   Alcotest.testable pp eq
+;;
 
 let row_testable : Db.row Alcotest.testable =
   let pp ppf arr =
     Format.fprintf ppf "[|";
-    Array.iter (fun v ->
-      Format.fprintf ppf " ";
-      (Alcotest.pp value_testable) ppf v;
-    ) arr;
+    Array.iter
+      (fun v ->
+         Format.fprintf ppf " ";
+         (Alcotest.pp value_testable) ppf v)
+      arr;
     Format.fprintf ppf " |]"
   in
   let eq a b =
-    Array.length a = Array.length b &&
-    Array.for_all2 (fun x y -> Alcotest.equal value_testable x y) a b
+    Array.length a = Array.length b
+    && Array.for_all2 (fun x y -> Alcotest.equal value_testable x y) a b
   in
   Alcotest.testable pp eq
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 1: Walking skeleton (Phase 0 demo)                             *)
@@ -124,8 +130,9 @@ let walking_skeleton () =
   Alcotest.(check int) "exactly 1 row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "2 columns" 2 (Array.length row);
-  Alcotest.check value_testable "id = V_int 2L"    (Db.V_int 2L)    row.(0);
+  Alcotest.check value_testable "id = V_int 2L" (Db.V_int 2L) row.(0);
   Alcotest.check value_testable "name = V_text bob" (Db.V_text "bob") row.(1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 2: SELECT * variations                                          *)
@@ -139,6 +146,7 @@ let select_all_rows () =
   exec db "INSERT INTO t (n) VALUES (3)";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "3 rows" 3 (List.length rows)
+;;
 
 let select_star_columns () =
   let db = fresh_db () in
@@ -148,8 +156,9 @@ let select_star_columns () =
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "2 columns (star preserves order)" 2 (Array.length row);
-  Alcotest.check value_testable "col 0 = id=10"     (Db.V_int 10L)    row.(0);
-  Alcotest.check value_testable "col 1 = name=foo"  (Db.V_text "foo") row.(1)
+  Alcotest.check value_testable "col 0 = id=10" (Db.V_int 10L) row.(0);
+  Alcotest.check value_testable "col 1 = name=foo" (Db.V_text "foo") row.(1)
+;;
 
 let select_named_cols () =
   let db = fresh_db () in
@@ -160,6 +169,7 @@ let select_named_cols () =
   let row = List.hd rows in
   Alcotest.(check int) "1 column (named projection)" 1 (Array.length row);
   Alcotest.check value_testable "id=7" (Db.V_int 7L) row.(0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 3: Multiple tables                                              *)
@@ -175,8 +185,9 @@ let two_tables () =
   let rows_b = query_ok db "SELECT * FROM b" in
   Alcotest.(check int) "a: 1 row" 1 (List.length rows_a);
   Alcotest.(check int) "b: 1 row" 1 (List.length rows_b);
-  Alcotest.check value_testable "a.x=42"       (Db.V_int 42L)       (List.hd rows_a).(0);
-  Alcotest.check value_testable "b.y=hello"    (Db.V_text "hello")  (List.hd rows_b).(0)
+  Alcotest.check value_testable "a.x=42" (Db.V_int 42L) (List.hd rows_a).(0);
+  Alcotest.check value_testable "b.y=hello" (Db.V_text "hello") (List.hd rows_b).(0)
+;;
 
 let table_isolation () =
   let db = fresh_db () in
@@ -188,7 +199,8 @@ let table_isolation () =
   let rows_a = query_ok db "SELECT * FROM a" in
   let rows_b = query_ok db "SELECT * FROM b" in
   Alcotest.(check int) "a: 2 rows" 2 (List.length rows_a);
-  Alcotest.(check int) "b: 1 row"  1 (List.length rows_b)
+  Alcotest.(check int) "b: 1 row" 1 (List.length rows_b)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 4: Error propagation through the API                           *)
@@ -197,41 +209,46 @@ let table_isolation () =
 let parse_error () =
   let db = fresh_db () in
   let result = run (Db.execute db "SLECT * FROM t;") in
-  (match err_or_fail "parse_error" result with
-   | Db.Parse _ -> ()
-   | _ -> Alcotest.fail "expected Parse error")
+  match err_or_fail "parse_error" result with
+  | Db.Parse _ -> ()
+  | _ -> Alcotest.fail "expected Parse error"
+;;
 
 let unknown_table () =
   let db = fresh_db () in
   let result = run (Db.query db "SELECT * FROM ghost") in
-  (match err_or_fail "unknown_table" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl) ->
-     Alcotest.(check string) "table name is ghost" "ghost" tbl
-   | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")")
+  match err_or_fail "unknown_table" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl) ->
+    Alcotest.(check string) "table name is ghost" "ghost" tbl
+  | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")"
+;;
 
 let unknown_column () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.query db "SELECT bogus FROM t") in
-  (match err_or_fail "unknown_column" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Unknown_column ...)")
+  match err_or_fail "unknown_column" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Unknown_column ...)"
+;;
 
 let type_mismatch () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.execute db "INSERT INTO t (x) VALUES ('text')") in
-  (match err_or_fail "type_mismatch" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Type_mismatch ...)")
+  match err_or_fail "type_mismatch" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Type_mismatch ...)"
+;;
 
 let arity_mismatch () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
   let result = run (Db.execute db "INSERT INTO t (a) VALUES (1, 2)") in
-  (match err_or_fail "arity_mismatch" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Arity_mismatch _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Arity_mismatch ...)")
+  match err_or_fail "arity_mismatch" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Arity_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Arity_mismatch ...)"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 5: NULL handling end-to-end                                     *)
@@ -245,8 +262,9 @@ let insert_null () =
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "2 columns" 2 (Array.length row);
-  Alcotest.check value_testable "id=1"        (Db.V_int 1L) row.(0);
-  Alcotest.check value_testable "val=V_null"  Db.V_null     row.(1)
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "val=V_null" Db.V_null row.(1)
+;;
 
 let where_null_no_match () =
   let db = fresh_db () in
@@ -255,6 +273,7 @@ let where_null_no_match () =
   (* NULL doesn't compare equal to anything *)
   let rows = query_ok db "SELECT * FROM t WHERE val = 'something'" in
   Alcotest.(check int) "0 rows (NULL doesn't match)" 0 (List.length rows)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 6: Rowid ordering                                               *)
@@ -269,11 +288,17 @@ let insert_order () =
   exec db "INSERT INTO t (n) VALUES (20)";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n
-    | _          -> Int64.minus_one) rows in
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
   (* Expect insertion order: 30, 10, 20 *)
-  Alcotest.(check (list int64)) "insertion order preserved" [30L; 10L; 20L] ns
+  Alcotest.(check (list int64)) "insertion order preserved" [ 30L; 10L; 20L ] ns
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 7: Stress / robustness                                          *)
@@ -293,8 +318,9 @@ let many_rows () =
   let filtered = query_ok db "SELECT * FROM t WHERE id = 50" in
   Alcotest.(check int) "1 filtered row" 1 (List.length filtered);
   let row = List.hd filtered in
-  Alcotest.check value_testable "id=50" (Db.V_int 50L)    row.(0);
-  Alcotest.check value_testable "val"   (Db.V_text "v50") row.(1)
+  Alcotest.check value_testable "id=50" (Db.V_int 50L) row.(0);
+  Alcotest.check value_testable "val" (Db.V_text "v50") row.(1)
+;;
 
 let close_then_reuse () =
   (* First db: open, use, close *)
@@ -310,6 +336,7 @@ let close_then_reuse () =
   Alcotest.(check int) "db2 has 1 row" 1 (List.length rows);
   Alcotest.check value_testable "db2 row value" (Db.V_text "hello") (List.hd rows).(0);
   run (Db.close db2)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 8: Row content verification                                     *)
@@ -323,6 +350,7 @@ let row_content_exact () =
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let expected = [| Db.V_int 42L; Db.V_text "eve"; Db.V_int 99L |] in
   Alcotest.check row_testable "exact row content" expected (List.hd rows)
+;;
 
 let select_partial_projection () =
   let db = fresh_db () in
@@ -335,12 +363,14 @@ let select_partial_projection () =
   Alcotest.(check int) "2 columns in projection" 2 (Array.length row);
   Alcotest.check value_testable "a=3" (Db.V_int 3L) row.(0);
   Alcotest.check value_testable "c=4" (Db.V_int 4L) row.(1)
+;;
 
 let empty_table_select () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "empty table → 0 rows" 0 (List.length rows)
+;;
 
 let select_where_text () =
   let db = fresh_db () in
@@ -351,8 +381,9 @@ let select_where_text () =
   let rows = query_ok db "SELECT id, word FROM words WHERE word = 'banana'" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.check value_testable "id=2"       (Db.V_int 2L)       row.(0);
+  Alcotest.check value_testable "id=2" (Db.V_int 2L) row.(0);
   Alcotest.check value_testable "word=banana" (Db.V_text "banana") row.(1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 9: Already_exists error                                         *)
@@ -362,45 +393,46 @@ let already_exists_error () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.execute db "CREATE TABLE t (y TEXT)") in
-  (match err_or_fail "already_exists" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
-     Alcotest.(check string) "table name is t" "t" name
-   | _ -> Alcotest.fail "expected Sema(Already_exists \"t\")")
+  match err_or_fail "already_exists" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
+    Alcotest.(check string) "table name is t" "t" name
+  | _ -> Alcotest.fail "expected Sema(Already_exists \"t\")"
+;;
 
 let parse_failure_via_lexer () =
-  run (
-    let* db = Db.open_in_memory () in
-    (* '@' is an unknown character — lexer calls failwith, not Parser.Error *)
-    let* r = Db.execute db "@ invalid" in
-    (match r with
-     | Error (Db.Parse _) -> ()
-     | _ -> Alcotest.fail "expected Parse error from lexer Failure");
-    Db.close db
-  )
+  run
+    (let* db = Db.open_in_memory () in
+     (* '@' is an unknown character — lexer calls failwith, not Parser.Error *)
+     let* r = Db.execute db "@ invalid" in
+     (match r with
+      | Error (Db.Parse _) -> ()
+      | _ -> Alcotest.fail "expected Parse error from lexer Failure");
+     Db.close db)
+;;
 
 let execute_with_select_is_runtime_error () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
-    (* execute with a SELECT — planner produces read op → Exec.execute raises → Runtime *)
-    let* r = Db.execute db "SELECT * FROM t;" in
-    (match r with
-     | Error (Db.Runtime _) -> ()
-     | _ -> Alcotest.fail "expected Runtime error for SELECT via execute");
-    Db.close db
-  )
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
+     (* execute with a SELECT — planner produces read op → Exec.execute raises → Runtime *)
+     let* r = Db.execute db "SELECT * FROM t;" in
+     (match r with
+      | Error (Db.Runtime _) -> ()
+      | _ -> Alcotest.fail "expected Runtime error for SELECT via execute");
+     Db.close db)
+;;
 
 let query_with_insert_is_runtime_error () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
-    (* query with INSERT — planner produces write op → Exec.query raises → Runtime *)
-    let* r = Db.query db "INSERT INTO t (x) VALUES (1);" in
-    (match r with
-     | Error (Db.Runtime _) -> ()
-     | _ -> Alcotest.fail "expected Runtime error for INSERT via query");
-    Db.close db
-  )
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (x INTEGER);" in
+     (* query with INSERT — planner produces write op → Exec.query raises → Runtime *)
+     let* r = Db.query db "INSERT INTO t (x) VALUES (1);" in
+     (match r with
+      | Error (Db.Runtime _) -> ()
+      | _ -> Alcotest.fail "expected Runtime error for INSERT via query");
+     Db.close db)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 10: REAL column type end-to-end                                *)
@@ -416,6 +448,7 @@ let real_create_insert_select () =
   Alcotest.(check int) "2 columns" 2 (Array.length row);
   Alcotest.check value_testable "id=1" (Db.V_int 1L) row.(0);
   Alcotest.check value_testable "val=3.14" (Db.V_real 3.14) row.(1)
+;;
 
 let real_negative () =
   let db = fresh_db () in
@@ -424,6 +457,7 @@ let real_negative () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "x=-1.5" (Db.V_real (-1.5)) (List.hd rows).(0)
+;;
 
 let real_zero () =
   let db = fresh_db () in
@@ -432,6 +466,7 @@ let real_zero () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "x=0.0" (Db.V_real 0.0) (List.hd rows).(0)
+;;
 
 let real_null () =
   let db = fresh_db () in
@@ -440,6 +475,7 @@ let real_null () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "x=null" Db.V_null (List.hd rows).(0)
+;;
 
 let real_multiple_rows () =
   let db = fresh_db () in
@@ -449,18 +485,20 @@ let real_multiple_rows () =
   exec db "INSERT INTO t (id, x) VALUES (3, -3.14)";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  Alcotest.check value_testable "row0.x" (Db.V_real 1.0)    (List.nth rows 0).(1);
-  Alcotest.check value_testable "row1.x" (Db.V_real 2.5)    (List.nth rows 1).(1);
+  Alcotest.check value_testable "row0.x" (Db.V_real 1.0) (List.nth rows 0).(1);
+  Alcotest.check value_testable "row1.x" (Db.V_real 2.5) (List.nth rows 1).(1);
   Alcotest.check value_testable "row2.x" (Db.V_real (-3.14)) (List.nth rows 2).(1)
+;;
 
 let real_type_mismatch () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x REAL)";
   (* Inserting an integer literal into a REAL column should fail type check *)
   let result = run (Db.execute db "INSERT INTO t (x) VALUES ('text')") in
-  (match err_or_fail "real_type_mismatch" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Type_mismatch)")
+  match err_or_fail "real_type_mismatch" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 11: BLOB column type end-to-end                                *)
@@ -475,16 +513,18 @@ let blob_null_insert () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.check value_testable "id=1"    (Db.V_int 1L) row.(0);
-  Alcotest.check value_testable "data=null" Db.V_null   row.(1)
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "data=null" Db.V_null row.(1)
+;;
 
 let blob_type_mismatch () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (data BLOB)";
   let result = run (Db.execute db "INSERT INTO t (data) VALUES ('text')") in
-  (match err_or_fail "blob_type_mismatch" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Type_mismatch) for text into blob col")
+  match err_or_fail "blob_type_mismatch" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Type_mismatch) for text into blob col"
+;;
 
 let blob_schema_preserved () =
   let db = fresh_db () in
@@ -494,8 +534,9 @@ let blob_schema_preserved () =
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "2 cols projected" 2 (Array.length row);
-  Alcotest.check value_testable "id=42"      (Db.V_int 42L)       row.(0);
-  Alcotest.check value_testable "name=hello" (Db.V_text "hello")  row.(1)
+  Alcotest.check value_testable "id=42" (Db.V_int 42L) row.(0);
+  Alcotest.check value_testable "name=hello" (Db.V_text "hello") row.(1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 12: REAL and BLOB together                                     *)
@@ -510,21 +551,23 @@ let real_and_blob_together () =
   Alcotest.(check int) "2 rows" 2 (List.length rows);
   let r0 = List.nth rows 0 in
   let r1 = List.nth rows 1 in
-  Alcotest.check value_testable "r0.id"      (Db.V_int 1L)    r0.(0);
-  Alcotest.check value_testable "r0.score"   (Db.V_real 99.5) r0.(1);
-  Alcotest.check value_testable "r0.payload" Db.V_null         r0.(2);
-  Alcotest.check value_testable "r1.id"      (Db.V_int 2L)    r1.(0);
-  Alcotest.check value_testable "r1.score"   Db.V_null         r1.(1);
-  Alcotest.check value_testable "r1.payload" Db.V_null         r1.(2)
+  Alcotest.check value_testable "r0.id" (Db.V_int 1L) r0.(0);
+  Alcotest.check value_testable "r0.score" (Db.V_real 99.5) r0.(1);
+  Alcotest.check value_testable "r0.payload" Db.V_null r0.(2);
+  Alcotest.check value_testable "r1.id" (Db.V_int 2L) r1.(0);
+  Alcotest.check value_testable "r1.score" Db.V_null r1.(1);
+  Alcotest.check value_testable "r1.payload" Db.V_null r1.(2)
+;;
 
 let already_exists_real_blob () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (f REAL, b BLOB)";
   let result = run (Db.execute db "CREATE TABLE t (x INTEGER)") in
-  (match err_or_fail "already_exists" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
-     Alcotest.(check string) "table name is t" "t" name
-   | _ -> Alcotest.fail "expected Sema(Already_exists)")
+  match err_or_fail "already_exists" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
+    Alcotest.(check string) "table name is t" "t" name
+  | _ -> Alcotest.fail "expected Sema(Already_exists)"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 13: ORDER BY end-to-end                                        *)
@@ -538,9 +581,16 @@ let order_by_asc () =
   exec db "INSERT INTO t (n) VALUES (20)";
   let rows = query_ok db "SELECT * FROM t ORDER BY n ASC" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "ascending order" [10L; 20L; 30L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "ascending order" [ 10L; 20L; 30L ] ns
+;;
 
 let order_by_desc () =
   let db = fresh_db () in
@@ -550,9 +600,16 @@ let order_by_desc () =
   exec db "INSERT INTO t (n) VALUES (20)";
   let rows = query_ok db "SELECT * FROM t ORDER BY n DESC" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "descending order" [30L; 20L; 10L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "descending order" [ 30L; 20L; 10L ] ns
+;;
 
 let order_by_default_asc () =
   let db = fresh_db () in
@@ -561,9 +618,16 @@ let order_by_default_asc () =
   exec db "INSERT INTO t (n) VALUES (1)";
   exec db "INSERT INTO t (n) VALUES (2)";
   let rows = query_ok db "SELECT * FROM t ORDER BY n" in
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "default asc" [1L; 2L; 3L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "default asc" [ 1L; 2L; 3L ] ns
+;;
 
 let limit_no_order () =
   let db = fresh_db () in
@@ -575,9 +639,16 @@ let limit_no_order () =
   exec db "INSERT INTO t (n) VALUES (50)";
   let rows = query_ok db "SELECT * FROM t LIMIT 3" in
   Alcotest.(check int) "limit 3" 3 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "insertion order first 3" [10L; 20L; 30L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "insertion order first 3" [ 10L; 20L; 30L ] ns
+;;
 
 let limit_with_offset () =
   let db = fresh_db () in
@@ -589,9 +660,16 @@ let limit_with_offset () =
   exec db "INSERT INTO t (n) VALUES (50)";
   let rows = query_ok db "SELECT * FROM t LIMIT 3 OFFSET 2" in
   Alcotest.(check int) "limit 3 offset 2 → 3 rows" 3 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "rows at positions 2,3,4" [30L; 40L; 50L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "rows at positions 2,3,4" [ 30L; 40L; 50L ] ns
+;;
 
 let order_by_then_limit () =
   let db = fresh_db () in
@@ -602,9 +680,16 @@ let order_by_then_limit () =
   exec db "INSERT INTO t (n) VALUES (20)";
   let rows = query_ok db "SELECT * FROM t ORDER BY n ASC LIMIT 2" in
   Alcotest.(check int) "limit 2 after sort" 2 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "smallest 2" [10L; 20L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "smallest 2" [ 10L; 20L ] ns
+;;
 
 let order_by_limit_offset () =
   let db = fresh_db () in
@@ -615,9 +700,16 @@ let order_by_limit_offset () =
   exec db "INSERT INTO t (n) VALUES (20)";
   let rows = query_ok db "SELECT * FROM t ORDER BY n ASC LIMIT 2 OFFSET 1" in
   Alcotest.(check int) "limit 2 offset 1 after sort" 2 (List.length rows);
-  let ns = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> Int64.minus_one) rows in
-  Alcotest.(check (list int64)) "2nd and 3rd smallest" [20L; 30L] ns
+  let ns =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> Int64.minus_one)
+      rows
+  in
+  Alcotest.(check (list int64)) "2nd and 3rd smallest" [ 20L; 30L ] ns
+;;
 
 let order_by_null_first () =
   let db = fresh_db () in
@@ -634,9 +726,10 @@ let order_by_null_first () =
   (match (List.nth rows 1).(1) with
    | Db.V_int 2L -> ()
    | _ -> Alcotest.fail "expected 2 second");
-  (match (List.nth rows 2).(1) with
-   | Db.V_int 5L -> ()
-   | _ -> Alcotest.fail "expected 5 last")
+  match (List.nth rows 2).(1) with
+  | Db.V_int 5L -> ()
+  | _ -> Alcotest.fail "expected 5 last"
+;;
 
 let order_by_text () =
   let db = fresh_db () in
@@ -645,9 +738,16 @@ let order_by_text () =
   exec db "INSERT INTO t (name) VALUES ('alice')";
   exec db "INSERT INTO t (name) VALUES ('bob')";
   let rows = query_ok db "SELECT * FROM t ORDER BY name ASC" in
-  let names = List.map (fun r -> match r.(0) with
-    | Db.V_text s -> s | _ -> "") rows in
-  Alcotest.(check (list string)) "alphabetical order" ["alice"; "bob"; "charlie"] names
+  let names =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "")
+      rows
+  in
+  Alcotest.(check (list string)) "alphabetical order" [ "alice"; "bob"; "charlie" ] names
+;;
 
 let order_by_expr () =
   let db = fresh_db () in
@@ -656,27 +756,45 @@ let order_by_expr () =
   exec db "INSERT INTO t VALUES (1)";
   exec db "INSERT INTO t VALUES (2)";
   let rows = query_ok db "SELECT n FROM t ORDER BY n * -1" in
-  let vals = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> -1L) rows in
-  Alcotest.(check (list int64)) "order_by_expr" [3L; 2L; 1L] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> -1L)
+      rows
+  in
+  Alcotest.(check (list int64)) "order_by_expr" [ 3L; 2L; 1L ] vals
+;;
 
 let test_order_by_expr_join () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
-    let* _ = Db.execute db "CREATE TABLE u (tid INTEGER, v TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 30)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (3, 20)" in
-    let* _ = Db.execute db "INSERT INTO u VALUES (1, 'a')" in
-    let* _ = Db.execute db "INSERT INTO u VALUES (2, 'b')" in
-    let* _ = Db.execute db "INSERT INTO u VALUES (3, 'c')" in
-    let* r = Db.query db "SELECT u.v FROM t JOIN u ON t.id = u.tid ORDER BY t.n" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    let vals = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
-    Alcotest.(check (list string)) "join_order_by" ["b"; "c"; "a"] vals;
-    Db.close db
-  )
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
+     let* _ = Db.execute db "CREATE TABLE u (tid INTEGER, v TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 30)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (3, 20)" in
+     let* _ = Db.execute db "INSERT INTO u VALUES (1, 'a')" in
+     let* _ = Db.execute db "INSERT INTO u VALUES (2, 'b')" in
+     let* _ = Db.execute db "INSERT INTO u VALUES (3, 'c')" in
+     let* r = Db.query db "SELECT u.v FROM t JOIN u ON t.id = u.tid ORDER BY t.n" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     let vals =
+       List.map
+         (fun r ->
+            match r.(0) with
+            | Db.V_text s -> s
+            | _ -> "?")
+         rows
+     in
+     Alcotest.(check (list string)) "join_order_by" [ "b"; "c"; "a" ] vals;
+     Db.close db)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 14: QCheck ORDER BY properties                                 *)
@@ -688,24 +806,33 @@ let qcheck_order_by_asc_sorted =
     ~count:10_000
     QCheck.(list_size Gen.(0 -- 20) nat_small)
     (fun ns ->
-      let db = Lwt_main.run (Db.open_in_memory ()) in
-      Lwt_main.run (
-        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-        let* () = Lwt_list.iter_s (fun n ->
-          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-          let* _ = Db.execute db sql in
-          Lwt.return_unit
-        ) ns in
-        let* result = Db.query db "SELECT * FROM t ORDER BY n ASC" in
-        match result with
-        | Error _ -> Lwt.return false
-        | Ok stream ->
-          let* rows = Lwt_stream.to_list stream in
-          let got = List.map (fun r -> match r.(0) with
-            | Db.V_int x -> Int64.to_int x | _ -> 0) rows in
-          let sorted = List.sort compare ns in
-          Lwt.return (got = sorted)
-      ))
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          let* result = Db.query db "SELECT * FROM t ORDER BY n ASC" in
+          match result with
+          | Error _ -> Lwt.return false
+          | Ok stream ->
+            let* rows = Lwt_stream.to_list stream in
+            let got =
+              List.map
+                (fun r ->
+                   match r.(0) with
+                   | Db.V_int x -> Int64.to_int x
+                   | _ -> 0)
+                rows
+            in
+            let sorted = List.sort compare ns in
+            Lwt.return (got = sorted)))
+;;
 
 let qcheck_order_by_desc_sorted =
   QCheck.Test.make
@@ -713,24 +840,33 @@ let qcheck_order_by_desc_sorted =
     ~count:10_000
     QCheck.(list_size Gen.(0 -- 20) nat_small)
     (fun ns ->
-      let db = Lwt_main.run (Db.open_in_memory ()) in
-      Lwt_main.run (
-        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-        let* () = Lwt_list.iter_s (fun n ->
-          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-          let* _ = Db.execute db sql in
-          Lwt.return_unit
-        ) ns in
-        let* result = Db.query db "SELECT * FROM t ORDER BY n DESC" in
-        match result with
-        | Error _ -> Lwt.return false
-        | Ok stream ->
-          let* rows = Lwt_stream.to_list stream in
-          let got = List.map (fun r -> match r.(0) with
-            | Db.V_int x -> Int64.to_int x | _ -> 0) rows in
-          let sorted = List.sort (fun a b -> compare b a) ns in
-          Lwt.return (got = sorted)
-      ))
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          let* result = Db.query db "SELECT * FROM t ORDER BY n DESC" in
+          match result with
+          | Error _ -> Lwt.return false
+          | Ok stream ->
+            let* rows = Lwt_stream.to_list stream in
+            let got =
+              List.map
+                (fun r ->
+                   match r.(0) with
+                   | Db.V_int x -> Int64.to_int x
+                   | _ -> 0)
+                rows
+            in
+            let sorted = List.sort (fun a b -> compare b a) ns in
+            Lwt.return (got = sorted)))
+;;
 
 let qcheck_limit_count =
   QCheck.Test.make
@@ -738,24 +874,27 @@ let qcheck_limit_count =
     ~count:10_000
     QCheck.(pair (list_size Gen.(0 -- 20) nat_small) (1 -- 10))
     (fun (ns, lim) ->
-      let db = Lwt_main.run (Db.open_in_memory ()) in
-      Lwt_main.run (
-        let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-        let* () = Lwt_list.iter_s (fun n ->
-          let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-          let* _ = Db.execute db sql in
-          Lwt.return_unit
-        ) ns in
-        let sql = Printf.sprintf "SELECT * FROM t LIMIT %d" lim in
-        let* result = Db.query db sql in
-        match result with
-        | Error _ -> Lwt.return false
-        | Ok stream ->
-          let* rows = Lwt_stream.to_list stream in
-          let n_got = List.length rows in
-          let n_exp = min lim (List.length ns) in
-          Lwt.return (n_got = n_exp)
-      ))
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          let sql = Printf.sprintf "SELECT * FROM t LIMIT %d" lim in
+          let* result = Db.query db sql in
+          match result with
+          | Error _ -> Lwt.return false
+          | Ok stream ->
+            let* rows = Lwt_stream.to_list stream in
+            let n_got = List.length rows in
+            let n_exp = min lim (List.length ns) in
+            Lwt.return (n_got = n_exp)))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 15: CREATE INDEX + index lookup                                *)
@@ -771,8 +910,9 @@ let create_index_simple () =
   let rows = query_ok db "SELECT id, name FROM t WHERE id = 2" in
   Alcotest.(check int) "1 row found via index" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.check value_testable "id=2"  (Db.V_int 2L)    row.(0);
-  Alcotest.check value_testable "name"  (Db.V_text "bob") row.(1)
+  Alcotest.check value_testable "id=2" (Db.V_int 2L) row.(0);
+  Alcotest.check value_testable "name" (Db.V_text "bob") row.(1)
+;;
 
 let create_index_on_text_column () =
   let db = fresh_db () in
@@ -784,6 +924,7 @@ let create_index_on_text_column () =
   let rows = query_ok db "SELECT id FROM t WHERE name = 'bob'" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "id=2" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
 let create_unique_index () =
   let db = fresh_db () in
@@ -792,6 +933,7 @@ let create_unique_index () =
   exec db "CREATE UNIQUE INDEX idx_id ON t (id)";
   let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
   Alcotest.(check int) "1 row" 1 (List.length rows)
+;;
 
 let unique_index_rejects_duplicate () =
   (* Second INSERT with same indexed value must return an error. *)
@@ -800,9 +942,10 @@ let unique_index_rejects_duplicate () =
   exec db "CREATE UNIQUE INDEX idx ON t (id)";
   exec db "INSERT INTO t (id, name) VALUES (1, 'alice')";
   let result = run (Db.execute db "INSERT INTO t (id, name) VALUES (1, 'bob')") in
-  (match err_or_fail "unique_index_rejects_duplicate" result with
-   | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected Runtime error for UNIQUE constraint violation")
+  match err_or_fail "unique_index_rejects_duplicate" result with
+  | Db.Runtime _ -> ()
+  | _ -> Alcotest.fail "expected Runtime error for UNIQUE constraint violation"
+;;
 
 let unique_index_allows_distinct_values () =
   (* Two rows with different values on a UNIQUE index must both succeed. *)
@@ -813,6 +956,7 @@ let unique_index_allows_distinct_values () =
   exec db "INSERT INTO t (id, name) VALUES (2, 'bob')";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "2 rows" 2 (List.length rows)
+;;
 
 let index_lookup_no_match () =
   let db = fresh_db () in
@@ -822,6 +966,7 @@ let index_lookup_no_match () =
   exec db "CREATE INDEX idx_id ON t (id)";
   let rows = query_ok db "SELECT * FROM t WHERE id = 99" in
   Alcotest.(check int) "0 rows for missing key" 0 (List.length rows)
+;;
 
 let index_lookup_returns_all_matches () =
   (* Index lookup must return every row whose key matches, not just one. *)
@@ -834,22 +979,29 @@ let index_lookup_returns_all_matches () =
   exec db "CREATE INDEX idx_val ON t (val)";
   let rows = query_ok db "SELECT name FROM t WHERE val = 5" in
   Alcotest.(check int) "3 matches" 3 (List.length rows);
-  let names = List.map (fun r -> match r.(0) with
-    | Db.V_text s -> s | _ -> "") rows |> List.sort String.compare in
-  Alcotest.(check (list string)) "matched names" ["a"; "b"; "c"] names
+  let names =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "")
+      rows
+    |> List.sort String.compare
+  in
+  Alcotest.(check (list string)) "matched names" [ "a"; "b"; "c" ] names
+;;
 
 let index_lookup_matches_seq_scan () =
   (* For each value we insert, verify the index lookup result equals
      what a sequential scan with WHERE would return. *)
   let db = fresh_db () in
   exec db "CREATE TABLE t (val INTEGER, name TEXT)";
-  let data = [
-    (10, "alpha"); (20, "beta"); (10, "gamma"); (30, "delta"); (20, "epsilon")
-  ] in
-  List.iter (fun (n, s) ->
-    let sql = Printf.sprintf "INSERT INTO t (val, name) VALUES (%d, '%s')" n s in
-    exec db sql
-  ) data;
+  let data = [ 10, "alpha"; 20, "beta"; 10, "gamma"; 30, "delta"; 20, "epsilon" ] in
+  List.iter
+    (fun (n, s) ->
+       let sql = Printf.sprintf "INSERT INTO t (val, name) VALUES (%d, '%s')" n s in
+       exec db sql)
+    data;
   (* Snapshot pre-index results *)
   let pre_10 = query_ok db "SELECT name FROM t WHERE val = 10" in
   let pre_20 = query_ok db "SELECT name FROM t WHERE val = 20" in
@@ -859,12 +1011,18 @@ let index_lookup_matches_seq_scan () =
   let post_20 = query_ok db "SELECT name FROM t WHERE val = 20" in
   let post_30 = query_ok db "SELECT name FROM t WHERE val = 30" in
   let names rows =
-    List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "") rows
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "")
+      rows
     |> List.sort String.compare
   in
   Alcotest.(check (list string)) "val=10 results" (names pre_10) (names post_10);
   Alcotest.(check (list string)) "val=20 results" (names pre_20) (names post_20);
   Alcotest.(check (list string)) "val=30 results" (names pre_30) (names post_30)
+;;
 
 let index_lookup_after_inserts () =
   (* Inserts after CREATE INDEX must also be findable. *)
@@ -877,30 +1035,34 @@ let index_lookup_after_inserts () =
   let rows = query_ok db "SELECT name FROM t WHERE id = 3" in
   Alcotest.(check int) "1 row found" 1 (List.length rows);
   Alcotest.check value_testable "name=carol" (Db.V_text "carol") (List.hd rows).(0)
+;;
 
 let create_index_unknown_table () =
   let db = fresh_db () in
   let result = run (Db.execute db "CREATE INDEX idx ON ghost (x)") in
-  (match err_or_fail "create_index_unknown_table" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Unknown_table)")
+  match err_or_fail "create_index_unknown_table" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Unknown_table)"
+;;
 
 let create_index_unknown_column () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER)";
   let result = run (Db.execute db "CREATE INDEX idx ON t (bogus)") in
-  (match err_or_fail "create_index_unknown_column" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Unknown_column)")
+  match err_or_fail "create_index_unknown_column" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Unknown_column)"
+;;
 
 let create_index_duplicate () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER)";
   exec db "CREATE INDEX idx ON t (id)";
   let result = run (Db.execute db "CREATE INDEX idx ON t (id)") in
-  (match err_or_fail "create_index_duplicate" result with
-   | Db.Sema (Sqlocaml_sql.Sema.Already_exists _) -> ()
-   | _ -> Alcotest.fail "expected Sema(Already_exists)")
+  match err_or_fail "create_index_duplicate" result with
+  | Db.Sema (Sqlocaml_sql.Sema.Already_exists _) -> ()
+  | _ -> Alcotest.fail "expected Sema(Already_exists)"
+;;
 
 let index_lookup_where_null_no_match () =
   (* WHERE col = NULL must return 0 rows even when an index exists
@@ -912,6 +1074,7 @@ let index_lookup_where_null_no_match () =
   exec db "CREATE INDEX idx ON t (val)";
   let rows = query_ok db "SELECT * FROM t WHERE val = NULL" in
   Alcotest.(check int) "0 rows for col = NULL" 0 (List.length rows)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Multi-column index test                                             *)
@@ -927,6 +1090,7 @@ let test_multi_col_index () =
   let rows = query_ok db "SELECT c FROM t WHERE a = 1" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check value_testable "value" (Db.V_text "x") (List.hd rows).(0)
+;;
 
 let test_multi_col_unique_index () =
   let db = fresh_db () in
@@ -940,9 +1104,10 @@ let test_multi_col_unique_index () =
    | Ok () -> ());
   (* Same (a=1, b=2) — MUST violate unique constraint *)
   let r2 = run (Db.execute db "INSERT INTO t VALUES (1, 2, 'z')") in
-  (match r2 with
-   | Ok () -> Alcotest.fail "should have rejected duplicate (1,2)"
-   | Error _ -> ())
+  match r2 with
+  | Ok () -> Alcotest.fail "should have rejected duplicate (1,2)"
+  | Error _ -> ()
+;;
 
 (* QCheck: random integer inserts + CREATE INDEX; index lookup must
    match sequential scan for every distinct value. *)
@@ -953,84 +1118,111 @@ let qcheck_index_lookup_matches_seq_scan =
     QCheck.(list_size Gen.(0 -- 20) (int_range (-100) 100))
     (fun ns ->
        let db = Lwt_main.run (Db.open_in_memory ()) in
-       Lwt_main.run (
-         let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-         let* () = Lwt_list.iter_s (fun n ->
-           let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-           let* _ = Db.execute db sql in
-           Lwt.return_unit
-         ) ns in
-         (* Snapshot results per distinct value, pre-index *)
-         let distinct = List.sort_uniq compare ns in
-         let* pre_counts = Lwt_list.map_s (fun v ->
-           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
-           match r with
-           | Error _ -> Lwt.return (v, -1)
-           | Ok stream ->
-             let* rows = Lwt_stream.to_list stream in
-             Lwt.return (v, List.length rows)
-         ) distinct in
-         let* _ = Db.execute db "CREATE INDEX idx_n ON t (n)" in
-         let* post_counts = Lwt_list.map_s (fun v ->
-           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
-           match r with
-           | Error _ -> Lwt.return (v, -1)
-           | Ok stream ->
-             let* rows = Lwt_stream.to_list stream in
-             Lwt.return (v, List.length rows)
-         ) distinct in
-         (* Also check a value that's not present (should give 0 in both) *)
-         let absent = 1000 in
-         let* r1 = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" absent) in
-         let* absent_post = match r1 with
-           | Error _ -> Lwt.return (-1)
-           | Ok s -> let* rs = Lwt_stream.to_list s in Lwt.return (List.length rs)
-         in
-         Lwt.return (pre_counts = post_counts && absent_post = 0)
-       ))
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          (* Snapshot results per distinct value, pre-index *)
+          let distinct = List.sort_uniq compare ns in
+          let* pre_counts =
+            Lwt_list.map_s
+              (fun v ->
+                 let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
+                 match r with
+                 | Error _ -> Lwt.return (v, -1)
+                 | Ok stream ->
+                   let* rows = Lwt_stream.to_list stream in
+                   Lwt.return (v, List.length rows))
+              distinct
+          in
+          let* _ = Db.execute db "CREATE INDEX idx_n ON t (n)" in
+          let* post_counts =
+            Lwt_list.map_s
+              (fun v ->
+                 let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" v) in
+                 match r with
+                 | Error _ -> Lwt.return (v, -1)
+                 | Ok stream ->
+                   let* rows = Lwt_stream.to_list stream in
+                   Lwt.return (v, List.length rows))
+              distinct
+          in
+          (* Also check a value that's not present (should give 0 in both) *)
+          let absent = 1000 in
+          let* r1 = Db.query db (Printf.sprintf "SELECT * FROM t WHERE n = %d" absent) in
+          let* absent_post =
+            match r1 with
+            | Error _ -> Lwt.return (-1)
+            | Ok s ->
+              let* rs = Lwt_stream.to_list s in
+              Lwt.return (List.length rs)
+          in
+          Lwt.return (pre_counts = post_counts && absent_post = 0)))
+;;
 
 (* QCheck: random text inserts + CREATE INDEX on the text column *)
 let qcheck_text_index_lookup =
   QCheck.Test.make
     ~name:"text_index_lookup: results match seq_scan for any value"
     ~count:10_000
-    QCheck.(list_size Gen.(0 -- 15)
-              (string_size ~gen:Gen.(char_range 'a' 'd') Gen.(1 -- 4)))
+    QCheck.(
+      list_size Gen.(0 -- 15) (string_size ~gen:Gen.(char_range 'a' 'd') Gen.(1 -- 4)))
     (fun ss ->
        let db = Lwt_main.run (Db.open_in_memory ()) in
-       Lwt_main.run (
-         let* _ = Db.execute db "CREATE TABLE t (s TEXT)" in
-         let* () = Lwt_list.iter_s (fun s ->
-           (* Escape single quotes by skipping inserts that contain them. *)
-           if String.contains s '\'' then Lwt.return_unit
-           else
-             let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
-             let* _ = Db.execute db sql in
-             Lwt.return_unit
-         ) ss in
-         let distinct =
-           List.filter (fun s -> not (String.contains s '\''))
-             (List.sort_uniq compare ss)
-         in
-         let* pre_counts = Lwt_list.map_s (fun v ->
-           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v) in
-           match r with
-           | Error _ -> Lwt.return (v, -1)
-           | Ok stream ->
-             let* rows = Lwt_stream.to_list stream in
-             Lwt.return (v, List.length rows)
-         ) distinct in
-         let* _ = Db.execute db "CREATE INDEX idx_s ON t (s)" in
-         let* post_counts = Lwt_list.map_s (fun v ->
-           let* r = Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v) in
-           match r with
-           | Error _ -> Lwt.return (v, -1)
-           | Ok stream ->
-             let* rows = Lwt_stream.to_list stream in
-             Lwt.return (v, List.length rows)
-         ) distinct in
-         Lwt.return (pre_counts = post_counts)
-       ))
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (s TEXT)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun s ->
+                 (* Escape single quotes by skipping inserts that contain them. *)
+                 if String.contains s '\''
+                 then Lwt.return_unit
+                 else (
+                   let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
+                   let* _ = Db.execute db sql in
+                   Lwt.return_unit))
+              ss
+          in
+          let distinct =
+            List.filter
+              (fun s -> not (String.contains s '\''))
+              (List.sort_uniq compare ss)
+          in
+          let* pre_counts =
+            Lwt_list.map_s
+              (fun v ->
+                 let* r =
+                   Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v)
+                 in
+                 match r with
+                 | Error _ -> Lwt.return (v, -1)
+                 | Ok stream ->
+                   let* rows = Lwt_stream.to_list stream in
+                   Lwt.return (v, List.length rows))
+              distinct
+          in
+          let* _ = Db.execute db "CREATE INDEX idx_s ON t (s)" in
+          let* post_counts =
+            Lwt_list.map_s
+              (fun v ->
+                 let* r =
+                   Db.query db (Printf.sprintf "SELECT * FROM t WHERE s = '%s'" v)
+                 in
+                 match r with
+                 | Error _ -> Lwt.return (v, -1)
+                 | Ok stream ->
+                   let* rows = Lwt_stream.to_list stream in
+                   Lwt.return (v, List.length rows))
+              distinct
+          in
+          Lwt.return (pre_counts = post_counts)))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 16: NOT NULL enforcement + DEFAULT constraints (Task 4)        *)
@@ -1043,13 +1235,14 @@ let not_null_insert_null () =
   let result = run (Db.execute db "INSERT INTO t (n) VALUES (NULL)") in
   match result with
   | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
-  | Error (Db.Runtime _) -> ()   (* also acceptable: runtime enforcement *)
+  | Error (Db.Runtime _) -> () (* also acceptable: runtime enforcement *)
   | Error e ->
     (match e with
-     | Db.Parse msg  -> Alcotest.failf "expected Not_null_violation, got Parse: %s" msg
-     | Db.Sema _     -> Alcotest.fail "expected Not_null_violation, got other Sema error"
+     | Db.Parse msg -> Alcotest.failf "expected Not_null_violation, got Parse: %s" msg
+     | Db.Sema _ -> Alcotest.fail "expected Not_null_violation, got other Sema error"
      | Db.Runtime msg -> Alcotest.failf "expected Not_null_violation, got Runtime: %s" msg)
   | Ok () -> Alcotest.fail "expected Not_null_violation error, got Ok"
+;;
 
 (** INSERT omitting a NOT NULL column that has a DEFAULT → uses default. *)
 let not_null_default_used_when_omitted () =
@@ -1060,7 +1253,8 @@ let not_null_default_used_when_omitted () =
   Alcotest.(check int) "1 row inserted" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "n=42 (from default)" (Db.V_int 42L) row.(0);
-  Alcotest.check value_testable "s=x"                  (Db.V_text "x") row.(1)
+  Alcotest.check value_testable "s=x" (Db.V_text "x") row.(1)
+;;
 
 (** INSERT omitting a NOT NULL column with DEFAULT 0 → uses 0. *)
 let not_null_default_zero () =
@@ -1070,6 +1264,7 @@ let not_null_default_zero () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "n=0 (default)" (Db.V_int 0L) (List.hd rows).(0)
+;;
 
 (** UPDATE SET col = NULL on a NOT NULL column → Not_null_violation. *)
 let not_null_update_to_null () =
@@ -1079,13 +1274,14 @@ let not_null_update_to_null () =
   let result = run (Db.execute db "UPDATE t SET n = NULL") in
   match result with
   | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
-  | Error (Db.Runtime _) -> ()   (* also acceptable *)
-  | Ok ()   -> Alcotest.fail "expected Not_null_violation on UPDATE, got Ok"
+  | Error (Db.Runtime _) -> () (* also acceptable *)
+  | Ok () -> Alcotest.fail "expected Not_null_violation on UPDATE, got Ok"
   | Error e ->
     (match e with
-     | Db.Parse msg  -> Alcotest.failf "got Parse: %s" msg
-     | Db.Sema _     -> Alcotest.fail "got other Sema error"
+     | Db.Parse msg -> Alcotest.failf "got Parse: %s" msg
+     | Db.Sema _ -> Alcotest.fail "got other Sema error"
      | Db.Runtime msg -> Alcotest.failf "got Runtime: %s" msg)
+;;
 
 (** Explicit DEFAULT value is returned after SELECT. *)
 let default_value_readable () =
@@ -1095,20 +1291,22 @@ let default_value_readable () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.check value_testable "x=1 (explicit)"   (Db.V_int 1L)    row.(0);
-  Alcotest.check value_testable "y=hi (default)"   (Db.V_text "hi") row.(1)
+  Alcotest.check value_testable "x=1 (explicit)" (Db.V_int 1L) row.(0);
+  Alcotest.check value_testable "y=hi (default)" (Db.V_text "hi") row.(1)
+;;
 
 (** INSERT omitting a NOT NULL column that has no DEFAULT → error. *)
 let not_null_omit_no_default () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER NOT NULL)" in
-    let* result = Db.execute db "INSERT INTO t (id) VALUES (1)" in
-    (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected error when omitting NOT NULL column with no default");
-    Db.close db
-  )
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER NOT NULL)" in
+     let* result = Db.execute db "INSERT INTO t (id) VALUES (1)" in
+     (match result with
+      | Error _ -> ()
+      | Ok () ->
+        Alcotest.fail "expected error when omitting NOT NULL column with no default");
+     Db.close db)
+;;
 
 (** QCheck: for a table with n INTEGER NOT NULL DEFAULT 99, inserting without
     specifying n always produces n=99.  10,000 trials. *)
@@ -1118,28 +1316,31 @@ let qcheck_default_applied =
     ~count:10_000
     QCheck.(string_size ~gen:Gen.(char_range 'a' 'z') Gen.(1 -- 8))
     (fun s ->
-       if String.contains s '\'' then true  (* skip strings with quotes *)
-       else
+       if String.contains s '\''
+       then true (* skip strings with quotes *)
+       else (
          let db = Lwt_main.run (Db.open_in_memory ()) in
-         Lwt_main.run (
-           let* _ = Db.execute db
-               "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 99, s TEXT)" in
-           let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
-           let* res = Db.execute db sql in
-           match res with
-           | Error _ -> Lwt.return false
-           | Ok () ->
-             let* qres = Db.query db "SELECT * FROM t" in
-             match qres with
-             | Error _ -> Lwt.return false
-             | Ok stream ->
-               let* rows = Lwt_stream.to_list stream in
-               match rows with
-               | [row] ->
-                 (match row.(0) with
-                  | Db.V_int 99L -> Lwt.return true
-                  | _             -> Lwt.return false)
-               | _ -> Lwt.return false))
+         Lwt_main.run
+           (let* _ =
+              Db.execute db "CREATE TABLE t (n INTEGER NOT NULL DEFAULT 99, s TEXT)"
+            in
+            let sql = Printf.sprintf "INSERT INTO t (s) VALUES ('%s')" s in
+            let* res = Db.execute db sql in
+            match res with
+            | Error _ -> Lwt.return false
+            | Ok () ->
+              let* qres = Db.query db "SELECT * FROM t" in
+              (match qres with
+               | Error _ -> Lwt.return false
+               | Ok stream ->
+                 let* rows = Lwt_stream.to_list stream in
+                 (match rows with
+                  | [ row ] ->
+                    (match row.(0) with
+                     | Db.V_int 99L -> Lwt.return true
+                     | _ -> Lwt.return false)
+                  | _ -> Lwt.return false)))))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 17: DROP TABLE and DROP INDEX (Task 7)                         *)
@@ -1150,12 +1351,14 @@ let expect_unknown_table label result =
   match err_or_fail label result with
   | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
   | _ -> Alcotest.failf "%s: expected Sema(Unknown_table)" label
+;;
 
 (** Helper: expect a Sema(Unknown_index) error. *)
 let expect_unknown_index label result =
   match err_or_fail label result with
   | Db.Sema (Sqlocaml_sql.Sema.Unknown_index _) -> ()
   | _ -> Alcotest.failf "%s: expected Sema(Unknown_index)" label
+;;
 
 (** DROP TABLE then SELECT returns Unknown_table. *)
 let drop_table_then_select () =
@@ -1165,12 +1368,14 @@ let drop_table_then_select () =
   exec db "DROP TABLE t";
   let result = run (Db.query db "SELECT * FROM t") in
   expect_unknown_table "drop_table_then_select" result
+;;
 
 (** DROP TABLE on a non-existent table → Unknown_table. *)
 let drop_table_nonexistent () =
   let db = fresh_db () in
   let result = run (Db.execute db "DROP TABLE ghost") in
   expect_unknown_table "drop_table_nonexistent" result
+;;
 
 (** DROP TABLE removes all rows — old data not visible after recreate. *)
 let drop_table_data_gone () =
@@ -1181,6 +1386,7 @@ let drop_table_data_gone () =
   exec db "CREATE TABLE t (n INTEGER)";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "no old rows after DROP+CREATE" 0 (List.length rows)
+;;
 
 (** DROP TABLE with associated index — indexes gone from catalog; subsequent
     SELECT on recreated table works (no crash). *)
@@ -1196,6 +1402,7 @@ let drop_table_with_index () =
   (* DROP INDEX on a now-deleted index should return Unknown_index *)
   let result2 = run (Db.execute db "DROP INDEX idx") in
   expect_unknown_index "drop_table_with_index: index gone" result2
+;;
 
 (** DROP TABLE then re-CREATE with same name succeeds and is empty. *)
 let drop_table_then_recreate () =
@@ -1208,6 +1415,7 @@ let drop_table_then_recreate () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row in recreated table" 1 (List.length rows);
   Alcotest.check value_testable "new row value" (Db.V_int 200L) (List.hd rows).(0)
+;;
 
 (** DROP INDEX then SELECT falls back to seq scan (no crash). *)
 let drop_index_then_select () =
@@ -1221,12 +1429,14 @@ let drop_index_then_select () =
   let rows = query_ok db "SELECT name FROM t WHERE id = 2" in
   Alcotest.(check int) "1 row via seq scan after DROP INDEX" 1 (List.length rows);
   Alcotest.check value_testable "name=bob" (Db.V_text "bob") (List.hd rows).(0)
+;;
 
 (** DROP INDEX on non-existent index → Unknown_index. *)
 let drop_index_nonexistent () =
   let db = fresh_db () in
   let result = run (Db.execute db "DROP INDEX no_such_idx") in
   expect_unknown_index "drop_index_nonexistent" result
+;;
 
 (** DROP INDEX then re-CREATE with same name succeeds. *)
 let drop_index_then_recreate () =
@@ -1238,6 +1448,7 @@ let drop_index_then_recreate () =
   exec db "CREATE INDEX idx ON t (id)";
   let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
   Alcotest.(check int) "1 row via recreated index" 1 (List.length rows)
+;;
 
 (** DROP the very first index ever created (id=0, first entry in _sys_indexes)
     and verify re-creation succeeds, proving the on-disk record was deleted. *)
@@ -1253,6 +1464,7 @@ let drop_first_index_then_recreate () =
   exec db "CREATE INDEX idx ON t (id)";
   let rows = query_ok db "SELECT * FROM t WHERE id = 1" in
   Alcotest.(check int) "0 rows (recreated index, empty table)" 0 (List.length rows)
+;;
 
 (** After DROP TABLE and re-CREATE, only new rows are visible. *)
 let drop_table_recreate_old_data_invisible () =
@@ -1266,8 +1478,9 @@ let drop_table_recreate_old_data_invisible () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "only 1 new row visible" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.check value_testable "id=10"     (Db.V_int 10L)     row.(0);
+  Alcotest.check value_testable "id=10" (Db.V_int 10L) row.(0);
   Alcotest.check value_testable "val=new10" (Db.V_text "new10") row.(1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 17: Gap-fill — Db.open_file error path, REAL DEFAULT roundtrip *)
@@ -1277,116 +1490,125 @@ let drop_table_recreate_old_data_invisible () =
     an OS-level error (e.g., EISDIR) — covers db.ml lines 34-36 and
     store.ml line 219. *)
 let open_file_invalid_path () =
-  run (
-    (* "/" is always a directory; openfile with O_RDWR on it fails. *)
-    let* result = Db.open_file ~path:"/" in
-    (match result with
-     | Ok _ -> Alcotest.fail "expected Error opening '/'"
-     | Error (Db.Runtime _) -> ()
-     | Error _ -> Alcotest.fail "expected Runtime error variant");
-    Lwt.return_unit
-  )
+  run
+    ((* "/" is always a directory; openfile with O_RDWR on it fails. *)
+     let* result = Db.open_file ~path:"/" in
+     (match result with
+      | Ok _ -> Alcotest.fail "expected Error opening '/'"
+      | Error (Db.Runtime _) -> ()
+      | Error _ -> Alcotest.fail "expected Runtime error variant");
+     Lwt.return_unit)
+;;
 
 (** Tempfile helper that survives a single test. *)
 let with_tempfile f =
   let path = Filename.temp_file "sqlocaml_gap_" ".db" in
-  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  (try Unix.unlink path with
+   | Unix.Unix_error _ -> ());
   let result = f path in
-  (try Unix.unlink path with Unix.Unix_error _ -> ());
+  (try Unix.unlink path with
+   | Unix.Unix_error _ -> ());
   result
+;;
 
 (** REAL DEFAULT round-trips through close+reopen, exercising
     encode/decode_default_value DV_real (catalog.ml lines 98-103 / 124-130)
     and the Some-default decode branch (catalog.ml line 174). *)
 let default_real_persists () =
   with_tempfile (fun path ->
-    run (
-      let* db_res = Db.open_file ~path in
-      let db = match db_res with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "open_file failed"
-      in
-      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, f REAL DEFAULT 2.5)" in
-      let* () = Db.close db in
-      (* Reopen and check schema *)
-      let* db_res2 = Db.open_file ~path in
-      let db2 = match db_res2 with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "reopen failed"
-      in
-      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
-      let* rq = Db.query db2 "SELECT * FROM t" in
-      let* rows = match rq with
-        | Ok stream -> Lwt_stream.to_list stream
-        | Error _ -> Alcotest.fail "query failed after reopen"
-      in
-      Alcotest.(check int) "1 row" 1 (List.length rows);
-      let r = List.hd rows in
-      Alcotest.check value_testable "n=1" (Db.V_int 1L) r.(0);
-      Alcotest.check value_testable "f=2.5 (default)" (Db.V_real 2.5) r.(1);
-      Db.close db2
-    )
-  )
+    run
+      (let* db_res = Db.open_file ~path in
+       let db =
+         match db_res with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* _ = Db.execute db "CREATE TABLE t (n INTEGER, f REAL DEFAULT 2.5)" in
+       let* () = Db.close db in
+       (* Reopen and check schema *)
+       let* db_res2 = Db.open_file ~path in
+       let db2 =
+         match db_res2 with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "reopen failed"
+       in
+       let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+       let* rq = Db.query db2 "SELECT * FROM t" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error _ -> Alcotest.fail "query failed after reopen"
+       in
+       Alcotest.(check int) "1 row" 1 (List.length rows);
+       let r = List.hd rows in
+       Alcotest.check value_testable "n=1" (Db.V_int 1L) r.(0);
+       Alcotest.check value_testable "f=2.5 (default)" (Db.V_real 2.5) r.(1);
+       Db.close db2))
+;;
 
 (** TEXT DEFAULT round-trips through close+reopen.
     Exercises catalog DV_text encode/decode_default_value branches. *)
 let default_text_persists () =
   with_tempfile (fun path ->
-    run (
-      let* db_res = Db.open_file ~path in
-      let db = match db_res with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "open_file failed"
-      in
-      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, s TEXT DEFAULT 'hello')" in
-      let* () = Db.close db in
-      let* db_res2 = Db.open_file ~path in
-      let db2 = match db_res2 with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "reopen failed"
-      in
-      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
-      let* rq = Db.query db2 "SELECT * FROM t" in
-      let* rows = match rq with
-        | Ok stream -> Lwt_stream.to_list stream
-        | Error _ -> Alcotest.fail "query failed after reopen"
-      in
-      Alcotest.(check int) "1 row" 1 (List.length rows);
-      let r = List.hd rows in
-      Alcotest.check value_testable "s=hello (default)" (Db.V_text "hello") r.(1);
-      Db.close db2
-    )
-  )
+    run
+      (let* db_res = Db.open_file ~path in
+       let db =
+         match db_res with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* _ = Db.execute db "CREATE TABLE t (n INTEGER, s TEXT DEFAULT 'hello')" in
+       let* () = Db.close db in
+       let* db_res2 = Db.open_file ~path in
+       let db2 =
+         match db_res2 with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "reopen failed"
+       in
+       let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+       let* rq = Db.query db2 "SELECT * FROM t" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error _ -> Alcotest.fail "query failed after reopen"
+       in
+       Alcotest.(check int) "1 row" 1 (List.length rows);
+       let r = List.hd rows in
+       Alcotest.check value_testable "s=hello (default)" (Db.V_text "hello") r.(1);
+       Db.close db2))
+;;
 
 (** INTEGER DEFAULT round-trips through close+reopen. Exercises DV_int
     encode/decode branches in catalog.ml. *)
 let default_int_persists () =
   with_tempfile (fun path ->
-    run (
-      let* db_res = Db.open_file ~path in
-      let db = match db_res with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "open_file failed"
-      in
-      let* _ = Db.execute db "CREATE TABLE t (n INTEGER, k INTEGER DEFAULT 42)" in
-      let* () = Db.close db in
-      let* db_res2 = Db.open_file ~path in
-      let db2 = match db_res2 with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "reopen failed"
-      in
-      let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
-      let* rq = Db.query db2 "SELECT * FROM t" in
-      let* rows = match rq with
-        | Ok stream -> Lwt_stream.to_list stream
-        | Error _ -> Alcotest.fail "query failed after reopen"
-      in
-      Alcotest.(check int) "1 row" 1 (List.length rows);
-      let r = List.hd rows in
-      Alcotest.check value_testable "k=42 (default)" (Db.V_int 42L) r.(1);
-      Db.close db2
-    )
-  )
+    run
+      (let* db_res = Db.open_file ~path in
+       let db =
+         match db_res with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* _ = Db.execute db "CREATE TABLE t (n INTEGER, k INTEGER DEFAULT 42)" in
+       let* () = Db.close db in
+       let* db_res2 = Db.open_file ~path in
+       let db2 =
+         match db_res2 with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "reopen failed"
+       in
+       let* _ = Db.execute db2 "INSERT INTO t (n) VALUES (1)" in
+       let* rq = Db.query db2 "SELECT * FROM t" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error _ -> Alcotest.fail "query failed after reopen"
+       in
+       Alcotest.(check int) "1 row" 1 (List.length rows);
+       let r = List.hd rows in
+       Alcotest.check value_testable "k=42 (default)" (Db.V_int 42L) r.(1);
+       Db.close db2))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group: BETWEEN and IN operators                                      *)
@@ -1399,9 +1621,16 @@ let test_between_query () =
   exec db "INSERT INTO t VALUES (5)";
   exec db "INSERT INTO t VALUES (10)";
   let rows = query_ok db "SELECT n FROM t WHERE n BETWEEN 3 AND 7" in
-  let vals = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> -1L) rows in
-  Alcotest.(check (list int64)) "between" [5L] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> -1L)
+      rows
+  in
+  Alcotest.(check (list int64)) "between" [ 5L ] vals
+;;
 
 let test_not_between_query () =
   let db = fresh_db () in
@@ -1410,9 +1639,18 @@ let test_not_between_query () =
   exec db "INSERT INTO t VALUES (5)";
   exec db "INSERT INTO t VALUES (10)";
   let rows = query_ok db "SELECT n FROM t WHERE n NOT BETWEEN 3 AND 7" in
-  let vals = List.sort Int64.compare (List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> -1L) rows) in
-  Alcotest.(check (list int64)) "not between" [1L; 10L] vals
+  let vals =
+    List.sort
+      Int64.compare
+      (List.map
+         (fun r ->
+            match r.(0) with
+            | Db.V_int n -> n
+            | _ -> -1L)
+         rows)
+  in
+  Alcotest.(check (list int64)) "not between" [ 1L; 10L ] vals
+;;
 
 let test_in_query () =
   let db = fresh_db () in
@@ -1421,9 +1659,18 @@ let test_in_query () =
   exec db "INSERT INTO t VALUES (2)";
   exec db "INSERT INTO t VALUES (3)";
   let rows = query_ok db "SELECT n FROM t WHERE n IN (1, 3)" in
-  let vals = List.sort Int64.compare (List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> -1L) rows) in
-  Alcotest.(check (list int64)) "in" [1L; 3L] vals
+  let vals =
+    List.sort
+      Int64.compare
+      (List.map
+         (fun r ->
+            match r.(0) with
+            | Db.V_int n -> n
+            | _ -> -1L)
+         rows)
+  in
+  Alcotest.(check (list int64)) "in" [ 1L; 3L ] vals
+;;
 
 let test_not_in_query () =
   let db = fresh_db () in
@@ -1432,9 +1679,16 @@ let test_not_in_query () =
   exec db "INSERT INTO t VALUES (2)";
   exec db "INSERT INTO t VALUES (3)";
   let rows = query_ok db "SELECT n FROM t WHERE n NOT IN (1, 3)" in
-  let vals = List.map (fun r -> match r.(0) with
-    | Db.V_int n -> n | _ -> -1L) rows in
-  Alcotest.(check (list int64)) "not in" [2L] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> n
+         | _ -> -1L)
+      rows
+  in
+  Alcotest.(check (list int64)) "not in" [ 2L ] vals
+;;
 
 (* ------------------------------------------------------------------ *)
 (* PRAGMA tests                                                         *)
@@ -1443,31 +1697,73 @@ let test_not_in_query () =
 module D = Db
 
 let test_pragma_table_info () =
-  run (
-    let* db = D.open_in_memory () in
-    let* _ = D.execute db "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT)" in
-    let* r = D.query db "PRAGMA table_info(t)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "pragma rows" 2 (List.length rows);
-    let col0 = List.nth rows 0 in
-    Alcotest.(check string) "col0 name" "id"      (match col0.(1) with D.V_text s -> s | _ -> "?");
-    Alcotest.(check string) "col0 type" "INTEGER"  (match col0.(2) with D.V_text s -> s | _ -> "?");
-    Alcotest.(check int64)  "col0 nn"   1L         (match col0.(3) with D.V_int n -> n | _ -> -1L);
-    Alcotest.(check int64)  "col0 pk"   1L         (match col0.(5) with D.V_int n -> n | _ -> -1L);
-    Lwt.return_unit)
+  run
+    (let* db = D.open_in_memory () in
+     let* _ =
+       D.execute db "CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, name TEXT)"
+     in
+     let* r = D.query db "PRAGMA table_info(t)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int) "pragma rows" 2 (List.length rows);
+     let col0 = List.nth rows 0 in
+     Alcotest.(check string)
+       "col0 name"
+       "id"
+       (match col0.(1) with
+        | D.V_text s -> s
+        | _ -> "?");
+     Alcotest.(check string)
+       "col0 type"
+       "INTEGER"
+       (match col0.(2) with
+        | D.V_text s -> s
+        | _ -> "?");
+     Alcotest.(check int64)
+       "col0 nn"
+       1L
+       (match col0.(3) with
+        | D.V_int n -> n
+        | _ -> -1L);
+     Alcotest.(check int64)
+       "col0 pk"
+       1L
+       (match col0.(5) with
+        | D.V_int n -> n
+        | _ -> -1L);
+     Lwt.return_unit)
+;;
 
 let test_pragma_index_list () =
-  run (
-    let* db = D.open_in_memory () in
-    let* _ = D.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
-    let* _ = D.execute db "CREATE INDEX idx_name ON t (name)" in
-    let* r = D.query db "PRAGMA index_list(t)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "idx rows" 1 (List.length rows);
-    let row = List.hd rows in
-    Alcotest.(check string) "idx name" "idx_name" (match row.(1) with D.V_text s -> s | _ -> "?");
-    Alcotest.(check int64)  "idx uniq" 0L         (match row.(2) with D.V_int n -> n | _ -> -1L);
-    Lwt.return_unit)
+  run
+    (let* db = D.open_in_memory () in
+     let* _ = D.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+     let* _ = D.execute db "CREATE INDEX idx_name ON t (name)" in
+     let* r = D.query db "PRAGMA index_list(t)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int) "idx rows" 1 (List.length rows);
+     let row = List.hd rows in
+     Alcotest.(check string)
+       "idx name"
+       "idx_name"
+       (match row.(1) with
+        | D.V_text s -> s
+        | _ -> "?");
+     Alcotest.(check int64)
+       "idx uniq"
+       0L
+       (match row.(2) with
+        | D.V_int n -> n
+        | _ -> -1L);
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* SELECT DISTINCT                                                      *)
@@ -1483,8 +1779,12 @@ let test_distinct () =
   let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
   Alcotest.(check int) "2 distinct x rows" 2 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "distinct x values"
-    [Db.V_int 1L; Db.V_int 2L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "distinct x values"
+    [ Db.V_int 1L; Db.V_int 2L ]
+    xs
+;;
 
 let test_distinct_multicolumn () =
   let db = fresh_db () in
@@ -1496,6 +1796,7 @@ let test_distinct_multicolumn () =
   (* Use ORDER BY x only (multi-key ORDER BY is not yet supported). *)
   let rows = query_ok db "SELECT DISTINCT x, y FROM t ORDER BY x" in
   Alcotest.(check int) "3 distinct (x,y) rows" 3 (List.length rows)
+;;
 
 let test_distinct_null () =
   let db = fresh_db () in
@@ -1506,32 +1807,41 @@ let test_distinct_null () =
   let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
   Alcotest.(check int) "2 distinct x rows (with null)" 2 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "distinct x with null"
-    [Db.V_null; Db.V_int 1L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "distinct x with null"
+    [ Db.V_null; Db.V_int 1L ]
+    xs
+;;
 
 (* ------------------------------------------------------------------ *)
 (* UNION / INTERSECT / EXCEPT                                           *)
 (* ------------------------------------------------------------------ *)
 
 let sort_rows rows =
-  List.sort (fun a b ->
-    let cmp_val x y = match x, y with
-      | Db.V_int  x, Db.V_int  y -> Int64.compare x y
-      | Db.V_text x, Db.V_text y -> String.compare x y
-      | Db.V_null,   Db.V_null   -> 0
-      | Db.V_null,   _           -> -1
-      | _,           Db.V_null   -> 1
-      | Db.V_real x, Db.V_real y -> Float.compare x y
-      | _,           _           -> 0
-    in
-    let len = min (Array.length a) (Array.length b) in
-    let rec go i =
-      if i >= len then 0
-      else let c = cmp_val a.(i) b.(i) in
-           if c <> 0 then c else go (i+1)
-    in
-    go 0
-  ) rows
+  List.sort
+    (fun a b ->
+       let cmp_val x y =
+         match x, y with
+         | Db.V_int x, Db.V_int y -> Int64.compare x y
+         | Db.V_text x, Db.V_text y -> String.compare x y
+         | Db.V_null, Db.V_null -> 0
+         | Db.V_null, _ -> -1
+         | _, Db.V_null -> 1
+         | Db.V_real x, Db.V_real y -> Float.compare x y
+         | _, _ -> 0
+       in
+       let len = min (Array.length a) (Array.length b) in
+       let rec go i =
+         if i >= len
+         then 0
+         else (
+           let c = cmp_val a.(i) b.(i) in
+           if c <> 0 then c else go (i + 1))
+       in
+       go 0)
+    rows
+;;
 
 let test_union () =
   let db = fresh_db () in
@@ -1544,8 +1854,12 @@ let test_union () =
   let rows = sort_rows (query_ok db "SELECT x FROM a UNION SELECT x FROM b") in
   Alcotest.(check int) "union deduplicates: 3 rows" 3 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "union values"
-    [Db.V_int 1L; Db.V_int 2L; Db.V_int 3L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "union values"
+    [ Db.V_int 1L; Db.V_int 2L; Db.V_int 3L ]
+    xs
+;;
 
 let test_union_all () =
   let db = fresh_db () in
@@ -1558,8 +1872,12 @@ let test_union_all () =
   let rows = sort_rows (query_ok db "SELECT x FROM a UNION ALL SELECT x FROM b") in
   Alcotest.(check int) "union all keeps duplicates: 4 rows" 4 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "union all values"
-    [Db.V_int 1L; Db.V_int 2L; Db.V_int 2L; Db.V_int 3L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "union all values"
+    [ Db.V_int 1L; Db.V_int 2L; Db.V_int 2L; Db.V_int 3L ]
+    xs
+;;
 
 let test_intersect () =
   let db = fresh_db () in
@@ -1573,8 +1891,8 @@ let test_intersect () =
   let rows = sort_rows (query_ok db "SELECT x FROM a INTERSECT SELECT x FROM b") in
   Alcotest.(check int) "intersect: 1 row" 1 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "intersect values"
-    [Db.V_int 2L] xs
+  Alcotest.check (Alcotest.list value_testable) "intersect values" [ Db.V_int 2L ] xs
+;;
 
 let test_except () =
   let db = fresh_db () in
@@ -1587,44 +1905,45 @@ let test_except () =
   let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
   Alcotest.(check int) "except: 1 row" 1 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "except values"
-    [Db.V_int 1L] xs
+  Alcotest.check (Alcotest.list value_testable) "except values" [ Db.V_int 1L ] xs
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Named and indexed parameters                                         *)
 (* ------------------------------------------------------------------ *)
 
 let test_indexed_params () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (10, 20)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (30, 40)" in
-    (* ?1 reuses slot 0 twice — both conditions use the same value *)
-    let* stmt_r = Db.prepare db "SELECT x FROM t WHERE x = ?1 OR y = ?1" in
-    (match stmt_r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (10, 20)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (30, 40)" in
+     (* ?1 reuses slot 0 twice — both conditions use the same value *)
+     let* stmt_r = Db.prepare db "SELECT x FROM t WHERE x = ?1 OR y = ?1" in
+     match stmt_r with
      | Error e -> Alcotest.failf "prepare: %s" (Format.asprintf "%a" Db.pp_error e)
      | Ok st ->
-       let* r = Db.iter st ~params:[Db.V_int 10L] in
+       let* r = Db.iter st ~params:[ Db.V_int 10L ] in
        (match r with
         | Error e -> Alcotest.failf "iter: %s" (Format.asprintf "%a" Db.pp_error e)
         | Ok stream ->
           let* rows = Lwt_stream.to_list stream in
           Alcotest.(check int) "indexed param rows" 1 (List.length rows);
           let* () = Db.finalize st in
-          Lwt.return_unit)))
+          Lwt.return_unit))
+;;
 
 let test_named_params_colon () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'world')" in
-    let* stmt_r = Db.prepare db "SELECT y FROM t WHERE x = :id" in
-    (match stmt_r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 'world')" in
+     let* stmt_r = Db.prepare db "SELECT y FROM t WHERE x = :id" in
+     match stmt_r with
      | Error e -> Alcotest.failf "prepare: %s" (Format.asprintf "%a" Db.pp_error e)
      | Ok st ->
-       let params = Array.to_list (Db.params_of_named st ["id", Db.V_int 1L]) in
+       let params = Array.to_list (Db.params_of_named st [ "id", Db.V_int 1L ]) in
        let* r = Db.iter st ~params in
        (match r with
         | Error e -> Alcotest.failf "iter: %s" (Format.asprintf "%a" Db.pp_error e)
@@ -1636,7 +1955,8 @@ let test_named_params_colon () =
              Alcotest.(check string) "named colon value" "hello" s
            | _ -> Alcotest.fail "unexpected rows");
           let* () = Db.finalize st in
-          Lwt.return_unit)))
+          Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Date/time functions                                                  *)
@@ -1649,73 +1969,75 @@ let dummy_db () =
   exec db "CREATE TABLE _d (n INTEGER)";
   exec db "INSERT INTO _d (n) VALUES (1)";
   db
+;;
 
 let test_date_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE('2024-01-15') FROM _d" in
-  (match rows with
-   | [[| Db.V_text d |]] ->
-     Alcotest.(check string) "date fn" "2024-01-15" d
-   | _ -> Alcotest.fail "expected one row with text")
+  match rows with
+  | [ [| Db.V_text d |] ] -> Alcotest.(check string) "date fn" "2024-01-15" d
+  | _ -> Alcotest.fail "expected one row with text"
+;;
 
 let test_time_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME('12:30:45') FROM _d" in
-  (match rows with
-   | [[| Db.V_text t |]] ->
-     Alcotest.(check string) "time fn" "12:30:45" t
-   | _ -> Alcotest.fail "expected one row with text")
+  match rows with
+  | [ [| Db.V_text t |] ] -> Alcotest.(check string) "time fn" "12:30:45" t
+  | _ -> Alcotest.fail "expected one row with text"
+;;
 
 let test_datetime_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME('2024-01-15 12:30:45') FROM _d" in
-  (match rows with
-   | [[| Db.V_text dt |]] ->
-     Alcotest.(check string) "datetime fn" "2024-01-15 12:30:45" dt
-   | _ -> Alcotest.fail "expected one row with text")
+  match rows with
+  | [ [| Db.V_text dt |] ] ->
+    Alcotest.(check string) "datetime fn" "2024-01-15 12:30:45" dt
+  | _ -> Alcotest.fail "expected one row with text"
+;;
 
 let test_julianday_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY('2000-01-01') FROM _d" in
-  (match rows with
-   | [[| Db.V_real jd |]] ->
-     Alcotest.(check bool) "julianday 2000-01-01"
-       true (abs_float (jd -. 2451544.5) < 0.001)
-   | _ -> Alcotest.fail "expected one row with real")
+  match rows with
+  | [ [| Db.V_real jd |] ] ->
+    Alcotest.(check bool) "julianday 2000-01-01" true (abs_float (jd -. 2451544.5) < 0.001)
+  | _ -> Alcotest.fail "expected one row with real"
+;;
 
 let test_unixepoch_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH('1970-01-01') FROM _d" in
-  (match rows with
-   | [[| Db.V_int n |]] ->
-     Alcotest.(check int64) "unixepoch 1970" 0L n
-   | _ -> Alcotest.fail "expected one row with int")
+  match rows with
+  | [ [| Db.V_int n |] ] -> Alcotest.(check int64) "unixepoch 1970" 0L n
+  | _ -> Alcotest.fail "expected one row with int"
+;;
 
 let test_strftime_fn () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT STRFTIME('%Y-%m-%d', '2024-06-15') FROM _d" in
-  (match rows with
-   | [[| Db.V_text s |]] ->
-     Alcotest.(check string) "strftime" "2024-06-15" s
-   | _ -> Alcotest.fail "expected one row with text")
+  match rows with
+  | [ [| Db.V_text s |] ] -> Alcotest.(check string) "strftime" "2024-06-15" s
+  | _ -> Alcotest.fail "expected one row with text"
+;;
 
 let test_date_now () =
-  Lwt_main.run (
-    (* 2024-01-15 00:00:00 UTC as unix timestamp *)
-    let fixed_ts = 1705276800.0 in
-    let* db = Db.open_in_memory ~clock:(fun () -> fixed_ts) () in
-    let* _ = Db.execute db "CREATE TABLE _d (n INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO _d (n) VALUES (1)" in
-    let* result = Db.query db "SELECT DATE('now') FROM _d" in
-    (match result with
+  Lwt_main.run
+    ((* 2024-01-15 00:00:00 UTC as unix timestamp *)
+     let fixed_ts = 1705276800.0 in
+     let* db = Db.open_in_memory ~clock:(fun () -> fixed_ts) () in
+     let* _ = Db.execute db "CREATE TABLE _d (n INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO _d (n) VALUES (1)" in
+     let* result = Db.query db "SELECT DATE('now') FROM _d" in
+     match result with
      | Error e -> Alcotest.failf "%a" Db.pp_error e
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        (match rows with
-        | [[| Db.V_text d |]] ->
-          Alcotest.(check string) "date now" "2024-01-15" d
+        | [ [| Db.V_text d |] ] -> Alcotest.(check string) "date now" "2024-01-15" d
         | _ -> Alcotest.fail "expected date string");
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: multi-key ORDER BY                                          *)
@@ -1732,12 +2054,16 @@ let test_multikey_order_by () =
   let rows = query_ok db "SELECT x, y FROM t ORDER BY x ASC, y ASC" in
   Alcotest.(check int) "multikey: 4 rows" 4 (List.length rows);
   let pairs = List.map (fun r -> r.(0), r.(1)) rows in
-  Alcotest.check (Alcotest.list (Alcotest.pair value_testable value_testable))
+  Alcotest.check
+    (Alcotest.list (Alcotest.pair value_testable value_testable))
     "multikey order asc asc"
     [ Db.V_int 1L, Db.V_int 1L
     ; Db.V_int 1L, Db.V_int 2L
     ; Db.V_int 1L, Db.V_int 3L
-    ; Db.V_int 2L, Db.V_int 2L ] pairs
+    ; Db.V_int 2L, Db.V_int 2L
+    ]
+    pairs
+;;
 
 (** First key equal, second key DESC breaks the tie. *)
 let test_multikey_order_by_mixed () =
@@ -1749,8 +2075,12 @@ let test_multikey_order_by_mixed () =
   let rows = query_ok db "SELECT x, y FROM t ORDER BY x ASC, y DESC" in
   Alcotest.(check int) "multikey mixed: 3 rows" 3 (List.length rows);
   let ys = List.map (fun r -> r.(1)) rows in
-  Alcotest.check (Alcotest.list value_testable) "multikey asc desc"
-    [Db.V_int 3L; Db.V_int 2L; Db.V_int 1L] ys
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "multikey asc desc"
+    [ Db.V_int 3L; Db.V_int 2L; Db.V_int 1L ]
+    ys
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: DISTINCT with V_real and V_blob (row_key coverage)          *)
@@ -1766,8 +2096,12 @@ let test_distinct_real () =
   let rows = query_ok db "SELECT DISTINCT x FROM t ORDER BY x" in
   Alcotest.(check int) "distinct real: 2 rows" 2 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "distinct real values"
-    [Db.V_real 1.5; Db.V_real 2.5] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "distinct real values"
+    [ Db.V_real 1.5; Db.V_real 2.5 ]
+    xs
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: INTERSECT / EXCEPT edge cases                               *)
@@ -1783,6 +2117,7 @@ let test_intersect_empty_right () =
   (* b is empty *)
   let rows = query_ok db "SELECT x FROM a INTERSECT SELECT x FROM b" in
   Alcotest.(check int) "intersect empty right: 0 rows" 0 (List.length rows)
+;;
 
 (** EXCEPT deduplication: left has duplicate 1s not in right → only one appears. *)
 let test_except_dedup_left () =
@@ -1797,8 +2132,12 @@ let test_except_dedup_left () =
   let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
   Alcotest.(check int) "except dedup: 2 rows" 2 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "except dedup values"
-    [Db.V_int 1L; Db.V_int 2L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "except dedup values"
+    [ Db.V_int 1L; Db.V_int 2L ]
+    xs
+;;
 
 (** EXCEPT where right side is empty → all left rows retained. *)
 let test_except_empty_right () =
@@ -1811,8 +2150,12 @@ let test_except_empty_right () =
   let rows = sort_rows (query_ok db "SELECT x FROM a EXCEPT SELECT x FROM b") in
   Alcotest.(check int) "except empty right: 2 rows" 2 (List.length rows);
   let xs = List.map (fun r -> r.(0)) rows in
-  Alcotest.check (Alcotest.list value_testable) "except empty right values"
-    [Db.V_int 1L; Db.V_int 2L] xs
+  Alcotest.check
+    (Alcotest.list value_testable)
+    "except empty right values"
+    [ Db.V_int 1L; Db.V_int 2L ]
+    xs
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: datetime eval_func error / fallback branches                *)
@@ -1822,145 +2165,163 @@ let test_except_empty_right () =
 let test_date_invalid_input () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE('not-a-date') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for invalid date string")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for invalid date string"
+;;
 
 (** DATE with a non-text arg (integer literal) → NULL (_ -> V_null branch). *)
 let test_date_nontext_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE(42) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for integer DATE arg")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for integer DATE arg"
+;;
 
 (** DATE with a modifier (rest <> [] branch) → NULL. *)
 let test_date_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE('2024-01-15', '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when modifier present")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when modifier present"
+;;
 
 (** TIME with invalid string → NULL (Error _ branch). *)
 let test_time_invalid_input () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME('bad-time') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for invalid time string")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for invalid time string"
+;;
 
 (** TIME with non-text arg → NULL. *)
 let test_time_nontext_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME(0) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for integer TIME arg")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for integer TIME arg"
+;;
 
 (** TIME with modifier → NULL. *)
 let test_time_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME('12:00:00', '+1 hour') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when TIME modifier present")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when TIME modifier present"
+;;
 
 (** DATETIME with invalid string → NULL (Error _ branch). *)
 let test_datetime_invalid_input () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME('bogus') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for invalid datetime string")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for invalid datetime string"
+;;
 
 (** DATETIME with non-text arg → NULL. *)
 let test_datetime_nontext_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME(1) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for integer DATETIME arg")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for integer DATETIME arg"
+;;
 
 (** DATETIME with modifier → NULL. *)
 let test_datetime_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME('2024-01-15', '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when DATETIME modifier present")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when DATETIME modifier present"
+;;
 
 (** JULIANDAY with invalid string → NULL (Error _ branch). *)
 let test_julianday_invalid () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY('bad') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for invalid julianday string")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for invalid julianday string"
+;;
 
 (** JULIANDAY with non-text arg → NULL. *)
 let test_julianday_nontext_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY(42) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for integer JULIANDAY arg")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for integer JULIANDAY arg"
+;;
 
 (** JULIANDAY with modifier → NULL. *)
 let test_julianday_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY('2000-01-01', 'start of month') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when JULIANDAY modifier present")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when JULIANDAY modifier present"
+;;
 
 (** UNIXEPOCH with invalid string → NULL (Error _ branch). *)
 let test_unixepoch_invalid () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH('bad') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for invalid unixepoch string")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for invalid unixepoch string"
+;;
 
 (** UNIXEPOCH with non-text arg → NULL. *)
 let test_unixepoch_nontext_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH(0) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for integer UNIXEPOCH arg")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for integer UNIXEPOCH arg"
+;;
 
 (** UNIXEPOCH with modifier → NULL. *)
 let test_unixepoch_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH('1970-01-01', '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when UNIXEPOCH modifier present")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when UNIXEPOCH modifier present"
+;;
 
 (** STRFTIME where fmt is not text (NULL) → NULL (_ -> V_null fallthrough). *)
 let test_strftime_null_fmt () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT STRFTIME(NULL, '2024-01-15') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when STRFTIME fmt is NULL")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when STRFTIME fmt is NULL"
+;;
 
 (** STRFTIME with invalid datetime string → NULL (Error _ branch). *)
 let test_strftime_invalid_ts () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT STRFTIME('%Y', 'bad-date') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when STRFTIME ts is invalid")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when STRFTIME ts is invalid"
+;;
 
 (** STRFTIME with modifier → NULL (rest <> [] branch). *)
 let test_strftime_with_modifier () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT STRFTIME('%Y', '2024-01-15', '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL when STRFTIME has modifier")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL when STRFTIME has modifier"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: datetime NULL-arg branches ([V_null] and V_null :: _)       *)
@@ -1970,81 +2331,91 @@ let test_strftime_with_modifier () =
 let test_date_null_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE(NULL) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for DATE(NULL)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for DATE(NULL)"
+;;
 
 (** DATE(NULL, 'x') → NULL via the V_null :: _ branch. *)
 let test_date_null_with_rest () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATE(NULL, '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for DATE(NULL, modifier)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for DATE(NULL, modifier)"
+;;
 
 (** TIME(NULL) → NULL via the [V_null] single-arg branch. *)
 let test_time_null_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME(NULL) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for TIME(NULL)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for TIME(NULL)"
+;;
 
 (** TIME(NULL, 'x') → NULL via the V_null :: _ branch. *)
 let test_time_null_with_rest () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT TIME(NULL, '+1 hour') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for TIME(NULL, modifier)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for TIME(NULL, modifier)"
+;;
 
 (** DATETIME(NULL) → NULL via the [V_null] single-arg branch. *)
 let test_datetime_null_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME(NULL) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for DATETIME(NULL)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for DATETIME(NULL)"
+;;
 
 (** DATETIME(NULL, 'x') → NULL via the V_null :: _ branch. *)
 let test_datetime_null_with_rest () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT DATETIME(NULL, '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for DATETIME(NULL, modifier)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for DATETIME(NULL, modifier)"
+;;
 
 (** JULIANDAY(NULL) → NULL via the [V_null] single-arg branch. *)
 let test_julianday_null_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY(NULL) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL)"
+;;
 
 (** JULIANDAY(NULL, 'x') → NULL via the V_null :: _ branch. *)
 let test_julianday_null_with_rest () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT JULIANDAY(NULL, 'start of month') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL, modifier)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for JULIANDAY(NULL, modifier)"
+;;
 
 (** UNIXEPOCH(NULL) → NULL via the [V_null] single-arg branch. *)
 let test_unixepoch_null_arg () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH(NULL) FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL)"
+;;
 
 (** UNIXEPOCH(NULL, 'x') → NULL via the V_null :: _ branch. *)
 let test_unixepoch_null_with_rest () =
   let db = dummy_db () in
   let rows = query_ok db "SELECT UNIXEPOCH(NULL, '+1 day') FROM _d" in
-  (match rows with
-   | [[| Db.V_null |]] -> ()
-   | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL, modifier)")
+  match rows with
+  | [ [| Db.V_null |] ] -> ()
+  | _ -> Alcotest.fail "expected NULL for UNIXEPOCH(NULL, modifier)"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 7: row_key V_blob coverage via DISTINCT on BLOB column         *)
@@ -2059,498 +2430,674 @@ let test_distinct_blob_null () =
   exec db "INSERT INTO t VALUES (NULL)";
   let rows = query_ok db "SELECT DISTINCT x FROM t" in
   Alcotest.(check int) "distinct blob null: 1 row" 1 (List.length rows)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group: ON CONFLICT (INSERT OR REPLACE / INSERT OR IGNORE)           *)
 (* ------------------------------------------------------------------ *)
 
 let test_insert_or_ignore () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
-    let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (1, 'second')" in
-    let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
+     let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (1, 'second')" in
+     let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "row count" 1 (List.length rows);
-       Alcotest.(check string) "value unchanged" "first"
-         (match rows with [[| Db.V_text s |]] -> s | _ -> "WRONG");
-       Lwt.return_unit))
+       Alcotest.(check string)
+         "value unchanged"
+         "first"
+         (match rows with
+          | [ [| Db.V_text s |] ] -> s
+          | _ -> "WRONG");
+       Lwt.return_unit)
+;;
 
 let test_insert_or_replace () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
-    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 'second')" in
-    let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'first')" in
+     let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 'second')" in
+     let* r = Db.query db "SELECT v FROM t WHERE id = 1" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "row count" 1 (List.length rows);
-       Alcotest.(check string) "value replaced" "second"
-         (match rows with [[| Db.V_text s |]] -> s | _ -> "WRONG");
-       Lwt.return_unit))
+       Alcotest.(check string)
+         "value replaced"
+         "second"
+         (match rows with
+          | [ [| Db.V_text s |] ] -> s
+          | _ -> "WRONG");
+       Lwt.return_unit)
+;;
 
 let test_insert_or_ignore_unique () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_name ON t (name)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
-    let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (2, 'alice')" in
-    let* r = Db.query db "SELECT COUNT(*) FROM t" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_name ON t (name)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+     let* _ = Db.execute db "INSERT OR IGNORE INTO t VALUES (2, 'alice')" in
+     let* r = Db.query db "SELECT COUNT(*) FROM t" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
-       Alcotest.(check int) "only original row" 1
-         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
-       Lwt.return_unit))
+       Alcotest.(check int)
+         "only original row"
+         1
+         (match rows with
+          | [ [| Db.V_int n |] ] -> Int64.to_int n
+          | _ -> -1);
+       Lwt.return_unit)
+;;
 
 let test_insert_or_replace_no_conflict () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)" in
-    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (99, 'new')" in
-    let* r = Db.query db "SELECT v FROM t WHERE id = 99" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)" in
+     let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (99, 'new')" in
+     let* r = Db.query db "SELECT v FROM t WHERE id = 99" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "row inserted" 1 (List.length rows);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_insert_or_replace_multi_unique () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (a INTEGER, b INTEGER)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_a ON t (a)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_b ON t (b)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 100)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 200)" in
-    (* New row (a=1, b=200) conflicts with row 1 via idx_a AND row 2 via idx_b
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (a INTEGER, b INTEGER)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_a ON t (a)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_b ON t (b)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 100)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 200)" in
+     (* New row (a=1, b=200) conflicts with row 1 via idx_a AND row 2 via idx_b
        REPLACE must delete BOTH old rows and insert the new one *)
-    let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 200)" in
-    let* r = Db.query db "SELECT COUNT(*) FROM t" in
-    (match r with
+     let* _ = Db.execute db "INSERT OR REPLACE INTO t VALUES (1, 200)" in
+     let* r = Db.query db "SELECT COUNT(*) FROM t" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
-       Alcotest.(check int) "only new row remains" 1
-         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
-       Lwt.return_unit))
+       Alcotest.(check int)
+         "only new row remains"
+         1
+         (match rows with
+          | [ [| Db.V_int n |] ] -> Int64.to_int n
+          | _ -> -1);
+       Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* RETURNING clause tests                                               *)
 (* ------------------------------------------------------------------ *)
 
 let test_insert_returning () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* r = Db.query db "INSERT INTO t VALUES (1, 'hello') RETURNING id, v" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* r = Db.query db "INSERT INTO t VALUES (1, 'hello') RETURNING id, v" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "one returned row" 1 (List.length rows);
        let row = List.hd rows in
-       Alcotest.(check int) "id=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
-       Alcotest.(check string) "v=hello" "hello" (match row.(1) with Db.V_text s -> s | _ -> "X");
-       Lwt.return_unit))
+       Alcotest.(check int)
+         "id=1"
+         1
+         (match row.(0) with
+          | Db.V_int n -> Int64.to_int n
+          | _ -> -1);
+       Alcotest.(check string)
+         "v=hello"
+         "hello"
+         (match row.(1) with
+          | Db.V_text s -> s
+          | _ -> "X");
+       Lwt.return_unit)
+;;
 
 let test_update_returning () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'old')" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'keep')" in
-    let* r = Db.query db "UPDATE t SET v = 'new' WHERE id = 1 RETURNING id, v" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'old')" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 'keep')" in
+     let* r = Db.query db "UPDATE t SET v = 'new' WHERE id = 1 RETURNING id, v" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "one updated row returned" 1 (List.length rows);
        let row = List.hd rows in
-       Alcotest.(check string) "v=new" "new" (match row.(1) with Db.V_text s -> s | _ -> "X");
-       Lwt.return_unit))
+       Alcotest.(check string)
+         "v=new"
+         "new"
+         (match row.(1) with
+          | Db.V_text s -> s
+          | _ -> "X");
+       Lwt.return_unit)
+;;
 
 let test_delete_returning () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'b')" in
-    let* r = Db.query db "DELETE FROM t WHERE id = 1 RETURNING id, v" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 'b')" in
+     let* r = Db.query db "DELETE FROM t WHERE id = 1 RETURNING id, v" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "one deleted row returned" 1 (List.length rows);
        let row = List.hd rows in
-       Alcotest.(check int) "id=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
-       Lwt.return_unit))
+       Alcotest.(check int)
+         "id=1"
+         1
+         (match row.(0) with
+          | Db.V_int n -> Int64.to_int n
+          | _ -> -1);
+       Lwt.return_unit)
+;;
 
 let test_update_returning_multi () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
-    let* r = Db.query db "UPDATE t SET v = v + 1 RETURNING id, v" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+     let* r = Db.query db "UPDATE t SET v = v + 1 RETURNING id, v" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "3 rows returned" 3 (List.length rows);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_delete_returning_multi () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (3)" in
-    let* r = Db.query db "DELETE FROM t RETURNING id" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (3)" in
+     let* r = Db.query db "DELETE FROM t RETURNING id" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "all 3 rows returned" 3 (List.length rows);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* alter_table                                                          *)
 (* ------------------------------------------------------------------ *)
 
 let test_alter_add_column () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
-    let* _ = Db.execute db "ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 0" in
-    let* r = Db.query db "SELECT id, name, score FROM t ORDER BY id" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
+     let* _ = Db.execute db "ALTER TABLE t ADD COLUMN score INTEGER DEFAULT 0" in
+     let* r = Db.query db "SELECT id, name, score FROM t ORDER BY id" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "2 rows" 2 (List.length rows);
        (match rows with
-        | [r1; r2] ->
-          Alcotest.(check int) "score1=0" 0 (match r1.(2) with Db.V_int n -> Int64.to_int n | _ -> -1);
-          Alcotest.(check int) "score2=0" 0 (match r2.(2) with Db.V_int n -> Int64.to_int n | _ -> -1)
+        | [ r1; r2 ] ->
+          Alcotest.(check int)
+            "score1=0"
+            0
+            (match r1.(2) with
+             | Db.V_int n -> Int64.to_int n
+             | _ -> -1);
+          Alcotest.(check int)
+            "score2=0"
+            0
+            (match r2.(2) with
+             | Db.V_int n -> Int64.to_int n
+             | _ -> -1)
         | _ -> Alcotest.fail "wrong row count");
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_alter_add_column_null_default () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (42)" in
-    let* _ = Db.execute db "ALTER TABLE t ADD COLUMN extra TEXT" in
-    let* r = Db.query db "SELECT id, extra FROM t" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (42)" in
+     let* _ = Db.execute db "ALTER TABLE t ADD COLUMN extra TEXT" in
+     let* r = Db.query db "SELECT id, extra FROM t" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        let row = List.hd rows in
        Alcotest.(check bool) "extra is null" true (row.(1) = Db.V_null);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_alter_add_not_null_no_default_error () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
-    let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN x TEXT NOT NULL") in
-    Alcotest.(check bool) "error for NOT NULL without DEFAULT" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+     let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN x TEXT NOT NULL") in
+     Alcotest.(check bool)
+       "error for NOT NULL without DEFAULT"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_rename_table () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE old_name (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "INSERT INTO old_name VALUES (1, 'x')" in
-    let* _ = Db.execute db "ALTER TABLE old_name RENAME TO new_name" in
-    (* Old name is gone *)
-    let r_old = Lwt_main.run (Db.query db "SELECT * FROM old_name") in
-    Alcotest.(check bool) "old name gone" true (match r_old with Error _ -> true | Ok _ -> false);
-    (* New name works *)
-    let* r = Db.query db "SELECT id, v FROM new_name" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE old_name (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "INSERT INTO old_name VALUES (1, 'x')" in
+     let* _ = Db.execute db "ALTER TABLE old_name RENAME TO new_name" in
+     (* Old name is gone *)
+     let r_old = Lwt_main.run (Db.query db "SELECT * FROM old_name") in
+     Alcotest.(check bool)
+       "old name gone"
+       true
+       (match r_old with
+        | Error _ -> true
+        | Ok _ -> false);
+     (* New name works *)
+     let* r = Db.query db "SELECT id, v FROM new_name" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "row still there" 1 (List.length rows);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_rename_column () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, old_col TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
-    let* _ = Db.execute db "ALTER TABLE t RENAME COLUMN old_col TO new_col" in
-    let* r = Db.query db "SELECT id, new_col FROM t" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, old_col TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'hello')" in
+     let* _ = Db.execute db "ALTER TABLE t RENAME COLUMN old_col TO new_col" in
+     let* r = Db.query db "SELECT id, new_col FROM t" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        let row = List.hd rows in
-       Alcotest.(check string) "value preserved" "hello"
-         (match row.(1) with Db.V_text s -> s | _ -> "X");
+       Alcotest.(check string)
+         "value preserved"
+         "hello"
+         (match row.(1) with
+          | Db.V_text s -> s
+          | _ -> "X");
        (* Old column name should fail *)
        let* r_old = Db.query db "SELECT old_col FROM t" in
-       Alcotest.(check bool) "old col name gone" true
-         (match r_old with Error _ -> true | Ok _ -> false);
-       Lwt.return_unit))
+       Alcotest.(check bool)
+         "old col name gone"
+         true
+         (match r_old with
+          | Error _ -> true
+          | Ok _ -> false);
+       Lwt.return_unit)
+;;
 
 let test_rename_column_no_keyword () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'abc')" in
-    let* _ = Db.execute db "ALTER TABLE t RENAME y TO z" in
-    let* r = Db.query db "SELECT x, z FROM t" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (x INTEGER, y TEXT)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'abc')" in
+     let* _ = Db.execute db "ALTER TABLE t RENAME y TO z" in
+     let* r = Db.query db "SELECT x, z FROM t" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        let row = List.hd rows in
-       Alcotest.(check string) "value preserved" "abc"
-         (match row.(1) with Db.V_text s -> s | _ -> "X");
-       Lwt.return_unit))
+       Alcotest.(check string)
+         "value preserved"
+         "abc"
+         (match row.(1) with
+          | Db.V_text s -> s
+          | _ -> "X");
+       Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group: Table-level UNIQUE and PRIMARY KEY constraints               *)
 (* ------------------------------------------------------------------ *)
 
 let test_table_unique_constraint () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE t (a TEXT, b INTEGER, UNIQUE(a, b))" in
-    let* _ = Db.execute db "INSERT INTO t VALUES ('x', 1)" in
-    let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES ('x', 1)") in
-    Alcotest.(check bool) "unique violation raises" true
-      (match r with Error (Db.Runtime _) -> true | _ -> false);
-    (* Different combinations are fine *)
-    let* _ = Db.execute db "INSERT INTO t VALUES ('x', 2)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES ('y', 1)" in
-    let* r2 = Db.query db "SELECT COUNT(*) FROM t" in
-    (match r2 with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (a TEXT, b INTEGER, UNIQUE(a, b))" in
+     let* _ = Db.execute db "INSERT INTO t VALUES ('x', 1)" in
+     let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES ('x', 1)") in
+     Alcotest.(check bool)
+       "unique violation raises"
+       true
+       (match r with
+        | Error (Db.Runtime _) -> true
+        | _ -> false);
+     (* Different combinations are fine *)
+     let* _ = Db.execute db "INSERT INTO t VALUES ('x', 2)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES ('y', 1)" in
+     let* r2 = Db.query db "SELECT COUNT(*) FROM t" in
+     match r2 with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
-       Alcotest.(check int) "3 unique rows" 3
-         (match rows with [[| Db.V_int n |]] -> Int64.to_int n | _ -> -1);
-       Lwt.return_unit))
+       Alcotest.(check int)
+         "3 unique rows"
+         3
+         (match rows with
+          | [ [| Db.V_int n |] ] -> Int64.to_int n
+          | _ -> -1);
+       Lwt.return_unit)
+;;
 
 let test_table_primary_key_constraint () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE t (id INTEGER, name TEXT, PRIMARY KEY(id))" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
-    let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") in
-    Alcotest.(check bool) "pk violation raises" true
-      (match r with Error (Db.Runtime _) -> true | _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT, PRIMARY KEY(id))" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+     let r = Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") in
+     Alcotest.(check bool)
+       "pk violation raises"
+       true
+       (match r with
+        | Error (Db.Runtime _) -> true
+        | _ -> false);
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 8 edge-case / error-path tests                                *)
 (* ------------------------------------------------------------------ *)
 
 let test_insert_or_abort_error () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
-    let r = Lwt_main.run (Db.execute db "INSERT OR ABORT INTO t VALUES (1, 'b')") in
-    Alcotest.(check bool) "abort raises on conflict" true
-      (match r with Error (Db.Runtime _) -> true | _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'a')" in
+     let r = Lwt_main.run (Db.execute db "INSERT OR ABORT INTO t VALUES (1, 'b')") in
+     Alcotest.(check bool)
+       "abort raises on conflict"
+       true
+       (match r with
+        | Error (Db.Runtime _) -> true
+        | _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_insert_returning_ignored () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 'orig')" in
-    let* r = Db.query db "INSERT OR IGNORE INTO t VALUES (1, 'new') RETURNING id, v" in
-    (match r with
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx_id ON t (id)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 'orig')" in
+     let* r = Db.query db "INSERT OR IGNORE INTO t VALUES (1, 'new') RETURNING id, v" in
+     match r with
      | Error e -> Alcotest.fail (fmt_err e)
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Alcotest.(check int) "empty stream when ignored" 0 (List.length rows);
-       Lwt.return_unit))
+       Lwt.return_unit)
+;;
 
 let test_alter_rename_nonexistent () =
-  Lwt_main.run (
-    let r = Lwt_main.run (
-      let* db = Db.open_in_memory () in
-      Db.execute db "ALTER TABLE nonexistent RENAME TO new_name"
-    ) in
-    Alcotest.(check bool) "error on nonexistent table" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let r =
+       Lwt_main.run
+         (let* db = Db.open_in_memory () in
+          Db.execute db "ALTER TABLE nonexistent RENAME TO new_name")
+     in
+     Alcotest.(check bool)
+       "error on nonexistent table"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_alter_rename_column_nonexistent () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
-    let r = Lwt_main.run (Db.execute db "ALTER TABLE t RENAME COLUMN nonexistent TO x") in
-    Alcotest.(check bool) "error on nonexistent column" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER)" in
+     let r =
+       Lwt_main.run (Db.execute db "ALTER TABLE t RENAME COLUMN nonexistent TO x")
+     in
+     Alcotest.(check bool)
+       "error on nonexistent column"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_alter_add_column_duplicate () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
-    let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN v TEXT") in
-    Alcotest.(check bool) "error on duplicate column name" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, v TEXT)" in
+     let r = Lwt_main.run (Db.execute db "ALTER TABLE t ADD COLUMN v TEXT") in
+     Alcotest.(check bool)
+       "error on duplicate column name"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_alter_rename_table_to_existing () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE a (id INTEGER)" in
-    let* _ = Db.execute db "CREATE TABLE b (id INTEGER)" in
-    let r = Lwt_main.run (Db.execute db "ALTER TABLE a RENAME TO b") in
-    Alcotest.(check bool) "error renaming to existing table name" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE a (id INTEGER)" in
+     let* _ = Db.execute db "CREATE TABLE b (id INTEGER)" in
+     let r = Lwt_main.run (Db.execute db "ALTER TABLE a RENAME TO b") in
+     Alcotest.(check bool)
+       "error renaming to existing table name"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_alter_add_column_nonexistent_table () =
-  Lwt_main.run (
-    let r = Lwt_main.run (
-      let* db = Db.open_in_memory () in
-      Db.execute db "ALTER TABLE nonexistent ADD COLUMN x TEXT"
-    ) in
-    Alcotest.(check bool) "error on nonexistent table" true
-      (match r with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let r =
+       Lwt_main.run
+         (let* db = Db.open_in_memory () in
+          Db.execute db "ALTER TABLE nonexistent ADD COLUMN x TEXT")
+     in
+     Alcotest.(check bool)
+       "error on nonexistent table"
+       true
+       (match r with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Subqueries                                                           *)
 (* ------------------------------------------------------------------ *)
 
 let test_scalar_subquery () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
-    let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "scalar subquery returns max" (Db.V_int 20L) row.(0)
-     | _ -> Alcotest.fail "expected exactly one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+     let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] ->
+        Alcotest.check value_testable "scalar subquery returns max" (Db.V_int 20L) row.(0)
+      | _ -> Alcotest.fail "expected exactly one row");
+     Lwt.return_unit)
+;;
 
 let test_scalar_subquery_null () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "scalar subquery on empty table returns null" Db.V_null row.(0)
-     | _ -> Alcotest.fail "expected exactly one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* r = Db.query db "SELECT (SELECT MAX(v) FROM t)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int) "scalar subquery returns one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] ->
+        Alcotest.check
+          value_testable
+          "scalar subquery on empty table returns null"
+          Db.V_null
+          row.(0)
+      | _ -> Alcotest.fail "expected exactly one row");
+     Lwt.return_unit)
+;;
 
 let test_exists_subquery () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY, ref_id INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO r VALUES (1, 1)" in
-    let* _ = Db.execute db "INSERT INTO r VALUES (2, 99)" in
-    let* res = Db.query db
-      "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t WHERE t.id = 1)" in
-    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "exists matches two rows" 2 (List.length rows);
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY, ref_id INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO r VALUES (1, 1)" in
+     let* _ = Db.execute db "INSERT INTO r VALUES (2, 99)" in
+     let* res =
+       Db.query db "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t WHERE t.id = 1)"
+     in
+     let* rows =
+       match res with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int) "exists matches two rows" 2 (List.length rows);
+     Lwt.return_unit)
+;;
 
 let test_exists_subquery_false () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY)" in
-    let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY)" in
-    let* _ = Db.execute db "INSERT INTO r VALUES (1)" in
-    let* res = Db.query db
-      "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t)" in
-    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    Alcotest.(check int) "exists on empty inner table returns 0 rows" 0 (List.length rows);
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY)" in
+     let* _ = Db.execute db "CREATE TABLE r (id INTEGER PRIMARY KEY)" in
+     let* _ = Db.execute db "INSERT INTO r VALUES (1)" in
+     let* res = Db.query db "SELECT id FROM r WHERE EXISTS (SELECT 1 FROM t)" in
+     let* rows =
+       match res with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     Alcotest.(check int)
+       "exists on empty inner table returns 0 rows"
+       0
+       (List.length rows);
+     Lwt.return_unit)
+;;
 
 let test_in_select_subquery () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
-    let* _ = Db.execute db "CREATE TABLE allowed (v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO allowed VALUES (10)" in
-    let* _ = Db.execute db "INSERT INTO allowed VALUES (30)" in
-    let* res = Db.query db "SELECT id FROM t WHERE v IN (SELECT v FROM allowed)" in
-    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    let ids = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "in-select returns matching rows"
-      [Db.V_int 1L; Db.V_int 3L] ids;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+     let* _ = Db.execute db "CREATE TABLE allowed (v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO allowed VALUES (10)" in
+     let* _ = Db.execute db "INSERT INTO allowed VALUES (30)" in
+     let* res = Db.query db "SELECT id FROM t WHERE v IN (SELECT v FROM allowed)" in
+     let* rows =
+       match res with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     let ids = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable))
+       "in-select returns matching rows"
+       [ Db.V_int 1L; Db.V_int 3L ]
+       ids;
+     Lwt.return_unit)
+;;
 
 let test_not_in_select_subquery () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
-    let* _ = Db.execute db "CREATE TABLE excluded (v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO excluded VALUES (20)" in
-    let* res = Db.query db "SELECT id FROM t WHERE v NOT IN (SELECT v FROM excluded)" in
-    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error _ -> Lwt.return []) in
-    let ids = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "not-in-select excludes row 2"
-      [Db.V_int 1L; Db.V_int 3L] ids;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (3, 30)" in
+     let* _ = Db.execute db "CREATE TABLE excluded (v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO excluded VALUES (20)" in
+     let* res = Db.query db "SELECT id FROM t WHERE v NOT IN (SELECT v FROM excluded)" in
+     let* rows =
+       match res with
+       | Ok s -> Lwt_stream.to_list s
+       | Error _ -> Lwt.return []
+     in
+     let ids = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable))
+       "not-in-select excludes row 2"
+       [ Db.V_int 1L; Db.V_int 3L ]
+       ids;
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* FOREIGN KEY parse and enforcement                                      *)
 (* ------------------------------------------------------------------ *)
 
 let test_fk_parse_create () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
-    let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
-    (* FK syntax must be accepted without error *)
-    let* _ = Db.execute db
-      "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))" in
-    (* Valid FK insert: user_id=1 exists in users *)
-    let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
-    Alcotest.(check bool) "valid FK insert succeeds" true (n = Ok ());
-    Lwt.return_unit)
-
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+     let* _ = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
+     (* FK syntax must be accepted without error *)
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES \
+          users(id))"
+     in
+     (* Valid FK insert: user_id=1 exists in users *)
+     let* n = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+     Alcotest.(check bool) "valid FK insert succeeds" true (n = Ok ());
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* FOREIGN KEY enforcement                                               *)
@@ -2558,115 +3105,176 @@ let test_fk_parse_create () =
 
 let test_fk_valid_insert () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)" in
-    let* () = exec "INSERT INTO fk_parent VALUES (1, 'alice')" in
-    let* () = exec "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES fk_parent(id))" in
-    let* () = exec "INSERT INTO fk_child VALUES (10, 1)" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child" in
-    Alcotest.(check int) "one row" 1
-      (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)" in
+     let* () = exec "INSERT INTO fk_parent VALUES (1, 'alice')" in
+     let* () =
+       exec "CREATE TABLE fk_child (id INTEGER, pid INTEGER REFERENCES fk_parent(id))"
+     in
+     let* () = exec "INSERT INTO fk_child VALUES (10, 1)" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child" in
+     Alcotest.(check int)
+       "one row"
+       1
+       (match rows with
+        | [ r ] ->
+          (match r.(0) with
+           | Db.V_int n -> Int64.to_int n
+           | _ -> -1)
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_invalid_insert () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE fk_parent2 (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fk_parent2 VALUES (1)" in
-    let* () = exec "CREATE TABLE fk_child2 (id INTEGER, pid INTEGER REFERENCES fk_parent2(id))" in
-    let* result = Db.execute db "INSERT INTO fk_child2 VALUES (10, 99)" in
-    (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected FK constraint error");
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE fk_parent2 (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fk_parent2 VALUES (1)" in
+     let* () =
+       exec "CREATE TABLE fk_child2 (id INTEGER, pid INTEGER REFERENCES fk_parent2(id))"
+     in
+     let* result = Db.execute db "INSERT INTO fk_child2 VALUES (10, 99)" in
+     (match result with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected FK constraint error");
+     Lwt.return_unit)
+;;
 
 let test_fk_null_allowed () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE fk_parent3 (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fk_parent3 VALUES (1)" in
-    let* () = exec "CREATE TABLE fk_child3 (id INTEGER, pid INTEGER REFERENCES fk_parent3(id))" in
-    let* () = exec "INSERT INTO fk_child3 VALUES (10, NULL)" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child3" in
-    Alcotest.(check int) "null fk ok" 1
-      (match rows with [r] -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) | _ -> -1);
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE fk_parent3 (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fk_parent3 VALUES (1)" in
+     let* () =
+       exec "CREATE TABLE fk_child3 (id INTEGER, pid INTEGER REFERENCES fk_parent3(id))"
+     in
+     let* () = exec "INSERT INTO fk_child3 VALUES (10, NULL)" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM fk_child3" in
+     Alcotest.(check int)
+       "null fk ok"
+       1
+       (match rows with
+        | [ r ] ->
+          (match r.(0) with
+           | Db.V_int n -> Int64.to_int n
+           | _ -> -1)
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_multi_col_unsupported () =
   (* Multi-column FK is now supported; this test verifies CREATE TABLE succeeds *)
   let db = fresh_db () in
-  run (
-    let* () = (let* r = Db.execute db "CREATE TABLE fp (x INTEGER, y INTEGER)" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* result = Db.execute db
-      "CREATE TABLE fc (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES fp(x, y))" in
-    (match result with
-     | Ok () -> ()
-     | Error e -> Alcotest.fail (Format.asprintf "unexpected error: %a" Db.pp_error e));
-    Lwt.return_unit)
+  run
+    (let* () =
+       let* r = Db.execute db "CREATE TABLE fp (x INTEGER, y INTEGER)" in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* result =
+       Db.execute
+         db
+         "CREATE TABLE fc (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES fp(x, y))"
+     in
+     (match result with
+      | Ok () -> ()
+      | Error e -> Alcotest.fail (Format.asprintf "unexpected error: %a" Db.pp_error e));
+     Lwt.return_unit)
+;;
 
 let fk_implicit_parent_col () =
   let db = fresh_db () in
-  run (
-    let* () = (let* r = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* () = (let* r = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* () = (let* r = Db.execute db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users)" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* () = (let* r = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* rows = query_ok_lwt db "SELECT count(*) FROM orders" in
-    Alcotest.check value_testable "count" (Db.V_int 1L) (List.hd rows).(0);
-    Lwt.return_unit)
+  run
+    (let* () =
+       let* r = Db.execute db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)" in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* () =
+       let* r = Db.execute db "INSERT INTO users VALUES (1, 'alice')" in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* () =
+       let* r =
+         Db.execute
+           db
+           "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES \
+            users)"
+       in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* () =
+       let* r = Db.execute db "INSERT INTO orders VALUES (1, 1)" in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* rows = query_ok_lwt db "SELECT count(*) FROM orders" in
+     Alcotest.check value_testable "count" (Db.V_int 1L) (List.hd rows).(0);
+     Lwt.return_unit)
+;;
 
 let fk_implicit_no_pk_error () =
   let db = fresh_db () in
-  run (
-    let* () = (let* r = Db.execute db "CREATE TABLE nopk (name TEXT)" in
-      match r with Ok () -> Lwt.return_unit | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)) in
-    let* result = Db.execute db "CREATE TABLE child (x INTEGER REFERENCES nopk)" in
-    (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected error for REFERENCES table with no PK");
-    Lwt.return_unit)
+  run
+    (let* () =
+       let* r = Db.execute db "CREATE TABLE nopk (name TEXT)" in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Lwt.fail_with (Format.asprintf "%a" Db.pp_error e)
+     in
+     let* result = Db.execute db "CREATE TABLE child (x INTEGER REFERENCES nopk)" in
+     (match result with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected error for REFERENCES table with no PK");
+     Lwt.return_unit)
+;;
 
 let fk_implicit_parent_not_found () =
   let db = fresh_db () in
-  run (
-    (* ghost_table does not exist *)
-    let* result = Db.execute db "CREATE TABLE child (x INTEGER REFERENCES ghost_table)" in
-    (match result with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "expected error for REFERENCES to non-existent table");
-    Lwt.return_unit)
+  run
+    ((* ghost_table does not exist *)
+     let* result =
+       Db.execute db "CREATE TABLE child (x INTEGER REFERENCES ghost_table)"
+     in
+     (match result with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected error for REFERENCES to non-existent table");
+     Lwt.return_unit)
+;;
 
 let fk_implicit_infers_pk_column () =
   let db = fresh_db () in
@@ -2677,6 +3285,7 @@ let fk_implicit_infers_pk_column () =
   let rows = query_ok db "PRAGMA foreign_key_list(orders)" in
   Alcotest.(check int) "1 fk row" 1 (List.length rows);
   Alcotest.check value_testable "parent_col=id" (Db.V_text "id") (List.hd rows).(4)
+;;
 
 let fk_implicit_table_level_pk () =
   (* Table-level PRIMARY KEY (id) should also work for inference *)
@@ -2686,414 +3295,538 @@ let fk_implicit_table_level_pk () =
   let rows = query_ok db "PRAGMA foreign_key_list(orders)" in
   Alcotest.(check int) "1 fk row" 1 (List.length rows);
   Alcotest.check value_testable "parent_col=id" (Db.V_text "id") (List.hd rows).(4)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* CHECK constraints                                                     *)
 (* ------------------------------------------------------------------ *)
 
 let test_check_insert_ok () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))" in
-    let* res = Db.execute db "INSERT INTO prices VALUES (1, 9.99)" in
-    Alcotest.(check bool) "valid row inserted" true (res = Ok ());
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))"
+     in
+     let* res = Db.execute db "INSERT INTO prices VALUES (1, 9.99)" in
+     Alcotest.(check bool) "valid row inserted" true (res = Ok ());
+     Lwt.return_unit)
+;;
 
 let test_check_insert_violation () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))" in
-    let* res = Db.execute db "INSERT INTO prices VALUES (1, -5.0)" in
-    (match res with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "expected CHECK violation but insert succeeded");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE prices (id INTEGER PRIMARY KEY, amount REAL CHECK (amount > 0))"
+     in
+     let* res = Db.execute db "INSERT INTO prices VALUES (1, -5.0)" in
+     (match res with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected CHECK violation but insert succeeded");
+     Lwt.return_unit)
+;;
 
 let test_check_update_violation () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 5)" in
-    let* res = Db.execute db "UPDATE t SET v = -1 WHERE id = 1" in
-    (match res with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "expected CHECK violation on update");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v >= 0))"
+     in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 5)" in
+     let* res = Db.execute db "UPDATE t SET v = -1 WHERE id = 1" in
+     (match res with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected CHECK violation on update");
+     Lwt.return_unit)
+;;
 
 let test_check_null_allowed () =
-  run (
-    (* SQLite CHECK: NULL in CHECK expr -> passes (not a violation) *)
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))" in
-    let* res = Db.execute db "INSERT INTO t VALUES (1, NULL)" in
-    Alcotest.(check bool) "null passes CHECK" true (res = Ok ());
-    Lwt.return_unit)
+  run
+    ((* SQLite CHECK: NULL in CHECK expr -> passes (not a violation) *)
+     let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))"
+     in
+     let* res = Db.execute db "INSERT INTO t VALUES (1, NULL)" in
+     Alcotest.(check bool) "null passes CHECK" true (res = Ok ());
+     Lwt.return_unit)
+;;
 
 let test_check_cache_invalidation () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v > 100))" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (150)" in
-    let* _ = Db.execute db "DROP TABLE t" in
-    let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v < 5))" in
-    (* This should pass new CHECK (v < 5), NOT be blocked by old cache *)
-    let* res = Db.execute db "INSERT INTO t VALUES (3)" in
-    Alcotest.(check bool) "insert passes new CHECK after DROP+CREATE" true (res = Ok ());
-    (* This should be blocked by new CHECK (v < 5) *)
-    let* res2 = Db.execute db "INSERT INTO t VALUES (200)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "old values should fail new CHECK");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v > 100))" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (150)" in
+     let* _ = Db.execute db "DROP TABLE t" in
+     let* _ = Db.execute db "CREATE TABLE t (v INTEGER CHECK (v < 5))" in
+     (* This should pass new CHECK (v < 5), NOT be blocked by old cache *)
+     let* res = Db.execute db "INSERT INTO t VALUES (3)" in
+     Alcotest.(check bool) "insert passes new CHECK after DROP+CREATE" true (res = Ok ());
+     (* This should be blocked by new CHECK (v < 5) *)
+     let* res2 = Db.execute db "INSERT INTO t VALUES (200)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "old values should fail new CHECK");
+     Lwt.return_unit)
+;;
 
 let test_check_agg_rejected () =
-  run (
-    let* db = Db.open_in_memory () in
-    Lwt.catch
-      (fun () ->
-        let* _ = Db.execute db
-          "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (count(v) > 0))" in
-        Alcotest.fail "expected aggregate in CHECK to be rejected")
-      (fun _exn -> Lwt.return_unit))
+  run
+    (let* db = Db.open_in_memory () in
+     Lwt.catch
+       (fun () ->
+          let* _ =
+            Db.execute
+              db
+              "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (count(v) > 0))"
+          in
+          Alcotest.fail "expected aggregate in CHECK to be rejected")
+       (fun _exn -> Lwt.return_unit))
+;;
 
 let test_check_persisted () =
-  run (
-    let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
-    Fun.protect ~finally:(fun () -> try Unix.unlink tmpfile with _ -> ()) (fun () ->
-      let* db_res = Db.open_file ~path:tmpfile in
-      let db = match db_res with Ok d -> d | Error _ -> failwith "open_file failed" in
-      let* _ = Db.execute db
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))" in
-      let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-      let* () = Db.close db in
-      let* db2_res = Db.open_file ~path:tmpfile in
-      let db2 = match db2_res with Ok d -> d | Error _ -> failwith "open_file2 failed" in
-      let* res = Db.execute db2 "INSERT INTO t VALUES (2, -1)" in
-      let* () = Db.close db2 in
-      (match res with
-       | Error _ -> ()
-       | Ok ()   -> Alcotest.fail "expected CHECK to persist after reopen");
-      Lwt.return_unit))
+  run
+    (let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
+     Fun.protect
+       ~finally:(fun () ->
+         try Unix.unlink tmpfile with
+         | _ -> ())
+       (fun () ->
+          let* db_res = Db.open_file ~path:tmpfile in
+          let db =
+            match db_res with
+            | Ok d -> d
+            | Error _ -> failwith "open_file failed"
+          in
+          let* _ =
+            Db.execute
+              db
+              "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0))"
+          in
+          let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+          let* () = Db.close db in
+          let* db2_res = Db.open_file ~path:tmpfile in
+          let db2 =
+            match db2_res with
+            | Ok d -> d
+            | Error _ -> failwith "open_file2 failed"
+          in
+          let* res = Db.execute db2 "INSERT INTO t VALUES (2, -1)" in
+          let* () = Db.close db2 in
+          (match res with
+           | Error _ -> ()
+           | Ok () -> Alcotest.fail "expected CHECK to persist after reopen");
+          Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 9 edge cases                                                   *)
 (* ------------------------------------------------------------------ *)
 
 let test_const_select () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* r = Db.query db "SELECT 1 + 1" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "const select error: %a" Db.pp_error e) in
-    Alcotest.(check int) "const select returns one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "1+1 = V_int 2" (Db.V_int 2L) row.(0)
-     | _ -> Alcotest.fail "expected exactly one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* r = Db.query db "SELECT 1 + 1" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "const select error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "const select returns one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] -> Alcotest.check value_testable "1+1 = V_int 2" (Db.V_int 2L) row.(0)
+      | _ -> Alcotest.fail "expected exactly one row");
+     Lwt.return_unit)
+;;
 
 let test_subquery_and_predicate () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
-    let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
-    let* res = Db.query db
-      "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE id = 1) AND v > 15" in
-    let* rows = (match res with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "subquery_and_pred error: %a" Db.pp_error e) in
-    let ids = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "exists AND predicate"
-      [Db.V_int 2L] ids;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
+     let* _ = Db.execute db "INSERT INTO t VALUES (2, 20)" in
+     let* res =
+       Db.query
+         db
+         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM t WHERE id = 1) AND v > 15"
+     in
+     let* rows =
+       match res with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "subquery_and_pred error: %a" Db.pp_error e
+     in
+     let ids = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable)) "exists AND predicate" [ Db.V_int 2L ] ids;
+     Lwt.return_unit)
+;;
 
 let test_check_complex_expr () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE prices_t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0 AND price < 1000))" in
-    let* res = Db.execute db "INSERT INTO prices_t VALUES (1, 99.9)" in
-    Alcotest.(check bool) "complex check passes" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO prices_t VALUES (2, 1500.0)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "expected CHECK violation for price > 1000");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE prices_t (id INTEGER PRIMARY KEY, price REAL CHECK (price > 0 AND \
+          price < 1000))"
+     in
+     let* res = Db.execute db "INSERT INTO prices_t VALUES (1, 99.9)" in
+     Alcotest.(check bool) "complex check passes" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO prices_t VALUES (2, 1500.0)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected CHECK violation for price > 1000");
+     Lwt.return_unit)
+;;
 
 let test_check_function_in_expr () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE names_t (id INTEGER PRIMARY KEY, name TEXT CHECK (LENGTH(name) > 0))" in
-    let* res = Db.execute db "INSERT INTO names_t VALUES (1, 'Alice')" in
-    (match res with
-     | Error e -> Alcotest.failf "INSERT error: %a" Db.pp_error e
-     | Ok () -> ());
-    Alcotest.(check bool) "check with function passes" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO names_t VALUES (2, '')" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok ()   -> Alcotest.fail "expected CHECK violation for empty name");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE names_t (id INTEGER PRIMARY KEY, name TEXT CHECK (LENGTH(name) > \
+          0))"
+     in
+     let* res = Db.execute db "INSERT INTO names_t VALUES (1, 'Alice')" in
+     (match res with
+      | Error e -> Alcotest.failf "INSERT error: %a" Db.pp_error e
+      | Ok () -> ());
+     Alcotest.(check bool) "check with function passes" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO names_t VALUES (2, '')" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected CHECK violation for empty name");
+     Lwt.return_unit)
+;;
 
 let test_text_scalar_subquery () =
   (* Covers exec.ml value_to_literal V_text branch *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE words (id INTEGER, w TEXT)" in
-    let* _ = Db.execute db "INSERT INTO words VALUES (1, 'apple')" in
-    let* _ = Db.execute db "INSERT INTO words VALUES (2, 'banana')" in
-    let* r = Db.query db "SELECT (SELECT MAX(w) FROM words)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "text scalar subquery error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "max text" (Db.V_text "banana") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE words (id INTEGER, w TEXT)" in
+     let* _ = Db.execute db "INSERT INTO words VALUES (1, 'apple')" in
+     let* _ = Db.execute db "INSERT INTO words VALUES (2, 'banana')" in
+     let* r = Db.query db "SELECT (SELECT MAX(w) FROM words)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "text scalar subquery error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] -> Alcotest.check value_testable "max text" (Db.V_text "banana") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_real_scalar_subquery () =
   (* Covers exec.ml value_to_literal V_real branch *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE prices (id INTEGER, price REAL)" in
-    let* _ = Db.execute db "INSERT INTO prices VALUES (1, 1.5)" in
-    let* _ = Db.execute db "INSERT INTO prices VALUES (2, 9.99)" in
-    let* r = Db.query db "SELECT (SELECT MAX(price) FROM prices)" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "real scalar subquery error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "max real" (Db.V_real 9.99) row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE prices (id INTEGER, price REAL)" in
+     let* _ = Db.execute db "INSERT INTO prices VALUES (1, 1.5)" in
+     let* _ = Db.execute db "INSERT INTO prices VALUES (2, 9.99)" in
+     let* r = Db.query db "SELECT (SELECT MAX(price) FROM prices)" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "real scalar subquery error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] -> Alcotest.check value_testable "max real" (Db.V_real 9.99) row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_like_in_where () =
   (* Covers sema.ml Like/Glob in ast_binop_to_sema and exec.ml like_match *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE names (id INTEGER, name TEXT)" in
-    let* _ = Db.execute db "INSERT INTO names VALUES (1, 'alice')" in
-    let* _ = Db.execute db "INSERT INTO names VALUES (2, 'bob')" in
-    let* _ = Db.execute db "INSERT INTO names VALUES (3, 'alicia')" in
-    let* r = Db.query db "SELECT id FROM names WHERE name LIKE 'ali%' ORDER BY id" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "LIKE query error: %a" Db.pp_error e) in
-    let ids = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "LIKE 'ali%' matches alice and alicia"
-      [Db.V_int 1L; Db.V_int 3L] ids;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE names (id INTEGER, name TEXT)" in
+     let* _ = Db.execute db "INSERT INTO names VALUES (1, 'alice')" in
+     let* _ = Db.execute db "INSERT INTO names VALUES (2, 'bob')" in
+     let* _ = Db.execute db "INSERT INTO names VALUES (3, 'alicia')" in
+     let* r = Db.query db "SELECT id FROM names WHERE name LIKE 'ali%' ORDER BY id" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "LIKE query error: %a" Db.pp_error e
+     in
+     let ids = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable))
+       "LIKE 'ali%' matches alice and alicia"
+       [ Db.V_int 1L; Db.V_int 3L ]
+       ids;
+     Lwt.return_unit)
+;;
 
 let test_modulo_operator () =
   (* Covers sema.ml Mod in ast_binop_to_sema and exec.ml Mod evaluation *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE nums (n INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO nums VALUES (7)" in
-    let* _ = Db.execute db "INSERT INTO nums VALUES (10)" in
-    let* r = Db.query db "SELECT n % 3 FROM nums ORDER BY n" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "modulo query error: %a" Db.pp_error e) in
-    let vals = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "7%3=1, 10%3=1"
-      [Db.V_int 1L; Db.V_int 1L] vals;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE nums (n INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO nums VALUES (7)" in
+     let* _ = Db.execute db "INSERT INTO nums VALUES (10)" in
+     let* r = Db.query db "SELECT n % 3 FROM nums ORDER BY n" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "modulo query error: %a" Db.pp_error e
+     in
+     let vals = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable))
+       "7%3=1, 10%3=1"
+       [ Db.V_int 1L; Db.V_int 1L ]
+       vals;
+     Lwt.return_unit)
+;;
 
 let test_sum_real_with_nulls () =
   (* Covers exec.ml SUM REAL path with NULLs (lines 1896-1904) *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE prices2 (id INTEGER, price REAL)" in
-    let* _ = Db.execute db "INSERT INTO prices2 VALUES (1, 1.5)" in
-    let* _ = Db.execute db "INSERT INTO prices2 VALUES (2, NULL)" in
-    let* _ = Db.execute db "INSERT INTO prices2 VALUES (3, 2.5)" in
-    let* r = Db.query db "SELECT SUM(price) FROM prices2" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "SUM REAL query error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "SUM(1.5 + NULL + 2.5) = 4.0" (Db.V_real 4.0) row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE prices2 (id INTEGER, price REAL)" in
+     let* _ = Db.execute db "INSERT INTO prices2 VALUES (1, 1.5)" in
+     let* _ = Db.execute db "INSERT INTO prices2 VALUES (2, NULL)" in
+     let* _ = Db.execute db "INSERT INTO prices2 VALUES (3, 2.5)" in
+     let* r = Db.query db "SELECT SUM(price) FROM prices2" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "SUM REAL query error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] ->
+        Alcotest.check
+          value_testable
+          "SUM(1.5 + NULL + 2.5) = 4.0"
+          (Db.V_real 4.0)
+          row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_avg_real_column () =
   (* Covers exec.ml AVG with REAL values (lines 1913-1922) *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE real_vals (v REAL)" in
-    let* _ = Db.execute db "INSERT INTO real_vals VALUES (2.0)" in
-    let* _ = Db.execute db "INSERT INTO real_vals VALUES (NULL)" in
-    let* _ = Db.execute db "INSERT INTO real_vals VALUES (4.0)" in
-    let* r = Db.query db "SELECT AVG(v) FROM real_vals" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "AVG REAL query error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "AVG(2.0, null, 4.0) = 3.0" (Db.V_real 3.0) row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE real_vals (v REAL)" in
+     let* _ = Db.execute db "INSERT INTO real_vals VALUES (2.0)" in
+     let* _ = Db.execute db "INSERT INTO real_vals VALUES (NULL)" in
+     let* _ = Db.execute db "INSERT INTO real_vals VALUES (4.0)" in
+     let* r = Db.query db "SELECT AVG(v) FROM real_vals" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "AVG REAL query error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] ->
+        Alcotest.check value_testable "AVG(2.0, null, 4.0) = 3.0" (Db.V_real 3.0) row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_check_add_binop () =
   (* Covers exec.ml ast_binop_to_plan for Add/Mod operators via CHECK *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE even_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (n % 2 = 0))" in
-    let* res = Db.execute db "INSERT INTO even_t VALUES (1, 4)" in
-    Alcotest.(check bool) "even passes CHECK" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO even_t VALUES (2, 3)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "odd should fail CHECK");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE even_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (n % 2 = 0))"
+     in
+     let* res = Db.execute db "INSERT INTO even_t VALUES (1, 4)" in
+     Alcotest.(check bool) "even passes CHECK" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO even_t VALUES (2, 3)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "odd should fail CHECK");
+     Lwt.return_unit)
+;;
 
 let test_check_concat_binop () =
   (* Covers exec.ml ast_binop_to_plan for Concat/Ne via CHECK *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE prefix_t (id INTEGER PRIMARY KEY, name TEXT CHECK (name || '' != ''))" in
-    let* res = Db.execute db "INSERT INTO prefix_t VALUES (1, 'Alice')" in
-    Alcotest.(check bool) "non-empty name passes" true (res = Ok ());
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE prefix_t (id INTEGER PRIMARY KEY, name TEXT CHECK (name || '' != \
+          ''))"
+     in
+     let* res = Db.execute db "INSERT INTO prefix_t VALUES (1, 'Alice')" in
+     Alcotest.(check bool) "non-empty name passes" true (res = Ok ());
+     Lwt.return_unit)
+;;
 
 let test_check_like_in_constraint () =
   (* Covers exec.ml ast_binop_to_plan for Like via CHECK *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE upper_t (id INTEGER PRIMARY KEY, code TEXT CHECK (code LIKE 'A%'))" in
-    let* res = Db.execute db "INSERT INTO upper_t VALUES (1, 'ABC')" in
-    Alcotest.(check bool) "A-prefix passes CHECK LIKE" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO upper_t VALUES (2, 'xyz')" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "non-A prefix should fail CHECK LIKE");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE upper_t (id INTEGER PRIMARY KEY, code TEXT CHECK (code LIKE 'A%'))"
+     in
+     let* res = Db.execute db "INSERT INTO upper_t VALUES (1, 'ABC')" in
+     Alcotest.(check bool) "A-prefix passes CHECK LIKE" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO upper_t VALUES (2, 'xyz')" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "non-A prefix should fail CHECK LIKE");
+     Lwt.return_unit)
+;;
 
 let test_check_not_operator () =
   (* Covers exec.ml ast_expr_to_plan_check E_not/E_neg/E_bitnot paths *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE not_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (NOT (n = 0)))" in
-    let* res = Db.execute db "INSERT INTO not_t VALUES (1, 5)" in
-    Alcotest.(check bool) "NOT(n=0) with n=5 passes" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO not_t VALUES (2, 0)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "NOT(n=0) with n=0 should fail");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE not_t (id INTEGER PRIMARY KEY, n INTEGER CHECK (NOT (n = 0)))"
+     in
+     let* res = Db.execute db "INSERT INTO not_t VALUES (1, 5)" in
+     Alcotest.(check bool) "NOT(n=0) with n=5 passes" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO not_t VALUES (2, 0)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "NOT(n=0) with n=0 should fail");
+     Lwt.return_unit)
+;;
 
 let test_check_between_in_check () =
   (* Covers exec.ml ast_expr_to_plan_check E_between path *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE range_t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v BETWEEN 1 AND 10))" in
-    let* res = Db.execute db "INSERT INTO range_t VALUES (1, 5)" in
-    Alcotest.(check bool) "v BETWEEN 1 AND 10 with v=5 passes" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO range_t VALUES (2, 15)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "v=15 should fail BETWEEN 1 AND 10");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE range_t (id INTEGER PRIMARY KEY, v INTEGER CHECK (v BETWEEN 1 AND \
+          10))"
+     in
+     let* res = Db.execute db "INSERT INTO range_t VALUES (1, 5)" in
+     Alcotest.(check bool) "v BETWEEN 1 AND 10 with v=5 passes" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO range_t VALUES (2, 15)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "v=15 should fail BETWEEN 1 AND 10");
+     Lwt.return_unit)
+;;
 
 let test_check_is_not_null_in_check () =
   (* Covers exec.ml ast_expr_to_plan_check E_is_not_null/E_is_null path *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db
-      "CREATE TABLE notnull_t (id INTEGER PRIMARY KEY, v TEXT CHECK (v IS NOT NULL))" in
-    let* res = Db.execute db "INSERT INTO notnull_t VALUES (1, 'hello')" in
-    Alcotest.(check bool) "IS NOT NULL with 'hello' passes" true (res = Ok ());
-    let* res2 = Db.execute db "INSERT INTO notnull_t VALUES (2, NULL)" in
-    (match res2 with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "NULL should fail IS NOT NULL check");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ =
+       Db.execute
+         db
+         "CREATE TABLE notnull_t (id INTEGER PRIMARY KEY, v TEXT CHECK (v IS NOT NULL))"
+     in
+     let* res = Db.execute db "INSERT INTO notnull_t VALUES (1, 'hello')" in
+     Alcotest.(check bool) "IS NOT NULL with 'hello' passes" true (res = Ok ());
+     let* res2 = Db.execute db "INSERT INTO notnull_t VALUES (2, NULL)" in
+     (match res2 with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "NULL should fail IS NOT NULL check");
+     Lwt.return_unit)
+;;
 
 let test_real_mod_int () =
   (* Covers exec.ml V_real,V_int Mod path (line 432-433) *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE rmod (v REAL)" in
-    let* _ = Db.execute db "INSERT INTO rmod VALUES (7.5)" in
-    (* 7.5 % 2 → should be 1.5 (real % int) *)
-    let* r = Db.query db "SELECT v % 2 FROM rmod" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "real_mod_int error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "7.5 % 2 = 1.5" (Db.V_real 1.5) row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE rmod (v REAL)" in
+     let* _ = Db.execute db "INSERT INTO rmod VALUES (7.5)" in
+     (* 7.5 % 2 → should be 1.5 (real % int) *)
+     let* r = Db.query db "SELECT v % 2 FROM rmod" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "real_mod_int error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] -> Alcotest.check value_testable "7.5 % 2 = 1.5" (Db.V_real 1.5) row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_real_ne_comparison () =
   (* Covers exec.ml eval_binop Ne with V_real,V_real (line 401) and null (line 398) *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE reals (id INTEGER, v REAL)" in
-    let* _ = Db.execute db "INSERT INTO reals VALUES (1, 1.5)" in
-    let* _ = Db.execute db "INSERT INTO reals VALUES (2, 2.5)" in
-    let* _ = Db.execute db "INSERT INTO reals VALUES (3, NULL)" in
-    (* REAL != REAL: v != 1.5 should return rows 2 (2.5 != 1.5) but not 1 or 3 *)
-    let* r = Db.query db "SELECT id FROM reals WHERE v != 1.5 ORDER BY id" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "real_ne_comparison error: %a" Db.pp_error e) in
-    let ids = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "only id=2 has v != 1.5"
-      [Db.V_int 2L] ids;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE reals (id INTEGER, v REAL)" in
+     let* _ = Db.execute db "INSERT INTO reals VALUES (1, 1.5)" in
+     let* _ = Db.execute db "INSERT INTO reals VALUES (2, 2.5)" in
+     let* _ = Db.execute db "INSERT INTO reals VALUES (3, NULL)" in
+     (* REAL != REAL: v != 1.5 should return rows 2 (2.5 != 1.5) but not 1 or 3 *)
+     let* r = Db.query db "SELECT id FROM reals WHERE v != 1.5 ORDER BY id" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "real_ne_comparison error: %a" Db.pp_error e
+     in
+     let ids = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable)) "only id=2 has v != 1.5" [ Db.V_int 2L ] ids;
+     Lwt.return_unit)
+;;
 
 let test_alter_add_text_default () =
   (* Covers exec.ml lines 1415-1416: ALTER TABLE ADD COLUMN with TEXT/REAL default *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE alter_t (id INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO alter_t VALUES (1)" in
-    (* Add TEXT column with default — covers L_text branch in execute_with_count *)
-    let* res = Db.execute db "ALTER TABLE alter_t ADD COLUMN status TEXT DEFAULT 'active'" in
-    Alcotest.(check bool) "ALTER ADD TEXT default ok" true (res = Ok ());
-    (* Add REAL column with default — covers L_real branch *)
-    let* res2 = Db.execute db "ALTER TABLE alter_t ADD COLUMN score REAL DEFAULT 0.0" in
-    Alcotest.(check bool) "ALTER ADD REAL default ok" true (res2 = Ok ());
-    let* r = Db.query db "SELECT id, status, score FROM alter_t" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "alter_add_text_default query error: %a" Db.pp_error e) in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [row] ->
-       Alcotest.check value_testable "status='active'" (Db.V_text "active") row.(1);
-       Alcotest.check value_testable "score=0.0" (Db.V_real 0.0) row.(2)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE alter_t (id INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO alter_t VALUES (1)" in
+     (* Add TEXT column with default — covers L_text branch in execute_with_count *)
+     let* res =
+       Db.execute db "ALTER TABLE alter_t ADD COLUMN status TEXT DEFAULT 'active'"
+     in
+     Alcotest.(check bool) "ALTER ADD TEXT default ok" true (res = Ok ());
+     (* Add REAL column with default — covers L_real branch *)
+     let* res2 = Db.execute db "ALTER TABLE alter_t ADD COLUMN score REAL DEFAULT 0.0" in
+     Alcotest.(check bool) "ALTER ADD REAL default ok" true (res2 = Ok ());
+     let* r = Db.query db "SELECT id, status, score FROM alter_t" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "alter_add_text_default query error: %a" Db.pp_error e
+     in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ row ] ->
+        Alcotest.check value_testable "status='active'" (Db.V_text "active") row.(1);
+        Alcotest.check value_testable "score=0.0" (Db.V_real 0.0) row.(2)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_int_real_comparison () =
   (* Covers exec.ml cmp_result V_int,V_real and V_real,V_int cross-type paths *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE mixed (n INTEGER)" in
-    let* _ = Db.execute db "INSERT INTO mixed VALUES (1)" in
-    let* _ = Db.execute db "INSERT INTO mixed VALUES (2)" in
-    let* _ = Db.execute db "INSERT INTO mixed VALUES (3)" in
-    (* WHERE n > 2.5 → integer vs real comparison, covering V_int,V_real path *)
-    let* r = Db.query db "SELECT n FROM mixed WHERE n > 2.5 ORDER BY n" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "int_real_cmp error: %a" Db.pp_error e) in
-    let vals = List.map (fun r -> r.(0)) rows in
-    Alcotest.(check (list value_testable)) "only 3 > 2.5"
-      [Db.V_int 3L] vals;
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE mixed (n INTEGER)" in
+     let* _ = Db.execute db "INSERT INTO mixed VALUES (1)" in
+     let* _ = Db.execute db "INSERT INTO mixed VALUES (2)" in
+     let* _ = Db.execute db "INSERT INTO mixed VALUES (3)" in
+     (* WHERE n > 2.5 → integer vs real comparison, covering V_int,V_real path *)
+     let* r = Db.query db "SELECT n FROM mixed WHERE n > 2.5 ORDER BY n" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "int_real_cmp error: %a" Db.pp_error e
+     in
+     let vals = List.map (fun r -> r.(0)) rows in
+     Alcotest.(check (list value_testable)) "only 3 > 2.5" [ Db.V_int 3L ] vals;
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 9 string-function coverage                                     *)
@@ -3106,67 +3839,105 @@ let test_int_real_comparison () =
 
 let test_trim_all_whitespace () =
   (* TRIM of strings with tabs/newlines → hits \t, \n, \r branches in trim helpers *)
-  run (
-    let* db = Db.open_in_memory () in
-    (* All spaces → str_trim_spaces empty-result branch *)
-    let* r = Db.query db "SELECT TRIM('   ')" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "TRIM all-space error: %a" Db.pp_error e) in
-    (match rows with
-     | [row] -> Alcotest.check value_testable "TRIM of spaces = empty" (Db.V_text "") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    (* TRIM with tab chars on both sides — covers '\t' in str_trim_spaces *)
-    let* r2 = Db.query db "SELECT TRIM('\thello\t')" in
-    let* rows2 = (match r2 with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "TRIM tab error: %a" Db.pp_error e) in
-    (match rows2 with
-     | [row] -> Alcotest.check value_testable "TRIM tabs from both sides" (Db.V_text "hello") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    (* LTRIM with tab — covers '\t' in str_ltrim_spaces *)
-    let* r3 = Db.query db "SELECT LTRIM('\thello')" in
-    let* rows3 = (match r3 with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "LTRIM tab error: %a" Db.pp_error e) in
-    (match rows3 with
-     | [row] -> Alcotest.check value_testable "LTRIM tab" (Db.V_text "hello") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    (* RTRIM with tabs only → str_rtrim_spaces empty-result branch *)
-    let* r4 = Db.query db "SELECT RTRIM('\t\t\t')" in
-    let* rows4 = (match r4 with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "RTRIM all-tabs error: %a" Db.pp_error e) in
-    (match rows4 with
-     | [row] -> Alcotest.check value_testable "RTRIM of tabs = empty" (Db.V_text "") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     (* All spaces → str_trim_spaces empty-result branch *)
+     let* r = Db.query db "SELECT TRIM('   ')" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "TRIM all-space error: %a" Db.pp_error e
+     in
+     (match rows with
+      | [ row ] ->
+        Alcotest.check value_testable "TRIM of spaces = empty" (Db.V_text "") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     (* TRIM with tab chars on both sides — covers '\t' in str_trim_spaces *)
+     let* r2 = Db.query db "SELECT TRIM('\thello\t')" in
+     let* rows2 =
+       match r2 with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "TRIM tab error: %a" Db.pp_error e
+     in
+     (match rows2 with
+      | [ row ] ->
+        Alcotest.check
+          value_testable
+          "TRIM tabs from both sides"
+          (Db.V_text "hello")
+          row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     (* LTRIM with tab — covers '\t' in str_ltrim_spaces *)
+     let* r3 = Db.query db "SELECT LTRIM('\thello')" in
+     let* rows3 =
+       match r3 with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "LTRIM tab error: %a" Db.pp_error e
+     in
+     (match rows3 with
+      | [ row ] -> Alcotest.check value_testable "LTRIM tab" (Db.V_text "hello") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     (* RTRIM with tabs only → str_rtrim_spaces empty-result branch *)
+     let* r4 = Db.query db "SELECT RTRIM('\t\t\t')" in
+     let* rows4 =
+       match r4 with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "RTRIM all-tabs error: %a" Db.pp_error e
+     in
+     (match rows4 with
+      | [ row ] ->
+        Alcotest.check value_testable "RTRIM of tabs = empty" (Db.V_text "") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_trim_chars_all_removed () =
   (* TRIM(s, chars) where all chars are in the trim-set → "" *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* r = Db.query db "SELECT TRIM('xxxxx', 'x')" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "TRIM chars all-removed error: %a" Db.pp_error e) in
-    (match rows with
-     | [row] -> Alcotest.check value_testable "TRIM('xxxxx','x') = empty" (Db.V_text "") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    let* r2 = Db.query db "SELECT RTRIM('aaa', 'a')" in
-    let* rows2 = (match r2 with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "RTRIM chars all-removed error: %a" Db.pp_error e) in
-    (match rows2 with
-     | [row] -> Alcotest.check value_testable "RTRIM('aaa','a') = empty" (Db.V_text "") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* r = Db.query db "SELECT TRIM('xxxxx', 'x')" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "TRIM chars all-removed error: %a" Db.pp_error e
+     in
+     (match rows with
+      | [ row ] ->
+        Alcotest.check value_testable "TRIM('xxxxx','x') = empty" (Db.V_text "") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     let* r2 = Db.query db "SELECT RTRIM('aaa', 'a')" in
+     let* rows2 =
+       match r2 with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "RTRIM chars all-removed error: %a" Db.pp_error e
+     in
+     (match rows2 with
+      | [ row ] ->
+        Alcotest.check value_testable "RTRIM('aaa','a') = empty" (Db.V_text "") row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_replace_empty_old () =
   (* REPLACE(s, '', rep) → s unchanged (covers str_replace empty-old branch) *)
-  run (
-    let* db = Db.open_in_memory () in
-    let* r = Db.query db "SELECT REPLACE('hello', '', 'X')" in
-    let* rows = (match r with Ok s -> Lwt_stream.to_list s | Error e ->
-      Alcotest.failf "REPLACE empty-old error: %a" Db.pp_error e) in
-    (match rows with
-     | [row] -> Alcotest.check value_testable "REPLACE with empty old = original" (Db.V_text "hello") row.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* r = Db.query db "SELECT REPLACE('hello', '', 'X')" in
+     let* rows =
+       match r with
+       | Ok s -> Lwt_stream.to_list s
+       | Error e -> Alcotest.failf "REPLACE empty-old error: %a" Db.pp_error e
+     in
+     (match rows with
+      | [ row ] ->
+        Alcotest.check
+          value_testable
+          "REPLACE with empty old = original"
+          (Db.V_text "hello")
+          row.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* CASE WHEN                                                            *)
@@ -3178,10 +3949,22 @@ let test_case_searched () =
   exec db "INSERT INTO t VALUES (3)";
   exec db "INSERT INTO t VALUES (-1)";
   exec db "INSERT INTO t VALUES (0)";
-  let rows = query_ok db
-    "SELECT CASE WHEN v > 0 THEN 'pos' WHEN v < 0 THEN 'neg' ELSE 'zero' END FROM t ORDER BY v" in
-  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
-  Alcotest.(check (list string)) "case_searched" ["neg"; "zero"; "pos"] labels
+  let rows =
+    query_ok
+      db
+      "SELECT CASE WHEN v > 0 THEN 'pos' WHEN v < 0 THEN 'neg' ELSE 'zero' END FROM t \
+       ORDER BY v"
+  in
+  let labels =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "?")
+      rows
+  in
+  Alcotest.(check (list string)) "case_searched" [ "neg"; "zero"; "pos" ] labels
+;;
 
 let test_case_simple () =
   let db = fresh_db () in
@@ -3189,18 +3972,33 @@ let test_case_simple () =
   exec db "INSERT INTO t VALUES (1)";
   exec db "INSERT INTO t VALUES (2)";
   exec db "INSERT INTO t VALUES (3)";
-  let rows = query_ok db
-    "SELECT CASE v WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t ORDER BY v" in
-  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
-  Alcotest.(check (list string)) "case_simple" ["one"; "two"; "other"] labels
+  let rows =
+    query_ok
+      db
+      "SELECT CASE v WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM t ORDER \
+       BY v"
+  in
+  let labels =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "?")
+      rows
+  in
+  Alcotest.(check (list string)) "case_simple" [ "one"; "two"; "other" ] labels
+;;
 
 let test_case_no_else () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (v INTEGER)";
   exec db "INSERT INTO t VALUES (99)";
   let rows = query_ok db "SELECT CASE WHEN v = 0 THEN 'zero' END FROM t" in
-  Alcotest.(check (list bool)) "null" [true]
+  Alcotest.(check (list bool))
+    "null"
+    [ true ]
     (List.map (fun r -> r.(0) = Db.V_null) rows)
+;;
 
 let test_case_null_scrutinee () =
   (* CASE NULL WHEN NULL THEN 1 ELSE 0 END = 0: simple CASE uses = (not IS) semantics *)
@@ -3208,8 +4006,16 @@ let test_case_null_scrutinee () =
   exec db "CREATE TABLE t (v INTEGER)";
   exec db "INSERT INTO t VALUES (NULL)";
   let rows = query_ok db "SELECT CASE v WHEN NULL THEN 1 ELSE 0 END FROM t" in
-  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "null_scrutinee" [0] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
+      rows
+  in
+  Alcotest.(check (list int)) "null_scrutinee" [ 0 ] vals
+;;
 
 let test_case_in_where () =
   let db = fresh_db () in
@@ -3217,27 +4023,56 @@ let test_case_in_where () =
   exec db "INSERT INTO t VALUES (1)";
   exec db "INSERT INTO t VALUES (2)";
   exec db "INSERT INTO t VALUES (3)";
-  let rows = query_ok db
-    "SELECT v FROM t WHERE CASE WHEN v > 1 THEN 1 ELSE 0 END = 1 ORDER BY v" in
-  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "case_in_where" [2; 3] vals
+  let rows =
+    query_ok db "SELECT v FROM t WHERE CASE WHEN v > 1 THEN 1 ELSE 0 END = 1 ORDER BY v"
+  in
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
+      rows
+  in
+  Alcotest.(check (list int)) "case_in_where" [ 2; 3 ] vals
+;;
 
 let test_case_nested () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (v INTEGER)";
   exec db "INSERT INTO t VALUES (5)";
-  let rows = query_ok db
-    "SELECT CASE WHEN v > 0 THEN CASE WHEN v > 3 THEN 'big' ELSE 'small' END ELSE 'neg' END FROM t" in
-  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
-  Alcotest.(check (list string)) "nested_case" ["big"] labels
+  let rows =
+    query_ok
+      db
+      "SELECT CASE WHEN v > 0 THEN CASE WHEN v > 3 THEN 'big' ELSE 'small' END ELSE \
+       'neg' END FROM t"
+  in
+  let labels =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "?")
+      rows
+  in
+  Alcotest.(check (list string)) "nested_case" [ "big" ] labels
+;;
 
 let test_case_arithmetic () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (v INTEGER)";
   exec db "INSERT INTO t VALUES (4)";
   let rows = query_ok db "SELECT CASE WHEN v > 2 THEN v * 10 ELSE v END FROM t" in
-  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "arithmetic" [40] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
+      rows
+  in
+  Alcotest.(check (list int)) "arithmetic" [ 40 ] vals
+;;
 
 (* ------------------------------------------------------------------ *)
 (* ── Multiple JOINs ──────────────────────────────────────────────── *)
@@ -3250,13 +4085,33 @@ let test_three_table_join () =
   exec db "INSERT INTO a VALUES (1, 'alice')";
   exec db "INSERT INTO b VALUES (1, 42)";
   exec db "INSERT INTO c VALUES (42, 'extra')";
-  let rows = query_ok db
-    "SELECT a.name, b.val, c.extra FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid" in
+  let rows =
+    query_ok
+      db
+      "SELECT a.name, b.val, c.extra FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = \
+       c.bid"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.(check string) "name"  "alice" (match row.(0) with Db.V_text s -> s | _ -> "?");
-  Alcotest.(check int)    "val"   42      (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1);
-  Alcotest.(check string) "extra" "extra" (match row.(2) with Db.V_text s -> s | _ -> "?")
+  Alcotest.(check string)
+    "name"
+    "alice"
+    (match row.(0) with
+     | Db.V_text s -> s
+     | _ -> "?");
+  Alcotest.(check int)
+    "val"
+    42
+    (match row.(1) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1);
+  Alcotest.(check string)
+    "extra"
+    "extra"
+    (match row.(2) with
+     | Db.V_text s -> s
+     | _ -> "?")
+;;
 
 let test_two_joins_with_where () =
   let db = fresh_db () in
@@ -3269,12 +4124,27 @@ let test_two_joins_with_where () =
   exec db "INSERT INTO o VALUES (2, 'book')";
   exec db "INSERT INTO p VALUES ('hat', 10)";
   exec db "INSERT INTO p VALUES ('book', 5)";
-  let rows = query_ok db
-    "SELECT u.name, p.price FROM u JOIN o ON u.id = o.uid JOIN p ON o.item = p.item WHERE u.id = 1" in
+  let rows =
+    query_ok
+      db
+      "SELECT u.name, p.price FROM u JOIN o ON u.id = o.uid JOIN p ON o.item = p.item \
+       WHERE u.id = 1"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
-  Alcotest.(check string) "name"  "alice" (match row.(0) with Db.V_text s -> s | _ -> "?");
-  Alcotest.(check int)    "price" 10      (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1)
+  Alcotest.(check string)
+    "name"
+    "alice"
+    (match row.(0) with
+     | Db.V_text s -> s
+     | _ -> "?");
+  Alcotest.(check int)
+    "price"
+    10
+    (match row.(1) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1)
+;;
 
 let test_two_left_joins () =
   let db = fresh_db () in
@@ -3285,15 +4155,20 @@ let test_two_left_joins () =
   exec db "INSERT INTO a VALUES (2)";
   exec db "INSERT INTO b VALUES (1, 'B1')";
   exec db "INSERT INTO c VALUES (2, 'C2')";
-  let rows = query_ok db
-    "SELECT a.id, b.v, c.w FROM a LEFT JOIN b ON a.id = b.aid LEFT JOIN c ON a.id = c.aid ORDER BY a.id" in
+  let rows =
+    query_ok
+      db
+      "SELECT a.id, b.v, c.w FROM a LEFT JOIN b ON a.id = b.aid LEFT JOIN c ON a.id = \
+       c.aid ORDER BY a.id"
+  in
   Alcotest.(check int) "two rows" 2 (List.length rows);
   let r0 = List.nth rows 0 in
   let r1 = List.nth rows 1 in
   Alcotest.(check bool) "b.v row0 not null" true (r0.(1) <> Db.V_null);
-  Alcotest.(check bool) "c.w row0 null"     true (r0.(2) = Db.V_null);
-  Alcotest.(check bool) "b.v row1 null"     true (r1.(1) = Db.V_null);
+  Alcotest.(check bool) "c.w row0 null" true (r0.(2) = Db.V_null);
+  Alcotest.(check bool) "b.v row1 null" true (r1.(1) = Db.V_null);
   Alcotest.(check bool) "c.w row1 not null" true (r1.(2) <> Db.V_null)
+;;
 
 let test_star_three_tables () =
   let db = fresh_db () in
@@ -3307,9 +4182,25 @@ let test_star_three_tables () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.(check int) "three cols" 3 (Array.length row);
-  Alcotest.(check int) "a=1" 1 (match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1);
-  Alcotest.(check int) "b=2" 2 (match row.(1) with Db.V_int n -> Int64.to_int n | _ -> -1);
-  Alcotest.(check int) "c=3" 3 (match row.(2) with Db.V_int n -> Int64.to_int n | _ -> -1)
+  Alcotest.(check int)
+    "a=1"
+    1
+    (match row.(0) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1);
+  Alcotest.(check int)
+    "b=2"
+    2
+    (match row.(1) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1);
+  Alcotest.(check int)
+    "c=3"
+    3
+    (match row.(2) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1)
+;;
 
 let test_multi_join_regression_one () =
   (* Regression: single JOIN still works *)
@@ -3320,6 +4211,7 @@ let test_multi_join_regression_one () =
   exec db "INSERT INTO b VALUES (1, 'Y')";
   let rows = query_ok db "SELECT a.v, b.w FROM a JOIN b ON a.id = b.aid" in
   Alcotest.(check int) "one row" 1 (List.length rows)
+;;
 
 (* ── Phase 10 edge cases ─────────────────────────────────────────── *)
 
@@ -3329,19 +4221,37 @@ let test_case_in_order_by () =
   exec db "INSERT INTO t VALUES (1)";
   exec db "INSERT INTO t VALUES (2)";
   exec db "INSERT INTO t VALUES (3)";
-  let rows = query_ok db
-    "SELECT v FROM t ORDER BY CASE v WHEN 1 THEN 3 WHEN 2 THEN 1 ELSE 2 END" in
-  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "case_order" [2; 3; 1] vals
+  let rows =
+    query_ok db "SELECT v FROM t ORDER BY CASE v WHEN 1 THEN 3 WHEN 2 THEN 1 ELSE 2 END"
+  in
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
+      rows
+  in
+  Alcotest.(check (list int)) "case_order" [ 2; 3; 1 ] vals
+;;
 
 let test_case_with_func () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (s TEXT)";
   exec db "INSERT INTO t VALUES ('hello')";
-  let rows = query_ok db
-    "SELECT CASE WHEN LENGTH(s) > 3 THEN UPPER(s) ELSE s END FROM t" in
-  let labels = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "?") rows in
-  Alcotest.(check (list string)) "case_func" ["HELLO"] labels
+  let rows =
+    query_ok db "SELECT CASE WHEN LENGTH(s) > 3 THEN UPPER(s) ELSE s END FROM t"
+  in
+  let labels =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "?")
+      rows
+  in
+  Alcotest.(check (list string)) "case_func" [ "HELLO" ] labels
+;;
 
 let test_case_in_update () =
   let db = fresh_db () in
@@ -3350,8 +4260,16 @@ let test_case_in_update () =
   exec db "INSERT INTO t VALUES (2, -3)";
   exec db "UPDATE t SET v = CASE WHEN v > 0 THEN v * 10 ELSE 0 END";
   let rows = query_ok db "SELECT v FROM t ORDER BY id" in
-  let vals = List.map (fun r -> match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1) rows in
-  Alcotest.(check (list int)) "update_case" [50; 0] vals
+  let vals =
+    List.map
+      (fun r ->
+         match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
+      rows
+  in
+  Alcotest.(check (list int)) "update_case" [ 50; 0 ] vals
+;;
 
 let test_case_in_join () =
   let db = fresh_db () in
@@ -3361,11 +4279,23 @@ let test_case_in_join () =
   exec db "INSERT INTO a VALUES (2)";
   exec db "INSERT INTO b VALUES (1, 10)";
   exec db "INSERT INTO b VALUES (2, 20)";
-  let rows = query_ok db
-    "SELECT a.id, CASE WHEN b.v > 15 THEN 'big' ELSE 'small' END FROM a JOIN b ON a.id = b.aid ORDER BY a.id" in
+  let rows =
+    query_ok
+      db
+      "SELECT a.id, CASE WHEN b.v > 15 THEN 'big' ELSE 'small' END FROM a JOIN b ON a.id \
+       = b.aid ORDER BY a.id"
+  in
   Alcotest.(check int) "two rows" 2 (List.length rows);
-  let labels = List.map (fun r -> match r.(1) with Db.V_text s -> s | _ -> "?") rows in
-  Alcotest.(check (list string)) "labels" ["small"; "big"] labels
+  let labels =
+    List.map
+      (fun r ->
+         match r.(1) with
+         | Db.V_text s -> s
+         | _ -> "?")
+      rows
+  in
+  Alcotest.(check (list string)) "labels" [ "small"; "big" ] labels
+;;
 
 let test_four_table_join () =
   let db = fresh_db () in
@@ -3377,10 +4307,20 @@ let test_four_table_join () =
   exec db "INSERT INTO b VALUES (1, 2)";
   exec db "INSERT INTO c VALUES (2, 3)";
   exec db "INSERT INTO d VALUES (3, 'found')";
-  let rows = query_ok db
-    "SELECT d.v FROM a JOIN b ON a.id = b.aid JOIN c ON b.bid = c.bid JOIN d ON c.cid = d.cid" in
+  let rows =
+    query_ok
+      db
+      "SELECT d.v FROM a JOIN b ON a.id = b.aid JOIN c ON b.bid = c.bid JOIN d ON c.cid \
+       = d.cid"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check string) "v" "found" (match (List.hd rows).(0) with Db.V_text s -> s | _ -> "?")
+  Alcotest.(check string)
+    "v"
+    "found"
+    (match (List.hd rows).(0) with
+     | Db.V_text s -> s
+     | _ -> "?")
+;;
 
 let test_multi_join_middle_col () =
   (* Tests qual_lookup resolving column on the MIDDLE table of a 3-way join *)
@@ -3391,11 +4331,17 @@ let test_multi_join_middle_col () =
   exec db "INSERT INTO a VALUES (1)";
   exec db "INSERT INTO b VALUES (1, 42)";
   exec db "INSERT INTO c VALUES (42, 'x')";
-  let rows = query_ok db
-    "SELECT b.val FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid" in
+  let rows =
+    query_ok db "SELECT b.val FROM a JOIN b ON a.id = b.aid JOIN c ON b.val = c.bid"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check int) "b.val" 42
-    (match (List.hd rows).(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
+  Alcotest.(check int)
+    "b.val"
+    42
+    (match (List.hd rows).(0) with
+     | Db.V_int n -> Int64.to_int n
+     | _ -> -1)
+;;
 
 let three_join_group_order () =
   let db = fresh_db () in
@@ -3405,14 +4351,18 @@ let three_join_group_order () =
   exec db "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
   exec db "INSERT INTO emp  VALUES (1, 1), (2, 1), (3, 2)";
   exec db "INSERT INTO sal  VALUES (1, 100), (2, 90), (3, 80)";
-  let rows = query_ok db
-    "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id \
-     JOIN sal ON emp.id = sal.emp_id GROUP BY dname ORDER BY dname" in
+  let rows =
+    query_ok
+      db
+      "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id JOIN \
+       sal ON emp.id = sal.emp_id GROUP BY dname ORDER BY dname"
+  in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "first=eng"   (Db.V_text "eng")   (List.nth rows 0).(0);
-  Alcotest.check value_testable "first=2"     (Db.V_int 2L)        (List.nth rows 0).(1);
+  Alcotest.check value_testable "first=eng" (Db.V_text "eng") (List.nth rows 0).(0);
+  Alcotest.check value_testable "first=2" (Db.V_int 2L) (List.nth rows 0).(1);
   Alcotest.check value_testable "second=sales" (Db.V_text "sales") (List.nth rows 1).(0);
-  Alcotest.check value_testable "second=1"    (Db.V_int 1L)        (List.nth rows 1).(1)
+  Alcotest.check value_testable "second=1" (Db.V_int 1L) (List.nth rows 1).(1)
+;;
 
 let two_join_group_order_regression () =
   let db = fresh_db () in
@@ -3420,12 +4370,16 @@ let two_join_group_order_regression () =
   exec db "CREATE TABLE emp  (id INTEGER, dept_id INTEGER)";
   exec db "INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')";
   exec db "INSERT INTO emp  VALUES (1, 1), (2, 1), (3, 2)";
-  let rows = query_ok db
-    "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id \
-     GROUP BY dname ORDER BY dname" in
+  let rows =
+    query_ok
+      db
+      "SELECT dept.dname, COUNT(emp.id) FROM dept JOIN emp ON dept.id = emp.dept_id \
+       GROUP BY dname ORDER BY dname"
+  in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "first=eng"   (Db.V_text "eng")   (List.nth rows 0).(0);
+  Alcotest.check value_testable "first=eng" (Db.V_text "eng") (List.nth rows 0).(0);
   Alcotest.check value_testable "second=sales" (Db.V_text "sales") (List.nth rows 1).(0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 11: CAST, NULLIF, IIF                                          *)
@@ -3437,48 +4391,54 @@ let test_cast_int_to_text () =
   exec db "INSERT INTO t VALUES (42)";
   let rows = query_ok db "SELECT CAST(n AS TEXT) FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check row_testable) "int to text"
-    [| Db.V_text "42" |] (List.nth rows 0)
+  Alcotest.(check row_testable) "int to text" [| Db.V_text "42" |] (List.nth rows 0)
+;;
 
 let test_cast_text_to_int () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (s TEXT)";
   exec db "INSERT INTO t VALUES ('123')";
   let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
-  Alcotest.(check row_testable) "text to int"
-    [| Db.V_int 123L |] (List.nth rows 0)
+  Alcotest.(check row_testable) "text to int" [| Db.V_int 123L |] (List.nth rows 0)
+;;
 
 let test_cast_text_to_int_invalid () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (s TEXT)";
   exec db "INSERT INTO t VALUES ('abc')";
   let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
-  Alcotest.(check row_testable) "invalid text to int gives 0"
-    [| Db.V_int 0L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "invalid text to int gives 0"
+    [| Db.V_int 0L |]
+    (List.nth rows 0)
+;;
 
 let test_cast_real_to_int () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (r REAL)";
   exec db "INSERT INTO t VALUES (3.9)";
   let rows = query_ok db "SELECT CAST(r AS INTEGER) FROM t" in
-  Alcotest.(check row_testable) "real truncated to int"
-    [| Db.V_int 3L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "real truncated to int"
+    [| Db.V_int 3L |]
+    (List.nth rows 0)
+;;
 
 let test_cast_int_to_real () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (5)";
   let rows = query_ok db "SELECT CAST(n AS REAL) FROM t" in
-  Alcotest.(check row_testable) "int to real"
-    [| Db.V_real 5.0 |] (List.nth rows 0)
+  Alcotest.(check row_testable) "int to real" [| Db.V_real 5.0 |] (List.nth rows 0)
+;;
 
 let test_cast_null () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (NULL)";
   let rows = query_ok db "SELECT CAST(n AS TEXT) FROM t" in
-  Alcotest.(check row_testable) "null cast is null"
-    [| Db.V_null |] (List.nth rows 0)
+  Alcotest.(check row_testable) "null cast is null" [| Db.V_null |] (List.nth rows 0)
+;;
 
 let test_cast_in_where () =
   let db = fresh_db () in
@@ -3488,46 +4448,56 @@ let test_cast_in_where () =
   let rows = query_ok db "SELECT s FROM t WHERE CAST(s AS INTEGER) > 5 ORDER BY s" in
   Alcotest.(check int) "one row passes" 1 (List.length rows);
   Alcotest.(check row_testable) "val" [| Db.V_text "10" |] (List.nth rows 0)
+;;
 
 let test_cast_text_float_prefix_to_int () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (s TEXT)";
   exec db "INSERT INTO t VALUES ('3.7')";
   let rows = query_ok db "SELECT CAST(s AS INTEGER) FROM t" in
-  Alcotest.(check row_testable) "float prefix to int"
-    [| Db.V_int 3L |] (List.nth rows 0)
+  Alcotest.(check row_testable) "float prefix to int" [| Db.V_int 3L |] (List.nth rows 0)
+;;
 
 let test_nullif_equal () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (5)";
   let rows = query_ok db "SELECT NULLIF(n, 5) FROM t" in
-  Alcotest.(check row_testable) "nullif returns null when equal"
-    [| Db.V_null |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "nullif returns null when equal"
+    [| Db.V_null |]
+    (List.nth rows 0)
+;;
 
 let test_nullif_unequal () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (5)";
   let rows = query_ok db "SELECT NULLIF(n, 3) FROM t" in
-  Alcotest.(check row_testable) "nullif returns a when unequal"
-    [| Db.V_int 5L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "nullif returns a when unequal"
+    [| Db.V_int 5L |]
+    (List.nth rows 0)
+;;
 
 let test_iif_true () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (10)";
   let rows = query_ok db "SELECT IIF(n > 5, 'big', 'small') FROM t" in
-  Alcotest.(check row_testable) "iif true branch"
-    [| Db.V_text "big" |] (List.nth rows 0)
+  Alcotest.(check row_testable) "iif true branch" [| Db.V_text "big" |] (List.nth rows 0)
+;;
 
 let test_iif_false () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (2)";
   let rows = query_ok db "SELECT IIF(n > 5, 'big', 'small') FROM t" in
-  Alcotest.(check row_testable) "iif false branch"
-    [| Db.V_text "small" |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "iif false branch"
+    [| Db.V_text "small" |]
+    (List.nth rows 0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 11: Column aliases                                             *)
@@ -3539,8 +4509,8 @@ let test_col_alias_basic () =
   exec db "INSERT INTO t VALUES (3)";
   let rows = query_ok db "SELECT n * 2 AS doubled FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check row_testable) "expr with alias"
-    [| Db.V_int 6L |] (List.nth rows 0)
+  Alcotest.(check row_testable) "expr with alias" [| Db.V_int 6L |] (List.nth rows 0)
+;;
 
 let test_col_alias_order_by () =
   let db = fresh_db () in
@@ -3553,30 +4523,37 @@ let test_col_alias_order_by () =
   Alcotest.(check row_testable) "row 0" [| Db.V_int 10L |] (List.nth rows 0);
   Alcotest.(check row_testable) "row 1" [| Db.V_int 20L |] (List.nth rows 1);
   Alcotest.(check row_testable) "row 2" [| Db.V_int 30L |] (List.nth rows 2)
+;;
 
 let test_col_alias_multiple () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
   exec db "INSERT INTO t VALUES (2, 3)";
   let rows = query_ok db "SELECT a + b AS sum, a * b AS product FROM t" in
-  Alcotest.(check row_testable) "two aliased cols"
-    [| Db.V_int 5L; Db.V_int 6L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "two aliased cols"
+    [| Db.V_int 5L; Db.V_int 6L |]
+    (List.nth rows 0)
+;;
 
 let test_col_alias_mixed () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (4)";
   let rows = query_ok db "SELECT n, n * 2 AS doubled FROM t" in
-  Alcotest.(check row_testable) "mixed proj"
-    [| Db.V_int 4L; Db.V_int 8L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "mixed proj"
+    [| Db.V_int 4L; Db.V_int 8L |]
+    (List.nth rows 0)
+;;
 
 let test_col_alias_cast () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t VALUES (7)";
   let rows = query_ok db "SELECT CAST(n AS TEXT) AS s FROM t" in
-  Alcotest.(check row_testable) "cast with alias"
-    [| Db.V_text "7" |] (List.nth rows 0)
+  Alcotest.(check row_testable) "cast with alias" [| Db.V_text "7" |] (List.nth rows 0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 11: Table aliases                                              *)
@@ -3587,19 +4564,25 @@ let test_cte_basic () =
   exec db "CREATE TABLE t (id INTEGER, val TEXT)";
   exec db "INSERT INTO t VALUES (1, 'a')";
   exec db "INSERT INTO t VALUES (2, 'b')";
-  let rows = query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte ORDER BY id" in
+  let rows =
+    query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte ORDER BY id"
+  in
   Alcotest.(check int) "two rows" 2 (List.length rows);
   Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0);
   Alcotest.(check row_testable) "row 1" [| Db.V_int 2L; Db.V_text "b" |] (List.nth rows 1)
+;;
 
 let test_cte_filter () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, val TEXT)";
   exec db "INSERT INTO t VALUES (1, 'a')";
   exec db "INSERT INTO t VALUES (2, 'b')";
-  let rows = query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte WHERE id = 1" in
+  let rows =
+    query_ok db "WITH cte AS (SELECT id, val FROM t) SELECT * FROM cte WHERE id = 1"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0)
+;;
 
 let test_cte_agg () =
   let db = fresh_db () in
@@ -3607,21 +4590,30 @@ let test_cte_agg () =
   exec db "INSERT INTO orders VALUES (1, 100)";
   exec db "INSERT INTO orders VALUES (1, 50)";
   exec db "INSERT INTO orders VALUES (2, 200)";
-  let rows = query_ok db
-    "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT * FROM totals ORDER BY user_id" in
+  let rows =
+    query_ok
+      db
+      "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY \
+       user_id) SELECT * FROM totals ORDER BY user_id"
+  in
   Alcotest.(check int) "two rows" 2 (List.length rows);
   Alcotest.(check row_testable) "row 0" [| Db.V_int 1L; Db.V_int 150L |] (List.nth rows 0);
   Alcotest.(check row_testable) "row 1" [| Db.V_int 2L; Db.V_int 200L |] (List.nth rows 1)
+;;
 
 let test_cte_col_name () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, name TEXT)";
   exec db "INSERT INTO t VALUES (1, 'alice')";
   exec db "INSERT INTO t VALUES (2, 'bob')";
-  let rows = query_ok db
-    "WITH cte AS (SELECT id, name FROM t) SELECT cte.name FROM cte WHERE cte.id = 1" in
+  let rows =
+    query_ok
+      db
+      "WITH cte AS (SELECT id, name FROM t) SELECT cte.name FROM cte WHERE cte.id = 1"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check row_testable) "row 0" [| Db.V_text "alice" |] (List.nth rows 0)
+;;
 
 let test_cte_order () =
   let db = fresh_db () in
@@ -3629,67 +4621,81 @@ let test_cte_order () =
   exec db "INSERT INTO t VALUES (3)";
   exec db "INSERT INTO t VALUES (1)";
   exec db "INSERT INTO t VALUES (2)";
-  let rows = query_ok db
-    "WITH cte AS (SELECT x FROM t) SELECT * FROM cte ORDER BY x" in
+  let rows = query_ok db "WITH cte AS (SELECT x FROM t) SELECT * FROM cte ORDER BY x" in
   Alcotest.(check int) "three rows" 3 (List.length rows);
   Alcotest.(check row_testable) "row 0" [| Db.V_int 1L |] (List.nth rows 0);
   Alcotest.(check row_testable) "row 1" [| Db.V_int 2L |] (List.nth rows 1);
   Alcotest.(check row_testable) "row 2" [| Db.V_int 3L |] (List.nth rows 2)
+;;
 
 let test_recursive_cte_series () =
   (* Generate integers 1..5 via recursive CTE *)
   let db = fresh_db () in
-  let rows = query_ok db
-    "WITH RECURSIVE cnt AS (
-       SELECT 1 AS n
-       UNION ALL
-       SELECT n + 1 FROM cnt WHERE n < 5
-     )
-     SELECT n FROM cnt ORDER BY n" in
+  let rows =
+    query_ok
+      db
+      "WITH RECURSIVE cnt AS (\n\
+      \       SELECT 1 AS n\n\
+      \       UNION ALL\n\
+      \       SELECT n + 1 FROM cnt WHERE n < 5\n\
+      \     )\n\
+      \     SELECT n FROM cnt ORDER BY n"
+  in
   Alcotest.(check int) "5 rows" 5 (List.length rows);
   Alcotest.(check row_testable) "n=1" [| Db.V_int 1L |] (List.nth rows 0);
   Alcotest.(check row_testable) "n=5" [| Db.V_int 5L |] (List.nth rows 4)
+;;
 
 let test_recursive_cte_sum () =
   (* Compute cumulative sum: row where i=4 has s=1+2+3+4=10 *)
   let db = fresh_db () in
-  let rows = query_ok db
-    "WITH RECURSIVE nums AS (
-       SELECT 1 AS i, 1 AS s
-       UNION ALL
-       SELECT i + 1, s + (i + 1) FROM nums WHERE i < 4
-     )
-     SELECT s FROM nums WHERE i = 4" in
+  let rows =
+    query_ok
+      db
+      "WITH RECURSIVE nums AS (\n\
+      \       SELECT 1 AS i, 1 AS s\n\
+      \       UNION ALL\n\
+      \       SELECT i + 1, s + (i + 1) FROM nums WHERE i < 4\n\
+      \     )\n\
+      \     SELECT s FROM nums WHERE i = 4"
+  in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.(check row_testable) "sum=10" [| Db.V_int 10L |] (List.nth rows 0)
+;;
 
 let test_recursive_cte_tree () =
   (* Hierarchical: find all descendants of node with parent=1 *)
   let db = fresh_db () in
   exec db "CREATE TABLE tree (id INTEGER, parent INTEGER)";
   exec db "INSERT INTO tree VALUES (1, 0), (2, 1), (3, 1), (4, 2)";
-  let rows = query_ok db
-    "WITH RECURSIVE desc AS (
-       SELECT id FROM tree WHERE parent = 1
-       UNION ALL
-       SELECT t.id FROM tree AS t INNER JOIN desc AS d ON t.parent = d.id
-     )
-     SELECT id FROM desc ORDER BY id" in
+  let rows =
+    query_ok
+      db
+      "WITH RECURSIVE desc AS (\n\
+      \       SELECT id FROM tree WHERE parent = 1\n\
+      \       UNION ALL\n\
+      \       SELECT t.id FROM tree AS t INNER JOIN desc AS d ON t.parent = d.id\n\
+      \     )\n\
+      \     SELECT id FROM desc ORDER BY id"
+  in
   Alcotest.(check int) "3 descendants" 3 (List.length rows);
   Alcotest.(check row_testable) "id=2" [| Db.V_int 2L |] (List.nth rows 0);
   Alcotest.(check row_testable) "id=3" [| Db.V_int 3L |] (List.nth rows 1);
   Alcotest.(check row_testable) "id=4" [| Db.V_int 4L |] (List.nth rows 2)
+;;
 
 let test_recursive_cte_non_recursive_unchanged () =
   (* Non-recursive WITH still works after this change *)
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   exec db "INSERT INTO t VALUES (1), (2), (3)";
-  let rows = query_ok db
-    "WITH sq AS (SELECT x FROM t WHERE x > 1) SELECT x FROM sq ORDER BY x" in
+  let rows =
+    query_ok db "WITH sq AS (SELECT x FROM t WHERE x > 1) SELECT x FROM sq ORDER BY x"
+  in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
   Alcotest.(check row_testable) "x=2" [| Db.V_int 2L |] (List.nth rows 0);
   Alcotest.(check row_testable) "x=3" [| Db.V_int 3L |] (List.nth rows 1)
+;;
 
 let test_tbl_alias_from () =
   let db = fresh_db () in
@@ -3697,8 +4703,11 @@ let test_tbl_alias_from () =
   exec db "INSERT INTO products VALUES (1, 'apple')";
   let rows = query_ok db "SELECT p.id, p.name FROM products AS p" in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check row_testable) "aliased table col refs"
-    [| Db.V_int 1L; Db.V_text "apple" |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "aliased table col refs"
+    [| Db.V_int 1L; Db.V_text "apple" |]
+    (List.nth rows 0)
+;;
 
 let test_tbl_alias_join () =
   let db = fresh_db () in
@@ -3706,11 +4715,15 @@ let test_tbl_alias_join () =
   exec db "CREATE TABLE b (aid INTEGER, extra TEXT)";
   exec db "INSERT INTO a VALUES (1, 'x')";
   exec db "INSERT INTO b VALUES (1, 'y')";
-  let rows = query_ok db
-    "SELECT x.val, y.extra FROM a AS x JOIN b AS y ON x.id = y.aid" in
+  let rows =
+    query_ok db "SELECT x.val, y.extra FROM a AS x JOIN b AS y ON x.id = y.aid"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check row_testable) "two aliased joined tables"
-    [| Db.V_text "x"; Db.V_text "y" |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "two aliased joined tables"
+    [| Db.V_text "x"; Db.V_text "y" |]
+    (List.nth rows 0)
+;;
 
 let test_tbl_alias_where () =
   let db = fresh_db () in
@@ -3720,6 +4733,7 @@ let test_tbl_alias_where () =
   let rows = query_ok db "SELECT r.n FROM t AS r WHERE r.n > 1" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check row_testable) "aliased where" [| Db.V_int 2L |] (List.nth rows 0)
+;;
 
 let test_tbl_alias_order_by () =
   let db = fresh_db () in
@@ -3729,6 +4743,7 @@ let test_tbl_alias_order_by () =
   let rows = query_ok db "SELECT r.n FROM t AS r ORDER BY r.n" in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
   Alcotest.(check row_testable) "first row" [| Db.V_int 1L |] (List.nth rows 0)
+;;
 
 let test_tbl_alias_three_join () =
   let db = fresh_db () in
@@ -3738,11 +4753,18 @@ let test_tbl_alias_three_join () =
   exec db "INSERT INTO d VALUES (1, 'eng')";
   exec db "INSERT INTO e VALUES (10, 1)";
   exec db "INSERT INTO s VALUES (10, 500)";
-  let rows = query_ok db
-    "SELECT d.name, s.pay FROM d AS d JOIN e AS e ON d.id = e.dept_id JOIN s AS s ON e.id = s.eid" in
+  let rows =
+    query_ok
+      db
+      "SELECT d.name, s.pay FROM d AS d JOIN e AS e ON d.id = e.dept_id JOIN s AS s ON \
+       e.id = s.eid"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
-  Alcotest.(check row_testable) "three alias join"
-    [| Db.V_text "eng"; Db.V_int 500L |] (List.nth rows 0)
+  Alcotest.(check row_testable)
+    "three alias join"
+    [| Db.V_text "eng"; Db.V_int 500L |]
+    (List.nth rows 0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Multi-row INSERT tests                                               *)
@@ -3754,9 +4776,18 @@ let test_multirow_basic () =
   exec db "INSERT INTO t VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')";
   let rows = query_ok db "SELECT * FROM t ORDER BY id" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  Alcotest.check row_testable "row 1" [| Db.V_int 1L; Db.V_text "alice" |] (List.nth rows 0);
-  Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "bob"   |] (List.nth rows 1);
-  Alcotest.check row_testable "row 3" [| Db.V_int 3L; Db.V_text "carol" |] (List.nth rows 2)
+  Alcotest.check
+    row_testable
+    "row 1"
+    [| Db.V_int 1L; Db.V_text "alice" |]
+    (List.nth rows 0);
+  Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "bob" |] (List.nth rows 1);
+  Alcotest.check
+    row_testable
+    "row 3"
+    [| Db.V_int 3L; Db.V_text "carol" |]
+    (List.nth rows 2)
+;;
 
 let test_multirow_single_still_works () =
   let db = fresh_db () in
@@ -3765,6 +4796,7 @@ let test_multirow_single_still_works () =
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check row_testable "row" [| Db.V_int 42L |] (List.nth rows 0)
+;;
 
 let test_multirow_on_conflict () =
   let db = fresh_db () in
@@ -3775,6 +4807,7 @@ let test_multirow_on_conflict () =
   Alcotest.(check int) "2 rows" 2 (List.length rows);
   Alcotest.check row_testable "row 1" [| Db.V_int 1L; Db.V_text "a" |] (List.nth rows 0);
   Alcotest.check row_testable "row 2" [| Db.V_int 2L; Db.V_text "c" |] (List.nth rows 1)
+;;
 
 let test_multirow_returning () =
   let db = fresh_db () in
@@ -3783,6 +4816,7 @@ let test_multirow_returning () =
   Alcotest.(check int) "2 rows" 2 (List.length rows);
   Alcotest.check row_testable "row 1" [| Db.V_int 1L |] (List.nth rows 0);
   Alcotest.check row_testable "row 2" [| Db.V_int 2L |] (List.nth rows 1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Correlated subqueries                                                *)
@@ -3795,10 +4829,15 @@ let test_corr_exists () =
   exec db "INSERT INTO users VALUES (1, 'alice')";
   exec db "INSERT INTO users VALUES (2, 'bob')";
   exec db "INSERT INTO orders VALUES (1, 100)";
-  let rows = query_ok db
-    "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)" in
+  let rows =
+    query_ok
+      db
+      "SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = \
+       users.id)"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "alice" [| Db.V_text "alice" |] (List.nth rows 0)
+;;
 
 let test_corr_not_exists () =
   let db = fresh_db () in
@@ -3807,10 +4846,15 @@ let test_corr_not_exists () =
   exec db "INSERT INTO users VALUES (1, 'alice')";
   exec db "INSERT INTO users VALUES (2, 'bob')";
   exec db "INSERT INTO orders VALUES (1)";
-  let rows = query_ok db
-    "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)" in
+  let rows =
+    query_ok
+      db
+      "SELECT name FROM users WHERE NOT EXISTS (SELECT 1 FROM orders WHERE \
+       orders.user_id = users.id)"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "bob" [| Db.V_text "bob" |] (List.nth rows 0)
+;;
 
 let test_corr_in_select () =
   let db = fresh_db () in
@@ -3819,10 +4863,15 @@ let test_corr_in_select () =
   exec db "INSERT INTO users VALUES (1, 'alice')";
   exec db "INSERT INTO users VALUES (2, 'bob')";
   exec db "INSERT INTO orders VALUES (1)";
-  let rows = query_ok db
-    "SELECT name FROM users WHERE users.id IN (SELECT user_id FROM orders WHERE orders.user_id = users.id)" in
+  let rows =
+    query_ok
+      db
+      "SELECT name FROM users WHERE users.id IN (SELECT user_id FROM orders WHERE \
+       orders.user_id = users.id)"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "alice" [| Db.V_text "alice" |] (List.nth rows 0)
+;;
 
 let test_corr_not_in_select () =
   let db = fresh_db () in
@@ -3831,195 +4880,277 @@ let test_corr_not_in_select () =
   exec db "INSERT INTO users VALUES (1, 'alice')";
   exec db "INSERT INTO users VALUES (2, 'bob')";
   exec db "INSERT INTO blocked VALUES (1)";
-  let rows = query_ok db
-    "SELECT name FROM users WHERE users.id NOT IN (SELECT user_id FROM blocked WHERE blocked.user_id = users.id)" in
+  let rows =
+    query_ok
+      db
+      "SELECT name FROM users WHERE users.id NOT IN (SELECT user_id FROM blocked WHERE \
+       blocked.user_id = users.id)"
+  in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check row_testable "bob" [| Db.V_text "bob" |] (List.nth rows 0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 13: UPSERT                                                    *)
 (* ------------------------------------------------------------------ *)
 
 let test_upsert_basic () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))" in
-    let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (1, 'old')" in
-    let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (1, 'new') ON CONFLICT(k) DO UPDATE SET v = excluded.v" in
-    let* rows = query_ok_lwt db "SELECT k, v FROM kv" in
-    Alcotest.(check int) "one row" 1 (List.length rows);
-    (match rows with
-     | [r] ->
-       Alcotest.check value_testable "k=1" (Db.V_int 1L) r.(0);
-       Alcotest.check value_testable "v=new" (Db.V_text "new") r.(1)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () =
+       exec_lwt db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))"
+     in
+     let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (1, 'old')" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO kv (k, v) VALUES (1, 'new') ON CONFLICT(k) DO UPDATE SET v = \
+          excluded.v"
+     in
+     let* rows = query_ok_lwt db "SELECT k, v FROM kv" in
+     Alcotest.(check int) "one row" 1 (List.length rows);
+     (match rows with
+      | [ r ] ->
+        Alcotest.check value_testable "k=1" (Db.V_int 1L) r.(0);
+        Alcotest.check value_testable "v=new" (Db.V_text "new") r.(1)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_upsert_no_conflict () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))" in
-    let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (1, 'first')" in
-    let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (2, 'second') ON CONFLICT(k) DO UPDATE SET v = excluded.v" in
-    let* rows = query_ok_lwt db "SELECT k, v FROM kv ORDER BY k" in
-    Alcotest.(check int) "two rows" 2 (List.length rows);
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () =
+       exec_lwt db "CREATE TABLE kv (k INTEGER NOT NULL, v TEXT NOT NULL, UNIQUE(k))"
+     in
+     let* () = exec_lwt db "INSERT INTO kv (k, v) VALUES (1, 'first')" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO kv (k, v) VALUES (2, 'second') ON CONFLICT(k) DO UPDATE SET v = \
+          excluded.v"
+     in
+     let* rows = query_ok_lwt db "SELECT k, v FROM kv ORDER BY k" in
+     Alcotest.(check int) "two rows" 2 (List.length rows);
+     Lwt.return_unit)
+;;
 
 let test_upsert_expression () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE counters (name TEXT NOT NULL, cnt INTEGER NOT NULL, UNIQUE(name))" in
-    let* () = exec_lwt db "INSERT INTO counters (name, cnt) VALUES ('hits', 1)" in
-    let* () = exec_lwt db "INSERT INTO counters (name, cnt) VALUES ('hits', 0) ON CONFLICT(name) DO UPDATE SET cnt = cnt + 1" in
-    let* rows = query_ok_lwt db "SELECT cnt FROM counters WHERE name = 'hits'" in
-    (match rows with
-     | [r] -> Alcotest.check value_testable "cnt=2" (Db.V_int 2L) r.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () =
+       exec_lwt
+         db
+         "CREATE TABLE counters (name TEXT NOT NULL, cnt INTEGER NOT NULL, UNIQUE(name))"
+     in
+     let* () = exec_lwt db "INSERT INTO counters (name, cnt) VALUES ('hits', 1)" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO counters (name, cnt) VALUES ('hits', 0) ON CONFLICT(name) DO \
+          UPDATE SET cnt = cnt + 1"
+     in
+     let* rows = query_ok_lwt db "SELECT cnt FROM counters WHERE name = 'hits'" in
+     (match rows with
+      | [ r ] -> Alcotest.check value_testable "cnt=2" (Db.V_int 2L) r.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_upsert_multiple_assignments () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE t (id INTEGER, a TEXT, b TEXT, UNIQUE(id))" in
-    let* () = exec_lwt db "INSERT INTO t (id, a, b) VALUES (1, 'a1', 'b1')" in
-    let* () = exec_lwt db "INSERT INTO t (id, a, b) VALUES (1, 'a2', 'b2') ON CONFLICT(id) DO UPDATE SET a = excluded.a, b = excluded.b" in
-    let* rows = query_ok_lwt db "SELECT a, b FROM t WHERE id = 1" in
-    (match rows with
-     | [r] ->
-       Alcotest.check value_testable "a=a2" (Db.V_text "a2") r.(0);
-       Alcotest.check value_testable "b=b2" (Db.V_text "b2") r.(1)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE t (id INTEGER, a TEXT, b TEXT, UNIQUE(id))" in
+     let* () = exec_lwt db "INSERT INTO t (id, a, b) VALUES (1, 'a1', 'b1')" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO t (id, a, b) VALUES (1, 'a2', 'b2') ON CONFLICT(id) DO UPDATE SET \
+          a = excluded.a, b = excluded.b"
+     in
+     let* rows = query_ok_lwt db "SELECT a, b FROM t WHERE id = 1" in
+     (match rows with
+      | [ r ] ->
+        Alcotest.check value_testable "a=a2" (Db.V_text "a2") r.(0);
+        Alcotest.check value_testable "b=b2" (Db.V_text "b2") r.(1)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_upsert_preserves_non_conflict_rows () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE kv (k INTEGER, v TEXT, UNIQUE(k))" in
-    let* () = exec_lwt db "INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c')" in
-    let* () = exec_lwt db "INSERT INTO kv VALUES (2, 'B') ON CONFLICT(k) DO UPDATE SET v = excluded.v" in
-    let* rows = query_ok_lwt db "SELECT k, v FROM kv ORDER BY k" in
-    Alcotest.(check int) "still 3 rows" 3 (List.length rows);
-    (match rows with
-     | [_; r2; _] ->
-       Alcotest.check value_testable "row2 v=B" (Db.V_text "B") r2.(1)
-     | _ -> Alcotest.fail "expected 3 rows");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE kv (k INTEGER, v TEXT, UNIQUE(k))" in
+     let* () = exec_lwt db "INSERT INTO kv VALUES (1, 'a'), (2, 'b'), (3, 'c')" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO kv VALUES (2, 'B') ON CONFLICT(k) DO UPDATE SET v = excluded.v"
+     in
+     let* rows = query_ok_lwt db "SELECT k, v FROM kv ORDER BY k" in
+     Alcotest.(check int) "still 3 rows" 3 (List.length rows);
+     (match rows with
+      | [ _; r2; _ ] -> Alcotest.check value_testable "row2 v=B" (Db.V_text "B") r2.(1)
+      | _ -> Alcotest.fail "expected 3 rows");
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 13: Views                                                     *)
 (* ------------------------------------------------------------------ *)
 
 let test_view_basic () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE users (id INTEGER, name TEXT, active INTEGER)" in
-    let* () = exec_lwt db "INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)" in
-    let* () = exec_lwt db "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1" in
-    let* rows = query_ok_lwt db "SELECT name FROM active_users ORDER BY id" in
-    Alcotest.(check int) "two active users" 2 (List.length rows);
-    (match rows with
-     | [r1; r2] ->
-       Alcotest.check value_testable "first=Alice" (Db.V_text "Alice") r1.(0);
-       Alcotest.check value_testable "second=Carol" (Db.V_text "Carol") r2.(0)
-     | _ -> Alcotest.fail "expected 2 rows");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE users (id INTEGER, name TEXT, active INTEGER)" in
+     let* () =
+       exec_lwt
+         db
+         "INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Carol', 1)"
+     in
+     let* () =
+       exec_lwt
+         db
+         "CREATE VIEW active_users AS SELECT id, name FROM users WHERE active = 1"
+     in
+     let* rows = query_ok_lwt db "SELECT name FROM active_users ORDER BY id" in
+     Alcotest.(check int) "two active users" 2 (List.length rows);
+     (match rows with
+      | [ r1; r2 ] ->
+        Alcotest.check value_testable "first=Alice" (Db.V_text "Alice") r1.(0);
+        Alcotest.check value_testable "second=Carol" (Db.V_text "Carol") r2.(0)
+      | _ -> Alcotest.fail "expected 2 rows");
+     Lwt.return_unit)
+;;
 
 let test_view_with_filter () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE products (id INTEGER, name TEXT, price INTEGER)" in
-    let* () = exec_lwt db "INSERT INTO products VALUES (1, 'A', 10), (2, 'B', 20), (3, 'C', 5)" in
-    let* () = exec_lwt db "CREATE VIEW cheap AS SELECT id, name, price FROM products WHERE price < 15" in
-    let* rows = query_ok_lwt db "SELECT name FROM cheap WHERE price > 7 ORDER BY name" in
-    Alcotest.(check int) "one result" 1 (List.length rows);
-    (match rows with
-     | [r] -> Alcotest.check value_testable "name=A" (Db.V_text "A") r.(0)
-     | _ -> Alcotest.fail "expected 1 row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () =
+       exec_lwt db "CREATE TABLE products (id INTEGER, name TEXT, price INTEGER)"
+     in
+     let* () =
+       exec_lwt db "INSERT INTO products VALUES (1, 'A', 10), (2, 'B', 20), (3, 'C', 5)"
+     in
+     let* () =
+       exec_lwt
+         db
+         "CREATE VIEW cheap AS SELECT id, name, price FROM products WHERE price < 15"
+     in
+     let* rows = query_ok_lwt db "SELECT name FROM cheap WHERE price > 7 ORDER BY name" in
+     Alcotest.(check int) "one result" 1 (List.length rows);
+     (match rows with
+      | [ r ] -> Alcotest.check value_testable "name=A" (Db.V_text "A") r.(0)
+      | _ -> Alcotest.fail "expected 1 row");
+     Lwt.return_unit)
+;;
 
 let test_view_aggregation () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE orders (customer TEXT, amount INTEGER)" in
-    let* () = exec_lwt db "INSERT INTO orders VALUES ('Alice', 100), ('Alice', 200), ('Bob', 50)" in
-    let* () = exec_lwt db "CREATE VIEW order_counts AS SELECT customer, COUNT(*) AS cnt FROM orders GROUP BY customer" in
-    let* rows = query_ok_lwt db "SELECT customer, cnt FROM order_counts ORDER BY customer" in
-    Alcotest.(check int) "two customers" 2 (List.length rows);
-    (match rows with
-     | [ra; rb] ->
-       Alcotest.check value_testable "alice cnt=2" (Db.V_int 2L) ra.(1);
-       Alcotest.check value_testable "bob cnt=1" (Db.V_int 1L) rb.(1)
-     | _ -> Alcotest.fail "expected 2 rows");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE orders (customer TEXT, amount INTEGER)" in
+     let* () =
+       exec_lwt db "INSERT INTO orders VALUES ('Alice', 100), ('Alice', 200), ('Bob', 50)"
+     in
+     let* () =
+       exec_lwt
+         db
+         "CREATE VIEW order_counts AS SELECT customer, COUNT(*) AS cnt FROM orders GROUP \
+          BY customer"
+     in
+     let* rows =
+       query_ok_lwt db "SELECT customer, cnt FROM order_counts ORDER BY customer"
+     in
+     Alcotest.(check int) "two customers" 2 (List.length rows);
+     (match rows with
+      | [ ra; rb ] ->
+        Alcotest.check value_testable "alice cnt=2" (Db.V_int 2L) ra.(1);
+        Alcotest.check value_testable "bob cnt=1" (Db.V_int 1L) rb.(1)
+      | _ -> Alcotest.fail "expected 2 rows");
+     Lwt.return_unit)
+;;
 
 let test_view_drop () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
-    let* () = exec_lwt db "INSERT INTO t VALUES (1)" in
-    let* () = exec_lwt db "CREATE VIEW v AS SELECT x FROM t" in
-    let* rows1 = query_ok_lwt db "SELECT x FROM v" in
-    Alcotest.(check int) "one row before drop" 1 (List.length rows1);
-    let* () = exec_lwt db "DROP VIEW v" in
-    let* result = Db.query db "SELECT x FROM v" in
-    Alcotest.(check bool) "error after drop" true
-      (match result with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
+     let* () = exec_lwt db "INSERT INTO t VALUES (1)" in
+     let* () = exec_lwt db "CREATE VIEW v AS SELECT x FROM t" in
+     let* rows1 = query_ok_lwt db "SELECT x FROM v" in
+     Alcotest.(check int) "one row before drop" 1 (List.length rows1);
+     let* () = exec_lwt db "DROP VIEW v" in
+     let* result = Db.query db "SELECT x FROM v" in
+     Alcotest.(check bool)
+       "error after drop"
+       true
+       (match result with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_view_count () =
-  run (
-    let* db = Db.open_in_memory () in
-    let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
-    let* () = exec_lwt db "INSERT INTO t VALUES (1), (2), (3), (4), (5)" in
-    let* () = exec_lwt db "CREATE VIEW big AS SELECT x FROM t WHERE x > 2" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM big" in
-    (match rows with
-     | [r] -> Alcotest.check value_testable "count=3" (Db.V_int 3L) r.(0)
-     | _ -> Alcotest.fail "expected one row");
-    Lwt.return_unit)
+  run
+    (let* db = Db.open_in_memory () in
+     let* () = exec_lwt db "CREATE TABLE t (x INTEGER)" in
+     let* () = exec_lwt db "INSERT INTO t VALUES (1), (2), (3), (4), (5)" in
+     let* () = exec_lwt db "CREATE VIEW big AS SELECT x FROM t WHERE x > 2" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM big" in
+     (match rows with
+      | [ r ] -> Alcotest.check value_testable "count=3" (Db.V_int 3L) r.(0)
+      | _ -> Alcotest.fail "expected one row");
+     Lwt.return_unit)
+;;
 
 let test_view_independent_per_db () =
-  run (
-    let* db1 = Db.open_in_memory () in
-    let* db2 = Db.open_in_memory () in
-    let* () = exec_lwt db1 "CREATE TABLE t (x INTEGER)" in
-    let* () = exec_lwt db1 "INSERT INTO t VALUES (42)" in
-    let* () = exec_lwt db1 "CREATE VIEW v AS SELECT x FROM t" in
-    let* () = exec_lwt db2 "CREATE TABLE t (x INTEGER)" in
-    let* result = Db.query db2 "SELECT x FROM v" in
-    Alcotest.(check bool) "db2 no view" true
-      (match result with Error _ -> true | Ok _ -> false);
-    Lwt.return_unit)
+  run
+    (let* db1 = Db.open_in_memory () in
+     let* db2 = Db.open_in_memory () in
+     let* () = exec_lwt db1 "CREATE TABLE t (x INTEGER)" in
+     let* () = exec_lwt db1 "INSERT INTO t VALUES (42)" in
+     let* () = exec_lwt db1 "CREATE VIEW v AS SELECT x FROM t" in
+     let* () = exec_lwt db2 "CREATE TABLE t (x INTEGER)" in
+     let* result = Db.query db2 "SELECT x FROM v" in
+     Alcotest.(check bool)
+       "db2 no view"
+       true
+       (match result with
+        | Error _ -> true
+        | Ok _ -> false);
+     Lwt.return_unit)
+;;
 
 let test_view_persistence () =
   with_tempfile (fun path ->
-    run (
-      let* db_res = Db.open_file ~path in
-      let db = match db_res with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "open_file failed"
-      in
-      let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
-      let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
-      let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
-      let* _ = Db.execute db "CREATE VIEW v AS SELECT name FROM t WHERE id = 1" in
-      let* () = Db.close db in
-      let* db_res2 = Db.open_file ~path in
-      let db2 = match db_res2 with
-        | Ok d -> d
-        | Error _ -> Alcotest.fail "reopen failed"
-      in
-      let* rq = Db.query db2 "SELECT name FROM v" in
-      let* rows = match rq with
-        | Ok stream -> Lwt_stream.to_list stream
-        | Error e -> Alcotest.failf "query failed after reopen: %a" Db.pp_error e
-      in
-      Alcotest.(check int) "1 row" 1 (List.length rows);
-      let r = List.hd rows in
-      Alcotest.check value_testable "name=alice" (Db.V_text "alice") r.(0);
-      Db.close db2
-    )
-  )
+    run
+      (let* db_res = Db.open_file ~path in
+       let db =
+         match db_res with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* _ = Db.execute db "CREATE TABLE t (id INTEGER, name TEXT)" in
+       let* _ = Db.execute db "INSERT INTO t VALUES (1, 'alice')" in
+       let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
+       let* _ = Db.execute db "CREATE VIEW v AS SELECT name FROM t WHERE id = 1" in
+       let* () = Db.close db in
+       let* db_res2 = Db.open_file ~path in
+       let db2 =
+         match db_res2 with
+         | Ok d -> d
+         | Error _ -> Alcotest.fail "reopen failed"
+       in
+       let* rq = Db.query db2 "SELECT name FROM v" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error e -> Alcotest.failf "query failed after reopen: %a" Db.pp_error e
+       in
+       Alcotest.(check int) "1 row" 1 (List.length rows);
+       let r = List.hd rows in
+       Alcotest.check value_testable "name=alice" (Db.V_text "alice") r.(0);
+       Db.close db2))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Window function tests                                                *)
@@ -4028,90 +5159,144 @@ let test_view_persistence () =
 let test_window_row_number () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (dept TEXT, name TEXT, salary INTEGER)";
-  exec db "INSERT INTO t VALUES ('eng', 'Alice', 90000), ('eng', 'Bob', 80000), ('hr', 'Carol', 70000), ('hr', 'Dave', 60000)";
+  exec
+    db
+    "INSERT INTO t VALUES ('eng', 'Alice', 90000), ('eng', 'Bob', 80000), ('hr', \
+     'Carol', 70000), ('hr', 'Dave', 60000)";
   (* Sort by dept and salary so the partition ordering is deterministic *)
-  let rows = query_ok db "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM t ORDER BY dept, salary DESC" in
+  let rows =
+    query_ok
+      db
+      "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn \
+       FROM t ORDER BY dept, salary DESC"
+  in
   Alcotest.(check int) "4 rows" 4 (List.length rows);
   Alcotest.check value_testable "Alice rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
-  Alcotest.check value_testable "Bob rn=2"   (Db.V_int 2L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "Bob rn=2" (Db.V_int 2L) (List.nth rows 1).(1);
   Alcotest.check value_testable "Carol rn=1" (Db.V_int 1L) (List.nth rows 2).(1);
-  Alcotest.check value_testable "Dave rn=2"  (Db.V_int 2L) (List.nth rows 3).(1)
+  Alcotest.check value_testable "Dave rn=2" (Db.V_int 2L) (List.nth rows 3).(1)
+;;
 
 let test_window_rank () =
   let db = fresh_db () in
   exec db "CREATE TABLE scores (name TEXT, score INTEGER)";
   exec db "INSERT INTO scores VALUES ('A', 100), ('B', 100), ('C', 90), ('D', 80)";
-  let rows = query_ok db "SELECT name, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY name" in
+  let rows =
+    query_ok
+      db
+      "SELECT name, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY name"
+  in
   Alcotest.(check int) "4 rows" 4 (List.length rows);
   Alcotest.check value_testable "A rank=1" (Db.V_int 1L) (List.nth rows 0).(1);
   Alcotest.check value_testable "B rank=1" (Db.V_int 1L) (List.nth rows 1).(1);
   Alcotest.check value_testable "C rank=3" (Db.V_int 3L) (List.nth rows 2).(1);
   Alcotest.check value_testable "D rank=4" (Db.V_int 4L) (List.nth rows 3).(1)
+;;
 
 let test_window_dense_rank () =
   let db = fresh_db () in
   exec db "CREATE TABLE scores (name TEXT, score INTEGER)";
   exec db "INSERT INTO scores VALUES ('A', 100), ('B', 100), ('C', 90), ('D', 80)";
-  let rows = query_ok db "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY name" in
+  let rows =
+    query_ok
+      db
+      "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS dr FROM scores ORDER BY \
+       name"
+  in
   Alcotest.check value_testable "A dr=1" (Db.V_int 1L) (List.nth rows 0).(1);
   Alcotest.check value_testable "C dr=2" (Db.V_int 2L) (List.nth rows 2).(1);
   Alcotest.check value_testable "D dr=3" (Db.V_int 3L) (List.nth rows 3).(1)
+;;
 
 let test_window_lag () =
   let db = fresh_db () in
   exec db "CREATE TABLE vals (id INTEGER, v INTEGER)";
   exec db "INSERT INTO vals VALUES (1, 10), (2, 20), (3, 30)";
-  let rows = query_ok db "SELECT id, v, LAG(v, 1, 0) OVER (ORDER BY id) AS prev FROM vals ORDER BY id" in
-  Alcotest.check value_testable "id=1 prev=0"  (Db.V_int 0L)  (List.nth rows 0).(2);
+  let rows =
+    query_ok
+      db
+      "SELECT id, v, LAG(v, 1, 0) OVER (ORDER BY id) AS prev FROM vals ORDER BY id"
+  in
+  Alcotest.check value_testable "id=1 prev=0" (Db.V_int 0L) (List.nth rows 0).(2);
   Alcotest.check value_testable "id=2 prev=10" (Db.V_int 10L) (List.nth rows 1).(2);
   Alcotest.check value_testable "id=3 prev=20" (Db.V_int 20L) (List.nth rows 2).(2)
+;;
 
 let test_window_lead () =
   let db = fresh_db () in
   exec db "CREATE TABLE vals (id INTEGER, v INTEGER)";
   exec db "INSERT INTO vals VALUES (1, 10), (2, 20), (3, 30)";
-  let rows = query_ok db "SELECT id, v, LEAD(v, 1, 0) OVER (ORDER BY id) AS nxt FROM vals ORDER BY id" in
+  let rows =
+    query_ok
+      db
+      "SELECT id, v, LEAD(v, 1, 0) OVER (ORDER BY id) AS nxt FROM vals ORDER BY id"
+  in
   Alcotest.check value_testable "id=1 nxt=20" (Db.V_int 20L) (List.nth rows 0).(2);
   Alcotest.check value_testable "id=2 nxt=30" (Db.V_int 30L) (List.nth rows 1).(2);
-  Alcotest.check value_testable "id=3 nxt=0"  (Db.V_int 0L)  (List.nth rows 2).(2)
+  Alcotest.check value_testable "id=3 nxt=0" (Db.V_int 0L) (List.nth rows 2).(2)
+;;
 
 let test_window_sum_over () =
   let db = fresh_db () in
   exec db "CREATE TABLE sales (id INTEGER, amount INTEGER)";
   exec db "INSERT INTO sales VALUES (1, 100), (2, 200), (3, 300)";
-  let rows = query_ok db "SELECT id, SUM(amount) OVER (ORDER BY id) AS running FROM sales ORDER BY id" in
+  let rows =
+    query_ok
+      db
+      "SELECT id, SUM(amount) OVER (ORDER BY id) AS running FROM sales ORDER BY id"
+  in
   Alcotest.check value_testable "id=1 running=100" (Db.V_int 100L) (List.nth rows 0).(1);
   Alcotest.check value_testable "id=2 running=300" (Db.V_int 300L) (List.nth rows 1).(1);
   Alcotest.check value_testable "id=3 running=600" (Db.V_int 600L) (List.nth rows 2).(1)
+;;
 
 let test_window_no_partition () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (x INTEGER)";
   exec db "INSERT INTO t VALUES (3), (1), (2)";
-  let rows = query_ok db "SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM t ORDER BY x" in
+  let rows =
+    query_ok db "SELECT x, ROW_NUMBER() OVER (ORDER BY x) AS rn FROM t ORDER BY x"
+  in
   Alcotest.check value_testable "x=1 rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
   Alcotest.check value_testable "x=2 rn=2" (Db.V_int 2L) (List.nth rows 1).(1);
   Alcotest.check value_testable "x=3 rn=3" (Db.V_int 3L) (List.nth rows 2).(1)
+;;
 
 let test_window_orderby_alias () =
   let db = fresh_db () in
   exec db "CREATE TABLE emp (dept TEXT, name TEXT, salary INTEGER)";
-  exec db "INSERT INTO emp VALUES ('eng','Alice',90000),('eng','Bob',80000),('hr','Carol',70000),('hr','Dave',60000)";
-  let rows = query_ok db "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM emp ORDER BY dept, rn" in
+  exec
+    db
+    "INSERT INTO emp VALUES \
+     ('eng','Alice',90000),('eng','Bob',80000),('hr','Carol',70000),('hr','Dave',60000)";
+  let rows =
+    query_ok
+      db
+      "SELECT name, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn \
+       FROM emp ORDER BY dept, rn"
+  in
   Alcotest.(check int) "4 rows" 4 (List.length rows);
   Alcotest.check value_testable "Alice rn=1" (Db.V_int 1L) (List.nth rows 0).(1);
-  Alcotest.check value_testable "Bob rn=2"   (Db.V_int 2L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "Bob rn=2" (Db.V_int 2L) (List.nth rows 1).(1);
   Alcotest.check value_testable "Carol rn=1" (Db.V_int 1L) (List.nth rows 2).(1);
-  Alcotest.check value_testable "Dave rn=2"  (Db.V_int 2L) (List.nth rows 3).(1)
+  Alcotest.check value_testable "Dave rn=2" (Db.V_int 2L) (List.nth rows 3).(1)
+;;
 
 let test_window_first_last_value () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (salary INTEGER)";
   exec db "INSERT INTO t VALUES (90000), (80000), (70000)";
-  let rows = query_ok db "SELECT salary, FIRST_VALUE(salary) OVER (ORDER BY salary DESC) AS first, LAST_VALUE(salary) OVER (ORDER BY salary DESC) AS last FROM t ORDER BY salary DESC" in
+  let rows =
+    query_ok
+      db
+      "SELECT salary, FIRST_VALUE(salary) OVER (ORDER BY salary DESC) AS first, \
+       LAST_VALUE(salary) OVER (ORDER BY salary DESC) AS last FROM t ORDER BY salary \
+       DESC"
+  in
   Alcotest.check value_testable "first=90000" (Db.V_int 90000L) (List.nth rows 0).(1);
   Alcotest.check value_testable "last row0=90000" (Db.V_int 90000L) (List.nth rows 0).(2);
   Alcotest.check value_testable "last row2=70000" (Db.V_int 70000L) (List.nth rows 2).(2)
+;;
 
 let test_window_rows_frame () =
   let db = fresh_db () in
@@ -4121,15 +5306,26 @@ let test_window_rows_frame () =
   exec db "INSERT INTO nums VALUES (3)";
   exec db "INSERT INTO nums VALUES (4)";
   exec db "INSERT INTO nums VALUES (5)";
-  let rows = query_ok db
-    "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM nums ORDER BY n" in
+  let rows =
+    query_ok
+      db
+      "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s \
+       FROM nums ORDER BY n"
+  in
   (* n=1: sum(1)=1; n=2: sum(1,2)=3; n=3: sum(2,3)=5; n=4: sum(3,4)=7; n=5: sum(4,5)=9 *)
-  let pairs = List.map (fun row ->
-    match row.(0), row.(1) with
-    | Db.V_int n, Db.V_int s -> (Int64.to_int n, Int64.to_int s)
-    | _ -> (-1, -1)) rows in
+  let pairs =
+    List.map
+      (fun row ->
+         match row.(0), row.(1) with
+         | Db.V_int n, Db.V_int s -> Int64.to_int n, Int64.to_int s
+         | _ -> -1, -1)
+      rows
+  in
   Alcotest.(check (list (pair int int)))
-    "rows_1_preceding" [(1,1);(2,3);(3,5);(4,7);(5,9)] pairs
+    "rows_1_preceding"
+    [ 1, 1; 2, 3; 3, 5; 4, 7; 5, 9 ]
+    pairs
+;;
 
 let test_window_rows_unbounded () =
   let db = fresh_db () in
@@ -4137,144 +5333,215 @@ let test_window_rows_unbounded () =
   exec db "INSERT INTO nums2 VALUES (10)";
   exec db "INSERT INTO nums2 VALUES (20)";
   exec db "INSERT INTO nums2 VALUES (30)";
-  let rows = query_ok db
-    "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM nums2 ORDER BY n" in
+  let rows =
+    query_ok
+      db
+      "SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT \
+       ROW) AS s FROM nums2 ORDER BY n"
+  in
   (* running sum: 10, 30, 60 *)
-  let pairs = List.map (fun row ->
-    match row.(0), row.(1) with
-    | Db.V_int n, Db.V_int s -> (Int64.to_int n, Int64.to_int s)
-    | _ -> (-1, -1)) rows in
+  let pairs =
+    List.map
+      (fun row ->
+         match row.(0), row.(1) with
+         | Db.V_int n, Db.V_int s -> Int64.to_int n, Int64.to_int s
+         | _ -> -1, -1)
+      rows
+  in
   Alcotest.(check (list (pair int int)))
-    "unbounded_preceding" [(10,10);(20,30);(30,60)] pairs
+    "unbounded_preceding"
+    [ 10, 10; 20, 30; 30, 60 ]
+    pairs
+;;
 
 let test_window_percent_rank () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE pr_t (s INTEGER)" in
-    let* () = exec "INSERT INTO pr_t VALUES (10)" in
-    let* () = exec "INSERT INTO pr_t VALUES (20)" in
-    let* () = exec "INSERT INTO pr_t VALUES (20)" in
-    let* () = exec "INSERT INTO pr_t VALUES (30)" in
-    let* rows_r = Db.query db
-      "SELECT s, PERCENT_RANK() OVER (ORDER BY s) FROM pr_t ORDER BY s" in
-    let rows = match rows_r with
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* n=4; rank(10)=1->0/3=0.0, rank(20)=2->1/3~0.333, rank(30)=4->3/3=1.0 *)
-    let pairs = List.map (function
-      | [|Db.V_int s; Db.V_real pr|] ->
-        (Int64.to_int s, Float.round (pr *. 1000.0) /. 1000.0)
-      | _ -> (-1, -1.0)) rows in
-    Alcotest.(check (list (pair int (float 0.001))))
-      "percent_rank" [(10, 0.0); (20, 0.333); (20, 0.333); (30, 1.0)] pairs;
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE pr_t (s INTEGER)" in
+     let* () = exec "INSERT INTO pr_t VALUES (10)" in
+     let* () = exec "INSERT INTO pr_t VALUES (20)" in
+     let* () = exec "INSERT INTO pr_t VALUES (20)" in
+     let* () = exec "INSERT INTO pr_t VALUES (30)" in
+     let* rows_r =
+       Db.query db "SELECT s, PERCENT_RANK() OVER (ORDER BY s) FROM pr_t ORDER BY s"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* n=4; rank(10)=1->0/3=0.0, rank(20)=2->1/3~0.333, rank(30)=4->3/3=1.0 *)
+     let pairs =
+       List.map
+         (function
+           | [| Db.V_int s; Db.V_real pr |] ->
+             Int64.to_int s, Float.round (pr *. 1000.0) /. 1000.0
+           | _ -> -1, -1.0)
+         rows
+     in
+     Alcotest.(check (list (pair int (float 0.001))))
+       "percent_rank"
+       [ 10, 0.0; 20, 0.333; 20, 0.333; 30, 1.0 ]
+       pairs;
+     Lwt.return_unit)
+;;
 
 let test_window_cume_dist () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE cd_t (s INTEGER)" in
-    let* () = exec "INSERT INTO cd_t VALUES (10)" in
-    let* () = exec "INSERT INTO cd_t VALUES (20)" in
-    let* () = exec "INSERT INTO cd_t VALUES (20)" in
-    let* () = exec "INSERT INTO cd_t VALUES (30)" in
-    let* rows_r = Db.query db
-      "SELECT s, CUME_DIST() OVER (ORDER BY s) FROM cd_t ORDER BY s" in
-    let rows = match rows_r with
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* n=4; <=10: 1->0.25; <=20: 3->0.75; <=30: 4->1.0 *)
-    let pairs = List.map (function
-      | [|Db.V_int s; Db.V_real cd|] ->
-        (Int64.to_int s, Float.round (cd *. 100.0) /. 100.0)
-      | _ -> (-1, -1.0)) rows in
-    Alcotest.(check (list (pair int (float 0.01))))
-      "cume_dist" [(10, 0.25); (20, 0.75); (20, 0.75); (30, 1.0)] pairs;
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE cd_t (s INTEGER)" in
+     let* () = exec "INSERT INTO cd_t VALUES (10)" in
+     let* () = exec "INSERT INTO cd_t VALUES (20)" in
+     let* () = exec "INSERT INTO cd_t VALUES (20)" in
+     let* () = exec "INSERT INTO cd_t VALUES (30)" in
+     let* rows_r =
+       Db.query db "SELECT s, CUME_DIST() OVER (ORDER BY s) FROM cd_t ORDER BY s"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* n=4; <=10: 1->0.25; <=20: 3->0.75; <=30: 4->1.0 *)
+     let pairs =
+       List.map
+         (function
+           | [| Db.V_int s; Db.V_real cd |] ->
+             Int64.to_int s, Float.round (cd *. 100.0) /. 100.0
+           | _ -> -1, -1.0)
+         rows
+     in
+     Alcotest.(check (list (pair int (float 0.01))))
+       "cume_dist"
+       [ 10, 0.25; 20, 0.75; 20, 0.75; 30, 1.0 ]
+       pairs;
+     Lwt.return_unit)
+;;
 
 let test_window_percent_rank_desc () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE pr_desc (s INTEGER)" in
-    let* () = exec "INSERT INTO pr_desc VALUES (10)" in
-    let* () = exec "INSERT INTO pr_desc VALUES (20)" in
-    let* () = exec "INSERT INTO pr_desc VALUES (20)" in
-    let* () = exec "INSERT INTO pr_desc VALUES (30)" in
-    let* rows_r = Db.query db
-      "SELECT s, PERCENT_RANK() OVER (ORDER BY s DESC) FROM pr_desc ORDER BY s DESC" in
-    let rows = match rows_r with
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* DESC order: [30, 20, 20, 10]; rank(30)=1->0/3=0.0; rank(20)=2->1/3≈0.333; rank(10)=4->3/3=1.0 *)
-    let pairs = List.map (function
-      | [|Db.V_int s; Db.V_real pr|] ->
-        (Int64.to_int s, Float.round (pr *. 1000.0) /. 1000.0)
-      | _ -> (-1, -1.0)) rows in
-    Alcotest.(check (list (pair int (float 0.001))))
-      "percent_rank_desc" [(30, 0.0); (20, 0.333); (20, 0.333); (10, 1.0)] pairs;
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE pr_desc (s INTEGER)" in
+     let* () = exec "INSERT INTO pr_desc VALUES (10)" in
+     let* () = exec "INSERT INTO pr_desc VALUES (20)" in
+     let* () = exec "INSERT INTO pr_desc VALUES (20)" in
+     let* () = exec "INSERT INTO pr_desc VALUES (30)" in
+     let* rows_r =
+       Db.query
+         db
+         "SELECT s, PERCENT_RANK() OVER (ORDER BY s DESC) FROM pr_desc ORDER BY s DESC"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* DESC order: [30, 20, 20, 10]; rank(30)=1->0/3=0.0; rank(20)=2->1/3≈0.333; rank(10)=4->3/3=1.0 *)
+     let pairs =
+       List.map
+         (function
+           | [| Db.V_int s; Db.V_real pr |] ->
+             Int64.to_int s, Float.round (pr *. 1000.0) /. 1000.0
+           | _ -> -1, -1.0)
+         rows
+     in
+     Alcotest.(check (list (pair int (float 0.001))))
+       "percent_rank_desc"
+       [ 30, 0.0; 20, 0.333; 20, 0.333; 10, 1.0 ]
+       pairs;
+     Lwt.return_unit)
+;;
 
 let test_window_cume_dist_desc () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE cd_desc (s INTEGER)" in
-    let* () = exec "INSERT INTO cd_desc VALUES (10)" in
-    let* () = exec "INSERT INTO cd_desc VALUES (20)" in
-    let* () = exec "INSERT INTO cd_desc VALUES (20)" in
-    let* () = exec "INSERT INTO cd_desc VALUES (30)" in
-    let* rows_r = Db.query db
-      "SELECT s, CUME_DIST() OVER (ORDER BY s DESC) FROM cd_desc ORDER BY s DESC" in
-    let rows = match rows_r with
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* DESC order: [30, 20, 20, 10]; <=30(desc): 1->0.25; <=20(desc): 3->0.75; <=10(desc): 4->1.0 *)
-    let pairs = List.map (function
-      | [|Db.V_int s; Db.V_real cd|] ->
-        (Int64.to_int s, Float.round (cd *. 100.0) /. 100.0)
-      | _ -> (-1, -1.0)) rows in
-    Alcotest.(check (list (pair int (float 0.01))))
-      "cume_dist_desc" [(30, 0.25); (20, 0.75); (20, 0.75); (10, 1.0)] pairs;
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE cd_desc (s INTEGER)" in
+     let* () = exec "INSERT INTO cd_desc VALUES (10)" in
+     let* () = exec "INSERT INTO cd_desc VALUES (20)" in
+     let* () = exec "INSERT INTO cd_desc VALUES (20)" in
+     let* () = exec "INSERT INTO cd_desc VALUES (30)" in
+     let* rows_r =
+       Db.query
+         db
+         "SELECT s, CUME_DIST() OVER (ORDER BY s DESC) FROM cd_desc ORDER BY s DESC"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* DESC order: [30, 20, 20, 10]; <=30(desc): 1->0.25; <=20(desc): 3->0.75; <=10(desc): 4->1.0 *)
+     let pairs =
+       List.map
+         (function
+           | [| Db.V_int s; Db.V_real cd |] ->
+             Int64.to_int s, Float.round (cd *. 100.0) /. 100.0
+           | _ -> -1, -1.0)
+         rows
+     in
+     Alcotest.(check (list (pair int (float 0.01))))
+       "cume_dist_desc"
+       [ 30, 0.25; 20, 0.75; 20, 0.75; 10, 1.0 ]
+       pairs;
+     Lwt.return_unit)
+;;
 
 let test_window_frame_non_agg_error () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec_ok sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec_ok "CREATE TABLE t (n INTEGER)" in
-    let* () = exec_ok "INSERT INTO t VALUES (1)" in
-    let* result = Db.execute db "SELECT RANK() OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t" in
-    (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected error for ROWS frame on non-aggregate window function");
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec_ok sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec_ok "CREATE TABLE t (n INTEGER)" in
+     let* () = exec_ok "INSERT INTO t VALUES (1)" in
+     let* result =
+       Db.execute
+         db
+         "SELECT RANK() OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+     in
+     (match result with
+      | Error _ -> ()
+      | Ok () ->
+        Alcotest.fail "expected error for ROWS frame on non-aggregate window function");
+     Lwt.return_unit)
+;;
 
 let test_window_in_agg () =
   let db = fresh_db () in
@@ -4283,15 +5550,20 @@ let test_window_in_agg () =
   exec db "INSERT INTO wagg VALUES ('eng', 200)";
   exec db "INSERT INTO wagg VALUES ('mkt', 150)";
   exec db "INSERT INTO wagg VALUES ('mkt', 50)";
-  let rows = query_ok db
-    "SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal) DESC) FROM wagg GROUP BY dept ORDER BY dept" in
+  let rows =
+    query_ok
+      db
+      "SELECT dept, SUM(sal), RANK() OVER (ORDER BY SUM(sal) DESC) FROM wagg GROUP BY \
+       dept ORDER BY dept"
+  in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "eng dept"   (Db.V_text "eng") (List.nth rows 0).(0);
-  Alcotest.check value_testable "eng sum"    (Db.V_int 300L)   (List.nth rows 0).(1);
-  Alcotest.check value_testable "eng rank=1" (Db.V_int 1L)     (List.nth rows 0).(2);
-  Alcotest.check value_testable "mkt dept"   (Db.V_text "mkt") (List.nth rows 1).(0);
-  Alcotest.check value_testable "mkt sum"    (Db.V_int 200L)   (List.nth rows 1).(1);
-  Alcotest.check value_testable "mkt rank=2" (Db.V_int 2L)     (List.nth rows 1).(2)
+  Alcotest.check value_testable "eng dept" (Db.V_text "eng") (List.nth rows 0).(0);
+  Alcotest.check value_testable "eng sum" (Db.V_int 300L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "eng rank=1" (Db.V_int 1L) (List.nth rows 0).(2);
+  Alcotest.check value_testable "mkt dept" (Db.V_text "mkt") (List.nth rows 1).(0);
+  Alcotest.check value_testable "mkt sum" (Db.V_int 200L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "mkt rank=2" (Db.V_int 2L) (List.nth rows 1).(2)
+;;
 
 let test_window_in_agg_count () =
   let db = fresh_db () in
@@ -4299,23 +5571,31 @@ let test_window_in_agg_count () =
   exec db "INSERT INTO wagg2 VALUES ('eng', 100)";
   exec db "INSERT INTO wagg2 VALUES ('eng', 200)";
   exec db "INSERT INTO wagg2 VALUES ('mkt', 150)";
-  let rows = query_ok db
-    "SELECT dept, COUNT(*), DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) FROM wagg2 GROUP BY dept ORDER BY dept" in
+  let rows =
+    query_ok
+      db
+      "SELECT dept, COUNT(*), DENSE_RANK() OVER (ORDER BY COUNT(*) DESC) FROM wagg2 \
+       GROUP BY dept ORDER BY dept"
+  in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "eng dept"         (Db.V_text "eng") (List.nth rows 0).(0);
-  Alcotest.check value_testable "eng count=2"      (Db.V_int 2L)     (List.nth rows 0).(1);
-  Alcotest.check value_testable "eng dense_rank=1" (Db.V_int 1L)     (List.nth rows 0).(2);
-  Alcotest.check value_testable "mkt dept"         (Db.V_text "mkt") (List.nth rows 1).(0);
-  Alcotest.check value_testable "mkt count=1"      (Db.V_int 1L)     (List.nth rows 1).(1);
-  Alcotest.check value_testable "mkt dense_rank=2" (Db.V_int 2L)     (List.nth rows 1).(2)
+  Alcotest.check value_testable "eng dept" (Db.V_text "eng") (List.nth rows 0).(0);
+  Alcotest.check value_testable "eng count=2" (Db.V_int 2L) (List.nth rows 0).(1);
+  Alcotest.check value_testable "eng dense_rank=1" (Db.V_int 1L) (List.nth rows 0).(2);
+  Alcotest.check value_testable "mkt dept" (Db.V_text "mkt") (List.nth rows 1).(0);
+  Alcotest.check value_testable "mkt count=1" (Db.V_int 1L) (List.nth rows 1).(1);
+  Alcotest.check value_testable "mkt dense_rank=2" (Db.V_int 2L) (List.nth rows 1).(2)
+;;
 
 let test_collate_nocase_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
   exec db "INSERT INTO t VALUES ('Alice'), ('BOB'), ('charlie')";
-  let rows = query_ok db "SELECT name FROM t WHERE name COLLATE NOCASE = 'alice' ORDER BY name" in
+  let rows =
+    query_ok db "SELECT name FROM t WHERE name COLLATE NOCASE = 'alice' ORDER BY name"
+  in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "Alice" (Db.V_text "Alice") (List.nth rows 0).(0)
+;;
 
 let test_collate_nocase_order () =
   let db = fresh_db () in
@@ -4323,17 +5603,25 @@ let test_collate_nocase_order () =
   exec db "INSERT INTO t VALUES ('banana'), ('Apple'), ('cherry')";
   let rows = query_ok db "SELECT name FROM t ORDER BY name COLLATE NOCASE" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  Alcotest.check value_testable "Apple first"   (Db.V_text "Apple")  (List.nth rows 0).(0);
+  Alcotest.check value_testable "Apple first" (Db.V_text "Apple") (List.nth rows 0).(0);
   Alcotest.check value_testable "banana second" (Db.V_text "banana") (List.nth rows 1).(0);
-  Alcotest.check value_testable "cherry third"  (Db.V_text "cherry") (List.nth rows 2).(0)
+  Alcotest.check value_testable "cherry third" (Db.V_text "cherry") (List.nth rows 2).(0)
+;;
 
 let test_collate_binary_eq () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (name TEXT)";
   exec db "INSERT INTO t VALUES ('Alice'), ('alice')";
-  let rows = query_ok db "SELECT name FROM t WHERE name COLLATE BINARY = 'alice' ORDER BY name" in
+  let rows =
+    query_ok db "SELECT name FROM t WHERE name COLLATE BINARY = 'alice' ORDER BY name"
+  in
   Alcotest.(check int) "1 row" 1 (List.length rows);
-  Alcotest.check value_testable "lowercase alice" (Db.V_text "alice") (List.nth rows 0).(0)
+  Alcotest.check
+    value_testable
+    "lowercase alice"
+    (Db.V_text "alice")
+    (List.nth rows 0).(0)
+;;
 
 let test_drop_column_basic () =
   let db = fresh_db () in
@@ -4342,10 +5630,11 @@ let test_drop_column_basic () =
   exec db "ALTER TABLE t DROP COLUMN age";
   let rows = query_ok db "SELECT id, name FROM t ORDER BY id" in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "row1 id"   (Db.V_int 1L)       (List.nth rows 0).(0);
-  Alcotest.check value_testable "row1 name" (Db.V_text "Alice")  (List.nth rows 0).(1);
-  Alcotest.check value_testable "row2 id"   (Db.V_int 2L)       (List.nth rows 1).(0);
-  Alcotest.check value_testable "row2 name" (Db.V_text "Bob")    (List.nth rows 1).(1)
+  Alcotest.check value_testable "row1 id" (Db.V_int 1L) (List.nth rows 0).(0);
+  Alcotest.check value_testable "row1 name" (Db.V_text "Alice") (List.nth rows 0).(1);
+  Alcotest.check value_testable "row2 id" (Db.V_int 2L) (List.nth rows 1).(0);
+  Alcotest.check value_testable "row2 name" (Db.V_text "Bob") (List.nth rows 1).(1)
+;;
 
 let test_drop_column_schema () =
   let db = fresh_db () in
@@ -4354,17 +5643,19 @@ let test_drop_column_schema () =
   exec db "INSERT INTO t (id, name) VALUES (1, 'Alice')";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "2 cols" 2 (Array.length (List.nth rows 0))
+;;
 
 let test_drop_column_nonexistent_fails () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, name TEXT)";
-  let err = run (
-    let* r = Db.execute db "ALTER TABLE t DROP COLUMN foo" in
-    Lwt.return (err_or_fail "drop nonexistent" r)
-  ) in
+  let err =
+    run
+      (let* r = Db.execute db "ALTER TABLE t DROP COLUMN foo" in
+       Lwt.return (err_or_fail "drop nonexistent" r))
+  in
   let msg = fmt_err err in
-  Alcotest.(check bool) "error mentions column" true
-    (String.length msg > 0)
+  Alcotest.(check bool) "error mentions column" true (String.length msg > 0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* IF NOT EXISTS                                                         *)
@@ -4372,55 +5663,66 @@ let test_drop_column_nonexistent_fails () =
 
 let test_create_table_if_not_exists () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec_sql sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec_sql "CREATE TABLE t_ine (id INTEGER)" in
-    let* () = exec_sql "INSERT INTO t_ine VALUES (42)" in
-    (* Second CREATE IF NOT EXISTS should succeed silently *)
-    let* () = exec_sql "CREATE TABLE IF NOT EXISTS t_ine (id INTEGER)" in
-    let* rows_r = Db.query db "SELECT id FROM t_ine" in
-    let rows = match rows_r with
-      | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* Table should still have the row — not re-created *)
-    Alcotest.(check int) "one row preserved" 1 (List.length rows);
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec_sql sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec_sql "CREATE TABLE t_ine (id INTEGER)" in
+     let* () = exec_sql "INSERT INTO t_ine VALUES (42)" in
+     (* Second CREATE IF NOT EXISTS should succeed silently *)
+     let* () = exec_sql "CREATE TABLE IF NOT EXISTS t_ine (id INTEGER)" in
+     let* rows_r = Db.query db "SELECT id FROM t_ine" in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* Table should still have the row — not re-created *)
+     Alcotest.(check int) "one row preserved" 1 (List.length rows);
+     Lwt.return_unit)
+;;
 
 let test_create_index_if_not_exists () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec_sql sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec_sql "CREATE TABLE idx_t (id INTEGER)" in
-    let* () = exec_sql "CREATE INDEX idx_t_id ON idx_t (id)" in
-    (* Second CREATE INDEX IF NOT EXISTS should succeed silently *)
-    let* () = exec_sql "CREATE INDEX IF NOT EXISTS idx_t_id ON idx_t (id)" in
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec_sql sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec_sql "CREATE TABLE idx_t (id INTEGER)" in
+     let* () = exec_sql "CREATE INDEX idx_t_id ON idx_t (id)" in
+     (* Second CREATE INDEX IF NOT EXISTS should succeed silently *)
+     let* () = exec_sql "CREATE INDEX IF NOT EXISTS idx_t_id ON idx_t (id)" in
+     Lwt.return_unit)
+;;
 
 let test_create_table_no_ine_fails () =
   let db = fresh_db () in
-  run (
-    let open Lwt.Syntax in
-    let exec_sql sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit
-    in
-    let* () = exec_sql "CREATE TABLE t_dup (id INTEGER)" in
-    let* result = Db.execute db "CREATE TABLE t_dup (id INTEGER)" in
-    (match result with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected error for duplicate table without IF NOT EXISTS");
-    Lwt.return_unit)
+  run
+    (let open Lwt.Syntax in
+     let exec_sql sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec_sql "CREATE TABLE t_dup (id INTEGER)" in
+     let* result = Db.execute db "CREATE TABLE t_dup (id INTEGER)" in
+     (match result with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected error for duplicate table without IF NOT EXISTS");
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Multi-column GROUP BY tests                                          *)
@@ -4428,75 +5730,138 @@ let test_create_table_no_ine_fails () =
 
 let test_group_by_two_cols () =
   let db = fresh_db () in
-  run (
-    let* r = Db.execute db "CREATE TABLE emp (dept TEXT, role TEXT, salary INTEGER)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 100)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 120)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'mgr', 200)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp VALUES ('hr',  'dev', 80)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* rows_r = Db.query db
-      "SELECT dept, role, COUNT(*) FROM emp GROUP BY dept, role ORDER BY dept, role" in
-    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    let triples = List.map (fun row ->
-      match row.(0), row.(1), row.(2) with
-      | Db.V_text d, Db.V_text r, Db.V_int c -> (d, r, Int64.to_int c)
-      | _ -> ("?","?",0)) rows in
-    Alcotest.(check (list (triple string string int)))
-      "two-col group" [("eng","dev",2);("eng","mgr",1);("hr","dev",1)] triples;
-    Lwt.return_unit)
+  run
+    (let* r = Db.execute db "CREATE TABLE emp (dept TEXT, role TEXT, salary INTEGER)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 100)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'dev', 120)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp VALUES ('eng', 'mgr', 200)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp VALUES ('hr',  'dev', 80)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* rows_r =
+       Db.query
+         db
+         "SELECT dept, role, COUNT(*) FROM emp GROUP BY dept, role ORDER BY dept, role"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     let triples =
+       List.map
+         (fun row ->
+            match row.(0), row.(1), row.(2) with
+            | Db.V_text d, Db.V_text r, Db.V_int c -> d, r, Int64.to_int c
+            | _ -> "?", "?", 0)
+         rows
+     in
+     Alcotest.(check (list (triple string string int)))
+       "two-col group"
+       [ "eng", "dev", 2; "eng", "mgr", 1; "hr", "dev", 1 ]
+       triples;
+     Lwt.return_unit)
+;;
 
 let test_group_by_two_cols_sum () =
   let db = fresh_db () in
-  run (
-    let* r = Db.execute db "CREATE TABLE emp2 (dept TEXT, role TEXT, salary INTEGER)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 100)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 120)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'mgr', 200)" in
-    (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-    let* rows_r = Db.query db
-      "SELECT dept, role, SUM(salary) FROM emp2 GROUP BY dept, role ORDER BY dept, role" in
-    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    let triples = List.map (fun row ->
-      match row.(0), row.(1), row.(2) with
-      | Db.V_text d, Db.V_text r, Db.V_int s -> (d, r, Int64.to_int s)
-      | _ -> ("?","?",0)) rows in
-    Alcotest.(check (list (triple string string int)))
-      "two-col sum" [("eng","dev",220);("eng","mgr",200)] triples;
-    Lwt.return_unit)
+  run
+    (let* r = Db.execute db "CREATE TABLE emp2 (dept TEXT, role TEXT, salary INTEGER)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 100)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'dev', 120)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* r = Db.execute db "INSERT INTO emp2 VALUES ('eng', 'mgr', 200)" in
+     (match r with
+      | Ok () -> ()
+      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+     let* rows_r =
+       Db.query
+         db
+         "SELECT dept, role, SUM(salary) FROM emp2 GROUP BY dept, role ORDER BY dept, \
+          role"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     let triples =
+       List.map
+         (fun row ->
+            match row.(0), row.(1), row.(2) with
+            | Db.V_text d, Db.V_text r, Db.V_int s -> d, r, Int64.to_int s
+            | _ -> "?", "?", 0)
+         rows
+     in
+     Alcotest.(check (list (triple string string int)))
+       "two-col sum"
+       [ "eng", "dev", 220; "eng", "mgr", 200 ]
+       triples;
+     Lwt.return_unit)
+;;
 
 let test_group_by_two_cols_having () =
   let db = fresh_db () in
-  run (
-    let exec sql = let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
-      Lwt.return_unit in
-    let* () = exec "CREATE TABLE emp4 (dept TEXT, role TEXT, salary INTEGER)" in
-    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 100)" in
-    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 120)" in
-    let* () = exec "INSERT INTO emp4 VALUES ('eng', 'mgr', 200)" in
-    let* () = exec "INSERT INTO emp4 VALUES ('hr',  'dev', 80)" in
-    let* rows_r = Db.query db
-      "SELECT dept, role, COUNT(*) FROM emp4 GROUP BY dept, role HAVING COUNT(*) > 1 ORDER BY dept, role" in
-    let rows = match rows_r with Ok s -> Lwt_main.run (Lwt_stream.to_list s)
-      | Error e -> failwith (Format.asprintf "%a" Db.pp_error e) in
-    (* Only (eng, dev) has COUNT > 1 *)
-    let triples = List.map (fun row ->
-      match row.(0), row.(1), row.(2) with
-      | Db.V_text d, Db.V_text r, Db.V_int c -> (d, r, Int64.to_int c)
-      | _ -> ("?","?",0)) rows in
-    Alcotest.(check (list (triple string string int)))
-      "having_count_gt1" [("eng","dev",2)] triples;
-    Lwt.return_unit)
+  run
+    (let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> failwith (Format.asprintf "%a" Db.pp_error e));
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE emp4 (dept TEXT, role TEXT, salary INTEGER)" in
+     let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 100)" in
+     let* () = exec "INSERT INTO emp4 VALUES ('eng', 'dev', 120)" in
+     let* () = exec "INSERT INTO emp4 VALUES ('eng', 'mgr', 200)" in
+     let* () = exec "INSERT INTO emp4 VALUES ('hr',  'dev', 80)" in
+     let* rows_r =
+       Db.query
+         db
+         "SELECT dept, role, COUNT(*) FROM emp4 GROUP BY dept, role HAVING COUNT(*) > 1 \
+          ORDER BY dept, role"
+     in
+     let rows =
+       match rows_r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> failwith (Format.asprintf "%a" Db.pp_error e)
+     in
+     (* Only (eng, dev) has COUNT > 1 *)
+     let triples =
+       List.map
+         (fun row ->
+            match row.(0), row.(1), row.(2) with
+            | Db.V_text d, Db.V_text r, Db.V_int c -> d, r, Int64.to_int c
+            | _ -> "?", "?", 0)
+         rows
+     in
+     Alcotest.(check (list (triple string string int)))
+       "having_count_gt1"
+       [ "eng", "dev", 2 ]
+       triples;
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 19: Math scalar functions                                       *)
@@ -4507,24 +5872,34 @@ let test_math_ceil () =
   let rows = query_ok db "SELECT CEIL(2.3)" in
   Alcotest.(check row_testable) "ceil(2.3)=3.0" [| Db.V_real 3.0 |] (List.nth rows 0);
   let rows2 = query_ok db "SELECT CEIL(-2.3)" in
-  Alcotest.(check row_testable) "ceil(-2.3)=-2.0" [| Db.V_real (-2.0) |] (List.nth rows2 0)
+  Alcotest.(check row_testable)
+    "ceil(-2.3)=-2.0"
+    [| Db.V_real (-2.0) |]
+    (List.nth rows2 0)
+;;
 
 let test_math_floor () =
   let db = fresh_db () in
   let rows = query_ok db "SELECT FLOOR(2.7)" in
   Alcotest.(check row_testable) "floor(2.7)=2.0" [| Db.V_real 2.0 |] (List.nth rows 0);
   let rows2 = query_ok db "SELECT FLOOR(-2.7)" in
-  Alcotest.(check row_testable) "floor(-2.7)=-3.0" [| Db.V_real (-3.0) |] (List.nth rows2 0)
+  Alcotest.(check row_testable)
+    "floor(-2.7)=-3.0"
+    [| Db.V_real (-3.0) |]
+    (List.nth rows2 0)
+;;
 
 let test_math_sqrt () =
   let db = fresh_db () in
   let rows = query_ok db "SELECT SQRT(4.0)" in
   Alcotest.(check row_testable) "sqrt(4.0)=2.0" [| Db.V_real 2.0 |] (List.nth rows 0)
+;;
 
 let test_math_pow () =
   let db = fresh_db () in
   let rows = query_ok db "SELECT POW(2.0, 10.0)" in
   Alcotest.(check row_testable) "pow(2,10)=1024" [| Db.V_real 1024.0 |] (List.nth rows 0)
+;;
 
 let test_math_sign () =
   let db = fresh_db () in
@@ -4534,6 +5909,7 @@ let test_math_sign () =
   Alcotest.(check row_testable) "sign(0)=0" [| Db.V_int 0L |] (List.nth r2 0);
   let r3 = query_ok db "SELECT SIGN(5)" in
   Alcotest.(check row_testable) "sign(5)=1" [| Db.V_int 1L |] (List.nth r3 0)
+;;
 
 let test_math_trunc () =
   let db = fresh_db () in
@@ -4541,15 +5917,17 @@ let test_math_trunc () =
   Alcotest.(check row_testable) "trunc(3.7)=3.0" [| Db.V_real 3.0 |] (List.nth r1 0);
   let r2 = query_ok db "SELECT TRUNC(-3.7)" in
   Alcotest.(check row_testable) "trunc(-3.7)=-3.0" [| Db.V_real (-3.0) |] (List.nth r2 0)
+;;
 
 let test_math_pi () =
   let db = fresh_db () in
   let rows = query_ok db "SELECT PI()" in
-  (match (List.nth rows 0).(0) with
-   | Db.V_real v ->
-     let diff = abs_float (v -. Float.pi) in
-     Alcotest.(check bool) "pi close to Float.pi" true (diff < 1e-10)
-   | _ -> Alcotest.fail "expected real value for PI()")
+  match (List.nth rows 0).(0) with
+  | Db.V_real v ->
+    let diff = abs_float (v -. Float.pi) in
+    Alcotest.(check bool) "pi close to Float.pi" true (diff < 1e-10)
+  | _ -> Alcotest.fail "expected real value for PI()"
+;;
 
 let test_math_trig () =
   let db = fresh_db () in
@@ -4559,6 +5937,7 @@ let test_math_trig () =
   Alcotest.(check row_testable) "cos(0)=1" [| Db.V_real 1.0 |] (List.nth r2 0);
   let r3 = query_ok db "SELECT TAN(0.0)" in
   Alcotest.(check row_testable) "tan(0)=0" [| Db.V_real 0.0 |] (List.nth r3 0)
+;;
 
 let test_math_log () =
   let db = fresh_db () in
@@ -4567,9 +5946,11 @@ let test_math_log () =
   let r2 = query_ok db "SELECT LOG10(1000.0)" in
   Alcotest.(check row_testable) "log10(1000)=3" [| Db.V_real 3.0 |] (List.nth r2 0);
   let r3 = query_ok db "SELECT LOG(10.0, 100.0)" in
-  (match (List.nth r3 0).(0) with
-   | Db.V_real v -> Alcotest.(check bool) "log(10,100)~2" true (abs_float (v -. 2.0) < 1e-10)
-   | _ -> Alcotest.fail "expected real value for LOG(10,100)")
+  match (List.nth r3 0).(0) with
+  | Db.V_real v ->
+    Alcotest.(check bool) "log(10,100)~2" true (abs_float (v -. 2.0) < 1e-10)
+  | _ -> Alcotest.fail "expected real value for LOG(10,100)"
+;;
 
 let test_nulls_first_last () =
   let db = fresh_db () in
@@ -4578,17 +5959,30 @@ let test_nulls_first_last () =
   exec db "INSERT INTO tnull VALUES (NULL)";
   exec db "INSERT INTO tnull VALUES (3)";
   let r1 = query_ok db "SELECT x FROM tnull ORDER BY x ASC NULLS LAST" in
-  Alcotest.check (Alcotest.list row_testable) "asc nulls last"
-    [[| Db.V_int 1L |]; [| Db.V_int 3L |]; [| Db.V_null |]] r1;
+  Alcotest.check
+    (Alcotest.list row_testable)
+    "asc nulls last"
+    [ [| Db.V_int 1L |]; [| Db.V_int 3L |]; [| Db.V_null |] ]
+    r1;
   let r2 = query_ok db "SELECT x FROM tnull ORDER BY x ASC NULLS FIRST" in
-  Alcotest.check (Alcotest.list row_testable) "asc nulls first"
-    [[| Db.V_null |]; [| Db.V_int 1L |]; [| Db.V_int 3L |]] r2;
+  Alcotest.check
+    (Alcotest.list row_testable)
+    "asc nulls first"
+    [ [| Db.V_null |]; [| Db.V_int 1L |]; [| Db.V_int 3L |] ]
+    r2;
   let r3 = query_ok db "SELECT x FROM tnull ORDER BY x DESC NULLS FIRST" in
-  Alcotest.check (Alcotest.list row_testable) "desc nulls first"
-    [[| Db.V_null |]; [| Db.V_int 3L |]; [| Db.V_int 1L |]] r3;
+  Alcotest.check
+    (Alcotest.list row_testable)
+    "desc nulls first"
+    [ [| Db.V_null |]; [| Db.V_int 3L |]; [| Db.V_int 1L |] ]
+    r3;
   let r4 = query_ok db "SELECT x FROM tnull ORDER BY x DESC NULLS LAST" in
-  Alcotest.check (Alcotest.list row_testable) "desc nulls last"
-    [[| Db.V_int 3L |]; [| Db.V_int 1L |]; [| Db.V_null |]] r4
+  Alcotest.check
+    (Alcotest.list row_testable)
+    "desc nulls last"
+    [ [| Db.V_int 3L |]; [| Db.V_int 1L |]; [| Db.V_null |] ]
+    r4
+;;
 
 let test_json_extract () =
   let db = fresh_db () in
@@ -4604,30 +5998,38 @@ let test_json_extract () =
   Alcotest.(check row_testable) "extract missing = null" [| Db.V_null |] (List.nth r5 0);
   let r6 = query_ok db {|SELECT json_extract('{"a":1.5}', '$.a')|} in
   Alcotest.(check row_testable) "extract real" [| Db.V_real 1.5 |] (List.nth r6 0)
+;;
 
 let test_json_object () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_object('a', 1, 'b', 'hi')|} in
-  Alcotest.(check row_testable) "json_object basic"
-    [| Db.V_text {|{"a":1,"b":"hi"}|} |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "json_object basic"
+    [| Db.V_text {|{"a":1,"b":"hi"}|} |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_object()|} in
-  Alcotest.(check row_testable) "json_object empty"
-    [| Db.V_text "{}" |] (List.nth r2 0)
+  Alcotest.(check row_testable) "json_object empty" [| Db.V_text "{}" |] (List.nth r2 0)
+;;
 
 let test_json_array () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_array(1, 2, 3)|} in
-  Alcotest.(check row_testable) "json_array ints"
-    [| Db.V_text "[1,2,3]" |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "json_array ints"
+    [| Db.V_text "[1,2,3]" |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_array()|} in
-  Alcotest.(check row_testable) "json_array empty"
-    [| Db.V_text "[]" |] (List.nth r2 0)
+  Alcotest.(check row_testable) "json_array empty" [| Db.V_text "[]" |] (List.nth r2 0)
+;;
 
 let test_json_type () =
   let db = fresh_db () in
   let check q expected =
     let r = query_ok db q in
-    Alcotest.(check row_testable) (q ^ "=" ^ expected) [| Db.V_text expected |] (List.nth r 0)
+    Alcotest.(check row_testable)
+      (q ^ "=" ^ expected)
+      [| Db.V_text expected |]
+      (List.nth r 0)
   in
   check {|SELECT json_type('{"a":1}')|} "object";
   check {|SELECT json_type('[1,2]')|} "array";
@@ -4639,7 +6041,11 @@ let test_json_type () =
   check {|SELECT json_type('false')|} "false";
   (* 2-arg form with path *)
   let r2 = query_ok db {|SELECT json_type('{"a":1}', '$.a')|} in
-  Alcotest.(check row_testable) "json_type with path" [| Db.V_text "integer" |] (List.nth r2 0)
+  Alcotest.(check row_testable)
+    "json_type with path"
+    [| Db.V_text "integer" |]
+    (List.nth r2 0)
+;;
 
 let test_json_valid () =
   let db = fresh_db () in
@@ -4651,626 +6057,973 @@ let test_json_valid () =
   Alcotest.(check row_testable) "array is valid" [| Db.V_int 1L |] (List.nth r3 0);
   let r4 = query_ok db {|SELECT json_valid(NULL)|} in
   Alcotest.(check row_testable) "json_valid(NULL) = null" [| Db.V_null |] (List.nth r4 0)
+;;
 
 let test_json_set () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_set('{"a":1}', '$.a', 99)|} in
-  Alcotest.(check row_testable) "set existing key"
-    [| Db.V_text {|{"a":99}|} |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "set existing key"
+    [| Db.V_text {|{"a":99}|} |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_set('{"a":1}', '$.b', 2)|} in
-  Alcotest.(check row_testable) "set new key"
-    [| Db.V_text {|{"a":1,"b":2}|} |] (List.nth r2 0);
+  Alcotest.(check row_testable)
+    "set new key"
+    [| Db.V_text {|{"a":1,"b":2}|} |]
+    (List.nth r2 0);
   let r3 = query_ok db {|SELECT json_set('[1,2,3]', '$[1]', 99)|} in
-  Alcotest.(check row_testable) "set array index"
-    [| Db.V_text "[1,99,3]" |] (List.nth r3 0);
+  Alcotest.(check row_testable)
+    "set array index"
+    [| Db.V_text "[1,99,3]" |]
+    (List.nth r3 0);
   let r4 = query_ok db {|SELECT json_set('{"a":1}', '$.b', 2, '$.c', 3)|} in
-  Alcotest.(check row_testable) "set multiple pairs"
-    [| Db.V_text {|{"a":1,"b":2,"c":3}|} |] (List.nth r4 0);
+  Alcotest.(check row_testable)
+    "set multiple pairs"
+    [| Db.V_text {|{"a":1,"b":2,"c":3}|} |]
+    (List.nth r4 0);
   let r5 = query_ok db {|SELECT json_set('[1,2,3]', '$[3]', 4)|} in
-  Alcotest.(check row_testable) "set at array length = append"
-    [| Db.V_text "[1,2,3,4]" |] (List.nth r5 0)
+  Alcotest.(check row_testable)
+    "set at array length = append"
+    [| Db.V_text "[1,2,3,4]" |]
+    (List.nth r5 0)
+;;
 
 let test_json_insert () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_insert('{"a":1}', '$.a', 99)|} in
-  Alcotest.(check row_testable) "insert existing no-op"
-    [| Db.V_text {|{"a":1}|} |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "insert existing no-op"
+    [| Db.V_text {|{"a":1}|} |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_insert('{"a":1}', '$.b', 2)|} in
-  Alcotest.(check row_testable) "insert new key"
-    [| Db.V_text {|{"a":1,"b":2}|} |] (List.nth r2 0)
+  Alcotest.(check row_testable)
+    "insert new key"
+    [| Db.V_text {|{"a":1,"b":2}|} |]
+    (List.nth r2 0)
+;;
 
 let test_json_replace () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_replace('{"a":1}', '$.a', 99)|} in
-  Alcotest.(check row_testable) "replace existing"
-    [| Db.V_text {|{"a":99}|} |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "replace existing"
+    [| Db.V_text {|{"a":99}|} |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_replace('{"a":1}', '$.b', 2)|} in
-  Alcotest.(check row_testable) "replace non-existing no-op"
-    [| Db.V_text {|{"a":1}|} |] (List.nth r2 0);
+  Alcotest.(check row_testable)
+    "replace non-existing no-op"
+    [| Db.V_text {|{"a":1}|} |]
+    (List.nth r2 0);
   let r3 = query_ok db {|SELECT json_replace('[1,2,3]', '$[3]', 4)|} in
-  Alcotest.(check row_testable) "replace out-of-bounds = no-op"
-    [| Db.V_text "[1,2,3]" |] (List.nth r3 0)
+  Alcotest.(check row_testable)
+    "replace out-of-bounds = no-op"
+    [| Db.V_text "[1,2,3]" |]
+    (List.nth r3 0)
+;;
 
 let test_json_remove () =
   let db = fresh_db () in
   let r1 = query_ok db {|SELECT json_remove('{"a":1,"b":2}', '$.a')|} in
-  Alcotest.(check row_testable) "remove object key"
-    [| Db.V_text {|{"b":2}|} |] (List.nth r1 0);
+  Alcotest.(check row_testable)
+    "remove object key"
+    [| Db.V_text {|{"b":2}|} |]
+    (List.nth r1 0);
   let r2 = query_ok db {|SELECT json_remove('[1,2,3]', '$[1]')|} in
-  Alcotest.(check row_testable) "remove array element"
-    [| Db.V_text "[1,3]" |] (List.nth r2 0);
+  Alcotest.(check row_testable)
+    "remove array element"
+    [| Db.V_text "[1,3]" |]
+    (List.nth r2 0);
   let r3 = query_ok db {|SELECT json_remove('{"a":1,"b":2,"c":3}', '$.a', '$.c')|} in
-  Alcotest.(check row_testable) "remove multiple paths"
-    [| Db.V_text {|{"b":2}|} |] (List.nth r3 0)
+  Alcotest.(check row_testable)
+    "remove multiple paths"
+    [| Db.V_text {|{"b":2}|} |]
+    (List.nth r3 0)
+;;
 
 (* ── Phase 21: SAVEPOINT / RELEASE / ROLLBACK TO ──────────────── *)
 
 let test_savepoint_rollback_undoes_insert () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE sp_t1 (x INTEGER)" in
-    let* () = exec "BEGIN" in
-    let* () = exec "SAVEPOINT s1" in
-    let* () = exec "INSERT INTO sp_t1 VALUES (1)" in
-    let* () = exec "ROLLBACK TO s1" in
-    let* () = exec "COMMIT" in
-    let* r = Db.query db "SELECT COUNT(*) FROM sp_t1" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "0 rows after rollback to savepoint" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE sp_t1 (x INTEGER)" in
+     let* () = exec "BEGIN" in
+     let* () = exec "SAVEPOINT s1" in
+     let* () = exec "INSERT INTO sp_t1 VALUES (1)" in
+     let* () = exec "ROLLBACK TO s1" in
+     let* () = exec "COMMIT" in
+     let* r = Db.query db "SELECT COUNT(*) FROM sp_t1" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "0 rows after rollback to savepoint"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_savepoint_release_keeps_insert () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE sp_t2 (x INTEGER)" in
-    let* () = exec "BEGIN" in
-    let* () = exec "SAVEPOINT s1" in
-    let* () = exec "INSERT INTO sp_t2 VALUES (42)" in
-    let* () = exec "RELEASE s1" in
-    let* () = exec "COMMIT" in
-    let* r = Db.query db "SELECT x FROM sp_t2" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "1 row after release" 1 (List.length rows);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE sp_t2 (x INTEGER)" in
+     let* () = exec "BEGIN" in
+     let* () = exec "SAVEPOINT s1" in
+     let* () = exec "INSERT INTO sp_t2 VALUES (42)" in
+     let* () = exec "RELEASE s1" in
+     let* () = exec "COMMIT" in
+     let* r = Db.query db "SELECT x FROM sp_t2" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "1 row after release" 1 (List.length rows);
+     Lwt.return_unit)
+;;
 
 let test_savepoint_partial_rollback () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE sp_t3 (x INTEGER)" in
-    let* () = exec "BEGIN" in
-    let* () = exec "INSERT INTO sp_t3 VALUES (1)" in
-    let* () = exec "SAVEPOINT s1" in
-    let* () = exec "INSERT INTO sp_t3 VALUES (2)" in
-    let* () = exec "ROLLBACK TO s1" in
-    let* () = exec "COMMIT" in
-    let* r = Db.query db "SELECT COUNT(*) FROM sp_t3" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "only pre-savepoint row survives" 1
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE sp_t3 (x INTEGER)" in
+     let* () = exec "BEGIN" in
+     let* () = exec "INSERT INTO sp_t3 VALUES (1)" in
+     let* () = exec "SAVEPOINT s1" in
+     let* () = exec "INSERT INTO sp_t3 VALUES (2)" in
+     let* () = exec "ROLLBACK TO s1" in
+     let* () = exec "COMMIT" in
+     let* r = Db.query db "SELECT COUNT(*) FROM sp_t3" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "only pre-savepoint row survives"
+       1
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_savepoint_double_rollback () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE sp_t4 (x INTEGER)" in
-    let* () = exec "BEGIN" in
-    let* () = exec "SAVEPOINT s" in
-    let* () = exec "INSERT INTO sp_t4 VALUES (1)" in
-    let* () = exec "ROLLBACK TO s" in
-    let* () = exec "INSERT INTO sp_t4 VALUES (2)" in
-    let* () = exec "ROLLBACK TO s" in
-    let* () = exec "COMMIT" in
-    let* r = Db.query db "SELECT COUNT(*) FROM sp_t4" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "savepoint reusable, 0 rows" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE sp_t4 (x INTEGER)" in
+     let* () = exec "BEGIN" in
+     let* () = exec "SAVEPOINT s" in
+     let* () = exec "INSERT INTO sp_t4 VALUES (1)" in
+     let* () = exec "ROLLBACK TO s" in
+     let* () = exec "INSERT INTO sp_t4 VALUES (2)" in
+     let* () = exec "ROLLBACK TO s" in
+     let* () = exec "COMMIT" in
+     let* r = Db.query db "SELECT COUNT(*) FROM sp_t4" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "savepoint reusable, 0 rows"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_savepoint_auto_begin () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE sp_ab (x INTEGER)" in
-    (* No BEGIN — SAVEPOINT should auto-begin *)
-    let* () = exec "SAVEPOINT s" in
-    let* () = exec "INSERT INTO sp_ab VALUES (99)" in
-    let* () = exec "RELEASE s" in
-    (* RELEASE should auto-commit since auto_began=true and savepoint_names=[] *)
-    let* r = Db.query db "SELECT x FROM sp_ab" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "auto-committed after release" 1 (List.length rows);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE sp_ab (x INTEGER)" in
+     (* No BEGIN — SAVEPOINT should auto-begin *)
+     let* () = exec "SAVEPOINT s" in
+     let* () = exec "INSERT INTO sp_ab VALUES (99)" in
+     let* () = exec "RELEASE s" in
+     (* RELEASE should auto-commit since auto_began=true and savepoint_names=[] *)
+     let* r = Db.query db "SELECT x FROM sp_ab" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "auto-committed after release" 1 (List.length rows);
+     Lwt.return_unit)
+;;
 
 (* ── Phase 21: FK DELETE/UPDATE parent-side enforcement ─────────── *)
 
 let test_fk_delete_referenced_parent_fails () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE fkp (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fkp VALUES (1)" in
-    let* () = exec "CREATE TABLE fkc (id INTEGER, pid INTEGER REFERENCES fkp(id))" in
-    let* () = exec "INSERT INTO fkc VALUES (10, 1)" in
-    let* result = Db.execute db "DELETE FROM fkp WHERE id = 1" in
-    Alcotest.(check bool) "delete referenced parent fails" true (Result.is_error result);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE fkp (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fkp VALUES (1)" in
+     let* () = exec "CREATE TABLE fkc (id INTEGER, pid INTEGER REFERENCES fkp(id))" in
+     let* () = exec "INSERT INTO fkc VALUES (10, 1)" in
+     let* result = Db.execute db "DELETE FROM fkp WHERE id = 1" in
+     Alcotest.(check bool) "delete referenced parent fails" true (Result.is_error result);
+     Lwt.return_unit)
+;;
 
 let test_fk_delete_unreferenced_parent_ok () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE fkp2 (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fkp2 VALUES (1)" in
-    let* () = exec "INSERT INTO fkp2 VALUES (2)" in
-    let* () = exec "CREATE TABLE fkc2 (id INTEGER, pid INTEGER REFERENCES fkp2(id))" in
-    let* () = exec "INSERT INTO fkc2 VALUES (10, 2)" in
-    let* () = exec "DELETE FROM fkp2 WHERE id = 1" in
-    let* r = Db.query db "SELECT COUNT(*) FROM fkp2" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "unreferenced parent deleted ok" 1
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE fkp2 (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fkp2 VALUES (1)" in
+     let* () = exec "INSERT INTO fkp2 VALUES (2)" in
+     let* () = exec "CREATE TABLE fkc2 (id INTEGER, pid INTEGER REFERENCES fkp2(id))" in
+     let* () = exec "INSERT INTO fkc2 VALUES (10, 2)" in
+     let* () = exec "DELETE FROM fkp2 WHERE id = 1" in
+     let* r = Db.query db "SELECT COUNT(*) FROM fkp2" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "unreferenced parent deleted ok"
+       1
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_delete_null_child_ok () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE fkp3 (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fkp3 VALUES (1)" in
-    let* () = exec "CREATE TABLE fkc3 (id INTEGER, pid INTEGER REFERENCES fkp3(id))" in
-    let* () = exec "INSERT INTO fkc3 VALUES (10, NULL)" in
-    let* () = exec "DELETE FROM fkp3 WHERE id = 1" in
-    let* r = Db.query db "SELECT COUNT(*) FROM fkp3" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "parent deleted when child FK is null" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE fkp3 (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fkp3 VALUES (1)" in
+     let* () = exec "CREATE TABLE fkc3 (id INTEGER, pid INTEGER REFERENCES fkp3(id))" in
+     let* () = exec "INSERT INTO fkc3 VALUES (10, NULL)" in
+     let* () = exec "DELETE FROM fkp3 WHERE id = 1" in
+     let* r = Db.query db "SELECT COUNT(*) FROM fkp3" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "parent deleted when child FK is null"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_update_referenced_col_fails () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE fkpu (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fkpu VALUES (1)" in
-    let* () = exec "CREATE TABLE fkcu (pid INTEGER REFERENCES fkpu(id))" in
-    let* () = exec "INSERT INTO fkcu VALUES (1)" in
-    let* result = Db.execute db "UPDATE fkpu SET id = 99 WHERE id = 1" in
-    Alcotest.(check bool) "update referenced parent col fails" true (Result.is_error result);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE fkpu (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fkpu VALUES (1)" in
+     let* () = exec "CREATE TABLE fkcu (pid INTEGER REFERENCES fkpu(id))" in
+     let* () = exec "INSERT INTO fkcu VALUES (1)" in
+     let* result = Db.execute db "UPDATE fkpu SET id = 99 WHERE id = 1" in
+     Alcotest.(check bool)
+       "update referenced parent col fails"
+       true
+       (Result.is_error result);
+     Lwt.return_unit)
+;;
 
 let test_fk_update_unreferenced_col_ok () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE fkpu2 (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO fkpu2 VALUES (1)" in
-    let* () = exec "INSERT INTO fkpu2 VALUES (2)" in
-    let* () = exec "CREATE TABLE fkcu2 (pid INTEGER REFERENCES fkpu2(id))" in
-    let* () = exec "INSERT INTO fkcu2 VALUES (1)" in
-    let* () = exec "UPDATE fkpu2 SET id = 99 WHERE id = 2" in
-    let* r = Db.query db "SELECT COUNT(*) FROM fkpu2" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "unreferenced parent update ok" 2
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE fkpu2 (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO fkpu2 VALUES (1)" in
+     let* () = exec "INSERT INTO fkpu2 VALUES (2)" in
+     let* () = exec "CREATE TABLE fkcu2 (pid INTEGER REFERENCES fkpu2(id))" in
+     let* () = exec "INSERT INTO fkcu2 VALUES (1)" in
+     let* () = exec "UPDATE fkpu2 SET id = 99 WHERE id = 2" in
+     let* r = Db.query db "SELECT COUNT(*) FROM fkpu2" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "unreferenced parent update ok"
+       2
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_cascade_delete () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE cpar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE cchi (id INTEGER, pid INTEGER REFERENCES cpar(id) ON DELETE CASCADE)" in
-    let* () = exec "INSERT INTO cpar VALUES (1)" in
-    let* () = exec "INSERT INTO cpar VALUES (2)" in
-    let* () = exec "INSERT INTO cchi VALUES (10, 1)" in
-    let* () = exec "INSERT INTO cchi VALUES (11, 1)" in
-    let* () = exec "INSERT INTO cchi VALUES (12, 2)" in
-    let* () = exec "DELETE FROM cpar WHERE id = 1" in
-    let* r = Db.query db "SELECT COUNT(*) FROM cchi" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "cascade deleted 2 rows, 1 remains" 1
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE cpar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE cchi (id INTEGER, pid INTEGER REFERENCES cpar(id) ON DELETE \
+          CASCADE)"
+     in
+     let* () = exec "INSERT INTO cpar VALUES (1)" in
+     let* () = exec "INSERT INTO cpar VALUES (2)" in
+     let* () = exec "INSERT INTO cchi VALUES (10, 1)" in
+     let* () = exec "INSERT INTO cchi VALUES (11, 1)" in
+     let* () = exec "INSERT INTO cchi VALUES (12, 2)" in
+     let* () = exec "DELETE FROM cpar WHERE id = 1" in
+     let* r = Db.query db "SELECT COUNT(*) FROM cchi" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "cascade deleted 2 rows, 1 remains"
+       1
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_cascade_delete_no_children () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE npar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE nchi (id INTEGER, pid INTEGER REFERENCES npar(id) ON DELETE CASCADE)" in
-    let* () = exec "INSERT INTO npar VALUES (1)" in
-    let* () = exec "DELETE FROM npar WHERE id = 1" in
-    let* r = Db.query db "SELECT COUNT(*) FROM npar" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "parent deleted when no children" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE npar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE nchi (id INTEGER, pid INTEGER REFERENCES npar(id) ON DELETE \
+          CASCADE)"
+     in
+     let* () = exec "INSERT INTO npar VALUES (1)" in
+     let* () = exec "DELETE FROM npar WHERE id = 1" in
+     let* r = Db.query db "SELECT COUNT(*) FROM npar" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "parent deleted when no children"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_cascade_update () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE upar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE uchi (id INTEGER, pid INTEGER REFERENCES upar(id) ON UPDATE CASCADE)" in
-    let* () = exec "INSERT INTO upar VALUES (1)" in
-    let* () = exec "INSERT INTO uchi VALUES (10, 1)" in
-    let* () = exec "INSERT INTO uchi VALUES (11, 1)" in
-    let* () = exec "UPDATE upar SET id = 99 WHERE id = 1" in
-    let* r = Db.query db "SELECT pid FROM uchi ORDER BY id" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "2 child rows updated" 2 (List.length rows);
-    Alcotest.check value_testable "child1 pid=99" (Db.V_int 99L) (List.nth rows 0).(0);
-    Alcotest.check value_testable "child2 pid=99" (Db.V_int 99L) (List.nth rows 1).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE upar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE uchi (id INTEGER, pid INTEGER REFERENCES upar(id) ON UPDATE \
+          CASCADE)"
+     in
+     let* () = exec "INSERT INTO upar VALUES (1)" in
+     let* () = exec "INSERT INTO uchi VALUES (10, 1)" in
+     let* () = exec "INSERT INTO uchi VALUES (11, 1)" in
+     let* () = exec "UPDATE upar SET id = 99 WHERE id = 1" in
+     let* r = Db.query db "SELECT pid FROM uchi ORDER BY id" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "2 child rows updated" 2 (List.length rows);
+     Alcotest.check value_testable "child1 pid=99" (Db.V_int 99L) (List.nth rows 0).(0);
+     Alcotest.check value_testable "child2 pid=99" (Db.V_int 99L) (List.nth rows 1).(0);
+     Lwt.return_unit)
+;;
 
 let test_fk_set_null_delete () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE snpar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE snchi (id INTEGER, pid INTEGER REFERENCES snpar(id) ON DELETE SET NULL)" in
-    let* () = exec "INSERT INTO snpar VALUES (1)" in
-    let* () = exec "INSERT INTO snchi VALUES (10, 1)" in
-    let* () = exec "DELETE FROM snpar WHERE id = 1" in
-    let* r = Db.query db "SELECT pid IS NULL FROM snchi" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "child pid set to null" 1
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE snpar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE snchi (id INTEGER, pid INTEGER REFERENCES snpar(id) ON DELETE SET \
+          NULL)"
+     in
+     let* () = exec "INSERT INTO snpar VALUES (1)" in
+     let* () = exec "INSERT INTO snchi VALUES (10, 1)" in
+     let* () = exec "DELETE FROM snpar WHERE id = 1" in
+     let* r = Db.query db "SELECT pid IS NULL FROM snchi" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "child pid set to null"
+       1
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_set_null_update () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE snupar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE snuchi (id INTEGER, pid INTEGER REFERENCES snupar(id) ON UPDATE SET NULL)" in
-    let* () = exec "INSERT INTO snupar VALUES (1)" in
-    let* () = exec "INSERT INTO snuchi VALUES (10, 1)" in
-    let* () = exec "UPDATE snupar SET id = 99 WHERE id = 1" in
-    let* r = Db.query db "SELECT pid IS NULL FROM snuchi" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "child pid set to null after parent update" 1
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE snupar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE snuchi (id INTEGER, pid INTEGER REFERENCES snupar(id) ON UPDATE \
+          SET NULL)"
+     in
+     let* () = exec "INSERT INTO snupar VALUES (1)" in
+     let* () = exec "INSERT INTO snuchi VALUES (10, 1)" in
+     let* () = exec "UPDATE snupar SET id = 99 WHERE id = 1" in
+     let* r = Db.query db "SELECT pid IS NULL FROM snuchi" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "child pid set to null after parent update"
+       1
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_set_default_delete () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE sdpar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO sdpar VALUES (0)" in
-    let* () = exec "INSERT INTO sdpar VALUES (1)" in
-    let* () = exec "CREATE TABLE sdchi (id INTEGER, pid INTEGER DEFAULT 0 REFERENCES sdpar(id) ON DELETE SET DEFAULT)" in
-    let* () = exec "INSERT INTO sdchi VALUES (10, 1)" in
-    let* () = exec "DELETE FROM sdpar WHERE id = 1" in
-    let* r = Db.query db "SELECT pid FROM sdchi" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "child pid reset to default 0" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE sdpar (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO sdpar VALUES (0)" in
+     let* () = exec "INSERT INTO sdpar VALUES (1)" in
+     let* () =
+       exec
+         "CREATE TABLE sdchi (id INTEGER, pid INTEGER DEFAULT 0 REFERENCES sdpar(id) ON \
+          DELETE SET DEFAULT)"
+     in
+     let* () = exec "INSERT INTO sdchi VALUES (10, 1)" in
+     let* () = exec "DELETE FROM sdpar WHERE id = 1" in
+     let* r = Db.query db "SELECT pid FROM sdchi" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "child pid reset to default 0"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_fk_no_action_blocks_delete () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE napar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "INSERT INTO napar VALUES (1)" in
-    let* () = exec "CREATE TABLE nachi (id INTEGER, pid INTEGER REFERENCES napar(id) ON DELETE NO ACTION)" in
-    let* () = exec "INSERT INTO nachi VALUES (10, 1)" in
-    let* result = Db.execute db "DELETE FROM napar WHERE id = 1" in
-    Alcotest.(check bool) "NO ACTION blocks delete" true (Result.is_error result);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE napar (id INTEGER PRIMARY KEY)" in
+     let* () = exec "INSERT INTO napar VALUES (1)" in
+     let* () =
+       exec
+         "CREATE TABLE nachi (id INTEGER, pid INTEGER REFERENCES napar(id) ON DELETE NO \
+          ACTION)"
+     in
+     let* () = exec "INSERT INTO nachi VALUES (10, 1)" in
+     let* result = Db.execute db "DELETE FROM napar WHERE id = 1" in
+     Alcotest.(check bool) "NO ACTION blocks delete" true (Result.is_error result);
+     Lwt.return_unit)
+;;
 
 let test_fk_cascade_table_level_fk () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "PRAGMA foreign_keys = 1" in
-    let* () = exec "CREATE TABLE tlpar (id INTEGER PRIMARY KEY)" in
-    let* () = exec "CREATE TABLE tlchi (id INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES tlpar(id) ON DELETE CASCADE)" in
-    let* () = exec "INSERT INTO tlpar VALUES (1)" in
-    let* () = exec "INSERT INTO tlchi VALUES (10, 1)" in
-    let* () = exec "DELETE FROM tlpar WHERE id = 1" in
-    let* r = Db.query db "SELECT COUNT(*) FROM tlchi" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "table-level CASCADE FK deletes child" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "PRAGMA foreign_keys = 1" in
+     let* () = exec "CREATE TABLE tlpar (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec
+         "CREATE TABLE tlchi (id INTEGER, pid INTEGER, FOREIGN KEY (pid) REFERENCES \
+          tlpar(id) ON DELETE CASCADE)"
+     in
+     let* () = exec "INSERT INTO tlpar VALUES (1)" in
+     let* () = exec "INSERT INTO tlchi VALUES (10, 1)" in
+     let* () = exec "DELETE FROM tlpar WHERE id = 1" in
+     let* r = Db.query db "SELECT COUNT(*) FROM tlchi" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "table-level CASCADE FK deletes child"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Triggers                                                             *)
 (* ------------------------------------------------------------------ *)
 
 let test_after_insert_trigger () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
-    let* () = exec "CREATE TABLE audit (t_id INTEGER, action TEXT)" in
-    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END" in
-    let* () = exec "INSERT INTO t VALUES (1, 'hello')" in
-    let* r = Db.query db "SELECT t_id, action FROM audit" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "1 audit row" 1 (List.length rows);
-    let row = List.hd rows in
-    Alcotest.check value_testable "t_id=1"       (Db.V_int 1L)         row.(0);
-    Alcotest.check value_testable "action=INSERT" (Db.V_text "INSERT")  row.(1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+     let* () = exec "CREATE TABLE audit (t_id INTEGER, action TEXT)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id, \
+          'INSERT'); END"
+     in
+     let* () = exec "INSERT INTO t VALUES (1, 'hello')" in
+     let* r = Db.query db "SELECT t_id, action FROM audit" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "1 audit row" 1 (List.length rows);
+     let row = List.hd rows in
+     Alcotest.check value_testable "t_id=1" (Db.V_int 1L) row.(0);
+     Alcotest.check value_testable "action=INSERT" (Db.V_text "INSERT") row.(1);
+     Lwt.return_unit)
+;;
 
 let test_after_insert_two_rows () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
-    let* () = exec "CREATE TABLE audit (t_id INTEGER)" in
-    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
-    let* () = exec "INSERT INTO t VALUES (10, 'a')" in
-    let* () = exec "INSERT INTO t VALUES (20, 'b')" in
-    let* r = Db.query db "SELECT t_id FROM audit ORDER BY t_id" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "2 audit rows" 2 (List.length rows);
-    Alcotest.check value_testable "first id=10"  (Db.V_int 10L) (List.nth rows 0).(0);
-    Alcotest.check value_testable "second id=20" (Db.V_int 20L) (List.nth rows 1).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+     let* () = exec "CREATE TABLE audit (t_id INTEGER)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); \
+          END"
+     in
+     let* () = exec "INSERT INTO t VALUES (10, 'a')" in
+     let* () = exec "INSERT INTO t VALUES (20, 'b')" in
+     let* r = Db.query db "SELECT t_id FROM audit ORDER BY t_id" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "2 audit rows" 2 (List.length rows);
+     Alcotest.check value_testable "first id=10" (Db.V_int 10L) (List.nth rows 0).(0);
+     Alcotest.check value_testable "second id=20" (Db.V_int 20L) (List.nth rows 1).(0);
+     Lwt.return_unit)
+;;
 
 let test_after_delete_trigger () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER)" in
-    let* () = exec "CREATE TABLE del_log (old_id INTEGER)" in
-    let* () = exec "INSERT INTO t VALUES (5)" in
-    let* () = exec "INSERT INTO t VALUES (6)" in
-    let* () = exec "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO del_log VALUES (OLD.id); END" in
-    let* () = exec "DELETE FROM t WHERE id = 5" in
-    let* r = Db.query db "SELECT old_id FROM del_log" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "1 del_log row" 1 (List.length rows);
-    Alcotest.check value_testable "old_id=5" (Db.V_int 5L) (List.hd rows).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER)" in
+     let* () = exec "CREATE TABLE del_log (old_id INTEGER)" in
+     let* () = exec "INSERT INTO t VALUES (5)" in
+     let* () = exec "INSERT INTO t VALUES (6)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_ad AFTER DELETE ON t BEGIN INSERT INTO del_log VALUES \
+          (OLD.id); END"
+     in
+     let* () = exec "DELETE FROM t WHERE id = 5" in
+     let* r = Db.query db "SELECT old_id FROM del_log" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "1 del_log row" 1 (List.length rows);
+     Alcotest.check value_testable "old_id=5" (Db.V_int 5L) (List.hd rows).(0);
+     Lwt.return_unit)
+;;
 
 let test_after_update_trigger () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
-    let* () = exec "CREATE TABLE changes (t_id INTEGER, old_val TEXT, new_val TEXT)" in
-    let* () = exec "INSERT INTO t VALUES (1, 'original')" in
-    let* () = exec "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO changes VALUES (OLD.id, OLD.val, NEW.val); END" in
-    let* () = exec "UPDATE t SET val = 'updated' WHERE id = 1" in
-    let* r = Db.query db "SELECT t_id, old_val, new_val FROM changes" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "1 changes row" 1 (List.length rows);
-    let row = List.hd rows in
-    Alcotest.check value_testable "t_id=1"            (Db.V_int 1L)           row.(0);
-    Alcotest.check value_testable "old_val=original"  (Db.V_text "original")  row.(1);
-    Alcotest.check value_testable "new_val=updated"   (Db.V_text "updated")   row.(2);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER, val TEXT)" in
+     let* () = exec "CREATE TABLE changes (t_id INTEGER, old_val TEXT, new_val TEXT)" in
+     let* () = exec "INSERT INTO t VALUES (1, 'original')" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO changes VALUES \
+          (OLD.id, OLD.val, NEW.val); END"
+     in
+     let* () = exec "UPDATE t SET val = 'updated' WHERE id = 1" in
+     let* r = Db.query db "SELECT t_id, old_val, new_val FROM changes" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "1 changes row" 1 (List.length rows);
+     let row = List.hd rows in
+     Alcotest.check value_testable "t_id=1" (Db.V_int 1L) row.(0);
+     Alcotest.check value_testable "old_val=original" (Db.V_text "original") row.(1);
+     Alcotest.check value_testable "new_val=updated" (Db.V_text "updated") row.(2);
+     Lwt.return_unit)
+;;
 
 let test_before_insert_trigger_aborts () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER)" in
-    let* () = exec "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO no_such_table VALUES (1); END" in
-    let* result = Db.execute db "INSERT INTO t VALUES (99)" in
-    Alcotest.(check bool) "before insert trigger failure aborts" true (Result.is_error result);
-    let* r = Db.query db "SELECT COUNT(*) FROM t" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "t is empty" 0
-      (match rows with [[|Db.V_int n|]] -> Int64.to_int n | _ -> -1);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_bi BEFORE INSERT ON t BEGIN INSERT INTO no_such_table VALUES \
+          (1); END"
+     in
+     let* result = Db.execute db "INSERT INTO t VALUES (99)" in
+     Alcotest.(check bool)
+       "before insert trigger failure aborts"
+       true
+       (Result.is_error result);
+     let* r = Db.query db "SELECT COUNT(*) FROM t" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int)
+       "t is empty"
+       0
+       (match rows with
+        | [ [| Db.V_int n |] ] -> Int64.to_int n
+        | _ -> -1);
+     Lwt.return_unit)
+;;
 
 let test_when_clause_conditional () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER, score INTEGER)" in
-    let* () = exec "CREATE TABLE high_scores (t_id INTEGER)" in
-    let* () = exec "CREATE TRIGGER t_when AFTER INSERT ON t WHEN NEW.score > 100 BEGIN INSERT INTO high_scores VALUES (NEW.id); END" in
-    let* () = exec "INSERT INTO t VALUES (1, 50)" in
-    let* () = exec "INSERT INTO t VALUES (2, 150)" in
-    let* r = Db.query db "SELECT t_id FROM high_scores" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "1 high_score row" 1 (List.length rows);
-    Alcotest.check value_testable "t_id=2" (Db.V_int 2L) (List.hd rows).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER, score INTEGER)" in
+     let* () = exec "CREATE TABLE high_scores (t_id INTEGER)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_when AFTER INSERT ON t WHEN NEW.score > 100 BEGIN INSERT INTO \
+          high_scores VALUES (NEW.id); END"
+     in
+     let* () = exec "INSERT INTO t VALUES (1, 50)" in
+     let* () = exec "INSERT INTO t VALUES (2, 150)" in
+     let* r = Db.query db "SELECT t_id FROM high_scores" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "1 high_score row" 1 (List.length rows);
+     Alcotest.check value_testable "t_id=2" (Db.V_int 2L) (List.hd rows).(0);
+     Lwt.return_unit)
+;;
 
 let test_drop_trigger () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER)" in
-    let* () = exec "CREATE TABLE audit (id INTEGER)" in
-    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
-    let* () = exec "INSERT INTO t VALUES (1)" in
-    let* () = exec "DROP TRIGGER t_ai" in
-    let* () = exec "INSERT INTO t VALUES (2)" in
-    let* r = Db.query db "SELECT id FROM audit ORDER BY id" in
-    let rows = match r with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "only 1 audit row after drop" 1 (List.length rows);
-    Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER)" in
+     let* () = exec "CREATE TABLE audit (id INTEGER)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); \
+          END"
+     in
+     let* () = exec "INSERT INTO t VALUES (1)" in
+     let* () = exec "DROP TRIGGER t_ai" in
+     let* () = exec "INSERT INTO t VALUES (2)" in
+     let* r = Db.query db "SELECT id FROM audit ORDER BY id" in
+     let rows =
+       match r with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "only 1 audit row after drop" 1 (List.length rows);
+     Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0);
+     Lwt.return_unit)
+;;
 
 let test_trigger_multiple_body_stmts () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let exec sql =
-      let* r = Db.execute db sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec "CREATE TABLE t (id INTEGER)" in
-    let* () = exec "CREATE TABLE tlog1 (id INTEGER)" in
-    let* () = exec "CREATE TABLE tlog2 (id INTEGER)" in
-    let* () = exec "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO tlog1 VALUES (NEW.id); INSERT INTO tlog2 VALUES (NEW.id); END" in
-    let* () = exec "INSERT INTO t VALUES (42)" in
-    let* r1 = Db.query db "SELECT id FROM tlog1" in
-    let rows1 = match r1 with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "tlog1 has 1 row" 1 (List.length rows1);
-    Alcotest.check value_testable "tlog1 id=42" (Db.V_int 42L) (List.hd rows1).(0);
-    let* r2 = Db.query db "SELECT id FROM tlog2" in
-    let rows2 = match r2 with Ok s -> Lwt_main.run (Lwt_stream.to_list s) | Error e -> Alcotest.failf "%a" Db.pp_error e in
-    Alcotest.(check int) "tlog2 has 1 row" 1 (List.length rows2);
-    Alcotest.check value_testable "tlog2 id=42" (Db.V_int 42L) (List.hd rows2).(0);
-    Lwt.return_unit)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let exec sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec "CREATE TABLE t (id INTEGER)" in
+     let* () = exec "CREATE TABLE tlog1 (id INTEGER)" in
+     let* () = exec "CREATE TABLE tlog2 (id INTEGER)" in
+     let* () =
+       exec
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO tlog1 VALUES (NEW.id); \
+          INSERT INTO tlog2 VALUES (NEW.id); END"
+     in
+     let* () = exec "INSERT INTO t VALUES (42)" in
+     let* r1 = Db.query db "SELECT id FROM tlog1" in
+     let rows1 =
+       match r1 with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "tlog1 has 1 row" 1 (List.length rows1);
+     Alcotest.check value_testable "tlog1 id=42" (Db.V_int 42L) (List.hd rows1).(0);
+     let* r2 = Db.query db "SELECT id FROM tlog2" in
+     let rows2 =
+       match r2 with
+       | Ok s -> Lwt_main.run (Lwt_stream.to_list s)
+       | Error e -> Alcotest.failf "%a" Db.pp_error e
+     in
+     Alcotest.(check int) "tlog2 has 1 row" 1 (List.length rows2);
+     Alcotest.check value_testable "tlog2 id=42" (Db.V_int 42L) (List.hd rows2).(0);
+     Lwt.return_unit)
+;;
 
 let test_trigger_persists_across_reopen () =
   let path = Filename.temp_file "sqlocaml_test" ".db" in
-  Lwt_main.run (
-    (* First session: create table, trigger, insert *)
-    let* result1 = Db.open_file ~path in
-    let db1 = match result1 with Ok db -> db | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e in
-    let exec1 sql =
-      let* r = Db.execute db1 sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "execute: %a" Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec1 "CREATE TABLE t (id INTEGER)" in
-    let* () = exec1 "CREATE TABLE audit (id INTEGER)" in
-    let* () = exec1 "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); END" in
-    let* () = exec1 "INSERT INTO t VALUES (1)" in
-    let* () = Db.close db1 in
-    (* Second session: reopen, insert again, verify trigger fired both times *)
-    let* result2 = Db.open_file ~path in
-    let db2 = match result2 with Ok db -> db | Error e -> Alcotest.failf "reopen: %a" Db.pp_error e in
-    let exec2 sql =
-      let* r = Db.execute db2 sql in
-      (match r with Ok () -> () | Error e -> Alcotest.failf "execute2: %a" Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec2 "INSERT INTO t VALUES (2)" in
-    let* r = Db.query db2 "SELECT id FROM audit ORDER BY id" in
-    (* Drain the stream with [let*] rather than a nested [Lwt_main.run]:
+  Lwt_main.run
+    ((* First session: create table, trigger, insert *)
+     let* result1 = Db.open_file ~path in
+     let db1 =
+       match result1 with
+       | Ok db -> db
+       | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e
+     in
+     let exec1 sql =
+       let* r = Db.execute db1 sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "execute: %a" Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec1 "CREATE TABLE t (id INTEGER)" in
+     let* () = exec1 "CREATE TABLE audit (id INTEGER)" in
+     let* () =
+       exec1
+         "CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO audit VALUES (NEW.id); \
+          END"
+     in
+     let* () = exec1 "INSERT INTO t VALUES (1)" in
+     let* () = Db.close db1 in
+     (* Second session: reopen, insert again, verify trigger fired both times *)
+     let* result2 = Db.open_file ~path in
+     let db2 =
+       match result2 with
+       | Ok db -> db
+       | Error e -> Alcotest.failf "reopen: %a" Db.pp_error e
+     in
+     let exec2 sql =
+       let* r = Db.execute db2 sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "execute2: %a" Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec2 "INSERT INTO t VALUES (2)" in
+     let* r = Db.query db2 "SELECT id FROM audit ORDER BY id" in
+     (* Drain the stream with [let*] rather than a nested [Lwt_main.run]:
        after #158, [Lwt_stream.to_list] on a freshly-reopened DB pulls
        through real [Lwt_unix.pread] calls, so the inner run would clash
        with the outer one. *)
-    let* rows =
-      match r with
-      | Error e -> Alcotest.failf "query: %a" Db.pp_error e
-      | Ok s -> Lwt_stream.to_list s
-    in
-    Alcotest.(check int) "two audit rows after reopen" 2 (List.length rows);
-    let id_of row = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1 in
-    Alcotest.(check int) "first audit id = 1" 1 (id_of (List.nth rows 0));
-    Alcotest.(check int) "second audit id = 2" 2 (id_of (List.nth rows 1));
-    let* () = Db.close db2 in
-    Sys.remove path;
-    Lwt.return_unit
-  )
+     let* rows =
+       match r with
+       | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+       | Ok s -> Lwt_stream.to_list s
+     in
+     Alcotest.(check int) "two audit rows after reopen" 2 (List.length rows);
+     let id_of row =
+       match row.(0) with
+       | Db.V_int n -> Int64.to_int n
+       | _ -> -1
+     in
+     Alcotest.(check int) "first audit id = 1" 1 (id_of (List.nth rows 0));
+     Alcotest.(check int) "second audit id = 2" 2 (id_of (List.nth rows 1));
+     let* () = Db.close db2 in
+     Sys.remove path;
+     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* UPDATE/DELETE with LIMIT/OFFSET/ORDER BY tests                       *)
@@ -5291,41 +7044,63 @@ let update_delete_limit_tests =
       exec db "DELETE FROM t ORDER BY id DESC LIMIT 1";
       let rows = query_ok db "SELECT id FROM t ORDER BY id" in
       Alcotest.(check int) "2 rows remain" 2 (List.length rows);
-      let ids = List.map (fun row ->
-        match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1
-      ) rows in
-      Alcotest.(check (list int)) "ids 1,2 remain" [1;2] ids)
+      let ids =
+        List.map
+          (fun row ->
+             match row.(0) with
+             | Db.V_int n -> Int64.to_int n
+             | _ -> -1)
+          rows
+      in
+      Alcotest.(check (list int)) "ids 1,2 remain" [ 1; 2 ] ids)
   ; Alcotest.test_case "delete order limit offset" `Quick (fun () ->
       let db = fresh_db () in
       exec db "CREATE TABLE t (id INTEGER)";
       exec db "INSERT INTO t VALUES (1),(2),(3),(4),(5)";
       exec db "DELETE FROM t ORDER BY id LIMIT 2 OFFSET 1";
       let rows = query_ok db "SELECT id FROM t ORDER BY id" in
-      let ids = List.map (fun row ->
-        match row.(0) with Db.V_int n -> Int64.to_int n | _ -> -1
-      ) rows in
-      Alcotest.(check (list int)) "ids 1,4,5 remain" [1;4;5] ids)
+      let ids =
+        List.map
+          (fun row ->
+             match row.(0) with
+             | Db.V_int n -> Int64.to_int n
+             | _ -> -1)
+          rows
+      in
+      Alcotest.(check (list int)) "ids 1,4,5 remain" [ 1; 4; 5 ] ids)
   ; Alcotest.test_case "update order limit" `Quick (fun () ->
       let db = fresh_db () in
       exec db "CREATE TABLE t (id INTEGER, v TEXT)";
       exec db "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')";
       exec db "UPDATE t SET v = 'z' ORDER BY id DESC LIMIT 1";
       let rows = query_ok db "SELECT id, v FROM t ORDER BY id" in
-      let vals = List.map (fun row ->
-        match row.(1) with Db.V_text s -> s | _ -> "?"
-      ) rows in
-      Alcotest.(check (list string)) "only id=3 updated" ["a";"b";"z"] vals)
+      let vals =
+        List.map
+          (fun row ->
+             match row.(1) with
+             | Db.V_text s -> s
+             | _ -> "?")
+          rows
+      in
+      Alcotest.(check (list string)) "only id=3 updated" [ "a"; "b"; "z" ] vals)
   ; Alcotest.test_case "update limit no order" `Quick (fun () ->
       let db = fresh_db () in
       exec db "CREATE TABLE t (id INTEGER, v TEXT)";
       exec db "INSERT INTO t VALUES (1,'a'),(2,'a'),(3,'a')";
       exec db "UPDATE t SET v = 'x' LIMIT 2";
       let rows = query_ok db "SELECT v FROM t" in
-      let nx = List.length (List.filter (fun row ->
-        match row.(0) with Db.V_text s -> s = "x" | _ -> false
-      ) rows) in
+      let nx =
+        List.length
+          (List.filter
+             (fun row ->
+                match row.(0) with
+                | Db.V_text s -> s = "x"
+                | _ -> false)
+             rows)
+      in
       Alcotest.(check int) "2 rows updated" 2 nx)
   ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Case-insensitive keyword tests                                        *)
@@ -5333,44 +7108,45 @@ let update_delete_limit_tests =
 
 let case_insensitive_tests =
   [ Alcotest.test_case "lowercase select" `Quick (fun () ->
-      run (
-        let* db = Db.open_in_memory () in
-        let* _ = Db.execute db "create table t (id integer, name text)" in
-        let* _ = Db.execute db "insert into t values (1, 'alice')" in
-        let* rows = Db.query db "select id, name from t where id = 1" in
-        (match rows with
+      run
+        (let* db = Db.open_in_memory () in
+         let* _ = Db.execute db "create table t (id integer, name text)" in
+         let* _ = Db.execute db "insert into t values (1, 'alice')" in
+         let* rows = Db.query db "select id, name from t where id = 1" in
+         match rows with
          | Error e -> Alcotest.failf "query: %a" Db.pp_error e
          | Ok s ->
            let* lst = Lwt_stream.to_list s in
            Alcotest.(check int) "row count" 1 (List.length lst);
-           Lwt.return_unit)))
+           Lwt.return_unit))
   ; Alcotest.test_case "mixed case ddl" `Quick (fun () ->
-      run (
-        let* db = Db.open_in_memory () in
-        let* _ = Db.execute db "CREATE TABLE t (id INTEGER, val TEXT NOT NULL)" in
-        let* _ = Db.execute db "Insert Into t (id, val) VALUES (42, 'hello')" in
-        let* rows = Db.query db "SELECT * From t" in
-        (match rows with
+      run
+        (let* db = Db.open_in_memory () in
+         let* _ = Db.execute db "CREATE TABLE t (id INTEGER, val TEXT NOT NULL)" in
+         let* _ = Db.execute db "Insert Into t (id, val) VALUES (42, 'hello')" in
+         let* rows = Db.query db "SELECT * From t" in
+         match rows with
          | Error e -> Alcotest.failf "query: %a" Db.pp_error e
          | Ok s ->
            let* lst = Lwt_stream.to_list s in
            Alcotest.(check int) "row count" 1 (List.length lst);
-           Lwt.return_unit)))
+           Lwt.return_unit))
   ; Alcotest.test_case "lowercase update delete" `Quick (fun () ->
-      run (
-        let* db = Db.open_in_memory () in
-        let* _ = Db.execute db "create table t (id integer, v text)" in
-        let* _ = Db.execute db "insert into t values (1, 'a'), (2, 'b')" in
-        let* _ = Db.execute db "update t set v = 'x' where id = 1" in
-        let* _ = Db.execute db "delete from t where id = 2" in
-        let* rows = Db.query db "select * from t" in
-        (match rows with
+      run
+        (let* db = Db.open_in_memory () in
+         let* _ = Db.execute db "create table t (id integer, v text)" in
+         let* _ = Db.execute db "insert into t values (1, 'a'), (2, 'b')" in
+         let* _ = Db.execute db "update t set v = 'x' where id = 1" in
+         let* _ = Db.execute db "delete from t where id = 2" in
+         let* rows = Db.query db "select * from t" in
+         match rows with
          | Error e -> Alcotest.failf "query: %a" Db.pp_error e
          | Ok s ->
            let* lst = Lwt_stream.to_list s in
            Alcotest.(check int) "row count" 1 (List.length lst);
-           Lwt.return_unit)))
+           Lwt.return_unit))
   ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* DEFAULT CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME             *)
@@ -5382,19 +7158,19 @@ let default_expression_tests =
   let fixed_clock = fun () -> fixed_ts in
   let fresh_clock_db () = run (Db.open_in_memory ~clock:fixed_clock ()) in
   let exec_db db sql =
-    run (
-      let* result = Db.execute db sql in
-      (match result with
-       | Ok () -> ()
-       | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
-      Lwt.return_unit)
+    run
+      (let* result = Db.execute db sql in
+       (match result with
+        | Ok () -> ()
+        | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
+       Lwt.return_unit)
   in
   let query_db db sql =
-    run (
-      let* result = Db.query db sql in
-      match result with
-      | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
-      | Ok stream -> Lwt_stream.to_list stream)
+    run
+      (let* result = Db.query db sql in
+       match result with
+       | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
+       | Ok stream -> Lwt_stream.to_list stream)
   in
   [ Alcotest.test_case "default current_timestamp" `Quick (fun () ->
       let db = fresh_clock_db () in
@@ -5402,55 +7178,54 @@ let default_expression_tests =
       exec_db db "INSERT INTO t (id) VALUES (1)";
       let rows = query_db db "SELECT ts FROM t" in
       Alcotest.(check int) "one row" 1 (List.length rows);
-      (match rows with
-       | [| Db.V_text ts |] :: _ ->
-         Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
-       | _ -> Alcotest.fail "expected text value"))
+      match rows with
+      | [| Db.V_text ts |] :: _ ->
+        Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
+      | _ -> Alcotest.fail "expected text value")
   ; Alcotest.test_case "default current_date" `Quick (fun () ->
       let db = fresh_clock_db () in
       exec_db db "CREATE TABLE t (id INTEGER, d TEXT DEFAULT CURRENT_DATE)";
       exec_db db "INSERT INTO t (id) VALUES (42)";
       let rows = query_db db "SELECT d FROM t" in
-      (match rows with
-       | [| Db.V_text d |] :: _ ->
-         Alcotest.(check string) "date value" "2024-01-15" d
-       | _ -> Alcotest.fail "expected text value"))
+      match rows with
+      | [| Db.V_text d |] :: _ -> Alcotest.(check string) "date value" "2024-01-15" d
+      | _ -> Alcotest.fail "expected text value")
   ; Alcotest.test_case "default current_time" `Quick (fun () ->
       let db = fresh_clock_db () in
       exec_db db "CREATE TABLE t (id INTEGER, tm TEXT DEFAULT CURRENT_TIME)";
       exec_db db "INSERT INTO t (id) VALUES (1)";
       let rows = query_db db "SELECT tm FROM t" in
-      (match rows with
-       | [| Db.V_text tm |] :: _ ->
-         Alcotest.(check string) "time value" "00:00:00" tm
-       | _ -> Alcotest.fail "expected text value"))
+      match rows with
+      | [| Db.V_text tm |] :: _ -> Alcotest.(check string) "time value" "00:00:00" tm
+      | _ -> Alcotest.fail "expected text value")
   ; Alcotest.test_case "explicit value overrides default" `Quick (fun () ->
       let db = fresh_clock_db () in
       exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP)";
       exec_db db "INSERT INTO t (id, ts) VALUES (1, '2020-01-01 00:00:00')";
       let rows = query_db db "SELECT ts FROM t" in
-      (match rows with
-       | [| Db.V_text ts |] :: _ ->
-         Alcotest.(check string) "explicit value" "2020-01-01 00:00:00" ts
-       | _ -> Alcotest.fail "expected text value"))
+      match rows with
+      | [| Db.V_text ts |] :: _ ->
+        Alcotest.(check string) "explicit value" "2020-01-01 00:00:00" ts
+      | _ -> Alcotest.fail "expected text value")
   ; Alcotest.test_case "null overrides default for nullable" `Quick (fun () ->
       let db = fresh_clock_db () in
       exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT CURRENT_TIMESTAMP)";
       exec_db db "INSERT INTO t (id, ts) VALUES (1, NULL)";
       let rows = query_db db "SELECT ts FROM t" in
-      (match rows with
-       | [| Db.V_null |] :: _ -> ()
-       | _ -> Alcotest.fail "expected NULL"))
+      match rows with
+      | [| Db.V_null |] :: _ -> ()
+      | _ -> Alcotest.fail "expected NULL")
   ; Alcotest.test_case "case insensitive current_timestamp" `Quick (fun () ->
       let db = fresh_clock_db () in
       exec_db db "CREATE TABLE t (id INTEGER, ts TEXT DEFAULT current_timestamp)";
       exec_db db "INSERT INTO t (id) VALUES (1)";
       let rows = query_db db "SELECT ts FROM t" in
-      (match rows with
-       | [| Db.V_text ts |] :: _ ->
-         Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
-       | _ -> Alcotest.fail "expected text value"))
+      match rows with
+      | [| Db.V_text ts |] :: _ ->
+        Alcotest.(check string) "timestamp value" "2024-01-15 00:00:00" ts
+      | _ -> Alcotest.fail "expected text value")
   ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Partial indexes (#57)                                                *)
@@ -5465,6 +7240,7 @@ let partial_index_basic () =
   exec db "INSERT INTO t VALUES (3, 'carol', 1)";
   let rows = query_ok db "SELECT id FROM t WHERE id = 2" in
   Alcotest.(check int) "bob found via scan" 1 (List.length rows)
+;;
 
 let partial_index_skips_non_matching () =
   let db = fresh_db () in
@@ -5476,6 +7252,7 @@ let partial_index_skips_non_matching () =
   let rows = query_ok db "SELECT id FROM t" in
   Alcotest.(check int) "one row left" 1 (List.length rows);
   Alcotest.check value_testable "bob remains" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
 let partial_unique_index () =
   let db = fresh_db () in
@@ -5486,6 +7263,7 @@ let partial_unique_index () =
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
   Alcotest.(check int) "two rows" 1 (List.length rows);
   Alcotest.check value_testable "count=2" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
 let partial_unique_rejects_duplicate () =
   let db = fresh_db () in
@@ -5493,31 +7271,44 @@ let partial_unique_rejects_duplicate () =
   exec db "CREATE UNIQUE INDEX idx ON t(name) WHERE active = 1";
   exec db "INSERT INTO t VALUES (1, 'alice', 1)";
   let result = run (Db.execute db "INSERT INTO t VALUES (2, 'alice', 1)") in
-  (match err_or_fail "partial_unique_rejects_duplicate" result with
-   | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected Runtime error for partial UNIQUE violation")
+  match err_or_fail "partial_unique_rejects_duplicate" result with
+  | Db.Runtime _ -> ()
+  | _ -> Alcotest.fail "expected Runtime error for partial UNIQUE violation"
+;;
 
 let partial_index_update_membership () =
   (* When the WHERE predicate column changes, rows enter/leave the partial index *)
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, active INTEGER)";
   exec db "CREATE UNIQUE INDEX idx ON t(id) WHERE active = 1";
-  exec db "INSERT INTO t VALUES (1, 0)";  (* not in index initially *)
+  exec db "INSERT INTO t VALUES (1, 0)";
+  (* not in index initially *)
   (* Flip active from 0 to 1: row enters the index *)
   exec db "UPDATE t SET active = 1 WHERE id = 1";
   (* Now a second INSERT with same id but active=1 should violate UNIQUE *)
   let result = run (Db.execute db "INSERT INTO t VALUES (1, 1)") in
-  (match err_or_fail "partial_update_membership" result with
-   | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected UNIQUE violation after row entered partial index")
+  match err_or_fail "partial_update_membership" result with
+  | Db.Runtime _ -> ()
+  | _ -> Alcotest.fail "expected UNIQUE violation after row entered partial index"
+;;
 
-let partial_index_tests = [
-  Alcotest.test_case "partial_index_basic"               `Quick partial_index_basic;
-  Alcotest.test_case "partial_index_skips_non_matching"  `Quick partial_index_skips_non_matching;
-  Alcotest.test_case "partial_unique_index"              `Quick partial_unique_index;
-  Alcotest.test_case "partial_unique_rejects_duplicate"  `Quick partial_unique_rejects_duplicate;
-  Alcotest.test_case "partial_index_update_membership"   `Quick partial_index_update_membership;
-]
+let partial_index_tests =
+  [ Alcotest.test_case "partial_index_basic" `Quick partial_index_basic
+  ; Alcotest.test_case
+      "partial_index_skips_non_matching"
+      `Quick
+      partial_index_skips_non_matching
+  ; Alcotest.test_case "partial_unique_index" `Quick partial_unique_index
+  ; Alcotest.test_case
+      "partial_unique_rejects_duplicate"
+      `Quick
+      partial_unique_rejects_duplicate
+  ; Alcotest.test_case
+      "partial_index_update_membership"
+      `Quick
+      partial_index_update_membership
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Expression indexes (#57)                                             *)
@@ -5533,6 +7324,7 @@ let expression_index_lower () =
   let rows = query_ok db "SELECT id FROM t WHERE lower(name) = 'alice'" in
   Alcotest.(check int) "found alice" 1 (List.length rows);
   Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0)
+;;
 
 let expression_index_unique_enforced () =
   let db = fresh_db () in
@@ -5540,9 +7332,10 @@ let expression_index_unique_enforced () =
   exec db "CREATE UNIQUE INDEX idx ON t(lower(name))";
   exec db "INSERT INTO t VALUES (1, 'Alice')";
   let result = run (Db.execute db "INSERT INTO t VALUES (2, 'alice')") in
-  (match err_or_fail "expr_unique_enforced" result with
-   | Db.Runtime _ -> ()
-   | _ -> Alcotest.fail "expected Runtime error for UNIQUE expression index violation")
+  match err_or_fail "expr_unique_enforced" result with
+  | Db.Runtime _ -> ()
+  | _ -> Alcotest.fail "expected Runtime error for UNIQUE expression index violation"
+;;
 
 let expression_index_update_maintains () =
   let db = fresh_db () in
@@ -5553,6 +7346,7 @@ let expression_index_update_maintains () =
   exec db "INSERT INTO t VALUES (2, 'alice')";
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
   Alcotest.check value_testable "two rows" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
 let expression_index_delete_maintains () =
   let db = fresh_db () in
@@ -5562,7 +7356,12 @@ let expression_index_delete_maintains () =
   exec db "DELETE FROM t WHERE id = 1";
   exec db "INSERT INTO t VALUES (2, -5)";
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
-  Alcotest.check value_testable "insert after delete succeeds" (Db.V_int 1L) (List.hd rows).(0)
+  Alcotest.check
+    value_testable
+    "insert after delete succeeds"
+    (Db.V_int 1L)
+    (List.hd rows).(0)
+;;
 
 let expression_index_mixed_plain_expr () =
   (* Mixed index: one plain column + one expression column *)
@@ -5578,7 +7377,12 @@ let expression_index_mixed_plain_expr () =
    | Db.Runtime _ -> ()
    | _ -> Alcotest.fail "expected UNIQUE violation for (id, lower(name))");
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
-  Alcotest.check value_testable "two rows before violation" (Db.V_int 2L) (List.hd rows).(0)
+  Alcotest.check
+    value_testable
+    "two rows before violation"
+    (Db.V_int 2L)
+    (List.hd rows).(0)
+;;
 
 let expression_index_catalog_version2 () =
   (* Exercise the v2 catalog path: expression + partial on same index *)
@@ -5586,22 +7390,28 @@ let expression_index_catalog_version2 () =
   exec db "CREATE TABLE t (id INTEGER, name TEXT, active INTEGER)";
   exec db "CREATE UNIQUE INDEX idx ON t(lower(name)) WHERE active = 1";
   exec db "INSERT INTO t VALUES (1, 'Alice', 1)";
-  exec db "INSERT INTO t VALUES (2, 'alice', 0)";  (* inactive: not in index, no conflict *)
+  exec db "INSERT INTO t VALUES (2, 'alice', 0)";
+  (* inactive: not in index, no conflict *)
   let result = run (Db.execute db "INSERT INTO t VALUES (3, 'alice', 1)") in
   (match err_or_fail "v2_expr_partial_unique" result with
    | Db.Runtime _ -> ()
    | _ -> Alcotest.fail "active expr+partial UNIQUE should be enforced");
   let rows = query_ok db "SELECT COUNT(*) FROM t" in
   Alcotest.check value_testable "two rows" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
-let expression_index_tests = [
-  Alcotest.test_case "expression_index_lower"    `Quick expression_index_lower;
-  Alcotest.test_case "expression_index_unique"   `Quick expression_index_unique_enforced;
-  Alcotest.test_case "expression_index_update"   `Quick expression_index_update_maintains;
-  Alcotest.test_case "expression_index_delete"   `Quick expression_index_delete_maintains;
-  Alcotest.test_case "expression_index_mixed"    `Quick expression_index_mixed_plain_expr;
-  Alcotest.test_case "expression_index_v2_catalog" `Quick expression_index_catalog_version2;
-]
+let expression_index_tests =
+  [ Alcotest.test_case "expression_index_lower" `Quick expression_index_lower
+  ; Alcotest.test_case "expression_index_unique" `Quick expression_index_unique_enforced
+  ; Alcotest.test_case "expression_index_update" `Quick expression_index_update_maintains
+  ; Alcotest.test_case "expression_index_delete" `Quick expression_index_delete_maintains
+  ; Alcotest.test_case "expression_index_mixed" `Quick expression_index_mixed_plain_expr
+  ; Alcotest.test_case
+      "expression_index_v2_catalog"
+      `Quick
+      expression_index_catalog_version2
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Generated columns (#58)                                              *)
@@ -5609,7 +7419,9 @@ let expression_index_tests = [
 
 let generated_col_stored_basic () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     id    INTEGER,
     name  TEXT,
     upper_name TEXT GENERATED ALWAYS AS (upper(name)) STORED
@@ -5619,10 +7431,13 @@ let generated_col_stored_basic () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "upper_name computed" (Db.V_text "ALICE") row.(2)
+;;
 
 let generated_col_virtual_treated_as_stored () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     a INTEGER,
     b INTEGER,
     c INTEGER GENERATED ALWAYS AS (a + b)
@@ -5631,10 +7446,13 @@ let generated_col_virtual_treated_as_stored () =
   let rows = query_ok db "SELECT c FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check value_testable "c=7" (Db.V_int 7L) (List.hd rows).(0)
+;;
 
 let generated_col_multiple () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE products (
+  exec
+    db
+    {|CREATE TABLE products (
     price  REAL,
     qty    INTEGER,
     total  REAL    GENERATED ALWAYS AS (price * qty) STORED,
@@ -5644,36 +7462,46 @@ let generated_col_multiple () =
   let rows = query_ok db "SELECT total, label FROM products" in
   let row = List.hd rows in
   (match row.(0) with
-   | Db.V_real f -> Alcotest.(check bool) "total~29.97" true (Float.abs (f -. 29.97) < 0.01)
+   | Db.V_real f ->
+     Alcotest.(check bool) "total~29.97" true (Float.abs (f -. 29.97) < 0.01)
    | _ -> Alcotest.fail "expected real for total");
   Alcotest.check value_testable "label" (Db.V_text "3") row.(1)
+;;
 
 let generated_col_reject_insert () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     x INTEGER,
     y INTEGER GENERATED ALWAYS AS (x * 2) STORED
   )|};
   let result = run (Db.execute db "INSERT INTO t (x, y) VALUES (1, 99)") in
-  (match err_or_fail "generated_col_reject_insert" result with
-   | Db.Sema _ -> ()
-   | _ -> Alcotest.fail "expected Sema error when inserting into generated column")
+  match err_or_fail "generated_col_reject_insert" result with
+  | Db.Sema _ -> ()
+  | _ -> Alcotest.fail "expected Sema error when inserting into generated column"
+;;
 
 let generated_col_reject_update () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     x INTEGER,
     y INTEGER GENERATED ALWAYS AS (x + 1) STORED
   )|};
   exec db "INSERT INTO t (x) VALUES (5)";
   let result = run (Db.execute db "UPDATE t SET y = 99") in
-  (match err_or_fail "generated_col_reject_update" result with
-   | Db.Sema _ -> ()
-   | _ -> Alcotest.fail "expected Sema error when updating generated column")
+  match err_or_fail "generated_col_reject_update" result with
+  | Db.Sema _ -> ()
+  | _ -> Alcotest.fail "expected Sema error when updating generated column"
+;;
 
 let generated_col_update_dependency () =
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     id INTEGER,
     val INTEGER,
     doubled INTEGER GENERATED ALWAYS AS (val * 2) STORED
@@ -5682,11 +7510,14 @@ let generated_col_update_dependency () =
   exec db "UPDATE t SET val = 20 WHERE id = 1";
   let rows = query_ok db "SELECT doubled FROM t WHERE id = 1" in
   Alcotest.check value_testable "doubled=40" (Db.V_int 40L) (List.hd rows).(0)
+;;
 
 let generated_col_chained () =
   (* Generated column that references another generated column (in-order eval) *)
   let db = fresh_db () in
-  exec db {|CREATE TABLE t (
+  exec
+    db
+    {|CREATE TABLE t (
     x   INTEGER,
     y   INTEGER GENERATED ALWAYS AS (x + 1) STORED,
     z   INTEGER GENERATED ALWAYS AS (y * 2) STORED
@@ -5694,15 +7525,18 @@ let generated_col_chained () =
   exec db "INSERT INTO t (x) VALUES (3)";
   let rows = query_ok db "SELECT x, y, z FROM t" in
   let row = List.hd rows in
-  Alcotest.check value_testable "y=x+1=4"  (Db.V_int 4L) row.(1);
-  Alcotest.check value_testable "z=y*2=8"  (Db.V_int 8L) row.(2)
+  Alcotest.check value_testable "y=x+1=4" (Db.V_int 4L) row.(1);
+  Alcotest.check value_testable "z=y*2=8" (Db.V_int 8L) row.(2)
+;;
 
 let generated_col_fk_cascade () =
   (* FK cascade on child table with a generated column — generated col must be recomputed *)
   let db = fresh_db () in
   exec db "PRAGMA foreign_keys = 1";
   exec db "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
-  exec db {|CREATE TABLE child (
+  exec
+    db
+    {|CREATE TABLE child (
     pid INTEGER REFERENCES parent(id) ON UPDATE CASCADE,
     doubled INTEGER GENERATED ALWAYS AS (pid * 2) STORED
   )|};
@@ -5715,17 +7549,25 @@ let generated_col_fk_cascade () =
   exec db "UPDATE parent SET id = 7 WHERE id = 5";
   let rows2 = query_ok db "SELECT doubled FROM child" in
   Alcotest.check value_testable "cascade doubled=14" (Db.V_int 14L) (List.hd rows2).(0)
+;;
 
-let generated_col_tests = [
-  Alcotest.test_case "generated_stored_basic"       `Quick generated_col_stored_basic;
-  Alcotest.test_case "generated_virtual_as_stored"  `Quick generated_col_virtual_treated_as_stored;
-  Alcotest.test_case "generated_multiple"           `Quick generated_col_multiple;
-  Alcotest.test_case "generated_reject_insert"      `Quick generated_col_reject_insert;
-  Alcotest.test_case "generated_reject_update"      `Quick generated_col_reject_update;
-  Alcotest.test_case "generated_update_dependency"  `Quick generated_col_update_dependency;
-  Alcotest.test_case "generated_chained"            `Quick generated_col_chained;
-  Alcotest.test_case "generated_fk_cascade"         `Quick generated_col_fk_cascade;
-]
+let generated_col_tests =
+  [ Alcotest.test_case "generated_stored_basic" `Quick generated_col_stored_basic
+  ; Alcotest.test_case
+      "generated_virtual_as_stored"
+      `Quick
+      generated_col_virtual_treated_as_stored
+  ; Alcotest.test_case "generated_multiple" `Quick generated_col_multiple
+  ; Alcotest.test_case "generated_reject_insert" `Quick generated_col_reject_insert
+  ; Alcotest.test_case "generated_reject_update" `Quick generated_col_reject_update
+  ; Alcotest.test_case
+      "generated_update_dependency"
+      `Quick
+      generated_col_update_dependency
+  ; Alcotest.test_case "generated_chained" `Quick generated_col_chained
+  ; Alcotest.test_case "generated_fk_cascade" `Quick generated_col_fk_cascade
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 26: PRAGMA tests                                               *)
@@ -5739,6 +7581,7 @@ let pragma_foreign_keys () =
   let row = List.hd rows in
   Alcotest.(check int) "one column" 1 (Array.length row);
   Alcotest.check value_testable "foreign_keys=0" (Db.V_int 0L) row.(0)
+;;
 
 (* PRAGMA journal_mode → [["delete"]] *)
 let pragma_journal_mode () =
@@ -5748,6 +7591,7 @@ let pragma_journal_mode () =
   let row = List.hd rows in
   Alcotest.(check int) "one column" 1 (Array.length row);
   Alcotest.check value_testable "journal_mode=delete" (Db.V_text "delete") row.(0)
+;;
 
 (* PRAGMA user_version default → 0 *)
 let pragma_user_version_default () =
@@ -5756,6 +7600,7 @@ let pragma_user_version_default () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "user_version default=0" (Db.V_int 0L) row.(0)
+;;
 
 (* PRAGMA user_version = 42; PRAGMA user_version → 42 *)
 let pragma_user_version_set_get () =
@@ -5765,6 +7610,7 @@ let pragma_user_version_set_get () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "user_version=42" (Db.V_int 42L) row.(0)
+;;
 
 (* Set twice — last write wins *)
 let pragma_user_version_update () =
@@ -5774,6 +7620,7 @@ let pragma_user_version_update () =
   let rows = query_ok db "PRAGMA user_version" in
   let row = List.hd rows in
   Alcotest.check value_testable "user_version=99 (last wins)" (Db.V_int 99L) row.(0)
+;;
 
 (* Set to 0 (reset) *)
 let pragma_user_version_zero () =
@@ -5783,6 +7630,7 @@ let pragma_user_version_zero () =
   let rows = query_ok db "PRAGMA user_version" in
   let row = List.hd rows in
   Alcotest.check value_testable "user_version reset to 0" (Db.V_int 0L) row.(0)
+;;
 
 (* Table with no FKs → empty result *)
 let pragma_foreign_key_list_empty () =
@@ -5790,6 +7638,7 @@ let pragma_foreign_key_list_empty () =
   exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
   let rows = query_ok db "PRAGMA foreign_key_list(t)" in
   Alcotest.(check int) "no FK rows" 0 (List.length rows)
+;;
 
 (* Table with one FK → 1 row; check parent table, local col, parent col *)
 let pragma_foreign_key_list_one () =
@@ -5805,12 +7654,15 @@ let pragma_foreign_key_list_one () =
   Alcotest.check value_testable "local col" (Db.V_text "pid") row.(3);
   (* col 4 = parent column *)
   Alcotest.check value_testable "parent col" (Db.V_text "id") row.(4)
+;;
 
 (* FK with ON DELETE CASCADE: verify on_delete column = "CASCADE" *)
 let pragma_foreign_key_list_cascade () =
   let db = fresh_db () in
   exec db "CREATE TABLE p (id INTEGER PRIMARY KEY)";
-  exec db "CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION)";
+  exec
+    db
+    "CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION)";
   let rows = query_ok db "PRAGMA foreign_key_list(c)" in
   Alcotest.(check int) "one FK row" 1 (List.length rows);
   let row = List.hd rows in
@@ -5820,12 +7672,14 @@ let pragma_foreign_key_list_cascade () =
   Alcotest.check value_testable "on_delete=CASCADE" (Db.V_text "CASCADE") row.(6);
   (* col 7 = match = "NONE" *)
   Alcotest.check value_testable "match=NONE" (Db.V_text "NONE") row.(7)
+;;
 
 (* Non-existent table → empty result *)
 let pragma_foreign_key_list_no_table () =
   let db = fresh_db () in
   let rows = query_ok db "PRAGMA foreign_key_list(no_such_table)" in
   Alcotest.(check int) "empty for unknown table" 0 (List.length rows)
+;;
 
 (* Empty database → "ok" *)
 let pragma_integrity_check_empty () =
@@ -5834,6 +7688,7 @@ let pragma_integrity_check_empty () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+;;
 
 (* Database with tables + data + indexes → "ok" *)
 let pragma_integrity_check_clean () =
@@ -5846,38 +7701,48 @@ let pragma_integrity_check_clean () =
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+;;
 
 (* Partial index: fewer index entries than rows is expected and OK *)
 let pragma_integrity_check_partial_ok () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, val INTEGER)";
   exec db "CREATE INDEX idx_partial ON t (val) WHERE val > 5";
-  exec db "INSERT INTO t VALUES (1, 3)";   (* not indexed *)
-  exec db "INSERT INTO t VALUES (2, 10)";  (* indexed *)
+  exec db "INSERT INTO t VALUES (1, 3)";
+  (* not indexed *)
+  exec db "INSERT INTO t VALUES (2, 10)";
+  (* indexed *)
   let rows = query_ok db "PRAGMA integrity_check" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "ok" (Db.V_text "ok") row.(0)
+;;
 
 let fk_off_by_default () =
   let db = fresh_db () in
   exec db "CREATE TABLE users (id INTEGER PRIMARY KEY)";
-  exec db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+  exec
+    db
+    "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
   (* FK is OFF by default — orphan insert should succeed *)
   exec db "INSERT INTO orders VALUES (1, 999)";
   let rows = query_ok db "SELECT id, user_id FROM orders" in
   Alcotest.(check int) "1 row" 1 (List.length rows);
   Alcotest.check value_testable "user_id=999" (Db.V_int 999L) (List.hd rows).(1)
+;;
 
 let fk_on_enforces () =
   let db = fresh_db () in
   exec db "PRAGMA foreign_keys = 1";
   exec db "CREATE TABLE users (id INTEGER PRIMARY KEY)";
-  exec db "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
+  exec
+    db
+    "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id))";
   (* FK is ON — orphan insert must fail *)
-  (match Lwt_main.run (Db.execute db "INSERT INTO orders VALUES (1, 999)") with
-   | Error _ -> ()
-   | Ok ()   -> Alcotest.fail "expected FK violation error")
+  match Lwt_main.run (Db.execute db "INSERT INTO orders VALUES (1, 999)") with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "expected FK violation error"
+;;
 
 let fk_pragma_roundtrip () =
   let db = fresh_db () in
@@ -5886,25 +7751,30 @@ let fk_pragma_roundtrip () =
   exec db "PRAGMA foreign_keys = 1";
   let on = query_ok db "PRAGMA foreign_keys" in
   Alcotest.check value_testable "now on" (Db.V_int 1L) (List.hd on).(0)
+;;
 
-let pragma_tests = [
-  Alcotest.test_case "foreign_keys"               `Quick pragma_foreign_keys;
-  Alcotest.test_case "journal_mode"               `Quick pragma_journal_mode;
-  Alcotest.test_case "user_version_default"       `Quick pragma_user_version_default;
-  Alcotest.test_case "user_version_set_get"       `Quick pragma_user_version_set_get;
-  Alcotest.test_case "user_version_update"        `Quick pragma_user_version_update;
-  Alcotest.test_case "user_version_zero"          `Quick pragma_user_version_zero;
-  Alcotest.test_case "fk_list_empty"              `Quick pragma_foreign_key_list_empty;
-  Alcotest.test_case "fk_list_one"                `Quick pragma_foreign_key_list_one;
-  Alcotest.test_case "fk_list_cascade"            `Quick pragma_foreign_key_list_cascade;
-  Alcotest.test_case "fk_list_no_table"           `Quick pragma_foreign_key_list_no_table;
-  Alcotest.test_case "integrity_check_empty"      `Quick pragma_integrity_check_empty;
-  Alcotest.test_case "integrity_check_clean"      `Quick pragma_integrity_check_clean;
-  Alcotest.test_case "integrity_check_partial_ok" `Quick pragma_integrity_check_partial_ok;
-  Alcotest.test_case "fk_off_by_default"          `Quick fk_off_by_default;
-  Alcotest.test_case "fk_on_enforces"             `Quick fk_on_enforces;
-  Alcotest.test_case "fk_pragma_roundtrip"        `Quick fk_pragma_roundtrip;
-]
+let pragma_tests =
+  [ Alcotest.test_case "foreign_keys" `Quick pragma_foreign_keys
+  ; Alcotest.test_case "journal_mode" `Quick pragma_journal_mode
+  ; Alcotest.test_case "user_version_default" `Quick pragma_user_version_default
+  ; Alcotest.test_case "user_version_set_get" `Quick pragma_user_version_set_get
+  ; Alcotest.test_case "user_version_update" `Quick pragma_user_version_update
+  ; Alcotest.test_case "user_version_zero" `Quick pragma_user_version_zero
+  ; Alcotest.test_case "fk_list_empty" `Quick pragma_foreign_key_list_empty
+  ; Alcotest.test_case "fk_list_one" `Quick pragma_foreign_key_list_one
+  ; Alcotest.test_case "fk_list_cascade" `Quick pragma_foreign_key_list_cascade
+  ; Alcotest.test_case "fk_list_no_table" `Quick pragma_foreign_key_list_no_table
+  ; Alcotest.test_case "integrity_check_empty" `Quick pragma_integrity_check_empty
+  ; Alcotest.test_case "integrity_check_clean" `Quick pragma_integrity_check_clean
+  ; Alcotest.test_case
+      "integrity_check_partial_ok"
+      `Quick
+      pragma_integrity_check_partial_ok
+  ; Alcotest.test_case "fk_off_by_default" `Quick fk_off_by_default
+  ; Alcotest.test_case "fk_on_enforces" `Quick fk_on_enforces
+  ; Alcotest.test_case "fk_pragma_roundtrip" `Quick fk_pragma_roundtrip
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 27: DROP IF EXISTS                                             *)
@@ -5912,9 +7782,10 @@ let pragma_tests = [
 
 let test_drop_table_if_exists_nonexistent () =
   let db = fresh_db () in
-  (match Lwt_main.run (Db.execute db "DROP TABLE IF EXISTS no_such_table") with
-   | Ok () -> ()
-   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "DROP TABLE IF EXISTS no_such_table") with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e
+;;
 
 let test_drop_table_if_exists_existing () =
   let db = fresh_db () in
@@ -5922,36 +7793,53 @@ let test_drop_table_if_exists_existing () =
   (match Lwt_main.run (Db.execute db "DROP TABLE IF EXISTS t") with
    | Ok () -> ()
    | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e);
-  (match Lwt_main.run (Db.execute db "DROP TABLE t") with
-   | Error (Db.Sema _) -> ()
-   | Ok () -> Alcotest.fail "expected error dropping nonexistent table"
-   | Error e -> Alcotest.failf "unexpected error: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "DROP TABLE t") with
+  | Error (Db.Sema _) -> ()
+  | Ok () -> Alcotest.fail "expected error dropping nonexistent table"
+  | Error e -> Alcotest.failf "unexpected error: %a" Db.pp_error e
+;;
 
 let test_drop_index_if_exists_nonexistent () =
   let db = fresh_db () in
-  (match Lwt_main.run (Db.execute db "DROP INDEX IF EXISTS no_such_idx") with
-   | Ok () -> ()
-   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "DROP INDEX IF EXISTS no_such_idx") with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e
+;;
 
 let test_drop_view_if_exists_nonexistent () =
   let db = fresh_db () in
-  (match Lwt_main.run (Db.execute db "DROP VIEW IF EXISTS no_such_view") with
-   | Ok () -> ()
-   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "DROP VIEW IF EXISTS no_such_view") with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e
+;;
 
 let test_drop_trigger_if_exists_nonexistent () =
   let db = fresh_db () in
-  (match Lwt_main.run (Db.execute db "DROP TRIGGER IF EXISTS no_such_trig") with
-   | Ok () -> ()
-   | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "DROP TRIGGER IF EXISTS no_such_trig") with
+  | Ok () -> ()
+  | Error e -> Alcotest.failf "expected Ok but got: %a" Db.pp_error e
+;;
 
-let drop_if_exists_tests = [
-  Alcotest.test_case "drop_table_ine_nonexistent"   `Quick test_drop_table_if_exists_nonexistent;
-  Alcotest.test_case "drop_table_ine_existing"      `Quick test_drop_table_if_exists_existing;
-  Alcotest.test_case "drop_index_ine_nonexistent"   `Quick test_drop_index_if_exists_nonexistent;
-  Alcotest.test_case "drop_view_ine_nonexistent"    `Quick test_drop_view_if_exists_nonexistent;
-  Alcotest.test_case "drop_trigger_ine_nonexistent" `Quick test_drop_trigger_if_exists_nonexistent;
-]
+let drop_if_exists_tests =
+  [ Alcotest.test_case
+      "drop_table_ine_nonexistent"
+      `Quick
+      test_drop_table_if_exists_nonexistent
+  ; Alcotest.test_case "drop_table_ine_existing" `Quick test_drop_table_if_exists_existing
+  ; Alcotest.test_case
+      "drop_index_ine_nonexistent"
+      `Quick
+      test_drop_index_if_exists_nonexistent
+  ; Alcotest.test_case
+      "drop_view_ine_nonexistent"
+      `Quick
+      test_drop_view_if_exists_nonexistent
+  ; Alcotest.test_case
+      "drop_trigger_ine_nonexistent"
+      `Quick
+      test_drop_trigger_if_exists_nonexistent
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 27: Primary KEY enforcement                                    *)
@@ -5961,10 +7849,11 @@ let test_pk_col_rejects_duplicate () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)";
   exec db "INSERT INTO t VALUES (1, 'alice')";
-  (match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") with
-   | Error (Db.Runtime _) -> ()
-   | Ok () -> Alcotest.fail "expected unique constraint violation on PK"
-   | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (1, 'bob')") with
+  | Error (Db.Runtime _) -> ()
+  | Ok () -> Alcotest.fail "expected unique constraint violation on PK"
+  | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e
+;;
 
 let test_pk_col_allows_distinct () =
   let db = fresh_db () in
@@ -5973,21 +7862,24 @@ let test_pk_col_allows_distinct () =
   exec db "INSERT INTO t VALUES (2, 'bob')";
   let rows = query_ok db "SELECT id FROM t ORDER BY id" in
   Alcotest.(check int) "two rows" 2 (List.length rows)
+;;
 
 let test_pk_col_rejects_null () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
-  (match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (NULL, 1)") with
-   | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "id")) -> ()
-   | Error (Db.Runtime _) -> ()   (* also acceptable: runtime enforcement *)
-   | Ok () -> Alcotest.fail "expected NOT NULL violation on PK"
-   | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e)
+  match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (NULL, 1)") with
+  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "id")) -> ()
+  | Error (Db.Runtime _) -> () (* also acceptable: runtime enforcement *)
+  | Ok () -> Alcotest.fail "expected NOT NULL violation on PK"
+  | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e
+;;
 
-let pk_enforcement_tests = [
-  Alcotest.test_case "rejects_duplicate" `Quick test_pk_col_rejects_duplicate;
-  Alcotest.test_case "allows_distinct"   `Quick test_pk_col_allows_distinct;
-  Alcotest.test_case "rejects_null"      `Quick test_pk_col_rejects_null;
-]
+let pk_enforcement_tests =
+  [ Alcotest.test_case "rejects_duplicate" `Quick test_pk_col_rejects_duplicate
+  ; Alcotest.test_case "allows_distinct" `Quick test_pk_col_allows_distinct
+  ; Alcotest.test_case "rejects_null" `Quick test_pk_col_rejects_null
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 27: GROUP_CONCAT                                               *)
@@ -6002,12 +7894,13 @@ let test_group_concat_basic () =
   let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   let v = (List.hd rows).(0) in
-  (match v with
-   | Db.V_text s ->
-     Alcotest.(check bool) "contains a" true (String.contains s 'a');
-     Alcotest.(check bool) "contains b" true (String.contains s 'b');
-     Alcotest.(check bool) "contains c" true (String.contains s 'c')
-   | _ -> Alcotest.fail "expected text")
+  match v with
+  | Db.V_text s ->
+    Alcotest.(check bool) "contains a" true (String.contains s 'a');
+    Alcotest.(check bool) "contains b" true (String.contains s 'b');
+    Alcotest.(check bool) "contains c" true (String.contains s 'c')
+  | _ -> Alcotest.fail "expected text"
+;;
 
 let test_group_concat_custom_sep () =
   let db = fresh_db () in
@@ -6016,10 +7909,10 @@ let test_group_concat_custom_sep () =
   exec db "INSERT INTO t VALUES ('y')";
   let rows = query_ok db "SELECT GROUP_CONCAT(v, '|') FROM t" in
   let v = (List.hd rows).(0) in
-  (match v with
-   | Db.V_text s ->
-     Alcotest.(check bool) "contains pipe" true (String.contains s '|')
-   | _ -> Alcotest.fail "expected text")
+  match v with
+  | Db.V_text s -> Alcotest.(check bool) "contains pipe" true (String.contains s '|')
+  | _ -> Alcotest.fail "expected text"
+;;
 
 let test_group_concat_skips_null () =
   let db = fresh_db () in
@@ -6029,9 +7922,10 @@ let test_group_concat_skips_null () =
   exec db "INSERT INTO t VALUES ('world')";
   let rows = query_ok db "SELECT GROUP_CONCAT(v, ',') FROM t" in
   let v = (List.hd rows).(0) in
-  (match v with
-   | Db.V_text s -> Alcotest.(check string) "null skipped" "hello,world" s
-   | _ -> Alcotest.fail "expected text")
+  match v with
+  | Db.V_text s -> Alcotest.(check string) "null skipped" "hello,world" s
+  | _ -> Alcotest.fail "expected text"
+;;
 
 let test_group_concat_empty () =
   let db = fresh_db () in
@@ -6039,6 +7933,7 @@ let test_group_concat_empty () =
   let rows = query_ok db "SELECT GROUP_CONCAT(v) FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check bool) "null for empty" true ((List.hd rows).(0) = Db.V_null)
+;;
 
 let test_group_concat_with_group_by () =
   let db = fresh_db () in
@@ -6048,6 +7943,7 @@ let test_group_concat_with_group_by () =
   exec db "INSERT INTO t VALUES ('b', '3')";
   let rows = query_ok db "SELECT k, GROUP_CONCAT(v) FROM t GROUP BY k ORDER BY k" in
   Alcotest.(check int) "two groups" 2 (List.length rows)
+;;
 
 let test_string_agg_alias () =
   let db = fresh_db () in
@@ -6056,29 +7952,33 @@ let test_string_agg_alias () =
   exec db "INSERT INTO t VALUES ('q')";
   let rows = query_ok db "SELECT STRING_AGG(v, '-') FROM t" in
   let v = (List.hd rows).(0) in
-  (match v with
-   | Db.V_text s ->
-     Alcotest.(check bool) "contains dash" true (String.contains s '-')
-   | _ -> Alcotest.fail "expected text")
+  match v with
+  | Db.V_text s -> Alcotest.(check bool) "contains dash" true (String.contains s '-')
+  | _ -> Alcotest.fail "expected text"
+;;
 
-let group_concat_tests = [
-  Alcotest.test_case "basic"          `Quick test_group_concat_basic;
-  Alcotest.test_case "custom_sep"     `Quick test_group_concat_custom_sep;
-  Alcotest.test_case "skips_null"     `Quick test_group_concat_skips_null;
-  Alcotest.test_case "empty_table"    `Quick test_group_concat_empty;
-  Alcotest.test_case "with_group_by"  `Quick test_group_concat_with_group_by;
-  Alcotest.test_case "string_agg"     `Quick test_string_agg_alias;
-]
+let group_concat_tests =
+  [ Alcotest.test_case "basic" `Quick test_group_concat_basic
+  ; Alcotest.test_case "custom_sep" `Quick test_group_concat_custom_sep
+  ; Alcotest.test_case "skips_null" `Quick test_group_concat_skips_null
+  ; Alcotest.test_case "empty_table" `Quick test_group_concat_empty
+  ; Alcotest.test_case "with_group_by" `Quick test_group_concat_with_group_by
+  ; Alcotest.test_case "string_agg" `Quick test_string_agg_alias
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 28: EXPLAIN / EXPLAIN ANALYZE                                  *)
 (* ------------------------------------------------------------------ *)
 
 let contains_pat pat s =
-  let pn = String.length pat and n = String.length s in
-  let rec f i = if i > n - pn then false
-    else if String.sub s i pn = pat then true else f (i+1)
-  in f 0
+  let pn = String.length pat
+  and n = String.length s in
+  let rec f i =
+    if i > n - pn then false else if String.sub s i pn = pat then true else f (i + 1)
+  in
+  f 0
+;;
 
 let test_explain_seqscan () =
   let db = fresh_db () in
@@ -6091,23 +7991,31 @@ let test_explain_seqscan () =
   Alcotest.(check int) "5 cols" 5 (Array.length root);
   Alcotest.(check value_testable) "root parent = -1" (Db.V_int (-1L)) root.(1);
   (* Check that at least one node contains "SeqScan" *)
-  let has_seqscan = List.exists (fun row ->
-    match row.(2) with
-    | Db.V_text s -> contains_pat "SeqScan" s
-    | _ -> false
-  ) rows in
+  let has_seqscan =
+    List.exists
+      (fun row ->
+         match row.(2) with
+         | Db.V_text s -> contains_pat "SeqScan" s
+         | _ -> false)
+      rows
+  in
   Alcotest.(check bool) "has SeqScan" true has_seqscan
+;;
 
 let test_explain_nulls () =
   let db = fresh_db () in
   run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
-  let stream = run (Db.query db "EXPLAIN SELECT * FROM t WHERE id > 5") |> Result.get_ok in
+  let stream =
+    run (Db.query db "EXPLAIN SELECT * FROM t WHERE id > 5") |> Result.get_ok
+  in
   let rows = run (Lwt_stream.to_list stream) in
   Alcotest.(check bool) "multiple nodes" true (List.length rows >= 2);
-  List.iter (fun row ->
-    Alcotest.(check value_testable) "actual_rows null" Db.V_null row.(3);
-    Alcotest.(check value_testable) "elapsed_ms null" Db.V_null row.(4)
-  ) rows
+  List.iter
+    (fun row ->
+       Alcotest.(check value_testable) "actual_rows null" Db.V_null row.(3);
+       Alcotest.(check value_testable) "elapsed_ms null" Db.V_null row.(4))
+    rows
+;;
 
 let test_explain_analyze_count () =
   let db = fresh_db () in
@@ -6119,20 +8027,24 @@ let test_explain_analyze_count () =
   Alcotest.(check bool) "non-empty" true (rows <> []);
   let root = List.hd rows in
   Alcotest.(check value_testable) "actual_rows = 2" (Db.V_int 2L) root.(3);
-  (match root.(4) with
-   | Db.V_real f -> Alcotest.(check bool) "elapsed >= 0" true (f >= 0.0)
-   | _ -> Alcotest.fail "elapsed_ms not V_real")
+  match root.(4) with
+  | Db.V_real f -> Alcotest.(check bool) "elapsed >= 0" true (f >= 0.0)
+  | _ -> Alcotest.fail "elapsed_ms not V_real"
+;;
 
 let test_explain_analyze_insert () =
   let db = fresh_db () in
   run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
-  let stream = run (Db.query db "EXPLAIN ANALYZE INSERT INTO t VALUES (1)") |> Result.get_ok in
+  let stream =
+    run (Db.query db "EXPLAIN ANALYZE INSERT INTO t VALUES (1)") |> Result.get_ok
+  in
   let rows = run (Lwt_stream.to_list stream) in
   Alcotest.(check bool) "non-empty" true (rows <> []);
   let root = List.hd rows in
-  (match root.(3) with
-   | Db.V_int n -> Alcotest.(check bool) "n >= 0" true (Int64.compare n 0L >= 0)
-   | _ -> Alcotest.fail "actual_rows not V_int")
+  match root.(3) with
+  | Db.V_int n -> Alcotest.(check bool) "n >= 0" true (Int64.compare n 0L >= 0)
+  | _ -> Alcotest.fail "actual_rows not V_int"
+;;
 
 let test_explain_does_not_execute () =
   let db = fresh_db () in
@@ -6142,6 +8054,7 @@ let test_explain_does_not_execute () =
   let data_stream = run (Db.query db "SELECT * FROM t") |> Result.get_ok in
   let data = run (Lwt_stream.to_list data_stream) in
   Alcotest.(check int) "table empty after EXPLAIN INSERT" 0 (List.length data)
+;;
 
 let test_explain_analyze_as_col_names () =
   let db = fresh_db () in
@@ -6151,13 +8064,16 @@ let test_explain_analyze_as_col_names () =
   let rows = run (Lwt_stream.to_list stream) in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.(check value_testable) "explain col" (Db.V_text "plan") (List.hd rows).(0)
+;;
 
 let test_explain_analyze_child_nulls () =
   let db = fresh_db () in
   run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
   run (Db.execute db "INSERT INTO t VALUES (1)") |> ignore;
   (* Filter + SeqScan = at least 2 plan nodes *)
-  let stream = run (Db.query db "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 0") |> Result.get_ok in
+  let stream =
+    run (Db.query db "EXPLAIN ANALYZE SELECT * FROM t WHERE id > 0") |> Result.get_ok
+  in
   let rows = run (Lwt_stream.to_list stream) in
   Alcotest.(check bool) "at least 2 nodes" true (List.length rows >= 2);
   (* Root (index 0) has non-NULL actual_rows and elapsed_ms *)
@@ -6169,12 +8085,20 @@ let test_explain_analyze_child_nulls () =
    | Db.V_real _ -> ()
    | _ -> Alcotest.fail "root elapsed_ms should be V_real");
   (* All other nodes have NULL *)
-  List.iteri (fun i row ->
-    if i > 0 then begin
-      Alcotest.(check value_testable) (Printf.sprintf "node %d actual_rows null" i) Db.V_null row.(3);
-      Alcotest.(check value_testable) (Printf.sprintf "node %d elapsed_ms null" i) Db.V_null row.(4)
-    end
-  ) rows
+  List.iteri
+    (fun i row ->
+       if i > 0
+       then (
+         Alcotest.(check value_testable)
+           (Printf.sprintf "node %d actual_rows null" i)
+           Db.V_null
+           row.(3);
+         Alcotest.(check value_testable)
+           (Printf.sprintf "node %d elapsed_ms null" i)
+           Db.V_null
+           row.(4)))
+    rows
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group phase29_insert_select: INSERT INTO ... SELECT ...             *)
@@ -6188,8 +8112,9 @@ let insert_select_basic () =
   exec db "INSERT INTO dst SELECT * FROM src";
   let rows = query_ok db "SELECT id, name FROM dst ORDER BY id" in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "id=1"       (Db.V_int 1L)       (List.nth rows 0).(0);
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.nth rows 0).(0);
   Alcotest.check value_testable "name=alice" (Db.V_text "alice") (List.nth rows 0).(1)
+;;
 
 let insert_select_with_cols () =
   let db = fresh_db () in
@@ -6199,8 +8124,9 @@ let insert_select_with_cols () =
   exec db "INSERT INTO dst (id, label) SELECT id, name FROM src ORDER BY id";
   let rows = query_ok db "SELECT id, label FROM dst ORDER BY id" in
   Alcotest.(check int) "2 rows" 2 (List.length rows);
-  Alcotest.check value_testable "id=1"        (Db.V_int 1L)       (List.nth rows 0).(0);
+  Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.nth rows 0).(0);
   Alcotest.check value_testable "label=alice" (Db.V_text "alice") (List.nth rows 0).(1)
+;;
 
 let insert_select_with_where () =
   let db = fresh_db () in
@@ -6210,6 +8136,7 @@ let insert_select_with_where () =
   exec db "INSERT INTO dst SELECT id, v FROM src WHERE v > 8";
   let rows = query_ok db "SELECT count(*) FROM dst" in
   Alcotest.check value_testable "2 rows copied" (Db.V_int 2L) (List.hd rows).(0)
+;;
 
 let insert_select_empty_source () =
   let db = fresh_db () in
@@ -6218,6 +8145,7 @@ let insert_select_empty_source () =
   exec db "INSERT INTO dst SELECT id FROM src";
   let rows = query_ok db "SELECT count(*) FROM dst" in
   Alcotest.check value_testable "0 rows" (Db.V_int 0L) (List.hd rows).(0)
+;;
 
 let insert_select_self_copy () =
   let db = fresh_db () in
@@ -6226,6 +8154,7 @@ let insert_select_self_copy () =
   exec db "INSERT INTO t SELECT id + 10, v * 2 FROM t";
   let rows = query_ok db "SELECT count(*) FROM t" in
   Alcotest.check value_testable "4 rows" (Db.V_int 4L) (List.hd rows).(0)
+;;
 
 let insert_select_bad_column () =
   let db = fresh_db () in
@@ -6233,60 +8162,77 @@ let insert_select_bad_column () =
   exec db "CREATE TABLE dst (id INTEGER, name TEXT)";
   exec db "INSERT INTO src VALUES (1)";
   (* 'bad_col' does not exist in dst — should error *)
-  (match run (Db.execute db "INSERT INTO dst (bad_col) SELECT id FROM src") with
-   | Error _ -> ()
-   | Ok ()   -> Alcotest.fail "expected error for unknown column name")
+  match run (Db.execute db "INSERT INTO dst (bad_col) SELECT id FROM src") with
+  | Error _ -> ()
+  | Ok () -> Alcotest.fail "expected error for unknown column name"
+;;
 
 (* ── Phase 30: Transitive FK CASCADE ─────────────────────────── *)
 
 (** Convenience: open an in-memory DB, pass it to [f], run the Lwt monad. *)
 let with_db f =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    f db)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     f db)
+;;
 
 (** Execute SQL; fail the test on error. *)
 let exec_in db sql =
   let* r = Db.execute db sql in
   (match r with
-   | Ok ()   -> ()
+   | Ok () -> ()
    | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e);
   Lwt.return_unit
+;;
 
 (** Query and collect rows; fail on error. *)
 let query_rows db sql =
   let* r = Db.query db sql in
   match r with
   | Error e -> Alcotest.failf "query %S: %a" sql Db.pp_error e
-  | Ok s    -> Lwt_stream.to_list s
+  | Ok s -> Lwt_stream.to_list s
+;;
 
 (** Assert that the row list matches the expected list of value arrays. *)
 let check_rows label expected actual =
   Alcotest.(check int) (label ^ " row count") (List.length expected) (List.length actual);
-  List.iteri (fun i (exp_row, act_row) ->
-    Array.iteri (fun j exp_val ->
-      Alcotest.check value_testable
-        (Printf.sprintf "%s row[%d] col[%d]" label i j)
-        exp_val act_row.(j)
-    ) exp_row
-  ) (List.combine expected actual)
+  List.iteri
+    (fun i (exp_row, act_row) ->
+       Array.iteri
+         (fun j exp_val ->
+            Alcotest.check
+              value_testable
+              (Printf.sprintf "%s row[%d] col[%d]" label i j)
+              exp_val
+              act_row.(j))
+         exp_row)
+    (List.combine expected actual)
+;;
 
 (** Assert that an execute result is an error (any error). *)
 let check_error label result =
   match result with
   | Error _ -> ()
-  | Ok ()   -> Alcotest.failf "%s: expected Error, got Ok" label
+  | Ok () -> Alcotest.failf "%s: expected Error, got Ok" label
+;;
 
 (** Execute SQL and return the result (Ok/Error) without failing. *)
-let exec_err db sql =
-  Lwt_main.run (Db.execute db sql)
+let exec_err db sql = Lwt_main.run (Db.execute db sql)
 
 let test_cascade_delete_three_levels () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
-    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO a VALUES (1)" in
     let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
@@ -6296,13 +8242,22 @@ let test_cascade_delete_three_levels () =
     let* c_rows = query_rows db "SELECT id FROM c" in
     check_rows "c empty after cascade" [] c_rows;
     Lwt.return_unit)
+;;
 
 let test_cascade_delete_mixed_actions () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
-    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE SET NULL)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE SET NULL)"
+    in
     let* () = exec_in db "INSERT INTO a VALUES (1)" in
     let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
@@ -6310,8 +8265,9 @@ let test_cascade_delete_mixed_actions () =
     let* b_rows = query_rows db "SELECT id FROM b" in
     check_rows "b empty" [] b_rows;
     let* c_rows = query_rows db "SELECT id, bid FROM c" in
-    check_rows "c.bid set to null" [[| Db.V_int 100L; Db.V_null |]] c_rows;
+    check_rows "c.bid set to null" [ [| Db.V_int 100L; Db.V_null |] ] c_rows;
     Lwt.return_unit)
+;;
 
 let test_cascade_update_three_levels () =
   (* a.id -> b.aid (ON UPDATE CASCADE); b.bid -> c.c_ref (ON UPDATE CASCADE).
@@ -6324,30 +8280,50 @@ let test_cascade_update_three_levels () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db "CREATE TABLE b (bid INTEGER PRIMARY KEY, aid INTEGER, UNIQUE (aid), FOREIGN KEY (aid) REFERENCES a(id) ON UPDATE CASCADE)" in
-    let* () = exec_in db "CREATE TABLE c (cid INTEGER, c_ref INTEGER REFERENCES b(aid) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE b (bid INTEGER PRIMARY KEY, aid INTEGER, UNIQUE (aid), FOREIGN KEY \
+         (aid) REFERENCES a(id) ON UPDATE CASCADE)"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (cid INTEGER, c_ref INTEGER REFERENCES b(aid) ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO a VALUES (1)" in
     let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO c VALUES (100, 1)" in
     let* () = exec_in db "UPDATE a SET id = 99 WHERE id = 1" in
     let* b_rows = query_rows db "SELECT bid, aid FROM b ORDER BY bid" in
-    check_rows "b.aid updated" [[| Db.V_int 10L; Db.V_int 99L |]] b_rows;
+    check_rows "b.aid updated" [ [| Db.V_int 10L; Db.V_int 99L |] ] b_rows;
     let* c_rows = query_rows db "SELECT cid, c_ref FROM c ORDER BY cid" in
-    check_rows "c.c_ref transitively updated" [[| Db.V_int 100L; Db.V_int 99L |]] c_rows;
+    check_rows "c.c_ref transitively updated" [ [| Db.V_int 100L; Db.V_int 99L |] ] c_rows;
     Lwt.return_unit)
+;;
 
 let test_cascade_restrict_on_grandchild () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)" in
-    let* () = exec_in db "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE RESTRICT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE b (id INTEGER, aid INTEGER REFERENCES a(id) ON DELETE CASCADE)"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER, bid INTEGER REFERENCES b(id) ON DELETE RESTRICT)"
+    in
     let* () = exec_in db "INSERT INTO a VALUES (1)" in
     let* () = exec_in db "INSERT INTO b VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO c VALUES (100, 10)" in
-    check_error "restrict blocks transitive delete"
+    check_error
+      "restrict blocks transitive delete"
       (exec_err db "DELETE FROM a WHERE id = 1");
     Lwt.return_unit)
+;;
 
 (* ── Phase 30: FTS snippet() ─────────────────────────────────── *)
 
@@ -6356,75 +8332,109 @@ let test_fts_snippet_basic () =
     let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
     let* () = exec_in db "INSERT INTO docs VALUES ('the quick brown fox')" in
     let* () = exec_in db "INSERT INTO docs VALUES ('a lazy dog')" in
-    let* rows = query_rows db
-      "SELECT snippet(docs, 0, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'fox'" in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(docs, 0, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'fox'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
-    let snip = match (List.hd rows).(0) with
+    let snip =
+      match (List.hd rows).(0) with
       | Db.V_text s -> s
       | _ -> Alcotest.fail "expected V_text"
     in
     Alcotest.(check bool) "snippet contains [fox]" true (contains_pat "[fox]" snip);
     Lwt.return_unit)
+;;
 
 let test_fts_snippet_no_match_doc () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
     let* () = exec_in db "INSERT INTO docs VALUES ('the quick brown fox')" in
-    let* rows = query_rows db
-      "SELECT snippet(docs, 0, '<b>', '</b>', '...', 3) FROM docs WHERE docs MATCH 'zebra'" in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(docs, 0, '<b>', '</b>', '...', 3) FROM docs WHERE docs MATCH \
+         'zebra'"
+    in
     check_rows "no docs match zebra" [] rows;
     Lwt.return_unit)
+;;
 
 let test_fts_snippet_window () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(body)" in
     let* () = exec_in db "INSERT INTO docs VALUES ('hello world from ocaml')" in
-    let* rows = query_rows db
-      "SELECT snippet(docs, 0, '*', '*', '...', 1) FROM docs WHERE docs MATCH 'world'" in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(docs, 0, '*', '*', '...', 1) FROM docs WHERE docs MATCH 'world'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
-    let snip = match (List.hd rows).(0) with
+    let snip =
+      match (List.hd rows).(0) with
       | Db.V_text s -> s
       | _ -> Alcotest.fail "expected V_text"
     in
     Alcotest.(check bool) "snippet contains *world*" true (contains_pat "*world*" snip);
     Lwt.return_unit)
+;;
 
 let test_fts_snippet_with_rank () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(title, body)" in
-    let* () = exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'Learn OCaml programming')" in
-    let* rows = query_rows db
-      "SELECT title, rank, snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'ocaml'" in
+    let* () =
+      exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'Learn OCaml programming')"
+    in
+    let* rows =
+      query_rows
+        db
+        "SELECT title, rank, snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs \
+         MATCH 'ocaml'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
     let row = List.hd rows in
     (match row.(0) with
      | Db.V_text s -> Alcotest.(check string) "title" "OCaml Guide" s
      | _ -> Alcotest.fail "expected V_text for title");
-    let snip = match row.(2) with
+    let snip =
+      match row.(2) with
       | Db.V_text s -> s
       | _ -> Alcotest.fail "expected V_text for snippet"
     in
-    Alcotest.(check bool) "snippet has [OCaml] or [ocaml]" true
+    Alcotest.(check bool)
+      "snippet has [OCaml] or [ocaml]"
+      true
       (contains_pat "[OCaml]" snip || contains_pat "[ocaml]" snip);
     Lwt.return_unit)
+;;
 
 let test_fts_snippet_term_in_other_col () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE docs USING fts5(title, body)" in
-    let* () = exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'learn programming here')" in
+    let* () =
+      exec_in db "INSERT INTO docs VALUES ('OCaml Guide', 'learn programming here')"
+    in
     (* Match is on 'title' (col 0), but snippet requests col 1 ('body') where 'ocaml' does not appear *)
-    let* rows = query_rows db
-      "SELECT snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'ocaml'" in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(docs, 1, '[', ']', '...', 3) FROM docs WHERE docs MATCH 'ocaml'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
     (* col 1 does not contain 'ocaml', so snippet falls back to truncated text without tags *)
-    let snip = match (List.hd rows).(0) with
+    let snip =
+      match (List.hd rows).(0) with
       | Db.V_text s -> s
       | _ -> Alcotest.fail "expected V_text"
     in
-    Alcotest.(check bool) "no tag in fallback snippet" true
-      (not (contains_pat "[" snip) && not (contains_pat "]" snip));
+    Alcotest.(check bool)
+      "no tag in fallback snippet"
+      true
+      ((not (contains_pat "[" snip)) && not (contains_pat "]" snip));
     Alcotest.(check bool) "fallback is non-empty" true (String.length snip > 0);
     Lwt.return_unit)
+;;
 
 (* ── Phase 35 Task 4: FTS snippet() SQLite parity ─────────────── *)
 
@@ -6432,40 +8442,56 @@ let snippet_text rows =
   match (List.hd rows).(0) with
   | Db.V_text s -> s
   | _ -> Alcotest.fail "expected V_text"
+;;
 
 let test_phase35_snippet_prefix_highlights_full_token () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
     let* () = exec_in db "INSERT INTO t VALUES ('foo food foobar football')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'foo*'" in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 0, '<b>', '</b>', '...', 8) FROM t WHERE t MATCH 'foo*'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
-    Alcotest.(check string) "prefix highlight wraps entire token"
+    Alcotest.(check string)
+      "prefix highlight wraps entire token"
       "<b>foo</b> <b>food</b> <b>foobar</b> <b>football</b>"
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 let test_phase35_snippet_start_of_doc_no_leading_ellipsis () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
     let* () = exec_in db "INSERT INTO t VALUES ('foo a b c d e f')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'" in
-    Alcotest.(check string) "no leading ellipsis when window at token 0"
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'"
+    in
+    Alcotest.(check string)
+      "no leading ellipsis when window at token 0"
       "<b>foo</b> a b..."
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 let test_phase35_snippet_end_of_doc_no_trailing_ellipsis () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
     let* () = exec_in db "INSERT INTO t VALUES ('a b c d e foo')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'" in
-    Alcotest.(check string) "no trailing ellipsis when window covers last token"
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 0, '<b>', '</b>', '...', 3) FROM t WHERE t MATCH 'foo'"
+    in
+    Alcotest.(check string)
+      "no trailing ellipsis when window covers last token"
       "...d e <b>foo</b>"
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 let test_phase35_snippet_sentence_aligned_window () =
   (* Per SQLite FTS5: when the document has no internal sentence boundaries,
@@ -6474,105 +8500,153 @@ let test_phase35_snippet_sentence_aligned_window () =
      behavior that ledes are more informative than mid-doc clusters. *)
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
-    let* () = exec_in db
-      "INSERT INTO t VALUES ('aaa bbb ccc foo a b c d e f g h i j foo bar foo baz qux')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 0, '<b>', '</b>', '...', 4) FROM t WHERE t MATCH 'foo'" in
-    Alcotest.(check string) "first-sentence bonus wins"
+    let* () =
+      exec_in
+        db
+        "INSERT INTO t VALUES ('aaa bbb ccc foo a b c d e f g h i j foo bar foo baz qux')"
+    in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 0, '<b>', '</b>', '...', 4) FROM t WHERE t MATCH 'foo'"
+    in
+    Alcotest.(check string)
+      "first-sentence bonus wins"
       "aaa bbb ccc <b>foo</b>..."
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 let test_phase35_snippet_dense_cluster_wins_when_no_lede () =
   (* When the early matches are too far from start to benefit from the
      sentence-0 bonus, the dense cluster window wins. *)
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(c)" in
-    let* () = exec_in db
-      "INSERT INTO t VALUES \
-       ('w1 w2 w3 w4 w5 w6 w7 w8 w9 wa wb wc wd we wf foo bar foo baz qux')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 0, '<b>', '</b>', '...', 5) FROM t WHERE t MATCH 'foo'" in
+    let* () =
+      exec_in
+        db
+        "INSERT INTO t VALUES ('w1 w2 w3 w4 w5 w6 w7 w8 w9 wa wb wc wd we wf foo bar foo \
+         baz qux')"
+    in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 0, '<b>', '</b>', '...', 5) FROM t WHERE t MATCH 'foo'"
+    in
     (* foo at positions 15 and 17.  Window=5 around the cluster captures
        both → score 1001.  No sentence bonus reaches it (matches > nToken
        away from sentence 0).  Should center around the cluster. *)
-    Alcotest.(check string) "dense cluster picked when start too far"
+    Alcotest.(check string)
+      "dense cluster picked when start too far"
       "...wf <b>foo</b> bar <b>foo</b> baz..."
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 let test_phase35_snippet_no_match_returns_lede () =
   with_db (fun db ->
     let* () = exec_in db "CREATE VIRTUAL TABLE t USING fts5(title, body)" in
-    let* () = exec_in db
-      "INSERT INTO t VALUES ('OCaml Guide', 'learn programming here today')" in
-    let* rows = query_rows db
-      "SELECT snippet(t, 1, '[', ']', '...', 3) FROM t WHERE t MATCH 'ocaml'" in
+    let* () =
+      exec_in db "INSERT INTO t VALUES ('OCaml Guide', 'learn programming here today')"
+    in
+    let* rows =
+      query_rows
+        db
+        "SELECT snippet(t, 1, '[', ']', '...', 3) FROM t WHERE t MATCH 'ocaml'"
+    in
     (* col 1 has no matches; SQLite emits first n_token tokens. *)
-    Alcotest.(check string) "no-match fallback returns leading tokens"
+    Alcotest.(check string)
+      "no-match fallback returns leading tokens"
       "learn programming here..."
       (snippet_text rows);
     Lwt.return_unit)
+;;
 
 (* ── Phase 30: sqlite_master virtual table ────────────────────── *)
 
 let test_sqlite_master_tables () =
   with_db (fun db ->
-    let* () = exec_in db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" in
-    let* rows = query_rows db
-      "SELECT type, name FROM sqlite_master WHERE type='table' ORDER BY name" in
-    check_rows "tables" [[| Db.V_text "table"; Db.V_text "users" |]] rows;
+    let* () =
+      exec_in db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+    in
+    let* rows =
+      query_rows
+        db
+        "SELECT type, name FROM sqlite_master WHERE type='table' ORDER BY name"
+    in
+    check_rows "tables" [ [| Db.V_text "table"; Db.V_text "users" |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_indexes () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER, name TEXT)" in
     let* () = exec_in db "CREATE UNIQUE INDEX idx_name ON t (name)" in
-    let* rows = query_rows db
-      "SELECT type, name, tbl_name FROM sqlite_master \
-       WHERE type='index' AND name='idx_name' ORDER BY name" in
-    check_rows "indexes"
-      [[| Db.V_text "index"; Db.V_text "idx_name"; Db.V_text "t" |]] rows;
+    let* rows =
+      query_rows
+        db
+        "SELECT type, name, tbl_name FROM sqlite_master WHERE type='index' AND \
+         name='idx_name' ORDER BY name"
+    in
+    check_rows
+      "indexes"
+      [ [| Db.V_text "index"; Db.V_text "idx_name"; Db.V_text "t" |] ]
+      rows;
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_sql_shape () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER NOT NULL, v TEXT DEFAULT 'x')" in
-    let* rows = query_rows db
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'" in
+    let* rows =
+      query_rows db "SELECT sql FROM sqlite_master WHERE type='table' AND name='t'"
+    in
     Alcotest.(check int) "one row" 1 (List.length rows);
-    let sql = match rows with
-      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
+    let sql =
+      match rows with
+      | r :: _ ->
+        (match r.(0) with
+         | Db.V_text s -> s
+         | _ -> "")
       | [] -> ""
     in
-    Alcotest.(check bool) "sql starts with CREATE TABLE" true
-      (String.length sql >= 12 &&
-       String.sub sql 0 12 = "CREATE TABLE");
+    Alcotest.(check bool)
+      "sql starts with CREATE TABLE"
+      true
+      (String.length sql >= 12 && String.sub sql 0 12 = "CREATE TABLE");
     Alcotest.(check bool) "sql contains NOT NULL" true (contains_pat "NOT NULL" sql);
     Alcotest.(check bool) "sql contains DEFAULT" true (contains_pat "DEFAULT" sql);
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_views () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER, v TEXT)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, v FROM t" in
-    let* rows = query_rows db
-      "SELECT type, name FROM sqlite_master WHERE type='view'" in
-    check_rows "view" [[| Db.V_text "view"; Db.V_text "v" |]] rows;
+    let* rows = query_rows db "SELECT type, name FROM sqlite_master WHERE type='view'" in
+    check_rows "view" [ [| Db.V_text "view"; Db.V_text "v" |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_all_types () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER)" in
     let* () = exec_in db "CREATE INDEX idx ON t (id)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id FROM t" in
-    let* rows = query_rows db
-      "SELECT type FROM sqlite_master ORDER BY type, name" in
-    let types = List.map (fun r -> match r.(0) with Db.V_text s -> s | _ -> "") rows in
+    let* rows = query_rows db "SELECT type FROM sqlite_master ORDER BY type, name" in
+    let types =
+      List.map
+        (fun r ->
+           match r.(0) with
+           | Db.V_text s -> s
+           | _ -> "")
+        rows
+    in
     Alcotest.(check bool) "has index" true (List.mem "index" types);
     Alcotest.(check bool) "has table" true (List.mem "table" types);
-    Alcotest.(check bool) "has view"  true (List.mem "view"  types);
+    Alcotest.(check bool) "has view" true (List.mem "view" types);
     Lwt.return_unit)
+;;
 
 let test_sqlite_schema_alias () =
   with_db (fun db ->
@@ -6580,33 +8654,40 @@ let test_sqlite_schema_alias () =
     let* rows = query_rows db "SELECT COUNT(*) FROM sqlite_schema" in
     Alcotest.(check int) "schema alias works" 1 (List.length rows);
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_count_star () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE a (id INTEGER)" in
     let* () = exec_in db "CREATE TABLE b (id INTEGER)" in
-    let* rows = query_rows db
-      "SELECT COUNT(*) FROM sqlite_master WHERE type='table'" in
+    let* rows = query_rows db "SELECT COUNT(*) FROM sqlite_master WHERE type='table'" in
     Alcotest.(check int) "count row" 1 (List.length rows);
-    let n = match rows with
-      | r :: _ -> (match r.(0) with Db.V_int n -> Int64.to_int n | _ -> -1)
+    let n =
+      match rows with
+      | r :: _ ->
+        (match r.(0) with
+         | Db.V_int n -> Int64.to_int n
+         | _ -> -1)
       | [] -> -1
     in
     Alcotest.(check int) "two tables" 2 n;
     Lwt.return_unit)
+;;
 
 let test_sqlite_master_trigger_tblname () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER)" in
     let* () = exec_in db "CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END" in
-    let* rows = query_rows db
-      "SELECT type, name, tbl_name FROM sqlite_master WHERE type='trigger'" in
+    let* rows =
+      query_rows db "SELECT type, name, tbl_name FROM sqlite_master WHERE type='trigger'"
+    in
     Alcotest.(check int) "one trigger" 1 (List.length rows);
     let row = List.hd rows in
     Alcotest.check value_testable "trigger type" (Db.V_text "trigger") row.(0);
     Alcotest.check value_testable "trigger name" (Db.V_text "trg") row.(1);
     Alcotest.check value_testable "trigger tbl_name" (Db.V_text "t") row.(2);
     Lwt.return_unit)
+;;
 
 (* ── Phase 31: ALTER TABLE ADD COLUMN REFERENCES ────────────────── *)
 
@@ -6615,22 +8696,29 @@ let test_alter_add_fk_column_valid_insert () =
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "INSERT INTO parent VALUES (1)" in
     let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
-    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
+    let* () =
+      exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)"
+    in
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "INSERT INTO child VALUES (10, 1)" in
     let* rows = query_rows db "SELECT id, parent_id FROM child" in
-    check_rows "valid FK insert" [[| Db.V_int 10L; Db.V_int 1L |]] rows;
+    check_rows "valid FK insert" [ [| Db.V_int 10L; Db.V_int 1L |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_alter_add_fk_column_invalid_insert_fails () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
-    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
-    check_error "FK violation on missing parent"
+    let* () =
+      exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)"
+    in
+    check_error
+      "FK violation on missing parent"
       (exec_err db "INSERT INTO child VALUES (10, 999)");
     Lwt.return_unit)
+;;
 
 let test_alter_add_fk_inferred_pk () =
   with_db (fun db ->
@@ -6638,37 +8726,51 @@ let test_alter_add_fk_inferred_pk () =
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "INSERT INTO parent VALUES (42)" in
     let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
-    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent" in
+    let* () =
+      exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent"
+    in
     let* () = exec_in db "INSERT INTO child VALUES (1, 42)" in
     let* rows = query_rows db "SELECT id, parent_id FROM child" in
-    check_rows "inferred PK FK insert" [[| Db.V_int 1L; Db.V_int 42L |]] rows;
+    check_rows "inferred PK FK insert" [ [| Db.V_int 1L; Db.V_int 42L |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_alter_add_fk_bad_parent_table () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
-    check_error "bad parent table rejected"
-      (exec_err db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES no_such_table(id)");
+    check_error
+      "bad parent table rejected"
+      (exec_err
+         db
+         "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES no_such_table(id)");
     Lwt.return_unit)
+;;
 
 let test_alter_add_fk_bad_parent_column () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "CREATE TABLE child (x INTEGER)" in
-    check_error "bad parent column rejected"
-      (exec_err db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(no_such_col)");
+    check_error
+      "bad parent column rejected"
+      (exec_err
+         db
+         "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(no_such_col)");
     Lwt.return_unit)
+;;
 
 let test_alter_add_fk_null_is_allowed () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "CREATE TABLE child (id INTEGER)" in
-    let* () = exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)" in
+    let* () =
+      exec_in db "ALTER TABLE child ADD COLUMN parent_id INTEGER REFERENCES parent(id)"
+    in
     let* () = exec_in db "INSERT INTO child VALUES (1, NULL)" in
     let* rows = query_rows db "SELECT id, parent_id FROM child" in
-    check_rows "NULL FK allowed" [[| Db.V_int 1L; Db.V_null |]] rows;
+    check_rows "NULL FK allowed" [ [| Db.V_int 1L; Db.V_null |] ] rows;
     Lwt.return_unit)
+;;
 
 (* ── Phase 31: INSTEAD OF triggers on views ──────────────────────── *)
 
@@ -6676,38 +8778,47 @@ let test_instead_of_insert () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
-       INSERT INTO real_t VALUES (NEW.id, NEW.name); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN INSERT INTO real_t VALUES \
+         (NEW.id, NEW.name); END"
+    in
     let* () = exec_in db "INSERT INTO v VALUES (1, 'alice')" in
     let* rows = query_rows db "SELECT id, name FROM real_t" in
-    check_rows "row in real_t" [[| Db.V_int 1L; Db.V_text "alice" |]] rows;
+    check_rows "row in real_t" [ [| Db.V_int 1L; Db.V_text "alice" |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_instead_of_insert_multirow () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
-       INSERT INTO real_t VALUES (NEW.id, NEW.name); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN INSERT INTO real_t VALUES \
+         (NEW.id, NEW.name); END"
+    in
     let* () = exec_in db "INSERT INTO v VALUES (1, 'alice'), (2, 'bob')" in
     let* rows = query_rows db "SELECT COUNT(*) FROM real_t" in
-    check_rows "two rows inserted" [[| Db.V_int 2L |]] rows;
+    check_rows "two rows inserted" [ [| Db.V_int 2L |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_instead_of_delete () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
     let* () = exec_in db "INSERT INTO real_t VALUES (1, 'alice')" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF DELETE ON v BEGIN \
-       DELETE FROM real_t; END" in
+    let* () =
+      exec_in db "CREATE TRIGGER t INSTEAD OF DELETE ON v BEGIN DELETE FROM real_t; END"
+    in
     let* () = exec_in db "DELETE FROM v" in
     let* rows = query_rows db "SELECT id FROM real_t" in
     check_rows "real_t empty after delete via view" [] rows;
     Lwt.return_unit)
+;;
 
 let test_instead_of_no_trigger_fails () =
   with_db (fun db ->
@@ -6716,22 +8827,26 @@ let test_instead_of_no_trigger_fails () =
     let result = exec_err db "INSERT INTO v VALUES (1)" in
     check_error "insert into view without trigger fails" result;
     Lwt.return_unit)
+;;
 
 let test_instead_of_insert_multiple_body_stmts () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
     let* () = exec_in db "CREATE TABLE audit (entry TEXT)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN \
-       INSERT INTO real_t VALUES (NEW.id, NEW.name); \
-       INSERT INTO audit VALUES ('inserted'); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN INSERT INTO real_t VALUES \
+         (NEW.id, NEW.name); INSERT INTO audit VALUES ('inserted'); END"
+    in
     let* () = exec_in db "INSERT INTO v VALUES (42, 'carol')" in
     let* audit_rows = query_rows db "SELECT entry FROM audit" in
-    check_rows "audit has entry" [[| Db.V_text "inserted" |]] audit_rows;
+    check_rows "audit has entry" [ [| Db.V_text "inserted" |] ] audit_rows;
     let* real_rows = query_rows db "SELECT id FROM real_t" in
-    check_rows "real_t has row" [[| Db.V_int 42L |]] real_rows;
+    check_rows "real_t has row" [ [| Db.V_int 42L |] ] real_rows;
     Lwt.return_unit)
+;;
 
 (* ── Phase 32 Task 1: INSTEAD OF UPDATE triggers ──────────────────── *)
 
@@ -6740,26 +8855,34 @@ let test_instead_of_update () =
     let* () = exec_in db "CREATE TABLE real_t (id INTEGER, name TEXT)" in
     let* () = exec_in db "INSERT INTO real_t VALUES (1, 'alice')" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
-       UPDATE real_t SET name = NEW.name; END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN UPDATE real_t SET name = \
+         NEW.name; END"
+    in
     let* () = exec_in db "UPDATE v SET name = 'updated'" in
     let* rows = query_rows db "SELECT id, name FROM real_t" in
-    check_rows "row in real_t updated" [[| Db.V_int 1L; Db.V_text "updated" |]] rows;
+    check_rows "row in real_t updated" [ [| Db.V_int 1L; Db.V_text "updated" |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_instead_of_update_multi_assign () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE real_t (a TEXT, b TEXT)" in
     let* () = exec_in db "INSERT INTO real_t VALUES ('old_a', 'old_b')" in
     let* () = exec_in db "CREATE VIEW v AS SELECT a, b FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
-       UPDATE real_t SET a = NEW.a, b = NEW.b; END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN UPDATE real_t SET a = NEW.a, b = \
+         NEW.b; END"
+    in
     let* () = exec_in db "UPDATE v SET a = 'hello', b = 'world'" in
     let* rows = query_rows db "SELECT a, b FROM real_t" in
-    check_rows "both columns updated" [[| Db.V_text "hello"; Db.V_text "world" |]] rows;
+    check_rows "both columns updated" [ [| Db.V_text "hello"; Db.V_text "world" |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_instead_of_update_no_trigger_fails () =
   with_db (fun db ->
@@ -6768,6 +8891,7 @@ let test_instead_of_update_no_trigger_fails () =
     let result = exec_err db "UPDATE v SET name = 'fail'" in
     check_error "update view without trigger fails" result;
     Lwt.return_unit)
+;;
 
 let test_instead_of_update_multi_stmt_body () =
   with_db (fun db ->
@@ -6775,16 +8899,19 @@ let test_instead_of_update_multi_stmt_body () =
     let* () = exec_in db "INSERT INTO real_t VALUES (1, 'original')" in
     let* () = exec_in db "CREATE TABLE audit (action TEXT)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, name FROM real_t" in
-    let* () = exec_in db
-      "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN \
-       UPDATE real_t SET name = NEW.name; \
-       INSERT INTO audit VALUES ('updated'); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t INSTEAD OF UPDATE ON v BEGIN UPDATE real_t SET name = \
+         NEW.name; INSERT INTO audit VALUES ('updated'); END"
+    in
     let* () = exec_in db "UPDATE v SET name = 'changed'" in
     let* audit_rows = query_rows db "SELECT action FROM audit" in
-    check_rows "audit has entry" [[| Db.V_text "updated" |]] audit_rows;
+    check_rows "audit has entry" [ [| Db.V_text "updated" |] ] audit_rows;
     let* real_rows = query_rows db "SELECT name FROM real_t" in
-    check_rows "real_t updated" [[| Db.V_text "changed" |]] real_rows;
+    check_rows "real_t updated" [ [| Db.V_text "changed" |] ] real_rows;
     Lwt.return_unit)
+;;
 
 (* ── Phase 31 Task 3: scalar utility functions ──────────────────── *)
 
@@ -6792,102 +8919,130 @@ let test_hex_blob () =
   let db = fresh_db () in
   let r = query_ok db "SELECT HEX(X'DEADBEEF')" in
   Alcotest.(check row_testable) "hex blob" [| Db.V_text "DEADBEEF" |] (List.nth r 0)
+;;
 
 let test_hex_text () =
   let db = fresh_db () in
   let r = query_ok db "SELECT HEX('abc')" in
   Alcotest.(check row_testable) "hex text" [| Db.V_text "616263" |] (List.nth r 0)
+;;
 
 let test_hex_null () =
   let db = fresh_db () in
   (* SQLite HEX(NULL) returns empty string, not NULL *)
   let r = query_ok db "SELECT HEX(NULL)" in
   Alcotest.(check row_testable) "hex null" [| Db.V_text "" |] (List.nth r 0)
+;;
 
 let test_hex_int_zero () =
   let db = fresh_db () in
   (* SQLite HEX(int) hexes the decimal string: HEX(0) = HEX("0") = "30" *)
   let r = query_ok db "SELECT HEX(0)" in
   Alcotest.(check row_testable) "hex int zero" [| Db.V_text "30" |] (List.nth r 0)
+;;
 
 let test_hex_int_nonzero () =
   let db = fresh_db () in
   (* HEX(255) = HEX("255") = "323535" *)
   let r = query_ok db "SELECT HEX(255)" in
   Alcotest.(check row_testable) "hex int 255" [| Db.V_text "323535" |] (List.nth r 0)
+;;
 
 let test_char_basic () =
   let db = fresh_db () in
   let r = query_ok db "SELECT CHAR(65, 66, 67)" in
   Alcotest.(check row_testable) "char basic" [| Db.V_text "ABC" |] (List.nth r 0)
+;;
 
 let test_char_single () =
   let db = fresh_db () in
   let r = query_ok db "SELECT CHAR(65)" in
   Alcotest.(check row_testable) "char single" [| Db.V_text "A" |] (List.nth r 0)
+;;
 
 let test_char_unicode () =
   let db = fresh_db () in
   (* CHAR(9731) is U+2603 SNOWMAN; UNICODE() should round-trip back to 9731 *)
   let r = query_ok db "SELECT UNICODE(CHAR(9731))" in
-  Alcotest.(check row_testable) "char snowman unicode roundtrip" [| Db.V_int 9731L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "char snowman unicode roundtrip"
+    [| Db.V_int 9731L |]
+    (List.nth r 0)
+;;
 
 let test_unicode_basic () =
   let db = fresh_db () in
   let r = query_ok db "SELECT UNICODE('A')" in
   Alcotest.(check row_testable) "unicode A" [| Db.V_int 65L |] (List.nth r 0)
+;;
 
 let test_unicode_empty () =
   let db = fresh_db () in
   let r = query_ok db "SELECT UNICODE('')" in
   Alcotest.(check row_testable) "unicode empty" [| Db.V_null |] (List.nth r 0)
+;;
 
 let test_unicode_null () =
   let db = fresh_db () in
   let r = query_ok db "SELECT UNICODE(NULL)" in
   Alcotest.(check row_testable) "unicode null" [| Db.V_null |] (List.nth r 0)
+;;
 
 let test_printf_basic () =
   let db = fresh_db () in
   let r = query_ok db "SELECT PRINTF('hello %s %d', 'world', 42)" in
-  Alcotest.(check row_testable) "printf basic" [| Db.V_text "hello world 42" |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "printf basic"
+    [| Db.V_text "hello world 42" |]
+    (List.nth r 0)
+;;
 
 let test_printf_percent () =
   let db = fresh_db () in
   let r = query_ok db "SELECT PRINTF('100%%')" in
   Alcotest.(check row_testable) "printf percent" [| Db.V_text "100%" |] (List.nth r 0)
+;;
 
 let test_printf_q_simple () =
   let db = fresh_db () in
   (* SQLite %q escapes internal quotes but does NOT add surrounding quotes *)
   let r = query_ok db "SELECT PRINTF('%q', 'hello')" in
   Alcotest.(check row_testable) "printf %q simple" [| Db.V_text "hello" |] (List.nth r 0)
+;;
 
 let test_printf_q_with_quotes () =
   let db = fresh_db () in
   (* Use CHAR(39) to inject a single-quote character, then verify %q escapes it *)
   let r = query_ok db "SELECT PRINTF('%q', CHAR(104, 105, 39, 115))" in
-  Alcotest.(check row_testable) "printf %q with quotes" [| Db.V_text "hi''s" |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "printf %q with quotes"
+    [| Db.V_text "hi''s" |]
+    (List.nth r 0)
+;;
 
 let test_format_alias () =
   let db = fresh_db () in
   let r = query_ok db "SELECT FORMAT('val=%d', 99)" in
   Alcotest.(check row_testable) "format alias" [| Db.V_text "val=99" |] (List.nth r 0)
+;;
 
 let test_zeroblob_length () =
   let db = fresh_db () in
   let r = query_ok db "SELECT LENGTH(ZEROBLOB(5))" in
   Alcotest.(check row_testable) "zeroblob length" [| Db.V_int 5L |] (List.nth r 0)
+;;
 
 let test_zeroblob_hex () =
   let db = fresh_db () in
   let r = query_ok db "SELECT HEX(ZEROBLOB(3))" in
   Alcotest.(check row_testable) "zeroblob hex" [| Db.V_text "000000" |] (List.nth r 0)
+;;
 
 let test_zeroblob_zero_len () =
   let db = fresh_db () in
   let r = query_ok db "SELECT LENGTH(ZEROBLOB(0))" in
   Alcotest.(check row_testable) "zeroblob zero len" [| Db.V_int 0L |] (List.nth r 0)
+;;
 
 (* ── Phase 32 Task 2: CHANGES, LAST_INSERT_ROWID, RANDOM, RANDOMBLOB ── *)
 
@@ -6896,6 +9051,7 @@ let test_changes_initial () =
   exec db "CREATE TABLE t (id INTEGER)";
   let r = query_ok db "SELECT CHANGES()" in
   Alcotest.(check row_testable) "changes initial" [| Db.V_int 0L |] (List.nth r 0)
+;;
 
 let test_changes_after_insert () =
   let db = fresh_db () in
@@ -6903,6 +9059,7 @@ let test_changes_after_insert () =
   exec db "INSERT INTO t VALUES (1)";
   let r = query_ok db "SELECT CHANGES()" in
   Alcotest.(check row_testable) "changes after insert" [| Db.V_int 1L |] (List.nth r 0)
+;;
 
 let test_changes_after_delete_multiple () =
   let db = fresh_db () in
@@ -6912,13 +9069,21 @@ let test_changes_after_delete_multiple () =
   exec db "INSERT INTO t VALUES (3)";
   exec db "DELETE FROM t";
   let r = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "changes after delete multiple" [| Db.V_int 3L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "changes after delete multiple"
+    [| Db.V_int 3L |]
+    (List.nth r 0)
+;;
 
 let test_last_insert_rowid_initial () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER)";
   let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
-  Alcotest.(check row_testable) "last_insert_rowid initial" [| Db.V_int 0L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "last_insert_rowid initial"
+    [| Db.V_int 0L |]
+    (List.nth r 0)
+;;
 
 let test_last_insert_rowid_after_inserts () =
   let db = fresh_db () in
@@ -6927,23 +9092,33 @@ let test_last_insert_rowid_after_inserts () =
   exec db "INSERT INTO t VALUES (20)";
   exec db "INSERT INTO t VALUES (30)";
   let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
-  Alcotest.(check row_testable) "last_insert_rowid after inserts" [| Db.V_int 3L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "last_insert_rowid after inserts"
+    [| Db.V_int 3L |]
+    (List.nth r 0)
+;;
 
 let test_random_is_integer () =
   let db = fresh_db () in
   let r = query_ok db "SELECT TYPEOF(RANDOM())" in
-  Alcotest.(check row_testable) "random is integer" [| Db.V_text "integer" |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "random is integer"
+    [| Db.V_text "integer" |]
+    (List.nth r 0)
+;;
 
 let test_randomblob_length () =
   let db = fresh_db () in
   let r = query_ok db "SELECT LENGTH(RANDOMBLOB(8))" in
   Alcotest.(check row_testable) "randomblob length" [| Db.V_int 8L |] (List.nth r 0)
+;;
 
 let test_randomblob_zero_length () =
   (* SQLite returns 1 for RANDOMBLOB(0) — minimum 1 byte is always allocated *)
   let db = fresh_db () in
   let r = query_ok db "SELECT LENGTH(RANDOMBLOB(0))" in
   Alcotest.(check row_testable) "randomblob zero length" [| Db.V_int 1L |] (List.nth r 0)
+;;
 
 (* ── Phase 32 Task 3: multi-column FOREIGN KEY ─────────────────────── *)
 
@@ -6952,75 +9127,99 @@ let test_multi_col_fk_valid_insert () =
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
     let* () = exec_in db "INSERT INTO parent VALUES (1, 2)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y))"
+    in
     let* () = exec_in db "INSERT INTO child VALUES (1, 2)" in
     let* rows = query_rows db "SELECT COUNT(*) FROM child" in
-    check_rows "child row inserted" [[| Db.V_int 1L |]] rows;
+    check_rows "child row inserted" [ [| Db.V_int 1L |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_multi_col_fk_invalid_insert () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
     let* () = exec_in db "INSERT INTO parent VALUES (1, 2)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y))"
+    in
     let result = exec_err db "INSERT INTO child VALUES (1, 99)" in
     check_error "fk violation blocks insert" result;
     Lwt.return_unit)
+;;
 
 let test_multi_col_fk_partial_null () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y))"
+    in
     (* NULL in one FK column skips enforcement *)
     let* () = exec_in db "INSERT INTO child VALUES (1, NULL)" in
     let* rows = query_rows db "SELECT a, b FROM child" in
-    check_rows "null fk allowed" [[| Db.V_int 1L; Db.V_null |]] rows;
+    check_rows "null fk allowed" [ [| Db.V_int 1L; Db.V_null |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_multi_col_fk_cascade_delete () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
     let* () = exec_in db "INSERT INTO parent VALUES (10, 20)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y) ON DELETE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO child VALUES (10, 20)" in
     let* () = exec_in db "DELETE FROM parent WHERE x = 10" in
     let* rows = query_rows db "SELECT COUNT(*) FROM child" in
-    check_rows "child cascaded" [[| Db.V_int 0L |]] rows;
+    check_rows "child cascaded" [ [| Db.V_int 0L |] ] rows;
     Lwt.return_unit)
+;;
 
 let test_multi_col_fk_pragma_list_count () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y))" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y))"
+    in
     let* rows = query_rows db "PRAGMA foreign_key_list(child)" in
     Alcotest.(check int) "one fk row" 1 (List.length rows);
     Lwt.return_unit)
+;;
 
 let test_multi_col_fk_restrict_delete_blocks () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (x INTEGER, y INTEGER)" in
     let* () = exec_in db "INSERT INTO parent VALUES (5, 6)" in
-    let* () = exec_in db
-      "CREATE TABLE child (a INTEGER, b INTEGER, \
-       FOREIGN KEY (a, b) REFERENCES parent(x, y) ON DELETE RESTRICT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES \
+         parent(x, y) ON DELETE RESTRICT)"
+    in
     let* () = exec_in db "INSERT INTO child VALUES (5, 6)" in
     let result = exec_err db "DELETE FROM parent WHERE x = 5" in
     check_error "restrict delete blocked" result;
     Lwt.return_unit)
+;;
 
 (* ── Phase 33 Task 1: trigger improvements ───────────────────────── *)
 
@@ -7029,15 +9228,19 @@ let test_for_each_row_parses () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (id INTEGER, val TEXT)" in
     let* () = exec_in db "CREATE TABLE audit (t_id INTEGER, action TEXT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW \
-       BEGIN INSERT INTO audit VALUES (NEW.id, 'INSERT'); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER t_ai AFTER INSERT ON t FOR EACH ROW BEGIN INSERT INTO audit \
+         VALUES (NEW.id, 'INSERT'); END"
+    in
     let* () = exec_in db "INSERT INTO t VALUES (1, 'hello')" in
     let* rows = query_rows db "SELECT t_id, action FROM audit" in
     Alcotest.(check int) "1 audit row" 1 (List.length rows);
-    Alcotest.check value_testable "t_id=1"        (Db.V_int 1L)        (List.hd rows).(0);
+    Alcotest.check value_testable "t_id=1" (Db.V_int 1L) (List.hd rows).(0);
     Alcotest.check value_testable "action=INSERT" (Db.V_text "INSERT") (List.hd rows).(1);
     Lwt.return_unit)
+;;
 
 (** Nested trigger firing: INSERT on a -> INSERT on b -> INSERT on c. *)
 let test_nested_trigger_fires () =
@@ -7045,44 +9248,54 @@ let test_nested_trigger_fires () =
     let* () = exec_in db "CREATE TABLE a (n INT)" in
     let* () = exec_in db "CREATE TABLE b (src INT)" in
     let* () = exec_in db "CREATE TABLE c (src INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER ta AFTER INSERT ON a \
-       BEGIN INSERT INTO b(src) VALUES(NEW.n); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER tb AFTER INSERT ON b \
-       BEGIN INSERT INTO c(src) VALUES(NEW.src); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ta AFTER INSERT ON a BEGIN INSERT INTO b(src) VALUES(NEW.n); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO c(src) VALUES(NEW.src); \
+         END"
+    in
     let* () = exec_in db "INSERT INTO a(n) VALUES(42)" in
     let* rows = query_rows db "SELECT src FROM c" in
     Alcotest.(check int) "1 row in c" 1 (List.length rows);
     Alcotest.check value_testable "c.src=42" (Db.V_int 42L) (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (** Self-firing trigger should hit the recursion limit and surface as
     an error rather than diverge. *)
 let test_trigger_recursion_limit () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE t (n INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER tt AFTER INSERT ON t \
-       BEGIN INSERT INTO t(n) VALUES(NEW.n + 1); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tt AFTER INSERT ON t BEGIN INSERT INTO t(n) VALUES(NEW.n + 1); \
+         END"
+    in
     let* result = Db.execute db "INSERT INTO t(n) VALUES(1)" in
     check_error "trigger recursion limit reached" result;
     Lwt.return_unit)
+;;
 
 (** INSTEAD OF UPDATE: OLD.* references resolve against the view's
     matching row(s) selected under the WHERE clause. *)
 let test_instead_of_update_old_row () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
     let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
-    let* () = exec_in db
-      "CREATE TABLE audit (old_val INT, new_val INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
-         INSERT INTO audit VALUES (OLD.val, NEW.val); \
-       END" in
+    let* () = exec_in db "CREATE TABLE audit (old_val INT, new_val INT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO audit VALUES \
+         (OLD.val, NEW.val); END"
+    in
     let* () = exec_in db "UPDATE v SET val = 999 WHERE id = 1" in
     let* rows = query_rows db "SELECT old_val, new_val FROM audit" in
     Alcotest.(check int) "1 audit row" 1 (List.length rows);
@@ -7090,23 +9303,27 @@ let test_instead_of_update_old_row () =
     Alcotest.check value_testable "old_val=100" (Db.V_int 100L) row.(0);
     Alcotest.check value_testable "new_val=999" (Db.V_int 999L) row.(1);
     Lwt.return_unit)
+;;
 
 (** INSERT OR REPLACE fires DELETE triggers on rows displaced by the
     UNIQUE conflict. *)
 let test_replace_fires_delete_trigger () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
+    let* () = exec_in db "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
     let* () = exec_in db "CREATE TABLE del_audit (deleted_id INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER td AFTER DELETE ON t \
-       BEGIN INSERT INTO del_audit VALUES(OLD.id); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER td AFTER DELETE ON t BEGIN INSERT INTO del_audit VALUES(OLD.id); \
+         END"
+    in
     let* () = exec_in db "INSERT INTO t VALUES (1, 10)" in
     let* () = exec_in db "INSERT OR REPLACE INTO t VALUES (1, 99)" in
     let* rows = query_rows db "SELECT deleted_id FROM del_audit" in
     Alcotest.(check int) "1 log row" 1 (List.length rows);
     Alcotest.check value_testable "deleted_id=1" (Db.V_int 1L) (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (** UPSERT (INSERT ... ON CONFLICT DO UPDATE) fires UPDATE triggers
     with OLD bound to the pre-update row, and does NOT fire INSERT
@@ -7116,42 +9333,55 @@ let test_replace_fires_delete_trigger () =
     path fires UPDATE trigger only. *)
 let test_upsert_fires_update_trigger () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
-    let* () = exec_in db
-      "CREATE TABLE upd_audit (old_n INT, new_n INT)" in
-    let* () = exec_in db
-      "CREATE TABLE ins_audit (new_n INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER tu AFTER UPDATE ON t \
-       BEGIN INSERT INTO upd_audit VALUES(OLD.n, NEW.n); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER ti AFTER INSERT ON t \
-       BEGIN INSERT INTO ins_audit VALUES(NEW.n); END" in
+    let* () = exec_in db "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT)" in
+    let* () = exec_in db "CREATE TABLE upd_audit (old_n INT, new_n INT)" in
+    let* () = exec_in db "CREATE TABLE ins_audit (new_n INT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tu AFTER UPDATE ON t BEGIN INSERT INTO upd_audit VALUES(OLD.n, \
+         NEW.n); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ti AFTER INSERT ON t BEGIN INSERT INTO ins_audit VALUES(NEW.n); \
+         END"
+    in
     (* Non-conflicting INSERT: INSERT trigger fires, UPDATE trigger does not. *)
     let* () = exec_in db "INSERT INTO t VALUES (1, 10)" in
     let* ins_rows1 = query_rows db "SELECT new_n FROM ins_audit" in
     let* upd_rows1 = query_rows db "SELECT old_n, new_n FROM upd_audit" in
-    Alcotest.(check int) "after plain INSERT, ins_audit has 1 row" 1
+    Alcotest.(check int)
+      "after plain INSERT, ins_audit has 1 row"
+      1
       (List.length ins_rows1);
-    Alcotest.(check int) "after plain INSERT, upd_audit has 0 rows" 0
+    Alcotest.(check int)
+      "after plain INSERT, upd_audit has 0 rows"
+      0
       (List.length upd_rows1);
     (* Conflicting UPSERT taking DO UPDATE branch: UPDATE trigger fires,
        INSERT trigger does NOT fire for the conflicting row. *)
-    let* () = exec_in db
-      "INSERT INTO t VALUES (1, 99) \
-       ON CONFLICT(id) DO UPDATE SET n = excluded.n" in
+    let* () =
+      exec_in
+        db
+        "INSERT INTO t VALUES (1, 99) ON CONFLICT(id) DO UPDATE SET n = excluded.n"
+    in
     let* ins_rows2 = query_rows db "SELECT new_n FROM ins_audit" in
     let* upd_rows2 = query_rows db "SELECT old_n, new_n FROM upd_audit" in
     Alcotest.(check int)
-      "after UPSERT-update, ins_audit unchanged (still 1 row)" 1
+      "after UPSERT-update, ins_audit unchanged (still 1 row)"
+      1
       (List.length ins_rows2);
     Alcotest.(check int)
-      "after UPSERT-update, upd_audit has 1 row" 1 (List.length upd_rows2);
+      "after UPSERT-update, upd_audit has 1 row"
+      1
+      (List.length upd_rows2);
     let upd_row = List.hd upd_rows2 in
     Alcotest.check value_testable "old_n=10" (Db.V_int 10L) upd_row.(0);
     Alcotest.check value_testable "new_n=99" (Db.V_int 99L) upd_row.(1);
     Lwt.return_unit)
+;;
 
 (** Issue 1: a nested INSERT OR REPLACE inside a trigger body fires
     DELETE triggers on conflict-displaced rows.  Setup:
@@ -7161,78 +9391,80 @@ let test_upsert_fires_update_trigger () =
     transitively, the DELETE trigger on B for the displaced row. *)
 let test_nested_trigger_insert_replace_fires_delete () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE a (id INTEGER PRIMARY KEY, v INT)" in
-    let* () = exec_in db
-      "CREATE TABLE b (id INTEGER PRIMARY KEY, v INT)" in
-    let* () = exec_in db
-      "CREATE TABLE del_audit (deleted_id INT, deleted_v INT)" in
+    let* () = exec_in db "CREATE TABLE a (id INTEGER PRIMARY KEY, v INT)" in
+    let* () = exec_in db "CREATE TABLE b (id INTEGER PRIMARY KEY, v INT)" in
+    let* () = exec_in db "CREATE TABLE del_audit (deleted_id INT, deleted_v INT)" in
     (* Seed B with id=1 so the replace inside the trigger will displace it. *)
     let* () = exec_in db "INSERT INTO b VALUES (1, 100)" in
-    let* () = exec_in db
-      "CREATE TRIGGER ta AFTER INSERT ON a \
-       BEGIN INSERT OR REPLACE INTO b VALUES (NEW.id, NEW.v); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER tb AFTER DELETE ON b \
-       BEGIN INSERT INTO del_audit VALUES (OLD.id, OLD.v); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ta AFTER INSERT ON a BEGIN INSERT OR REPLACE INTO b VALUES \
+         (NEW.id, NEW.v); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tb AFTER DELETE ON b BEGIN INSERT INTO del_audit VALUES (OLD.id, \
+         OLD.v); END"
+    in
     (* Inserting (1, 999) into A should cause the body to run
        INSERT OR REPLACE INTO B(1, 999), displacing (1, 100). *)
     let* () = exec_in db "INSERT INTO a VALUES (1, 999)" in
-    let* del_rows = query_rows db
-      "SELECT deleted_id, deleted_v FROM del_audit" in
+    let* del_rows = query_rows db "SELECT deleted_id, deleted_v FROM del_audit" in
     Alcotest.(check int) "1 delete-audit row" 1 (List.length del_rows);
     let row = List.hd del_rows in
     Alcotest.check value_testable "deleted_id=1" (Db.V_int 1L) row.(0);
     Alcotest.check value_testable "deleted_v=100" (Db.V_int 100L) row.(1);
     Lwt.return_unit)
+;;
 
 (** Issue 2a: INSTEAD OF UPDATE on a view with derivable column names but
     a WHERE clause that matches zero view rows must NOT fire the trigger. *)
 let test_instead_of_update_old_row_zero_matches () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
     let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
-    let* () = exec_in db
-      "CREATE TABLE audit (old_val INT, new_val INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
-         INSERT INTO audit VALUES (OLD.val, NEW.val); \
-       END" in
+    let* () = exec_in db "CREATE TABLE audit (old_val INT, new_val INT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO audit VALUES \
+         (OLD.val, NEW.val); END"
+    in
     (* WHERE matches no rows; trigger must fire zero times. *)
     let* () = exec_in db "UPDATE v SET val = 999 WHERE id = 42" in
     let* rows = query_rows db "SELECT old_val, new_val FROM audit" in
-    Alcotest.(check int) "0 audit rows for zero-match UPDATE" 0
-      (List.length rows);
+    Alcotest.(check int) "0 audit rows for zero-match UPDATE" 0 (List.length rows);
     Lwt.return_unit)
+;;
 
 (** Issue 2b: INSTEAD OF UPDATE on a view whose projection is purely
     expressions without aliases (so [view_col_names] returns []) must
     preserve the Phase 32 fallback of firing once with OLD=NULL. *)
 let test_instead_of_update_old_row_unnamed_view_cols () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
     let* () = exec_in db "INSERT INTO base VALUES (1, 100)" in
     (* View projects an unaliased expression so column names can't be
        derived from the projection. *)
     let* () = exec_in db "CREATE VIEW v AS SELECT id + 0, val + 0 FROM base" in
-    let* () = exec_in db
-      "CREATE TABLE audit (new_val INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
-         INSERT INTO audit VALUES (NEW.val); \
-       END" in
+    let* () = exec_in db "CREATE TABLE audit (new_val INT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO audit VALUES \
+         (NEW.val); END"
+    in
     (* WHERE clause can't bind to view columns either, but trigger must
        still fire once with NEW populated and OLD=NULL (the fallback). *)
     let* () = exec_in db "UPDATE v SET val = 999" in
     let* rows = query_rows db "SELECT new_val FROM audit" in
-    Alcotest.(check int) "1 audit row (fallback fires once)" 1
-      (List.length rows);
-    Alcotest.check value_testable "new_val=999" (Db.V_int 999L)
-      (List.hd rows).(0);
+    Alcotest.(check int) "1 audit row (fallback fires once)" 1 (List.length rows);
+    Alcotest.check value_testable "new_val=999" (Db.V_int 999L) (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (** Issue 3: INSTEAD OF UPDATE with a subquery in the WHERE clause must
     not crash even though [expr_to_sql] can't serialize subqueries.
@@ -7240,31 +9472,30 @@ let test_instead_of_update_old_row_unnamed_view_cols () =
     — that's acceptable; the important thing is no Failure escapes. *)
 let test_instead_of_update_where_subquery_no_crash () =
   with_db (fun db ->
-    let* () = exec_in db
-      "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
+    let* () = exec_in db "CREATE TABLE base (id INTEGER PRIMARY KEY, val INT)" in
     let* () = exec_in db "INSERT INTO base VALUES (1, 100), (2, 200)" in
     let* () = exec_in db "CREATE TABLE pick (id INT)" in
     let* () = exec_in db "INSERT INTO pick VALUES (1)" in
     let* () = exec_in db "CREATE VIEW v AS SELECT id, val FROM base" in
-    let* () = exec_in db
-      "CREATE TABLE audit (new_val INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN \
-         INSERT INTO audit VALUES (NEW.val); \
-       END" in
+    let* () = exec_in db "CREATE TABLE audit (new_val INT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO audit VALUES \
+         (NEW.val); END"
+    in
     (* WHERE contains a subquery; expr_to_sql will fail; we must fall
        back to firing once with OLD=NULL rather than crashing. *)
-    let* r = Db.execute db
-      "UPDATE v SET val = 999 WHERE id IN (SELECT id FROM pick)" in
+    let* r = Db.execute db "UPDATE v SET val = 999 WHERE id IN (SELECT id FROM pick)" in
     (match r with
-     | Ok ()   -> ()
+     | Ok () -> ()
      | Error e -> Alcotest.failf "expected no crash: %a" Db.pp_error e);
     (* Trigger fired once (NEW.val=999, OLD=NULL fallback). *)
     let* rows = query_rows db "SELECT new_val FROM audit" in
     Alcotest.(check int) "1 audit row from fallback" 1 (List.length rows);
-    Alcotest.check value_testable "new_val=999" (Db.V_int 999L)
-      (List.hd rows).(0);
+    Alcotest.check value_testable "new_val=999" (Db.V_int 999L) (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (* ── Phase 33 Task 2: FK index-based child-row lookup ────────────── *)
 
@@ -7274,18 +9505,20 @@ let test_fk_index_cascade_delete () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE parent (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE child (id INTEGER PRIMARY KEY, \
-       parent_id INT REFERENCES parent(id) ON DELETE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INT REFERENCES parent(id) \
+         ON DELETE CASCADE)"
+    in
     let* () = exec_in db "CREATE INDEX idx_child_parent ON child(parent_id)" in
     let* () = exec_in db "INSERT INTO parent VALUES (1), (2), (3)" in
-    let* () = exec_in db
-      "INSERT INTO child VALUES (10, 1), (20, 1), (30, 2), (40, 3)" in
+    let* () = exec_in db "INSERT INTO child VALUES (10, 1), (20, 1), (30, 2), (40, 3)" in
     let* () = exec_in db "DELETE FROM parent WHERE id = 1" in
     let* rows = query_rows db "SELECT id FROM child ORDER BY id" in
-    check_rows "cascade via index"
-      [[| Db.V_int 30L |]; [| Db.V_int 40L |]] rows;
+    check_rows "cascade via index" [ [| Db.V_int 30L |]; [| Db.V_int 40L |] ] rows;
     Lwt.return_unit)
+;;
 
 (** No index present: the fallback scan path must still produce the
     correct cascade behaviour. *)
@@ -7293,55 +9526,70 @@ let test_fk_index_no_index_fallback () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
-       p_id INT REFERENCES p(id) ON DELETE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT REFERENCES p(id) ON DELETE \
+         CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
     let* () = exec_in db "INSERT INTO c VALUES (10, 1), (20, 2)" in
     let* () = exec_in db "DELETE FROM p WHERE id = 1" in
     let* rows = query_rows db "SELECT id FROM c" in
-    check_rows "cascade without index" [[| Db.V_int 20L |]] rows;
+    check_rows "cascade without index" [ [| Db.V_int 20L |] ] rows;
     Lwt.return_unit)
+;;
 
 (** Multi-column FK with a covering composite index: RESTRICT must block
     the parent delete just as the scan path does. *)
 let test_fk_index_multi_col_restrict () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
-    let* () = exec_in db
-      "CREATE TABLE p (a INT, b INT, PRIMARY KEY(a, b))" in
-    let* () = exec_in db
-      "CREATE TABLE c (id INT PRIMARY KEY, ca INT, cb INT, \
-       FOREIGN KEY(ca, cb) REFERENCES p(a, b) ON DELETE RESTRICT)" in
+    let* () = exec_in db "CREATE TABLE p (a INT, b INT, PRIMARY KEY(a, b))" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INT PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca, cb) \
+         REFERENCES p(a, b) ON DELETE RESTRICT)"
+    in
     let* () = exec_in db "CREATE INDEX idx_c_ab ON c(ca, cb)" in
     let* () = exec_in db "INSERT INTO p VALUES (1, 10), (2, 20)" in
     let* () = exec_in db "INSERT INTO c VALUES (1, 1, 10)" in
     let result = exec_err db "DELETE FROM p WHERE a = 1 AND b = 10" in
     check_error "RESTRICT fires with composite index" result;
     let* rows = query_rows db "SELECT a, b FROM p ORDER BY a" in
-    check_rows "parent still has both rows"
-      [[| Db.V_int 1L; Db.V_int 10L |];
-       [| Db.V_int 2L; Db.V_int 20L |]] rows;
+    check_rows
+      "parent still has both rows"
+      [ [| Db.V_int 1L; Db.V_int 10L |]; [| Db.V_int 2L; Db.V_int 20L |] ]
+      rows;
     Lwt.return_unit)
+;;
 
 (** SET NULL via index: parent delete should NULL out the child column. *)
 let test_fk_index_set_null () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
-       p_id INT REFERENCES p(id) ON DELETE SET NULL)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT REFERENCES p(id) ON DELETE SET \
+         NULL)"
+    in
     let* () = exec_in db "CREATE INDEX idx_c_p ON c(p_id)" in
     let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
     let* () = exec_in db "INSERT INTO c VALUES (10, 1), (20, 1), (30, 2)" in
     let* () = exec_in db "DELETE FROM p WHERE id = 1" in
     let* rows = query_rows db "SELECT id, p_id FROM c ORDER BY id" in
-    check_rows "SET NULL via index"
-      [[| Db.V_int 10L; Db.V_null |];
-       [| Db.V_int 20L; Db.V_null |];
-       [| Db.V_int 30L; Db.V_int 2L |]] rows;
+    check_rows
+      "SET NULL via index"
+      [ [| Db.V_int 10L; Db.V_null |]
+      ; [| Db.V_int 20L; Db.V_null |]
+      ; [| Db.V_int 30L; Db.V_int 2L |]
+      ]
+      rows;
     Lwt.return_unit)
+;;
 
 (** INSERT-side validation: presence check uses the parent's primary-key
     tree.  Insert a child row that references a non-existent parent —
@@ -7352,52 +9600,68 @@ let test_fk_index_update_restrict_blocks () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE c (id INTEGER PRIMARY KEY, \
-       p_id INT REFERENCES p(id) ON UPDATE RESTRICT)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT REFERENCES p(id) ON UPDATE \
+         RESTRICT)"
+    in
     let* () = exec_in db "CREATE INDEX idx_c_p ON c(p_id)" in
     let* () = exec_in db "INSERT INTO p VALUES (1), (2)" in
     let* () = exec_in db "INSERT INTO c VALUES (10, 1)" in
     let result = exec_err db "UPDATE p SET id = 99 WHERE id = 1" in
     check_error "UPDATE RESTRICT detected via index" result;
     Lwt.return_unit)
+;;
 
 (** Index path must agree with fallback scan path: same rows, same order.
     We seed the same data into two databases — one with the FK index, one
     without — and verify the post-cascade child contents are identical. *)
 let test_fk_index_consistency_with_fallback () =
-  Lwt_main.run (
-    let setup_and_delete db ~create_index =
-      let* () = exec_in db "PRAGMA foreign_keys = 1" in
-      let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT)" in
-      let* () = exec_in db
-        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT, payload TEXT, \
-         FOREIGN KEY(p_id) REFERENCES p(id) ON DELETE CASCADE)" in
-      let* () = if create_index
-                then exec_in db "CREATE INDEX idx_c_p ON c(p_id)"
-                else Lwt.return_unit in
-      let* () = exec_in db
-        "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')" in
-      let* () = exec_in db
-        "INSERT INTO c VALUES \
-         (10, 1, 'x1'), (11, 1, 'x2'), (12, 2, 'y'), \
-         (13, 3, 'z1'), (14, 3, 'z2'), (15, 4, 'w')" in
-      let* () = exec_in db "DELETE FROM p WHERE id IN (1, 3)" in
-      query_rows db "SELECT id, p_id, payload FROM c ORDER BY id"
-    in
-    let* db_idx = Db.open_in_memory () in
-    let* rows_idx = setup_and_delete db_idx ~create_index:true in
-    let* db_noi = Db.open_in_memory () in
-    let* rows_noi = setup_and_delete db_noi ~create_index:false in
-    Alcotest.(check int) "index path: row count" 2 (List.length rows_idx);
-    Alcotest.(check int) "scan  path: row count" 2 (List.length rows_noi);
-    (* Equality cell-by-cell. *)
-    List.iter2 (fun ri rn ->
-      Array.iter2 (fun a b ->
-        Alcotest.check value_testable "index path == scan path" a b
-      ) ri rn
-    ) rows_idx rows_noi;
-    Lwt.return_unit)
+  Lwt_main.run
+    (let setup_and_delete db ~create_index =
+       let* () = exec_in db "PRAGMA foreign_keys = 1" in
+       let* () = exec_in db "CREATE TABLE p (id INTEGER PRIMARY KEY, tag TEXT)" in
+       let* () =
+         exec_in
+           db
+           "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INT, payload TEXT, FOREIGN \
+            KEY(p_id) REFERENCES p(id) ON DELETE CASCADE)"
+       in
+       let* () =
+         if create_index
+         then exec_in db "CREATE INDEX idx_c_p ON c(p_id)"
+         else Lwt.return_unit
+       in
+       let* () =
+         exec_in db "INSERT INTO p VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')"
+       in
+       let* () =
+         exec_in
+           db
+           "INSERT INTO c VALUES (10, 1, 'x1'), (11, 1, 'x2'), (12, 2, 'y'), (13, 3, \
+            'z1'), (14, 3, 'z2'), (15, 4, 'w')"
+       in
+       let* () = exec_in db "DELETE FROM p WHERE id IN (1, 3)" in
+       query_rows db "SELECT id, p_id, payload FROM c ORDER BY id"
+     in
+     let* db_idx = Db.open_in_memory () in
+     let* rows_idx = setup_and_delete db_idx ~create_index:true in
+     let* db_noi = Db.open_in_memory () in
+     let* rows_noi = setup_and_delete db_noi ~create_index:false in
+     Alcotest.(check int) "index path: row count" 2 (List.length rows_idx);
+     Alcotest.(check int) "scan  path: row count" 2 (List.length rows_noi);
+     (* Equality cell-by-cell. *)
+     List.iter2
+       (fun ri rn ->
+          Array.iter2
+            (fun a b -> Alcotest.check value_testable "index path == scan path" a b)
+            ri
+            rn)
+       rows_idx
+       rows_noi;
+     Lwt.return_unit)
+;;
 
 (* ── Phase 33 Task 3: TOTAL_CHANGES() and SQLITE_VERSION() ─────────── *)
 
@@ -7405,8 +9669,8 @@ let test_total_changes_initial () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER)";
   let r = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "total_changes initial"
-    [| Db.V_int 0L |] (List.nth r 0)
+  Alcotest.(check row_testable) "total_changes initial" [| Db.V_int 0L |] (List.nth r 0)
+;;
 
 let test_total_changes_after_multi_insert () =
   let db = fresh_db () in
@@ -7414,8 +9678,11 @@ let test_total_changes_after_multi_insert () =
   exec db "INSERT INTO t VALUES (1),(2),(3)";
   exec db "INSERT INTO t VALUES (4),(5)";
   let r = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "total_changes after 5 inserts"
-    [| Db.V_int 5L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "total_changes after 5 inserts"
+    [| Db.V_int 5L |]
+    (List.nth r 0)
+;;
 
 let test_total_changes_accumulates_across_dml_kinds () =
   let db = fresh_db () in
@@ -7423,8 +9690,11 @@ let test_total_changes_accumulates_across_dml_kinds () =
   exec db "INSERT INTO t VALUES (1),(2),(3)";
   exec db "DELETE FROM t WHERE id = 1";
   let r = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "total_changes after 3 inserts + 1 delete"
-    [| Db.V_int 4L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "total_changes after 3 inserts + 1 delete"
+    [| Db.V_int 4L |]
+    (List.nth r 0)
+;;
 
 let test_total_changes_vs_changes () =
   (* TOTAL_CHANGES accumulates; CHANGES is per-statement *)
@@ -7433,24 +9703,35 @@ let test_total_changes_vs_changes () =
   exec db "INSERT INTO t VALUES (1),(2),(3)";
   exec db "INSERT INTO t VALUES (4)";
   let r_changes = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "changes is last-DML count"
-    [| Db.V_int 1L |] (List.nth r_changes 0);
+  Alcotest.(check row_testable)
+    "changes is last-DML count"
+    [| Db.V_int 1L |]
+    (List.nth r_changes 0);
   let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "total_changes is cumulative"
-    [| Db.V_int 4L |] (List.nth r_total 0)
+  Alcotest.(check row_testable)
+    "total_changes is cumulative"
+    [| Db.V_int 4L |]
+    (List.nth r_total 0)
+;;
 
 let test_sqlite_version_value () =
   let db = fresh_db () in
   let r = query_ok db "SELECT SQLITE_VERSION()" in
-  Alcotest.(check row_testable) "sqlite_version literal"
-    [| Db.V_text "3.45.0-sqlocaml" |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "sqlite_version literal"
+    [| Db.V_text "3.45.0-sqlocaml" |]
+    (List.nth r 0)
+;;
 
 let test_sqlite_version_in_expression () =
   (* Verify it can be used inside string functions *)
   let db = fresh_db () in
   let r = query_ok db "SELECT LENGTH(SQLITE_VERSION())" in
-  Alcotest.(check row_testable) "sqlite_version length"
-    [| Db.V_int (Int64.of_int (String.length "3.45.0-sqlocaml")) |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "sqlite_version length"
+    [| Db.V_int (Int64.of_int (String.length "3.45.0-sqlocaml")) |]
+    (List.nth r 0)
+;;
 
 (* ── Phase 33 Task 4: VIRTUAL vs STORED generated columns ────────────── *)
 
@@ -7461,13 +9742,15 @@ let test_virtual_gen_column_basic () =
   exec db "INSERT INTO t(a, b) VALUES (3, 4), (10, 20)";
   let rows = query_ok db "SELECT a, b, c FROM t ORDER BY a" in
   Alcotest.(check int) "two rows" 2 (List.length rows);
-  let r0 = List.nth rows 0 and r1 = List.nth rows 1 in
-  Alcotest.check value_testable "row0 a=3"  (Db.V_int 3L)  r0.(0);
-  Alcotest.check value_testable "row0 b=4"  (Db.V_int 4L)  r0.(1);
-  Alcotest.check value_testable "row0 c=7"  (Db.V_int 7L)  r0.(2);
+  let r0 = List.nth rows 0
+  and r1 = List.nth rows 1 in
+  Alcotest.check value_testable "row0 a=3" (Db.V_int 3L) r0.(0);
+  Alcotest.check value_testable "row0 b=4" (Db.V_int 4L) r0.(1);
+  Alcotest.check value_testable "row0 c=7" (Db.V_int 7L) r0.(2);
   Alcotest.check value_testable "row1 a=10" (Db.V_int 10L) r1.(0);
   Alcotest.check value_testable "row1 b=20" (Db.V_int 20L) r1.(1);
   Alcotest.check value_testable "row1 c=30" (Db.V_int 30L) r1.(2)
+;;
 
 let test_virtual_gen_changes_with_underlying () =
   (* UPDATE a base column; VIRTUAL must reflect the new value on subsequent SELECT. *)
@@ -7478,6 +9761,7 @@ let test_virtual_gen_changes_with_underlying () =
   let rows = query_ok db "SELECT c FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check value_testable "c reflects updated a" (Db.V_int 101L) (List.hd rows).(0)
+;;
 
 let test_stored_gen_column_still_works () =
   (* Regression: STORED gen cols must still persist (Task 4 must not break Task 1). *)
@@ -7487,35 +9771,44 @@ let test_stored_gen_column_still_works () =
   let rows = query_ok db "SELECT c FROM t" in
   Alcotest.(check int) "one row" 1 (List.length rows);
   Alcotest.check value_testable "stored c=12" (Db.V_int 12L) (List.hd rows).(0)
+;;
 
 let test_virtual_gen_in_update_where () =
   (* Virtual column referenced in the WHERE clause of an UPDATE — predicate must
      evaluate against the recomputed value, not the V_null placeholder. *)
   let db = fresh_db () in
-  exec db "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec
+    db
+    "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "INSERT INTO t(id, a, b) VALUES (1, 3, 4), (2, 10, 20), (3, 5, 5)";
   (* Update only the row whose virtual c = 30 (10+20). *)
   exec db "UPDATE t SET a = 0 WHERE c = 30";
   let rows = query_ok db "SELECT id, a, c FROM t ORDER BY id" in
   Alcotest.(check int) "three rows" 3 (List.length rows);
-  let r0 = List.nth rows 0 and r1 = List.nth rows 1 and r2 = List.nth rows 2 in
+  let r0 = List.nth rows 0
+  and r1 = List.nth rows 1
+  and r2 = List.nth rows 2 in
   Alcotest.check value_testable "row0 a unchanged" (Db.V_int 3L) r0.(1);
   Alcotest.check value_testable "row0 c=7" (Db.V_int 7L) r0.(2);
   Alcotest.check value_testable "row1 a zeroed" (Db.V_int 0L) r1.(1);
   Alcotest.check value_testable "row1 c=20 (0+20)" (Db.V_int 20L) r1.(2);
   Alcotest.check value_testable "row2 a unchanged" (Db.V_int 5L) r2.(1);
   Alcotest.check value_testable "row2 c=10" (Db.V_int 10L) r2.(2)
+;;
 
 let test_virtual_gen_in_delete_where () =
   (* Virtual column referenced in DELETE WHERE — predicate must recompute. *)
   let db = fresh_db () in
-  exec db "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec
+    db
+    "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "INSERT INTO t(id, a, b) VALUES (1, 3, 4), (2, 10, 20), (3, 5, 5)";
   exec db "DELETE FROM t WHERE c > 15";
   let rows = query_ok db "SELECT id FROM t ORDER BY id" in
   Alcotest.(check int) "two rows remain" 2 (List.length rows);
   Alcotest.check value_testable "id 1 remains" (Db.V_int 1L) (List.nth rows 0).(0);
   Alcotest.check value_testable "id 3 remains" (Db.V_int 3L) (List.nth rows 1).(0)
+;;
 
 let test_virtual_gen_default_is_virtual () =
   (* When neither STORED nor VIRTUAL is specified, SQLite (and our parser)
@@ -7525,7 +9818,12 @@ let test_virtual_gen_default_is_virtual () =
   exec db "INSERT INTO t(a, b) VALUES (6, 7)";
   exec db "UPDATE t SET a = 2 WHERE b = 7";
   let rows = query_ok db "SELECT c FROM t" in
-  Alcotest.check value_testable "c recomputed after UPDATE" (Db.V_int 14L) (List.hd rows).(0)
+  Alcotest.check
+    value_testable
+    "c recomputed after UPDATE"
+    (Db.V_int 14L)
+    (List.hd rows).(0)
+;;
 
 let test_virtual_in_index_now_supported () =
   (* Phase 35 Task 2: CREATE INDEX on a VIRTUAL generated column is now
@@ -7533,8 +9831,7 @@ let test_virtual_in_index_now_supported () =
      row before extracting index keys, so the index is keyed by the
      recomputed value rather than NULL. *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "CREATE INDEX idx_c ON t(c)";
   exec db "INSERT INTO t(a, b) VALUES (1, 2), (3, 4), (10, 5)";
   (* SELECT by virtual column should find rows via the index lookup. *)
@@ -7547,17 +9844,17 @@ let test_virtual_in_index_now_supported () =
   Alcotest.(check int) "one row matches c=15" 1 (List.length rows);
   let row = List.hd rows in
   Alcotest.check value_testable "a=10" (Db.V_int 10L) row.(0);
-  Alcotest.check value_testable "b=5"  (Db.V_int 5L)  row.(1);
+  Alcotest.check value_testable "b=5" (Db.V_int 5L) row.(1);
   let rows = query_ok db "SELECT a FROM t WHERE c = 99" in
   Alcotest.(check int) "no rows match c=99" 0 (List.length rows)
+;;
 
 let test_virtual_in_index_expr_now_supported () =
   (* Expression indexes that reference a VIRTUAL column by name should also
      work — the index expression is evaluated on the virtuals-populated
      scratch row. *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "CREATE INDEX idx_c1 ON t(c + 1)";
   exec db "INSERT INTO t(a, b) VALUES (1, 2), (4, 5)";
   let rows = query_ok db "SELECT a, b FROM t WHERE c + 1 = 4" in
@@ -7570,24 +9867,30 @@ let test_virtual_in_index_expr_now_supported () =
   let row = List.hd rows in
   Alcotest.check value_testable "a=4" (Db.V_int 4L) row.(0);
   Alcotest.check value_testable "b=5" (Db.V_int 5L) row.(1)
+;;
 
 let test_stored_in_index_still_allowed () =
   (* Regression: STORED generated columns are still indexable. *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)";
+  exec db "CREATE TABLE t (a INT, b INT, c INT GENERATED ALWAYS AS (a + b) STORED)";
   let result = run (Db.execute db "CREATE INDEX idx ON t(c)") in
-  Alcotest.(check bool) "CREATE INDEX on STORED still allowed"
-    true (match result with Ok _ -> true | Error _ -> false)
+  Alcotest.(check bool)
+    "CREATE INDEX on STORED still allowed"
+    true
+    (match result with
+     | Ok _ -> true
+     | Error _ -> false)
+;;
 
 let test_virtual_in_check_now_supported () =
   (* Phase 35 Task 2: CHECK that references a VIRTUAL generated column is
      now supported.  exec.ml evaluates the CHECK on a scratch row with
      VIRTUAL cells populated. *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (a INT, b INT CHECK (c > 0), \
-     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec
+    db
+    "CREATE TABLE t (a INT, b INT CHECK (c > 0), c INT GENERATED ALWAYS AS (a + b) \
+     VIRTUAL)";
   (* Row satisfying the CHECK (a + b > 0). *)
   exec db "INSERT INTO t(a, b) VALUES (3, 4)";
   let rows = query_ok db "SELECT a, b, c FROM t" in
@@ -7596,29 +9899,41 @@ let test_virtual_in_check_now_supported () =
   Alcotest.check value_testable "c=7" (Db.V_int 7L) row.(2);
   (* Row violating the CHECK (a + b = 0). *)
   let result = run (Db.execute db "INSERT INTO t(a, b) VALUES (-3, 3)") in
-  Alcotest.(check bool) "CHECK violation on virtual column rejected"
-    true (match result with Error _ -> true | Ok _ -> false);
+  Alcotest.(check bool)
+    "CHECK violation on virtual column rejected"
+    true
+    (match result with
+     | Error _ -> true
+     | Ok _ -> false);
   (* Row violating the CHECK (a + b < 0). *)
   let result = run (Db.execute db "INSERT INTO t(a, b) VALUES (-5, 1)") in
-  Alcotest.(check bool) "CHECK violation (negative) rejected"
-    true (match result with Error _ -> true | Ok _ -> false)
+  Alcotest.(check bool)
+    "CHECK violation (negative) rejected"
+    true
+    (match result with
+     | Error _ -> true
+     | Ok _ -> false)
+;;
 
 let test_virtual_in_index_update_underlying () =
   (* Phase 35 Task 2: updating a base column that feeds a VIRTUAL column
      must rewrite the index entry (delete old key, insert new key). *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (id INT, a INT, b INT, \
-     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec
+    db
+    "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "CREATE INDEX idx_c ON t(c)";
-  exec db "INSERT INTO t(id, a, b) VALUES (1, 1, 2)";  (* c = 3 *)
-  exec db "INSERT INTO t(id, a, b) VALUES (2, 5, 5)";  (* c = 10 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 1, 2)";
+  (* c = 3 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (2, 5, 5)";
+  (* c = 10 *)
   (* Before UPDATE: look up old value via index. *)
   let rows = query_ok db "SELECT id FROM t WHERE c = 3" in
   Alcotest.(check int) "row id=1 found via c=3" 1 (List.length rows);
   Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd rows).(0);
   (* UPDATE base column a, which changes c. *)
-  exec db "UPDATE t SET a = 100 WHERE id = 1";  (* c becomes 102 *)
+  exec db "UPDATE t SET a = 100 WHERE id = 1";
+  (* c becomes 102 *)
   (* Old index entry should be gone. *)
   let rows = query_ok db "SELECT id FROM t WHERE c = 3" in
   Alcotest.(check int) "old c=3 no longer found via index" 0 (List.length rows);
@@ -7629,17 +9944,20 @@ let test_virtual_in_index_update_underlying () =
   (* Untouched row remains. *)
   let rows = query_ok db "SELECT id FROM t WHERE c = 10" in
   Alcotest.(check int) "row id=2 still found via c=10" 1 (List.length rows)
+;;
 
 let test_virtual_in_index_delete_drops_entry () =
   (* Phase 35 Task 2: deleting a row must drop the corresponding index
      entry on a VIRTUAL column. *)
   let db = fresh_db () in
-  exec db
-    "CREATE TABLE t (id INT, a INT, b INT, \
-     c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
+  exec
+    db
+    "CREATE TABLE t (id INT, a INT, b INT, c INT GENERATED ALWAYS AS (a + b) VIRTUAL)";
   exec db "CREATE INDEX idx_c ON t(c)";
-  exec db "INSERT INTO t(id, a, b) VALUES (1, 2, 3)";  (* c = 5 *)
-  exec db "INSERT INTO t(id, a, b) VALUES (2, 4, 4)";  (* c = 8 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (1, 2, 3)";
+  (* c = 5 *)
+  exec db "INSERT INTO t(id, a, b) VALUES (2, 4, 4)";
+  (* c = 8 *)
   let rows = query_ok db "SELECT id FROM t WHERE c = 5" in
   Alcotest.(check int) "c=5 found before DELETE" 1 (List.length rows);
   exec db "DELETE FROM t WHERE id = 1";
@@ -7647,6 +9965,7 @@ let test_virtual_in_index_delete_drops_entry () =
   Alcotest.(check int) "c=5 not found after DELETE" 0 (List.length rows);
   let rows = query_ok db "SELECT id FROM t WHERE c = 8" in
   Alcotest.(check int) "c=8 still found" 1 (List.length rows)
+;;
 
 (* ── Phase 34 Task 1: PRAGMA recursive_triggers ───────────────── *)
 
@@ -7657,15 +9976,21 @@ let test_recursive_triggers_default_on () =
   with_db (fun db ->
     let* () = exec_in db "CREATE TABLE a (n INT)" in
     let* () = exec_in db "CREATE TABLE b (m INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER ta AFTER INSERT ON a \
-       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER tb AFTER INSERT ON b \
-       BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ta AFTER INSERT ON a BEGIN INSERT INTO b(m) VALUES(NEW.n); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); \
+         END"
+    in
     let* result = Db.execute db "INSERT INTO a(n) VALUES(1)" in
     check_error "recursive chain hits limit with default ON" result;
     Lwt.return_unit)
+;;
 
 (** With recursive_triggers OFF, the top-level trigger still fires
     once but nested DML inside the trigger body does not fire further
@@ -7675,12 +10000,17 @@ let test_recursive_triggers_off () =
     let* () = exec_in db "PRAGMA recursive_triggers = OFF" in
     let* () = exec_in db "CREATE TABLE a (n INT)" in
     let* () = exec_in db "CREATE TABLE b (m INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER ta AFTER INSERT ON a \
-       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER tb AFTER INSERT ON b \
-       BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ta AFTER INSERT ON a BEGIN INSERT INTO b(m) VALUES(NEW.n); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO a(n) VALUES(NEW.m + 100); \
+         END"
+    in
     let* () = exec_in db "INSERT INTO a(n) VALUES(1)" in
     let* rows_a = query_rows db "SELECT n FROM a" in
     let* rows_b = query_rows db "SELECT m FROM b" in
@@ -7688,8 +10018,9 @@ let test_recursive_triggers_off () =
        That nested INSERT into b is inside the trigger body so tb does
        NOT fire. So a has its original row, b has the one inserted row. *)
     Alcotest.(check int) "a has only original row" 1 (List.length rows_a);
-    Alcotest.(check int) "b has one inserted row"  1 (List.length rows_b);
+    Alcotest.(check int) "b has one inserted row" 1 (List.length rows_b);
     Lwt.return_unit)
+;;
 
 (** PRAGMA recursive_triggers (read) returns 1 by default and reflects
     the current flag after a write. *)
@@ -7697,17 +10028,15 @@ let test_recursive_triggers_pragma_read () =
   with_db (fun db ->
     let* rows = query_rows db "PRAGMA recursive_triggers" in
     Alcotest.(check int) "one row" 1 (List.length rows);
-    Alcotest.check value_testable "default reads 1"
-      (Db.V_int 1L) (List.hd rows).(0);
+    Alcotest.check value_testable "default reads 1" (Db.V_int 1L) (List.hd rows).(0);
     let* () = exec_in db "PRAGMA recursive_triggers = OFF" in
     let* rows = query_rows db "PRAGMA recursive_triggers" in
-    Alcotest.check value_testable "after OFF reads 0"
-      (Db.V_int 0L) (List.hd rows).(0);
+    Alcotest.check value_testable "after OFF reads 0" (Db.V_int 0L) (List.hd rows).(0);
     let* () = exec_in db "PRAGMA recursive_triggers = 1" in
     let* rows = query_rows db "PRAGMA recursive_triggers" in
-    Alcotest.check value_testable "after ON reads 1"
-      (Db.V_int 1L) (List.hd rows).(0);
+    Alcotest.check value_testable "after ON reads 1" (Db.V_int 1L) (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (** Verifying the OFF gate at depth > 0: insert into table a fires
     trigger ta; ta inserts into b, which (with recursion ON) would
@@ -7721,33 +10050,43 @@ let test_recursive_triggers_off_top_level_still_fires () =
     let* () = exec_in db "CREATE TABLE a (n INT)" in
     let* () = exec_in db "CREATE TABLE b (m INT)" in
     let* () = exec_in db "CREATE TABLE c (k INT)" in
-    let* () = exec_in db
-      "CREATE TRIGGER ta AFTER INSERT ON a \
-       BEGIN INSERT INTO b(m) VALUES(NEW.n); END" in
-    let* () = exec_in db
-      "CREATE TRIGGER tb AFTER INSERT ON b \
-       BEGIN INSERT INTO c(k) VALUES(NEW.m); END" in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER ta AFTER INSERT ON a BEGIN INSERT INTO b(m) VALUES(NEW.n); END"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TRIGGER tb AFTER INSERT ON b BEGIN INSERT INTO c(k) VALUES(NEW.m); END"
+    in
     let* () = exec_in db "INSERT INTO a(n) VALUES(7)" in
     let* rows_b = query_rows db "SELECT m FROM b" in
     let* rows_c = query_rows db "SELECT k FROM c" in
     (* ta (the depth-0 trigger) DID fire — b got the row.
        tb (which would be depth-1) did NOT fire — c is empty. *)
     Alcotest.(check int) "b populated by top-level trigger" 1 (List.length rows_b);
-    Alcotest.check value_testable "b.m = 7"
-      (Db.V_int 7L) (List.hd rows_b).(0);
+    Alcotest.check value_testable "b.m = 7" (Db.V_int 7L) (List.hd rows_b).(0);
     Alcotest.(check int) "c empty (nested trigger suppressed)" 0 (List.length rows_c);
     Lwt.return_unit)
+;;
 
-let phase34_recursive_triggers_tests = [
-  Alcotest.test_case "default_on_chain_hits_limit"
-    `Quick test_recursive_triggers_default_on;
-  Alcotest.test_case "off_blocks_nested_firing"
-    `Quick test_recursive_triggers_off;
-  Alcotest.test_case "pragma_read_reflects_flag"
-    `Quick test_recursive_triggers_pragma_read;
-  Alcotest.test_case "off_top_level_still_fires"
-    `Quick test_recursive_triggers_off_top_level_still_fires;
-]
+let phase34_recursive_triggers_tests =
+  [ Alcotest.test_case
+      "default_on_chain_hits_limit"
+      `Quick
+      test_recursive_triggers_default_on
+  ; Alcotest.test_case "off_blocks_nested_firing" `Quick test_recursive_triggers_off
+  ; Alcotest.test_case
+      "pragma_read_reflects_flag"
+      `Quick
+      test_recursive_triggers_pragma_read
+  ; Alcotest.test_case
+      "off_top_level_still_fires"
+      `Quick
+      test_recursive_triggers_off_top_level_still_fires
+  ]
+;;
 
 (* phase34 task-2: SET NULL / SET DEFAULT inside transitive cascade chains. *)
 
@@ -7759,17 +10098,20 @@ let test_phase34_setnull_single_level_still_works () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p34a (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE p34b (id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34a(id) ON DELETE SET NULL)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34b (id INTEGER PRIMARY KEY, a_id INT REFERENCES p34a(id) ON \
+         DELETE SET NULL)"
+    in
     let* () = exec_in db "INSERT INTO p34a VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34b VALUES (10, 1)" in
     let* () = exec_in db "DELETE FROM p34a WHERE id = 1" in
     let* rows = query_rows db "SELECT a_id FROM p34b WHERE id = 10" in
     Alcotest.(check int) "one b row remains" 1 (List.length rows);
-    Alcotest.check value_testable "a_id was SET NULL"
-      Db.V_null (List.hd rows).(0);
+    Alcotest.check value_testable "a_id was SET NULL" Db.V_null (List.hd rows).(0);
     Lwt.return_unit)
+;;
 
 (** The Task 2 fix in action.  Schema:
       a(id PK)
@@ -7795,19 +10137,27 @@ let test_phase34_setnull_propagates_via_on_update_cascade () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p34tA (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE p34tB (b_id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34tA(id) ON DELETE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34tB (b_id INTEGER PRIMARY KEY, a_id INT REFERENCES p34tA(id) ON \
+         DELETE CASCADE)"
+    in
     (* Column-level UNIQUE isn't supported here, so emit the constraint as
        a table-level UNIQUE on c.b_id.  c.b_id must be UNIQUE so d can FK
        to it. *)
-    let* () = exec_in db
-      "CREATE TABLE p34tC (c_id INTEGER PRIMARY KEY, \
-       b_id INT REFERENCES p34tB(b_id) ON DELETE SET NULL, \
-       UNIQUE (b_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34tD (d_id INTEGER PRIMARY KEY, \
-       c_b_id INT REFERENCES p34tC(b_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34tC (c_id INTEGER PRIMARY KEY, b_id INT REFERENCES p34tB(b_id) \
+         ON DELETE SET NULL, UNIQUE (b_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34tD (d_id INTEGER PRIMARY KEY, c_b_id INT REFERENCES p34tC(b_id) \
+         ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34tA VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34tB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34tC VALUES (100, 10)" in
@@ -7818,17 +10168,18 @@ let test_phase34_setnull_propagates_via_on_update_cascade () =
     Alcotest.(check int) "b cascaded-deleted" 0 (List.length rows_b);
     (* c.b_id should have been SET NULL by cascade_delete_row_in_tx. *)
     let* rows_c = query_rows db "SELECT b_id FROM p34tC WHERE c_id = 100" in
-    Alcotest.(check int) "c row preserved (SET NULL, not deleted)"
-      1 (List.length rows_c);
-    Alcotest.check value_testable "c.b_id SET NULL"
-      Db.V_null (List.hd rows_c).(0);
+    Alcotest.(check int) "c row preserved (SET NULL, not deleted)" 1 (List.length rows_c);
+    Alcotest.check value_testable "c.b_id SET NULL" Db.V_null (List.hd rows_c).(0);
     (* d.c_b_id should have cascaded to NULL via cascade_update_col_in_tx. *)
     let* rows_d = query_rows db "SELECT c_b_id FROM p34tD WHERE d_id = 1000" in
     Alcotest.(check int) "d row preserved" 1 (List.length rows_d);
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "d.c_b_id was UPDATE-CASCADEd from the SET NULL on c.b_id"
-      Db.V_null (List.hd rows_d).(0);
+      Db.V_null
+      (List.hd rows_d).(0);
     Lwt.return_unit)
+;;
 
 (** Same idea via UPDATE-side cascade, exercising the cascade_update_col_in_tx
     SET NULL branch.  Schema:
@@ -7866,17 +10217,24 @@ let test_phase34_update_setnull_propagates () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p34uA (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE p34uB (b_id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34uA(id) ON UPDATE CASCADE, \
-       UNIQUE (a_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34uC (c_id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34uB(a_id) ON UPDATE SET NULL, \
-       UNIQUE (a_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34uD (d_id INTEGER PRIMARY KEY, \
-       c_a_id INT REFERENCES p34uC(a_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34uB (b_id INTEGER PRIMARY KEY, a_id INT REFERENCES p34uA(id) ON \
+         UPDATE CASCADE, UNIQUE (a_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34uC (c_id INTEGER PRIMARY KEY, a_id INT REFERENCES p34uB(a_id) \
+         ON UPDATE SET NULL, UNIQUE (a_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34uD (d_id INTEGER PRIMARY KEY, c_a_id INT REFERENCES p34uC(a_id) \
+         ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34uA VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34uB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34uC VALUES (100, 1)" in
@@ -7884,18 +10242,27 @@ let test_phase34_update_setnull_propagates () =
     let* () = exec_in db "UPDATE p34uA SET id = 99 WHERE id = 1" in
     (* b.a_id cascaded to 99. *)
     let* rows_b = query_rows db "SELECT a_id FROM p34uB WHERE b_id = 10" in
-    Alcotest.check value_testable "b.a_id cascaded to 99"
-      (Db.V_int 99L) (List.hd rows_b).(0);
+    Alcotest.check
+      value_testable
+      "b.a_id cascaded to 99"
+      (Db.V_int 99L)
+      (List.hd rows_b).(0);
     (* c.a_id should be SET NULL (cascade_update_col_in_tx SET NULL arm). *)
     let* rows_c = query_rows db "SELECT a_id FROM p34uC WHERE c_id = 100" in
-    Alcotest.check value_testable "c.a_id SET NULL via transitive UPDATE"
-      Db.V_null (List.hd rows_c).(0);
+    Alcotest.check
+      value_testable
+      "c.a_id SET NULL via transitive UPDATE"
+      Db.V_null
+      (List.hd rows_c).(0);
     (* With the fix: d.c_a_id should also have cascaded to NULL. *)
     let* rows_d = query_rows db "SELECT c_a_id FROM p34uD WHERE d_id = 1000" in
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "d.c_a_id cascaded to NULL via the transitive SET NULL on c.a_id"
-      Db.V_null (List.hd rows_d).(0);
+      Db.V_null
+      (List.hd rows_d).(0);
     Lwt.return_unit)
+;;
 
 (** SET DEFAULT counterpart: a top-level DELETE on A cascades to B; B's
     deletion has SET DEFAULT on C; that becomes an UPDATE on C which is
@@ -7907,28 +10274,42 @@ let test_phase34_setdefault_propagates_via_on_update_cascade () =
     let* () = exec_in db "CREATE TABLE p34dA (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "INSERT INTO p34dA VALUES (7)" in
     let* () = exec_in db "INSERT INTO p34dA VALUES (1)" in
-    let* () = exec_in db
-      "CREATE TABLE p34dB (b_id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34dA(id) ON DELETE CASCADE)" in
-    let* () = exec_in db
-      "CREATE TABLE p34dC (c_id INTEGER PRIMARY KEY, \
-       b_id INT DEFAULT 99 REFERENCES p34dB(b_id) ON DELETE SET DEFAULT, \
-       UNIQUE (b_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34dD (d_id INTEGER PRIMARY KEY, \
-       c_b_id INT REFERENCES p34dC(b_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34dB (b_id INTEGER PRIMARY KEY, a_id INT REFERENCES p34dA(id) ON \
+         DELETE CASCADE)"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34dC (c_id INTEGER PRIMARY KEY, b_id INT DEFAULT 99 REFERENCES \
+         p34dB(b_id) ON DELETE SET DEFAULT, UNIQUE (b_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34dD (d_id INTEGER PRIMARY KEY, c_b_id INT REFERENCES p34dC(b_id) \
+         ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34dB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34dC VALUES (100, 10)" in
     let* () = exec_in db "INSERT INTO p34dD VALUES (1000, 10)" in
     let* () = exec_in db "DELETE FROM p34dA WHERE id = 1" in
     let* rows_c = query_rows db "SELECT b_id FROM p34dC WHERE c_id = 100" in
-    Alcotest.check value_testable "c.b_id reset to default 99"
-      (Db.V_int 99L) (List.hd rows_c).(0);
+    Alcotest.check
+      value_testable
+      "c.b_id reset to default 99"
+      (Db.V_int 99L)
+      (List.hd rows_c).(0);
     let* rows_d = query_rows db "SELECT c_b_id FROM p34dD WHERE d_id = 1000" in
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "d.c_b_id cascaded to 99 via the transitive SET DEFAULT on c.b_id"
-      (Db.V_int 99L) (List.hd rows_d).(0);
+      (Db.V_int 99L)
+      (List.hd rows_d).(0);
     Lwt.return_unit)
+;;
 
 (** Exercises the INLINE FK enforcement in execute_delete (not the
     cascade_delete_row_in_tx helper).  Schema:
@@ -7947,31 +10328,37 @@ let test_phase34_inline_delete_setnull_propagates () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p34iA (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE p34iB (id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34iA(id) ON DELETE SET NULL, \
-       UNIQUE (a_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34iC (c_id INTEGER PRIMARY KEY, \
-       b_aid INT REFERENCES p34iB(a_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34iB (id INTEGER PRIMARY KEY, a_id INT REFERENCES p34iA(id) ON \
+         DELETE SET NULL, UNIQUE (a_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34iC (c_id INTEGER PRIMARY KEY, b_aid INT REFERENCES p34iB(a_id) \
+         ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34iA VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34iB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34iC VALUES (100, 1)" in
     let* () = exec_in db "DELETE FROM p34iA WHERE id = 1" in
     (* B row preserved with a_id SET NULL. *)
     let* rows_b = query_rows db "SELECT a_id FROM p34iB WHERE id = 10" in
-    Alcotest.(check int) "b row preserved (SET NULL, not deleted)"
-      1 (List.length rows_b);
-    Alcotest.check value_testable "b.a_id SET NULL"
-      Db.V_null (List.hd rows_b).(0);
+    Alcotest.(check int) "b row preserved (SET NULL, not deleted)" 1 (List.length rows_b);
+    Alcotest.check value_testable "b.a_id SET NULL" Db.V_null (List.hd rows_b).(0);
     (* With the fix: c.b_aid should have cascaded to NULL via
        cascade_update_col_in_tx (B's ON UPDATE CASCADE to C). *)
     let* rows_c = query_rows db "SELECT b_aid FROM p34iC WHERE c_id = 100" in
     Alcotest.(check int) "c row preserved" 1 (List.length rows_c);
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "c.b_aid cascaded to NULL via the inline SET NULL on b.a_id"
-      Db.V_null (List.hd rows_c).(0);
+      Db.V_null
+      (List.hd rows_c).(0);
     Lwt.return_unit)
+;;
 
 (** SET DEFAULT counterpart of the inline-DELETE test above.  Identical
     shape, but the inline FK action is ON DELETE SET DEFAULT (default
@@ -7982,24 +10369,35 @@ let test_phase34_inline_delete_setdefault_propagates () =
     let* () = exec_in db "CREATE TABLE p34idA (id INTEGER PRIMARY KEY)" in
     let* () = exec_in db "INSERT INTO p34idA VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34idA VALUES (99)" in
-    let* () = exec_in db
-      "CREATE TABLE p34idB (id INTEGER PRIMARY KEY, \
-       a_id INT DEFAULT 99 REFERENCES p34idA(id) ON DELETE SET DEFAULT, \
-       UNIQUE (a_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34idC (c_id INTEGER PRIMARY KEY, \
-       b_aid INT REFERENCES p34idB(a_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34idB (id INTEGER PRIMARY KEY, a_id INT DEFAULT 99 REFERENCES \
+         p34idA(id) ON DELETE SET DEFAULT, UNIQUE (a_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34idC (c_id INTEGER PRIMARY KEY, b_aid INT REFERENCES \
+         p34idB(a_id) ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34idB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34idC VALUES (100, 1)" in
     let* () = exec_in db "DELETE FROM p34idA WHERE id = 1" in
     let* rows_b = query_rows db "SELECT a_id FROM p34idB WHERE id = 10" in
-    Alcotest.check value_testable "b.a_id reset to default 99"
-      (Db.V_int 99L) (List.hd rows_b).(0);
+    Alcotest.check
+      value_testable
+      "b.a_id reset to default 99"
+      (Db.V_int 99L)
+      (List.hd rows_b).(0);
     let* rows_c = query_rows db "SELECT b_aid FROM p34idC WHERE c_id = 100" in
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "c.b_aid cascaded to 99 via the inline SET DEFAULT on b.a_id"
-      (Db.V_int 99L) (List.hd rows_c).(0);
+      (Db.V_int 99L)
+      (List.hd rows_c).(0);
     Lwt.return_unit)
+;;
 
 (** UPDATE counterpart: top-level UPDATE on A triggers the inline ON
     UPDATE SET NULL on B, which must in turn cascade to C via ON UPDATE
@@ -8008,84 +10406,116 @@ let test_phase34_inline_update_setnull_propagates () =
   with_db (fun db ->
     let* () = exec_in db "PRAGMA foreign_keys = 1" in
     let* () = exec_in db "CREATE TABLE p34iuA (id INTEGER PRIMARY KEY)" in
-    let* () = exec_in db
-      "CREATE TABLE p34iuB (id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES p34iuA(id) ON UPDATE SET NULL, \
-       UNIQUE (a_id))" in
-    let* () = exec_in db
-      "CREATE TABLE p34iuC (c_id INTEGER PRIMARY KEY, \
-       b_aid INT REFERENCES p34iuB(a_id) ON UPDATE CASCADE)" in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34iuB (id INTEGER PRIMARY KEY, a_id INT REFERENCES p34iuA(id) ON \
+         UPDATE SET NULL, UNIQUE (a_id))"
+    in
+    let* () =
+      exec_in
+        db
+        "CREATE TABLE p34iuC (c_id INTEGER PRIMARY KEY, b_aid INT REFERENCES \
+         p34iuB(a_id) ON UPDATE CASCADE)"
+    in
     let* () = exec_in db "INSERT INTO p34iuA VALUES (1)" in
     let* () = exec_in db "INSERT INTO p34iuB VALUES (10, 1)" in
     let* () = exec_in db "INSERT INTO p34iuC VALUES (100, 1)" in
     let* () = exec_in db "UPDATE p34iuA SET id = 99 WHERE id = 1" in
     let* rows_b = query_rows db "SELECT a_id FROM p34iuB WHERE id = 10" in
-    Alcotest.check value_testable "b.a_id SET NULL via inline ON UPDATE"
-      Db.V_null (List.hd rows_b).(0);
+    Alcotest.check
+      value_testable
+      "b.a_id SET NULL via inline ON UPDATE"
+      Db.V_null
+      (List.hd rows_b).(0);
     let* rows_c = query_rows db "SELECT b_aid FROM p34iuC WHERE c_id = 100" in
-    Alcotest.check value_testable
+    Alcotest.check
+      value_testable
       "c.b_aid cascaded to NULL via the inline ON UPDATE SET NULL on b.a_id"
-      Db.V_null (List.hd rows_c).(0);
+      Db.V_null
+      (List.hd rows_c).(0);
     Lwt.return_unit)
+;;
 
-let phase34_transitive_setnull_tests = [
-  Alcotest.test_case "setnull_single_level_regression"
-    `Quick test_phase34_setnull_single_level_still_works;
-  Alcotest.test_case "setnull_propagates_via_on_update_cascade"
-    `Quick test_phase34_setnull_propagates_via_on_update_cascade;
-  Alcotest.test_case "update_setnull_propagates_via_on_update_cascade"
-    `Quick test_phase34_update_setnull_propagates;
-  Alcotest.test_case "setdefault_propagates_via_on_update_cascade"
-    `Quick test_phase34_setdefault_propagates_via_on_update_cascade;
-  Alcotest.test_case "inline_delete_setnull_propagates_via_on_update_cascade"
-    `Quick test_phase34_inline_delete_setnull_propagates;
-  Alcotest.test_case "inline_delete_setdefault_propagates_via_on_update_cascade"
-    `Quick test_phase34_inline_delete_setdefault_propagates;
-  Alcotest.test_case "inline_update_setnull_propagates_via_on_update_cascade"
-    `Quick test_phase34_inline_update_setnull_propagates;
-]
+let phase34_transitive_setnull_tests =
+  [ Alcotest.test_case
+      "setnull_single_level_regression"
+      `Quick
+      test_phase34_setnull_single_level_still_works
+  ; Alcotest.test_case
+      "setnull_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_setnull_propagates_via_on_update_cascade
+  ; Alcotest.test_case
+      "update_setnull_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_update_setnull_propagates
+  ; Alcotest.test_case
+      "setdefault_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_setdefault_propagates_via_on_update_cascade
+  ; Alcotest.test_case
+      "inline_delete_setnull_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_inline_delete_setnull_propagates
+  ; Alcotest.test_case
+      "inline_delete_setdefault_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_inline_delete_setdefault_propagates
+  ; Alcotest.test_case
+      "inline_update_setnull_propagates_via_on_update_cascade"
+      `Quick
+      test_phase34_inline_update_setnull_propagates
+  ]
+;;
 
 (* ── Phase 34 Task 3: prepared statements counter tracking ──────────── *)
 
 (* Helper: prepare and unwrap, failing the test if compilation fails. *)
 let prepare_ok db sql =
-  run (
-    let* r = Db.prepare db sql in
-    match r with
-    | Ok st  -> Lwt.return st
-    | Error e -> Alcotest.failf "prepare(%s): %s" sql (fmt_err e)
-  )
+  run
+    (let* r = Db.prepare db sql in
+     match r with
+     | Ok st -> Lwt.return st
+     | Error e -> Alcotest.failf "prepare(%s): %s" sql (fmt_err e))
+;;
 
 (* Helper: run prepared statement with given params, returning rows-changed
    count, failing the test on Error. *)
 let run_ok st params =
-  run (
-    let* r = Db.run st ~params in
-    match r with
-    | Ok n   -> Lwt.return n
-    | Error e -> Alcotest.failf "run: %s" (fmt_err e)
-  )
+  run
+    (let* r = Db.run st ~params in
+     match r with
+     | Ok n -> Lwt.return n
+     | Error e -> Alcotest.failf "run: %s" (fmt_err e))
+;;
 
 let test_phase34_prepared_insert_updates_changes () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
-  let n1 = run_ok st [Db.V_int 1L] in
+  let n1 = run_ok st [ Db.V_int 1L ] in
   Alcotest.(check int) "prepared insert returns 1" 1 n1;
   let r = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "CHANGES() after prepared insert"
-    [| Db.V_int 1L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "CHANGES() after prepared insert"
+    [| Db.V_int 1L |]
+    (List.nth r 0)
+;;
 
 let test_phase34_prepared_insert_updates_total_changes () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
-  let _ = run_ok st [Db.V_int 1L] in
-  let _ = run_ok st [Db.V_int 2L] in
-  let _ = run_ok st [Db.V_int 3L] in
+  let _ = run_ok st [ Db.V_int 1L ] in
+  let _ = run_ok st [ Db.V_int 2L ] in
+  let _ = run_ok st [ Db.V_int 3L ] in
   let r = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "TOTAL_CHANGES() after 3 prepared inserts"
-    [| Db.V_int 3L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "TOTAL_CHANGES() after 3 prepared inserts"
+    [| Db.V_int 3L |]
+    (List.nth r 0)
+;;
 
 let test_phase34_prepared_insert_updates_last_insert_rowid () =
   (* Each INSERT auto-assigns the next rowid; after two prepared inserts
@@ -8093,39 +10523,52 @@ let test_phase34_prepared_insert_updates_last_insert_rowid () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
   let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
-  let _ = run_ok st [Db.V_int 10L] in
-  let _ = run_ok st [Db.V_int 20L] in
+  let _ = run_ok st [ Db.V_int 10L ] in
+  let _ = run_ok st [ Db.V_int 20L ] in
   let r = query_ok db "SELECT LAST_INSERT_ROWID()" in
-  Alcotest.(check row_testable) "LAST_INSERT_ROWID() after 2 prepared inserts"
-    [| Db.V_int 2L |] (List.nth r 0)
+  Alcotest.(check row_testable)
+    "LAST_INSERT_ROWID() after 2 prepared inserts"
+    [| Db.V_int 2L |]
+    (List.nth r 0)
+;;
 
 let test_phase34_prepared_update_updates_changes () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
   exec db "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30)";
   let st = prepare_ok db "UPDATE t SET n = ? WHERE id <= ?" in
-  let n = run_ok st [Db.V_int 99L; Db.V_int 2L] in
+  let n = run_ok st [ Db.V_int 99L; Db.V_int 2L ] in
   Alcotest.(check int) "prepared update returns 2" 2 n;
   let r_changes = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "CHANGES() after prepared update"
-    [| Db.V_int 2L |] (List.nth r_changes 0);
+  Alcotest.(check row_testable)
+    "CHANGES() after prepared update"
+    [| Db.V_int 2L |]
+    (List.nth r_changes 0);
   let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "TOTAL_CHANGES() includes prepared update"
-    [| Db.V_int 5L |] (List.nth r_total 0)
+  Alcotest.(check row_testable)
+    "TOTAL_CHANGES() includes prepared update"
+    [| Db.V_int 5L |]
+    (List.nth r_total 0)
+;;
 
 let test_phase34_prepared_delete_updates_changes () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER, n INTEGER)";
   exec db "INSERT INTO t (id, n) VALUES (1, 10), (2, 20), (3, 30), (4, 40)";
   let st = prepare_ok db "DELETE FROM t WHERE n >= ?" in
-  let n = run_ok st [Db.V_int 30L] in
+  let n = run_ok st [ Db.V_int 30L ] in
   Alcotest.(check int) "prepared delete returns 2" 2 n;
   let r_changes = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "CHANGES() after prepared delete"
-    [| Db.V_int 2L |] (List.nth r_changes 0);
+  Alcotest.(check row_testable)
+    "CHANGES() after prepared delete"
+    [| Db.V_int 2L |]
+    (List.nth r_changes 0);
   let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "TOTAL_CHANGES() includes prepared delete"
-    [| Db.V_int 6L |] (List.nth r_total 0)
+  Alcotest.(check row_testable)
+    "TOTAL_CHANGES() includes prepared delete"
+    [| Db.V_int 6L |]
+    (List.nth r_total 0)
+;;
 
 let test_phase34_prepared_changes_is_per_statement () =
   (* CHANGES() reflects only the last DML; running a prepared insert
@@ -8134,102 +10577,148 @@ let test_phase34_prepared_changes_is_per_statement () =
   exec db "CREATE TABLE t (n INTEGER)";
   exec db "INSERT INTO t (n) VALUES (10), (20), (30)";
   let st = prepare_ok db "INSERT INTO t(n) VALUES(?)" in
-  let _ = run_ok st [Db.V_int 99L] in
+  let _ = run_ok st [ Db.V_int 99L ] in
   let r_changes = query_ok db "SELECT CHANGES()" in
-  Alcotest.(check row_testable) "CHANGES() reflects last prepared insert"
-    [| Db.V_int 1L |] (List.nth r_changes 0);
+  Alcotest.(check row_testable)
+    "CHANGES() reflects last prepared insert"
+    [| Db.V_int 1L |]
+    (List.nth r_changes 0);
   let r_total = query_ok db "SELECT TOTAL_CHANGES()" in
-  Alcotest.(check row_testable) "TOTAL_CHANGES() accumulates across kinds"
-    [| Db.V_int 4L |] (List.nth r_total 0)
+  Alcotest.(check row_testable)
+    "TOTAL_CHANGES() accumulates across kinds"
+    [| Db.V_int 4L |]
+    (List.nth r_total 0)
+;;
 
-let phase34_prepared_counters_tests = [
-  Alcotest.test_case "prepared_insert_updates_changes"
-    `Quick test_phase34_prepared_insert_updates_changes;
-  Alcotest.test_case "prepared_insert_updates_total_changes"
-    `Quick test_phase34_prepared_insert_updates_total_changes;
-  Alcotest.test_case "prepared_insert_updates_last_insert_rowid"
-    `Quick test_phase34_prepared_insert_updates_last_insert_rowid;
-  Alcotest.test_case "prepared_update_updates_changes"
-    `Quick test_phase34_prepared_update_updates_changes;
-  Alcotest.test_case "prepared_delete_updates_changes"
-    `Quick test_phase34_prepared_delete_updates_changes;
-  Alcotest.test_case "prepared_changes_is_per_statement"
-    `Quick test_phase34_prepared_changes_is_per_statement;
-]
+let phase34_prepared_counters_tests =
+  [ Alcotest.test_case
+      "prepared_insert_updates_changes"
+      `Quick
+      test_phase34_prepared_insert_updates_changes
+  ; Alcotest.test_case
+      "prepared_insert_updates_total_changes"
+      `Quick
+      test_phase34_prepared_insert_updates_total_changes
+  ; Alcotest.test_case
+      "prepared_insert_updates_last_insert_rowid"
+      `Quick
+      test_phase34_prepared_insert_updates_last_insert_rowid
+  ; Alcotest.test_case
+      "prepared_update_updates_changes"
+      `Quick
+      test_phase34_prepared_update_updates_changes
+  ; Alcotest.test_case
+      "prepared_delete_updates_changes"
+      `Quick
+      test_phase34_prepared_delete_updates_changes
+  ; Alcotest.test_case
+      "prepared_changes_is_per_statement"
+      `Quick
+      test_phase34_prepared_changes_is_per_statement
+  ]
+;;
 
 (* ── Phase 34 Task 4: sqlite_master lists FTS5 virtual tables ──────── *)
 
 let test_phase34_master_lists_fts () =
   let db = fresh_db () in
   exec db "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
-  let rows = query_ok db
-    "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'docs'" in
+  let rows =
+    query_ok db "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name = 'docs'"
+  in
   Alcotest.(check int) "exactly one FTS row in sqlite_master" 1 (List.length rows);
-  Alcotest.(check row_testable) "FTS row fields match"
-    [| Db.V_text "table";
-       Db.V_text "docs";
-       Db.V_text "docs";
-       Db.V_text "CREATE VIRTUAL TABLE docs USING fts5(title, body)" |]
+  Alcotest.(check row_testable)
+    "FTS row fields match"
+    [| Db.V_text "table"
+     ; Db.V_text "docs"
+     ; Db.V_text "docs"
+     ; Db.V_text "CREATE VIRTUAL TABLE docs USING fts5(title, body)"
+    |]
     (List.hd rows)
+;;
 
 let test_phase34_master_fts_and_regular_both_listed_as_table () =
   let db = fresh_db () in
   exec db "CREATE TABLE regular (n INT)";
   exec db "CREATE VIRTUAL TABLE search USING fts5(content)";
-  let rows = query_ok db
-    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name" in
+  let rows =
+    query_ok db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+  in
   Alcotest.(check int) "two type='table' rows" 2 (List.length rows);
-  Alcotest.(check row_testable) "first is regular"
-    [| Db.V_text "regular" |] (List.nth rows 0);
-  Alcotest.(check row_testable) "second is FTS search"
-    [| Db.V_text "search" |] (List.nth rows 1)
+  Alcotest.(check row_testable)
+    "first is regular"
+    [| Db.V_text "regular" |]
+    (List.nth rows 0);
+  Alcotest.(check row_testable)
+    "second is FTS search"
+    [| Db.V_text "search" |]
+    (List.nth rows 1)
+;;
 
 let test_phase34_master_fts_sql_column () =
   (* Verify the reconstructed CREATE VIRTUAL TABLE statement is exactly what
      SQLite stores in sqlite_master.sql for an FTS5 table. *)
   let db = fresh_db () in
   exec db "CREATE VIRTUAL TABLE docs USING fts5(body)";
-  let rows = query_ok db
-    "SELECT sql FROM sqlite_master WHERE name='docs'" in
-  Alcotest.(check row_testable) "sql column matches canonical form"
+  let rows = query_ok db "SELECT sql FROM sqlite_master WHERE name='docs'" in
+  Alcotest.(check row_testable)
+    "sql column matches canonical form"
     [| Db.V_text "CREATE VIRTUAL TABLE docs USING fts5(body)" |]
     (List.hd rows)
+;;
 
-let phase34_master_fts_tests = [
-  Alcotest.test_case "master_lists_fts_table_row"
-    `Quick test_phase34_master_lists_fts;
-  Alcotest.test_case "master_fts_and_regular_both_listed_as_table"
-    `Quick test_phase34_master_fts_and_regular_both_listed_as_table;
-  Alcotest.test_case "master_fts_sql_column_canonical"
-    `Quick test_phase34_master_fts_sql_column;
-]
+let phase34_master_fts_tests =
+  [ Alcotest.test_case "master_lists_fts_table_row" `Quick test_phase34_master_lists_fts
+  ; Alcotest.test_case
+      "master_fts_and_regular_both_listed_as_table"
+      `Quick
+      test_phase34_master_fts_and_regular_both_listed_as_table
+  ; Alcotest.test_case
+      "master_fts_sql_column_canonical"
+      `Quick
+      test_phase34_master_fts_sql_column
+  ]
+;;
 
-let phase33_virtual_gen_tests = [
-  Alcotest.test_case "virtual_basic"
-    `Quick test_virtual_gen_column_basic;
-  Alcotest.test_case "virtual_changes_with_underlying"
-    `Quick test_virtual_gen_changes_with_underlying;
-  Alcotest.test_case "stored_still_works"
-    `Quick test_stored_gen_column_still_works;
-  Alcotest.test_case "virtual_in_update_where"
-    `Quick test_virtual_gen_in_update_where;
-  Alcotest.test_case "virtual_in_delete_where"
-    `Quick test_virtual_gen_in_delete_where;
-  Alcotest.test_case "virtual_default_keyword_omitted"
-    `Quick test_virtual_gen_default_is_virtual;
-  Alcotest.test_case "virtual_in_index_now_supported"
-    `Quick test_virtual_in_index_now_supported;
-  Alcotest.test_case "virtual_in_index_expr_now_supported"
-    `Quick test_virtual_in_index_expr_now_supported;
-  Alcotest.test_case "stored_in_index_still_allowed"
-    `Quick test_stored_in_index_still_allowed;
-  Alcotest.test_case "virtual_in_check_now_supported"
-    `Quick test_virtual_in_check_now_supported;
-  Alcotest.test_case "virtual_in_index_update_underlying"
-    `Quick test_virtual_in_index_update_underlying;
-  Alcotest.test_case "virtual_in_index_delete_drops_entry"
-    `Quick test_virtual_in_index_delete_drops_entry;
-]
+let phase33_virtual_gen_tests =
+  [ Alcotest.test_case "virtual_basic" `Quick test_virtual_gen_column_basic
+  ; Alcotest.test_case
+      "virtual_changes_with_underlying"
+      `Quick
+      test_virtual_gen_changes_with_underlying
+  ; Alcotest.test_case "stored_still_works" `Quick test_stored_gen_column_still_works
+  ; Alcotest.test_case "virtual_in_update_where" `Quick test_virtual_gen_in_update_where
+  ; Alcotest.test_case "virtual_in_delete_where" `Quick test_virtual_gen_in_delete_where
+  ; Alcotest.test_case
+      "virtual_default_keyword_omitted"
+      `Quick
+      test_virtual_gen_default_is_virtual
+  ; Alcotest.test_case
+      "virtual_in_index_now_supported"
+      `Quick
+      test_virtual_in_index_now_supported
+  ; Alcotest.test_case
+      "virtual_in_index_expr_now_supported"
+      `Quick
+      test_virtual_in_index_expr_now_supported
+  ; Alcotest.test_case
+      "stored_in_index_still_allowed"
+      `Quick
+      test_stored_in_index_still_allowed
+  ; Alcotest.test_case
+      "virtual_in_check_now_supported"
+      `Quick
+      test_virtual_in_check_now_supported
+  ; Alcotest.test_case
+      "virtual_in_index_update_underlying"
+      `Quick
+      test_virtual_in_index_update_underlying
+  ; Alcotest.test_case
+      "virtual_in_index_delete_drops_entry"
+      `Quick
+      test_virtual_in_index_delete_drops_entry
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 35 — FK DEFERRABLE INITIALLY DEFERRED                          *)
@@ -8238,297 +10727,325 @@ let phase33_virtual_gen_tests = [
 let int_of_row = function
   | [| Db.V_int n |] -> Int64.to_int n
   | _ -> -1
+;;
 
 (* Inside a single explicit txn, insert child before parent, commit succeeds. *)
 let test_phase35_deferred_child_before_parent () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE d_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE d_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES d_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO d_chi VALUES (10, 1)" in  (* parent not yet inserted *)
-    let* () = exec_lwt "INSERT INTO d_par VALUES (1)" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM d_par" in
-    let n_par = int_of_row (List.hd rows_par) in
-    let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM d_chi" in
-    let n_chi = int_of_row (List.hd rows_chi) in
-    Alcotest.(check int) "parent count" 1 n_par;
-    Alcotest.(check int) "child count"  1 n_chi;
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE d_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE d_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES d_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO d_chi VALUES (10, 1)" in
+     (* parent not yet inserted *)
+     let* () = exec_lwt "INSERT INTO d_par VALUES (1)" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM d_par" in
+     let n_par = int_of_row (List.hd rows_par) in
+     let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM d_chi" in
+     let n_chi = int_of_row (List.hd rows_chi) in
+     Alcotest.(check int) "parent count" 1 n_par;
+     Alcotest.(check int) "child count" 1 n_chi;
+     Lwt.return_unit)
+;;
 
 (* If FK constraint is not deferred, the same INSERT-before-parent fails immediately. *)
 let test_phase35_immediate_still_rejects_at_insert () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE i_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE i_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES i_par(id))" in
-    let* () = exec_lwt "BEGIN" in
-    let* r = Db.execute db "INSERT INTO i_chi VALUES (10, 99)" in
-    (match r with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected immediate FK violation on INSERT");
-    let* _ = Db.execute db "ROLLBACK" in
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE i_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE i_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES i_par(id))"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* r = Db.execute db "INSERT INTO i_chi VALUES (10, 99)" in
+     (match r with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected immediate FK violation on INSERT");
+     let* _ = Db.execute db "ROLLBACK" in
+     Lwt.return_unit)
+;;
 
 (* Deferred FK still fails if violation persists at commit time. *)
 let test_phase35_deferred_still_violated_fails_at_commit () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE df_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE df_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES df_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO df_chi VALUES (10, 1)" in
-    let* r = Db.execute db "COMMIT" in
-    (match r with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected deferred FK violation at COMMIT");
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE df_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE df_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES df_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO df_chi VALUES (10, 1)" in
+     let* r = Db.execute db "COMMIT" in
+     (match r with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected deferred FK violation at COMMIT");
+     Lwt.return_unit)
+;;
 
 (* If the child row is deleted before commit, the deferred violation drops. *)
 let test_phase35_deferred_resolved_by_delete () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE dr_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE dr_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES dr_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO dr_chi VALUES (10, 99)" in
-    let* () = exec_lwt "DELETE FROM dr_chi WHERE id = 10" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM dr_chi" in
-    Alcotest.(check int) "child empty"  0
-      (int_of_row (List.hd rows));
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE dr_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE dr_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES dr_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO dr_chi VALUES (10, 99)" in
+     let* () = exec_lwt "DELETE FROM dr_chi WHERE id = 10" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM dr_chi" in
+     Alcotest.(check int) "child empty" 0 (int_of_row (List.hd rows));
+     Lwt.return_unit)
+;;
 
 (* PRAGMA defer_foreign_keys = ON makes an IMMEDIATE constraint defer for the txn. *)
 let test_phase35_pragma_defer_foreign_keys () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE pd_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE pd_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES pd_par(id))" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "PRAGMA defer_foreign_keys = ON" in
-    let* () = exec_lwt "INSERT INTO pd_chi VALUES (10, 1)" in  (* would fail without pragma *)
-    let* () = exec_lwt "INSERT INTO pd_par VALUES (1)" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi" in
-    Alcotest.(check int) "child count" 1
-      (int_of_row (List.hd rows_chi));
-    let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM pd_par" in
-    Alcotest.(check int) "parent count" 1
-      (int_of_row (List.hd rows_par));
-    (* Verify PRAGMA is reset to OFF after txn ends. *)
-    let* rows = query_ok_lwt db "PRAGMA defer_foreign_keys" in
-    Alcotest.(check int) "pragma resets to 0 after txn" 0
-      (int_of_row (List.hd rows));
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE pd_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE pd_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES pd_par(id))"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "PRAGMA defer_foreign_keys = ON" in
+     let* () = exec_lwt "INSERT INTO pd_chi VALUES (10, 1)" in
+     (* would fail without pragma *)
+     let* () = exec_lwt "INSERT INTO pd_par VALUES (1)" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows_chi = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi" in
+     Alcotest.(check int) "child count" 1 (int_of_row (List.hd rows_chi));
+     let* rows_par = query_ok_lwt db "SELECT COUNT(*) FROM pd_par" in
+     Alcotest.(check int) "parent count" 1 (int_of_row (List.hd rows_par));
+     (* Verify PRAGMA is reset to OFF after txn ends. *)
+     let* rows = query_ok_lwt db "PRAGMA defer_foreign_keys" in
+     Alcotest.(check int) "pragma resets to 0 after txn" 0 (int_of_row (List.hd rows));
+     Lwt.return_unit)
+;;
 
 (* Deferred INSERT of N children before parents within a txn commits cleanly. *)
 let test_phase35_multi_row_deferred () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE m_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE m_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES m_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO m_chi VALUES (10, 1)" in
-    let* () = exec_lwt "INSERT INTO m_chi VALUES (20, 2)" in
-    let* () = exec_lwt "INSERT INTO m_chi VALUES (30, 3)" in
-    let* () = exec_lwt "INSERT INTO m_par VALUES (1)" in
-    let* () = exec_lwt "INSERT INTO m_par VALUES (2)" in
-    let* () = exec_lwt "INSERT INTO m_par VALUES (3)" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM m_chi" in
-    Alcotest.(check int) "all children persisted" 3
-      (int_of_row (List.hd rows));
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE m_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE m_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES m_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO m_chi VALUES (10, 1)" in
+     let* () = exec_lwt "INSERT INTO m_chi VALUES (20, 2)" in
+     let* () = exec_lwt "INSERT INTO m_chi VALUES (30, 3)" in
+     let* () = exec_lwt "INSERT INTO m_par VALUES (1)" in
+     let* () = exec_lwt "INSERT INTO m_par VALUES (2)" in
+     let* () = exec_lwt "INSERT INTO m_par VALUES (3)" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM m_chi" in
+     Alcotest.(check int) "all children persisted" 3 (int_of_row (List.hd rows));
+     Lwt.return_unit)
+;;
 
 (* In autocommit mode, deferred FK still must enforce — behave like immediate. *)
 let test_phase35_autocommit_deferred_behaves_immediate () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE ac_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE ac_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES ac_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    (* No BEGIN: each INSERT is its own implicit txn. *)
-    let* r = Db.execute db "INSERT INTO ac_chi VALUES (10, 1)" in
-    (match r with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "expected immediate FK violation in autocommit");
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE ac_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE ac_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES ac_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     (* No BEGIN: each INSERT is its own implicit txn. *)
+     let* r = Db.execute db "INSERT INTO ac_chi VALUES (10, 1)" in
+     (match r with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "expected immediate FK violation in autocommit");
+     Lwt.return_unit)
+;;
 
 (* Rollback clears pending deferred FK violations. *)
 let test_phase35_rollback_clears_pending () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE rb_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE rb_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES rb_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO rb_chi VALUES (10, 99)" in
-    let* () = exec_lwt "ROLLBACK" in
-    (* After ROLLBACK, the pending check is gone — next statement should succeed
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE rb_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE rb_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES rb_par(id) \
+          DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO rb_chi VALUES (10, 99)" in
+     let* () = exec_lwt "ROLLBACK" in
+     (* After ROLLBACK, the pending check is gone — next statement should succeed
        even though the row that violated never got committed. *)
-    let* () = exec_lwt "INSERT INTO rb_par VALUES (1)" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM rb_par" in
-    Alcotest.(check int) "parent inserted after rollback" 1
-      (int_of_row (List.hd rows));
-    Lwt.return_unit)
+     let* () = exec_lwt "INSERT INTO rb_par VALUES (1)" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM rb_par" in
+     Alcotest.(check int) "parent inserted after rollback" 1 (int_of_row (List.hd rows));
+     Lwt.return_unit)
+;;
 
 (* DEFERRABLE INITIALLY IMMEDIATE is accepted but behaves IMMEDIATE. *)
 let test_phase35_initially_immediate_is_immediate () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE ii_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE ii_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES ii_par(id) DEFERRABLE INITIALLY IMMEDIATE)" in
-    let* () = exec_lwt "BEGIN" in
-    let* r = Db.execute db "INSERT INTO ii_chi VALUES (10, 99)" in
-    (match r with
-     | Error _ -> ()
-     | Ok () -> Alcotest.fail "INITIALLY IMMEDIATE should fail at insert");
-    let* _ = Db.execute db "ROLLBACK" in
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE ii_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE ii_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES ii_par(id) \
+          DEFERRABLE INITIALLY IMMEDIATE)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* r = Db.execute db "INSERT INTO ii_chi VALUES (10, 99)" in
+     (match r with
+      | Error _ -> ()
+      | Ok () -> Alcotest.fail "INITIALLY IMMEDIATE should fail at insert");
+     let* _ = Db.execute db "ROLLBACK" in
+     Lwt.return_unit)
+;;
 
 (* Table-level FOREIGN KEY with DEFERRABLE INITIALLY DEFERRED. *)
 let test_phase35_table_level_deferred () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE tl_par (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE tl_chi (id INTEGER PRIMARY KEY, pid INTEGER, \
-       FOREIGN KEY (pid) REFERENCES tl_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "INSERT INTO tl_chi VALUES (1, 100)" in
-    let* () = exec_lwt "INSERT INTO tl_par VALUES (100)" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows = query_ok_lwt db "SELECT COUNT(*) FROM tl_chi" in
-    Alcotest.(check int) "child inserted" 1
-      (int_of_row (List.hd rows));
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE tl_par (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE tl_chi (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) \
+          REFERENCES tl_par(id) DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "INSERT INTO tl_chi VALUES (1, 100)" in
+     let* () = exec_lwt "INSERT INTO tl_par VALUES (100)" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows = query_ok_lwt db "SELECT COUNT(*) FROM tl_chi" in
+     Alcotest.(check int) "child inserted" 1 (int_of_row (List.hd rows));
+     Lwt.return_unit)
+;;
 
 (* Parent-side DELETE of referenced row: deferred RESTRICT permits temporary
    violation iff the child row is also gone by commit. *)
 let test_phase35_deferred_parent_delete_with_child_delete () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE pd_par2 (id INTEGER PRIMARY KEY)" in
-    let* () = exec_lwt
-      "CREATE TABLE pd_chi2 (id INTEGER PRIMARY KEY, pid INTEGER \
-       REFERENCES pd_par2(id) DEFERRABLE INITIALLY DEFERRED)" in
-    let* () = exec_lwt "INSERT INTO pd_par2 VALUES (1)" in
-    let* () = exec_lwt "INSERT INTO pd_chi2 VALUES (10, 1)" in
-    let* () = exec_lwt "BEGIN" in
-    let* () = exec_lwt "DELETE FROM pd_par2 WHERE id = 1" in  (* would fail under immediate *)
-    let* () = exec_lwt "DELETE FROM pd_chi2 WHERE id = 10" in
-    let* () = exec_lwt "COMMIT" in
-    let* rows_par2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_par2" in
-    Alcotest.(check int) "parent empty" 0
-      (int_of_row (List.hd rows_par2));
-    let* rows_chi2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi2" in
-    Alcotest.(check int) "child empty" 0
-      (int_of_row (List.hd rows_chi2));
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE pd_par2 (id INTEGER PRIMARY KEY)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE pd_chi2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES \
+          pd_par2(id) DEFERRABLE INITIALLY DEFERRED)"
+     in
+     let* () = exec_lwt "INSERT INTO pd_par2 VALUES (1)" in
+     let* () = exec_lwt "INSERT INTO pd_chi2 VALUES (10, 1)" in
+     let* () = exec_lwt "BEGIN" in
+     let* () = exec_lwt "DELETE FROM pd_par2 WHERE id = 1" in
+     (* would fail under immediate *)
+     let* () = exec_lwt "DELETE FROM pd_chi2 WHERE id = 10" in
+     let* () = exec_lwt "COMMIT" in
+     let* rows_par2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_par2" in
+     Alcotest.(check int) "parent empty" 0 (int_of_row (List.hd rows_par2));
+     let* rows_chi2 = query_ok_lwt db "SELECT COUNT(*) FROM pd_chi2" in
+     Alcotest.(check int) "child empty" 0 (int_of_row (List.hd rows_chi2));
+     Lwt.return_unit)
+;;
 
 (* Regression: Phase 35 Task 1 review blocker.  All other deferred-FK tests
    use [Db.open_in_memory], whose [ro_begin] reads the live tree and masks
@@ -8553,70 +11070,77 @@ let test_phase35_deferred_parent_delete_with_child_delete () =
       report "no rows to check", and silently let the broken COMMIT through.
 *)
 let test_phase35_deferred_btree_backend () =
-  Lwt_main.run (
-    let path = Filename.temp_file "sqlocaml_phase35" ".db" in
-    (* [Filename.temp_file] creates the file; [Db.open_file] expects either
+  Lwt_main.run
+    (let path = Filename.temp_file "sqlocaml_phase35" ".db" in
+     (* [Filename.temp_file] creates the file; [Db.open_file] expects either
        absent or a previously initialised database, so delete the empty stub
        first. *)
-    (try Sys.remove path with _ -> ());
-    Lwt.finalize
-      (fun () ->
-        let* r = Db.open_file ~path in
-        let db = match r with
-          | Ok d -> d
-          | Error e -> Alcotest.failf "open_file failed: %a" Db.pp_error e
-        in
-        let exec_lwt sql =
-          let* r = Db.execute db sql in
-          (match r with
-           | Ok () -> ()
-           | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-          Lwt.return_unit
-        in
-        (* Lwt-monadic [query_ok] equivalent: avoids the nested
+     (try Sys.remove path with
+      | _ -> ());
+     Lwt.finalize
+       (fun () ->
+          let* r = Db.open_file ~path in
+          let db =
+            match r with
+            | Ok d -> d
+            | Error e -> Alcotest.failf "open_file failed: %a" Db.pp_error e
+          in
+          let exec_lwt sql =
+            let* r = Db.execute db sql in
+            (match r with
+             | Ok () -> ()
+             | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+            Lwt.return_unit
+          in
+          (* Lwt-monadic [query_ok] equivalent: avoids the nested
            [Lwt_main.run] inside [query_ok] (file-scope helper at
            line 33), which after #158 deadlocks when [Lwt_stream.to_list]
            pulls through real [Lwt_unix.pread] calls on this on-disk DB. *)
-        let query_ok_lwt sql =
-          let* r = Db.query db sql in
-          match r with
-          | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
-          | Ok stream -> Lwt_stream.to_list stream
-        in
-        let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-        let* () = exec_lwt "CREATE TABLE bt_par (id INTEGER PRIMARY KEY)" in
-        let* () = exec_lwt
-          "CREATE TABLE bt_chi (id INTEGER PRIMARY KEY, pid INTEGER \
-           REFERENCES bt_par(id) DEFERRABLE INITIALLY DEFERRED)" in
-        (* a) Happy path: child before parent inside a txn — COMMIT succeeds. *)
-        let* () = exec_lwt "BEGIN" in
-        let* () = exec_lwt "INSERT INTO bt_chi VALUES (10, 1)" in
-        let* () = exec_lwt "INSERT INTO bt_par VALUES (1)" in
-        let* () = exec_lwt "COMMIT" in
-        let* rows_par = query_ok_lwt "SELECT COUNT(*) FROM bt_par" in
-        let n_par = int_of_row (List.hd rows_par) in
-        let* rows_chi = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
-        let n_chi = int_of_row (List.hd rows_chi) in
-        Alcotest.(check int) "btree (a): parent count" 1 n_par;
-        Alcotest.(check int) "btree (a): child count"  1 n_chi;
-        (* b) Still-violated path: deferred FK with no resolution — COMMIT
+          let query_ok_lwt sql =
+            let* r = Db.query db sql in
+            match r with
+            | Error _ -> Alcotest.failf "query_ok_lwt: unexpected error for: %s" sql
+            | Ok stream -> Lwt_stream.to_list stream
+          in
+          let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+          let* () = exec_lwt "CREATE TABLE bt_par (id INTEGER PRIMARY KEY)" in
+          let* () =
+            exec_lwt
+              "CREATE TABLE bt_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES \
+               bt_par(id) DEFERRABLE INITIALLY DEFERRED)"
+          in
+          (* a) Happy path: child before parent inside a txn — COMMIT succeeds. *)
+          let* () = exec_lwt "BEGIN" in
+          let* () = exec_lwt "INSERT INTO bt_chi VALUES (10, 1)" in
+          let* () = exec_lwt "INSERT INTO bt_par VALUES (1)" in
+          let* () = exec_lwt "COMMIT" in
+          let* rows_par = query_ok_lwt "SELECT COUNT(*) FROM bt_par" in
+          let n_par = int_of_row (List.hd rows_par) in
+          let* rows_chi = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
+          let n_chi = int_of_row (List.hd rows_chi) in
+          Alcotest.(check int) "btree (a): parent count" 1 n_par;
+          Alcotest.(check int) "btree (a): child count" 1 n_chi;
+          (* b) Still-violated path: deferred FK with no resolution — COMMIT
            must fail.  Under the bug, the fresh RO snapshot misses the child
            write and reports "no violation", silently letting COMMIT through. *)
-        let* () = exec_lwt "BEGIN" in
-        let* () = exec_lwt "INSERT INTO bt_chi VALUES (20, 999)" in
-        let* r = Db.execute db "COMMIT" in
-        (match r with
-         | Error _ -> ()
-         | Ok () ->
-           Alcotest.fail
-             "btree (b): expected COMMIT to fail (deferred FK still violated)");
-        let* rows_chi2 = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
-        let n_chi2 = int_of_row (List.hd rows_chi2) in
-        Alcotest.(check int) "btree (b): child still 1 after failed COMMIT"
-          1 n_chi2;
-        let* () = Db.close db in
-        Lwt.return_unit)
-      (fun () -> (try Sys.remove path with _ -> ()); Lwt.return_unit))
+          let* () = exec_lwt "BEGIN" in
+          let* () = exec_lwt "INSERT INTO bt_chi VALUES (20, 999)" in
+          let* r = Db.execute db "COMMIT" in
+          (match r with
+           | Error _ -> ()
+           | Ok () ->
+             Alcotest.fail
+               "btree (b): expected COMMIT to fail (deferred FK still violated)");
+          let* rows_chi2 = query_ok_lwt "SELECT COUNT(*) FROM bt_chi" in
+          let n_chi2 = int_of_row (List.hd rows_chi2) in
+          Alcotest.(check int) "btree (b): child still 1 after failed COMMIT" 1 n_chi2;
+          let* () = Db.close db in
+          Lwt.return_unit)
+       (fun () ->
+          (try Sys.remove path with
+           | _ -> ());
+          Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Phase 35 task 3 — FK cascade cycle detection + DDL identifier quoting *)
@@ -8627,202 +11151,263 @@ let test_phase35_deferred_btree_backend () =
    must terminate and clear both rows. *)
 let test_phase35_cascade_cycle_terminates () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt "CREATE TABLE cyc_a (id INTEGER PRIMARY KEY, b_id INT)" in
-    let* () = exec_lwt
-      "CREATE TABLE cyc_b (id INTEGER PRIMARY KEY, \
-       a_id INT REFERENCES cyc_a(id) ON DELETE CASCADE)" in
-    let* () = exec_lwt
-      "ALTER TABLE cyc_a ADD COLUMN b_ref INT \
-       REFERENCES cyc_b(id) ON DELETE CASCADE" in
-    let* () = exec_lwt "INSERT INTO cyc_a (id, b_id) VALUES (1, NULL)" in
-    let* () = exec_lwt "INSERT INTO cyc_b (id, a_id) VALUES (10, 1)" in
-    let* () = exec_lwt "UPDATE cyc_a SET b_ref = 10 WHERE id = 1" in
-    let* () = exec_lwt "DELETE FROM cyc_a WHERE id = 1" in
-    let* rows_a = query_ok_lwt db "SELECT COUNT(*) FROM cyc_a" in
-    let n_a = int_of_row (List.hd rows_a) in
-    let* rows_b = query_ok_lwt db "SELECT COUNT(*) FROM cyc_b" in
-    let n_b = int_of_row (List.hd rows_b) in
-    Alcotest.(check int) "cyc_a count after cycle delete" 0 n_a;
-    Alcotest.(check int) "cyc_b count after cycle delete" 0 n_b;
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE cyc_a (id INTEGER PRIMARY KEY, b_id INT)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE cyc_b (id INTEGER PRIMARY KEY, a_id INT REFERENCES cyc_a(id) ON \
+          DELETE CASCADE)"
+     in
+     let* () =
+       exec_lwt
+         "ALTER TABLE cyc_a ADD COLUMN b_ref INT REFERENCES cyc_b(id) ON DELETE CASCADE"
+     in
+     let* () = exec_lwt "INSERT INTO cyc_a (id, b_id) VALUES (1, NULL)" in
+     let* () = exec_lwt "INSERT INTO cyc_b (id, a_id) VALUES (10, 1)" in
+     let* () = exec_lwt "UPDATE cyc_a SET b_ref = 10 WHERE id = 1" in
+     let* () = exec_lwt "DELETE FROM cyc_a WHERE id = 1" in
+     let* rows_a = query_ok_lwt db "SELECT COUNT(*) FROM cyc_a" in
+     let n_a = int_of_row (List.hd rows_a) in
+     let* rows_b = query_ok_lwt db "SELECT COUNT(*) FROM cyc_b" in
+     let n_b = int_of_row (List.hd rows_b) in
+     Alcotest.(check int) "cyc_a count after cycle delete" 0 n_a;
+     Alcotest.(check int) "cyc_b count after cycle delete" 0 n_b;
+     Lwt.return_unit)
+;;
 
 (* Same cycle but seeded via UPDATE: changing parent column on cyc_a triggers
    ON UPDATE cascade through cyc_b which references back to cyc_a.id.  Without
    cycle detection the UPDATE could loop. *)
 let test_phase35_cascade_update_cycle_terminates () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "PRAGMA foreign_keys = 1" in
-    let* () = exec_lwt
-      "CREATE TABLE upd_a (id INTEGER PRIMARY KEY, val INTEGER)" in
-    let* () = exec_lwt
-      "CREATE TABLE upd_b (id INTEGER PRIMARY KEY, \
-       a_val INTEGER REFERENCES upd_a(val) ON UPDATE CASCADE)" in
-    let* () = exec_lwt "INSERT INTO upd_a VALUES (1, 100)" in
-    let* () = exec_lwt "INSERT INTO upd_b VALUES (10, 100)" in
-    (* Cascade-update the parent column; child must follow.  Cycle guard
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "PRAGMA foreign_keys = 1" in
+     let* () = exec_lwt "CREATE TABLE upd_a (id INTEGER PRIMARY KEY, val INTEGER)" in
+     let* () =
+       exec_lwt
+         "CREATE TABLE upd_b (id INTEGER PRIMARY KEY, a_val INTEGER REFERENCES \
+          upd_a(val) ON UPDATE CASCADE)"
+     in
+     let* () = exec_lwt "INSERT INTO upd_a VALUES (1, 100)" in
+     let* () = exec_lwt "INSERT INTO upd_b VALUES (10, 100)" in
+     (* Cascade-update the parent column; child must follow.  Cycle guard
        prevents infinite loops if the FK graph were cyclic. *)
-    let* () = exec_lwt "UPDATE upd_a SET val = 200 WHERE id = 1" in
-    let* rows_b = query_ok_lwt db "SELECT a_val FROM upd_b WHERE id = 10" in
-    let v_b = int_of_row (List.hd rows_b) in
-    Alcotest.(check int) "upd_b.a_val cascaded" 200 v_b;
-    Lwt.return_unit)
+     let* () = exec_lwt "UPDATE upd_a SET val = 200 WHERE id = 1" in
+     let* rows_b = query_ok_lwt db "SELECT a_val FROM upd_b WHERE id = 10" in
+     let v_b = int_of_row (List.hd rows_b) in
+     Alcotest.(check int) "upd_b.a_val cascaded" 200 v_b;
+     Lwt.return_unit)
+;;
 
 (* Verify ddl_of_table quotes a table name containing a space, and that the
    quoted SQL stored in sqlite_master.sql round-trips through the parser
    (re-executes cleanly on a fresh DB). *)
 let test_phase35_ddl_quoting_table_with_space () =
   let db = fresh_db () in
-  run (
-    let* () =
-      let* r = Db.execute db "CREATE TABLE \"my table\" (\"a col\" INTEGER)" in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* rows = query_ok_lwt db
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='my table'" in
-    Alcotest.(check int) "one row from sqlite_master" 1 (List.length rows);
-    let sql = match rows with
-      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
-      | [] -> ""
-    in
-    Alcotest.(check bool) "table name quoted in DDL" true
-      (contains_pat "\"my table\"" sql);
-    Alcotest.(check bool) "column name quoted in DDL" true
-      (contains_pat "\"a col\"" sql);
-    (* Round-trip: feed the SQL back to a fresh DB.  If quoting is wrong
+  run
+    (let* () =
+       let* r = Db.execute db "CREATE TABLE \"my table\" (\"a col\" INTEGER)" in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* rows =
+       query_ok_lwt
+         db
+         "SELECT sql FROM sqlite_master WHERE type='table' AND name='my table'"
+     in
+     Alcotest.(check int) "one row from sqlite_master" 1 (List.length rows);
+     let sql =
+       match rows with
+       | r :: _ ->
+         (match r.(0) with
+          | Db.V_text s -> s
+          | _ -> "")
+       | [] -> ""
+     in
+     Alcotest.(check bool)
+       "table name quoted in DDL"
+       true
+       (contains_pat "\"my table\"" sql);
+     Alcotest.(check bool) "column name quoted in DDL" true (contains_pat "\"a col\"" sql);
+     (* Round-trip: feed the SQL back to a fresh DB.  If quoting is wrong
        the parser will choke on the bare identifier. *)
-    let* db2 = fresh_db_lwt () in
-    let* r = Db.execute db2 sql in
-    (match r with
-     | Ok () -> ()
-     | Error e -> Alcotest.failf "round-trip error: %a" Db.pp_error e);
-    Lwt.return_unit)
+     let* db2 = fresh_db_lwt () in
+     let* r = Db.execute db2 sql in
+     (match r with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "round-trip error: %a" Db.pp_error e);
+     Lwt.return_unit)
+;;
 
 (* Normal identifiers (alphanumeric + underscore) must not get spurious
    quotes — regression guard. *)
 let test_phase35_ddl_quoting_normal_identifiers_unquoted () =
   let db = fresh_db () in
-  run (
-    let* () =
-      let* r = Db.execute db
-        "CREATE TABLE plain_t (id INTEGER PRIMARY KEY, name TEXT)" in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* rows = query_ok_lwt db
-      "SELECT sql FROM sqlite_master WHERE type='table' AND name='plain_t'" in
-    let sql = match rows with
-      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
-      | [] -> ""
-    in
-    Alcotest.(check bool) "no quoting on plain_t" false
-      (contains_pat "\"plain_t\"" sql);
-    Alcotest.(check bool) "no quoting on id"      false
-      (contains_pat "\"id\"" sql);
-    Alcotest.(check bool) "no quoting on name"    false
-      (contains_pat "\"name\"" sql);
-    Lwt.return_unit)
+  run
+    (let* () =
+       let* r =
+         Db.execute db "CREATE TABLE plain_t (id INTEGER PRIMARY KEY, name TEXT)"
+       in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "create error: %a" Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* rows =
+       query_ok_lwt
+         db
+         "SELECT sql FROM sqlite_master WHERE type='table' AND name='plain_t'"
+     in
+     let sql =
+       match rows with
+       | r :: _ ->
+         (match r.(0) with
+          | Db.V_text s -> s
+          | _ -> "")
+       | [] -> ""
+     in
+     Alcotest.(check bool) "no quoting on plain_t" false (contains_pat "\"plain_t\"" sql);
+     Alcotest.(check bool) "no quoting on id" false (contains_pat "\"id\"" sql);
+     Alcotest.(check bool) "no quoting on name" false (contains_pat "\"name\"" sql);
+     Lwt.return_unit)
+;;
 
 (* Index names and column references containing weird chars round-trip. *)
 let test_phase35_ddl_quoting_index () =
   let db = fresh_db () in
-  run (
-    let exec_lwt sql =
-      let* r = Db.execute db sql in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* () = exec_lwt "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
-    let* () = exec_lwt
-      "CREATE INDEX \"weird idx\" ON \"weird tbl\" (\"col x\")" in
-    let* rows = query_ok_lwt db
-      "SELECT sql FROM sqlite_master WHERE type='index' AND name='weird idx'" in
-    let sql = match rows with
-      | r :: _ -> (match r.(0) with Db.V_text s -> s | _ -> "")
-      | [] -> ""
-    in
-    Alcotest.(check bool) "index name quoted"  true
-      (contains_pat "\"weird idx\"" sql);
-    Alcotest.(check bool) "index table quoted" true
-      (contains_pat "\"weird tbl\"" sql);
-    Alcotest.(check bool) "index col quoted"   true
-      (contains_pat "\"col x\"" sql);
-    let* db2 = fresh_db_lwt () in
-    let* () =
-      let* r = Db.execute db2 "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
-      (match r with
-       | Ok () -> ()
-       | Error e -> Alcotest.failf "create2: %a" Db.pp_error e);
-      Lwt.return_unit
-    in
-    let* r = Db.execute db2 sql in
-    (match r with
-     | Ok () -> ()
-     | Error e -> Alcotest.failf "round-trip index: %a" Db.pp_error e);
-    Lwt.return_unit)
+  run
+    (let exec_lwt sql =
+       let* r = Db.execute db sql in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "exec error: %s -- %a" sql Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* () = exec_lwt "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
+     let* () = exec_lwt "CREATE INDEX \"weird idx\" ON \"weird tbl\" (\"col x\")" in
+     let* rows =
+       query_ok_lwt
+         db
+         "SELECT sql FROM sqlite_master WHERE type='index' AND name='weird idx'"
+     in
+     let sql =
+       match rows with
+       | r :: _ ->
+         (match r.(0) with
+          | Db.V_text s -> s
+          | _ -> "")
+       | [] -> ""
+     in
+     Alcotest.(check bool) "index name quoted" true (contains_pat "\"weird idx\"" sql);
+     Alcotest.(check bool) "index table quoted" true (contains_pat "\"weird tbl\"" sql);
+     Alcotest.(check bool) "index col quoted" true (contains_pat "\"col x\"" sql);
+     let* db2 = fresh_db_lwt () in
+     let* () =
+       let* r = Db.execute db2 "CREATE TABLE \"weird tbl\" (\"col x\" INTEGER)" in
+       (match r with
+        | Ok () -> ()
+        | Error e -> Alcotest.failf "create2: %a" Db.pp_error e);
+       Lwt.return_unit
+     in
+     let* r = Db.execute db2 sql in
+     (match r with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "round-trip index: %a" Db.pp_error e);
+     Lwt.return_unit)
+;;
 
-let phase35_task3_tests = [
-  Alcotest.test_case "cascade_cycle_delete_terminates"
-    `Quick test_phase35_cascade_cycle_terminates;
-  Alcotest.test_case "cascade_cycle_update_terminates"
-    `Quick test_phase35_cascade_update_cycle_terminates;
-  Alcotest.test_case "ddl_quoting_table_with_space"
-    `Quick test_phase35_ddl_quoting_table_with_space;
-  Alcotest.test_case "ddl_quoting_normal_identifiers_unquoted"
-    `Quick test_phase35_ddl_quoting_normal_identifiers_unquoted;
-  Alcotest.test_case "ddl_quoting_index_identifiers"
-    `Quick test_phase35_ddl_quoting_index;
-]
+let phase35_task3_tests =
+  [ Alcotest.test_case
+      "cascade_cycle_delete_terminates"
+      `Quick
+      test_phase35_cascade_cycle_terminates
+  ; Alcotest.test_case
+      "cascade_cycle_update_terminates"
+      `Quick
+      test_phase35_cascade_update_cycle_terminates
+  ; Alcotest.test_case
+      "ddl_quoting_table_with_space"
+      `Quick
+      test_phase35_ddl_quoting_table_with_space
+  ; Alcotest.test_case
+      "ddl_quoting_normal_identifiers_unquoted"
+      `Quick
+      test_phase35_ddl_quoting_normal_identifiers_unquoted
+  ; Alcotest.test_case
+      "ddl_quoting_index_identifiers"
+      `Quick
+      test_phase35_ddl_quoting_index
+  ]
+;;
 
-let phase35_fk_deferrable_tests = [
-  Alcotest.test_case "deferred_child_before_parent"
-    `Quick test_phase35_deferred_child_before_parent;
-  Alcotest.test_case "deferred_btree_backend_regression"
-    `Quick test_phase35_deferred_btree_backend;
-  Alcotest.test_case "immediate_still_rejects_at_insert"
-    `Quick test_phase35_immediate_still_rejects_at_insert;
-  Alcotest.test_case "deferred_still_violated_fails_at_commit"
-    `Quick test_phase35_deferred_still_violated_fails_at_commit;
-  Alcotest.test_case "deferred_resolved_by_delete"
-    `Quick test_phase35_deferred_resolved_by_delete;
-  Alcotest.test_case "pragma_defer_foreign_keys_overrides_immediate"
-    `Quick test_phase35_pragma_defer_foreign_keys;
-  Alcotest.test_case "multi_row_deferred_commit_ok"
-    `Quick test_phase35_multi_row_deferred;
-  Alcotest.test_case "autocommit_deferred_behaves_immediate"
-    `Quick test_phase35_autocommit_deferred_behaves_immediate;
-  Alcotest.test_case "rollback_clears_pending_violation"
-    `Quick test_phase35_rollback_clears_pending;
-  Alcotest.test_case "deferrable_initially_immediate_acts_immediate"
-    `Quick test_phase35_initially_immediate_is_immediate;
-  Alcotest.test_case "table_level_foreign_key_deferred"
-    `Quick test_phase35_table_level_deferred;
-  Alcotest.test_case "deferred_parent_delete_resolved_by_child_delete"
-    `Quick test_phase35_deferred_parent_delete_with_child_delete;
-]
+let phase35_fk_deferrable_tests =
+  [ Alcotest.test_case
+      "deferred_child_before_parent"
+      `Quick
+      test_phase35_deferred_child_before_parent
+  ; Alcotest.test_case
+      "deferred_btree_backend_regression"
+      `Quick
+      test_phase35_deferred_btree_backend
+  ; Alcotest.test_case
+      "immediate_still_rejects_at_insert"
+      `Quick
+      test_phase35_immediate_still_rejects_at_insert
+  ; Alcotest.test_case
+      "deferred_still_violated_fails_at_commit"
+      `Quick
+      test_phase35_deferred_still_violated_fails_at_commit
+  ; Alcotest.test_case
+      "deferred_resolved_by_delete"
+      `Quick
+      test_phase35_deferred_resolved_by_delete
+  ; Alcotest.test_case
+      "pragma_defer_foreign_keys_overrides_immediate"
+      `Quick
+      test_phase35_pragma_defer_foreign_keys
+  ; Alcotest.test_case
+      "multi_row_deferred_commit_ok"
+      `Quick
+      test_phase35_multi_row_deferred
+  ; Alcotest.test_case
+      "autocommit_deferred_behaves_immediate"
+      `Quick
+      test_phase35_autocommit_deferred_behaves_immediate
+  ; Alcotest.test_case
+      "rollback_clears_pending_violation"
+      `Quick
+      test_phase35_rollback_clears_pending
+  ; Alcotest.test_case
+      "deferrable_initially_immediate_acts_immediate"
+      `Quick
+      test_phase35_initially_immediate_is_immediate
+  ; Alcotest.test_case
+      "table_level_foreign_key_deferred"
+      `Quick
+      test_phase35_table_level_deferred
+  ; Alcotest.test_case
+      "deferred_parent_delete_resolved_by_child_delete"
+      `Quick
+      test_phase35_deferred_parent_delete_with_child_delete
+  ]
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Helper tests (#161): the *_lwt family must exist and behave        *)
@@ -8830,697 +11415,900 @@ let phase35_fk_deferrable_tests = [
 (* ------------------------------------------------------------------ *)
 
 let helper_query_ok_lwt_smoke () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* r1 = Db.execute db "CREATE TABLE t (x INTEGER)" in
-    (match r1 with
-     | Ok () -> ()
-     | Error e -> Alcotest.failf "create: %s" (fmt_err e));
-    let* r2 = Db.execute db "INSERT INTO t (x) VALUES (1), (2), (3)" in
-    (match r2 with
-     | Ok () -> ()
-     | Error e -> Alcotest.failf "insert: %s" (fmt_err e));
-    let* rows = query_ok_lwt db "SELECT x FROM t ORDER BY x" in
-    Alcotest.(check int) "row count" 3 (List.length rows);
-    let* () = Db.close db in
-    Lwt.return_unit
-  )
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* r1 = Db.execute db "CREATE TABLE t (x INTEGER)" in
+     (match r1 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "create: %s" (fmt_err e));
+     let* r2 = Db.execute db "INSERT INTO t (x) VALUES (1), (2), (3)" in
+     (match r2 with
+      | Ok () -> ()
+      | Error e -> Alcotest.failf "insert: %s" (fmt_err e));
+     let* rows = query_ok_lwt db "SELECT x FROM t ORDER BY x" in
+     Alcotest.(check int) "row count" 3 (List.length rows);
+     let* () = Db.close db in
+     Lwt.return_unit)
+;;
 
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
 let () =
-  Alcotest.run "E2E" [
-    "walking_skeleton", [
-      Alcotest.test_case "walking_skeleton" `Quick walking_skeleton;
-    ];
-    "select_variations", [
-      Alcotest.test_case "select_all_rows"    `Quick select_all_rows;
-      Alcotest.test_case "select_star_columns" `Quick select_star_columns;
-      Alcotest.test_case "select_named_cols"  `Quick select_named_cols;
-    ];
-    "multiple_tables", [
-      Alcotest.test_case "two_tables"      `Quick two_tables;
-      Alcotest.test_case "table_isolation" `Quick table_isolation;
-    ];
-    "error_propagation", [
-      Alcotest.test_case "parse_error"                       `Quick parse_error;
-      Alcotest.test_case "unknown_table"                     `Quick unknown_table;
-      Alcotest.test_case "unknown_column"                    `Quick unknown_column;
-      Alcotest.test_case "type_mismatch"                     `Quick type_mismatch;
-      Alcotest.test_case "arity_mismatch"                    `Quick arity_mismatch;
-      Alcotest.test_case "already_exists"                    `Quick already_exists_error;
-      Alcotest.test_case "parse_failure_via_lexer"           `Quick parse_failure_via_lexer;
-      Alcotest.test_case "execute_with_select_is_runtime"    `Quick execute_with_select_is_runtime_error;
-      Alcotest.test_case "query_with_insert_is_runtime"      `Quick query_with_insert_is_runtime_error;
-    ];
-    "null_handling", [
-      Alcotest.test_case "insert_null"        `Quick insert_null;
-      Alcotest.test_case "where_null_no_match" `Quick where_null_no_match;
-    ];
-    "rowid_ordering", [
-      Alcotest.test_case "insert_order" `Quick insert_order;
-    ];
-    "stress_robustness", [
-      Alcotest.test_case "many_rows"        `Quick many_rows;
-      Alcotest.test_case "close_then_reuse" `Quick close_then_reuse;
-    ];
-    "row_content", [
-      Alcotest.test_case "row_content_exact"         `Quick row_content_exact;
-      Alcotest.test_case "select_partial_projection"  `Quick select_partial_projection;
-      Alcotest.test_case "empty_table_select"         `Quick empty_table_select;
-      Alcotest.test_case "select_where_text"          `Quick select_where_text;
-    ];
-    "real_column", [
-      Alcotest.test_case "real_create_insert_select" `Quick real_create_insert_select;
-      Alcotest.test_case "real_negative"             `Quick real_negative;
-      Alcotest.test_case "real_zero"                 `Quick real_zero;
-      Alcotest.test_case "real_null"                 `Quick real_null;
-      Alcotest.test_case "real_multiple_rows"        `Quick real_multiple_rows;
-      Alcotest.test_case "real_type_mismatch"        `Quick real_type_mismatch;
-    ];
-    "blob_column", [
-      Alcotest.test_case "blob_null_insert"          `Quick blob_null_insert;
-      Alcotest.test_case "blob_type_mismatch"        `Quick blob_type_mismatch;
-      Alcotest.test_case "blob_schema_preserved"     `Quick blob_schema_preserved;
-    ];
-    "real_and_blob", [
-      Alcotest.test_case "real_and_blob_together"    `Quick real_and_blob_together;
-      Alcotest.test_case "already_exists_real_blob"  `Quick already_exists_real_blob;
-    ];
-    "order_by", [
-      Alcotest.test_case "order_by_asc"         `Quick order_by_asc;
-      Alcotest.test_case "order_by_desc"        `Quick order_by_desc;
-      Alcotest.test_case "order_by_default_asc" `Quick order_by_default_asc;
-      Alcotest.test_case "order_by_null_first"  `Quick order_by_null_first;
-      Alcotest.test_case "order_by_text"        `Quick order_by_text;
-      Alcotest.test_case "order_by_expr"        `Quick order_by_expr;
-      Alcotest.test_case "join_order_by"        `Quick test_order_by_expr_join;
-    ];
-    "nulls_first_last", [
-      Alcotest.test_case "nulls_first_last" `Quick test_nulls_first_last;
-    ];
-    "limit_offset", [
-      Alcotest.test_case "limit_no_order"       `Quick limit_no_order;
-      Alcotest.test_case "limit_with_offset"    `Quick limit_with_offset;
-      Alcotest.test_case "order_by_then_limit"  `Quick order_by_then_limit;
-      Alcotest.test_case "order_by_limit_offset" `Quick order_by_limit_offset;
-    ];
-    "qcheck_order_limit", (
-      List.map QCheck_alcotest.to_alcotest [
-        qcheck_order_by_asc_sorted;
-        qcheck_order_by_desc_sorted;
-        qcheck_limit_count;
-      ]
-    );
-    "create_index", [
-      Alcotest.test_case "create_index_simple"              `Quick create_index_simple;
-      Alcotest.test_case "create_index_on_text_column"      `Quick create_index_on_text_column;
-      Alcotest.test_case "create_unique_index"              `Quick create_unique_index;
-      Alcotest.test_case "unique_index_rejects_duplicate"    `Quick unique_index_rejects_duplicate;
-      Alcotest.test_case "unique_index_allows_distinct"      `Quick unique_index_allows_distinct_values;
-      Alcotest.test_case "index_lookup_no_match"            `Quick index_lookup_no_match;
-      Alcotest.test_case "index_lookup_returns_all_matches" `Quick index_lookup_returns_all_matches;
-      Alcotest.test_case "index_lookup_matches_seq_scan"    `Quick index_lookup_matches_seq_scan;
-      Alcotest.test_case "index_lookup_after_inserts"       `Quick index_lookup_after_inserts;
-      Alcotest.test_case "create_index_unknown_table"       `Quick create_index_unknown_table;
-      Alcotest.test_case "create_index_unknown_column"      `Quick create_index_unknown_column;
-      Alcotest.test_case "create_index_duplicate"           `Quick create_index_duplicate;
-      Alcotest.test_case "index_lookup_where_null_no_match"  `Quick index_lookup_where_null_no_match;
-      Alcotest.test_case "multi_col_index"                   `Quick test_multi_col_index;
-      Alcotest.test_case "multi_col_unique_index"             `Quick test_multi_col_unique_index;
-    ];
-    "qcheck_create_index", (
-      List.map QCheck_alcotest.to_alcotest [
-        qcheck_index_lookup_matches_seq_scan;
-        qcheck_text_index_lookup;
-      ]
-    );
-    "not_null_and_default", [
-      Alcotest.test_case "not_null_insert_null"             `Quick not_null_insert_null;
-      Alcotest.test_case "not_null_default_used_when_omitted" `Quick not_null_default_used_when_omitted;
-      Alcotest.test_case "not_null_default_zero"            `Quick not_null_default_zero;
-      Alcotest.test_case "not_null_update_to_null"          `Quick not_null_update_to_null;
-      Alcotest.test_case "default_value_readable"           `Quick default_value_readable;
-      Alcotest.test_case "not_null_omit_no_default"         `Quick not_null_omit_no_default;
-    ];
-    "qcheck_not_null_default", (
-      List.map QCheck_alcotest.to_alcotest [
-        qcheck_default_applied;
-      ]
-    );
-    "drop_table_and_index", [
-      Alcotest.test_case "drop_table_then_select"             `Quick drop_table_then_select;
-      Alcotest.test_case "drop_table_nonexistent"             `Quick drop_table_nonexistent;
-      Alcotest.test_case "drop_table_data_gone"               `Quick drop_table_data_gone;
-      Alcotest.test_case "drop_table_with_index"              `Quick drop_table_with_index;
-      Alcotest.test_case "drop_table_then_recreate"           `Quick drop_table_then_recreate;
-      Alcotest.test_case "drop_index_then_select"             `Quick drop_index_then_select;
-      Alcotest.test_case "drop_index_nonexistent"             `Quick drop_index_nonexistent;
-      Alcotest.test_case "drop_index_then_recreate"           `Quick drop_index_then_recreate;
-      Alcotest.test_case "drop_table_recreate_old_data_invis" `Quick drop_table_recreate_old_data_invisible;
-      Alcotest.test_case "drop_first_index_then_recreate"     `Quick drop_first_index_then_recreate;
-    ];
-    "gap_fill", [
-      Alcotest.test_case "open_file_invalid_path"  `Quick open_file_invalid_path;
-      Alcotest.test_case "default_real_persists"   `Quick default_real_persists;
-      Alcotest.test_case "default_text_persists"   `Quick default_text_persists;
-      Alcotest.test_case "default_int_persists"    `Quick default_int_persists;
-    ];
-    "between_in", [
-      Alcotest.test_case "between"     `Quick test_between_query;
-      Alcotest.test_case "not_between" `Quick test_not_between_query;
-      Alcotest.test_case "in"          `Quick test_in_query;
-      Alcotest.test_case "not_in"      `Quick test_not_in_query;
-    ];
-    "pragma", [
-      Alcotest.test_case "table_info"  `Quick test_pragma_table_info;
-      Alcotest.test_case "index_list"  `Quick test_pragma_index_list;
-    ];
-    "select_distinct", [
-      Alcotest.test_case "distinct_single_col"   `Quick test_distinct;
-      Alcotest.test_case "distinct_multicolumn"  `Quick test_distinct_multicolumn;
-      Alcotest.test_case "distinct_null"         `Quick test_distinct_null;
-    ];
-    "set_operations", [
-      Alcotest.test_case "union"      `Quick test_union;
-      Alcotest.test_case "union_all"  `Quick test_union_all;
-      Alcotest.test_case "intersect"  `Quick test_intersect;
-      Alcotest.test_case "except"     `Quick test_except;
-    ];
-    "named_indexed_params", [
-      Alcotest.test_case "indexed_params"       `Quick test_indexed_params;
-      Alcotest.test_case "named_params_colon"   `Quick test_named_params_colon;
-    ];
-    "datetime_functions", [
-      Alcotest.test_case "date_fn"      `Quick test_date_fn;
-      Alcotest.test_case "time_fn"      `Quick test_time_fn;
-      Alcotest.test_case "datetime_fn"  `Quick test_datetime_fn;
-      Alcotest.test_case "julianday_fn" `Quick test_julianday_fn;
-      Alcotest.test_case "unixepoch_fn" `Quick test_unixepoch_fn;
-      Alcotest.test_case "strftime_fn"  `Quick test_strftime_fn;
-      Alcotest.test_case "date_now"     `Quick test_date_now;
-    ];
-    "multikey_order_by", [
-      Alcotest.test_case "multikey_asc_asc"   `Quick test_multikey_order_by;
-      Alcotest.test_case "multikey_asc_desc"  `Quick test_multikey_order_by_mixed;
-    ];
-    "distinct_types", [
-      Alcotest.test_case "distinct_real"  `Quick test_distinct_real;
-    ];
-    "set_op_edge_cases", [
-      Alcotest.test_case "intersect_empty_right"  `Quick test_intersect_empty_right;
-      Alcotest.test_case "except_dedup_left"      `Quick test_except_dedup_left;
-      Alcotest.test_case "except_empty_right"     `Quick test_except_empty_right;
-    ];
-    "datetime_null_branches", [
-      Alcotest.test_case "date_invalid_input"      `Quick test_date_invalid_input;
-      Alcotest.test_case "date_nontext_arg"        `Quick test_date_nontext_arg;
-      Alcotest.test_case "date_with_modifier"      `Quick test_date_with_modifier;
-      Alcotest.test_case "time_invalid_input"      `Quick test_time_invalid_input;
-      Alcotest.test_case "time_nontext_arg"        `Quick test_time_nontext_arg;
-      Alcotest.test_case "time_with_modifier"      `Quick test_time_with_modifier;
-      Alcotest.test_case "datetime_invalid_input"  `Quick test_datetime_invalid_input;
-      Alcotest.test_case "datetime_nontext_arg"    `Quick test_datetime_nontext_arg;
-      Alcotest.test_case "datetime_with_modifier"  `Quick test_datetime_with_modifier;
-      Alcotest.test_case "julianday_invalid"       `Quick test_julianday_invalid;
-      Alcotest.test_case "julianday_nontext_arg"   `Quick test_julianday_nontext_arg;
-      Alcotest.test_case "julianday_with_modifier" `Quick test_julianday_with_modifier;
-      Alcotest.test_case "unixepoch_invalid"       `Quick test_unixepoch_invalid;
-      Alcotest.test_case "unixepoch_nontext_arg"   `Quick test_unixepoch_nontext_arg;
-      Alcotest.test_case "unixepoch_with_modifier" `Quick test_unixepoch_with_modifier;
-      Alcotest.test_case "strftime_null_fmt"       `Quick test_strftime_null_fmt;
-      Alcotest.test_case "strftime_invalid_ts"     `Quick test_strftime_invalid_ts;
-      Alcotest.test_case "strftime_with_modifier"  `Quick test_strftime_with_modifier;
-    ];
-    "datetime_null_arg_branches", [
-      Alcotest.test_case "date_null_arg"           `Quick test_date_null_arg;
-      Alcotest.test_case "date_null_with_rest"     `Quick test_date_null_with_rest;
-      Alcotest.test_case "time_null_arg"           `Quick test_time_null_arg;
-      Alcotest.test_case "time_null_with_rest"     `Quick test_time_null_with_rest;
-      Alcotest.test_case "datetime_null_arg"       `Quick test_datetime_null_arg;
-      Alcotest.test_case "datetime_null_with_rest" `Quick test_datetime_null_with_rest;
-      Alcotest.test_case "julianday_null_arg"      `Quick test_julianday_null_arg;
-      Alcotest.test_case "julianday_null_with_rest" `Quick test_julianday_null_with_rest;
-      Alcotest.test_case "unixepoch_null_arg"      `Quick test_unixepoch_null_arg;
-      Alcotest.test_case "unixepoch_null_with_rest" `Quick test_unixepoch_null_with_rest;
-    ];
-    "distinct_blob", [
-      Alcotest.test_case "distinct_blob_null"  `Quick test_distinct_blob_null;
-    ];
-    "on_conflict", [
-      Alcotest.test_case "insert_or_ignore"             `Quick test_insert_or_ignore;
-      Alcotest.test_case "insert_or_replace"            `Quick test_insert_or_replace;
-      Alcotest.test_case "insert_or_ignore_unique"      `Quick test_insert_or_ignore_unique;
-      Alcotest.test_case "insert_or_replace_no_conflict" `Quick test_insert_or_replace_no_conflict;
-      Alcotest.test_case "insert_or_replace_multi_unique" `Quick test_insert_or_replace_multi_unique;
-      Alcotest.test_case "insert_or_abort_error"        `Quick test_insert_or_abort_error;
-    ];
-    "returning", [
-      Alcotest.test_case "insert_returning"        `Quick test_insert_returning;
-      Alcotest.test_case "update_returning"        `Quick test_update_returning;
-      Alcotest.test_case "delete_returning"        `Quick test_delete_returning;
-      Alcotest.test_case "update_returning_multi"  `Quick test_update_returning_multi;
-      Alcotest.test_case "delete_returning_multi"  `Quick test_delete_returning_multi;
-      Alcotest.test_case "insert_returning_ignored" `Quick test_insert_returning_ignored;
-    ];
-    "alter_table", [
-      Alcotest.test_case "add_column"                    `Quick test_alter_add_column;
-      Alcotest.test_case "add_column_null_default"       `Quick test_alter_add_column_null_default;
-      Alcotest.test_case "add_not_null_no_default_error" `Quick test_alter_add_not_null_no_default_error;
-      Alcotest.test_case "rename_table"                  `Quick test_rename_table;
-      Alcotest.test_case "rename_column"                 `Quick test_rename_column;
-      Alcotest.test_case "rename_column_no_keyword"      `Quick test_rename_column_no_keyword;
-      Alcotest.test_case "rename_nonexistent"            `Quick test_alter_rename_nonexistent;
-      Alcotest.test_case "rename_column_nonexistent"     `Quick test_alter_rename_column_nonexistent;
-      Alcotest.test_case "add_column_duplicate"          `Quick test_alter_add_column_duplicate;
-      Alcotest.test_case "rename_table_to_existing"      `Quick test_alter_rename_table_to_existing;
-      Alcotest.test_case "add_column_nonexistent_table"  `Quick test_alter_add_column_nonexistent_table;
-    ];
-    "table_constraints", [
-      Alcotest.test_case "table_unique_constraint"      `Quick test_table_unique_constraint;
-      Alcotest.test_case "table_primary_key_constraint" `Quick test_table_primary_key_constraint;
-    ];
-    "subqueries", [
-      Alcotest.test_case "scalar_subquery"         `Quick test_scalar_subquery;
-      Alcotest.test_case "scalar_subquery_null"    `Quick test_scalar_subquery_null;
-      Alcotest.test_case "exists_true"             `Quick test_exists_subquery;
-      Alcotest.test_case "exists_false"            `Quick test_exists_subquery_false;
-      Alcotest.test_case "in_select"               `Quick test_in_select_subquery;
-      Alcotest.test_case "not_in_select"           `Quick test_not_in_select_subquery;
-    ];
-    "fk_parse", [
-      Alcotest.test_case "fk_references_col"     `Quick test_fk_parse_create;
-    ];
-    "foreign_key", [
-      Alcotest.test_case "valid_insert"          `Quick test_fk_valid_insert;
-      Alcotest.test_case "invalid_insert"        `Quick test_fk_invalid_insert;
-      Alcotest.test_case "null_allowed"          `Quick test_fk_null_allowed;
-      Alcotest.test_case "multi_col_supported"   `Quick test_fk_multi_col_unsupported;
-      Alcotest.test_case "implicit_parent_col"        `Quick fk_implicit_parent_col;
-      Alcotest.test_case "implicit_no_pk_error"       `Quick fk_implicit_no_pk_error;
-      Alcotest.test_case "implicit_parent_not_found"  `Quick fk_implicit_parent_not_found;
-      Alcotest.test_case "implicit_infers_pk_column"  `Quick fk_implicit_infers_pk_column;
-      Alcotest.test_case "implicit_table_level_pk"    `Quick fk_implicit_table_level_pk;
-    ];
-    "check_constraints", [
-      Alcotest.test_case "insert_ok"           `Quick test_check_insert_ok;
-      Alcotest.test_case "insert_violation"    `Quick test_check_insert_violation;
-      Alcotest.test_case "update_violation"    `Quick test_check_update_violation;
-      Alcotest.test_case "null_allowed"        `Quick test_check_null_allowed;
-      Alcotest.test_case "persisted"           `Quick test_check_persisted;
-      Alcotest.test_case "cache_invalidation"  `Quick test_check_cache_invalidation;
-      Alcotest.test_case "agg_in_check_rejected" `Quick test_check_agg_rejected;
-    ];
-    "phase9_edge", [
-      Alcotest.test_case "const_select"          `Quick test_const_select;
-      Alcotest.test_case "subquery_and_pred"     `Quick test_subquery_and_predicate;
-      Alcotest.test_case "check_complex_expr"    `Quick test_check_complex_expr;
-      Alcotest.test_case "check_function_expr"   `Quick test_check_function_in_expr;
-      Alcotest.test_case "text_scalar_subquery"  `Quick test_text_scalar_subquery;
-      Alcotest.test_case "real_scalar_subquery"  `Quick test_real_scalar_subquery;
-      Alcotest.test_case "like_in_where"         `Quick test_like_in_where;
-      Alcotest.test_case "modulo_operator"       `Quick test_modulo_operator;
-      Alcotest.test_case "sum_real_with_nulls"   `Quick test_sum_real_with_nulls;
-      Alcotest.test_case "avg_real_column"       `Quick test_avg_real_column;
-      Alcotest.test_case "check_add_binop"       `Quick test_check_add_binop;
-      Alcotest.test_case "check_concat_binop"    `Quick test_check_concat_binop;
-      Alcotest.test_case "check_like_constraint" `Quick test_check_like_in_constraint;
-      Alcotest.test_case "int_real_comparison"   `Quick test_int_real_comparison;
-      Alcotest.test_case "real_ne_comparison"    `Quick test_real_ne_comparison;
-      Alcotest.test_case "real_mod_int"          `Quick test_real_mod_int;
-      Alcotest.test_case "alter_add_text_default"   `Quick test_alter_add_text_default;
-      Alcotest.test_case "check_not_operator"        `Quick test_check_not_operator;
-      Alcotest.test_case "check_between_in_check"    `Quick test_check_between_in_check;
-      Alcotest.test_case "check_is_not_null_in_check" `Quick test_check_is_not_null_in_check;
-    ];
-    "string_coverage", [
-      Alcotest.test_case "trim_all_whitespace"    `Quick test_trim_all_whitespace;
-      Alcotest.test_case "trim_chars_all_removed" `Quick test_trim_chars_all_removed;
-      Alcotest.test_case "replace_empty_old"      `Quick test_replace_empty_old;
-    ];
-    "case_when", [
-      Alcotest.test_case "case_searched"       `Quick test_case_searched;
-      Alcotest.test_case "case_simple"         `Quick test_case_simple;
-      Alcotest.test_case "case_no_else"        `Quick test_case_no_else;
-      Alcotest.test_case "case_null_scrutinee" `Quick test_case_null_scrutinee;
-      Alcotest.test_case "case_in_where"       `Quick test_case_in_where;
-      Alcotest.test_case "case_nested"         `Quick test_case_nested;
-      Alcotest.test_case "case_arithmetic"     `Quick test_case_arithmetic;
-    ];
-    "multi_join", [
-      Alcotest.test_case "three_table_join"    `Quick test_three_table_join;
-      Alcotest.test_case "two_joins_with_where" `Quick test_two_joins_with_where;
-      Alcotest.test_case "two_left_joins"      `Quick test_two_left_joins;
-      Alcotest.test_case "star_three_tables"   `Quick test_star_three_tables;
-      Alcotest.test_case "regression_one_join" `Quick test_multi_join_regression_one;
-      Alcotest.test_case "three_join_group_order"       `Quick three_join_group_order;
-      Alcotest.test_case "two_join_group_order_regression" `Quick two_join_group_order_regression;
-    ];
-    "phase10_edge", [
-      Alcotest.test_case "case_in_order_by"   `Quick test_case_in_order_by;
-      Alcotest.test_case "case_with_func"     `Quick test_case_with_func;
-      Alcotest.test_case "case_in_update"     `Quick test_case_in_update;
-      Alcotest.test_case "case_in_join"       `Quick test_case_in_join;
-      Alcotest.test_case "four_table_join"    `Quick test_four_table_join;
-      Alcotest.test_case "multi_join_mid_col" `Quick test_multi_join_middle_col;
-    ];
-    "cast_expr", [
-      Alcotest.test_case "cast_int_to_text"      `Quick test_cast_int_to_text;
-      Alcotest.test_case "cast_text_to_int"      `Quick test_cast_text_to_int;
-      Alcotest.test_case "cast_text_to_int_inv"  `Quick test_cast_text_to_int_invalid;
-      Alcotest.test_case "cast_real_to_int"      `Quick test_cast_real_to_int;
-      Alcotest.test_case "cast_int_to_real"      `Quick test_cast_int_to_real;
-      Alcotest.test_case "cast_null"             `Quick test_cast_null;
-      Alcotest.test_case "cast_in_where"         `Quick test_cast_in_where;
-      Alcotest.test_case "cast_text_float_pfx"  `Quick test_cast_text_float_prefix_to_int;
-    ];
-    "nullif_iif", [
-      Alcotest.test_case "nullif_equal"   `Quick test_nullif_equal;
-      Alcotest.test_case "nullif_unequal" `Quick test_nullif_unequal;
-      Alcotest.test_case "iif_true"       `Quick test_iif_true;
-      Alcotest.test_case "iif_false"      `Quick test_iif_false;
-    ];
-    "col_alias", [
-      Alcotest.test_case "basic"     `Quick test_col_alias_basic;
-      Alcotest.test_case "order_by"  `Quick test_col_alias_order_by;
-      Alcotest.test_case "multiple"  `Quick test_col_alias_multiple;
-      Alcotest.test_case "mixed"     `Quick test_col_alias_mixed;
-      Alcotest.test_case "cast"      `Quick test_col_alias_cast;
-    ];
-    "tbl_alias", [
-      Alcotest.test_case "from"       `Quick test_tbl_alias_from;
-      Alcotest.test_case "join"       `Quick test_tbl_alias_join;
-      Alcotest.test_case "where"      `Quick test_tbl_alias_where;
-      Alcotest.test_case "order_by"   `Quick test_tbl_alias_order_by;
-      Alcotest.test_case "three_join" `Quick test_tbl_alias_three_join;
-    ];
-    "cte", [
-      Alcotest.test_case "basic"    `Quick test_cte_basic;
-      Alcotest.test_case "filter"   `Quick test_cte_filter;
-      Alcotest.test_case "agg"      `Quick test_cte_agg;
-      Alcotest.test_case "col_name" `Quick test_cte_col_name;
-      Alcotest.test_case "order"    `Quick test_cte_order;
-    ];
-    "multi_insert", [
-      Alcotest.test_case "basic"         `Quick test_multirow_basic;
-      Alcotest.test_case "single_works"  `Quick test_multirow_single_still_works;
-      Alcotest.test_case "on_conflict"   `Quick test_multirow_on_conflict;
-      Alcotest.test_case "returning"     `Quick test_multirow_returning;
-    ];
-    "correlated", [
-      Alcotest.test_case "exists"     `Quick test_corr_exists;
-      Alcotest.test_case "not_exists" `Quick test_corr_not_exists;
-      Alcotest.test_case "in_select"  `Quick test_corr_in_select;
-      Alcotest.test_case "not_in"     `Quick test_corr_not_in_select;
-    ];
-    "upsert", [
-      Alcotest.test_case "basic"                `Quick test_upsert_basic;
-      Alcotest.test_case "no_conflict"          `Quick test_upsert_no_conflict;
-      Alcotest.test_case "expression"           `Quick test_upsert_expression;
-      Alcotest.test_case "multiple_assignments" `Quick test_upsert_multiple_assignments;
-      Alcotest.test_case "preserves_others"     `Quick test_upsert_preserves_non_conflict_rows;
-    ];
-    "view", [
-      Alcotest.test_case "basic"        `Quick test_view_basic;
-      Alcotest.test_case "filter"       `Quick test_view_with_filter;
-      Alcotest.test_case "agg"          `Quick test_view_aggregation;
-      Alcotest.test_case "drop"         `Quick test_view_drop;
-      Alcotest.test_case "count"        `Quick test_view_count;
-      Alcotest.test_case "per_db"       `Quick test_view_independent_per_db;
-      Alcotest.test_case "persistence"  `Quick test_view_persistence;
-    ];
-    "window", [
-      Alcotest.test_case "row_number"       `Quick test_window_row_number;
-      Alcotest.test_case "rank"             `Quick test_window_rank;
-      Alcotest.test_case "dense_rank"       `Quick test_window_dense_rank;
-      Alcotest.test_case "lag"              `Quick test_window_lag;
-      Alcotest.test_case "lead"             `Quick test_window_lead;
-      Alcotest.test_case "sum_over"         `Quick test_window_sum_over;
-      Alcotest.test_case "no_partition"     `Quick test_window_no_partition;
-      Alcotest.test_case "first_last_value" `Quick test_window_first_last_value;
-      Alcotest.test_case "orderby_alias"    `Quick test_window_orderby_alias;
-      Alcotest.test_case "rows_frame"       `Quick test_window_rows_frame;
-      Alcotest.test_case "rows_unbounded"   `Quick test_window_rows_unbounded;
-      Alcotest.test_case "percent_rank"      `Quick test_window_percent_rank;
-      Alcotest.test_case "cume_dist"         `Quick test_window_cume_dist;
-      Alcotest.test_case "percent_rank_desc"    `Quick test_window_percent_rank_desc;
-      Alcotest.test_case "cume_dist_desc"        `Quick test_window_cume_dist_desc;
-      Alcotest.test_case "frame_non_agg_error"   `Quick test_window_frame_non_agg_error;
-      Alcotest.test_case "window_in_agg"         `Quick test_window_in_agg;
-      Alcotest.test_case "window_in_agg_count"   `Quick test_window_in_agg_count;
-    ];
-    "recursive_cte", [
-      Alcotest.test_case "series"                  `Quick test_recursive_cte_series;
-      Alcotest.test_case "sum"                     `Quick test_recursive_cte_sum;
-      Alcotest.test_case "tree"                    `Quick test_recursive_cte_tree;
-      Alcotest.test_case "non_recursive_unchanged" `Quick test_recursive_cte_non_recursive_unchanged;
-    ];
-    "collate", [
-      Alcotest.test_case "nocase_eq"    `Quick test_collate_nocase_eq;
-      Alcotest.test_case "nocase_order" `Quick test_collate_nocase_order;
-      Alcotest.test_case "binary_eq"    `Quick test_collate_binary_eq;
-    ];
-    "drop_column", [
-      Alcotest.test_case "basic"           `Quick test_drop_column_basic;
-      Alcotest.test_case "schema"          `Quick test_drop_column_schema;
-      Alcotest.test_case "nonexistent_err" `Quick test_drop_column_nonexistent_fails;
-    ];
-    "if_not_exists", [
-      Alcotest.test_case "create_table_ine"     `Quick test_create_table_if_not_exists;
-      Alcotest.test_case "create_index_ine"     `Quick test_create_index_if_not_exists;
-      Alcotest.test_case "create_table_no_ine"  `Quick test_create_table_no_ine_fails;
-    ];
-    "group_by_multi", [
-      Alcotest.test_case "two_cols_count"  `Quick test_group_by_two_cols;
-      Alcotest.test_case "two_cols_sum"    `Quick test_group_by_two_cols_sum;
-      Alcotest.test_case "two_cols_having" `Quick test_group_by_two_cols_having;
-    ];
-    "math", [
-      Alcotest.test_case "math_ceil"  `Quick test_math_ceil;
-      Alcotest.test_case "math_floor" `Quick test_math_floor;
-      Alcotest.test_case "math_sqrt"  `Quick test_math_sqrt;
-      Alcotest.test_case "math_pow"   `Quick test_math_pow;
-      Alcotest.test_case "math_sign"  `Quick test_math_sign;
-      Alcotest.test_case "math_trunc" `Quick test_math_trunc;
-      Alcotest.test_case "math_pi"    `Quick test_math_pi;
-      Alcotest.test_case "math_trig"  `Quick test_math_trig;
-      Alcotest.test_case "math_log"   `Quick test_math_log;
-    ];
-    "json", [
-      Alcotest.test_case "json_extract" `Quick test_json_extract;
-      Alcotest.test_case "json_object"  `Quick test_json_object;
-      Alcotest.test_case "json_array"   `Quick test_json_array;
-      Alcotest.test_case "json_type"    `Quick test_json_type;
-      Alcotest.test_case "json_valid"   `Quick test_json_valid;
-      Alcotest.test_case "json_set"     `Quick test_json_set;
-      Alcotest.test_case "json_insert"  `Quick test_json_insert;
-      Alcotest.test_case "json_replace" `Quick test_json_replace;
-      Alcotest.test_case "json_remove"  `Quick test_json_remove;
-    ];
-    "savepoint", [
-      Alcotest.test_case "rollback_undoes_insert"  `Quick test_savepoint_rollback_undoes_insert;
-      Alcotest.test_case "release_keeps_insert"    `Quick test_savepoint_release_keeps_insert;
-      Alcotest.test_case "partial_rollback"        `Quick test_savepoint_partial_rollback;
-      Alcotest.test_case "double_rollback"         `Quick test_savepoint_double_rollback;
-      Alcotest.test_case "auto_begin"              `Quick test_savepoint_auto_begin;
-    ];
-    "fk_delete_update", [
-      Alcotest.test_case "delete_ref_fails"     `Quick test_fk_delete_referenced_parent_fails;
-      Alcotest.test_case "delete_no_ref_ok"     `Quick test_fk_delete_unreferenced_parent_ok;
-      Alcotest.test_case "delete_null_child_ok" `Quick test_fk_delete_null_child_ok;
-      Alcotest.test_case "update_ref_fails"     `Quick test_fk_update_referenced_col_fails;
-      Alcotest.test_case "update_no_ref_ok"     `Quick test_fk_update_unreferenced_col_ok;
-      Alcotest.test_case "cascade_delete"         `Quick test_fk_cascade_delete;
-      Alcotest.test_case "cascade_delete_empty"   `Quick test_fk_cascade_delete_no_children;
-      Alcotest.test_case "cascade_update"         `Quick test_fk_cascade_update;
-      Alcotest.test_case "set_null_delete"        `Quick test_fk_set_null_delete;
-      Alcotest.test_case "set_null_update"        `Quick test_fk_set_null_update;
-      Alcotest.test_case "set_default_delete"     `Quick test_fk_set_default_delete;
-      Alcotest.test_case "no_action_blocks"       `Quick test_fk_no_action_blocks_delete;
-      Alcotest.test_case "cascade_table_level_fk" `Quick test_fk_cascade_table_level_fk;
-    ];
-    "triggers", [
-      Alcotest.test_case "after_insert"          `Quick test_after_insert_trigger;
-      Alcotest.test_case "after_insert_two_rows" `Quick test_after_insert_two_rows;
-      Alcotest.test_case "after_delete"          `Quick test_after_delete_trigger;
-      Alcotest.test_case "after_update"          `Quick test_after_update_trigger;
-      Alcotest.test_case "before_insert_aborts"  `Quick test_before_insert_trigger_aborts;
-      Alcotest.test_case "when_clause_conditional" `Quick test_when_clause_conditional;
-      Alcotest.test_case "drop_trigger"          `Quick test_drop_trigger;
-      Alcotest.test_case "multiple_body_stmts"   `Quick test_trigger_multiple_body_stmts;
-      Alcotest.test_case "persists_across_reopen" `Quick test_trigger_persists_across_reopen;
-    ];
-    "case_insensitive", case_insensitive_tests;
-    "update_delete_limit", update_delete_limit_tests;
-    "default_expressions", default_expression_tests;
-    "partial_indexes", partial_index_tests;
-    "expression_indexes", expression_index_tests;
-    "generated_columns", generated_col_tests;
-    "phase26_pragma", pragma_tests;
-    "phase27_drop_ife", drop_if_exists_tests;
-    "phase27_pk", pk_enforcement_tests;
-    "phase27_group_concat", group_concat_tests;
-    "phase28_explain", [
-      Alcotest.test_case "seqscan plan" `Quick test_explain_seqscan;
-      Alcotest.test_case "explain nulls for non-analyze" `Quick test_explain_nulls;
-      Alcotest.test_case "analyze select count" `Quick test_explain_analyze_count;
-      Alcotest.test_case "analyze insert" `Quick test_explain_analyze_insert;
-      Alcotest.test_case "explain does not execute" `Quick test_explain_does_not_execute;
-      Alcotest.test_case "explain analyze as col names" `Quick test_explain_analyze_as_col_names;
-      Alcotest.test_case "analyze child rows have null stats" `Quick test_explain_analyze_child_nulls;
-    ];
-    "phase29_insert_select", [
-      Alcotest.test_case "insert_select_basic"         `Quick insert_select_basic;
-      Alcotest.test_case "insert_select_with_cols"     `Quick insert_select_with_cols;
-      Alcotest.test_case "insert_select_with_where"    `Quick insert_select_with_where;
-      Alcotest.test_case "insert_select_empty_source"  `Quick insert_select_empty_source;
-      Alcotest.test_case "insert_select_self_copy"     `Quick insert_select_self_copy;
-      Alcotest.test_case "insert_select_bad_column"    `Quick insert_select_bad_column;
-    ];
-    "phase30_cascade", [
-      Alcotest.test_case "three_levels_delete"  `Quick test_cascade_delete_three_levels;
-      Alcotest.test_case "mixed_actions_delete" `Quick test_cascade_delete_mixed_actions;
-      Alcotest.test_case "three_levels_update"  `Quick test_cascade_update_three_levels;
-      Alcotest.test_case "restrict_grandchild"  `Quick test_cascade_restrict_on_grandchild;
-    ];
-    "phase30_snippet", [
-      Alcotest.test_case "basic"         `Quick test_fts_snippet_basic;
-      Alcotest.test_case "no_match_doc"  `Quick test_fts_snippet_no_match_doc;
-      Alcotest.test_case "window"        `Quick test_fts_snippet_window;
-      Alcotest.test_case "with_rank"     `Quick test_fts_snippet_with_rank;
-      Alcotest.test_case "term_in_other_col" `Quick test_fts_snippet_term_in_other_col;
-    ];
-    "phase35_snippet_parity", [
-      Alcotest.test_case "prefix_highlights_full_token" `Quick
-        test_phase35_snippet_prefix_highlights_full_token;
-      Alcotest.test_case "start_of_doc_no_leading_ellipsis" `Quick
-        test_phase35_snippet_start_of_doc_no_leading_ellipsis;
-      Alcotest.test_case "end_of_doc_no_trailing_ellipsis" `Quick
-        test_phase35_snippet_end_of_doc_no_trailing_ellipsis;
-      Alcotest.test_case "sentence_aligned_window" `Quick
-        test_phase35_snippet_sentence_aligned_window;
-      Alcotest.test_case "dense_cluster_wins_when_no_lede" `Quick
-        test_phase35_snippet_dense_cluster_wins_when_no_lede;
-      Alcotest.test_case "no_match_returns_lede" `Quick
-        test_phase35_snippet_no_match_returns_lede;
-    ];
-    "phase30_sqlite_master", [
-      Alcotest.test_case "tables"       `Quick test_sqlite_master_tables;
-      Alcotest.test_case "indexes"      `Quick test_sqlite_master_indexes;
-      Alcotest.test_case "sql_shape"    `Quick test_sqlite_master_sql_shape;
-      Alcotest.test_case "views"        `Quick test_sqlite_master_views;
-      Alcotest.test_case "all_types"    `Quick test_sqlite_master_all_types;
-      Alcotest.test_case "schema_alias" `Quick test_sqlite_schema_alias;
-      Alcotest.test_case "count_star"      `Quick test_sqlite_master_count_star;
-      Alcotest.test_case "trigger_tblname" `Quick test_sqlite_master_trigger_tblname;
-    ];
-    "phase31_alter_fk", [
-      Alcotest.test_case "valid_insert"          `Quick test_alter_add_fk_column_valid_insert;
-      Alcotest.test_case "invalid_insert_fails"  `Quick test_alter_add_fk_column_invalid_insert_fails;
-      Alcotest.test_case "inferred_pk"           `Quick test_alter_add_fk_inferred_pk;
-      Alcotest.test_case "bad_parent_table"      `Quick test_alter_add_fk_bad_parent_table;
-      Alcotest.test_case "bad_parent_column"     `Quick test_alter_add_fk_bad_parent_column;
-      Alcotest.test_case "null_is_allowed"       `Quick test_alter_add_fk_null_is_allowed;
-    ];
-    "phase31_instead_of", [
-      Alcotest.test_case "insert"                `Quick test_instead_of_insert;
-      Alcotest.test_case "insert_multirow"       `Quick test_instead_of_insert_multirow;
-      Alcotest.test_case "delete"                `Quick test_instead_of_delete;
-      Alcotest.test_case "no_trigger_fails"      `Quick test_instead_of_no_trigger_fails;
-      Alcotest.test_case "multiple_body_stmts"   `Quick test_instead_of_insert_multiple_body_stmts;
-    ];
-    "phase32_instead_of_update", [
-      Alcotest.test_case "update"                `Quick test_instead_of_update;
-      Alcotest.test_case "update_multi_assign"   `Quick test_instead_of_update_multi_assign;
-      Alcotest.test_case "update_no_trigger_fails" `Quick test_instead_of_update_no_trigger_fails;
-      Alcotest.test_case "update_multi_stmt_body" `Quick test_instead_of_update_multi_stmt_body;
-    ];
-    "phase31_scalar", [
-      Alcotest.test_case "hex_blob"              `Quick test_hex_blob;
-      Alcotest.test_case "hex_text"              `Quick test_hex_text;
-      Alcotest.test_case "hex_null"              `Quick test_hex_null;
-      Alcotest.test_case "hex_int_zero"          `Quick test_hex_int_zero;
-      Alcotest.test_case "hex_int_nonzero"       `Quick test_hex_int_nonzero;
-      Alcotest.test_case "char_basic"            `Quick test_char_basic;
-      Alcotest.test_case "char_single"           `Quick test_char_single;
-      Alcotest.test_case "char_unicode"          `Quick test_char_unicode;
-      Alcotest.test_case "unicode_basic"         `Quick test_unicode_basic;
-      Alcotest.test_case "unicode_empty"         `Quick test_unicode_empty;
-      Alcotest.test_case "unicode_null"          `Quick test_unicode_null;
-      Alcotest.test_case "printf_basic"          `Quick test_printf_basic;
-      Alcotest.test_case "printf_percent"        `Quick test_printf_percent;
-      Alcotest.test_case "printf_q_simple"       `Quick test_printf_q_simple;
-      Alcotest.test_case "printf_q_with_quotes"  `Quick test_printf_q_with_quotes;
-      Alcotest.test_case "format_alias"          `Quick test_format_alias;
-      Alcotest.test_case "zeroblob_length"       `Quick test_zeroblob_length;
-      Alcotest.test_case "zeroblob_hex"          `Quick test_zeroblob_hex;
-      Alcotest.test_case "zeroblob_zero_len"     `Quick test_zeroblob_zero_len;
-    ];
-    "phase32_session_fns", [
-      Alcotest.test_case "changes_initial"               `Quick test_changes_initial;
-      Alcotest.test_case "changes_after_insert"          `Quick test_changes_after_insert;
-      Alcotest.test_case "changes_after_delete_multiple" `Quick test_changes_after_delete_multiple;
-      Alcotest.test_case "last_insert_rowid_initial"     `Quick test_last_insert_rowid_initial;
-      Alcotest.test_case "last_insert_rowid_after_inserts" `Quick test_last_insert_rowid_after_inserts;
-      Alcotest.test_case "random_is_integer"             `Quick test_random_is_integer;
-      Alcotest.test_case "randomblob_length"             `Quick test_randomblob_length;
-      Alcotest.test_case "randomblob_zero_length"        `Quick test_randomblob_zero_length;
-    ];
-    "phase32_multi_col_fk", [
-      Alcotest.test_case "valid_insert"           `Quick test_multi_col_fk_valid_insert;
-      Alcotest.test_case "invalid_insert"         `Quick test_multi_col_fk_invalid_insert;
-      Alcotest.test_case "partial_null"           `Quick test_multi_col_fk_partial_null;
-      Alcotest.test_case "cascade_delete"         `Quick test_multi_col_fk_cascade_delete;
-      Alcotest.test_case "pragma_list_count"      `Quick test_multi_col_fk_pragma_list_count;
-      Alcotest.test_case "restrict_delete_blocks" `Quick test_multi_col_fk_restrict_delete_blocks;
-    ];
-    "phase33_triggers", [
-      Alcotest.test_case "for_each_row_parses"      `Quick test_for_each_row_parses;
-      Alcotest.test_case "nested_trigger_fires"     `Quick test_nested_trigger_fires;
-      Alcotest.test_case "trigger_recursion_limit"  `Quick test_trigger_recursion_limit;
-      Alcotest.test_case "instead_of_update_old_row" `Quick test_instead_of_update_old_row;
-      Alcotest.test_case "replace_fires_delete_trigger" `Quick test_replace_fires_delete_trigger;
-      Alcotest.test_case "upsert_fires_update_trigger"  `Quick test_upsert_fires_update_trigger;
-      Alcotest.test_case "nested_trigger_insert_replace_fires_delete"
-        `Quick test_nested_trigger_insert_replace_fires_delete;
-      Alcotest.test_case "instead_of_update_old_row_zero_matches"
-        `Quick test_instead_of_update_old_row_zero_matches;
-      Alcotest.test_case "instead_of_update_old_row_unnamed_view_cols"
-        `Quick test_instead_of_update_old_row_unnamed_view_cols;
-      Alcotest.test_case "instead_of_update_where_subquery_no_crash"
-        `Quick test_instead_of_update_where_subquery_no_crash;
-    ];
-    "phase33_fk_index", [
-      Alcotest.test_case "cascade_delete"          `Quick test_fk_index_cascade_delete;
-      Alcotest.test_case "no_index_fallback"       `Quick test_fk_index_no_index_fallback;
-      Alcotest.test_case "multi_col_restrict"      `Quick test_fk_index_multi_col_restrict;
-      Alcotest.test_case "set_null"                `Quick test_fk_index_set_null;
-      Alcotest.test_case "update_restrict_blocks"  `Quick test_fk_index_update_restrict_blocks;
-      Alcotest.test_case "consistency_with_fallback" `Quick test_fk_index_consistency_with_fallback;
-    ];
-    "phase33_new_fns", [
-      Alcotest.test_case "total_changes_initial"
-        `Quick test_total_changes_initial;
-      Alcotest.test_case "total_changes_after_multi_insert"
-        `Quick test_total_changes_after_multi_insert;
-      Alcotest.test_case "total_changes_accumulates_across_dml_kinds"
-        `Quick test_total_changes_accumulates_across_dml_kinds;
-      Alcotest.test_case "total_changes_vs_changes"
-        `Quick test_total_changes_vs_changes;
-      Alcotest.test_case "sqlite_version_value"
-        `Quick test_sqlite_version_value;
-      Alcotest.test_case "sqlite_version_in_expression"
-        `Quick test_sqlite_version_in_expression;
-    ];
-    "phase33_virtual_gen", phase33_virtual_gen_tests;
-    "phase34_recursive_triggers", phase34_recursive_triggers_tests;
-    "phase34_transitive_setnull", phase34_transitive_setnull_tests;
-    "phase34_prepared_counters", phase34_prepared_counters_tests;
-    "phase34_master_fts", phase34_master_fts_tests;
-    "phase35_fk_deferrable", phase35_fk_deferrable_tests;
-    "phase35_task3", phase35_task3_tests;
-    "helpers (#161)", [
-      Alcotest.test_case "query_ok_lwt smoke" `Quick helper_query_ok_lwt_smoke;
-    ];
-  ]
+  Alcotest.run
+    "E2E"
+    [ ( "walking_skeleton"
+      , [ Alcotest.test_case "walking_skeleton" `Quick walking_skeleton ] )
+    ; ( "select_variations"
+      , [ Alcotest.test_case "select_all_rows" `Quick select_all_rows
+        ; Alcotest.test_case "select_star_columns" `Quick select_star_columns
+        ; Alcotest.test_case "select_named_cols" `Quick select_named_cols
+        ] )
+    ; ( "multiple_tables"
+      , [ Alcotest.test_case "two_tables" `Quick two_tables
+        ; Alcotest.test_case "table_isolation" `Quick table_isolation
+        ] )
+    ; ( "error_propagation"
+      , [ Alcotest.test_case "parse_error" `Quick parse_error
+        ; Alcotest.test_case "unknown_table" `Quick unknown_table
+        ; Alcotest.test_case "unknown_column" `Quick unknown_column
+        ; Alcotest.test_case "type_mismatch" `Quick type_mismatch
+        ; Alcotest.test_case "arity_mismatch" `Quick arity_mismatch
+        ; Alcotest.test_case "already_exists" `Quick already_exists_error
+        ; Alcotest.test_case "parse_failure_via_lexer" `Quick parse_failure_via_lexer
+        ; Alcotest.test_case
+            "execute_with_select_is_runtime"
+            `Quick
+            execute_with_select_is_runtime_error
+        ; Alcotest.test_case
+            "query_with_insert_is_runtime"
+            `Quick
+            query_with_insert_is_runtime_error
+        ] )
+    ; ( "null_handling"
+      , [ Alcotest.test_case "insert_null" `Quick insert_null
+        ; Alcotest.test_case "where_null_no_match" `Quick where_null_no_match
+        ] )
+    ; "rowid_ordering", [ Alcotest.test_case "insert_order" `Quick insert_order ]
+    ; ( "stress_robustness"
+      , [ Alcotest.test_case "many_rows" `Quick many_rows
+        ; Alcotest.test_case "close_then_reuse" `Quick close_then_reuse
+        ] )
+    ; ( "row_content"
+      , [ Alcotest.test_case "row_content_exact" `Quick row_content_exact
+        ; Alcotest.test_case "select_partial_projection" `Quick select_partial_projection
+        ; Alcotest.test_case "empty_table_select" `Quick empty_table_select
+        ; Alcotest.test_case "select_where_text" `Quick select_where_text
+        ] )
+    ; ( "real_column"
+      , [ Alcotest.test_case "real_create_insert_select" `Quick real_create_insert_select
+        ; Alcotest.test_case "real_negative" `Quick real_negative
+        ; Alcotest.test_case "real_zero" `Quick real_zero
+        ; Alcotest.test_case "real_null" `Quick real_null
+        ; Alcotest.test_case "real_multiple_rows" `Quick real_multiple_rows
+        ; Alcotest.test_case "real_type_mismatch" `Quick real_type_mismatch
+        ] )
+    ; ( "blob_column"
+      , [ Alcotest.test_case "blob_null_insert" `Quick blob_null_insert
+        ; Alcotest.test_case "blob_type_mismatch" `Quick blob_type_mismatch
+        ; Alcotest.test_case "blob_schema_preserved" `Quick blob_schema_preserved
+        ] )
+    ; ( "real_and_blob"
+      , [ Alcotest.test_case "real_and_blob_together" `Quick real_and_blob_together
+        ; Alcotest.test_case "already_exists_real_blob" `Quick already_exists_real_blob
+        ] )
+    ; ( "order_by"
+      , [ Alcotest.test_case "order_by_asc" `Quick order_by_asc
+        ; Alcotest.test_case "order_by_desc" `Quick order_by_desc
+        ; Alcotest.test_case "order_by_default_asc" `Quick order_by_default_asc
+        ; Alcotest.test_case "order_by_null_first" `Quick order_by_null_first
+        ; Alcotest.test_case "order_by_text" `Quick order_by_text
+        ; Alcotest.test_case "order_by_expr" `Quick order_by_expr
+        ; Alcotest.test_case "join_order_by" `Quick test_order_by_expr_join
+        ] )
+    ; ( "nulls_first_last"
+      , [ Alcotest.test_case "nulls_first_last" `Quick test_nulls_first_last ] )
+    ; ( "limit_offset"
+      , [ Alcotest.test_case "limit_no_order" `Quick limit_no_order
+        ; Alcotest.test_case "limit_with_offset" `Quick limit_with_offset
+        ; Alcotest.test_case "order_by_then_limit" `Quick order_by_then_limit
+        ; Alcotest.test_case "order_by_limit_offset" `Quick order_by_limit_offset
+        ] )
+    ; ( "qcheck_order_limit"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ qcheck_order_by_asc_sorted; qcheck_order_by_desc_sorted; qcheck_limit_count ]
+      )
+    ; ( "create_index"
+      , [ Alcotest.test_case "create_index_simple" `Quick create_index_simple
+        ; Alcotest.test_case
+            "create_index_on_text_column"
+            `Quick
+            create_index_on_text_column
+        ; Alcotest.test_case "create_unique_index" `Quick create_unique_index
+        ; Alcotest.test_case
+            "unique_index_rejects_duplicate"
+            `Quick
+            unique_index_rejects_duplicate
+        ; Alcotest.test_case
+            "unique_index_allows_distinct"
+            `Quick
+            unique_index_allows_distinct_values
+        ; Alcotest.test_case "index_lookup_no_match" `Quick index_lookup_no_match
+        ; Alcotest.test_case
+            "index_lookup_returns_all_matches"
+            `Quick
+            index_lookup_returns_all_matches
+        ; Alcotest.test_case
+            "index_lookup_matches_seq_scan"
+            `Quick
+            index_lookup_matches_seq_scan
+        ; Alcotest.test_case
+            "index_lookup_after_inserts"
+            `Quick
+            index_lookup_after_inserts
+        ; Alcotest.test_case
+            "create_index_unknown_table"
+            `Quick
+            create_index_unknown_table
+        ; Alcotest.test_case
+            "create_index_unknown_column"
+            `Quick
+            create_index_unknown_column
+        ; Alcotest.test_case "create_index_duplicate" `Quick create_index_duplicate
+        ; Alcotest.test_case
+            "index_lookup_where_null_no_match"
+            `Quick
+            index_lookup_where_null_no_match
+        ; Alcotest.test_case "multi_col_index" `Quick test_multi_col_index
+        ; Alcotest.test_case "multi_col_unique_index" `Quick test_multi_col_unique_index
+        ] )
+    ; ( "qcheck_create_index"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ qcheck_index_lookup_matches_seq_scan; qcheck_text_index_lookup ] )
+    ; ( "not_null_and_default"
+      , [ Alcotest.test_case "not_null_insert_null" `Quick not_null_insert_null
+        ; Alcotest.test_case
+            "not_null_default_used_when_omitted"
+            `Quick
+            not_null_default_used_when_omitted
+        ; Alcotest.test_case "not_null_default_zero" `Quick not_null_default_zero
+        ; Alcotest.test_case "not_null_update_to_null" `Quick not_null_update_to_null
+        ; Alcotest.test_case "default_value_readable" `Quick default_value_readable
+        ; Alcotest.test_case "not_null_omit_no_default" `Quick not_null_omit_no_default
+        ] )
+    ; ( "qcheck_not_null_default"
+      , List.map QCheck_alcotest.to_alcotest [ qcheck_default_applied ] )
+    ; ( "drop_table_and_index"
+      , [ Alcotest.test_case "drop_table_then_select" `Quick drop_table_then_select
+        ; Alcotest.test_case "drop_table_nonexistent" `Quick drop_table_nonexistent
+        ; Alcotest.test_case "drop_table_data_gone" `Quick drop_table_data_gone
+        ; Alcotest.test_case "drop_table_with_index" `Quick drop_table_with_index
+        ; Alcotest.test_case "drop_table_then_recreate" `Quick drop_table_then_recreate
+        ; Alcotest.test_case "drop_index_then_select" `Quick drop_index_then_select
+        ; Alcotest.test_case "drop_index_nonexistent" `Quick drop_index_nonexistent
+        ; Alcotest.test_case "drop_index_then_recreate" `Quick drop_index_then_recreate
+        ; Alcotest.test_case
+            "drop_table_recreate_old_data_invis"
+            `Quick
+            drop_table_recreate_old_data_invisible
+        ; Alcotest.test_case
+            "drop_first_index_then_recreate"
+            `Quick
+            drop_first_index_then_recreate
+        ] )
+    ; ( "gap_fill"
+      , [ Alcotest.test_case "open_file_invalid_path" `Quick open_file_invalid_path
+        ; Alcotest.test_case "default_real_persists" `Quick default_real_persists
+        ; Alcotest.test_case "default_text_persists" `Quick default_text_persists
+        ; Alcotest.test_case "default_int_persists" `Quick default_int_persists
+        ] )
+    ; ( "between_in"
+      , [ Alcotest.test_case "between" `Quick test_between_query
+        ; Alcotest.test_case "not_between" `Quick test_not_between_query
+        ; Alcotest.test_case "in" `Quick test_in_query
+        ; Alcotest.test_case "not_in" `Quick test_not_in_query
+        ] )
+    ; ( "pragma"
+      , [ Alcotest.test_case "table_info" `Quick test_pragma_table_info
+        ; Alcotest.test_case "index_list" `Quick test_pragma_index_list
+        ] )
+    ; ( "select_distinct"
+      , [ Alcotest.test_case "distinct_single_col" `Quick test_distinct
+        ; Alcotest.test_case "distinct_multicolumn" `Quick test_distinct_multicolumn
+        ; Alcotest.test_case "distinct_null" `Quick test_distinct_null
+        ] )
+    ; ( "set_operations"
+      , [ Alcotest.test_case "union" `Quick test_union
+        ; Alcotest.test_case "union_all" `Quick test_union_all
+        ; Alcotest.test_case "intersect" `Quick test_intersect
+        ; Alcotest.test_case "except" `Quick test_except
+        ] )
+    ; ( "named_indexed_params"
+      , [ Alcotest.test_case "indexed_params" `Quick test_indexed_params
+        ; Alcotest.test_case "named_params_colon" `Quick test_named_params_colon
+        ] )
+    ; ( "datetime_functions"
+      , [ Alcotest.test_case "date_fn" `Quick test_date_fn
+        ; Alcotest.test_case "time_fn" `Quick test_time_fn
+        ; Alcotest.test_case "datetime_fn" `Quick test_datetime_fn
+        ; Alcotest.test_case "julianday_fn" `Quick test_julianday_fn
+        ; Alcotest.test_case "unixepoch_fn" `Quick test_unixepoch_fn
+        ; Alcotest.test_case "strftime_fn" `Quick test_strftime_fn
+        ; Alcotest.test_case "date_now" `Quick test_date_now
+        ] )
+    ; ( "multikey_order_by"
+      , [ Alcotest.test_case "multikey_asc_asc" `Quick test_multikey_order_by
+        ; Alcotest.test_case "multikey_asc_desc" `Quick test_multikey_order_by_mixed
+        ] )
+    ; "distinct_types", [ Alcotest.test_case "distinct_real" `Quick test_distinct_real ]
+    ; ( "set_op_edge_cases"
+      , [ Alcotest.test_case "intersect_empty_right" `Quick test_intersect_empty_right
+        ; Alcotest.test_case "except_dedup_left" `Quick test_except_dedup_left
+        ; Alcotest.test_case "except_empty_right" `Quick test_except_empty_right
+        ] )
+    ; ( "datetime_null_branches"
+      , [ Alcotest.test_case "date_invalid_input" `Quick test_date_invalid_input
+        ; Alcotest.test_case "date_nontext_arg" `Quick test_date_nontext_arg
+        ; Alcotest.test_case "date_with_modifier" `Quick test_date_with_modifier
+        ; Alcotest.test_case "time_invalid_input" `Quick test_time_invalid_input
+        ; Alcotest.test_case "time_nontext_arg" `Quick test_time_nontext_arg
+        ; Alcotest.test_case "time_with_modifier" `Quick test_time_with_modifier
+        ; Alcotest.test_case "datetime_invalid_input" `Quick test_datetime_invalid_input
+        ; Alcotest.test_case "datetime_nontext_arg" `Quick test_datetime_nontext_arg
+        ; Alcotest.test_case "datetime_with_modifier" `Quick test_datetime_with_modifier
+        ; Alcotest.test_case "julianday_invalid" `Quick test_julianday_invalid
+        ; Alcotest.test_case "julianday_nontext_arg" `Quick test_julianday_nontext_arg
+        ; Alcotest.test_case "julianday_with_modifier" `Quick test_julianday_with_modifier
+        ; Alcotest.test_case "unixepoch_invalid" `Quick test_unixepoch_invalid
+        ; Alcotest.test_case "unixepoch_nontext_arg" `Quick test_unixepoch_nontext_arg
+        ; Alcotest.test_case "unixepoch_with_modifier" `Quick test_unixepoch_with_modifier
+        ; Alcotest.test_case "strftime_null_fmt" `Quick test_strftime_null_fmt
+        ; Alcotest.test_case "strftime_invalid_ts" `Quick test_strftime_invalid_ts
+        ; Alcotest.test_case "strftime_with_modifier" `Quick test_strftime_with_modifier
+        ] )
+    ; ( "datetime_null_arg_branches"
+      , [ Alcotest.test_case "date_null_arg" `Quick test_date_null_arg
+        ; Alcotest.test_case "date_null_with_rest" `Quick test_date_null_with_rest
+        ; Alcotest.test_case "time_null_arg" `Quick test_time_null_arg
+        ; Alcotest.test_case "time_null_with_rest" `Quick test_time_null_with_rest
+        ; Alcotest.test_case "datetime_null_arg" `Quick test_datetime_null_arg
+        ; Alcotest.test_case "datetime_null_with_rest" `Quick test_datetime_null_with_rest
+        ; Alcotest.test_case "julianday_null_arg" `Quick test_julianday_null_arg
+        ; Alcotest.test_case
+            "julianday_null_with_rest"
+            `Quick
+            test_julianday_null_with_rest
+        ; Alcotest.test_case "unixepoch_null_arg" `Quick test_unixepoch_null_arg
+        ; Alcotest.test_case
+            "unixepoch_null_with_rest"
+            `Quick
+            test_unixepoch_null_with_rest
+        ] )
+    ; ( "distinct_blob"
+      , [ Alcotest.test_case "distinct_blob_null" `Quick test_distinct_blob_null ] )
+    ; ( "on_conflict"
+      , [ Alcotest.test_case "insert_or_ignore" `Quick test_insert_or_ignore
+        ; Alcotest.test_case "insert_or_replace" `Quick test_insert_or_replace
+        ; Alcotest.test_case "insert_or_ignore_unique" `Quick test_insert_or_ignore_unique
+        ; Alcotest.test_case
+            "insert_or_replace_no_conflict"
+            `Quick
+            test_insert_or_replace_no_conflict
+        ; Alcotest.test_case
+            "insert_or_replace_multi_unique"
+            `Quick
+            test_insert_or_replace_multi_unique
+        ; Alcotest.test_case "insert_or_abort_error" `Quick test_insert_or_abort_error
+        ] )
+    ; ( "returning"
+      , [ Alcotest.test_case "insert_returning" `Quick test_insert_returning
+        ; Alcotest.test_case "update_returning" `Quick test_update_returning
+        ; Alcotest.test_case "delete_returning" `Quick test_delete_returning
+        ; Alcotest.test_case "update_returning_multi" `Quick test_update_returning_multi
+        ; Alcotest.test_case "delete_returning_multi" `Quick test_delete_returning_multi
+        ; Alcotest.test_case
+            "insert_returning_ignored"
+            `Quick
+            test_insert_returning_ignored
+        ] )
+    ; ( "alter_table"
+      , [ Alcotest.test_case "add_column" `Quick test_alter_add_column
+        ; Alcotest.test_case
+            "add_column_null_default"
+            `Quick
+            test_alter_add_column_null_default
+        ; Alcotest.test_case
+            "add_not_null_no_default_error"
+            `Quick
+            test_alter_add_not_null_no_default_error
+        ; Alcotest.test_case "rename_table" `Quick test_rename_table
+        ; Alcotest.test_case "rename_column" `Quick test_rename_column
+        ; Alcotest.test_case
+            "rename_column_no_keyword"
+            `Quick
+            test_rename_column_no_keyword
+        ; Alcotest.test_case "rename_nonexistent" `Quick test_alter_rename_nonexistent
+        ; Alcotest.test_case
+            "rename_column_nonexistent"
+            `Quick
+            test_alter_rename_column_nonexistent
+        ; Alcotest.test_case "add_column_duplicate" `Quick test_alter_add_column_duplicate
+        ; Alcotest.test_case
+            "rename_table_to_existing"
+            `Quick
+            test_alter_rename_table_to_existing
+        ; Alcotest.test_case
+            "add_column_nonexistent_table"
+            `Quick
+            test_alter_add_column_nonexistent_table
+        ] )
+    ; ( "table_constraints"
+      , [ Alcotest.test_case "table_unique_constraint" `Quick test_table_unique_constraint
+        ; Alcotest.test_case
+            "table_primary_key_constraint"
+            `Quick
+            test_table_primary_key_constraint
+        ] )
+    ; ( "subqueries"
+      , [ Alcotest.test_case "scalar_subquery" `Quick test_scalar_subquery
+        ; Alcotest.test_case "scalar_subquery_null" `Quick test_scalar_subquery_null
+        ; Alcotest.test_case "exists_true" `Quick test_exists_subquery
+        ; Alcotest.test_case "exists_false" `Quick test_exists_subquery_false
+        ; Alcotest.test_case "in_select" `Quick test_in_select_subquery
+        ; Alcotest.test_case "not_in_select" `Quick test_not_in_select_subquery
+        ] )
+    ; "fk_parse", [ Alcotest.test_case "fk_references_col" `Quick test_fk_parse_create ]
+    ; ( "foreign_key"
+      , [ Alcotest.test_case "valid_insert" `Quick test_fk_valid_insert
+        ; Alcotest.test_case "invalid_insert" `Quick test_fk_invalid_insert
+        ; Alcotest.test_case "null_allowed" `Quick test_fk_null_allowed
+        ; Alcotest.test_case "multi_col_supported" `Quick test_fk_multi_col_unsupported
+        ; Alcotest.test_case "implicit_parent_col" `Quick fk_implicit_parent_col
+        ; Alcotest.test_case "implicit_no_pk_error" `Quick fk_implicit_no_pk_error
+        ; Alcotest.test_case
+            "implicit_parent_not_found"
+            `Quick
+            fk_implicit_parent_not_found
+        ; Alcotest.test_case
+            "implicit_infers_pk_column"
+            `Quick
+            fk_implicit_infers_pk_column
+        ; Alcotest.test_case "implicit_table_level_pk" `Quick fk_implicit_table_level_pk
+        ] )
+    ; ( "check_constraints"
+      , [ Alcotest.test_case "insert_ok" `Quick test_check_insert_ok
+        ; Alcotest.test_case "insert_violation" `Quick test_check_insert_violation
+        ; Alcotest.test_case "update_violation" `Quick test_check_update_violation
+        ; Alcotest.test_case "null_allowed" `Quick test_check_null_allowed
+        ; Alcotest.test_case "persisted" `Quick test_check_persisted
+        ; Alcotest.test_case "cache_invalidation" `Quick test_check_cache_invalidation
+        ; Alcotest.test_case "agg_in_check_rejected" `Quick test_check_agg_rejected
+        ] )
+    ; ( "phase9_edge"
+      , [ Alcotest.test_case "const_select" `Quick test_const_select
+        ; Alcotest.test_case "subquery_and_pred" `Quick test_subquery_and_predicate
+        ; Alcotest.test_case "check_complex_expr" `Quick test_check_complex_expr
+        ; Alcotest.test_case "check_function_expr" `Quick test_check_function_in_expr
+        ; Alcotest.test_case "text_scalar_subquery" `Quick test_text_scalar_subquery
+        ; Alcotest.test_case "real_scalar_subquery" `Quick test_real_scalar_subquery
+        ; Alcotest.test_case "like_in_where" `Quick test_like_in_where
+        ; Alcotest.test_case "modulo_operator" `Quick test_modulo_operator
+        ; Alcotest.test_case "sum_real_with_nulls" `Quick test_sum_real_with_nulls
+        ; Alcotest.test_case "avg_real_column" `Quick test_avg_real_column
+        ; Alcotest.test_case "check_add_binop" `Quick test_check_add_binop
+        ; Alcotest.test_case "check_concat_binop" `Quick test_check_concat_binop
+        ; Alcotest.test_case "check_like_constraint" `Quick test_check_like_in_constraint
+        ; Alcotest.test_case "int_real_comparison" `Quick test_int_real_comparison
+        ; Alcotest.test_case "real_ne_comparison" `Quick test_real_ne_comparison
+        ; Alcotest.test_case "real_mod_int" `Quick test_real_mod_int
+        ; Alcotest.test_case "alter_add_text_default" `Quick test_alter_add_text_default
+        ; Alcotest.test_case "check_not_operator" `Quick test_check_not_operator
+        ; Alcotest.test_case "check_between_in_check" `Quick test_check_between_in_check
+        ; Alcotest.test_case
+            "check_is_not_null_in_check"
+            `Quick
+            test_check_is_not_null_in_check
+        ] )
+    ; ( "string_coverage"
+      , [ Alcotest.test_case "trim_all_whitespace" `Quick test_trim_all_whitespace
+        ; Alcotest.test_case "trim_chars_all_removed" `Quick test_trim_chars_all_removed
+        ; Alcotest.test_case "replace_empty_old" `Quick test_replace_empty_old
+        ] )
+    ; ( "case_when"
+      , [ Alcotest.test_case "case_searched" `Quick test_case_searched
+        ; Alcotest.test_case "case_simple" `Quick test_case_simple
+        ; Alcotest.test_case "case_no_else" `Quick test_case_no_else
+        ; Alcotest.test_case "case_null_scrutinee" `Quick test_case_null_scrutinee
+        ; Alcotest.test_case "case_in_where" `Quick test_case_in_where
+        ; Alcotest.test_case "case_nested" `Quick test_case_nested
+        ; Alcotest.test_case "case_arithmetic" `Quick test_case_arithmetic
+        ] )
+    ; ( "multi_join"
+      , [ Alcotest.test_case "three_table_join" `Quick test_three_table_join
+        ; Alcotest.test_case "two_joins_with_where" `Quick test_two_joins_with_where
+        ; Alcotest.test_case "two_left_joins" `Quick test_two_left_joins
+        ; Alcotest.test_case "star_three_tables" `Quick test_star_three_tables
+        ; Alcotest.test_case "regression_one_join" `Quick test_multi_join_regression_one
+        ; Alcotest.test_case "three_join_group_order" `Quick three_join_group_order
+        ; Alcotest.test_case
+            "two_join_group_order_regression"
+            `Quick
+            two_join_group_order_regression
+        ] )
+    ; ( "phase10_edge"
+      , [ Alcotest.test_case "case_in_order_by" `Quick test_case_in_order_by
+        ; Alcotest.test_case "case_with_func" `Quick test_case_with_func
+        ; Alcotest.test_case "case_in_update" `Quick test_case_in_update
+        ; Alcotest.test_case "case_in_join" `Quick test_case_in_join
+        ; Alcotest.test_case "four_table_join" `Quick test_four_table_join
+        ; Alcotest.test_case "multi_join_mid_col" `Quick test_multi_join_middle_col
+        ] )
+    ; ( "cast_expr"
+      , [ Alcotest.test_case "cast_int_to_text" `Quick test_cast_int_to_text
+        ; Alcotest.test_case "cast_text_to_int" `Quick test_cast_text_to_int
+        ; Alcotest.test_case "cast_text_to_int_inv" `Quick test_cast_text_to_int_invalid
+        ; Alcotest.test_case "cast_real_to_int" `Quick test_cast_real_to_int
+        ; Alcotest.test_case "cast_int_to_real" `Quick test_cast_int_to_real
+        ; Alcotest.test_case "cast_null" `Quick test_cast_null
+        ; Alcotest.test_case "cast_in_where" `Quick test_cast_in_where
+        ; Alcotest.test_case
+            "cast_text_float_pfx"
+            `Quick
+            test_cast_text_float_prefix_to_int
+        ] )
+    ; ( "nullif_iif"
+      , [ Alcotest.test_case "nullif_equal" `Quick test_nullif_equal
+        ; Alcotest.test_case "nullif_unequal" `Quick test_nullif_unequal
+        ; Alcotest.test_case "iif_true" `Quick test_iif_true
+        ; Alcotest.test_case "iif_false" `Quick test_iif_false
+        ] )
+    ; ( "col_alias"
+      , [ Alcotest.test_case "basic" `Quick test_col_alias_basic
+        ; Alcotest.test_case "order_by" `Quick test_col_alias_order_by
+        ; Alcotest.test_case "multiple" `Quick test_col_alias_multiple
+        ; Alcotest.test_case "mixed" `Quick test_col_alias_mixed
+        ; Alcotest.test_case "cast" `Quick test_col_alias_cast
+        ] )
+    ; ( "tbl_alias"
+      , [ Alcotest.test_case "from" `Quick test_tbl_alias_from
+        ; Alcotest.test_case "join" `Quick test_tbl_alias_join
+        ; Alcotest.test_case "where" `Quick test_tbl_alias_where
+        ; Alcotest.test_case "order_by" `Quick test_tbl_alias_order_by
+        ; Alcotest.test_case "three_join" `Quick test_tbl_alias_three_join
+        ] )
+    ; ( "cte"
+      , [ Alcotest.test_case "basic" `Quick test_cte_basic
+        ; Alcotest.test_case "filter" `Quick test_cte_filter
+        ; Alcotest.test_case "agg" `Quick test_cte_agg
+        ; Alcotest.test_case "col_name" `Quick test_cte_col_name
+        ; Alcotest.test_case "order" `Quick test_cte_order
+        ] )
+    ; ( "multi_insert"
+      , [ Alcotest.test_case "basic" `Quick test_multirow_basic
+        ; Alcotest.test_case "single_works" `Quick test_multirow_single_still_works
+        ; Alcotest.test_case "on_conflict" `Quick test_multirow_on_conflict
+        ; Alcotest.test_case "returning" `Quick test_multirow_returning
+        ] )
+    ; ( "correlated"
+      , [ Alcotest.test_case "exists" `Quick test_corr_exists
+        ; Alcotest.test_case "not_exists" `Quick test_corr_not_exists
+        ; Alcotest.test_case "in_select" `Quick test_corr_in_select
+        ; Alcotest.test_case "not_in" `Quick test_corr_not_in_select
+        ] )
+    ; ( "upsert"
+      , [ Alcotest.test_case "basic" `Quick test_upsert_basic
+        ; Alcotest.test_case "no_conflict" `Quick test_upsert_no_conflict
+        ; Alcotest.test_case "expression" `Quick test_upsert_expression
+        ; Alcotest.test_case
+            "multiple_assignments"
+            `Quick
+            test_upsert_multiple_assignments
+        ; Alcotest.test_case
+            "preserves_others"
+            `Quick
+            test_upsert_preserves_non_conflict_rows
+        ] )
+    ; ( "view"
+      , [ Alcotest.test_case "basic" `Quick test_view_basic
+        ; Alcotest.test_case "filter" `Quick test_view_with_filter
+        ; Alcotest.test_case "agg" `Quick test_view_aggregation
+        ; Alcotest.test_case "drop" `Quick test_view_drop
+        ; Alcotest.test_case "count" `Quick test_view_count
+        ; Alcotest.test_case "per_db" `Quick test_view_independent_per_db
+        ; Alcotest.test_case "persistence" `Quick test_view_persistence
+        ] )
+    ; ( "window"
+      , [ Alcotest.test_case "row_number" `Quick test_window_row_number
+        ; Alcotest.test_case "rank" `Quick test_window_rank
+        ; Alcotest.test_case "dense_rank" `Quick test_window_dense_rank
+        ; Alcotest.test_case "lag" `Quick test_window_lag
+        ; Alcotest.test_case "lead" `Quick test_window_lead
+        ; Alcotest.test_case "sum_over" `Quick test_window_sum_over
+        ; Alcotest.test_case "no_partition" `Quick test_window_no_partition
+        ; Alcotest.test_case "first_last_value" `Quick test_window_first_last_value
+        ; Alcotest.test_case "orderby_alias" `Quick test_window_orderby_alias
+        ; Alcotest.test_case "rows_frame" `Quick test_window_rows_frame
+        ; Alcotest.test_case "rows_unbounded" `Quick test_window_rows_unbounded
+        ; Alcotest.test_case "percent_rank" `Quick test_window_percent_rank
+        ; Alcotest.test_case "cume_dist" `Quick test_window_cume_dist
+        ; Alcotest.test_case "percent_rank_desc" `Quick test_window_percent_rank_desc
+        ; Alcotest.test_case "cume_dist_desc" `Quick test_window_cume_dist_desc
+        ; Alcotest.test_case "frame_non_agg_error" `Quick test_window_frame_non_agg_error
+        ; Alcotest.test_case "window_in_agg" `Quick test_window_in_agg
+        ; Alcotest.test_case "window_in_agg_count" `Quick test_window_in_agg_count
+        ] )
+    ; ( "recursive_cte"
+      , [ Alcotest.test_case "series" `Quick test_recursive_cte_series
+        ; Alcotest.test_case "sum" `Quick test_recursive_cte_sum
+        ; Alcotest.test_case "tree" `Quick test_recursive_cte_tree
+        ; Alcotest.test_case
+            "non_recursive_unchanged"
+            `Quick
+            test_recursive_cte_non_recursive_unchanged
+        ] )
+    ; ( "collate"
+      , [ Alcotest.test_case "nocase_eq" `Quick test_collate_nocase_eq
+        ; Alcotest.test_case "nocase_order" `Quick test_collate_nocase_order
+        ; Alcotest.test_case "binary_eq" `Quick test_collate_binary_eq
+        ] )
+    ; ( "drop_column"
+      , [ Alcotest.test_case "basic" `Quick test_drop_column_basic
+        ; Alcotest.test_case "schema" `Quick test_drop_column_schema
+        ; Alcotest.test_case "nonexistent_err" `Quick test_drop_column_nonexistent_fails
+        ] )
+    ; ( "if_not_exists"
+      , [ Alcotest.test_case "create_table_ine" `Quick test_create_table_if_not_exists
+        ; Alcotest.test_case "create_index_ine" `Quick test_create_index_if_not_exists
+        ; Alcotest.test_case "create_table_no_ine" `Quick test_create_table_no_ine_fails
+        ] )
+    ; ( "group_by_multi"
+      , [ Alcotest.test_case "two_cols_count" `Quick test_group_by_two_cols
+        ; Alcotest.test_case "two_cols_sum" `Quick test_group_by_two_cols_sum
+        ; Alcotest.test_case "two_cols_having" `Quick test_group_by_two_cols_having
+        ] )
+    ; ( "math"
+      , [ Alcotest.test_case "math_ceil" `Quick test_math_ceil
+        ; Alcotest.test_case "math_floor" `Quick test_math_floor
+        ; Alcotest.test_case "math_sqrt" `Quick test_math_sqrt
+        ; Alcotest.test_case "math_pow" `Quick test_math_pow
+        ; Alcotest.test_case "math_sign" `Quick test_math_sign
+        ; Alcotest.test_case "math_trunc" `Quick test_math_trunc
+        ; Alcotest.test_case "math_pi" `Quick test_math_pi
+        ; Alcotest.test_case "math_trig" `Quick test_math_trig
+        ; Alcotest.test_case "math_log" `Quick test_math_log
+        ] )
+    ; ( "json"
+      , [ Alcotest.test_case "json_extract" `Quick test_json_extract
+        ; Alcotest.test_case "json_object" `Quick test_json_object
+        ; Alcotest.test_case "json_array" `Quick test_json_array
+        ; Alcotest.test_case "json_type" `Quick test_json_type
+        ; Alcotest.test_case "json_valid" `Quick test_json_valid
+        ; Alcotest.test_case "json_set" `Quick test_json_set
+        ; Alcotest.test_case "json_insert" `Quick test_json_insert
+        ; Alcotest.test_case "json_replace" `Quick test_json_replace
+        ; Alcotest.test_case "json_remove" `Quick test_json_remove
+        ] )
+    ; ( "savepoint"
+      , [ Alcotest.test_case
+            "rollback_undoes_insert"
+            `Quick
+            test_savepoint_rollback_undoes_insert
+        ; Alcotest.test_case
+            "release_keeps_insert"
+            `Quick
+            test_savepoint_release_keeps_insert
+        ; Alcotest.test_case "partial_rollback" `Quick test_savepoint_partial_rollback
+        ; Alcotest.test_case "double_rollback" `Quick test_savepoint_double_rollback
+        ; Alcotest.test_case "auto_begin" `Quick test_savepoint_auto_begin
+        ] )
+    ; ( "fk_delete_update"
+      , [ Alcotest.test_case
+            "delete_ref_fails"
+            `Quick
+            test_fk_delete_referenced_parent_fails
+        ; Alcotest.test_case
+            "delete_no_ref_ok"
+            `Quick
+            test_fk_delete_unreferenced_parent_ok
+        ; Alcotest.test_case "delete_null_child_ok" `Quick test_fk_delete_null_child_ok
+        ; Alcotest.test_case "update_ref_fails" `Quick test_fk_update_referenced_col_fails
+        ; Alcotest.test_case "update_no_ref_ok" `Quick test_fk_update_unreferenced_col_ok
+        ; Alcotest.test_case "cascade_delete" `Quick test_fk_cascade_delete
+        ; Alcotest.test_case
+            "cascade_delete_empty"
+            `Quick
+            test_fk_cascade_delete_no_children
+        ; Alcotest.test_case "cascade_update" `Quick test_fk_cascade_update
+        ; Alcotest.test_case "set_null_delete" `Quick test_fk_set_null_delete
+        ; Alcotest.test_case "set_null_update" `Quick test_fk_set_null_update
+        ; Alcotest.test_case "set_default_delete" `Quick test_fk_set_default_delete
+        ; Alcotest.test_case "no_action_blocks" `Quick test_fk_no_action_blocks_delete
+        ; Alcotest.test_case
+            "cascade_table_level_fk"
+            `Quick
+            test_fk_cascade_table_level_fk
+        ] )
+    ; ( "triggers"
+      , [ Alcotest.test_case "after_insert" `Quick test_after_insert_trigger
+        ; Alcotest.test_case "after_insert_two_rows" `Quick test_after_insert_two_rows
+        ; Alcotest.test_case "after_delete" `Quick test_after_delete_trigger
+        ; Alcotest.test_case "after_update" `Quick test_after_update_trigger
+        ; Alcotest.test_case
+            "before_insert_aborts"
+            `Quick
+            test_before_insert_trigger_aborts
+        ; Alcotest.test_case "when_clause_conditional" `Quick test_when_clause_conditional
+        ; Alcotest.test_case "drop_trigger" `Quick test_drop_trigger
+        ; Alcotest.test_case "multiple_body_stmts" `Quick test_trigger_multiple_body_stmts
+        ; Alcotest.test_case
+            "persists_across_reopen"
+            `Quick
+            test_trigger_persists_across_reopen
+        ] )
+    ; "case_insensitive", case_insensitive_tests
+    ; "update_delete_limit", update_delete_limit_tests
+    ; "default_expressions", default_expression_tests
+    ; "partial_indexes", partial_index_tests
+    ; "expression_indexes", expression_index_tests
+    ; "generated_columns", generated_col_tests
+    ; "phase26_pragma", pragma_tests
+    ; "phase27_drop_ife", drop_if_exists_tests
+    ; "phase27_pk", pk_enforcement_tests
+    ; "phase27_group_concat", group_concat_tests
+    ; ( "phase28_explain"
+      , [ Alcotest.test_case "seqscan plan" `Quick test_explain_seqscan
+        ; Alcotest.test_case "explain nulls for non-analyze" `Quick test_explain_nulls
+        ; Alcotest.test_case "analyze select count" `Quick test_explain_analyze_count
+        ; Alcotest.test_case "analyze insert" `Quick test_explain_analyze_insert
+        ; Alcotest.test_case
+            "explain does not execute"
+            `Quick
+            test_explain_does_not_execute
+        ; Alcotest.test_case
+            "explain analyze as col names"
+            `Quick
+            test_explain_analyze_as_col_names
+        ; Alcotest.test_case
+            "analyze child rows have null stats"
+            `Quick
+            test_explain_analyze_child_nulls
+        ] )
+    ; ( "phase29_insert_select"
+      , [ Alcotest.test_case "insert_select_basic" `Quick insert_select_basic
+        ; Alcotest.test_case "insert_select_with_cols" `Quick insert_select_with_cols
+        ; Alcotest.test_case "insert_select_with_where" `Quick insert_select_with_where
+        ; Alcotest.test_case
+            "insert_select_empty_source"
+            `Quick
+            insert_select_empty_source
+        ; Alcotest.test_case "insert_select_self_copy" `Quick insert_select_self_copy
+        ; Alcotest.test_case "insert_select_bad_column" `Quick insert_select_bad_column
+        ] )
+    ; ( "phase30_cascade"
+      , [ Alcotest.test_case "three_levels_delete" `Quick test_cascade_delete_three_levels
+        ; Alcotest.test_case
+            "mixed_actions_delete"
+            `Quick
+            test_cascade_delete_mixed_actions
+        ; Alcotest.test_case "three_levels_update" `Quick test_cascade_update_three_levels
+        ; Alcotest.test_case
+            "restrict_grandchild"
+            `Quick
+            test_cascade_restrict_on_grandchild
+        ] )
+    ; ( "phase30_snippet"
+      , [ Alcotest.test_case "basic" `Quick test_fts_snippet_basic
+        ; Alcotest.test_case "no_match_doc" `Quick test_fts_snippet_no_match_doc
+        ; Alcotest.test_case "window" `Quick test_fts_snippet_window
+        ; Alcotest.test_case "with_rank" `Quick test_fts_snippet_with_rank
+        ; Alcotest.test_case "term_in_other_col" `Quick test_fts_snippet_term_in_other_col
+        ] )
+    ; ( "phase35_snippet_parity"
+      , [ Alcotest.test_case
+            "prefix_highlights_full_token"
+            `Quick
+            test_phase35_snippet_prefix_highlights_full_token
+        ; Alcotest.test_case
+            "start_of_doc_no_leading_ellipsis"
+            `Quick
+            test_phase35_snippet_start_of_doc_no_leading_ellipsis
+        ; Alcotest.test_case
+            "end_of_doc_no_trailing_ellipsis"
+            `Quick
+            test_phase35_snippet_end_of_doc_no_trailing_ellipsis
+        ; Alcotest.test_case
+            "sentence_aligned_window"
+            `Quick
+            test_phase35_snippet_sentence_aligned_window
+        ; Alcotest.test_case
+            "dense_cluster_wins_when_no_lede"
+            `Quick
+            test_phase35_snippet_dense_cluster_wins_when_no_lede
+        ; Alcotest.test_case
+            "no_match_returns_lede"
+            `Quick
+            test_phase35_snippet_no_match_returns_lede
+        ] )
+    ; ( "phase30_sqlite_master"
+      , [ Alcotest.test_case "tables" `Quick test_sqlite_master_tables
+        ; Alcotest.test_case "indexes" `Quick test_sqlite_master_indexes
+        ; Alcotest.test_case "sql_shape" `Quick test_sqlite_master_sql_shape
+        ; Alcotest.test_case "views" `Quick test_sqlite_master_views
+        ; Alcotest.test_case "all_types" `Quick test_sqlite_master_all_types
+        ; Alcotest.test_case "schema_alias" `Quick test_sqlite_schema_alias
+        ; Alcotest.test_case "count_star" `Quick test_sqlite_master_count_star
+        ; Alcotest.test_case "trigger_tblname" `Quick test_sqlite_master_trigger_tblname
+        ] )
+    ; ( "phase31_alter_fk"
+      , [ Alcotest.test_case "valid_insert" `Quick test_alter_add_fk_column_valid_insert
+        ; Alcotest.test_case
+            "invalid_insert_fails"
+            `Quick
+            test_alter_add_fk_column_invalid_insert_fails
+        ; Alcotest.test_case "inferred_pk" `Quick test_alter_add_fk_inferred_pk
+        ; Alcotest.test_case "bad_parent_table" `Quick test_alter_add_fk_bad_parent_table
+        ; Alcotest.test_case
+            "bad_parent_column"
+            `Quick
+            test_alter_add_fk_bad_parent_column
+        ; Alcotest.test_case "null_is_allowed" `Quick test_alter_add_fk_null_is_allowed
+        ] )
+    ; ( "phase31_instead_of"
+      , [ Alcotest.test_case "insert" `Quick test_instead_of_insert
+        ; Alcotest.test_case "insert_multirow" `Quick test_instead_of_insert_multirow
+        ; Alcotest.test_case "delete" `Quick test_instead_of_delete
+        ; Alcotest.test_case "no_trigger_fails" `Quick test_instead_of_no_trigger_fails
+        ; Alcotest.test_case
+            "multiple_body_stmts"
+            `Quick
+            test_instead_of_insert_multiple_body_stmts
+        ] )
+    ; ( "phase32_instead_of_update"
+      , [ Alcotest.test_case "update" `Quick test_instead_of_update
+        ; Alcotest.test_case
+            "update_multi_assign"
+            `Quick
+            test_instead_of_update_multi_assign
+        ; Alcotest.test_case
+            "update_no_trigger_fails"
+            `Quick
+            test_instead_of_update_no_trigger_fails
+        ; Alcotest.test_case
+            "update_multi_stmt_body"
+            `Quick
+            test_instead_of_update_multi_stmt_body
+        ] )
+    ; ( "phase31_scalar"
+      , [ Alcotest.test_case "hex_blob" `Quick test_hex_blob
+        ; Alcotest.test_case "hex_text" `Quick test_hex_text
+        ; Alcotest.test_case "hex_null" `Quick test_hex_null
+        ; Alcotest.test_case "hex_int_zero" `Quick test_hex_int_zero
+        ; Alcotest.test_case "hex_int_nonzero" `Quick test_hex_int_nonzero
+        ; Alcotest.test_case "char_basic" `Quick test_char_basic
+        ; Alcotest.test_case "char_single" `Quick test_char_single
+        ; Alcotest.test_case "char_unicode" `Quick test_char_unicode
+        ; Alcotest.test_case "unicode_basic" `Quick test_unicode_basic
+        ; Alcotest.test_case "unicode_empty" `Quick test_unicode_empty
+        ; Alcotest.test_case "unicode_null" `Quick test_unicode_null
+        ; Alcotest.test_case "printf_basic" `Quick test_printf_basic
+        ; Alcotest.test_case "printf_percent" `Quick test_printf_percent
+        ; Alcotest.test_case "printf_q_simple" `Quick test_printf_q_simple
+        ; Alcotest.test_case "printf_q_with_quotes" `Quick test_printf_q_with_quotes
+        ; Alcotest.test_case "format_alias" `Quick test_format_alias
+        ; Alcotest.test_case "zeroblob_length" `Quick test_zeroblob_length
+        ; Alcotest.test_case "zeroblob_hex" `Quick test_zeroblob_hex
+        ; Alcotest.test_case "zeroblob_zero_len" `Quick test_zeroblob_zero_len
+        ] )
+    ; ( "phase32_session_fns"
+      , [ Alcotest.test_case "changes_initial" `Quick test_changes_initial
+        ; Alcotest.test_case "changes_after_insert" `Quick test_changes_after_insert
+        ; Alcotest.test_case
+            "changes_after_delete_multiple"
+            `Quick
+            test_changes_after_delete_multiple
+        ; Alcotest.test_case
+            "last_insert_rowid_initial"
+            `Quick
+            test_last_insert_rowid_initial
+        ; Alcotest.test_case
+            "last_insert_rowid_after_inserts"
+            `Quick
+            test_last_insert_rowid_after_inserts
+        ; Alcotest.test_case "random_is_integer" `Quick test_random_is_integer
+        ; Alcotest.test_case "randomblob_length" `Quick test_randomblob_length
+        ; Alcotest.test_case "randomblob_zero_length" `Quick test_randomblob_zero_length
+        ] )
+    ; ( "phase32_multi_col_fk"
+      , [ Alcotest.test_case "valid_insert" `Quick test_multi_col_fk_valid_insert
+        ; Alcotest.test_case "invalid_insert" `Quick test_multi_col_fk_invalid_insert
+        ; Alcotest.test_case "partial_null" `Quick test_multi_col_fk_partial_null
+        ; Alcotest.test_case "cascade_delete" `Quick test_multi_col_fk_cascade_delete
+        ; Alcotest.test_case
+            "pragma_list_count"
+            `Quick
+            test_multi_col_fk_pragma_list_count
+        ; Alcotest.test_case
+            "restrict_delete_blocks"
+            `Quick
+            test_multi_col_fk_restrict_delete_blocks
+        ] )
+    ; ( "phase33_triggers"
+      , [ Alcotest.test_case "for_each_row_parses" `Quick test_for_each_row_parses
+        ; Alcotest.test_case "nested_trigger_fires" `Quick test_nested_trigger_fires
+        ; Alcotest.test_case "trigger_recursion_limit" `Quick test_trigger_recursion_limit
+        ; Alcotest.test_case
+            "instead_of_update_old_row"
+            `Quick
+            test_instead_of_update_old_row
+        ; Alcotest.test_case
+            "replace_fires_delete_trigger"
+            `Quick
+            test_replace_fires_delete_trigger
+        ; Alcotest.test_case
+            "upsert_fires_update_trigger"
+            `Quick
+            test_upsert_fires_update_trigger
+        ; Alcotest.test_case
+            "nested_trigger_insert_replace_fires_delete"
+            `Quick
+            test_nested_trigger_insert_replace_fires_delete
+        ; Alcotest.test_case
+            "instead_of_update_old_row_zero_matches"
+            `Quick
+            test_instead_of_update_old_row_zero_matches
+        ; Alcotest.test_case
+            "instead_of_update_old_row_unnamed_view_cols"
+            `Quick
+            test_instead_of_update_old_row_unnamed_view_cols
+        ; Alcotest.test_case
+            "instead_of_update_where_subquery_no_crash"
+            `Quick
+            test_instead_of_update_where_subquery_no_crash
+        ] )
+    ; ( "phase33_fk_index"
+      , [ Alcotest.test_case "cascade_delete" `Quick test_fk_index_cascade_delete
+        ; Alcotest.test_case "no_index_fallback" `Quick test_fk_index_no_index_fallback
+        ; Alcotest.test_case "multi_col_restrict" `Quick test_fk_index_multi_col_restrict
+        ; Alcotest.test_case "set_null" `Quick test_fk_index_set_null
+        ; Alcotest.test_case
+            "update_restrict_blocks"
+            `Quick
+            test_fk_index_update_restrict_blocks
+        ; Alcotest.test_case
+            "consistency_with_fallback"
+            `Quick
+            test_fk_index_consistency_with_fallback
+        ] )
+    ; ( "phase33_new_fns"
+      , [ Alcotest.test_case "total_changes_initial" `Quick test_total_changes_initial
+        ; Alcotest.test_case
+            "total_changes_after_multi_insert"
+            `Quick
+            test_total_changes_after_multi_insert
+        ; Alcotest.test_case
+            "total_changes_accumulates_across_dml_kinds"
+            `Quick
+            test_total_changes_accumulates_across_dml_kinds
+        ; Alcotest.test_case
+            "total_changes_vs_changes"
+            `Quick
+            test_total_changes_vs_changes
+        ; Alcotest.test_case "sqlite_version_value" `Quick test_sqlite_version_value
+        ; Alcotest.test_case
+            "sqlite_version_in_expression"
+            `Quick
+            test_sqlite_version_in_expression
+        ] )
+    ; "phase33_virtual_gen", phase33_virtual_gen_tests
+    ; "phase34_recursive_triggers", phase34_recursive_triggers_tests
+    ; "phase34_transitive_setnull", phase34_transitive_setnull_tests
+    ; "phase34_prepared_counters", phase34_prepared_counters_tests
+    ; "phase34_master_fts", phase34_master_fts_tests
+    ; "phase35_fk_deferrable", phase35_fk_deferrable_tests
+    ; "phase35_task3", phase35_task3_tests
+    ; ( "helpers (#161)"
+      , [ Alcotest.test_case "query_ok_lwt smoke" `Quick helper_query_ok_lwt_smoke ] )
+    ]
+;;

@@ -2,15 +2,17 @@
     Pages 0 and 1 hold the two alternating file headers.
     The header with the higher txn_id and valid CRC is the live state. *)
 
-type t = {
-  txn_id         : int64;
-  root_page      : int64;
-  freelist_page  : int64;
-  n_pages_total  : int64;
-  schema_version : int64;
-}
+type t =
+  { txn_id : int64
+  ; root_page : int64
+  ; freelist_page : int64
+  ; n_pages_total : int64
+  ; schema_version : int64
+  }
 
-type error = Io of string | Both_headers_corrupt
+type error =
+  | Io of string
+  | Both_headers_corrupt
 
 (** Pretty-print all header fields. *)
 val pp : Format.formatter -> t -> unit
@@ -37,8 +39,7 @@ val commit : Pager.t -> prev_header:t -> new_state:t -> (unit, error) result Lwt
     callers coalesce the actual fsync across multiple writers.  On
     non-WAL backends this falls through to the regular sync flush, so it
     is safe to call regardless of backend. *)
-val commit_no_sync :
-  Pager.t -> prev_header:t -> new_state:t -> (unit, error) result Lwt.t
+val commit_no_sync : Pager.t -> prev_header:t -> new_state:t -> (unit, error) result Lwt.t
 
 (** Initialise a brand-new empty file: write both header pages with txn_id=0
     and zeroed root/freelist. Called once on new file creation.

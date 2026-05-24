@@ -22,11 +22,11 @@ val create : unit -> t
 
 (** [acquire_read] increments the reader counter and returns
     immediately.  Never blocks. *)
-val acquire_read  : t -> unit Lwt.t
+val acquire_read : t -> unit Lwt.t
 
 (** [release_read] decrements the counter; broadcasts when it reaches
     zero (used by the checkpoint coordinator). *)
-val release_read  : t -> unit
+val release_read : t -> unit
 
 (** [acquire_write] blocks while another writer is active.  Does NOT
     block on active readers. *)
@@ -36,7 +36,7 @@ val acquire_write : t -> unit Lwt.t
 val release_write : t -> unit
 
 (** Acquire shared (reader) access for the duration of [f]. *)
-val with_read  : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+val with_read : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** Acquire exclusive (writer) access for the duration of [f]. *)
 val with_write : t -> (unit -> 'a Lwt.t) -> 'a Lwt.t

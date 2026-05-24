@@ -18,72 +18,82 @@ let default_cache_capacity = 1024
 
 let cache_capacity_from_env () =
   match Sys.getenv_opt "SQLOCAML_PAGE_CACHE" with
-  | Some s -> (match int_of_string_opt s with
-               | Some n when n > 0 -> n
-               | _ -> default_cache_capacity)
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n when n > 0 -> n
+     | _ -> default_cache_capacity)
   | None -> default_cache_capacity
+;;
 
-type cache_key = int64 * int   (* (page_id, version);  -1 = main DB *)
+type cache_key = int64 * int (* (page_id, version);  -1 = main DB *)
 
-let cache_key_main pid : cache_key = (pid, -1)
+let cache_key_main pid : cache_key = pid, -1
 
-type wal_callbacks = {
-  wal_find_page    : int64 -> int option;
-  wal_find_page_at : int64 -> max_frame:int -> int option;
-  wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
-  wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
-  wal_append_commit_no_sync :
-    (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
-  wal_sync         : unit -> (unit, string) result Lwt.t;
-}
+type wal_callbacks =
+  { wal_find_page : int64 -> int option
+  ; wal_find_page_at : int64 -> max_frame:int -> int option
+  ; wal_read_frame : int -> (Cstruct.t, string) result Lwt.t
+  ; wal_append_commit : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
+  ; wal_append_commit_no_sync : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
+  ; wal_sync : unit -> (unit, string) result Lwt.t
+  }
 
-type t = {
-  read_page  : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
-  write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t;
-  sync       : unit -> (unit, string) result Lwt.t;
-  resize     : n_pages:int64 -> (unit, string) result Lwt.t;
-  cache      : (cache_key, Cstruct.t) Hashtbl.t;
-  dirty      : (int64, Cstruct.t) Hashtbl.t;
-  fifo       : cache_key Queue.t;   (* insertion order for FIFO eviction *)
-  cache_capacity : int;
-  pinned     : (cache_key, int) Hashtbl.t;
-  (* Refcount per cache key of live RO snapshots that have materialised it
+type t =
+  { read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t
+  ; write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t
+  ; sync : unit -> (unit, string) result Lwt.t
+  ; resize : n_pages:int64 -> (unit, string) result Lwt.t
+  ; cache : (cache_key, Cstruct.t) Hashtbl.t
+  ; dirty : (int64, Cstruct.t) Hashtbl.t
+  ; fifo : cache_key Queue.t (* insertion order for FIFO eviction *)
+  ; cache_capacity : int
+  ; pinned : (cache_key, int) Hashtbl.t
+  ; (* Refcount per cache key of live RO snapshots that have materialised it
      (#159).  [maybe_evict] never drops a key with refcount > 0.  Multiple
      concurrent snapshots referencing the same page share the count. *)
-  mutable n_pages       : int64;
-  mutable freelist      : Freelist.t;
-  mutable current_txn_id  : int64;
-  mutable alloc_min_safe  : int64;
-  mutable wal            : wal_callbacks option;
-}
+    mutable n_pages : int64
+  ; mutable freelist : Freelist.t
+  ; mutable current_txn_id : int64
+  ; mutable alloc_min_safe : int64
+  ; mutable wal : wal_callbacks option
+  }
 
-type error = Block_error of string | Corruption of string
+type error =
+  | Block_error of string
+  | Corruption of string
 
 let pp_error fmt = function
   | Block_error msg -> Format.fprintf fmt "Block_error: %s" msg
-  | Corruption msg  -> Format.fprintf fmt "Corruption: %s" msg
+  | Corruption msg -> Format.fprintf fmt "Corruption: %s" msg
+;;
 
 let pp fmt t =
-  Format.fprintf fmt
+  Format.fprintf
+    fmt
     "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld }@]"
-    t.n_pages (Hashtbl.length t.cache) (Hashtbl.length t.dirty) t.current_txn_id
+    t.n_pages
+    (Hashtbl.length t.cache)
+    (Hashtbl.length t.dirty)
+    t.current_txn_id
+;;
 
 let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
-  { read_page;
-    write_page;
-    sync;
-    resize;
-    cache           = Hashtbl.create 64;
-    dirty           = Hashtbl.create 16;
-    fifo            = Queue.create ();
-    cache_capacity  = cache_capacity_from_env ();
-    pinned          = Hashtbl.create 16;
-    n_pages;
-    freelist;
-    current_txn_id  = 0L;
-    alloc_min_safe  = 0L;
-    wal             = None;
+  { read_page
+  ; write_page
+  ; sync
+  ; resize
+  ; cache = Hashtbl.create 64
+  ; dirty = Hashtbl.create 16
+  ; fifo = Queue.create ()
+  ; cache_capacity = cache_capacity_from_env ()
+  ; pinned = Hashtbl.create 16
+  ; n_pages
+  ; freelist
+  ; current_txn_id = 0L
+  ; alloc_min_safe = 0L
+  ; wal = None
   }
+;;
 
 let set_wal t cb =
   (* Any cache entries built before the WAL hook was attached came from
@@ -96,6 +106,8 @@ let set_wal t cb =
      Queue.clear t.fifo
    | _ -> ());
   t.wal <- cb
+;;
+
 let wal_mode t = t.wal <> None
 
 (** Evict the oldest cache entry if the cache is at capacity.
@@ -103,34 +115,34 @@ let wal_mode t = t.wal <> None
 let maybe_evict t =
   (* Keep trying to evict until we find a clean page or the cache is small enough *)
   let cache_size = Hashtbl.length t.cache in
-  if cache_size < t.cache_capacity then ()
-  else begin
+  if cache_size < t.cache_capacity
+  then ()
+  else (
     (* Scan the FIFO queue front-to-back looking for an evictable page
        (neither dirty nor pinned). *)
     let evicted = ref false in
     let temp = Queue.create () in
-    while not !evicted && not (Queue.is_empty t.fifo) do
+    while (not !evicted) && not (Queue.is_empty t.fifo) do
       let key = Queue.pop t.fifo in
-      if Hashtbl.mem t.dirty (fst key) || Hashtbl.mem t.pinned key then
+      if Hashtbl.mem t.dirty (fst key) || Hashtbl.mem t.pinned key
+      then
         (* dirty or pinned — put back at end so we don't lose track of it *)
         Queue.push key temp
-      else begin
+      else (
         Hashtbl.remove t.cache key;
         evicted := true;
         (* push anything we moved to temp back into the real queue *)
         Queue.iter (fun k -> Queue.push k t.fifo) temp;
-        Queue.clear temp
-      end
+        Queue.clear temp)
     done;
     (* If we couldn't evict (all cached pages are dirty/pinned), keep them. *)
-    if not !evicted then
-      Queue.iter (fun k -> Queue.push k t.fifo) temp
-  end
+    if not !evicted then Queue.iter (fun k -> Queue.push k t.fifo) temp)
+;;
 
 (* Largest number of distinct pages a set of live snapshots may pin.  We
    always keep a reserve of evictable slots so [maybe_evict] can make
    progress and the cache stays bounded even under a giant scan. *)
-let max_pinned t = t.cache_capacity - (max 8 (t.cache_capacity / 8))
+let max_pinned t = t.cache_capacity - max 8 (t.cache_capacity / 8)
 
 (* Pin [page_id] for the snapshot whose pin set is [s], if budget allows.
    Idempotent per snapshot: a page already in [s] is not double-counted.
@@ -140,31 +152,33 @@ let pin_page t pin_set page_id =
   match pin_set with
   | None -> ()
   | Some s ->
-    if not (Hashtbl.mem s page_id) && Hashtbl.length t.pinned < max_pinned t
-    then begin
+    if (not (Hashtbl.mem s page_id)) && Hashtbl.length t.pinned < max_pinned t
+    then (
       Hashtbl.replace s page_id ();
       let key = cache_key_main page_id in
       let c = Option.value ~default:0 (Hashtbl.find_opt t.pinned key) in
-      Hashtbl.replace t.pinned key (c + 1)
-    end
+      Hashtbl.replace t.pinned key (c + 1))
+;;
 
 (** Release every pin held by a snapshot (called from [Store.ro_end]).
     Decrements the shared refcount for each page the snapshot pinned. *)
 let unpin_all t pin_set =
-  Hashtbl.iter (fun page_id () ->
-    let key = cache_key_main page_id in
-    match Hashtbl.find_opt t.pinned key with
-    | None | Some 1 -> Hashtbl.remove t.pinned key
-    | Some n -> Hashtbl.replace t.pinned key (n - 1)
-  ) pin_set
+  Hashtbl.iter
+    (fun page_id () ->
+       let key = cache_key_main page_id in
+       match Hashtbl.find_opt t.pinned key with
+       | None | Some 1 -> Hashtbl.remove t.pinned key
+       | Some n -> Hashtbl.replace t.pinned key (n - 1))
+    pin_set
+;;
 
 (** Add a page to the cache, evicting if necessary. *)
 let cache_add t key buf =
   let already_cached = Hashtbl.mem t.cache key in
   maybe_evict t;
   Hashtbl.replace t.cache key buf;
-  if not already_cached then
-    Queue.push key t.fifo
+  if not already_cached then Queue.push key t.fifo
+;;
 
 (** Make a deep copy of a Cstruct. *)
 let cstruct_dup src =
@@ -172,6 +186,7 @@ let cstruct_dup src =
   let dst = Cstruct.create len in
   Cstruct.blit src 0 dst 0 len;
   dst
+;;
 
 (* Resolve [page_id] from the WAL, if any.  [finder] picks the relevant frame
    (latest, or latest <= a snapshot bound).  WAL frames are NOT cached: frame
@@ -182,13 +197,14 @@ let resolve_wal_page t finder =
   match t.wal with
   | None -> Lwt.return_ok None
   | Some cb ->
-    match finder cb with
-    | None -> Lwt.return_ok None
-    | Some frame_idx ->
-      let* r = cb.wal_read_frame frame_idx in
-      (match r with
-       | Error s -> Lwt.return_error (Block_error s)
-       | Ok page -> Lwt.return_ok (Some (cstruct_dup page)))
+    (match finder cb with
+     | None -> Lwt.return_ok None
+     | Some frame_idx ->
+       let* r = cb.wal_read_frame frame_idx in
+       (match r with
+        | Error s -> Lwt.return_error (Block_error s)
+        | Ok page -> Lwt.return_ok (Some (cstruct_dup page))))
+;;
 
 (* Load [page_id] from the shared cache, or from the block device on a miss
    (caching the result).  The returned Cstruct is fresh. *)
@@ -202,12 +218,13 @@ let load_main_page t pin_set page_id =
   | None ->
     let buf = Cstruct.create Page.page_size in
     let* result = t.read_page ~page_id buf in
-    match result with
-    | Error msg -> Lwt.return_error (Block_error msg)
-    | Ok () ->
-      cache_add t key (cstruct_dup buf);
-      pin_page t pin_set page_id;
-      Lwt.return_ok buf
+    (match result with
+     | Error msg -> Lwt.return_error (Block_error msg)
+     | Ok () ->
+       cache_add t key (cstruct_dup buf);
+       pin_page t pin_set page_id;
+       Lwt.return_ok buf)
+;;
 
 let read ?snapshot_frames ?pin_set t page_id =
   let open Lwt.Syntax in
@@ -227,11 +244,14 @@ let read ?snapshot_frames ?pin_set t page_id =
   | Some max_frame ->
     (* Snapshot reader path: never consult [dirty]. *)
     load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
+;;
 
 let write t page_id buf =
   let copy = cstruct_dup buf in
   Hashtbl.replace t.dirty page_id copy
-  (* Previously also injected into the shared cache here for
+;;
+
+(* Previously also injected into the shared cache here for
      read-after-write inside the same txn.  Removed (#149): a concurrent
      reader at an older snapshot would see uncommitted bytes.  The
      [dirty] table already covers writer read-after-write — [read]
@@ -250,15 +270,14 @@ let alloc t =
     let* result = t.resize ~n_pages:new_pages in
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
-     | Ok ()     ->
+     | Ok () ->
        t.n_pages <- new_pages;
        Lwt.return_ok new_id)
+;;
 
 let free t ~page_id ~freed_at_txn_id =
-  t.freelist <-
-    Freelist.add t.freelist
-      ~page_id:(Int64.to_int32 page_id)
-      ~freed_at_txn_id
+  t.freelist <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
+;;
 
 (* Internal: drive the WAL append callback [append] with the dirty
    entries; on success clear the dirty set.  Used by both [flush] (sync)
@@ -267,7 +286,8 @@ let free t ~page_id ~freed_at_txn_id =
 let flush_via_wal t ~append =
   let open Lwt.Syntax in
   let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
-  if entries = [] then Lwt.return_ok ()
+  if entries = []
+  then Lwt.return_ok ()
   else
     let* r = append entries in
     match r with
@@ -275,6 +295,7 @@ let flush_via_wal t ~append =
     | Ok () ->
       Hashtbl.clear t.dirty;
       Lwt.return_ok ()
+;;
 
 let flush_no_sync t =
   match t.wal with
@@ -282,9 +303,7 @@ let flush_no_sync t =
   | None ->
     (* Non-WAL backends have no notion of deferred sync — fall through to
        the regular [flush] which writes pages + syncs. *)
-    let entries =
-      Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty []
-    in
+    let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
     let open Lwt.Syntax in
     let rec write_all = function
       | [] ->
@@ -306,6 +325,7 @@ let flush_no_sync t =
            write_all rest)
     in
     write_all entries
+;;
 
 let wal_sync t =
   match t.wal with
@@ -316,21 +336,22 @@ let wal_sync t =
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () -> Lwt.return_ok ())
   | None -> Lwt.return_ok ()
+;;
 
 let flush t =
   let open Lwt.Syntax in
   let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
   match t.wal with
   | Some cb ->
-    if entries = [] then Lwt.return_ok ()
-    else begin
+    if entries = []
+    then Lwt.return_ok ()
+    else
       let* r = cb.wal_append_commit entries in
-      match r with
-      | Error msg -> Lwt.return_error (Block_error msg)
-      | Ok () ->
-        Hashtbl.clear t.dirty;
-        Lwt.return_ok ()
-    end
+      (match r with
+       | Error msg -> Lwt.return_error (Block_error msg)
+       | Ok () ->
+         Hashtbl.clear t.dirty;
+         Lwt.return_ok ())
   | None ->
     (* Legacy path: write every dirty page to the main DB and sync. *)
     let rec write_all = function
@@ -353,37 +374,32 @@ let flush t =
            write_all rest)
     in
     write_all entries
+;;
 
 let n_pages t = t.n_pages
-
 let freelist t = t.freelist
-
 let set_txn_id t id = t.current_txn_id <- id
-
 let get_txn_id t = t.current_txn_id
-
 let set_alloc_min_safe t v = t.alloc_min_safe <- v
 
 (* Number of distinct pages currently pinned by live RO snapshots (#159).
    Exposed for #164 testing: lets a test assert pins return to 0 after a
    snapshot ends — including when its reader closure raised. *)
 let pinned_count t = Hashtbl.length t.pinned
-
 let set_freelist t fl = t.freelist <- fl
-
 let set_n_pages t n = t.n_pages <- n
 
 let clear_dirty t =
   let dirty_pids = Hashtbl.fold (fun pid _ acc -> pid :: acc) t.dirty [] in
-  List.iter (fun pid ->
-    Hashtbl.remove t.dirty pid;
-    Hashtbl.remove t.cache (cache_key_main pid)
-  ) dirty_pids;
+  List.iter
+    (fun pid ->
+       Hashtbl.remove t.dirty pid;
+       Hashtbl.remove t.cache (cache_key_main pid))
+    dirty_pids;
   let old_fifo = Queue.copy t.fifo in
   Queue.clear t.fifo;
-  Queue.iter (fun key ->
-    if Hashtbl.mem t.cache key then Queue.push key t.fifo
-  ) old_fifo
+  Queue.iter (fun key -> if Hashtbl.mem t.cache key then Queue.push key t.fifo) old_fifo
+;;
 
 type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
 
@@ -392,6 +408,7 @@ let dirty_clone t = Hashtbl.copy t.dirty
 let dirty_restore t snap =
   Hashtbl.reset t.dirty;
   Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k v) snap
+;;
 
 let flush_one_to_main t ~page_id ~buf =
   let open Lwt.Syntax in
@@ -401,6 +418,7 @@ let flush_one_to_main t ~page_id ~buf =
     cache_add t (cache_key_main page_id) (cstruct_dup buf);
     Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)
+;;
 
 let flush_sync_main t =
   let open Lwt.Syntax in
@@ -408,6 +426,7 @@ let flush_sync_main t =
   match r with
   | Ok () -> Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)
+;;
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

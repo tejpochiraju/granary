@@ -13,14 +13,14 @@
 *)
 
 type fts_term =
-  | FT_exact  of string         (** single exact term *)
-  | FT_prefix of string         (** prefix: "foo*" stored as "foo" *)
-  | FT_phrase of string list    (** phrase: consecutive terms *)
+  | FT_exact of string (** single exact term *)
+  | FT_prefix of string (** prefix: "foo*" stored as "foo" *)
+  | FT_phrase of string list (** phrase: consecutive terms *)
 
 type t =
-  | FQ_and  of t list   (** all must match (default for spaces) *)
-  | FQ_or   of t list   (** any must match *)
-  | FQ_not  of t        (** must NOT match; used inside FQ_and *)
+  | FQ_and of t list (** all must match (default for spaces) *)
+  | FQ_or of t list (** any must match *)
+  | FQ_not of t (** must NOT match; used inside FQ_and *)
   | FQ_term of fts_term
 
 (** Parse a raw MATCH query string. Returns [Error msg] on malformed input. *)

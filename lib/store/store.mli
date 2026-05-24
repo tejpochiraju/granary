@@ -16,6 +16,7 @@ val pp : Format.formatter -> t -> unit
 
 (** Phantom types for transaction modes. *)
 type ro
+
 type rw
 
 (** A transaction handle, phantom-typed by mode. *)
@@ -50,32 +51,32 @@ val open_file : path:string -> (t, error) result Lwt.t
     device as fresh and initialises it.  Pass [~n_pages:0L] for Mirage adapters
     (which bound-check internally against device capacity).
     [~close] is called by [Store.close]. *)
-val open_block :
-  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  sync       : (unit -> (unit, string) result Lwt.t) ->
-  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
-  n_pages    : int64 ->
-  close      : (unit -> unit Lwt.t) ->
-  (t, error) result Lwt.t
+val open_block
+  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
+  -> n_pages:int64
+  -> close:(unit -> unit Lwt.t)
+  -> (t, error) result Lwt.t
 
 (** Open a B+-tree backed store in WAL mode. Commits append dirty pages
     to the WAL device; reads route through the WAL first and fall back
     to the main DB. Crash recovery is performed automatically when the
     WAL is opened. *)
-val open_block_wal :
-  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  sync       : (unit -> (unit, string) result Lwt.t) ->
-  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
-  n_pages    : int64 ->
-  wal_read_at  : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  wal_write_at : (offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  wal_sync     : (unit -> (unit, string) result Lwt.t) ->
-  wal_size_bytes : int64 ->
-  close      : (unit -> unit Lwt.t) ->
-  wal_close  : (unit -> unit Lwt.t) ->
-  (t, error) result Lwt.t
+val open_block_wal
+  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
+  -> n_pages:int64
+  -> wal_read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> wal_write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> wal_sync:(unit -> (unit, string) result Lwt.t)
+  -> wal_size_bytes:int64
+  -> close:(unit -> unit Lwt.t)
+  -> wal_close:(unit -> unit Lwt.t)
+  -> (t, error) result Lwt.t
 
 (** Convenience wrapper: open WAL-mode store using two Unix files,
     [path] for the main DB and [path ^ "-wal"] for the WAL. *)
@@ -93,7 +94,7 @@ val ro_begin : t -> ro txn Lwt.t
 val rw_begin : t -> rw txn Lwt.t
 
 (** Commit a read-write transaction, making its mutations durable. *)
-val commit   : rw txn -> unit Lwt.t
+val commit : rw txn -> unit Lwt.t
 
 (** Roll back a read-write transaction. Phase 0: mutations cannot be
     rolled back (they were applied immediately); this just releases the
@@ -102,7 +103,7 @@ val rollback : rw txn -> unit Lwt.t
 
 (** Push a named savepoint by snapshotting current Mem tree state.
     No-op on the B-tree backend (deferred). *)
-val savepoint_begin   : rw txn -> string -> unit Lwt.t
+val savepoint_begin : rw txn -> string -> unit Lwt.t
 
 (** Release the named savepoint and all newer ones.
     Writes accumulated since the savepoint remain in the outer transaction.
@@ -115,7 +116,7 @@ val savepoint_release : rw txn -> string -> unit Lwt.t
 val savepoint_rollback : rw txn -> string -> unit Lwt.t
 
 (** End a read-only transaction. *)
-val ro_end   : ro txn -> unit Lwt.t
+val ro_end : ro txn -> unit Lwt.t
 
 (** [with_ro t f] runs [f] over a fresh RO snapshot and ends the snapshot
     when [f] finishes — including if [f] raises. Use this instead of a bare
@@ -145,10 +146,9 @@ val cursor_close : cursor -> unit
 
 (** Result of a seek or first operation. *)
 type seek_result =
-  | Found of bytes
-    (** Cursor is positioned at the exact key. *)
-  | Not_found of [`Greater of bytes | `End]
-    (** No exact match. [`Greater k] means cursor is at the next key [k].
+  | Found of bytes (** Cursor is positioned at the exact key. *)
+  | Not_found of [ `Greater of bytes | `End ]
+  (** No exact match. [`Greater k] means cursor is at the next key [k].
         [`End] means there is no key >= the sought key. *)
 
 (** Seek to the smallest key >= the given key.

@@ -29,10 +29,12 @@ val pp_error : Format.formatter -> error -> unit
     the pages they materialise into the given set (#159) so concurrent writer
     CoW churn can't evict the reader's working set; released via
     [Pager.unpin_all]. *)
-val create :
-  ?snapshot_frames:int ->
-  ?pin_set:(int64, unit) Hashtbl.t ->
-  Pager.t -> root_page:int64 -> t
+val create
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> Pager.t
+  -> root_page:int64
+  -> t
 
 (** The current root page id.  Changes after each mutation.
     [0L] means an empty tree. *)
@@ -69,8 +71,10 @@ val cursor_open : t -> (cursor, error) result Lwt.t
     @return [`Found] if an exact match exists.
     @return [`Not_found_after k] if the cursor stopped at a key greater than
             [k] (or past the end of the tree). *)
-val cursor_seek : cursor -> bytes ->
-  ([ `Found | `Not_found_after of bytes ], error) result Lwt.t
+val cursor_seek
+  :  cursor
+  -> bytes
+  -> ([ `Found | `Not_found_after of bytes ], error) result Lwt.t
 
 (** Return the entry at the current cursor position and advance.
     Returns [None] when the cursor has passed the last entry. *)

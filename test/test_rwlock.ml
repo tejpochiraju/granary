@@ -24,6 +24,7 @@ let test_many_readers_concurrent () =
   in
   run (Lwt.join (List.init 16 task));
   Alcotest.(check int) "all readers ran" 16 !n
+;;
 
 let test_writers_serialised () =
   let lock = R.create () in
@@ -39,6 +40,7 @@ let test_writers_serialised () =
   in
   run (Lwt.join (List.init 8 task));
   Alcotest.(check int) "writers serialised" 1 !max_active
+;;
 
 (* Readers DO NOT block writers and writers DO NOT block readers.
    Both should be able to make progress concurrently. *)
@@ -59,14 +61,15 @@ let test_reader_and_writer_concurrent () =
       order := `W_end :: !order;
       Lwt.return_unit)
   in
-  run (Lwt.join [r; w]);
+  run (Lwt.join [ r; w ]);
   let log = List.rev !order in
   (* Both ran; both reached end.  Order between them is unspecified. *)
-  let count tag = List.length (List.filter ((=) tag) log) in
+  let count tag = List.length (List.filter (( = ) tag) log) in
   Alcotest.(check int) "reader started" 1 (count `R_start);
-  Alcotest.(check int) "reader ended"   1 (count `R_end);
+  Alcotest.(check int) "reader ended" 1 (count `R_end);
   Alcotest.(check int) "writer started" 1 (count `W_start);
-  Alcotest.(check int) "writer ended"   1 (count `W_end)
+  Alcotest.(check int) "writer ended" 1 (count `W_end)
+;;
 
 (* Issue #149 deadlock regression: in the same fiber, ro_begin then
    rw_begin must NOT deadlock.  Under the previous Rwlock semantics
@@ -74,23 +77,30 @@ let test_reader_and_writer_concurrent () =
    writer-mutex + reader-counter design it returns promptly. *)
 let test_same_fiber_read_then_write_no_deadlock () =
   let lock = R.create () in
-  run (
-    let* () = R.acquire_read lock in
-    let* () = R.acquire_write lock in
-    R.release_write lock;
-    R.release_read lock;
-    Lwt.return_unit);
+  run
+    (let* () = R.acquire_read lock in
+     let* () = R.acquire_write lock in
+     R.release_write lock;
+     R.release_read lock;
+     Lwt.return_unit);
   Alcotest.(check int) "lock fully released" 0 (R.readers lock);
   Alcotest.(check bool) "no writer active" false (R.writer_active lock)
+;;
 
 let () =
-  Alcotest.run "rwlock" [
-    "basic", [
-      Alcotest.test_case "many readers concurrent" `Quick test_many_readers_concurrent;
-      Alcotest.test_case "writers serialised"      `Quick test_writers_serialised;
-      Alcotest.test_case "reader and writer can be concurrent"
-        `Quick test_reader_and_writer_concurrent;
-      Alcotest.test_case "same-fiber read then write no deadlock"
-        `Quick test_same_fiber_read_then_write_no_deadlock;
+  Alcotest.run
+    "rwlock"
+    [ ( "basic"
+      , [ Alcotest.test_case "many readers concurrent" `Quick test_many_readers_concurrent
+        ; Alcotest.test_case "writers serialised" `Quick test_writers_serialised
+        ; Alcotest.test_case
+            "reader and writer can be concurrent"
+            `Quick
+            test_reader_and_writer_concurrent
+        ; Alcotest.test_case
+            "same-fiber read then write no deadlock"
+            `Quick
+            test_same_fiber_read_then_write_no_deadlock
+        ] )
     ]
-  ]
+;;

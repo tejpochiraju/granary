@@ -1,4 +1,5 @@
 (library
  (name sqlocaml_parallel)
  (public_name sqlocaml.parallel)
- (instrumentation (backend bisect_ppx)))
+ (instrumentation
+  (backend bisect_ppx)))

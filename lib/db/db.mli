@@ -7,18 +7,18 @@ val pp : Format.formatter -> t -> unit
 
 (** Re-export value type for convenience. *)
 type value = Sqlocaml_encoding.Row.value =
-  | V_int  of int64
+  | V_int of int64
   | V_text of string
   | V_null
   | V_real of float
   | V_blob of bytes
 
-type row = Sqlocaml_encoding.Row.t   (* value array *)
+type row = Sqlocaml_encoding.Row.t (* value array *)
 
 type error =
-  | Parse   of string                (** SQL syntax error *)
-  | Sema    of Sqlocaml_sql.Sema.error  (** name/type error *)
-  | Runtime of string                (** unexpected internal error *)
+  | Parse of string (** SQL syntax error *)
+  | Sema of Sqlocaml_sql.Sema.error (** name/type error *)
+  | Runtime of string (** unexpected internal error *)
 
 (** Open a fresh in-memory database.  [clock] is an optional Unix-timestamp
     provider used by SQL date/time functions when invoked with the literal
@@ -40,14 +40,14 @@ val open_file_wal : path:string -> (t, error) result Lwt.t
     the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]
     for Mirage adapters; the adapter handles device-capacity bounds
     internally.  [~close] is called by [Db.close]. *)
-val open_block :
-  read_page  : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  write_page : (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  sync       : (unit -> (unit, string) result Lwt.t) ->
-  resize     : (n_pages:int64 -> (unit, string) result Lwt.t) ->
-  n_pages    : int64 ->
-  close      : (unit -> unit Lwt.t) ->
-  (t, error) result Lwt.t
+val open_block
+  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
+  -> n_pages:int64
+  -> close:(unit -> unit Lwt.t)
+  -> (t, error) result Lwt.t
 
 (** Close the database, flushing and releasing the underlying store. *)
 val close : t -> unit Lwt.t
@@ -93,15 +93,15 @@ type stmt
 
 (** Compile [sql] into a prepared statement.  Returns [Error] if the
     SQL cannot be parsed or the schema check fails. *)
-val prepare  : t -> string -> (stmt, error) result Lwt.t
+val prepare : t -> string -> (stmt, error) result Lwt.t
 
 (** Execute a write statement (INSERT, UPDATE, DELETE) with the given
     positional parameter values.  Returns the rows-affected count. *)
-val run      : stmt -> params:value list -> (int, error) result Lwt.t
+val run : stmt -> params:value list -> (int, error) result Lwt.t
 
 (** Execute a read statement (SELECT) with the given positional
     parameter values.  Returns a stream of result rows. *)
-val iter     : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
+val iter : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
 
 (** Release resources held by a prepared statement.  No-op in this
     implementation, but should be called for forward compatibility. *)

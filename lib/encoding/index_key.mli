@@ -5,7 +5,7 @@
 
 type value =
   | IK_null
-  | IK_int  of int64
+  | IK_int of int64
   | IK_real of float
   | IK_text of string
   | IK_blob of bytes

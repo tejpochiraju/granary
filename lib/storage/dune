@@ -2,5 +2,7 @@
  (name sqlocaml_storage)
  (public_name sqlocaml.storage)
  (libraries cstruct lwt sqlocaml.block)
- (preprocess (pps lwt_ppx))
- (instrumentation (backend bisect_ppx)))
+ (preprocess
+  (pps lwt_ppx))
+ (instrumentation
+  (backend bisect_ppx)))

@@ -3,7 +3,13 @@
     to prevent concurrent access from two processes. *)
 
 type t
-type error = Io of string | Out_of_bounds of { page_id: int64; n_pages: int64 }
+
+type error =
+  | Io of string
+  | Out_of_bounds of
+      { page_id : int64
+      ; n_pages : int64
+      }
 
 (** Pretty-print the file's page count. *)
 val pp : Format.formatter -> t -> unit
@@ -16,22 +22,22 @@ val page_size : int
 
 (** [open_ ~path] opens (or creates) the file and takes an exclusive
     [flock]. *)
-val open_  : path:string -> (t, error) result Lwt.t
+val open_ : path:string -> (t, error) result Lwt.t
 
 (** Release the lock and close the underlying file descriptor. *)
-val close  : t -> (unit, error) result Lwt.t
+val close : t -> (unit, error) result Lwt.t
 
 (** Current size of the file, in pages. *)
-val n_pages    : t -> int64
+val n_pages : t -> int64
 
 (** [read_page t ~page_id buf] reads page [page_id] into [buf]. *)
-val read_page  : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
+val read_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
 
 (** [write_page t ~page_id buf] writes [buf] to page [page_id]. *)
 val write_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
 
 (** [fsync] the underlying file, durably persisting prior writes. *)
-val sync       : t -> (unit, error) result Lwt.t
+val sync : t -> (unit, error) result Lwt.t
 
 (** [resize t ~n_pages] grows or shrinks the file to [n_pages] pages. *)
-val resize     : t -> n_pages:int64 -> (unit, error) result Lwt.t
+val resize : t -> n_pages:int64 -> (unit, error) result Lwt.t

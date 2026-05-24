@@ -1,72 +1,93 @@
 open Lwt.Syntax
-module S         = Sqlocaml_store.Store
-module Cat       = Sqlocaml_catalog.Catalog
-module Row       = Sqlocaml_encoding.Row
-module Rowid     = Sqlocaml_encoding.Rowid
+module S = Sqlocaml_store.Store
+module Cat = Sqlocaml_catalog.Catalog
+module Row = Sqlocaml_encoding.Row
+module Rowid = Sqlocaml_encoding.Rowid
 module Index_key = Sqlocaml_encoding.Index_key
-module Varint    = Sqlocaml_encoding.Varint
+module Varint = Sqlocaml_encoding.Varint
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
 
 let lit_to_value : Ast.literal -> Row.value = function
-  | Ast.L_int  n -> Row.V_int n
+  | Ast.L_int n -> Row.V_int n
   | Ast.L_text s -> Row.V_text s
-  | Ast.L_null   -> Row.V_null
+  | Ast.L_null -> Row.V_null
   | Ast.L_real f -> Row.V_real f
   | Ast.L_blob b -> Row.V_blob b
-  | Ast.L_current_timestamp
-  | Ast.L_current_date
-  | Ast.L_current_time ->
+  | Ast.L_current_timestamp | Ast.L_current_date | Ast.L_current_time ->
     failwith "lit_to_value: CURRENT_* should not appear as a plan literal"
+;;
 
 let value_to_literal : Row.value -> Ast.literal = function
-  | Row.V_int n  -> Ast.L_int n
+  | Row.V_int n -> Ast.L_int n
   | Row.V_text s -> Ast.L_text s
   | Row.V_real f -> Ast.L_real f
   | Row.V_blob b -> Ast.L_blob b
-  | Row.V_null   -> Ast.L_null
+  | Row.V_null -> Ast.L_null
+;;
 
 let row_value_to_index_value : Row.value -> Index_key.value = function
-  | Row.V_int  n -> Index_key.IK_int n
+  | Row.V_int n -> Index_key.IK_int n
   | Row.V_text s -> Index_key.IK_text s
-  | Row.V_null   -> Index_key.IK_null
+  | Row.V_null -> Index_key.IK_null
   | Row.V_real f -> Index_key.IK_real f
   | Row.V_blob b -> Index_key.IK_blob b
+;;
 
 let compare_values (a : Row.value) (b : Row.value) : int =
   match a, b with
   | Row.V_null, Row.V_null -> 0
-  | Row.V_null, _          -> -1  (* NULLs sort first — less than any non-null value, matches SQLite *)
-  | _, Row.V_null          -> 1
-  | Row.V_int  x, Row.V_int  y -> Int64.compare x y
+  | Row.V_null, _ ->
+    -1 (* NULLs sort first — less than any non-null value, matches SQLite *)
+  | _, Row.V_null -> 1
+  | Row.V_int x, Row.V_int y -> Int64.compare x y
   | Row.V_real x, Row.V_real y -> Float.compare x y
   | Row.V_text x, Row.V_text y -> String.compare x y
   | Row.V_blob x, Row.V_blob y -> Bytes.compare x y
-  | _,            _            -> 0  (* cross-type: shouldn't happen *)
+  | _, _ -> 0 (* cross-type: shouldn't happen *)
+;;
 
-let compare_with_nulls (dir : [`Asc | `Desc]) (nulls : [`Nulls_first | `Nulls_last])
-    (va : Row.value) (vb : Row.value) : int =
+let compare_with_nulls
+      (dir : [ `Asc | `Desc ])
+      (nulls : [ `Nulls_first | `Nulls_last ])
+      (va : Row.value)
+      (vb : Row.value)
+  : int
+  =
   match va, vb with
   | Row.V_null, Row.V_null -> 0
-  | Row.V_null, _ -> (match nulls with `Nulls_first -> -1 | `Nulls_last -> 1)
-  | _, Row.V_null -> (match nulls with `Nulls_first -> 1 | `Nulls_last -> -1)
+  | Row.V_null, _ ->
+    (match nulls with
+     | `Nulls_first -> -1
+     | `Nulls_last -> 1)
+  | _, Row.V_null ->
+    (match nulls with
+     | `Nulls_first -> 1
+     | `Nulls_last -> -1)
   | _, _ ->
     let c = compare_values va vb in
-    (match dir with `Asc -> c | `Desc -> -c)
+    (match dir with
+     | `Asc -> c
+     | `Desc -> -c)
+;;
 
 let list_drop n lst =
   let rec go k = function
     | [] -> []
-    | (_ :: t) as l -> if k <= 0 then l else go (k - 1) t
-  in go n lst
+    | _ :: t as l -> if k <= 0 then l else go (k - 1) t
+  in
+  go n lst
+;;
 
 let list_take n lst =
   let rec go k = function
     | [] -> []
     | h :: t -> if k <= 0 then [] else h :: go (k - 1) t
-  in go n lst
+  in
+  go n lst
+;;
 
 (** Find a column ordinal by name within a [Row.column] list. *)
 let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
@@ -76,6 +97,7 @@ let find_col_idx_by_name (cols : Row.column list) (name : string) : int =
     | _ :: rest -> find (i + 1) rest
   in
   find 0 cols
+;;
 
 (* Module-level cache for compiled CHECK expressions.
    Key: (table_name, column_ordinal, check_sql) → compiled Plan.expr.
@@ -87,89 +109,110 @@ let check_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.cr
 
 let sql_of_row_type = function
   | Row.Integer -> "INTEGER"
-  | Row.Text    -> "TEXT"
-  | Row.Real    -> "REAL"
-  | Row.Blob    -> "BLOB"
+  | Row.Text -> "TEXT"
+  | Row.Real -> "REAL"
+  | Row.Blob -> "BLOB"
+;;
 
 let sql_of_default_value = function
-  | Row.DV_int n  -> Int64.to_string n
+  | Row.DV_int n -> Int64.to_string n
   | Row.DV_text s ->
     let escaped = String.concat "''" (String.split_on_char '\'' s) in
     Printf.sprintf "'%s'" escaped
   | Row.DV_real f -> Printf.sprintf "%g" f
   | Row.DV_blob b ->
-    let hex = Bytes.to_seq b
+    let hex =
+      Bytes.to_seq b
       |> Seq.map (fun c -> Printf.sprintf "%02X" (Char.code c))
       |> List.of_seq
       |> String.concat ""
     in
     Printf.sprintf "X'%s'" hex
-  | Row.DV_null   -> "NULL"
+  | Row.DV_null -> "NULL"
   | Row.DV_current_timestamp -> "CURRENT_TIMESTAMP"
-  | Row.DV_current_date      -> "CURRENT_DATE"
-  | Row.DV_current_time      -> "CURRENT_TIME"
+  | Row.DV_current_date -> "CURRENT_DATE"
+  | Row.DV_current_time -> "CURRENT_TIME"
+;;
 
 let sql_of_fk_action = function
-  | Cat.FA_no_action   -> "NO ACTION"
-  | Cat.FA_restrict    -> "RESTRICT"
-  | Cat.FA_cascade     -> "CASCADE"
-  | Cat.FA_set_null    -> "SET NULL"
+  | Cat.FA_no_action -> "NO ACTION"
+  | Cat.FA_restrict -> "RESTRICT"
+  | Cat.FA_cascade -> "CASCADE"
+  | Cat.FA_set_null -> "SET NULL"
   | Cat.FA_set_default -> "SET DEFAULT"
+;;
 
 (* Phase 35 task 3b: quote DDL identifiers that contain non-alphanumeric
    characters, start with a digit, or are empty.  Embedded double-quotes are
    doubled per SQL identifier syntax. *)
 let needs_quoting s =
-  String.length s = 0 ||
-  (let c = s.[0] in not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_')) ||
-  String.exists (fun c ->
-    not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-         (c >= '0' && c <= '9') || c = '_')) s
+  String.length s = 0
+  || (let c = s.[0] in
+      not ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c = '_'))
+  || String.exists
+       (fun c ->
+          not
+            ((c >= 'A' && c <= 'Z')
+             || (c >= 'a' && c <= 'z')
+             || (c >= '0' && c <= '9')
+             || c = '_'))
+       s
+;;
 
 let quote_ident s =
-  if needs_quoting s then
-    "\"" ^ String.concat "\"\"" (String.split_on_char '"' s) ^ "\""
+  if needs_quoting s
+  then "\"" ^ String.concat "\"\"" (String.split_on_char '"' s) ^ "\""
   else s
+;;
 
 let ddl_of_table (meta : Cat.table_meta) =
-  let col_parts = List.map (fun (col : Row.column) ->
-    let buf = Buffer.create 64 in
-    Buffer.add_string buf (quote_ident col.Row.name);
-    Buffer.add_char   buf ' ';
-    Buffer.add_string buf (sql_of_row_type col.Row.ty);
-    if col.Row.not_null    then Buffer.add_string buf " NOT NULL";
-    if col.Row.primary_key then Buffer.add_string buf " PRIMARY KEY";
-    (match col.Row.default with
-     | None    -> ()
-     | Some dv ->
-       Buffer.add_string buf " DEFAULT ";
-       Buffer.add_string buf (sql_of_default_value dv));
-    (match col.Row.check_sql with
-     | None     -> ()
-     | Some sql ->
-       Buffer.add_string buf " CHECK(";
-       Buffer.add_string buf sql;
-       Buffer.add_char   buf ')');
-    (match col.Row.generated_as with
-     | None -> ()
-     | Some (expr_sql, is_stored) ->
-       Buffer.add_string buf " GENERATED ALWAYS AS (";
-       Buffer.add_string buf expr_sql;
-       Buffer.add_string buf ") ";
-       Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
-    Buffer.contents buf
-  ) meta.Cat.columns in
-  let fk_parts = List.map (fun (fk : Cat.fk_constraint) ->
-    Printf.sprintf "FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s ON UPDATE %s"
-      (String.concat ", " (List.map quote_ident fk.Cat.fk_local_cols))
-      (quote_ident fk.Cat.fk_parent_table)
-      (String.concat ", " (List.map quote_ident fk.Cat.fk_parent_cols))
-      (sql_of_fk_action fk.Cat.fk_on_delete)
-      (sql_of_fk_action fk.Cat.fk_on_update)
-  ) meta.Cat.fk_constraints in
-  Printf.sprintf "CREATE TABLE %s (%s)"
+  let col_parts =
+    List.map
+      (fun (col : Row.column) ->
+         let buf = Buffer.create 64 in
+         Buffer.add_string buf (quote_ident col.Row.name);
+         Buffer.add_char buf ' ';
+         Buffer.add_string buf (sql_of_row_type col.Row.ty);
+         if col.Row.not_null then Buffer.add_string buf " NOT NULL";
+         if col.Row.primary_key then Buffer.add_string buf " PRIMARY KEY";
+         (match col.Row.default with
+          | None -> ()
+          | Some dv ->
+            Buffer.add_string buf " DEFAULT ";
+            Buffer.add_string buf (sql_of_default_value dv));
+         (match col.Row.check_sql with
+          | None -> ()
+          | Some sql ->
+            Buffer.add_string buf " CHECK(";
+            Buffer.add_string buf sql;
+            Buffer.add_char buf ')');
+         (match col.Row.generated_as with
+          | None -> ()
+          | Some (expr_sql, is_stored) ->
+            Buffer.add_string buf " GENERATED ALWAYS AS (";
+            Buffer.add_string buf expr_sql;
+            Buffer.add_string buf ") ";
+            Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
+         Buffer.contents buf)
+      meta.Cat.columns
+  in
+  let fk_parts =
+    List.map
+      (fun (fk : Cat.fk_constraint) ->
+         Printf.sprintf
+           "FOREIGN KEY (%s) REFERENCES %s(%s) ON DELETE %s ON UPDATE %s"
+           (String.concat ", " (List.map quote_ident fk.Cat.fk_local_cols))
+           (quote_ident fk.Cat.fk_parent_table)
+           (String.concat ", " (List.map quote_ident fk.Cat.fk_parent_cols))
+           (sql_of_fk_action fk.Cat.fk_on_delete)
+           (sql_of_fk_action fk.Cat.fk_on_update))
+      meta.Cat.fk_constraints
+  in
+  Printf.sprintf
+    "CREATE TABLE %s (%s)"
     (quote_ident meta.Cat.name)
     (String.concat ", " (col_parts @ fk_parts))
+;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
     Falls back to the trigger name if the ON clause is not found. *)
@@ -182,44 +225,61 @@ let trigger_table_of_sql trigger_name sql =
     let n = String.length upper in
     (* Search for " ON " pattern *)
     let rec search i =
-      if i + 4 >= n then trigger_name
-      else if upper.[i] = ' ' && upper.[i+1] = 'O' && upper.[i+2] = 'N' && upper.[i+3] = ' ' then
+      if i + 4 >= n
+      then trigger_name
+      else if
+        upper.[i] = ' '
+        && upper.[i + 1] = 'O'
+        && upper.[i + 2] = 'N'
+        && upper.[i + 3] = ' '
+      then (
         (* Found " ON " — extract the identifier that follows *)
         let start = i + 4 in
         let j = ref start in
-        while !j < n &&
-              (let c = upper.[!j] in
-               (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_') do
+        while
+          !j < n
+          &&
+          let c = upper.[!j] in
+          (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_'
+        do
           incr j
         done;
-        if !j > start then String.sub sql start (!j - start)
-        else trigger_name
+        if !j > start then String.sub sql start (!j - start) else trigger_name)
       else search (i + 1)
     in
     search 0
+;;
 
 let ddl_of_index (idx : Cat.index_info) =
   let unique_kw = if idx.Cat.idx_unique then "UNIQUE " else "" in
-  let col_strs = List.map2 (fun col_sql is_expr ->
-    if is_expr then Printf.sprintf "(%s)" col_sql
-    else quote_ident col_sql
-  ) idx.Cat.idx_columns idx.Cat.idx_expr_flags in
+  let col_strs =
+    List.map2
+      (fun col_sql is_expr ->
+         if is_expr then Printf.sprintf "(%s)" col_sql else quote_ident col_sql)
+      idx.Cat.idx_columns
+      idx.Cat.idx_expr_flags
+  in
   let cols_str = String.concat ", " col_strs in
-  let where_clause = match idx.Cat.idx_where_sql with
-    | None     -> ""
+  let where_clause =
+    match idx.Cat.idx_where_sql with
+    | None -> ""
     | Some sql -> Printf.sprintf " WHERE %s" sql
   in
-  Printf.sprintf "CREATE %sINDEX %s ON %s (%s)%s"
+  Printf.sprintf
+    "CREATE %sINDEX %s ON %s (%s)%s"
     unique_kw
     (quote_ident idx.Cat.idx_name)
     (quote_ident idx.Cat.idx_table)
-    cols_str where_clause
+    cols_str
+    where_clause
+;;
 
 let ddl_of_fts (m : Cat.fts_table_meta) =
-  Printf.sprintf "CREATE VIRTUAL TABLE %s USING fts5(%s)"
+  Printf.sprintf
+    "CREATE VIRTUAL TABLE %s USING fts5(%s)"
     (quote_ident m.Cat.fts_name)
     (String.concat ", " (List.map quote_ident m.Cat.fts_columns))
-
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Expression evaluation                                                *)
@@ -229,66 +289,99 @@ let ddl_of_fts (m : Cat.fts_table_meta) =
 
 let value_truthy : Row.value -> bool = function
   | Row.V_null | Row.V_int 0L -> false
-  | _                          -> true
+  | _ -> true
+;;
 
 (* Pattern matching helpers for LIKE and GLOB.
    Uses naive recursive backtracking: worst case is O(2^k) for k '%'/'*'
    metacharacters against an adversarial string.  Acceptable for typical
    SQL workloads; replace with NFA/DP if adversarial patterns are a concern. *)
 let rec like_match pat pi str si =
-  let plen = String.length pat and slen = String.length str in
-  if pi = plen then si = slen
-  else match pat.[pi] with
-  | '%' -> like_match pat (pi+1) str si ||
-            (si < slen && like_match pat pi str (si+1))
-  | '_' -> si < slen && like_match pat (pi+1) str (si+1)
-  | c   -> si < slen && Char.lowercase_ascii c = Char.lowercase_ascii str.[si] &&
-            like_match pat (pi+1) str (si+1)
+  let plen = String.length pat
+  and slen = String.length str in
+  if pi = plen
+  then si = slen
+  else (
+    match pat.[pi] with
+    | '%' ->
+      like_match pat (pi + 1) str si || (si < slen && like_match pat pi str (si + 1))
+    | '_' -> si < slen && like_match pat (pi + 1) str (si + 1)
+    | c ->
+      si < slen
+      && Char.lowercase_ascii c = Char.lowercase_ascii str.[si]
+      && like_match pat (pi + 1) str (si + 1))
+;;
 
 let rec glob_match pat pi str si =
-  let plen = String.length pat and slen = String.length str in
-  if pi = plen then si = slen
-  else match pat.[pi] with
-  | '*' -> glob_match pat (pi+1) str si ||
-            (si < slen && glob_match pat pi str (si+1))
-  | '?' -> si < slen && glob_match pat (pi+1) str (si+1)
-  | c   -> si < slen && c = str.[si] && glob_match pat (pi+1) str (si+1)
+  let plen = String.length pat
+  and slen = String.length str in
+  if pi = plen
+  then si = slen
+  else (
+    match pat.[pi] with
+    | '*' ->
+      glob_match pat (pi + 1) str si || (si < slen && glob_match pat pi str (si + 1))
+    | '?' -> si < slen && glob_match pat (pi + 1) str (si + 1)
+    | c -> si < slen && c = str.[si] && glob_match pat (pi + 1) str (si + 1))
+;;
 
 let str_trim_spaces s =
   let n = String.length s in
-  let l = ref 0 and r = ref (n - 1) in
-  while !l <= !r && (let c = s.[!l] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do incr l done;
-  while !r >= !l && (let c = s.[!r] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do decr r done;
+  let l = ref 0
+  and r = ref (n - 1) in
+  while
+    !l <= !r
+    &&
+    let c = s.[!l] in
+    c = ' ' || c = '\t' || c = '\n' || c = '\r'
+  do
+    incr l
+  done;
+  while
+    !r >= !l
+    &&
+    let c = s.[!r] in
+    c = ' ' || c = '\t' || c = '\n' || c = '\r'
+  do
+    decr r
+  done;
   if !l > !r then "" else String.sub s !l (!r - !l + 1)
+;;
 
 let parse_int_prefix s =
   let s = String.trim s in
   match Int64.of_string_opt s with
   | Some n -> n
   | None ->
-    match float_of_string_opt s with
-    | Some f -> Int64.of_float f
-    | None ->
-      (* Scan leading numeric prefix: optional sign, digits, optional decimal *)
-      let n = String.length s in
-      let i = ref 0 in
-      if !i < n && (s.[!i] = '-' || s.[!i] = '+') then incr i;
-      let digit_start = !i in
-      while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do incr i done;
-      (* Include decimal part for float->int conversion *)
-      let has_dot = !i < n && s.[!i] = '.' in
-      if has_dot then begin
-        incr i;
-        while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do incr i done
-      end;
-      if !i > digit_start then
-        (match float_of_string_opt (String.sub s 0 !i) with
+    (match float_of_string_opt s with
+     | Some f -> Int64.of_float f
+     | None ->
+       (* Scan leading numeric prefix: optional sign, digits, optional decimal *)
+       let n = String.length s in
+       let i = ref 0 in
+       if !i < n && (s.[!i] = '-' || s.[!i] = '+') then incr i;
+       let digit_start = !i in
+       while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do
+         incr i
+       done;
+       (* Include decimal part for float->int conversion *)
+       let has_dot = !i < n && s.[!i] = '.' in
+       if has_dot
+       then (
+         incr i;
+         while !i < n && s.[!i] >= '0' && s.[!i] <= '9' do
+           incr i
+         done);
+       if !i > digit_start
+       then (
+         match float_of_string_opt (String.sub s 0 !i) with
          | Some f -> Int64.of_float f
          | None ->
-           match Int64.of_string_opt (String.sub s 0 !i) with
-           | Some v -> v
-           | None -> 0L)
-      else 0L
+           (match Int64.of_string_opt (String.sub s 0 !i) with
+            | Some v -> v
+            | None -> 0L))
+       else 0L)
+;;
 
 let parse_real_prefix s =
   let s = String.trim s in
@@ -301,105 +394,157 @@ let parse_real_prefix s =
     let found = ref false in
     let i = ref n in
     while !i > 0 && not !found do
-      (match float_of_string_opt (String.sub s 0 !i) with
-       | Some f -> result := f; found := true
-       | None   -> decr i)
+      match float_of_string_opt (String.sub s 0 !i) with
+      | Some f ->
+        result := f;
+        found := true
+      | None -> decr i
     done;
     !result
+;;
 
 let str_trim_chars s chars =
   let n = String.length s in
-  let l = ref 0 and r = ref (n - 1) in
-  while !l <= !r && String.contains chars s.[!l] do incr l done;
-  while !r >= !l && String.contains chars s.[!r] do decr r done;
+  let l = ref 0
+  and r = ref (n - 1) in
+  while !l <= !r && String.contains chars s.[!l] do
+    incr l
+  done;
+  while !r >= !l && String.contains chars s.[!r] do
+    decr r
+  done;
   if !l > !r then "" else String.sub s !l (!r - !l + 1)
+;;
 
 let str_ltrim_spaces s =
   let n = String.length s in
   let l = ref 0 in
-  while !l < n && (let c = s.[!l] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do incr l done;
+  while
+    !l < n
+    &&
+    let c = s.[!l] in
+    c = ' ' || c = '\t' || c = '\n' || c = '\r'
+  do
+    incr l
+  done;
   String.sub s !l (n - !l)
+;;
 
 let str_ltrim_chars s chars =
   let n = String.length s in
   let l = ref 0 in
-  while !l < n && String.contains chars s.[!l] do incr l done;
+  while !l < n && String.contains chars s.[!l] do
+    incr l
+  done;
   String.sub s !l (n - !l)
+;;
 
 let str_rtrim_spaces s =
   let n = String.length s in
   let r = ref (n - 1) in
-  while !r >= 0 && (let c = s.[!r] in c = ' ' || c = '\t' || c = '\n' || c = '\r') do decr r done;
+  while
+    !r >= 0
+    &&
+    let c = s.[!r] in
+    c = ' ' || c = '\t' || c = '\n' || c = '\r'
+  do
+    decr r
+  done;
   if !r < 0 then "" else String.sub s 0 (!r + 1)
+;;
 
 let str_rtrim_chars s chars =
   let r = ref (String.length s - 1) in
-  while !r >= 0 && String.contains chars s.[!r] do decr r done;
+  while !r >= 0 && String.contains chars s.[!r] do
+    decr r
+  done;
   if !r < 0 then "" else String.sub s 0 (!r + 1)
+;;
 
 let str_replace s old rep =
-  if String.length old = 0 then s
-  else
+  if String.length old = 0
+  then s
+  else (
     let buf = Buffer.create (String.length s) in
-    let n = String.length s and m = String.length old in
+    let n = String.length s
+    and m = String.length old in
     let i = ref 0 in
     while !i <= n - m do
-      if String.sub s !i m = old then (Buffer.add_string buf rep; i := !i + m)
-      else (Buffer.add_char buf s.[!i]; incr i)
+      if String.sub s !i m = old
+      then (
+        Buffer.add_string buf rep;
+        i := !i + m)
+      else (
+        Buffer.add_char buf s.[!i];
+        incr i)
     done;
-    while !i < n do Buffer.add_char buf s.[!i]; incr i done;
-    Buffer.contents buf
+    while !i < n do
+      Buffer.add_char buf s.[!i];
+      incr i
+    done;
+    Buffer.contents buf)
+;;
 
 let str_instr s sub =
-  let n = String.length s and m = String.length sub in
-  if m = 0 then 1
-  else
+  let n = String.length s
+  and m = String.length sub in
+  if m = 0
+  then 1
+  else (
     let found = ref 0 in
     let i = ref 0 in
     while !found = 0 && !i <= n - m do
-      if String.sub s !i m = sub then found := !i + 1  (* 1-indexed *)
-      else incr i
+      if String.sub s !i m = sub then found := !i + 1 (* 1-indexed *) else incr i
     done;
-    !found
+    !found)
+;;
 
 let row_key (row : Row.t) : string =
   let buf = Buffer.create 64 in
-  Array.iter (function
-    | Row.V_null   -> Buffer.add_string buf "N|"
-    | Row.V_int n  -> Buffer.add_char buf 'I';
-                      Buffer.add_string buf (Int64.to_string n);
-                      Buffer.add_char buf '|'
-    | Row.V_real f -> Buffer.add_char buf 'R';
-                      Buffer.add_string buf (Printf.sprintf "%h" f);
-                      Buffer.add_char buf '|'
-    | Row.V_text s -> Buffer.add_char buf 'T';
-                      Buffer.add_string buf (string_of_int (String.length s));
-                      Buffer.add_char buf ':';
-                      Buffer.add_string buf s;
-                      Buffer.add_char buf '|'
-    | Row.V_blob b -> Buffer.add_char buf 'B';
-                      Buffer.add_string buf (string_of_int (Bytes.length b));
-                      Buffer.add_char buf ':';
-                      Buffer.add_bytes buf b;
-                      Buffer.add_char buf '|'
-  ) row;
+  Array.iter
+    (function
+      | Row.V_null -> Buffer.add_string buf "N|"
+      | Row.V_int n ->
+        Buffer.add_char buf 'I';
+        Buffer.add_string buf (Int64.to_string n);
+        Buffer.add_char buf '|'
+      | Row.V_real f ->
+        Buffer.add_char buf 'R';
+        Buffer.add_string buf (Printf.sprintf "%h" f);
+        Buffer.add_char buf '|'
+      | Row.V_text s ->
+        Buffer.add_char buf 'T';
+        Buffer.add_string buf (string_of_int (String.length s));
+        Buffer.add_char buf ':';
+        Buffer.add_string buf s;
+        Buffer.add_char buf '|'
+      | Row.V_blob b ->
+        Buffer.add_char buf 'B';
+        Buffer.add_string buf (string_of_int (Bytes.length b));
+        Buffer.add_char buf ':';
+        Buffer.add_bytes buf b;
+        Buffer.add_char buf '|')
+    row;
   Buffer.contents buf
+;;
 
 let json_of_sql : Row.value -> Json.value = function
-  | Row.V_null   -> Json.J_null
-  | Row.V_int n  -> Json.J_int n
+  | Row.V_null -> Json.J_null
+  | Row.V_int n -> Json.J_int n
   | Row.V_real f -> Json.J_float f
   | Row.V_text s -> Json.J_string s
   | Row.V_blob b -> Json.J_string (Bytes.to_string b)
+;;
 
 let sql_of_json : Json.value -> Row.value = function
-  | Json.J_null     -> Row.V_null
-  | Json.J_bool b   -> Row.V_int (if b then 1L else 0L)
-  | Json.J_int n    -> Row.V_int n
-  | Json.J_float f  -> Row.V_real f
+  | Json.J_null -> Row.V_null
+  | Json.J_bool b -> Row.V_int (if b then 1L else 0L)
+  | Json.J_int n -> Row.V_int n
+  | Json.J_float f -> Row.V_real f
   | Json.J_string s -> Row.V_text s
-  | Json.J_array _  as v -> Row.V_text (Json.to_string v)
+  | Json.J_array _ as v -> Row.V_text (Json.to_string v)
   | Json.J_object _ as v -> Row.V_text (Json.to_string v)
+;;
 
 (* ── Scalar-function evaluation, split by category (#168) ──────────
    [eval_func] dispatches to the [eval_*_func] helpers below; each returns
@@ -411,49 +556,57 @@ let hex_encode_str s =
   let buf = Buffer.create (String.length s * 2) in
   String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
   Buffer.contents buf
+;;
 
 (* UTF-8 encode each in-range integer codepoint, mirroring SQLite's char(). *)
 let char_encode args =
   let buf = Buffer.create 16 in
-  List.iter (fun v ->
-    match v with
-    | Row.V_int n when n >= 1L && n <= 0x10FFFFL ->
-      let cp = Int64.to_int n in
-      if cp < 0x80 then
-        Buffer.add_char buf (Char.chr cp)
-      else if cp < 0x800 then begin
-        Buffer.add_char buf (Char.chr (0xC0 lor (cp lsr 6)));
-        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-      end else if cp < 0x10000 then begin
-        Buffer.add_char buf (Char.chr (0xE0 lor (cp lsr 12)));
-        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
-        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-      end else begin
-        Buffer.add_char buf (Char.chr (0xF0 lor (cp lsr 18)));
-        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
-        Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
-        Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F)))
-      end
-    | _ -> ()
-  ) args;
+  List.iter
+    (fun v ->
+       match v with
+       | Row.V_int n when n >= 1L && n <= 0x10FFFFL ->
+         let cp = Int64.to_int n in
+         if cp < 0x80
+         then Buffer.add_char buf (Char.chr cp)
+         else if cp < 0x800
+         then (
+           Buffer.add_char buf (Char.chr (0xC0 lor (cp lsr 6)));
+           Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F))))
+         else if cp < 0x10000
+         then (
+           Buffer.add_char buf (Char.chr (0xE0 lor (cp lsr 12)));
+           Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+           Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F))))
+         else (
+           Buffer.add_char buf (Char.chr (0xF0 lor (cp lsr 18)));
+           Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 12) land 0x3F)));
+           Buffer.add_char buf (Char.chr (0x80 lor ((cp lsr 6) land 0x3F)));
+           Buffer.add_char buf (Char.chr (0x80 lor (cp land 0x3F))))
+       | _ -> ())
+    args;
   Buffer.contents buf
+;;
 
 (* Decode the codepoint of the first UTF-8 character of [s] (s non-empty). *)
 let unicode_codepoint s =
   let b0 = Char.code s.[0] in
-  if b0 < 0x80 then b0
-  else if b0 < 0xE0 && String.length s >= 2 then
-    ((b0 land 0x1F) lsl 6) lor (Char.code s.[1] land 0x3F)
-  else if b0 < 0xF0 && String.length s >= 3 then
+  if b0 < 0x80
+  then b0
+  else if b0 < 0xE0 && String.length s >= 2
+  then ((b0 land 0x1F) lsl 6) lor (Char.code s.[1] land 0x3F)
+  else if b0 < 0xF0 && String.length s >= 3
+  then
     ((b0 land 0x0F) lsl 12)
     lor ((Char.code s.[1] land 0x3F) lsl 6)
     lor (Char.code s.[2] land 0x3F)
-  else if b0 >= 0xF0 && String.length s >= 4 then
+  else if b0 >= 0xF0 && String.length s >= 4
+  then
     ((b0 land 0x07) lsl 18)
     lor ((Char.code s.[1] land 0x3F) lsl 12)
     lor ((Char.code s.[2] land 0x3F) lsl 6)
     lor (Char.code s.[3] land 0x3F)
   else b0
+;;
 
 (* Emit one printf conversion [spec] (the char after '%') to [buf], pulling
    the next argument via [get_arg]. *)
@@ -462,338 +615,467 @@ let printf_emit buf spec (get_arg : unit -> Row.value) =
   | '%' -> Buffer.add_char buf '%'
   | 'd' | 'i' ->
     (match get_arg () with
-     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+     | Row.V_int n2 -> Buffer.add_string buf (Int64.to_string n2)
      | Row.V_real f -> Buffer.add_string buf (string_of_int (int_of_float f))
-     | Row.V_text s -> (try Buffer.add_string buf (string_of_int (int_of_string s))
-                        with Failure _ -> ())
+     | Row.V_text s ->
+       (try Buffer.add_string buf (string_of_int (int_of_string s)) with
+        | Failure _ -> ())
      | _ -> ())
   | 'f' ->
     (match get_arg () with
      | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%f" f)
-     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%f" (Int64.to_float n2))
+     | Row.V_int n2 -> Buffer.add_string buf (Printf.sprintf "%f" (Int64.to_float n2))
      | _ -> ())
   | 'e' ->
     (match get_arg () with
      | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%e" f)
-     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%e" (Int64.to_float n2))
+     | Row.V_int n2 -> Buffer.add_string buf (Printf.sprintf "%e" (Int64.to_float n2))
      | _ -> ())
   | 'g' ->
     (match get_arg () with
      | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-     | Row.V_int  n2 -> Buffer.add_string buf (Printf.sprintf "%g" (Int64.to_float n2))
+     | Row.V_int n2 -> Buffer.add_string buf (Printf.sprintf "%g" (Int64.to_float n2))
      | _ -> ())
   | 's' ->
     (match get_arg () with
      | Row.V_text s -> Buffer.add_string buf s
-     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+     | Row.V_int n2 -> Buffer.add_string buf (Int64.to_string n2)
      | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-     | Row.V_null   -> Buffer.add_string buf "NULL"
+     | Row.V_null -> Buffer.add_string buf "NULL"
      | Row.V_blob _ -> Buffer.add_string buf "")
   | 'q' ->
     (match get_arg () with
      | Row.V_text s ->
-       String.iter (fun c ->
-         if c = '\'' then Buffer.add_string buf "''"
-         else Buffer.add_char buf c) s
-     | Row.V_int  n2 -> Buffer.add_string buf (Int64.to_string n2)
+       String.iter
+         (fun c -> if c = '\'' then Buffer.add_string buf "''" else Buffer.add_char buf c)
+         s
+     | Row.V_int n2 -> Buffer.add_string buf (Int64.to_string n2)
      | Row.V_real f -> Buffer.add_string buf (Printf.sprintf "%g" f)
-     | Row.V_null   -> Buffer.add_string buf "NULL"
+     | Row.V_null -> Buffer.add_string buf "NULL"
      | Row.V_blob _ -> ())
   | c ->
     Buffer.add_char buf '%';
     Buffer.add_char buf c
+;;
 
 (* SQLite printf()/format(): a small subset of C printf conversions. *)
 let printf_format fmt rest =
   let args_arr = Array.of_list rest in
   let arg_idx = ref 0 in
   let get_arg () =
-    let v = if !arg_idx < Array.length args_arr
-            then args_arr.(!arg_idx)
-            else Row.V_null in
-    incr arg_idx; v
+    let v =
+      if !arg_idx < Array.length args_arr then args_arr.(!arg_idx) else Row.V_null
+    in
+    incr arg_idx;
+    v
   in
   let buf = Buffer.create 64 in
   let n = String.length fmt in
   let i = ref 0 in
   while !i < n do
-    if fmt.[!i] = '%' then begin
+    if fmt.[!i] = '%'
+    then (
       incr i;
-      if !i < n then begin printf_emit buf fmt.[!i] get_arg; incr i end
-    end else begin
+      if !i < n
+      then (
+        printf_emit buf fmt.[!i] get_arg;
+        incr i))
+    else (
       Buffer.add_char buf fmt.[!i];
-      incr i
-    end
+      incr i)
   done;
   Buffer.contents buf
+;;
 
 let eval_str_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
   match func, args with
-  | Ast.Fn_length, [Row.V_text s] -> Some (Row.V_int (Int64.of_int (String.length s)))
-  | Ast.Fn_length, [Row.V_blob b] -> Some (Row.V_int (Int64.of_int (Bytes.length b)))
-  | Ast.Fn_length, [Row.V_null]   -> Some Row.V_null
-  | Ast.Fn_length, [_]            -> Some Row.V_null  (* non-text/blob: return null like SQLite *)
-  | Ast.Fn_lower,  [Row.V_text s] -> Some (Row.V_text (String.lowercase_ascii s))
-  | Ast.Fn_lower,  [Row.V_null]   -> Some Row.V_null
-  | Ast.Fn_lower,  [_]            -> Some Row.V_null
-  | Ast.Fn_upper,  [Row.V_text s] -> Some (Row.V_text (String.uppercase_ascii s))
-  | Ast.Fn_upper,  [Row.V_null]   -> Some Row.V_null
-  | Ast.Fn_upper,  [_]            -> Some Row.V_null
-  | Ast.Fn_substr, (Row.V_text s :: rest) ->
-    Some (match rest with
-     | [Row.V_int start] ->
-       let i = max 0 (Int64.to_int start - 1) in
-       if i >= String.length s then Row.V_text ""
-       else Row.V_text (String.sub s i (String.length s - i))
-     | [Row.V_int start; Row.V_int len] ->
-       let i = max 0 (Int64.to_int start - 1) in
-       let l = Int64.to_int len in
-       if i >= String.length s || l <= 0 then Row.V_text ""
-       else Row.V_text (String.sub s i (min l (String.length s - i)))
-     | _ -> Row.V_null)
-  | Ast.Fn_substr, (Row.V_null :: _) -> Some Row.V_null
-  | Ast.Fn_trim,  [Row.V_text s]                        -> Some (Row.V_text (str_trim_spaces s))
-  | Ast.Fn_trim,  [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_trim_chars s chars))
-  | Ast.Fn_trim,  [_; Row.V_null]                       -> Some Row.V_null
-  | Ast.Fn_trim,  (Row.V_null :: _)                     -> Some Row.V_null
-  | Ast.Fn_ltrim, [Row.V_text s]                        -> Some (Row.V_text (str_ltrim_spaces s))
-  | Ast.Fn_ltrim, [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_ltrim_chars s chars))
-  | Ast.Fn_ltrim, [_; Row.V_null]                       -> Some Row.V_null
-  | Ast.Fn_ltrim, (Row.V_null :: _)                     -> Some Row.V_null
-  | Ast.Fn_rtrim, [Row.V_text s]                        -> Some (Row.V_text (str_rtrim_spaces s))
-  | Ast.Fn_rtrim, [Row.V_text s; Row.V_text chars]      -> Some (Row.V_text (str_rtrim_chars s chars))
-  | Ast.Fn_rtrim, [_; Row.V_null]                       -> Some Row.V_null
-  | Ast.Fn_rtrim, (Row.V_null :: _)                     -> Some Row.V_null
-  | Ast.Fn_replace, [Row.V_text s; Row.V_text old; Row.V_text rep] ->
+  | Ast.Fn_length, [ Row.V_text s ] -> Some (Row.V_int (Int64.of_int (String.length s)))
+  | Ast.Fn_length, [ Row.V_blob b ] -> Some (Row.V_int (Int64.of_int (Bytes.length b)))
+  | Ast.Fn_length, [ Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_length, [ _ ] -> Some Row.V_null (* non-text/blob: return null like SQLite *)
+  | Ast.Fn_lower, [ Row.V_text s ] -> Some (Row.V_text (String.lowercase_ascii s))
+  | Ast.Fn_lower, [ Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_lower, [ _ ] -> Some Row.V_null
+  | Ast.Fn_upper, [ Row.V_text s ] -> Some (Row.V_text (String.uppercase_ascii s))
+  | Ast.Fn_upper, [ Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_upper, [ _ ] -> Some Row.V_null
+  | Ast.Fn_substr, Row.V_text s :: rest ->
+    Some
+      (match rest with
+       | [ Row.V_int start ] ->
+         let i = max 0 (Int64.to_int start - 1) in
+         if i >= String.length s
+         then Row.V_text ""
+         else Row.V_text (String.sub s i (String.length s - i))
+       | [ Row.V_int start; Row.V_int len ] ->
+         let i = max 0 (Int64.to_int start - 1) in
+         let l = Int64.to_int len in
+         if i >= String.length s || l <= 0
+         then Row.V_text ""
+         else Row.V_text (String.sub s i (min l (String.length s - i)))
+       | _ -> Row.V_null)
+  | Ast.Fn_substr, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_trim, [ Row.V_text s ] -> Some (Row.V_text (str_trim_spaces s))
+  | Ast.Fn_trim, [ Row.V_text s; Row.V_text chars ] ->
+    Some (Row.V_text (str_trim_chars s chars))
+  | Ast.Fn_trim, [ _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_trim, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_ltrim, [ Row.V_text s ] -> Some (Row.V_text (str_ltrim_spaces s))
+  | Ast.Fn_ltrim, [ Row.V_text s; Row.V_text chars ] ->
+    Some (Row.V_text (str_ltrim_chars s chars))
+  | Ast.Fn_ltrim, [ _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_ltrim, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_rtrim, [ Row.V_text s ] -> Some (Row.V_text (str_rtrim_spaces s))
+  | Ast.Fn_rtrim, [ Row.V_text s; Row.V_text chars ] ->
+    Some (Row.V_text (str_rtrim_chars s chars))
+  | Ast.Fn_rtrim, [ _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_rtrim, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_replace, [ Row.V_text s; Row.V_text old; Row.V_text rep ] ->
     Some (Row.V_text (str_replace s old rep))
-  | Ast.Fn_replace, [_; Row.V_null; _] -> Some Row.V_null
-  | Ast.Fn_replace, [_; _; Row.V_null] -> Some Row.V_null
-  | Ast.Fn_replace, (Row.V_null :: _) -> Some Row.V_null
-  | Ast.Fn_instr, [Row.V_text s; Row.V_text sub] ->
+  | Ast.Fn_replace, [ _; Row.V_null; _ ] -> Some Row.V_null
+  | Ast.Fn_replace, [ _; _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_replace, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_instr, [ Row.V_text s; Row.V_text sub ] ->
     Some (Row.V_int (Int64.of_int (str_instr s sub)))
-  | Ast.Fn_instr, (Row.V_null :: _) | Ast.Fn_instr, [_; Row.V_null] -> Some Row.V_null
-  | Ast.Fn_hex, [Row.V_blob b] -> Some (Row.V_text (hex_encode_str (Bytes.to_string b)))
-  | Ast.Fn_hex, [Row.V_text s] -> Some (Row.V_text (hex_encode_str s))
-  | Ast.Fn_hex, [Row.V_int n]  -> Some (Row.V_text (hex_encode_str (Int64.to_string n)))
-  | Ast.Fn_hex, [Row.V_null]   -> Some (Row.V_text "")
+  | Ast.Fn_instr, Row.V_null :: _ | Ast.Fn_instr, [ _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_hex, [ Row.V_blob b ] -> Some (Row.V_text (hex_encode_str (Bytes.to_string b)))
+  | Ast.Fn_hex, [ Row.V_text s ] -> Some (Row.V_text (hex_encode_str s))
+  | Ast.Fn_hex, [ Row.V_int n ] -> Some (Row.V_text (hex_encode_str (Int64.to_string n)))
+  | Ast.Fn_hex, [ Row.V_null ] -> Some (Row.V_text "")
   | Ast.Fn_char, args -> Some (Row.V_text (char_encode args))
-  | Ast.Fn_unicode, [Row.V_text s] when String.length s > 0 ->
+  | Ast.Fn_unicode, [ Row.V_text s ] when String.length s > 0 ->
     Some (Row.V_int (Int64.of_int (unicode_codepoint s)))
-  | Ast.Fn_unicode, [Row.V_text _] -> Some Row.V_null
-  | Ast.Fn_unicode, [Row.V_null]   -> Some Row.V_null
-  | Ast.Fn_printf, (Row.V_text fmt :: rest) -> Some (Row.V_text (printf_format fmt rest))
+  | Ast.Fn_unicode, [ Row.V_text _ ] -> Some Row.V_null
+  | Ast.Fn_unicode, [ Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_printf, Row.V_text fmt :: rest -> Some (Row.V_text (printf_format fmt rest))
   | Ast.Fn_printf, _ -> Some Row.V_null
   | _ -> None
+;;
 
 let eval_math_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
   let to_float_opt = function
     | Row.V_real f -> Some f
-    | Row.V_int n  -> Some (Int64.to_float n)
-    | _            -> None
+    | Row.V_int n -> Some (Int64.to_float n)
+    | _ -> None
   in
   match func, args with
-  | Ast.Fn_abs,    [Row.V_int  n] -> Some (Row.V_int  (Int64.abs n))
-  | Ast.Fn_abs,    [Row.V_real f] -> Some (Row.V_real (Float.abs f))
-  | Ast.Fn_abs,    [Row.V_null]   -> Some Row.V_null
-  | Ast.Fn_abs,    [_]            -> Some Row.V_null
-  | Ast.Fn_round, [Row.V_real f] -> Some (Row.V_real (Float.round f))
-  | Ast.Fn_round, [Row.V_int n] -> Some (Row.V_real (Int64.to_float n))
-  | Ast.Fn_round, [Row.V_real f; Row.V_int d] ->
+  | Ast.Fn_abs, [ Row.V_int n ] -> Some (Row.V_int (Int64.abs n))
+  | Ast.Fn_abs, [ Row.V_real f ] -> Some (Row.V_real (Float.abs f))
+  | Ast.Fn_abs, [ Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_abs, [ _ ] -> Some Row.V_null
+  | Ast.Fn_round, [ Row.V_real f ] -> Some (Row.V_real (Float.round f))
+  | Ast.Fn_round, [ Row.V_int n ] -> Some (Row.V_real (Int64.to_float n))
+  | Ast.Fn_round, [ Row.V_real f; Row.V_int d ] ->
     let factor = 10. ** Int64.to_float d in
     Some (Row.V_real (Float.round (f *. factor) /. factor))
-  | Ast.Fn_round, [Row.V_int n; Row.V_int _] -> Some (Row.V_real (Int64.to_float n))
-  | Ast.Fn_round, [_; Row.V_null] -> Some Row.V_null
-  | Ast.Fn_round, (Row.V_null :: _) -> Some Row.V_null
-  | Ast.Fn_ceil, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.ceil f) | None -> Row.V_null)
-  | Ast.Fn_floor, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.floor f) | None -> Row.V_null)
-  | Ast.Fn_sqrt, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.sqrt f) | None -> Row.V_null)
-  | Ast.Fn_pow, [b; e] ->
-    Some (match to_float_opt b, to_float_opt e with
-     | Some bf, Some ef -> Row.V_real (bf ** ef)
-     | _ -> Row.V_null)
-  | Ast.Fn_exp, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.exp f) | None -> Row.V_null)
-  | Ast.Fn_ln, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
-  | Ast.Fn_log, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.log f) | None -> Row.V_null)
-  | Ast.Fn_log, [b; x] ->
-    Some (match to_float_opt b, to_float_opt x with
-     | Some bf, Some xf -> Row.V_real (Float.log xf /. Float.log bf)
-     | _ -> Row.V_null)
-  | Ast.Fn_log2, [v] ->
-    Some (match to_float_opt v with
-     | Some f -> Row.V_real (Float.log f /. Float.log 2.0)
-     | None -> Row.V_null)
-  | Ast.Fn_log10, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.log10 f) | None -> Row.V_null)
-  | Ast.Fn_sign, [v] ->
-    Some (match to_float_opt v with
-     | Some f -> Row.V_int (if f > 0.0 then 1L else if f < 0.0 then (-1L) else 0L)
-     | None -> Row.V_null)
-  | Ast.Fn_trunc, [v] ->
-    Some (match to_float_opt v with
-     | Some f -> Row.V_real (if f >= 0.0 then Float.floor f else Float.ceil f)
-     | None -> Row.V_null)
-  | Ast.Fn_trunc, [v; d] ->
-    Some (match to_float_opt v, to_float_opt d with
-     | Some f, Some df ->
-       let factor = 10.0 ** (Float.round df) in
-       let fx = f *. factor in
-       Row.V_real ((if fx >= 0.0 then Float.floor fx else Float.ceil fx) /. factor)
-     | _ -> Row.V_null)
+  | Ast.Fn_round, [ Row.V_int n; Row.V_int _ ] -> Some (Row.V_real (Int64.to_float n))
+  | Ast.Fn_round, [ _; Row.V_null ] -> Some Row.V_null
+  | Ast.Fn_round, Row.V_null :: _ -> Some Row.V_null
+  | Ast.Fn_ceil, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.ceil f)
+       | None -> Row.V_null)
+  | Ast.Fn_floor, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.floor f)
+       | None -> Row.V_null)
+  | Ast.Fn_sqrt, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.sqrt f)
+       | None -> Row.V_null)
+  | Ast.Fn_pow, [ b; e ] ->
+    Some
+      (match to_float_opt b, to_float_opt e with
+       | Some bf, Some ef -> Row.V_real (bf ** ef)
+       | _ -> Row.V_null)
+  | Ast.Fn_exp, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.exp f)
+       | None -> Row.V_null)
+  | Ast.Fn_ln, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.log f)
+       | None -> Row.V_null)
+  | Ast.Fn_log, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.log f)
+       | None -> Row.V_null)
+  | Ast.Fn_log, [ b; x ] ->
+    Some
+      (match to_float_opt b, to_float_opt x with
+       | Some bf, Some xf -> Row.V_real (Float.log xf /. Float.log bf)
+       | _ -> Row.V_null)
+  | Ast.Fn_log2, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.log f /. Float.log 2.0)
+       | None -> Row.V_null)
+  | Ast.Fn_log10, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.log10 f)
+       | None -> Row.V_null)
+  | Ast.Fn_sign, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_int (if f > 0.0 then 1L else if f < 0.0 then -1L else 0L)
+       | None -> Row.V_null)
+  | Ast.Fn_trunc, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (if f >= 0.0 then Float.floor f else Float.ceil f)
+       | None -> Row.V_null)
+  | Ast.Fn_trunc, [ v; d ] ->
+    Some
+      (match to_float_opt v, to_float_opt d with
+       | Some f, Some df ->
+         let factor = 10.0 ** Float.round df in
+         let fx = f *. factor in
+         Row.V_real ((if fx >= 0.0 then Float.floor fx else Float.ceil fx) /. factor)
+       | _ -> Row.V_null)
   | Ast.Fn_pi, [] -> Some (Row.V_real Float.pi)
-  | Ast.Fn_sin, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.sin f) | None -> Row.V_null)
-  | Ast.Fn_cos, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.cos f) | None -> Row.V_null)
-  | Ast.Fn_tan, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.tan f) | None -> Row.V_null)
-  | Ast.Fn_asin, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.asin f) | None -> Row.V_null)
-  | Ast.Fn_acos, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.acos f) | None -> Row.V_null)
-  | Ast.Fn_atan, [v] ->
-    Some (match to_float_opt v with Some f -> Row.V_real (Float.atan f) | None -> Row.V_null)
-  | Ast.Fn_atan2, [y; x] ->
-    Some (match to_float_opt y, to_float_opt x with
-     | Some yf, Some xf -> Row.V_real (Float.atan2 yf xf)
-     | _ -> Row.V_null)
-  | Ast.Fn_degrees, [v] ->
-    Some (match to_float_opt v with
-     | Some f -> Row.V_real (f *. 180.0 /. Float.pi)
-     | None -> Row.V_null)
-  | Ast.Fn_radians, [v] ->
-    Some (match to_float_opt v with
-     | Some f -> Row.V_real (f *. Float.pi /. 180.0)
-     | None -> Row.V_null)
+  | Ast.Fn_sin, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.sin f)
+       | None -> Row.V_null)
+  | Ast.Fn_cos, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.cos f)
+       | None -> Row.V_null)
+  | Ast.Fn_tan, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.tan f)
+       | None -> Row.V_null)
+  | Ast.Fn_asin, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.asin f)
+       | None -> Row.V_null)
+  | Ast.Fn_acos, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.acos f)
+       | None -> Row.V_null)
+  | Ast.Fn_atan, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (Float.atan f)
+       | None -> Row.V_null)
+  | Ast.Fn_atan2, [ y; x ] ->
+    Some
+      (match to_float_opt y, to_float_opt x with
+       | Some yf, Some xf -> Row.V_real (Float.atan2 yf xf)
+       | _ -> Row.V_null)
+  | Ast.Fn_degrees, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (f *. 180.0 /. Float.pi)
+       | None -> Row.V_null)
+  | Ast.Fn_radians, [ v ] ->
+    Some
+      (match to_float_opt v with
+       | Some f -> Row.V_real (f *. Float.pi /. 180.0)
+       | None -> Row.V_null)
   | _ -> None
+;;
 
 (* date/time/datetime/julianday/unixepoch share arg-shape handling; only the
    final conversion differs. *)
 let eval_datetime_unary clock args (conv : Datetime.dt -> Row.value) : Row.value =
   match args with
-  | [] | [Row.V_null] -> Row.V_null
+  | [] | [ Row.V_null ] -> Row.V_null
   | Row.V_null :: _ -> Row.V_null
   | Row.V_text ts :: rest ->
-    if rest <> [] then Row.V_null
-    else (match Datetime.parse ?now:clock ts with
+    if rest <> []
+    then Row.V_null
+    else (
+      match Datetime.parse ?now:clock ts with
       | Error _ -> Row.V_null
-      | Ok dt   -> conv dt)
+      | Ok dt -> conv dt)
   | _ -> Row.V_null
+;;
 
 let eval_datetime_func clock (func : Ast.scalar_func) (args : Row.value list)
-    : Row.value option =
+  : Row.value option
+  =
   match func with
-  | Ast.Fn_date -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_date dt)))
-  | Ast.Fn_time -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_time dt)))
-  | Ast.Fn_datetime -> Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_datetime dt)))
-  | Ast.Fn_julianday -> Some (eval_datetime_unary clock args (fun dt -> Row.V_real (Datetime.to_julianday dt)))
-  | Ast.Fn_unixepoch -> Some (eval_datetime_unary clock args (fun dt -> Row.V_int (Datetime.to_unixepoch dt)))
+  | Ast.Fn_date ->
+    Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_date dt)))
+  | Ast.Fn_time ->
+    Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_time dt)))
+  | Ast.Fn_datetime ->
+    Some (eval_datetime_unary clock args (fun dt -> Row.V_text (Datetime.to_datetime dt)))
+  | Ast.Fn_julianday ->
+    Some
+      (eval_datetime_unary clock args (fun dt -> Row.V_real (Datetime.to_julianday dt)))
+  | Ast.Fn_unixepoch ->
+    Some (eval_datetime_unary clock args (fun dt -> Row.V_int (Datetime.to_unixepoch dt)))
   | Ast.Fn_strftime ->
-    Some (match args with
-     | Row.V_text fmt :: Row.V_text ts :: rest ->
-       if rest <> [] then Row.V_null
-       else (match Datetime.parse ?now:clock ts with
-         | Error _ -> Row.V_null
-         | Ok dt   -> Row.V_text (Datetime.strftime fmt dt))
-     | _ -> Row.V_null)
+    Some
+      (match args with
+       | Row.V_text fmt :: Row.V_text ts :: rest ->
+         if rest <> []
+         then Row.V_null
+         else (
+           match Datetime.parse ?now:clock ts with
+           | Error _ -> Row.V_null
+           | Ok dt -> Row.V_text (Datetime.strftime fmt dt))
+       | _ -> Row.V_null)
   | _ -> None
+;;
 
 (* json_set/insert/replace differ only in the per-path Json.path_* operation. *)
-let json_modify (path_op : Json.value -> string -> Json.value -> Json.value)
-    json_v rest : Row.value =
-  let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
+let json_modify (path_op : Json.value -> string -> Json.value -> Json.value) json_v rest
+  : Row.value
+  =
+  let json_s =
+    match json_v with
+    | Row.V_text s -> s
+    | _ -> ""
+  in
   match Json.parse json_s with
   | Error _ -> Row.V_null
   | Ok jv ->
     let rec apply jv = function
       | path_v :: val_v :: rest ->
-        let path = (match path_v with Row.V_text s -> s | _ -> "") in
+        let path =
+          match path_v with
+          | Row.V_text s -> s
+          | _ -> ""
+        in
         apply (path_op jv path (json_of_sql val_v)) rest
       | _ -> jv
     in
     Row.V_text (Json.to_string (apply jv rest))
+;;
 
 let eval_json_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
   match func, args with
-  | Ast.Fn_json_extract, [json_v; path_v] ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    let path_s = (match path_v with Row.V_text s -> s | _ -> "") in
-    Some (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv   ->
-       (match Json.path_get jv path_s with
-        | None   -> Row.V_null
-        | Some v -> sql_of_json v))
+  | Ast.Fn_json_extract, [ json_v; path_v ] ->
+    let json_s =
+      match json_v with
+      | Row.V_text s -> s
+      | _ -> ""
+    in
+    let path_s =
+      match path_v with
+      | Row.V_text s -> s
+      | _ -> ""
+    in
+    Some
+      (match Json.parse json_s with
+       | Error _ -> Row.V_null
+       | Ok jv ->
+         (match Json.path_get jv path_s with
+          | None -> Row.V_null
+          | Some v -> sql_of_json v))
   | Ast.Fn_json_object, pairs ->
-    if List.length pairs mod 2 <> 0 then Some Row.V_null
-    else
+    if List.length pairs mod 2 <> 0
+    then Some Row.V_null
+    else (
       let rec make_pairs = function
-        | []          -> []
+        | [] -> []
         | k :: v :: rest ->
-          let key = (match k with Row.V_text s -> s | _ -> "") in
+          let key =
+            match k with
+            | Row.V_text s -> s
+            | _ -> ""
+          in
           (key, json_of_sql v) :: make_pairs rest
-        | [_]         -> assert false
+        | [ _ ] -> assert false
       in
-      Some (Row.V_text (Json.to_string (Json.J_object (make_pairs pairs))))
+      Some (Row.V_text (Json.to_string (Json.J_object (make_pairs pairs)))))
   | Ast.Fn_json_array, elems ->
     Some (Row.V_text (Json.to_string (Json.J_array (List.map json_of_sql elems))))
-  | Ast.Fn_json_type, [json_v] ->
-    Some (match json_v with
-     | Row.V_text s ->
-       (match Json.parse s with
-        | Error _ -> Row.V_null
-        | Ok jv   -> Row.V_text (Json.type_name jv))
-     | _ -> Row.V_null)
-  | Ast.Fn_json_type, [json_v; path_v] ->
-    Some (match json_v, path_v with
-     | Row.V_text s, Row.V_text path ->
-       (match Json.parse s with
-        | Error _ -> Row.V_null
-        | Ok jv   ->
-          (match Json.path_get jv path with
-           | None    -> Row.V_null
-           | Some sub -> Row.V_text (Json.type_name sub)))
-     | _ -> Row.V_null)
-  | Ast.Fn_json_valid, [json_v] ->
-    Some (match json_v with
-     | Row.V_null -> Row.V_null
-     | Row.V_text s ->
-       (match Json.parse s with Ok _ -> Row.V_int 1L | Error _ -> Row.V_int 0L)
-     | _ -> Row.V_int 0L)
+  | Ast.Fn_json_type, [ json_v ] ->
+    Some
+      (match json_v with
+       | Row.V_text s ->
+         (match Json.parse s with
+          | Error _ -> Row.V_null
+          | Ok jv -> Row.V_text (Json.type_name jv))
+       | _ -> Row.V_null)
+  | Ast.Fn_json_type, [ json_v; path_v ] ->
+    Some
+      (match json_v, path_v with
+       | Row.V_text s, Row.V_text path ->
+         (match Json.parse s with
+          | Error _ -> Row.V_null
+          | Ok jv ->
+            (match Json.path_get jv path with
+             | None -> Row.V_null
+             | Some sub -> Row.V_text (Json.type_name sub)))
+       | _ -> Row.V_null)
+  | Ast.Fn_json_valid, [ json_v ] ->
+    Some
+      (match json_v with
+       | Row.V_null -> Row.V_null
+       | Row.V_text s ->
+         (match Json.parse s with
+          | Ok _ -> Row.V_int 1L
+          | Error _ -> Row.V_int 0L)
+       | _ -> Row.V_int 0L)
   | Ast.Fn_json_set, json_v :: rest -> Some (json_modify Json.path_set json_v rest)
   | Ast.Fn_json_insert, json_v :: rest -> Some (json_modify Json.path_insert json_v rest)
-  | Ast.Fn_json_replace, json_v :: rest -> Some (json_modify Json.path_replace json_v rest)
+  | Ast.Fn_json_replace, json_v :: rest ->
+    Some (json_modify Json.path_replace json_v rest)
   | Ast.Fn_json_remove, json_v :: paths ->
-    let json_s = (match json_v with Row.V_text s -> s | _ -> "") in
-    Some (match Json.parse json_s with
-     | Error _ -> Row.V_null
-     | Ok jv ->
-       let result = List.fold_left (fun acc path_v ->
-         let path = (match path_v with Row.V_text s -> s | _ -> "") in
-         Json.path_remove acc path
-       ) jv paths in
-       Row.V_text (Json.to_string result))
+    let json_s =
+      match json_v with
+      | Row.V_text s -> s
+      | _ -> ""
+    in
+    Some
+      (match Json.parse json_s with
+       | Error _ -> Row.V_null
+       | Ok jv ->
+         let result =
+           List.fold_left
+             (fun acc path_v ->
+                let path =
+                  match path_v with
+                  | Row.V_text s -> s
+                  | _ -> ""
+                in
+                Json.path_remove acc path)
+             jv
+             paths
+         in
+         Row.V_text (Json.to_string result))
   | _ -> None
+;;
 
 let eval_misc_func (func : Ast.scalar_func) (args : Row.value list) : Row.value option =
   match func, args with
   | Ast.Fn_coalesce, vs ->
-    Some (match List.find_opt (fun v -> v <> Row.V_null) vs with
-     | Some v -> v | None -> Row.V_null)
-  | Ast.Fn_ifnull, [a; b] -> Some (match a with Row.V_null -> b | v -> v)
-  | Ast.Fn_typeof, [v] ->
-    Some (Row.V_text (match v with
-      | Row.V_int  _ -> "integer"
-      | Row.V_real _ -> "real"
-      | Row.V_text _ -> "text"
-      | Row.V_blob _ -> "blob"
-      | Row.V_null   -> "null"))
-  | Ast.Fn_zeroblob, [Row.V_int n] when n >= 0L ->
+    Some
+      (match List.find_opt (fun v -> v <> Row.V_null) vs with
+       | Some v -> v
+       | None -> Row.V_null)
+  | Ast.Fn_ifnull, [ a; b ] ->
+    Some
+      (match a with
+       | Row.V_null -> b
+       | v -> v)
+  | Ast.Fn_typeof, [ v ] ->
+    Some
+      (Row.V_text
+         (match v with
+          | Row.V_int _ -> "integer"
+          | Row.V_real _ -> "real"
+          | Row.V_text _ -> "text"
+          | Row.V_blob _ -> "blob"
+          | Row.V_null -> "null"))
+  | Ast.Fn_zeroblob, [ Row.V_int n ] when n >= 0L ->
     Some (Row.V_blob (Bytes.make (Int64.to_int n) '\000'))
   | Ast.Fn_zeroblob, _ -> Some Row.V_null
   | Ast.Fn_random, [] ->
@@ -802,29 +1084,32 @@ let eval_misc_func (func : Ast.scalar_func) (args : Row.value list) : Row.value 
     let b2 = Int64.of_int (Random.bits ()) in
     let sign = if Random.bool () then Int64.min_int else 0L in
     let v =
-      Int64.logor sign
-        (Int64.logor
-          (Int64.shift_left b2 60)
-          (Int64.logor (Int64.shift_left b1 30) b0))
+      Int64.logor
+        sign
+        (Int64.logor (Int64.shift_left b2 60) (Int64.logor (Int64.shift_left b1 30) b0))
     in
     Some (Row.V_int v)
   | Ast.Fn_random, _ -> Some Row.V_null
   (* SQLite always generates at least 1 byte, even for n <= 0.
      Clamp to [1, Sys.max_string_length] to avoid allocation errors. *)
-  | Ast.Fn_randomblob, [Row.V_int n] ->
-    let sz = max 1 (if n < 0L || n > Int64.of_int Sys.max_string_length
-                    then 1 else Int64.to_int n) in
+  | Ast.Fn_randomblob, [ Row.V_int n ] ->
+    let sz =
+      max
+        1
+        (if n < 0L || n > Int64.of_int Sys.max_string_length then 1 else Int64.to_int n)
+    in
     Some (Row.V_blob (Bytes.init sz (fun _ -> Char.chr (Random.int 256))))
   | Ast.Fn_randomblob, _ -> Some Row.V_null
   | Ast.Fn_changes, [] -> Some (Row.V_int 0L)
-  | Ast.Fn_changes, _  -> Some Row.V_null
+  | Ast.Fn_changes, _ -> Some Row.V_null
   | Ast.Fn_last_insert_rowid, [] -> Some (Row.V_int 0L)
-  | Ast.Fn_last_insert_rowid, _  -> Some Row.V_null
+  | Ast.Fn_last_insert_rowid, _ -> Some Row.V_null
   | Ast.Fn_total_changes, [] -> Some (Row.V_int 0L)
-  | Ast.Fn_total_changes, _  -> Some Row.V_null
+  | Ast.Fn_total_changes, _ -> Some Row.V_null
   | Ast.Fn_sqlite_version, [] -> Some (Row.V_text "3.45.0-sqlocaml")
-  | Ast.Fn_sqlite_version, _  -> Some Row.V_null
+  | Ast.Fn_sqlite_version, _ -> Some Row.V_null
   | _ -> None
+;;
 
 (* CAST evaluation; [v] is the already-evaluated operand. NULL casts to NULL. *)
 let eval_cast (v : Row.value) (ty : Ast.ty) : Row.value =
@@ -834,64 +1119,76 @@ let eval_cast (v : Row.value) (ty : Ast.ty) : Row.value =
     (match ty with
      | Ast.Ty_int ->
        (match v with
-        | Row.V_int n  -> Row.V_int n
+        | Row.V_int n -> Row.V_int n
         | Row.V_real f -> Row.V_int (Int64.of_float f)
         | Row.V_text s -> Row.V_int (parse_int_prefix s)
         | Row.V_blob _ -> Row.V_int 0L
-        | Row.V_null   -> assert false)
+        | Row.V_null -> assert false)
      | Ast.Ty_real ->
        (match v with
-        | Row.V_int n  -> Row.V_real (Int64.to_float n)
+        | Row.V_int n -> Row.V_real (Int64.to_float n)
         | Row.V_real f -> Row.V_real f
         | Row.V_text s -> Row.V_real (parse_real_prefix s)
         | Row.V_blob _ -> Row.V_real 0.0
-        | Row.V_null   -> assert false)
+        | Row.V_null -> assert false)
      | Ast.Ty_text ->
        (match v with
-        | Row.V_int n  -> Row.V_text (Int64.to_string n)
+        | Row.V_int n -> Row.V_text (Int64.to_string n)
         | Row.V_real f ->
           (* SQLite appends ".0" when the %.15g result has no decimal point
              or exponent, so that CAST(1.0 AS TEXT) → "1.0" not "1". *)
           let s = Printf.sprintf "%.15g" f in
-          let needs_dot = not (String.contains s '.' || String.contains s 'e'
-                               || String.contains s 'E' || String.contains s 'n') in
+          let needs_dot =
+            not
+              (String.contains s '.'
+               || String.contains s 'e'
+               || String.contains s 'E'
+               || String.contains s 'n')
+          in
           Row.V_text (if needs_dot then s ^ ".0" else s)
         | Row.V_text s -> Row.V_text s
         | Row.V_blob b -> Row.V_text (Bytes.to_string b)
-        | Row.V_null   -> assert false)
+        | Row.V_null -> assert false)
      | Ast.Ty_blob ->
        (match v with
         | Row.V_blob b -> Row.V_blob b
         | Row.V_text s -> Row.V_blob (Bytes.of_string s)
-        | Row.V_int n  -> Row.V_blob (Bytes.of_string (Int64.to_string n))
+        | Row.V_int n -> Row.V_blob (Bytes.of_string (Int64.to_string n))
         | Row.V_real f -> Row.V_blob (Bytes.of_string (Printf.sprintf "%.15g" f))
-        | Row.V_null   -> assert false))
+        | Row.V_null -> assert false))
+;;
 
 (* Bitwise binops: result is NULL unless both operands are integers. *)
 let int_bitop lv rv f =
   match lv, rv with
   | Row.V_int a, Row.V_int b -> Row.V_int (f a b)
   | _ -> Row.V_null
+;;
 
-let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (row : Row.t) (e : Plan.expr) : Row.value =
+let rec eval_expr
+          (clock : (unit -> float) option)
+          (params : Row.value array)
+          (row : Row.t)
+          (e : Plan.expr)
+  : Row.value
+  =
   match e with
-  | Plan.P_lit l            -> lit_to_value l
-  | Plan.P_col i            -> row.(i)
-  | Plan.P_param i          ->
-    if i < Array.length params then params.(i) else Row.V_null
+  | Plan.P_lit l -> lit_to_value l
+  | Plan.P_col i -> row.(i)
+  | Plan.P_param i -> if i < Array.length params then params.(i) else Row.V_null
   | Plan.P_neg e ->
     (match eval_expr clock params row e with
-     | Row.V_int  n -> Row.V_int  (Int64.neg n)
-     | Row.V_real f -> Row.V_real (-. f)
-     | Row.V_null   -> Row.V_null
-     | _            -> failwith "unary minus requires numeric operand")
+     | Row.V_int n -> Row.V_int (Int64.neg n)
+     | Row.V_real f -> Row.V_real (-.f)
+     | Row.V_null -> Row.V_null
+     | _ -> failwith "unary minus requires numeric operand")
   | Plan.P_bitnot e ->
     (match eval_expr clock params row e with
      | Row.V_int n -> Row.V_int (Int64.lognot n)
-     | Row.V_null  -> Row.V_null
-     | _           -> Row.V_null)
+     | Row.V_null -> Row.V_null
+     | _ -> Row.V_null)
   | Plan.P_between (x, lo, hi) ->
-    let vx  = eval_expr clock params row x  in
+    let vx = eval_expr clock params row x in
     let vlo = eval_expr clock params row lo in
     let vhi = eval_expr clock params row hi in
     (match vx, vlo, vhi with
@@ -904,11 +1201,11 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
   | Plan.P_is_null e ->
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_int 1L
-     | _          -> Row.V_int 0L)
+     | _ -> Row.V_int 0L)
   | Plan.P_is_not_null e ->
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_int 0L
-     | _          -> Row.V_int 1L)
+     | _ -> Row.V_int 1L)
   | Plan.P_not e ->
     (match eval_expr clock params row e with
      | Row.V_null -> Row.V_null
@@ -920,14 +1217,17 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
       | Plan.P_collate (_, Ast.Collate_nocase) -> true
       | _ -> false
     in
-    let nocase_text v = match v with
+    let nocase_text v =
+      match v with
       | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
       | o -> o
     in
-    let (lv', rv') =
-      if is_nocase lhs_e then (lv, nocase_text rv)
-      else if is_nocase rhs_e then (nocase_text lv, rv)
-      else (lv, rv)
+    let lv', rv' =
+      if is_nocase lhs_e
+      then lv, nocase_text rv
+      else if is_nocase rhs_e
+      then nocase_text lv, rv
+      else lv, rv
     in
     eval_binop op lv' rv'
   | Plan.P_func (func, args) ->
@@ -941,109 +1241,150 @@ let rec eval_expr (clock : (unit -> float) option) (params : Row.value array) (r
   | Plan.P_excluded_col _ ->
     failwith "Exec: P_excluded_col in eval_expr — must be substituted before evaluation"
   | Plan.P_window_slot _ ->
-    failwith "Exec: P_window_slot in eval_expr — must be substituted by planner before evaluation"
+    failwith
+      "Exec: P_window_slot in eval_expr — must be substituted by planner before \
+       evaluation"
   | Plan.P_collate (e, Ast.Collate_nocase) ->
     let v = eval_expr clock params row e in
-    (match v with Row.V_text s -> Row.V_text (String.lowercase_ascii s) | o -> o)
+    (match v with
+     | Row.V_text s -> Row.V_text (String.lowercase_ascii s)
+     | o -> o)
   | Plan.P_collate (e, _) ->
-    eval_expr clock params row e  (* Collate_binary and Collate_rtrim are identity *)
+    eval_expr clock params row e (* Collate_binary and Collate_rtrim are identity *)
 
 and eval_in clock params row x vals =
   let vx = eval_expr clock params row x in
-  if vx = Row.V_null then Row.V_null
-  else
-    let result = List.fold_left (fun acc ve ->
-      let v = eval_expr clock params row ve in
-      match acc with
-      | `Found -> `Found
-      | _ when v = Row.V_null -> `Maybe
-      | _ when compare_values vx v = 0 -> `Found
-      | acc -> acc
-    ) `Not_found vals in
-    (match result with
-     | `Found     -> Row.V_int 1L
-     | `Maybe     -> Row.V_null
-     | `Not_found -> Row.V_int 0L)
+  if vx = Row.V_null
+  then Row.V_null
+  else (
+    let result =
+      List.fold_left
+        (fun acc ve ->
+           let v = eval_expr clock params row ve in
+           match acc with
+           | `Found -> `Found
+           | _ when v = Row.V_null -> `Maybe
+           | _ when compare_values vx v = 0 -> `Found
+           | acc -> acc)
+        `Not_found
+        vals
+    in
+    match result with
+    | `Found -> Row.V_int 1L
+    | `Maybe -> Row.V_null
+    | `Not_found -> Row.V_int 0L)
 
 and eval_case_expr clock params row scrutinee branches else_ =
   let scr_val = Option.map (eval_expr clock params row) scrutinee in
   let rec find_match = function
     | [] ->
       (match else_ with
-       | None   -> Row.V_null
+       | None -> Row.V_null
        | Some e -> eval_expr clock params row e)
     | (cond, result) :: rest ->
-      let matched = match scr_val with
-        | None ->
-          value_truthy (eval_expr clock params row cond)
+      let matched =
+        match scr_val with
+        | None -> value_truthy (eval_expr clock params row cond)
         | Some sv ->
           let cv = eval_expr clock params row cond in
           (match sv, cv with
            | Row.V_null, _ | _, Row.V_null -> false
            | _ -> compare_values sv cv = 0)
       in
-      if matched then eval_expr clock params row result
-      else find_match rest
+      if matched then eval_expr clock params row result else find_match rest
   in
   find_match branches
 
-and eval_func (clock : (unit -> float) option) (func : Ast.scalar_func) (args : Row.value list) : Row.value =
-  match eval_str_func func args with Some v -> v | None ->
-  match eval_math_func func args with Some v -> v | None ->
-  match eval_datetime_func clock func args with Some v -> v | None ->
-  match eval_json_func func args with Some v -> v | None ->
-  match eval_misc_func func args with Some v -> v | None ->
-  failwith "scalar_func: unexpected argument count (arity check should have caught this)"
+and eval_func
+      (clock : (unit -> float) option)
+      (func : Ast.scalar_func)
+      (args : Row.value list)
+  : Row.value
+  =
+  match eval_str_func func args with
+  | Some v -> v
+  | None ->
+    (match eval_math_func func args with
+     | Some v -> v
+     | None ->
+       (match eval_datetime_func clock func args with
+        | Some v -> v
+        | None ->
+          (match eval_json_func func args with
+           | Some v -> v
+           | None ->
+             (match eval_misc_func func args with
+              | Some v -> v
+              | None ->
+                failwith
+                  "scalar_func: unexpected argument count (arity check should have \
+                   caught this)"))))
 
 and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
   match op with
   | Plan.And ->
-    let lt = value_truthy lv and rt = value_truthy rv in
-    let ln = lv = Row.V_null  and rn = rv = Row.V_null in
-    if lt && rt then Row.V_int 1L
-    else if (not ln && not lt) || (not rn && not rt) then Row.V_int 0L
+    let lt = value_truthy lv
+    and rt = value_truthy rv in
+    let ln = lv = Row.V_null
+    and rn = rv = Row.V_null in
+    if lt && rt
+    then Row.V_int 1L
+    else if ((not ln) && not lt) || ((not rn) && not rt)
+    then Row.V_int 0L
     else Row.V_null
   | Plan.Or ->
-    let lt = value_truthy lv and rt = value_truthy rv in
-    let ln = lv = Row.V_null  and rn = rv = Row.V_null in
-    if lt || rt then Row.V_int 1L
-    else if not ln && not rn then Row.V_int 0L
+    let lt = value_truthy lv
+    and rt = value_truthy rv in
+    let ln = lv = Row.V_null
+    and rn = rv = Row.V_null in
+    if lt || rt
+    then Row.V_int 1L
+    else if (not ln) && not rn
+    then Row.V_int 0L
     else Row.V_null
   (* NULL compared with anything yields NULL (3-valued logic). Cross-type → false. *)
   | Plan.Eq ->
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 1L else Row.V_int 0L
-     | Row.V_blob x, Row.V_blob y -> if Bytes.equal  x y then Row.V_int 1L else Row.V_int 0L
-     | _                          -> Row.V_int 0L)
+     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_text x, Row.V_text y ->
+       if String.equal x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_real x, Row.V_real y ->
+       if Float.equal x y then Row.V_int 1L else Row.V_int 0L
+     | Row.V_blob x, Row.V_blob y ->
+       if Bytes.equal x y then Row.V_int 1L else Row.V_int 0L
+     | _ -> Row.V_int 0L)
   | Plan.Ne ->
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
-     | Row.V_int  x, Row.V_int  y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_text x, Row.V_text y -> if String.equal x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_real x, Row.V_real y -> if Float.equal  x y then Row.V_int 0L else Row.V_int 1L
-     | Row.V_blob x, Row.V_blob y -> if Bytes.equal  x y then Row.V_int 0L else Row.V_int 1L
-     | _                          -> Row.V_int 0L)
-  | Plan.Lt -> cmp_result lv rv (fun c -> c <  0)
+     | Row.V_int x, Row.V_int y -> if Int64.equal x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_text x, Row.V_text y ->
+       if String.equal x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_real x, Row.V_real y ->
+       if Float.equal x y then Row.V_int 0L else Row.V_int 1L
+     | Row.V_blob x, Row.V_blob y ->
+       if Bytes.equal x y then Row.V_int 0L else Row.V_int 1L
+     | _ -> Row.V_int 0L)
+  | Plan.Lt -> cmp_result lv rv (fun c -> c < 0)
   | Plan.Le -> cmp_result lv rv (fun c -> c <= 0)
-  | Plan.Gt -> cmp_result lv rv (fun c -> c >  0)
+  | Plan.Gt -> cmp_result lv rv (fun c -> c > 0)
   | Plan.Ge -> cmp_result lv rv (fun c -> c >= 0)
   | Plan.Add -> arith_op lv rv Int64.add ( +. )
   | Plan.Sub -> arith_op lv rv Int64.sub ( -. )
   | Plan.Mul -> arith_op lv rv Int64.mul ( *. )
   | Plan.Div ->
-    arith_op lv rv
+    arith_op
+      lv
+      rv
       (fun a b -> if Int64.equal b 0L then failwith "division by zero" else Int64.div a b)
       ( /. )
   | Plan.Concat ->
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
      | Row.V_text a, Row.V_text b -> Row.V_text (a ^ b)
-     | Row.V_text a, Row.V_int  n -> Row.V_text (a ^ Int64.to_string n)
-     | Row.V_int  n, Row.V_text b -> Row.V_text (Int64.to_string n ^ b)
-     | Row.V_int  a, Row.V_int  b -> Row.V_text (Int64.to_string a ^ Int64.to_string b)
+     | Row.V_text a, Row.V_int n -> Row.V_text (a ^ Int64.to_string n)
+     | Row.V_int n, Row.V_text b -> Row.V_text (Int64.to_string n ^ b)
+     | Row.V_int a, Row.V_int b -> Row.V_text (Int64.to_string a ^ Int64.to_string b)
      | _ -> Row.V_null)
   | Plan.Mod ->
     (match lv, rv with
@@ -1058,12 +1399,12 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
        if b = 0L then Row.V_null else Row.V_real (mod_float a (Int64.to_float b))
      | _ -> Row.V_null)
   | Plan.Bit_and -> int_bitop lv rv Int64.logand
-  | Plan.Bit_or  -> int_bitop lv rv Int64.logor
-  | Plan.Lshift  ->
+  | Plan.Bit_or -> int_bitop lv rv Int64.logor
+  | Plan.Lshift ->
     int_bitop lv rv (fun a b ->
       let n = Int64.to_int b in
       if n < 0 || n >= 64 then 0L else Int64.shift_left a n)
-  | Plan.Rshift  ->
+  | Plan.Rshift ->
     int_bitop lv rv (fun a b ->
       let n = Int64.to_int b in
       if n < 0 || n >= 64 then 0L else Int64.shift_right a n)
@@ -1071,7 +1412,10 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
     (match lv, rv with
      | Row.V_null, _ | _, Row.V_null -> Row.V_null
      | Row.V_text str, Row.V_text pat ->
-       Row.V_int (if like_match (String.lowercase_ascii pat) 0 (String.lowercase_ascii str) 0 then 1L else 0L)
+       Row.V_int
+         (if like_match (String.lowercase_ascii pat) 0 (String.lowercase_ascii str) 0
+          then 1L
+          else 0L)
      | _ -> Row.V_null)
   | Plan.Glob ->
     (match lv, rv with
@@ -1083,177 +1427,229 @@ and eval_binop (op : Plan.binop) (lv : Row.value) (rv : Row.value) : Row.value =
 and cmp_result lv rv pred =
   match lv, rv with
   | Row.V_null, _ | _, Row.V_null -> Row.V_null
-  | Row.V_int _,  Row.V_int _
+  | Row.V_int _, Row.V_int _
   | Row.V_text _, Row.V_text _
   | Row.V_real _, Row.V_real _
   | Row.V_blob _, Row.V_blob _ ->
     if pred (compare_values lv rv) then Row.V_int 1L else Row.V_int 0L
   (* Cross-type numeric comparisons: promote int to float *)
-  | Row.V_real a, Row.V_int  b ->
+  | Row.V_real a, Row.V_int b ->
     let c = Float.compare a (Int64.to_float b) in
     if pred c then Row.V_int 1L else Row.V_int 0L
-  | Row.V_int  a, Row.V_real b ->
+  | Row.V_int a, Row.V_real b ->
     let c = Float.compare (Int64.to_float a) b in
     if pred c then Row.V_int 1L else Row.V_int 0L
-  | _ -> Row.V_int 0L  (* cross-type comparisons are false *)
+  | _ -> Row.V_int 0L (* cross-type comparisons are false *)
 
 and arith_op lv rv int_f float_f =
   match lv, rv with
   | Row.V_null, _ | _, Row.V_null -> Row.V_null
-  | Row.V_int  a, Row.V_int  b -> Row.V_int  (int_f a b)
+  | Row.V_int a, Row.V_int b -> Row.V_int (int_f a b)
   | Row.V_real a, Row.V_real b -> Row.V_real (float_f a b)
-  | Row.V_int  a, Row.V_real b -> Row.V_real (float_f (Int64.to_float a) b)
-  | Row.V_real a, Row.V_int  b -> Row.V_real (float_f a (Int64.to_float b))
+  | Row.V_int a, Row.V_real b -> Row.V_real (float_f (Int64.to_float a) b)
+  | Row.V_real a, Row.V_int b -> Row.V_real (float_f a (Int64.to_float b))
   | _ -> failwith "arithmetic on non-numeric operands"
+;;
 
 let project_row (ords : int list) (row : Row.t) : Row.t =
   Array.of_list (List.map (fun i -> row.(i)) ords)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* CHECK constraint evaluation                                          *)
 (* ------------------------------------------------------------------ *)
 
 let ast_binop_to_plan : Ast.binop -> Plan.binop = function
-  | Ast.Eq -> Plan.Eq | Ast.Ne -> Plan.Ne | Ast.Lt -> Plan.Lt | Ast.Le -> Plan.Le
-  | Ast.Gt -> Plan.Gt | Ast.Ge -> Plan.Ge
-  | Ast.Add -> Plan.Add | Ast.Sub -> Plan.Sub
-  | Ast.Mul -> Plan.Mul | Ast.Div -> Plan.Div
-  | Ast.And -> Plan.And | Ast.Or  -> Plan.Or
-  | Ast.Concat -> Plan.Concat | Ast.Mod -> Plan.Mod
-  | Ast.Bit_and -> Plan.Bit_and | Ast.Bit_or -> Plan.Bit_or
-  | Ast.Lshift  -> Plan.Lshift  | Ast.Rshift -> Plan.Rshift
-  | Ast.Like -> Plan.Like | Ast.Glob -> Plan.Glob
+  | Ast.Eq -> Plan.Eq
+  | Ast.Ne -> Plan.Ne
+  | Ast.Lt -> Plan.Lt
+  | Ast.Le -> Plan.Le
+  | Ast.Gt -> Plan.Gt
+  | Ast.Ge -> Plan.Ge
+  | Ast.Add -> Plan.Add
+  | Ast.Sub -> Plan.Sub
+  | Ast.Mul -> Plan.Mul
+  | Ast.Div -> Plan.Div
+  | Ast.And -> Plan.And
+  | Ast.Or -> Plan.Or
+  | Ast.Concat -> Plan.Concat
+  | Ast.Mod -> Plan.Mod
+  | Ast.Bit_and -> Plan.Bit_and
+  | Ast.Bit_or -> Plan.Bit_or
+  | Ast.Lshift -> Plan.Lshift
+  | Ast.Rshift -> Plan.Rshift
+  | Ast.Like -> Plan.Like
+  | Ast.Glob -> Plan.Glob
+;;
 
 let rec ast_expr_to_plan_check (columns : Row.column list) (e : Ast.expr) : Plan.expr =
   match e with
-  | Ast.E_lit l       -> Plan.P_lit l
-  | Ast.E_col name    -> Plan.P_col (find_col_idx_by_name columns name)
+  | Ast.E_lit l -> Plan.P_lit l
+  | Ast.E_col name -> Plan.P_col (find_col_idx_by_name columns name)
   | Ast.E_tbl_col (_, name) -> Plan.P_col (find_col_idx_by_name columns name)
   | Ast.E_binop (op, a, b) ->
-    Plan.P_binop (ast_binop_to_plan op,
-                  ast_expr_to_plan_check columns a,
-                  ast_expr_to_plan_check columns b)
-  | Ast.E_not e      -> Plan.P_not (ast_expr_to_plan_check columns e)
-  | Ast.E_is_null e  -> Plan.P_is_null (ast_expr_to_plan_check columns e)
+    Plan.P_binop
+      ( ast_binop_to_plan op
+      , ast_expr_to_plan_check columns a
+      , ast_expr_to_plan_check columns b )
+  | Ast.E_not e -> Plan.P_not (ast_expr_to_plan_check columns e)
+  | Ast.E_is_null e -> Plan.P_is_null (ast_expr_to_plan_check columns e)
   | Ast.E_is_not_null e -> Plan.P_is_not_null (ast_expr_to_plan_check columns e)
-  | Ast.E_neg e      -> Plan.P_neg (ast_expr_to_plan_check columns e)
-  | Ast.E_bitnot e   -> Plan.P_bitnot (ast_expr_to_plan_check columns e)
+  | Ast.E_neg e -> Plan.P_neg (ast_expr_to_plan_check columns e)
+  | Ast.E_bitnot e -> Plan.P_bitnot (ast_expr_to_plan_check columns e)
   | Ast.E_between (x, lo, hi) ->
-    Plan.P_between (ast_expr_to_plan_check columns x,
-                    ast_expr_to_plan_check columns lo,
-                    ast_expr_to_plan_check columns hi)
+    Plan.P_between
+      ( ast_expr_to_plan_check columns x
+      , ast_expr_to_plan_check columns lo
+      , ast_expr_to_plan_check columns hi )
   | Ast.E_in (x, vals) ->
-    Plan.P_in (ast_expr_to_plan_check columns x,
-               List.map (ast_expr_to_plan_check columns) vals)
-  | Ast.E_func (f, args) ->
-    Plan.P_func (f, List.map (ast_expr_to_plan_check columns) args)
+    Plan.P_in
+      (ast_expr_to_plan_check columns x, List.map (ast_expr_to_plan_check columns) vals)
+  | Ast.E_func (f, args) -> Plan.P_func (f, List.map (ast_expr_to_plan_check columns) args)
   | Ast.E_case { scrutinee; branches; else_ } ->
     let go = ast_expr_to_plan_check columns in
-    Plan.P_case {
-      scrutinee = Option.map go scrutinee;
-      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
-      else_     = Option.map go else_;
-    }
+    Plan.P_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
   | Ast.E_cast (e, ty) -> Plan.P_cast (ast_expr_to_plan_check columns e, ty)
   | Ast.E_collate (e, c) -> Plan.P_collate (ast_expr_to_plan_check columns e, c)
   | _ -> failwith "ast_expr_to_plan_check: unsupported expression in CHECK"
+;;
 
-let compile_check_expr (table_name : string) (col_idx : int)
-    (columns : Row.column list) (check_sql : string) : Plan.expr =
-  let key = (table_name, col_idx, check_sql) in
+let compile_check_expr
+      (table_name : string)
+      (col_idx : int)
+      (columns : Row.column list)
+      (check_sql : string)
+  : Plan.expr
+  =
+  let key = table_name, col_idx, check_sql in
   match Hashtbl.find_opt check_expr_cache key with
   | Some e -> e
   | None ->
     let lexbuf = Lexing.from_string check_sql in
     let ast_expr =
-      try Parser.expr_only Lexer.token lexbuf
-      with Parser.Error | Failure _ ->
-        failwith (Printf.sprintf "CHECK constraint parse error for %s.col%d: %s"
-          table_name col_idx check_sql)
+      try Parser.expr_only Lexer.token lexbuf with
+      | Parser.Error | Failure _ ->
+        failwith
+          (Printf.sprintf
+             "CHECK constraint parse error for %s.col%d: %s"
+             table_name
+             col_idx
+             check_sql)
     in
     let plan_expr = ast_expr_to_plan_check columns ast_expr in
     Hashtbl.add check_expr_cache key plan_expr;
     plan_expr
+;;
 
 (* Cache for compiled generated-column expressions.
    Key: (table_name, col_idx, expr_sql) — same three-part pattern as check_expr_cache.
    Schema changes invalidate entries via clear on DROP TABLE / DROP COLUMN. *)
 let generated_expr_cache : (string * int * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
 
-let compile_generated_expr (table_name : string) (col_idx : int)
-    (columns : Row.column list) (expr_sql : string) : Plan.expr =
-  let key = (table_name, col_idx, expr_sql) in
+let compile_generated_expr
+      (table_name : string)
+      (col_idx : int)
+      (columns : Row.column list)
+      (expr_sql : string)
+  : Plan.expr
+  =
+  let key = table_name, col_idx, expr_sql in
   match Hashtbl.find_opt generated_expr_cache key with
   | Some e -> e
   | None ->
     let lexbuf = Lexing.from_string expr_sql in
     let ast_expr =
-      try Parser.expr_only Lexer.token lexbuf
-      with Parser.Error | Failure _ -> failwith (Printf.sprintf
-        "generated column expr parse error for %s.col%d: %s" table_name col_idx expr_sql)
+      try Parser.expr_only Lexer.token lexbuf with
+      | Parser.Error | Failure _ ->
+        failwith
+          (Printf.sprintf
+             "generated column expr parse error for %s.col%d: %s"
+             table_name
+             col_idx
+             expr_sql)
     in
     let plan_expr = ast_expr_to_plan_check columns ast_expr in
     Hashtbl.add generated_expr_cache key plan_expr;
     plan_expr
+;;
 
-(** Compute all generated columns in [row] in-place.
+(** Compute STORED generated columns on the write path, in-place in [row].
     Iterates columns in schema order; earlier generated columns are available
-    to later generated column expressions (in-order dependency). *)
-(** Compute STORED generated columns on the write path. VIRTUAL generated
-    columns are set to [V_null] in memory and on disk; they are recomputed
-    on read via [compute_virtual_generated_cols]. *)
+    to later generated column expressions (in-order dependency). VIRTUAL
+    generated columns are set to [V_null] in memory and on disk; they are
+    recomputed on read via [compute_virtual_generated_cols]. *)
 let compute_stored_generated_cols
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (meta : Cat.table_meta)
-    (row : Row.t) : unit =
-  List.iteri (fun i (col : Row.column) ->
-    match col.Row.generated_as with
-    | None -> ()
-    | Some (sql, true) ->
-      let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
-      row.(i) <- eval_expr clock params row plan_e
-    | Some (_, false) ->
-      (* VIRTUAL: write NULL placeholder; recomputed on read. *)
-      row.(i) <- Row.V_null
-  ) meta.Cat.columns
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      (row : Row.t)
+  : unit
+  =
+  List.iteri
+    (fun i (col : Row.column) ->
+       match col.Row.generated_as with
+       | None -> ()
+       | Some (sql, true) ->
+         let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
+         row.(i) <- eval_expr clock params row plan_e
+       | Some (_, false) ->
+         (* VIRTUAL: write NULL placeholder; recomputed on read. *)
+         row.(i) <- Row.V_null)
+    meta.Cat.columns
+;;
 
 (** Recompute VIRTUAL generated columns from the underlying row values.
     Invoked after [Row.decode] for table-row reads in [exec.ml]. *)
 let compute_virtual_generated_cols
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (meta : Cat.table_meta)
-    (row : Row.t) : unit =
-  List.iteri (fun i (col : Row.column) ->
-    match col.Row.generated_as with
-    | Some (sql, false) ->
-      let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
-      row.(i) <- eval_expr clock params row plan_e
-    | _ -> ()
-  ) meta.Cat.columns
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      (row : Row.t)
+  : unit
+  =
+  List.iteri
+    (fun i (col : Row.column) ->
+       match col.Row.generated_as with
+       | Some (sql, false) ->
+         let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
+         row.(i) <- eval_expr clock params row plan_e
+       | _ -> ())
+    meta.Cat.columns
+;;
 
 (** Like [compute_virtual_generated_cols] but driven by [(name, columns)]
     rather than a full [Cat.table_meta]. Used by call sites that only have
     a column list in scope (e.g., [execute_create_index]). *)
 let compute_virtual_generated_cols_cols
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    ~(table_name : string)
-    (columns : Row.column list)
-    (row : Row.t) : unit =
-  List.iteri (fun i (col : Row.column) ->
-    match col.Row.generated_as with
-    | Some (sql, false) ->
-      let plan_e = compile_generated_expr table_name i columns sql in
-      row.(i) <- eval_expr clock params row plan_e
-    | _ -> ()
-  ) columns
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      ~(table_name : string)
+      (columns : Row.column list)
+      (row : Row.t)
+  : unit
+  =
+  List.iteri
+    (fun i (col : Row.column) ->
+       match col.Row.generated_as with
+       | Some (sql, false) ->
+         let plan_e = compile_generated_expr table_name i columns sql in
+         row.(i) <- eval_expr clock params row plan_e
+       | _ -> ())
+    columns
+;;
 
 let has_virtual_cols (columns : Row.column list) : bool =
-  List.exists (fun (c : Row.column) ->
-    match c.Row.generated_as with Some (_, false) -> true | _ -> false
-  ) columns
+  List.exists
+    (fun (c : Row.column) ->
+       match c.Row.generated_as with
+       | Some (_, false) -> true
+       | _ -> false)
+    columns
+;;
 
 (** [with_computed_virtuals]: return a copy of [row] with any VIRTUAL
     generated columns recomputed.  Used by the index-key extraction and
@@ -1261,152 +1657,189 @@ let has_virtual_cols (columns : Row.column list) : bool =
     up-to-date value instead of [V_null].  Returns [row] unchanged when
     the table has no virtual columns (the common case). *)
 let with_computed_virtuals
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (meta : Cat.table_meta)
-    (row : Row.t) : Row.t =
-  if not (has_virtual_cols meta.Cat.columns) then row
-  else begin
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      (row : Row.t)
+  : Row.t
+  =
+  if not (has_virtual_cols meta.Cat.columns)
+  then row
+  else (
     let row' = Array.copy row in
     compute_virtual_generated_cols clock params meta row';
-    row'
-  end
+    row')
+;;
 
 (** Like [with_computed_virtuals] but takes a [(table_name, columns)] pair. *)
 let with_computed_virtuals_cols
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    ~(table_name : string)
-    (columns : Row.column list)
-    (row : Row.t) : Row.t =
-  if not (has_virtual_cols columns) then row
-  else begin
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      ~(table_name : string)
+      (columns : Row.column list)
+      (row : Row.t)
+  : Row.t
+  =
+  if not (has_virtual_cols columns)
+  then row
+  else (
     let row' = Array.copy row in
     compute_virtual_generated_cols_cols clock params ~table_name columns row';
-    row'
-  end
+    row')
+;;
 
 (** [decode_with_virtual]: like [Row.decode], but also recomputes any VIRTUAL
     generated columns in the schema. Skips the recompute when the table has
     no virtual cols (the common case). *)
 let decode_with_virtual
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (meta : Cat.table_meta)
-    (bytes : bytes) : Row.t =
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      (bytes : bytes)
+  : Row.t
+  =
   let row = Row.decode meta.Cat.columns bytes in
   if has_virtual_cols meta.Cat.columns
   then compute_virtual_generated_cols clock params meta row;
   row
+;;
 
 (** Variant that takes a [(table_name, columns)] pair instead of a full meta. *)
 let decode_with_virtual_cols
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    ~(table_name : string)
-    (columns : Row.column list)
-    (bytes : bytes) : Row.t =
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      ~(table_name : string)
+      (columns : Row.column list)
+      (bytes : bytes)
+  : Row.t
+  =
   let row = Row.decode columns bytes in
   if has_virtual_cols columns
   then compute_virtual_generated_cols_cols clock params ~table_name columns row;
   row
+;;
 
-let index_where_cache : (string * string * string * string, Plan.expr) Hashtbl.t = Hashtbl.create 8
+let index_where_cache : (string * string * string * string, Plan.expr) Hashtbl.t =
+  Hashtbl.create 8
+;;
 
 let compile_index_where (idx : Cat.index_info) (columns : Row.column list) : Plan.expr =
   match idx.idx_where_sql with
   | None -> failwith "compile_index_where: called on non-partial index"
   | Some sql ->
     let schema_sig = String.concat "," (List.map (fun c -> c.Row.name) columns) in
-    let key = (idx.idx_name, idx.idx_table, sql, schema_sig) in
-    match Hashtbl.find_opt index_where_cache key with
-    | Some e -> e
-    | None ->
-      let lexbuf = Lexing.from_string sql in
-      let ast_expr =
-        try Parser.expr_only Lexer.token lexbuf
-        with Parser.Error | Failure _ -> failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx.idx_name sql)
-      in
-      let plan_expr = ast_expr_to_plan_check columns ast_expr in
-      Hashtbl.add index_where_cache key plan_expr;
-      plan_expr
+    let key = idx.idx_name, idx.idx_table, sql, schema_sig in
+    (match Hashtbl.find_opt index_where_cache key with
+     | Some e -> e
+     | None ->
+       let lexbuf = Lexing.from_string sql in
+       let ast_expr =
+         try Parser.expr_only Lexer.token lexbuf with
+         | Parser.Error | Failure _ ->
+           failwith (Printf.sprintf "index WHERE parse error for %s: %s" idx.idx_name sql)
+       in
+       let plan_expr = ast_expr_to_plan_check columns ast_expr in
+       Hashtbl.add index_where_cache key plan_expr;
+       plan_expr)
+;;
 
 let row_matches_index_where
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (idx : Cat.index_info)
-    (schema : Row.column list)
-    (row : Row.t) : bool =
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (idx : Cat.index_info)
+      (schema : Row.column list)
+      (row : Row.t)
+  : bool
+  =
   match idx.idx_where_sql with
   | None -> true
   | Some _ ->
     let plan_e = compile_index_where idx schema in
     value_truthy (eval_expr clock params row plan_e)
+;;
 
 (* Cache for compiled index column expressions.
    Key: (idx_name, idx_table, expr_sql, schema_sig) — four parts to prevent collisions. *)
 let index_expr_cache : (string * string * string * string, Plan.expr) Hashtbl.t =
   Hashtbl.create 8
+;;
 
-let compile_index_col_expr (idx : Cat.index_info) (i : int) (columns : Row.column list) : Plan.expr =
+let compile_index_col_expr (idx : Cat.index_info) (i : int) (columns : Row.column list)
+  : Plan.expr
+  =
   let expr_sql = List.nth idx.idx_columns i in
   let schema_sig = String.concat "," (List.map (fun c -> c.Row.name) columns) in
-  let key = (idx.idx_name, idx.idx_table, expr_sql, schema_sig) in
+  let key = idx.idx_name, idx.idx_table, expr_sql, schema_sig in
   match Hashtbl.find_opt index_expr_cache key with
   | Some e -> e
   | None ->
     let lexbuf = Lexing.from_string expr_sql in
     let ast_expr =
-      try Parser.expr_only Lexer.token lexbuf
-      with Parser.Error | Failure _ -> failwith (Printf.sprintf
-        "index expr parse error for %s[%d]: %s" idx.idx_name i expr_sql)
+      try Parser.expr_only Lexer.token lexbuf with
+      | Parser.Error | Failure _ ->
+        failwith
+          (Printf.sprintf "index expr parse error for %s[%d]: %s" idx.idx_name i expr_sql)
     in
     let plan_e = ast_expr_to_plan_check columns ast_expr in
     Hashtbl.add index_expr_cache key plan_e;
     plan_e
+;;
 
 (** Evaluate all index key values for [row] against [idx].
     For expression-indexed columns, evaluates the compiled expression.
     For plain columns, fetches from the row by column ordinal. *)
 let get_index_key_values
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (idx : Cat.index_info)
-    (schema : Row.column list)
-    (row : Row.t) : Row.value list =
-  List.mapi (fun i col_sql ->
-    let is_expr =
-      if i < List.length idx.idx_expr_flags
-      then List.nth idx.idx_expr_flags i
-      else false
-    in
-    if is_expr then
-      let plan_e = compile_index_col_expr idx i schema in
-      eval_expr clock params row plan_e
-    else
-      let col_idx = find_col_idx_by_name schema col_sql in
-      row.(col_idx)
-  ) idx.idx_columns
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (idx : Cat.index_info)
+      (schema : Row.column list)
+      (row : Row.t)
+  : Row.value list
+  =
+  List.mapi
+    (fun i col_sql ->
+       let is_expr =
+         if i < List.length idx.idx_expr_flags
+         then List.nth idx.idx_expr_flags i
+         else false
+       in
+       if is_expr
+       then (
+         let plan_e = compile_index_col_expr idx i schema in
+         eval_expr clock params row plan_e)
+       else (
+         let col_idx = find_col_idx_by_name schema col_sql in
+         row.(col_idx)))
+    idx.idx_columns
+;;
 
 let eval_check_constraints
-    (clock : (unit -> float) option)
-    (params : Row.value array)
-    (table_meta : Cat.table_meta)
-    (row : Row.t) : unit =
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
+  : unit
+  =
   (* Phase 35 Task 2: populate VIRTUAL generated columns into a scratch row
      before evaluating CHECKs, so checks that reference a VIRTUAL column see
      the up-to-date value instead of [V_null]. *)
   let row_for_check = with_computed_virtuals clock params table_meta row in
-  List.iteri (fun i (col : Row.column) ->
-    match col.check_sql with
-    | None -> ()
-    | Some check_sql ->
-      let check_plan = compile_check_expr table_meta.name i table_meta.columns check_sql in
-      let result = eval_expr clock params row_for_check check_plan in
-      (* SQLite: NULL result -> passes (not a violation) *)
-      if result <> Row.V_null && not (value_truthy result) then
-        failwith (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name)
-  ) table_meta.columns
+  List.iteri
+    (fun i (col : Row.column) ->
+       match col.check_sql with
+       | None -> ()
+       | Some check_sql ->
+         let check_plan =
+           compile_check_expr table_meta.name i table_meta.columns check_sql
+         in
+         let result = eval_expr clock params row_for_check check_plan in
+         (* SQLite: NULL result -> passes (not a violation) *)
+         if result <> Row.V_null && not (value_truthy result)
+         then
+           failwith
+             (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name))
+    table_meta.columns
+;;
 
 (* ------------------------------------------------------------------ *)
 (* FTS inverted-index helpers                                           *)
@@ -1416,41 +1849,53 @@ let eval_check_constraints
     Rowid stored with sign bit flipped so unsigned byte order = signed int64 order. *)
 let fts_term_key term rowid =
   let rb = Bytes.create 8 in
-  let v  = Int64.logxor rowid Int64.min_int in
+  let v = Int64.logxor rowid Int64.min_int in
   for i = 0 to 7 do
-    Bytes.set_uint8 rb i
-      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7-i)*8)) 0xFFL))
+    Bytes.set_uint8
+      rb
+      i
+      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7 - i) * 8)) 0xFFL))
   done;
-  Bytes.concat Bytes.empty [Bytes.of_string term; Bytes.of_string "\x00"; rb]
+  Bytes.concat Bytes.empty [ Bytes.of_string term; Bytes.of_string "\x00"; rb ]
+;;
 
 let fts_stats_key = Bytes.of_string "\x00\x00"
 
 let fts_doclen_key rowid =
   let rb = Bytes.create 8 in
-  let v  = Int64.logxor rowid Int64.min_int in
+  let v = Int64.logxor rowid Int64.min_int in
   for i = 0 to 7 do
-    Bytes.set_uint8 rb i
-      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7-i)*8)) 0xFFL))
+    Bytes.set_uint8
+      rb
+      i
+      (Int64.to_int (Int64.logand (Int64.shift_right_logical v ((7 - i) * 8)) 0xFFL))
   done;
   Bytes.cat (Bytes.of_string "\x00\x01") rb
+;;
 
 (** Value: varint pairs (col, pos)* — all positions for one (term, rowid). *)
 let encode_positions positions =
   let buf = Buffer.create (List.length positions * 2) in
-  List.iter (fun (col, pos) ->
-    Varint.encode_uint64 buf (Int64.of_int col);
-    Varint.encode_uint64 buf (Int64.of_int pos)) positions;
+  List.iter
+    (fun (col, pos) ->
+       Varint.encode_uint64 buf (Int64.of_int col);
+       Varint.encode_uint64 buf (Int64.of_int pos))
+    positions;
   Buffer.to_bytes buf
+;;
 
 (** FTS content row: n_cols_varint ++ (col_len_varint ++ col_bytes)* *)
 let fts_encode_content (texts : string list) : bytes =
   let buf = Buffer.create 64 in
   Varint.encode_uint64 buf (Int64.of_int (List.length texts));
-  List.iter (fun s ->
-    let b = Bytes.of_string s in
-    Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
-    Buffer.add_bytes buf b) texts;
+  List.iter
+    (fun s ->
+       let b = Bytes.of_string s in
+       Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+       Buffer.add_bytes buf b)
+    texts;
   Buffer.to_bytes buf
+;;
 
 let decode_positions value =
   let len = Bytes.length value in
@@ -1458,11 +1903,12 @@ let decode_positions value =
   let result = ref [] in
   while !pos < len do
     let col, off1 = Varint.decode_uint64 value !pos in
-    let p, off2   = Varint.decode_uint64 value off1 in
+    let p, off2 = Varint.decode_uint64 value off1 in
     result := (Int64.to_int col, Int64.to_int p) :: !result;
     pos := off2
   done;
   List.rev !result
+;;
 
 let fts_decode_content bytes =
   let n, off0 = Varint.decode_uint64 bytes 0 in
@@ -1476,59 +1922,77 @@ let fts_decode_content bytes =
     pos := off + Int64.to_int len
   done;
   List.rev !texts
+;;
 
 (** Read global FTS stats from index tree: (total_docs, total_tokens). *)
 let read_fts_stats tx index_tree =
   let+ bytes_opt = S.get tx index_tree fts_stats_key in
   match bytes_opt with
-  | None -> (0, 0)
+  | None -> 0, 0
   | Some b ->
     let docs, off = Varint.decode_uint64 b 0 in
-    let toks, _   = Varint.decode_uint64 b off in
-    (Int64.to_int docs, Int64.to_int toks)
+    let toks, _ = Varint.decode_uint64 b off in
+    Int64.to_int docs, Int64.to_int toks
+;;
 
 let write_fts_stats tx index_tree docs tokens =
   let buf = Buffer.create 16 in
   Varint.encode_uint64 buf (Int64.of_int docs);
   Varint.encode_uint64 buf (Int64.of_int tokens);
   S.put tx index_tree fts_stats_key (Buffer.to_bytes buf)
+;;
 
 (** Write inverted index entries for a newly inserted document. *)
 let fts_index_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
   let tokens = Fts_tokenizer.tokenize col_texts in
   (* Group by term *)
   let by_term : (string, (int * int) list) Hashtbl.t = Hashtbl.create 8 in
-  List.iter (fun (tok : Fts_tokenizer.token) ->
-    let lst = Option.value ~default:[] (Hashtbl.find_opt by_term tok.term) in
-    Hashtbl.replace by_term tok.term ((tok.col, tok.pos) :: lst)) tokens;
+  List.iter
+    (fun (tok : Fts_tokenizer.token) ->
+       let lst = Option.value ~default:[] (Hashtbl.find_opt by_term tok.term) in
+       Hashtbl.replace by_term tok.term ((tok.col, tok.pos) :: lst))
+    tokens;
   (* Write one entry per unique term *)
-  let* () = Hashtbl.fold (fun term positions acc ->
-    let* () = acc in
-    let key   = fts_term_key term rowid in
-    let value = encode_positions (List.rev positions) in
-    S.put tx fts_meta.Cat.fts_index_tree key value) by_term (Lwt.return_unit) in
+  let* () =
+    Hashtbl.fold
+      (fun term positions acc ->
+         let* () = acc in
+         let key = fts_term_key term rowid in
+         let value = encode_positions (List.rev positions) in
+         S.put tx fts_meta.Cat.fts_index_tree key value)
+      by_term
+      Lwt.return_unit
+  in
   (* Write doc length *)
   let dlen = List.length tokens in
   let dlen_buf = Buffer.create 4 in
   Varint.encode_uint64 dlen_buf (Int64.of_int dlen);
-  let* () = S.put tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid)
-                  (Buffer.to_bytes dlen_buf) in
+  let* () =
+    S.put tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid) (Buffer.to_bytes dlen_buf)
+  in
   (* Update global stats *)
-  let* (docs, toks) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+  let* docs, toks = read_fts_stats tx fts_meta.Cat.fts_index_tree in
   write_fts_stats tx fts_meta.Cat.fts_index_tree (docs + 1) (toks + dlen)
+;;
 
 (** Remove inverted index entries for a deleted document. *)
 let fts_deindex_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
   let tokens = Fts_tokenizer.tokenize col_texts in
-  let terms = List.sort_uniq String.compare
-    (List.map (fun (t : Fts_tokenizer.token) -> t.term) tokens) in
-  let* () = Lwt_list.iter_s (fun term ->
-    S.del tx fts_meta.Cat.fts_index_tree (fts_term_key term rowid)) terms in
+  let terms =
+    List.sort_uniq
+      String.compare
+      (List.map (fun (t : Fts_tokenizer.token) -> t.term) tokens)
+  in
+  let* () =
+    Lwt_list.iter_s
+      (fun term -> S.del tx fts_meta.Cat.fts_index_tree (fts_term_key term rowid))
+      terms
+  in
   let dlen = List.length tokens in
   let* () = S.del tx fts_meta.Cat.fts_index_tree (fts_doclen_key rowid) in
-  let* (docs, toks) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
-  write_fts_stats tx fts_meta.Cat.fts_index_tree
-    (max 0 (docs - 1)) (max 0 (toks - dlen))
+  let* docs, toks = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+  write_fts_stats tx fts_meta.Cat.fts_index_tree (max 0 (docs - 1)) (max 0 (toks - dlen))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* FTS query execution                                                  *)
@@ -1545,24 +2009,28 @@ let fts_posting_list tx ~index_tree term =
     match S.cursor_next cur with
     | None -> ()
     | Some (key, value) ->
-      if Bytes.length key >= Bytes.length prefix &&
-         Bytes.equal (Bytes.sub key 0 (Bytes.length prefix)) prefix then begin
+      if
+        Bytes.length key >= Bytes.length prefix
+        && Bytes.equal (Bytes.sub key 0 (Bytes.length prefix)) prefix
+      then (
         (* Extract rowid from last 8 bytes (sign-bit-flipped) *)
         let rowid_off = Bytes.length key - 8 in
         let v = ref 0L in
         for i = 0 to 7 do
-          v := Int64.logor (Int64.shift_left !v 8)
-                 (Int64.of_int (Bytes.get_uint8 key (rowid_off + i)))
+          v
+          := Int64.logor
+               (Int64.shift_left !v 8)
+               (Int64.of_int (Bytes.get_uint8 key (rowid_off + i)))
         done;
         let rowid = Int64.logxor !v Int64.min_int in
         let positions = decode_positions value in
         entries := (rowid, positions) :: !entries;
-        gather ()
-      end
+        gather ())
   in
   gather ();
   S.cursor_close cur;
   Lwt.return (List.rev !entries)
+;;
 
 (** Fetch posting lists for a prefix: merge all (rowid, positions) for terms matching prefix* *)
 let fts_prefix_posting_list tx ~index_tree prefix_str =
@@ -1583,36 +2051,39 @@ let fts_prefix_posting_list tx ~index_tree prefix_str =
         if Bytes.get_uint8 key !i = 0 then null_pos := !i;
         incr i
       done;
-      if !null_pos > 0 then begin
+      if !null_pos > 0
+      then (
         let term_len = !null_pos in
         (* Check term has our prefix *)
-        if term_len >= plen &&
-           Bytes.equal (Bytes.sub key 0 plen) prefix_bytes then begin
+        if term_len >= plen && Bytes.equal (Bytes.sub key 0 plen) prefix_bytes
+        then (
           let rowid_off = !null_pos + 1 in
-          if rowid_off + 8 <= klen then begin
+          if rowid_off + 8 <= klen
+          then (
             let v = ref 0L in
             for j = 0 to 7 do
-              v := Int64.logor (Int64.shift_left !v 8)
-                     (Int64.of_int (Bytes.get_uint8 key (rowid_off + j)))
+              v
+              := Int64.logor
+                   (Int64.shift_left !v 8)
+                   (Int64.of_int (Bytes.get_uint8 key (rowid_off + j)))
             done;
             let rowid = Int64.logxor !v Int64.min_int in
             let positions = decode_positions value in
             let existing = Option.value ~default:[] (Hashtbl.find_opt by_rowid rowid) in
             Hashtbl.replace by_rowid rowid (existing @ positions);
             gather ()
-          end
-        end
-        (* if term no longer has the prefix, stop — keys are sorted *)
-      end
+            (* if term no longer has the prefix, stop — keys are sorted *))))
   in
   gather ();
   S.cursor_close cur;
-  Lwt.return (Hashtbl.fold (fun rowid positions acc -> (rowid, positions) :: acc) by_rowid [])
+  Lwt.return
+    (Hashtbl.fold (fun rowid positions acc -> (rowid, positions) :: acc) by_rowid [])
+;;
 
-(** Execute an FTS query, returning [(rowid, positions)] for matching documents. *)
 (* FTS phrase match: all [words] must appear consecutively in the same column.
    For each candidate doc, check there is a start position p and column c with
    word[i] at (col=c, pos=p+i) for all i. *)
+(** Execute an FTS query, returning [(rowid, positions)] for matching documents. *)
 let fts_phrase_match tx ~index_tree words =
   match words with
   | [] -> Lwt.return []
@@ -1630,77 +2101,114 @@ let fts_phrase_match tx ~index_tree words =
     let n = Array.length all_pls in
     (* Check whether doc with [rowid] contains the phrase. *)
     let phrase_matches rowid =
-      let term_positions = Array.map (fun pl ->
-        match List.assoc_opt rowid pl with
-        | None -> []
-        | Some pos -> pos) all_pls in
-      List.exists (fun (c0, p0) ->
-        let rec check i =
-          if i >= n then true
-          else List.mem (c0, p0 + i) term_positions.(i) && check (i + 1)
-        in check 1) term_positions.(0)
+      let term_positions =
+        Array.map
+          (fun pl ->
+             match List.assoc_opt rowid pl with
+             | None -> []
+             | Some pos -> pos)
+          all_pls
+      in
+      List.exists
+        (fun (c0, p0) ->
+           let rec check i =
+             if i >= n
+             then true
+             else List.mem (c0, p0 + i) term_positions.(i) && check (i + 1)
+           in
+           check 1)
+        term_positions.(0)
     in
     let matched = List.filter (fun (r, _) -> phrase_matches r) candidates in
     Lwt.return matched
+;;
 
 let rec fts_execute_query tx ~index_tree query =
   match query with
-  | Fts_query.FQ_term (Fts_query.FT_exact term) ->
-    fts_posting_list tx ~index_tree term
+  | Fts_query.FQ_term (Fts_query.FT_exact term) -> fts_posting_list tx ~index_tree term
   | Fts_query.FQ_term (Fts_query.FT_prefix prefix) ->
     fts_prefix_posting_list tx ~index_tree prefix
-  | Fts_query.FQ_term (Fts_query.FT_phrase words) ->
-    fts_phrase_match tx ~index_tree words
+  | Fts_query.FQ_term (Fts_query.FT_phrase words) -> fts_phrase_match tx ~index_tree words
   | Fts_query.FQ_and qs ->
-    let positive = List.filter (function Fts_query.FQ_not _ -> false | _ -> true) qs in
-    let negated  = List.filter_map (function Fts_query.FQ_not q -> Some q | _ -> None) qs in
+    let positive =
+      List.filter
+        (function
+          | Fts_query.FQ_not _ -> false
+          | _ -> true)
+        qs
+    in
+    let negated =
+      List.filter_map
+        (function
+          | Fts_query.FQ_not q -> Some q
+          | _ -> None)
+        qs
+    in
     let* pos_results = Lwt_list.map_s (fts_execute_query tx ~index_tree) positive in
     let* neg_results = Lwt_list.map_s (fts_execute_query tx ~index_tree) negated in
     let neg_ids = List.concat_map (List.map fst) neg_results in
-    let intersected = match pos_results with
+    let intersected =
+      match pos_results with
       | [] -> []
       | first :: rest ->
-        List.fold_left (fun acc pl ->
-          let ids = List.map fst pl in
-          List.filter (fun (r, _) -> List.mem r ids) acc) first rest
+        List.fold_left
+          (fun acc pl ->
+             let ids = List.map fst pl in
+             List.filter (fun (r, _) -> List.mem r ids) acc)
+          first
+          rest
     in
     Lwt.return (List.filter (fun (r, _) -> not (List.mem r neg_ids)) intersected)
   | Fts_query.FQ_or qs ->
     let* results = Lwt_list.map_s (fts_execute_query tx ~index_tree) qs in
     let seen : (int64, unit) Hashtbl.t = Hashtbl.create 16 in
-    let union = List.concat_map (fun pl ->
-      List.filter (fun (r, _) ->
-        if Hashtbl.mem seen r then false
-        else begin Hashtbl.replace seen r (); true end) pl) results in
+    let union =
+      List.concat_map
+        (fun pl ->
+           List.filter
+             (fun (r, _) ->
+                if Hashtbl.mem seen r
+                then false
+                else (
+                  Hashtbl.replace seen r ();
+                  true))
+             pl)
+        results
+    in
     Lwt.return union
   | Fts_query.FQ_not _ ->
     (* Standalone NOT is meaningless; returns empty set.
        NOT inside AND is handled in the FQ_and case above. *)
     Lwt.return []
+;;
 
 (** Helper: find the first index [i] such that [pred lst[i]] holds. *)
 let list_find_index pred lst =
   let rec go i = function
     | [] -> None
     | x :: _ when pred x -> Some (i, x)
-    | _ :: rest -> go (i+1) rest
-  in go 0 lst
+    | _ :: rest -> go (i + 1) rest
+  in
+  go 0 lst
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Transaction mode                                                     *)
 (* ------------------------------------------------------------------ *)
 
 type txn_mode =
-  | Auto        (** Each DML op starts and commits its own RW txn. *)
-  | In_txn of S.rw S.txn  (** Use this txn; skip auto begin/commit. *)
+  | Auto (** Each DML op starts and commits its own RW txn. *)
+  | In_txn of S.rw S.txn (** Use this txn; skip auto begin/commit. *)
 
 let acquire_txn store mode =
   match mode with
-  | Auto -> let* tx = S.rw_begin store in Lwt.return (tx, true)
+  | Auto ->
+    let* tx = S.rw_begin store in
+    Lwt.return (tx, true)
   | In_txn tx -> Lwt.return (tx, false)
+;;
 
-let release_txn tx owned =
-  if owned then S.commit tx else Lwt.return_unit
+let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
 
 (* ------------------------------------------------------------------ *)
 (* execute: write operations only                                       *)
@@ -1712,31 +2220,35 @@ let rec substitute_excluded (excluded_row : Row.t) (e : Plan.expr) : Plan.expr =
   match e with
   | Plan.P_excluded_col i -> Plan.P_lit (value_to_literal excluded_row.(i))
   | Plan.P_binop (op, a, b) ->
-    Plan.P_binop (op, substitute_excluded excluded_row a, substitute_excluded excluded_row b)
-  | Plan.P_not e      -> Plan.P_not (substitute_excluded excluded_row e)
-  | Plan.P_is_null e  -> Plan.P_is_null (substitute_excluded excluded_row e)
+    Plan.P_binop
+      (op, substitute_excluded excluded_row a, substitute_excluded excluded_row b)
+  | Plan.P_not e -> Plan.P_not (substitute_excluded excluded_row e)
+  | Plan.P_is_null e -> Plan.P_is_null (substitute_excluded excluded_row e)
   | Plan.P_is_not_null e -> Plan.P_is_not_null (substitute_excluded excluded_row e)
-  | Plan.P_neg e      -> Plan.P_neg (substitute_excluded excluded_row e)
-  | Plan.P_bitnot e   -> Plan.P_bitnot (substitute_excluded excluded_row e)
+  | Plan.P_neg e -> Plan.P_neg (substitute_excluded excluded_row e)
+  | Plan.P_bitnot e -> Plan.P_bitnot (substitute_excluded excluded_row e)
   | Plan.P_between (x, lo, hi) ->
-    Plan.P_between (substitute_excluded excluded_row x,
-                    substitute_excluded excluded_row lo,
-                    substitute_excluded excluded_row hi)
+    Plan.P_between
+      ( substitute_excluded excluded_row x
+      , substitute_excluded excluded_row lo
+      , substitute_excluded excluded_row hi )
   | Plan.P_in (x, vals) ->
-    Plan.P_in (substitute_excluded excluded_row x,
-               List.map (substitute_excluded excluded_row) vals)
+    Plan.P_in
+      ( substitute_excluded excluded_row x
+      , List.map (substitute_excluded excluded_row) vals )
   | Plan.P_func (f, args) ->
     Plan.P_func (f, List.map (substitute_excluded excluded_row) args)
   | Plan.P_case { scrutinee; branches; else_ } ->
     let go = substitute_excluded excluded_row in
-    Plan.P_case {
-      scrutinee = Option.map go scrutinee;
-      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
-      else_     = Option.map go else_;
-    }
+    Plan.P_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
   | Plan.P_cast (e, ty) -> Plan.P_cast (substitute_excluded excluded_row e, ty)
   | Plan.P_collate (e, c) -> Plan.P_collate (substitute_excluded excluded_row e, c)
   | other -> other
+;;
 
 (** True if any value in the list is NULL. *)
 let any_null_val = List.exists (fun v -> v = Row.V_null)
@@ -1744,13 +2256,16 @@ let any_null_val = List.exists (fun v -> v = Row.V_null)
 (** Find column indices for a list of column names in [schema].
     Returns [None] for any name not found. *)
 let find_col_idxs schema col_names =
-  List.map (fun name ->
-    let rec fi i = function
-      | [] -> None
-      | (c : Row.column) :: _ when String.equal c.name name -> Some i
-      | _ :: rest -> fi (i + 1) rest
-    in fi 0 schema
-  ) col_names
+  List.map
+    (fun name ->
+       let rec fi i = function
+         | [] -> None
+         | (c : Row.column) :: _ when String.equal c.name name -> Some i
+         | _ :: rest -> fi (i + 1) rest
+       in
+       fi 0 schema)
+    col_names
+;;
 
 (** Non-raising variant of find_col_idx_by_name: returns [None] if not found. *)
 let find_col_idx_by_name_opt schema col_name =
@@ -1758,7 +2273,9 @@ let find_col_idx_by_name_opt schema col_name =
     | [] -> None
     | (c : Row.column) :: _ when String.equal c.name col_name -> Some i
     | _ :: rest -> fi (i + 1) rest
-  in fi 0 schema
+  in
+  fi 0 schema
+;;
 
 (** Encode a multi-column index-key prefix (no rowid).  Used by FK enforcement
     to seek to the first entry whose leading key columns match a target value
@@ -1768,60 +2285,69 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
   let total = List.fold_left (fun acc b -> acc + Bytes.length b) 0 parts in
   let buf = Bytes.create total in
   let off = ref 0 in
-  List.iter (fun b ->
-    let len = Bytes.length b in
-    Bytes.blit b 0 buf !off len;
-    off := !off + len
-  ) parts;
-  (buf, total)
+  List.iter
+    (fun b ->
+       let len = Bytes.length b in
+       Bytes.blit b 0 buf !off len;
+       off := !off + len)
+    parts;
+  buf, total
+;;
 
 (** Decode the rowid from the trailing 8 bytes of an index key. *)
 let decode_index_key_rowid (ikey : bytes) : int64 =
   let n = Bytes.length ikey in
   let v = ref 0L in
   for i = 0 to 7 do
-    v := Int64.logor (Int64.shift_left !v 8)
-           (Int64.of_int (Bytes.get_uint8 ikey (n - 8 + i)))
+    v
+    := Int64.logor
+         (Int64.shift_left !v 8)
+         (Int64.of_int (Bytes.get_uint8 ikey (n - 8 + i)))
   done;
   Int64.logxor !v Int64.min_int
+;;
 
 (* Full-table-scan fallbacks shared by the FK lookup/scan helpers below
    (used when no index covers the child columns). [full_scan_exists] stops at
    the first matching row; [full_scan_collect] gathers all (rowid,row) matches. *)
 let full_scan_exists tx (meta : Cat.table_meta) (pred : Row.t -> bool) : bool Lwt.t =
-  let* cur   = S.cursor_open tx meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let found  = ref false in
+  let* cur = S.cursor_open tx meta.Cat.tree_id in
+  let _sr = S.cursor_first cur in
+  let found = ref false in
   let rec scan () =
-    if !found then ()
-    else match S.cursor_next cur with
-    | None -> ()
-    | Some (_k, vbytes) ->
-      let row = decode_with_virtual None [||] meta vbytes in
-      if pred row then found := true
-      else scan ()
+    if !found
+    then ()
+    else (
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (_k, vbytes) ->
+        let row = decode_with_virtual None [||] meta vbytes in
+        if pred row then found := true else scan ())
   in
   scan ();
   S.cursor_close cur;
   Lwt.return !found
+;;
 
 let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
-    : (int64 * Row.t) list Lwt.t =
-  let* cur   = S.cursor_open tx meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
+  : (int64 * Row.t) list Lwt.t
+  =
+  let* cur = S.cursor_open tx meta.Cat.tree_id in
+  let _sr = S.cursor_first cur in
+  let buf = ref [] in
   let rec scan () =
     match S.cursor_next cur with
     | None -> ()
     | Some (kbytes, vbytes) ->
       let rowid = Rowid.decode kbytes in
-      let row   = decode_with_virtual None [||] meta vbytes in
+      let row = decode_with_virtual None [||] meta vbytes in
       if pred row then buf := (rowid, row) :: !buf;
       scan ()
   in
   scan ();
   S.cursor_close cur;
   Lwt.return (List.rev !buf)
+;;
 
 (** Internal: scan [child_meta] within an already-open transaction (RO or RW)
     for any row whose [child_col_idxs] match [parent_vals].  Used by both the
@@ -1829,405 +2355,621 @@ let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
     (which must see writes performed in the active RW txn — opening a fresh
     [ro_begin] on the B+-tree backend would snapshot the pre-txn state and
     miss the about-to-commit rows). *)
-let fk_child_has_ref_multi_in_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
-    ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
+let fk_child_has_ref_multi_in_tx
+      (cat : Cat.t)
+      tx
+      (child_meta : Cat.table_meta)
+      ~(child_col_idxs : int list)
+      ~(parent_vals : Row.value list)
+  =
   match
-    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+    Cat.find_index_covering_cols
+      cat
+      ~table_name:child_meta.Cat.name
       ~col_idxs:child_col_idxs
   with
   | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
     let ivs = List.map row_value_to_index_value parent_vals in
     let prefix, plen = encode_index_key_prefix ivs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* cur   = S.cursor_open tx idx.Cat.idx_tree_id in
-    let _sr    = S.cursor_seek cur seek_key in
-    let found  = ref false in
+    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
+    let _sr = S.cursor_seek cur seek_key in
+    let found = ref false in
     let exhausted = ref false in
     let rec walk () =
-      if !found || !exhausted then Lwt.return_unit
-      else match S.cursor_next cur with
-      | None -> exhausted := true; Lwt.return_unit
-      | Some (ikey, _ival) ->
-        if Bytes.length ikey >= plen + 8 &&
-           Bytes.equal (Bytes.sub ikey 0 plen) prefix
-        then begin
-          let rowid = decode_index_key_rowid ikey in
-          let* row_opt =
-            S.get tx child_meta.Cat.tree_id (Rowid.encode rowid)
-          in
-          (match row_opt with
-           | None -> walk ()
-           | Some vbytes ->
-             let row = decode_with_virtual None [||] child_meta vbytes in
-             let ok = List.for_all2 (fun ci pv ->
-               compare_values row.(ci) pv = 0
-             ) child_col_idxs parent_vals in
-             if ok then begin found := true; Lwt.return_unit end
-             else walk ())
-        end else begin
+      if !found || !exhausted
+      then Lwt.return_unit
+      else (
+        match S.cursor_next cur with
+        | None ->
           exhausted := true;
           Lwt.return_unit
-        end
+        | Some (ikey, _ival) ->
+          if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then (
+            let rowid = decode_index_key_rowid ikey in
+            let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+            match row_opt with
+            | None -> walk ()
+            | Some vbytes ->
+              let row = decode_with_virtual None [||] child_meta vbytes in
+              let ok =
+                List.for_all2
+                  (fun ci pv -> compare_values row.(ci) pv = 0)
+                  child_col_idxs
+                  parent_vals
+              in
+              if ok
+              then (
+                found := true;
+                Lwt.return_unit)
+              else walk ())
+          else (
+            exhausted := true;
+            Lwt.return_unit))
     in
     let* () = walk () in
     S.cursor_close cur;
     Lwt.return !found
   | _ ->
     full_scan_exists tx child_meta (fun row ->
-      List.for_all2 (fun ci pv -> compare_values row.(ci) pv = 0)
-        child_col_idxs parent_vals)
+      List.for_all2
+        (fun ci pv -> compare_values row.(ci) pv = 0)
+        child_col_idxs
+        parent_vals)
+;;
 
 (** Scan [child_meta] for any row where all [child_col_idxs] match [parent_vals]
     simultaneously.  When an index covers [child_col_idxs] as a leading prefix,
     use it; otherwise fall back to a full table scan.
     Opens and closes its own RO snapshot. *)
-let fk_child_has_ref_multi (cat : Cat.t) store (child_meta : Cat.table_meta)
-    ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
-  S.with_ro store @@ fun ro_tx ->
+let fk_child_has_ref_multi
+      (cat : Cat.t)
+      store
+      (child_meta : Cat.table_meta)
+      ~(child_col_idxs : int list)
+      ~(parent_vals : Row.value list)
+  =
+  S.with_ro store
+  @@ fun ro_tx ->
   fk_child_has_ref_multi_in_tx cat ro_tx child_meta ~child_col_idxs ~parent_vals
+;;
 
 (** Internal: scan [parent_meta] within an already-open transaction (RO or
     RW) for a row matching [parent_vals] on [parent_idxs].  Used by the
     deferred FK recheck path to observe uncommitted writes in the active
     write txn. *)
-let fk_parent_has_row_in_tx tx (parent_meta : Cat.table_meta)
-    ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
-  let* cur   = S.cursor_open tx parent_meta.Cat.tree_id in
-  let _sr    = S.cursor_first cur in
-  let found  = ref false in
+let fk_parent_has_row_in_tx
+      tx
+      (parent_meta : Cat.table_meta)
+      ~(parent_idxs : int list)
+      ~(parent_vals : Row.value list)
+  : bool Lwt.t
+  =
+  let* cur = S.cursor_open tx parent_meta.Cat.tree_id in
+  let _sr = S.cursor_first cur in
+  let found = ref false in
   let rec scan () =
-    if !found then ()
-    else match S.cursor_next cur with
-    | None -> ()
-    | Some (_k, vbytes) ->
-      let row = decode_with_virtual None [||] parent_meta vbytes in
-      let ok = List.for_all2 (fun pi pv ->
-        compare_values row.(pi) pv = 0
-      ) parent_idxs parent_vals in
-      if ok then found := true
-      else scan ()
+    if !found
+    then ()
+    else (
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (_k, vbytes) ->
+        let row = decode_with_virtual None [||] parent_meta vbytes in
+        let ok =
+          List.for_all2
+            (fun pi pv -> compare_values row.(pi) pv = 0)
+            parent_idxs
+            parent_vals
+        in
+        if ok then found := true else scan ())
   in
   scan ();
   S.cursor_close cur;
   Lwt.return !found
+;;
 
 (** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
     Returns true iff such a row exists.  Used at INSERT/UPDATE time
     (immediate FK enforcement); opens and closes its own RO snapshot. *)
-let fk_parent_has_row store (parent_meta : Cat.table_meta)
-    ~(parent_idxs : int list) ~(parent_vals : Row.value list) : bool Lwt.t =
-  S.with_ro store @@ fun ro_tx ->
-  let* found = fk_parent_has_row_in_tx ro_tx parent_meta
-                 ~parent_idxs ~parent_vals in
+let fk_parent_has_row
+      store
+      (parent_meta : Cat.table_meta)
+      ~(parent_idxs : int list)
+      ~(parent_vals : Row.value list)
+  : bool Lwt.t
+  =
+  S.with_ro store
+  @@ fun ro_tx ->
+  let* found = fk_parent_has_row_in_tx ro_tx parent_meta ~parent_idxs ~parent_vals in
   Lwt.return found
+;;
 
 (** Helper for FK enforcement: routes a violation either to the pending
     queue (deferred) or raises immediately (immediate).  [recheck] is the
     closure invoked at commit time; it must return true iff the violation
     is still present. *)
-let fk_violation ~deferred (cat : Cat.t) ~kind ~table ~rowid ~msg
-    ~(recheck : Cat.pending_fk_recheck) =
-  if deferred then begin
-    Cat.queue_pending_fk_check cat {
-      Cat.pfk_kind    = kind;
-      Cat.pfk_table   = table;
-      Cat.pfk_rowid   = rowid;
-      Cat.pfk_message = msg;
-      Cat.pfk_recheck = recheck;
-    };
-    Lwt.return_unit
-  end else
-    Lwt.fail_with msg
+let fk_violation
+      ~deferred
+      (cat : Cat.t)
+      ~kind
+      ~table
+      ~rowid
+      ~msg
+      ~(recheck : Cat.pending_fk_recheck)
+  =
+  if deferred
+  then (
+    Cat.queue_pending_fk_check
+      cat
+      { Cat.pfk_kind = kind
+      ; Cat.pfk_table = table
+      ; Cat.pfk_rowid = rowid
+      ; Cat.pfk_message = msg
+      ; Cat.pfk_recheck = recheck
+      };
+    Lwt.return_unit)
+  else Lwt.fail_with msg
+;;
 
 (* Immediate/deferred FK existence check for one [fk] of an INSERT row. *)
-let enforce_insert_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
-    (row : Row.t) (fk : Cat.fk_constraint) : unit Lwt.t =
+let enforce_insert_fk
+      store
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
+      (fk : Cat.fk_constraint)
+  : unit Lwt.t
+  =
   let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
   let local_idxs_opt = find_col_idxs table_meta.Cat.columns fk.fk_local_cols in
-  if List.exists Option.is_none local_idxs_opt then
-    Lwt.fail_with (Printf.sprintf "FOREIGN KEY: some local columns not found in table '%s'"
-      table_meta.Cat.name)
-  else
-  let local_idxs = List.filter_map Fun.id local_idxs_opt in
-  let local_vals = List.map (fun i -> row.(i)) local_idxs in
-  (* NULL in any FK column => skip enforcement *)
-  if any_null_val local_vals then Lwt.return_unit
-  else
-    (match Cat.find_table_cached cat ~name:fk.fk_parent_table with
-     | None ->
-       Lwt.fail_with (Printf.sprintf "FOREIGN KEY: parent table '%s' not found"
-                        fk.fk_parent_table)
-     | Some parent_meta ->
-       let parent_idxs_opt = find_col_idxs parent_meta.Cat.columns fk.fk_parent_cols in
-       let parent_idxs = List.filter_map Fun.id parent_idxs_opt in
-       if List.length parent_idxs <> List.length fk.fk_parent_cols then
-         Lwt.fail_with (Printf.sprintf
-           "FOREIGN KEY: column not found in parent table '%s'"
-           fk.fk_parent_table)
-       else begin
-         let child_col_idxs = local_idxs in
-         let table_name = table_meta.Cat.name in
-         let parent_meta_name = parent_meta.Cat.name in
-         let msg = Printf.sprintf
-           "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
-           fk.fk_parent_table (String.concat ", " fk.fk_parent_cols)
-         in
-         let* found = fk_parent_has_row store parent_meta
-                        ~parent_idxs ~parent_vals:local_vals in
-         if found then Lwt.return_unit
-         else
-           (* Deferred recheck threads the active write txn so it observes
+  if List.exists Option.is_none local_idxs_opt
+  then
+    Lwt.fail_with
+      (Printf.sprintf
+         "FOREIGN KEY: some local columns not found in table '%s'"
+         table_meta.Cat.name)
+  else (
+    let local_idxs = List.filter_map Fun.id local_idxs_opt in
+    let local_vals = List.map (fun i -> row.(i)) local_idxs in
+    (* NULL in any FK column => skip enforcement *)
+    if any_null_val local_vals
+    then Lwt.return_unit
+    else (
+      match Cat.find_table_cached cat ~name:fk.fk_parent_table with
+      | None ->
+        Lwt.fail_with
+          (Printf.sprintf "FOREIGN KEY: parent table '%s' not found" fk.fk_parent_table)
+      | Some parent_meta ->
+        let parent_idxs_opt = find_col_idxs parent_meta.Cat.columns fk.fk_parent_cols in
+        let parent_idxs = List.filter_map Fun.id parent_idxs_opt in
+        if List.length parent_idxs <> List.length fk.fk_parent_cols
+        then
+          Lwt.fail_with
+            (Printf.sprintf
+               "FOREIGN KEY: column not found in parent table '%s'"
+               fk.fk_parent_table)
+        else (
+          let child_col_idxs = local_idxs in
+          let table_name = table_meta.Cat.name in
+          let parent_meta_name = parent_meta.Cat.name in
+          let msg =
+            Printf.sprintf
+              "FOREIGN KEY constraint failed: no row in '%s' where %s matches"
+              fk.fk_parent_table
+              (String.concat ", " fk.fk_parent_cols)
+          in
+          let* found =
+            fk_parent_has_row store parent_meta ~parent_idxs ~parent_vals:local_vals
+          in
+          if found
+          then Lwt.return_unit
+          else (
+            (* Deferred recheck threads the active write txn so it observes
               uncommitted writes (a fresh ro_begin would miss them). *)
-           let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-             match Cat.find_table_cached cat ~name:table_name,
-                   Cat.find_table_cached cat ~name:parent_meta_name with
-             | None, _ | _, None -> Lwt.return false
-             | Some child_now, Some parent_now ->
-               let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                                  ~child_col_idxs ~parent_vals:local_vals in
-               if not has_child then Lwt.return false
-               else
-                 let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                                     ~parent_idxs ~parent_vals:local_vals in
-                 Lwt.return (not has_parent)
-           } in
-           fk_violation ~deferred:is_deferred cat ~kind:`Insert
-             ~table:table_name ~rowid:0L ~msg ~recheck
-       end)
+            let recheck =
+              { Cat.recheck =
+                  (fun (type m) (recheck_tx : m S.txn) ->
+                    match
+                      ( Cat.find_table_cached cat ~name:table_name
+                      , Cat.find_table_cached cat ~name:parent_meta_name )
+                    with
+                    | None, _ | _, None -> Lwt.return false
+                    | Some child_now, Some parent_now ->
+                      let* has_child =
+                        fk_child_has_ref_multi_in_tx
+                          cat
+                          recheck_tx
+                          child_now
+                          ~child_col_idxs
+                          ~parent_vals:local_vals
+                      in
+                      if not has_child
+                      then Lwt.return false
+                      else
+                        let* has_parent =
+                          fk_parent_has_row_in_tx
+                            recheck_tx
+                            parent_now
+                            ~parent_idxs
+                            ~parent_vals:local_vals
+                        in
+                        Lwt.return (not has_parent))
+              }
+            in
+            fk_violation
+              ~deferred:is_deferred
+              cat
+              ~kind:`Insert
+              ~table:table_name
+              ~rowid:0L
+              ~msg
+              ~recheck))))
+;;
 
 (* Evaluate all FK constraints for an INSERT of [row] before any writes. *)
-let enforce_insert_fks store (cat : Cat.t) (table_meta : Cat.table_meta)
-    (row : Row.t) : unit Lwt.t =
+let enforce_insert_fks store (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
+  : unit Lwt.t
+  =
   let fks = table_meta.Cat.fk_constraints in
-  if fks = [] || not (Cat.get_fk_enforcement cat) then Lwt.return_unit
+  if fks = [] || not (Cat.get_fk_enforcement cat)
+  then Lwt.return_unit
   else Lwt_list.iter_s (enforce_insert_fk store cat table_meta row) fks
+;;
 
 (* Resolve the rowid for an INSERT: the INTEGER PRIMARY KEY for WITHOUT ROWID
    tables (must be present, non-NULL, integer), else a freshly allocated one. *)
 let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
-    : int64 Lwt.t =
-  if table_meta.Cat.without_rowid then begin
+  : int64 Lwt.t
+  =
+  if table_meta.Cat.without_rowid
+  then (
     match
       List.find_index (fun (c : Row.column) -> c.primary_key) table_meta.Cat.columns
     with
     | None ->
-      Lwt.fail_with (Printf.sprintf
-        "WITHOUT ROWID table '%s' has no PRIMARY KEY column" table_meta.Cat.name)
+      Lwt.fail_with
+        (Printf.sprintf
+           "WITHOUT ROWID table '%s' has no PRIMARY KEY column"
+           table_meta.Cat.name)
     | Some pk_idx ->
       (match row.(pk_idx) with
        | Row.V_int n -> Lwt.return n
        | Row.V_null ->
-         Lwt.fail_with (Printf.sprintf
-           "WITHOUT ROWID table '%s': PRIMARY KEY column must not be NULL"
-           table_meta.Cat.name)
+         Lwt.fail_with
+           (Printf.sprintf
+              "WITHOUT ROWID table '%s': PRIMARY KEY column must not be NULL"
+              table_meta.Cat.name)
        | _ ->
-         Lwt.fail_with (Printf.sprintf
-           "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
-           table_meta.Cat.name))
-  end
+         Lwt.fail_with
+           (Printf.sprintf
+              "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
+              table_meta.Cat.name)))
   else Cat.next_rowid_in_txn cat ~name:table_meta.name tx
+;;
 
 (* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
    delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
    UNIQUE violation. *)
-let check_insert_unique tx (table_meta : Cat.table_meta)
-    ~clock ~params ~(row_for_idx : Row.t)
-    ~(on_conflict : Ast.conflict_action option)
-    ~(upsert_update : (string list * (int * Plan.expr) list) option)
-    (idxs : Cat.index_info list) : (bool * int64 list * int64 option) Lwt.t =
-  Lwt_list.fold_left_s (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
-    if skip || not idx.idx_unique then Lwt.return (skip, dels, upsert_rid)
-    else if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-    then Lwt.return (skip, dels, upsert_rid)
-    else begin
-      let iks    = List.map row_value_to_index_value
-                     (get_index_key_values clock params idx table_meta.columns row_for_idx) in
-      let prefix, plen = encode_index_key_prefix iks in
-      let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-      let* cur     = S.cursor_open tx idx.idx_tree_id in
-      let _        = S.cursor_seek cur seek_key in
-      let conflict_rowid_opt =
-        match S.cursor_next cur with
-        | None -> None
-        | Some (ikey, _) ->
-          if Bytes.length ikey >= plen &&
-             Bytes.equal (Bytes.sub ikey 0 plen) prefix
-          then
-            let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-            Some (Rowid.decode rid_bytes)
-          else None
-      in
-      S.cursor_close cur;
-      match conflict_rowid_opt with
-      | None -> Lwt.return (false, dels, upsert_rid)
-      | Some old_rowid ->
-        (match on_conflict, upsert_update with
-         | Some Ast.CA_ignore, _ ->
-           Lwt.return (true, dels, upsert_rid)  (* skip=true, stop checking *)
-         | Some Ast.CA_replace, _ ->
-           Lwt.return (false, old_rowid :: dels, upsert_rid)
-         | _, Some (conflict_cols, _) when
-             List.sort String.compare idx.idx_columns =
-             List.sort String.compare conflict_cols ->
-           Lwt.return (false, dels, Some old_rowid)
-         | _ ->
-           Lwt.fail_with (Printf.sprintf
-             "UNIQUE constraint violated: duplicate value in columns (%s)"
-             (String.concat ", " idx.idx_columns)))
-    end
-  ) (false, [], None) idxs
+let check_insert_unique
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      ~(on_conflict : Ast.conflict_action option)
+      ~(upsert_update : (string list * (int * Plan.expr) list) option)
+      (idxs : Cat.index_info list)
+  : (bool * int64 list * int64 option) Lwt.t
+  =
+  Lwt_list.fold_left_s
+    (fun (skip, dels, upsert_rid) (idx : Cat.index_info) ->
+       if skip || not idx.idx_unique
+       then Lwt.return (skip, dels, upsert_rid)
+       else if
+         not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+       then Lwt.return (skip, dels, upsert_rid)
+       else (
+         let iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx table_meta.columns row_for_idx)
+         in
+         let prefix, plen = encode_index_key_prefix iks in
+         let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+         let* cur = S.cursor_open tx idx.idx_tree_id in
+         let _ = S.cursor_seek cur seek_key in
+         let conflict_rowid_opt =
+           match S.cursor_next cur with
+           | None -> None
+           | Some (ikey, _) ->
+             if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+             then (
+               let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+               Some (Rowid.decode rid_bytes))
+             else None
+         in
+         S.cursor_close cur;
+         match conflict_rowid_opt with
+         | None -> Lwt.return (false, dels, upsert_rid)
+         | Some old_rowid ->
+           (match on_conflict, upsert_update with
+            | Some Ast.CA_ignore, _ ->
+              Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
+            | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
+            | _, Some (conflict_cols, _)
+              when List.sort String.compare idx.idx_columns
+                   = List.sort String.compare conflict_cols ->
+              Lwt.return (false, dels, Some old_rowid)
+            | _ ->
+              Lwt.fail_with
+                (Printf.sprintf
+                   "UNIQUE constraint violated: duplicate value in columns (%s)"
+                   (String.concat ", " idx.idx_columns)))))
+    (false, [], None)
+    idxs
+;;
 
 (* Write [row]'s index entries (honoring each index's WHERE predicate). *)
-let insert_row_indexes tx (table_meta : Cat.table_meta) ~clock ~params
-    ~(row_for_idx : Row.t) ~rowid (idxs : Cat.index_info list) : unit Lwt.t =
-  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
-    then Lwt.return_unit
-    else begin
-      let iks  = List.map row_value_to_index_value
-                   (get_index_key_values clock params idx table_meta.columns row_for_idx) in
-      let ikey = Index_key.encode iks ~rowid in
-      S.put tx idx.idx_tree_id ikey Bytes.empty
-    end
-  ) idxs
+let insert_row_indexes
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      ~rowid
+      (idxs : Cat.index_info list)
+  : unit Lwt.t
+  =
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       if not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
+       then Lwt.return_unit
+       else (
+         let iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx table_meta.columns row_for_idx)
+         in
+         let ikey = Index_key.encode iks ~rowid in
+         S.put tx idx.idx_tree_id ikey Bytes.empty))
+    idxs
+;;
 
 (* REPLACE conflict resolution: delete each [to_delete] row and its index
    entries (firing BEFORE DELETE); returns the displaced rows in original order. *)
-let delete_replace_conflicts tx (table_meta : Cat.table_meta)
-    ~clock ~params ~(idxs : Cat.index_info list) ~on_replace_delete_before
-    to_delete : Row.t list Lwt.t =
+let delete_replace_conflicts
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(idxs : Cat.index_info list)
+      ~on_replace_delete_before
+      to_delete
+  : Row.t list Lwt.t
+  =
   let displaced_rows : Row.t list ref = ref [] in
-  let* () = Lwt_list.iter_s (fun old_rowid ->
-    let old_key = Rowid.encode old_rowid in
-    let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
-    match old_bytes_opt with
-    | None -> Lwt.return_unit
-    | Some old_bytes ->
-      let old_row = decode_with_virtual clock params table_meta old_bytes in
-      displaced_rows := old_row :: !displaced_rows;
-      let* () = match on_replace_delete_before with
-        | None   -> Lwt.return_unit
-        | Some f -> f ~tx ~old_row
-      in
-      let* () = S.del tx table_meta.tree_id old_key in
-      Lwt_list.iter_s (fun (idx2 : Cat.index_info) ->
-        if not (row_matches_index_where clock params idx2 table_meta.columns old_row)
-        then Lwt.return_unit
-        else begin
-          let iks2     = List.map row_value_to_index_value
-                           (get_index_key_values clock params idx2 table_meta.columns old_row) in
-          let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
-          S.del tx idx2.idx_tree_id old_ikey
-        end
-      ) idxs
-  ) (List.sort_uniq compare to_delete) in
+  let* () =
+    Lwt_list.iter_s
+      (fun old_rowid ->
+         let old_key = Rowid.encode old_rowid in
+         let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+         match old_bytes_opt with
+         | None -> Lwt.return_unit
+         | Some old_bytes ->
+           let old_row = decode_with_virtual clock params table_meta old_bytes in
+           displaced_rows := old_row :: !displaced_rows;
+           let* () =
+             match on_replace_delete_before with
+             | None -> Lwt.return_unit
+             | Some f -> f ~tx ~old_row
+           in
+           let* () = S.del tx table_meta.tree_id old_key in
+           Lwt_list.iter_s
+             (fun (idx2 : Cat.index_info) ->
+                if
+                  not
+                    (row_matches_index_where clock params idx2 table_meta.columns old_row)
+                then Lwt.return_unit
+                else (
+                  let iks2 =
+                    List.map
+                      row_value_to_index_value
+                      (get_index_key_values clock params idx2 table_meta.columns old_row)
+                  in
+                  let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
+                  S.del tx idx2.idx_tree_id old_ikey))
+             idxs)
+      (List.sort_uniq compare to_delete)
+  in
   Lwt.return (List.rev !displaced_rows)
+;;
 
 (* UPSERT DO UPDATE: apply [assigns] to conflicting row [old_rowid], refresh
    indexes, fire BEFORE/AFTER UPDATE hooks, commit if we own the txn. *)
-let execute_upsert_update tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~owned ~(row : Row.t)
-    ~(assigns : (int * Plan.expr) list) ~old_rowid
-    ~on_upsert_update_before ~on_upsert_update : bool Lwt.t =
+let execute_upsert_update
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~owned
+      ~(row : Row.t)
+      ~(assigns : (int * Plan.expr) list)
+      ~old_rowid
+      ~on_upsert_update_before
+      ~on_upsert_update
+  : bool Lwt.t
+  =
   let old_key = Rowid.encode old_rowid in
   let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
-  (match old_bytes_opt with
-   | None ->
-     let* () = if owned then S.rollback tx else Lwt.return_unit in
-     Lwt.return false
-   | Some old_bytes ->
-     let old_row = decode_with_virtual clock params table_meta old_bytes in
-     let new_row = Array.copy old_row in
-     List.iter (fun (col_ord, expr) ->
-       let e' = substitute_excluded row expr in
-       new_row.(col_ord) <- eval_expr clock params old_row e'
-     ) assigns;
-     compute_stored_generated_cols clock params table_meta new_row;
-     eval_check_constraints clock params table_meta new_row;
-     let* () = match on_upsert_update_before with
-       | None -> Lwt.return_unit
-       | Some f -> f ~tx ~old_row ~new_row
-     in
-     let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-     let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-       let old_matches = row_matches_index_where clock params idx table_meta.columns old_row in
-       let new_matches = row_matches_index_where clock params idx table_meta.columns new_row_for_idx in
-       let old_iks = List.map row_value_to_index_value
-                       (get_index_key_values clock params idx table_meta.columns old_row) in
-       let new_iks = List.map row_value_to_index_value
-                       (get_index_key_values clock params idx table_meta.columns new_row_for_idx) in
-       let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
-       let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
-       let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
-       if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-       else Lwt.return_unit
-     ) (Cat.indexes_for_table cat ~table:table_meta.name) in
-     let new_bytes = Row.encode table_meta.columns new_row in
-     let* () = S.del tx table_meta.tree_id old_key in
-     let* () = S.put tx table_meta.tree_id old_key new_bytes in
-     let* () = match on_upsert_update with
-       | None -> Lwt.return_unit
-       | Some f -> f ~tx ~old_row ~new_row
-     in
-     let* () = release_txn tx owned in
-     Lwt.return true)
+  match old_bytes_opt with
+  | None ->
+    let* () = if owned then S.rollback tx else Lwt.return_unit in
+    Lwt.return false
+  | Some old_bytes ->
+    let old_row = decode_with_virtual clock params table_meta old_bytes in
+    let new_row = Array.copy old_row in
+    List.iter
+      (fun (col_ord, expr) ->
+         let e' = substitute_excluded row expr in
+         new_row.(col_ord) <- eval_expr clock params old_row e')
+      assigns;
+    compute_stored_generated_cols clock params table_meta new_row;
+    eval_check_constraints clock params table_meta new_row;
+    let* () =
+      match on_upsert_update_before with
+      | None -> Lwt.return_unit
+      | Some f -> f ~tx ~old_row ~new_row
+    in
+    let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+    let* () =
+      Lwt_list.iter_s
+        (fun (idx : Cat.index_info) ->
+           let old_matches =
+             row_matches_index_where clock params idx table_meta.columns old_row
+           in
+           let new_matches =
+             row_matches_index_where clock params idx table_meta.columns new_row_for_idx
+           in
+           let old_iks =
+             List.map
+               row_value_to_index_value
+               (get_index_key_values clock params idx table_meta.columns old_row)
+           in
+           let new_iks =
+             List.map
+               row_value_to_index_value
+               (get_index_key_values clock params idx table_meta.columns new_row_for_idx)
+           in
+           let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
+           let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
+           let* () =
+             if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
+           in
+           if new_matches
+           then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+           else Lwt.return_unit)
+        (Cat.indexes_for_table cat ~table:table_meta.name)
+    in
+    let new_bytes = Row.encode table_meta.columns new_row in
+    let* () = S.del tx table_meta.tree_id old_key in
+    let* () = S.put tx table_meta.tree_id old_key new_bytes in
+    let* () =
+      match on_upsert_update with
+      | None -> Lwt.return_unit
+      | Some f -> f ~tx ~old_row ~new_row
+    in
+    let* () = release_txn tx owned in
+    Lwt.return true
+;;
 
 (* Plain INSERT path (no UPSERT match): honor IGNORE (skip), delete REPLACE
    conflicts, write the new row + index entries, fire AFTER hooks, commit if owned. *)
-let execute_insert_write tx (table_meta : Cat.table_meta)
-    ~clock ~params ~owned ~(row : Row.t) ~(row_for_idx : Row.t) ~rowid
-    ~(idxs : Cat.index_info list) ~skip ~to_delete
-    ~on_replace_delete_before ~on_replace_delete ~after_hook : bool Lwt.t =
-  if skip then begin
+let execute_insert_write
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~owned
+      ~(row : Row.t)
+      ~(row_for_idx : Row.t)
+      ~rowid
+      ~(idxs : Cat.index_info list)
+      ~skip
+      ~to_delete
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~after_hook
+  : bool Lwt.t
+  =
+  if skip
+  then
     (* IGNORE: rollback if we own the txn (undo rowid allocation), return false *)
     let* () = if owned then S.rollback tx else Lwt.return_unit in
     Lwt.return false
-  end else begin
+  else
     let* displaced_rows =
-      delete_replace_conflicts tx table_meta ~clock ~params ~idxs
-        ~on_replace_delete_before to_delete in
-    let key   = Rowid.encode rowid in
+      delete_replace_conflicts
+        tx
+        table_meta
+        ~clock
+        ~params
+        ~idxs
+        ~on_replace_delete_before
+        to_delete
+    in
+    let key = Rowid.encode rowid in
     let bytes = Row.encode table_meta.columns row in
     let* () = S.put tx table_meta.tree_id key bytes in
     let* () = insert_row_indexes tx table_meta ~clock ~params ~row_for_idx ~rowid idxs in
-    let* () = match on_replace_delete with
-      | None   -> Lwt.return_unit
+    let* () =
+      match on_replace_delete with
+      | None -> Lwt.return_unit
       | Some f -> Lwt_list.iter_s (fun old_row -> f ~tx ~old_row) displaced_rows
     in
-    let* () = match after_hook with None -> Lwt.return_unit | Some f -> f ~tx ~new_row:row in
+    let* () =
+      match after_hook with
+      | None -> Lwt.return_unit
+      | Some f -> f ~tx ~new_row:row
+    in
     let* () = release_txn tx owned in
     Lwt.return true
-  end
+;;
 
 (* Build the row to insert: use [prebuilt_row] if given, else evaluate each
    (ordinal, expr) into a fresh NULL-filled row of the table's width. *)
-let build_insert_row ~clock ~params ~prebuilt_row ~ordinals ~values
-    (table_meta : Cat.table_meta) : Row.t =
+let build_insert_row
+      ~clock
+      ~params
+      ~prebuilt_row
+      ~ordinals
+      ~values
+      (table_meta : Cat.table_meta)
+  : Row.t
+  =
   match prebuilt_row with
   | Some r -> r
   | None ->
     let n = List.length table_meta.columns in
     let r = Array.make n Row.V_null in
-    List.iter2 (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr) ordinals values;
+    List.iter2
+      (fun ord expr -> r.(ord) <- eval_expr clock params [||] expr)
+      ordinals
+      values;
     r
+;;
 
 (** Run [Op_insert] against the store: write the new row to the table
     tree and, if any indexes are defined on the table, also write the
     corresponding index entries (checking UNIQUE constraints first).
     Uses a SINGLE RW txn for both the row write and index writes. *)
-let execute_insert ?(mode = Auto) ?(params = [||])
-    ?(clock : (unit -> float) option = None)
-    ?(on_conflict : Ast.conflict_action option = None)
-    ?(upsert_update : (string list * (int * Plan.expr) list) option = None)
-    ?(prebuilt_row : Row.t option = None)
-    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    (store : S.t) (cat : Cat.t)
-    ~(table_meta : Cat.table_meta) ~ordinals ~(values : Plan.expr list) : bool Lwt.t =
+let execute_insert
+      ?(mode = Auto)
+      ?(params = [||])
+      ?(clock : (unit -> float) option = None)
+      ?(on_conflict : Ast.conflict_action option = None)
+      ?(upsert_update : (string list * (int * Plan.expr) list) option = None)
+      ?(prebuilt_row : Row.t option = None)
+      ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
+      ?(after_hook : (tx:S.rw S.txn -> new_row:Row.t -> unit Lwt.t) option = None)
+      ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      ?(on_upsert_update_before :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_upsert_update :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      (store : S.t)
+      (cat : Cat.t)
+      ~(table_meta : Cat.table_meta)
+      ~ordinals
+      ~(values : Plan.expr list)
+  : bool Lwt.t
+  =
   let row = build_insert_row ~clock ~params ~prebuilt_row ~ordinals ~values table_meta in
   compute_stored_generated_cols clock params table_meta row;
   (* Evaluate CHECK and FK constraints before any writes. *)
@@ -2238,91 +2980,148 @@ let execute_insert ?(mode = Auto) ?(params = [||])
      acquire/reuse the txn first, then allocate the rowid within it.  BEFORE
      INSERT fires inside the parent txn so its nested DML shares the tx and
      its writes roll back atomically with the parent on failure. *)
-  let* (tx, owned) = acquire_txn store mode in
+  let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      let* () = match before_hook with
-        | None -> Lwt.return_unit
-        | Some f -> f ~tx ~new_row:(Array.copy row) in
-      let* rowid = insert_rowid tx cat table_meta row in
-      let idxs   = Cat.indexes_for_table cat ~table:table_meta.name in
-      (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
+       let* () =
+         match before_hook with
+         | None -> Lwt.return_unit
+         | Some f -> f ~tx ~new_row:(Array.copy row)
+       in
+       let* rowid = insert_rowid tx cat table_meta row in
+       let idxs = Cat.indexes_for_table cat ~table:table_meta.name in
+       (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)
-      let row_for_idx = with_computed_virtuals clock params table_meta row in
-      let* (skip, to_delete, upsert_rowid) =
-        check_insert_unique tx table_meta ~clock ~params ~row_for_idx
-          ~on_conflict ~upsert_update idxs
-      in
-      match upsert_update, upsert_rowid with
-      | Some (_, assigns), Some old_rowid ->
-        execute_upsert_update tx cat table_meta ~clock ~params ~owned ~row
-          ~assigns ~old_rowid ~on_upsert_update_before ~on_upsert_update
-      | _ ->
-        execute_insert_write tx table_meta ~clock ~params ~owned ~row
-          ~row_for_idx ~rowid ~idxs ~skip ~to_delete
-          ~on_replace_delete_before ~on_replace_delete ~after_hook)
+       let row_for_idx = with_computed_virtuals clock params table_meta row in
+       let* skip, to_delete, upsert_rowid =
+         check_insert_unique
+           tx
+           table_meta
+           ~clock
+           ~params
+           ~row_for_idx
+           ~on_conflict
+           ~upsert_update
+           idxs
+       in
+       match upsert_update, upsert_rowid with
+       | Some (_, assigns), Some old_rowid ->
+         execute_upsert_update
+           tx
+           cat
+           table_meta
+           ~clock
+           ~params
+           ~owned
+           ~row
+           ~assigns
+           ~old_rowid
+           ~on_upsert_update_before
+           ~on_upsert_update
+       | _ ->
+         execute_insert_write
+           tx
+           table_meta
+           ~clock
+           ~params
+           ~owned
+           ~row
+           ~row_for_idx
+           ~rowid
+           ~idxs
+           ~skip
+           ~to_delete
+           ~on_replace_delete_before
+           ~on_replace_delete
+           ~after_hook)
     (fun exn ->
-      (* On any exception: rollback if we own the txn, then re-raise. *)
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
-      Lwt.fail exn)
+       (* On any exception: rollback if we own the txn, then re-raise. *)
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
+;;
 
 (** Run [Op_create_index]: register the index in the catalog, then scan
     the table tree and populate the index tree with one entry per row. *)
-let execute_create_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~name ~table ~tree_id
-    ~col_sqls
-    ~col_expr_flags
-    ~(where_expr : Plan.expr option)
-    ~where_sql
-    ~unique
-    ~(columns : Row.column list) : unit Lwt.t =
-  let* res = Cat.create_index cat ~name ~table ~columns:col_sqls
-      ~unique ~expr_flags:col_expr_flags ~where_sql in
+let execute_create_index
+      ?(mode = Auto)
+      (store : S.t)
+      (cat : Cat.t)
+      ~name
+      ~table
+      ~tree_id
+      ~col_sqls
+      ~col_expr_flags
+      ~(where_expr : Plan.expr option)
+      ~where_sql
+      ~unique
+      ~(columns : Row.column list)
+  : unit Lwt.t
+  =
+  let* res =
+    Cat.create_index
+      cat
+      ~name
+      ~table
+      ~columns:col_sqls
+      ~unique
+      ~expr_flags:col_expr_flags
+      ~where_sql
+  in
   match res with
   | Error msg -> failwith msg
   | Ok info ->
-    let* (tx, owned) = acquire_txn store mode in
+    let* tx, owned = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        let* cur = S.cursor_open tx tree_id in
-        let _sr = S.cursor_first cur in
-        let rec walk () =
-          match S.cursor_next cur with
-          | None -> Lwt.return_unit
-          | Some (kbytes, vbytes) ->
-            let rowid = Rowid.decode kbytes in
-            let row = decode_with_virtual_cols None [||] ~table_name:table columns vbytes in
-            let skip = match where_expr with
-              | None -> false
-              | Some we -> not (value_truthy (eval_expr None [||] row we))
-            in
-            if skip then walk ()
-            else begin
-              let iks = List.map row_value_to_index_value
-                          (get_index_key_values None [||] info columns row) in
-              let ikey = Index_key.encode iks ~rowid in
-              let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
-              walk ()
-            end
-        in
-        let* () = walk () in
-        S.cursor_close cur;
-        release_txn tx owned)
+         let* cur = S.cursor_open tx tree_id in
+         let _sr = S.cursor_first cur in
+         let rec walk () =
+           match S.cursor_next cur with
+           | None -> Lwt.return_unit
+           | Some (kbytes, vbytes) ->
+             let rowid = Rowid.decode kbytes in
+             let row =
+               decode_with_virtual_cols None [||] ~table_name:table columns vbytes
+             in
+             let skip =
+               match where_expr with
+               | None -> false
+               | Some we -> not (value_truthy (eval_expr None [||] row we))
+             in
+             if skip
+             then walk ()
+             else (
+               let iks =
+                 List.map
+                   row_value_to_index_value
+                   (get_index_key_values None [||] info columns row)
+               in
+               let ikey = Index_key.encode iks ~rowid in
+               let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
+               walk ())
+         in
+         let* () = walk () in
+         S.cursor_close cur;
+         release_txn tx owned)
       (fun exn ->
-        (* On any exception: rollback if we own the txn, then re-raise. *)
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.fail exn)
+         (* On any exception: rollback if we own the txn, then re-raise. *)
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
+;;
 
 (** Check whether inserting a new index entry for [new_row] with
     [rowid] into [idx] would violate a UNIQUE constraint.  Returns
     [true] if a different row already has the same indexed value. *)
 let unique_violation_on_update
-    (tx : S.rw S.txn)
-    (idx : Cat.index_info)
-    (_new_values : Row.value list)    (* kept for call-site compat but unused for expr indexes *)
-    ~(rowid : int64)
-    ~(new_row : Row.t)
-    ~(schema : Row.column list) : bool Lwt.t =
+      (tx : S.rw S.txn)
+      (idx : Cat.index_info)
+      (_new_values : Row.value list)
+        (* kept for call-site compat but unused for expr indexes *)
+      ~(rowid : int64)
+      ~(new_row : Row.t)
+      ~(schema : Row.column list)
+  : bool Lwt.t
+  =
   (* For UNIQUE check we use the first value as the seek prefix.
      This is a conservative approach: we seek to the first key with the
      matching first-column value, then compare the entire encoded key.
@@ -2331,16 +3130,20 @@ let unique_violation_on_update
   let new_row_for_idx =
     with_computed_virtuals_cols None [||] ~table_name:idx.Cat.idx_table schema new_row
   in
-  let ik_values = List.map row_value_to_index_value
-                    (get_index_key_values None [||] idx schema new_row_for_idx) in
+  let ik_values =
+    List.map
+      row_value_to_index_value
+      (get_index_key_values None [||] idx schema new_row_for_idx)
+  in
   (* Encode all values (no rowid) as the exact-match key; [encode_index_key_prefix]
      concatenates each value's encoding in order, same as the index key body. *)
   let full_key_no_rowid, full_klen = encode_index_key_prefix ik_values in
-  let prefix = match ik_values with
+  let prefix =
+    match ik_values with
     | [] -> Bytes.empty
     | ik :: _ -> Index_key.encode_value ik
   in
-  let plen     = Bytes.length prefix in
+  let plen = Bytes.length prefix in
   let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
   let* cur = S.cursor_open tx idx.idx_tree_id in
   let _sr = S.cursor_seek cur seek_key in
@@ -2350,46 +3153,57 @@ let unique_violation_on_update
     match S.cursor_next cur with
     | None -> Lwt.return false
     | Some (ikey, _) ->
-      if Bytes.length ikey >= plen + 8 &&
-         Bytes.equal (Bytes.sub ikey 0 plen) prefix
-      then begin
+      if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+      then
         (* Check that the full value prefix (all columns) also matches *)
-        if Bytes.length ikey >= full_klen + 8 &&
-           Bytes.equal (Bytes.sub ikey 0 full_klen) full_key_no_rowid
-        then begin
+        if
+          Bytes.length ikey >= full_klen + 8
+          && Bytes.equal (Bytes.sub ikey 0 full_klen) full_key_no_rowid
+        then (
           let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
           let other = Rowid.decode rowid_bytes in
-          if Int64.equal other rowid then scan ()
-          else Lwt.return true
-        end else
-          scan ()
-      end else
-        Lwt.return false
+          if Int64.equal other rowid then scan () else Lwt.return true)
+        else scan ()
+      else Lwt.return false
   in
   let* result = scan () in
   S.cursor_close cur;
   Lwt.return result
+;;
 
 (** Build the list of (child_table_meta, relevant_fk_constraints) pairs
     for tables that have FK constraints pointing to [parent_table_name]. *)
 let build_child_refs cat ~parent_table_name =
   let* all_tables = Cat.list_tables cat in
-  Lwt.return (List.filter_map (fun (child_meta : Cat.table_meta) ->
-    let fks = List.filter (fun (fk : Cat.fk_constraint) ->
-      String.equal fk.fk_parent_table parent_table_name
-    ) child_meta.Cat.fk_constraints in
-    if fks = [] then None else Some (child_meta, fks)
-  ) all_tables)
+  Lwt.return
+    (List.filter_map
+       (fun (child_meta : Cat.table_meta) ->
+          let fks =
+            List.filter
+              (fun (fk : Cat.fk_constraint) ->
+                 String.equal fk.fk_parent_table parent_table_name)
+              child_meta.Cat.fk_constraints
+          in
+          if fks = [] then None else Some (child_meta, fks))
+       all_tables)
+;;
 
 (** Scan [child_meta] using an existing RW transaction for rows where all
     [child_col_idxs] match [parent_vals] simultaneously.  When an index covers
     [child_col_idxs] as a leading prefix, the scan is driven by the index;
     otherwise it falls back to a full table scan.
     Returns (rowid, row) list. *)
-let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
-    ~(child_col_idxs : int list) ~(parent_vals : Row.value list) =
+let scan_child_rows_multi_tx
+      (cat : Cat.t)
+      tx
+      (child_meta : Cat.table_meta)
+      ~(child_col_idxs : int list)
+      ~(parent_vals : Row.value list)
+  =
   match
-    Cat.find_index_covering_cols cat ~table_name:child_meta.Cat.name
+    Cat.find_index_covering_cols
+      cat
+      ~table_name:child_meta.Cat.name
       ~col_idxs:child_col_idxs
   with
   | Some idx when not (List.exists (fun v -> v = Row.V_null) parent_vals) ->
@@ -2397,342 +3211,602 @@ let scan_child_rows_multi_tx (cat : Cat.t) tx (child_meta : Cat.table_meta)
     let prefix, plen = encode_index_key_prefix ivs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
-    let _sr  = S.cursor_seek cur seek_key in
-    let buf  = ref [] in
+    let _sr = S.cursor_seek cur seek_key in
+    let buf = ref [] in
     let exhausted = ref false in
     let rec walk () =
-      if !exhausted then Lwt.return_unit
-      else match S.cursor_next cur with
-      | None -> exhausted := true; Lwt.return_unit
-      | Some (ikey, _ival) ->
-        if Bytes.length ikey >= plen + 8 &&
-           Bytes.equal (Bytes.sub ikey 0 plen) prefix
-        then begin
-          let rowid = decode_index_key_rowid ikey in
-          let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
-          (match row_opt with
-           | None -> walk ()
-           | Some vbytes ->
-             let row = decode_with_virtual None [||] child_meta vbytes in
-             let all_match = List.for_all2 (fun ci pv ->
-               compare_values row.(ci) pv = 0
-             ) child_col_idxs parent_vals in
-             if all_match then buf := (rowid, row) :: !buf;
-             walk ())
-        end else begin
+      if !exhausted
+      then Lwt.return_unit
+      else (
+        match S.cursor_next cur with
+        | None ->
           exhausted := true;
           Lwt.return_unit
-        end
+        | Some (ikey, _ival) ->
+          if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then (
+            let rowid = decode_index_key_rowid ikey in
+            let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+            match row_opt with
+            | None -> walk ()
+            | Some vbytes ->
+              let row = decode_with_virtual None [||] child_meta vbytes in
+              let all_match =
+                List.for_all2
+                  (fun ci pv -> compare_values row.(ci) pv = 0)
+                  child_col_idxs
+                  parent_vals
+              in
+              if all_match then buf := (rowid, row) :: !buf;
+              walk ())
+          else (
+            exhausted := true;
+            Lwt.return_unit))
     in
     let* () = walk () in
     S.cursor_close cur;
     Lwt.return (List.rev !buf)
   | _ ->
     full_scan_collect tx child_meta (fun row ->
-      List.for_all2 (fun ci pv -> compare_values row.(ci) pv = 0)
-        child_col_idxs parent_vals)
+      List.for_all2
+        (fun ci pv -> compare_values row.(ci) pv = 0)
+        child_col_idxs
+        parent_vals)
+;;
 
 (** Delete a single row and its index entries within an existing RW transaction. *)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
-  let rowid_key  = Rowid.encode rowid in
+  let rowid_key = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* Phase 35 Task 2: ensure VIRTUAL gen cols are populated before key extraction. *)
   let row_for_idx = with_computed_virtuals None [||] meta row in
-  let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    if not (row_matches_index_where None [||] idx meta.Cat.columns row_for_idx)
-    then Lwt.return_unit
-    else begin
-      let iks      = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx meta.Cat.columns row_for_idx) in
-      let old_ikey = Index_key.encode iks ~rowid in
-      S.del tx idx.idx_tree_id old_ikey
-    end
-  ) child_idxs in
+  let* () =
+    Lwt_list.iter_s
+      (fun (idx : Cat.index_info) ->
+         if not (row_matches_index_where None [||] idx meta.Cat.columns row_for_idx)
+         then Lwt.return_unit
+         else (
+           let iks =
+             List.map
+               row_value_to_index_value
+               (get_index_key_values None [||] idx meta.Cat.columns row_for_idx)
+           in
+           let old_ikey = Index_key.encode iks ~rowid in
+           S.del tx idx.idx_tree_id old_ikey))
+      child_idxs
+  in
   S.del tx meta.Cat.tree_id rowid_key
+;;
 
 (** Update one column to [new_val] in a row within an existing RW transaction.
     Also updates index entries for any index that covers [col_idx]. *)
-let update_col_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
-  let schema     = meta.Cat.columns in
-  let rowid_key  = Rowid.encode rowid in
-  let new_row    = Array.copy row in
+let update_col_in_tx
+      tx
+      (cat : Cat.t)
+      (meta : Cat.table_meta)
+      ~rowid
+      ~(row : Row.t)
+      ~col_idx
+      ~new_val
+  =
+  let schema = meta.Cat.columns in
+  let rowid_key = Rowid.encode rowid in
+  let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
-  let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    let has_where = idx.idx_where_sql <> None in
-    (* For expression indexes, we always update (can't cheaply determine dependency).
+  let* () =
+    Lwt_list.iter_s
+      (fun (idx : Cat.index_info) ->
+         let has_where = idx.idx_where_sql <> None in
+         (* For expression indexes, we always update (can't cheaply determine dependency).
        For plain indexes, only skip if col is not indexed AND no WHERE clause. *)
-    let has_expr_col = List.exists Fun.id idx.idx_expr_flags in
-    let col_is_plain = List.filter_map Fun.id (List.mapi (fun i col_sql ->
-      let is_expr = if i < List.length idx.idx_expr_flags
-                    then List.nth idx.idx_expr_flags i else false in
-      if is_expr then None
-      else Some (find_col_idx_by_name schema col_sql)
-    ) idx.idx_columns) in
-    (* Only skip if: no expr cols, col is not in plain indexed cols, no WHERE *)
-    if not has_expr_col && not (List.mem col_idx col_is_plain) && not has_where
-    then Lwt.return_unit
-    else begin
-      (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row before
+         let has_expr_col = List.exists Fun.id idx.idx_expr_flags in
+         let col_is_plain =
+           List.filter_map
+             Fun.id
+             (List.mapi
+                (fun i col_sql ->
+                   let is_expr =
+                     if i < List.length idx.idx_expr_flags
+                     then List.nth idx.idx_expr_flags i
+                     else false
+                   in
+                   if is_expr then None else Some (find_col_idx_by_name schema col_sql))
+                idx.idx_columns)
+         in
+         (* Only skip if: no expr cols, col is not in plain indexed cols, no WHERE *)
+         if (not has_expr_col) && (not (List.mem col_idx col_is_plain)) && not has_where
+         then Lwt.return_unit
+         else (
+           (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row before
          extracting index keys.  [row] was decoded with virtuals already. *)
-      let row_for_idx = with_computed_virtuals None [||] meta row in
-      let new_row_for_idx = with_computed_virtuals None [||] meta new_row in
-      let old_matches = row_matches_index_where None [||] idx schema row_for_idx in
-      let new_matches = row_matches_index_where None [||] idx schema new_row_for_idx in
-      let old_iks  = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx schema row_for_idx) in
-      let new_iks  = List.map row_value_to_index_value
-                       (get_index_key_values None [||] idx schema new_row_for_idx) in
-      let old_ikey = Index_key.encode old_iks ~rowid in
-      let new_ikey = Index_key.encode new_iks ~rowid in
-      let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
-      if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-      else Lwt.return_unit
-    end
-  ) child_idxs in
+           let row_for_idx = with_computed_virtuals None [||] meta row in
+           let new_row_for_idx = with_computed_virtuals None [||] meta new_row in
+           let old_matches = row_matches_index_where None [||] idx schema row_for_idx in
+           let new_matches =
+             row_matches_index_where None [||] idx schema new_row_for_idx
+           in
+           let old_iks =
+             List.map
+               row_value_to_index_value
+               (get_index_key_values None [||] idx schema row_for_idx)
+           in
+           let new_iks =
+             List.map
+               row_value_to_index_value
+               (get_index_key_values None [||] idx schema new_row_for_idx)
+           in
+           let old_ikey = Index_key.encode old_iks ~rowid in
+           let new_ikey = Index_key.encode new_iks ~rowid in
+           let* () =
+             if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
+           in
+           if new_matches
+           then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+           else Lwt.return_unit))
+      child_idxs
+  in
   let new_bytes = Row.encode schema new_row in
   S.put tx meta.Cat.tree_id rowid_key new_bytes
+;;
 
 (* Build the commit-time recheck for a deferred FK violation: it still stands
    iff a child row references [parent_vals] AND no parent row has them.
    Re-resolves column indices against the current schema. *)
-let make_fk_recheck (cat : Cat.t) ~child_name ~parent_name ~child_cols ~parent_cols
-    ~parent_vals : Cat.pending_fk_recheck =
-  { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-    match Cat.find_table_cached cat ~name:child_name,
-          Cat.find_table_cached cat ~name:parent_name with
-    | None, _ | _, None -> Lwt.return false
-    | Some child_now, Some parent_now ->
-      let cci = List.filter_map
-        (find_col_idx_by_name_opt child_now.Cat.columns) child_cols in
-      let pci = List.filter_map
-        (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols in
-      if List.length cci <> List.length child_cols
-         || List.length pci <> List.length parent_cols
-      then Lwt.return false
-      else
-        let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                           ~child_col_idxs:cci ~parent_vals in
-        if not has_child then Lwt.return false
-        else
-          let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                              ~parent_idxs:pci ~parent_vals in
-          Lwt.return (not has_parent)
+let make_fk_recheck
+      (cat : Cat.t)
+      ~child_name
+      ~parent_name
+      ~child_cols
+      ~parent_cols
+      ~parent_vals
+  : Cat.pending_fk_recheck
+  =
+  { Cat.recheck =
+      (fun (type m) (recheck_tx : m S.txn) ->
+        match
+          ( Cat.find_table_cached cat ~name:child_name
+          , Cat.find_table_cached cat ~name:parent_name )
+        with
+        | None, _ | _, None -> Lwt.return false
+        | Some child_now, Some parent_now ->
+          let cci =
+            List.filter_map (find_col_idx_by_name_opt child_now.Cat.columns) child_cols
+          in
+          let pci =
+            List.filter_map (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols
+          in
+          if
+            List.length cci <> List.length child_cols
+            || List.length pci <> List.length parent_cols
+          then Lwt.return false
+          else
+            let* has_child =
+              fk_child_has_ref_multi_in_tx
+                cat
+                recheck_tx
+                child_now
+                ~child_col_idxs:cci
+                ~parent_vals
+            in
+            if not has_child
+            then Lwt.return false
+            else
+              let* has_parent =
+                fk_parent_has_row_in_tx
+                  recheck_tx
+                  parent_now
+                  ~parent_idxs:pci
+                  ~parent_vals
+              in
+              Lwt.return (not has_parent))
   }
+;;
 
 (* The DEFAULT value for [col] as a Row.value, resolving CURRENT_* sentinels
    via the clock.  Shared by the ON DELETE / ON UPDATE SET DEFAULT cascades. *)
 let fk_default_value clock params (col : Row.column) : Row.value =
   match col.Row.default with
-  | None               -> Row.V_null
-  | Some Row.DV_int  n -> Row.V_int  n
-  | Some Row.DV_text s -> Row.V_text s
-  | Some Row.DV_real f -> Row.V_real f
-  | Some Row.DV_blob b -> Row.V_blob b
-  | Some Row.DV_null   -> Row.V_null
+  | None -> Row.V_null
+  | Some (Row.DV_int n) -> Row.V_int n
+  | Some (Row.DV_text s) -> Row.V_text s
+  | Some (Row.DV_real f) -> Row.V_real f
+  | Some (Row.DV_blob b) -> Row.V_blob b
+  | Some Row.DV_null -> Row.V_null
   | Some Row.DV_current_timestamp ->
-    eval_expr clock params [||]
-      (Plan.P_func (Ast.Fn_datetime, [Plan.P_lit (Ast.L_text "now")]))
+    eval_expr
+      clock
+      params
+      [||]
+      (Plan.P_func (Ast.Fn_datetime, [ Plan.P_lit (Ast.L_text "now") ]))
   | Some Row.DV_current_date ->
-    eval_expr clock params [||]
-      (Plan.P_func (Ast.Fn_date, [Plan.P_lit (Ast.L_text "now")]))
+    eval_expr
+      clock
+      params
+      [||]
+      (Plan.P_func (Ast.Fn_date, [ Plan.P_lit (Ast.L_text "now") ]))
   | Some Row.DV_current_time ->
-    eval_expr clock params [||]
-      (Plan.P_func (Ast.Fn_time, [Plan.P_lit (Ast.L_text "now")]))
+    eval_expr
+      clock
+      params
+      [||]
+      (Plan.P_func (Ast.Fn_time, [ Plan.P_lit (Ast.L_text "now") ]))
+;;
 
 (** Recursively delete a row and cascade FK actions to child tables.
     Only runs cascade logic when FK enforcement is enabled in [cat]. *)
-let rec cascade_delete_row_in_tx tx (cat : Cat.t)
-    ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
-    (clock : (unit -> float) option) (params : Row.value array)
-    (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
-  let visited_key = (meta.Cat.name, rowid) in
-  if Hashtbl.mem visited visited_key then Lwt.return_unit
-  else begin
+let rec cascade_delete_row_in_tx
+          tx
+          (cat : Cat.t)
+          ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
+          (clock : (unit -> float) option)
+          (params : Row.value array)
+          (meta : Cat.table_meta)
+          ~rowid
+          ~(row : Row.t)
+  =
+  let visited_key = meta.Cat.name, rowid in
+  if Hashtbl.mem visited visited_key
+  then Lwt.return_unit
+  else (
     Hashtbl.add visited visited_key ();
     let* child_refs =
-      if Cat.get_fk_enforcement cat then
-        build_child_refs cat ~parent_table_name:meta.Cat.name
+      if Cat.get_fk_enforcement cat
+      then build_child_refs cat ~parent_table_name:meta.Cat.name
       else Lwt.return []
     in
     let* () =
-      Lwt_list.iter_s (fun (child_meta, fks) ->
-        Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-          cascade_delete_fk tx cat visited clock params meta ~rowid ~row child_meta fk
-        ) fks
-      ) child_refs
+      Lwt_list.iter_s
+        (fun (child_meta, fks) ->
+           Lwt_list.iter_s
+             (fun (fk : Cat.fk_constraint) ->
+                cascade_delete_fk
+                  tx
+                  cat
+                  visited
+                  clock
+                  params
+                  meta
+                  ~rowid
+                  ~row
+                  child_meta
+                  fk)
+             fks)
+        child_refs
     in
-    delete_row_in_tx tx cat meta ~rowid ~row
-  end
+    delete_row_in_tx tx cat meta ~rowid ~row)
 
 (* Apply the ON DELETE action of one [fk] (child_meta references meta) while
    deleting [row] of [meta] at [rowid]. *)
-and cascade_delete_fk tx cat visited clock params (meta : Cat.table_meta)
-    ~rowid ~(row : Row.t) (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) =
+and cascade_delete_fk
+      tx
+      cat
+      visited
+      clock
+      params
+      (meta : Cat.table_meta)
+      ~rowid
+      ~(row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  =
   let parent_col_idxs_opt =
-    List.map (find_col_idx_by_name_opt meta.Cat.columns) fk.Cat.fk_parent_cols in
-  if List.exists Option.is_none parent_col_idxs_opt then Lwt.return_unit
-  else
-  let parent_col_idxs = List.filter_map Fun.id parent_col_idxs_opt in
-  let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
-  if any_null_val parent_vals then Lwt.return_unit
-  else begin
-    let child_col_idxs_opt =
-      List.map (find_col_idx_by_name_opt child_meta.Cat.columns) fk.Cat.fk_local_cols in
-    if List.exists Option.is_none child_col_idxs_opt then Lwt.return_unit
-    else
-    let child_col_idxs = List.filter_map Fun.id child_col_idxs_opt in
-    match fk.Cat.fk_on_delete with
-    | Cat.FA_restrict | Cat.FA_no_action ->
-      cascade_delete_restrict cat tx meta child_meta fk ~parent_vals ~child_col_idxs ~rowid
-    | Cat.FA_cascade ->
-      let* child_rows =
-        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals in
-      Lwt_list.iter_s (fun (crid, crow) ->
-        cascade_delete_row_in_tx tx cat ~visited clock params
-          child_meta ~rowid:crid ~row:crow
-      ) child_rows
-    | Cat.FA_set_null ->
-      cascade_delete_set_null tx cat visited clock params child_meta
-        ~child_col_idxs ~parent_vals
-    | Cat.FA_set_default ->
-      cascade_delete_set_default tx cat visited clock params child_meta
-        ~child_col_idxs ~parent_vals
-  end
+    List.map (find_col_idx_by_name_opt meta.Cat.columns) fk.Cat.fk_parent_cols
+  in
+  if List.exists Option.is_none parent_col_idxs_opt
+  then Lwt.return_unit
+  else (
+    let parent_col_idxs = List.filter_map Fun.id parent_col_idxs_opt in
+    let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
+    if any_null_val parent_vals
+    then Lwt.return_unit
+    else (
+      let child_col_idxs_opt =
+        List.map (find_col_idx_by_name_opt child_meta.Cat.columns) fk.Cat.fk_local_cols
+      in
+      if List.exists Option.is_none child_col_idxs_opt
+      then Lwt.return_unit
+      else (
+        let child_col_idxs = List.filter_map Fun.id child_col_idxs_opt in
+        match fk.Cat.fk_on_delete with
+        | Cat.FA_restrict | Cat.FA_no_action ->
+          cascade_delete_restrict
+            cat
+            tx
+            meta
+            child_meta
+            fk
+            ~parent_vals
+            ~child_col_idxs
+            ~rowid
+        | Cat.FA_cascade ->
+          let* child_rows =
+            scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+          in
+          Lwt_list.iter_s
+            (fun (crid, crow) ->
+               cascade_delete_row_in_tx
+                 tx
+                 cat
+                 ~visited
+                 clock
+                 params
+                 child_meta
+                 ~rowid:crid
+                 ~row:crow)
+            child_rows
+        | Cat.FA_set_null ->
+          cascade_delete_set_null
+            tx
+            cat
+            visited
+            clock
+            params
+            child_meta
+            ~child_col_idxs
+            ~parent_vals
+        | Cat.FA_set_default ->
+          cascade_delete_set_default
+            tx
+            cat
+            visited
+            clock
+            params
+            child_meta
+            ~child_col_idxs
+            ~parent_vals)))
 
 (* ON DELETE RESTRICT/NO ACTION: if any child row still references the parent,
    queue a deferred recheck or raise immediately. *)
-and cascade_delete_restrict cat tx (meta : Cat.table_meta)
-    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint)
-    ~(parent_vals : Row.value list) ~child_col_idxs ~rowid =
+and cascade_delete_restrict
+      cat
+      tx
+      (meta : Cat.table_meta)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+      ~(parent_vals : Row.value list)
+      ~child_col_idxs
+      ~rowid
+  =
   let is_deferred = fk.Cat.fk_deferrable || Cat.get_defer_fks_pragma cat in
   let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals in
-  if child_rows <> [] then
-    let msg = Printf.sprintf
-      "FOREIGN KEY constraint failed: '%s.%s' is still \
-       referenced by '%s.%s'"
-      meta.Cat.name (String.concat "," fk.Cat.fk_parent_cols)
-      child_meta.Cat.name (String.concat "," fk.Cat.fk_local_cols)
+    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+  in
+  if child_rows <> []
+  then (
+    let msg =
+      Printf.sprintf
+        "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
+        meta.Cat.name
+        (String.concat "," fk.Cat.fk_parent_cols)
+        child_meta.Cat.name
+        (String.concat "," fk.Cat.fk_local_cols)
     in
     let parent_meta_name = meta.Cat.name in
     let child_meta_name = child_meta.Cat.name in
     let parent_cols_copy = fk.Cat.fk_parent_cols in
     let child_cols_copy = fk.Cat.fk_local_cols in
-    let recheck = { Cat.recheck = fun (type m) (recheck_tx : m S.txn) ->
-      match Cat.find_table_cached cat ~name:child_meta_name,
-            Cat.find_table_cached cat ~name:parent_meta_name with
-      | None, _ | _, None -> Lwt.return false
-      | Some child_now, Some parent_now ->
-        let cci = List.filter_map
-          (find_col_idx_by_name_opt child_now.Cat.columns) child_cols_copy in
-        let pci = List.filter_map
-          (find_col_idx_by_name_opt parent_now.Cat.columns) parent_cols_copy in
-        if List.length cci <> List.length child_cols_copy
-           || List.length pci <> List.length parent_cols_copy
-        then Lwt.return false
-        else
-          let* has_child = fk_child_has_ref_multi_in_tx cat recheck_tx child_now
-                             ~child_col_idxs:cci ~parent_vals in
-          if not has_child then Lwt.return false
-          else
-            let* has_parent = fk_parent_has_row_in_tx recheck_tx parent_now
-                                ~parent_idxs:pci ~parent_vals in
-            Lwt.return (not has_parent)
-    } in
-    fk_violation ~deferred:is_deferred cat ~kind:`Delete
-      ~table:parent_meta_name ~rowid ~msg ~recheck
+    let recheck =
+      { Cat.recheck =
+          (fun (type m) (recheck_tx : m S.txn) ->
+            match
+              ( Cat.find_table_cached cat ~name:child_meta_name
+              , Cat.find_table_cached cat ~name:parent_meta_name )
+            with
+            | None, _ | _, None -> Lwt.return false
+            | Some child_now, Some parent_now ->
+              let cci =
+                List.filter_map
+                  (find_col_idx_by_name_opt child_now.Cat.columns)
+                  child_cols_copy
+              in
+              let pci =
+                List.filter_map
+                  (find_col_idx_by_name_opt parent_now.Cat.columns)
+                  parent_cols_copy
+              in
+              if
+                List.length cci <> List.length child_cols_copy
+                || List.length pci <> List.length parent_cols_copy
+              then Lwt.return false
+              else
+                let* has_child =
+                  fk_child_has_ref_multi_in_tx
+                    cat
+                    recheck_tx
+                    child_now
+                    ~child_col_idxs:cci
+                    ~parent_vals
+                in
+                if not has_child
+                then Lwt.return false
+                else
+                  let* has_parent =
+                    fk_parent_has_row_in_tx
+                      recheck_tx
+                      parent_now
+                      ~parent_idxs:pci
+                      ~parent_vals
+                  in
+                  Lwt.return (not has_parent))
+      }
+    in
+    fk_violation
+      ~deferred:is_deferred
+      cat
+      ~kind:`Delete
+      ~table:parent_meta_name
+      ~rowid
+      ~msg
+      ~recheck)
   else Lwt.return_unit
 
 (* ON DELETE SET NULL: set each child FK column to NULL (rejecting NOT NULL),
    routing through cascade_update_col_in_tx so further ON UPDATE chains run. *)
-and cascade_delete_set_null tx cat visited clock params (child_meta : Cat.table_meta)
-    ~child_col_idxs ~(parent_vals : Row.value list) =
+and cascade_delete_set_null
+      tx
+      cat
+      visited
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      ~child_col_idxs
+      ~(parent_vals : Row.value list)
+  =
   let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals in
-  if child_rows = [] then Lwt.return_unit
+    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+  in
+  if child_rows = []
+  then Lwt.return_unit
   else
     (* For single-col FKs (common case), apply to the one child col.
        For multi-col, apply SET NULL to each child col independently. *)
-    Lwt_list.iter_s (fun child_col_idx ->
-      let col = List.nth child_meta.Cat.columns child_col_idx in
-      if col.Row.not_null then
-        Lwt.fail_with (Printf.sprintf
-          "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column '%s.%s'"
-          child_meta.Cat.name col.Row.name)
-      else
-        Lwt_list.iter_s (fun (crid, crow) ->
-          cascade_update_col_in_tx tx cat ~visited clock params
-            child_meta
-            ~rowid:crid ~row:crow
-            ~col_idx:child_col_idx ~new_val:Row.V_null
-        ) child_rows
-    ) child_col_idxs
+    Lwt_list.iter_s
+      (fun child_col_idx ->
+         let col = List.nth child_meta.Cat.columns child_col_idx in
+         if col.Row.not_null
+         then
+           Lwt.fail_with
+             (Printf.sprintf
+                "FOREIGN KEY constraint failed: ON DELETE SET NULL on NOT NULL column \
+                 '%s.%s'"
+                child_meta.Cat.name
+                col.Row.name)
+         else
+           Lwt_list.iter_s
+             (fun (crid, crow) ->
+                cascade_update_col_in_tx
+                  tx
+                  cat
+                  ~visited
+                  clock
+                  params
+                  child_meta
+                  ~rowid:crid
+                  ~row:crow
+                  ~col_idx:child_col_idx
+                  ~new_val:Row.V_null)
+             child_rows)
+      child_col_idxs
 
 (* ON DELETE SET DEFAULT: like SET NULL but with each column's DEFAULT value. *)
-and cascade_delete_set_default tx cat visited clock params (child_meta : Cat.table_meta)
-    ~child_col_idxs ~(parent_vals : Row.value list) =
+and cascade_delete_set_default
+      tx
+      cat
+      visited
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      ~child_col_idxs
+      ~(parent_vals : Row.value list)
+  =
   let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals in
-  if child_rows = [] then Lwt.return_unit
+    scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+  in
+  if child_rows = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun child_col_idx ->
-      let col = List.nth child_meta.Cat.columns child_col_idx in
-      let default_val = fk_default_value clock params col in
-      if col.Row.not_null && default_val = Row.V_null then
-        Lwt.fail_with (Printf.sprintf
-          "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column '%s.%s' with no default"
-          child_meta.Cat.name col.Row.name)
-      else
-        Lwt_list.iter_s (fun (crid, crow) ->
-          cascade_update_col_in_tx tx cat ~visited clock params
-            child_meta
-            ~rowid:crid ~row:crow
-            ~col_idx:child_col_idx ~new_val:default_val
-        ) child_rows
-    ) child_col_idxs
+    Lwt_list.iter_s
+      (fun child_col_idx ->
+         let col = List.nth child_meta.Cat.columns child_col_idx in
+         let default_val = fk_default_value clock params col in
+         if col.Row.not_null && default_val = Row.V_null
+         then
+           Lwt.fail_with
+             (Printf.sprintf
+                "FOREIGN KEY constraint failed: ON DELETE SET DEFAULT on NOT NULL column \
+                 '%s.%s' with no default"
+                child_meta.Cat.name
+                col.Row.name)
+         else
+           Lwt_list.iter_s
+             (fun (crid, crow) ->
+                cascade_update_col_in_tx
+                  tx
+                  cat
+                  ~visited
+                  clock
+                  params
+                  child_meta
+                  ~rowid:crid
+                  ~row:crow
+                  ~col_idx:child_col_idx
+                  ~new_val:default_val)
+             child_rows)
+      child_col_idxs
 
 (** Recursively update a column and cascade FK UPDATE actions to child tables
     that reference this column. *)
-and cascade_update_col_in_tx tx (cat : Cat.t)
-    ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
-    (clock : (unit -> float) option) (params : Row.value array)
-    (meta : Cat.table_meta) ~rowid ~(row : Row.t) ~col_idx ~new_val =
-  let visited_key = (meta.Cat.name, rowid) in
-  if Hashtbl.mem visited visited_key then Lwt.return_unit
-  else begin
+and cascade_update_col_in_tx
+      tx
+      (cat : Cat.t)
+      ?(visited : (string * int64, unit) Hashtbl.t = Hashtbl.create 16)
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (meta : Cat.table_meta)
+      ~rowid
+      ~(row : Row.t)
+      ~col_idx
+      ~new_val
+  =
+  let visited_key = meta.Cat.name, rowid in
+  if Hashtbl.mem visited visited_key
+  then Lwt.return_unit
+  else (
     Hashtbl.add visited visited_key ();
     let* () = update_col_in_tx tx cat meta ~rowid ~row ~col_idx ~new_val in
-    if not (Cat.get_fk_enforcement cat) then Lwt.return_unit
-    else begin
+    if not (Cat.get_fk_enforcement cat)
+    then Lwt.return_unit
+    else (
       let parent_col_name = (List.nth meta.Cat.columns col_idx).Row.name in
       let* all_child_refs = build_child_refs cat ~parent_table_name:meta.Cat.name in
       let col_child_refs =
-        List.filter_map (fun (child_meta, fks) ->
-          let matching_fks =
-            List.filter (fun (fk : Cat.fk_constraint) ->
-              List.mem parent_col_name fk.Cat.fk_parent_cols
-            ) fks
-          in
-          if matching_fks = [] then None
-          else Some (child_meta, matching_fks)
-        ) all_child_refs
+        List.filter_map
+          (fun (child_meta, fks) ->
+             let matching_fks =
+               List.filter
+                 (fun (fk : Cat.fk_constraint) ->
+                    List.mem parent_col_name fk.Cat.fk_parent_cols)
+                 fks
+             in
+             if matching_fks = [] then None else Some (child_meta, matching_fks))
+          all_child_refs
       in
-      Lwt_list.iter_s (fun (child_meta, fks) ->
-        Lwt_list.iter_s (fun (fk : Cat.fk_constraint) ->
-          cascade_update_fk tx cat visited clock params meta ~row ~new_val
-            ~parent_col_name child_meta fk
-        ) fks
-      ) col_child_refs
-    end
-  end
+      Lwt_list.iter_s
+        (fun (child_meta, fks) ->
+           Lwt_list.iter_s
+             (fun (fk : Cat.fk_constraint) ->
+                cascade_update_fk
+                  tx
+                  cat
+                  visited
+                  clock
+                  params
+                  meta
+                  ~row
+                  ~new_val
+                  ~parent_col_name
+                  child_meta
+                  fk)
+             fks)
+        col_child_refs))
 
 (* Apply the ON UPDATE action of one [fk] when [parent_col_name] of [meta]
    changes to [new_val]. *)
-and cascade_update_fk tx cat visited clock params (meta : Cat.table_meta)
-    ~(row : Row.t) ~new_val ~parent_col_name (child_meta : Cat.table_meta)
-    (fk : Cat.fk_constraint) =
+and cascade_update_fk
+      tx
+      cat
+      visited
+      clock
+      params
+      (meta : Cat.table_meta)
+      ~(row : Row.t)
+      ~new_val
+      ~parent_col_name
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  =
   (* Find the position of parent_col_name in fk_parent_cols to get the
      corresponding fk_local_cols entry for single-update cascade. *)
   let fk_pos =
@@ -2740,142 +3814,294 @@ and cascade_update_fk tx cat visited clock params (meta : Cat.table_meta)
       | [] -> 0
       | col :: _ when String.equal col parent_col_name -> i
       | _ :: rest -> find_pos (i + 1) rest
-    in find_pos 0 fk.Cat.fk_parent_cols
+    in
+    find_pos 0 fk.Cat.fk_parent_cols
   in
   let child_col_name = List.nth fk.Cat.fk_local_cols fk_pos in
-  let child_col_idx  = find_col_idx_by_name child_meta.Cat.columns child_col_name in
+  let child_col_idx = find_col_idx_by_name child_meta.Cat.columns child_col_name in
   (* For multi-col FKs, we need all parent_vals to scan child rows *)
-  let all_parent_col_idxs = List.map
-    (fun c -> find_col_idx_by_name meta.Cat.columns c) fk.Cat.fk_parent_cols
+  let all_parent_col_idxs =
+    List.map (fun c -> find_col_idx_by_name meta.Cat.columns c) fk.Cat.fk_parent_cols
   in
   let all_parent_vals_old = List.map (fun i -> row.(i)) all_parent_col_idxs in
   match fk.Cat.fk_on_update with
   | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
   | Cat.FA_cascade ->
-    let all_child_col_idxs = List.map
-      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
+    let all_child_col_idxs =
+      List.map
+        (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
+        fk.Cat.fk_local_cols
     in
     let* child_rows =
-      scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs:all_child_col_idxs ~parent_vals:all_parent_vals_old
+      scan_child_rows_multi_tx
+        cat
+        tx
+        child_meta
+        ~child_col_idxs:all_child_col_idxs
+        ~parent_vals:all_parent_vals_old
     in
-    Lwt_list.iter_s (fun (crid, crow) ->
-      cascade_update_col_in_tx tx cat ~visited clock params child_meta
-        ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val
-    ) child_rows
+    Lwt_list.iter_s
+      (fun (crid, crow) ->
+         cascade_update_col_in_tx
+           tx
+           cat
+           ~visited
+           clock
+           params
+           child_meta
+           ~rowid:crid
+           ~row:crow
+           ~col_idx:child_col_idx
+           ~new_val)
+      child_rows
   | Cat.FA_set_null ->
-    cascade_update_set_null tx cat visited clock params child_meta fk
-      ~child_col_idx ~child_col_name ~parent_vals_old:all_parent_vals_old
+    cascade_update_set_null
+      tx
+      cat
+      visited
+      clock
+      params
+      child_meta
+      fk
+      ~child_col_idx
+      ~child_col_name
+      ~parent_vals_old:all_parent_vals_old
   | Cat.FA_set_default ->
-    cascade_update_set_default tx cat visited clock params child_meta fk
-      ~child_col_idx ~child_col_name ~parent_vals_old:all_parent_vals_old
+    cascade_update_set_default
+      tx
+      cat
+      visited
+      clock
+      params
+      child_meta
+      fk
+      ~child_col_idx
+      ~child_col_name
+      ~parent_vals_old:all_parent_vals_old
 
 (* ON UPDATE SET NULL for one fk's child column. *)
-and cascade_update_set_null tx cat visited clock params (child_meta : Cat.table_meta)
-    (fk : Cat.fk_constraint) ~child_col_idx ~child_col_name ~parent_vals_old =
+and cascade_update_set_null
+      tx
+      cat
+      visited
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+      ~child_col_idx
+      ~child_col_name
+      ~parent_vals_old
+  =
   let col = List.nth child_meta.Cat.columns child_col_idx in
-  if col.Row.not_null then
-    Lwt.fail_with (Printf.sprintf
-      "FOREIGN KEY constraint failed: ON UPDATE SET NULL on \
-       NOT NULL column '%s.%s'"
-      child_meta.Cat.name child_col_name)
-  else begin
-    let all_child_col_idxs = List.map
-      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
+  if col.Row.not_null
+  then
+    Lwt.fail_with
+      (Printf.sprintf
+         "FOREIGN KEY constraint failed: ON UPDATE SET NULL on NOT NULL column '%s.%s'"
+         child_meta.Cat.name
+         child_col_name)
+  else (
+    let all_child_col_idxs =
+      List.map
+        (fun c -> find_col_idx_by_name child_meta.Cat.columns c)
+        fk.Cat.fk_local_cols
     in
     let* child_rows =
-      scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs:all_child_col_idxs ~parent_vals:parent_vals_old
+      scan_child_rows_multi_tx
+        cat
+        tx
+        child_meta
+        ~child_col_idxs:all_child_col_idxs
+        ~parent_vals:parent_vals_old
     in
-    Lwt_list.iter_s (fun (crid, crow) ->
-      cascade_update_col_in_tx tx cat ~visited clock params child_meta
-        ~rowid:crid ~row:crow
-        ~col_idx:child_col_idx ~new_val:Row.V_null
-    ) child_rows
-  end
+    Lwt_list.iter_s
+      (fun (crid, crow) ->
+         cascade_update_col_in_tx
+           tx
+           cat
+           ~visited
+           clock
+           params
+           child_meta
+           ~rowid:crid
+           ~row:crow
+           ~col_idx:child_col_idx
+           ~new_val:Row.V_null)
+      child_rows)
 
 (* ON UPDATE SET DEFAULT for one fk's child column. *)
-and cascade_update_set_default tx cat visited clock params (child_meta : Cat.table_meta)
-    (fk : Cat.fk_constraint) ~child_col_idx ~child_col_name ~parent_vals_old =
-  let all_child_col_idxs = List.map
-    (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
+and cascade_update_set_default
+      tx
+      cat
+      visited
+      clock
+      params
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+      ~child_col_idx
+      ~child_col_name
+      ~parent_vals_old
+  =
+  let all_child_col_idxs =
+    List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.Cat.fk_local_cols
   in
   let* child_rows =
-    scan_child_rows_multi_tx cat tx child_meta
-      ~child_col_idxs:all_child_col_idxs ~parent_vals:parent_vals_old
+    scan_child_rows_multi_tx
+      cat
+      tx
+      child_meta
+      ~child_col_idxs:all_child_col_idxs
+      ~parent_vals:parent_vals_old
   in
-  if child_rows = [] then Lwt.return_unit
-  else begin
+  if child_rows = []
+  then Lwt.return_unit
+  else (
     let col = List.nth child_meta.Cat.columns child_col_idx in
     let default_val = fk_default_value clock params col in
-    if col.Row.not_null && default_val = Row.V_null then
-      Lwt.fail_with (Printf.sprintf
-        "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column '%s.%s' with no default"
-        child_meta.Cat.name child_col_name)
+    if col.Row.not_null && default_val = Row.V_null
+    then
+      Lwt.fail_with
+        (Printf.sprintf
+           "FOREIGN KEY constraint failed: ON UPDATE SET DEFAULT on NOT NULL column \
+            '%s.%s' with no default"
+           child_meta.Cat.name
+           child_col_name)
     else
-      Lwt_list.iter_s (fun (crid, crow) ->
-        cascade_update_col_in_tx tx cat ~visited clock params child_meta
-          ~rowid:crid ~row:crow
-          ~col_idx:child_col_idx ~new_val:default_val
-      ) child_rows
-  end
+      Lwt_list.iter_s
+        (fun (crid, crow) ->
+           cascade_update_col_in_tx
+             tx
+             cat
+             ~visited
+             clock
+             params
+             child_meta
+             ~rowid:crid
+             ~row:crow
+             ~col_idx:child_col_idx
+             ~new_val:default_val)
+        child_rows)
+;;
 
 (* Apply SET NULL to each [child_col_idxs] of every row in [child_rows],
    rejecting NOT NULL columns; routes through cascade_update_col_in_tx so the
    write propagates further ON UPDATE chains.  [op_label] is "ON UPDATE" /
    "ON DELETE" for the error message. *)
-let cascade_apply_set_null tx (cat : Cat.t) ~clock ~params ~visited ~op_label
-    (child_meta : Cat.table_meta) ~child_col_idxs child_rows : unit Lwt.t =
-  if child_rows = [] then Lwt.return_unit
+let cascade_apply_set_null
+      tx
+      (cat : Cat.t)
+      ~clock
+      ~params
+      ~visited
+      ~op_label
+      (child_meta : Cat.table_meta)
+      ~child_col_idxs
+      child_rows
+  : unit Lwt.t
+  =
+  if child_rows = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun child_col_idx ->
-      let col = List.nth child_meta.Cat.columns child_col_idx in
-      if col.Row.not_null then
-        Lwt.fail_with (Printf.sprintf
-          "FOREIGN KEY constraint failed: %s SET NULL on NOT NULL column '%s.%s'"
-          op_label child_meta.Cat.name col.Row.name)
-      else
-        Lwt_list.iter_s (fun (crid, crow) ->
-          cascade_update_col_in_tx tx cat ~visited clock params child_meta
-            ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:Row.V_null
-        ) child_rows
-    ) child_col_idxs
+    Lwt_list.iter_s
+      (fun child_col_idx ->
+         let col = List.nth child_meta.Cat.columns child_col_idx in
+         if col.Row.not_null
+         then
+           Lwt.fail_with
+             (Printf.sprintf
+                "FOREIGN KEY constraint failed: %s SET NULL on NOT NULL column '%s.%s'"
+                op_label
+                child_meta.Cat.name
+                col.Row.name)
+         else
+           Lwt_list.iter_s
+             (fun (crid, crow) ->
+                cascade_update_col_in_tx
+                  tx
+                  cat
+                  ~visited
+                  clock
+                  params
+                  child_meta
+                  ~rowid:crid
+                  ~row:crow
+                  ~col_idx:child_col_idx
+                  ~new_val:Row.V_null)
+             child_rows)
+      child_col_idxs
+;;
 
 (* Apply SET DEFAULT to each [child_col_idxs] of every row in [child_rows]. *)
-let cascade_apply_set_default tx (cat : Cat.t) ~clock ~params ~visited ~op_label
-    (child_meta : Cat.table_meta) ~child_col_idxs child_rows : unit Lwt.t =
-  if child_rows = [] then Lwt.return_unit
+let cascade_apply_set_default
+      tx
+      (cat : Cat.t)
+      ~clock
+      ~params
+      ~visited
+      ~op_label
+      (child_meta : Cat.table_meta)
+      ~child_col_idxs
+      child_rows
+  : unit Lwt.t
+  =
+  if child_rows = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun child_col_idx ->
-      let col = List.nth child_meta.Cat.columns child_col_idx in
-      let default_val = fk_default_value clock params col in
-      if col.Row.not_null && default_val = Row.V_null then
-        Lwt.fail_with (Printf.sprintf
-          "FOREIGN KEY constraint failed: %s SET DEFAULT on NOT NULL column '%s.%s' with no default"
-          op_label child_meta.Cat.name col.Row.name)
-      else
-        Lwt_list.iter_s (fun (crid, crow) ->
-          cascade_update_col_in_tx tx cat ~visited clock params child_meta
-            ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:default_val
-        ) child_rows
-    ) child_col_idxs
+    Lwt_list.iter_s
+      (fun child_col_idx ->
+         let col = List.nth child_meta.Cat.columns child_col_idx in
+         let default_val = fk_default_value clock params col in
+         if col.Row.not_null && default_val = Row.V_null
+         then
+           Lwt.fail_with
+             (Printf.sprintf
+                "FOREIGN KEY constraint failed: %s SET DEFAULT on NOT NULL column \
+                 '%s.%s' with no default"
+                op_label
+                child_meta.Cat.name
+                col.Row.name)
+         else
+           Lwt_list.iter_s
+             (fun (crid, crow) ->
+                cascade_update_col_in_tx
+                  tx
+                  cat
+                  ~visited
+                  clock
+                  params
+                  child_meta
+                  ~rowid:crid
+                  ~row:crow
+                  ~col_idx:child_col_idx
+                  ~new_val:default_val)
+             child_rows)
+      child_col_idxs
+;;
 
 (* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
    under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-let drain_matching_rows store (table_meta : Cat.table_meta) ~clock ~params
-    ~(where : Plan.expr option) : (int64 * Row.t) list Lwt.t =
-  S.with_ro store @@ fun tx_ro ->
-  let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-  let _sr    = S.cursor_first cur in
-  let buf    = ref [] in
+let drain_matching_rows
+      store
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(where : Plan.expr option)
+  : (int64 * Row.t) list Lwt.t
+  =
+  S.with_ro store
+  @@ fun tx_ro ->
+  let* cur = S.cursor_open tx_ro table_meta.tree_id in
+  let _sr = S.cursor_first cur in
+  let buf = ref [] in
   let rec drain () =
     match S.cursor_next cur with
     | None -> ()
     | Some (kbytes, vbytes) ->
       let rowid = Rowid.decode kbytes in
-      let row   = decode_with_virtual clock params table_meta vbytes in
-      let keep  = match where with
-        | None      -> true
+      let row = decode_with_virtual clock params table_meta vbytes in
+      let keep =
+        match where with
+        | None -> true
         | Some pred -> value_truthy (eval_expr clock params row pred)
       in
       if keep then buf := (rowid, row) :: !buf;
@@ -2884,220 +4110,426 @@ let drain_matching_rows store (table_meta : Cat.table_meta) ~clock ~params
   drain ();
   S.cursor_close cur;
   Lwt.return (List.rev !buf)
+;;
 
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)
 let apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches =
   let sorted =
-    if order = [] then matches
+    if order = []
+    then matches
     else
-      List.sort (fun (_, ra) (_, rb) ->
-        let rec cmp = function
-          | [] -> 0
-          | (e, dir, nulls) :: rest ->
-            let va = eval_expr clock params ra e in
-            let vb = eval_expr clock params rb e in
-            let c = compare_with_nulls dir nulls va vb in
-            if c <> 0 then c else cmp rest
-        in cmp order
-      ) matches
+      List.sort
+        (fun (_, ra) (_, rb) ->
+           let rec cmp = function
+             | [] -> 0
+             | (e, dir, nulls) :: rest ->
+               let va = eval_expr clock params ra e in
+               let vb = eval_expr clock params rb e in
+               let c = compare_with_nulls dir nulls va vb in
+               if c <> 0 then c else cmp rest
+           in
+           cmp order)
+        matches
   in
-  let after_offset = match offset with
+  let after_offset =
+    match offset with
     | None | Some 0 -> sorted
     | Some n -> list_drop n sorted
   in
   match limit with
   | None -> after_offset
   | Some n -> list_take n after_offset
+;;
 
 (* Build the post-UPDATE row: copy [old_row] and apply each (i, expr) in
    [assignments], evaluating expr against the OLD row. *)
 let apply_assignments ~clock ~params assignments (old_row : Row.t) : Row.t =
   let new_row = Array.copy old_row in
-  List.iter (fun (i, expr) -> new_row.(i) <- eval_expr clock params old_row expr) assignments;
+  List.iter
+    (fun (i, expr) -> new_row.(i) <- eval_expr clock params old_row expr)
+    assignments;
   new_row
+;;
 
 (* Pre-write RESTRICT/NO ACTION FK check for one UPDATE row's [fk]: if the
    parent key changes and is still referenced, raise (or queue deferred). *)
-let precheck_update_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~rowid_outer ~(old_row : Row.t) ~(new_row : Row.t)
-    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
+let precheck_update_fk
+      store
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~rowid_outer
+      ~(old_row : Row.t)
+      ~(new_row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  : unit Lwt.t
+  =
   match fk.fk_on_update with
   | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
   | Cat.FA_restrict | Cat.FA_no_action ->
     let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-    let parent_col_idxs = List.map
-      (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+    let parent_col_idxs =
+      List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+    in
     let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
     let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
-    let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
-    if unchanged then Lwt.return_unit
-    else if any_null_val old_vals then Lwt.return_unit
-    else begin
-      let child_col_idxs = List.map
-        (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
-      let* has_ref = fk_child_has_ref_multi cat store child_meta
-        ~child_col_idxs ~parent_vals:old_vals in
-      if has_ref then
-        let msg = Printf.sprintf
-          "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
-          table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-          child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+    let unchanged =
+      List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals
+    in
+    if unchanged
+    then Lwt.return_unit
+    else if any_null_val old_vals
+    then Lwt.return_unit
+    else (
+      let child_col_idxs =
+        List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+      in
+      let* has_ref =
+        fk_child_has_ref_multi cat store child_meta ~child_col_idxs ~parent_vals:old_vals
+      in
+      if has_ref
+      then (
+        let msg =
+          Printf.sprintf
+            "FOREIGN KEY constraint failed: update to '%s.%s' is referenced by '%s.%s'"
+            table_meta.Cat.name
+            (String.concat "," fk.fk_parent_cols)
+            child_meta.Cat.name
+            (String.concat "," fk.fk_local_cols)
         in
-        let recheck = make_fk_recheck cat
-          ~child_name:child_meta.Cat.name ~parent_name:table_meta.Cat.name
-          ~child_cols:fk.fk_local_cols ~parent_cols:fk.fk_parent_cols
-          ~parent_vals:old_vals in
-        fk_violation ~deferred:is_deferred cat ~kind:`Update
-          ~table:table_meta.Cat.name ~rowid:rowid_outer ~msg ~recheck
-      else Lwt.return_unit
-    end
+        let recheck =
+          make_fk_recheck
+            cat
+            ~child_name:child_meta.Cat.name
+            ~parent_name:table_meta.Cat.name
+            ~child_cols:fk.fk_local_cols
+            ~parent_cols:fk.fk_parent_cols
+            ~parent_vals:old_vals
+        in
+        fk_violation
+          ~deferred:is_deferred
+          cat
+          ~kind:`Update
+          ~table:table_meta.Cat.name
+          ~rowid:rowid_outer
+          ~msg
+          ~recheck)
+      else Lwt.return_unit)
+;;
 
 (* Pre-write FK RESTRICT check across all matched UPDATE rows. *)
-let precheck_update_fk_restrict store (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~assignments ~child_refs matches : unit Lwt.t =
-  if child_refs = [] then Lwt.return_unit
+let precheck_update_fk_restrict
+      store
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~assignments
+      ~child_refs
+      matches
+  : unit Lwt.t
+  =
+  if child_refs = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun (rowid_outer, old_row) ->
-      let new_row = apply_assignments ~clock ~params assignments old_row in
-      Lwt_list.iter_s (fun (child_meta, fks) ->
-        Lwt_list.iter_s (precheck_update_fk store cat table_meta
-                           ~rowid_outer ~old_row ~new_row child_meta) fks
-      ) child_refs
-    ) matches
+    Lwt_list.iter_s
+      (fun (rowid_outer, old_row) ->
+         let new_row = apply_assignments ~clock ~params assignments old_row in
+         Lwt_list.iter_s
+           (fun (child_meta, fks) ->
+              Lwt_list.iter_s
+                (precheck_update_fk
+                   store
+                   cat
+                   table_meta
+                   ~rowid_outer
+                   ~old_row
+                   ~new_row
+                   child_meta)
+                fks)
+           child_refs)
+      matches
+;;
 
 (* First UPDATE pass: validate UNIQUE for every target row against the full
    set of new values (an updated row may collide with another updated row). *)
 (* Check one unique index for an UPDATE that turns [old_row] into [new_row]
    (with virtuals computed in [new_row_for_idx]); fails the Lwt thread on a
    duplicate. *)
-let check_index_unique_on_update tx (idx : Cat.index_info)
-    ~clock ~params ~schema ~old_row ~new_row ~new_row_for_idx ~rowid : unit Lwt.t =
-  if not idx.idx_unique then Lwt.return_unit
+let check_index_unique_on_update
+      tx
+      (idx : Cat.index_info)
+      ~clock
+      ~params
+      ~schema
+      ~old_row
+      ~new_row
+      ~new_row_for_idx
+      ~rowid
+  : unit Lwt.t
+  =
+  if not idx.idx_unique
+  then Lwt.return_unit
   else if not (row_matches_index_where clock params idx schema new_row_for_idx)
   then Lwt.return_unit
-  else begin
+  else (
     let old_vs = get_index_key_values clock params idx schema old_row in
     let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
-    let values_equal a b = match a, b with
-      | Row.V_null, Row.V_null     -> true
-      | Row.V_int  x, Row.V_int  y -> Int64.equal x y
+    let values_equal a b =
+      match a, b with
+      | Row.V_null, Row.V_null -> true
+      | Row.V_int x, Row.V_int y -> Int64.equal x y
       | Row.V_text x, Row.V_text y -> String.equal x y
       | Row.V_real x, Row.V_real y -> Float.equal x y
       | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
-      | _                           -> false
+      | _ -> false
     in
     let unchanged = List.for_all2 values_equal old_vs new_vs in
-    if unchanged then Lwt.return_unit
+    if unchanged
+    then Lwt.return_unit
     else
       let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
-      if dup then
-        Lwt.fail_with (Printf.sprintf
-          "UNIQUE constraint violated: duplicate value in columns (%s)"
-          (String.concat ", " idx.idx_columns))
-      else Lwt.return_unit
-  end
+      if dup
+      then
+        Lwt.fail_with
+          (Printf.sprintf
+             "UNIQUE constraint violated: duplicate value in columns (%s)"
+             (String.concat ", " idx.idx_columns))
+      else Lwt.return_unit)
+;;
 
-let validate_update_unique tx (table_meta : Cat.table_meta)
-    ~clock ~params ~indexes ~assignments matches : unit Lwt.t =
+let validate_update_unique
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~indexes
+      ~assignments
+      matches
+  : unit Lwt.t
+  =
   let schema = table_meta.Cat.columns in
-  Lwt_list.iter_s (fun (rowid, old_row) ->
-    let new_row = apply_assignments ~clock ~params assignments old_row in
-    compute_stored_generated_cols clock params table_meta new_row;
-    eval_check_constraints clock params table_meta new_row;
-    let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-    Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-      check_index_unique_on_update tx idx
-        ~clock ~params ~schema ~old_row ~new_row ~new_row_for_idx ~rowid
-    ) indexes
-  ) matches
+  Lwt_list.iter_s
+    (fun (rowid, old_row) ->
+       let new_row = apply_assignments ~clock ~params assignments old_row in
+       compute_stored_generated_cols clock params table_meta new_row;
+       eval_check_constraints clock params table_meta new_row;
+       let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+       Lwt_list.iter_s
+         (fun (idx : Cat.index_info) ->
+            check_index_unique_on_update
+              tx
+              idx
+              ~clock
+              ~params
+              ~schema
+              ~old_row
+              ~new_row
+              ~new_row_for_idx
+              ~rowid)
+         indexes)
+    matches
+;;
 
 (* Delete [row]'s old index entries and insert the new ones for an UPDATE. *)
-let reindex_row tx (table_meta : Cat.table_meta) ~clock ~params
-    ~(old_row : Row.t) ~(new_row : Row.t) ~rowid indexes : unit Lwt.t =
+let reindex_row
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(old_row : Row.t)
+      ~(new_row : Row.t)
+      ~rowid
+      indexes
+  : unit Lwt.t
+  =
   let schema = table_meta.Cat.columns in
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
   let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    let old_matches = row_matches_index_where clock params idx schema old_row_for_idx in
-    let new_matches = row_matches_index_where clock params idx schema new_row_for_idx in
-    let old_iks = List.map row_value_to_index_value
-                    (get_index_key_values clock params idx schema old_row_for_idx) in
-    let new_iks = List.map row_value_to_index_value
-                    (get_index_key_values clock params idx schema new_row_for_idx) in
-    let old_ikey = Index_key.encode old_iks ~rowid in
-    let new_ikey = Index_key.encode new_iks ~rowid in
-    let* () = if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit in
-    if new_matches then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-    else Lwt.return_unit
-  ) indexes
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       let old_matches =
+         row_matches_index_where clock params idx schema old_row_for_idx
+       in
+       let new_matches =
+         row_matches_index_where clock params idx schema new_row_for_idx
+       in
+       let old_iks =
+         List.map
+           row_value_to_index_value
+           (get_index_key_values clock params idx schema old_row_for_idx)
+       in
+       let new_iks =
+         List.map
+           row_value_to_index_value
+           (get_index_key_values clock params idx schema new_row_for_idx)
+       in
+       let old_ikey = Index_key.encode old_iks ~rowid in
+       let new_ikey = Index_key.encode new_iks ~rowid in
+       let* () =
+         if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
+       in
+       if new_matches
+       then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+       else Lwt.return_unit)
+    indexes
+;;
 
 (* Apply the ON UPDATE cascade of one [fk] for a parent row changing
    [old_row] -> [new_row], within the RW txn (RESTRICT handled in precheck). *)
-let apply_update_cascade_fk tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~visited ~(old_row : Row.t) ~(new_row : Row.t)
-    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
-  let parent_col_idxs = List.map
-    (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+let apply_update_cascade_fk
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~visited
+      ~(old_row : Row.t)
+      ~(new_row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  : unit Lwt.t
+  =
+  let parent_col_idxs =
+    List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+  in
   let old_vals = List.map (fun i -> old_row.(i)) parent_col_idxs in
   let new_vals = List.map (fun i -> new_row.(i)) parent_col_idxs in
-  let unchanged = List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals in
-  if unchanged then Lwt.return_unit
-  else if any_null_val old_vals then Lwt.return_unit
-  else begin
-    let child_col_idxs = List.map
-      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+  let unchanged =
+    List.for_all2 (fun ov nv -> compare_values ov nv = 0) old_vals new_vals
+  in
+  if unchanged
+  then Lwt.return_unit
+  else if any_null_val old_vals
+  then Lwt.return_unit
+  else (
+    let child_col_idxs =
+      List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+    in
     match fk.fk_on_update with
     | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
     | Cat.FA_cascade ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals:old_vals in
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
+      in
       (* For cascade, use the first child col (single-col FK compat) *)
       let child_col_idx = List.hd child_col_idxs in
       let new_val_single = List.hd new_vals in
-      Lwt_list.iter_s (fun (crid, crow) ->
-        cascade_update_col_in_tx tx cat ~visited clock params child_meta
-          ~rowid:crid ~row:crow ~col_idx:child_col_idx ~new_val:new_val_single
-      ) child_rows
+      Lwt_list.iter_s
+        (fun (crid, crow) ->
+           cascade_update_col_in_tx
+             tx
+             cat
+             ~visited
+             clock
+             params
+             child_meta
+             ~rowid:crid
+             ~row:crow
+             ~col_idx:child_col_idx
+             ~new_val:new_val_single)
+        child_rows
     | Cat.FA_set_null ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals:old_vals in
-      cascade_apply_set_null tx cat ~clock ~params ~visited ~op_label:"ON UPDATE"
-        child_meta ~child_col_idxs child_rows
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
+      in
+      cascade_apply_set_null
+        tx
+        cat
+        ~clock
+        ~params
+        ~visited
+        ~op_label:"ON UPDATE"
+        child_meta
+        ~child_col_idxs
+        child_rows
     | Cat.FA_set_default ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals:old_vals in
-      cascade_apply_set_default tx cat ~clock ~params ~visited ~op_label:"ON UPDATE"
-        child_meta ~child_col_idxs child_rows
-  end
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals:old_vals
+      in
+      cascade_apply_set_default
+        tx
+        cat
+        ~clock
+        ~params
+        ~visited
+        ~op_label:"ON UPDATE"
+        child_meta
+        ~child_col_idxs
+        child_rows)
+;;
 
 (* Apply all ON UPDATE cascades for a parent row changing old_row -> new_row. *)
-let apply_update_cascades tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~visited ~child_refs ~(old_row : Row.t) ~(new_row : Row.t)
-    : unit Lwt.t =
-  if child_refs = [] then Lwt.return_unit
+let apply_update_cascades
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~visited
+      ~child_refs
+      ~(old_row : Row.t)
+      ~(new_row : Row.t)
+  : unit Lwt.t
+  =
+  if child_refs = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun (child_meta, fks) ->
-      Lwt_list.iter_s (apply_update_cascade_fk tx cat table_meta
-                         ~clock ~params ~visited ~old_row ~new_row child_meta) fks
-    ) child_refs
+    Lwt_list.iter_s
+      (fun (child_meta, fks) ->
+         Lwt_list.iter_s
+           (apply_update_cascade_fk
+              tx
+              cat
+              table_meta
+              ~clock
+              ~params
+              ~visited
+              ~old_row
+              ~new_row
+              child_meta)
+           fks)
+      child_refs
+;;
 
 (* Apply one matched UPDATE row: compute new row, run ON UPDATE cascades,
    reindex, and overwrite the row in the table tree. *)
-let apply_update_row tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~child_refs ~indexes ~assignments (rowid, old_row) : unit Lwt.t =
+let apply_update_row
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~child_refs
+      ~indexes
+      ~assignments
+      (rowid, old_row)
+  : unit Lwt.t
+  =
   let new_row = apply_assignments ~clock ~params assignments old_row in
   compute_stored_generated_cols clock params table_meta new_row;
   (* Phase 35 task 3a: per-row visited set seeded with parent rowid, so
      cyclic ON UPDATE cascades terminate. *)
   let visited = Hashtbl.create 16 in
   Hashtbl.add visited (table_meta.Cat.name, rowid) ();
-  let* () = apply_update_cascades tx cat table_meta ~clock ~params ~visited
-              ~child_refs ~old_row ~new_row in
+  let* () =
+    apply_update_cascades
+      tx
+      cat
+      table_meta
+      ~clock
+      ~params
+      ~visited
+      ~child_refs
+      ~old_row
+      ~new_row
+  in
   let key = Rowid.encode rowid in
   let* () = reindex_row tx table_meta ~clock ~params ~old_row ~new_row ~rowid indexes in
   let new_bytes = Row.encode table_meta.Cat.columns new_row in
   let* () = S.del tx table_meta.tree_id key in
   S.put tx table_meta.tree_id key new_bytes
+;;
 
 (* Fire an UPDATE row-hook (BEFORE/AFTER) for each matched row, recomputing
    the post-UPDATE row from the pre-write snapshot.  For non-deterministic
@@ -3107,256 +4539,435 @@ let run_update_hook ~clock ~params ~assignments ~tx hook matches : unit Lwt.t =
   match hook with
   | None -> Lwt.return_unit
   | Some f ->
-    Lwt_list.iter_s (fun (_rowid, old_row) ->
-      let new_row = apply_assignments ~clock ~params assignments old_row in
-      f ~tx ~old_row ~new_row
-    ) matches
+    Lwt_list.iter_s
+      (fun (_rowid, old_row) ->
+         let new_row = apply_assignments ~clock ~params assignments old_row in
+         f ~tx ~old_row ~new_row)
+      matches
+;;
 
 (** Run [Op_update]: drain matching rows into a list (snapshot read),
     then for each (rowid, old_row) compute the new row, update index
     entries, and overwrite the row in the table tree.  Returns the
     number of rows whose contents were modified. *)
-let execute_update ?(mode = Auto) ?(params = [||])
-    ?(clock : (unit -> float) option = None)
-    ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    (store : S.t)
-    (cat : Cat.t)
-    ~(table_meta : Cat.table_meta)
-    ~(assignments : (int * Plan.expr) list)
-    ~(where : Plan.expr option)
-    ~(order : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
-    ~(limit : int option)
-    ~(offset : int option)
-    ~(indexes : Cat.index_info list)
-  : int Lwt.t =
+let execute_update
+      ?(mode = Auto)
+      ?(params = [||])
+      ?(clock : (unit -> float) option = None)
+      ?(before_hook :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(after_hook :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      (store : S.t)
+      (cat : Cat.t)
+      ~(table_meta : Cat.table_meta)
+      ~(assignments : (int * Plan.expr) list)
+      ~(where : Plan.expr option)
+      ~(order : (Plan.expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list)
+      ~(limit : int option)
+      ~(offset : int option)
+      ~(indexes : Cat.index_info list)
+  : int Lwt.t
+  =
   let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
   let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
-  if n = 0 then Lwt.return 0
-  else begin
+  if n = 0
+  then Lwt.return 0
+  else
     let* child_refs =
-      if Cat.get_fk_enforcement cat then
-        build_child_refs cat ~parent_table_name:table_meta.Cat.name
+      if Cat.get_fk_enforcement cat
+      then build_child_refs cat ~parent_table_name:table_meta.Cat.name
       else Lwt.return []
     in
     (* FK pre-check: fail for RESTRICT/NO_ACTION when a referenced key changes.
        CASCADE/SET_NULL/SET_DEFAULT are applied inside the RW transaction below. *)
-    let* () = precheck_update_fk_restrict store cat table_meta
-                ~clock ~params ~assignments ~child_refs matches in
+    let* () =
+      precheck_update_fk_restrict
+        store
+        cat
+        table_meta
+        ~clock
+        ~params
+        ~assignments
+        ~child_refs
+        matches
+    in
     (* Phase 38: BEFORE/AFTER UPDATE fire inside the parent txn so nested DML
        shares it (atomic rollback on failure; no nested-trigger deadlock). *)
-    let* (tx, owned) = acquire_txn store mode in
+    let* tx, owned = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        let* () = run_update_hook ~clock ~params ~assignments ~tx before_hook matches in
-        let* () = validate_update_unique tx table_meta ~clock ~params
-                    ~indexes ~assignments matches in
-        let* () = Lwt_list.iter_s
-                    (apply_update_row tx cat table_meta ~clock ~params
-                       ~child_refs ~indexes ~assignments) matches in
-        let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
-        let* () = release_txn tx owned in
-        Lwt.return n)
+         let* () = run_update_hook ~clock ~params ~assignments ~tx before_hook matches in
+         let* () =
+           validate_update_unique
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~indexes
+             ~assignments
+             matches
+         in
+         let* () =
+           Lwt_list.iter_s
+             (apply_update_row
+                tx
+                cat
+                table_meta
+                ~clock
+                ~params
+                ~child_refs
+                ~indexes
+                ~assignments)
+             matches
+         in
+         let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
+         let* () = release_txn tx owned in
+         Lwt.return n)
       (fun exn ->
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.fail exn)
-  end
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
+;;
 
 (* Pre-write RESTRICT/NO ACTION FK check for one DELETE row's [fk]: if a
    child still references the row being deleted, raise (or queue deferred). *)
-let precheck_delete_fk store (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~rowid_outer ~(row : Row.t) (child_meta : Cat.table_meta)
-    (fk : Cat.fk_constraint) : unit Lwt.t =
+let precheck_delete_fk
+      store
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~rowid_outer
+      ~(row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  : unit Lwt.t
+  =
   match fk.fk_on_delete with
   | Cat.FA_cascade | Cat.FA_set_null | Cat.FA_set_default -> Lwt.return_unit
   | Cat.FA_restrict | Cat.FA_no_action ->
     let is_deferred = fk.fk_deferrable || Cat.get_defer_fks_pragma cat in
-    let parent_col_idxs = List.map
-      (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+    let parent_col_idxs =
+      List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+    in
     let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
-    if any_null_val parent_vals then Lwt.return_unit
-    else begin
-      let child_col_idxs = List.map
-        (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
-      let* has_ref = fk_child_has_ref_multi cat store child_meta
-        ~child_col_idxs ~parent_vals in
-      if has_ref then
-        let msg = Printf.sprintf
-          "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
-          table_meta.Cat.name (String.concat "," fk.fk_parent_cols)
-          child_meta.Cat.name (String.concat "," fk.fk_local_cols)
+    if any_null_val parent_vals
+    then Lwt.return_unit
+    else (
+      let child_col_idxs =
+        List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+      in
+      let* has_ref =
+        fk_child_has_ref_multi cat store child_meta ~child_col_idxs ~parent_vals
+      in
+      if has_ref
+      then (
+        let msg =
+          Printf.sprintf
+            "FOREIGN KEY constraint failed: '%s.%s' is still referenced by '%s.%s'"
+            table_meta.Cat.name
+            (String.concat "," fk.fk_parent_cols)
+            child_meta.Cat.name
+            (String.concat "," fk.fk_local_cols)
         in
-        let recheck = make_fk_recheck cat
-          ~child_name:child_meta.Cat.name ~parent_name:table_meta.Cat.name
-          ~child_cols:fk.fk_local_cols ~parent_cols:fk.fk_parent_cols
-          ~parent_vals in
-        fk_violation ~deferred:is_deferred cat ~kind:`Delete
-          ~table:table_meta.Cat.name ~rowid:rowid_outer ~msg ~recheck
-      else Lwt.return_unit
-    end
+        let recheck =
+          make_fk_recheck
+            cat
+            ~child_name:child_meta.Cat.name
+            ~parent_name:table_meta.Cat.name
+            ~child_cols:fk.fk_local_cols
+            ~parent_cols:fk.fk_parent_cols
+            ~parent_vals
+        in
+        fk_violation
+          ~deferred:is_deferred
+          cat
+          ~kind:`Delete
+          ~table:table_meta.Cat.name
+          ~rowid:rowid_outer
+          ~msg
+          ~recheck)
+      else Lwt.return_unit)
+;;
 
 (* Pre-write FK RESTRICT check across all matched DELETE rows. *)
-let precheck_delete_fk_restrict store (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~child_refs matches : unit Lwt.t =
-  if child_refs = [] then Lwt.return_unit
+let precheck_delete_fk_restrict
+      store
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~child_refs
+      matches
+  : unit Lwt.t
+  =
+  if child_refs = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun (rowid_outer, row) ->
-      Lwt_list.iter_s (fun (child_meta, fks) ->
-        Lwt_list.iter_s (precheck_delete_fk store cat table_meta
-                           ~rowid_outer ~row child_meta) fks
-      ) child_refs
-    ) matches
+    Lwt_list.iter_s
+      (fun (rowid_outer, row) ->
+         Lwt_list.iter_s
+           (fun (child_meta, fks) ->
+              Lwt_list.iter_s
+                (precheck_delete_fk store cat table_meta ~rowid_outer ~row child_meta)
+                fks)
+           child_refs)
+      matches
+;;
 
 (* Apply the ON DELETE cascade of one [fk] for parent [row] being deleted,
    within the RW txn (RESTRICT handled in precheck). *)
-let apply_delete_cascade_fk tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~visited ~(row : Row.t)
-    (child_meta : Cat.table_meta) (fk : Cat.fk_constraint) : unit Lwt.t =
-  let parent_col_idxs = List.map
-    (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols in
+let apply_delete_cascade_fk
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~visited
+      ~(row : Row.t)
+      (child_meta : Cat.table_meta)
+      (fk : Cat.fk_constraint)
+  : unit Lwt.t
+  =
+  let parent_col_idxs =
+    List.map (fun c -> find_col_idx_by_name table_meta.Cat.columns c) fk.fk_parent_cols
+  in
   let parent_vals = List.map (fun i -> row.(i)) parent_col_idxs in
-  if any_null_val parent_vals then Lwt.return_unit
-  else begin
-    let child_col_idxs = List.map
-      (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols in
+  if any_null_val parent_vals
+  then Lwt.return_unit
+  else (
+    let child_col_idxs =
+      List.map (fun c -> find_col_idx_by_name child_meta.Cat.columns c) fk.fk_local_cols
+    in
     match fk.fk_on_delete with
     | Cat.FA_restrict | Cat.FA_no_action -> Lwt.return_unit
     | Cat.FA_cascade ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals in
-      Lwt_list.iter_s (fun (crid, crow) ->
-        cascade_delete_row_in_tx tx cat ~visited clock params child_meta ~rowid:crid ~row:crow
-      ) child_rows
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+      in
+      Lwt_list.iter_s
+        (fun (crid, crow) ->
+           cascade_delete_row_in_tx
+             tx
+             cat
+             ~visited
+             clock
+             params
+             child_meta
+             ~rowid:crid
+             ~row:crow)
+        child_rows
     | Cat.FA_set_null ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals in
-      cascade_apply_set_null tx cat ~clock ~params ~visited ~op_label:"ON DELETE"
-        child_meta ~child_col_idxs child_rows
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+      in
+      cascade_apply_set_null
+        tx
+        cat
+        ~clock
+        ~params
+        ~visited
+        ~op_label:"ON DELETE"
+        child_meta
+        ~child_col_idxs
+        child_rows
     | Cat.FA_set_default ->
-      let* child_rows = scan_child_rows_multi_tx cat tx child_meta
-        ~child_col_idxs ~parent_vals in
-      cascade_apply_set_default tx cat ~clock ~params ~visited ~op_label:"ON DELETE"
-        child_meta ~child_col_idxs child_rows
-  end
+      let* child_rows =
+        scan_child_rows_multi_tx cat tx child_meta ~child_col_idxs ~parent_vals
+      in
+      cascade_apply_set_default
+        tx
+        cat
+        ~clock
+        ~params
+        ~visited
+        ~op_label:"ON DELETE"
+        child_meta
+        ~child_col_idxs
+        child_rows)
+;;
 
 (* Apply all ON DELETE cascades for parent [row] being deleted. *)
-let apply_delete_cascades tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~visited ~child_refs ~(row : Row.t) : unit Lwt.t =
-  if child_refs = [] then Lwt.return_unit
+let apply_delete_cascades
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~visited
+      ~child_refs
+      ~(row : Row.t)
+  : unit Lwt.t
+  =
+  if child_refs = []
+  then Lwt.return_unit
   else
-    Lwt_list.iter_s (fun (child_meta, fks) ->
-      Lwt_list.iter_s (apply_delete_cascade_fk tx cat table_meta
-                         ~clock ~params ~visited ~row child_meta) fks
-    ) child_refs
+    Lwt_list.iter_s
+      (fun (child_meta, fks) ->
+         Lwt_list.iter_s
+           (apply_delete_cascade_fk
+              tx
+              cat
+              table_meta
+              ~clock
+              ~params
+              ~visited
+              ~row
+              child_meta)
+           fks)
+      child_refs
+;;
 
 (* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
-let delete_row_indexes tx (table_meta : Cat.table_meta) ~clock ~params
-    ~(row : Row.t) ~rowid indexes : unit Lwt.t =
+let delete_row_indexes
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row : Row.t)
+      ~rowid
+      indexes
+  : unit Lwt.t
+  =
   let schema = table_meta.Cat.columns in
   let row_for_idx = with_computed_virtuals clock params table_meta row in
-  Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-    if not (row_matches_index_where clock params idx schema row_for_idx)
-    then Lwt.return_unit
-    else begin
-      let iks      = List.map row_value_to_index_value
-                       (get_index_key_values clock params idx schema row_for_idx) in
-      let old_ikey = Index_key.encode iks ~rowid in
-      S.del tx idx.idx_tree_id old_ikey
-    end
-  ) indexes
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       if not (row_matches_index_where clock params idx schema row_for_idx)
+       then Lwt.return_unit
+       else (
+         let iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx schema row_for_idx)
+         in
+         let old_ikey = Index_key.encode iks ~rowid in
+         S.del tx idx.idx_tree_id old_ikey))
+    indexes
+;;
 
 (* Delete one matched row: run ON DELETE cascades, remove index entries, then
    remove the row.  Visited set seeded with this row so cyclic cascades stop. *)
-let apply_delete_row tx (cat : Cat.t) (table_meta : Cat.table_meta)
-    ~clock ~params ~child_refs ~indexes (rowid, row) : unit Lwt.t =
+let apply_delete_row
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~child_refs
+      ~indexes
+      (rowid, row)
+  : unit Lwt.t
+  =
   let visited = Hashtbl.create 16 in
   Hashtbl.add visited (table_meta.Cat.name, rowid) ();
-  let* () = apply_delete_cascades tx cat table_meta ~clock ~params ~visited ~child_refs ~row in
+  let* () =
+    apply_delete_cascades tx cat table_meta ~clock ~params ~visited ~child_refs ~row
+  in
   let rowid_key = Rowid.encode rowid in
   let* () = delete_row_indexes tx table_meta ~clock ~params ~row ~rowid indexes in
   S.del tx table_meta.tree_id rowid_key
+;;
 
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
     then for each matching (rowid, row) remove index entries and the
     row itself from the table tree.  Returns the number of rows deleted. *)
-let execute_delete ?(mode = Auto) ?(params = [||])
-    ?(clock : (unit -> float) option = None)
-    ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(after_hook  : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    (store : S.t)
-    (cat : Cat.t)
-    ~(table_meta : Cat.table_meta)
-    ~(where : Plan.expr option)
-    ~(order : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
-    ~(limit : int option)
-    ~(offset : int option)
-    ~(indexes : Cat.index_info list)
-  : int Lwt.t =
+let execute_delete
+      ?(mode = Auto)
+      ?(params = [||])
+      ?(clock : (unit -> float) option = None)
+      ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      ?(after_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      (store : S.t)
+      (cat : Cat.t)
+      ~(table_meta : Cat.table_meta)
+      ~(where : Plan.expr option)
+      ~(order : (Plan.expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list)
+      ~(limit : int option)
+      ~(offset : int option)
+      ~(indexes : Cat.index_info list)
+  : int Lwt.t
+  =
   let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
   let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
-  if n = 0 then Lwt.return 0
-  else begin
+  if n = 0
+  then Lwt.return 0
+  else
     (* FK pre-check: fail for RESTRICT/NO_ACTION; CASCADE/SET_NULL/SET_DEFAULT
        are applied inside the RW transaction below. *)
     let* child_refs =
-      if Cat.get_fk_enforcement cat then
-        build_child_refs cat ~parent_table_name:table_meta.Cat.name
+      if Cat.get_fk_enforcement cat
+      then build_child_refs cat ~parent_table_name:table_meta.Cat.name
       else Lwt.return []
     in
     let* () = precheck_delete_fk_restrict store cat table_meta ~child_refs matches in
     (* Phase 38: BEFORE/AFTER DELETE fire inside the parent txn so nested DML
        shares it and trigger failures roll back the DELETE. *)
-    let* (tx, owned) = acquire_txn store mode in
+    let* tx, owned = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        let* () = match before_hook with
-          | None -> Lwt.return_unit
-          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
-        in
-        let* () = Lwt_list.iter_s
-                    (apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes)
-                    matches in
-        let* () = match after_hook with
-          | None -> Lwt.return_unit
-          | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
-        in
-        let* () = release_txn tx owned in
-        Lwt.return n)
+         let* () =
+           match before_hook with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
+         in
+         let* () =
+           Lwt_list.iter_s
+             (apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes)
+             matches
+         in
+         let* () =
+           match after_hook with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
+         in
+         let* () = release_txn tx owned in
+         Lwt.return n)
       (fun exn ->
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.fail exn)
-  end
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
+;;
 
 (** Run [Op_drop_table]: remove catalog entries for the table and all
     its indexes.  The B+-tree pages are NOT reclaimed in Phase 2. *)
-let execute_drop_table ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~(table_meta : Cat.table_meta)
-    ~(_indexes : Cat.index_info list) : unit Lwt.t =
-  let* (tx, owned) = acquire_txn store mode in
+let execute_drop_table
+      ?(mode = Auto)
+      (store : S.t)
+      (cat : Cat.t)
+      ~(table_meta : Cat.table_meta)
+      ~(_indexes : Cat.index_info list)
+  : unit Lwt.t
+  =
+  let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      let* () = Cat.drop_table cat tx ~name:table_meta.Cat.name in
-      release_txn tx owned)
+       let* () = Cat.drop_table cat tx ~name:table_meta.Cat.name in
+       release_txn tx owned)
     (fun exn ->
-      (* On any exception: rollback if we own the txn, then re-raise. *)
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
-      Lwt.fail exn)
+       (* On any exception: rollback if we own the txn, then re-raise. *)
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
+;;
 
 (** Run [Op_drop_index]: remove catalog entry for the index.
     The B+-tree pages are NOT reclaimed in Phase 2. *)
-let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
-    ~(idx_info : Cat.index_info) : unit Lwt.t =
-  let* (tx, owned) = acquire_txn store mode in
+let execute_drop_index
+      ?(mode = Auto)
+      (store : S.t)
+      (cat : Cat.t)
+      ~(idx_info : Cat.index_info)
+  : unit Lwt.t
+  =
+  let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      let* () = Cat.drop_index cat tx ~name:idx_info.Cat.idx_name in
-      release_txn tx owned)
+       let* () = Cat.drop_index cat tx ~name:idx_info.Cat.idx_name in
+       release_txn tx owned)
     (fun exn ->
-      (* On any exception: rollback if we own the txn, then re-raise. *)
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
-      Lwt.fail exn)
+       (* On any exception: rollback if we own the txn, then re-raise. *)
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* EXPLAIN plan-tree pretty-printer                                     *)
@@ -3364,268 +4975,488 @@ let execute_drop_index ?(mode = Auto) (store : S.t) (cat : Cat.t)
 
 let op_name = function
   | Plan.Op_seq_scan { table_meta } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_filter _                -> "Filter"
-  | Plan.Op_project _               -> "Project"
-  | Plan.Op_expr_project _          -> "ExprProject"
-  | Plan.Op_sort _                  -> "Sort"
+  | Plan.Op_filter _ -> "Filter"
+  | Plan.Op_project _ -> "Project"
+  | Plan.Op_expr_project _ -> "ExprProject"
+  | Plan.Op_sort _ -> "Sort"
   | Plan.Op_limit { limit; offset; _ } ->
     Printf.sprintf "Limit(%d offset %d)" limit offset
-  | Plan.Op_aggregate _             -> "Aggregate"
+  | Plan.Op_aggregate _ -> "Aggregate"
   | Plan.Op_hash_join { join_kind; _ } ->
-    (match join_kind with `Inner -> "HashJoin" | `Left -> "LeftHashJoin")
+    (match join_kind with
+     | `Inner -> "HashJoin"
+     | `Left -> "LeftHashJoin")
   | Plan.Op_nested_loop_join { join_kind; right_meta; _ } ->
     (match join_kind with
      | `Inner -> "NestedLoopJoin(" ^ right_meta.Cat.name ^ ")"
-     | `Left  -> "LeftNestedLoopJoin(" ^ right_meta.Cat.name ^ ")")
-  | Plan.Op_index_lookup { table_meta; _ } ->
-    "IndexLookup(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_union { all; _ }        -> if all then "UnionAll" else "Union"
-  | Plan.Op_intersect _             -> "Intersect"
-  | Plan.Op_except _                -> "Except"
-  | Plan.Op_distinct _              -> "Distinct"
-  | Plan.Op_const_select _          -> "ConstSelect"
-  | Plan.Op_window _                -> "Window"
+     | `Left -> "LeftNestedLoopJoin(" ^ right_meta.Cat.name ^ ")")
+  | Plan.Op_index_lookup { table_meta; _ } -> "IndexLookup(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_union { all; _ } -> if all then "UnionAll" else "Union"
+  | Plan.Op_intersect _ -> "Intersect"
+  | Plan.Op_except _ -> "Except"
+  | Plan.Op_distinct _ -> "Distinct"
+  | Plan.Op_const_select _ -> "ConstSelect"
+  | Plan.Op_window _ -> "Window"
   | Plan.Op_with_cte { cte_name; _ } -> "WithCte(" ^ cte_name ^ ")"
   | Plan.Op_cte_scan { cte_name; _ } -> "CteScan(" ^ cte_name ^ ")"
   | Plan.Op_insert { table_meta; _ } -> "Insert(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_insert_select { table_meta; _ } ->
-    "InsertSelect(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_insert_select { table_meta; _ } -> "InsertSelect(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_update { table_meta; _ } -> "Update(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_delete { table_meta; _ } -> "Delete(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_create_table { name; _ } -> "CreateTable(" ^ name ^ ")"
   | Plan.Op_create_index { name; table; _ } ->
     "CreateIndex(" ^ name ^ " on " ^ table ^ ")"
-  | Plan.Op_drop_table { table_meta; _ } ->
-    "DropTable(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_drop_index { idx_info } ->
-    "DropIndex(" ^ idx_info.Cat.idx_name ^ ")"
-  | Plan.Op_alter_table { table_meta; _ } ->
-    "AlterTable(" ^ table_meta.Cat.name ^ ")"
-  | Plan.Op_begin               -> "Begin"
-  | Plan.Op_commit              -> "Commit"
-  | Plan.Op_rollback            -> "Rollback"
-  | Plan.Op_savepoint name      -> "Savepoint(" ^ name ^ ")"
-  | Plan.Op_release name        -> "Release(" ^ name ^ ")"
-  | Plan.Op_rollback_to name    -> "RollbackTo(" ^ name ^ ")"
-  | Plan.Op_create_view { name; _ }    -> "CreateView(" ^ name ^ ")"
-  | Plan.Op_drop_view { name }         -> "DropView(" ^ name ^ ")"
+  | Plan.Op_drop_table { table_meta; _ } -> "DropTable(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_drop_index { idx_info } -> "DropIndex(" ^ idx_info.Cat.idx_name ^ ")"
+  | Plan.Op_alter_table { table_meta; _ } -> "AlterTable(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_begin -> "Begin"
+  | Plan.Op_commit -> "Commit"
+  | Plan.Op_rollback -> "Rollback"
+  | Plan.Op_savepoint name -> "Savepoint(" ^ name ^ ")"
+  | Plan.Op_release name -> "Release(" ^ name ^ ")"
+  | Plan.Op_rollback_to name -> "RollbackTo(" ^ name ^ ")"
+  | Plan.Op_create_view { name; _ } -> "CreateView(" ^ name ^ ")"
+  | Plan.Op_drop_view { name } -> "DropView(" ^ name ^ ")"
   | Plan.Op_create_trigger { name; _ } -> "CreateTrigger(" ^ name ^ ")"
-  | Plan.Op_drop_trigger { name }      -> "DropTrigger(" ^ name ^ ")"
-  | Plan.Op_pragma_rows _              -> "Pragma"
-  | Plan.Op_pragma_get_user_version    -> "Pragma(get_user_version)"
+  | Plan.Op_drop_trigger { name } -> "DropTrigger(" ^ name ^ ")"
+  | Plan.Op_pragma_rows _ -> "Pragma"
+  | Plan.Op_pragma_get_user_version -> "Pragma(get_user_version)"
   | Plan.Op_pragma_set_user_version { version } ->
     Printf.sprintf "Pragma(set_user_version=%Ld)" version
-  | Plan.Op_pragma_integrity_check     -> "Pragma(integrity_check)"
-  | Plan.Op_pragma_get_fk              -> "Pragma(get_foreign_keys)"
-  | Plan.Op_pragma_set_fk { on }       -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
-  | Plan.Op_pragma_get_recursive_triggers ->
-    "Pragma(get_recursive_triggers)"
+  | Plan.Op_pragma_integrity_check -> "Pragma(integrity_check)"
+  | Plan.Op_pragma_get_fk -> "Pragma(get_foreign_keys)"
+  | Plan.Op_pragma_set_fk { on } -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
+  | Plan.Op_pragma_get_recursive_triggers -> "Pragma(get_recursive_triggers)"
   | Plan.Op_pragma_set_recursive_triggers { on } ->
     Printf.sprintf "Pragma(set_recursive_triggers=%b)" on
-  | Plan.Op_pragma_get_defer_fk        -> "Pragma(get_defer_foreign_keys)"
+  | Plan.Op_pragma_get_defer_fk -> "Pragma(get_defer_foreign_keys)"
   | Plan.Op_pragma_set_defer_fk { on } ->
     Printf.sprintf "Pragma(set_defer_foreign_keys=%b)" on
-  | Plan.Op_pragma_wal_checkpoint      -> "Pragma(wal_checkpoint)"
+  | Plan.Op_pragma_wal_checkpoint -> "Pragma(wal_checkpoint)"
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
-  | Plan.Op_vacuum                     -> "Vacuum"
-  | Plan.Op_attach { schema; _ }       -> Printf.sprintf "Attach(%s)" schema
-  | Plan.Op_detach { schema }          -> Printf.sprintf "Detach(%s)" schema
-  | Plan.Op_database_list              -> "Pragma(database_list)"
-  | Plan.Op_active_database_get        -> "Pragma(active_database)"
+  | Plan.Op_vacuum -> "Vacuum"
+  | Plan.Op_attach { schema; _ } -> Printf.sprintf "Attach(%s)" schema
+  | Plan.Op_detach { schema } -> Printf.sprintf "Detach(%s)" schema
+  | Plan.Op_database_list -> "Pragma(database_list)"
+  | Plan.Op_active_database_get -> "Pragma(active_database)"
   | Plan.Op_active_database_set { schema } ->
     Printf.sprintf "Pragma(active_database=%s)" schema
-  | Plan.Op_no_op                      -> "NoOp"
-  | Plan.Op_changes                    -> "Changes"
-  | Plan.Op_last_insert_rowid          -> "LastInsertRowid"
-  | Plan.Op_total_changes              -> "TotalChanges"
-  | Plan.Op_explain { analyze; _ }     ->
-    if analyze then "ExplainAnalyze" else "Explain"
+  | Plan.Op_no_op -> "NoOp"
+  | Plan.Op_changes -> "Changes"
+  | Plan.Op_last_insert_rowid -> "LastInsertRowid"
+  | Plan.Op_total_changes -> "TotalChanges"
+  | Plan.Op_explain { analyze; _ } -> if analyze then "ExplainAnalyze" else "Explain"
   | Plan.Op_create_fts_table { name; _ } -> "CreateFtsTable(" ^ name ^ ")"
-  | Plan.Op_fts_insert { fts_meta; _ }   -> "FtsInsert(" ^ fts_meta.Cat.fts_name ^ ")"
-  | Plan.Op_fts_delete { fts_meta; _ }   -> "FtsDelete(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_insert { fts_meta; _ } -> "FtsInsert(" ^ fts_meta.Cat.fts_name ^ ")"
+  | Plan.Op_fts_delete { fts_meta; _ } -> "FtsDelete(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_fts_seq_scan { fts_meta; _ } -> "FtsSeqScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_fts_match_scan { fts_meta; _ } ->
     "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_sqlite_master -> "SqliteMaster"
+;;
 
 let op_children = function
-  | Plan.Op_filter { child; _ }      -> [child]
-  | Plan.Op_project { child; _ }     -> [child]
-  | Plan.Op_expr_project { child; _ }-> [child]
-  | Plan.Op_sort { child; _ }        -> [child]
-  | Plan.Op_limit { child; _ }       -> [child]
-  | Plan.Op_distinct { child }       -> [child]
-  | Plan.Op_aggregate { child; _ }   -> [child]
-  | Plan.Op_window { child; _ }      -> [child]
-  | Plan.Op_hash_join { left; right; _ } -> [left; right]
-  | Plan.Op_nested_loop_join { left; _ } -> [left]
-  | Plan.Op_union { left; right; _ } -> [left; right]
-  | Plan.Op_intersect { left; right } -> [left; right]
-  | Plan.Op_except { left; right }   -> [left; right]
-  | Plan.Op_with_cte { def; query; _ } -> [def; query]
-  | Plan.Op_explain { inner; _ }     -> [inner]
-  | Plan.Op_insert_select { source; _ } -> [source]
-  | _                                -> []
+  | Plan.Op_filter { child; _ } -> [ child ]
+  | Plan.Op_project { child; _ } -> [ child ]
+  | Plan.Op_expr_project { child; _ } -> [ child ]
+  | Plan.Op_sort { child; _ } -> [ child ]
+  | Plan.Op_limit { child; _ } -> [ child ]
+  | Plan.Op_distinct { child } -> [ child ]
+  | Plan.Op_aggregate { child; _ } -> [ child ]
+  | Plan.Op_window { child; _ } -> [ child ]
+  | Plan.Op_hash_join { left; right; _ } -> [ left; right ]
+  | Plan.Op_nested_loop_join { left; _ } -> [ left ]
+  | Plan.Op_union { left; right; _ } -> [ left; right ]
+  | Plan.Op_intersect { left; right } -> [ left; right ]
+  | Plan.Op_except { left; right } -> [ left; right ]
+  | Plan.Op_with_cte { def; query; _ } -> [ def; query ]
+  | Plan.Op_explain { inner; _ } -> [ inner ]
+  | Plan.Op_insert_select { source; _ } -> [ source ]
+  | _ -> []
+;;
 
 let explain_plan op =
   let counter = ref 0 in
   let rec walk parent op =
     let id = !counter in
     incr counter;
-    let my_row = [| Row.V_int (Int64.of_int id);
-                    Row.V_int (Int64.of_int parent);
-                    Row.V_text (op_name op) |] in
+    let my_row =
+      [| Row.V_int (Int64.of_int id)
+       ; Row.V_int (Int64.of_int parent)
+       ; Row.V_text (op_name op)
+      |]
+    in
     my_row :: List.concat_map (walk id) (op_children op)
   in
   walk (-1) op
+;;
 
 (** Forward reference to [to_stream], which is defined in the mutually-recursive
     block starting at [pre_eval_subquery].  [execute_with_count] needs this to
     implement [Op_insert_select] (read source, then write rows). *)
-let to_stream_ref : ((unit -> float) option -> Row.value array -> S.t -> ?mode:txn_mode -> ?cat:Cat.t option -> Plan.op -> Row.t Lwt_stream.t Lwt.t) ref =
+let to_stream_ref
+  : ((unit -> float) option
+     -> Row.value array
+     -> S.t
+     -> ?mode:txn_mode
+     -> ?cat:Cat.t option
+     -> Plan.op
+     -> Row.t Lwt_stream.t Lwt.t)
+      ref
+  =
   ref (fun _clock _params _store ?mode:_ ?cat:_ _op ->
     failwith "to_stream_ref not yet initialised")
+;;
 
+(* Op_create_table: register the table, its UNIQUE indexes, and FK constraints. *)
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
-(* Op_create_table: register the table, its UNIQUE indexes, and FK constraints. *)
-let execute_create_table_op (cat : Cat.t) ~name ~columns ~uniq_idxs ~if_not_exists
-    ~fk_constraints ~without_rowid : int Lwt.t =
-  if if_not_exists && Cat.table_exists cat ~name then
-    Lwt.return 0
-  else begin
+let execute_create_table_op
+      (cat : Cat.t)
+      ~name
+      ~columns
+      ~uniq_idxs
+      ~if_not_exists
+      ~fk_constraints
+      ~without_rowid
+  : int Lwt.t
+  =
+  if if_not_exists && Cat.table_exists cat ~name
+  then Lwt.return 0
+  else
     let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
-    let* () = Lwt_list.iter_s (fun (idx_name, col_names) ->
-      let* result = Cat.create_index cat ~name:idx_name ~table:name
-          ~columns:col_names ~unique:true
-          ~expr_flags:(List.map (fun _ -> false) col_names)
-          ~where_sql:None in
-      match result with
-      | Error msg -> Lwt.fail_with msg
-      | Ok _      -> Lwt.return_unit
-    ) uniq_idxs in
     let* () =
-      if fk_constraints = [] then Lwt.return_unit
-      else begin
-        let fk_list = List.map (fun (lcs, pt, pcs, od, ou, def) ->
-          Cat.{ fk_local_cols = lcs; fk_parent_table = pt; fk_parent_cols = pcs;
-                fk_on_delete = od; fk_on_update = ou; fk_deferrable = def }
-        ) fk_constraints in
+      Lwt_list.iter_s
+        (fun (idx_name, col_names) ->
+           let* result =
+             Cat.create_index
+               cat
+               ~name:idx_name
+               ~table:name
+               ~columns:col_names
+               ~unique:true
+               ~expr_flags:(List.map (fun _ -> false) col_names)
+               ~where_sql:None
+           in
+           match result with
+           | Error msg -> Lwt.fail_with msg
+           | Ok _ -> Lwt.return_unit)
+        uniq_idxs
+    in
+    let* () =
+      if fk_constraints = []
+      then Lwt.return_unit
+      else (
+        let fk_list =
+          List.map
+            (fun (lcs, pt, pcs, od, ou, def) ->
+               Cat.
+                 { fk_local_cols = lcs
+                 ; fk_parent_table = pt
+                 ; fk_parent_cols = pcs
+                 ; fk_on_delete = od
+                 ; fk_on_update = ou
+                 ; fk_deferrable = def
+                 })
+            fk_constraints
+        in
         let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
         Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
-        Lwt.return_unit
-      end
+        Lwt.return_unit)
     in
     Lwt.return 0
-  end
+;;
 
 (* Op_insert: insert each VALUES row, counting successful inserts. *)
-let execute_insert_values store (cat : Cat.t) ~mode ~params ~clock ~before_hook
-    ~after_hook ~on_replace_delete_before ~on_replace_delete
-    ~on_upsert_update_before ~on_upsert_update
-    ~table_meta ~ordinals ~values ~on_conflict ~upsert_update : int Lwt.t =
-  let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
-  let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
-  Lwt_list.fold_left_s (fun count row_vals ->
-    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict ~upsert_update
-                      ~before_hook:bh ~after_hook:ah
-                      ~on_replace_delete_before ~on_replace_delete
-                      ~on_upsert_update_before ~on_upsert_update
-                      store cat ~table_meta ~ordinals ~values:row_vals in
-    Lwt.return (count + if inserted then 1 else 0)
-  ) 0 values
+let execute_insert_values
+      store
+      (cat : Cat.t)
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~table_meta
+      ~ordinals
+      ~values
+      ~on_conflict
+      ~upsert_update
+  : int Lwt.t
+  =
+  let bh =
+    Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      before_hook
+  in
+  let ah =
+    Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      after_hook
+  in
+  Lwt_list.fold_left_s
+    (fun count row_vals ->
+       let* inserted =
+         execute_insert
+           ~mode
+           ~params
+           ~clock
+           ~on_conflict
+           ~upsert_update
+           ~before_hook:bh
+           ~after_hook:ah
+           ~on_replace_delete_before
+           ~on_replace_delete
+           ~on_upsert_update_before
+           ~on_upsert_update
+           store
+           cat
+           ~table_meta
+           ~ordinals
+           ~values:row_vals
+       in
+       Lwt.return (count + if inserted then 1 else 0))
+    0
+    values
+;;
 
 (* Op_insert_select: insert one row per source-stream row. *)
-let execute_insert_select_op store (cat : Cat.t) ~mode ~params ~clock ~before_hook
-    ~after_hook ~on_replace_delete_before ~on_replace_delete
-    ~on_upsert_update_before ~on_upsert_update
-    ~(table_meta : Cat.table_meta) ~ordinals ~source ~on_conflict : int Lwt.t =
+let execute_insert_select_op
+      store
+      (cat : Cat.t)
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~(table_meta : Cat.table_meta)
+      ~ordinals
+      ~source
+      ~on_conflict
+  : int Lwt.t
+  =
   let n_cols = List.length table_meta.Cat.columns in
-  let bh = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) before_hook in
-  let ah = Option.map (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None) after_hook in
+  let bh =
+    Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      before_hook
+  in
+  let ah =
+    Option.map
+      (fun f ~tx ~new_row -> f ~tx ~new_row:(Some new_row) ~old_row:None)
+      after_hook
+  in
   let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
   let* src_rows = Lwt_stream.to_list stream in
-  Lwt_list.fold_left_s (fun count src_row ->
-    let row_arr = Array.make n_cols Row.V_null in
-    List.iteri (fun i ord ->
-      if i < Array.length src_row then row_arr.(ord) <- src_row.(i)
-    ) ordinals;
-    let* inserted = execute_insert ~mode ~params ~clock ~on_conflict
-                      ~before_hook:bh ~after_hook:ah
-                      ~on_replace_delete_before ~on_replace_delete
-                      ~on_upsert_update_before ~on_upsert_update
-                      store cat ~table_meta ~ordinals ~values:[]
-                      ~prebuilt_row:(Some row_arr) in
-    Lwt.return (count + if inserted then 1 else 0)
-  ) 0 src_rows
+  Lwt_list.fold_left_s
+    (fun count src_row ->
+       let row_arr = Array.make n_cols Row.V_null in
+       List.iteri
+         (fun i ord -> if i < Array.length src_row then row_arr.(ord) <- src_row.(i))
+         ordinals;
+       let* inserted =
+         execute_insert
+           ~mode
+           ~params
+           ~clock
+           ~on_conflict
+           ~before_hook:bh
+           ~after_hook:ah
+           ~on_replace_delete_before
+           ~on_replace_delete
+           ~on_upsert_update_before
+           ~on_upsert_update
+           store
+           cat
+           ~table_meta
+           ~ordinals
+           ~values:[]
+           ~prebuilt_row:(Some row_arr)
+       in
+       Lwt.return (count + if inserted then 1 else 0))
+    0
+    src_rows
+;;
 
 (* Op_update dispatch: adapt the new/old-row hooks and delegate to execute_update. *)
-let execute_update_op store cat ~mode ~params ~clock ~before_hook ~after_hook
-    ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes : int Lwt.t =
-  let bh = Option.map (fun f ~tx ~old_row ~new_row ->
-    f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)) before_hook in
-  let ah = Option.map (fun f ~tx ~old_row ~new_row ->
-    f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row)) after_hook in
-  execute_update ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-    store cat ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
+let execute_update_op
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~table_meta
+      ~assignments
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
+  : int Lwt.t
+  =
+  let bh =
+    Option.map
+      (fun f ~tx ~old_row ~new_row ->
+         f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row))
+      before_hook
+  in
+  let ah =
+    Option.map
+      (fun f ~tx ~old_row ~new_row ->
+         f ~tx ~new_row:(Some new_row) ~old_row:(Some old_row))
+      after_hook
+  in
+  execute_update
+    ~mode
+    ~params
+    ~clock
+    ~before_hook:bh
+    ~after_hook:ah
+    store
+    cat
+    ~table_meta
+    ~assignments
+    ~where
+    ~order
+    ~limit
+    ~offset
+    ~indexes
+;;
 
 (* Op_delete dispatch: adapt the old-row hooks and delegate to execute_delete. *)
-let execute_delete_op store cat ~mode ~params ~clock ~before_hook ~after_hook
-    ~table_meta ~where ~order ~limit ~offset ~indexes : int Lwt.t =
-  let bh = Option.map (fun f ~tx ~old_row ->
-    f ~tx ~new_row:None ~old_row:(Some old_row)) before_hook in
-  let ah = Option.map (fun f ~tx ~old_row ->
-    f ~tx ~new_row:None ~old_row:(Some old_row)) after_hook in
-  execute_delete ~mode ~params ~clock ~before_hook:bh ~after_hook:ah
-    store cat ~table_meta ~where ~order ~limit ~offset ~indexes
+let execute_delete_op
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~table_meta
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
+  : int Lwt.t
+  =
+  let bh =
+    Option.map
+      (fun f ~tx ~old_row -> f ~tx ~new_row:None ~old_row:(Some old_row))
+      before_hook
+  in
+  let ah =
+    Option.map
+      (fun f ~tx ~old_row -> f ~tx ~new_row:None ~old_row:(Some old_row))
+      after_hook
+  in
+  execute_delete
+    ~mode
+    ~params
+    ~clock
+    ~before_hook:bh
+    ~after_hook:ah
+    store
+    cat
+    ~table_meta
+    ~where
+    ~order
+    ~limit
+    ~offset
+    ~indexes
+;;
 
 (* Op_drop_table: drop the table and invalidate its cached CHECK / generated
    expressions. *)
-let execute_drop_table_op store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
-    ~indexes : int Lwt.t =
+let execute_drop_table_op
+      store
+      (cat : Cat.t)
+      ~mode
+      ~(table_meta : Cat.table_meta)
+      ~indexes
+  : int Lwt.t
+  =
   let* () = execute_drop_table ~mode store cat ~table_meta ~_indexes:indexes in
-  Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
-    if String.equal tbl table_meta.name then None else Some v) check_expr_cache;
-  Hashtbl.filter_map_inplace (fun (tbl, _, _) v ->
-    if String.equal tbl table_meta.name then None else Some v) generated_expr_cache;
+  Hashtbl.filter_map_inplace
+    (fun (tbl, _, _) v -> if String.equal tbl table_meta.name then None else Some v)
+    check_expr_cache;
+  Hashtbl.filter_map_inplace
+    (fun (tbl, _, _) v -> if String.equal tbl table_meta.name then None else Some v)
+    generated_expr_cache;
   Lwt.return 0
+;;
 
 (* Op_fts_insert: allocate a rowid, store the content row, and index it. *)
-let execute_fts_insert store (cat : Cat.t) ~mode ~clock ~params
-    (fts_meta : Cat.fts_table_meta) ~col_names ~col_values : int Lwt.t =
-  let* (tx, owned) = acquire_txn store mode in
+let execute_fts_insert
+      store
+      (cat : Cat.t)
+      ~mode
+      ~clock
+      ~params
+      (fts_meta : Cat.fts_table_meta)
+      ~col_names
+      ~col_values
+  : int Lwt.t
+  =
+  let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-      let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
-      let key = Rowid.encode rowid in
-      let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
-      let n_cols = List.length fts_meta.Cat.fts_columns in
-      let texts = Array.make n_cols "" in
-      List.iter2 (fun col_name v ->
-        match list_find_index (String.equal col_name) fts_meta.Cat.fts_columns with
-        | None -> ()
-        | Some (i, _) -> texts.(i) <- (match v with Row.V_text s -> s | _ -> "")
-      ) col_names vals;
-      let text_list = Array.to_list texts in
-      let* () = S.put tx fts_meta.Cat.fts_content_tree key
-                  (fts_encode_content text_list) in
-      let col_texts = List.mapi (fun i t -> (i, t)) text_list in
-      let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
-      let* () = release_txn tx owned in
-      Lwt.return 1)
+       let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
+       let key = Rowid.encode rowid in
+       let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
+       let n_cols = List.length fts_meta.Cat.fts_columns in
+       let texts = Array.make n_cols "" in
+       List.iter2
+         (fun col_name v ->
+            match list_find_index (String.equal col_name) fts_meta.Cat.fts_columns with
+            | None -> ()
+            | Some (i, _) ->
+              texts.(i)
+              <- (match v with
+                  | Row.V_text s -> s
+                  | _ -> ""))
+         col_names
+         vals;
+       let text_list = Array.to_list texts in
+       let* () =
+         S.put tx fts_meta.Cat.fts_content_tree key (fts_encode_content text_list)
+       in
+       let col_texts = List.mapi (fun i t -> i, t) text_list in
+       let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
+       let* () = release_txn tx owned in
+       Lwt.return 1)
     (fun exn ->
-      let* () = if owned then S.rollback tx else Lwt.return_unit in
-      Lwt.fail exn)
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
+;;
 
 (* Op_fts_delete: drain matching content rows, then delete + de-index them. *)
-let execute_fts_delete store (cat : Cat.t) ~mode ~clock ~params
-    (fts_meta : Cat.fts_table_meta) ~where : int Lwt.t =
+let execute_fts_delete
+      store
+      (cat : Cat.t)
+      ~mode
+      ~clock
+      ~params
+      (fts_meta : Cat.fts_table_meta)
+      ~where
+  : int Lwt.t
+  =
   ignore cat;
   let* matches =
-    S.with_ro store @@ fun tx_ro ->
+    S.with_ro store
+    @@ fun tx_ro ->
     let* cur = S.cursor_open tx_ro fts_meta.Cat.fts_content_tree in
     let _sr = S.cursor_first cur in
     let buf = ref [] in
@@ -3636,8 +5467,9 @@ let execute_fts_delete store (cat : Cat.t) ~mode ~clock ~params
         let rowid = Rowid.decode kbytes in
         let texts = fts_decode_content vbytes in
         let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        let keep = match where with
-          | None      -> true
+        let keep =
+          match where with
+          | None -> true
           | Some pred -> value_truthy (eval_expr clock params row pred)
         in
         if keep then buf := (rowid, kbytes, texts) :: !buf;
@@ -3648,121 +5480,146 @@ let execute_fts_delete store (cat : Cat.t) ~mode ~clock ~params
     Lwt.return (List.rev !buf)
   in
   let n = List.length matches in
-  if n = 0 then Lwt.return 0
-  else begin
-    let* (tx, owned) = acquire_txn store mode in
+  if n = 0
+  then Lwt.return 0
+  else
+    let* tx, owned = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-        let* () =
-          Lwt_list.iter_s (fun (rowid, key, texts) ->
-            let col_texts = List.mapi (fun i t -> (i, t)) texts in
-            let* () = S.del tx fts_meta.Cat.fts_content_tree key in
-            fts_deindex_document tx ~fts_meta ~rowid ~col_texts
-          ) matches
-        in
-        let* () = release_txn tx owned in
-        Lwt.return n)
+         let* () =
+           Lwt_list.iter_s
+             (fun (rowid, key, texts) ->
+                let col_texts = List.mapi (fun i t -> i, t) texts in
+                let* () = S.del tx fts_meta.Cat.fts_content_tree key in
+                fts_deindex_document tx ~fts_meta ~rowid ~col_texts)
+             matches
+         in
+         let* () = release_txn tx owned in
+         Lwt.return n)
       (fun exn ->
-        let* () = if owned then S.rollback tx else Lwt.return_unit in
-        Lwt.fail exn)
-  end
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
+;;
 
 (* Drop cached CHECK and generated-column expressions for [table_name]
    (used after DROP COLUMN, which can invalidate them). *)
 let clear_table_expr_caches table_name =
   let clear cache =
-    let to_clear = Hashtbl.fold (fun (tn, idx, sql) _ acc ->
-      if String.equal tn table_name then (tn, idx, sql) :: acc else acc) cache [] in
+    let to_clear =
+      Hashtbl.fold
+        (fun (tn, idx, sql) _ acc ->
+           if String.equal tn table_name then (tn, idx, sql) :: acc else acc)
+        cache
+        []
+    in
     List.iter (Hashtbl.remove cache) to_clear
   in
   clear check_expr_cache;
   clear generated_expr_cache
+;;
 
 (* Convert an AST column definition into a catalog [Row.column]. *)
 let column_of_col_def col_def : Row.column =
-  {
-    Row.name        = col_def.Ast.name;
-    Row.ty          = (match col_def.Ast.ty with
-                       | Ast.Ty_int  -> Row.Integer
-                       | Ast.Ty_text -> Row.Text
-                       | Ast.Ty_real -> Row.Real
-                       | Ast.Ty_blob -> Row.Blob);
-    Row.not_null    = col_def.Ast.not_null;
-    Row.primary_key = col_def.Ast.primary_key;
-    Row.default     = (match col_def.Ast.default with
-                       | None              -> None
-                       | Some Ast.L_null   -> Some Row.DV_null
-                       | Some (Ast.L_int  n) -> Some (Row.DV_int  n)
-                       | Some (Ast.L_text s) -> Some (Row.DV_text s)
-                       | Some (Ast.L_real f) -> Some (Row.DV_real f)
-                       | Some (Ast.L_blob b) -> Some (Row.DV_blob b)
-                       | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
-                       | Some Ast.L_current_date      -> Some Row.DV_current_date
-                       | Some Ast.L_current_time      -> Some Row.DV_current_time);
-    Row.check_sql    = Option.map Ast.expr_to_sql col_def.Ast.check;
-    Row.generated_as = Option.map (fun (e, s) ->
-      (Ast.expr_to_sql e, s = `Stored)) col_def.Ast.generated_as;
+  { Row.name = col_def.Ast.name
+  ; Row.ty =
+      (match col_def.Ast.ty with
+       | Ast.Ty_int -> Row.Integer
+       | Ast.Ty_text -> Row.Text
+       | Ast.Ty_real -> Row.Real
+       | Ast.Ty_blob -> Row.Blob)
+  ; Row.not_null = col_def.Ast.not_null
+  ; Row.primary_key = col_def.Ast.primary_key
+  ; Row.default =
+      (match col_def.Ast.default with
+       | None -> None
+       | Some Ast.L_null -> Some Row.DV_null
+       | Some (Ast.L_int n) -> Some (Row.DV_int n)
+       | Some (Ast.L_text s) -> Some (Row.DV_text s)
+       | Some (Ast.L_real f) -> Some (Row.DV_real f)
+       | Some (Ast.L_blob b) -> Some (Row.DV_blob b)
+       | Some Ast.L_current_timestamp -> Some Row.DV_current_timestamp
+       | Some Ast.L_current_date -> Some Row.DV_current_date
+       | Some Ast.L_current_time -> Some Row.DV_current_time)
+  ; Row.check_sql = Option.map Ast.expr_to_sql col_def.Ast.check
+  ; Row.generated_as =
+      Option.map (fun (e, s) -> Ast.expr_to_sql e, s = `Stored) col_def.Ast.generated_as
   }
+;;
 
 (* ALTER TABLE ADD COLUMN: add [col_def] to the catalog and persist any inline
    FK reference it declares. *)
 let alter_add_column (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def : int Lwt.t =
   let col = column_of_col_def col_def in
   let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
-  (match result with
-   | Error msg -> Lwt.fail_with msg
-   | Ok () ->
-     (match col_def.Ast.fk_ref with
-      | None -> Lwt.return 0
-      | Some (parent_table, parent_col, ast_od, ast_ou, ast_def) ->
-        let inferred_parent_col =
-          if parent_col = "" then
-            (match Cat.find_table_cached cat ~name:parent_table with
-             | None -> parent_col
-             | Some pm ->
-               (match List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns with
-                | None -> parent_col
-                | Some pk -> pk.Row.name))
-          else parent_col
-        in
-        let new_fk : Cat.fk_constraint = {
-          Cat.fk_local_cols   = [col_def.Ast.name];
-          Cat.fk_parent_table = parent_table;
-          Cat.fk_parent_cols  = [inferred_parent_col];
-          Cat.fk_on_delete    = ast_od;
-          Cat.fk_on_update    = ast_ou;
-          Cat.fk_deferrable   = ast_def;
-        } in
-        let existing_fks =
-          match Cat.find_table_cached cat ~name:table_meta.Cat.name with
-          | None -> []
-          | Some m -> m.Cat.fk_constraints
-        in
-        let new_fks = existing_fks @ [new_fk] in
-        let* () = Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks in
-        Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
-        Lwt.return 0))
+  match result with
+  | Error msg -> Lwt.fail_with msg
+  | Ok () ->
+    (match col_def.Ast.fk_ref with
+     | None -> Lwt.return 0
+     | Some (parent_table, parent_col, ast_od, ast_ou, ast_def) ->
+       let inferred_parent_col =
+         if parent_col = ""
+         then (
+           match Cat.find_table_cached cat ~name:parent_table with
+           | None -> parent_col
+           | Some pm ->
+             (match
+                List.find_opt (fun (c : Row.column) -> c.primary_key) pm.Cat.columns
+              with
+              | None -> parent_col
+              | Some pk -> pk.Row.name))
+         else parent_col
+       in
+       let new_fk : Cat.fk_constraint =
+         { Cat.fk_local_cols = [ col_def.Ast.name ]
+         ; Cat.fk_parent_table = parent_table
+         ; Cat.fk_parent_cols = [ inferred_parent_col ]
+         ; Cat.fk_on_delete = ast_od
+         ; Cat.fk_on_update = ast_ou
+         ; Cat.fk_deferrable = ast_def
+         }
+       in
+       let existing_fks =
+         match Cat.find_table_cached cat ~name:table_meta.Cat.name with
+         | None -> []
+         | Some m -> m.Cat.fk_constraints
+       in
+       let new_fks = existing_fks @ [ new_fk ] in
+       let* () =
+         Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks
+       in
+       Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
+       Lwt.return 0)
+;;
 
 (* ALTER TABLE DROP COLUMN: drop dependent indexes, migrate rows to the new
    shape, drop the catalog column, and invalidate cached expressions. *)
 let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name
-    : int Lwt.t =
+  : int Lwt.t
+  =
   let table_name = table_meta.Cat.name in
   let col_idx = find_col_idx_by_name table_meta.Cat.columns col_name in
   let new_columns = List.filteri (fun i _ -> i <> col_idx) table_meta.Cat.columns in
-  let idxs_on_col = List.filter (fun (idx : Cat.index_info) ->
-    List.mem col_name idx.Cat.idx_columns)
-    (Cat.indexes_for_table cat ~table:table_name) in
-  let* () = if idxs_on_col = [] then Lwt.return_unit
-    else begin
+  let idxs_on_col =
+    List.filter
+      (fun (idx : Cat.index_info) -> List.mem col_name idx.Cat.idx_columns)
+      (Cat.indexes_for_table cat ~table:table_name)
+  in
+  let* () =
+    if idxs_on_col = []
+    then Lwt.return_unit
+    else
       let* tx_idx = S.rw_begin store in
-      let* () = Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-        Cat.drop_index cat tx_idx ~name:idx.idx_name) idxs_on_col in
+      let* () =
+        Lwt_list.iter_s
+          (fun (idx : Cat.index_info) -> Cat.drop_index cat tx_idx ~name:idx.idx_name)
+          idxs_on_col
+      in
       S.commit tx_idx
-    end
   in
   let* rows =
-    S.with_ro store @@ fun tx_ro ->
+    S.with_ro store
+    @@ fun tx_ro ->
     let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
     let _sr = S.cursor_first cur in
     let rows = ref [] in
@@ -3771,8 +5628,9 @@ let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_nam
       | None -> ()
       | Some (k, v) ->
         let old_row = decode_with_virtual None [||] table_meta v in
-        let new_row = Array.of_list
-          (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row)) in
+        let new_row =
+          Array.of_list (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row))
+        in
         rows := (Bytes.copy k, new_row) :: !rows;
         drain ()
     in
@@ -3781,96 +5639,240 @@ let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_nam
     Lwt.return !rows
   in
   let* tx = S.rw_begin store in
-  let* () = Lwt_list.iter_s (fun (k, new_row) ->
-    let new_bytes = Row.encode new_columns new_row in
-    S.put tx table_meta.Cat.tree_id k new_bytes) rows in
+  let* () =
+    Lwt_list.iter_s
+      (fun (k, new_row) ->
+         let new_bytes = Row.encode new_columns new_row in
+         S.put tx table_meta.Cat.tree_id k new_bytes)
+      rows
+  in
   let* () = S.commit tx in
   let* result = Cat.drop_column cat ~table_name ~col_name in
-  (match result with
-   | Error msg -> Lwt.fail_with msg
-   | Ok ()     -> clear_table_expr_caches table_name; Lwt.return 0)
+  match result with
+  | Error msg -> Lwt.fail_with msg
+  | Ok () ->
+    clear_table_expr_caches table_name;
+    Lwt.return 0
+;;
 
 (* ALTER TABLE RENAME TABLE: rename in the catalog and remap cached CHECK /
    generated-column entries from the old name to the new one. *)
-let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name
-    : int Lwt.t =
+let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name : int Lwt.t =
   let* result = Cat.rename_table cat ~old_name:table_meta.Cat.name ~new_name in
-  (match result with
-   | Error msg -> Lwt.fail_with msg
-   | Ok ()     ->
-     let remap tbl_cache =
-       let to_add = Hashtbl.fold (fun (tbl, idx, sql) v acc ->
-         if String.equal tbl table_meta.Cat.name then (new_name, idx, sql, v) :: acc
-         else acc) tbl_cache [] in
-       List.iter (fun (_, idx, sql, _) ->
-         Hashtbl.remove tbl_cache (table_meta.Cat.name, idx, sql)) to_add;
-       List.iter (fun (new_t, idx, sql, v) ->
-         Hashtbl.add tbl_cache (new_t, idx, sql) v) to_add
-     in
-     remap check_expr_cache;
-     remap generated_expr_cache;
-     Lwt.return 0)
+  match result with
+  | Error msg -> Lwt.fail_with msg
+  | Ok () ->
+    let remap tbl_cache =
+      let to_add =
+        Hashtbl.fold
+          (fun (tbl, idx, sql) v acc ->
+             if String.equal tbl table_meta.Cat.name
+             then (new_name, idx, sql, v) :: acc
+             else acc)
+          tbl_cache
+          []
+      in
+      List.iter
+        (fun (_, idx, sql, _) -> Hashtbl.remove tbl_cache (table_meta.Cat.name, idx, sql))
+        to_add;
+      List.iter
+        (fun (new_t, idx, sql, v) -> Hashtbl.add tbl_cache (new_t, idx, sql) v)
+        to_add
+    in
+    remap check_expr_cache;
+    remap generated_expr_cache;
+    Lwt.return 0
+;;
 
 (* Op_alter_table: dispatch on the ALTER action. *)
 let execute_alter_table store (cat : Cat.t) ~(table_meta : Cat.table_meta) action
-    : int Lwt.t =
+  : int Lwt.t
+  =
   match action with
   | Ast.AA_add_column col_def -> alter_add_column cat ~table_meta col_def
   | Ast.AA_rename_table new_name -> alter_rename_table cat ~table_meta new_name
   | Ast.AA_rename_column (old_col, new_col) ->
-    let* result = Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col in
-    (match result with Error msg -> Lwt.fail_with msg | Ok () -> Lwt.return 0)
+    let* result =
+      Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col
+    in
+    (match result with
+     | Error msg -> Lwt.fail_with msg
+     | Ok () -> Lwt.return 0)
   | Ast.AA_drop_column col_name -> alter_drop_column store cat ~table_meta col_name
+;;
 
 (* Op_create_index: create the index unless IF NOT EXISTS finds it present. *)
-let execute_create_index_op store (cat : Cat.t) ~mode ~name ~table ~tree_id
-    ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns
-    ~if_not_exists : int Lwt.t =
-  if if_not_exists && Cat.index_exists cat ~name then Lwt.return 0
-  else begin
-    let* () = execute_create_index ~mode store cat ~name ~table ~tree_id
-                ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns in
+let execute_create_index_op
+      store
+      (cat : Cat.t)
+      ~mode
+      ~name
+      ~table
+      ~tree_id
+      ~col_sqls
+      ~col_expr_flags
+      ~where_expr
+      ~where_sql
+      ~unique
+      ~columns
+      ~if_not_exists
+  : int Lwt.t
+  =
+  if if_not_exists && Cat.index_exists cat ~name
+  then Lwt.return 0
+  else
+    let* () =
+      execute_create_index
+        ~mode
+        store
+        cat
+        ~name
+        ~table
+        ~tree_id
+        ~col_sqls
+        ~col_expr_flags
+        ~where_expr
+        ~where_sql
+        ~unique
+        ~columns
+    in
     Lwt.return 0
-  end
+;;
 
 (** [execute_with_count] returns the rows-affected count.  For most
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
-let execute_with_count ?(mode = Auto)
-    ?(clock : (unit -> float) option = None)
-    ?(params = [||])
-    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    (store : S.t) (cat : Cat.t) (op : Plan.op)
-  : int Lwt.t =
+let execute_with_count
+      ?(mode = Auto)
+      ?(clock : (unit -> float) option = None)
+      ?(params = [||])
+      ?(before_hook :
+          (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t)
+            option =
+        None)
+      ?(after_hook :
+          (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t)
+            option =
+        None)
+      ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      ?(on_upsert_update_before :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_upsert_update :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      (store : S.t)
+      (cat : Cat.t)
+      (op : Plan.op)
+  : int Lwt.t
+  =
   match op with
-  | Plan.Op_create_table { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
-    execute_create_table_op cat ~name ~columns ~uniq_idxs ~if_not_exists
-      ~fk_constraints ~without_rowid
-  | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
-    execute_insert_values store cat ~mode ~params ~clock ~before_hook ~after_hook
-      ~on_replace_delete_before ~on_replace_delete
-      ~on_upsert_update_before ~on_upsert_update
-      ~table_meta ~ordinals ~values ~on_conflict ~upsert_update
+  | Plan.Op_create_table
+      { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
+    execute_create_table_op
+      cat
+      ~name
+      ~columns
+      ~uniq_idxs
+      ~if_not_exists
+      ~fk_constraints
+      ~without_rowid
+  | Plan.Op_insert
+      { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
+    execute_insert_values
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~table_meta
+      ~ordinals
+      ~values
+      ~on_conflict
+      ~upsert_update
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
-    execute_insert_select_op store cat ~mode ~params ~clock ~before_hook ~after_hook
-      ~on_replace_delete_before ~on_replace_delete
-      ~on_upsert_update_before ~on_upsert_update
-      ~table_meta ~ordinals ~source ~on_conflict
-  | Plan.Op_create_index { name; table; tree_id; col_sqls; col_expr_flags;
-                           where_expr; where_sql; unique; columns; if_not_exists } ->
-    execute_create_index_op store cat ~mode ~name ~table ~tree_id
-      ~col_sqls ~col_expr_flags ~where_expr ~where_sql ~unique ~columns ~if_not_exists
-  | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
-    execute_update_op store cat ~mode ~params ~clock ~before_hook ~after_hook
-      ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes
+    execute_insert_select_op
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      ~table_meta
+      ~ordinals
+      ~source
+      ~on_conflict
+  | Plan.Op_create_index
+      { name
+      ; table
+      ; tree_id
+      ; col_sqls
+      ; col_expr_flags
+      ; where_expr
+      ; where_sql
+      ; unique
+      ; columns
+      ; if_not_exists
+      } ->
+    execute_create_index_op
+      store
+      cat
+      ~mode
+      ~name
+      ~table
+      ~tree_id
+      ~col_sqls
+      ~col_expr_flags
+      ~where_expr
+      ~where_sql
+      ~unique
+      ~columns
+      ~if_not_exists
+  | Plan.Op_update
+      { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
+    execute_update_op
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~table_meta
+      ~assignments
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
-    execute_delete_op store cat ~mode ~params ~clock ~before_hook ~after_hook
-      ~table_meta ~where ~order ~limit ~offset ~indexes
+    execute_delete_op
+      store
+      cat
+      ~mode
+      ~params
+      ~clock
+      ~before_hook
+      ~after_hook
+      ~table_meta
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
   | Plan.Op_drop_table { table_meta; indexes } ->
     execute_drop_table_op store cat ~mode ~table_meta ~indexes
   | Plan.Op_drop_index { idx_info } ->
@@ -3885,9 +5887,14 @@ let execute_with_count ?(mode = Auto)
     execute_fts_delete store cat ~mode ~clock ~params fts_meta ~where
   | Plan.Op_alter_table { table_meta; action } ->
     execute_alter_table store cat ~table_meta action
-  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
-  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _ ->
-    failwith "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
+  | Plan.Op_begin
+  | Plan.Op_commit
+  | Plan.Op_rollback
+  | Plan.Op_savepoint _
+  | Plan.Op_release _
+  | Plan.Op_rollback_to _ ->
+    failwith
+      "Exec.execute_with_count: BEGIN/COMMIT/ROLLBACK/SAVEPOINT handled by Db layer"
   | Plan.Op_pragma_rows _ -> Lwt.return 0
   | Plan.Op_pragma_set_user_version { version } ->
     let* tx = S.rw_begin store in
@@ -3910,77 +5917,125 @@ let execute_with_count ?(mode = Auto)
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
   | Plan.Op_vacuum ->
-    Lwt.fail_with
-      "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
-  | Plan.Op_attach _ | Plan.Op_detach _
-  | Plan.Op_database_list | Plan.Op_active_database_get
+    Lwt.fail_with "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
+  | Plan.Op_attach _
+  | Plan.Op_detach _
+  | Plan.Op_database_list
+  | Plan.Op_active_database_get
   | Plan.Op_active_database_set _ ->
     Lwt.fail_with
       "ATTACH/DETACH/database_list/active_database must be executed via Db.execute"
-  | Plan.Op_create_view _ | Plan.Op_drop_view _
-  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
+  | Plan.Op_create_view _
+  | Plan.Op_drop_view _
+  | Plan.Op_create_trigger _
+  | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
   | Plan.Op_explain _ -> Lwt.return 0
-  | Plan.Op_union _ | Plan.Op_intersect _ | Plan.Op_except _
-  | Plan.Op_const_select _ | Plan.Op_with_cte _ | Plan.Op_cte_scan _
+  | Plan.Op_union _
+  | Plan.Op_intersect _
+  | Plan.Op_except _
+  | Plan.Op_const_select _
+  | Plan.Op_with_cte _
+  | Plan.Op_cte_scan _
   | Plan.Op_window _
-  | Plan.Op_pragma_get_user_version | Plan.Op_pragma_integrity_check
+  | Plan.Op_pragma_get_user_version
+  | Plan.Op_pragma_integrity_check
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_pragma_get_defer_fk
   | Plan.Op_pragma_get_wal_autocheckpoint
-  | Plan.Op_changes | Plan.Op_last_insert_rowid | Plan.Op_total_changes ->
-    failwith "Exec.execute: use Exec.query for read operations"
-  | Plan.Op_seq_scan _ | Plan.Op_filter _ | Plan.Op_project _
+  | Plan.Op_changes
+  | Plan.Op_last_insert_rowid
+  | Plan.Op_total_changes -> failwith "Exec.execute: use Exec.query for read operations"
+  | Plan.Op_seq_scan _
+  | Plan.Op_filter _
+  | Plan.Op_project _
   | Plan.Op_expr_project _
-  | Plan.Op_sort _ | Plan.Op_limit _ | Plan.Op_index_lookup _
-  | Plan.Op_nested_loop_join _ | Plan.Op_hash_join _ | Plan.Op_aggregate _
-  | Plan.Op_fts_seq_scan _ | Plan.Op_fts_match_scan _
-  | Plan.Op_distinct _ | Plan.Op_sqlite_master ->
-    failwith "Exec.execute: use Exec.query for read operations"
+  | Plan.Op_sort _
+  | Plan.Op_limit _
+  | Plan.Op_index_lookup _
+  | Plan.Op_nested_loop_join _
+  | Plan.Op_hash_join _
+  | Plan.Op_aggregate _
+  | Plan.Op_fts_seq_scan _
+  | Plan.Op_fts_match_scan _
+  | Plan.Op_distinct _
+  | Plan.Op_sqlite_master -> failwith "Exec.execute: use Exec.query for read operations"
+;;
 
 (** Compatibility entry point: discards the rows-affected count. *)
-let execute ?(mode = Auto)
-    ?(clock : (unit -> float) option = None)
-    ?(params = [||])
-    ?(before_hook : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(after_hook  : (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t) option = None)
-    ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update_before  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    ?(on_upsert_update  : (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option = None)
-    (store : S.t) (cat : Cat.t) (op : Plan.op) : unit Lwt.t =
-  let* _n = execute_with_count ~mode ~clock ~params ~before_hook ~after_hook
-              ~on_replace_delete_before ~on_replace_delete
-              ~on_upsert_update_before ~on_upsert_update store cat op in
+let execute
+      ?(mode = Auto)
+      ?(clock : (unit -> float) option = None)
+      ?(params = [||])
+      ?(before_hook :
+          (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t)
+            option =
+        None)
+      ?(after_hook :
+          (tx:S.rw S.txn -> new_row:Row.t option -> old_row:Row.t option -> unit Lwt.t)
+            option =
+        None)
+      ?(on_replace_delete_before : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_replace_delete : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      ?(on_upsert_update_before :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      ?(on_upsert_update :
+          (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
+        None)
+      (store : S.t)
+      (cat : Cat.t)
+      (op : Plan.op)
+  : unit Lwt.t
+  =
+  let* _n =
+    execute_with_count
+      ~mode
+      ~clock
+      ~params
+      ~before_hook
+      ~after_hook
+      ~on_replace_delete_before
+      ~on_replace_delete
+      ~on_upsert_update_before
+      ~on_upsert_update
+      store
+      cat
+      op
+  in
   Lwt.return_unit
+;;
 
 (* ------------------------------------------------------------------ *)
 (* BM25 scoring helpers                                                 *)
 (* ------------------------------------------------------------------ *)
 
-let bm25_score ~k1 ~b ~total_docs ~total_tokens
-               ~n_docs_with_term ~term_freq ~doc_length =
-  if total_docs = 0 || n_docs_with_term = 0 then 0.0
-  else
-    let n      = Float.of_int total_docs in
-    let n_t    = Float.of_int n_docs_with_term in
-    let tf     = Float.of_int term_freq in
-    let dl     = Float.of_int doc_length in
-    let avgdl  = Float.of_int total_tokens /. n in
-    let idf    = Float.log ((n -. n_t +. 0.5) /. (n_t +. 0.5) +. 1.0) in
-    idf *. (tf *. (k1 +. 1.0)) /. (tf +. k1 *. (1.0 -. b +. b *. dl /. avgdl))
+let bm25_score ~k1 ~b ~total_docs ~total_tokens ~n_docs_with_term ~term_freq ~doc_length =
+  if total_docs = 0 || n_docs_with_term = 0
+  then 0.0
+  else (
+    let n = Float.of_int total_docs in
+    let n_t = Float.of_int n_docs_with_term in
+    let tf = Float.of_int term_freq in
+    let dl = Float.of_int doc_length in
+    let avgdl = Float.of_int total_tokens /. n in
+    let idf = Float.log (((n -. n_t +. 0.5) /. (n_t +. 0.5)) +. 1.0) in
+    idf *. (tf *. (k1 +. 1.0)) /. (tf +. (k1 *. (1.0 -. b +. (b *. dl /. avgdl)))))
+;;
 
 (** Collect all positive (non-negated) terms from a query for BM25. *)
 let fts_query_terms query =
   let rec collect = function
-    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [t]
-    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [t]
+    | Fts_query.FQ_term (Fts_query.FT_exact t) -> [ t ]
+    | Fts_query.FQ_term (Fts_query.FT_prefix t) -> [ t ]
     | Fts_query.FQ_term (Fts_query.FT_phrase ts) -> ts
-    | Fts_query.FQ_and qs | Fts_query.FQ_or qs   -> List.concat_map collect qs
-    | Fts_query.FQ_not _                          -> []
+    | Fts_query.FQ_and qs | Fts_query.FQ_or qs -> List.concat_map collect qs
+    | Fts_query.FQ_not _ -> []
   in
   List.sort_uniq String.compare (collect query)
+;;
 
 (** A snippet phrase is the unit SQLite FTS5 reports via xPhraseSize:
     either a single token (exact or prefix) or a multi-token exact
@@ -3988,81 +6043,98 @@ let fts_query_terms query =
     and is scored ONCE per occurrence (not once per constituent
     token) to mirror SQLite's centering and bm25 behaviour. *)
 type snippet_phrase =
-  | SP_term   of string * [`Exact | `Prefix]
-  | SP_phrase of string list   (* length >= 2; all matched exactly *)
+  | SP_term of string * [ `Exact | `Prefix ]
+  | SP_phrase of string list (* length >= 2; all matched exactly *)
 
 (** Collect snippet phrases from a query in left-to-right order. *)
 let fts_query_terms_with_kind query : snippet_phrase list =
   let rec collect = function
-    | Fts_query.FQ_term (Fts_query.FT_exact t)   -> [SP_term (t, `Exact)]
-    | Fts_query.FQ_term (Fts_query.FT_prefix t)  -> [SP_term (t, `Prefix)]
+    | Fts_query.FQ_term (Fts_query.FT_exact t) -> [ SP_term (t, `Exact) ]
+    | Fts_query.FQ_term (Fts_query.FT_prefix t) -> [ SP_term (t, `Prefix) ]
     | Fts_query.FQ_term (Fts_query.FT_phrase ts) ->
       (match ts with
-       | []   -> []
-       | [t]  -> [SP_term (t, `Exact)]
-       | _    -> [SP_phrase ts])
-    | Fts_query.FQ_and qs | Fts_query.FQ_or qs   -> List.concat_map collect qs
-    | Fts_query.FQ_not _                          -> []
+       | [] -> []
+       | [ t ] -> [ SP_term (t, `Exact) ]
+       | _ -> [ SP_phrase ts ])
+    | Fts_query.FQ_and qs | Fts_query.FQ_or qs -> List.concat_map collect qs
+    | Fts_query.FQ_not _ -> []
   in
   (* De-duplicate identical phrases (so a query like `foo AND foo` does
      not over-credit token highlights). Preserve first-occurrence order. *)
   let seen = Hashtbl.create 8 in
   let key = function
-    | SP_term (t, `Exact)  -> "e:" ^ t
+    | SP_term (t, `Exact) -> "e:" ^ t
     | SP_term (t, `Prefix) -> "p:" ^ t
-    | SP_phrase ts         -> "P:" ^ String.concat "\x00" ts
+    | SP_phrase ts -> "P:" ^ String.concat "\x00" ts
   in
-  List.filter (fun p ->
-    let k = key p in
-    if Hashtbl.mem seen k then false
-    else (Hashtbl.add seen k (); true)) (collect query)
+  List.filter
+    (fun p ->
+       let k = key p in
+       if Hashtbl.mem seen k
+       then false
+       else (
+         Hashtbl.add seen k ();
+         true))
+    (collect query)
+;;
 
 (** Test whether the phrase at index [pi] matches the token sequence
     starting at [tokens.(i)]. Returns the phrase length on hit (so the
     caller can compute the end position), else [None]. *)
 let phrase_match_at
-    ~(phrases : snippet_phrase array)
-    ~(tokens  : Fts_tokenizer.token array)
-    (pi : int) (i : int) : int option =
+      ~(phrases : snippet_phrase array)
+      ~(tokens : Fts_tokenizer.token array)
+      (pi : int)
+      (i : int)
+  : int option
+  =
   let n_toks = Array.length tokens in
   let token_at j = tokens.(j).Fts_tokenizer.term in
   match phrases.(pi) with
   | SP_term (t, `Exact) ->
     if i < n_toks && String.equal (token_at i) t then Some 1 else None
   | SP_term (t, `Prefix) ->
-    if i < n_toks then
+    if i < n_toks
+    then (
       let tk = token_at i in
-      if String.length tk >= String.length t
-         && String.equal (String.sub tk 0 (String.length t)) t
-      then Some 1 else None
+      if
+        String.length tk >= String.length t
+        && String.equal (String.sub tk 0 (String.length t)) t
+      then Some 1
+      else None)
     else None
   | SP_phrase ts ->
     let len = List.length ts in
-    if i + len > n_toks then None
-    else
+    if i + len > n_toks
+    then None
+    else (
       let rec walk j = function
-        | []        -> true
+        | [] -> true
         | t :: rest ->
-          if String.equal (token_at (i + j)) t then walk (j + 1) rest
-          else false
+          if String.equal (token_at (i + j)) t then walk (j + 1) rest else false
       in
-      if walk 0 ts then Some len else None
+      if walk 0 ts then Some len else None)
+;;
 
 (** Find the first phrase that matches at token position [i].
     Returns [(phrase_idx, length)] if any. *)
 let token_phrase_match
-    ~(phrases : snippet_phrase array)
-    ~(tokens  : Fts_tokenizer.token array)
-    (i : int) : (int * int) option =
+      ~(phrases : snippet_phrase array)
+      ~(tokens : Fts_tokenizer.token array)
+      (i : int)
+  : (int * int) option
+  =
   let n = Array.length phrases in
   let rec loop pi =
-    if pi >= n then None
-    else
+    if pi >= n
+    then None
+    else (
       match phrase_match_at ~phrases ~tokens pi i with
       | Some len -> Some (pi, len)
-      | None     -> loop (pi + 1)
+      | None -> loop (pi + 1))
   in
   loop 0
+;;
 
 (** Identify FTS5 "sentence start" token positions in a column.
     Position 0 is always a sentence start. Any token preceded (after any
@@ -4072,29 +6144,34 @@ let fts_sentence_starts ~col_text ~(tokens : Fts_tokenizer.token array) : int ar
   let buf = Buffer.create 8 in
   for i = 0 to n - 1 do
     let tok = tokens.(i) in
-    if i = 0 then Buffer.add_string buf (string_of_int 0)
-    else begin
+    if i = 0
+    then Buffer.add_string buf (string_of_int 0)
+    else (
       let start = tok.Fts_tokenizer.start_byte in
       (* Walk backwards skipping ' ', '\t', '\n', '\r'. *)
       let j = ref (start - 1) in
-      while !j >= 0
-            && (let c = col_text.[!j] in
-                c = ' ' || c = '\t' || c = '\n' || c = '\r')
-      do decr j done;
-      if !j >= 0 then begin
+      while
+        !j >= 0
+        &&
         let c = col_text.[!j] in
-        if c = '.' || c = ':' then begin
+        c = ' ' || c = '\t' || c = '\n' || c = '\r'
+      do
+        decr j
+      done;
+      if !j >= 0
+      then (
+        let c = col_text.[!j] in
+        if c = '.' || c = ':'
+        then (
           if Buffer.length buf > 0 then Buffer.add_char buf ',';
-          Buffer.add_string buf (string_of_int i)
-        end
-      end
-    end
+          Buffer.add_string buf (string_of_int i))))
   done;
-  if Buffer.length buf = 0 then [| 0 |]
+  if Buffer.length buf = 0
+  then [| 0 |]
   else
     Array.of_list
-      (List.map int_of_string
-         (String.split_on_char ',' (Buffer.contents buf)))
+      (List.map int_of_string (String.split_on_char ',' (Buffer.contents buf)))
+;;
 
 (** Score a candidate window [i_pos, i_pos + n_token).
     Returns [(score, i_adj)] where:
@@ -4106,33 +6183,38 @@ let fts_sentence_starts ~col_text ~(tokens : Fts_tokenizer.token array) : int ar
     a multi-token phrase counts as a single contiguous instance whose
     extent spans [position, position + length). *)
 let fts_snippet_score
-    ~(instances : (int * int * int) list)
-    ~(a_seen : bool array)
-    ~(i_pos : int) ~(n_token : int) ~(n_docsize : int) : int * int =
+      ~(instances : (int * int * int) list)
+      ~(a_seen : bool array)
+      ~(i_pos : int)
+      ~(n_token : int)
+      ~(n_docsize : int)
+  : int * int
+  =
   let i_end = i_pos + n_token in
   let score = ref 0 in
   let i_first = ref (-1) in
-  let i_last  = ref 0 in
-  List.iter (fun (ip, io, len) ->
-    (* Phrase fully inside the window. SQLite requires the entire
+  let i_last = ref 0 in
+  List.iter
+    (fun (ip, io, len) ->
+       (* Phrase fully inside the window. SQLite requires the entire
        phrase span to fit; partial overlaps don't count. *)
-    if io >= i_pos && io + len <= i_end then begin
-      score := !score + (if a_seen.(ip) then 1 else 1000);
-      a_seen.(ip) <- true;
-      if !i_first < 0 then i_first := io;
-      i_last := io + len
-    end
-  ) instances;
+       if io >= i_pos && io + len <= i_end
+       then (
+         score := !score + if a_seen.(ip) then 1 else 1000;
+         a_seen.(ip) <- true;
+         if !i_first < 0 then i_first := io;
+         i_last := io + len))
+    instances;
   let i_adj =
-    if !i_first < 0 then i_pos
-    else !i_first - (n_token - (!i_last - !i_first)) / 2
+    if !i_first < 0 then i_pos else !i_first - ((n_token - (!i_last - !i_first)) / 2)
   in
-  let i_adj =
-    if i_adj + n_token > n_docsize then n_docsize - n_token else i_adj
-  in
+  let i_adj = if i_adj + n_token > n_docsize then n_docsize - n_token else i_adj in
   let i_adj = if i_adj < 0 then 0 else i_adj in
-  (!score, i_adj)
+  !score, i_adj
+;;
 
+(* Greedy scan for snippet phrase matches: at each token take the first phrase
+   that matches, skipping past its length. Returns [(phrase_idx,pos,len)] list. *)
 (** Build a highlighted excerpt of [col_text] for the given snippet [spec].
     Replicates SQLite FTS5's snippet() algorithm:
       - For each phrase instance, score the window anchored at its position
@@ -4144,31 +6226,30 @@ let fts_snippet_score
       - Prepend [ellipsis] unless window starts at token 0.
       - Append [ellipsis] unless window covers through the last token.
     [query_terms] is a list of snippet phrases. *)
-(* Greedy scan for snippet phrase matches: at each token take the first phrase
-   that matches, skipping past its length. Returns [(phrase_idx,pos,len)] list. *)
 let snippet_build_instances ~phrases ~tokens ~n_toks =
   let acc = ref [] in
   let i = ref 0 in
   while !i < n_toks do
     match token_phrase_match ~phrases ~tokens !i with
-    | None         -> incr i
+    | None -> incr i
     | Some (ip, len) ->
       acc := (ip, tokens.(!i).Fts_tokenizer.pos, len) :: !acc;
       i := !i + len
   done;
   List.rev !acc
+;;
 
 (* No-match snippet: SQLite anchors at sentence start 0 and emits the first
    n_token tokens (no leading ellipsis; trailing ellipsis if doc is longer). *)
 let snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec =
-  if n_toks = 0 then ""
-  else begin
+  if n_toks = 0
+  then ""
+  else (
     let win_end_excl = min n_toks n_token in
     let last_tok = tokens.(win_end_excl - 1) in
     let prefix_text = String.sub col_text 0 last_tok.Fts_tokenizer.end_byte in
-    if win_end_excl >= n_toks then prefix_text
-    else prefix_text ^ spec.Plan.ellipsis
-  end
+    if win_end_excl >= n_toks then prefix_text else prefix_text ^ spec.Plan.ellipsis)
+;;
 
 (* Choose the best snippet window start: score each instance position and each
    preceding sentence start (with a sentence-alignment bonus). *)
@@ -4176,27 +6257,40 @@ let snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec =
    centered window and (when the column is longer than one window) the latest
    sentence start before [io], with a sentence-alignment bonus — feeding each
    to [consider]. *)
-let snippet_score_instance ~consider ~instances ~a_seen ~sentence_starts
-    ~n_phrases ~n_token ~n_toks io =
+let snippet_score_instance
+      ~consider
+      ~instances
+      ~a_seen
+      ~sentence_starts
+      ~n_phrases
+      ~n_token
+      ~n_toks
+      io
+  =
   (* Non-sentence-aligned: window anchored at this instance, centered. *)
   Array.fill a_seen 0 n_phrases false;
-  let (score, i_adj) =
-    fts_snippet_score ~instances ~a_seen ~i_pos:io ~n_token ~n_docsize:n_toks in
+  let score, i_adj =
+    fts_snippet_score ~instances ~a_seen ~i_pos:io ~n_token ~n_docsize:n_toks
+  in
   consider score i_adj;
   (* Sentence-aligned: latest sentence start strictly before io. *)
-  if n_toks > n_token then begin
+  if n_toks > n_token
+  then (
     let n_sent = Array.length sentence_starts in
     let jj = ref 0 in
-    while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do incr jj done;
+    while !jj < n_sent - 1 && sentence_starts.(!jj + 1) <= io do
+      incr jj
+    done;
     let s_start = sentence_starts.(!jj) in
-    if s_start < io then begin
+    if s_start < io
+    then (
       Array.fill a_seen 0 n_phrases false;
-      let (score, _) =
-        fts_snippet_score ~instances ~a_seen ~i_pos:s_start ~n_token ~n_docsize:n_toks in
+      let score, _ =
+        fts_snippet_score ~instances ~a_seen ~i_pos:s_start ~n_token ~n_docsize:n_toks
+      in
       let bonus = if s_start = 0 then 120 else 100 in
-      consider (score + bonus) s_start
-    end
-  end
+      consider (score + bonus) s_start))
+;;
 
 let snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks =
   let a_seen = Array.make (max 1 n_phrases) false in
@@ -4204,44 +6298,66 @@ let snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks
   let best_score = ref 0 in
   let best_start = ref 0 in
   let consider score start_pos =
-    if score > !best_score then begin best_score := score; best_start := start_pos end
+    if score > !best_score
+    then (
+      best_score := score;
+      best_start := start_pos)
   in
-  List.iter (fun (_ip, io, _len) ->
-    snippet_score_instance ~consider ~instances ~a_seen ~sentence_starts
-      ~n_phrases ~n_token ~n_toks io)
+  List.iter
+    (fun (_ip, io, _len) ->
+       snippet_score_instance
+         ~consider
+         ~instances
+         ~a_seen
+         ~sentence_starts
+         ~n_phrases
+         ~n_token
+         ~n_toks
+         io)
     instances;
   !best_start
+;;
 
 (* Reconstruct the snippet text for the chosen window, wrapping matched phrase
    instances in start/end tags and emitting leading/trailing ellipses. *)
-let snippet_render ~col_text ~tokens ~token_instance_at ~i_best_start ~n_token
-    ~n_toks ~spec =
+let snippet_render
+      ~col_text
+      ~tokens
+      ~token_instance_at
+      ~i_best_start
+      ~n_token
+      ~n_toks
+      ~spec
+  =
   let i_range_end = i_best_start + n_token - 1 in
   let buf = Buffer.create 128 in
   if i_best_start > 0 then Buffer.add_string buf spec.Plan.ellipsis;
-  if n_toks > 0 then begin
+  if n_toks > 0
+  then (
     let first_in_range = i_best_start in
-    let last_in_range  = min (n_toks - 1) i_range_end in
+    let last_in_range = min (n_toks - 1) i_range_end in
     let prev_end = ref tokens.(first_in_range).Fts_tokenizer.start_byte in
     let prev_inst = ref (-1) in
     for i = first_in_range to last_in_range do
       let tok = tokens.(i) in
       let inst = token_instance_at.(i) in
       let gap_len = tok.Fts_tokenizer.start_byte - !prev_end in
-      let gap =
-        if gap_len > 0 then String.sub col_text !prev_end gap_len else ""
-      in
-      if !prev_inst <> inst then begin
+      let gap = if gap_len > 0 then String.sub col_text !prev_end gap_len else "" in
+      if !prev_inst <> inst
+      then (
         (* Close the previous wrap, emit gap outside, open a new wrap if
            entering a phrase instance. *)
         if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
         Buffer.add_string buf gap;
-        if inst >= 0 then Buffer.add_string buf spec.Plan.start_tag
-      end else
+        if inst >= 0 then Buffer.add_string buf spec.Plan.start_tag)
+      else
         (* Same wrap state — gap belongs to it (e.g. space inside <b>..</b>). *)
         Buffer.add_string buf gap;
-      Buffer.add_string buf
-        (String.sub col_text tok.Fts_tokenizer.start_byte
+      Buffer.add_string
+        buf
+        (String.sub
+           col_text
+           tok.Fts_tokenizer.start_byte
            (tok.Fts_tokenizer.end_byte - tok.Fts_tokenizer.start_byte));
       prev_end := tok.Fts_tokenizer.end_byte;
       prev_inst := inst
@@ -4249,20 +6365,23 @@ let snippet_render ~col_text ~tokens ~token_instance_at ~i_best_start ~n_token
     if !prev_inst >= 0 then Buffer.add_string buf spec.Plan.end_tag;
     (* Trailing: append the rest of the source if the window reaches the last
        token, else a trailing ellipsis. *)
-    if i_range_end >= n_toks - 1 then begin
+    if i_range_end >= n_toks - 1
+    then (
       let last_end = tokens.(last_in_range).Fts_tokenizer.end_byte in
-      if last_end < String.length col_text then
-        Buffer.add_string buf
-          (String.sub col_text last_end (String.length col_text - last_end))
-    end else
-      Buffer.add_string buf spec.Plan.ellipsis
-  end;
+      if last_end < String.length col_text
+      then
+        Buffer.add_string
+          buf
+          (String.sub col_text last_end (String.length col_text - last_end)))
+    else Buffer.add_string buf spec.Plan.ellipsis);
   Buffer.contents buf
+;;
 
 let compute_snippet
-    ~col_text
-    ~(query_terms : snippet_phrase list)
-    ~(spec : Plan.snippet_spec) =
+      ~col_text
+      ~(query_terms : snippet_phrase list)
+      ~(spec : Plan.snippet_spec)
+  =
   let tokens = Array.of_list (Fts_tokenizer.tokenize_string ~col:0 col_text) in
   let n_toks = Array.length tokens in
   let phrases = Array.of_list query_terms in
@@ -4272,17 +6391,27 @@ let compute_snippet
   (* Mark each token position with its covering instance index (-1 = none),
      so adjacent occurrences of the same phrase emit separate wraps. *)
   let token_instance_at = Array.make (max 1 n_toks) (-1) in
-  List.iteri (fun inst_idx (_ip, io, len) ->
-    for k = 0 to len - 1 do
-      if io + k < n_toks then token_instance_at.(io + k) <- inst_idx
-    done
-  ) instances;
-  if instances = [] || n_phrases = 0 then
-    snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec
-  else
+  List.iteri
+    (fun inst_idx (_ip, io, len) ->
+       for k = 0 to len - 1 do
+         if io + k < n_toks then token_instance_at.(io + k) <- inst_idx
+       done)
+    instances;
+  if instances = [] || n_phrases = 0
+  then snippet_no_match ~col_text ~tokens ~n_toks ~n_token ~spec
+  else (
     let i_best_start =
-      snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks in
-    snippet_render ~col_text ~tokens ~token_instance_at ~i_best_start ~n_token ~n_toks ~spec
+      snippet_best_window ~instances ~tokens ~col_text ~n_phrases ~n_token ~n_toks
+    in
+    snippet_render
+      ~col_text
+      ~tokens
+      ~token_instance_at
+      ~i_best_start
+      ~n_token
+      ~n_toks
+      ~spec)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* substitute_cte: replace Op_cte_scan nodes with Op_pragma_rows       *)
@@ -4293,139 +6422,159 @@ let compute_snippet
 (** Check whether any unresolved subquery nodes remain in a Plan.expr. *)
 let rec plan_expr_has_subquery : Plan.expr -> bool = function
   | Plan.P_subquery _ | Plan.P_exists _ | Plan.P_in_select _ -> true
-  | Plan.P_binop (_, a, b)        -> plan_expr_has_subquery a || plan_expr_has_subquery b
-  | Plan.P_not e | Plan.P_is_null e | Plan.P_is_not_null e
-  | Plan.P_neg e | Plan.P_bitnot e -> plan_expr_has_subquery e
-  | Plan.P_between (x, lo, hi)    ->
+  | Plan.P_binop (_, a, b) -> plan_expr_has_subquery a || plan_expr_has_subquery b
+  | Plan.P_not e
+  | Plan.P_is_null e
+  | Plan.P_is_not_null e
+  | Plan.P_neg e
+  | Plan.P_bitnot e -> plan_expr_has_subquery e
+  | Plan.P_between (x, lo, hi) ->
     plan_expr_has_subquery x || plan_expr_has_subquery lo || plan_expr_has_subquery hi
-  | Plan.P_in (x, vs)             -> plan_expr_has_subquery x || List.exists plan_expr_has_subquery vs
-  | Plan.P_func (_, args)         -> List.exists plan_expr_has_subquery args
+  | Plan.P_in (x, vs) -> plan_expr_has_subquery x || List.exists plan_expr_has_subquery vs
+  | Plan.P_func (_, args) -> List.exists plan_expr_has_subquery args
   | Plan.P_case { scrutinee; branches; else_ } ->
     Option.fold ~none:false ~some:plan_expr_has_subquery scrutinee
-    || List.exists (fun (c, r) -> plan_expr_has_subquery c || plan_expr_has_subquery r) branches
+    || List.exists
+         (fun (c, r) -> plan_expr_has_subquery c || plan_expr_has_subquery r)
+         branches
     || Option.fold ~none:false ~some:plan_expr_has_subquery else_
-  | Plan.P_cast (e, _)            -> plan_expr_has_subquery e
-  | Plan.P_collate (e, _)        -> plan_expr_has_subquery e
-  | _                             -> false
+  | Plan.P_cast (e, _) -> plan_expr_has_subquery e
+  | Plan.P_collate (e, _) -> plan_expr_has_subquery e
+  | _ -> false
+;;
 
 (** Extract table_meta from the leftmost seq scan in a plan op. *)
 let rec get_outer_scan_meta : Plan.op -> Cat.table_meta option = function
   | Plan.Op_seq_scan { table_meta } -> Some table_meta
-  | Plan.Op_filter  { child; _ }    -> get_outer_scan_meta child
-  | Plan.Op_sort    { child; _ }    -> get_outer_scan_meta child
-  | Plan.Op_limit   { child; _ }    -> get_outer_scan_meta child
+  | Plan.Op_filter { child; _ } -> get_outer_scan_meta child
+  | Plan.Op_sort { child; _ } -> get_outer_scan_meta child
+  | Plan.Op_limit { child; _ } -> get_outer_scan_meta child
   | Plan.Op_index_lookup { table_meta; _ } -> Some table_meta
-  | _                               -> None
+  | _ -> None
+;;
 
 (** Substitute outer column refs (table.col) with literal values from the outer row. *)
-let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.expr) : Ast.expr =
+let rec substitute_outer_in_expr (meta : Cat.table_meta) (row : Row.t) (e : Ast.expr)
+  : Ast.expr
+  =
   let go = substitute_outer_in_expr meta row in
   match e with
   | Ast.E_tbl_col (tbl, col) when String.equal tbl meta.Cat.name ->
     (try
        let i = find_col_idx_by_name meta.Cat.columns col in
        Ast.E_lit (value_to_literal row.(i))
-     with Failure _ -> e)
-  | Ast.E_binop (op, a, b)         -> Ast.E_binop (op, go a, go b)
-  | Ast.E_not a                    -> Ast.E_not (go a)
-  | Ast.E_is_null a                -> Ast.E_is_null (go a)
-  | Ast.E_is_not_null a            -> Ast.E_is_not_null (go a)
-  | Ast.E_neg a                    -> Ast.E_neg (go a)
-  | Ast.E_bitnot a                 -> Ast.E_bitnot (go a)
-  | Ast.E_between (x, lo, hi)      -> Ast.E_between (go x, go lo, go hi)
-  | Ast.E_in (x, vals)             -> Ast.E_in (go x, List.map go vals)
-  | Ast.E_func (f, args)           -> Ast.E_func (f, List.map go args)
-  | Ast.E_cast (x, ty)             -> Ast.E_cast (go x, ty)
+     with
+     | Failure _ -> e)
+  | Ast.E_binop (op, a, b) -> Ast.E_binop (op, go a, go b)
+  | Ast.E_not a -> Ast.E_not (go a)
+  | Ast.E_is_null a -> Ast.E_is_null (go a)
+  | Ast.E_is_not_null a -> Ast.E_is_not_null (go a)
+  | Ast.E_neg a -> Ast.E_neg (go a)
+  | Ast.E_bitnot a -> Ast.E_bitnot (go a)
+  | Ast.E_between (x, lo, hi) -> Ast.E_between (go x, go lo, go hi)
+  | Ast.E_in (x, vals) -> Ast.E_in (go x, List.map go vals)
+  | Ast.E_func (f, args) -> Ast.E_func (f, List.map go args)
+  | Ast.E_cast (x, ty) -> Ast.E_cast (go x, ty)
   | Ast.E_case { scrutinee; branches; else_ } ->
-    Ast.E_case {
-      scrutinee = Option.map go scrutinee;
-      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
-      else_     = Option.map go else_;
-    }
+    Ast.E_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
   | _ -> e
+;;
 
 (** Substitute outer column refs in any embedded Ast.stmt nodes inside a
     Plan.expr (correlated subqueries / EXISTS / IN). *)
 let rec substitute_outer_in_plan_expr
-    (meta : Cat.table_meta) (row : Row.t) (e : Plan.expr) : Plan.expr =
+          (meta : Cat.table_meta)
+          (row : Row.t)
+          (e : Plan.expr)
+  : Plan.expr
+  =
   let go = substitute_outer_in_plan_expr meta row in
   match e with
-  | Plan.P_exists inner ->
-    Plan.P_exists (substitute_outer_in_stmt meta row inner)
+  | Plan.P_exists inner -> Plan.P_exists (substitute_outer_in_stmt meta row inner)
   | Plan.P_in_select (x, inner) ->
     Plan.P_in_select (go x, substitute_outer_in_stmt meta row inner)
-  | Plan.P_subquery inner ->
-    Plan.P_subquery (substitute_outer_in_stmt meta row inner)
-  | Plan.P_binop (op, a, b)    -> Plan.P_binop (op, go a, go b)
-  | Plan.P_not a               -> Plan.P_not (go a)
-  | Plan.P_is_null a           -> Plan.P_is_null (go a)
-  | Plan.P_is_not_null a       -> Plan.P_is_not_null (go a)
-  | Plan.P_neg a               -> Plan.P_neg (go a)
-  | Plan.P_bitnot a            -> Plan.P_bitnot (go a)
+  | Plan.P_subquery inner -> Plan.P_subquery (substitute_outer_in_stmt meta row inner)
+  | Plan.P_binop (op, a, b) -> Plan.P_binop (op, go a, go b)
+  | Plan.P_not a -> Plan.P_not (go a)
+  | Plan.P_is_null a -> Plan.P_is_null (go a)
+  | Plan.P_is_not_null a -> Plan.P_is_not_null (go a)
+  | Plan.P_neg a -> Plan.P_neg (go a)
+  | Plan.P_bitnot a -> Plan.P_bitnot (go a)
   | Plan.P_between (x, lo, hi) -> Plan.P_between (go x, go lo, go hi)
-  | Plan.P_in (x, vs)          -> Plan.P_in (go x, List.map go vs)
-  | Plan.P_func (f, args)      -> Plan.P_func (f, List.map go args)
+  | Plan.P_in (x, vs) -> Plan.P_in (go x, List.map go vs)
+  | Plan.P_func (f, args) -> Plan.P_func (f, List.map go args)
   | Plan.P_case { scrutinee; branches; else_ } ->
-    Plan.P_case {
-      scrutinee = Option.map go scrutinee;
-      branches  = List.map (fun (c, r) -> (go c, go r)) branches;
-      else_     = Option.map go else_;
-    }
-  | Plan.P_cast (e, ty)        -> Plan.P_cast (go e, ty)
-  | _                          -> e
+    Plan.P_case
+      { scrutinee = Option.map go scrutinee
+      ; branches = List.map (fun (c, r) -> go c, go r) branches
+      ; else_ = Option.map go else_
+      }
+  | Plan.P_cast (e, ty) -> Plan.P_cast (go e, ty)
+  | _ -> e
 
 (** Apply substitute_outer_in_expr to WHERE/HAVING/JOIN ON clauses in an AST stmt. *)
-and substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.stmt) : Ast.stmt =
+and substitute_outer_in_stmt (meta : Cat.table_meta) (row : Row.t) (s : Ast.stmt)
+  : Ast.stmt
+  =
   let go_e = substitute_outer_in_expr meta row in
   let go_s = substitute_outer_in_stmt meta row in
   match s with
   | Ast.S_select r ->
-    Ast.S_select { r with
-      where  = Option.map go_e r.where;
-      having = Option.map go_e r.having;
-      joins  = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins;
-    }
+    Ast.S_select
+      { r with
+        where = Option.map go_e r.where
+      ; having = Option.map go_e r.having
+      ; joins = List.map (fun j -> { j with Ast.on = go_e j.Ast.on }) r.joins
+      }
   | Ast.S_compound { op; left; right; order; limit; offset } ->
     Ast.S_compound { op; left = go_s left; right = go_s right; order; limit; offset }
   | Ast.S_with_cte { name; def; query; recursive } ->
     Ast.S_with_cte { name; def = go_s def; query = go_s query; recursive }
   | _ -> s
+;;
 
 let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) : Plan.op =
   let go = substitute_cte ~cte_name ~rows in
   match op with
   | Plan.Op_cte_scan { cte_name = n; _ } when String.equal n cte_name ->
     Plan.Op_pragma_rows { rows }
-  | Plan.Op_filter r          -> Plan.Op_filter { r with child = go r.child }
-  | Plan.Op_project r         -> Plan.Op_project { r with child = go r.child }
-  | Plan.Op_expr_project r    -> Plan.Op_expr_project { r with child = go r.child }
-  | Plan.Op_sort r            -> Plan.Op_sort { r with child = go r.child }
-  | Plan.Op_limit r           -> Plan.Op_limit { r with child = go r.child }
-  | Plan.Op_distinct r        -> Plan.Op_distinct { child = go r.child }
-  | Plan.Op_aggregate r       -> Plan.Op_aggregate { r with child = go r.child }
+  | Plan.Op_filter r -> Plan.Op_filter { r with child = go r.child }
+  | Plan.Op_project r -> Plan.Op_project { r with child = go r.child }
+  | Plan.Op_expr_project r -> Plan.Op_expr_project { r with child = go r.child }
+  | Plan.Op_sort r -> Plan.Op_sort { r with child = go r.child }
+  | Plan.Op_limit r -> Plan.Op_limit { r with child = go r.child }
+  | Plan.Op_distinct r -> Plan.Op_distinct { child = go r.child }
+  | Plan.Op_aggregate r -> Plan.Op_aggregate { r with child = go r.child }
   | Plan.Op_nested_loop_join r -> Plan.Op_nested_loop_join { r with left = go r.left }
-  | Plan.Op_hash_join r       -> Plan.Op_hash_join { r with left = go r.left; right = go r.right }
-  | Plan.Op_union r           -> Plan.Op_union { r with left = go r.left; right = go r.right }
-  | Plan.Op_intersect r       -> Plan.Op_intersect { left = go r.left; right = go r.right }
-  | Plan.Op_except r          -> Plan.Op_except { left = go r.left; right = go r.right }
+  | Plan.Op_hash_join r ->
+    Plan.Op_hash_join { r with left = go r.left; right = go r.right }
+  | Plan.Op_union r -> Plan.Op_union { r with left = go r.left; right = go r.right }
+  | Plan.Op_intersect r -> Plan.Op_intersect { left = go r.left; right = go r.right }
+  | Plan.Op_except r -> Plan.Op_except { left = go r.left; right = go r.right }
   | Plan.Op_with_cte r when not (String.equal r.cte_name cte_name) ->
     Plan.Op_with_cte { r with query = go r.query }
   | Plan.Op_window r -> Plan.Op_window { r with child = go r.child }
   | Plan.Op_insert_select ({ source; _ } as r) ->
     Plan.Op_insert_select { r with source = go source }
   | _ -> op
+;;
 
 let rec pre_eval_subquery
-    (clock : (unit -> float) option)
-    (store : S.t)
-    (params : Row.value array)
-    (cat_opt : Cat.t option)
-    (e : Plan.expr) : Plan.expr Lwt.t =
+          (clock : (unit -> float) option)
+          (store : S.t)
+          (params : Row.value array)
+          (cat_opt : Cat.t option)
+          (e : Plan.expr)
+  : Plan.expr Lwt.t
+  =
   match e with
   | Plan.P_subquery inner_ast ->
     eval_scalar_subquery clock store params cat_opt e inner_ast
-  | Plan.P_exists inner_ast ->
-    eval_exists_subquery clock store params cat_opt e inner_ast
+  | Plan.P_exists inner_ast -> eval_exists_subquery clock store params cat_opt e inner_ast
   | Plan.P_in_select (x, inner_ast) ->
     eval_in_select clock store params cat_opt e x inner_ast
   | Plan.P_binop (op, a, b) ->
@@ -4448,12 +6597,12 @@ let rec pre_eval_subquery
     let* a' = pre_eval_subquery clock store params cat_opt a in
     Lwt.return (Plan.P_bitnot a')
   | Plan.P_between (x, lo, hi) ->
-    let* x'  = pre_eval_subquery clock store params cat_opt x in
+    let* x' = pre_eval_subquery clock store params cat_opt x in
     let* lo' = pre_eval_subquery clock store params cat_opt lo in
     let* hi' = pre_eval_subquery clock store params cat_opt hi in
     Lwt.return (Plan.P_between (x', lo', hi'))
   | Plan.P_in (x, vals) ->
-    let* x'    = pre_eval_subquery clock store params cat_opt x in
+    let* x' = pre_eval_subquery clock store params cat_opt x in
     let* vals' = Lwt_list.map_s (pre_eval_subquery clock store params cat_opt) vals in
     Lwt.return (Plan.P_in (x', vals'))
   | Plan.P_func (f, args) ->
@@ -4462,19 +6611,22 @@ let rec pre_eval_subquery
   | Plan.P_case { scrutinee; branches; else_ } ->
     let* scrutinee' =
       match scrutinee with
-      | None   -> Lwt.return None
+      | None -> Lwt.return None
       | Some e ->
         let+ e' = pre_eval_subquery clock store params cat_opt e in
         Some e'
     in
-    let* branches' = Lwt_list.map_s (fun (cond, res) ->
-      let* cond' = pre_eval_subquery clock store params cat_opt cond in
-      let+ res'  = pre_eval_subquery clock store params cat_opt res  in
-      (cond', res')
-    ) branches in
+    let* branches' =
+      Lwt_list.map_s
+        (fun (cond, res) ->
+           let* cond' = pre_eval_subquery clock store params cat_opt cond in
+           let+ res' = pre_eval_subquery clock store params cat_opt res in
+           cond', res')
+        branches
+    in
     let+ else_' =
       match else_ with
-      | None   -> Lwt.return None
+      | None -> Lwt.return None
       | Some e ->
         let+ e' = pre_eval_subquery clock store params cat_opt e in
         Some e'
@@ -4491,7 +6643,8 @@ let rec pre_eval_subquery
 (* Scalar subquery: run [inner_ast], yield its first column's first value as a
    literal (NULL if empty); returns [e] unchanged if it fails to bind. *)
 and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
-    : Plan.expr Lwt.t =
+  : Plan.expr Lwt.t
+  =
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit Ast.L_null)
   | Some cat ->
@@ -4502,7 +6655,8 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
        let op = Planner.plan ~cat bound in
        let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
        let* rows = Lwt_stream.to_list stream in
-       let v = match rows with
+       let v =
+         match rows with
          | [] -> Ast.L_null
          | row :: _ when Array.length row >= 1 -> value_to_literal row.(0)
          | _ -> Ast.L_null
@@ -4511,7 +6665,8 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
 
 (* EXISTS subquery: 1 if [inner_ast] yields any row, else 0. *)
 and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
-    : Plan.expr Lwt.t =
+  : Plan.expr Lwt.t
+  =
   match cat_opt with
   | None -> Lwt.return (Plan.P_lit (Ast.L_int 0L))
   | Some cat ->
@@ -4526,7 +6681,8 @@ and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
 
 (* IN (subquery): materialize [inner_ast]'s first column into the IN value list. *)
 and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
-    : Plan.expr Lwt.t =
+  : Plan.expr Lwt.t
+  =
   match cat_opt with
   | None -> Lwt.return (Plan.P_in (x, []))
   | Some cat ->
@@ -4537,9 +6693,14 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
        let op = Planner.plan ~cat bound in
        let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
        let* rows = Lwt_stream.to_list stream in
-       let vals = List.filter_map (fun row ->
-         if Array.length row >= 1 then Some (Plan.P_lit (value_to_literal row.(0)))
-         else None) rows in
+       let vals =
+         List.filter_map
+           (fun row ->
+              if Array.length row >= 1
+              then Some (Plan.P_lit (value_to_literal row.(0)))
+              else None)
+           rows
+       in
        let* x' = pre_eval_subquery clock store params cat_opt x in
        Lwt.return (Plan.P_in (x', vals)))
 
@@ -4547,79 +6708,128 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
 (* Window function helpers                                              *)
 (* ------------------------------------------------------------------ *)
 
-and eval_partition_key clock params (row : Row.t) (partition_by : Plan.expr list) : Row.value list =
+and eval_partition_key clock params (row : Row.t) (partition_by : Plan.expr list)
+  : Row.value list
+  =
   List.map (eval_expr clock params row) partition_by
 
 and partition_keys_equal (a : Row.value list) (b : Row.value list) : bool =
-  List.length a = List.length b &&
-  List.for_all2 (fun x y -> compare_values x y = 0) a b
+  List.length a = List.length b && List.for_all2 (fun x y -> compare_values x y = 0) a b
 
-and group_by_partition clock params (partition_by : Plan.expr list)
-    (indexed_rows : (int * Row.t) list)
-    : (Row.value list * (int * Row.t) list) list =
-  List.fold_left (fun acc (idx, row) ->
-    let key = eval_partition_key clock params row partition_by in
-    match List.find_opt (fun (k, _) -> partition_keys_equal k key) acc with
-    | Some _ ->
-      List.map (fun (k, pairs) ->
-        if partition_keys_equal k key then (k, pairs @ [(idx, row)]) else (k, pairs)
-      ) acc
-    | None -> acc @ [(key, [(idx, row)])]
-  ) [] indexed_rows
+and group_by_partition
+      clock
+      params
+      (partition_by : Plan.expr list)
+      (indexed_rows : (int * Row.t) list)
+  : (Row.value list * (int * Row.t) list) list
+  =
+  List.fold_left
+    (fun acc (idx, row) ->
+       let key = eval_partition_key clock params row partition_by in
+       match List.find_opt (fun (k, _) -> partition_keys_equal k key) acc with
+       | Some _ ->
+         List.map
+           (fun (k, pairs) ->
+              if partition_keys_equal k key then k, pairs @ [ idx, row ] else k, pairs)
+           acc
+       | None -> acc @ [ key, [ idx, row ] ])
+    []
+    indexed_rows
 
-and sort_partition_by clock params
-    (order_by : (Plan.expr * [`Asc | `Desc] * [`Nulls_first | `Nulls_last]) list)
-    (indexed_rows : (int * Row.t) list) : (int * Row.t) list =
-  if order_by = [] then indexed_rows
+and sort_partition_by
+      clock
+      params
+      (order_by : (Plan.expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list)
+      (indexed_rows : (int * Row.t) list)
+  : (int * Row.t) list
+  =
+  if order_by = []
+  then indexed_rows
   else
-    List.sort (fun (_, ra) (_, rb) ->
-      let rec cmp = function
-        | [] -> 0
-        | (e, dir, nulls) :: rest ->
-          let va = eval_expr clock params ra e in
-          let vb = eval_expr clock params rb e in
-          let c = compare_with_nulls dir nulls va vb in
-          if c <> 0 then c else cmp rest
-      in cmp order_by
-    ) indexed_rows
+    List.sort
+      (fun (_, ra) (_, rb) ->
+         let rec cmp = function
+           | [] -> 0
+           | (e, dir, nulls) :: rest ->
+             let va = eval_expr clock params ra e in
+             let vb = eval_expr clock params rb e in
+             let c = compare_with_nulls dir nulls va vb in
+             if c <> 0 then c else cmp rest
+         in
+         cmp order_by)
+      indexed_rows
 
-and win_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_rank
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   let cur_rank = ref 1 in
   for pos = 0 to n - 1 do
-    if pos > 0 then begin
-      let order_changed = List.exists (fun (e, dir, nulls) ->
-        compare_with_nulls dir nulls
-          (eval_expr clock params sorted_rows.(pos)   e)
-          (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-      ) wplan.Plan.order_by in
-      if order_changed then cur_rank := pos + 1
-    end;
+    if pos > 0
+    then (
+      let order_changed =
+        List.exists
+          (fun (e, dir, nulls) ->
+             compare_with_nulls
+               dir
+               nulls
+               (eval_expr clock params sorted_rows.(pos) e)
+               (eval_expr clock params sorted_rows.(pos - 1) e)
+             <> 0)
+          wplan.Plan.order_by
+      in
+      if order_changed then cur_rank := pos + 1);
     results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
   done
 
-and win_dense_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_dense_rank
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   let cur_rank = ref 1 in
   for pos = 0 to n - 1 do
-    if pos > 0 then begin
-      let order_changed = List.exists (fun (e, dir, nulls) ->
-        compare_with_nulls dir nulls
-          (eval_expr clock params sorted_rows.(pos)   e)
-          (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-      ) wplan.Plan.order_by in
-      if order_changed then incr cur_rank
-    end;
+    if pos > 0
+    then (
+      let order_changed =
+        List.exists
+          (fun (e, dir, nulls) ->
+             compare_with_nulls
+               dir
+               nulls
+               (eval_expr clock params sorted_rows.(pos) e)
+               (eval_expr clock params sorted_rows.(pos - 1) e)
+             <> 0)
+          wplan.Plan.order_by
+      in
+      if order_changed then incr cur_rank);
     results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int !cur_rank)
   done
 
-and win_ntile clock params (wplan : Plan.window_plan_item) _sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_ntile
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      _sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   let n_buckets =
     match wplan.Plan.args with
-    | [e] -> (match eval_expr clock params [||] e with
-              | Row.V_int k -> Int64.to_int k
-              | _ -> 1)
+    | [ e ] ->
+      (match eval_expr clock params [||] e with
+       | Row.V_int k -> Int64.to_int k
+       | _ -> 1)
     | _ -> 1
   in
   let n_buckets = max 1 n_buckets in
@@ -4628,51 +6838,75 @@ and win_ntile clock params (wplan : Plan.window_plan_item) _sorted_rows sorted_o
     results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int bucket)
   done
 
-and win_lag_lead clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
-  let is_lag = (wplan.Plan.func = Ast.WF_lag) in
+and win_lag_lead
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
+  let is_lag = wplan.Plan.func = Ast.WF_lag in
   let offset =
     match wplan.Plan.args with
-    | _ :: e :: _ -> (match eval_expr clock params [||] e with
-                      | Row.V_int k -> Int64.to_int k
-                      | _ -> 1)
+    | _ :: e :: _ ->
+      (match eval_expr clock params [||] e with
+       | Row.V_int k -> Int64.to_int k
+       | _ -> 1)
     | _ -> 1
   in
   let default_expr =
-    match wplan.Plan.args with _ :: _ :: e :: _ -> Some e | _ -> None
+    match wplan.Plan.args with
+    | _ :: _ :: e :: _ -> Some e
+    | _ -> None
   in
   for pos = 0 to n - 1 do
     let src_pos = if is_lag then pos - offset else pos + offset in
     let v =
-      if src_pos >= 0 && src_pos < n then
-        (match wplan.Plan.args with
-         | e :: _ -> eval_expr clock params sorted_rows.(src_pos) e
-         | []     -> Row.V_null)
-      else
-        (match default_expr with
-         | Some e -> eval_expr clock params sorted_rows.(pos) e
-         | None   -> Row.V_null)
+      if src_pos >= 0 && src_pos < n
+      then (
+        match wplan.Plan.args with
+        | e :: _ -> eval_expr clock params sorted_rows.(src_pos) e
+        | [] -> Row.V_null)
+      else (
+        match default_expr with
+        | Some e -> eval_expr clock params sorted_rows.(pos) e
+        | None -> Row.V_null)
     in
     results.(sorted_orig_idxs.(pos)) <- v
   done
 
-and win_first_value clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_first_value
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   let arg_expr =
     match wplan.Plan.args with
     | e :: _ -> e
     | [] -> failwith "FIRST_VALUE requires one argument"
   in
   let first_val =
-    if n > 0 then eval_expr clock params sorted_rows.(0) arg_expr
-    else Row.V_null
+    if n > 0 then eval_expr clock params sorted_rows.(0) arg_expr else Row.V_null
   in
   for pos = 0 to n - 1 do
     results.(sorted_orig_idxs.(pos)) <- first_val
   done
 
-and win_nth_value clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_nth_value
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   let arg_expr =
     match wplan.Plan.args with
     | e :: _ -> e
@@ -4680,58 +6914,85 @@ and win_nth_value clock params (wplan : Plan.window_plan_item) sorted_rows sorte
   in
   let n_arg =
     match wplan.Plan.args with
-    | _ :: e :: _ -> (match eval_expr clock params [||] e with
-                      | Row.V_int k -> Int64.to_int k
-                      | _ -> 1)
+    | _ :: e :: _ ->
+      (match eval_expr clock params [||] e with
+       | Row.V_int k -> Int64.to_int k
+       | _ -> 1)
     | _ -> 1
   in
   for pos = 0 to n - 1 do
     let v =
-      if n_arg >= 1 && n_arg <= pos + 1 then
-        eval_expr clock params sorted_rows.(n_arg - 1) arg_expr
-      else
-        Row.V_null
+      if n_arg >= 1 && n_arg <= pos + 1
+      then eval_expr clock params sorted_rows.(n_arg - 1) arg_expr
+      else Row.V_null
     in
     results.(sorted_orig_idxs.(pos)) <- v
   done
 
-and win_percent_rank clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_percent_rank
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   (* PERCENT_RANK = peer_group_start / (n - 1).  Positional adjacency in the
      already-direction-sorted array, so DESC works without knowing direction. *)
-  if n = 0 then ()
-  else begin
+  if n = 0
+  then ()
+  else (
     let peer_start = ref 0 in
     for pos = 0 to n - 1 do
-      if pos > 0 then begin
-        let order_changed = List.exists (fun (e, dir, nulls) ->
-          compare_with_nulls dir nulls
-            (eval_expr clock params sorted_rows.(pos)   e)
-            (eval_expr clock params sorted_rows.(pos-1) e) <> 0
-        ) wplan.Plan.order_by in
-        if order_changed then peer_start := pos
-      end;
-      let pct = if n <= 1 then 0.0
-                else Float.of_int !peer_start /. Float.of_int (n - 1) in
+      if pos > 0
+      then (
+        let order_changed =
+          List.exists
+            (fun (e, dir, nulls) ->
+               compare_with_nulls
+                 dir
+                 nulls
+                 (eval_expr clock params sorted_rows.(pos) e)
+                 (eval_expr clock params sorted_rows.(pos - 1) e)
+               <> 0)
+            wplan.Plan.order_by
+        in
+        if order_changed then peer_start := pos);
+      let pct =
+        if n <= 1 then 0.0 else Float.of_int !peer_start /. Float.of_int (n - 1)
+      in
       results.(sorted_orig_idxs.(pos)) <- Row.V_real pct
-    done
-  end
+    done)
 
-and win_cume_dist clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n =
+and win_cume_dist
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+  =
   (* CUME_DIST = (last position in peer group + 1) / n.  Positional adjacency
      in the already-direction-sorted array, so DESC works correctly. *)
-  if n = 0 then ()
-  else begin
+  if n = 0
+  then ()
+  else (
     let pos = ref 0 in
     while !pos < n do
       let peer_end = ref !pos in
-      while !peer_end + 1 < n &&
-            List.for_all (fun (e, dir, nulls) ->
-              compare_with_nulls dir nulls
-                (eval_expr clock params sorted_rows.(!peer_end + 1) e)
-                (eval_expr clock params sorted_rows.(!peer_end)     e) = 0
-            ) wplan.Plan.order_by
+      while
+        !peer_end + 1 < n
+        && List.for_all
+             (fun (e, dir, nulls) ->
+                compare_with_nulls
+                  dir
+                  nulls
+                  (eval_expr clock params sorted_rows.(!peer_end + 1) e)
+                  (eval_expr clock params sorted_rows.(!peer_end) e)
+                = 0)
+             wplan.Plan.order_by
       do
         incr peer_end
       done;
@@ -4740,106 +7001,149 @@ and win_cume_dist clock params (wplan : Plan.window_plan_item) sorted_rows sorte
         results.(sorted_orig_idxs.(i)) <- Row.V_real cd
       done;
       pos := !peer_end + 1
-    done
-  end
+    done)
 
 (* Compute one aggregate-window value over the rows in [indices]. *)
-and win_agg_over_frame agg_func (arg_expr : Plan.expr option)
-    (arg_vals : Row.value array) indices : Row.value =
+and win_agg_over_frame
+      agg_func
+      (arg_expr : Plan.expr option)
+      (arg_vals : Row.value array)
+      indices
+  : Row.value
+  =
   match agg_func with
   | Ast.Agg_count ->
     let cnt =
-      if arg_expr = None then List.length indices
+      if arg_expr = None
+      then List.length indices
       else List.length (List.filter (fun i -> not (arg_vals.(i) = Row.V_null)) indices)
     in
     Row.V_int (Int64.of_int cnt)
   | Ast.Agg_sum ->
-    List.fold_left (fun acc i ->
-      match acc, arg_vals.(i) with
-      | _, Row.V_null                       -> acc
-      | Row.V_null, v                       -> v
-      | Row.V_int  a, Row.V_int  b          -> Row.V_int  (Int64.add a b)
-      | Row.V_real a, Row.V_real b          -> Row.V_real (a +. b)
-      | Row.V_int  a, Row.V_real b          -> Row.V_real (Int64.to_float a +. b)
-      | Row.V_real a, Row.V_int  b          -> Row.V_real (a +. Int64.to_float b)
-      | _, _                                -> acc
-    ) Row.V_null indices
+    List.fold_left
+      (fun acc i ->
+         match acc, arg_vals.(i) with
+         | _, Row.V_null -> acc
+         | Row.V_null, v -> v
+         | Row.V_int a, Row.V_int b -> Row.V_int (Int64.add a b)
+         | Row.V_real a, Row.V_real b -> Row.V_real (a +. b)
+         | Row.V_int a, Row.V_real b -> Row.V_real (Int64.to_float a +. b)
+         | Row.V_real a, Row.V_int b -> Row.V_real (a +. Int64.to_float b)
+         | _, _ -> acc)
+      Row.V_null
+      indices
   | Ast.Agg_avg ->
-    let vals = List.filter_map (fun i ->
-      match arg_vals.(i) with
-      | Row.V_int  n -> Some (Int64.to_float n)
-      | Row.V_real f -> Some f
-      | _            -> None
-    ) indices in
-    if vals = [] then Row.V_null
+    let vals =
+      List.filter_map
+        (fun i ->
+           match arg_vals.(i) with
+           | Row.V_int n -> Some (Int64.to_float n)
+           | Row.V_real f -> Some f
+           | _ -> None)
+        indices
+    in
+    if vals = []
+    then Row.V_null
     else Row.V_real (List.fold_left ( +. ) 0.0 vals /. float_of_int (List.length vals))
   | Ast.Agg_min ->
-    List.fold_left (fun acc i ->
-      match arg_vals.(i) with
-      | Row.V_null -> acc
-      | v -> (match acc with
-        | Row.V_null -> v
-        | acc_v -> if compare_values v acc_v < 0 then v else acc_v)
-    ) Row.V_null indices
+    List.fold_left
+      (fun acc i ->
+         match arg_vals.(i) with
+         | Row.V_null -> acc
+         | v ->
+           (match acc with
+            | Row.V_null -> v
+            | acc_v -> if compare_values v acc_v < 0 then v else acc_v))
+      Row.V_null
+      indices
   | Ast.Agg_max ->
-    List.fold_left (fun acc i ->
-      match arg_vals.(i) with
-      | Row.V_null -> acc
-      | v -> (match acc with
-        | Row.V_null -> v
-        | acc_v -> if compare_values v acc_v > 0 then v else acc_v)
-    ) Row.V_null indices
+    List.fold_left
+      (fun acc i ->
+         match arg_vals.(i) with
+         | Row.V_null -> acc
+         | v ->
+           (match acc with
+            | Row.V_null -> v
+            | acc_v -> if compare_values v acc_v > 0 then v else acc_v))
+      Row.V_null
+      indices
   | Ast.Agg_group_concat sep ->
     let separator = Option.value sep ~default:"," in
-    let parts = List.filter_map (fun i ->
-      match arg_vals.(i) with
-      | Row.V_null -> None
-      | Row.V_int  n -> Some (Int64.to_string n)
-      | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-      | Row.V_text s -> Some s
-      | Row.V_blob _ -> Some ""
-    ) indices in
-    if parts = [] then Row.V_null
-    else Row.V_text (String.concat separator parts)
+    let parts =
+      List.filter_map
+        (fun i ->
+           match arg_vals.(i) with
+           | Row.V_null -> None
+           | Row.V_int n -> Some (Int64.to_string n)
+           | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+           | Row.V_text s -> Some s
+           | Row.V_blob _ -> Some "")
+        indices
+    in
+    if parts = [] then Row.V_null else Row.V_text (String.concat separator parts)
 
-and win_aggregate clock params (wplan : Plan.window_plan_item) sorted_rows sorted_orig_idxs
-    (results : Row.value array) n agg_func =
+and win_aggregate
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      sorted_rows
+      sorted_orig_idxs
+      (results : Row.value array)
+      n
+      agg_func
+  =
   let has_order = wplan.Plan.order_by <> [] in
-  let arg_expr = match wplan.Plan.args with e :: _ -> Some e | [] -> None in
-  let arg_vals = Array.init n (fun pos ->
-    match arg_expr with
-    | Some e -> eval_expr clock params sorted_rows.(pos) e
-    | None   -> Row.V_null
-  ) in
+  let arg_expr =
+    match wplan.Plan.args with
+    | e :: _ -> Some e
+    | [] -> None
+  in
+  let arg_vals =
+    Array.init n (fun pos ->
+      match arg_expr with
+      | Some e -> eval_expr clock params sorted_rows.(pos) e
+      | None -> Row.V_null)
+  in
   let resolve_bound bound pos =
     match bound with
     | Ast.FB_unbounded_preceding -> 0
-    | Ast.FB_preceding k         -> max 0 (pos - k)
-    | Ast.FB_current_row         -> pos
-    | Ast.FB_following k         -> min (n - 1) (pos + k)
+    | Ast.FB_preceding k -> max 0 (pos - k)
+    | Ast.FB_current_row -> pos
+    | Ast.FB_following k -> min (n - 1) (pos + k)
     | Ast.FB_unbounded_following -> n - 1
   in
   for pos = 0 to n - 1 do
-    let (frame_start, frame_end) = match wplan.Plan.frame with
+    let frame_start, frame_end =
+      match wplan.Plan.frame with
       | None ->
         (* Default: UNBOUNDED PRECEDING AND CURRENT ROW with ORDER BY, else
            UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING. *)
         let fe = if has_order then pos else n - 1 in
-        (0, fe)
+        0, fe
       | Some spec ->
         (* RANGE numeric bounds approximated as ROWS — full value-based RANGE
            semantics not implemented. *)
-        (resolve_bound spec.Ast.start pos, resolve_bound spec.Ast.end_ pos)
+        resolve_bound spec.Ast.start pos, resolve_bound spec.Ast.end_ pos
     in
     let frame_start = max 0 frame_start in
-    let frame_end   = min (n - 1) frame_end in
-    let indices = if frame_start > frame_end then []
-                  else List.init (frame_end - frame_start + 1) (fun i -> frame_start + i) in
-    results.(sorted_orig_idxs.(pos)) <- win_agg_over_frame agg_func arg_expr arg_vals indices
+    let frame_end = min (n - 1) frame_end in
+    let indices =
+      if frame_start > frame_end
+      then []
+      else List.init (frame_end - frame_start + 1) (fun i -> frame_start + i)
+    in
+    results.(sorted_orig_idxs.(pos))
+    <- win_agg_over_frame agg_func arg_expr arg_vals indices
   done
 
-and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
-    (sorted_indexed : (int * Row.t) list) (n_total : int) : Row.value array =
+and compute_window_for_partition
+      clock
+      params
+      (wplan : Plan.window_plan_item)
+      (sorted_indexed : (int * Row.t) list)
+      (n_total : int)
+  : Row.value array
+  =
   let results = Array.make n_total Row.V_null in
   let sorted_rows = Array.of_list (List.map snd sorted_indexed) in
   let sorted_orig_idxs = Array.of_list (List.map fst sorted_indexed) in
@@ -4850,10 +7154,13 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        results.(sorted_orig_idxs.(pos)) <- Row.V_int (Int64.of_int (pos + 1))
      done
    | Ast.WF_rank -> win_rank clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_dense_rank -> win_dense_rank clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_dense_rank ->
+     win_dense_rank clock params wplan sorted_rows sorted_orig_idxs results n
    | Ast.WF_ntile -> win_ntile clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_lag | Ast.WF_lead -> win_lag_lead clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_first_value -> win_first_value clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_lag | Ast.WF_lead ->
+     win_lag_lead clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_first_value ->
+     win_first_value clock params wplan sorted_rows sorted_orig_idxs results n
    | Ast.WF_last_value ->
      let arg_expr =
        match wplan.Plan.args with
@@ -4861,113 +7168,147 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
        | [] -> failwith "LAST_VALUE requires one argument"
      in
      for pos = 0 to n - 1 do
-       results.(sorted_orig_idxs.(pos)) <-
-         eval_expr clock params sorted_rows.(pos) arg_expr
+       results.(sorted_orig_idxs.(pos))
+       <- eval_expr clock params sorted_rows.(pos) arg_expr
      done
-   | Ast.WF_nth_value -> win_nth_value clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_percent_rank -> win_percent_rank clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_cume_dist -> win_cume_dist clock params wplan sorted_rows sorted_orig_idxs results n
-   | Ast.WF_agg agg_func -> win_aggregate clock params wplan sorted_rows sorted_orig_idxs results n agg_func
-  );
+   | Ast.WF_nth_value ->
+     win_nth_value clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_percent_rank ->
+     win_percent_rank clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_cume_dist ->
+     win_cume_dist clock params wplan sorted_rows sorted_orig_idxs results n
+   | Ast.WF_agg agg_func ->
+     win_aggregate clock params wplan sorted_rows sorted_orig_idxs results n agg_func);
   results
 
 and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
-  let* tx  = S.ro_begin store in
+  let* tx = S.ro_begin store in
   let* cur = S.cursor_open tx table_meta.tree_id in
   let _sr = S.cursor_first cur in
   (* Snapshot lifetime tied to the stream: end on exhaustion OR a mid-scan read
      error so a corrupt page can't leak locks/refcounts/pins (#164). Idempotent. *)
   let ended = ref false in
   let finish () =
-    if !ended then Lwt.return_unit
-    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    if !ended
+    then Lwt.return_unit
+    else (
+      ended := true;
+      S.cursor_close cur;
+      S.ro_end tx)
   in
-  let stream = Lwt_stream.from (fun () ->
-    Lwt.catch
-      (fun () ->
-        match S.cursor_next cur with
-        | None ->
-          let%lwt () = finish () in
-          Lwt.return_none
-        | Some (_key, vbytes) ->
-          let row = decode_with_virtual clock params table_meta vbytes in
-          Lwt.return_some row)
-      (fun exn -> let%lwt () = finish () in Lwt.fail exn)
-  ) in
+  let stream =
+    Lwt_stream.from (fun () ->
+      Lwt.catch
+        (fun () ->
+           match S.cursor_next cur with
+           | None ->
+             let%lwt () = finish () in
+             Lwt.return_none
+           | Some (_key, vbytes) ->
+             let row = decode_with_virtual clock params table_meta vbytes in
+             Lwt.return_some row)
+        (fun exn ->
+           let%lwt () = finish () in
+           Lwt.fail exn))
+  in
   Lwt.return stream
 
 and stream_filter clock params store mode cat pred child =
   let* child_stream = to_stream clock params store ~mode ~cat child in
   let* pred' = pre_eval_subquery clock store params cat pred in
-  if not (plan_expr_has_subquery pred') then
-    Lwt.return (Lwt_stream.filter (fun row ->
-      value_truthy (eval_expr clock params row pred')
-    ) child_stream)
-  else begin
+  if not (plan_expr_has_subquery pred')
+  then
+    Lwt.return
+      (Lwt_stream.filter
+         (fun row -> value_truthy (eval_expr clock params row pred'))
+         child_stream)
+  else (
     let outer_meta = get_outer_scan_meta child in
     match outer_meta with
-    | None ->
-      Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
+    | None -> Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
     | Some meta ->
-      Lwt.return (Lwt_stream.filter_s (fun row ->
-        let subst_pred = substitute_outer_in_plan_expr meta row pred' in
-        let* resolved = pre_eval_subquery clock store params cat subst_pred in
-        Lwt.return (value_truthy (eval_expr clock params row resolved))
-      ) child_stream)
-  end
+      Lwt.return
+        (Lwt_stream.filter_s
+           (fun row ->
+              let subst_pred = substitute_outer_in_plan_expr meta row pred' in
+              let* resolved = pre_eval_subquery clock store params cat subst_pred in
+              Lwt.return (value_truthy (eval_expr clock params row resolved)))
+           child_stream))
 
 and stream_expr_project clock params store mode cat exprs child =
   let* inner = to_stream clock params store ~mode ~cat child in
-  let* exprs' = Lwt_list.map_s
-    (fun (e, _alias) -> pre_eval_subquery clock store params cat e) exprs in
+  let* exprs' =
+    Lwt_list.map_s (fun (e, _alias) -> pre_eval_subquery clock store params cat e) exprs
+  in
   let has_corr = List.exists plan_expr_has_subquery exprs' in
-  if not has_corr then
+  if not has_corr
+  then (
     let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
-    Lwt.return (Lwt_stream.map eval_exprs inner)
-  else
+    Lwt.return (Lwt_stream.map eval_exprs inner))
+  else (
     let outer_meta = get_outer_scan_meta child in
-    (match outer_meta with
-     | None ->
-       let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
-       Lwt.return (Lwt_stream.map eval_exprs inner)
-     | Some meta ->
-       Lwt.return (Lwt_stream.map_s (fun row ->
-         let* vals = Lwt_list.map_s (fun e ->
-           let e_subst = substitute_outer_in_plan_expr meta row e in
-           let* resolved = pre_eval_subquery clock store params cat e_subst in
-           Lwt.return (eval_expr clock params row resolved)
-         ) exprs' in
-         Lwt.return (Array.of_list vals)
-       ) inner))
+    match outer_meta with
+    | None ->
+      let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
+      Lwt.return (Lwt_stream.map eval_exprs inner)
+    | Some meta ->
+      Lwt.return
+        (Lwt_stream.map_s
+           (fun row ->
+              let* vals =
+                Lwt_list.map_s
+                  (fun e ->
+                     let e_subst = substitute_outer_in_plan_expr meta row e in
+                     let* resolved = pre_eval_subquery clock store params cat e_subst in
+                     Lwt.return (eval_expr clock params row resolved))
+                  exprs'
+              in
+              Lwt.return (Array.of_list vals))
+           inner))
 
 and stream_sort clock params store mode cat keys child =
   let* inner = to_stream clock params store ~mode ~cat child in
   let* rows = Lwt_stream.to_list inner in
-  let* keys' = Lwt_list.map_s (fun (e, dir, nulls) ->
-      let* e' = pre_eval_subquery clock store params cat e in
-      Lwt.return (e', dir, nulls)) keys in
+  let* keys' =
+    Lwt_list.map_s
+      (fun (e, dir, nulls) ->
+         let* e' = pre_eval_subquery clock store params cat e in
+         Lwt.return (e', dir, nulls))
+      keys
+  in
   let cmp a b =
-    List.fold_left (fun acc (key, dir, nulls) ->
-      if acc <> 0 then acc
-      else
-        let va = eval_expr clock params a key
-        and vb = eval_expr clock params b key in
-        compare_with_nulls dir nulls va vb
-    ) 0 keys'
+    List.fold_left
+      (fun acc (key, dir, nulls) ->
+         if acc <> 0
+         then acc
+         else (
+           let va = eval_expr clock params a key
+           and vb = eval_expr clock params b key in
+           compare_with_nulls dir nulls va vb))
+      0
+      keys'
   in
   Lwt.return (Lwt_stream.of_list (List.sort cmp rows))
 
-and stream_index_lookup clock params store table_tree idx_tree col_type lookup_val
-    (table_meta : Cat.table_meta) =
+and stream_index_lookup
+      clock
+      params
+      store
+      table_tree
+      idx_tree
+      col_type
+      lookup_val
+      (table_meta : Cat.table_meta)
+  =
   let lookup_v =
     let v = eval_expr clock params [||] lookup_val in
     match v, col_type with
     | Row.V_null, _ -> Index_key.IK_null
-    | Row.V_int  n, Row.Integer -> Index_key.IK_int n
-    | Row.V_text s, Row.Text    -> Index_key.IK_text s
-    | Row.V_real f, Row.Real    -> Index_key.IK_real f
-    | Row.V_blob b, Row.Blob    -> Index_key.IK_blob b
-    | _, _ -> Index_key.IK_null  (* type mismatch: nothing matches *)
+    | Row.V_int n, Row.Integer -> Index_key.IK_int n
+    | Row.V_text s, Row.Text -> Index_key.IK_text s
+    | Row.V_real f, Row.Real -> Index_key.IK_real f
+    | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
+    | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *)
   in
   let prefix = Index_key.encode_value lookup_v in
   let plen = Bytes.length prefix in
@@ -4978,53 +7319,75 @@ and stream_index_lookup clock params store table_tree idx_tree col_type lookup_v
   let exhausted = ref false in
   let ended = ref false in
   let finish () =
-    if !ended then Lwt.return_unit
-    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    if !ended
+    then Lwt.return_unit
+    else (
+      ended := true;
+      S.cursor_close cur;
+      S.ro_end tx)
   in
-  let stream = Lwt_stream.from (fun () ->
-    if !exhausted then Lwt.return_none
-    else Lwt.catch (fun () -> begin
-      let rec next () =
-        match S.cursor_next cur with
-        | None ->
-          exhausted := true;
-          let%lwt () = finish () in
-          Lwt.return_none
-        | Some (ikey, _ival) ->
-          if Bytes.length ikey >= plen + 8 &&
-             Bytes.equal (Bytes.sub ikey 0 plen) prefix
-          then begin
-            let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-            let rowid = Rowid.decode rowid_bytes in
-            let table_key = Rowid.encode rowid in
-            let%lwt vrow = S.get tx table_tree table_key in
-            match vrow with
-            | None -> next ()
-            | Some vbytes ->
-              let row = decode_with_virtual clock params table_meta vbytes in
-              Lwt.return_some row
-          end else begin
-            exhausted := true;
-            let%lwt () = finish () in
-            Lwt.return_none
-          end
-      in
-      next ()
-    end)
-      (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)
-  ) in
+  let stream =
+    Lwt_stream.from (fun () ->
+      if !exhausted
+      then Lwt.return_none
+      else
+        Lwt.catch
+          (fun () ->
+             let rec next () =
+               match S.cursor_next cur with
+               | None ->
+                 exhausted := true;
+                 let%lwt () = finish () in
+                 Lwt.return_none
+               | Some (ikey, _ival) ->
+                 if
+                   Bytes.length ikey >= plen + 8
+                   && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                 then (
+                   let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+                   let rowid = Rowid.decode rowid_bytes in
+                   let table_key = Rowid.encode rowid in
+                   let%lwt vrow = S.get tx table_tree table_key in
+                   match vrow with
+                   | None -> next ()
+                   | Some vbytes ->
+                     let row = decode_with_virtual clock params table_meta vbytes in
+                     Lwt.return_some row)
+                 else (
+                   exhausted := true;
+                   let%lwt () = finish () in
+                   Lwt.return_none)
+             in
+             next ())
+          (fun exn ->
+             exhausted := true;
+             let%lwt () = finish () in
+             Lwt.fail exn))
+  in
   Lwt.return stream
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)
-and nlj_probe_left clock params tx (right_meta : Cat.table_meta) idx_tree
-    left_col_idx join_kind n_right_cols out lrow : unit Lwt.t =
+and nlj_probe_left
+      clock
+      params
+      tx
+      (right_meta : Cat.table_meta)
+      idx_tree
+      left_col_idx
+      join_kind
+      n_right_cols
+      out
+      lrow
+  : unit Lwt.t
+  =
   let lkey = lrow.(left_col_idx) in
-  if lkey = Row.V_null then begin
-    if join_kind = `Left then
-      out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out;
-    Lwt.return_unit
-  end else begin
+  if lkey = Row.V_null
+  then (
+    if join_kind = `Left
+    then out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out;
+    Lwt.return_unit)
+  else (
     let ik_value = row_value_to_index_value lkey in
     let prefix = Index_key.encode_value ik_value in
     let plen = Bytes.length prefix in
@@ -5036,21 +7399,20 @@ and nlj_probe_left clock params tx (right_meta : Cat.table_meta) idx_tree
       match S.cursor_next cur with
       | None -> Lwt.return_unit
       | Some (ikey, _) ->
-        if Bytes.length ikey >= plen + 8 &&
-           Bytes.equal (Bytes.sub ikey 0 plen) prefix
-        then begin
+        if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then (
           let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
           let rowid = Rowid.decode rowid_bytes in
           let table_key = Rowid.encode rowid in
           let* vrow = S.get tx right_meta.Cat.tree_id table_key in
-          (match vrow with
-           | None -> scan ()
-           | Some vbytes ->
-             let rrow = decode_with_virtual clock params right_meta vbytes in
-             out := Array.append lrow rrow :: !out;
-             found := true;
-             scan ())
-        end else Lwt.return_unit
+          match vrow with
+          | None -> scan ()
+          | Some vbytes ->
+            let rrow = decode_with_virtual clock params right_meta vbytes in
+            out := Array.append lrow rrow :: !out;
+            found := true;
+            scan ())
+        else Lwt.return_unit
     in
     let* () = scan () in
     S.cursor_close cur;
@@ -5058,151 +7420,233 @@ and nlj_probe_left clock params tx (right_meta : Cat.table_meta) idx_tree
      | `Left when not !found ->
        out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out
      | _ -> ());
-    Lwt.return_unit
-  end
+    Lwt.return_unit)
 
-and stream_nested_loop_join clock params store mode cat left (right_meta : Cat.table_meta)
-    idx_tree left_col_idx join_kind n_right_cols =
+and stream_nested_loop_join
+      clock
+      params
+      store
+      mode
+      cat
+      left
+      (right_meta : Cat.table_meta)
+      idx_tree
+      left_col_idx
+      join_kind
+      n_right_cols
+  =
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* left_rows = Lwt_stream.to_list left_stream in
-  S.with_ro store @@ fun tx ->
+  S.with_ro store
+  @@ fun tx ->
   let out = ref [] in
-  let* () = Lwt_list.iter_s
-    (nlj_probe_left clock params tx right_meta idx_tree left_col_idx join_kind n_right_cols out)
-    left_rows in
+  let* () =
+    Lwt_list.iter_s
+      (nlj_probe_left
+         clock
+         params
+         tx
+         right_meta
+         idx_tree
+         left_col_idx
+         join_kind
+         n_right_cols
+         out)
+      left_rows
+  in
   Lwt.return (Lwt_stream.of_list (List.rev !out))
 
 (* Build a hash table mapping each right row's join key to its rows; NULL keys
    are excluded (they never match an equi-join probe). *)
 and hash_build right_rows right_key : (bytes, Row.t list) Hashtbl.t =
   let tbl = Hashtbl.create 64 in
-  List.iter (fun rrow ->
-    match rrow.(right_key) with
-    | Row.V_null -> ()
-    | key_v ->
-      let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
-      let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
-      Hashtbl.replace tbl key_bytes (rrow :: prev)
-  ) right_rows;
+  List.iter
+    (fun rrow ->
+       match rrow.(right_key) with
+       | Row.V_null -> ()
+       | key_v ->
+         let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+         let prev =
+           try Hashtbl.find tbl key_bytes with
+           | Not_found -> []
+         in
+         Hashtbl.replace tbl key_bytes (rrow :: prev))
+    right_rows;
   tbl
 
-and stream_hash_join clock params store mode cat left right left_key right_key
-    join_kind n_right_cols =
-  let* left_stream  = to_stream clock params store ~mode ~cat left in
+and stream_hash_join
+      clock
+      params
+      store
+      mode
+      cat
+      left
+      right
+      left_key
+      right_key
+      join_kind
+      n_right_cols
+  =
+  let* left_stream = to_stream clock params store ~mode ~cat left in
   let* right_stream = to_stream clock params store ~mode ~cat right in
   let* right_rows = Lwt_stream.to_list right_stream in
-  if left_key < 0 || right_key < 0 then begin
+  if left_key < 0 || right_key < 0
+  then (
     (* Cartesian product fallback (general ON predicate). *)
     let* left_rows = Lwt_stream.to_list left_stream in
     let out = ref [] in
-    List.iter (fun lrow ->
-      let any = ref false in
-      List.iter (fun rrow ->
-        out := Array.append lrow rrow :: !out;
-        any := true
-      ) right_rows;
-      (match join_kind with
-       | `Left when not !any ->
-         let null_right = Array.make n_right_cols Row.V_null in
-         out := Array.append lrow null_right :: !out
-       | _ -> ())
-    ) left_rows;
-    Lwt.return (Lwt_stream.of_list (List.rev !out))
-  end else begin
+    List.iter
+      (fun lrow ->
+         let any = ref false in
+         List.iter
+           (fun rrow ->
+              out := Array.append lrow rrow :: !out;
+              any := true)
+           right_rows;
+         match join_kind with
+         | `Left when not !any ->
+           let null_right = Array.make n_right_cols Row.V_null in
+           out := Array.append lrow null_right :: !out
+         | _ -> ())
+      left_rows;
+    Lwt.return (Lwt_stream.of_list (List.rev !out)))
+  else (
     let tbl = hash_build right_rows right_key in
     let* left_rows = Lwt_stream.to_list left_stream in
     let out = ref [] in
-    List.iter (fun lrow ->
-      let key_v = lrow.(left_key) in
-      let any = ref false in
-      (match key_v with
-       | Row.V_null -> ()
-       | _ ->
-         let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
-         (match Hashtbl.find_opt tbl key_bytes with
-          | None -> ()
-          | Some rrows ->
-            List.iter (fun rrow ->
-              out := Array.append lrow rrow :: !out;
-              any := true
-            ) (List.rev rrows)));
-      (match join_kind with
-       | `Left when not !any ->
-         let null_right = Array.make n_right_cols Row.V_null in
-         out := Array.append lrow null_right :: !out
-       | _ -> ())
-    ) left_rows;
-    Lwt.return (Lwt_stream.of_list (List.rev !out))
-  end
+    List.iter
+      (fun lrow ->
+         let key_v = lrow.(left_key) in
+         let any = ref false in
+         (match key_v with
+          | Row.V_null -> ()
+          | _ ->
+            let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+            (match Hashtbl.find_opt tbl key_bytes with
+             | None -> ()
+             | Some rrows ->
+               List.iter
+                 (fun rrow ->
+                    out := Array.append lrow rrow :: !out;
+                    any := true)
+                 (List.rev rrows)));
+         match join_kind with
+         | `Left when not !any ->
+           let null_right = Array.make n_right_cols Row.V_null in
+           out := Array.append lrow null_right :: !out
+         | _ -> ())
+      left_rows;
+    Lwt.return (Lwt_stream.of_list (List.rev !out)))
 
 (* SUM over a group's column [i]: preserve INT vs REAL like SQLite-lite. *)
 and agg_sum group_rows i : Row.value =
-  let any_real = List.exists (fun r ->
-    match r.(i) with Row.V_real _ -> true | _ -> false) group_rows in
-  let any_non_null = List.exists (fun r ->
-    match r.(i) with Row.V_null -> false | _ -> true) group_rows in
-  if not any_non_null then Row.V_null
-  else if any_real then
-    let s = List.fold_left (fun acc r ->
-      match r.(i) with
-      | Row.V_null -> acc
-      | Row.V_int n -> acc +. Int64.to_float n
-      | Row.V_real f -> acc +. f
-      | _ -> failwith "SUM on non-numeric value") 0.0 group_rows in
-    Row.V_real s
-  else
-    let s = List.fold_left (fun acc r ->
-      match r.(i) with
-      | Row.V_null -> acc
-      | Row.V_int n -> Int64.add acc n
-      | _ -> failwith "SUM on non-numeric value") 0L group_rows in
-    Row.V_int s
+  let any_real =
+    List.exists
+      (fun r ->
+         match r.(i) with
+         | Row.V_real _ -> true
+         | _ -> false)
+      group_rows
+  in
+  let any_non_null =
+    List.exists
+      (fun r ->
+         match r.(i) with
+         | Row.V_null -> false
+         | _ -> true)
+      group_rows
+  in
+  if not any_non_null
+  then Row.V_null
+  else if any_real
+  then (
+    let s =
+      List.fold_left
+        (fun acc r ->
+           match r.(i) with
+           | Row.V_null -> acc
+           | Row.V_int n -> acc +. Int64.to_float n
+           | Row.V_real f -> acc +. f
+           | _ -> failwith "SUM on non-numeric value")
+        0.0
+        group_rows
+    in
+    Row.V_real s)
+  else (
+    let s =
+      List.fold_left
+        (fun acc r ->
+           match r.(i) with
+           | Row.V_null -> acc
+           | Row.V_int n -> Int64.add acc n
+           | _ -> failwith "SUM on non-numeric value")
+        0L
+        group_rows
+    in
+    Row.V_int s)
 
 (* Evaluate one aggregate [spec] over the rows of a group. *)
 and aggregate_one (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
   match spec.func, spec.col_ord with
-  | Ast.Agg_count, None ->
-    Row.V_int (Int64.of_int (List.length group_rows))
+  | Ast.Agg_count, None -> Row.V_int (Int64.of_int (List.length group_rows))
   | Ast.Agg_count, Some i ->
-    let n = List.fold_left (fun acc r ->
-      match r.(i) with Row.V_null -> acc | _ -> acc + 1) 0 group_rows in
+    let n =
+      List.fold_left
+        (fun acc r ->
+           match r.(i) with
+           | Row.V_null -> acc
+           | _ -> acc + 1)
+        0
+        group_rows
+    in
     Row.V_int (Int64.of_int n)
   | Ast.Agg_sum, Some i -> agg_sum group_rows i
   | Ast.Agg_avg, Some i ->
-    let sum, n = List.fold_left (fun (s, n) r ->
-      match r.(i) with
-      | Row.V_null -> (s, n)
-      | Row.V_int x -> (s +. Int64.to_float x, n + 1)
-      | Row.V_real f -> (s +. f, n + 1)
-      | _ -> failwith "AVG on non-numeric value") (0.0, 0) group_rows in
+    let sum, n =
+      List.fold_left
+        (fun (s, n) r ->
+           match r.(i) with
+           | Row.V_null -> s, n
+           | Row.V_int x -> s +. Int64.to_float x, n + 1
+           | Row.V_real f -> s +. f, n + 1
+           | _ -> failwith "AVG on non-numeric value")
+        (0.0, 0)
+        group_rows
+    in
     if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
   | Ast.Agg_min, Some i ->
-    List.fold_left (fun acc r ->
-      match r.(i), acc with
-      | Row.V_null, _ -> acc
-      | v, Row.V_null -> v
-      | v, cur -> if compare_values v cur < 0 then v else cur
-    ) Row.V_null group_rows
+    List.fold_left
+      (fun acc r ->
+         match r.(i), acc with
+         | Row.V_null, _ -> acc
+         | v, Row.V_null -> v
+         | v, cur -> if compare_values v cur < 0 then v else cur)
+      Row.V_null
+      group_rows
   | Ast.Agg_max, Some i ->
-    List.fold_left (fun acc r ->
-      match r.(i), acc with
-      | Row.V_null, _ -> acc
-      | v, Row.V_null -> v
-      | v, cur -> if compare_values v cur > 0 then v else cur
-    ) Row.V_null group_rows
+    List.fold_left
+      (fun acc r ->
+         match r.(i), acc with
+         | Row.V_null, _ -> acc
+         | v, Row.V_null -> v
+         | v, cur -> if compare_values v cur > 0 then v else cur)
+      Row.V_null
+      group_rows
   | Ast.Agg_group_concat sep, Some i ->
     let separator = Option.value sep ~default:"," in
-    let parts = List.filter_map (fun r ->
-      match r.(i) with
-      | Row.V_null -> None
-      | Row.V_int  n -> Some (Int64.to_string n)
-      | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-      | Row.V_text s -> Some s
-      | Row.V_blob _ -> Some ""
-    ) group_rows in
+    let parts =
+      List.filter_map
+        (fun r ->
+           match r.(i) with
+           | Row.V_null -> None
+           | Row.V_int n -> Some (Int64.to_string n)
+           | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+           | Row.V_text s -> Some s
+           | Row.V_blob _ -> Some "")
+        group_rows
+    in
     if parts = [] then Row.V_null else Row.V_text (String.concat separator parts)
-  | Ast.Agg_group_concat _, None ->
-    failwith "GROUP_CONCAT requires a column argument"
+  | Ast.Agg_group_concat _, None -> failwith "GROUP_CONCAT requires a column argument"
   | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
     failwith "non-COUNT aggregate must have a column argument"
 
@@ -5212,61 +7656,87 @@ and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list 
   let compare_group_keys ka kb =
     List.fold_left2 (fun acc a b -> if acc <> 0 then acc else compare_values a b) 0 ka kb
   in
-  if group_cols = [] then [ ([], rows) ]
-  else begin
-    let sorted = List.stable_sort (fun a b ->
-      compare_group_keys (group_keys_of_row a) (group_keys_of_row b)) rows in
+  if group_cols = []
+  then [ [], rows ]
+  else (
+    let sorted =
+      List.stable_sort
+        (fun a b -> compare_group_keys (group_keys_of_row a) (group_keys_of_row b))
+        rows
+    in
     let rec group_runs acc cur_key cur_rows = function
       | [] ->
         (match cur_rows with
          | [] -> List.rev acc
-         | _  -> List.rev ((cur_key, List.rev cur_rows) :: acc))
+         | _ -> List.rev ((cur_key, List.rev cur_rows) :: acc))
       | r :: rest ->
         let k = group_keys_of_row r in
-        if cur_rows <> [] && compare_group_keys k cur_key = 0 then
-          group_runs acc cur_key (r :: cur_rows) rest
-        else
+        if cur_rows <> [] && compare_group_keys k cur_key = 0
+        then group_runs acc cur_key (r :: cur_rows) rest
+        else (
           let acc' = if cur_rows = [] then acc else (cur_key, List.rev cur_rows) :: acc in
-          group_runs acc' k [r] rest
+          group_runs acc' k [ r ] rest)
     in
-    group_runs [] [] [] sorted
-  end
+    group_runs [] [] [] sorted)
 
 (* Append post-aggregate window-function columns to [after_having] rows. *)
 and aggregate_apply_windows clock params agg_windows after_having =
-  if agg_windows = [] then after_having
-  else begin
+  if agg_windows = []
+  then after_having
+  else (
     let n_total = List.length after_having in
-    let indexed = List.mapi (fun i r -> (i, r)) after_having in
-    let window_arrays = List.map (fun (wplan : Plan.window_plan_item) ->
-      let partitions = group_by_partition clock params wplan.Plan.partition_by indexed in
-      let combined = Array.make n_total Row.V_null in
-      List.iter (fun (_, partition_indexed) ->
-        let sorted = sort_partition_by clock params wplan.Plan.order_by partition_indexed in
-        let part_results = compute_window_for_partition clock params wplan sorted n_total in
-        List.iter (fun (orig_idx, _) ->
-          combined.(orig_idx) <- part_results.(orig_idx)
-        ) sorted
-      ) partitions;
-      combined
-    ) agg_windows in
-    List.mapi (fun i row ->
-      let extras = List.map (fun arr -> arr.(i)) window_arrays in
-      Array.append row (Array.of_list extras)
-    ) after_having
-  end
+    let indexed = List.mapi (fun i r -> i, r) after_having in
+    let window_arrays =
+      List.map
+        (fun (wplan : Plan.window_plan_item) ->
+           let partitions =
+             group_by_partition clock params wplan.Plan.partition_by indexed
+           in
+           let combined = Array.make n_total Row.V_null in
+           List.iter
+             (fun (_, partition_indexed) ->
+                let sorted =
+                  sort_partition_by clock params wplan.Plan.order_by partition_indexed
+                in
+                let part_results =
+                  compute_window_for_partition clock params wplan sorted n_total
+                in
+                List.iter
+                  (fun (orig_idx, _) -> combined.(orig_idx) <- part_results.(orig_idx))
+                  sorted)
+             partitions;
+           combined)
+        agg_windows
+    in
+    List.mapi
+      (fun i row ->
+         let extras = List.map (fun arr -> arr.(i)) window_arrays in
+         Array.append row (Array.of_list extras))
+      after_having)
 
-and stream_aggregate clock params store mode cat child group_cols aggs having proj
-    agg_windows =
+and stream_aggregate
+      clock
+      params
+      store
+      mode
+      cat
+      child
+      group_cols
+      aggs
+      having
+      proj
+      agg_windows
+  =
   let* inner = to_stream clock params store ~mode ~cat child in
   let* rows = Lwt_stream.to_list inner in
   let n_group_cols = List.length group_cols in
   let groups = aggregate_build_groups group_cols rows in
   let agg_output_rows =
-    List.map (fun (group_key, group_rows) ->
-      let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
-      Array.of_list (group_key @ agg_vals)
-    ) groups
+    List.map
+      (fun (group_key, group_rows) ->
+         let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
+         Array.of_list (group_key @ agg_vals))
+      groups
   in
   let after_having =
     match having with
@@ -5275,16 +7745,18 @@ and stream_aggregate clock params store mode cat child group_cols aggs having pr
       List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
   in
   let n_agg_cols = n_group_cols + List.length aggs in
-  let with_windows =
-    aggregate_apply_windows clock params agg_windows after_having in
+  let with_windows = aggregate_apply_windows clock params agg_windows after_having in
   let final_rows =
-    List.map (fun agg_row ->
-      Array.of_list (List.map (function
-        | Plan.PI_group_col i   -> agg_row.(i)
-        | Plan.PI_agg_slot k    -> agg_row.(n_group_cols + k)
-        | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
-      ) proj)
-    ) with_windows
+    List.map
+      (fun agg_row ->
+         Array.of_list
+           (List.map
+              (function
+                | Plan.PI_group_col i -> agg_row.(i)
+                | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
+                | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j))
+              proj))
+      with_windows
   in
   Lwt.return (Lwt_stream.of_list final_rows)
 
@@ -5295,12 +7767,17 @@ and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where
   let exhausted = ref false in
   let ended = ref false in
   let finish () =
-    if !ended then Lwt.return_unit
-    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+    if !ended
+    then Lwt.return_unit
+    else (
+      ended := true;
+      S.cursor_close cur;
+      S.ro_end tx)
   in
   let rec read_next () =
-    if !exhausted then Lwt.return_none
-    else
+    if !exhausted
+    then Lwt.return_none
+    else (
       match S.cursor_next cur with
       | None ->
         exhausted := true;
@@ -5309,298 +7786,506 @@ and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where
       | Some (_key, val_bytes) ->
         let texts = fts_decode_content val_bytes in
         let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        let emit = match where with
-          | None      -> true
+        let emit =
+          match where with
+          | None -> true
           | Some pred -> value_truthy (eval_expr clock params row pred)
         in
-        if emit then Lwt.return_some row
-        else read_next ()
+        if emit then Lwt.return_some row else read_next ())
   in
-  Lwt.return (Lwt_stream.from (fun () ->
-    Lwt.catch read_next
-      (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)))
+  Lwt.return
+    (Lwt_stream.from (fun () ->
+       Lwt.catch read_next (fun exn ->
+         exhausted := true;
+         let%lwt () = finish () in
+         Lwt.fail exn)))
 
 (* BM25-score FTS [matches] against [query] when rank is requested; otherwise
    tag each with score 0.0.  Each term's own per-doc term-frequency is used. *)
 and fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_rank =
-  if not include_rank then
-    Lwt.return (List.map (fun (rowid, positions) -> (rowid, positions, 0.0)) matches)
-  else begin
-    let* (total_docs, total_tokens) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+  if not include_rank
+  then Lwt.return (List.map (fun (rowid, positions) -> rowid, positions, 0.0) matches)
+  else
+    let* total_docs, total_tokens = read_fts_stats tx fts_meta.Cat.fts_index_tree in
     let query_terms = fts_query_terms query in
-    let* term_data = Lwt_list.map_s (fun term ->
-      let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
-      Lwt.return (List.length pl, pl)) query_terms in
-    let* doc_lengths = Lwt_list.map_s (fun (rowid, positions) ->
-      let dlen_key = fts_doclen_key rowid in
-      let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
-      let dl = match v with
-        | None -> 1
-        | Some b -> let (n, _) = Varint.decode_uint64 b 0 in Int64.to_int n
-      in
-      Lwt.return (rowid, positions, dl)) matches in
-    let scored = List.map (fun (rowid, positions, dl) ->
-      let score = List.fold_left (fun acc (n_docs, term_pl) ->
-        let tf = match List.assoc_opt rowid term_pl with
-          | None -> 0
-          | Some pos -> List.length pos
-        in
-        acc +. bm25_score ~k1:1.2 ~b:0.75 ~total_docs ~total_tokens
-                           ~n_docs_with_term:n_docs ~term_freq:tf ~doc_length:dl)
-        0.0 term_data in
-      (rowid, positions, score)) doc_lengths in
+    let* term_data =
+      Lwt_list.map_s
+        (fun term ->
+           let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
+           Lwt.return (List.length pl, pl))
+        query_terms
+    in
+    let* doc_lengths =
+      Lwt_list.map_s
+        (fun (rowid, positions) ->
+           let dlen_key = fts_doclen_key rowid in
+           let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
+           let dl =
+             match v with
+             | None -> 1
+             | Some b ->
+               let n, _ = Varint.decode_uint64 b 0 in
+               Int64.to_int n
+           in
+           Lwt.return (rowid, positions, dl))
+        matches
+    in
+    let scored =
+      List.map
+        (fun (rowid, positions, dl) ->
+           let score =
+             List.fold_left
+               (fun acc (n_docs, term_pl) ->
+                  let tf =
+                    match List.assoc_opt rowid term_pl with
+                    | None -> 0
+                    | Some pos -> List.length pos
+                  in
+                  acc
+                  +. bm25_score
+                       ~k1:1.2
+                       ~b:0.75
+                       ~total_docs
+                       ~total_tokens
+                       ~n_docs_with_term:n_docs
+                       ~term_freq:tf
+                       ~doc_length:dl)
+               0.0
+               term_data
+           in
+           rowid, positions, score)
+        doc_lengths
+    in
     Lwt.return scored
-  end
 
-and stream_fts_match_scan _clock _params store (fts_meta : Cat.fts_table_meta) query
-    proj include_rank snippets =
-  S.with_ro store @@ fun tx ->
+and stream_fts_match_scan
+      _clock
+      _params
+      store
+      (fts_meta : Cat.fts_table_meta)
+      query
+      proj
+      include_rank
+      snippets
+  =
+  S.with_ro store
+  @@ fun tx ->
   let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
   let* scored_matches = fts_score_matches tx fts_meta query matches include_rank in
-  let sorted = if include_rank then
-    List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
-  else scored_matches in
+  let sorted =
+    if include_rank
+    then List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
+    else scored_matches
+  in
   let snippet_terms = fts_query_terms_with_kind query in
-  let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
-    let key = Rowid.encode rowid in
-    let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
-    match val_opt with
-    | None -> Lwt.return None
-    | Some bytes ->
-      let texts = fts_decode_content bytes in
-      let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-      let projected =
-        if proj = [] && snippets = [] then Array.to_list full_row
-        else List.map (fun i -> full_row.(i)) proj
-      in
-      let snippet_vals =
-        List.map (fun (spec : Plan.snippet_spec) ->
-          let col_text =
-            let idx =
-              if spec.Plan.col_idx < 0 then 0
-              else min spec.Plan.col_idx (max 0 (List.length texts - 1))
-            in
-            if texts = [] then "" else List.nth texts idx
-          in
-          Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec)
-        ) snippets
-      in
-      let row_values =
-        projected
-        @ (if include_rank then [Row.V_real score] else [])
-        @ snippet_vals
-      in
-      Lwt.return (Some (Array.of_list row_values))) sorted in
+  let* rows =
+    Lwt_list.filter_map_s
+      (fun (rowid, _positions, score) ->
+         let key = Rowid.encode rowid in
+         let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
+         match val_opt with
+         | None -> Lwt.return None
+         | Some bytes ->
+           let texts = fts_decode_content bytes in
+           let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+           let projected =
+             if proj = [] && snippets = []
+             then Array.to_list full_row
+             else List.map (fun i -> full_row.(i)) proj
+           in
+           let snippet_vals =
+             List.map
+               (fun (spec : Plan.snippet_spec) ->
+                  let col_text =
+                    let idx =
+                      if spec.Plan.col_idx < 0
+                      then 0
+                      else min spec.Plan.col_idx (max 0 (List.length texts - 1))
+                    in
+                    if texts = [] then "" else List.nth texts idx
+                  in
+                  Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec))
+               snippets
+           in
+           let row_values =
+             projected
+             @ (if include_rank then [ Row.V_real score ] else [])
+             @ snippet_vals
+           in
+           Lwt.return (Some (Array.of_list row_values)))
+      sorted
+  in
   Lwt.return (Lwt_stream.of_list rows)
 
 and stream_pragma_integrity_check store cat =
-  let cat_val = match cat with
+  let cat_val =
+    match cat with
     | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
     | Some c -> c
   in
   let* tables = Cat.list_tables cat_val in
-  let errors  = ref [] in
+  let errors = ref [] in
   let add_err msg = errors := msg :: !errors in
   let count_entries tx tid =
     let count = ref 0 in
-    let* cur  = S.cursor_open tx tid in
-    let _sr   = S.cursor_first cur in
+    let* cur = S.cursor_open tx tid in
+    let _sr = S.cursor_first cur in
     let rec go () =
       match S.cursor_next cur with
-      | None   -> Lwt.return_unit
-      | Some _ -> incr count; go ()
+      | None -> Lwt.return_unit
+      | Some _ ->
+        incr count;
+        go ()
     in
     let* () = go () in
     S.cursor_close cur;
     Lwt.return !count
   in
-  S.with_ro store @@ fun tx ->
+  S.with_ro store
+  @@ fun tx ->
   let* () =
-    Lwt_list.iter_s (fun (meta : Cat.table_meta) ->
-      let* row_count = count_entries tx meta.tree_id in
-      let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
-      Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-        let is_partial = idx.idx_where_sql <> None in
-        let* idx_count = count_entries tx idx.idx_tree_id in
-        (if (not is_partial) && idx_count <> row_count then
-          add_err (Printf.sprintf
-            "index %s on %s: %d entries != %d rows"
-            idx.idx_name meta.name idx_count row_count));
-        Lwt.return_unit
-      ) idxs
-    ) tables
+    Lwt_list.iter_s
+      (fun (meta : Cat.table_meta) ->
+         let* row_count = count_entries tx meta.tree_id in
+         let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
+         Lwt_list.iter_s
+           (fun (idx : Cat.index_info) ->
+              let is_partial = idx.idx_where_sql <> None in
+              let* idx_count = count_entries tx idx.idx_tree_id in
+              if (not is_partial) && idx_count <> row_count
+              then
+                add_err
+                  (Printf.sprintf
+                     "index %s on %s: %d entries != %d rows"
+                     idx.idx_name
+                     meta.name
+                     idx_count
+                     row_count);
+              Lwt.return_unit)
+           idxs)
+      tables
   in
   let result = List.rev !errors in
   let rows =
-    if result = [] then [ [| Row.V_text "ok" |] ]
+    if result = []
+    then [ [| Row.V_text "ok" |] ]
     else List.map (fun msg -> [| Row.V_text msg |]) result
   in
   Lwt.return (Lwt_stream.of_list rows)
 
 and stream_sqlite_master store cat =
-  let cat_val = match cat with
-    | None   -> failwith "Exec.to_stream: Op_sqlite_master requires catalog"
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_sqlite_master requires catalog"
     | Some c -> c
   in
   let* tables = Cat.list_tables cat_val in
-  let table_rows = List.map (fun (meta : Cat.table_meta) ->
-    [| Row.V_text "table"; Row.V_text meta.Cat.name; Row.V_text meta.Cat.name;
-       Row.V_int  (Int64.of_int meta.Cat.tree_id);
-       Row.V_text (ddl_of_table meta) |]
-  ) tables in
+  let table_rows =
+    List.map
+      (fun (meta : Cat.table_meta) ->
+         [| Row.V_text "table"
+          ; Row.V_text meta.Cat.name
+          ; Row.V_text meta.Cat.name
+          ; Row.V_int (Int64.of_int meta.Cat.tree_id)
+          ; Row.V_text (ddl_of_table meta)
+         |])
+      tables
+  in
   let index_rows =
-    List.concat_map (fun (meta : Cat.table_meta) ->
-      List.map (fun (idx : Cat.index_info) ->
-        [| Row.V_text "index"; Row.V_text idx.Cat.idx_name; Row.V_text idx.Cat.idx_table;
-           Row.V_int  (Int64.of_int idx.Cat.idx_tree_id);
-           Row.V_text (ddl_of_index idx) |]
-      ) (Cat.indexes_for_table cat_val ~table:meta.Cat.name)
-    ) tables
+    List.concat_map
+      (fun (meta : Cat.table_meta) ->
+         List.map
+           (fun (idx : Cat.index_info) ->
+              [| Row.V_text "index"
+               ; Row.V_text idx.Cat.idx_name
+               ; Row.V_text idx.Cat.idx_table
+               ; Row.V_int (Int64.of_int idx.Cat.idx_tree_id)
+               ; Row.V_text (ddl_of_index idx)
+              |])
+           (Cat.indexes_for_table cat_val ~table:meta.Cat.name))
+      tables
   in
   let* views = Cat.load_all_views store in
-  let view_rows = List.map (fun (name, sql) ->
-    [| Row.V_text "view"; Row.V_text name; Row.V_text name; Row.V_int  0L; Row.V_text sql |]
-  ) views in
+  let view_rows =
+    List.map
+      (fun (name, sql) ->
+         [| Row.V_text "view"
+          ; Row.V_text name
+          ; Row.V_text name
+          ; Row.V_int 0L
+          ; Row.V_text sql
+         |])
+      views
+  in
   let* triggers = Cat.load_all_triggers store in
-  let trigger_rows = List.map (fun (name, sql) ->
-    let tbl_name = trigger_table_of_sql name sql in
-    [| Row.V_text "trigger"; Row.V_text name; Row.V_text tbl_name; Row.V_int  0L; Row.V_text sql |]
-  ) triggers in
-  let fts_rows = List.map (fun (m : Cat.fts_table_meta) ->
-    [| Row.V_text "table"; Row.V_text m.Cat.fts_name; Row.V_text m.Cat.fts_name;
-       Row.V_int  (Int64.of_int m.Cat.fts_content_tree);
-       Row.V_text (ddl_of_fts m) |]
-  ) (Cat.list_fts_tables cat_val) in
-  Lwt.return (Lwt_stream.of_list
-    (table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+  let trigger_rows =
+    List.map
+      (fun (name, sql) ->
+         let tbl_name = trigger_table_of_sql name sql in
+         [| Row.V_text "trigger"
+          ; Row.V_text name
+          ; Row.V_text tbl_name
+          ; Row.V_int 0L
+          ; Row.V_text sql
+         |])
+      triggers
+  in
+  let fts_rows =
+    List.map
+      (fun (m : Cat.fts_table_meta) ->
+         [| Row.V_text "table"
+          ; Row.V_text m.Cat.fts_name
+          ; Row.V_text m.Cat.fts_name
+          ; Row.V_int (Int64.of_int m.Cat.fts_content_tree)
+          ; Row.V_text (ddl_of_fts m)
+         |])
+      (Cat.list_fts_tables cat_val)
+  in
+  Lwt.return
+    (Lwt_stream.of_list (table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
 
 and stream_union clock params store mode cat all left right =
-  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let combined = Lwt_stream.append ls rs in
-  if all then Lwt.return combined
-  else begin
+  if all
+  then Lwt.return combined
+  else
     let* rows = Lwt_stream.to_list combined in
     let seen = Hashtbl.create 64 in
-    let deduped = List.filter (fun row ->
-      let k = row_key row in
-      if Hashtbl.mem seen k then false
-      else (Hashtbl.replace seen k (); true)
-    ) rows in
+    let deduped =
+      List.filter
+        (fun row ->
+           let k = row_key row in
+           if Hashtbl.mem seen k
+           then false
+           else (
+             Hashtbl.replace seen k ();
+             true))
+        rows
+    in
     Lwt.return (Lwt_stream.of_list deduped)
-  end
 
 and stream_intersect clock params store mode cat left right =
-  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
   List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
-  let result = List.filter (fun row ->
-    let k = row_key row in
-    if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k then false
-    else (Hashtbl.replace seen k (); true)
-  ) left_list in
+  let result =
+    List.filter
+      (fun row ->
+         let k = row_key row in
+         if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k
+         then false
+         else (
+           Hashtbl.replace seen k ();
+           true))
+      left_list
+  in
   Lwt.return (Lwt_stream.of_list result)
 
 and stream_except clock params store mode cat left right =
-  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* ls = to_stream clock params store ~mode ~cat left in
   let* rs = to_stream clock params store ~mode ~cat right in
   let* right_list = Lwt_stream.to_list rs in
   let right_set = Hashtbl.create (max 1 (List.length right_list)) in
   List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
   let* left_list = Lwt_stream.to_list ls in
   let seen = Hashtbl.create 64 in
-  let result = List.filter (fun row ->
-    let k = row_key row in
-    if Hashtbl.mem right_set k || Hashtbl.mem seen k then false
-    else (Hashtbl.replace seen k (); true)
-  ) left_list in
+  let result =
+    List.filter
+      (fun row ->
+         let k = row_key row in
+         if Hashtbl.mem right_set k || Hashtbl.mem seen k
+         then false
+         else (
+           Hashtbl.replace seen k ();
+           true))
+      left_list
+  in
   Lwt.return (Lwt_stream.of_list result)
 
-and stream_insert_returning clock params store mode cat (table_meta : Cat.table_meta)
-    ordinals values on_conflict returning upsert_update =
+and stream_insert_returning
+      clock
+      params
+      store
+      mode
+      cat
+      (table_meta : Cat.table_meta)
+      ordinals
+      values
+      on_conflict
+      returning
+      upsert_update
+  =
   match cat with
   | None -> failwith "Exec.query: RETURNING requires catalog context"
   | Some c ->
-    let* result_lists = Lwt_list.map_s (fun row_vals ->
-      let n = List.length table_meta.columns in
-      let inserted_row = Array.make n Row.V_null in
-      List.iter2 (fun ord e ->
-        inserted_row.(ord) <- eval_expr clock params [||] e) ordinals row_vals;
-      let* inserted =
-        execute_insert ~mode ~clock ~on_conflict ~upsert_update ~prebuilt_row:(Some inserted_row)
-          store c ~table_meta ~ordinals ~values:row_vals
-      in
-      if not inserted then Lwt.return []
-      else
-        let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
-        Lwt.return [result]
-    ) values in
+    let* result_lists =
+      Lwt_list.map_s
+        (fun row_vals ->
+           let n = List.length table_meta.columns in
+           let inserted_row = Array.make n Row.V_null in
+           List.iter2
+             (fun ord e -> inserted_row.(ord) <- eval_expr clock params [||] e)
+             ordinals
+             row_vals;
+           let* inserted =
+             execute_insert
+               ~mode
+               ~clock
+               ~on_conflict
+               ~upsert_update
+               ~prebuilt_row:(Some inserted_row)
+               store
+               c
+               ~table_meta
+               ~ordinals
+               ~values:row_vals
+           in
+           if not inserted
+           then Lwt.return []
+           else (
+             let result =
+               Array.of_list (List.map (eval_expr clock params inserted_row) returning)
+             in
+             Lwt.return [ result ]))
+        values
+    in
     Lwt.return (Lwt_stream.of_list (List.concat result_lists))
 
-and stream_update_returning clock params store mode cat (table_meta : Cat.table_meta)
-    assignments where order limit offset indexes returning =
+and stream_update_returning
+      clock
+      params
+      store
+      mode
+      cat
+      (table_meta : Cat.table_meta)
+      assignments
+      where
+      order
+      limit
+      offset
+      indexes
+      returning
+  =
   (* Snapshot matching rows BEFORE the update to compute RETURNING values.
      NOTE: the RETURNING snapshot and the actual write use separate scans that
      each apply the same order/limit/offset; non-deterministic ORDER BY
      expressions could surface RETURNING values for different rows. *)
   let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
   let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
-  let result_rows = List.map (fun (_, old_row) ->
-    let new_row = apply_assignments ~clock ~params assignments old_row in
-    compute_stored_generated_cols clock params table_meta new_row;
-    Array.of_list (List.map (eval_expr clock params new_row) returning)
-  ) matched in
-  let c = match cat with Some c -> c
-    | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
-  let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments
-             ~where ~order ~limit ~offset ~indexes in
+  let result_rows =
+    List.map
+      (fun (_, old_row) ->
+         let new_row = apply_assignments ~clock ~params assignments old_row in
+         compute_stored_generated_cols clock params table_meta new_row;
+         Array.of_list (List.map (eval_expr clock params new_row) returning))
+      matched
+  in
+  let c =
+    match cat with
+    | Some c -> c
+    | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context"
+  in
+  let* _ =
+    execute_update
+      ~mode
+      ~params
+      ~clock
+      store
+      c
+      ~table_meta
+      ~assignments
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
+  in
   Lwt.return (Lwt_stream.of_list result_rows)
 
-and stream_delete_returning clock params store mode cat (table_meta : Cat.table_meta)
-    where order limit offset indexes returning =
+and stream_delete_returning
+      clock
+      params
+      store
+      mode
+      cat
+      (table_meta : Cat.table_meta)
+      where
+      order
+      limit
+      offset
+      indexes
+      returning
+  =
   (* Snapshot matching rows BEFORE the delete to compute RETURNING values
      (see stream_update_returning re: non-deterministic ORDER BY). *)
   let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
   let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
-  let result_rows = List.map (fun (_, old_row) ->
-    Array.of_list (List.map (eval_expr clock params old_row) returning)
-  ) matched in
-  let c = match cat with Some c -> c
-    | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
-  let* _ = execute_delete ~mode ~params ~clock store c ~table_meta
-             ~where ~order ~limit ~offset ~indexes in
+  let result_rows =
+    List.map
+      (fun (_, old_row) ->
+         Array.of_list (List.map (eval_expr clock params old_row) returning))
+      matched
+  in
+  let c =
+    match cat with
+    | Some c -> c
+    | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context"
+  in
+  let* _ =
+    execute_delete
+      ~mode
+      ~params
+      ~clock
+      store
+      c
+      ~table_meta
+      ~where
+      ~order
+      ~limit
+      ~offset
+      ~indexes
+  in
   Lwt.return (Lwt_stream.of_list result_rows)
 
 and stream_const_select clock params store cat exprs =
   let raw_exprs = List.map fst exprs in
   let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) raw_exprs in
   let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
-  Lwt.return (Lwt_stream.of_list [row])
+  Lwt.return (Lwt_stream.of_list [ row ])
 
 and stream_with_cte_recursive clock params store mode cat cte_name def query =
-  let (base_op, recursive_arm) = match def with
-    | Plan.Op_union { all = true; left; right } -> (left, right)
+  let base_op, recursive_arm =
+    match def with
+    | Plan.Op_union { all = true; left; right } -> left, right
     | _ ->
-      failwith "Exec: recursive CTE def must be UNION ALL — non-UNION-ALL recursive CTEs are not supported"
+      failwith
+        "Exec: recursive CTE def must be UNION ALL — non-UNION-ALL recursive CTEs are \
+         not supported"
   in
   let* base_stream = to_stream clock params store ~mode ~cat base_op in
   let* seed_rows = Lwt_stream.to_list base_stream in
   let max_iterations = 1000 in
   let rec iterate depth acc working =
-    if working = [] then Lwt.return acc
-    else if depth >= max_iterations then
-      failwith (Printf.sprintf
-        "Exec: recursive CTE '%s' exceeded maximum iteration depth of %d"
-        cte_name max_iterations)
-    else
+    if working = []
+    then Lwt.return acc
+    else if depth >= max_iterations
+    then
+      failwith
+        (Printf.sprintf
+           "Exec: recursive CTE '%s' exceeded maximum iteration depth of %d"
+           cte_name
+           max_iterations)
+    else (
       let patched_arm = substitute_cte ~cte_name ~rows:working recursive_arm in
       let* new_stream = to_stream clock params store ~mode ~cat patched_arm in
       let* new_rows = Lwt_stream.to_list new_stream in
-      iterate (depth + 1) (acc @ new_rows) new_rows
+      iterate (depth + 1) (acc @ new_rows) new_rows)
   in
   let* all_rows = iterate 0 seed_rows seed_rows in
   let patched_query = substitute_cte ~cte_name ~rows:all_rows query in
@@ -5610,79 +8295,122 @@ and stream_window clock params store mode cat child windows =
   let* child_stream = to_stream clock params store ~mode ~cat child in
   let* all_rows = Lwt_stream.to_list child_stream in
   let n_rows = List.length all_rows in
-  if n_rows = 0 then Lwt.return (Lwt_stream.of_list [])
-  else begin
+  if n_rows = 0
+  then Lwt.return (Lwt_stream.of_list [])
+  else (
     let all_rows_arr = Array.of_list all_rows in
     let n_windows = List.length windows in
     let window_results : Row.value array array =
       Array.init n_windows (fun wi ->
         let wplan = List.nth windows wi in
-        let indexed_rows = List.mapi (fun i row -> (i, row)) all_rows in
-        let partitions = group_by_partition clock params wplan.Plan.partition_by indexed_rows in
+        let indexed_rows = List.mapi (fun i row -> i, row) all_rows in
+        let partitions =
+          group_by_partition clock params wplan.Plan.partition_by indexed_rows
+        in
         let combined = Array.make n_rows Row.V_null in
-        List.iter (fun (_, partition_idx_rows) ->
-          let sorted = sort_partition_by clock params wplan.Plan.order_by partition_idx_rows in
-          let part_results = compute_window_for_partition clock params wplan sorted n_rows in
-          List.iter (fun (orig_idx, _) ->
-            combined.(orig_idx) <- part_results.(orig_idx)
-          ) sorted
-        ) partitions;
-        combined
-      )
+        List.iter
+          (fun (_, partition_idx_rows) ->
+             let sorted =
+               sort_partition_by clock params wplan.Plan.order_by partition_idx_rows
+             in
+             let part_results =
+               compute_window_for_partition clock params wplan sorted n_rows
+             in
+             List.iter
+               (fun (orig_idx, _) -> combined.(orig_idx) <- part_results.(orig_idx))
+               sorted)
+          partitions;
+        combined)
     in
-    let augmented = Array.to_list (Array.mapi (fun i row ->
-      let extras = Array.init n_windows (fun wi -> window_results.(wi).(i)) in
-      Array.append row extras
-    ) all_rows_arr) in
-    Lwt.return (Lwt_stream.of_list augmented)
-  end
+    let augmented =
+      Array.to_list
+        (Array.mapi
+           (fun i row ->
+              let extras = Array.init n_windows (fun wi -> window_results.(wi).(i)) in
+              Array.append row extras)
+           all_rows_arr)
+    in
+    Lwt.return (Lwt_stream.of_list augmented))
 
 and stream_explain clock params store mode cat analyze inner =
   let plan_rows = explain_plan inner in
   let nullify row = Array.append row [| Row.V_null; Row.V_null |] in
-  if not analyze then
-    Lwt.return (Lwt_stream.of_list (List.map nullify plan_rows))
-  else begin
-    let cat_v = match cat with Some c -> c
-      | None -> failwith "EXPLAIN ANALYZE requires a catalog" in
-    let t0 = match clock with Some c -> c () | None -> 0.0 in
+  if not analyze
+  then Lwt.return (Lwt_stream.of_list (List.map nullify plan_rows))
+  else (
+    let cat_v =
+      match cat with
+      | Some c -> c
+      | None -> failwith "EXPLAIN ANALYZE requires a catalog"
+    in
+    let t0 =
+      match clock with
+      | Some c -> c ()
+      | None -> 0.0
+    in
     let* n =
-      let is_write = match inner with
-        | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _
-        | Plan.Op_create_table _ | Plan.Op_create_index _
-        | Plan.Op_drop_table _ | Plan.Op_drop_index _
-        | Plan.Op_alter_table _ | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
-        | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
-        | Plan.Op_create_view _ | Plan.Op_drop_view _
-        | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
+      let is_write =
+        match inner with
+        | Plan.Op_insert _
+        | Plan.Op_insert_select _
+        | Plan.Op_update _
+        | Plan.Op_delete _
+        | Plan.Op_create_table _
+        | Plan.Op_create_index _
+        | Plan.Op_drop_table _
+        | Plan.Op_drop_index _
+        | Plan.Op_alter_table _
+        | Plan.Op_begin
+        | Plan.Op_commit
+        | Plan.Op_rollback
+        | Plan.Op_savepoint _
+        | Plan.Op_release _
+        | Plan.Op_rollback_to _
+        | Plan.Op_create_view _
+        | Plan.Op_drop_view _
+        | Plan.Op_create_trigger _
+        | Plan.Op_drop_trigger _
         | Plan.Op_pragma_set_user_version _
         | Plan.Op_pragma_set_fk _
         | Plan.Op_pragma_set_recursive_triggers _
         | Plan.Op_pragma_set_defer_fk _
         | Plan.Op_pragma_set_wal_autocheckpoint _
-        | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
+        | Plan.Op_fts_insert _
+        | Plan.Op_fts_delete _
         | Plan.Op_create_fts_table _ -> true
         | _ -> false
       in
-      if is_write then
-        execute_with_count ~mode ~clock ~params store cat_v inner
-      else begin
+      if is_write
+      then execute_with_count ~mode ~clock ~params store cat_v inner
+      else
         let* s = to_stream clock params store ~mode ~cat inner in
         let* rows = Lwt_stream.to_list s in
         Lwt.return (List.length rows)
-      end
     in
     let elapsed_ms =
-      match clock with Some c -> (c () -. t0) *. 1000.0 | None -> 0.0 in
-    let rows = List.mapi (fun i row ->
-      if i = 0 then
-        Array.append row [| Row.V_int (Int64.of_int n); Row.V_real elapsed_ms |]
-      else nullify row
-    ) plan_rows in
-    Lwt.return (Lwt_stream.of_list rows)
-  end
+      match clock with
+      | Some c -> (c () -. t0) *. 1000.0
+      | None -> 0.0
+    in
+    let rows =
+      List.mapi
+        (fun i row ->
+           if i = 0
+           then Array.append row [| Row.V_int (Int64.of_int n); Row.V_real elapsed_ms |]
+           else nullify row)
+        plan_rows
+    in
+    Lwt.return (Lwt_stream.of_list rows))
 
-and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+and to_stream
+      (clock : (unit -> float) option)
+      (params : Row.value array)
+      (store : S.t)
+      ?(mode : txn_mode = Auto)
+      ?(cat : Cat.t option = None)
+      (op : Plan.op)
+  : Row.t Lwt_stream.t Lwt.t
+  =
   match op with
   | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
@@ -5700,65 +8428,164 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_distinct { child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let seen = Hashtbl.create 64 in
-    Lwt.return (Lwt_stream.filter (fun row ->
-      let k = row_key row in
-      if Hashtbl.mem seen k then false
-      else (Hashtbl.replace seen k (); true)
-    ) inner)
-  | Plan.Op_index_lookup { table_tree; idx_tree; col_idx = _;
-                           col_type; lookup_val; table_meta } ->
-    stream_index_lookup clock params store table_tree idx_tree col_type lookup_val table_meta
-  | Plan.Op_nested_loop_join {
-      left; right_meta; idx_tree;
-      right_col_idx = _; left_col_idx; join_kind;
-      right_col_offset = _; n_right_cols } ->
-    stream_nested_loop_join clock params store mode cat left right_meta idx_tree
-      left_col_idx join_kind n_right_cols
-  | Plan.Op_hash_join {
-      left; right; left_key; right_key; join_kind;
-      right_col_offset = _; n_right_cols } ->
-    stream_hash_join clock params store mode cat left right left_key right_key
-      join_kind n_right_cols
+    Lwt.return
+      (Lwt_stream.filter
+         (fun row ->
+            let k = row_key row in
+            if Hashtbl.mem seen k
+            then false
+            else (
+              Hashtbl.replace seen k ();
+              true))
+         inner)
+  | Plan.Op_index_lookup
+      { table_tree; idx_tree; col_idx = _; col_type; lookup_val; table_meta } ->
+    stream_index_lookup
+      clock
+      params
+      store
+      table_tree
+      idx_tree
+      col_type
+      lookup_val
+      table_meta
+  | Plan.Op_nested_loop_join
+      { left
+      ; right_meta
+      ; idx_tree
+      ; right_col_idx = _
+      ; left_col_idx
+      ; join_kind
+      ; right_col_offset = _
+      ; n_right_cols
+      } ->
+    stream_nested_loop_join
+      clock
+      params
+      store
+      mode
+      cat
+      left
+      right_meta
+      idx_tree
+      left_col_idx
+      join_kind
+      n_right_cols
+  | Plan.Op_hash_join
+      { left; right; left_key; right_key; join_kind; right_col_offset = _; n_right_cols }
+    ->
+    stream_hash_join
+      clock
+      params
+      store
+      mode
+      cat
+      left
+      right
+      left_key
+      right_key
+      join_kind
+      n_right_cols
   | Plan.Op_aggregate { child; group_cols; aggs; having; proj; windows = agg_windows } ->
-    stream_aggregate clock params store mode cat child group_cols aggs having proj agg_windows
+    stream_aggregate
+      clock
+      params
+      store
+      mode
+      cat
+      child
+      group_cols
+      aggs
+      having
+      proj
+      agg_windows
   | Plan.Op_fts_seq_scan { fts_meta; where } ->
     stream_fts_seq_scan clock params store fts_meta where
   | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
     stream_fts_match_scan clock params store fts_meta query proj include_rank snippets
   | Plan.Op_pragma_rows { rows } -> Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
-    S.with_ro store @@ fun tx ->
-    let* v  = Cat.read_user_version_tx tx in
+    S.with_ro store
+    @@ fun tx ->
+    let* v = Cat.read_user_version_tx tx in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int v |] ])
   | Plan.Op_pragma_get_fk ->
-    let v = match cat with None -> false | Some cat -> Cat.get_fk_enforcement cat in
+    let v =
+      match cat with
+      | None -> false
+      | Some cat -> Cat.get_fk_enforcement cat
+    in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_get_recursive_triggers ->
-    let v = match cat with None -> true | Some cat -> Cat.get_recursive_triggers cat in
+    let v =
+      match cat with
+      | None -> true
+      | Some cat -> Cat.get_recursive_triggers cat
+    in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_get_wal_autocheckpoint ->
     let n = S.wal_autocheckpoint store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
   | Plan.Op_pragma_get_defer_fk ->
-    let v = match cat with None -> false | Some cat -> Cat.get_defer_fks_pragma cat in
+    let v =
+      match cat with
+      | None -> false
+      | Some cat -> Cat.get_defer_fks_pragma cat
+    in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check -> stream_pragma_integrity_check store cat
   | Plan.Op_sqlite_master -> stream_sqlite_master store cat
-  | Plan.Op_union { all; left; right } -> stream_union clock params store mode cat all left right
-  | Plan.Op_intersect { left; right } -> stream_intersect clock params store mode cat left right
+  | Plan.Op_union { all; left; right } ->
+    stream_union clock params store mode cat all left right
+  | Plan.Op_intersect { left; right } ->
+    stream_intersect clock params store mode cat left right
   | Plan.Op_except { left; right } -> stream_except clock params store mode cat left right
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     when returning <> [] ->
-    stream_insert_returning clock params store mode cat table_meta ordinals values
-      on_conflict returning upsert_update
-  | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning }
+    stream_insert_returning
+      clock
+      params
+      store
+      mode
+      cat
+      table_meta
+      ordinals
+      values
+      on_conflict
+      returning
+      upsert_update
+  | Plan.Op_update
+      { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    stream_update_returning clock params store mode cat table_meta assignments where
-      order limit offset indexes returning
+    stream_update_returning
+      clock
+      params
+      store
+      mode
+      cat
+      table_meta
+      assignments
+      where
+      order
+      limit
+      offset
+      indexes
+      returning
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    stream_delete_returning clock params store mode cat table_meta where
-      order limit offset indexes returning
+    stream_delete_returning
+      clock
+      params
+      store
+      mode
+      cat
+      table_meta
+      where
+      order
+      limit
+      offset
+      indexes
+      returning
   | Plan.Op_changes ->
     failwith "Exec.to_stream: Op_changes must be intercepted in db.ml query"
   | Plan.Op_last_insert_rowid ->
@@ -5774,20 +8601,33 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_with_cte { cte_name; def; query; recursive = true } ->
     stream_with_cte_recursive clock params store mode cat cte_name def query
   | Plan.Op_cte_scan { cte_name; _ } ->
-    failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
+    failwith
+      (Printf.sprintf
+         "Exec: unsubstituted Op_cte_scan '%s' — internal planner error"
+         cte_name)
   | Plan.Op_window { child; windows; n_input_cols = _ } ->
     stream_window clock params store mode cat child windows
   | Plan.Op_no_op -> Lwt.return (Lwt_stream.of_list [])
-  | Plan.Op_explain { analyze; inner } -> stream_explain clock params store mode cat analyze inner
-  | Plan.Op_create_table _ | Plan.Op_create_index _
-  | Plan.Op_drop_table _ | Plan.Op_drop_index _
+  | Plan.Op_explain { analyze; inner } ->
+    stream_explain clock params store mode cat analyze inner
+  | Plan.Op_create_table _
+  | Plan.Op_create_index _
+  | Plan.Op_drop_table _
+  | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
-  | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
+  | Plan.Op_fts_insert _
+  | Plan.Op_fts_delete _
   | Plan.Op_alter_table _
-  | Plan.Op_create_view _ | Plan.Op_drop_view _
-  | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
-  | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
-  | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
+  | Plan.Op_create_view _
+  | Plan.Op_drop_view _
+  | Plan.Op_create_trigger _
+  | Plan.Op_drop_trigger _
+  | Plan.Op_begin
+  | Plan.Op_commit
+  | Plan.Op_rollback
+  | Plan.Op_savepoint _
+  | Plan.Op_release _
+  | Plan.Op_rollback_to _
   | Plan.Op_pragma_set_user_version _
   | Plan.Op_pragma_set_fk _
   | Plan.Op_pragma_set_recursive_triggers _
@@ -5795,13 +8635,15 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
   | Plan.Op_pragma_set_wal_autocheckpoint _
   | Plan.Op_pragma_wal_checkpoint
   | Plan.Op_vacuum
-  | Plan.Op_attach _ | Plan.Op_detach _
+  | Plan.Op_attach _
+  | Plan.Op_detach _
   | Plan.Op_active_database_set _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_database_list | Plan.Op_active_database_get ->
     failwith "Exec.query: routed via Db.query (no Db handle)"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
+;;
 
 (* Wire the forward reference so execute_with_count can call to_stream for
    Op_insert_select.  This runs once at module initialization time, after both
@@ -5812,9 +8654,17 @@ let () = to_stream_ref := to_stream
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
-let query ?(mode = Auto) ?(clock : (unit -> float) option = None) ?(params = [||]) (store : S.t) (cat : Cat.t) (op : Plan.op) :
-    Row.t Lwt_stream.t Lwt.t =
+let query
+      ?(mode = Auto)
+      ?(clock : (unit -> float) option = None)
+      ?(params = [||])
+      (store : S.t)
+      (cat : Cat.t)
+      (op : Plan.op)
+  : Row.t Lwt_stream.t Lwt.t
+  =
   to_stream clock params store ~mode ~cat:(Some cat) op
+;;
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

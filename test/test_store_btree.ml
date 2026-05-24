@@ -6,39 +6,42 @@
     additional B+-tree-specific size limits. *)
 
 open Lwt.Syntax
-
 module S = Sqlocaml_store.Store
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make(Block)
+module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
 
 let bs s = Bytes.of_string s
-
 let run = Lwt_main.run
-
 let counter = ref 0
+
 let fresh_path () =
   let n = !counter in
   incr counter;
   Printf.sprintf "/tmp/sqlocaml_test_store_btree_%04d.db" n
+;;
 
-let cleanup path = (try Unix.unlink path with _ -> ())
+let cleanup path =
+  try Unix.unlink path with
+  | _ -> ()
+;;
 
 let ok_store : (S.t, S.error) result -> S.t = function
   | Ok t -> t
   | Error e -> Alcotest.failf "open_file error: %a" S.pp_error e
+;;
 
 let bytes_eq =
-  Alcotest.testable
-    (fun ppf b -> Format.fprintf ppf "%S" (Bytes.to_string b))
-    Bytes.equal
+  Alcotest.testable (fun ppf b -> Format.fprintf ppf "%S" (Bytes.to_string b)) Bytes.equal
+;;
 
 let bytes_opt_eq =
-  Alcotest.(option
-    (testable (fun ppf b -> Format.fprintf ppf "%S" (Bytes.to_string b))
-       Bytes.equal))
+  Alcotest.(
+    option
+      (testable (fun ppf b -> Format.fprintf ppf "%S" (Bytes.to_string b)) Bytes.equal))
+;;
 
 (* Run a test against a fresh DB file, cleaning up on the way out. *)
 let with_fresh_db ~f =
@@ -46,169 +49,187 @@ let with_fresh_db ~f =
   cleanup path;
   Lwt.finalize
     (fun () -> f path)
-    (fun () -> cleanup path; Lwt.return_unit)
+    (fun () ->
+       cleanup path;
+       Lwt.return_unit)
+;;
 
 let tmp_block_file size_mb =
   let path = Filename.temp_file "sqlocaml_ob_test" ".raw" in
-  let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CREAT] 0o644 in
+  let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (size_mb * 1024 * 1024);
   Unix.close fd;
   path
+;;
 
 let with_block_store path f =
-  run (
-    let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
-    let* adapter = MB.connect dev in
-    let* result = S.open_block
-      ~read_page:(MB.read_page adapter)
-      ~write_page:(MB.write_page adapter)
-      ~sync:(MB.sync adapter)
-      ~resize:(MB.resize adapter)
-      ~n_pages:(MB.n_pages adapter)
-      ~close:(fun () -> MB.close adapter)
-    in
-    match result with
-    | Error e -> Alcotest.failf "open_block failed: %a" S.pp_error e
-    | Ok store ->
-      Lwt.finalize (fun () -> f store) (fun () -> S.close store)
-  )
+  run
+    (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+     let* adapter = MB.connect dev in
+     let* result =
+       S.open_block
+         ~read_page:(MB.read_page adapter)
+         ~write_page:(MB.write_page adapter)
+         ~sync:(MB.sync adapter)
+         ~resize:(MB.resize adapter)
+         ~n_pages:(MB.n_pages adapter)
+         ~close:(fun () -> MB.close adapter)
+     in
+     match result with
+     | Error e -> Alcotest.failf "open_block failed: %a" S.pp_error e
+     | Ok store -> Lwt.finalize (fun () -> f store) (fun () -> S.close store))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 1. open_file basics                                                  *)
 (* ------------------------------------------------------------------ *)
 
 let test_open_creates_file () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    Alcotest.(check bool) "file exists on disk" true (Sys.file_exists path);
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       Alcotest.(check bool) "file exists on disk" true (Sys.file_exists path);
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 let test_basic_put_get () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "k") (bs "v") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* got = S.get tx 0 (bs "k") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "put then get" (Some (bs "v")) got;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "k") (bs "v") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* got = S.get tx 0 (bs "k") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "put then get" (Some (bs "v")) got;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 2. Persistence across reopen                                         *)
 (* ------------------------------------------------------------------ *)
 
 let test_persistence_after_reopen () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "alpha") (bs "1") in
-    let* () = S.put tx 0 (bs "beta")  (bs "2") in
-    let* () = S.put tx 0 (bs "gamma") (bs "3") in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* a = S.get tx 0 (bs "alpha") in
-    let* b = S.get tx 0 (bs "beta") in
-    let* g = S.get tx 0 (bs "gamma") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "alpha" (Some (bs "1")) a;
-    Alcotest.check bytes_opt_eq "beta"  (Some (bs "2")) b;
-    Alcotest.check bytes_opt_eq "gamma" (Some (bs "3")) g;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "alpha") (bs "1") in
+       let* () = S.put tx 0 (bs "beta") (bs "2") in
+       let* () = S.put tx 0 (bs "gamma") (bs "3") in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* a = S.get tx 0 (bs "alpha") in
+       let* b = S.get tx 0 (bs "beta") in
+       let* g = S.get tx 0 (bs "gamma") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "alpha" (Some (bs "1")) a;
+       Alcotest.check bytes_opt_eq "beta" (Some (bs "2")) b;
+       Alcotest.check bytes_opt_eq "gamma" (Some (bs "3")) g;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 let test_delete_persists () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "k") (bs "v") in
-    let* () = S.commit tx in
-    let* tx = S.rw_begin s in
-    let* () = S.del tx 0 (bs "k") in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* got = S.get tx 0 (bs "k") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "deleted stays deleted" None got;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "k") (bs "v") in
+       let* () = S.commit tx in
+       let* tx = S.rw_begin s in
+       let* () = S.del tx 0 (bs "k") in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* got = S.get tx 0 (bs "k") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "deleted stays deleted" None got;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 let test_no_commit_no_persistence () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "k") (bs "v") in
-    (* Rollback instead of commit — data must NOT persist. *)
-    let* () = S.rollback tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* got = S.get tx 0 (bs "k") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "rolled-back put does not persist" None got;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "k") (bs "v") in
+       (* Rollback instead of commit — data must NOT persist. *)
+       let* () = S.rollback tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* got = S.get tx 0 (bs "k") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "rolled-back put does not persist" None got;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 3. Multiple trees                                                    *)
 (* ------------------------------------------------------------------ *)
 
 let test_multiple_trees_independent () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 5 (bs "k") (bs "five") in
-    let* () = S.put tx 7 (bs "k") (bs "seven") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* g5 = S.get tx 5 (bs "k") in
-    let* g7 = S.get tx 7 (bs "k") in
-    let* g9 = S.get tx 9 (bs "k") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "tree 5"  (Some (bs "five"))  g5;
-    Alcotest.check bytes_opt_eq "tree 7"  (Some (bs "seven")) g7;
-    Alcotest.check bytes_opt_eq "tree 9 empty" None g9;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 5 (bs "k") (bs "five") in
+       let* () = S.put tx 7 (bs "k") (bs "seven") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* g5 = S.get tx 5 (bs "k") in
+       let* g7 = S.get tx 7 (bs "k") in
+       let* g9 = S.get tx 9 (bs "k") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "tree 5" (Some (bs "five")) g5;
+       Alcotest.check bytes_opt_eq "tree 7" (Some (bs "seven")) g7;
+       Alcotest.check bytes_opt_eq "tree 9 empty" None g9;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 let test_multiple_trees_persist () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 16 (bs "x") (bs "X") in
-    let* () = S.put tx 17 (bs "y") (bs "Y") in
-    let* () = S.put tx 18 (bs "z") (bs "Z") in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* a = S.get tx 16 (bs "x") in
-    let* b = S.get tx 17 (bs "y") in
-    let* c = S.get tx 18 (bs "z") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "tid 16 persists" (Some (bs "X")) a;
-    Alcotest.check bytes_opt_eq "tid 17 persists" (Some (bs "Y")) b;
-    Alcotest.check bytes_opt_eq "tid 18 persists" (Some (bs "Z")) c;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 16 (bs "x") (bs "X") in
+       let* () = S.put tx 17 (bs "y") (bs "Y") in
+       let* () = S.put tx 18 (bs "z") (bs "Z") in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* a = S.get tx 16 (bs "x") in
+       let* b = S.get tx 17 (bs "y") in
+       let* c = S.get tx 18 (bs "z") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "tid 16 persists" (Some (bs "X")) a;
+       Alcotest.check bytes_opt_eq "tid 17 persists" (Some (bs "Y")) b;
+       Alcotest.check bytes_opt_eq "tid 18 persists" (Some (bs "Z")) c;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 4. Cursor over B+-tree backend                                       *)
@@ -221,52 +242,56 @@ let collect_all c =
     | Some kv -> loop (kv :: acc)
   in
   loop []
+;;
 
 let test_cursor_returns_sorted () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    (* Insert in arbitrary order *)
-    let* () = S.put tx 0 (bs "c") (bs "3") in
-    let* () = S.put tx 0 (bs "a") (bs "1") in
-    let* () = S.put tx 0 (bs "b") (bs "2") in
-    let* () = S.put tx 0 (bs "d") (bs "4") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let _ = S.cursor_first cur in
-    let entries = collect_all cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    let keys = List.map (fun (k, _) -> Bytes.to_string k) entries in
-    Alcotest.(check (list string)) "sorted" ["a"; "b"; "c"; "d"] keys;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       (* Insert in arbitrary order *)
+       let* () = S.put tx 0 (bs "c") (bs "3") in
+       let* () = S.put tx 0 (bs "a") (bs "1") in
+       let* () = S.put tx 0 (bs "b") (bs "2") in
+       let* () = S.put tx 0 (bs "d") (bs "4") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let _ = S.cursor_first cur in
+       let entries = collect_all cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       let keys = List.map (fun (k, _) -> Bytes.to_string k) entries in
+       Alcotest.(check (list string)) "sorted" [ "a"; "b"; "c"; "d" ] keys;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 let test_cursor_seek_between () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "a") (bs "1") in
-    let* () = S.put tx 0 (bs "c") (bs "3") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let r = S.cursor_seek cur (bs "b") in
-    let nxt = S.cursor_next cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    (match r with
-     | S.Not_found (`Greater k) ->
-       Alcotest.check bytes_eq "greater" (bs "c") k
-     | _ -> Alcotest.fail "expected Not_found Greater");
-    (match nxt with
-     | Some (k, _) -> Alcotest.check bytes_eq "next" (bs "c") k
-     | None -> Alcotest.fail "expected Some");
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "a") (bs "1") in
+       let* () = S.put tx 0 (bs "c") (bs "3") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let r = S.cursor_seek cur (bs "b") in
+       let nxt = S.cursor_next cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       (match r with
+        | S.Not_found (`Greater k) -> Alcotest.check bytes_eq "greater" (bs "c") k
+        | _ -> Alcotest.fail "expected Not_found Greater");
+       (match nxt with
+        | Some (k, _) -> Alcotest.check bytes_eq "next" (bs "c") k
+        | None -> Alcotest.fail "expected Some");
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 5. Transaction serialisation                                         *)
@@ -277,159 +302,173 @@ let test_cursor_seek_between () =
    acquiring the first, observing it does not complete, then committing
    the first and confirming the second proceeds. *)
 let test_rw_serialises () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx1 = S.rw_begin s in
-    (* Start a second rw_begin in the background — it should block. *)
-    let snd_started = ref false in
-    let snd =
-      let* tx2 = S.rw_begin s in
-      snd_started := true;
-      let* () = S.put tx2 0 (bs "from-2") (bs "v") in
-      S.commit tx2
-    in
-    (* Give Lwt a chance to schedule.  Pause yields to the scheduler. *)
-    let* () = Lwt.pause () in
-    Alcotest.(check bool) "second rw blocks while first holds lock"
-      false !snd_started;
-    (* Commit first — second should now run. *)
-    let* () = S.put tx1 0 (bs "from-1") (bs "v") in
-    let* () = S.commit tx1 in
-    let* () = snd in
-    Alcotest.(check bool) "second rw eventually runs" true !snd_started;
-    let* tx = S.ro_begin s in
-    let* a = S.get tx 0 (bs "from-1") in
-    let* b = S.get tx 0 (bs "from-2") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "first writer's write" (Some (bs "v")) a;
-    Alcotest.check bytes_opt_eq "second writer's write" (Some (bs "v")) b;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx1 = S.rw_begin s in
+       (* Start a second rw_begin in the background — it should block. *)
+       let snd_started = ref false in
+       let snd =
+         let* tx2 = S.rw_begin s in
+         snd_started := true;
+         let* () = S.put tx2 0 (bs "from-2") (bs "v") in
+         S.commit tx2
+       in
+       (* Give Lwt a chance to schedule.  Pause yields to the scheduler. *)
+       let* () = Lwt.pause () in
+       Alcotest.(check bool) "second rw blocks while first holds lock" false !snd_started;
+       (* Commit first — second should now run. *)
+       let* () = S.put tx1 0 (bs "from-1") (bs "v") in
+       let* () = S.commit tx1 in
+       let* () = snd in
+       Alcotest.(check bool) "second rw eventually runs" true !snd_started;
+       let* tx = S.ro_begin s in
+       let* a = S.get tx 0 (bs "from-1") in
+       let* b = S.get tx 0 (bs "from-2") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "first writer's write" (Some (bs "v")) a;
+       Alcotest.check bytes_opt_eq "second writer's write" (Some (bs "v")) b;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 6. Overwrite                                                          *)
 (* ------------------------------------------------------------------ *)
 
 let test_overwrite_persists () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "k") (bs "first") in
-    let* () = S.commit tx in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "k") (bs "second") in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* got = S.get tx 0 (bs "k") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "overwrite persists"
-      (Some (bs "second")) got;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "k") (bs "first") in
+       let* () = S.commit tx in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "k") (bs "second") in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* got = S.get tx 0 (bs "k") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "overwrite persists" (Some (bs "second")) got;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 7. Many puts (exercises B+-tree splits)                              *)
 (* ------------------------------------------------------------------ *)
 
 let test_many_puts () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let n = 200 in
-    let* tx = S.rw_begin s in
-    let* () =
-      Lwt_list.iter_s (fun i ->
-        let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
-        let v = Bytes.of_string (Printf.sprintf "v%05d" i) in
-        S.put tx 0 k v
-      ) (List.init n Fun.id)
-    in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* results =
-      Lwt_list.map_s (fun i ->
-        let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
-        S.get tx 0 k
-      ) (List.init n Fun.id)
-    in
-    let* () = S.ro_end tx in
-    List.iteri (fun i got ->
-      let expected = Some (Bytes.of_string (Printf.sprintf "v%05d" i)) in
-      Alcotest.check bytes_opt_eq (Printf.sprintf "k%05d" i) expected got
-    ) results;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let n = 200 in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
+              let v = Bytes.of_string (Printf.sprintf "v%05d" i) in
+              S.put tx 0 k v)
+           (List.init n Fun.id)
+       in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* results =
+         Lwt_list.map_s
+           (fun i ->
+              let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
+              S.get tx 0 k)
+           (List.init n Fun.id)
+       in
+       let* () = S.ro_end tx in
+       List.iteri
+         (fun i got ->
+            let expected = Some (Bytes.of_string (Printf.sprintf "v%05d" i)) in
+            Alcotest.check bytes_opt_eq (Printf.sprintf "k%05d" i) expected got)
+         results;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 let test_many_puts_persist () =
-  run (with_fresh_db ~f:(fun path ->
-    let n = 100 in
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () =
-      Lwt_list.iter_s (fun i ->
-        let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
-        let v = Bytes.of_string (Printf.sprintf "v%05d" i) in
-        S.put tx 0 k v
-      ) (List.init n Fun.id)
-    in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* results =
-      Lwt_list.map_s (fun i ->
-        let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
-        S.get tx 0 k
-      ) (List.init n Fun.id)
-    in
-    let* () = S.ro_end tx in
-    List.iteri (fun i got ->
-      let expected = Some (Bytes.of_string (Printf.sprintf "v%05d" i)) in
-      Alcotest.check bytes_opt_eq (Printf.sprintf "k%05d persists" i)
-        expected got
-    ) results;
-    let* () = S.close s2 in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let n = 100 in
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
+              let v = Bytes.of_string (Printf.sprintf "v%05d" i) in
+              S.put tx 0 k v)
+           (List.init n Fun.id)
+       in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* results =
+         Lwt_list.map_s
+           (fun i ->
+              let k = Bytes.of_string (Printf.sprintf "k%05d" i) in
+              S.get tx 0 k)
+           (List.init n Fun.id)
+       in
+       let* () = S.ro_end tx in
+       List.iteri
+         (fun i got ->
+            let expected = Some (Bytes.of_string (Printf.sprintf "v%05d" i)) in
+            Alcotest.check bytes_opt_eq (Printf.sprintf "k%05d persists" i) expected got)
+         results;
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 8. Empty / missing                                                   *)
 (* ------------------------------------------------------------------ *)
 
 let test_missing_key () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.ro_begin s in
-    let* got = S.get tx 0 (bs "absent") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "missing key" None got;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.ro_begin s in
+       let* got = S.get tx 0 (bs "absent") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "missing key" None got;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 let test_cursor_empty () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let first = S.cursor_first cur in
-    let nxt = S.cursor_next cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    (match first with
-     | S.Not_found `End -> ()
-     | _ -> Alcotest.fail "expected Not_found End");
-    Alcotest.(check (option (pair bytes_eq bytes_eq)))
-      "cursor_next on empty" None nxt;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let first = S.cursor_first cur in
+       let nxt = S.cursor_next cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       (match first with
+        | S.Not_found `End -> ()
+        | _ -> Alcotest.fail "expected Not_found End");
+       Alcotest.(check (option (pair bytes_eq bytes_eq))) "cursor_next on empty" None nxt;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 9. QCheck: random put/del/get sequence matches in-memory backend     *)
@@ -444,37 +483,38 @@ type op =
 
 let op_gen =
   let open QCheck.Gen in
-  let small_bytes =
-    map Bytes.of_string (string_size ~gen:char (int_bound 32))
-  in
-  let small_val =
-    map Bytes.of_string (string_size ~gen:char (int_bound 64))
-  in
+  let small_bytes = map Bytes.of_string (string_size ~gen:char (int_bound 32)) in
+  let small_val = map Bytes.of_string (string_size ~gen:char (int_bound 64)) in
   oneof_weighted
     [ 3, map2 (fun k v -> Put (k, v)) small_bytes small_val
     ; 1, map (fun k -> Del k) small_bytes
     ]
+;;
 
 let arb_ops =
-  QCheck.make ~print:(fun ops ->
-    let one = function
-      | Put (k, v) ->
-        Printf.sprintf "Put(%S,%S)" (Bytes.to_string k) (Bytes.to_string v)
-      | Del k -> Printf.sprintf "Del(%S)" (Bytes.to_string k)
-    in
-    "[" ^ String.concat "; " (List.map one ops) ^ "]")
+  QCheck.make
+    ~print:(fun ops ->
+      let one = function
+        | Put (k, v) ->
+          Printf.sprintf "Put(%S,%S)" (Bytes.to_string k) (Bytes.to_string v)
+        | Del k -> Printf.sprintf "Del(%S)" (Bytes.to_string k)
+      in
+      "[" ^ String.concat "; " (List.map one ops) ^ "]")
     QCheck.Gen.(list_size (int_bound 30) op_gen)
+;;
 
 let apply_to_store s ops =
   let* tx = S.rw_begin s in
   let* () =
-    Lwt_list.iter_s (fun op ->
-      match op with
-      | Put (k, v) -> S.put tx 0 k v
-      | Del k      -> S.del tx 0 k
-    ) ops
+    Lwt_list.iter_s
+      (fun op ->
+         match op with
+         | Put (k, v) -> S.put tx 0 k v
+         | Del k -> S.del tx 0 k)
+      ops
   in
   S.commit tx
+;;
 
 let collect_via_cursor s =
   let* tx = S.ro_begin s in
@@ -484,223 +524,252 @@ let collect_via_cursor s =
   S.cursor_close cur;
   let* () = S.ro_end tx in
   Lwt.return acc
+;;
 
 let prop_btree_matches_mem =
-  QCheck.Test.make ~count:10_000 ~name:"btree backend matches Mem backend"
+  QCheck.Test.make
+    ~count:10_000
+    ~name:"btree backend matches Mem backend"
     arb_ops
     (fun ops ->
-      Lwt_main.run (
-        let path = fresh_path () in
-        cleanup path;
-        Lwt.finalize (fun () ->
-          let* r = S.open_file ~path in
-          let bt = ok_store r in
-          let mem = S.create () in
-          let* () = apply_to_store bt ops in
-          let* () = apply_to_store mem ops in
-          let* bt_entries = collect_via_cursor bt in
-          let* mem_entries = collect_via_cursor mem in
-          let* () = S.close bt in
-          let eq =
-            List.length bt_entries = List.length mem_entries
-            && List.for_all2 (fun (k1, v1) (k2, v2) ->
-                 Bytes.equal k1 k2 && Bytes.equal v1 v2)
-                 bt_entries mem_entries
-          in
-          Lwt.return eq
-        ) (fun () -> cleanup path; Lwt.return_unit)
-      ))
+       Lwt_main.run
+         (let path = fresh_path () in
+          cleanup path;
+          Lwt.finalize
+            (fun () ->
+               let* r = S.open_file ~path in
+               let bt = ok_store r in
+               let mem = S.create () in
+               let* () = apply_to_store bt ops in
+               let* () = apply_to_store mem ops in
+               let* bt_entries = collect_via_cursor bt in
+               let* mem_entries = collect_via_cursor mem in
+               let* () = S.close bt in
+               let eq =
+                 List.length bt_entries = List.length mem_entries
+                 && List.for_all2
+                      (fun (k1, v1) (k2, v2) -> Bytes.equal k1 k2 && Bytes.equal v1 v2)
+                      bt_entries
+                      mem_entries
+               in
+               Lwt.return eq)
+            (fun () ->
+               cleanup path;
+               Lwt.return_unit)))
+;;
 
 let prop_persist_roundtrip =
-  QCheck.Test.make ~count:10_000
+  QCheck.Test.make
+    ~count:10_000
     ~name:"persistence: writes survive close/reopen"
     arb_ops
     (fun ops ->
-      Lwt_main.run (
-        let path = fresh_path () in
-        cleanup path;
-        Lwt.finalize (fun () ->
-          let* r = S.open_file ~path in
-          let s = ok_store r in
-          let* () = apply_to_store s ops in
-          let* before = collect_via_cursor s in
-          let* () = S.close s in
-          let* r2 = S.open_file ~path in
-          let s2 = ok_store r2 in
-          let* after = collect_via_cursor s2 in
-          let* () = S.close s2 in
-          let eq =
-            List.length before = List.length after
-            && List.for_all2 (fun (k1, v1) (k2, v2) ->
-                 Bytes.equal k1 k2 && Bytes.equal v1 v2)
-                 before after
-          in
-          Lwt.return eq
-        ) (fun () -> cleanup path; Lwt.return_unit)
-      ))
+       Lwt_main.run
+         (let path = fresh_path () in
+          cleanup path;
+          Lwt.finalize
+            (fun () ->
+               let* r = S.open_file ~path in
+               let s = ok_store r in
+               let* () = apply_to_store s ops in
+               let* before = collect_via_cursor s in
+               let* () = S.close s in
+               let* r2 = S.open_file ~path in
+               let s2 = ok_store r2 in
+               let* after = collect_via_cursor s2 in
+               let* () = S.close s2 in
+               let eq =
+                 List.length before = List.length after
+                 && List.for_all2
+                      (fun (k1, v1) (k2, v2) -> Bytes.equal k1 k2 && Bytes.equal v1 v2)
+                      before
+                      after
+               in
+               Lwt.return eq)
+            (fun () ->
+               cleanup path;
+               Lwt.return_unit)))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 10. Additional coverage: pp_error / rollback / cursor seek/value     *)
 (* ------------------------------------------------------------------ *)
 
 let test_pp_error_all_variants () =
-  let s_block = Format.asprintf "%a" S.pp_error (S.Block_error "io")    in
-  let s_corr  = Format.asprintf "%a" S.pp_error (S.Corruption  "bad")   in
-  let s_klg   = Format.asprintf "%a" S.pp_error (S.Key_too_large 999)   in
-  let s_vlg   = Format.asprintf "%a" S.pp_error (S.Value_too_large 12345) in
-  let s_hdr   = Format.asprintf "%a" S.pp_error (S.Header_error "h")    in
+  let s_block = Format.asprintf "%a" S.pp_error (S.Block_error "io") in
+  let s_corr = Format.asprintf "%a" S.pp_error (S.Corruption "bad") in
+  let s_klg = Format.asprintf "%a" S.pp_error (S.Key_too_large 999) in
+  let s_vlg = Format.asprintf "%a" S.pp_error (S.Value_too_large 12345) in
+  let s_hdr = Format.asprintf "%a" S.pp_error (S.Header_error "h") in
   let contains hay needle =
-    let hl = String.length hay and nl = String.length needle in
+    let hl = String.length hay
+    and nl = String.length needle in
     let rec go i =
-      if i > hl - nl then false
-      else if String.sub hay i nl = needle then true
+      if i > hl - nl
+      then false
+      else if String.sub hay i nl = needle
+      then true
       else go (i + 1)
     in
     go 0
   in
-  Alcotest.(check bool) "Block_error fmt"     true (contains s_block "Block_error");
-  Alcotest.(check bool) "Corruption fmt"      true (contains s_corr  "Corruption");
-  Alcotest.(check bool) "Key_too_large fmt"   true (contains s_klg   "999");
-  Alcotest.(check bool) "Value_too_large fmt" true (contains s_vlg   "12345");
-  Alcotest.(check bool) "Header_error fmt"    true (contains s_hdr   "Header_error")
+  Alcotest.(check bool) "Block_error fmt" true (contains s_block "Block_error");
+  Alcotest.(check bool) "Corruption fmt" true (contains s_corr "Corruption");
+  Alcotest.(check bool) "Key_too_large fmt" true (contains s_klg "999");
+  Alcotest.(check bool) "Value_too_large fmt" true (contains s_vlg "12345");
+  Alcotest.(check bool) "Header_error fmt" true (contains s_hdr "Header_error")
+;;
 
 (* Rollback on a Btree-backed store should restore the meta-tree from
    the committed header and drop the in-memory tree handles. *)
 let test_rollback_btree_drops_uncommitted () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    (* First: commit one value *)
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "committed") (bs "1") in
-    let* () = S.commit tx in
-    (* Second: begin txn, put more, then rollback *)
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "rolled-back") (bs "2") in
-    let* () = S.rollback tx in
-    (* committed value still visible *)
-    let* tx = S.ro_begin s in
-    let* a = S.get tx 0 (bs "committed") in
-    let* b = S.get tx 0 (bs "rolled-back") in
-    let* () = S.ro_end tx in
-    Alcotest.check bytes_opt_eq "committed survives" (Some (bs "1")) a;
-    Alcotest.check bytes_opt_eq "rolled-back gone"   None b;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       (* First: commit one value *)
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "committed") (bs "1") in
+       let* () = S.commit tx in
+       (* Second: begin txn, put more, then rollback *)
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "rolled-back") (bs "2") in
+       let* () = S.rollback tx in
+       (* committed value still visible *)
+       let* tx = S.ro_begin s in
+       let* a = S.get tx 0 (bs "committed") in
+       let* b = S.get tx 0 (bs "rolled-back") in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "committed survives" (Some (bs "1")) a;
+       Alcotest.check bytes_opt_eq "rolled-back gone" None b;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* cursor_seek over Btree backend hitting `Found *)
 let test_cursor_seek_found () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "alpha") (bs "1") in
-    let* () = S.put tx 0 (bs "beta")  (bs "2") in
-    let* () = S.put tx 0 (bs "gamma") (bs "3") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let r = S.cursor_seek cur (bs "beta") in
-    let v_before_next = S.cursor_value cur in
-    let nxt = S.cursor_next cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    (match r with
-     | S.Found k -> Alcotest.check bytes_eq "Found beta" (bs "beta") k
-     | _ -> Alcotest.fail "expected Found");
-    Alcotest.check bytes_opt_eq "cursor_value at Found"
-      (Some (bs "2")) v_before_next;
-    (match nxt with
-     | Some (k, v) ->
-       Alcotest.check bytes_eq "next is beta (positioned)" (bs "beta") k;
-       Alcotest.check bytes_eq "value is 2" (bs "2") v
-     | None -> Alcotest.fail "expected Some");
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "alpha") (bs "1") in
+       let* () = S.put tx 0 (bs "beta") (bs "2") in
+       let* () = S.put tx 0 (bs "gamma") (bs "3") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let r = S.cursor_seek cur (bs "beta") in
+       let v_before_next = S.cursor_value cur in
+       let nxt = S.cursor_next cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       (match r with
+        | S.Found k -> Alcotest.check bytes_eq "Found beta" (bs "beta") k
+        | _ -> Alcotest.fail "expected Found");
+       Alcotest.check bytes_opt_eq "cursor_value at Found" (Some (bs "2")) v_before_next;
+       (match nxt with
+        | Some (k, v) ->
+          Alcotest.check bytes_eq "next is beta (positioned)" (bs "beta") k;
+          Alcotest.check bytes_eq "value is 2" (bs "2") v
+        | None -> Alcotest.fail "expected Some");
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* cursor_seek past end on Btree backend yields Not_found `End *)
 let test_cursor_seek_past_end () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "a") (bs "1") in
-    let* () = S.put tx 0 (bs "b") (bs "2") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let r = S.cursor_seek cur (bs "zzz") in
-    let nxt = S.cursor_next cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    (match r with
-     | S.Not_found `End -> ()
-     | _ -> Alcotest.fail "expected Not_found End");
-    Alcotest.(check (option (pair bytes_eq bytes_eq)))
-      "next past end is None" None nxt;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "a") (bs "1") in
+       let* () = S.put tx 0 (bs "b") (bs "2") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let r = S.cursor_seek cur (bs "zzz") in
+       let nxt = S.cursor_next cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       (match r with
+        | S.Not_found `End -> ()
+        | _ -> Alcotest.fail "expected Not_found End");
+       Alcotest.(check (option (pair bytes_eq bytes_eq))) "next past end is None" None nxt;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* cursor_first on a non-empty Btree backend returns Found of first key.
    cursor_value before any next call should yield the positioned value. *)
 let test_cursor_first_btree () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "x") (bs "1") in
-    let* () = S.put tx 0 (bs "y") (bs "2") in
-    let* () = S.commit tx in
-    let* tx = S.ro_begin s in
-    let* cur = S.cursor_open tx 0 in
-    let f = S.cursor_first cur in
-    let v = S.cursor_value cur in
-    S.cursor_close cur;
-    let* () = S.ro_end tx in
-    (match f with
-     | S.Found k -> Alcotest.check bytes_eq "first is x" (bs "x") k
-     | _ -> Alcotest.fail "expected Found");
-    Alcotest.check bytes_opt_eq "cursor_value at first"
-      (Some (bs "1")) v;
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "x") (bs "1") in
+       let* () = S.put tx 0 (bs "y") (bs "2") in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* cur = S.cursor_open tx 0 in
+       let f = S.cursor_first cur in
+       let v = S.cursor_value cur in
+       S.cursor_close cur;
+       let* () = S.ro_end tx in
+       (match f with
+        | S.Found k -> Alcotest.check bytes_eq "first is x" (bs "x") k
+        | _ -> Alcotest.fail "expected Found");
+       Alcotest.check bytes_opt_eq "cursor_value at first" (Some (bs "1")) v;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* put with key > 512 bytes triggers Btree.Key_too_large which Store
    surfaces as a failed Lwt promise (via unwrap_error/fail_with).  *)
 let test_put_key_too_large_btree () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let big_key = Bytes.make 600 'k' in
-    let* exc =
-      Lwt.catch
-        (fun () -> let* () = S.put tx 0 big_key (bs "v") in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    Alcotest.(check bool) "put raised on oversized key" true (exc <> None);
-    (* Try to recover so we can close cleanly *)
-    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let big_key = Bytes.make 600 'k' in
+       let* exc =
+         Lwt.catch
+           (fun () ->
+              let* () = S.put tx 0 big_key (bs "v") in
+              Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       Alcotest.(check bool) "put raised on oversized key" true (exc <> None);
+       (* Try to recover so we can close cleanly *)
+       let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* Large values now spill to an overflow chain instead of erroring.
    Verify a 2000-byte value round-trips. *)
 let test_put_value_too_large_btree () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    let* tx = S.rw_begin s in
-    let big_val = Bytes.make 2000 'v' in
-    let* () = S.put tx 0 (bs "k") big_val in
-    let* () = S.commit tx in
-    let* tx_ro = S.ro_begin s in
-    let* g = S.get tx_ro 0 (bs "k") in
-    let* () = S.ro_end tx_ro in
-    Alcotest.(check bool) "2000-byte value round-trips via overflow chain"
-      true (g = Some big_val);
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let big_val = Bytes.make 2000 'v' in
+       let* () = S.put tx 0 (bs "k") big_val in
+       let* () = S.commit tx in
+       let* tx_ro = S.ro_begin s in
+       let* g = S.get tx_ro 0 (bs "k") in
+       let* () = S.ro_end tx_ro in
+       Alcotest.(check bool)
+         "2000-byte value round-trips via overflow chain"
+         true
+         (g = Some big_val);
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* Overwrite a tree page on disk with a valid-CRC Header-kind page,
    so Btree descends into it and returns Tree_corrupt (caught by
@@ -708,69 +777,79 @@ let test_put_value_too_large_btree () =
    This exercises map_btree_err's Tree_corrupt arm and the
    get/put/del/cursor_open Btree-error tails. *)
 let test_btree_corrupt_propagation () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    (* Insert enough rows that the table tree has multiple pages so
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       (* Insert enough rows that the table tree has multiple pages so
        the meta-tree references a real page (>= page 2). *)
-    let* tx = S.rw_begin s in
-    let* () = S.put tx 0 (bs "a") (bs "1") in
-    let* () = S.put tx 0 (bs "b") (bs "2") in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    (* Overwrite pages 2 onwards with a fully-valid Header-kind page
+       let* tx = S.rw_begin s in
+       let* () = S.put tx 0 (bs "a") (bs "1") in
+       let* () = S.put tx 0 (bs "b") (bs "2") in
+       let* () = S.commit tx in
+       let* () = S.close s in
+       (* Overwrite pages 2 onwards with a fully-valid Header-kind page
        (CRC sealed) so read_common succeeds and Btree returns
        Tree_corrupt. *)
-    let module Pg = Sqlocaml_storage.Page in
-    let bogus = Cstruct.create Pg.page_size in
-    Cstruct.memset bogus 0;
-    Pg.write_common bogus
-      { Pg.kind = Pg.Header; flags = 0; n_keys = 0;
-        right_page = 0l; crc32 = 0l };
-    Pg.seal bogus;
-    let bogus_bytes = Bytes.create Pg.page_size in
-    Cstruct.blit_to_bytes bogus 0 bogus_bytes 0 Pg.page_size;
-    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
-    let st = Unix.fstat fd in
-    let n_pages = st.Unix.st_size / Pg.page_size in
-    for i = 2 to n_pages - 1 do
-      let _ = Unix.lseek fd (i * Pg.page_size) Unix.SEEK_SET in
-      let _ = Unix.write fd bogus_bytes 0 Pg.page_size in
-      ()
-    done;
-    Unix.close fd;
-    let* r2 = S.open_file ~path in
-    let s2 = ok_store r2 in
-    let* tx = S.ro_begin s2 in
-    let* exc =
-      Lwt.catch
-        (fun () -> let* _ = S.get tx 0 (bs "a") in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    let* () = S.ro_end tx in
-    Alcotest.(check bool) "get raised on corruption" true (exc <> None);
-    let* tx = S.rw_begin s2 in
-    let* exc2 =
-      Lwt.catch
-        (fun () -> let* _ = S.cursor_open tx 0 in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    Alcotest.(check bool) "cursor_open raised on corruption" true (exc2 <> None);
-    let* exc3 =
-      Lwt.catch
-        (fun () -> let* () = S.put tx 0 (bs "c") (bs "3") in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    Alcotest.(check bool) "put raised on corruption" true (exc3 <> None);
-    let* exc4 =
-      Lwt.catch
-        (fun () -> let* () = S.del tx 0 (bs "a") in Lwt.return_none)
-        (fun e  -> Lwt.return_some (Printexc.to_string e))
-    in
-    Alcotest.(check bool) "del raised on corruption" true (exc4 <> None);
-    let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
-    let* () = S.close s2 in
-    Lwt.return_unit))
+       let module Pg = Sqlocaml_storage.Page in
+       let bogus = Cstruct.create Pg.page_size in
+       Cstruct.memset bogus 0;
+       Pg.write_common
+         bogus
+         { Pg.kind = Pg.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l };
+       Pg.seal bogus;
+       let bogus_bytes = Bytes.create Pg.page_size in
+       Cstruct.blit_to_bytes bogus 0 bogus_bytes 0 Pg.page_size;
+       let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
+       let st = Unix.fstat fd in
+       let n_pages = st.Unix.st_size / Pg.page_size in
+       for i = 2 to n_pages - 1 do
+         let _ = Unix.lseek fd (i * Pg.page_size) Unix.SEEK_SET in
+         let _ = Unix.write fd bogus_bytes 0 Pg.page_size in
+         ()
+       done;
+       Unix.close fd;
+       let* r2 = S.open_file ~path in
+       let s2 = ok_store r2 in
+       let* tx = S.ro_begin s2 in
+       let* exc =
+         Lwt.catch
+           (fun () ->
+              let* _ = S.get tx 0 (bs "a") in
+              Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       let* () = S.ro_end tx in
+       Alcotest.(check bool) "get raised on corruption" true (exc <> None);
+       let* tx = S.rw_begin s2 in
+       let* exc2 =
+         Lwt.catch
+           (fun () ->
+              let* _ = S.cursor_open tx 0 in
+              Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       Alcotest.(check bool) "cursor_open raised on corruption" true (exc2 <> None);
+       let* exc3 =
+         Lwt.catch
+           (fun () ->
+              let* () = S.put tx 0 (bs "c") (bs "3") in
+              Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       Alcotest.(check bool) "put raised on corruption" true (exc3 <> None);
+       let* exc4 =
+         Lwt.catch
+           (fun () ->
+              let* () = S.del tx 0 (bs "a") in
+              Lwt.return_none)
+           (fun e -> Lwt.return_some (Printexc.to_string e))
+       in
+       Alcotest.(check bool) "del raised on corruption" true (exc4 <> None);
+       let* () = Lwt.catch (fun () -> S.rollback tx) (fun _ -> Lwt.return_unit) in
+       let* () = S.close s2 in
+       Lwt.return_unit))
+;;
 
 (* Open a file whose two header pages are both corrupt -- should yield
    Header_error in Store.open_file's Btree-init path. *)
@@ -784,20 +863,19 @@ let test_open_corrupt_headers_both () =
   output_bytes oc garbage;
   close_out oc;
   let finished = ref false in
-  Lwt_main.run (
-    let* r = S.open_file ~path in
-    (match r with
+  Lwt_main.run
+    (let* r = S.open_file ~path in
+     match r with
      | Ok s ->
        let* () = S.close s in
        Alcotest.fail "expected Header_error for corrupt headers"
      | Error (S.Header_error _) ->
        finished := true;
        Lwt.return_unit
-     | Error e ->
-       Alcotest.failf "expected Header_error, got: %a" S.pp_error e)
-  );
+     | Error e -> Alcotest.failf "expected Header_error, got: %a" S.pp_error e);
   cleanup path;
   Alcotest.(check bool) "got expected error" true !finished
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 11. Freelist persistence                                             *)
@@ -805,69 +883,79 @@ let test_open_corrupt_headers_both () =
 
 let test_freelist_survives_reopen () =
   let path = Filename.temp_file "sqlocaml_fl_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Insert 50 rows to force some B+-tree page allocations *)
-    for i = 1 to 50 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      let value = Bytes.of_string "value" in
-      run (S.put tx 16 key value);
-      run (S.commit tx)
-    done;
-    (* Delete half to free pages via CoW *)
-    for i = 1 to 25 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.del tx 16 key);
-      run (S.commit tx)
-    done;
-    let fl_before = S.freelist_size store in
-    run (S.close store);
-    (* Reopen and verify freelist recovered *)
-    let store2 = Result.get_ok (run (S.open_file ~path)) in
-    let fl_after = S.freelist_size store2 in
-    Alcotest.(check bool) "freelist non-empty after reopen"
-      true (fl_after > 0);
-    Alcotest.(check int) "freelist size matches" fl_before fl_after;
-    run (S.close store2))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Insert 50 rows to force some B+-tree page allocations *)
+       for i = 1 to 50 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         let value = Bytes.of_string "value" in
+         run (S.put tx 16 key value);
+         run (S.commit tx)
+       done;
+       (* Delete half to free pages via CoW *)
+       for i = 1 to 25 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.del tx 16 key);
+         run (S.commit tx)
+       done;
+       let fl_before = S.freelist_size store in
+       run (S.close store);
+       (* Reopen and verify freelist recovered *)
+       let store2 = Result.get_ok (run (S.open_file ~path)) in
+       let fl_after = S.freelist_size store2 in
+       Alcotest.(check bool) "freelist non-empty after reopen" true (fl_after > 0);
+       Alcotest.(check int) "freelist size matches" fl_before fl_after;
+       run (S.close store2))
+;;
 
 let test_freed_pages_reused_after_reopen () =
   let path = Filename.temp_file "sqlocaml_reuse_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Build initial state *)
-    for i = 1 to 30 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    (* Delete all to free pages *)
-    for i = 1 to 30 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.del tx 16 key);
-      run (S.commit tx)
-    done;
-    let n_pages_after_delete = S.n_pages store in
-    run (S.close store);
-    (* Reopen: freelist should be loaded *)
-    let store2 = Result.get_ok (run (S.open_file ~path)) in
-    Alcotest.(check bool) "freelist loaded on reopen"
-      true (S.freelist_size store2 > 0);
-    (* Reinsert: should reuse freed pages, file should not grow significantly *)
-    for i = 1 to 30 do
-      let tx = run (S.rw_begin store2) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    let n_pages_after_reinsert = S.n_pages store2 in
-    (* Allow some growth for freelist pages themselves, but it should be bounded *)
-    Alcotest.(check bool) "pages reused — file doesn't grow much"
-      true (n_pages_after_reinsert <= Int64.add n_pages_after_delete 10L);
-    run (S.close store2))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Build initial state *)
+       for i = 1 to 30 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       (* Delete all to free pages *)
+       for i = 1 to 30 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.del tx 16 key);
+         run (S.commit tx)
+       done;
+       let n_pages_after_delete = S.n_pages store in
+       run (S.close store);
+       (* Reopen: freelist should be loaded *)
+       let store2 = Result.get_ok (run (S.open_file ~path)) in
+       Alcotest.(check bool) "freelist loaded on reopen" true (S.freelist_size store2 > 0);
+       (* Reinsert: should reuse freed pages, file should not grow significantly *)
+       for i = 1 to 30 do
+         let tx = run (S.rw_begin store2) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       let n_pages_after_reinsert = S.n_pages store2 in
+       (* Allow some growth for freelist pages themselves, but it should be bounded *)
+       Alcotest.(check bool)
+         "pages reused — file doesn't grow much"
+         true
+         (n_pages_after_reinsert <= Int64.add n_pages_after_delete 10L);
+       run (S.close store2))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 12. Rollback correctness                                             *)
@@ -875,73 +963,103 @@ let test_freed_pages_reused_after_reopen () =
 
 let test_rollback_restores_data () =
   let path = Filename.temp_file "sqlocaml_rb_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx1 = run (S.rw_begin store) in
-    run (S.put tx1 16 (Bytes.of_string "key") (Bytes.of_string "original"));
-    run (S.commit tx1);
-    let tx2 = run (S.rw_begin store) in
-    run (S.put tx2 16 (Bytes.of_string "key") (Bytes.of_string "changed"));
-    run (S.rollback tx2);
-    let tx3 = run (S.ro_begin store) in
-    let v = run (S.get tx3 16 (Bytes.of_string "key")) in
-    run (S.ro_end tx3);
-    Alcotest.(check (option string)) "rolled back to original"
-      (Some "original") (Option.map Bytes.to_string v);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx1 = run (S.rw_begin store) in
+       run (S.put tx1 16 (Bytes.of_string "key") (Bytes.of_string "original"));
+       run (S.commit tx1);
+       let tx2 = run (S.rw_begin store) in
+       run (S.put tx2 16 (Bytes.of_string "key") (Bytes.of_string "changed"));
+       run (S.rollback tx2);
+       let tx3 = run (S.ro_begin store) in
+       let v = run (S.get tx3 16 (Bytes.of_string "key")) in
+       run (S.ro_end tx3);
+       Alcotest.(check (option string))
+         "rolled back to original"
+         (Some "original")
+         (Option.map Bytes.to_string v);
+       run (S.close store))
+;;
 
 let test_rollback_freelist_not_corrupted () =
   let path = Filename.temp_file "sqlocaml_rb2_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx1 = run (S.rw_begin store) in
-    run (S.put tx1 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
-    run (S.commit tx1);
-    (* Capture exact freelist entries after commit *)
-    let fl_entries_after_commit = S.freelist_entries store in
-    (* Start a txn that modifies the tree (causes CoW frees) *)
-    let tx2 = run (S.rw_begin store) in
-    run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
-    run (S.rollback tx2);
-    (* Freelist must be identical (same entries, same order) after rollback *)
-    let fl_entries_after_rollback = S.freelist_entries store in
-    Alcotest.(check int) "freelist size unchanged after rollback"
-      (List.length fl_entries_after_commit) (List.length fl_entries_after_rollback);
-    Alcotest.(check bool) "freelist contents identical after rollback"
-      true (fl_entries_after_commit = fl_entries_after_rollback);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx1 = run (S.rw_begin store) in
+       run (S.put tx1 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
+       run (S.commit tx1);
+       (* Capture exact freelist entries after commit *)
+       let fl_entries_after_commit = S.freelist_entries store in
+       (* Start a txn that modifies the tree (causes CoW frees) *)
+       let tx2 = run (S.rw_begin store) in
+       run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
+       run (S.rollback tx2);
+       (* Freelist must be identical (same entries, same order) after rollback *)
+       let fl_entries_after_rollback = S.freelist_entries store in
+       Alcotest.(check int)
+         "freelist size unchanged after rollback"
+         (List.length fl_entries_after_commit)
+         (List.length fl_entries_after_rollback);
+       Alcotest.(check bool)
+         "freelist contents identical after rollback"
+         true
+         (fl_entries_after_commit = fl_entries_after_rollback);
+       run (S.close store))
+;;
 
 let test_rollback_then_commit_works () =
   let path = Filename.temp_file "sqlocaml_rb3_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx1 = run (S.rw_begin store) in
-    run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "first"));
-    run (S.rollback tx1);
-    let tx2 = run (S.rw_begin store) in
-    run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "second"));
-    run (S.commit tx2);
-    let tx3 = run (S.ro_begin store) in
-    let v = run (S.get tx3 16 (Bytes.of_string "k")) in
-    run (S.ro_end tx3);
-    Alcotest.(check (option string)) "second write committed"
-      (Some "second") (Option.map Bytes.to_string v);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx1 = run (S.rw_begin store) in
+       run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "first"));
+       run (S.rollback tx1);
+       let tx2 = run (S.rw_begin store) in
+       run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "second"));
+       run (S.commit tx2);
+       let tx3 = run (S.ro_begin store) in
+       let v = run (S.get tx3 16 (Bytes.of_string "k")) in
+       run (S.ro_end tx3);
+       Alcotest.(check (option string))
+         "second write committed"
+         (Some "second")
+         (Option.map Bytes.to_string v);
+       run (S.close store))
+;;
 
 let test_rollback_new_key_absent () =
   let path = Filename.temp_file "sqlocaml_rb4_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Insert a brand-new key then rollback — key must not exist after *)
-    let tx1 = run (S.rw_begin store) in
-    run (S.put tx1 16 (Bytes.of_string "new_key") (Bytes.of_string "val"));
-    run (S.rollback tx1);
-    let tx2 = run (S.ro_begin store) in
-    let v = run (S.get tx2 16 (Bytes.of_string "new_key")) in
-    run (S.ro_end tx2);
-    Alcotest.(check (option string)) "new key absent after rollback"
-      None (Option.map Bytes.to_string v);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Insert a brand-new key then rollback — key must not exist after *)
+       let tx1 = run (S.rw_begin store) in
+       run (S.put tx1 16 (Bytes.of_string "new_key") (Bytes.of_string "val"));
+       run (S.rollback tx1);
+       let tx2 = run (S.ro_begin store) in
+       let v = run (S.get tx2 16 (Bytes.of_string "new_key")) in
+       run (S.ro_end tx2);
+       Alcotest.(check (option string))
+         "new key absent after rollback"
+         None
+         (Option.map Bytes.to_string v);
+       run (S.close store))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 13. Snapshot isolation                                               *)
@@ -949,139 +1067,174 @@ let test_rollback_new_key_absent () =
 
 let test_ro_sees_committed_not_in_progress () =
   let path = Filename.temp_file "sqlocaml_snap_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx1 = run (S.rw_begin store) in
-    run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "committed"));
-    run (S.commit tx1);
-    (* Open RO snapshot at txn_id=1 *)
-    let ro = run (S.ro_begin store) in
-    (* Start a concurrent RW txn that modifies the same key *)
-    let tx2 = run (S.rw_begin store) in
-    run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "uncommitted"));
-    (* RO snapshot should NOT see the uncommitted write *)
-    let v = run (S.get ro 16 (Bytes.of_string "k")) in
-    Alcotest.(check (option string)) "RO sees committed value"
-      (Some "committed") (Option.map Bytes.to_string v);
-    run (S.commit tx2);
-    (* RO snapshot still sees OLD committed value even after commit *)
-    let v2 = run (S.get ro 16 (Bytes.of_string "k")) in
-    Alcotest.(check (option string)) "RO still sees snapshot value"
-      (Some "committed") (Option.map Bytes.to_string v2);
-    run (S.ro_end ro);
-    (* New RO txn sees latest committed value *)
-    let ro3 = run (S.ro_begin store) in
-    let v3 = run (S.get ro3 16 (Bytes.of_string "k")) in
-    run (S.ro_end ro3);
-    Alcotest.(check (option string)) "new RO sees latest commit"
-      (Some "uncommitted") (Option.map Bytes.to_string v3);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx1 = run (S.rw_begin store) in
+       run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "committed"));
+       run (S.commit tx1);
+       (* Open RO snapshot at txn_id=1 *)
+       let ro = run (S.ro_begin store) in
+       (* Start a concurrent RW txn that modifies the same key *)
+       let tx2 = run (S.rw_begin store) in
+       run (S.put tx2 16 (Bytes.of_string "k") (Bytes.of_string "uncommitted"));
+       (* RO snapshot should NOT see the uncommitted write *)
+       let v = run (S.get ro 16 (Bytes.of_string "k")) in
+       Alcotest.(check (option string))
+         "RO sees committed value"
+         (Some "committed")
+         (Option.map Bytes.to_string v);
+       run (S.commit tx2);
+       (* RO snapshot still sees OLD committed value even after commit *)
+       let v2 = run (S.get ro 16 (Bytes.of_string "k")) in
+       Alcotest.(check (option string))
+         "RO still sees snapshot value"
+         (Some "committed")
+         (Option.map Bytes.to_string v2);
+       run (S.ro_end ro);
+       (* New RO txn sees latest committed value *)
+       let ro3 = run (S.ro_begin store) in
+       let v3 = run (S.get ro3 16 (Bytes.of_string "k")) in
+       run (S.ro_end ro3);
+       Alcotest.(check (option string))
+         "new RO sees latest commit"
+         (Some "uncommitted")
+         (Option.map Bytes.to_string v3);
+       run (S.close store))
+;;
 
 let test_ro_after_rw_begin_safe () =
   (* Verify: opening an RO snapshot AFTER rw_begin does not corrupt reader's data.
      The critical ordering: rw_begin → ro_begin → put/commit → verify reader sees original. *)
   let path = Filename.temp_file "sqlocaml_ro_after_rw_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Commit initial state *)
-    let tx0 = run (S.rw_begin store) in
-    run (S.put tx0 16 (Bytes.of_string "key") (Bytes.of_string "original"));
-    run (S.commit tx0);
-    (* Start RW txn FIRST — then open RO snapshot *)
-    let tx_rw = run (S.rw_begin store) in
-    let ro = run (S.ro_begin store) in    (* ro_begin AFTER rw_begin *)
-    (* RO sees committed state before this RW txn *)
-    let v0 = run (S.get ro 16 (Bytes.of_string "key")) in
-    Alcotest.(check (option string)) "ro sees committed before rw"
-      (Some "original") (Option.map Bytes.to_string v0);
-    (* Do mutations in the RW txn and commit *)
-    run (S.put tx_rw 16 (Bytes.of_string "key") (Bytes.of_string "modified"));
-    run (S.commit tx_rw);
-    (* RO snapshot still sees original (snapshot isolation) *)
-    let v1 = run (S.get ro 16 (Bytes.of_string "key")) in
-    Alcotest.(check (option string)) "ro still sees original after commit"
-      (Some "original") (Option.map Bytes.to_string v1);
-    (* Start another RW txn — should be safe even with reader active *)
-    let tx_rw2 = run (S.rw_begin store) in
-    run (S.put tx_rw2 16 (Bytes.of_string "key") (Bytes.of_string "final"));
-    run (S.commit tx_rw2);
-    (* RO snapshot still sees original *)
-    let v2 = run (S.get ro 16 (Bytes.of_string "key")) in
-    Alcotest.(check (option string)) "ro sees original after second commit"
-      (Some "original") (Option.map Bytes.to_string v2);
-    run (S.ro_end ro);
-    (* New reader sees final value *)
-    let ro2 = run (S.ro_begin store) in
-    let v3 = run (S.get ro2 16 (Bytes.of_string "key")) in
-    run (S.ro_end ro2);
-    Alcotest.(check (option string)) "new ro sees final" (Some "final")
-      (Option.map Bytes.to_string v3);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Commit initial state *)
+       let tx0 = run (S.rw_begin store) in
+       run (S.put tx0 16 (Bytes.of_string "key") (Bytes.of_string "original"));
+       run (S.commit tx0);
+       (* Start RW txn FIRST — then open RO snapshot *)
+       let tx_rw = run (S.rw_begin store) in
+       let ro = run (S.ro_begin store) in
+       (* ro_begin AFTER rw_begin *)
+       (* RO sees committed state before this RW txn *)
+       let v0 = run (S.get ro 16 (Bytes.of_string "key")) in
+       Alcotest.(check (option string))
+         "ro sees committed before rw"
+         (Some "original")
+         (Option.map Bytes.to_string v0);
+       (* Do mutations in the RW txn and commit *)
+       run (S.put tx_rw 16 (Bytes.of_string "key") (Bytes.of_string "modified"));
+       run (S.commit tx_rw);
+       (* RO snapshot still sees original (snapshot isolation) *)
+       let v1 = run (S.get ro 16 (Bytes.of_string "key")) in
+       Alcotest.(check (option string))
+         "ro still sees original after commit"
+         (Some "original")
+         (Option.map Bytes.to_string v1);
+       (* Start another RW txn — should be safe even with reader active *)
+       let tx_rw2 = run (S.rw_begin store) in
+       run (S.put tx_rw2 16 (Bytes.of_string "key") (Bytes.of_string "final"));
+       run (S.commit tx_rw2);
+       (* RO snapshot still sees original *)
+       let v2 = run (S.get ro 16 (Bytes.of_string "key")) in
+       Alcotest.(check (option string))
+         "ro sees original after second commit"
+         (Some "original")
+         (Option.map Bytes.to_string v2);
+       run (S.ro_end ro);
+       (* New reader sees final value *)
+       let ro2 = run (S.ro_begin store) in
+       let v3 = run (S.get ro2 16 (Bytes.of_string "key")) in
+       run (S.ro_end ro2);
+       Alcotest.(check (option string))
+         "new ro sees final"
+         (Some "final")
+         (Option.map Bytes.to_string v3);
+       run (S.close store))
+;;
 
 let test_active_reader_gates_freelist () =
   let path = Filename.temp_file "sqlocaml_gate_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Build some tree structure *)
-    for i = 1 to 20 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    (* Open RO snapshot — active reader pins current pages *)
-    let ro = run (S.ro_begin store) in
-    let n_pages_before_delete = S.n_pages store in
-    (* Delete all rows — CoW frees pages, but reader is active so they can't be reused *)
-    for i = 1 to 20 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.del tx 16 key);
-      run (S.commit tx)
-    done;
-    (* Reinsert — with active reader, freed pages are gated; file may grow *)
-    for i = 1 to 20 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    (* Verify RO reader still sees all 20 original keys via snapshot *)
-    let cur = run (S.cursor_open ro 16) in
-    let _sr = S.cursor_first cur in
-    let count = ref 0 in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some _ -> incr count; drain ()
-    in
-    drain ();
-    S.cursor_close cur;
-    Alcotest.(check bool) "ro snapshot sees all 20 original keys"
-      true (!count = 20);
-    let n_with_reader = S.n_pages store in
-    (* Close reader — freed pages now ungated *)
-    run (S.ro_end ro);
-    (* Verify reader saw consistent snapshot throughout *)
-    Alcotest.(check bool) "file grew while reader was active"
-      true (n_with_reader > n_pages_before_delete);
-    (* Second delete+reinsert cycle without reader — pages reused, file doesn't grow *)
-    for i = 1 to 20 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.del tx 16 key);
-      run (S.commit tx)
-    done;
-    for i = 1 to 20 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    let n_no_reader = S.n_pages store in
-    Alcotest.(check bool) "file doesn't grow after reader closes"
-      true (n_no_reader <= n_with_reader);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Build some tree structure *)
+       for i = 1 to 20 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       (* Open RO snapshot — active reader pins current pages *)
+       let ro = run (S.ro_begin store) in
+       let n_pages_before_delete = S.n_pages store in
+       (* Delete all rows — CoW frees pages, but reader is active so they can't be reused *)
+       for i = 1 to 20 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.del tx 16 key);
+         run (S.commit tx)
+       done;
+       (* Reinsert — with active reader, freed pages are gated; file may grow *)
+       for i = 1 to 20 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       (* Verify RO reader still sees all 20 original keys via snapshot *)
+       let cur = run (S.cursor_open ro 16) in
+       let _sr = S.cursor_first cur in
+       let count = ref 0 in
+       let rec drain () =
+         match S.cursor_next cur with
+         | None -> ()
+         | Some _ ->
+           incr count;
+           drain ()
+       in
+       drain ();
+       S.cursor_close cur;
+       Alcotest.(check bool) "ro snapshot sees all 20 original keys" true (!count = 20);
+       let n_with_reader = S.n_pages store in
+       (* Close reader — freed pages now ungated *)
+       run (S.ro_end ro);
+       (* Verify reader saw consistent snapshot throughout *)
+       Alcotest.(check bool)
+         "file grew while reader was active"
+         true
+         (n_with_reader > n_pages_before_delete);
+       (* Second delete+reinsert cycle without reader — pages reused, file doesn't grow *)
+       for i = 1 to 20 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.del tx 16 key);
+         run (S.commit tx)
+       done;
+       for i = 1 to 20 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       let n_no_reader = S.n_pages store in
+       Alcotest.(check bool)
+         "file doesn't grow after reader closes"
+         true
+         (n_no_reader <= n_with_reader);
+       run (S.close store))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 13b. map_btree_err Block_error / Corruption coverage                *)
@@ -1090,42 +1243,47 @@ let test_active_reader_gates_freelist () =
 (* ------------------------------------------------------------------ *)
 
 let test_btree_block_error_propagation () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    (* Write enough data to create a real tree with multiple pages *)
-    let* tx = S.rw_begin s in
-    let* () = Lwt_list.iter_s (fun i ->
-      let k = Bytes.of_string (Printf.sprintf "key%04d" i) in
-      let v = Bytes.of_string (Printf.sprintf "val%04d" i) in
-      S.put tx 0 k v
-    ) (List.init 20 Fun.id) in
-    let* () = S.commit tx in
-    let* () = S.close s in
-    (* Truncate the file to just 2 pages, making it too short for the data *)
-    let page_size = Sqlocaml_storage.Page.page_size in
-    let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
-    let _ = Unix.ftruncate fd (2 * page_size) in
-    Unix.close fd;
-    (* Reopen: should succeed (headers on page 0-1 are intact) *)
-    let* r2 = S.open_file ~path in
-    (match r2 with
-     | Error _ ->
-       (* File truncation may corrupt headers too — that's ok, abort *)
-       Lwt.return_unit
-     | Ok s2 ->
-       let* tx2 = S.ro_begin s2 in
-       let* exc =
-         Lwt.catch
-           (fun () ->
-             let* _ = S.get tx2 0 (Bytes.of_string "key0000") in
-             Lwt.return_none)
-           (fun e -> Lwt.return_some (Printexc.to_string e))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       (* Write enough data to create a real tree with multiple pages *)
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let k = Bytes.of_string (Printf.sprintf "key%04d" i) in
+              let v = Bytes.of_string (Printf.sprintf "val%04d" i) in
+              S.put tx 0 k v)
+           (List.init 20 Fun.id)
        in
-       let* () = S.ro_end tx2 in
-       (* Either Block_error (out of bounds) or Tree_corrupt — both are ok *)
-       Alcotest.(check bool) "truncated file raises on get" true (exc <> None);
-       S.close s2)))
+       let* () = S.commit tx in
+       let* () = S.close s in
+       (* Truncate the file to just 2 pages, making it too short for the data *)
+       let page_size = Sqlocaml_storage.Page.page_size in
+       let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
+       let _ = Unix.ftruncate fd (2 * page_size) in
+       Unix.close fd;
+       (* Reopen: should succeed (headers on page 0-1 are intact) *)
+       let* r2 = S.open_file ~path in
+       match r2 with
+       | Error _ ->
+         (* File truncation may corrupt headers too — that's ok, abort *)
+         Lwt.return_unit
+       | Ok s2 ->
+         let* tx2 = S.ro_begin s2 in
+         let* exc =
+           Lwt.catch
+             (fun () ->
+                let* _ = S.get tx2 0 (Bytes.of_string "key0000") in
+                Lwt.return_none)
+             (fun e -> Lwt.return_some (Printexc.to_string e))
+         in
+         let* () = S.ro_end tx2 in
+         (* Either Block_error (out of bounds) or Tree_corrupt — both are ok *)
+         Alcotest.(check bool) "truncated file raises on get" true (exc <> None);
+         S.close s2))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 13c. read_freelist_pages error path                                  *)
@@ -1135,64 +1293,72 @@ let test_btree_block_error_propagation () =
 
 let test_freelist_read_error_path () =
   let path = Filename.temp_file "sqlocaml_fl_err_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    (* Create a file with many CoW operations so freelist has entries *)
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Do many commits to build up freelist entries *)
-    for i = 1 to 30 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.put tx 16 key (Bytes.of_string "v"));
-      run (S.commit tx)
-    done;
-    for i = 1 to 30 do
-      let tx = run (S.rw_begin store) in
-      let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-      run (S.del tx 16 key);
-      run (S.commit tx)
-    done;
-    let freelist_sz = S.freelist_size store in
-    run (S.close store);
-    if freelist_sz > 0 then begin
-      (* The freelist was written. Now corrupt the header to make freelist_page
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       (* Create a file with many CoW operations so freelist has entries *)
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Do many commits to build up freelist entries *)
+       for i = 1 to 30 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       for i = 1 to 30 do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.del tx 16 key);
+         run (S.commit tx)
+       done;
+       let freelist_sz = S.freelist_size store in
+       run (S.close store);
+       if freelist_sz > 0
+       then (
+         let (* The freelist was written. Now corrupt the header to make freelist_page
          point to a page beyond the end of the file, triggering Pager.read error. *)
-      let module Pg = Sqlocaml_storage.Page in
-      let module Pager = Sqlocaml_storage.Pager in
-      let fd = Unix.openfile path [Unix.O_RDWR] 0o644 in
-      let st = Unix.fstat fd in
-      let file_size = st.Unix.st_size in
-      let n_pages = file_size / Pg.page_size in
-      (* Read header to find which header page is "live" *)
-      let buf0 = Bytes.create Pg.page_size in
-      let _ = Unix.lseek fd 0 Unix.SEEK_SET in
-      let _ = Unix.read fd buf0 0 Pg.page_size in
-      let buf1 = Bytes.create Pg.page_size in
-      let _ = Unix.lseek fd Pg.page_size Unix.SEEK_SET in
-      let _ = Unix.read fd buf1 0 Pg.page_size in
-      (* Set freelist_page field in BOTH header pages to a beyond-EOF page *)
-      (* Header layout: offset 32 = freelist_page (int64 BE) *)
-      let out_of_bounds = Int64.of_int (n_pages + 100) in
-      let set_freelist_page buf offset =
-        (* Offset 32 in header is freelist_page as int64 BE *)
-        Bytes.set_int64_be buf 32 out_of_bounds;
-        (* Re-seal the CRC *)
-        let cs = Cstruct.of_bytes buf in
-        Sqlocaml_storage.Page.seal cs;
-        let resealed = Bytes.create Pg.page_size in
-        Cstruct.blit_to_bytes cs 0 resealed 0 Pg.page_size;
-        let _ = Unix.lseek fd offset Unix.SEEK_SET in
-        let _ = Unix.write fd resealed 0 Pg.page_size in
-        ()
-      in
-      set_freelist_page buf0 0;
-      set_freelist_page buf1 Pg.page_size;
-      Unix.close fd;
-      (* Reopen: the freelist read will fail since freelist_page is out of bounds *)
-      let store2 = Result.get_ok (run (S.open_file ~path)) in
-      (* The freelist should be empty (error during read caused early return) *)
-      let _ = S.freelist_size store2 in
-      run (S.close store2)
-    end)
+           module
+           Pg =
+           Sqlocaml_storage.Page
+         in
+         let module Pager = Sqlocaml_storage.Pager in
+         let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
+         let st = Unix.fstat fd in
+         let file_size = st.Unix.st_size in
+         let n_pages = file_size / Pg.page_size in
+         (* Read header to find which header page is "live" *)
+         let buf0 = Bytes.create Pg.page_size in
+         let _ = Unix.lseek fd 0 Unix.SEEK_SET in
+         let _ = Unix.read fd buf0 0 Pg.page_size in
+         let buf1 = Bytes.create Pg.page_size in
+         let _ = Unix.lseek fd Pg.page_size Unix.SEEK_SET in
+         let _ = Unix.read fd buf1 0 Pg.page_size in
+         (* Set freelist_page field in BOTH header pages to a beyond-EOF page *)
+         (* Header layout: offset 32 = freelist_page (int64 BE) *)
+         let out_of_bounds = Int64.of_int (n_pages + 100) in
+         let set_freelist_page buf offset =
+           (* Offset 32 in header is freelist_page as int64 BE *)
+           Bytes.set_int64_be buf 32 out_of_bounds;
+           (* Re-seal the CRC *)
+           let cs = Cstruct.of_bytes buf in
+           Sqlocaml_storage.Page.seal cs;
+           let resealed = Bytes.create Pg.page_size in
+           Cstruct.blit_to_bytes cs 0 resealed 0 Pg.page_size;
+           let _ = Unix.lseek fd offset Unix.SEEK_SET in
+           let _ = Unix.write fd resealed 0 Pg.page_size in
+           ()
+         in
+         set_freelist_page buf0 0;
+         set_freelist_page buf1 Pg.page_size;
+         Unix.close fd;
+         (* Reopen: the freelist read will fail since freelist_page is out of bounds *)
+         let store2 = Result.get_ok (run (S.open_file ~path)) in
+         (* The freelist should be empty (error during read caused early return) *)
+         let _ = S.freelist_size store2 in
+         run (S.close store2)))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 14. min_active_reader_txn with multiple readers                     *)
@@ -1201,25 +1367,30 @@ let test_freelist_read_error_path () =
 
 let test_multiple_active_readers () =
   let path = Filename.temp_file "sqlocaml_multi_ro_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    (* Commit two rounds to advance txn_id so we get different snap_txn_ids *)
-    let tx = run (S.rw_begin store) in
-    run (S.put tx 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
-    run (S.commit tx);
-    let ro1 = run (S.ro_begin store) in
-    (* Advance txn_id again *)
-    let tx2 = run (S.rw_begin store) in
-    run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
-    run (S.commit tx2);
-    let ro2 = run (S.ro_begin store) in
-    (* Both readers are active; rw_begin will see both in active_readers *)
-    let tx3 = run (S.rw_begin store) in
-    run (S.commit tx3);
-    (* Cleanup *)
-    run (S.ro_end ro1);
-    run (S.ro_end ro2);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       (* Commit two rounds to advance txn_id so we get different snap_txn_ids *)
+       let tx = run (S.rw_begin store) in
+       run (S.put tx 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
+       run (S.commit tx);
+       let ro1 = run (S.ro_begin store) in
+       (* Advance txn_id again *)
+       let tx2 = run (S.rw_begin store) in
+       run (S.put tx2 16 (Bytes.of_string "k2") (Bytes.of_string "v2"));
+       run (S.commit tx2);
+       let ro2 = run (S.ro_begin store) in
+       (* Both readers are active; rw_begin will see both in active_readers *)
+       let tx3 = run (S.rw_begin store) in
+       run (S.commit tx3);
+       (* Cleanup *)
+       run (S.ro_end ro1);
+       run (S.ro_end ro2);
+       run (S.close store))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 15. bt_get_tree_ro cache hit path                                   *)
@@ -1228,20 +1399,31 @@ let test_multiple_active_readers () =
 
 let test_ro_cache_hit () =
   let path = Filename.temp_file "sqlocaml_ro_cache_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx = run (S.rw_begin store) in
-    run (S.put tx 16 (Bytes.of_string "a") (Bytes.of_string "1"));
-    run (S.commit tx);
-    let ro = run (S.ro_begin store) in
-    (* First access: cache miss — builds tree from meta *)
-    let v1 = run (S.get ro 16 (Bytes.of_string "a")) in
-    (* Second access: cache hit — returns cached Btree *)
-    let v2 = run (S.get ro 16 (Bytes.of_string "a")) in
-    run (S.ro_end ro);
-    Alcotest.(check (option string)) "first read" (Some "1") (Option.map Bytes.to_string v1);
-    Alcotest.(check (option string)) "second read (cache hit)" (Some "1") (Option.map Bytes.to_string v2);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx = run (S.rw_begin store) in
+       run (S.put tx 16 (Bytes.of_string "a") (Bytes.of_string "1"));
+       run (S.commit tx);
+       let ro = run (S.ro_begin store) in
+       (* First access: cache miss — builds tree from meta *)
+       let v1 = run (S.get ro 16 (Bytes.of_string "a")) in
+       (* Second access: cache hit — returns cached Btree *)
+       let v2 = run (S.get ro 16 (Bytes.of_string "a")) in
+       run (S.ro_end ro);
+       Alcotest.(check (option string))
+         "first read"
+         (Some "1")
+         (Option.map Bytes.to_string v1);
+       Alcotest.(check (option string))
+         "second read (cache hit)"
+         (Some "1")
+         (Option.map Bytes.to_string v2);
+       run (S.close store))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* 16. ro_begin / ro_end on Btree: ref-count multiple readers          *)
@@ -1250,25 +1432,32 @@ let test_ro_cache_hit () =
 
 let test_ro_refcount () =
   let path = Filename.temp_file "sqlocaml_ro_refcount_" ".db" in
-  Fun.protect ~finally:(fun () -> try Sys.remove path with _ -> ()) (fun () ->
-    let store = Result.get_ok (run (S.open_file ~path)) in
-    let tx = run (S.rw_begin store) in
-    run (S.put tx 16 (Bytes.of_string "x") (Bytes.of_string "y"));
-    run (S.commit tx);
-    (* Open two RO snapshots at the same txn_id — ref-count goes to 2 *)
-    let ro1 = run (S.ro_begin store) in
-    let ro2 = run (S.ro_begin store) in
-    (* First ro_end: count drops from 2 to 1 (Some n branch) *)
-    run (S.ro_end ro1);
-    (* Second ro_end: count drops to 0 (Some 1 branch → remove) *)
-    run (S.ro_end ro2);
-    (* Engine must still work *)
-    let ro3 = run (S.ro_begin store) in
-    let v = run (S.get ro3 16 (Bytes.of_string "x")) in
-    run (S.ro_end ro3);
-    Alcotest.(check (option string)) "value after ro refcount" (Some "y")
-      (Option.map Bytes.to_string v);
-    run (S.close store))
+  Fun.protect
+    ~finally:(fun () ->
+      try Sys.remove path with
+      | _ -> ())
+    (fun () ->
+       let store = Result.get_ok (run (S.open_file ~path)) in
+       let tx = run (S.rw_begin store) in
+       run (S.put tx 16 (Bytes.of_string "x") (Bytes.of_string "y"));
+       run (S.commit tx);
+       (* Open two RO snapshots at the same txn_id — ref-count goes to 2 *)
+       let ro1 = run (S.ro_begin store) in
+       let ro2 = run (S.ro_begin store) in
+       (* First ro_end: count drops from 2 to 1 (Some n branch) *)
+       run (S.ro_end ro1);
+       (* Second ro_end: count drops to 0 (Some 1 branch → remove) *)
+       run (S.ro_end ro2);
+       (* Engine must still work *)
+       let ro3 = run (S.ro_begin store) in
+       let v = run (S.get ro3 16 (Bytes.of_string "x")) in
+       run (S.ro_end ro3);
+       Alcotest.(check (option string))
+         "value after ro refcount"
+         (Some "y")
+         (Option.map Bytes.to_string v);
+       run (S.close store))
+;;
 
 (* #164: [with_ro] must release the read lock, the active-reader refcount,
    and the snapshot's pinned pages even when the reader closure raises
@@ -1276,40 +1465,43 @@ let test_ro_refcount () =
    the error path and all three leak (freelist reuse stalls, the read lock
    never drops, and #159 cache pins stay forever). *)
 let test_with_ro_releases_on_exception () =
-  run (with_fresh_db ~f:(fun path ->
-    let* r = S.open_file ~path in
-    let s = ok_store r in
-    (* Seed rows so an RO walk touches real pages and takes pins. *)
-    let* tx = S.rw_begin s in
-    let rec seed i =
-      if i >= 200 then Lwt.return_unit
-      else
-        let k = bs (Printf.sprintf "key%05d" i) in
-        let* () = S.put tx 0 k (bs (string_of_int i)) in
-        seed (i + 1)
-    in
-    let* () = seed 0 in
-    let* () = S.commit tx in
-    Alcotest.(check int) "no readers before"    0 (S.active_reader_count s);
-    Alcotest.(check int) "no pins before"        0 (S.pinned_page_count s);
-    Alcotest.(check int) "no read locks before"  0 (S.live_read_locks s);
-    (* A reader that does a real read (taking pins) then raises. *)
-    let* () =
-      Lwt.catch
-        (fun () ->
-          S.with_ro s (fun tx ->
-            let* _ = S.get tx 0 (bs "key00100") in
-            Lwt.fail (Failure "boom mid-snapshot")))
-        (fun _ -> Lwt.return_unit)
-    in
-    Alcotest.(check int) "active readers released after exception" 0
-      (S.active_reader_count s);
-    Alcotest.(check int) "pins released after exception" 0
-      (S.pinned_page_count s);
-    Alcotest.(check int) "read lock released after exception" 0
-      (S.live_read_locks s);
-    let* () = S.close s in
-    Lwt.return_unit))
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path in
+       let s = ok_store r in
+       (* Seed rows so an RO walk touches real pages and takes pins. *)
+       let* tx = S.rw_begin s in
+       let rec seed i =
+         if i >= 200
+         then Lwt.return_unit
+         else (
+           let k = bs (Printf.sprintf "key%05d" i) in
+           let* () = S.put tx 0 k (bs (string_of_int i)) in
+           seed (i + 1))
+       in
+       let* () = seed 0 in
+       let* () = S.commit tx in
+       Alcotest.(check int) "no readers before" 0 (S.active_reader_count s);
+       Alcotest.(check int) "no pins before" 0 (S.pinned_page_count s);
+       Alcotest.(check int) "no read locks before" 0 (S.live_read_locks s);
+       (* A reader that does a real read (taking pins) then raises. *)
+       let* () =
+         Lwt.catch
+           (fun () ->
+              S.with_ro s (fun tx ->
+                let* _ = S.get tx 0 (bs "key00100") in
+                Lwt.fail (Failure "boom mid-snapshot")))
+           (fun _ -> Lwt.return_unit)
+       in
+       Alcotest.(check int)
+         "active readers released after exception"
+         0
+         (S.active_reader_count s);
+       Alcotest.(check int) "pins released after exception" 0 (S.pinned_page_count s);
+       Alcotest.(check int) "read lock released after exception" 0 (S.live_read_locks s);
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* open_block tests                                                     *)
@@ -1317,37 +1509,43 @@ let test_with_ro_releases_on_exception () =
 
 let test_open_block_fresh () =
   let path = tmp_block_file 4 in
-  Fun.protect ~finally:(fun () -> (try Unix.unlink path with _ -> ())) (fun () ->
-    with_block_store path (fun store ->
-      let* tx = S.rw_begin store in
-      let* () = S.put tx 0 (bs "hello") (bs "world") in
-      S.commit tx
-    )
-  )
+  Fun.protect
+    ~finally:(fun () ->
+      try Unix.unlink path with
+      | _ -> ())
+    (fun () ->
+       with_block_store path (fun store ->
+         let* tx = S.rw_begin store in
+         let* () = S.put tx 0 (bs "hello") (bs "world") in
+         S.commit tx))
+;;
 
 let test_open_block_reopen_persists () =
   let path = tmp_block_file 4 in
-  Fun.protect ~finally:(fun () -> (try Unix.unlink path with _ -> ())) (fun () ->
-    with_block_store path (fun store ->
-      let* tx = S.rw_begin store in
-      let* () = S.put tx 0 (bs "k1") (bs "v1") in
-      S.commit tx
-    );
-    with_block_store path (fun store ->
-      let* tx = S.ro_begin store in
-      let* v = S.get tx 0 (bs "k1") in
-      let* () = S.ro_end tx in
-      Alcotest.(check (option bytes)) "value persisted" (Some (bs "v1")) v;
-      Lwt.return_unit
-    )
-  )
+  Fun.protect
+    ~finally:(fun () ->
+      try Unix.unlink path with
+      | _ -> ())
+    (fun () ->
+       with_block_store path (fun store ->
+         let* tx = S.rw_begin store in
+         let* () = S.put tx 0 (bs "k1") (bs "v1") in
+         S.commit tx);
+       with_block_store path (fun store ->
+         let* tx = S.ro_begin store in
+         let* v = S.get tx 0 (bs "k1") in
+         let* () = S.ro_end tx in
+         Alcotest.(check (option bytes)) "value persisted" (Some (bs "v1")) v;
+         Lwt.return_unit))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* SAVEPOINT on B-tree (#136)                                           *)
 (* ------------------------------------------------------------------ *)
 
 let test_savepoint_rollback_undoes_writes () =
-  run @@ with_fresh_db ~f:(fun path ->
+  run
+  @@ with_fresh_db ~f:(fun path ->
     let* sr = S.open_file ~path in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
@@ -1363,9 +1561,11 @@ let test_savepoint_rollback_undoes_writes () =
     let* () = S.commit tx in
     let* () = S.close store in
     Lwt.return_unit)
+;;
 
 let test_savepoint_release_keeps_writes () =
-  run @@ with_fresh_db ~f:(fun path ->
+  run
+  @@ with_fresh_db ~f:(fun path ->
     let* sr = S.open_file ~path in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
@@ -1382,9 +1582,11 @@ let test_savepoint_release_keeps_writes () =
     Alcotest.(check bytes_opt_eq) "release persisted" (Some (bs "v")) v;
     let* () = S.close store2 in
     Lwt.return_unit)
+;;
 
 let test_savepoint_nested_partial_rollback () =
-  run @@ with_fresh_db ~f:(fun path ->
+  run
+  @@ with_fresh_db ~f:(fun path ->
     let* sr = S.open_file ~path in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
@@ -1398,21 +1600,23 @@ let test_savepoint_nested_partial_rollback () =
     let* va = S.get tx 16 (bs "a") in
     let* vb = S.get tx 16 (bs "b") in
     let* vc = S.get tx 16 (bs "c") in
-    Alcotest.(check bytes_opt_eq) "a stays"      (Some (bs "1")) va;
-    Alcotest.(check bytes_opt_eq) "b stays"      (Some (bs "2")) vb;
-    Alcotest.(check bytes_opt_eq) "c undone"     None vc;
+    Alcotest.(check bytes_opt_eq) "a stays" (Some (bs "1")) va;
+    Alcotest.(check bytes_opt_eq) "b stays" (Some (bs "2")) vb;
+    Alcotest.(check bytes_opt_eq) "c undone" None vc;
     (* Roll back the outer savepoint: b should disappear too. *)
     let* () = S.savepoint_rollback tx "outer" in
     let* va = S.get tx 16 (bs "a") in
     let* vb = S.get tx 16 (bs "b") in
-    Alcotest.(check bytes_opt_eq) "a still stays"   (Some (bs "1")) va;
-    Alcotest.(check bytes_opt_eq) "b now undone"    None vb;
+    Alcotest.(check bytes_opt_eq) "a still stays" (Some (bs "1")) va;
+    Alcotest.(check bytes_opt_eq) "b now undone" None vb;
     let* () = S.commit tx in
     let* () = S.close store in
     Lwt.return_unit)
+;;
 
 let test_savepoint_double_rollback_reuses () =
-  run @@ with_fresh_db ~f:(fun path ->
+  run
+  @@ with_fresh_db ~f:(fun path ->
     let* sr = S.open_file ~path in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
@@ -1428,9 +1632,11 @@ let test_savepoint_double_rollback_reuses () =
     let* () = S.commit tx in
     let* () = S.close store in
     Lwt.return_unit)
+;;
 
 let test_savepoint_then_commit_persists () =
-  run @@ with_fresh_db ~f:(fun path ->
+  run
+  @@ with_fresh_db ~f:(fun path ->
     let* sr = S.open_file ~path in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
@@ -1451,6 +1657,7 @@ let test_savepoint_then_commit_persists () =
     Alcotest.(check bytes_opt_eq) "b persists" (Some (bs "2")) vb;
     let* () = S.close store2 in
     Lwt.return_unit)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
@@ -1458,85 +1665,113 @@ let test_savepoint_then_commit_persists () =
 
 let () =
   let qcheck_tests =
-    List.map QCheck_alcotest.to_alcotest [
-      prop_btree_matches_mem;
-      prop_persist_roundtrip;
-    ]
+    List.map
+      QCheck_alcotest.to_alcotest
+      [ prop_btree_matches_mem; prop_persist_roundtrip ]
   in
-  Alcotest.run "store_btree" [
-    "open_file", [
-      Alcotest.test_case "creates_file"   `Quick test_open_creates_file;
-      Alcotest.test_case "basic_put_get"  `Quick test_basic_put_get;
-    ];
-    "persistence", [
-      Alcotest.test_case "reopen"         `Quick test_persistence_after_reopen;
-      Alcotest.test_case "delete_persists" `Quick test_delete_persists;
-      Alcotest.test_case "no_commit"      `Quick test_no_commit_no_persistence;
-      Alcotest.test_case "overwrite"      `Quick test_overwrite_persists;
-      Alcotest.test_case "many_persist"   `Quick test_many_puts_persist;
-    ];
-    "multi_tree", [
-      Alcotest.test_case "independent"    `Quick test_multiple_trees_independent;
-      Alcotest.test_case "persist"        `Quick test_multiple_trees_persist;
-    ];
-    "cursor", [
-      Alcotest.test_case "sorted"         `Quick test_cursor_returns_sorted;
-      Alcotest.test_case "seek_between"   `Quick test_cursor_seek_between;
-      Alcotest.test_case "empty"          `Quick test_cursor_empty;
-    ];
-    "txn", [
-      Alcotest.test_case "rw_serialises"  `Quick test_rw_serialises;
-    ];
-    "scale", [
-      Alcotest.test_case "many_puts"      `Quick test_many_puts;
-    ];
-    "missing", [
-      Alcotest.test_case "missing_key"    `Quick test_missing_key;
-    ];
-    "extra", [
-      Alcotest.test_case "btree_block_error" `Quick test_btree_block_error_propagation;
-      Alcotest.test_case "freelist_read_error" `Quick test_freelist_read_error_path;
-      Alcotest.test_case "pp_error all variants"   `Quick test_pp_error_all_variants;
-      Alcotest.test_case "rollback drops uncommitted" `Quick test_rollback_btree_drops_uncommitted;
-      Alcotest.test_case "cursor_seek found (btree)"  `Quick test_cursor_seek_found;
-      Alcotest.test_case "cursor_seek past end (btree)" `Quick test_cursor_seek_past_end;
-      Alcotest.test_case "cursor_first (btree)"       `Quick test_cursor_first_btree;
-      Alcotest.test_case "put key too large"         `Quick test_put_key_too_large_btree;
-      Alcotest.test_case "put value too large"       `Quick test_put_value_too_large_btree;
-      Alcotest.test_case "open corrupt headers"      `Quick test_open_corrupt_headers_both;
-      Alcotest.test_case "btree corruption surfaces" `Quick test_btree_corrupt_propagation;
-    ];
-    "freelist", [
-      Alcotest.test_case "survives reopen"          `Quick test_freelist_survives_reopen;
-      Alcotest.test_case "freed pages reused"       `Quick test_freed_pages_reused_after_reopen;
-    ];
-    "rollback", [
-      Alcotest.test_case "restores_data"            `Quick test_rollback_restores_data;
-      Alcotest.test_case "freelist_not_corrupted"   `Quick test_rollback_freelist_not_corrupted;
-      Alcotest.test_case "then_commit_works"        `Quick test_rollback_then_commit_works;
-      Alcotest.test_case "new_key_absent"           `Quick test_rollback_new_key_absent;
-    ];
-    "snapshot", [
-      Alcotest.test_case "ro_sees_committed_not_in_progress" `Quick test_ro_sees_committed_not_in_progress;
-      Alcotest.test_case "active_reader_gates_freelist" `Quick test_active_reader_gates_freelist;
-      Alcotest.test_case "ro_after_rw_begin_safe" `Quick test_ro_after_rw_begin_safe;
-    ];
-    "readers", [
-      Alcotest.test_case "multiple_active_readers"   `Quick test_multiple_active_readers;
-      Alcotest.test_case "ro_cache_hit"              `Quick test_ro_cache_hit;
-      Alcotest.test_case "ro_refcount"               `Quick test_ro_refcount;
-      Alcotest.test_case "with_ro_releases_on_exception" `Quick test_with_ro_releases_on_exception;
-    ];
-    "qcheck", qcheck_tests;
-    "open_block", [
-      Alcotest.test_case "fresh_init"       `Quick test_open_block_fresh;
-      Alcotest.test_case "reopen_persists"  `Quick test_open_block_reopen_persists;
-    ];
-    "savepoint", [
-      Alcotest.test_case "rollback_undoes"      `Quick test_savepoint_rollback_undoes_writes;
-      Alcotest.test_case "release_keeps"        `Quick test_savepoint_release_keeps_writes;
-      Alcotest.test_case "nested_partial"       `Quick test_savepoint_nested_partial_rollback;
-      Alcotest.test_case "double_rollback"      `Quick test_savepoint_double_rollback_reuses;
-      Alcotest.test_case "commit_persists"      `Quick test_savepoint_then_commit_persists;
-    ];
-  ]
+  Alcotest.run
+    "store_btree"
+    [ ( "open_file"
+      , [ Alcotest.test_case "creates_file" `Quick test_open_creates_file
+        ; Alcotest.test_case "basic_put_get" `Quick test_basic_put_get
+        ] )
+    ; ( "persistence"
+      , [ Alcotest.test_case "reopen" `Quick test_persistence_after_reopen
+        ; Alcotest.test_case "delete_persists" `Quick test_delete_persists
+        ; Alcotest.test_case "no_commit" `Quick test_no_commit_no_persistence
+        ; Alcotest.test_case "overwrite" `Quick test_overwrite_persists
+        ; Alcotest.test_case "many_persist" `Quick test_many_puts_persist
+        ] )
+    ; ( "multi_tree"
+      , [ Alcotest.test_case "independent" `Quick test_multiple_trees_independent
+        ; Alcotest.test_case "persist" `Quick test_multiple_trees_persist
+        ] )
+    ; ( "cursor"
+      , [ Alcotest.test_case "sorted" `Quick test_cursor_returns_sorted
+        ; Alcotest.test_case "seek_between" `Quick test_cursor_seek_between
+        ; Alcotest.test_case "empty" `Quick test_cursor_empty
+        ] )
+    ; "txn", [ Alcotest.test_case "rw_serialises" `Quick test_rw_serialises ]
+    ; "scale", [ Alcotest.test_case "many_puts" `Quick test_many_puts ]
+    ; "missing", [ Alcotest.test_case "missing_key" `Quick test_missing_key ]
+    ; ( "extra"
+      , [ Alcotest.test_case "btree_block_error" `Quick test_btree_block_error_propagation
+        ; Alcotest.test_case "freelist_read_error" `Quick test_freelist_read_error_path
+        ; Alcotest.test_case "pp_error all variants" `Quick test_pp_error_all_variants
+        ; Alcotest.test_case
+            "rollback drops uncommitted"
+            `Quick
+            test_rollback_btree_drops_uncommitted
+        ; Alcotest.test_case "cursor_seek found (btree)" `Quick test_cursor_seek_found
+        ; Alcotest.test_case
+            "cursor_seek past end (btree)"
+            `Quick
+            test_cursor_seek_past_end
+        ; Alcotest.test_case "cursor_first (btree)" `Quick test_cursor_first_btree
+        ; Alcotest.test_case "put key too large" `Quick test_put_key_too_large_btree
+        ; Alcotest.test_case "put value too large" `Quick test_put_value_too_large_btree
+        ; Alcotest.test_case "open corrupt headers" `Quick test_open_corrupt_headers_both
+        ; Alcotest.test_case
+            "btree corruption surfaces"
+            `Quick
+            test_btree_corrupt_propagation
+        ] )
+    ; ( "freelist"
+      , [ Alcotest.test_case "survives reopen" `Quick test_freelist_survives_reopen
+        ; Alcotest.test_case
+            "freed pages reused"
+            `Quick
+            test_freed_pages_reused_after_reopen
+        ] )
+    ; ( "rollback"
+      , [ Alcotest.test_case "restores_data" `Quick test_rollback_restores_data
+        ; Alcotest.test_case
+            "freelist_not_corrupted"
+            `Quick
+            test_rollback_freelist_not_corrupted
+        ; Alcotest.test_case "then_commit_works" `Quick test_rollback_then_commit_works
+        ; Alcotest.test_case "new_key_absent" `Quick test_rollback_new_key_absent
+        ] )
+    ; ( "snapshot"
+      , [ Alcotest.test_case
+            "ro_sees_committed_not_in_progress"
+            `Quick
+            test_ro_sees_committed_not_in_progress
+        ; Alcotest.test_case
+            "active_reader_gates_freelist"
+            `Quick
+            test_active_reader_gates_freelist
+        ; Alcotest.test_case "ro_after_rw_begin_safe" `Quick test_ro_after_rw_begin_safe
+        ] )
+    ; ( "readers"
+      , [ Alcotest.test_case "multiple_active_readers" `Quick test_multiple_active_readers
+        ; Alcotest.test_case "ro_cache_hit" `Quick test_ro_cache_hit
+        ; Alcotest.test_case "ro_refcount" `Quick test_ro_refcount
+        ; Alcotest.test_case
+            "with_ro_releases_on_exception"
+            `Quick
+            test_with_ro_releases_on_exception
+        ] )
+    ; "qcheck", qcheck_tests
+    ; ( "open_block"
+      , [ Alcotest.test_case "fresh_init" `Quick test_open_block_fresh
+        ; Alcotest.test_case "reopen_persists" `Quick test_open_block_reopen_persists
+        ] )
+    ; ( "savepoint"
+      , [ Alcotest.test_case
+            "rollback_undoes"
+            `Quick
+            test_savepoint_rollback_undoes_writes
+        ; Alcotest.test_case "release_keeps" `Quick test_savepoint_release_keeps_writes
+        ; Alcotest.test_case
+            "nested_partial"
+            `Quick
+            test_savepoint_nested_partial_rollback
+        ; Alcotest.test_case
+            "double_rollback"
+            `Quick
+            test_savepoint_double_rollback_reuses
+        ; Alcotest.test_case "commit_persists" `Quick test_savepoint_then_commit_persists
+        ] )
+    ]
+;;

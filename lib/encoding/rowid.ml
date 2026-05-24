@@ -6,6 +6,7 @@ let encode n =
     Bytes.set_uint8 b i byte
   done;
   b
+;;
 
 let decode b =
   let n = ref 0L in
@@ -14,6 +15,7 @@ let decode b =
     n := Int64.logor !n (Int64.shift_left (Int64.of_int byte) ((7 - i) * 8))
   done;
   Int64.logxor !n 0x8000_0000_0000_0000L
+;;
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

@@ -2,5 +2,7 @@
  (name sqlocaml_catalog)
  (public_name sqlocaml.catalog)
  (libraries lwt sqlocaml.encoding sqlocaml.store)
- (preprocess (pps lwt_ppx))
- (instrumentation (backend bisect_ppx)))
+ (preprocess
+  (pps lwt_ppx))
+ (instrumentation
+  (backend bisect_ppx)))

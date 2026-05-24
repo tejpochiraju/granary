@@ -5,15 +5,12 @@
     reusable entry with the lowest [freed_at_txn_id] (oldest freed first).
     All operations are pure — no mutation. *)
 
-type t = (int32 * int64) list
 (** [(page_id, freed_at_txn_id)] pairs, in insertion order. *)
+type t = (int32 * int64) list
 
 let empty : t = []
-
 let pp fmt t = Format.fprintf fmt "Freelist.t { entries = %d }" (List.length t)
-
-let add (t : t) ~page_id ~freed_at_txn_id : t =
-  (page_id, freed_at_txn_id) :: t
+let add (t : t) ~page_id ~freed_at_txn_id : t = (page_id, freed_at_txn_id) :: t
 
 (** Find the entry with the lowest freed_at_txn_id among those where
     freed_at_txn_id < min_safe_txn_id.  Returns [(best_entry, rest)] or [None]. *)
@@ -22,14 +19,13 @@ let pop (t : t) ~min_safe_txn_id : (int32 * t) option =
   let best =
     List.fold_left
       (fun acc (pid, txn) ->
-         if Int64.compare txn min_safe_txn_id < 0 then
+         if Int64.compare txn min_safe_txn_id < 0
+         then (
            match acc with
            | None -> Some (pid, txn)
            | Some (_, best_txn) ->
-             if Int64.compare txn best_txn < 0 then Some (pid, txn)
-             else acc
-         else
-           acc)
+             if Int64.compare txn best_txn < 0 then Some (pid, txn) else acc)
+         else acc)
       None
       t
   in
@@ -43,20 +39,18 @@ let pop (t : t) ~min_safe_txn_id : (int32 * t) option =
       | x :: rest -> x :: remove_first rest
     in
     Some (pid, remove_first t)
+;;
 
 let to_list (t : t) : (int32 * int64) list = t
-
 let of_list (l : (int32 * int64) list) : t = l
-
 let size (t : t) : int = List.length t
 
 let reusable_count (t : t) ~min_safe_txn_id : int =
   List.fold_left
-    (fun acc (_, txn) ->
-       if Int64.compare txn min_safe_txn_id < 0 then acc + 1
-       else acc)
+    (fun acc (_, txn) -> if Int64.compare txn min_safe_txn_id < 0 then acc + 1 else acc)
     0
     t
+;;
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

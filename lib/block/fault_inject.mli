@@ -16,10 +16,10 @@ type t
 (** Pretty-print a wrapper's write count and fault state. *)
 val pp : Format.formatter -> t -> unit
 
-type config = {
-  fail_after_writes : int option;
-  fail_on_sync      : bool;
-}
+type config =
+  { fail_after_writes : int option
+  ; fail_on_sync : bool
+  }
 
 (** Default: no faults injected. *)
 val default_config : config
@@ -32,18 +32,31 @@ val default_config : config
     The [close] callback returns [unit Lwt.t] to match [Db.open_block]'s
     signature: any error from the underlying [Unix_file.close] is
     swallowed (logged-and-discarded) at the wrapper boundary. *)
-val open_with_faults :
-  path:string ->
-  size_bytes:int ->
-  config:config ->
-  ( t *
-    (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) *  (* read_page *)
-    (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) *  (* write_page *)
-    (unit -> (unit, string) result Lwt.t) *                        (* sync *)
-    (n_pages:int64 -> (unit, string) result Lwt.t) *               (* resize *)
-    int64 *                                                        (* n_pages *)
-    (unit -> unit Lwt.t)                                           (* close *)
-  ) Lwt.t
+val open_with_faults
+  :  path:string
+  -> size_bytes:int
+  -> config:config
+  -> (t
+     * (page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+     * (page_id:
+          (* read_page *)
+          int64
+        -> Cstruct.t
+        -> (unit, string) result Lwt.t)
+     * ((* write_page *)
+        unit
+        -> (unit, string) result Lwt.t)
+     * (n_pages:
+          (* sync *)
+          int64
+        -> (unit, string) result Lwt.t)
+     * (* resize *)
+       int64
+     * ((* n_pages *)
+        unit
+        -> unit Lwt.t))
+       (* close *)
+       Lwt.t
 
 (** Number of successful underlying writes observed by this wrapper. *)
 val writes_completed : t -> int

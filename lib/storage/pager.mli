@@ -2,7 +2,10 @@
     Holds dirty pages in memory until [flush] is called. *)
 
 type t
-type error = Block_error of string | Corruption of string
+
+type error =
+  | Block_error of string
+  | Corruption of string
 
 (** Pretty-print page count, cache/dirty sizes and current txn id. *)
 val pp : Format.formatter -> t -> unit
@@ -13,14 +16,14 @@ val pp_error : Format.formatter -> error -> unit
 (** Create a pager over an open Unix_file or Mem block device.
     [n_pages]: current total pages in the file (from header, or 0 for empty file).
     [freelist]: the current freelist state (deserialized from the file, or [Freelist.empty]). *)
-val create :
-  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t) ->
-  sync:(unit -> (unit, string) result Lwt.t) ->
-  resize:(n_pages:int64 -> (unit, string) result Lwt.t) ->
-  n_pages:int64 ->
-  freelist:Freelist.t ->
-  t
+val create
+  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
+  -> n_pages:int64
+  -> freelist:Freelist.t
+  -> t
 
 (** Read a page.
     [snapshot_frames] (default [None]): writer / non-WAL reader path —
@@ -36,10 +39,12 @@ val create :
     that always leaves a reserve of evictable slots.
 
     The returned Cstruct.t is a fresh copy — caller may modify it freely. *)
-val read :
-  ?snapshot_frames:int ->
-  ?pin_set:(int64, unit) Hashtbl.t ->
-  t -> int64 -> (Cstruct.t, error) result Lwt.t
+val read
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> t
+  -> int64
+  -> (Cstruct.t, error) result Lwt.t
 
 (** Release every page pinned into [pin_set] by a snapshot's reads.
     Decrements the shared pin refcount per page; pages reaching zero
@@ -95,10 +100,10 @@ val pinned_count : t -> int
 (** Replace the in-memory freelist (used after deserializing from disk). *)
 val set_freelist : t -> Freelist.t -> unit
 
-val set_n_pages : t -> int64 -> unit
 (** Override the pager's current page count.  Used by [Store.open_block]
     after probing headers to set the authoritative logical page count
     without going through the resize callback. *)
+val set_n_pages : t -> int64 -> unit
 
 (** Discard all dirty pages (and remove them from the read cache) without
     writing them to disk. Used on rollback to prevent aborted writes from
@@ -110,15 +115,14 @@ val clear_dirty : t -> unit
     set to the WAL as a single commit batch instead of writing to the
     main DB. The Pager does not depend on [Sqlocaml_storage.Wal] — the
     caller wires the callbacks in. *)
-type wal_callbacks = {
-  wal_find_page    : int64 -> int option;
-  wal_find_page_at : int64 -> max_frame:int -> int option;
-  wal_read_frame   : int -> (Cstruct.t, string) result Lwt.t;
-  wal_append_commit: (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
-  wal_append_commit_no_sync :
-    (int64 * Cstruct.t) list -> (unit, string) result Lwt.t;
-  wal_sync         : unit -> (unit, string) result Lwt.t;
-}
+type wal_callbacks =
+  { wal_find_page : int64 -> int option
+  ; wal_find_page_at : int64 -> max_frame:int -> int option
+  ; wal_read_frame : int -> (Cstruct.t, string) result Lwt.t
+  ; wal_append_commit : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
+  ; wal_append_commit_no_sync : (int64 * Cstruct.t) list -> (unit, string) result Lwt.t
+  ; wal_sync : unit -> (unit, string) result Lwt.t
+  }
 
 (** Install (or clear) the WAL hook. Pass [None] to revert to direct
     main-DB writes. *)
@@ -129,8 +133,7 @@ val wal_mode : t -> bool
 
 (** Write a single page directly to the main-DB callback, bypassing the
     WAL hook. Used by checkpointing. Does not sync. *)
-val flush_one_to_main :
-  t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t
+val flush_one_to_main : t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t
 
 (** Sync the main-DB callback. Used at the end of checkpoint. *)
 val flush_sync_main : t -> (unit, error) result Lwt.t

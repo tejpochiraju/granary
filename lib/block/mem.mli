@@ -5,8 +5,12 @@
     tests and ephemeral databases. [sync] is a no-op. *)
 
 type t
+
 type error =
-  | Out_of_bounds of { page_id : int64; n_pages : int64 }
+  | Out_of_bounds of
+      { page_id : int64
+      ; n_pages : int64
+      }
 
 (** Pretty-print the device's page count. *)
 val pp : Format.formatter -> t -> unit
@@ -21,16 +25,16 @@ val page_size : int
 val create : n_pages:int64 -> t
 
 (** Current size of the device, in pages. *)
-val n_pages    : t -> int64
+val n_pages : t -> int64
 
 (** [read_page t ~page_id buf] copies page [page_id] into [buf]. *)
-val read_page  : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
+val read_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
 
 (** [write_page t ~page_id buf] stores [buf] as page [page_id]. *)
 val write_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
 
 (** No-op for the in-memory backend (nothing to flush). *)
-val sync       : t -> (unit, error) result Lwt.t
+val sync : t -> (unit, error) result Lwt.t
 
 (** [resize t ~n_pages] grows or shrinks the device to [n_pages] pages. *)
-val resize     : t -> n_pages:int64 -> (unit, error) result Lwt.t
+val resize : t -> n_pages:int64 -> (unit, error) result Lwt.t

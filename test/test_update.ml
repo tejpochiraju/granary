@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module Db  = Sqlocaml.Db
+module Db = Sqlocaml.Db
 module Row = Sqlocaml_encoding.Row
 
 (* ------------------------------------------------------------------ *)
@@ -7,60 +7,63 @@ module Row = Sqlocaml_encoding.Row
 (* ------------------------------------------------------------------ *)
 
 let run = Lwt_main.run
-
 let fresh_db () = run (Db.open_in_memory ())
 
 let exec db sql =
-  run (
-    let* result = Db.execute db sql in
-    (match result with
-     | Ok () -> ()
-     | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
-    Lwt.return_unit
-  )
+  run
+    (let* result = Db.execute db sql in
+     (match result with
+      | Ok () -> ()
+      | Error _ -> Alcotest.failf "exec: unexpected error for: %s" sql);
+     Lwt.return_unit)
+;;
 
 let exec_err db sql =
-  run (
-    let* result = Db.execute db sql in
-    (match result with
+  run
+    (let* result = Db.execute db sql in
+     match result with
      | Ok () -> Alcotest.failf "exec_err: expected Error for: %s" sql
      | Error e -> Lwt.return e)
-  )
+;;
 
 let query_ok db sql =
-  run (
-    let* result = Db.query db sql in
-    match result with
-    | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
-    | Ok stream ->
-      Lwt_stream.to_list stream
-  )
+  run
+    (let* result = Db.query db sql in
+     match result with
+     | Error _ -> Alcotest.failf "query_ok: unexpected error for: %s" sql
+     | Ok stream -> Lwt_stream.to_list stream)
+;;
 
 let value_testable : Db.value Alcotest.testable =
-  let pp ppf v = match v with
-    | Db.V_int  n -> Format.fprintf ppf "V_int(%Ld)" n
+  let pp ppf v =
+    match v with
+    | Db.V_int n -> Format.fprintf ppf "V_int(%Ld)" n
     | Db.V_text s -> Format.fprintf ppf "V_text(%S)" s
-    | Db.V_null   -> Format.fprintf ppf "V_null"
+    | Db.V_null -> Format.fprintf ppf "V_null"
     | Db.V_real f -> Format.fprintf ppf "V_real(%h)" f
     | Db.V_blob b -> Format.fprintf ppf "V_blob(%d bytes)" (Bytes.length b)
   in
-  let eq a b = match a, b with
-    | Db.V_int  x, Db.V_int  y -> Int64.equal x y
+  let eq a b =
+    match a, b with
+    | Db.V_int x, Db.V_int y -> Int64.equal x y
     | Db.V_text x, Db.V_text y -> String.equal x y
-    | Db.V_null,   Db.V_null   -> true
+    | Db.V_null, Db.V_null -> true
     | Db.V_real x, Db.V_real y -> Float.equal x y
     | Db.V_blob x, Db.V_blob y -> Bytes.equal x y
-    | _,           _           -> false
+    | _, _ -> false
   in
   Alcotest.testable pp eq
+;;
 
 let int_of_v = function
   | Db.V_int n -> Int64.to_int n
   | _ -> -1
+;;
 
 let text_of_v = function
   | Db.V_text s -> s
   | _ -> ""
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 1: Basic UPDATE semantics                                      *)
@@ -76,7 +79,8 @@ let update_all_no_where () =
   let rows = query_ok db "SELECT n FROM t" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
   let ns = List.map (fun r -> int_of_v r.(0)) rows in
-  Alcotest.(check (list int)) "all 99" [99; 99; 99] ns
+  Alcotest.(check (list int)) "all 99" [ 99; 99; 99 ] ns
+;;
 
 let update_with_where () =
   let db = fresh_db () in
@@ -86,8 +90,9 @@ let update_with_where () =
   exec db "INSERT INTO t (id, n) VALUES (3, 30)";
   exec db "UPDATE t SET n = 99 WHERE id = 2";
   let rows = query_ok db "SELECT id, n FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), int_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int int))) "rows" [(1, 10); (2, 99); (3, 30)] pairs
+  let pairs = List.map (fun r -> int_of_v r.(0), int_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int int))) "rows" [ 1, 10; 2, 99; 3, 30 ] pairs
+;;
 
 let update_text_column_with_filter () =
   let db = fresh_db () in
@@ -97,9 +102,9 @@ let update_text_column_with_filter () =
   exec db "INSERT INTO t (id, n, s) VALUES (3, 7, 'c')";
   exec db "UPDATE t SET s = 'new' WHERE n > 3";
   let rows = query_ok db "SELECT id, s FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), text_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int string)))
-    "rows" [(1, "a"); (2, "new"); (3, "new")] pairs
+  let pairs = List.map (fun r -> int_of_v r.(0), text_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int string))) "rows" [ 1, "a"; 2, "new"; 3, "new" ] pairs
+;;
 
 let update_expression_self_reference () =
   let db = fresh_db () in
@@ -110,7 +115,8 @@ let update_expression_self_reference () =
   exec db "UPDATE t SET n = n + 10";
   let rows = query_ok db "SELECT n FROM t" in
   let ns = List.map (fun r -> int_of_v r.(0)) rows in
-  Alcotest.(check (list int)) "incremented" [11; 12; 13] ns
+  Alcotest.(check (list int)) "incremented" [ 11; 12; 13 ] ns
+;;
 
 let update_to_null () =
   let db = fresh_db () in
@@ -121,9 +127,8 @@ let update_to_null () =
   exec db "UPDATE t SET s = NULL";
   let rows = query_ok db "SELECT s FROM t" in
   Alcotest.(check int) "3 rows" 3 (List.length rows);
-  List.iter (fun r ->
-    Alcotest.check value_testable "NULL" Db.V_null r.(0)
-  ) rows
+  List.iter (fun r -> Alcotest.check value_testable "NULL" Db.V_null r.(0)) rows
+;;
 
 let update_multiple_assignments () =
   let db = fresh_db () in
@@ -132,10 +137,14 @@ let update_multiple_assignments () =
   exec db "INSERT INTO t (id, n, s) VALUES (2, 2, 'old')";
   exec db "UPDATE t SET n = 100, s = 'new' WHERE id = 1";
   let rows = query_ok db "SELECT id, n, s FROM t ORDER BY id ASC" in
-  let triples = List.map (fun r ->
-    (int_of_v r.(0), int_of_v r.(1), text_of_v r.(2))) rows in
+  let triples =
+    List.map (fun r -> int_of_v r.(0), int_of_v r.(1), text_of_v r.(2)) rows
+  in
   Alcotest.(check (list (triple int int string)))
-    "rows" [(1, 100, "new"); (2, 2, "old")] triples
+    "rows"
+    [ 1, 100, "new"; 2, 2, "old" ]
+    triples
+;;
 
 let update_where_no_match () =
   let db = fresh_db () in
@@ -144,8 +153,9 @@ let update_where_no_match () =
   exec db "INSERT INTO t (id, n) VALUES (2, 20)";
   exec db "UPDATE t SET n = 99 WHERE id = 999";
   let rows = query_ok db "SELECT id, n FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), int_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int int))) "unchanged" [(1, 10); (2, 20)] pairs
+  let pairs = List.map (fun r -> int_of_v r.(0), int_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int int))) "unchanged" [ 1, 10; 2, 20 ] pairs
+;;
 
 let update_with_complex_where () =
   let db = fresh_db () in
@@ -156,9 +166,9 @@ let update_with_complex_where () =
   exec db "INSERT INTO t (id, n) VALUES (4, 40)";
   exec db "UPDATE t SET n = 0 WHERE n > 15 AND n < 35";
   let rows = query_ok db "SELECT id, n FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), int_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int int)))
-    "rows" [(1, 10); (2, 0); (3, 0); (4, 40)] pairs
+  let pairs = List.map (fun r -> int_of_v r.(0), int_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int int))) "rows" [ 1, 10; 2, 0; 3, 0; 4, 40 ] pairs
+;;
 
 let update_empty_table () =
   let db = fresh_db () in
@@ -166,6 +176,7 @@ let update_empty_table () =
   exec db "UPDATE t SET n = 99";
   let rows = query_ok db "SELECT * FROM t" in
   Alcotest.(check int) "0 rows" 0 (List.length rows)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 2: Semantic errors                                              *)
@@ -178,6 +189,7 @@ let update_unknown_table () =
   | Error (Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl)) ->
     Alcotest.(check string) "table name" "ghost" tbl
   | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")"
+;;
 
 let update_unknown_column () =
   let db = fresh_db () in
@@ -186,6 +198,7 @@ let update_unknown_column () =
   match e with
   | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
+;;
 
 let update_unknown_column_in_where () =
   let db = fresh_db () in
@@ -194,6 +207,7 @@ let update_unknown_column_in_where () =
   match e with
   | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
+;;
 
 let update_type_mismatch_int_text () =
   let db = fresh_db () in
@@ -202,6 +216,7 @@ let update_type_mismatch_int_text () =
   match e with
   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
+;;
 
 let update_type_mismatch_text_int () =
   let db = fresh_db () in
@@ -210,6 +225,7 @@ let update_type_mismatch_text_int () =
   match e with
   | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
+;;
 
 let update_null_is_allowed_on_int () =
   let db = fresh_db () in
@@ -219,6 +235,7 @@ let update_null_is_allowed_on_int () =
   exec db "UPDATE t SET n = NULL";
   let rows = query_ok db "SELECT n FROM t" in
   Alcotest.check value_testable "n = NULL" Db.V_null (List.hd rows).(0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 3: UPDATE via query is a runtime error                          *)
@@ -232,6 +249,7 @@ let update_via_query_returns_runtime_error () =
   match result with
   | Error (Db.Runtime _) -> ()
   | _ -> Alcotest.fail "expected Runtime error for UPDATE via query"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 4: Index interactions                                          *)
@@ -250,9 +268,9 @@ let update_with_unique_index_violation () =
    | _ -> Alcotest.fail "expected Runtime error for UNIQUE violation");
   (* The row should not have been modified. *)
   let rows = query_ok db "SELECT id, n FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), int_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int int)))
-    "unchanged" [(1, 10); (2, 20)] pairs
+  let pairs = List.map (fun r -> int_of_v r.(0), int_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int int))) "unchanged" [ 1, 10; 2, 20 ] pairs
+;;
 
 let update_with_unique_index_to_same_value_ok () =
   (* UPDATE that doesn't change the indexed value should not raise. *)
@@ -264,10 +282,14 @@ let update_with_unique_index_to_same_value_ok () =
   (* Set the same value back — should be fine. *)
   exec db "UPDATE t SET s = 'X' WHERE id = 1";
   let rows = query_ok db "SELECT id, n, s FROM t ORDER BY id ASC" in
-  let triples = List.map (fun r ->
-    (int_of_v r.(0), int_of_v r.(1), text_of_v r.(2))) rows in
+  let triples =
+    List.map (fun r -> int_of_v r.(0), int_of_v r.(1), text_of_v r.(2)) rows
+  in
   Alcotest.(check (list (triple int int string)))
-    "rows" [(1, 10, "X"); (2, 20, "b")] triples
+    "rows"
+    [ 1, 10, "X"; 2, 20, "b" ]
+    triples
+;;
 
 let update_with_unique_index_new_value_ok () =
   (* Updating to a distinct new value must succeed. *)
@@ -278,16 +300,15 @@ let update_with_unique_index_new_value_ok () =
   exec db "CREATE UNIQUE INDEX idx ON t (n)";
   exec db "UPDATE t SET n = 30 WHERE id = 1";
   let rows = query_ok db "SELECT id, n FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), int_of_v r.(1))) rows in
-  Alcotest.(check (list (pair int int)))
-    "rows" [(1, 30); (2, 20)] pairs;
+  let pairs = List.map (fun r -> int_of_v r.(0), int_of_v r.(1)) rows in
+  Alcotest.(check (list (pair int int))) "rows" [ 1, 30; 2, 20 ] pairs;
   (* The updated row must be findable via the index. *)
   let lookup = query_ok db "SELECT id FROM t WHERE n = 30" in
   Alcotest.(check int) "1 match for n=30" 1 (List.length lookup);
   Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd lookup).(0);
   let lookup_old = query_ok db "SELECT id FROM t WHERE n = 10" in
-  Alcotest.(check int) "0 match for n=10 (old value gone)"
-    0 (List.length lookup_old)
+  Alcotest.(check int) "0 match for n=10 (old value gone)" 0 (List.length lookup_old)
+;;
 
 (* Update TEXT/REAL/BLOB unique-indexed column to same value — exercises
    the unchanged check in execute_update (exec.ml lines 354-359). *)
@@ -301,6 +322,7 @@ let update_text_unique_same_value () =
   exec db "UPDATE t SET s = 'hello' WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t WHERE s = 'hello'" in
   Alcotest.(check int) "still 1 row for s='hello'" 1 (List.length rows)
+;;
 
 let update_real_unique_same_value () =
   let db = fresh_db () in
@@ -311,6 +333,7 @@ let update_real_unique_same_value () =
   exec db "UPDATE t SET f = 3.14 WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t" in
   Alcotest.(check int) "row still present" 1 (List.length rows)
+;;
 
 let update_real_unique_new_value () =
   let db = fresh_db () in
@@ -322,6 +345,7 @@ let update_real_unique_new_value () =
   exec db "UPDATE t SET f = 9.9 WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t" in
   Alcotest.(check int) "both rows still present" 2 (List.length rows)
+;;
 
 let update_null_unchanged () =
   let db = fresh_db () in
@@ -333,6 +357,7 @@ let update_null_unchanged () =
   exec db "UPDATE t SET n = NULL WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t" in
   Alcotest.(check int) "row still present after null→null" 1 (List.length rows)
+;;
 
 let update_text_unique_new_value () =
   (* Update to a different TEXT value in a unique index — not unchanged, checks no violation *)
@@ -344,6 +369,7 @@ let update_text_unique_new_value () =
   exec db "UPDATE t SET s = 'newval' WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t WHERE s = 'newval'" in
   Alcotest.(check int) "updated row found by new text value" 1 (List.length rows)
+;;
 
 let update_cross_type_unchanged () =
   (* Test where old_v and new_v have different types (the `_` arm) *)
@@ -359,6 +385,7 @@ let update_cross_type_unchanged () =
   exec db "UPDATE t SET n = 10 WHERE id = 1";
   let rows = query_ok db "SELECT id FROM t" in
   Alcotest.(check int) "row present after null→int update" 1 (List.length rows)
+;;
 
 let update_with_non_unique_index_lookup () =
   (* Verify that index entries are correctly updated for non-unique
@@ -375,9 +402,9 @@ let update_with_non_unique_index_lookup () =
   Alcotest.(check int) "1 match for n=99" 1 (List.length found_99);
   Alcotest.check value_testable "id=1" (Db.V_int 1L) (List.hd found_99).(0);
   let found_10 = query_ok db "SELECT id FROM t WHERE n = 10" in
-  Alcotest.(check int) "1 match for n=10 (only id=2)"
-    1 (List.length found_10);
+  Alcotest.(check int) "1 match for n=10 (only id=2)" 1 (List.length found_10);
   Alcotest.check value_testable "id=2" (Db.V_int 2L) (List.hd found_10).(0)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 5: Rows-affected count                                          *)
@@ -394,6 +421,7 @@ let update_returns_count () =
   match result with
   | Ok n -> Alcotest.(check int) "3 rows affected" 3 n
   | Error _ -> Alcotest.fail "expected Ok count"
+;;
 
 let update_returns_zero_when_no_match () =
   let db = fresh_db () in
@@ -403,6 +431,7 @@ let update_returns_zero_when_no_match () =
   match result with
   | Ok n -> Alcotest.(check int) "0 rows" 0 n
   | Error _ -> Alcotest.fail "expected Ok 0"
+;;
 
 let update_all_returns_total_count () =
   let db = fresh_db () in
@@ -414,6 +443,7 @@ let update_all_returns_total_count () =
   match result with
   | Ok n -> Alcotest.(check int) "7 rows" 7 n
   | Error _ -> Alcotest.fail "expected Ok 7"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 6: Real and Blob columns                                        *)
@@ -426,12 +456,13 @@ let update_real_column () =
   exec db "INSERT INTO t (id, x) VALUES (2, 2.0)";
   exec db "UPDATE t SET x = 99.5 WHERE id = 2";
   let rows = query_ok db "SELECT id, x FROM t ORDER BY id ASC" in
-  let pairs = List.map (fun r -> (int_of_v r.(0), r.(1))) rows in
+  let pairs = List.map (fun r -> int_of_v r.(0), r.(1)) rows in
   match pairs with
-  | [(1, x1); (2, x2)] ->
+  | [ (1, x1); (2, x2) ] ->
     Alcotest.check value_testable "row 1 unchanged" (Db.V_real 1.0) x1;
-    Alcotest.check value_testable "row 2 updated"   (Db.V_real 99.5) x2
+    Alcotest.check value_testable "row 2 updated" (Db.V_real 99.5) x2
   | _ -> Alcotest.fail "expected 2 rows"
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 7: QCheck                                                       *)
@@ -444,26 +475,33 @@ let qcheck_update_doubles_values =
     QCheck.(list_size Gen.(0 -- 15) (int_range (-100) 100))
     (fun ns ->
        let db = Lwt_main.run (Db.open_in_memory ()) in
-       Lwt_main.run (
-         let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-         let* () = Lwt_list.iter_s (fun n ->
-           let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-           let* _ = Db.execute db sql in
-           Lwt.return_unit
-         ) ns in
-         let* _ = Db.execute db "UPDATE t SET n = n * 2" in
-         let* result = Db.query db "SELECT n FROM t" in
-         match result with
-         | Error _ -> Lwt.return false
-         | Ok stream ->
-           let* rows = Lwt_stream.to_list stream in
-           let got = List.map (fun r -> match r.(0) with
-             | Row.V_int x -> Int64.to_int x
-             | _ -> 0) rows in
-           let expected = List.map (fun n -> n * 2) ns in
-           Lwt.return (List.length got = List.length expected
-                       && got = expected)
-       ))
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          let* _ = Db.execute db "UPDATE t SET n = n * 2" in
+          let* result = Db.query db "SELECT n FROM t" in
+          match result with
+          | Error _ -> Lwt.return false
+          | Ok stream ->
+            let* rows = Lwt_stream.to_list stream in
+            let got =
+              List.map
+                (fun r ->
+                   match r.(0) with
+                   | Row.V_int x -> Int64.to_int x
+                   | _ -> 0)
+                rows
+            in
+            let expected = List.map (fun n -> n * 2) ns in
+            Lwt.return (List.length got = List.length expected && got = expected)))
+;;
 
 let qcheck_update_count_matches =
   QCheck.Test.make
@@ -472,21 +510,24 @@ let qcheck_update_count_matches =
     QCheck.(pair (list_size Gen.(0 -- 15) (int_range 0 50)) (int_range 0 50))
     (fun (ns, k) ->
        let db = Lwt_main.run (Db.open_in_memory ()) in
-       Lwt_main.run (
-         let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
-         let* () = Lwt_list.iter_s (fun n ->
-           let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
-           let* _ = Db.execute db sql in
-           Lwt.return_unit
-         ) ns in
-         let sql = Printf.sprintf "UPDATE t SET n = -1 WHERE n > %d" k in
-         let* result = Db.execute_change_count db sql in
-         match result with
-         | Error _ -> Lwt.return false
-         | Ok got_count ->
-           let expected = List.length (List.filter (fun n -> n > k) ns) in
-           Lwt.return (got_count = expected)
-       ))
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (n INTEGER)" in
+          let* () =
+            Lwt_list.iter_s
+              (fun n ->
+                 let sql = Printf.sprintf "INSERT INTO t (n) VALUES (%d)" n in
+                 let* _ = Db.execute db sql in
+                 Lwt.return_unit)
+              ns
+          in
+          let sql = Printf.sprintf "UPDATE t SET n = -1 WHERE n > %d" k in
+          let* result = Db.execute_change_count db sql in
+          match result with
+          | Error _ -> Lwt.return false
+          | Ok got_count ->
+            let expected = List.length (List.filter (fun n -> n > k) ns) in
+            Lwt.return (got_count = expected)))
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Group 8: Known limitations                                           *)
@@ -504,84 +545,120 @@ let qcheck_update_count_matches =
    old index entries before checking).  For now, callers must work around
    this by updating through an intermediate value that doesn't collide. *)
 let update_unique_swap_rejected () =
-  Lwt_main.run (
-    let* db = Db.open_in_memory () in
-    let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
-    let* _ = Db.execute db "CREATE UNIQUE INDEX idx ON t(n)" in
-    let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
-    let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (2, -1)" in
-    (* Attempt to negate all n values: row 1: 1 -> -1, row 2: -1 -> 1.
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let* _ = Db.execute db "CREATE TABLE t (id INTEGER, n INTEGER)" in
+     let* _ = Db.execute db "CREATE UNIQUE INDEX idx ON t(n)" in
+     let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (1, 1)" in
+     let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (2, -1)" in
+     (* Attempt to negate all n values: row 1: 1 -> -1, row 2: -1 -> 1.
        Logically this is a pure swap and the final state would satisfy
        UNIQUE(n), but sqlocaml rejects it because -1 already exists in the
        committed index when the pre-update check runs for row 1. *)
-    let* result = Db.execute db "UPDATE t SET n = 0 - n" in
-    (* Expect a UNIQUE violation Runtime error — not Ok. *)
-    Alcotest.(check bool) "swap rejected due to committed-state UNIQUE check" true
-      (match result with Error (Db.Runtime _) -> true | _ -> false);
-    Db.close db
-  )
+     let* result = Db.execute db "UPDATE t SET n = 0 - n" in
+     (* Expect a UNIQUE violation Runtime error — not Ok. *)
+     Alcotest.(check bool)
+       "swap rejected due to committed-state UNIQUE check"
+       true
+       (match result with
+        | Error (Db.Runtime _) -> true
+        | _ -> false);
+     Db.close db)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
 let () =
-  Alcotest.run "Update" [
-    "basic", [
-      Alcotest.test_case "update_all_no_where"            `Quick update_all_no_where;
-      Alcotest.test_case "update_with_where"              `Quick update_with_where;
-      Alcotest.test_case "update_text_column_with_filter" `Quick update_text_column_with_filter;
-      Alcotest.test_case "update_expression_self_ref"     `Quick update_expression_self_reference;
-      Alcotest.test_case "update_to_null"                 `Quick update_to_null;
-      Alcotest.test_case "update_multiple_assignments"    `Quick update_multiple_assignments;
-      Alcotest.test_case "update_where_no_match"          `Quick update_where_no_match;
-      Alcotest.test_case "update_with_complex_where"      `Quick update_with_complex_where;
-      Alcotest.test_case "update_empty_table"             `Quick update_empty_table;
-    ];
-    "sema_errors", [
-      Alcotest.test_case "unknown_table"           `Quick update_unknown_table;
-      Alcotest.test_case "unknown_column"          `Quick update_unknown_column;
-      Alcotest.test_case "unknown_column_in_where" `Quick update_unknown_column_in_where;
-      Alcotest.test_case "type_mismatch_int_text"  `Quick update_type_mismatch_int_text;
-      Alcotest.test_case "type_mismatch_text_int"  `Quick update_type_mismatch_text_int;
-      Alcotest.test_case "null_is_allowed_on_int"  `Quick update_null_is_allowed_on_int;
-    ];
-    "runtime_routing", [
-      Alcotest.test_case "update_via_query_is_runtime_error"
-        `Quick update_via_query_returns_runtime_error;
-    ];
-    "indexes", [
-      Alcotest.test_case "unique_index_violation"        `Quick update_with_unique_index_violation;
-      Alcotest.test_case "unique_index_same_value_ok"    `Quick update_with_unique_index_to_same_value_ok;
-      Alcotest.test_case "unique_index_new_value_ok"     `Quick update_with_unique_index_new_value_ok;
-      Alcotest.test_case "non_unique_index_lookup"       `Quick update_with_non_unique_index_lookup;
-      Alcotest.test_case "text_unique_same_value"        `Quick update_text_unique_same_value;
-      Alcotest.test_case "real_unique_same_value"        `Quick update_real_unique_same_value;
-      Alcotest.test_case "real_unique_new_value"         `Quick update_real_unique_new_value;
-      Alcotest.test_case "null_unchanged"                `Quick update_null_unchanged;
-      Alcotest.test_case "text_unique_new_value"          `Quick update_text_unique_new_value;
-      Alcotest.test_case "cross_type_unchanged"          `Quick update_cross_type_unchanged;
-    ];
-    "row_count", [
-      Alcotest.test_case "update_returns_count"             `Quick update_returns_count;
-      Alcotest.test_case "update_returns_zero_when_no_match" `Quick update_returns_zero_when_no_match;
-      Alcotest.test_case "update_all_returns_total_count"   `Quick update_all_returns_total_count;
-    ];
-    "real_column", [
-      Alcotest.test_case "update_real_column" `Quick update_real_column;
-    ];
-    "qcheck", (
-      List.map QCheck_alcotest.to_alcotest [
-        qcheck_update_doubles_values;
-        qcheck_update_count_matches;
-      ]
-    );
-    "known_limitations", [
-      (* This test documents the committed-state UNIQUE check limitation:
+  Alcotest.run
+    "Update"
+    [ ( "basic"
+      , [ Alcotest.test_case "update_all_no_where" `Quick update_all_no_where
+        ; Alcotest.test_case "update_with_where" `Quick update_with_where
+        ; Alcotest.test_case
+            "update_text_column_with_filter"
+            `Quick
+            update_text_column_with_filter
+        ; Alcotest.test_case
+            "update_expression_self_ref"
+            `Quick
+            update_expression_self_reference
+        ; Alcotest.test_case "update_to_null" `Quick update_to_null
+        ; Alcotest.test_case
+            "update_multiple_assignments"
+            `Quick
+            update_multiple_assignments
+        ; Alcotest.test_case "update_where_no_match" `Quick update_where_no_match
+        ; Alcotest.test_case "update_with_complex_where" `Quick update_with_complex_where
+        ; Alcotest.test_case "update_empty_table" `Quick update_empty_table
+        ] )
+    ; ( "sema_errors"
+      , [ Alcotest.test_case "unknown_table" `Quick update_unknown_table
+        ; Alcotest.test_case "unknown_column" `Quick update_unknown_column
+        ; Alcotest.test_case
+            "unknown_column_in_where"
+            `Quick
+            update_unknown_column_in_where
+        ; Alcotest.test_case "type_mismatch_int_text" `Quick update_type_mismatch_int_text
+        ; Alcotest.test_case "type_mismatch_text_int" `Quick update_type_mismatch_text_int
+        ; Alcotest.test_case "null_is_allowed_on_int" `Quick update_null_is_allowed_on_int
+        ] )
+    ; ( "runtime_routing"
+      , [ Alcotest.test_case
+            "update_via_query_is_runtime_error"
+            `Quick
+            update_via_query_returns_runtime_error
+        ] )
+    ; ( "indexes"
+      , [ Alcotest.test_case
+            "unique_index_violation"
+            `Quick
+            update_with_unique_index_violation
+        ; Alcotest.test_case
+            "unique_index_same_value_ok"
+            `Quick
+            update_with_unique_index_to_same_value_ok
+        ; Alcotest.test_case
+            "unique_index_new_value_ok"
+            `Quick
+            update_with_unique_index_new_value_ok
+        ; Alcotest.test_case
+            "non_unique_index_lookup"
+            `Quick
+            update_with_non_unique_index_lookup
+        ; Alcotest.test_case "text_unique_same_value" `Quick update_text_unique_same_value
+        ; Alcotest.test_case "real_unique_same_value" `Quick update_real_unique_same_value
+        ; Alcotest.test_case "real_unique_new_value" `Quick update_real_unique_new_value
+        ; Alcotest.test_case "null_unchanged" `Quick update_null_unchanged
+        ; Alcotest.test_case "text_unique_new_value" `Quick update_text_unique_new_value
+        ; Alcotest.test_case "cross_type_unchanged" `Quick update_cross_type_unchanged
+        ] )
+    ; ( "row_count"
+      , [ Alcotest.test_case "update_returns_count" `Quick update_returns_count
+        ; Alcotest.test_case
+            "update_returns_zero_when_no_match"
+            `Quick
+            update_returns_zero_when_no_match
+        ; Alcotest.test_case
+            "update_all_returns_total_count"
+            `Quick
+            update_all_returns_total_count
+        ] )
+    ; "real_column", [ Alcotest.test_case "update_real_column" `Quick update_real_column ]
+    ; ( "qcheck"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ qcheck_update_doubles_values; qcheck_update_count_matches ] )
+    ; ( "known_limitations"
+      , [ (* This test documents the committed-state UNIQUE check limitation:
          a single UPDATE that swaps unique values across rows is incorrectly
          rejected.  The test asserts the *current* (buggy) behaviour so that
          any future fix will cause it to fail and prompt updating the test. *)
-      Alcotest.test_case "update_unique_swap_rejected"
-        `Quick update_unique_swap_rejected;
-    ];
-  ]
+          Alcotest.test_case
+            "update_unique_swap_rejected"
+            `Quick
+            update_unique_swap_rejected
+        ] )
+    ]
+;;
