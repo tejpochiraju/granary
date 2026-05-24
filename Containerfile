@@ -6,5 +6,7 @@ RUN opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx mirage-b
 # merlint linter (#153): git-only, no opam release; pin the known-good commit.
 RUN opam pin add -y -k git merlint "https://github.com/samoht/merlint.git#d5548822dea1ad3b845eabd4b569946a05e42423" \
  && opam install -y merlint
+# ocamlformat (#171): exact pin — the .ocamlformat `version` field must equal this.
+RUN opam install -y ocamlformat.0.29.0
 WORKDIR /workspace
 ENTRYPOINT ["opam", "exec", "--"]
