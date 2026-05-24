@@ -25,7 +25,7 @@ let test_parse_datetime_space () =
      Alcotest.(check string) "time part" "09:05:03"   (to_time dt)
    | Error e -> Alcotest.fail e)
 
-let test_parse_datetime_T () =
+let test_parse_datetime_t () =
   let r = parse "2024-06-15T09:05:03" in
   (match r with
    | Ok dt -> Alcotest.(check string) "T sep date" "2024-06-15" (to_date dt)
@@ -252,7 +252,7 @@ let () =
     "parse", [
       Alcotest.test_case "date only"             `Quick test_parse_date_only;
       Alcotest.test_case "datetime space sep"    `Quick test_parse_datetime_space;
-      Alcotest.test_case "datetime T sep"        `Quick test_parse_datetime_T;
+      Alcotest.test_case "datetime T sep"        `Quick test_parse_datetime_t;
       Alcotest.test_case "date only no time"     `Quick test_parse_date_only_no_time;
       Alcotest.test_case "time only HH:MM:SS"    `Quick test_parse_time_only;
       Alcotest.test_case "time only HH:MM"       `Quick test_parse_time_hhmm;

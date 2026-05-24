@@ -1,6 +1,6 @@
 (* Phase 1 store.  Two backends share the same interface:
 
-   - [Mem] — pure in-memory [BytesMap]-per-tree (the Phase 0 backend).
+   - [Mem] — pure in-memory [Bytes_map]-per-tree (the Phase 0 backend).
      Used by [create ()].  No I/O, no size limits, no errors.
 
    - [Btree] — CoW B+-tree over a Pager over a BLOCK device (Unix file).
@@ -19,7 +19,7 @@ module Page     = Sqlocaml_storage.Page
 module Unix_file = Sqlocaml_block.Unix_file
 module Varint   = Sqlocaml_encoding.Varint
 
-module BytesMap = Map.Make (Bytes)
+module Bytes_map = Map.Make (Bytes)
 
 type ro
 type rw
@@ -125,7 +125,7 @@ type bt_state = {
 let default_wal_autocheckpoint_threshold = 1000
 
 type backend =
-  | Mem  of (tree_id, Bytes.t BytesMap.t ref) Hashtbl.t
+  | Mem  of (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t
   | Btree of bt_state
 
 type t = {
@@ -134,10 +134,10 @@ type t = {
   (* Snapshot of Mem backend tree contents taken at rw_begin.
      Used to implement rollback for the in-memory backend.
      None when no RW transaction is active. *)
-  mutable mem_rw_snapshot : (tree_id * Bytes.t BytesMap.t) list option;
+  mutable mem_rw_snapshot : (tree_id * Bytes.t Bytes_map.t) list option;
   (* Savepoint stack for the Mem backend; newest entry at front.
      Each entry is (savepoint_name, snapshot_of_all_trees). *)
-  mutable mem_savepoints  : (string * (tree_id * Bytes.t BytesMap.t) list) list;
+  mutable mem_savepoints  : (string * (tree_id * Bytes.t Bytes_map.t) list) list;
 }
 
 type ro_snapshot = {
@@ -187,7 +187,7 @@ let mem_tree trees tid =
   match Hashtbl.find_opt trees tid with
   | Some r -> r
   | None ->
-    let r = ref BytesMap.empty in
+    let r = ref Bytes_map.empty in
     Hashtbl.add trees tid r;
     r
 
@@ -1393,7 +1393,7 @@ let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
     | Ro snap ->
       (match snap.rs_store.backend with
        | Mem trees ->
-         Lwt.return (BytesMap.find_opt key !(mem_tree trees tid))
+         Lwt.return (Bytes_map.find_opt key !(mem_tree trees tid))
        | Btree st ->
          let* r = bt_get_tree_ro snap st tid in
          let* bt = unwrap_error r in
@@ -1406,7 +1406,7 @@ let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
     | Rw t ->
       (match t.backend with
        | Mem trees ->
-         Lwt.return (BytesMap.find_opt key !(mem_tree trees tid))
+         Lwt.return (Bytes_map.find_opt key !(mem_tree trees tid))
        | Btree st ->
          let* r = bt_get_tree st tid in
          let* bt = unwrap_error r in
@@ -1421,7 +1421,7 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
   match t.backend with
   | Mem trees ->
     let r = mem_tree trees tid in
-    r := BytesMap.add key value !r;
+    r := Bytes_map.add key value !r;
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
@@ -1439,7 +1439,7 @@ let del (Rw t : rw txn) tid key : unit Lwt.t =
   match t.backend with
   | Mem trees ->
     let r = mem_tree trees tid in
-    r := BytesMap.remove key !r;
+    r := Bytes_map.remove key !r;
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
@@ -1477,7 +1477,7 @@ let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
     | Ro snap ->
       (match snap.rs_store.backend with
        | Mem trees ->
-         let entries = BytesMap.bindings !(mem_tree trees tid) in
+         let entries = Bytes_map.bindings !(mem_tree trees tid) in
          Lwt.return { all = entries; remaining = []; ready = false }
        | Btree st ->
          let* r = bt_get_tree_ro snap st tid in
@@ -1496,7 +1496,7 @@ let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
       let t = store_of tx in
       (match t.backend with
        | Mem trees ->
-         let entries = BytesMap.bindings !(mem_tree trees tid) in
+         let entries = Bytes_map.bindings !(mem_tree trees tid) in
          Lwt.return { all = entries; remaining = []; ready = false }
        | Btree st ->
          let* r = bt_get_tree st tid in

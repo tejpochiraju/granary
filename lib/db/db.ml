@@ -463,7 +463,7 @@ let rollback_to_savepoint t name =
 (* Trigger firing helpers                                               *)
 (* ------------------------------------------------------------------ *)
 
-let trigger_meta_of_ast _name = function
+let trigger_meta_of_ast = function
   | Sql.Ast.S_create_trigger { timing; event; table; when_; body; _ } ->
     let trig_timing = (match timing with
       | Sql.Ast.TT_before     -> `Before
@@ -630,7 +630,7 @@ let rec fire_trigger_stmt ?(tx : S.rw S.txn option = None) t stmt =
 and make_trigger_hook t table_meta ~timing ~event =
   let matching =
     Hashtbl.fold (fun _name ast acc ->
-      match trigger_meta_of_ast _name ast with
+      match trigger_meta_of_ast ast with
       | Some m when
           String.equal m.trig_table table_meta.Cat.name &&
           m.trig_timing = timing && m.trig_event = event ->
@@ -799,7 +799,7 @@ let make_col_schema names =
 (** Collect INSTEAD OF triggers on [view_name] matching the given event. *)
 let find_instead_of t view_name event =
   Hashtbl.fold (fun _name trig_ast acc ->
-    match trigger_meta_of_ast _name trig_ast with
+    match trigger_meta_of_ast trig_ast with
     | Some m when
         String.equal m.trig_table view_name &&
         m.trig_timing = `Instead_of &&

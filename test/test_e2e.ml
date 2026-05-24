@@ -6137,8 +6137,8 @@ let test_explain_analyze_insert () =
 let test_explain_does_not_execute () =
   let db = fresh_db () in
   run (Db.execute db "CREATE TABLE t (id INTEGER)") |> ignore;
-  let _stream = run (Db.query db "EXPLAIN INSERT INTO t VALUES (99)") |> Result.get_ok in
-  let _ = run (Lwt_stream.to_list _stream) in
+  let stream = run (Db.query db "EXPLAIN INSERT INTO t VALUES (99)") |> Result.get_ok in
+  let _ = run (Lwt_stream.to_list stream) in
   let data_stream = run (Db.query db "SELECT * FROM t") |> Result.get_ok in
   let data = run (Lwt_stream.to_list data_stream) in
   Alcotest.(check int) "table empty after EXPLAIN INSERT" 0 (List.length data)

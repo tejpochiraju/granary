@@ -1,9 +1,9 @@
 (** Ordered byte-keyed store.
-    Phase 0: in-memory [BytesMap] per [tree_id].
+    Phase 0: in-memory [Bytes_map] per [tree_id].
     Phase 1: CoW B+-tree on BLOCK behind the same interface.
 
     Two backends are available:
-    - [create ()] — in-memory [BytesMap] (no size limits on keys/values).
+    - [create ()] — in-memory [Bytes_map] (no size limits on keys/values).
       This is the legacy Phase 0 backend, retained for tests and
       ephemeral use cases that exceed B+-tree leaf-cell size limits.
     - [open_file ~path] — CoW B+-tree over a Unix_file BLOCK device.
