@@ -55,7 +55,21 @@ so unexpected errors now propagate. With production narrowed and `test/` exclude
 E105 reaches a documented zero and is ready to enforce. This drops the curated
 report to ~378 findings.
 
-## Enabled rules: current findings (~378)
+### Scoped exclusion: E005 in `test/` only (#168)
+
+`E005` (long functions) stays **enabled for `lib/` and `bin/`** but is excluded
+for `test/*.ml*`. merlint auto-skips functions in *nested* test directories, but
+our suite lives flat under `test/` (its dirname has no `/`), so long bench
+harnesses (`open_slow_store`, `main`, `open_slow_wal`) are not auto-skipped;
+long test/bench setup is acceptable. The `#168` refactor drives E005 down in
+`lib/`: `lib/sql/exec.ml` (the largest module) is now **E005-clean** — its 19
+long functions, including the 1058-line `to_stream`, the 399-line
+`execute_with_count`, and the `execute_insert`/`update`/`delete` drivers, were
+decomposed into named helpers (behavior-preserving; full suite green). The
+remaining E005 findings live in other modules (sema/store/db/catalog/btree/
+planner/encoding) and are tracked for the same per-module treatment.
+
+## Enabled rules: current findings (~357)
 
 All other rules stay on. The notable remaining findings, none yet enforced:
 
@@ -63,7 +77,7 @@ All other rules stay on. The notable remaining findings, none yet enforced:
 |------|------|-------|-------------|
 | E105 | Catch-all Exception Handler | 0 | Resolved (#167) — 12 production sites narrowed; `test/` scaffolding excluded. Enforceable. |
 | E331 | Redundant Function Prefixes | 89 | Open. |
-| E005 | Long Functions | 56 | Tracked follow-up — a substantial refactor (e.g. `to_stream` is 1058 lines). |
+| E005 | Long Functions | 34 | #168 in progress — `lib/sql/exec.ml` fully decomposed (E005-clean); remaining in sema/store/db/catalog/btree/planner/encoding. `test/` excluded. |
 | E405 | Missing Value Documentation | 41 | Open. |
 | E110 | Silenced Warning | 13 | Open — `[@@warning "-32"]`/`-69` on API/test bindings. |
 | E415 | Missing Pretty Printer | 9 | Open. |
