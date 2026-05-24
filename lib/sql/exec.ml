@@ -4924,112 +4924,827 @@ and compute_window_for_partition clock params (wplan : Plan.window_plan_item)
   );
   results
 
-and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
-  match op with
-  | Plan.Op_seq_scan { table_meta } ->
-    let* tx  = S.ro_begin store in
-    let* cur = S.cursor_open tx table_meta.tree_id in
-    (* cursor_first positions the cursor; cursor_next returns the first entry
-       on the first call when ready=true (per store.mli contract). *)
-    let _sr = S.cursor_first cur in
-    (* Snapshot lifetime is tied to the stream: end it on exhaustion OR when a
-       read raises mid-scan, so a corrupt page can't leak the read lock,
-       active-reader refcount, or pinned pages (#164).  [finish] is idempotent. *)
-    let ended = ref false in
-    let finish () =
-      if !ended then Lwt.return_unit
-      else begin ended := true; S.cursor_close cur; S.ro_end tx end
-    in
-    let stream = Lwt_stream.from (fun () ->
-      Lwt.catch
-        (fun () ->
-          match S.cursor_next cur with
-          | None ->
+and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
+  let* tx  = S.ro_begin store in
+  let* cur = S.cursor_open tx table_meta.tree_id in
+  let _sr = S.cursor_first cur in
+  (* Snapshot lifetime tied to the stream: end on exhaustion OR a mid-scan read
+     error so a corrupt page can't leak locks/refcounts/pins (#164). Idempotent. *)
+  let ended = ref false in
+  let finish () =
+    if !ended then Lwt.return_unit
+    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+  in
+  let stream = Lwt_stream.from (fun () ->
+    Lwt.catch
+      (fun () ->
+        match S.cursor_next cur with
+        | None ->
+          let%lwt () = finish () in
+          Lwt.return_none
+        | Some (_key, vbytes) ->
+          let row = decode_with_virtual clock params table_meta vbytes in
+          Lwt.return_some row)
+      (fun exn -> let%lwt () = finish () in Lwt.fail exn)
+  ) in
+  Lwt.return stream
+
+and stream_filter clock params store mode cat pred child =
+  let* child_stream = to_stream clock params store ~mode ~cat child in
+  let* pred' = pre_eval_subquery clock store params cat pred in
+  if not (plan_expr_has_subquery pred') then
+    Lwt.return (Lwt_stream.filter (fun row ->
+      value_truthy (eval_expr clock params row pred')
+    ) child_stream)
+  else begin
+    let outer_meta = get_outer_scan_meta child in
+    match outer_meta with
+    | None ->
+      Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
+    | Some meta ->
+      Lwt.return (Lwt_stream.filter_s (fun row ->
+        let subst_pred = substitute_outer_in_plan_expr meta row pred' in
+        let* resolved = pre_eval_subquery clock store params cat subst_pred in
+        Lwt.return (value_truthy (eval_expr clock params row resolved))
+      ) child_stream)
+  end
+
+and stream_expr_project clock params store mode cat exprs child =
+  let* inner = to_stream clock params store ~mode ~cat child in
+  let* exprs' = Lwt_list.map_s
+    (fun (e, _alias) -> pre_eval_subquery clock store params cat e) exprs in
+  let has_corr = List.exists plan_expr_has_subquery exprs' in
+  if not has_corr then
+    let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
+    Lwt.return (Lwt_stream.map eval_exprs inner)
+  else
+    let outer_meta = get_outer_scan_meta child in
+    (match outer_meta with
+     | None ->
+       let eval_exprs row = Array.of_list (List.map (eval_expr clock params row) exprs') in
+       Lwt.return (Lwt_stream.map eval_exprs inner)
+     | Some meta ->
+       Lwt.return (Lwt_stream.map_s (fun row ->
+         let* vals = Lwt_list.map_s (fun e ->
+           let e_subst = substitute_outer_in_plan_expr meta row e in
+           let* resolved = pre_eval_subquery clock store params cat e_subst in
+           Lwt.return (eval_expr clock params row resolved)
+         ) exprs' in
+         Lwt.return (Array.of_list vals)
+       ) inner))
+
+and stream_sort clock params store mode cat keys child =
+  let* inner = to_stream clock params store ~mode ~cat child in
+  let* rows = Lwt_stream.to_list inner in
+  let* keys' = Lwt_list.map_s (fun (e, dir, nulls) ->
+      let* e' = pre_eval_subquery clock store params cat e in
+      Lwt.return (e', dir, nulls)) keys in
+  let cmp a b =
+    List.fold_left (fun acc (key, dir, nulls) ->
+      if acc <> 0 then acc
+      else
+        let va = eval_expr clock params a key
+        and vb = eval_expr clock params b key in
+        compare_with_nulls dir nulls va vb
+    ) 0 keys'
+  in
+  Lwt.return (Lwt_stream.of_list (List.sort cmp rows))
+
+and stream_index_lookup clock params store table_tree idx_tree col_type lookup_val
+    (table_meta : Cat.table_meta) =
+  let lookup_v =
+    let v = eval_expr clock params [||] lookup_val in
+    match v, col_type with
+    | Row.V_null, _ -> Index_key.IK_null
+    | Row.V_int  n, Row.Integer -> Index_key.IK_int n
+    | Row.V_text s, Row.Text    -> Index_key.IK_text s
+    | Row.V_real f, Row.Real    -> Index_key.IK_real f
+    | Row.V_blob b, Row.Blob    -> Index_key.IK_blob b
+    | _, _ -> Index_key.IK_null  (* type mismatch: nothing matches *)
+  in
+  let prefix = Index_key.encode_value lookup_v in
+  let plen = Bytes.length prefix in
+  let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+  let* tx = S.ro_begin store in
+  let* cur = S.cursor_open tx idx_tree in
+  let _sr = S.cursor_seek cur seek_key in
+  let exhausted = ref false in
+  let ended = ref false in
+  let finish () =
+    if !ended then Lwt.return_unit
+    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+  in
+  let stream = Lwt_stream.from (fun () ->
+    if !exhausted then Lwt.return_none
+    else Lwt.catch (fun () -> begin
+      let rec next () =
+        match S.cursor_next cur with
+        | None ->
+          exhausted := true;
+          let%lwt () = finish () in
+          Lwt.return_none
+        | Some (ikey, _ival) ->
+          if Bytes.length ikey >= plen + 8 &&
+             Bytes.equal (Bytes.sub ikey 0 plen) prefix
+          then begin
+            let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+            let rowid = Rowid.decode rowid_bytes in
+            let table_key = Rowid.encode rowid in
+            let%lwt vrow = S.get tx table_tree table_key in
+            match vrow with
+            | None -> next ()
+            | Some vbytes ->
+              let row = decode_with_virtual clock params table_meta vbytes in
+              Lwt.return_some row
+          end else begin
+            exhausted := true;
             let%lwt () = finish () in
             Lwt.return_none
-          | Some (_key, vbytes) ->
-            let row = decode_with_virtual clock params table_meta vbytes in
-            Lwt.return_some row)
-        (fun exn -> let%lwt () = finish () in Lwt.fail exn)
-    ) in
-    Lwt.return stream
-  | Plan.Op_filter { pred; child } ->
-    let* child_stream = to_stream clock params store ~mode ~cat child in
-    let* pred' = pre_eval_subquery clock store params cat pred in
-    if not (plan_expr_has_subquery pred') then
-      (* Fast path: all subqueries resolved — filter synchronously *)
-      Lwt.return (Lwt_stream.filter (fun row ->
-        value_truthy (eval_expr clock params row pred')
-      ) child_stream)
-    else begin
-      (* Slow path: correlated subqueries remain — evaluate async per row *)
-      let outer_meta = get_outer_scan_meta child in
-      match outer_meta with
+          end
+      in
+      next ()
+    end)
+      (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)
+  ) in
+  Lwt.return stream
+
+(* Probe the right index for one left row [lrow], appending matched (or a
+   null-padded row for LEFT JOIN) combinations to [out]. *)
+and nlj_probe_left clock params tx (right_meta : Cat.table_meta) idx_tree
+    left_col_idx join_kind n_right_cols out lrow : unit Lwt.t =
+  let lkey = lrow.(left_col_idx) in
+  if lkey = Row.V_null then begin
+    if join_kind = `Left then
+      out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out;
+    Lwt.return_unit
+  end else begin
+    let ik_value = row_value_to_index_value lkey in
+    let prefix = Index_key.encode_value ik_value in
+    let plen = Bytes.length prefix in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* cur = S.cursor_open tx idx_tree in
+    let _sr = S.cursor_seek cur seek_key in
+    let found = ref false in
+    let rec scan () =
+      match S.cursor_next cur with
+      | None -> Lwt.return_unit
+      | Some (ikey, _) ->
+        if Bytes.length ikey >= plen + 8 &&
+           Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then begin
+          let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+          let rowid = Rowid.decode rowid_bytes in
+          let table_key = Rowid.encode rowid in
+          let* vrow = S.get tx right_meta.Cat.tree_id table_key in
+          (match vrow with
+           | None -> scan ()
+           | Some vbytes ->
+             let rrow = decode_with_virtual clock params right_meta vbytes in
+             out := Array.append lrow rrow :: !out;
+             found := true;
+             scan ())
+        end else Lwt.return_unit
+    in
+    let* () = scan () in
+    S.cursor_close cur;
+    (match join_kind with
+     | `Left when not !found ->
+       out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out
+     | _ -> ());
+    Lwt.return_unit
+  end
+
+and stream_nested_loop_join clock params store mode cat left (right_meta : Cat.table_meta)
+    idx_tree left_col_idx join_kind n_right_cols =
+  let* left_stream = to_stream clock params store ~mode ~cat left in
+  let* left_rows = Lwt_stream.to_list left_stream in
+  S.with_ro store @@ fun tx ->
+  let out = ref [] in
+  let* () = Lwt_list.iter_s
+    (nlj_probe_left clock params tx right_meta idx_tree left_col_idx join_kind n_right_cols out)
+    left_rows in
+  Lwt.return (Lwt_stream.of_list (List.rev !out))
+
+(* Build a hash table mapping each right row's join key to its rows; NULL keys
+   are excluded (they never match an equi-join probe). *)
+and hash_build right_rows right_key : (bytes, Row.t list) Hashtbl.t =
+  let tbl = Hashtbl.create 64 in
+  List.iter (fun rrow ->
+    match rrow.(right_key) with
+    | Row.V_null -> ()
+    | key_v ->
+      let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+      let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
+      Hashtbl.replace tbl key_bytes (rrow :: prev)
+  ) right_rows;
+  tbl
+
+and stream_hash_join clock params store mode cat left right left_key right_key
+    join_kind n_right_cols =
+  let* left_stream  = to_stream clock params store ~mode ~cat left in
+  let* right_stream = to_stream clock params store ~mode ~cat right in
+  let* right_rows = Lwt_stream.to_list right_stream in
+  if left_key < 0 || right_key < 0 then begin
+    (* Cartesian product fallback (general ON predicate). *)
+    let* left_rows = Lwt_stream.to_list left_stream in
+    let out = ref [] in
+    List.iter (fun lrow ->
+      let any = ref false in
+      List.iter (fun rrow ->
+        out := Array.append lrow rrow :: !out;
+        any := true
+      ) right_rows;
+      (match join_kind with
+       | `Left when not !any ->
+         let null_right = Array.make n_right_cols Row.V_null in
+         out := Array.append lrow null_right :: !out
+       | _ -> ())
+    ) left_rows;
+    Lwt.return (Lwt_stream.of_list (List.rev !out))
+  end else begin
+    let tbl = hash_build right_rows right_key in
+    let* left_rows = Lwt_stream.to_list left_stream in
+    let out = ref [] in
+    List.iter (fun lrow ->
+      let key_v = lrow.(left_key) in
+      let any = ref false in
+      (match key_v with
+       | Row.V_null -> ()
+       | _ ->
+         let key_bytes = Index_key.encode_value (row_value_to_index_value key_v) in
+         (match Hashtbl.find_opt tbl key_bytes with
+          | None -> ()
+          | Some rrows ->
+            List.iter (fun rrow ->
+              out := Array.append lrow rrow :: !out;
+              any := true
+            ) (List.rev rrows)));
+      (match join_kind with
+       | `Left when not !any ->
+         let null_right = Array.make n_right_cols Row.V_null in
+         out := Array.append lrow null_right :: !out
+       | _ -> ())
+    ) left_rows;
+    Lwt.return (Lwt_stream.of_list (List.rev !out))
+  end
+
+(* SUM over a group's column [i]: preserve INT vs REAL like SQLite-lite. *)
+and agg_sum group_rows i : Row.value =
+  let any_real = List.exists (fun r ->
+    match r.(i) with Row.V_real _ -> true | _ -> false) group_rows in
+  let any_non_null = List.exists (fun r ->
+    match r.(i) with Row.V_null -> false | _ -> true) group_rows in
+  if not any_non_null then Row.V_null
+  else if any_real then
+    let s = List.fold_left (fun acc r ->
+      match r.(i) with
+      | Row.V_null -> acc
+      | Row.V_int n -> acc +. Int64.to_float n
+      | Row.V_real f -> acc +. f
+      | _ -> failwith "SUM on non-numeric value") 0.0 group_rows in
+    Row.V_real s
+  else
+    let s = List.fold_left (fun acc r ->
+      match r.(i) with
+      | Row.V_null -> acc
+      | Row.V_int n -> Int64.add acc n
+      | _ -> failwith "SUM on non-numeric value") 0L group_rows in
+    Row.V_int s
+
+(* Evaluate one aggregate [spec] over the rows of a group. *)
+and aggregate_one (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
+  match spec.func, spec.col_ord with
+  | Ast.Agg_count, None ->
+    Row.V_int (Int64.of_int (List.length group_rows))
+  | Ast.Agg_count, Some i ->
+    let n = List.fold_left (fun acc r ->
+      match r.(i) with Row.V_null -> acc | _ -> acc + 1) 0 group_rows in
+    Row.V_int (Int64.of_int n)
+  | Ast.Agg_sum, Some i -> agg_sum group_rows i
+  | Ast.Agg_avg, Some i ->
+    let sum, n = List.fold_left (fun (s, n) r ->
+      match r.(i) with
+      | Row.V_null -> (s, n)
+      | Row.V_int x -> (s +. Int64.to_float x, n + 1)
+      | Row.V_real f -> (s +. f, n + 1)
+      | _ -> failwith "AVG on non-numeric value") (0.0, 0) group_rows in
+    if n = 0 then Row.V_null else Row.V_real (sum /. float_of_int n)
+  | Ast.Agg_min, Some i ->
+    List.fold_left (fun acc r ->
+      match r.(i), acc with
+      | Row.V_null, _ -> acc
+      | v, Row.V_null -> v
+      | v, cur -> if compare_values v cur < 0 then v else cur
+    ) Row.V_null group_rows
+  | Ast.Agg_max, Some i ->
+    List.fold_left (fun acc r ->
+      match r.(i), acc with
+      | Row.V_null, _ -> acc
+      | v, Row.V_null -> v
+      | v, cur -> if compare_values v cur > 0 then v else cur
+    ) Row.V_null group_rows
+  | Ast.Agg_group_concat sep, Some i ->
+    let separator = Option.value sep ~default:"," in
+    let parts = List.filter_map (fun r ->
+      match r.(i) with
+      | Row.V_null -> None
+      | Row.V_int  n -> Some (Int64.to_string n)
+      | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
+      | Row.V_text s -> Some s
+      | Row.V_blob _ -> Some ""
+    ) group_rows in
+    if parts = [] then Row.V_null else Row.V_text (String.concat separator parts)
+  | Ast.Agg_group_concat _, None ->
+    failwith "GROUP_CONCAT requires a column argument"
+  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
+    failwith "non-COUNT aggregate must have a column argument"
+
+(* Partition [rows] into (group_key, group_rows) by [group_cols] (stable). *)
+and aggregate_build_groups group_cols rows : (Row.value list * Row.t list) list =
+  let group_keys_of_row row = List.map (fun i -> row.(i)) group_cols in
+  let compare_group_keys ka kb =
+    List.fold_left2 (fun acc a b -> if acc <> 0 then acc else compare_values a b) 0 ka kb
+  in
+  if group_cols = [] then [ ([], rows) ]
+  else begin
+    let sorted = List.stable_sort (fun a b ->
+      compare_group_keys (group_keys_of_row a) (group_keys_of_row b)) rows in
+    let rec group_runs acc cur_key cur_rows = function
+      | [] ->
+        (match cur_rows with
+         | [] -> List.rev acc
+         | _  -> List.rev ((cur_key, List.rev cur_rows) :: acc))
+      | r :: rest ->
+        let k = group_keys_of_row r in
+        if cur_rows <> [] && compare_group_keys k cur_key = 0 then
+          group_runs acc cur_key (r :: cur_rows) rest
+        else
+          let acc' = if cur_rows = [] then acc else (cur_key, List.rev cur_rows) :: acc in
+          group_runs acc' k [r] rest
+    in
+    group_runs [] [] [] sorted
+  end
+
+(* Append post-aggregate window-function columns to [after_having] rows. *)
+and aggregate_apply_windows clock params agg_windows after_having =
+  if agg_windows = [] then after_having
+  else begin
+    let n_total = List.length after_having in
+    let indexed = List.mapi (fun i r -> (i, r)) after_having in
+    let window_arrays = List.map (fun (wplan : Plan.window_plan_item) ->
+      let partitions = group_by_partition clock params wplan.Plan.partition_by indexed in
+      let combined = Array.make n_total Row.V_null in
+      List.iter (fun (_, partition_indexed) ->
+        let sorted = sort_partition_by clock params wplan.Plan.order_by partition_indexed in
+        let part_results = compute_window_for_partition clock params wplan sorted n_total in
+        List.iter (fun (orig_idx, _) ->
+          combined.(orig_idx) <- part_results.(orig_idx)
+        ) sorted
+      ) partitions;
+      combined
+    ) agg_windows in
+    List.mapi (fun i row ->
+      let extras = List.map (fun arr -> arr.(i)) window_arrays in
+      Array.append row (Array.of_list extras)
+    ) after_having
+  end
+
+and stream_aggregate clock params store mode cat child group_cols aggs having proj
+    agg_windows =
+  let* inner = to_stream clock params store ~mode ~cat child in
+  let* rows = Lwt_stream.to_list inner in
+  let n_group_cols = List.length group_cols in
+  let groups = aggregate_build_groups group_cols rows in
+  let agg_output_rows =
+    List.map (fun (group_key, group_rows) ->
+      let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
+      Array.of_list (group_key @ agg_vals)
+    ) groups
+  in
+  let after_having =
+    match having with
+    | None -> agg_output_rows
+    | Some pred ->
+      List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
+  in
+  let n_agg_cols = n_group_cols + List.length aggs in
+  let with_windows =
+    aggregate_apply_windows clock params agg_windows after_having in
+  let final_rows =
+    List.map (fun agg_row ->
+      Array.of_list (List.map (function
+        | Plan.PI_group_col i   -> agg_row.(i)
+        | Plan.PI_agg_slot k    -> agg_row.(n_group_cols + k)
+        | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
+      ) proj)
+    ) with_windows
+  in
+  Lwt.return (Lwt_stream.of_list final_rows)
+
+and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where =
+  let* tx = S.ro_begin store in
+  let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
+  let _sr = S.cursor_first cur in
+  let exhausted = ref false in
+  let ended = ref false in
+  let finish () =
+    if !ended then Lwt.return_unit
+    else begin ended := true; S.cursor_close cur; S.ro_end tx end
+  in
+  let rec read_next () =
+    if !exhausted then Lwt.return_none
+    else
+      match S.cursor_next cur with
       | None ->
-        (* No outer table meta: correlated substitution impossible.
-           Return false for all rows — matches pre-existing behavior for
-           unresolvable subqueries, but O(1) instead of O(n) bind calls. *)
-        Lwt.return (Lwt_stream.filter (fun _row -> false) child_stream)
-      | Some meta ->
-        Lwt.return (Lwt_stream.filter_s (fun row ->
-          let subst_pred = substitute_outer_in_plan_expr meta row pred' in
-          let* resolved = pre_eval_subquery clock store params cat subst_pred in
-          Lwt.return (value_truthy (eval_expr clock params row resolved))
-        ) child_stream)
-    end
+        exhausted := true;
+        let%lwt () = finish () in
+        Lwt.return_none
+      | Some (_key, val_bytes) ->
+        let texts = fts_decode_content val_bytes in
+        let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+        let emit = match where with
+          | None      -> true
+          | Some pred -> value_truthy (eval_expr clock params row pred)
+        in
+        if emit then Lwt.return_some row
+        else read_next ()
+  in
+  Lwt.return (Lwt_stream.from (fun () ->
+    Lwt.catch read_next
+      (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)))
+
+(* BM25-score FTS [matches] against [query] when rank is requested; otherwise
+   tag each with score 0.0.  Each term's own per-doc term-frequency is used. *)
+and fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_rank =
+  if not include_rank then
+    Lwt.return (List.map (fun (rowid, positions) -> (rowid, positions, 0.0)) matches)
+  else begin
+    let* (total_docs, total_tokens) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+    let query_terms = fts_query_terms query in
+    let* term_data = Lwt_list.map_s (fun term ->
+      let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
+      Lwt.return (List.length pl, pl)) query_terms in
+    let* doc_lengths = Lwt_list.map_s (fun (rowid, positions) ->
+      let dlen_key = fts_doclen_key rowid in
+      let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
+      let dl = match v with
+        | None -> 1
+        | Some b -> let (n, _) = Varint.decode_uint64 b 0 in Int64.to_int n
+      in
+      Lwt.return (rowid, positions, dl)) matches in
+    let scored = List.map (fun (rowid, positions, dl) ->
+      let score = List.fold_left (fun acc (n_docs, term_pl) ->
+        let tf = match List.assoc_opt rowid term_pl with
+          | None -> 0
+          | Some pos -> List.length pos
+        in
+        acc +. bm25_score ~k1:1.2 ~b:0.75 ~total_docs ~total_tokens
+                           ~n_docs_with_term:n_docs ~term_freq:tf ~doc_length:dl)
+        0.0 term_data in
+      (rowid, positions, score)) doc_lengths in
+    Lwt.return scored
+  end
+
+and stream_fts_match_scan _clock _params store (fts_meta : Cat.fts_table_meta) query
+    proj include_rank snippets =
+  S.with_ro store @@ fun tx ->
+  let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
+  let* scored_matches = fts_score_matches tx fts_meta query matches include_rank in
+  let sorted = if include_rank then
+    List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
+  else scored_matches in
+  let snippet_terms = fts_query_terms_with_kind query in
+  let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
+    let key = Rowid.encode rowid in
+    let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
+    match val_opt with
+    | None -> Lwt.return None
+    | Some bytes ->
+      let texts = fts_decode_content bytes in
+      let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+      let projected =
+        if proj = [] && snippets = [] then Array.to_list full_row
+        else List.map (fun i -> full_row.(i)) proj
+      in
+      let snippet_vals =
+        List.map (fun (spec : Plan.snippet_spec) ->
+          let col_text =
+            let idx =
+              if spec.Plan.col_idx < 0 then 0
+              else min spec.Plan.col_idx (max 0 (List.length texts - 1))
+            in
+            if texts = [] then "" else List.nth texts idx
+          in
+          Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec)
+        ) snippets
+      in
+      let row_values =
+        projected
+        @ (if include_rank then [Row.V_real score] else [])
+        @ snippet_vals
+      in
+      Lwt.return (Some (Array.of_list row_values))) sorted in
+  Lwt.return (Lwt_stream.of_list rows)
+
+and stream_pragma_integrity_check store cat =
+  let cat_val = match cat with
+    | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  let errors  = ref [] in
+  let add_err msg = errors := msg :: !errors in
+  let count_entries tx tid =
+    let count = ref 0 in
+    let* cur  = S.cursor_open tx tid in
+    let _sr   = S.cursor_first cur in
+    let rec go () =
+      match S.cursor_next cur with
+      | None   -> Lwt.return_unit
+      | Some _ -> incr count; go ()
+    in
+    let* () = go () in
+    S.cursor_close cur;
+    Lwt.return !count
+  in
+  S.with_ro store @@ fun tx ->
+  let* () =
+    Lwt_list.iter_s (fun (meta : Cat.table_meta) ->
+      let* row_count = count_entries tx meta.tree_id in
+      let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
+      Lwt_list.iter_s (fun (idx : Cat.index_info) ->
+        let is_partial = idx.idx_where_sql <> None in
+        let* idx_count = count_entries tx idx.idx_tree_id in
+        (if (not is_partial) && idx_count <> row_count then
+          add_err (Printf.sprintf
+            "index %s on %s: %d entries != %d rows"
+            idx.idx_name meta.name idx_count row_count));
+        Lwt.return_unit
+      ) idxs
+    ) tables
+  in
+  let result = List.rev !errors in
+  let rows =
+    if result = [] then [ [| Row.V_text "ok" |] ]
+    else List.map (fun msg -> [| Row.V_text msg |]) result
+  in
+  Lwt.return (Lwt_stream.of_list rows)
+
+and stream_sqlite_master store cat =
+  let cat_val = match cat with
+    | None   -> failwith "Exec.to_stream: Op_sqlite_master requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  let table_rows = List.map (fun (meta : Cat.table_meta) ->
+    [| Row.V_text "table"; Row.V_text meta.Cat.name; Row.V_text meta.Cat.name;
+       Row.V_int  (Int64.of_int meta.Cat.tree_id);
+       Row.V_text (ddl_of_table meta) |]
+  ) tables in
+  let index_rows =
+    List.concat_map (fun (meta : Cat.table_meta) ->
+      List.map (fun (idx : Cat.index_info) ->
+        [| Row.V_text "index"; Row.V_text idx.Cat.idx_name; Row.V_text idx.Cat.idx_table;
+           Row.V_int  (Int64.of_int idx.Cat.idx_tree_id);
+           Row.V_text (ddl_of_index idx) |]
+      ) (Cat.indexes_for_table cat_val ~table:meta.Cat.name)
+    ) tables
+  in
+  let* views = Cat.load_all_views store in
+  let view_rows = List.map (fun (name, sql) ->
+    [| Row.V_text "view"; Row.V_text name; Row.V_text name; Row.V_int  0L; Row.V_text sql |]
+  ) views in
+  let* triggers = Cat.load_all_triggers store in
+  let trigger_rows = List.map (fun (name, sql) ->
+    let tbl_name = trigger_table_of_sql name sql in
+    [| Row.V_text "trigger"; Row.V_text name; Row.V_text tbl_name; Row.V_int  0L; Row.V_text sql |]
+  ) triggers in
+  let fts_rows = List.map (fun (m : Cat.fts_table_meta) ->
+    [| Row.V_text "table"; Row.V_text m.Cat.fts_name; Row.V_text m.Cat.fts_name;
+       Row.V_int  (Int64.of_int m.Cat.fts_content_tree);
+       Row.V_text (ddl_of_fts m) |]
+  ) (Cat.list_fts_tables cat_val) in
+  Lwt.return (Lwt_stream.of_list
+    (table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+
+and stream_union clock params store mode cat all left right =
+  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* rs = to_stream clock params store ~mode ~cat right in
+  let combined = Lwt_stream.append ls rs in
+  if all then Lwt.return combined
+  else begin
+    let* rows = Lwt_stream.to_list combined in
+    let seen = Hashtbl.create 64 in
+    let deduped = List.filter (fun row ->
+      let k = row_key row in
+      if Hashtbl.mem seen k then false
+      else (Hashtbl.replace seen k (); true)
+    ) rows in
+    Lwt.return (Lwt_stream.of_list deduped)
+  end
+
+and stream_intersect clock params store mode cat left right =
+  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* rs = to_stream clock params store ~mode ~cat right in
+  let* right_list = Lwt_stream.to_list rs in
+  let right_set = Hashtbl.create (max 1 (List.length right_list)) in
+  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  let* left_list = Lwt_stream.to_list ls in
+  let seen = Hashtbl.create 64 in
+  let result = List.filter (fun row ->
+    let k = row_key row in
+    if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k then false
+    else (Hashtbl.replace seen k (); true)
+  ) left_list in
+  Lwt.return (Lwt_stream.of_list result)
+
+and stream_except clock params store mode cat left right =
+  let* ls = to_stream clock params store ~mode ~cat left  in
+  let* rs = to_stream clock params store ~mode ~cat right in
+  let* right_list = Lwt_stream.to_list rs in
+  let right_set = Hashtbl.create (max 1 (List.length right_list)) in
+  List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
+  let* left_list = Lwt_stream.to_list ls in
+  let seen = Hashtbl.create 64 in
+  let result = List.filter (fun row ->
+    let k = row_key row in
+    if Hashtbl.mem right_set k || Hashtbl.mem seen k then false
+    else (Hashtbl.replace seen k (); true)
+  ) left_list in
+  Lwt.return (Lwt_stream.of_list result)
+
+and stream_insert_returning clock params store mode cat (table_meta : Cat.table_meta)
+    ordinals values on_conflict returning upsert_update =
+  match cat with
+  | None -> failwith "Exec.query: RETURNING requires catalog context"
+  | Some c ->
+    let* result_lists = Lwt_list.map_s (fun row_vals ->
+      let n = List.length table_meta.columns in
+      let inserted_row = Array.make n Row.V_null in
+      List.iter2 (fun ord e ->
+        inserted_row.(ord) <- eval_expr clock params [||] e) ordinals row_vals;
+      let* inserted =
+        execute_insert ~mode ~clock ~on_conflict ~upsert_update ~prebuilt_row:(Some inserted_row)
+          store c ~table_meta ~ordinals ~values:row_vals
+      in
+      if not inserted then Lwt.return []
+      else
+        let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
+        Lwt.return [result]
+    ) values in
+    Lwt.return (Lwt_stream.of_list (List.concat result_lists))
+
+and stream_update_returning clock params store mode cat (table_meta : Cat.table_meta)
+    assignments where order limit offset indexes returning =
+  (* Snapshot matching rows BEFORE the update to compute RETURNING values.
+     NOTE: the RETURNING snapshot and the actual write use separate scans that
+     each apply the same order/limit/offset; non-deterministic ORDER BY
+     expressions could surface RETURNING values for different rows. *)
+  let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
+  let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
+  let result_rows = List.map (fun (_, old_row) ->
+    let new_row = apply_assignments ~clock ~params assignments old_row in
+    compute_stored_generated_cols clock params table_meta new_row;
+    Array.of_list (List.map (eval_expr clock params new_row) returning)
+  ) matched in
+  let c = match cat with Some c -> c
+    | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
+  let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments
+             ~where ~order ~limit ~offset ~indexes in
+  Lwt.return (Lwt_stream.of_list result_rows)
+
+and stream_delete_returning clock params store mode cat (table_meta : Cat.table_meta)
+    where order limit offset indexes returning =
+  (* Snapshot matching rows BEFORE the delete to compute RETURNING values
+     (see stream_update_returning re: non-deterministic ORDER BY). *)
+  let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
+  let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
+  let result_rows = List.map (fun (_, old_row) ->
+    Array.of_list (List.map (eval_expr clock params old_row) returning)
+  ) matched in
+  let c = match cat with Some c -> c
+    | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
+  let* _ = execute_delete ~mode ~params ~clock store c ~table_meta
+             ~where ~order ~limit ~offset ~indexes in
+  Lwt.return (Lwt_stream.of_list result_rows)
+
+and stream_const_select clock params store cat exprs =
+  let raw_exprs = List.map fst exprs in
+  let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) raw_exprs in
+  let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
+  Lwt.return (Lwt_stream.of_list [row])
+
+and stream_with_cte_recursive clock params store mode cat cte_name def query =
+  let (base_op, recursive_arm) = match def with
+    | Plan.Op_union { all = true; left; right } -> (left, right)
+    | _ ->
+      failwith "Exec: recursive CTE def must be UNION ALL — non-UNION-ALL recursive CTEs are not supported"
+  in
+  let* base_stream = to_stream clock params store ~mode ~cat base_op in
+  let* seed_rows = Lwt_stream.to_list base_stream in
+  let max_iterations = 1000 in
+  let rec iterate depth acc working =
+    if working = [] then Lwt.return acc
+    else if depth >= max_iterations then
+      failwith (Printf.sprintf
+        "Exec: recursive CTE '%s' exceeded maximum iteration depth of %d"
+        cte_name max_iterations)
+    else
+      let patched_arm = substitute_cte ~cte_name ~rows:working recursive_arm in
+      let* new_stream = to_stream clock params store ~mode ~cat patched_arm in
+      let* new_rows = Lwt_stream.to_list new_stream in
+      iterate (depth + 1) (acc @ new_rows) new_rows
+  in
+  let* all_rows = iterate 0 seed_rows seed_rows in
+  let patched_query = substitute_cte ~cte_name ~rows:all_rows query in
+  to_stream clock params store ~mode ~cat patched_query
+
+and stream_window clock params store mode cat child windows =
+  let* child_stream = to_stream clock params store ~mode ~cat child in
+  let* all_rows = Lwt_stream.to_list child_stream in
+  let n_rows = List.length all_rows in
+  if n_rows = 0 then Lwt.return (Lwt_stream.of_list [])
+  else begin
+    let all_rows_arr = Array.of_list all_rows in
+    let n_windows = List.length windows in
+    let window_results : Row.value array array =
+      Array.init n_windows (fun wi ->
+        let wplan = List.nth windows wi in
+        let indexed_rows = List.mapi (fun i row -> (i, row)) all_rows in
+        let partitions = group_by_partition clock params wplan.Plan.partition_by indexed_rows in
+        let combined = Array.make n_rows Row.V_null in
+        List.iter (fun (_, partition_idx_rows) ->
+          let sorted = sort_partition_by clock params wplan.Plan.order_by partition_idx_rows in
+          let part_results = compute_window_for_partition clock params wplan sorted n_rows in
+          List.iter (fun (orig_idx, _) ->
+            combined.(orig_idx) <- part_results.(orig_idx)
+          ) sorted
+        ) partitions;
+        combined
+      )
+    in
+    let augmented = Array.to_list (Array.mapi (fun i row ->
+      let extras = Array.init n_windows (fun wi -> window_results.(wi).(i)) in
+      Array.append row extras
+    ) all_rows_arr) in
+    Lwt.return (Lwt_stream.of_list augmented)
+  end
+
+and stream_explain clock params store mode cat analyze inner =
+  let plan_rows = explain_plan inner in
+  let nullify row = Array.append row [| Row.V_null; Row.V_null |] in
+  if not analyze then
+    Lwt.return (Lwt_stream.of_list (List.map nullify plan_rows))
+  else begin
+    let cat_v = match cat with Some c -> c
+      | None -> failwith "EXPLAIN ANALYZE requires a catalog" in
+    let t0 = match clock with Some c -> c () | None -> 0.0 in
+    let* n =
+      let is_write = match inner with
+        | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _
+        | Plan.Op_create_table _ | Plan.Op_create_index _
+        | Plan.Op_drop_table _ | Plan.Op_drop_index _
+        | Plan.Op_alter_table _ | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
+        | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
+        | Plan.Op_create_view _ | Plan.Op_drop_view _
+        | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
+        | Plan.Op_pragma_set_user_version _
+        | Plan.Op_pragma_set_fk _
+        | Plan.Op_pragma_set_recursive_triggers _
+        | Plan.Op_pragma_set_defer_fk _
+        | Plan.Op_pragma_set_wal_autocheckpoint _
+        | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
+        | Plan.Op_create_fts_table _ -> true
+        | _ -> false
+      in
+      if is_write then
+        execute_with_count ~mode ~clock ~params store cat_v inner
+      else begin
+        let* s = to_stream clock params store ~mode ~cat inner in
+        let* rows = Lwt_stream.to_list s in
+        Lwt.return (List.length rows)
+      end
+    in
+    let elapsed_ms =
+      match clock with Some c -> (c () -. t0) *. 1000.0 | None -> 0.0 in
+    let rows = List.mapi (fun i row ->
+      if i = 0 then
+        Array.append row [| Row.V_int (Int64.of_int n); Row.V_real elapsed_ms |]
+      else nullify row
+    ) plan_rows in
+    Lwt.return (Lwt_stream.of_list rows)
+  end
+
+and to_stream (clock : (unit -> float) option) (params : Row.value array) (store : S.t) ?(mode : txn_mode = Auto) ?(cat : Cat.t option = None) (op : Plan.op) : Row.t Lwt_stream.t Lwt.t =
+  match op with
+  | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store table_meta
+  | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     Lwt.return (Lwt_stream.map (project_row ordinals) inner)
   | Plan.Op_expr_project { exprs; child } ->
-    let* inner = to_stream clock params store ~mode ~cat child in
-    let* exprs' = Lwt_list.map_s
-      (fun (e, _alias) -> pre_eval_subquery clock store params cat e)
-      exprs
-    in
-    let has_corr = List.exists plan_expr_has_subquery exprs' in
-    if not has_corr then
-      let eval_exprs row =
-        Array.of_list (List.map (eval_expr clock params row) exprs')
-      in
-      Lwt.return (Lwt_stream.map eval_exprs inner)
-    else
-      (* Slow path: correlated subqueries in projection — substitute and
-         re-evaluate per row. *)
-      let outer_meta = get_outer_scan_meta child in
-      (match outer_meta with
-       | None ->
-         (* No outer scan to correlate against — evaluate as-is; the
-            unresolved P_subquery nodes will return V_null. *)
-         let eval_exprs row =
-           Array.of_list (List.map (eval_expr clock params row) exprs')
-         in
-         Lwt.return (Lwt_stream.map eval_exprs inner)
-       | Some meta ->
-         Lwt.return (Lwt_stream.map_s (fun row ->
-           let* vals = Lwt_list.map_s (fun e ->
-             let e_subst = substitute_outer_in_plan_expr meta row e in
-             let* resolved = pre_eval_subquery clock store params cat e_subst in
-             Lwt.return (eval_expr clock params row resolved)
-           ) exprs' in
-           Lwt.return (Array.of_list vals)
-         ) inner))
-  | Plan.Op_sort { keys; child } ->
-    let* inner = to_stream clock params store ~mode ~cat child in
-    let* rows = Lwt_stream.to_list inner in
-    let* keys' = Lwt_list.map_s (fun (e, dir, nulls) ->
-        let* e' = pre_eval_subquery clock store params cat e in
-        Lwt.return (e', dir, nulls)) keys in
-    let cmp a b =
-      List.fold_left (fun acc (key, dir, nulls) ->
-        if acc <> 0 then acc
-        else
-          let va = eval_expr clock params a key
-          and vb = eval_expr clock params b key in
-          compare_with_nulls dir nulls va vb
-      ) 0 keys'
-    in
-    let sorted = List.sort cmp rows in
-    Lwt.return (Lwt_stream.of_list sorted)
+    stream_expr_project clock params store mode cat exprs child
+  | Plan.Op_sort { keys; child } -> stream_sort clock params store mode cat keys child
   | Plan.Op_limit { limit; offset; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
     let* rows = Lwt_stream.to_list inner in
@@ -5045,920 +5760,78 @@ and to_stream (clock : (unit -> float) option) (params : Row.value array) (store
     ) inner)
   | Plan.Op_index_lookup { table_tree; idx_tree; col_idx = _;
                            col_type; lookup_val; table_meta } ->
-    (* Encode the lookup value as an IndexKey.value matching the column type. *)
-    let lookup_v =
-      let v = eval_expr clock params [||] lookup_val in
-      match v, col_type with
-      | Row.V_null, _ -> Index_key.IK_null
-      | Row.V_int  n, Row.Integer -> Index_key.IK_int n
-      | Row.V_text s, Row.Text    -> Index_key.IK_text s
-      | Row.V_real f, Row.Real    -> Index_key.IK_real f
-      | Row.V_blob b, Row.Blob    -> Index_key.IK_blob b
-      | _, _ ->
-        (* Type mismatch: no rows can match — use null to short-circuit
-           (no row will be a value-prefix match). *)
-        Index_key.IK_null
-    in
-    let prefix = Index_key.encode_value lookup_v in
-    let plen = Bytes.length prefix in
-    (* Position cursor at the first entry >= prefix ++ min_rowid. *)
-    let seek_key =
-      let rowid_bytes = Rowid.encode Int64.min_int in
-      Bytes.cat prefix rowid_bytes
-    in
-    let* tx = S.ro_begin store in
-    let* cur = S.cursor_open tx idx_tree in
-    let _sr = S.cursor_seek cur seek_key in
-    let exhausted = ref false in
-    (* End the snapshot on exhaustion OR a mid-scan read error (#164).
-       [finish] is idempotent. *)
-    let ended = ref false in
-    let finish () =
-      if !ended then Lwt.return_unit
-      else begin ended := true; S.cursor_close cur; S.ro_end tx end
-    in
-    let stream = Lwt_stream.from (fun () ->
-      if !exhausted then Lwt.return_none
-      else Lwt.catch (fun () -> begin
-        let rec next () =
-          match S.cursor_next cur with
-          | None ->
-            exhausted := true;
-            let%lwt () = finish () in
-            Lwt.return_none
-          | Some (ikey, _ival) ->
-            (* Check value-prefix match. *)
-            if Bytes.length ikey >= plen + 8 &&
-               Bytes.equal (Bytes.sub ikey 0 plen) prefix
-            then begin
-              (* Extract rowid from the last 8 bytes. *)
-              let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-              let rowid = Rowid.decode rowid_bytes in
-              let table_key = Rowid.encode rowid in
-              let%lwt vrow = S.get tx table_tree table_key in
-              match vrow with
-              | None ->
-                (* Skip orphan index entries gracefully. *)
-                next ()
-              | Some vbytes ->
-                let row = decode_with_virtual clock params table_meta vbytes in
-                Lwt.return_some row
-            end else begin
-              exhausted := true;
-              let%lwt () = finish () in
-              Lwt.return_none
-            end
-        in
-        next ()
-      end)
-        (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)
-    ) in
-    Lwt.return stream
+    stream_index_lookup clock params store table_tree idx_tree col_type lookup_val table_meta
   | Plan.Op_nested_loop_join {
       left; right_meta; idx_tree;
       right_col_idx = _; left_col_idx; join_kind;
       right_col_offset = _; n_right_cols } ->
-    (* Indexed nested-loop join: for each left row, seek the right
-       index tree for the join key and collect matching right rows. *)
-    let* left_stream = to_stream clock params store ~mode ~cat left in
-    let* left_rows = Lwt_stream.to_list left_stream in
-    S.with_ro store @@ fun tx ->
-    let out = ref [] in
-    let is_left_join = (join_kind = `Left) in
-    let* () =
-      Lwt_list.iter_s (fun lrow ->
-        let lkey = lrow.(left_col_idx) in
-        (* SQL NULL semantics: NULL = NULL is false, so a NULL join key
-           never matches any right row.  Skip the index probe entirely. *)
-        if lkey = Row.V_null then begin
-          if is_left_join then begin
-            let null_right = Array.make n_right_cols Row.V_null in
-            out := Array.append lrow null_right :: !out
-          end;
-          Lwt.return_unit
-        end else begin
-          (* Encode the lookup value uniformly via row_value_to_index_value;
-             cross-type entries simply will not match. *)
-          let ik_value = row_value_to_index_value lkey in
-          let prefix = Index_key.encode_value ik_value in
-          let plen = Bytes.length prefix in
-          let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-          let* cur = S.cursor_open tx idx_tree in
-          let _sr = S.cursor_seek cur seek_key in
-          let found = ref false in
-          let rec scan () =
-            match S.cursor_next cur with
-            | None -> Lwt.return_unit
-            | Some (ikey, _) ->
-              if Bytes.length ikey >= plen + 8 &&
-                 Bytes.equal (Bytes.sub ikey 0 plen) prefix
-              then begin
-                let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-                let rowid = Rowid.decode rowid_bytes in
-                let table_key = Rowid.encode rowid in
-                let* vrow = S.get tx right_meta.Cat.tree_id table_key in
-                (match vrow with
-                 | None -> scan ()
-                 | Some vbytes ->
-                   let rrow = decode_with_virtual clock params right_meta vbytes in
-                   let combined = Array.append lrow rrow in
-                   out := combined :: !out;
-                   found := true;
-                   scan ())
-              end else Lwt.return_unit
-          in
-          let* () = scan () in
-          S.cursor_close cur;
-          (match join_kind with
-           | `Left when not !found ->
-             let null_right = Array.make n_right_cols Row.V_null in
-             out := Array.append lrow null_right :: !out
-           | _ -> ());
-          Lwt.return_unit
-        end
-      ) left_rows
-    in
-    Lwt.return (Lwt_stream.of_list (List.rev !out))
+    stream_nested_loop_join clock params store mode cat left right_meta idx_tree
+      left_col_idx join_kind n_right_cols
   | Plan.Op_hash_join {
       left; right; left_key; right_key; join_kind;
       right_col_offset = _; n_right_cols } ->
-    let* left_stream  = to_stream clock params store ~mode ~cat left in
-    let* right_stream = to_stream clock params store ~mode ~cat right in
-    let* right_rows = Lwt_stream.to_list right_stream in
-    if left_key < 0 || right_key < 0 then begin
-      (* Cartesian product fallback (general ON predicate). *)
-      let* left_rows = Lwt_stream.to_list left_stream in
-      let out = ref [] in
-      List.iter (fun lrow ->
-        let any = ref false in
-        List.iter (fun rrow ->
-          out := Array.append lrow rrow :: !out;
-          any := true
-        ) right_rows;
-        (match join_kind with
-         | `Left when not !any ->
-           let null_right = Array.make n_right_cols Row.V_null in
-           out := Array.append lrow null_right :: !out
-         | _ -> ())
-      ) left_rows;
-      Lwt.return (Lwt_stream.of_list (List.rev !out))
-    end else begin
-      (* Build phase: hash right rows by their join key.
-         NULL-keyed right rows are excluded: they can never match any probe
-         (probe phase already skips NULL left keys, so NULL = NULL never fires). *)
-      let tbl : (bytes, Row.t list) Hashtbl.t = Hashtbl.create 64 in
-      List.iter (fun rrow ->
-        let key_v = rrow.(right_key) in
-        match key_v with
-        | Row.V_null -> ()   (* NULL join key: never matches, skip *)
-        | _ ->
-          let key_bytes =
-            Index_key.encode_value (row_value_to_index_value key_v)
-          in
-          let prev = try Hashtbl.find tbl key_bytes with Not_found -> [] in
-          Hashtbl.replace tbl key_bytes (rrow :: prev)
-      ) right_rows;
-      let* left_rows = Lwt_stream.to_list left_stream in
-      let out = ref [] in
-      List.iter (fun lrow ->
-        let key_v = lrow.(left_key) in
-        let any = ref false in
-        (match key_v with
-         | Row.V_null -> ()                (* NULL never joins in equi-join *)
-         | _ ->
-           let key_bytes =
-             Index_key.encode_value (row_value_to_index_value key_v)
-           in
-           (match Hashtbl.find_opt tbl key_bytes with
-            | None -> ()
-            | Some rrows ->
-              (* Preserve build-order: rrows is reversed-insertion. *)
-              List.iter (fun rrow ->
-                out := Array.append lrow rrow :: !out;
-                any := true
-              ) (List.rev rrows)));
-        (match join_kind with
-         | `Left when not !any ->
-           let null_right = Array.make n_right_cols Row.V_null in
-           out := Array.append lrow null_right :: !out
-         | _ -> ())
-      ) left_rows;
-      Lwt.return (Lwt_stream.of_list (List.rev !out))
-    end
+    stream_hash_join clock params store mode cat left right left_key right_key
+      join_kind n_right_cols
   | Plan.Op_aggregate { child; group_cols; aggs; having; proj; windows = agg_windows } ->
-    let* inner = to_stream clock params store ~mode ~cat child in
-    let* rows = Lwt_stream.to_list inner in
-    let n_group_cols = List.length group_cols in
-    let group_keys_of_row row = List.map (fun i -> row.(i)) group_cols in
-    let compare_group_keys ka kb =
-      List.fold_left2 (fun acc a b ->
-        if acc <> 0 then acc else compare_values a b
-      ) 0 ka kb
-    in
-    let groups : (Row.value list * Row.t list) list =
-      if group_cols = [] then
-        [ ([], rows) ]
-      else begin
-        (* Stable-sort by group key tuple, then split runs of equal keys. *)
-        let sorted =
-          List.stable_sort (fun a b ->
-            compare_group_keys (group_keys_of_row a) (group_keys_of_row b)
-          ) rows
-        in
-        let rec group_runs acc cur_key cur_rows = function
-          | [] ->
-            (match cur_rows with
-             | [] -> List.rev acc
-             | _  -> List.rev ((cur_key, List.rev cur_rows) :: acc))
-          | r :: rest ->
-            let k = group_keys_of_row r in
-            if cur_rows <> [] && compare_group_keys k cur_key = 0 then
-              group_runs acc cur_key (r :: cur_rows) rest
-            else
-              let acc' =
-                if cur_rows = [] then acc
-                else (cur_key, List.rev cur_rows) :: acc
-              in
-              group_runs acc' k [r] rest
-        in
-        group_runs [] [] [] sorted
-      end
-    in
-    let compute_agg (spec : Plan.agg_spec) (group_rows : Row.t list) : Row.value =
-      match spec.func, spec.col_ord with
-      | Ast.Agg_count, None ->
-        Row.V_int (Int64.of_int (List.length group_rows))
-      | Ast.Agg_count, Some i ->
-        let n = List.fold_left (fun acc r ->
-          match r.(i) with
-          | Row.V_null -> acc
-          | _ -> acc + 1
-        ) 0 group_rows in
-        Row.V_int (Int64.of_int n)
-      | Ast.Agg_sum, Some i ->
-        (* Sum non-null numeric values; preserve INT vs REAL like SQLite-lite. *)
-        let any_real = List.exists (fun r ->
-          match r.(i) with Row.V_real _ -> true | _ -> false
-        ) group_rows in
-        let any_non_null = List.exists (fun r ->
-          match r.(i) with Row.V_null -> false | _ -> true
-        ) group_rows in
-        if not any_non_null then Row.V_null
-        else if any_real then
-          let s = List.fold_left (fun acc r ->
-            match r.(i) with
-            | Row.V_null -> acc
-            | Row.V_int n -> acc +. Int64.to_float n
-            | Row.V_real f -> acc +. f
-            | _ -> failwith "SUM on non-numeric value"
-          ) 0.0 group_rows in
-          Row.V_real s
-        else
-          let s = List.fold_left (fun acc r ->
-            match r.(i) with
-            | Row.V_null -> acc
-            | Row.V_int n -> Int64.add acc n
-            | _ -> failwith "SUM on non-numeric value"
-          ) 0L group_rows in
-          Row.V_int s
-      | Ast.Agg_avg, Some i ->
-        let sum, n = List.fold_left (fun (s, n) r ->
-          match r.(i) with
-          | Row.V_null -> (s, n)
-          | Row.V_int x -> (s +. Int64.to_float x, n + 1)
-          | Row.V_real f -> (s +. f, n + 1)
-          | _ -> failwith "AVG on non-numeric value"
-        ) (0.0, 0) group_rows in
-        if n = 0 then Row.V_null
-        else Row.V_real (sum /. float_of_int n)
-      | Ast.Agg_min, Some i ->
-        List.fold_left (fun acc r ->
-          match r.(i), acc with
-          | Row.V_null, _ -> acc
-          | v, Row.V_null -> v
-          | v, cur ->
-            if compare_values v cur < 0 then v else cur
-        ) Row.V_null group_rows
-      | Ast.Agg_max, Some i ->
-        List.fold_left (fun acc r ->
-          match r.(i), acc with
-          | Row.V_null, _ -> acc
-          | v, Row.V_null -> v
-          | v, cur ->
-            if compare_values v cur > 0 then v else cur
-        ) Row.V_null group_rows
-      | Ast.Agg_group_concat sep, Some i ->
-        let separator = Option.value sep ~default:"," in
-        let parts = List.filter_map (fun r ->
-          match r.(i) with
-          | Row.V_null -> None
-          | Row.V_int  n -> Some (Int64.to_string n)
-          | Row.V_real f -> Some (Printf.sprintf "%.17g" f)
-          | Row.V_text s -> Some s
-          | Row.V_blob _ -> Some ""
-        ) group_rows in
-        if parts = [] then Row.V_null
-        else Row.V_text (String.concat separator parts)
-      | Ast.Agg_group_concat _, None ->
-        failwith "GROUP_CONCAT requires a column argument"
-      | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max), None ->
-        failwith "non-COUNT aggregate must have a column argument"
-    in
-    let agg_output_rows =
-      List.map (fun (group_key, group_rows) ->
-        let agg_vals = List.map (fun spec -> compute_agg spec group_rows) aggs in
-        (* Output row: [key0; key1; ...; agg0; agg1; ...] *)
-        Array.of_list (group_key @ agg_vals)
-      ) groups
-    in
-    (* Apply HAVING on the aggregate output row. *)
-    let after_having =
-      match having with
-      | None -> agg_output_rows
-      | Some pred ->
-        List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
-    in
-    (* Compute post-aggregate window functions if any. *)
-    let n_agg_cols = n_group_cols + List.length aggs in
-    let with_windows =
-      if agg_windows = [] then after_having
-      else begin
-        let n_total = List.length after_having in
-        let indexed = List.mapi (fun i r -> (i, r)) after_having in
-        let window_arrays = List.map (fun (wplan : Plan.window_plan_item) ->
-          let partitions = group_by_partition clock params wplan.Plan.partition_by indexed in
-          let combined = Array.make n_total Row.V_null in
-          List.iter (fun (_, partition_indexed) ->
-            let sorted = sort_partition_by clock params wplan.Plan.order_by partition_indexed in
-            let part_results = compute_window_for_partition clock params wplan sorted n_total in
-            List.iter (fun (orig_idx, _) ->
-              combined.(orig_idx) <- part_results.(orig_idx)
-            ) sorted
-          ) partitions;
-          combined
-        ) agg_windows in
-        List.mapi (fun i row ->
-          let extras = List.map (fun arr -> arr.(i)) window_arrays in
-          Array.append row (Array.of_list extras)
-        ) after_having
-      end
-    in
-    (* Project to final output row. *)
-    let final_rows =
-      List.map (fun agg_row ->
-        Array.of_list (List.map (function
-          | Plan.PI_group_col i   -> agg_row.(i)
-          | Plan.PI_agg_slot k    -> agg_row.(n_group_cols + k)
-          | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j)
-        ) proj)
-      ) with_windows
-    in
-    Lwt.return (Lwt_stream.of_list final_rows)
+    stream_aggregate clock params store mode cat child group_cols aggs having proj agg_windows
   | Plan.Op_fts_seq_scan { fts_meta; where } ->
-    let* tx = S.ro_begin store in
-    let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
-    let _sr = S.cursor_first cur in
-    let exhausted = ref false in
-    (* End the snapshot on exhaustion OR a mid-scan read error (#164).
-       [finish] is idempotent. *)
-    let ended = ref false in
-    let finish () =
-      if !ended then Lwt.return_unit
-      else begin ended := true; S.cursor_close cur; S.ro_end tx end
-    in
-    let rec read_next () =
-      if !exhausted then Lwt.return_none
-      else
-        match S.cursor_next cur with
-        | None ->
-          exhausted := true;
-          let%lwt () = finish () in
-          Lwt.return_none
-        | Some (_key, val_bytes) ->
-          let texts = fts_decode_content val_bytes in
-          let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-          let emit = match where with
-            | None      -> true
-            | Some pred -> value_truthy (eval_expr clock params row pred)
-          in
-          if emit then Lwt.return_some row
-          else read_next ()
-    in
-    Lwt.return (Lwt_stream.from (fun () ->
-      Lwt.catch read_next
-        (fun exn -> exhausted := true; let%lwt () = finish () in Lwt.fail exn)))
+    stream_fts_seq_scan clock params store fts_meta where
   | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
-    S.with_ro store @@ fun tx ->
-    let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
-    (* Compute BM25 scores when rank is requested *)
-    let* scored_matches =
-      if not include_rank then
-        Lwt.return (List.map (fun (rowid, positions) -> (rowid, positions, 0.0)) matches)
-      else begin
-        let* (total_docs, total_tokens) = read_fts_stats tx fts_meta.Cat.fts_index_tree in
-        let query_terms = fts_query_terms query in
-        (* Fetch per-term posting lists: (n_docs_with_term, posting_list).
-           Keeping the posting list lets us look up each term's tf per document. *)
-        let* term_data = Lwt_list.map_s (fun term ->
-          let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
-          Lwt.return (List.length pl, pl)) query_terms in
-        let* doc_lengths = Lwt_list.map_s (fun (rowid, positions) ->
-          let dlen_key = fts_doclen_key rowid in
-          let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
-          let dl = match v with
-            | None -> 1
-            | Some b -> let (n, _) = Varint.decode_uint64 b 0 in Int64.to_int n
-          in
-          Lwt.return (rowid, positions, dl)) matches in
-        let scored = List.map (fun (rowid, positions, dl) ->
-          (* Use each term's own tf (occurrences in this doc) rather than
-             a single shared tf from the combined query result. *)
-          let score = List.fold_left (fun acc (n_docs, term_pl) ->
-            let tf = match List.assoc_opt rowid term_pl with
-              | None -> 0
-              | Some pos -> List.length pos
-            in
-            acc +. bm25_score ~k1:1.2 ~b:0.75 ~total_docs ~total_tokens
-                               ~n_docs_with_term:n_docs ~term_freq:tf ~doc_length:dl)
-            0.0 term_data in
-          (rowid, positions, score)) doc_lengths in
-        Lwt.return scored
-      end
-    in
-    (* Sort by BM25 score descending when rank is included *)
-    let sorted = if include_rank then
-      List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
-    else scored_matches in
-    let snippet_terms = fts_query_terms_with_kind query in
-    let* rows = Lwt_list.filter_map_s (fun (rowid, _positions, score) ->
-      let key = Rowid.encode rowid in
-      let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
-      match val_opt with
-      | None -> Lwt.return None
-      | Some bytes ->
-        let texts = fts_decode_content bytes in
-        let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-        (* If proj=[] and there are snippets, it means only snippets were selected
-           (no regular columns). If proj=[] with no snippets, it means SELECT *. *)
-        let projected =
-          if proj = [] && snippets = [] then Array.to_list full_row
-          else List.map (fun i -> full_row.(i)) proj
-        in
-        let snippet_vals =
-          List.map (fun (spec : Plan.snippet_spec) ->
-            let col_text =
-              let idx =
-                if spec.Plan.col_idx < 0 then 0
-                else min spec.Plan.col_idx (max 0 (List.length texts - 1))
-              in
-              if texts = [] then "" else List.nth texts idx
-            in
-            Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec)
-          ) snippets
-        in
-        let row_values =
-          projected
-          @ (if include_rank then [Row.V_real score] else [])
-          @ snippet_vals
-        in
-        Lwt.return (Some (Array.of_list row_values))) sorted in
-    Lwt.return (Lwt_stream.of_list rows)
-  | Plan.Op_pragma_rows { rows } ->
-    Lwt.return (Lwt_stream.of_list rows)
+    stream_fts_match_scan clock params store fts_meta query proj include_rank snippets
+  | Plan.Op_pragma_rows { rows } -> Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
     S.with_ro store @@ fun tx ->
     let* v  = Cat.read_user_version_tx tx in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int v |] ])
   | Plan.Op_pragma_get_fk ->
-    let v = match cat with
-      | None     -> false
-      | Some cat -> Cat.get_fk_enforcement cat
-    in
+    let v = match cat with None -> false | Some cat -> Cat.get_fk_enforcement cat in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_get_recursive_triggers ->
-    let v = match cat with
-      | None     -> true  (* default ON when no catalog is supplied *)
-      | Some cat -> Cat.get_recursive_triggers cat
-    in
+    let v = match cat with None -> true | Some cat -> Cat.get_recursive_triggers cat in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_get_wal_autocheckpoint ->
     let n = S.wal_autocheckpoint store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
   | Plan.Op_pragma_get_defer_fk ->
-    let v = match cat with
-      | None     -> false
-      | Some cat -> Cat.get_defer_fks_pragma cat
-    in
+    let v = match cat with None -> false | Some cat -> Cat.get_defer_fks_pragma cat in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
-  | Plan.Op_pragma_integrity_check ->
-    let cat_val = match cat with
-      | None -> failwith "Exec.to_stream: Op_pragma_integrity_check requires catalog"
-      | Some c -> c
-    in
-    let* tables = Cat.list_tables cat_val in
-    let errors  = ref [] in
-    let add_err msg = errors := msg :: !errors in
-    let count_entries tx tid =
-      let count = ref 0 in
-      let* cur  = S.cursor_open tx tid in
-      let _sr   = S.cursor_first cur in
-      let rec go () =
-        match S.cursor_next cur with
-        | None   -> Lwt.return_unit
-        | Some _ -> incr count; go ()
-      in
-      let* () = go () in
-      S.cursor_close cur;
-      Lwt.return !count
-    in
-    S.with_ro store @@ fun tx ->
-    let* () =
-      Lwt_list.iter_s (fun (meta : Cat.table_meta) ->
-        let* row_count = count_entries tx meta.tree_id in
-        let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
-        Lwt_list.iter_s (fun (idx : Cat.index_info) ->
-          let is_partial = idx.idx_where_sql <> None in
-          let* idx_count = count_entries tx idx.idx_tree_id in
-          (if (not is_partial) && idx_count <> row_count then
-            add_err (Printf.sprintf
-              "index %s on %s: %d entries != %d rows"
-              idx.idx_name meta.name idx_count row_count));
-          Lwt.return_unit
-        ) idxs
-      ) tables
-    in
-    let result = List.rev !errors in
-    let rows =
-      if result = [] then [ [| Row.V_text "ok" |] ]
-      else List.map (fun msg -> [| Row.V_text msg |]) result
-    in
-    Lwt.return (Lwt_stream.of_list rows)
-  | Plan.Op_sqlite_master ->
-    let cat_val = match cat with
-      | None   -> failwith "Exec.to_stream: Op_sqlite_master requires catalog"
-      | Some c -> c
-    in
-    let* tables = Cat.list_tables cat_val in
-    let table_rows = List.map (fun (meta : Cat.table_meta) ->
-      [| Row.V_text "table";
-         Row.V_text meta.Cat.name;
-         Row.V_text meta.Cat.name;
-         Row.V_int  (Int64.of_int meta.Cat.tree_id);
-         Row.V_text (ddl_of_table meta) |]
-    ) tables in
-    let index_rows =
-      List.concat_map (fun (meta : Cat.table_meta) ->
-        List.map (fun (idx : Cat.index_info) ->
-          [| Row.V_text "index";
-             Row.V_text idx.Cat.idx_name;
-             Row.V_text idx.Cat.idx_table;
-             Row.V_int  (Int64.of_int idx.Cat.idx_tree_id);
-             Row.V_text (ddl_of_index idx) |]
-        ) (Cat.indexes_for_table cat_val ~table:meta.Cat.name)
-      ) tables
-    in
-    let* views = Cat.load_all_views store in
-    let view_rows = List.map (fun (name, sql) ->
-      [| Row.V_text "view";
-         Row.V_text name;
-         Row.V_text name;
-         Row.V_int  0L;
-         Row.V_text sql |]
-    ) views in
-    let* triggers = Cat.load_all_triggers store in
-    let trigger_rows = List.map (fun (name, sql) ->
-      let tbl_name = trigger_table_of_sql name sql in
-      [| Row.V_text "trigger";
-         Row.V_text name;
-         Row.V_text tbl_name;
-         Row.V_int  0L;
-         Row.V_text sql |]
-    ) triggers in
-    let fts_rows = List.map (fun (m : Cat.fts_table_meta) ->
-      [| Row.V_text "table";
-         Row.V_text m.Cat.fts_name;
-         Row.V_text m.Cat.fts_name;
-         Row.V_int  (Int64.of_int m.Cat.fts_content_tree);
-         Row.V_text (ddl_of_fts m) |]
-    ) (Cat.list_fts_tables cat_val) in
-    let all_rows = table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows in
-    Lwt.return (Lwt_stream.of_list all_rows)
-  | Plan.Op_union { all; left; right } ->
-    let* ls = to_stream clock params store ~mode ~cat left  in
-    let* rs = to_stream clock params store ~mode ~cat right in
-    let combined = Lwt_stream.append ls rs in
-    if all then Lwt.return combined
-    else begin
-      let* rows = Lwt_stream.to_list combined in
-      let seen = Hashtbl.create 64 in
-      let deduped = List.filter (fun row ->
-        let k = row_key row in
-        if Hashtbl.mem seen k then false
-        else (Hashtbl.replace seen k (); true)
-      ) rows in
-      Lwt.return (Lwt_stream.of_list deduped)
-    end
-  | Plan.Op_intersect { left; right } ->
-    let* ls = to_stream clock params store ~mode ~cat left  in
-    let* rs = to_stream clock params store ~mode ~cat right in
-    let* right_list = Lwt_stream.to_list rs in
-    let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-    List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
-    let* left_list = Lwt_stream.to_list ls in
-    (* INTERSECT deduplicates: each distinct left row that also appears in right *)
-    let seen = Hashtbl.create 64 in
-    let result = List.filter (fun row ->
-      let k = row_key row in
-      if (not (Hashtbl.mem right_set k)) || Hashtbl.mem seen k then false
-      else (Hashtbl.replace seen k (); true)
-    ) left_list in
-    Lwt.return (Lwt_stream.of_list result)
-  | Plan.Op_except { left; right } ->
-    let* ls = to_stream clock params store ~mode ~cat left  in
-    let* rs = to_stream clock params store ~mode ~cat right in
-    let* right_list = Lwt_stream.to_list rs in
-    let right_set = Hashtbl.create (max 1 (List.length right_list)) in
-    List.iter (fun r -> Hashtbl.replace right_set (row_key r) ()) right_list;
-    let* left_list = Lwt_stream.to_list ls in
-    (* EXCEPT deduplicates: each distinct left row not in right *)
-    let seen = Hashtbl.create 64 in
-    let result = List.filter (fun row ->
-      let k = row_key row in
-      if Hashtbl.mem right_set k || Hashtbl.mem seen k then false
-      else (Hashtbl.replace seen k (); true)
-    ) left_list in
-    Lwt.return (Lwt_stream.of_list result)
+  | Plan.Op_pragma_integrity_check -> stream_pragma_integrity_check store cat
+  | Plan.Op_sqlite_master -> stream_sqlite_master store cat
+  | Plan.Op_union { all; left; right } -> stream_union clock params store mode cat all left right
+  | Plan.Op_intersect { left; right } -> stream_intersect clock params store mode cat left right
+  | Plan.Op_except { left; right } -> stream_except clock params store mode cat left right
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     when returning <> [] ->
-    (match cat with
-     | None -> failwith "Exec.query: RETURNING requires catalog context"
-     | Some c ->
-       let* result_lists = Lwt_list.map_s (fun row_vals ->
-         let n = List.length table_meta.columns in
-         let inserted_row = Array.make n Row.V_null in
-         List.iter2 (fun ord e ->
-           inserted_row.(ord) <- eval_expr clock params [||] e
-         ) ordinals row_vals;
-         let* inserted =
-           execute_insert ~mode ~clock ~on_conflict ~upsert_update ~prebuilt_row:(Some inserted_row)
-             store c ~table_meta ~ordinals ~values:row_vals
-         in
-         if not inserted then Lwt.return []
-         else
-           let result = Array.of_list (List.map (eval_expr clock params inserted_row) returning) in
-           Lwt.return [result]
-       ) values in
-       Lwt.return (Lwt_stream.of_list (List.concat result_lists)))
+    stream_insert_returning clock params store mode cat table_meta ordinals values
+      on_conflict returning upsert_update
   | Plan.Op_update { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    (* Snapshot matching rows BEFORE update to compute RETURNING values. *)
-    let* matched =
-      S.with_ro store @@ fun tx_ro ->
-      let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-      let _sr    = S.cursor_first cur in
-      let buf    = ref [] in
-      let rec drain () =
-        match S.cursor_next cur with
-        | None -> ()
-        | Some (kbytes, vbytes) ->
-          let rowid = Rowid.decode kbytes in
-          let row = decode_with_virtual clock params table_meta vbytes in
-          let keep = match where with
-            | None      -> true
-            | Some pred -> value_truthy (eval_expr clock params row pred)
-          in
-          if keep then buf := (rowid, row) :: !buf;
-          drain ()
-      in
-      drain ();
-      S.cursor_close cur;
-      Lwt.return (List.rev !buf)
-    in
-    (* Apply ORDER BY, OFFSET, LIMIT *)
-    let matched =
-      let sorted =
-        if order = [] then matched
-        else
-          List.sort (fun (_, ra) (_, rb) ->
-            let rec cmp = function
-              | [] -> 0
-              | (e, dir, nulls) :: rest ->
-                let va = eval_expr clock params ra e in
-                let vb = eval_expr clock params rb e in
-                let c = compare_with_nulls dir nulls va vb in
-                if c <> 0 then c else cmp rest
-            in cmp order
-          ) matched
-      in
-      let after_offset = match offset with
-        | None | Some 0 -> sorted
-        | Some n -> list_drop n sorted
-      in
-      match limit with
-      | None -> after_offset
-      | Some n -> list_take n after_offset
-    in
-    (* Compute new values for each matched row, project RETURNING from new row. *)
-    let result_rows = List.map (fun (_, old_row) ->
-      let new_row = Array.copy old_row in
-      List.iter (fun (i, expr) ->
-        new_row.(i) <- eval_expr clock params old_row expr
-      ) assignments;
-      compute_stored_generated_cols clock params table_meta new_row;
-      Array.of_list (List.map (eval_expr clock params new_row) returning)
-    ) matched in
-    (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot
-       and the actual write use separate table scans that both apply the same
-       order/limit/offset. Non-deterministic expressions (e.g. random()) could
-       return RETURNING values for rows different from those actually modified. *)
-    let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context" in
-    let* _ = execute_update ~mode ~params ~clock store c ~table_meta ~assignments ~where ~order ~limit ~offset ~indexes in
-    Lwt.return (Lwt_stream.of_list result_rows)
+    stream_update_returning clock params store mode cat table_meta assignments where
+      order limit offset indexes returning
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
-    (* Snapshot matching rows BEFORE delete to compute RETURNING values. *)
-    let* matched =
-      S.with_ro store @@ fun tx_ro ->
-      let* cur   = S.cursor_open tx_ro table_meta.tree_id in
-      let _sr    = S.cursor_first cur in
-      let buf    = ref [] in
-      let rec drain () =
-        match S.cursor_next cur with
-        | None -> ()
-        | Some (_kbytes, vbytes) ->
-          let row = decode_with_virtual clock params table_meta vbytes in
-          let keep = match where with
-            | None      -> true
-            | Some pred -> value_truthy (eval_expr clock params row pred)
-          in
-          if keep then buf := row :: !buf;
-          drain ()
-      in
-      drain ();
-      S.cursor_close cur;
-      Lwt.return (List.rev !buf)
-    in
-    (* Apply ORDER BY, OFFSET, LIMIT *)
-    let matched =
-      let sorted =
-        if order = [] then matched
-        else
-          List.sort (fun ra rb ->
-            let rec cmp = function
-              | [] -> 0
-              | (e, dir, nulls) :: rest ->
-                let va = eval_expr clock params ra e in
-                let vb = eval_expr clock params rb e in
-                let c = compare_with_nulls dir nulls va vb in
-                if c <> 0 then c else cmp rest
-            in cmp order
-          ) matched
-      in
-      let after_offset = match offset with
-        | None | Some 0 -> sorted
-        | Some n -> list_drop n sorted
-      in
-      match limit with
-      | None -> after_offset
-      | Some n -> list_take n after_offset
-    in
-    let result_rows = List.map (fun old_row ->
-      Array.of_list (List.map (eval_expr clock params old_row) returning)
-    ) matched in
-    (* NOTE: ORDER BY expressions must be deterministic — the RETURNING snapshot
-       and the actual write use separate table scans that both apply the same
-       order/limit/offset. Non-deterministic expressions (e.g. random()) could
-       return RETURNING values for rows different from those actually modified. *)
-    let c = match cat with Some c -> c | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context" in
-    let* _ = execute_delete ~mode ~params ~clock store c ~table_meta ~where ~order ~limit ~offset ~indexes in
-    Lwt.return (Lwt_stream.of_list result_rows)
+    stream_delete_returning clock params store mode cat table_meta where
+      order limit offset indexes returning
   | Plan.Op_changes ->
     failwith "Exec.to_stream: Op_changes must be intercepted in db.ml query"
   | Plan.Op_last_insert_rowid ->
     failwith "Exec.to_stream: Op_last_insert_rowid must be intercepted in db.ml query"
   | Plan.Op_total_changes ->
     failwith "Exec.to_stream: Op_total_changes must be intercepted in db.ml query"
-  | Plan.Op_const_select { exprs } ->
-    (* FROM-less SELECT: evaluate each expression with an empty row and
-       return a single result row. Aliases are stored in the plan for
-       column-name purposes but are not needed during execution. *)
-    let raw_exprs = List.map fst exprs in
-    let* exprs' = Lwt_list.map_s (pre_eval_subquery clock store params cat) raw_exprs in
-    let row = Array.of_list (List.map (eval_expr clock params [||]) exprs') in
-    Lwt.return (Lwt_stream.of_list [row])
+  | Plan.Op_const_select { exprs } -> stream_const_select clock params store cat exprs
   | Plan.Op_with_cte { cte_name; def; query; recursive = false } ->
     let* def_stream = to_stream clock params store ~mode ~cat def in
     let* cte_rows = Lwt_stream.to_list def_stream in
     let patched = substitute_cte ~cte_name ~rows:cte_rows query in
     to_stream clock params store ~mode ~cat patched
-
   | Plan.Op_with_cte { cte_name; def; query; recursive = true } ->
-    (* Recursive CTE: def must be Op_union { all=true; left=base_case; right=recursive_arm }.
-       Execute base case once, then iteratively execute recursive_arm substituting
-       the CTE scan with current working rows, until no new rows are produced. *)
-    let (base_op, recursive_arm) = match def with
-      | Plan.Op_union { all = true; left; right } -> (left, right)
-      | _ ->
-        failwith "Exec: recursive CTE def must be UNION ALL — non-UNION-ALL recursive CTEs are not supported"
-    in
-    let* base_stream = to_stream clock params store ~mode ~cat base_op in
-    let* seed_rows = Lwt_stream.to_list base_stream in
-    let max_iterations = 1000 in
-    let rec iterate depth acc working =
-      if working = [] then Lwt.return acc
-      else if depth >= max_iterations then
-        failwith (Printf.sprintf
-          "Exec: recursive CTE '%s' exceeded maximum iteration depth of %d"
-          cte_name max_iterations)
-      else
-        let patched_arm = substitute_cte ~cte_name ~rows:working recursive_arm in
-        let* new_stream = to_stream clock params store ~mode ~cat patched_arm in
-        let* new_rows = Lwt_stream.to_list new_stream in
-        iterate (depth + 1) (acc @ new_rows) new_rows
-    in
-    let* all_rows = iterate 0 seed_rows seed_rows in
-    let patched_query = substitute_cte ~cte_name ~rows:all_rows query in
-    to_stream clock params store ~mode ~cat patched_query
+    stream_with_cte_recursive clock params store mode cat cte_name def query
   | Plan.Op_cte_scan { cte_name; _ } ->
     failwith (Printf.sprintf "Exec: unsubstituted Op_cte_scan '%s' — internal planner error" cte_name)
   | Plan.Op_window { child; windows; n_input_cols = _ } ->
-    let* child_stream = to_stream clock params store ~mode ~cat child in
-    let* all_rows = Lwt_stream.to_list child_stream in
-    let n_rows = List.length all_rows in
-    if n_rows = 0 then Lwt.return (Lwt_stream.of_list [])
-    else begin
-      let all_rows_arr = Array.of_list all_rows in
-      let n_windows = List.length windows in
-      let window_results : Row.value array array =
-        Array.init n_windows (fun wi ->
-          let wplan = List.nth windows wi in
-          let indexed_rows = List.mapi (fun i row -> (i, row)) all_rows in
-          let partitions = group_by_partition clock params wplan.Plan.partition_by indexed_rows in
-          let combined = Array.make n_rows Row.V_null in
-          List.iter (fun (_, partition_idx_rows) ->
-            let sorted = sort_partition_by clock params wplan.Plan.order_by partition_idx_rows in
-            let part_results = compute_window_for_partition clock params wplan sorted n_rows in
-            List.iter (fun (orig_idx, _) ->
-              combined.(orig_idx) <- part_results.(orig_idx)
-            ) sorted
-          ) partitions;
-          combined
-        )
-      in
-      let augmented = Array.to_list (Array.mapi (fun i row ->
-        let extras = Array.init n_windows (fun wi -> window_results.(wi).(i)) in
-        Array.append row extras
-      ) all_rows_arr) in
-      Lwt.return (Lwt_stream.of_list augmented)
-    end
+    stream_window clock params store mode cat child windows
   | Plan.Op_no_op -> Lwt.return (Lwt_stream.of_list [])
-  | Plan.Op_explain { analyze; inner } ->
-    let plan_rows = explain_plan inner in
-    let nullify row = Array.append row [| Row.V_null; Row.V_null |] in
-    if not analyze then
-      Lwt.return (Lwt_stream.of_list (List.map nullify plan_rows))
-    else begin
-      let cat_v = match cat with Some c -> c
-        | None -> failwith "EXPLAIN ANALYZE requires a catalog" in
-      let t0 = match clock with Some c -> c () | None -> 0.0 in
-      let* n =
-        let is_write = match inner with
-          | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _
-          | Plan.Op_create_table _ | Plan.Op_create_index _
-          | Plan.Op_drop_table _ | Plan.Op_drop_index _
-          | Plan.Op_alter_table _ | Plan.Op_begin | Plan.Op_commit | Plan.Op_rollback
-          | Plan.Op_savepoint _ | Plan.Op_release _ | Plan.Op_rollback_to _
-          | Plan.Op_create_view _ | Plan.Op_drop_view _
-          | Plan.Op_create_trigger _ | Plan.Op_drop_trigger _
-          | Plan.Op_pragma_set_user_version _
-          | Plan.Op_pragma_set_fk _
-          | Plan.Op_pragma_set_recursive_triggers _
-          | Plan.Op_pragma_set_defer_fk _
-          | Plan.Op_pragma_set_wal_autocheckpoint _
-          | Plan.Op_fts_insert _ | Plan.Op_fts_delete _
-          | Plan.Op_create_fts_table _ -> true
-          | _ -> false
-        in
-        if is_write then
-          execute_with_count ~mode ~clock ~params store cat_v inner
-        else begin
-          let* s = to_stream clock params store ~mode ~cat inner in
-          let* rows = Lwt_stream.to_list s in
-          Lwt.return (List.length rows)
-        end
-      in
-      let elapsed_ms =
-        match clock with Some c -> (c () -. t0) *. 1000.0 | None -> 0.0
-      in
-      let rows = List.mapi (fun i row ->
-        if i = 0 then
-          Array.append row
-            [| Row.V_int (Int64.of_int n); Row.V_real elapsed_ms |]
-        else
-          nullify row
-      ) plan_rows in
-      Lwt.return (Lwt_stream.of_list rows)
-    end
+  | Plan.Op_explain { analyze; inner } -> stream_explain clock params store mode cat analyze inner
   | Plan.Op_create_table _ | Plan.Op_create_index _
   | Plan.Op_drop_table _ | Plan.Op_drop_index _
   | Plan.Op_create_fts_table _
