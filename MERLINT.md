@@ -62,14 +62,17 @@ for `test/*.ml*`. merlint auto-skips functions in *nested* test directories, but
 our suite lives flat under `test/` (its dirname has no `/`), so long bench
 harnesses (`open_slow_store`, `main`, `open_slow_wal`) are not auto-skipped;
 long test/bench setup is acceptable. The `#168` refactor drives E005 down in
-`lib/`: `lib/sql/exec.ml` (the largest module) is now **E005-clean** — its 19
-long functions, including the 1058-line `to_stream`, the 399-line
-`execute_with_count`, and the `execute_insert`/`update`/`delete` drivers, were
-decomposed into named helpers (behavior-preserving; full suite green). The
-remaining E005 findings live in other modules (sema/store/db/catalog/btree/
-planner/encoding) and are tracked for the same per-module treatment.
+`lib/`: `lib/sql/exec.ml` and `lib/sql/sema.ml` (the two largest modules) are
+now **E005-clean**. exec.ml's 19 long functions (incl. the 1058-line
+`to_stream`, 399-line `execute_with_count`, and the
+`execute_insert`/`update`/`delete` drivers) and sema.ml's 11 (incl. the
+669-line `bind_select`, 219-line `bind_internal`, and the `bind_expr`/
+`bind_create` families) were decomposed into named helpers
+(behavior-preserving; full suite green). The remaining E005 findings live in
+other modules (store/db/catalog/btree/planner/encoding) and are tracked for the
+same per-module treatment.
 
-## Enabled rules: current findings (~357)
+## Enabled rules: current findings (~346)
 
 All other rules stay on. The notable remaining findings, none yet enforced:
 
@@ -77,7 +80,7 @@ All other rules stay on. The notable remaining findings, none yet enforced:
 |------|------|-------|-------------|
 | E105 | Catch-all Exception Handler | 0 | Resolved (#167) — 12 production sites narrowed; `test/` scaffolding excluded. Enforceable. |
 | E331 | Redundant Function Prefixes | 89 | Open. |
-| E005 | Long Functions | 34 | #168 in progress — `lib/sql/exec.ml` fully decomposed (E005-clean); remaining in sema/store/db/catalog/btree/planner/encoding. `test/` excluded. |
+| E005 | Long Functions | 23 | #168 in progress — `lib/sql/exec.ml` and `lib/sql/sema.ml` fully decomposed (E005-clean); remaining in store/db/catalog/btree/planner/encoding. `test/` excluded. |
 | E405 | Missing Value Documentation | 41 | Open. |
 | E110 | Silenced Warning | 13 | Open — `[@@warning "-32"]`/`-69` on API/test bindings. |
 | E415 | Missing Pretty Printer | 9 | Open. |
