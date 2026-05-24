@@ -1,9 +1,15 @@
 name: Coverage
 
+# PAUSED on the OCaml 5.4 bump (#165). bisect_ppx (<= 2.8.3) requires
+# ppxlib < 0.36, but 5.4.1 forces lwt_ppx 6.1 -> ppxlib 0.38, so bisect_ppx
+# and lwt_ppx are mutually exclusive on 5.4. Coverage cannot run until
+# bisect_ppx supports ppxlib >= 0.36. Tracked in #166.
+# Manual-only until then; restore the push/tags triggers below to re-enable.
 on:
-  push:
-    branches: ["main"]
-    tags: ["v*"]
+  workflow_dispatch:
+  # push:
+  #   branches: ["main"]
+  #   tags: ["v*"]
 
 env:
   COVERAGE_THRESHOLD: "85"
@@ -12,7 +18,7 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     container:
-      image: ocaml/opam:ubuntu-24.04-ocaml-5.1
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
 
     steps:
       - uses: actions/checkout@v4
@@ -26,8 +32,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.1-cov-${{ hashFiles('sqlocaml.opam') }}
-          restore-keys: opam-5.1-cov-
+          key: opam-5.4-cov-${{ hashFiles('sqlocaml.opam') }}
+          restore-keys: opam-5.4-cov-
 
       - name: Install opam packages (including bisect_ppx)
         run: |

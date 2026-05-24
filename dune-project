@@ -9,7 +9,7 @@
  (synopsis "Pure-OCaml SQL engine")
  (description "Pure-OCaml SQL engine targeting MirageOS unikernels.")
  (depends
-  (ocaml (>= 5.1))
+  (ocaml (>= 5.4))
   (dune (>= 3.16))
   (lwt (>= 5.7))
   (cstruct (>= 6.2))
