@@ -1,4 +1,10 @@
-(* lib/sql/json.mli *)
+(** JSON value model and the SQLite [json1] scalar functions.
+
+    Provides a parsed {!value} tree, text (de)serialisation, type
+    introspection, and the path-based accessors/mutators ([path_get],
+    [path_set], [path_insert], [path_replace], [path_remove]) used to
+    implement the SQL JSON functions. *)
+
 type value =
   | J_null
   | J_bool of bool

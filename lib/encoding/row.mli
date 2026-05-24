@@ -1,3 +1,9 @@
+(** Row schema and value (de)serialisation.
+
+    Defines column types ({!ty}), DEFAULT/CHECK/GENERATED column metadata
+    ({!column}, {!schema}) and the runtime cell {!value}s of a row ({!t}),
+    plus the binary [encode]/[decode] of a row against its schema. *)
+
 type ty =
   | Integer
   | Text

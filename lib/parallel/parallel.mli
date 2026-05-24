@@ -1,3 +1,10 @@
+(** Portable multi-core gate around OCaml 5 domains.
+
+    Lets call sites offer a parallel implementation that is only taken when
+    the runtime actually has more than one domain available, falling back to
+    a sequential equivalent on monocore targets (notably Solo5/Mirage, where
+    a second domain cannot be spawned). *)
+
 val available : unit -> bool
 (** [true] when the runtime recommends more than one domain — i.e. a
     multi-core Unix host. Always [false] on monocore Solo5/Mirage, where
