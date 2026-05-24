@@ -15,6 +15,27 @@
 #          under test/; it is not a 1:1 mirror of lib/ modules. These fire on
 #          every test file (and E605 on lib modules) by design, not as defects.
 #
+#   E618 - "avoid X__Y module access". Every finding is the lwt_ppx-generated
+#          binding `__ppx_lwt_0` from `let%lwt`/`let*` expansion, attributed back
+#          to the source line. It is ppx output, not hand-written double-underscore
+#          module access; there are zero genuine `Module__Sub` uses in the tree.
+#          A pure tooling artifact, like the test-layout rules above.
+#
+# Naming-convention opinions we decline (#153) - merlint's preferred terse
+# style conflicts with this project's deliberate descriptive naming (same
+# rationale as E320 above):
+#   E331 - "redundant function prefixes": wants create_table->table,
+#          find_index->index, get_fk_enforcement->fk_enforcement. Our create_*/
+#          find_*/get_* names mirror the SQL DDL they implement and read clearer
+#          than bare nouns.
+#   E325 - "find_/get_ option semantics": wants find_table->get_table. This
+#          directly CONTRADICTS E331 (which wants find_table->table) on the very
+#          same definitions, so the two cannot both be satisfied; our find_*
+#          (returns option) convention is deliberate.
+#   E332 - "prefer 'v' constructor": wants Pager.create->Pager.v, Mem.create->
+#          Mem.v, etc. We use `create` consistently across modules (same stance
+#          as the E205 Fmt opinion).
+#
 # Scoped to test/ only (#167, #168):
 #   E105 - catch-all exception handlers. In tests these are idiomatic best-effort
 #          cleanup (temp-file teardown `(try Unix.unlink p with _ -> ())`,
@@ -36,6 +57,6 @@
 
 rules:
   - files: **/*.ml*
-    exclude: [E205, E320, E410, E600, E605, E606, E610]
+    exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332]
   - files: test/*.ml*
     exclude: [E105, E005]

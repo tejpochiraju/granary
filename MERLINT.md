@@ -40,8 +40,12 @@ conventions, not defects:
 | E605 | Missing Test File | One test file exercises many library modules by design. |
 | E606 | Test File in Wrong Directory | All tests live flat under `test/` intentionally. |
 | E610 | Test Without Library | Tests don't map 1:1 to a library module of the same name. |
+| E618 | Avoid X__Y Module Access | Tooling artifact (#153): every finding is the `lwt_ppx`-generated `__ppx_lwt_0` binding from `let%lwt`/`let*`, mapped back to the source line. Not hand-written module access; zero genuine `Module__Sub` uses exist. |
+| E331 | Redundant Function Prefixes | Naming opinion (#153): wants `create_table`→`table`, `find_index`→`index`. Our `create_*`/`find_*`/`get_*` names mirror the SQL DDL they implement (same rationale as E320). |
+| E325 | Function Naming Convention | Naming opinion (#153): wants `find_table`→`get_table`, directly contradicting E331 (`find_table`→`table`) on the same definitions. Our `find_*` (returns option) convention is deliberate. |
+| E332 | Prefer 'v' Constructor | Naming opinion (#153): wants `Pager.create`→`Pager.v` etc. We use `create` consistently (same stance as the E205 `Fmt` opinion). |
 
-Excluding these takes the raw report from ~4077 to ~504 findings.
+Excluding these takes the raw report from ~4077 to ~265 findings.
 
 ### Scoped exclusion: E105 in `test/` only (#167)
 
@@ -72,24 +76,23 @@ incl. the 1058-line `to_stream`), `sema.ml` (11, incl. the 669-line
 (`fault_inject`/`index_key`/`row`/`json`/`pager`). E005 is now enforceable for
 `lib/` + `bin/`.
 
-## Enabled rules: current findings (~323)
+## Enabled rules: current findings (~87)
 
 All other rules stay on. The notable remaining findings, none yet enforced:
 
 | Rule | Name | Count | Disposition |
 |------|------|-------|-------------|
 | E105 | Catch-all Exception Handler | 0 | Resolved (#167) — 12 production sites narrowed; `test/` scaffolding excluded. Enforceable. |
-| E331 | Redundant Function Prefixes | 89 | Open. |
 | E005 | Long Functions | 0 | Resolved (#168) — all `lib/` + `bin/` functions decomposed into named helpers; `test/` excluded. Enforceable. |
-| E405 | Missing Value Documentation | 41 | Open. |
+| E405 | Missing Value Documentation | 41 | Open — being driven to zero under #153. |
 | E110 | Silenced Warning | 13 | Open — `[@@warning "-32"]`/`-69` on API/test bindings. |
-| E415 | Missing Pretty Printer | 9 | Open. |
-| E325 / E330 | Function / Module naming | 6 each | Open. |
-| E335 | Used Underscore-Prefixed Binding | 4 | Open. |
+| E415 | Missing Pretty Printer | 9 | Open — adding `pp` to opaque `t` types. |
+| E330 | Redundant Module Name | 6 | Open — `fts_query`/`store_of` fixable; `page_size`/`wal_magic` under review. |
 | E010 | Deep Nesting | 4 | Open. |
+| E335 | Used Underscore-Prefixed Binding | 4 | Open. |
 | E400 | Missing MLI Documentation | 4 | Open. |
-| E001 | High Cyclomatic Complexity | 3 | Open. |
-| E505 | Missing MLI File | 2 | Open — `lib/sql/ast.ml`, `lib/sql/plan.ml`. |
+| E505 | Missing MLI File | 2 | Open — `lib/sql/ast.ml`, `lib/sql/plan.ml`; large interface task, deferred to a follow-up. |
+| E001 | High Cyclomatic Complexity | 1 | Open — `test/test_sqlite_corpus.ml:parse_file`. |
 | E500 | Missing `.ocamlformat` | 1 | Open. |
 | E300 / E310 | Variant / Value naming | 1 each | Open. |
 
