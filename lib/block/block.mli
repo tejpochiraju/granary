@@ -5,7 +5,11 @@ module type S = sig
   type error
 
   val pp_error : Format.formatter -> error -> unit
-  val page_size : int
+
+  (** This device's page size in bytes (#95): a per-file choice fixed at
+      creation, no longer a compile-time constant. *)
+  val page_size : t -> int
+
   val n_pages : t -> int64
   val read_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
   val write_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t

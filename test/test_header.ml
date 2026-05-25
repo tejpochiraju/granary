@@ -87,6 +87,7 @@ let zero_header =
     ; n_pages_total = 0L
     ; schema_version = 0L
     ; format_version = Header.current_format_version
+    ; geom = Geometry.default
     }
 ;;
 
@@ -97,6 +98,7 @@ let make_state
       ?(n_pages_total = 0L)
       ?(schema_version = 0L)
       ?(format_version = Header.current_format_version)
+      ?(geom = Geometry.default)
       ()
   =
   Header.
@@ -106,6 +108,7 @@ let make_state
     ; n_pages_total
     ; schema_version
     ; format_version
+    ; geom
     }
 ;;
 
@@ -327,6 +330,7 @@ let test_unsupported_format_rejected () =
       ; schema_version = 0L
       ; page_size = Int32.of_int Page.page_size
       ; format_version = bad_version
+      ; reserved_bytes_per_page = 0l
       };
     Page.seal buf;
     let bytes = Bytes.create Page.page_size in
@@ -425,6 +429,7 @@ let test_commit_flush_error () =
       ; n_pages_total = 3L
       ; schema_version = 0L
       ; format_version = Header.current_format_version
+      ; geom = Geometry.default
       }
   in
   match run (Header.commit pager ~prev_header:zero_header ~new_state) with
@@ -516,6 +521,7 @@ let prop_commit_sequence =
                  ; n_pages_total = Int64.of_int (i + 2)
                  ; schema_version = 0L
                  ; format_version = Header.current_format_version
+                 ; geom = Geometry.default
                  }
              in
              match run (Header.commit pager ~prev_header:prev_h ~new_state) with

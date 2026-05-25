@@ -19,13 +19,17 @@ module Make (B : Mirage_block.S) : sig
   (** Adapter state: wraps [B.t] with page-granularity access. *)
   type t
 
-  (** [connect dev] reads [get_info] from [dev] to determine sector size
-      and capacity, then creates an adapter with logical [n_pages = 0].
-      Raises [Failure] if [page_size (4096)] is not a multiple of the
-      device's [sector_size]. *)
-  val connect : B.t -> t Lwt.t
+  (** [connect ?page_size dev] reads [get_info] from [dev] to determine sector
+      size and capacity, then creates an adapter with logical [n_pages = 0].
+      [page_size] defaults to 4096 (#95).  Raises [Failure] if [page_size] is
+      not a multiple of the device's [sector_size]. *)
+  val connect : ?page_size:int -> B.t -> t Lwt.t
 
   val n_pages : t -> int64
+
+  (** This adapter's page size in bytes (#95). *)
+  val page_size : t -> int
+
   val read_page : t -> page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   val write_page : t -> page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   val sync : t -> unit -> (unit, string) result Lwt.t

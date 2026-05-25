@@ -37,7 +37,7 @@ let setup () =
   (try Unix.unlink (path ^ "-wal") with
    | _ -> ());
   let db =
-    match run (Db.open_file_wal ~path) with
+    match run (Db.open_file_wal ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file_wal failed"
   in
@@ -132,7 +132,7 @@ let test_within_snapshot_stable_count () =
   (try Unix.unlink (path ^ "-wal") with
    | _ -> ());
   run
-    (let* sr = S.open_file_wal ~path in
+    (let* sr = S.open_file_wal ~path () in
      let st =
        match sr with
        | Ok s -> s

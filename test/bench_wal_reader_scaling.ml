@@ -37,7 +37,7 @@ let setup () =
   (try Unix.unlink (path ^ "-wal") with
    | _ -> ());
   let db =
-    match run (Db.open_file_wal ~path) with
+    match run (Db.open_file_wal ~path ()) with
     | Ok d -> d
     | Error _ -> failwith "open failed"
   in

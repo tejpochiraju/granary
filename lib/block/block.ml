@@ -3,7 +3,7 @@ module type S = sig
   type error
 
   val pp_error : Format.formatter -> error -> unit
-  val page_size : int
+  val page_size : t -> int
   val n_pages : t -> int64
   val read_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t
   val write_page : t -> page_id:int64 -> Cstruct.t -> (unit, error) result Lwt.t

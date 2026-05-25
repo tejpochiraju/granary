@@ -258,7 +258,7 @@ let test_wal_backend_concurrent_readers_writer () =
   (try Unix.unlink (path ^ "-wal") with
    | _ -> ());
   let db =
-    match run (Db.open_file_wal ~path) with
+    match run (Db.open_file_wal ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file_wal failed"
   in
@@ -307,7 +307,7 @@ let test_file_backend_concurrent () =
   (try Unix.unlink path with
    | _ -> ());
   let db =
-    match run (Db.open_file ~path) with
+    match run (Db.open_file ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file failed"
   in

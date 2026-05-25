@@ -18,11 +18,12 @@ val pp : Format.formatter -> t -> unit
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
-(** Page size in bytes (4096). *)
-val page_size : int
+(** This device's page size in bytes (#95). *)
+val page_size : t -> int
 
-(** [create ~n_pages] allocates a zero-filled device of [n_pages] pages. *)
-val create : n_pages:int64 -> t
+(** [create ?page_size ~n_pages ()] allocates a zero-filled device of [n_pages]
+    pages, each [page_size] bytes (default 4096, #95). *)
+val create : ?page_size:int -> n_pages:int64 -> unit -> t
 
 (** Current size of the device, in pages. *)
 val n_pages : t -> int64

@@ -124,7 +124,7 @@ let wrap_inline_value (v : bytes) : bytes =
    next_pid = 0. *)
 let write_overflow_chain pager (value : bytes) : (int64 * int, error) result Lwt.t =
   let total = Bytes.length value in
-  let chunk = Page.max_overflow_payload_bytes in
+  let chunk = Pager.max_overflow_payload_bytes pager in
   (* Number of pages needed (at least one even for empty values, though we
      never spill empties). *)
   let n_pages = max 1 ((total + chunk - 1) / chunk) in
@@ -152,8 +152,14 @@ let write_overflow_chain pager (value : bytes) : (int64 * int, error) result Lwt
         in
         let remaining = total - offset in
         let payload_len = min chunk remaining in
-        let buf = Cstruct.create Page.page_size in
-        Page.write_overflow buf ~next_pid ~payload:value ~payload_off:offset ~payload_len;
+        let buf = Cstruct.create (Pager.page_size pager) in
+        Page.write_overflow
+          ~reserved:(Pager.reserved_bytes pager)
+          buf
+          ~next_pid
+          ~payload:value
+          ~payload_off:offset
+          ~payload_len;
         Page.seal buf;
         Pager.write pager pid buf;
         write_chain (idx + 1) rest (offset + payload_len)
@@ -317,11 +323,12 @@ let decode_branch_entries buf (common : Page.common) : Page.branch_entry list * 
    given [right_page] (next-leaf pointer).
    Writes the page to the pager under [page_id] and returns unit (or error). *)
 let build_and_write_leaf pager ~page_id ~entries ~right_page : (unit, error) result Lwt.t =
-  let buf = Cstruct.create Page.page_size in
+  let reserved = Pager.reserved_bytes pager in
+  let buf = Cstruct.create (Pager.page_size pager) in
   Cstruct.memset buf 0;
   let _final_offset =
     List.fold_left
-      (fun off (k, v) -> Page.leaf_append_entry buf ~offset:off ~key:k ~value:v)
+      (fun off (k, v) -> Page.leaf_append_entry ~reserved buf ~offset:off ~key:k ~value:v)
       Page.data_offset
       entries
   in
@@ -346,12 +353,18 @@ let build_and_write_leaf pager ~page_id ~entries ~right_page : (unit, error) res
 let build_and_write_branch pager ~page_id ~entries ~right_page
   : (unit, error) result Lwt.t
   =
-  let buf = Cstruct.create Page.page_size in
+  let reserved = Pager.reserved_bytes pager in
+  let buf = Cstruct.create (Pager.page_size pager) in
   Cstruct.memset buf 0;
   let _final_offset =
     List.fold_left
       (fun off (k, lc) ->
-         Page.branch_append_entry buf ~offset:off ~key:k ~left_child:(int32_of_page_id lc))
+         Page.branch_append_entry
+           ~reserved
+           buf
+           ~offset:off
+           ~key:k
+           ~left_child:(int32_of_page_id lc))
       Page.data_offset
       entries
   in
@@ -692,7 +705,7 @@ let write_leaf_maybe_split pager (entries : (bytes * bytes) list) ~right_page
   : (write_result, error) result Lwt.t
   =
   let total = leaf_entries_total_size entries in
-  if total <= Page.max_data_bytes
+  if total <= Pager.max_data_bytes pager
   then
     let* alloc_r = Pager.alloc pager in
     bind_pager alloc_r (fun new_pid ->
@@ -742,7 +755,7 @@ let write_branch_maybe_split pager (entries : (bytes * int64) list) ~right_page
   let total = branch_entries_total_size entries in
   (* Branches need at least an 8-byte head (right_page already in common) so
      [max_data_bytes] suffices. *)
-  if total <= Page.max_data_bytes
+  if total <= Pager.max_data_bytes pager
   then
     let* alloc_r = Pager.alloc pager in
     bind_pager alloc_r (fun new_pid ->

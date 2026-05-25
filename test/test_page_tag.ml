@@ -43,6 +43,7 @@ let open_store read_page write_page sync resize =
       ~resize
       ~n_pages:0L
       ~close:(fun () -> Lwt.return_unit)
+      ()
   in
   match r with
   | Ok st -> Lwt.return st

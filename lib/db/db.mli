@@ -35,12 +35,14 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     constructors ([open_file] / [open_file_wal]) live in the [sqlocaml.unix]
     driver library so this core carries no [unix] dependency (#170). *)
 val open_block
-  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  :  ?geom:Sqlocaml_storage.Geometry.t
+  -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
   -> n_pages:int64
   -> close:(unit -> unit Lwt.t)
+  -> unit
   -> (t, error) result Lwt.t
 
 (** Wrap an already-open {!Sqlocaml_store.Store.t} as a database handle,

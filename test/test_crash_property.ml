@@ -58,7 +58,7 @@ let prop_snapshot_iso =
        cleanup path;
        try
          run
-           (let* sr = S.open_file_wal ~path in
+           (let* sr = S.open_file_wal ~path () in
             let st = ok_store sr in
             (* Take RO snapshot first, while DB is empty. *)
             let* ro = S.ro_begin st in
@@ -101,7 +101,7 @@ let prop_snapshot_iso =
    each. Returns the on-disk WAL byte content and the list of expected
    states. *)
 let build_sequence_to_disk ~path ~commits =
-  let* sr = S.open_file_wal ~path in
+  let* sr = S.open_file_wal ~path () in
   let st = ok_store sr in
   let prefixes = ref [] in
   let cur = Hashtbl.create 32 in
@@ -194,7 +194,7 @@ let prop_crash_then_open =
                 if wal_size = 0 then 0 else truncate_offset_extra mod (wal_size + 1)
               in
               truncate_wal path keep;
-              let* sr = S.open_file_wal ~path in
+              let* sr = S.open_file_wal ~path () in
               let st = ok_store sr in
               let* observed = read_all_keys st all_keys in
               let* () = S.close st in

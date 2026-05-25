@@ -81,6 +81,7 @@ let with_block_store path f =
          ~resize:(MB.resize adapter)
          ~n_pages:(MB.n_pages adapter)
          ~close:(fun () -> MB.close adapter)
+         ()
      in
      match result with
      | Error e -> Alcotest.failf "open_block failed: %a" S.pp_error e
@@ -94,7 +95,7 @@ let with_block_store path f =
 let test_open_creates_file () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        Alcotest.(check bool) "file exists on disk" true (Sys.file_exists path);
        let* () = S.close s in
@@ -104,7 +105,7 @@ let test_open_creates_file () =
 let test_basic_put_get () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "k") (bs "v") in
@@ -124,7 +125,7 @@ let test_basic_put_get () =
 let test_persistence_after_reopen () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "alpha") (bs "1") in
@@ -132,7 +133,7 @@ let test_persistence_after_reopen () =
        let* () = S.put tx 0 (bs "gamma") (bs "3") in
        let* () = S.commit tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* a = S.get tx 0 (bs "alpha") in
@@ -149,7 +150,7 @@ let test_persistence_after_reopen () =
 let test_delete_persists () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "k") (bs "v") in
@@ -158,7 +159,7 @@ let test_delete_persists () =
        let* () = S.del tx 0 (bs "k") in
        let* () = S.commit tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* got = S.get tx 0 (bs "k") in
@@ -171,14 +172,14 @@ let test_delete_persists () =
 let test_no_commit_no_persistence () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "k") (bs "v") in
        (* Rollback instead of commit — data must NOT persist. *)
        let* () = S.rollback tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* got = S.get tx 0 (bs "k") in
@@ -195,7 +196,7 @@ let test_no_commit_no_persistence () =
 let test_multiple_trees_independent () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 5 (bs "k") (bs "five") in
@@ -216,7 +217,7 @@ let test_multiple_trees_independent () =
 let test_multiple_trees_persist () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 16 (bs "x") (bs "X") in
@@ -224,7 +225,7 @@ let test_multiple_trees_persist () =
        let* () = S.put tx 18 (bs "z") (bs "Z") in
        let* () = S.commit tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* a = S.get tx 16 (bs "x") in
@@ -254,7 +255,7 @@ let collect_all c =
 let test_cursor_returns_sorted () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        (* Insert in arbitrary order *)
@@ -278,7 +279,7 @@ let test_cursor_returns_sorted () =
 let test_cursor_seek_between () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "a") (bs "1") in
@@ -311,7 +312,7 @@ let test_cursor_seek_between () =
 let test_rw_serialises () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx1 = S.rw_begin s in
        (* Start a second rw_begin in the background — it should block. *)
@@ -347,7 +348,7 @@ let test_rw_serialises () =
 let test_overwrite_persists () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "k") (bs "first") in
@@ -356,7 +357,7 @@ let test_overwrite_persists () =
        let* () = S.put tx 0 (bs "k") (bs "second") in
        let* () = S.commit tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* got = S.get tx 0 (bs "k") in
@@ -373,7 +374,7 @@ let test_overwrite_persists () =
 let test_many_puts () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let n = 200 in
        let* tx = S.rw_begin s in
@@ -408,7 +409,7 @@ let test_many_puts_persist () =
   run
     (with_fresh_db ~f:(fun path ->
        let n = 100 in
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () =
@@ -421,7 +422,7 @@ let test_many_puts_persist () =
        in
        let* () = S.commit tx in
        let* () = S.close s in
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* results =
@@ -448,7 +449,7 @@ let test_many_puts_persist () =
 let test_missing_key () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.ro_begin s in
        let* got = S.get tx 0 (bs "absent") in
@@ -461,7 +462,7 @@ let test_missing_key () =
 let test_cursor_empty () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.ro_begin s in
        let* cur = S.cursor_open tx 0 in
@@ -544,7 +545,7 @@ let prop_btree_matches_mem =
           cleanup path;
           Lwt.finalize
             (fun () ->
-               let* r = S.open_file ~path in
+               let* r = S.open_file ~path () in
                let bt = ok_store r in
                let mem = S.create () in
                let* () = apply_to_store bt ops in
@@ -576,12 +577,12 @@ let prop_persist_roundtrip =
           cleanup path;
           Lwt.finalize
             (fun () ->
-               let* r = S.open_file ~path in
+               let* r = S.open_file ~path () in
                let s = ok_store r in
                let* () = apply_to_store s ops in
                let* before = collect_via_cursor s in
                let* () = S.close s in
-               let* r2 = S.open_file ~path in
+               let* r2 = S.open_file ~path () in
                let s2 = ok_store r2 in
                let* after = collect_via_cursor s2 in
                let* () = S.close s2 in
@@ -632,7 +633,7 @@ let test_pp_error_all_variants () =
 let test_rollback_btree_drops_uncommitted () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        (* First: commit one value *)
        let* tx = S.rw_begin s in
@@ -657,7 +658,7 @@ let test_rollback_btree_drops_uncommitted () =
 let test_cursor_seek_found () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "alpha") (bs "1") in
@@ -688,7 +689,7 @@ let test_cursor_seek_found () =
 let test_cursor_seek_past_end () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "a") (bs "1") in
@@ -713,7 +714,7 @@ let test_cursor_seek_past_end () =
 let test_cursor_first_btree () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let* () = S.put tx 0 (bs "x") (bs "1") in
@@ -738,7 +739,7 @@ let test_cursor_first_btree () =
 let test_put_key_too_large_btree () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let big_key = Bytes.make 600 'k' in
@@ -761,7 +762,7 @@ let test_put_key_too_large_btree () =
 let test_put_value_too_large_btree () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        let* tx = S.rw_begin s in
        let big_val = Bytes.make 2000 'v' in
@@ -786,7 +787,7 @@ let test_put_value_too_large_btree () =
 let test_btree_corrupt_propagation () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        (* Insert enough rows that the table tree has multiple pages so
        the meta-tree references a real page (>= page 2). *)
@@ -816,7 +817,7 @@ let test_btree_corrupt_propagation () =
          ()
        done;
        Unix.close fd;
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        let s2 = ok_store r2 in
        let* tx = S.ro_begin s2 in
        let* exc =
@@ -871,7 +872,7 @@ let test_open_corrupt_headers_both () =
   close_out oc;
   let finished = ref false in
   Lwt_main.run
-    (let* r = S.open_file ~path in
+    (let* r = S.open_file ~path () in
      match r with
      | Ok s ->
        let* () = S.close s in
@@ -895,7 +896,7 @@ let test_freelist_survives_reopen () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Insert 50 rows to force some B+-tree page allocations *)
        for i = 1 to 50 do
          let tx = run (S.rw_begin store) in
@@ -914,7 +915,7 @@ let test_freelist_survives_reopen () =
        let fl_before = S.freelist_size store in
        run (S.close store);
        (* Reopen and verify freelist recovered *)
-       let store2 = Result.get_ok (run (S.open_file ~path)) in
+       let store2 = Result.get_ok (run (S.open_file ~path ())) in
        let fl_after = S.freelist_size store2 in
        Alcotest.(check bool) "freelist non-empty after reopen" true (fl_after > 0);
        Alcotest.(check int) "freelist size matches" fl_before fl_after;
@@ -928,7 +929,7 @@ let test_freed_pages_reused_after_reopen () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Build initial state *)
        for i = 1 to 30 do
          let tx = run (S.rw_begin store) in
@@ -946,7 +947,7 @@ let test_freed_pages_reused_after_reopen () =
        let n_pages_after_delete = S.n_pages store in
        run (S.close store);
        (* Reopen: freelist should be loaded *)
-       let store2 = Result.get_ok (run (S.open_file ~path)) in
+       let store2 = Result.get_ok (run (S.open_file ~path ())) in
        Alcotest.(check bool) "freelist loaded on reopen" true (S.freelist_size store2 > 0);
        (* Reinsert: should reuse freed pages, file should not grow significantly *)
        for i = 1 to 30 do
@@ -975,7 +976,7 @@ let test_rollback_restores_data () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx1 = run (S.rw_begin store) in
        run (S.put tx1 16 (Bytes.of_string "key") (Bytes.of_string "original"));
        run (S.commit tx1);
@@ -999,7 +1000,7 @@ let test_rollback_freelist_not_corrupted () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx1 = run (S.rw_begin store) in
        run (S.put tx1 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
        run (S.commit tx1);
@@ -1029,7 +1030,7 @@ let test_rollback_then_commit_works () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx1 = run (S.rw_begin store) in
        run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "first"));
        run (S.rollback tx1);
@@ -1053,7 +1054,7 @@ let test_rollback_new_key_absent () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Insert a brand-new key then rollback — key must not exist after *)
        let tx1 = run (S.rw_begin store) in
        run (S.put tx1 16 (Bytes.of_string "new_key") (Bytes.of_string "val"));
@@ -1079,7 +1080,7 @@ let test_ro_sees_committed_not_in_progress () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx1 = run (S.rw_begin store) in
        run (S.put tx1 16 (Bytes.of_string "k") (Bytes.of_string "committed"));
        run (S.commit tx1);
@@ -1122,7 +1123,7 @@ let test_ro_after_rw_begin_safe () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Commit initial state *)
        let tx0 = run (S.rw_begin store) in
        run (S.put tx0 16 (Bytes.of_string "key") (Bytes.of_string "original"));
@@ -1175,7 +1176,7 @@ let test_active_reader_gates_freelist () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Build some tree structure *)
        for i = 1 to 20 do
          let tx = run (S.rw_begin store) in
@@ -1252,7 +1253,7 @@ let test_active_reader_gates_freelist () =
 let test_btree_block_error_propagation () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        (* Write enough data to create a real tree with multiple pages *)
        let* tx = S.rw_begin s in
@@ -1272,7 +1273,7 @@ let test_btree_block_error_propagation () =
        let _ = Unix.ftruncate fd (2 * page_size) in
        Unix.close fd;
        (* Reopen: should succeed (headers on page 0-1 are intact) *)
-       let* r2 = S.open_file ~path in
+       let* r2 = S.open_file ~path () in
        match r2 with
        | Error _ ->
          (* File truncation may corrupt headers too — that's ok, abort *)
@@ -1306,7 +1307,7 @@ let test_freelist_read_error_path () =
       | _ -> ())
     (fun () ->
        (* Create a file with many CoW operations so freelist has entries *)
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Do many commits to build up freelist entries *)
        for i = 1 to 30 do
          let tx = run (S.rw_begin store) in
@@ -1361,7 +1362,7 @@ let test_freelist_read_error_path () =
          set_freelist_page buf1 Pg.page_size;
          Unix.close fd;
          (* Reopen: the freelist read will fail since freelist_page is out of bounds *)
-         let store2 = Result.get_ok (run (S.open_file ~path)) in
+         let store2 = Result.get_ok (run (S.open_file ~path ())) in
          (* The freelist should be empty (error during read caused early return) *)
          let _ = S.freelist_size store2 in
          run (S.close store2)))
@@ -1379,7 +1380,7 @@ let test_multiple_active_readers () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        (* Commit two rounds to advance txn_id so we get different snap_txn_ids *)
        let tx = run (S.rw_begin store) in
        run (S.put tx 16 (Bytes.of_string "k1") (Bytes.of_string "v1"));
@@ -1411,7 +1412,7 @@ let test_ro_cache_hit () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx = run (S.rw_begin store) in
        run (S.put tx 16 (Bytes.of_string "a") (Bytes.of_string "1"));
        run (S.commit tx);
@@ -1444,7 +1445,7 @@ let test_ro_refcount () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-       let store = Result.get_ok (run (S.open_file ~path)) in
+       let store = Result.get_ok (run (S.open_file ~path ())) in
        let tx = run (S.rw_begin store) in
        run (S.put tx 16 (Bytes.of_string "x") (Bytes.of_string "y"));
        run (S.commit tx);
@@ -1474,7 +1475,7 @@ let test_ro_refcount () =
 let test_with_ro_releases_on_exception () =
   run
     (with_fresh_db ~f:(fun path ->
-       let* r = S.open_file ~path in
+       let* r = S.open_file ~path () in
        let s = ok_store r in
        (* Seed rows so an RO walk touches real pages and takes pins. *)
        let* tx = S.rw_begin s in
@@ -1553,7 +1554,7 @@ let test_open_block_reopen_persists () =
 let test_savepoint_rollback_undoes_writes () =
   run
   @@ with_fresh_db ~f:(fun path ->
-    let* sr = S.open_file ~path in
+    let* sr = S.open_file ~path () in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
     let* () = S.put tx 16 (bs "before") (bs "1") in
@@ -1573,7 +1574,7 @@ let test_savepoint_rollback_undoes_writes () =
 let test_savepoint_release_keeps_writes () =
   run
   @@ with_fresh_db ~f:(fun path ->
-    let* sr = S.open_file ~path in
+    let* sr = S.open_file ~path () in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
     let* () = S.savepoint_begin tx "sp1" in
@@ -1581,7 +1582,7 @@ let test_savepoint_release_keeps_writes () =
     let* () = S.savepoint_release tx "sp1" in
     let* () = S.commit tx in
     let* () = S.close store in
-    let* sr2 = S.open_file ~path in
+    let* sr2 = S.open_file ~path () in
     let store2 = ok_store sr2 in
     let* tx = S.ro_begin store2 in
     let* v = S.get tx 16 (bs "k") in
@@ -1594,7 +1595,7 @@ let test_savepoint_release_keeps_writes () =
 let test_savepoint_nested_partial_rollback () =
   run
   @@ with_fresh_db ~f:(fun path ->
-    let* sr = S.open_file ~path in
+    let* sr = S.open_file ~path () in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
     let* () = S.put tx 16 (bs "a") (bs "1") in
@@ -1624,7 +1625,7 @@ let test_savepoint_nested_partial_rollback () =
 let test_savepoint_double_rollback_reuses () =
   run
   @@ with_fresh_db ~f:(fun path ->
-    let* sr = S.open_file ~path in
+    let* sr = S.open_file ~path () in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
     let* () = S.savepoint_begin tx "sp" in
@@ -1644,7 +1645,7 @@ let test_savepoint_double_rollback_reuses () =
 let test_savepoint_then_commit_persists () =
   run
   @@ with_fresh_db ~f:(fun path ->
-    let* sr = S.open_file ~path in
+    let* sr = S.open_file ~path () in
     let store = ok_store sr in
     let* tx = S.rw_begin store in
     let* () = S.put tx 16 (bs "a") (bs "1") in
@@ -1654,7 +1655,7 @@ let test_savepoint_then_commit_persists () =
     let* () = S.savepoint_release tx "sp" in
     let* () = S.commit tx in
     let* () = S.close store in
-    let* sr2 = S.open_file ~path in
+    let* sr2 = S.open_file ~path () in
     let store2 = ok_store sr2 in
     let* tx = S.ro_begin store2 in
     let* va = S.get tx 16 (bs "a") in

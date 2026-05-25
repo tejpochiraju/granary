@@ -7,6 +7,8 @@
   test_row
   test_schema_fingerprint
   test_store
+  test_geometry
+  test_geometry_e2e
   test_catalog
   test_lexer
   test_parser

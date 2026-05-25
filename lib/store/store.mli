@@ -52,23 +52,31 @@ val create : unit -> t
     [init_if_corrupt] controls the both-headers-corrupt case: when [true] the
     device is treated as fresh and initialised (correct for zeroed block
     devices); when [false] it returns [Header_error] instead, so an
-    existing-but-corrupt file is not silently clobbered. *)
+    existing-but-corrupt file is not silently clobbered.
+
+    [geom] (#95, default {!Sqlocaml_storage.Geometry.default}) is the geometry
+    used when CREATING a fresh device.  For an existing device the geometry is
+    discovered by peeking page 0, and [geom] is ignored.  The block backend's
+    own page size must already match (see [Unix_file.set_page_size]). *)
 val open_block
-  :  init_if_corrupt:bool
+  :  ?geom:Sqlocaml_storage.Geometry.t
+  -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
   -> n_pages:int64
   -> close:(unit -> unit Lwt.t)
+  -> unit
   -> (t, error) result Lwt.t
 
 (** Open a B+-tree backed store in WAL mode. Commits append dirty pages
     to the WAL device; reads route through the WAL first and fall back
     to the main DB. Crash recovery is performed automatically when the
-    WAL is opened. *)
+    WAL is opened.  [geom] behaves as in {!open_block} (#95). *)
 val open_block_wal
-  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  :  ?geom:Sqlocaml_storage.Geometry.t
+  -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
@@ -79,6 +87,7 @@ val open_block_wal
   -> wal_size_bytes:int64
   -> close:(unit -> unit Lwt.t)
   -> wal_close:(unit -> unit Lwt.t)
+  -> unit
   -> (t, error) result Lwt.t
 
 (** Close the store. After this, any use of the store or its txns is

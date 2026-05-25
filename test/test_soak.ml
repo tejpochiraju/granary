@@ -144,7 +144,7 @@ let test_soak_file () =
   (try Unix.unlink path with
    | _ -> ());
   let db =
-    match run (Db.open_file ~path) with
+    match run (Db.open_file ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file failed"
   in

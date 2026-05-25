@@ -170,7 +170,7 @@ let open_mem () = Db.open_in_memory ()
 let close_mem = Db.close
 
 let open_file path () =
-  let* r = Db.open_file ~path in
+  let* r = Db.open_file ~path () in
   match r with
   | Ok db -> Lwt.return db
   | Error e ->

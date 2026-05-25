@@ -68,6 +68,7 @@ let open_store () =
       ~resize
       ~n_pages:0L
       ~close:(fun () -> Lwt.return_unit)
+      ()
   in
   match r with
   | Ok st -> Lwt.return (st, reads)

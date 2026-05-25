@@ -21,10 +21,26 @@ val provider : Sqlocaml.Db.file_provider
 val install : unit -> unit
 
 (** Open a persistent B+-tree database at file [path], registering the file
-    provider for this process.  Creates the file if absent. *)
-val open_file : path:string -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
+    provider for this process.  Creates the file if absent.
+
+    [page_size] (default 4096, a multiple of 4096 up to 65536) and
+    [reserved_bytes_per_page] (default 0) set the page geometry when CREATING a
+    new file (#95); they are immutable thereafter and ignored when reopening an
+    existing file (whose stored geometry is used).  Reopening with an explicit
+    geometry that disagrees with the file is rejected. *)
+val open_file
+  :  ?page_size:int
+  -> ?reserved_bytes_per_page:int
+  -> path:string
+  -> unit
+  -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
 
 (** Open a persistent WAL-mode database ([path] for the main DB, [path ^ "-wal"]
     for the WAL), registering the file provider.  Crash recovery runs
-    automatically at open. *)
-val open_file_wal : path:string -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
+    automatically at open.  Geometry arguments behave as in {!open_file} (#95). *)
+val open_file_wal
+  :  ?page_size:int
+  -> ?reserved_bytes_per_page:int
+  -> path:string
+  -> unit
+  -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t

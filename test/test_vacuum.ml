@@ -41,7 +41,7 @@ let unwrap_db_err pfx = function
 ;;
 
 let open_path path =
-  let* dbr = Db.open_file ~path in
+  let* dbr = Db.open_file ~path () in
   Lwt.return (unwrap_db_err "open" dbr)
 ;;
 

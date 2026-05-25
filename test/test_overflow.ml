@@ -56,14 +56,14 @@ let test_small_overflow () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let v = Bytes.make 801 'X' in
           let* tx = S.rw_begin st in
           let* () = S.put tx 16 (bs "key1") v in
           let* () = S.commit tx in
           let* () = S.close st in
-          let* sr2 = S.open_file ~path in
+          let* sr2 = S.open_file ~path () in
           let st2 = ok_store sr2 in
           let* tx2 = S.ro_begin st2 in
           let* g = S.get tx2 16 (bs "key1") in
@@ -83,7 +83,7 @@ let test_multi_page_overflow () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let v = Bytes.init 12000 (fun i -> Char.chr (i land 0xff)) in
           let* tx = S.rw_begin st in
@@ -107,7 +107,7 @@ let test_huge_overflow () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let v = Bytes.init 200_000 (fun i -> Char.chr (i * 7 land 0xff)) in
           let* tx = S.rw_begin st in
@@ -135,7 +135,7 @@ let test_inline_does_not_overflow () =
      Lwt.finalize
        (fun () ->
           let single_put_pages ~value ~path =
-            let* sr = S.open_file ~path in
+            let* sr = S.open_file ~path () in
             let st = ok_store sr in
             let* tx = S.rw_begin st in
             let* () = S.put tx 16 (bs "k") value in
@@ -175,7 +175,7 @@ let test_replace_frees_chain () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let mk i = Bytes.init 5000 (fun j -> Char.chr ((i + j) land 0xff)) in
           let* tx = S.rw_begin st in
@@ -219,7 +219,7 @@ let test_del_frees_chain () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let v = Bytes.make 7000 'Z' in
           let initial_size = ref 0 in
@@ -266,7 +266,7 @@ let test_cursor_decodes_overflow () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let big = Bytes.init 10_000 (fun i -> Char.chr (i land 0xff)) in
           let small = bs "tiny" in
@@ -306,14 +306,14 @@ let test_overflow_wal_mode () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file_wal ~path in
+          let* sr = S.open_file_wal ~path () in
           let st = ok_store sr in
           let v = Bytes.init 30_000 (fun i -> Char.chr (i * 13 land 0xff)) in
           let* tx = S.rw_begin st in
           let* () = S.put tx 16 (bs "wal-blob") v in
           let* () = S.commit tx in
           let* () = S.close st in
-          let* sr2 = S.open_file_wal ~path in
+          let* sr2 = S.open_file_wal ~path () in
           let st2 = ok_store sr2 in
           let* tx2 = S.ro_begin st2 in
           let* g = S.get tx2 16 (bs "wal-blob") in
@@ -333,7 +333,7 @@ let test_savepoint_rollback_overflow () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr = S.open_file ~path in
+          let* sr = S.open_file ~path () in
           let st = ok_store sr in
           let pre = Bytes.make 6000 'A' in
           let post = Bytes.make 6000 'B' in

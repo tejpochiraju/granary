@@ -170,7 +170,7 @@ let test_bench_file () =
   (try Unix.unlink path with
    | _ -> ());
   let db =
-    match run (Db.open_file ~path) with
+    match run (Db.open_file ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file failed"
   in
@@ -189,7 +189,7 @@ let test_bench_wal () =
   (try Unix.unlink wal with
    | _ -> ());
   let db =
-    match run (Db.open_file_wal ~path) with
+    match run (Db.open_file_wal ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open_file_wal failed"
   in

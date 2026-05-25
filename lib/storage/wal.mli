@@ -43,7 +43,9 @@ type frame =
   ; page : Cstruct.t (** 4096 bytes *)
   }
 
-(** Size of one WAL frame on disk in bytes (24-byte frame header + 4096-byte page = 4120). *)
+(** Size of one WAL frame for the DEFAULT 4096-byte geometry (24-byte frame
+    header + 4096-byte page = 4120).  A WAL opened with a non-default
+    [page_size] uses a proportionally larger frame internally (#95). *)
 val frame_size_bytes : int
 
 (** Size of a WAL frame header in bytes (24). *)
@@ -59,12 +61,17 @@ val pp_error : Format.formatter -> error -> unit
     empty (or smaller than [header_size_bytes]) the WAL is initialised
     with a fresh salt and seed. Otherwise the header is read, and a
     forward scan recovers the index of every page in the last contiguous
-    committed batch. A trailing partial batch is silently discarded. *)
+    committed batch. A trailing partial batch is silently discarded.
+
+    [page_size] (default {!Geometry.default}'s 4096) sets the frame's page
+    payload size; it must match the main DB geometry (#95). *)
 val open_
-  :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  :  ?page_size:int
+  -> read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> size_bytes:int64
+  -> unit
   -> (t, error) result Lwt.t
 
 (** Total committed frames currently in the WAL. *)

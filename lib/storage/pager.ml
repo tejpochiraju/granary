@@ -43,6 +43,12 @@ type t =
   ; write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; sync : unit -> (unit, string) result Lwt.t
   ; resize : n_pages:int64 -> (unit, string) result Lwt.t
+  ; mutable geom : Geometry.t
+    (** Page geometry for this file (#95): buffers are allocated at
+        [geom.page_size]; [btree]/[store] read [max_data_bytes] etc. from here.
+        Defaults to {!Geometry.default}; the open path calls {!set_geom} once
+        with the file's real geometry before any page op, after which it is
+        effectively immutable. *)
   ; cache : (cache_key, Cstruct.t) Hashtbl.t
   ; dirty : (int64, Cstruct.t) Hashtbl.t
   ; fifo : cache_key Queue.t (* insertion order for FIFO eviction *)
@@ -87,6 +93,7 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; write_page
   ; sync
   ; resize
+  ; geom = Geometry.default
   ; cache = Hashtbl.create 64
   ; dirty = Hashtbl.create 16
   ; fifo = Queue.create ()
@@ -105,6 +112,18 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
    pages.  Reset to 0 before writing system-tree (e.g. meta) pages. *)
 let set_write_tag t (tag : int32) = t.write_tag <- tag
 let write_tag t = t.write_tag
+
+(* #95: set the file's page geometry.  Called once by the open path before any
+   page read/write, after peeking/deciding the geometry. *)
+let set_geom t geom = t.geom <- geom
+
+(* #95: page geometry accessors (cheap field reads on the hot path). *)
+let geom t = t.geom
+let page_size t = t.geom.page_size
+let reserved_bytes t = t.geom.reserved_bytes_per_page
+let max_data_bytes t = Geometry.max_data_bytes t.geom
+let max_overflow_payload_bytes t = Geometry.max_overflow_payload_bytes t.geom
+let max_freelist_entries_per_page t = Geometry.max_freelist_entries_per_page t.geom
 
 let set_wal t cb =
   (* Any cache entries built before the WAL hook was attached came from
@@ -227,7 +246,7 @@ let load_main_page t pin_set page_id =
     pin_page t pin_set page_id;
     Lwt.return_ok (cstruct_dup buf)
   | None ->
-    let buf = Cstruct.create Page.page_size in
+    let buf = Cstruct.create t.geom.page_size in
     let* result = t.read_page ~page_id buf in
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)

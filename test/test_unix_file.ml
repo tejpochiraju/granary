@@ -1,7 +1,7 @@
 open Lwt.Syntax
 module UF = Sqlocaml_unix.Unix_file
 
-let page_size = UF.page_size
+let page_size = 4096
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                             *)
@@ -38,7 +38,7 @@ let open_creates_file_test () =
     (let path = fresh_path () in
      (try Unix.unlink path with
       | _ -> ());
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -58,7 +58,7 @@ let open_existing_file_test () =
   Lwt_main.run
     (let path = fresh_path () in
      (* Create file with 2 pages via resize *)
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      let* () =
        match r with
        | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
@@ -68,7 +68,7 @@ let open_existing_file_test () =
          Lwt.return_unit
      in
      (* Re-open; should see 2 pages *)
-     let* r2 = UF.open_ ~path in
+     let* r2 = UF.open_ ~path () in
      let* () =
        match r2 with
        | Error e -> Alcotest.failf "re-open error: %a" UF.pp_error e
@@ -88,7 +88,7 @@ let open_existing_file_test () =
 let resize_write_read_roundtrip_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -122,7 +122,7 @@ let resize_write_read_roundtrip_test () =
 let read_oob_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -152,7 +152,7 @@ let read_oob_test () =
 let write_oob_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -171,7 +171,7 @@ let write_oob_test () =
 let oob_error_fields_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -192,7 +192,7 @@ let oob_error_fields_test () =
 let read_oob_empty_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -215,7 +215,7 @@ let read_oob_empty_test () =
 let sync_after_write_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -249,11 +249,11 @@ let sync_after_write_test () =
 let flock_conflict_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r1 = UF.open_ ~path in
+     let* r1 = UF.open_ ~path () in
      match r1 with
      | Error e -> Alcotest.failf "first open_ error: %a" UF.pp_error e
      | Ok t1 ->
-       let* r2 = UF.open_ ~path in
+       let* r2 = UF.open_ ~path () in
        (match r2 with
         | Ok _ -> Alcotest.fail "expected lock conflict on second open_, got Ok"
         | Error (UF.Io _) -> () (* expected *)
@@ -271,14 +271,14 @@ let flock_conflict_test () =
 let close_releases_lock_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r1 = UF.open_ ~path in
+     let* r1 = UF.open_ ~path () in
      let t1 =
        match r1 with
        | Error e -> Alcotest.failf "first open_ error: %a" UF.pp_error e
        | Ok t -> t
      in
      (* second open should fail *)
-     let* r2 = UF.open_ ~path in
+     let* r2 = UF.open_ ~path () in
      (match r2 with
       | Ok _ -> Alcotest.fail "expected conflict before close"
       | Error _ -> ());
@@ -288,7 +288,7 @@ let close_releases_lock_test () =
       | Error e -> Alcotest.failf "close error: %a" UF.pp_error e
       | Ok () -> ());
      (* third open after close should succeed *)
-     let* r3 = UF.open_ ~path in
+     let* r3 = UF.open_ ~path () in
      let* () =
        match r3 with
        | Error e -> Alcotest.failf "open after close error: %a" UF.pp_error e
@@ -337,7 +337,7 @@ let pp_error_oob_test () =
 let resize_grow_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -361,7 +361,7 @@ let resize_grow_test () =
 let resize_shrink_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -385,7 +385,7 @@ let resize_shrink_test () =
 let resize_preserves_data_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -411,7 +411,7 @@ let resize_preserves_data_test () =
 let resize_to_zero_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -439,7 +439,7 @@ let resize_to_zero_test () =
 let page_isolation_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->
@@ -485,7 +485,7 @@ let cross_process_lock_test () =
    | _ -> ());
   (* Ensure the file exists with at least one page so it has bytes for lockf *)
   Lwt_main.run
-    (let* r = UF.open_ ~path in
+    (let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "prepare: %a" UF.pp_error e
      | Ok t ->
@@ -512,7 +512,7 @@ let cross_process_lock_test () =
     Unix.close r_pipe;
     let result =
       Lwt_main.run
-        (let* r = UF.open_ ~path in
+        (let* r = UF.open_ ~path () in
          match r with
          | Ok t ->
            let* _ = UF.close t in
@@ -533,7 +533,7 @@ let cross_process_lock_test () =
 let ops_on_closed_fd_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open: %a" UF.pp_error e
      | Ok t ->
@@ -600,7 +600,7 @@ let prop_write_read_roundtrip =
        let path = fresh_path () in
        let result =
          Lwt_main.run
-           (let* ro = UF.open_ ~path in
+           (let* ro = UF.open_ ~path () in
             match ro with
             | Error _ -> Lwt.return false
             | Ok t ->
@@ -648,7 +648,7 @@ let prop_page_independence =
        let path = fresh_path () in
        let result =
          Lwt_main.run
-           (let* ro = UF.open_ ~path in
+           (let* ro = UF.open_ ~path () in
             match ro with
             | Error _ -> Lwt.return false
             | Ok t ->
@@ -698,7 +698,7 @@ let prop_oob_always_errors =
        let path = fresh_path () in
        let result =
          Lwt_main.run
-           (let* ro = UF.open_ ~path in
+           (let* ro = UF.open_ ~path () in
             match ro with
             | Error _ -> Lwt.return false
             | Ok t ->
@@ -732,7 +732,7 @@ let prop_resize_n_pages_correct =
        let path = fresh_path () in
        let result =
          Lwt_main.run
-           (let* ro = UF.open_ ~path in
+           (let* ro = UF.open_ ~path () in
             match ro with
             | Error _ -> Lwt.return false
             | Ok t ->
@@ -768,7 +768,7 @@ let prop_resize_n_pages_correct =
 let read_page_yields_to_timer_test () =
   Lwt_main.run
     (let path = fresh_path () in
-     let* r = UF.open_ ~path in
+     let* r = UF.open_ ~path () in
      match r with
      | Error e -> Alcotest.failf "open_ error: %a" UF.pp_error e
      | Ok t ->

@@ -14,6 +14,10 @@ type t =
     (** On-disk format version (#174).  Preserved across commits; only a fresh
         [init] stamps [current_format_version].  Opening a header whose version
         exceeds [max_supported_format_version] fails with [Unsupported_format]. *)
+  ; geom : Geometry.t
+    (** Page geometry persisted in the header (#95): page_size at byte 56,
+        reserved_bytes_per_page at byte 64.  Chosen at creation, immutable
+        thereafter, preserved verbatim across commits. *)
   }
 
 (* On-disk format versions:
@@ -49,9 +53,9 @@ let pp fmt t =
 (* Convert a Pager error to our error type. *)
 let of_pager_err e = Io (Format.asprintf "%a" Pager.pp_error e)
 
-(* Build a sealed header page buffer. *)
+(* Build a sealed header page buffer.  Sized to the file's geometry (#95). *)
 let build_page (h : t) =
-  let buf = Cstruct.create Page.page_size in
+  let buf = Cstruct.create h.geom.page_size in
   Page.write_common
     buf
     { Page.kind = Page.Header; flags = 0; n_keys = 0; right_page = 0l; crc32 = 0l };
@@ -62,8 +66,9 @@ let build_page (h : t) =
     ; freelist_page = h.freelist_page
     ; n_pages_total = h.n_pages_total
     ; schema_version = h.schema_version
-    ; page_size = Int32.of_int Page.page_size
+    ; page_size = Int32.of_int h.geom.page_size
     ; format_version = h.format_version
+    ; reserved_bytes_per_page = Int32.of_int h.geom.reserved_bytes_per_page
     };
   Page.seal buf;
   buf
@@ -83,14 +88,24 @@ let decode_page buf =
       then None
       else (
         let f = Page.read_header_fields buf in
-        Some
-          { txn_id = f.Page.txn_id
-          ; root_page = f.Page.root_page
-          ; freelist_page = f.Page.freelist_page
-          ; n_pages_total = f.Page.n_pages_total
-          ; schema_version = f.Page.schema_version
-          ; format_version = f.Page.format_version
-          }))
+        (* Reconstruct the persisted geometry (#95).  A stored geometry that
+           fails validation is treated as corruption — the header is rejected. *)
+        match
+          Geometry.create
+            ~page_size:(Int32.to_int f.Page.page_size)
+            ~reserved_bytes_per_page:(Int32.to_int f.Page.reserved_bytes_per_page)
+        with
+        | Error _ -> None
+        | Ok geom ->
+          Some
+            { txn_id = f.Page.txn_id
+            ; root_page = f.Page.root_page
+            ; freelist_page = f.Page.freelist_page
+            ; n_pages_total = f.Page.n_pages_total
+            ; schema_version = f.Page.schema_version
+            ; format_version = f.Page.format_version
+            ; geom
+            }))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -131,6 +146,25 @@ let read_live pager =
        else Ok h)
 ;;
 
+(* #95 bootstrap: learn a file's geometry from the leading bytes of page 0
+   WITHOUT verifying the CRC — the CRC covers the whole real page, whose size
+   we don't yet know.  The page_size/reserved fields live at bytes 56/64, always
+   within the first 4096 bytes regardless of the true page size, so a single
+   default-geometry read of page 0 is enough to discover them.  Returns [None]
+   for a zeroed/fresh page (page_size 0 fails validation) or for garbage; the
+   caller then falls back to a caller-supplied or default geometry, and the
+   subsequent full {!read_live} CRC-verifies under the chosen geometry. *)
+let peek_geometry (first_bytes : Cstruct.t) : Geometry.t option =
+  if Cstruct.length first_bytes < 68
+  then None
+  else (
+    let page_size = Int32.to_int (Cstruct.BE.get_uint32 first_bytes 56) in
+    let reserved = Int32.to_int (Cstruct.BE.get_uint32 first_bytes 64) in
+    match Geometry.create ~page_size ~reserved_bytes_per_page:reserved with
+    | Ok g -> Some g
+    | Error _ -> None)
+;;
+
 (* Internal: write the next header into the inactive page slot.  Returns
    the prepared header value (so callers can mirror it into in-memory
    state).  Does NOT flush — callers choose [Pager.flush] (full sync) or
@@ -166,6 +200,7 @@ let init pager =
     ; n_pages_total = 0L
     ; schema_version = 0L
     ; format_version = current_format_version
+    ; geom = Pager.geom pager
     }
   in
   let buf0 = build_page zero in

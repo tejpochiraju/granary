@@ -11,6 +11,9 @@ type t =
   ; format_version : int32
     (** On-disk format version (#174).  Preserved across commits; only a fresh
         [init] stamps [current_format_version]. *)
+  ; geom : Geometry.t
+    (** Page geometry persisted in the header (#95): page_size + reserved bytes,
+        fixed at creation, preserved verbatim across commits. *)
   }
 
 (** On-disk format version this build writes for freshly-initialised
@@ -32,6 +35,15 @@ val pp : Format.formatter -> t -> unit
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
+
+(** #95 bootstrap: discover a file's page geometry from the leading bytes of
+    page 0 (page_size at byte 56, reserved at byte 64) WITHOUT verifying the
+    CRC — the CRC covers the whole real page, whose size is what we're trying
+    to learn.  Pass at least the first 68 bytes of page 0 (a default 4096-byte
+    read suffices).  Returns [None] for a fresh/zeroed page or garbage, in which
+    case the caller uses a supplied/default geometry.  Once the geometry is
+    known, {!read_live} re-reads and CRC-verifies the full header pages. *)
+val peek_geometry : Cstruct.t -> Geometry.t option
 
 (** Read both headers (pages 0 and 1) from the pager.
     Pick the live one: the valid header (passes CRC) with the higher txn_id.

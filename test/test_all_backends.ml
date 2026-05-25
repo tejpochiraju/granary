@@ -91,7 +91,7 @@ let with_mem_db f =
 ;;
 
 let with_file_db path f =
-  let* r = DB.open_file ~path in
+  let* r = DB.open_file ~path () in
   match r with
   | Error e -> Alcotest.failf "open_file failed: %s" (error_msg e)
   | Ok db -> Lwt.finalize (fun () -> f db) (fun () -> DB.close db)
@@ -108,6 +108,7 @@ let with_mirage_db path f =
       ~resize:(MB.resize adapter)
       ~n_pages:(MB.n_pages adapter)
       ~close:(fun () -> MB.close adapter)
+      ()
   in
   match r with
   | Error e -> Alcotest.failf "open_block failed: %s" (error_msg e)

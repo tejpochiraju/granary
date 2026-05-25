@@ -18,6 +18,7 @@ module Pager = Sqlocaml_storage.Pager
 module Header = Sqlocaml_storage.Header
 module Freelist = Sqlocaml_storage.Freelist
 module Page = Sqlocaml_storage.Page
+module Geometry = Sqlocaml_storage.Geometry
 module Varint = Sqlocaml_encoding.Varint
 module Bytes_map = Map.Make (Bytes)
 
@@ -359,7 +360,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
         | Error _ -> Lwt.return (Freelist.of_list (List.rev acc))
         | Ok buf ->
           let common = Page.read_common buf in
-          let n = min common.Page.n_keys Page.max_freelist_entries_per_page in
+          let n = min common.Page.n_keys (Pager.max_freelist_entries_per_page pager) in
           let next_pid =
             Int64.logand 0xFFFFFFFFL (Int64.of_int32 common.Page.right_page)
           in
@@ -444,7 +445,21 @@ let close (t : t) : unit Lwt.t =
     st.close_fn ()
 ;;
 
+(* #95: discover the file's geometry by reading page 0's leading bytes through
+   the raw block callback (page 0 is always at offset 0, so this works whatever
+   the backend's addressing page size, and it bypasses the pager cache).  Falls
+   back to [fallback] for a fresh/empty/zeroed device, which a subsequent
+   [Header.init] then stamps. *)
+let peek_geometry ~read_page ~fallback =
+  let buf = Cstruct.create Geometry.default.page_size in
+  let%lwt r = read_page ~page_id:0L buf in
+  match r with
+  | Ok () -> Lwt.return (Option.value (Header.peek_geometry buf) ~default:fallback)
+  | Error _ -> Lwt.return fallback
+;;
+
 let open_block
+      ?(geom = Geometry.default)
       ~(init_if_corrupt : bool)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -452,11 +467,16 @@ let open_block
       ~(resize : n_pages:int64 -> (unit, string) result Lwt.t)
       ~(n_pages : int64)
       ~(close : unit -> unit Lwt.t)
+      ()
   : (t, error) result Lwt.t
   =
   let pager =
     Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
   in
+  (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
+     fresh one) before any header read so buffers are sized correctly (#95). *)
+  let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+  Pager.set_geom pager eff_geom;
   let%lwt hr = Header.read_live pager in
   match hr with
   | Error Header.Both_headers_corrupt when init_if_corrupt ->
@@ -554,6 +574,7 @@ let finish_wal_open ~close ~wal_close ~pager ~wal ~was_fresh =
 ;;
 
 let open_block_wal
+      ?(geom = Geometry.default)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(write_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
       ~(sync : unit -> (unit, string) result Lwt.t)
@@ -565,11 +586,16 @@ let open_block_wal
       ~(wal_size_bytes : int64)
       ~(close : unit -> unit Lwt.t)
       ~(wal_close : unit -> unit Lwt.t)
+      ()
   : (t, error) result Lwt.t
   =
   let pager =
     Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
   in
+  (* Adopt the file's real geometry before any header read or WAL open so the
+     main-DB buffers and the WAL frame size both match it (#95). *)
+  let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+  Pager.set_geom pager eff_geom;
   (* Step 1: read the main-DB header (or initialise if fresh). The WAL
      hook is NOT installed yet, so writes go directly to the main DB.
      [was_fresh] flag preserves the post-init n_pages override below. *)
@@ -592,10 +618,12 @@ let open_block_wal
     (* Step 2: open the WAL and recover its index. *)
     let%lwt wr =
       Wal.open_
+        ~page_size:(Pager.page_size pager)
         ~read_at:wal_read_at
         ~write_at:wal_write_at
         ~sync:wal_sync
         ~size_bytes:wal_size_bytes
+        ()
     in
     (match wr with
      | Error e ->
@@ -734,7 +762,7 @@ let free_old_freelist_pages pager ~first_page =
 (* Build and write a single freelist page holding [chunk] (possibly empty),
    chaining to [next]. *)
 let write_one_freelist_page pager ~pid ~next ~chunk =
-  let buf = Cstruct.create Page.page_size in
+  let buf = Cstruct.create (Pager.page_size pager) in
   Cstruct.memset buf 0;
   Page.write_common
     buf
@@ -754,7 +782,7 @@ let write_one_freelist_page pager ~pid ~next ~chunk =
 let write_freelist_pages pager : int64 Lwt.t =
   let entries_before = Freelist.to_list (Pager.freelist pager) in
   let n_entries = List.length entries_before in
-  let max_per = Page.max_freelist_entries_per_page in
+  let max_per = Pager.max_freelist_entries_per_page pager in
   let n_fl_pages = (n_entries + max_per - 1) / max_per in
   if n_fl_pages = 0
   then Lwt.return 0L
@@ -988,6 +1016,8 @@ let commit_prepare_btree
     ; (* Preserve the on-disk format version this db was opened with (#174);
          never silently upgrade or downgrade it here. *)
       format_version = st.current_header.format_version
+    ; (* Preserve the file's page geometry (#95); fixed at creation. *)
+      geom = st.current_header.geom
     }
   in
   let* r = header_commit st.pager ~prev_header:st.current_header ~new_state in

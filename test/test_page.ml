@@ -226,6 +226,7 @@ let test_header_fields_roundtrip () =
       ; schema_version = 1L
       ; page_size = 4096l
       ; format_version = 1l
+      ; reserved_bytes_per_page = 0l
       }
   in
   P.write_header_fields buf hf;
@@ -575,6 +576,71 @@ let test_leaf_entry_at_val_overflow () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* 9c. Large-page geometry (#95): the codec sizes itself to the buffer  *)
+(*     length, not a hard-coded 4096, so 8K/16K pages work end-to-end.  *)
+(* ------------------------------------------------------------------ *)
+
+(* The CRC must cover the WHOLE page, not just the first 4096 bytes — so a
+   corruption past offset 4096 on a 16K page is still detected. *)
+let test_crc_covers_whole_large_page () =
+  let buf = Cstruct.create 16384 in
+  Cstruct.memset buf 0;
+  P.write_common buf (make_common P.Leaf);
+  P.seal buf;
+  Alcotest.(check bool) "sealed 16K page verifies" true (P.verify_crc buf);
+  flip_byte buf 9000;
+  Alcotest.(check bool) "CRC covers byte 9000 of a 16K page" false (P.verify_crc buf)
+;;
+
+(* Leaf entries can be appended and read back past offset 4096 on a large
+   page — the append guard is the buffer end, not 4096. *)
+let test_leaf_append_beyond_4096 () =
+  let buf = Cstruct.create 16384 in
+  Cstruct.memset buf 0;
+  let key = Bytes.make 100 'k' in
+  let value = Bytes.make 100 'v' in
+  let rec fill off n =
+    if n = 0 then off else fill (P.leaf_append_entry buf ~offset:off ~key ~value) (n - 1)
+  in
+  (* 60 entries * (4 + 100 + 100) = 12240 bytes of data, crossing 4096. *)
+  let last_off = fill P.data_offset 60 in
+  Alcotest.(check bool) "appended past offset 4096" true (last_off > 4096);
+  (* Walk to the entry that begins beyond 4096 and confirm it round-trips. *)
+  let rec find off =
+    if off > 4096
+    then off
+    else (
+      match P.leaf_entry_at buf ~offset:off with
+      | `End -> Alcotest.fail "unexpected End before crossing 4096"
+      | `Entry (e : P.leaf_entry) -> find e.next_offset)
+  in
+  let beyond = find P.data_offset in
+  match P.leaf_entry_at buf ~offset:beyond with
+  | `End -> Alcotest.fail "expected Entry beyond offset 4096"
+  | `Entry (e : P.leaf_entry) ->
+    Alcotest.(check bool) "key beyond 4096 round-trips" true (Bytes.equal key e.key);
+    Alcotest.(check bool) "value beyond 4096 round-trips" true (Bytes.equal value e.value)
+;;
+
+(* An append whose entry would intrude into the reserved tail (#95) is
+   refused, even though it would fit if the reserved bytes were usable. *)
+let test_leaf_append_respects_reserved () =
+  let key = Bytes.make 30 'k' in
+  let value = Bytes.make 30 'v' in
+  let offset = 4000 in
+  (* entry_size = 4 + 30 + 30 = 64, ending at 4064 — within 4096 but past the
+     reserved-aware ceiling 4096 - 64 = 4032. *)
+  let no_reserve = Cstruct.create 4096 in
+  Cstruct.memset no_reserve 0;
+  let _ = P.leaf_append_entry no_reserve ~offset ~key ~value in
+  let reserved = Cstruct.create 4096 in
+  Cstruct.memset reserved 0;
+  match P.leaf_append_entry ~reserved:64 reserved ~offset ~key ~value with
+  | _ -> Alcotest.fail "expected Invalid_argument: entry intrudes into reserved tail"
+  | exception Invalid_argument _ -> ()
+;;
+
+(* ------------------------------------------------------------------ *)
 (* 10. QCheck property tests                                           *)
 (* ------------------------------------------------------------------ *)
 
@@ -829,6 +895,20 @@ let () =
             `Quick
             test_freelist_multiple_entries
         ; Alcotest.test_case "freelist isolation" `Quick test_freelist_isolation
+        ] )
+    ; ( "large_page"
+      , [ Alcotest.test_case
+            "CRC covers whole 16K page"
+            `Quick
+            test_crc_covers_whole_large_page
+        ; Alcotest.test_case
+            "leaf append/read beyond 4096"
+            `Quick
+            test_leaf_append_beyond_4096
+        ; Alcotest.test_case
+            "leaf append respects reserved tail"
+            `Quick
+            test_leaf_append_respects_reserved
         ] )
     ; "qcheck", qcheck_tests
     ]

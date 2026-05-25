@@ -40,7 +40,7 @@ let test_fts_persists_across_reopen () =
   run (fun () ->
     let path = Filename.temp_file "test_fts_persist" ".db" in
     (* Create and close *)
-    let* db1_r = D.open_file ~path in
+    let* db1_r = D.open_file ~path () in
     match db1_r with
     | Error e -> Alcotest.failf "open1: %s" (Format.asprintf "%a" D.pp_error e)
     | Ok db1 ->
@@ -50,7 +50,7 @@ let test_fts_persists_across_reopen () =
        | Ok () ->
          let* () = D.close db1 in
          (* Reopen and verify the FTS DDL succeeds again with a different name *)
-         let* db2_r = D.open_file ~path in
+         let* db2_r = D.open_file ~path () in
          (match db2_r with
           | Error e -> Alcotest.failf "open2: %s" (Format.asprintf "%a" D.pp_error e)
           | Ok db2 ->

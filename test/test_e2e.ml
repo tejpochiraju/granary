@@ -1498,7 +1498,7 @@ let drop_table_recreate_old_data_invisible () =
 let open_file_invalid_path () =
   run
     ((* "/" is always a directory; openfile with O_RDWR on it fails. *)
-     let* result = Db.open_file ~path:"/" in
+     let* result = Db.open_file ~path:"/" () in
      (match result with
       | Ok _ -> Alcotest.fail "expected Error opening '/'"
       | Error (Db.Runtime _) -> ()
@@ -1523,7 +1523,7 @@ let with_tempfile f =
 let default_real_persists () =
   with_tempfile (fun path ->
     run
-      (let* db_res = Db.open_file ~path in
+      (let* db_res = Db.open_file ~path () in
        let db =
          match db_res with
          | Ok d -> d
@@ -1532,7 +1532,7 @@ let default_real_persists () =
        let* _ = Db.execute db "CREATE TABLE t (n INTEGER, f REAL DEFAULT 2.5)" in
        let* () = Db.close db in
        (* Reopen and check schema *)
-       let* db_res2 = Db.open_file ~path in
+       let* db_res2 = Db.open_file ~path () in
        let db2 =
          match db_res2 with
          | Ok d -> d
@@ -1557,7 +1557,7 @@ let default_real_persists () =
 let default_text_persists () =
   with_tempfile (fun path ->
     run
-      (let* db_res = Db.open_file ~path in
+      (let* db_res = Db.open_file ~path () in
        let db =
          match db_res with
          | Ok d -> d
@@ -1565,7 +1565,7 @@ let default_text_persists () =
        in
        let* _ = Db.execute db "CREATE TABLE t (n INTEGER, s TEXT DEFAULT 'hello')" in
        let* () = Db.close db in
-       let* db_res2 = Db.open_file ~path in
+       let* db_res2 = Db.open_file ~path () in
        let db2 =
          match db_res2 with
          | Ok d -> d
@@ -1589,7 +1589,7 @@ let default_text_persists () =
 let default_int_persists () =
   with_tempfile (fun path ->
     run
-      (let* db_res = Db.open_file ~path in
+      (let* db_res = Db.open_file ~path () in
        let db =
          match db_res with
          | Ok d -> d
@@ -1597,7 +1597,7 @@ let default_int_persists () =
        in
        let* _ = Db.execute db "CREATE TABLE t (n INTEGER, k INTEGER DEFAULT 42)" in
        let* () = Db.close db in
-       let* db_res2 = Db.open_file ~path in
+       let* db_res2 = Db.open_file ~path () in
        let db2 =
          match db_res2 with
          | Ok d -> d
@@ -3401,7 +3401,7 @@ let test_check_persisted () =
          try Unix.unlink tmpfile with
          | _ -> ())
        (fun () ->
-          let* db_res = Db.open_file ~path:tmpfile in
+          let* db_res = Db.open_file ~path:tmpfile () in
           let db =
             match db_res with
             | Ok d -> d
@@ -3414,7 +3414,7 @@ let test_check_persisted () =
           in
           let* _ = Db.execute db "INSERT INTO t VALUES (1, 10)" in
           let* () = Db.close db in
-          let* db2_res = Db.open_file ~path:tmpfile in
+          let* db2_res = Db.open_file ~path:tmpfile () in
           let db2 =
             match db2_res with
             | Ok d -> d
@@ -5129,7 +5129,7 @@ let test_view_independent_per_db () =
 let test_view_persistence () =
   with_tempfile (fun path ->
     run
-      (let* db_res = Db.open_file ~path in
+      (let* db_res = Db.open_file ~path () in
        let db =
          match db_res with
          | Ok d -> d
@@ -5140,7 +5140,7 @@ let test_view_persistence () =
        let* _ = Db.execute db "INSERT INTO t VALUES (2, 'bob')" in
        let* _ = Db.execute db "CREATE VIEW v AS SELECT name FROM t WHERE id = 1" in
        let* () = Db.close db in
-       let* db_res2 = Db.open_file ~path in
+       let* db_res2 = Db.open_file ~path () in
        let db2 =
          match db_res2 with
          | Ok d -> d
@@ -6971,7 +6971,7 @@ let test_trigger_persists_across_reopen () =
   let path = Filename.temp_file "sqlocaml_test" ".db" in
   Lwt_main.run
     ((* First session: create table, trigger, insert *)
-     let* result1 = Db.open_file ~path in
+     let* result1 = Db.open_file ~path () in
      let db1 =
        match result1 with
        | Ok db -> db
@@ -6994,7 +6994,7 @@ let test_trigger_persists_across_reopen () =
      let* () = exec1 "INSERT INTO t VALUES (1)" in
      let* () = Db.close db1 in
      (* Second session: reopen, insert again, verify trigger fired both times *)
-     let* result2 = Db.open_file ~path in
+     let* result2 = Db.open_file ~path () in
      let db2 =
        match result2 with
        | Ok db -> db
@@ -11085,7 +11085,7 @@ let test_phase35_deferred_btree_backend () =
       | _ -> ());
      Lwt.finalize
        (fun () ->
-          let* r = Db.open_file ~path in
+          let* r = Db.open_file ~path () in
           let db =
             match r with
             | Ok d -> d

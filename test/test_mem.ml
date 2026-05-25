@@ -15,7 +15,7 @@ let string_contains haystack needle =
   go 0
 ;;
 
-let page_size = Mem.page_size
+let page_size = 4096
 
 (* Helper: create a fresh Cstruct buffer of page_size *)
 let make_buf () = Cstruct.create page_size
@@ -33,7 +33,7 @@ let buf_of_bytes b =
 
 let read_zeros_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.read_page m ~page_id:0L buf in
      match r with
@@ -46,7 +46,7 @@ let read_zeros_test () =
 
 let write_then_read_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let hello = Bytes.of_string "hello" in
      let wbuf = make_buf () in
      Cstruct.blit_from_bytes hello 0 wbuf 0 (Bytes.length hello);
@@ -71,7 +71,7 @@ let write_then_read_test () =
 
 let page_isolation_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let wbuf = make_buf () in
      Cstruct.memset wbuf 0xAB;
      let* wr = Mem.write_page m ~page_id:0L wbuf in
@@ -90,7 +90,7 @@ let page_isolation_test () =
 
 let full_page_write_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:2L in
+    (let m = Mem.create ~n_pages:2L () in
      let payload = Bytes.init page_size (fun i -> Char.chr (i mod 256)) in
      let wbuf = buf_of_bytes payload in
      let* wr = Mem.write_page m ~page_id:0L wbuf in
@@ -109,7 +109,7 @@ let full_page_write_test () =
 
 let overwrite_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:2L in
+    (let m = Mem.create ~n_pages:2L () in
      let mk s =
        let b = Bytes.make page_size '\x00' in
        String.iteri (fun i c -> Bytes.set b i c) s;
@@ -130,7 +130,7 @@ let overwrite_test () =
 
 let write_last_valid_page_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'Z';
      let* wr = Mem.write_page m ~page_id:3L wbuf in
@@ -147,7 +147,7 @@ let write_last_valid_page_test () =
 
 let write_page_0_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:1L in
+    (let m = Mem.create ~n_pages:1L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'X';
      let* wr = Mem.write_page m ~page_id:0L wbuf in
@@ -168,7 +168,7 @@ let write_page_0_test () =
 
 let read_oob_exact_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.read_page m ~page_id:4L buf in
      (match r with
@@ -179,7 +179,7 @@ let read_oob_exact_test () =
 
 let read_oob_high_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.read_page m ~page_id:100L buf in
      (match r with
@@ -190,7 +190,7 @@ let read_oob_high_test () =
 
 let read_oob_negative_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.read_page m ~page_id:(-1L) buf in
      (match r with
@@ -201,7 +201,7 @@ let read_oob_negative_test () =
 
 let write_oob_exact_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.write_page m ~page_id:4L buf in
      (match r with
@@ -212,7 +212,7 @@ let write_oob_exact_test () =
 
 let write_oob_negative_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.write_page m ~page_id:(-1L) buf in
      (match r with
@@ -223,7 +223,7 @@ let write_oob_negative_test () =
 
 let oob_error_fields_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let buf = make_buf () in
      let* r = Mem.read_page m ~page_id:5L buf in
      (match r with
@@ -236,7 +236,7 @@ let oob_error_fields_test () =
 
 let empty_backend_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:0L in
+    (let m = Mem.create ~n_pages:0L () in
      let buf = make_buf () in
      let* rr = Mem.read_page m ~page_id:0L buf in
      (match rr with
@@ -255,7 +255,7 @@ let empty_backend_test () =
 
 let resize_grow_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:2L in
+    (let m = Mem.create ~n_pages:2L () in
      let* r = Mem.resize m ~n_pages:8L in
      (match r with
       | Error e -> Alcotest.failf "resize error: %a" Mem.pp_error e
@@ -273,7 +273,7 @@ let resize_grow_test () =
 
 let resize_shrink_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:8L in
+    (let m = Mem.create ~n_pages:8L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'S';
      let* _ = Mem.write_page m ~page_id:7L wbuf in
@@ -292,7 +292,7 @@ let resize_shrink_test () =
 
 let resize_grow_preserves_data_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:2L in
+    (let m = Mem.create ~n_pages:2L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'P';
      let* _ = Mem.write_page m ~page_id:0L wbuf in
@@ -308,7 +308,7 @@ let resize_grow_preserves_data_test () =
 
 let resize_shrink_then_grow_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:8L in
+    (let m = Mem.create ~n_pages:8L () in
      (* Write to all pages *)
      let wbuf = make_buf () in
      Cstruct.memset wbuf 0xFF;
@@ -343,7 +343,7 @@ let resize_shrink_then_grow_test () =
 
 let resize_to_same_size_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'Q';
      let* _ = Mem.write_page m ~page_id:0L wbuf in
@@ -362,7 +362,7 @@ let resize_to_same_size_test () =
 
 let resize_to_zero_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let* r = Mem.resize m ~n_pages:0L in
      (match r with
       | Error e -> Alcotest.failf "resize error: %a" Mem.pp_error e
@@ -386,7 +386,7 @@ let resize_to_zero_test () =
 
 let sync_always_ok_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:4L in
+    (let m = Mem.create ~n_pages:4L () in
      let* r = Mem.sync m in
      (match r with
       | Error e -> Alcotest.failf "sync error: %a" Mem.pp_error e
@@ -396,7 +396,7 @@ let sync_always_ok_test () =
 
 let sync_after_write_test () =
   Lwt_main.run
-    (let m = Mem.create ~n_pages:2L in
+    (let m = Mem.create ~n_pages:2L () in
      let wbuf = make_buf () in
      Cstruct.set_char wbuf 0 'Y';
      let* _ = Mem.write_page m ~page_id:0L wbuf in
@@ -440,7 +440,7 @@ let prop_write_read_roundtrip =
     ~count:200
     (QCheck.make gen)
     (fun (page_id, payload) ->
-       let m = Mem.create ~n_pages:10L in
+       let m = Mem.create ~n_pages:10L () in
        let wbuf = buf_of_bytes payload in
        let ok =
          Lwt_main.run
@@ -473,7 +473,7 @@ let prop_oob_always_errors =
     ~count:500
     (QCheck.make gen)
     (fun page_id ->
-       let m = Mem.create ~n_pages:4L in
+       let m = Mem.create ~n_pages:4L () in
        Lwt_main.run
          (let buf = make_buf () in
           let* rr = Mem.read_page m ~page_id buf in
@@ -497,7 +497,7 @@ let prop_resize_n_pages_correct =
     ~count:1000
     (QCheck.make (QCheck.Gen.int_range 0 20))
     (fun n ->
-       let m = Mem.create ~n_pages:1L in
+       let m = Mem.create ~n_pages:1L () in
        Lwt_main.run
          (let* r = Mem.resize m ~n_pages:(Int64.of_int n) in
           match r with
@@ -517,7 +517,7 @@ let prop_fresh_pages_are_zero =
     ~count:500
     (QCheck.make gen)
     (fun (size, page_id) ->
-       let m = Mem.create ~n_pages:(Int64.of_int size) in
+       let m = Mem.create ~n_pages:(Int64.of_int size) () in
        Lwt_main.run
          (let buf = make_buf () in
           let* rr = Mem.read_page m ~page_id:(Int64.of_int page_id) buf in

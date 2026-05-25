@@ -117,7 +117,7 @@ let () =
        if db_path = ":memory:"
        then Db.open_in_memory ()
        else
-         let* result = Sqlocaml_unix.open_file ~path:db_path in
+         let* result = Sqlocaml_unix.open_file ~path:db_path () in
          match result with
          | Ok db -> Lwt.return db
          | Error e ->

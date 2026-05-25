@@ -97,7 +97,7 @@ let unix_write_at fd ~offset (src : Cstruct.t) =
    the simulated stall — which is exactly the #149 invariant we want
    to measure. *)
 let open_slow_wal ~path ~delay =
-  let* fr = UF.open_ ~path in
+  let* fr = UF.open_ ~path () in
   let file =
     match fr with
     | Ok f -> f
@@ -171,6 +171,7 @@ let open_slow_wal ~path ~delay =
       ~wal_size_bytes
       ~close
       ~wal_close
+      ()
   in
   match sr with
   | Ok s -> Lwt.return s

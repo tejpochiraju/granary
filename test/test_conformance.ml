@@ -126,7 +126,7 @@ let run_suite open_db close_db tests =
 let open_mem () = Db.open_in_memory ()
 
 let open_unix_file path () =
-  let* result = Db.open_file ~path in
+  let* result = Db.open_file ~path () in
   match result with
   | Ok db -> Lwt.return db
   | Error _ -> Alcotest.fail "open_unix_file: failed to open db"
@@ -839,6 +839,7 @@ let open_mirage path () =
       ~resize:(MB.resize adapter)
       ~n_pages:(MB.n_pages adapter)
       ~close:(fun () -> MB.close adapter)
+      ()
   in
   match r with
   | Ok db -> Lwt.return db

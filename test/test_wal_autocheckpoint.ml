@@ -61,7 +61,7 @@ let bs = Bytes.of_string
 let test_bounded_under_low_threshold () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st =
       match sr with
       | Ok t -> t
@@ -106,7 +106,7 @@ let test_bounded_under_low_threshold () =
 let test_zero_threshold_disables () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st =
       match sr with
       | Ok t -> t
@@ -140,7 +140,7 @@ let test_zero_threshold_disables () =
 let test_default_threshold () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st =
       match sr with
       | Ok t -> t
@@ -165,7 +165,7 @@ let row_int_first stream =
 let test_pragma_round_trip () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* db = D.open_file_wal ~path in
+    let* db = D.open_file_wal ~path () in
     let db =
       match db with
       | Ok d -> d
@@ -225,7 +225,7 @@ let test_writer_not_blocked_by_autocheckpoint () =
   (try Unix.unlink (path ^ "-wal") with
    | _ -> ());
   let db =
-    match run (D.open_file_wal ~path) with
+    match run (D.open_file_wal ~path ()) with
     | Ok d -> d
     | Error _ -> Alcotest.fail "open"
   in

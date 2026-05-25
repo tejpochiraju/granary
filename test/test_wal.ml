@@ -53,6 +53,7 @@ let fresh_wal ?(size = 65536) () =
       ~write_at:(write_at d)
       ~sync:sync_ok
       ~size_bytes:(dev_size d)
+      ()
   in
   match r with
   | Ok w -> Lwt.return (d, w)
@@ -133,6 +134,7 @@ let test_recovery_replays_committed () =
          ~write_at:(write_at d)
          ~sync:sync_ok
          ~size_bytes:(dev_size d)
+         ()
      in
      let w2 =
        match r with
@@ -175,6 +177,7 @@ let test_recovery_drops_partial_trailing_batch () =
          ~write_at:(write_at d)
          ~sync:sync_ok
          ~size_bytes:(dev_size d)
+         ()
      in
      let w2 =
        match r with
@@ -209,6 +212,7 @@ let test_recovery_drops_uncommitted_batch () =
          ~write_at:(write_at d)
          ~sync:sync_ok
          ~size_bytes:(dev_size d)
+         ()
      in
      let w2 =
        match r with
@@ -293,6 +297,7 @@ let test_find_page_at_after_recovery () =
          ~write_at:(write_at d)
          ~sync:sync_ok
          ~size_bytes:(dev_size d)
+         ()
      in
      let w2 =
        match r with

@@ -70,7 +70,7 @@ let open_with_faults ~path ~size_bytes ~config =
   Unix.ftruncate fd size_bytes;
   Unix.close fd;
   let t = { config; writes = 0; faulted = false } in
-  let* uf_result = Unix_file.open_ ~path in
+  let* uf_result = Unix_file.open_ ~path () in
   match uf_result with
   | Error e ->
     Lwt.fail_with

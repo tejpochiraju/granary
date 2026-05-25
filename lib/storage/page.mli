@@ -4,16 +4,20 @@
     the page layout as Cstruct accessors and the types for each page kind.
     No I/O happens here — this is a pure codec. *)
 
-(** 4096 bytes per page. *)
+(** Default page size in bytes (4096).  The codec itself sizes to the actual
+    buffer length (#95); runtime geometry lives in {!Geometry}/{!Pager}.  This
+    constant is the default value, used for building default-geometry pages
+    (mainly in tests). *)
 val page_size : int
 
-(** 16 bytes — the common page header. *)
+(** 16 bytes — the common page header (geometry-independent). *)
 val header_size : int
 
 (** 16 — first byte of the data area (same as [header_size]). *)
 val data_offset : int
 
-(** 4080 — bytes available in the data area (bytes 16..4095). *)
+(** 4080 — usable data bytes for the DEFAULT 4096 geometry.  For a runtime
+    geometry use {!Geometry.max_data_bytes}. *)
 val max_data_bytes : int
 
 (** Kind of a page. *)
@@ -66,8 +70,10 @@ type header_fields =
   ; freelist_page : int64 (** int64 BE; first freelist page, 0 if none *)
   ; n_pages_total : int64 (** int64 BE; total pages in file including headers *)
   ; schema_version : int64 (** int64 BE *)
-  ; page_size : int32 (** int32 BE; must be 4096 *)
+  ; page_size : int32 (** int32 BE; a multiple of 4096 (#95) *)
   ; format_version : int32 (** int32 BE; 1 for v1 *)
+  ; reserved_bytes_per_page : int32
+    (** int32 BE; fixed bytes carved off each page's tail (#95), 0 by default *)
   }
 
 (** Read header-page fields from [buf] (reads bytes 16–63). *)
@@ -95,9 +101,17 @@ type branch_entry =
 val branch_entry_at : Cstruct.t -> offset:int -> [ `Entry of branch_entry | `End ]
 
 (** Append a branch entry at [offset].  Returns the next offset after the
-    appended entry.  Raises [Invalid_argument] if the entry would overflow the
-    page or if [key] is longer than 65535 bytes. *)
-val branch_append_entry : Cstruct.t -> offset:int -> key:bytes -> left_child:int32 -> int
+    appended entry.  The usable ceiling is [Cstruct.length buf - reserved]
+    ([reserved] defaults to 0, #95); the page size is taken from the buffer.
+    Raises [Invalid_argument] if the entry would overflow that ceiling or if
+    [key] is longer than 65535 bytes. *)
+val branch_append_entry
+  :  ?reserved:int
+  -> Cstruct.t
+  -> offset:int
+  -> key:bytes
+  -> left_child:int32
+  -> int
 
 (** A decoded leaf page entry. *)
 type leaf_entry =
@@ -114,12 +128,21 @@ type leaf_entry =
     Returns `` `Entry leaf_entry`` or `` `End``. *)
 val leaf_entry_at : Cstruct.t -> offset:int -> [ `Entry of leaf_entry | `End ]
 
-(** Append a leaf entry at [offset].  Returns the next offset.  Raises
-    [Invalid_argument] if the entry would overflow the page or if [key] or
-    [value] is longer than 65535 bytes. *)
-val leaf_append_entry : Cstruct.t -> offset:int -> key:bytes -> value:bytes -> int
+(** Append a leaf entry at [offset].  Returns the next offset.  The usable
+    ceiling is [Cstruct.length buf - reserved] ([reserved] defaults to 0, #95);
+    the page size is taken from the buffer.  Raises [Invalid_argument] if the
+    entry would overflow that ceiling or if [key] or [value] is longer than
+    65535 bytes. *)
+val leaf_append_entry
+  :  ?reserved:int
+  -> Cstruct.t
+  -> offset:int
+  -> key:bytes
+  -> value:bytes
+  -> int
 
-(** [4080 / 12 = 340] freelist entries fit per page. *)
+(** [4080 / 12 = 340] freelist entries per page for the DEFAULT 4096 geometry.
+    For a runtime geometry use {!Geometry.max_freelist_entries_per_page}. *)
 val max_freelist_entries_per_page : int
 
 (** A decoded freelist page entry. *)
@@ -139,7 +162,8 @@ val freelist_set_entry
   -> freed_at_txn_id:int64
   -> unit
 
-(** Maximum payload bytes per overflow page = 4080 - 2 (payload_len header). *)
+(** Maximum payload bytes per overflow page for the default 4096 geometry
+    (4080 - 2).  For a runtime geometry use {!Geometry.max_overflow_payload_bytes}. *)
 val max_overflow_payload_bytes : int
 
 (** Read the payload length stored at bytes 16..17 of an Overflow page. *)
@@ -149,10 +173,12 @@ val overflow_payload_len : Cstruct.t -> int
 val overflow_payload : Cstruct.t -> bytes
 
 (** Write an overflow page: sets kind=Overflow, n_keys=0, right_page=next_pid,
-    payload_len, and copies [payload] into the data area.  Does NOT seal — caller
-    invokes [seal]. *)
+    payload_len, and copies [payload] into the data area.  The maximum payload
+    is [Cstruct.length buf - data_offset - 2 - reserved] ([reserved] defaults to
+    0, #95).  Does NOT seal — caller invokes [seal]. *)
 val write_overflow
-  :  Cstruct.t
+  :  ?reserved:int
+  -> Cstruct.t
   -> next_pid:int32
   -> payload:bytes
   -> payload_off:int

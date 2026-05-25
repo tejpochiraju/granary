@@ -13,7 +13,9 @@ val pp : Format.formatter -> t -> unit
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
-(** Create a pager over an open Unix_file or Mem block device.
+(** Create a pager over an open Unix_file or Mem block device.  The geometry
+    defaults to {!Geometry.default} (4096/0); the open path calls {!set_geom}
+    with the file's real geometry before any page op (#95).
     [n_pages]: current total pages in the file (from header, or 0 for empty file).
     [freelist]: the current freelist state (deserialized from the file, or [Freelist.empty]). *)
 val create
@@ -24,6 +26,28 @@ val create
   -> n_pages:int64
   -> freelist:Freelist.t
   -> t
+
+(** Set this pager's page geometry (#95).  Called once by the open path before
+    any page read/write, after the geometry is peeked/decided. *)
+val set_geom : t -> Geometry.t -> unit
+
+(** The page geometry chosen for this pager (#95). *)
+val geom : t -> Geometry.t
+
+(** [geom.page_size] — bytes per page on disk. *)
+val page_size : t -> int
+
+(** [geom.reserved_bytes_per_page] — fixed bytes carved off each page's tail. *)
+val reserved_bytes : t -> int
+
+(** Usable data-area bytes per page for this geometry. *)
+val max_data_bytes : t -> int
+
+(** Maximum payload an overflow page can hold for this geometry. *)
+val max_overflow_payload_bytes : t -> int
+
+(** Freelist entries per freelist page for this geometry. *)
+val max_freelist_entries_per_page : t -> int
 
 (** Read a page.
     [snapshot_frames] (default [None]): writer / non-WAL reader path —

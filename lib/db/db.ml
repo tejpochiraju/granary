@@ -168,11 +168,12 @@ let of_store ?clock ?file_path store =
     }
 ;;
 
-let open_block ~read_page ~write_page ~sync ~resize ~n_pages ~close
+let open_block ?geom ~read_page ~write_page ~sync ~resize ~n_pages ~close ()
   : (t, error) result Lwt.t
   =
   let* result =
     S.open_block
+      ?geom
       ~init_if_corrupt:true
       ~read_page
       ~write_page
@@ -180,6 +181,7 @@ let open_block ~read_page ~write_page ~sync ~resize ~n_pages ~close
       ~resize
       ~n_pages
       ~close
+      ()
   in
   match result with
   | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))

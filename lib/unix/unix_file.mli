@@ -17,12 +17,19 @@ val pp : Format.formatter -> t -> unit
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
 
-(** Page size in bytes (4096). *)
-val page_size : int
+(** This file's page size in bytes (#95). *)
+val page_size : t -> int
 
-(** [open_ ~path] opens (or creates) the file and takes an exclusive
-    [flock]. *)
-val open_ : path:string -> (t, error) result Lwt.t
+(** [set_page_size t ps] adopts page size [ps] for addressing and recomputes
+    the logical page count from the file's byte size (#95).  Called by the open
+    path after peeking the header's geometry on an existing file. *)
+val set_page_size : t -> int -> unit
+
+(** [open_ ?page_size ~path ()] opens (or creates) the file and takes an
+    exclusive [flock].  [page_size] (default 4096, #95) sets the addressing
+    granularity; for an existing file of a different geometry, open at the
+    default then {!set_page_size} after peeking the header. *)
+val open_ : ?page_size:int -> path:string -> unit -> (t, error) result Lwt.t
 
 (** Release the lock and close the underlying file descriptor. *)
 val close : t -> (unit, error) result Lwt.t

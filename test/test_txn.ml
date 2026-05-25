@@ -16,7 +16,7 @@ let fresh_file_db () =
   let path = Printf.sprintf "/tmp/sqlocaml_txn_test_%04d.db" n in
   (try Unix.unlink path with
    | _ -> ());
-  match run (Db.open_file ~path) with
+  match run (Db.open_file ~path ()) with
   | Ok db -> db, path
   | Error _ -> Alcotest.fail "open_file failed"
 ;;

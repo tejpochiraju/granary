@@ -119,7 +119,7 @@ let open_db ~path =
   then
     let* d = Db.open_in_memory () in
     Lwt.return (Ok d)
-  else Sqlocaml_unix.open_file ~path
+  else Sqlocaml_unix.open_file ~path ()
 ;;
 
 (* ------------------------------------------------------------------ *)

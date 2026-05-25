@@ -33,7 +33,7 @@ let open_with_fi ~path ~config =
     FI.open_with_faults ~path ~size_bytes:(4 * 1024 * 1024) ~config
   in
   let* r =
-    Db.open_block ~read_page:read ~write_page:write ~sync ~resize ~n_pages ~close
+    Db.open_block ~read_page:read ~write_page:write ~sync ~resize ~n_pages ~close ()
   in
   match r with
   | Ok db -> Lwt.return (Some (db, handle))
@@ -186,7 +186,7 @@ let test_reopen_after_fault () =
             and [Error _] are acceptable Phase 36a outcomes. *)
           let* reopen_r =
             Lwt.catch
-              (fun () -> Db.open_file ~path)
+              (fun () -> Db.open_file ~path ())
               (fun exn ->
                  Lwt.return
                    (Error

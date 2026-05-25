@@ -1,16 +1,18 @@
 open Lwt.Syntax
 
-let page_size = 4096
+(* Default page size when none is supplied (#95). *)
+let default_page_size = 4096
 
 module Make (B : Mirage_block.S) = struct
   type t =
     { dev : B.t
+    ; page_size : int
     ; sectors_per_page : int
     ; capacity : int64
     ; mutable n_pages : int64
     }
 
-  let connect dev =
+  let connect ?(page_size = default_page_size) dev =
     let* info = B.get_info dev in
     let sector_size = info.Mirage_block.sector_size in
     if page_size mod sector_size <> 0
@@ -25,10 +27,11 @@ module Make (B : Mirage_block.S) = struct
       let capacity =
         Int64.div info.Mirage_block.size_sectors (Int64.of_int sectors_per_page)
       in
-      Lwt.return { dev; sectors_per_page; capacity; n_pages = 0L })
+      Lwt.return { dev; page_size; sectors_per_page; capacity; n_pages = 0L })
   ;;
 
   let n_pages t = t.n_pages
+  let page_size t = t.page_size
 
   let in_capacity t page_id =
     Int64.compare page_id 0L >= 0 && Int64.compare page_id t.capacity < 0

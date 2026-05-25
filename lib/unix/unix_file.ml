@@ -1,6 +1,7 @@
 open Lwt.Syntax
 
-let page_size = 4096
+(* Default page size when none is supplied (#95). *)
+let default_page_size = 4096
 
 type error =
   | Io of string
@@ -25,9 +26,20 @@ type t =
   { fd : Lwt_unix.file_descr
   ; inode_key : int * int
   ; mutable n_pages : int64
+  ; mutable page_size : int (** bytes per page for addressing (#95) *)
+  ; mutable size_bytes : int (** file size at open; used to recompute n_pages *)
   }
 
 let n_pages t = t.n_pages
+let page_size t = t.page_size
+
+(* #95: adopt a new page size (after peeking the header's geometry) and
+   recompute the logical page count from the file's byte size. *)
+let set_page_size t ps =
+  t.page_size <- ps;
+  t.n_pages <- Int64.of_int (t.size_bytes / ps)
+;;
+
 let pp fmt t = Format.fprintf fmt "Unix_file.t { n_pages = %Ld }" t.n_pages
 
 let in_bounds t page_id =
@@ -69,7 +81,7 @@ let pwrite_exactly fd ~file_offset buf off len =
    report. *)
 let close_silently fd = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
 
-let open_ ~path =
+let open_ ?(page_size = default_page_size) ~path () =
   Lwt.catch
     (fun () ->
        let* fd = Lwt_unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
@@ -88,7 +100,8 @@ let open_ ~path =
                    let* size = Lwt_unix.lseek fd 0 Unix.SEEK_END in
                    let n_pages = Int64.of_int (size / page_size) in
                    Hashtbl.add locked_inodes key ();
-                   Lwt.return_ok { fd; inode_key = key; n_pages })
+                   Lwt.return_ok
+                     { fd; inode_key = key; n_pages; page_size; size_bytes = size })
                 (function
                   | Unix.Unix_error (Unix.EWOULDBLOCK, _, _) ->
                     let* () = close_silently fd in
@@ -125,10 +138,13 @@ let read_page t ~page_id buf =
   else
     Lwt.catch
       (fun () ->
-         let offset = Int64.to_int (Int64.mul page_id (Int64.of_int page_size)) in
-         let tmp = Bytes.create page_size in
-         let* () = pread_exactly t.fd ~file_offset:offset tmp 0 page_size in
-         Cstruct.blit_from_bytes tmp 0 buf 0 page_size;
+         (* Transfer the caller's buffer length (#95): a short read (e.g. the
+            4096-byte geometry peek of page 0) reads only the leading bytes. *)
+         let len = Cstruct.length buf in
+         let offset = Int64.to_int (Int64.mul page_id (Int64.of_int t.page_size)) in
+         let tmp = Bytes.create len in
+         let* () = pread_exactly t.fd ~file_offset:offset tmp 0 len in
+         Cstruct.blit_from_bytes tmp 0 buf 0 len;
          Lwt.return_ok ())
       (function
         | Unix.Unix_error (e, _, _) -> Lwt.return_error (Io (Unix.error_message e))
@@ -142,10 +158,11 @@ let write_page t ~page_id buf =
   else
     Lwt.catch
       (fun () ->
-         let offset = Int64.to_int (Int64.mul page_id (Int64.of_int page_size)) in
-         let tmp = Bytes.create page_size in
-         Cstruct.blit_to_bytes buf 0 tmp 0 page_size;
-         let* () = pwrite_exactly t.fd ~file_offset:offset tmp 0 page_size in
+         let len = Cstruct.length buf in
+         let offset = Int64.to_int (Int64.mul page_id (Int64.of_int t.page_size)) in
+         let tmp = Bytes.create len in
+         Cstruct.blit_to_bytes buf 0 tmp 0 len;
+         let* () = pwrite_exactly t.fd ~file_offset:offset tmp 0 len in
          Lwt.return_ok ())
       (function
         | Unix.Unix_error (e, _, _) -> Lwt.return_error (Io (Unix.error_message e))
@@ -166,9 +183,10 @@ let sync t =
 let resize t ~n_pages =
   Lwt.catch
     (fun () ->
-       let new_size = Int64.to_int (Int64.mul n_pages (Int64.of_int page_size)) in
+       let new_size = Int64.to_int (Int64.mul n_pages (Int64.of_int t.page_size)) in
        let* () = Lwt_unix.ftruncate t.fd new_size in
        t.n_pages <- n_pages;
+       t.size_bytes <- new_size;
        Lwt.return_ok ())
     (function
       | Unix.Unix_error (e, _, _) -> Lwt.return_error (Io (Unix.error_message e))

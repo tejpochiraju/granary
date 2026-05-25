@@ -51,7 +51,7 @@ let with_fresh ~f =
 let test_wal_mode_flag () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     Alcotest.(check bool) "wal_mode set" true (S.wal_mode st);
     let* () = S.close st in
@@ -61,7 +61,7 @@ let test_wal_mode_flag () =
 let test_wal_commit_then_read_same_session () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k") (bs "v") in
@@ -77,7 +77,7 @@ let test_wal_commit_then_read_same_session () =
 let test_wal_commit_visible_after_reopen () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k") (bs "v") in
@@ -85,7 +85,7 @@ let test_wal_commit_visible_after_reopen () =
     let* () = S.close st in
     (* Reopen: the WAL still has the commit; main DB has not yet been
        checkpointed, so the data lives only in WAL. *)
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let* v = S.get tx 16 (bs "k") in
@@ -98,7 +98,7 @@ let test_wal_commit_visible_after_reopen () =
 let test_wal_multi_commits_latest_wins () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k") (bs "v1") in
@@ -107,7 +107,7 @@ let test_wal_multi_commits_latest_wins () =
     let* () = S.put tx 16 (bs "k") (bs "v2") in
     let* () = S.commit tx in
     let* () = S.close st in
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let* v = S.get tx 16 (bs "k") in
@@ -120,7 +120,7 @@ let test_wal_multi_commits_latest_wins () =
 let test_wal_rollback_drops_writes () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k1") (bs "v1") in
@@ -141,7 +141,7 @@ let test_wal_rollback_drops_writes () =
 let test_wal_savepoint_inside_wal () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "a") (bs "1") in
@@ -150,7 +150,7 @@ let test_wal_savepoint_inside_wal () =
     let* () = S.savepoint_rollback tx "sp" in
     let* () = S.commit tx in
     let* () = S.close st in
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let* va = S.get tx 16 (bs "a") in
@@ -165,7 +165,7 @@ let test_wal_savepoint_inside_wal () =
 let test_wal_many_commits () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let n = 20 in
     let rec do_inserts i =
@@ -181,7 +181,7 @@ let test_wal_many_commits () =
     in
     let* () = do_inserts 0 in
     let* () = S.close st in
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let rec verify i =
@@ -203,7 +203,7 @@ let test_wal_many_commits () =
 let test_wal_checkpoint_migrates_data () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k") (bs "v") in
@@ -221,14 +221,14 @@ let test_wal_checkpoint_migrates_data () =
 let test_wal_checkpoint_then_reopen () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "k") (bs "checkpointed") in
     let* () = S.commit tx in
     let* () = S.checkpoint st in
     let* () = S.close st in
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let* v = S.get tx 16 (bs "k") in
@@ -244,7 +244,7 @@ let test_wal_checkpoint_then_reopen () =
 let test_wal_checkpoint_with_commits_after () =
   run
   @@ with_fresh ~f:(fun path ->
-    let* sr = S.open_file_wal ~path in
+    let* sr = S.open_file_wal ~path () in
     let st = ok_store sr in
     let* tx = S.rw_begin st in
     let* () = S.put tx 16 (bs "old") (bs "1") in
@@ -255,7 +255,7 @@ let test_wal_checkpoint_with_commits_after () =
     let* () = S.put tx 16 (bs "new") (bs "2") in
     let* () = S.commit tx in
     let* () = S.close st in
-    let* sr2 = S.open_file_wal ~path in
+    let* sr2 = S.open_file_wal ~path () in
     let st2 = ok_store sr2 in
     let* tx = S.ro_begin st2 in
     let* vo = S.get tx 16 (bs "old") in
@@ -283,7 +283,7 @@ let test_pragma_wal_checkpoint_via_sql () =
   let module Db = Sqlocaml.Db in
   run
   @@ with_fresh ~f:(fun path ->
-    let* r = Sqlocaml_unix.open_file_wal ~path in
+    let* r = Sqlocaml_unix.open_file_wal ~path () in
     let db =
       match r with
       | Ok db -> db

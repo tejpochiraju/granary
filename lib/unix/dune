@@ -1,7 +1,14 @@
 (library
  (name sqlocaml_unix)
  (public_name sqlocaml.unix)
- (libraries lwt lwt.unix unix cstruct sqlocaml.store sqlocaml)
+ (libraries
+  lwt
+  lwt.unix
+  unix
+  cstruct
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

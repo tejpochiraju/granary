@@ -87,7 +87,7 @@ let test_torn_write_midframe () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr1 = S.open_file_wal ~path in
+          let* sr1 = S.open_file_wal ~path () in
           let st1 = ok_store sr1 in
           let* tx = S.rw_begin st1 in
           let* () = S.put tx 16 (bs "good") (bs "1") in
@@ -102,7 +102,7 @@ let test_torn_write_midframe () =
           let junk = Bytes.make extra '\xAA' in
           let _ = Unix.write fd junk 0 extra in
           Unix.close fd;
-          let* sr2 = S.open_file_wal ~path in
+          let* sr2 = S.open_file_wal ~path () in
           let st2 = ok_store sr2 in
           let* tx = S.ro_begin st2 in
           let* v = S.get tx 16 (bs "good") in
@@ -124,7 +124,7 @@ let test_single_byte_corruption () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr1 = S.open_file_wal ~path in
+          let* sr1 = S.open_file_wal ~path () in
           let st1 = ok_store sr1 in
           let* tx = S.rw_begin st1 in
           let* () = S.put tx 16 (bs "ok") (bs "1") in
@@ -142,7 +142,7 @@ let test_single_byte_corruption () =
           (* Recovery: the only valid committed batch was the one we just
          broke, so the WAL contributes nothing and the store opens with
          just the on-disk-header (empty) state. *)
-          let* sr2 = S.open_file_wal ~path in
+          let* sr2 = S.open_file_wal ~path () in
           let st2 = ok_store sr2 in
           let* tx = S.ro_begin st2 in
           let* v = S.get tx 16 (bs "ok") in
@@ -165,7 +165,7 @@ let test_incomplete_batch_dropped () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* sr1 = S.open_file_wal ~path in
+          let* sr1 = S.open_file_wal ~path () in
           let st1 = ok_store sr1 in
           let* tx = S.rw_begin st1 in
           let* () = S.put tx 16 (bs "alpha") (bs "1") in
@@ -181,7 +181,7 @@ let test_incomplete_batch_dropped () =
           let _ = Unix.write fd frame 0 (Bytes.length frame) in
           let _ = off in
           Unix.close fd;
-          let* sr2 = S.open_file_wal ~path in
+          let* sr2 = S.open_file_wal ~path () in
           let st2 = ok_store sr2 in
           let* tx = S.ro_begin st2 in
           let* v = S.get tx 16 (bs "alpha") in
@@ -209,7 +209,7 @@ let test_seeded_random_truncation () =
          cleanup path;
          Lwt.finalize
            (fun () ->
-              let* sr1 = S.open_file_wal ~path in
+              let* sr1 = S.open_file_wal ~path () in
               let st1 = ok_store sr1 in
               let prefixes = ref [ Hashtbl.create 1 ] in
               let cur = Hashtbl.create 8 in
@@ -232,7 +232,7 @@ let test_seeded_random_truncation () =
               let fd = Unix.openfile (path ^ "-wal") [ Unix.O_RDWR ] 0o644 in
               Unix.ftruncate fd keep;
               Unix.close fd;
-              let* sr2 = S.open_file_wal ~path in
+              let* sr2 = S.open_file_wal ~path () in
               let st2 = ok_store sr2 in
               let* tx = S.ro_begin st2 in
               let* v0 = S.get tx 16 (bs "k0") in

@@ -256,7 +256,7 @@ let test_mixed_column_types_roundtrip () =
       | _ -> ())
     (fun () ->
        run
-         (let* sr = S.open_file ~path in
+         (let* sr = S.open_file ~path () in
           let store =
             match sr with
             | Ok s -> s
@@ -273,7 +273,7 @@ let test_mixed_column_types_roundtrip () =
           let* _ = C.create_table cat ~name:"mixed" ~columns:cols ~without_rowid:false in
           let* () = S.close store in
           (* Reopen and force the catalog to decode columns from disk *)
-          let* sr2 = S.open_file ~path in
+          let* sr2 = S.open_file ~path () in
           let store2 =
             match sr2 with
             | Ok s -> s

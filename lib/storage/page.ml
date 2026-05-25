@@ -104,7 +104,7 @@ let crc32_table : int32 array =
 *)
 let compute_crc buf =
   let crc = ref 0xFFFFFFFFl in
-  for i = 0 to page_size - 1 do
+  for i = 0 to Cstruct.length buf - 1 do
     (* Treat bytes 8..11 (the stored CRC32 field) as zero during computation *)
     let byte = if i >= 8 && i <= 11 then 0 else Char.code (Cstruct.get_char buf i) in
     let idx = Int32.to_int (Int32.logand (Int32.logxor !crc (Int32.of_int byte)) 0xFFl) in
@@ -145,7 +145,8 @@ let read_tag buf : int32 = Cstruct.BE.get_uint32 buf tag_offset
     +48  [8] schema_version (int64 BE)
     +56  [4] page_size      (int32 BE)
     +60  [4] format_version (int32 BE)
-    +64..4095 reserved zeros
+    +64  [4] reserved_bytes_per_page (int32 BE, #95)
+    +68..(page_size-1) reserved zeros
 *)
 
 type header_fields =
@@ -156,6 +157,7 @@ type header_fields =
   ; schema_version : int64
   ; page_size : int32
   ; format_version : int32
+  ; reserved_bytes_per_page : int32
   }
 
 let read_header_fields buf =
@@ -166,6 +168,7 @@ let read_header_fields buf =
   let schema_version = Cstruct.BE.get_uint64 buf 48 in
   let page_size = Cstruct.BE.get_uint32 buf 56 in
   let format_version = Cstruct.BE.get_uint32 buf 60 in
+  let reserved_bytes_per_page = Cstruct.BE.get_uint32 buf 64 in
   { txn_id
   ; root_page
   ; freelist_page
@@ -173,20 +176,22 @@ let read_header_fields buf =
   ; schema_version
   ; page_size
   ; format_version
+  ; reserved_bytes_per_page
   }
 ;;
 
 let write_header_fields buf hf =
-  (* Zero bytes 16..4095 first so the reserved area (64..4095) is clean.
-     write_common handles bytes 0..15 separately. *)
-  Cstruct.memset (Cstruct.sub buf 16 (page_size - 16)) 0;
+  (* Zero bytes 16..end first so the reserved area is clean (sized to the
+     actual page buffer, #95).  write_common handles bytes 0..15 separately. *)
+  Cstruct.memset (Cstruct.sub buf 16 (Cstruct.length buf - 16)) 0;
   Cstruct.BE.set_uint64 buf 16 hf.txn_id;
   Cstruct.BE.set_uint64 buf 24 hf.root_page;
   Cstruct.BE.set_uint64 buf 32 hf.freelist_page;
   Cstruct.BE.set_uint64 buf 40 hf.n_pages_total;
   Cstruct.BE.set_uint64 buf 48 hf.schema_version;
   Cstruct.BE.set_uint32 buf 56 hf.page_size;
-  Cstruct.BE.set_uint32 buf 60 hf.format_version
+  Cstruct.BE.set_uint32 buf 60 hf.format_version;
+  Cstruct.BE.set_uint32 buf 64 hf.reserved_bytes_per_page
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -206,6 +211,7 @@ type branch_entry =
   }
 
 let branch_entry_at buf ~offset =
+  let page_size = Cstruct.length buf in
   (* Need at least 6 bytes for key_len (2) + left_child (4) *)
   if offset + 6 > page_size
   then `End
@@ -221,12 +227,13 @@ let branch_entry_at buf ~offset =
       `Entry { key; left_child; next_offset }))
 ;;
 
-let branch_append_entry buf ~offset ~key ~left_child =
+let branch_append_entry ?(reserved = 0) buf ~offset ~key ~left_child =
+  let page_size = Cstruct.length buf in
   let key_len = Bytes.length key in
   if key_len > 0xFFFF
   then invalid_arg "branch_append_entry: key too long (max 65535 bytes)";
   let entry_size = 2 + key_len + 4 in
-  if offset + entry_size > page_size
+  if offset + entry_size > page_size - reserved
   then
     invalid_arg
       (Printf.sprintf
@@ -256,6 +263,7 @@ type leaf_entry =
   }
 
 let leaf_entry_at buf ~offset =
+  let page_size = Cstruct.length buf in
   (* Need at least 4 bytes for key_len (2) + val_len (2) *)
   if offset + 4 > page_size
   then `End
@@ -276,14 +284,15 @@ let leaf_entry_at buf ~offset =
         `Entry { key; value; next_offset })))
 ;;
 
-let leaf_append_entry buf ~offset ~key ~value =
+let leaf_append_entry ?(reserved = 0) buf ~offset ~key ~value =
+  let page_size = Cstruct.length buf in
   let key_len = Bytes.length key in
   let val_len = Bytes.length value in
   if key_len > 0xFFFF then invalid_arg "leaf_append_entry: key too long (max 65535 bytes)";
   if val_len > 0xFFFF
   then invalid_arg "leaf_append_entry: value too long (max 65535 bytes)";
   let entry_size = 2 + key_len + 2 + val_len in
-  if offset + entry_size > page_size
+  if offset + entry_size > page_size - reserved
   then
     invalid_arg
       (Printf.sprintf
@@ -351,8 +360,9 @@ let overflow_payload buf =
   out
 ;;
 
-let write_overflow buf ~next_pid ~payload ~payload_off ~payload_len =
-  if payload_len < 0 || payload_len > max_overflow_payload_bytes
+let write_overflow ?(reserved = 0) buf ~next_pid ~payload ~payload_off ~payload_len =
+  let max_payload = Cstruct.length buf - data_offset - 2 - reserved in
+  if payload_len < 0 || payload_len > max_payload
   then
     invalid_arg (Printf.sprintf "write_overflow: payload_len %d out of range" payload_len);
   Cstruct.memset buf 0;

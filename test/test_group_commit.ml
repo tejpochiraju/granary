@@ -53,7 +53,7 @@ let cleanup path =
 let open_wal_db () =
   let path = fresh_path () in
   cleanup path;
-  let* db = D.open_file_wal ~path in
+  let* db = D.open_file_wal ~path () in
   match db with
   | Ok db -> Lwt.return (db, path)
   | Error e -> Alcotest.failf "open_file_wal: %a" D.pp_error e
@@ -280,7 +280,7 @@ let test_group_commit_durable_after_reopen () =
      cleanup path;
      Lwt.finalize
        (fun () ->
-          let* db = D.open_file_wal ~path in
+          let* db = D.open_file_wal ~path () in
           let db =
             match db with
             | Ok d -> d
@@ -299,7 +299,7 @@ let test_group_commit_durable_after_reopen () =
                  fiber_inserts db ~base ~n:per_fiber))
           in
           let* () = D.close db in
-          let* db2 = D.open_file_wal ~path in
+          let* db2 = D.open_file_wal ~path () in
           let db2 =
             match db2 with
             | Ok d -> d
@@ -373,7 +373,7 @@ let unix_write_at fd ~offset (src : Cstruct.t) =
    [!fail_sync] is true.  Also counts every invocation so the test can
    verify the assertion exercises both drainer and joiner paths. *)
 let open_wal_with_injected_sync ~path ~fail_sync ~sync_calls =
-  let* fr = UF.open_ ~path in
+  let* fr = UF.open_ ~path () in
   let file =
     match fr with
     | Ok f -> f
@@ -454,6 +454,7 @@ let open_wal_with_injected_sync ~path ~fail_sync ~sync_calls =
       ~wal_size_bytes
       ~close
       ~wal_close
+      ()
   in
   match sr with
   | Ok s -> Lwt.return s

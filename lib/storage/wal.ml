@@ -2,10 +2,14 @@
 
 open Lwt.Syntax
 
-let page_size = 4096
 let header_size_bytes = 24
 let frame_meta_bytes = 24
-let frame_size_bytes = frame_meta_bytes + page_size (* = 4120 *)
+
+(* Default-geometry frame size (4096-byte page + 24-byte meta = 4120).  A WAL's
+   actual frame size follows its page size — see [t.frame_size] (#95).  This
+   module-level constant is the 4096 default, exposed for callers/tests that
+   build default-geometry WALs. *)
+let frame_size_bytes = frame_meta_bytes + Geometry.default.page_size
 let wal_magic = 0x57414C35_00000000L (* "WAL5\0\0\0\0" *)
 
 type frame =
@@ -28,6 +32,8 @@ type t =
   { read_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; sync : unit -> (unit, string) result Lwt.t
+  ; page_size : int (** page bytes per frame (#95); matches the main DB geometry *)
+  ; frame_size : int (** [frame_meta_bytes + page_size] *)
   ; mutable size_bytes : int64
   ; (* Tracks the high-water mark of the WAL device — initialised to the
      size at open, grows as we append frames so subsequent reads know
@@ -164,10 +170,10 @@ let read_header ~read_at =
 (* Frame read at offset                                                *)
 (* ----------------------------------------------------------------- *)
 
-let frame_offset idx =
+let frame_offset t idx =
   Int64.add
     (Int64.of_int header_size_bytes)
-    (Int64.mul (Int64.of_int idx) (Int64.of_int frame_size_bytes))
+    (Int64.mul (Int64.of_int idx) (Int64.of_int t.frame_size))
 ;;
 
 (* [verify=true] computes and checks the frame checksum (used during
@@ -178,19 +184,19 @@ let frame_offset idx =
    single biggest hot-path cost on WAL reads, so skipping it when sound
    is the main win. *)
 let read_frame_raw ?(verify = true) t idx =
-  let off = frame_offset idx in
-  let last_byte = Int64.add off (Int64.of_int frame_size_bytes) in
+  let off = frame_offset t idx in
+  let last_byte = Int64.add off (Int64.of_int t.frame_size) in
   if Int64.compare last_byte t.size_bytes > 0
   then Lwt.return_ok None
   else (
-    let buf = Cstruct.create frame_size_bytes in
+    let buf = Cstruct.create t.frame_size in
     let* r = t.read_at ~offset:off buf in
     match r with
     | Error s -> Lwt.return_error (Block_error s)
     | Ok () ->
       let page_id = Cstruct.BE.get_uint64 buf 0 in
       let flags = Cstruct.BE.get_uint64 buf 8 in
-      let page = Cstruct.sub buf frame_meta_bytes page_size in
+      let page = Cstruct.sub buf frame_meta_bytes t.page_size in
       let ok =
         if verify
         then (
@@ -202,8 +208,8 @@ let read_frame_raw ?(verify = true) t idx =
       if ok
       then (
         let is_commit = Int64.logand flags 1L <> 0L in
-        let page_copy = Cstruct.create page_size in
-        Cstruct.blit page 0 page_copy 0 page_size;
+        let page_copy = Cstruct.create t.page_size in
+        Cstruct.blit page 0 page_copy 0 t.page_size;
         Lwt.return_ok (Some { frame_idx = idx; page_id; is_commit; page = page_copy }))
       else Lwt.return_ok None)
 ;;
@@ -253,7 +259,15 @@ let recover_index t =
     Lwt.return_ok ()
 ;;
 
-let open_ ~read_at ~write_at ~sync ~size_bytes =
+let open_
+      ?(page_size = Geometry.default.page_size)
+      ~read_at
+      ~write_at
+      ~sync
+      ~size_bytes
+      ()
+  =
+  let frame_size = frame_meta_bytes + page_size in
   if Int64.compare size_bytes (Int64.of_int header_size_bytes) < 0
   then
     (* Device too small for even a header; treat as fresh and init. *)
@@ -265,6 +279,8 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
         { read_at
         ; write_at
         ; sync
+        ; page_size
+        ; frame_size
         ; size_bytes
         ; salt
         ; seed
@@ -286,6 +302,8 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
            { read_at
            ; write_at
            ; sync
+           ; page_size
+           ; frame_size
            ; size_bytes
            ; salt
            ; seed
@@ -298,6 +316,8 @@ let open_ ~read_at ~write_at ~sync ~size_bytes =
         { read_at
         ; write_at
         ; sync
+        ; page_size
+        ; frame_size
         ; size_bytes
         ; salt
         ; seed
@@ -334,21 +354,21 @@ let read_frame t idx =
 (* ----------------------------------------------------------------- *)
 
 let write_frame t ~idx ~page_id ~is_commit ~page =
-  let buf = Cstruct.create frame_size_bytes in
+  let buf = Cstruct.create t.frame_size in
   Cstruct.BE.set_uint64 buf 0 page_id;
   let flags = if is_commit then 1L else 0L in
   Cstruct.BE.set_uint64 buf 8 flags;
-  Cstruct.blit page 0 buf frame_meta_bytes page_size;
+  Cstruct.blit page 0 buf frame_meta_bytes t.page_size;
   let ck =
     frame_checksum
       ~salt:t.salt
       ~seed:t.seed
       ~page_id
       ~flags
-      ~page:(Cstruct.sub buf frame_meta_bytes page_size)
+      ~page:(Cstruct.sub buf frame_meta_bytes t.page_size)
   in
   Cstruct.BE.set_uint64 buf 16 ck;
-  let off = frame_offset idx in
+  let off = frame_offset t idx in
   t.write_at ~offset:off buf
 ;;
 
@@ -383,7 +403,7 @@ let publish_pages t ~base pages =
   let new_end =
     Int64.add
       (Int64.of_int header_size_bytes)
-      (Int64.mul (Int64.of_int (base + n)) (Int64.of_int frame_size_bytes))
+      (Int64.mul (Int64.of_int (base + n)) (Int64.of_int t.frame_size))
   in
   if Int64.compare new_end t.size_bytes > 0 then t.size_bytes <- new_end
 ;;

@@ -108,7 +108,7 @@ let unix_write_at fd ~offset (src : Cstruct.t) =
    so a properly-cooperating Pager + Btree + cursor stack will let the
    writer fiber make progress during that stall. *)
 let open_slow_store ~path ~read_delay ~wal_delay =
-  let* fr = UF.open_ ~path in
+  let* fr = UF.open_ ~path () in
   let file =
     match fr with
     | Ok f -> f
@@ -183,6 +183,7 @@ let open_slow_store ~path ~read_delay ~wal_delay =
       ~wal_size_bytes
       ~close
       ~wal_close
+      ()
   in
   match sr with
   | Ok s -> Lwt.return s
