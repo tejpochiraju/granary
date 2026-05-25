@@ -72,7 +72,7 @@ type error =
    core itself carries no OS/filesystem dependency (#170); when no provider is
    installed, ATTACH and VACUUM fail with a clear error. *)
 type file_provider =
-  { open_store : path:string -> (S.t, S.error) result Lwt.t
+  { open_store : ?geom:S.Geometry.t -> path:string -> unit -> (S.t, S.error) result Lwt.t
   ; remove_file : string -> unit
   ; rename_file : string -> string -> unit
   }
@@ -265,7 +265,10 @@ let vacuum t : unit Lwt.t =
         let tmp_path = path ^ ".vacuum-tmp" in
         prov.remove_file tmp_path;
         prov.remove_file (tmp_path ^ "-wal");
-        let* dst_r = prov.open_store ~path:tmp_path in
+        (* Rebuild at the source's geometry so a non-default page_size /
+           reserved-bytes choice survives the vacuum (#176). *)
+        let geom = S.geometry t.store in
+        let* dst_r = prov.open_store ~geom ~path:tmp_path () in
         (match dst_r with
          | Error e ->
            let msg = Format.asprintf "VACUUM open tmp: %a" S.pp_error e in
@@ -278,7 +281,7 @@ let vacuum t : unit Lwt.t =
            (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
            prov.remove_file (path ^ "-wal");
            prov.rename_file tmp_path path;
-           let* new_store_r = prov.open_store ~path in
+           let* new_store_r = prov.open_store ~path () in
            (match new_store_r with
             | Error e ->
               let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
@@ -1209,7 +1212,7 @@ let execute_control_op top t sql op =
                    "ATTACH requires a file provider; link sqlocaml.unix and call \
                     Db.set_file_provider"))
          | Some prov ->
-           let* result = prov.open_store ~path in
+           let* result = prov.open_store ~path () in
            (match result with
             | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
             | Ok store ->

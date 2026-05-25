@@ -13,8 +13,17 @@
 
 type t
 
+(** Page geometry (#95), re-exported so callers can name {!Geometry.t} without
+    depending on [sqlocaml.storage] directly. *)
+module Geometry = Sqlocaml_storage.Geometry
+
 (** Pretty-print the store's backend kind (Mem or Btree). *)
 val pp : Format.formatter -> t -> unit
+
+(** The page geometry this store is backed by (#176).  The in-memory backend
+    reports {!Geometry.default}; a B+-tree store reports the geometry peeked or
+    chosen at open time.  VACUUM reads this to rebuild at the same page_size. *)
+val geometry : t -> Geometry.t
 
 (** Phantom types for transaction modes. *)
 type ro

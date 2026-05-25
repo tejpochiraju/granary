@@ -14,8 +14,25 @@ module Db = struct
 end
 
 module Row = Sqlocaml_encoding.Row
+module Geometry = Sqlocaml_storage.Geometry
+module Header = Sqlocaml_storage.Header
 
 let run = Lwt_main.run
+
+(* Read the persisted geometry straight off page 0 of a closed file (header
+   fields at bytes 56/64 always sit within the first 4096 bytes), so a test can
+   assert what page size a file is actually stored at. *)
+let peek_file_geometry path =
+  let ic = open_in_bin path in
+  Fun.protect
+    ~finally:(fun () -> close_in ic)
+    (fun () ->
+       let len = 4096 in
+       let b = Bytes.create len in
+       really_input ic b 0 len;
+       Header.peek_geometry (Cstruct.of_bytes b))
+;;
+
 let counter = ref 0
 
 let fresh_path () =
@@ -165,6 +182,54 @@ let test_vacuum_with_overflow_blobs () =
      Lwt.return_unit)
 ;;
 
+(* 4b. VACUUM of a non-default-geometry database must preserve the chosen
+       page_size (#176): the rebuild used to open the temp file at the default
+       4096, silently shrinking a 16K database. *)
+let test_vacuum_preserves_geometry () =
+  run
+    (let path = fresh_path () in
+     cleanup path;
+     let* dbr = Db.open_file ~page_size:16384 ~path () in
+     let db = unwrap_db_err "open 16k" dbr in
+     let* () = exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT)" in
+     let* () =
+       Lwt_list.iter_s
+         (fun i ->
+            let payload = String.make 200 'x' in
+            exec
+              db
+              (Printf.sprintf "INSERT INTO t (id, payload) VALUES (%d, '%s')" i payload))
+         (List.init 500 Fun.id)
+     in
+     (* Delete most rows so the freelist is non-empty when VACUUM runs. *)
+     let* () = exec db "DELETE FROM t WHERE id >= 50" in
+     let before =
+       match peek_file_geometry path with
+       | Some g -> g
+       | None -> Alcotest.fail "could not peek geometry before vacuum"
+     in
+     Alcotest.(check int) "created at 16K" 16384 before.Geometry.page_size;
+     let* () = exec db "VACUUM" in
+     let* rows = query db "SELECT id FROM t ORDER BY id" in
+     Alcotest.(check int) "50 rows survive vacuum" 50 (List.length rows);
+     let* () = Db.close db in
+     let after =
+       match peek_file_geometry path with
+       | Some g -> g
+       | None -> Alcotest.fail "could not peek geometry after vacuum"
+     in
+     Alcotest.(check int)
+       "page_size preserved across vacuum"
+       16384
+       after.Geometry.page_size;
+     Alcotest.(check int)
+       "reserved_bytes preserved across vacuum"
+       before.Geometry.reserved_bytes_per_page
+       after.Geometry.reserved_bytes_per_page;
+     cleanup path;
+     Lwt.return_unit)
+;;
+
 (* 5. VACUUM inside an explicit transaction fails cleanly. *)
 let test_vacuum_inside_txn_fails () =
   run
@@ -206,6 +271,10 @@ let () =
             "overflow blobs survive"
             `Quick
             test_vacuum_with_overflow_blobs
+        ; Alcotest.test_case
+            "preserves page geometry"
+            `Quick
+            test_vacuum_preserves_geometry
         ] )
     ; ( "guards"
       , [ Alcotest.test_case "rejects inside txn" `Quick test_vacuum_inside_txn_fails

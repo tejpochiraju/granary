@@ -152,6 +152,15 @@ let pp fmt t =
      | Btree _ -> "Btree")
 ;;
 
+(* #95/#176: the page geometry this store is backed by.  The in-memory backend
+   has no on-disk geometry, so it reports {!Geometry.default}; VACUUM uses this
+   to rebuild the temp file at the source's page_size/reserved. *)
+let geometry t =
+  match t.backend with
+  | Mem _ -> Geometry.default
+  | Btree st -> Pager.geom st.pager
+;;
+
 type ro_snapshot =
   { rs_store : t
   ; rs_snap_txn_id : int64

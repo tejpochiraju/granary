@@ -8,9 +8,22 @@ module Unix_file = Unix_file
 module Fault_inject = Fault_inject
 module Store = Store
 
-(* The process-wide provider the core uses for ATTACH and VACUUM. *)
+(* The process-wide provider the core uses for ATTACH and VACUUM.  VACUUM passes
+   the source database's geometry (#176) so the rebuilt file keeps its page_size
+   and reserved bytes; opening an existing file (ATTACH, vacuum reopen) ignores
+   it and peeks the header instead. *)
 let provider : Sqlocaml.Db.file_provider =
-  { Sqlocaml.Db.open_store = (fun ~path -> Store.open_file ~path ())
+  { Sqlocaml.Db.open_store =
+      (fun ?geom ~path () ->
+        match geom with
+        | None -> Store.open_file ~path ()
+        | Some g ->
+          Store.open_file
+            ~page_size:g.Sqlocaml_storage.Geometry.page_size
+            ~reserved_bytes_per_page:g.Sqlocaml_storage.Geometry.reserved_bytes_per_page
+            ~explicit_geometry:true
+            ~path
+            ())
   ; remove_file =
       (fun p ->
         try Unix.unlink p with
