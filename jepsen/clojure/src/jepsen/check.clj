@@ -189,38 +189,54 @@
 
 (defn- counter-check
   [history]
-  (let [;; Counter is GLOBAL — all adds/reads share the same counter.
-        ;; The key in :value [k v] is metadata; v is the counter value.
+  (let [;; Counter is PER-KEY — each key has an independent counter.
+        ;; :value [k v] where k=key, v=counter_value for that key.
         add-entries (for [op history
                           :when (and (= :ok (:type op))
                                      (= :add (:f op)))
                           :let [v (:value op)]
                           :when (and (vector? v) (>= (count v) 2))]
-                      {:val (second v) :ts (or (:time op) 0)})
-        total-adds (count add-entries)
-        ;; Collect reads: (value, time)
+                      {:k (first v) :val (second v) :ts (or (:time op) 0)})
+        ;; Count adds per key
+        add-counts (reduce (fn [m {:keys [k]}]
+                             (update m k (fnil inc 0)))
+                           {}
+                           add-entries)
+        ;; Collect reads: (key, value, time)
         read-entries (for [op history
                            :when (and (= :ok (:type op))
                                       (= :read (:f op)))
                            :let [v (:value op)]
                            :when (and (vector? v) (>= (count v) 2))]
-                       {:val (second v) :ts (or (:time op) 0)})
-        ;; Check monotonic globally: read values non-decreasing over time
-        sorted-reads (sort-by :ts read-entries)
-        read-vals (map :val sorted-reads)
-        monotonic (or (empty? read-vals) (apply <= read-vals))
-        ;; Check bounds: each read value in [0, total_adds]
-        anomalies (for [{:keys [val ts]} read-entries
-                        :when (not (<= 0 val total-adds))]
-                    {:val val :ts ts :total-adds total-adds})]
+                       {:k (first v) :val (second v) :ts (or (:time op) 0)})
+        ;; Per-key monotonic: read values non-decreasing for each key
+        read-seqs (reduce (fn [m {:keys [k val ts]}]
+                            (update m k (fn [vs] (conj (or vs []) [ts val]))))
+                          {}
+                          read-entries)
+        monotonic (every? (fn [[k pairs]]
+                            (let [vals (map second (sort-by first pairs))]
+                              (or (empty? vals) (apply <= vals))))
+                          read-seqs)
+        ;; Per-key bounds: each read in [0, total_adds_for_key]
+        ;; and sufficient: read value >= # of adds to that key completed before it
+        anomalies (for [{:keys [k val ts]} read-entries
+                        :let [total-k (get add-counts k 0)
+                              adds-before (count (filter #(and (= k (:k %))
+                                                               (< (:ts %) ts))
+                                                         add-entries))]
+                        :when (or (not (<= 0 val total-k))
+                                  (< val adds-before))]
+                    {:key k :val val :ts ts
+                     :total total-k :adds-before adds-before})]
     {:valid? (and monotonic (empty? anomalies))
-     :total-adds total-adds
+     :adds-per-key add-counts
      :reads-checked (count read-entries)
      :monotonic monotonic
      :anomalies anomalies
      :anomaly (cond
                 (not monotonic) "reads not monotonic"
-                (seq anomalies) (str "read value out of bounds: " (pr-str anomalies)))}))
+                (seq anomalies) (str "read anomalies: " (pr-str anomalies)))}))
 
 (defn check-counter
   [history opts]
