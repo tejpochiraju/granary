@@ -8,7 +8,7 @@
     {:invoke/:ok/:fail} is recorded with a nanosecond timestamp into a
     Jepsen-format EDN history file.
 
-    Supports nemeses: crash-restart, process pause. *)
+    Supports nemeses: crash-restart, process pause, lazyfs, clock-skew. *)
 
 open Lwt.Syntax
 
@@ -34,6 +34,8 @@ type nemesis =
   | NoNemesis
   | CrashRestart of { crash_after_ops : int }
   | ProcessPause of { pause_after_ops : int; pause_duration_s : float }
+  | LazyFS of { lose_after_ops : int }
+  | ClockSkew
 
 (* ----------------------------------------------------------------- *)
 (* State shared across workers                                       *)
@@ -206,6 +208,11 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
       Some (pause_after_ops, pause_duration_s)
     | _ -> None
   in
+  (* Record clock-skew if FAKETIME is set *)
+  (match nemesis with
+   | ClockSkew ->
+     let _ = Nemesis.record_clock_skew nem_state in ()
+   | _ -> ());
   let* db = open_db backend in
   let* () = create_schema db workload in
   let states = Array.init n_workers (fun _ -> make_worker_state ()) in
@@ -213,8 +220,15 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
     worker_loop db workload st ops_per_worker nem_state pause_config
   ) states) in
   let* () = Lwt.join workers in
+  (* Trigger lazyfs lose-unsynced if configured *)
+  let lazyfs_entries =
+    match nemesis with
+    | LazyFS _ ->
+      [ Nemesis.trigger_lose_unsynced nem_state ]
+    | _ -> []
+  in
   let* final_entries = final_read db workload in
-  let history = collect_history states final_entries in
+  let history = collect_history states (lazyfs_entries @ final_entries) in
   Printf.printf "Completed %d operations across %d workers\n"
     (List.length history) n_workers;
   Edn_history.write_history history_path history;
@@ -284,7 +298,7 @@ let () =
     ("--workload", Arg.Set_string workload_name,
      " Workload: list-append|bank|set|counter");
     ("--nemesis", Arg.Set_string nemesis_name,
-     " Nemesis: none|crash-restart|pause");
+     " Nemesis: none|crash-restart|pause|lazyfs|clock-skew");
     ("--workers", Arg.Set_int n_workers, " Concurrent workers");
     ("--ops", Arg.Set_int ops_per_worker, " Ops per worker");
     ("--keys", Arg.Set_int key_range, " Distinct keys/accounts");
@@ -319,6 +333,9 @@ let () =
     | "pause" ->
       ProcessPause { pause_after_ops = !pause_after;
                      pause_duration_s = !pause_dur }
+    | "lazyfs" ->
+      LazyFS { lose_after_ops = !crash_after }
+    | "clock-skew" -> ClockSkew
     | s -> failwith (Printf.sprintf "unknown nemesis: %s" s)
   in
   (match nemesis_val with

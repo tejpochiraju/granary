@@ -92,6 +92,27 @@ run-pause: build
 		--nemesis pause --pause-after 40 --pause-dur 3.0 --workers 4 --ops 100 \
 		--history /tmp/sqlocaml_jepsen_pause.edn
 
+.PHONY: run-lazyfs
+run-lazyfs: build
+	@echo "=== Running set workload with lazyfs (un-fsynced write loss) ==="
+	@echo "Requires: --privileged or --device /dev/fuse for FUSE"
+	podman run --rm --device /dev/fuse -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload set --backend wal --path /tmp/lazyfs_mount/test.db \
+		--nemesis lazyfs --workers 2 --ops 40 \
+		--history /tmp/sqlocaml_jepsen_lazyfs.edn
+
+.PHONY: run-clock-skew
+run-clock-skew: build
+	@echo "=== Running list-append with clock-skew (faketime +5d) ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		-e FAKETIME="+5d" \
+		-e LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload list-append --backend mem \
+		--nemesis clock-skew --workers 4 --ops 50 \
+		--history /tmp/sqlocaml_jepsen_clockskew.edn
+
 .PHONY: negative
 negative: build
 	@echo "=== Generating negative-control histories ==="

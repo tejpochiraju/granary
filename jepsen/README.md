@@ -105,6 +105,26 @@ opam exec -- dune exec jepsen/ocaml/harness.exe -- \
   --history /tmp/history.edn
 ```
 
+### With lazyfs nemesis (un-fsynced write loss)
+
+Requires `--device /dev/fuse` for FUSE:
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload set --backend wal --path /tmp/lazyfs_mount/test.db \
+  --nemesis lazyfs --workers 2 --ops 40 \
+  --history /tmp/history.edn
+```
+
+### With clock-skew nemesis (faketime)
+
+```bash
+FAKETIME="+5d" LD_PRELOAD=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 \
+  opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload list-append --backend mem \
+  --nemesis clock-skew --workers 4 --ops 50 \
+  --history /tmp/history.edn
+```
+
 ### With process-pause nemesis
 
 ```bash
@@ -154,7 +174,5 @@ jepsen/
 - [x] **Core (no faults):** OCaml harness + EDN recorder + Clojure Elle checker
 - [x] **Negative controls:** dirty read, lost update, bank lost transfer, set lost element, counter non-monotonic — for every workload
 - [x] **More workloads:** bank (transfer + total-conservation), set (durability), counter (monotonic bounds)
-- [x] **Nemeses:** crash-restart, process pause
-- [ ] **lazyfs nemesis:** un-fsynced write loss for durability testing
-- [ ] **Clock skew nemesis:** via faketime
+- [x] **Nemeses:** crash-restart, process pause, lazyfs, clock-skew
 - [ ] **CI wiring:** per-workload+nemesis gates
