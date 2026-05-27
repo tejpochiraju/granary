@@ -172,6 +172,11 @@ type ro_snapshot =
     (* Page ids this snapshot has pinned in the Pager cache (#159).  Every
      snapshot read records the pages it materialises here; [ro_end]
      releases them via [Pager.unpin_all].  Unused for the Mem backend. *)
+  ; rs_mem_snap : (tree_id * Bytes.t Bytes_map.t) list option
+    (** #178: for the in-memory backend, a deep copy of every tree's
+        contents taken at [ro_begin] so RO reads never see uncommitted
+        writes from a concurrent (but rollback-destined) writer.
+        [None] for Btree backend. *)
   }
 
 type 'a txn =
@@ -211,6 +216,16 @@ let mem_tree trees tid =
     let r = ref Bytes_map.empty in
     Hashtbl.add trees tid r;
     r
+;;
+
+(* #178: look up a tree in the snapshot taken at [ro_begin] for the
+   in-memory backend.  Returns [Bytes_map.empty] when the tree didn't
+   exist at snapshot time — an RO reader should see an empty tree, not
+   the live (possibly uncommitted) contents. *)
+let mem_tree_snap (snap : (tree_id * Bytes.t Bytes_map.t) list) (tid : tree_id) =
+  match List.assoc_opt tid snap with
+  | Some map -> map
+  | None -> Bytes_map.empty
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -656,7 +671,12 @@ let ro_begin t =
      still in flight?" *)
   let* () = Rwlock.acquire_read t.lock in
   match t.backend with
-  | Mem _ ->
+  | Mem trees ->
+    (* #178: snapshot every tree so RO reads never observe uncommitted
+       writes from a concurrent writer that later rolls back.  The
+       Btree backend gets snapshot isolation from the pager/WAL layer;
+       the mem backend must provide it here. *)
+    let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
     Lwt.return
       (Ro
          { rs_store = t
@@ -665,6 +685,7 @@ let ro_begin t =
          ; rs_snap_trees = Hashtbl.create 1
          ; rs_snap_frames = 0
          ; rs_pinned = Hashtbl.create 1
+         ; rs_mem_snap = Some snap
          })
   | Btree st ->
     let snap_txn_id = st.current_header.txn_id in
@@ -690,6 +711,7 @@ let ro_begin t =
          ; rs_snap_trees = Hashtbl.create 4
          ; rs_snap_frames = snap_frames
          ; rs_pinned = Hashtbl.create 64
+         ; rs_mem_snap = None
          })
 ;;
 
@@ -1372,7 +1394,16 @@ let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
   match tx with
   | Ro snap ->
     (match snap.rs_store.backend with
-     | Mem trees -> Lwt.return (Bytes_map.find_opt key !(mem_tree trees tid))
+     | Mem _ ->
+       (* #178: read from the snapshot captured at ro_begin so this
+          reader never sees uncommitted writes from a concurrent writer
+          that may later roll back. *)
+       let map =
+         match snap.rs_mem_snap with
+         | Some snap -> mem_tree_snap snap tid
+         | None -> Bytes_map.empty
+       in
+       Lwt.return (Bytes_map.find_opt key map)
      | Btree st ->
        let* r = bt_get_tree_ro snap st tid in
        let* bt = unwrap_error r in
@@ -1465,8 +1496,17 @@ let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
   match tx with
   | Ro snap ->
     (match snap.rs_store.backend with
-     | Mem trees ->
-       let entries = Bytes_map.bindings !(mem_tree trees tid) in
+     | Mem _ ->
+       (* #178: materialise from the snapshot captured at ro_begin.
+          Without this, a concurrent writer's uncommitted modifications
+          would leak into the cursor — and survive even if the writer
+          later rolls back. *)
+       let map =
+         match snap.rs_mem_snap with
+         | Some snap -> mem_tree_snap snap tid
+         | None -> Bytes_map.empty
+       in
+       let entries = Bytes_map.bindings map in
        Lwt.return { all = entries; remaining = []; ready = false }
      | Btree st ->
        let* r = bt_get_tree_ro snap st tid in
