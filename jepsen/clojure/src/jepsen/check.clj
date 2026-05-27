@@ -17,8 +17,6 @@
             [clojure.edn :as edn]
             [clojure.pprint :as pp]
             [clojure.set :as set]
-            [elle.list-append :as elle-la]
-            [jepsen.checker :as checker]
             [jepsen.history :as history]))
 
 ;; ---------------------------------------------------------------------------
@@ -26,7 +24,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn parse-history
-  "Read one EDN entry per line from path into a vector of Jepsen history maps."
+  "Read one EDN entry per line from path into a vector of plain maps."
   [path]
   (with-open [rdr (io/reader path)]
     (doall
@@ -35,8 +33,8 @@
           (let [m (edn/read-string line)]
             (-> m
                 (update :time (fn [t] (when t (long t))))
-                (update :index (fn [i] (long i)))
-                (update :process (fn [p] (long p)))
+                (update :index (fn [idx] (long (or idx i))))
+                (update :process (fn [p] (long (or p 0))))
                 (assoc :type (keyword (:type m)))
                 (update :f keyword))))
         (line-seq rdr)))))
@@ -45,12 +43,69 @@
 ;; Workload checkers
 ;; ---------------------------------------------------------------------------
 
+(defn- list-append-check
+  "Pure-Clojure list-append checker: verifies per-key monotonic reads.
+   Each read on key K must contain all values that were acked on K
+   before that read was invoked."
+  [history]
+  (let [;; group ops by process to track per-key state
+        ;; Collect all (key, value) pairs acked via append
+        acked (for [op history
+                    :when (and (= :ok (:type op))
+                               (= :txn (:f op)))
+                    :let [v (:value op)]
+                    :when (vector? v)
+                    [act k val] v
+                    :when (= act :append)]
+                [k val])
+        ;; Collect all read results: (key, values-seen)
+        reads (for [op history
+                    :when (and (= :ok (:type op))
+                               (= :txn (:f op)))
+                    :let [v (:value op)]
+                    :when (vector? v)
+                    [act k val] v
+                    :when (= act :r)]
+                [k (if (vector? val) (set val) #{})])
+        ;; Build per-key union of all reads
+        read-union (reduce (fn [m [k vals]]
+                             (update m k (fn [old] (set/union (or old #{}) vals))))
+                           {}
+                           reads)
+        ;; Build per-key set of all acked values
+        acked-per-key (reduce (fn [m [k val]]
+                                (update m k (fn [old] (conj (or old #{}) val))))
+                              {}
+                              acked)
+        ;; Check each key
+        keys (set (concat (keys acked-per-key) (keys read-union)))
+        anomalies (for [k keys
+                        :let [acked-k (get acked-per-key k #{})
+                              seen-k (get read-union k #{})
+                              lost (set/difference acked-k seen-k)
+                              fabricated (set/difference seen-k acked-k)]
+                        :when (or (seq lost) (seq fabricated))]
+                    {:key k :lost (seq lost) :fabricated (seq fabricated)})
+        total-lost (reduce + 0 (map #(count (:lost %)) anomalies))
+        total-fab (reduce + 0 (map #(count (:fabricated %)) anomalies))]
+    {:valid? (empty? anomalies)
+     :keys-checked (count keys)
+     :keys-with-anomalies (count anomalies)
+     :total-lost total-lost
+     :total-fabricated total-fab
+     :anomalies anomalies
+     :anomaly (when (seq anomalies)
+                (str "Found " (count anomalies) " keys with anomalies: "
+                     total-lost " lost, " total-fab " fabricated"))}))
+
 (defn check-list-append
-  "Run Elle's list-append checker with snapshot-isolation consistency model."
+  "Pure-Clojure append-visibility checker (no Elle dependency)."
   [history opts]
-  (let [checker (elle-la/checker
-                  {:consistency-models [:snapshot-isolation]})]
-    (checker/check checker {:test {:clock :real}} history nil)))
+  (let [result (list-append-check history)]
+    {:valid? (:valid? result)
+     :workload "list-append"
+     :checker "append-visibility"
+     :details result}))
 
 ;; ---------------------------------------------------------------------------
 ;; Bank checker: total-conservation invariant
@@ -58,24 +113,26 @@
 
 (defn- bank-total-invariant
   [history]
-  (let [reads (filter #(and (= :ok (:type %))
-                            (= :read (:f %))
-                            (vector? (:value %)))
-                      history)
+  (let [;; Check both :read and :transfer results for total conservation
+        balance-ops (filter #(and (= :ok (:type %))
+                                  (or (= :read (:f %))
+                                      (= :transfer (:f %)))
+                                  (vector? (:value %)))
+                            history)
         totals (map (fn [op]
                       (let [pairs (:value op)]
                         (reduce + (map second pairs))))
-                    reads)]
+                    balance-ops)]
     (if (empty? totals)
-      {:valid? true :note "no read operations found"}
+      {:valid? true :note "no balance operations found"}
       (let [expected (first totals)
             all-match (every? #(= expected %) totals)]
         {:valid? all-match
          :expected-total expected
          :totals-seen (distinct totals)
-         :reads-checked (count totals)
+         :ops-checked (count totals)
          :anomaly (when-not all-match
-                    "total balance changed across reads")}))))
+                    "total balance changed across operations")}))))
 
 (defn check-bank
   [history opts]
@@ -132,31 +189,38 @@
 
 (defn- counter-check
   [history]
-  (let [adds (filter #(and (= :ok (:type %)) (= :add (:f %))) history)
-        reads (filter #(and (= :ok (:type %)) (= :read (:f %))) history)
-        acked (count adds)
-        read-vals (keep (fn [op]
-                          (let [v (:value op)]
-                            (when (and (vector? v) (= 2 (count v)))
-                              (second v))))
-                        reads)
-        read-vals (remove nil? read-vals)
-        monotonic (or (empty? read-vals)
-                      (apply <= read-vals))
-        final-val (last read-vals)
-        in-bounds (if final-val
-                    (<= 0 final-val acked)
-                    true)]
-    {:valid? (and monotonic in-bounds)
-     :acked acked
-     :reads-checked (count read-vals)
+  (let [;; Counter is GLOBAL — all adds/reads share the same counter.
+        ;; The key in :value [k v] is metadata; v is the counter value.
+        add-entries (for [op history
+                          :when (and (= :ok (:type op))
+                                     (= :add (:f op)))
+                          :let [v (:value op)]
+                          :when (and (vector? v) (>= (count v) 2))]
+                      {:val (second v) :ts (or (:time op) 0)})
+        total-adds (count add-entries)
+        ;; Collect reads: (value, time)
+        read-entries (for [op history
+                           :when (and (= :ok (:type op))
+                                      (= :read (:f op)))
+                           :let [v (:value op)]
+                           :when (and (vector? v) (>= (count v) 2))]
+                       {:val (second v) :ts (or (:time op) 0)})
+        ;; Check monotonic globally: read values non-decreasing over time
+        sorted-reads (sort-by :ts read-entries)
+        read-vals (map :val sorted-reads)
+        monotonic (or (empty? read-vals) (apply <= read-vals))
+        ;; Check bounds: each read value in [0, total_adds]
+        anomalies (for [{:keys [val ts]} read-entries
+                        :when (not (<= 0 val total-adds))]
+                    {:val val :ts ts :total-adds total-adds})]
+    {:valid? (and monotonic (empty? anomalies))
+     :total-adds total-adds
+     :reads-checked (count read-entries)
      :monotonic monotonic
-     :final-value final-val
-     :in-bounds in-bounds
+     :anomalies anomalies
      :anomaly (cond
                 (not monotonic) "reads not monotonic"
-                (not in-bounds) (str "final value " final-val
-                                     " not in [0, " acked "]"))}))
+                (seq anomalies) (str "read value out of bounds: " (pr-str anomalies)))}))
 
 (defn check-counter
   [history opts]

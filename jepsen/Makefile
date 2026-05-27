@@ -124,7 +124,7 @@ negative: build
 .PHONY: build-full
 build-full:
 	@echo "=== Building Jepsen container (Java + Clojure + OCaml) ==="
-	podman build -t $(IMG_JEPSEN) -f Containerfile.jepsen $(PWD)/..
+	podman build -t $(IMG_JEPSEN) -f jepsen/Containerfile.jepsen $(PWD)/..
 
 .PHONY: check
 check:

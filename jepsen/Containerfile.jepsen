@@ -1,0 +1,16 @@
+# Jepsen checker container for sqlocaml
+# Provides Java 21 + Clojure CLI + Elle/Jepsen checker deps
+#
+# Build:   podman build -t sqlocaml-jepsen -f jepsen/Containerfile.jepsen .
+# Run:     podman run --rm -v $(pwd):/workspace:z -w /workspace/jepsen/clojure \
+#            sqlocaml-jepsen clojure -M -m jepsen.check <history.edn> -w list-append
+
+FROM docker.io/library/clojure:temurin-21-noble
+
+# Pre-download Clojure deps so they're cached in an image layer
+WORKDIR /deps
+COPY jepsen/clojure/deps.edn ./
+RUN clojure -P && rm -rf /deps
+
+WORKDIR /workspace
+ENTRYPOINT ["clojure"]
