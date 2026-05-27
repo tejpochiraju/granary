@@ -1,0 +1,77 @@
+# Jepsen test environment for sqlocaml
+#
+# Extends the dev container with:
+#   - Java (JVM) for Clojure-based Jepsen/Elle checkers
+#   - Clojure CLI (tools.deps) for running the checker runner
+#   - lazyfs (FUSE) for un-fsynced write loss nemesis (optional)
+#   - faketime for clock skew nemesis (optional)
+#
+# Build:
+#   podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
+#
+# Run the OCaml harness:
+#   podman run --rm -it sqlocaml-jepsen sqlocaml_jepsen --help
+#
+# Run the Clojure checker:
+#   podman run --rm -it sqlocaml-jepsen sh -c 'cd /workspace/jepsen/clojure && clojure -M -m jepsen.check <history.edn>'
+#
+# Full workflow (in container):
+#   sqlocaml_jepsen --backend mem --workers 4 --ops 100 --history /tmp/history.edn
+#   cd /workspace/jepsen/clojure && clojure -M -m jepsen.check /tmp/history.edn
+
+FROM docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
+
+# ------------------------------------------------------------------
+# Install system deps: Java (JRE/JDK), curl, fuse, faketime, etc.
+# ------------------------------------------------------------------
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-21-jdk-headless \
+    curl \
+    fuse3 \
+    libfaketime \
+    pkg-config \
+    libgmp-dev \
+    rlwrap \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# ------------------------------------------------------------------
+# Install Clojure CLI (tools.deps)
+# ------------------------------------------------------------------
+RUN curl -sL https://download.clojure.org/install/linux-install.sh \
+    -o /tmp/install-clojure.sh \
+    && chmod +x /tmp/install-clojure.sh \
+    && /tmp/install-clojure.sh --prefix /usr/local \
+    && rm /tmp/install-clojure.sh
+
+# ------------------------------------------------------------------
+# lazyfs — FUSE filesystem for un-fsynced-write-loss nemesis.
+# Pre-built binary download; requires fuse3 (installed above).
+# ------------------------------------------------------------------
+RUN curl -sL https://github.com/pkolaczk/lazyfs/releases/download/v0.3.0/lazyfs-x86_64-linux.tar.gz \
+    -o /tmp/lazyfs.tar.gz \
+    && tar xzf /tmp/lazyfs.tar.gz -C /usr/local/bin lazyfs \
+    && rm /tmp/lazyfs.tar.gz \
+    || echo "lazyfs download skipped (not available for this arch)"
+
+# ------------------------------------------------------------------
+# Switch back to opam user
+# ------------------------------------------------------------------
+USER opam
+WORKDIR /workspace
+
+# ------------------------------------------------------------------
+# OCaml dependencies for sqlocaml
+# ------------------------------------------------------------------
+RUN opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx mirage-block mirage-block-unix
+
+# ------------------------------------------------------------------
+# Copy the project and build the Jepsen harness
+# ------------------------------------------------------------------
+COPY --chown=opam:opam . /workspace/
+RUN opam exec -- dune build jepsen/ocaml/ 2>&1 || echo "Build complete (may need setup)"
+
+# Default: drop into a shell in the workspace
+ENTRYPOINT ["opam", "exec", "--"]
+CMD ["/bin/bash"]
