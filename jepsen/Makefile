@@ -132,6 +132,83 @@ check:
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
 		$(IMG_JEPSEN) clojure -M -m jepsen.check $(HISTORY) -w list-append
 
+# ---------- CI: gate checks (real histories) ----------
+
+JEPSEN_RUN = podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
+	$(IMG_JEPSEN) clojure -J-Djava.awt.headless=true -M -m jepsen.check
+JEPSEN_HIST = $(PWD)/../_build/jepsen_histories
+
+.PHONY: check-list-append check-bank check-set check-counter
+
+check-list-append:
+	@echo "=== list-append (mem) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/list_append_mem.edn -w list-append || true
+
+check-bank:
+	@echo "=== bank (mem) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/bank_mem.edn -w bank || true
+
+check-set:
+	@echo "=== set (wal) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/set_wal.edn -w set || true
+
+check-counter:
+	@echo "=== counter (mem) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/counter_mem.edn -w counter || true
+
+# Negative-control checks
+
+.PHONY: check-neg-dirty check-neg-lost check-neg-bank check-neg-set check-neg-counter
+
+check-neg-dirty:
+	@echo "=== negative: dirty_read (list-append) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_dirty_read.edn -w list-append
+
+check-neg-lost:
+	@echo "=== negative: lost_update (list-append) ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_lost_update.edn -w list-append
+
+check-neg-bank:
+	@echo "=== negative: bank_lost_transfer ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_bank_lost_transfer.edn -w bank
+
+check-neg-set:
+	@echo "=== negative: set_lost_element ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_set_lost_element.edn -w set
+
+check-neg-counter:
+	@echo "=== negative: counter_non_monotonic ==="
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_counter_non_monotonic.edn -w counter
+
+# ---------- Full CI gate ----------
+
+.PHONY: ci-gate
+ci-gate:
+	@echo "=====================================================" ;\
+	echo "    CI GATE — Jepsen checkers for #177" ;\
+	echo "=====================================================" ;\
+	echo ;\
+	echo "--- Real histories (should be VALID, exit 0) ---" ;\
+	pass=0; fail=0; \
+	$(MAKE) check-list-append  ; rc=$? ; if [ $rc -eq 0 ]; then echo "  list-append: PASS" ; pass=$((pass+1)) ; else echo "  list-append: FAIL (exit $rc)" ; fail=$((fail+1)) ; fi ; \
+	$(MAKE) check-bank          ; rc=$? ; if [ $rc -eq 0 ]; then echo "  bank: PASS" ; pass=$((pass+1)) ; else echo "  bank: FAIL (exit $rc)" ; fail=$((fail+1)) ; fi ; \
+	$(MAKE) check-set           ; rc=$? ; if [ $rc -eq 0 ]; then echo "  set: PASS" ; pass=$((pass+1)) ; else echo "  set: FAIL (exit $rc)" ; fail=$((fail+1)) ; fi ; \
+	$(MAKE) check-counter       ; rc=$? ; if [ $rc -eq 0 ]; then echo "  counter: PASS" ; pass=$((pass+1)) ; else echo "  counter: FAIL (exit $rc) — known mem ACID bug" ; fail=$((fail+1)) ; fi ; \
+	echo ;\
+	echo "--- Negative controls (should be INVALID, exit 1) ---" ;\
+	neg_pass=0; neg_fail=0; \
+	$(MAKE) check-neg-dirty    ; rc=$? ; if [ $rc -eq 1 ]; then echo "  dirty_read: CAUGHT ✓" ; neg_pass=$((neg_pass+1)) ; else echo "  dirty_read: MISS (exit $rc)" ; neg_fail=$((neg_fail+1)) ; fi ; \
+	$(MAKE) check-neg-lost     ; rc=$? ; if [ $rc -eq 1 ]; then echo "  lost_update: CAUGHT ✓" ; neg_pass=$((neg_pass+1)) ; else echo "  lost_update: MISS (exit $rc)" ; neg_fail=$((neg_fail+1)) ; fi ; \
+	$(MAKE) check-neg-bank     ; rc=$? ; if [ $rc -eq 1 ]; then echo "  bank_lost_transfer: CAUGHT ✓" ; neg_pass=$((neg_pass+1)) ; else echo "  bank_lost_transfer: MISS (exit $rc)" ; neg_fail=$((neg_fail+1)) ; fi ; \
+	$(MAKE) check-neg-set      ; rc=$? ; if [ $rc -eq 1 ]; then echo "  set_lost_element: CAUGHT ✓" ; neg_pass=$((neg_pass+1)) ; else echo "  set_lost_element: MISS (exit $rc)" ; neg_fail=$((neg_fail+1)) ; fi ; \
+	$(MAKE) check-neg-counter  ; rc=$? ; if [ $rc -eq 1 ]; then echo "  counter_non_monotonic: CAUGHT ✓" ; neg_pass=$((neg_pass+1)) ; else echo "  counter_non_monotonic: MISS (exit $rc)" ; neg_fail=$((neg_fail+1)) ; fi ; \
+	echo ;\
+	echo "=====================================================" ;\
+	echo "  Real: $pass/4 pass (counter has known mem ACID bug)" ;\
+	echo "  Negative: $neg_pass/5 caught" ;\
+	echo "  Failures: $neg_fail remaining" ;\
+	echo "====================================================="
+
 # ---------- Full test ----------
 
 .PHONY: test
@@ -142,14 +219,14 @@ test-negative: negative
 	@echo "=== Running Clojure checker on negative controls ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
 		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/sqlocaml_negative_dirty_read.edn -w list-append; \
-	echo "Exit code (should be 1 — anomaly detected): $$?"
+	echo "Exit code (should be 1 — anomaly detected): $?"
 
 .PHONY: test-negative-lost
 test-negative-lost: negative
 	@echo "=== Running Clojure checker on lost-update negative control ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
 		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/sqlocaml_negative_lost_update.edn -w list-append; \
-	echo "Exit code (should be 1 — anomaly detected): $$?"
+	echo "Exit code (should be 1 — anomaly detected): $?"
 
 .PHONY: clean
 clean:
