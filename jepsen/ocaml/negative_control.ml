@@ -1,101 +1,141 @@
-(** Negative control — deliberately broken list-append history.
+(** Negative controls — deliberately broken histories for each workload.
 
-    This harness creates a history that violates snapshot isolation by
-    injecting a dirty read: one transaction writes a value, then a second
-    concurrent transaction observes it before the first commits.
-
-    The point: Elle's list-append checker MUST detect this as an anomaly
-    (G1a at minimum).  If it doesn't, the checker is not wired correctly
-    or the history format is wrong.  RED before GREEN.
-
-    Unlike the real harness, this doesn't use sqlocaml at all — it directly
-    constructs an EDN history file with a known-bad interleaving. *)
+    Each negative control constructs a history that a correct checker MUST
+    detect as invalid. RED before GREEN. *)
 
 open Edn_history
 
-(** Build a negative-control history: two concurrent transactions where T1
-    writes v=1 under key=0, T2 reads v=1 from key=0 before T1 commits.
+(* ================================================================= *)
+(* List-append negative controls                                     *)
+(* ================================================================= *)
 
-    Elle's checker should flag G1a (dirty read / aborted read) or at minimum
-    G1c (intermediate read). *)
-
-let build_negative_history () =
+(** Dirty read: T2 observes T1's uncommitted write. *)
+let build_dirty_read () =
   let t0 = 0L in
-  let _t1 = 100_000L in    (* T1 begin *)
-  let t2 = 200_000L in    (* T2 begin — T1 still active *)
-  let t3 = 300_000L in    (* T2 reads key 0, sees v=1 — DIRTY! *)
-  let t4 = 400_000L in    (* T1 commits *)
-  let _t5 = 500_000L in    (* T2 reads key 0 again — sees v=1 *)
-
-  (* T1: append v=1 to key=0 *)
+  let t2 = 200_000L in
+  let t3 = 300_000L in
+  let t4 = 400_000L in
   let txn1 = [Append (0, 1); Read (0, [])] in
-  (* T2: read key=0 *)
   let txn2 = [Read (0, [])] in
-
-  [
-    (* T1 invoke *)
-    { typ = Invoke; f = "txn"; value = Txn txn1; process = 0; index = 0;
+  [ { typ = Invoke; f = "txn"; value = Txn txn1; process = 0; index = 0;
       time_ns = t0 };
-    (* T1 begin writes (auto-commit on the low-level store) — we just let T1
-       proceed; the value 1 is now visible to a concurrent snapshot. *)
-    (* T1 writes inserted at t1 *)
-
-    (* T2 concurrent read — sees T1's uncommitted write if no SI *)
     { typ = Invoke; f = "txn"; value = Txn txn2; process = 1; index = 1;
       time_ns = t2 };
-    (* T2 reads [1] — this is dirty! *)
-    { typ = Ok; f = "txn";
-      value = Txn [Read (0, [1])];
+    { typ = Ok; f = "txn"; value = Txn [Read (0, [1])];
       process = 1; index = 2; time_ns = t3 };
-    (* T1 commits *)
-    { typ = Ok; f = "txn";
-      value = Txn [Append (0, 1); Read (0, [1])];
+    { typ = Ok; f = "txn"; value = Txn [Append (0, 1); Read (0, [1])];
       process = 0; index = 3; time_ns = t4 };
-    (* T2 final read (same txn?) — no, separate txn but we keep it clean *)
   ]
 
-(** Build a second negative-control: lost update.
-    T1 reads key 0 -> [], appends 1.
-    T2 concurrently reads key 0 -> [], appends 2.
-    Result: only [1] or [2] visible — a lost update (G2 / G-single). *)
-
-let build_lost_update_negative () =
+(** Lost update: T1 and T2 both see [] then each append, losing one. *)
+let build_lost_update () =
   let t0 = 0L in
   let t1 = 100_000L in
   let t2 = 200_000L in
   let t3 = 300_000L in
-  let _t4 = 400_000L in
-  let _t5 = 500_000L in
-
-  (* T1: append 1 to key=0 *)
-  let _txn1 = [Append (0, 1); Read (0, [1])] in
-  (* T2: append 2 to key=0 (concurrent with T1) *)
-  let _txn2 = [Append (0, 2); Read (0, [2])] in
-
-  [
-    (* T1 invokes *)
-    { typ = Invoke; f = "txn"; value = Txn [Append (0, 1); Read (0, [])];
+  [ { typ = Invoke; f = "txn"; value = Txn [Append (0, 1); Read (0, [])];
       process = 0; index = 0; time_ns = t0 };
-    (* T1 appends 1, reads back [1] *)
     { typ = Ok; f = "txn"; value = Txn [Append (0, 1); Read (0, [1])];
       process = 0; index = 1; time_ns = t1 };
-    (* T2 invokes *)
     { typ = Invoke; f = "txn"; value = Txn [Append (0, 2); Read (0, [])];
       process = 1; index = 2; time_ns = t2 };
-    (* T2 appends 2, reads back [2] — but should have seen [1,2]!
-       This is a lost update / G-single. *)
     { typ = Ok; f = "txn"; value = Txn [Append (0, 2); Read (0, [2])];
       process = 1; index = 3; time_ns = t3 };
   ]
 
+(* ================================================================= *)
+(* Bank negative control: total not conserved                        *)
+(* ================================================================= *)
+
+let build_bank_lost_transfer () =
+  let t0 = 0L in
+  let t1 = 100_000L in
+  let t2 = 200_000L in
+  let t3 = 300_000L in
+  [ (* Transfer 10 from account 0 to 1 *)
+    { typ = Invoke; f = "transfer"; value = Transfer (0, 1, 10);
+      process = 0; index = 0; time_ns = t0 };
+    (* But the balance read shows total went from 200 to 210 — fabricated! *)
+    { typ = Ok; f = "transfer";
+      value = BankRead [(0, 90L); (1, 120L)];  (* 90+120=210, should be 200 *)
+      process = 0; index = 1; time_ns = t1 };
+    (* Final read: different total again *)
+    { typ = Invoke; f = "read"; value = BankRead [];
+      process = (-2); index = 0; time_ns = t2 };
+    { typ = Ok; f = "read";
+      value = BankRead [(0, 90L); (1, 110L)];  (* 90+110=200 *)
+      process = (-2); index = 1; time_ns = t3 };
+  ]
+
+(* ================================================================= *)
+(* Set negative control: lost element                                *)
+(* ================================================================= *)
+
+let build_set_lost_element () =
+  let t0 = 0L in
+  let t1 = 100_000L in
+  let t2 = 200_000L in
+  let t3 = 300_000L in
+  let t4 = 400_000L in
+  let t5 = 500_000L in
+  [ (* Add element 1 *)
+    { typ = Invoke; f = "add"; value = SetAdd 1;
+      process = 0; index = 0; time_ns = t0 };
+    { typ = Ok; f = "add"; value = SetAdd 1;
+      process = 0; index = 1; time_ns = t1 };
+    (* Add element 2 *)
+    { typ = Invoke; f = "add"; value = SetAdd 2;
+      process = 0; index = 2; time_ns = t2 };
+    { typ = Ok; f = "add"; value = SetAdd 2;
+      process = 0; index = 3; time_ns = t3 };
+    (* Final read — element 1 is missing! *)
+    { typ = Invoke; f = "read"; value = SetRead [];
+      process = (-2); index = 0; time_ns = t4 };
+    { typ = Ok; f = "read"; value = SetRead [2];  (* element 1 lost *)
+      process = (-2); index = 1; time_ns = t5 };
+  ]
+
+(* ================================================================= *)
+(* Counter negative control: non-monotonic read                      *)
+(* ================================================================= *)
+
+let build_counter_non_monotonic () =
+  let t0 = 0L in
+  let t1 = 100_000L in
+  let t2 = 200_000L in
+  let t3 = 300_000L in
+  let t4 = 400_000L in
+  let t5 = 500_000L in
+  [ (* Increment key 0 twice *)
+    { typ = Invoke; f = "add"; value = Add (0, 1);
+      process = 0; index = 0; time_ns = t0 };
+    { typ = Ok; f = "add"; value = Read (0, Some 1);
+      process = 0; index = 1; time_ns = t1 };
+    { typ = Invoke; f = "add"; value = Add (0, 1);
+      process = 0; index = 2; time_ns = t2 };
+    { typ = Ok; f = "add"; value = Read (0, Some 2);
+      process = 0; index = 3; time_ns = t3 };
+    (* Final reads — value goes down! (non-monotonic) *)
+    { typ = Invoke; f = "read"; value = Read (0, None);
+      process = (-2); index = 0; time_ns = t4 };
+    { typ = Ok; f = "read"; value = Read (0, Some 1);  (* went from 2 to 1! *)
+      process = (-2); index = 1; time_ns = t5 };
+  ]
+
+(* ================================================================= *)
+(* Main                                                              *)
+(* ================================================================= *)
+
 let () =
   Random.self_init ();
-  let dirty_history = build_negative_history () in
-  Edn_history.write_history "/tmp/sqlocaml_negative_dirty_read.edn" dirty_history;
-  Printf.printf "Wrote %d entries (dirty-read negative control) to /tmp/sqlocaml_negative_dirty_read.edn\n"
-    (List.length dirty_history);
-
-  let lost_history = build_lost_update_negative () in
-  Edn_history.write_history "/tmp/sqlocaml_negative_lost_update.edn" lost_history;
-  Printf.printf "Wrote %d entries (lost-update negative control) to /tmp/sqlocaml_negative_lost_update.edn\n"
-    (List.length lost_history)
+  let write name entries =
+    let path = Printf.sprintf "/tmp/sqlocaml_negative_%s.edn" name in
+    Edn_history.write_history path entries;
+    Printf.printf "Wrote %d entries (%s negative control) to %s\n"
+      (List.length entries) name path
+  in
+  write "dirty_read" (build_dirty_read ());
+  write "lost_update" (build_lost_update ());
+  write "bank_lost_transfer" (build_bank_lost_transfer ());
+  write "set_lost_element" (build_set_lost_element ());
+  write "counter_non_monotonic" (build_counter_non_monotonic ())

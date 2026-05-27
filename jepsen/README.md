@@ -69,16 +69,66 @@ clojure -M -m jepsen.check /tmp/sqlocaml_negative_dirty_read.edn -w list-append
 clojure -M -m jepsen.check /tmp/sqlocaml_negative_lost_update.edn -w list-append
 ```
 
+### Bank workload
+
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload bank --backend mem --workers 4 --ops 100 --keys 5 \
+  --history /tmp/history.edn
+clojure -M -m jepsen.check /tmp/history.edn -w bank
+```
+
+### Set workload
+
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload set --backend file --path /tmp/test.db --workers 4 --ops 50 \
+  --history /tmp/history.edn
+clojure -M -m jepsen.check /tmp/history.edn -w set
+```
+
+### Counter workload
+
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload counter --backend mem --workers 4 --ops 200 --keys 5 \
+  --history /tmp/history.edn
+clojure -M -m jepsen.check /tmp/history.edn -w counter
+```
+
+### With crash-restart nemesis
+
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload set --backend wal --path /tmp/test.db \
+  --nemesis crash-restart --crash-after 30 --workers 2 --ops 60 \
+  --history /tmp/history.edn
+```
+
+### With process-pause nemesis
+
+```bash
+opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+  --workload list-append --backend mem \
+  --nemesis pause --pause-after 40 --pause-dur 3.0 --workers 4 --ops 100 \
+  --history /tmp/history.edn
+```
+
 ## CLI options (harness)
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--backend` | `mem` | Backend: `mem` \| `file` \| `wal` |
+| `--workload` | `list-append` | Workload: `list-append` \| `bank` \| `set` \| `counter` |
+| `--nemesis` | `none` | Nemesis: `none` \| `crash-restart` \| `pause` |
 | `--path` | `/tmp/sqlocaml_jepsen.db` | DB file path (for file/wal) |
 | `--workers` | `4` | Number of concurrent worker fibers |
 | `--ops` | `100` | Operations per worker |
-| `--keys` | `10` | Number of distinct keys |
+| `--keys` | `10` | Number of distinct keys/accounts |
 | `--history` | `/tmp/sqlocaml_jepsen_history.edn` | Output EDN history path |
+| `--crash-after` | `50` | Ops per worker before crash (crash-restart) |
+| `--pause-after` | `30` | Ops per worker before pause (pause) |
+| `--pause-dur` | `2.0` | Pause duration in seconds (pause) |
 
 ## File layout
 
@@ -102,7 +152,9 @@ jepsen/
 ## Phased rollout (per #177)
 
 - [x] **Core (no faults):** OCaml harness + EDN recorder + Clojure Elle checker
-- [ ] **Negative controls:** prove each checker catches its violation
-- [ ] **More workloads:** bank, set, counter
-- [ ] **Nemeses:** pause, crash, lazyfs, clock skew
+- [x] **Negative controls:** dirty read, lost update, bank lost transfer, set lost element, counter non-monotonic — for every workload
+- [x] **More workloads:** bank (transfer + total-conservation), set (durability), counter (monotonic bounds)
+- [x] **Nemeses:** crash-restart, process pause
+- [ ] **lazyfs nemesis:** un-fsynced write loss for durability testing
+- [ ] **Clock skew nemesis:** via faketime
 - [ ] **CI wiring:** per-workload+nemesis gates

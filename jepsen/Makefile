@@ -46,6 +46,52 @@ run-wal: build
 		--backend wal --path /tmp/sqlocaml_jepsen.db --workers 4 --ops 100 --keys 10 \
 		--history $(HISTORY)
 
+# ---------- New workloads ----------
+
+.PHONY: run-bank
+run-bank: build
+	@echo "=== Running bank workload ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload bank --backend mem --workers 4 --ops 100 --keys 5 \
+		--history /tmp/sqlocaml_jepsen_bank.edn
+
+.PHONY: run-set
+run-set: build
+	@echo "=== Running set workload ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload set --backend file --path /tmp/sqlocaml_jepsen_set.db \
+		--workers 4 --ops 50 --history /tmp/sqlocaml_jepsen_set.edn
+
+.PHONY: run-counter
+run-counter: build
+	@echo "=== Running counter workload ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload counter --backend mem --workers 4 --ops 200 --keys 5 \
+		--history /tmp/sqlocaml_jepsen_counter.edn
+
+# ---------- Nemesis runs ----------
+
+.PHONY: run-crash
+run-crash: build
+	@echo "=== Running set workload with crash-restart ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload set --backend wal --path /tmp/sqlocaml_jepsen_crash.db \
+		--nemesis crash-restart --crash-after 30 --workers 2 --ops 60 \
+		--history /tmp/sqlocaml_jepsen_crash.edn
+
+.PHONY: run-pause
+run-pause: build
+	@echo "=== Running list-append with process-pause ==="
+	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
+		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
+		--workload list-append --backend mem \
+		--nemesis pause --pause-after 40 --pause-dur 3.0 --workers 4 --ops 100 \
+		--history /tmp/sqlocaml_jepsen_pause.edn
+
 .PHONY: negative
 negative: build
 	@echo "=== Generating negative-control histories ==="

@@ -3,11 +3,12 @@
     Usage: harness.exe [options]
 
     Runs N concurrent Lwt worker fibers against a single in-memory or
-    file-backed database, each executing list-append (or other workload)
-    transactions.  Every operation's {:invoke/:ok/:fail} is recorded with a
-    nanosecond timestamp into a Jepsen-format EDN history file.
+    file-backed database, each executing one of the supported workloads
+    (list-append, bank, set, counter).  Every operation's
+    {:invoke/:ok/:fail} is recorded with a nanosecond timestamp into a
+    Jepsen-format EDN history file.
 
-    Phase 1 (core, no faults): list-append only, no nemeses. *)
+    Supports nemeses: crash-restart, process pause. *)
 
 open Lwt.Syntax
 
@@ -18,7 +19,24 @@ module Db = struct
 end
 
 (* ----------------------------------------------------------------- *)
-(* State shared across workers — the history accumulator              *)
+(* Types                                                              *)
+(* ----------------------------------------------------------------- *)
+
+type backend = Mem | File of string | WAL of string
+
+type workload =
+  | ListAppend
+  | Bank of { n_accounts : int; max_amount : int }
+  | Set
+  | Counter of { key_range : int }
+
+type nemesis =
+  | NoNemesis
+  | CrashRestart of { crash_after_ops : int }
+  | ProcessPause of { pause_after_ops : int; pause_duration_s : float }
+
+(* ----------------------------------------------------------------- *)
+(* State shared across workers                                       *)
 (* ----------------------------------------------------------------- *)
 
 type worker_state = {
@@ -29,80 +47,222 @@ type worker_state = {
 let make_worker_state () = { entries = []; count = 0 }
 
 (* ----------------------------------------------------------------- *)
-(* Main harness driver                                                *)
+(* Database open helpers                                              *)
 (* ----------------------------------------------------------------- *)
 
-type backend = Mem | File of string | WAL of string
+let open_db backend =
+  match backend with
+  | Mem -> Db.open_in_memory ()
+  | File path ->
+    let* r = Db.open_file ~path () in
+    (match r with
+     | Ok db -> Lwt.return db
+     | Error e ->
+       failwith (Printf.sprintf "open_file(%s) failed: %s" path
+                   (Format.asprintf "%a" Db.pp_error e)))
+  | WAL path ->
+    let* r = Db.open_file_wal ~path () in
+    (match r with
+     | Ok db -> Lwt.return db
+     | Error e ->
+       failwith (Printf.sprintf "open_file_wal(%s) failed: %s" path
+                   (Format.asprintf "%a" Db.pp_error e)))
 
-let run_harness
-    ~backend
-    ~n_workers
-    ~ops_per_worker
-    ~key_range
-    ~history_path
-  =
-  (* Open database *)
-  let* db =
-    match backend with
-    | Mem ->
-      Db.open_in_memory ()
-    | File path ->
-      let* r = Db.open_file ~path () in
-      (match r with
-       | Ok db -> Lwt.return db
-       | Error e -> failwith (Printf.sprintf "open_file(%s) failed: %s" path (Format.asprintf "%a" Db.pp_error e)))
-    | WAL path ->
-      let* r = Db.open_file_wal ~path () in
-      (match r with
-       | Ok db -> Lwt.return db
-       | Error e -> failwith (Printf.sprintf "open_file_wal(%s) failed: %s" path (Format.asprintf "%a" Db.pp_error e)))
+(* ----------------------------------------------------------------- *)
+(* Create schema based on workload                                    *)
+(* ----------------------------------------------------------------- *)
+
+let create_schema db = function
+  | ListAppend -> Workload_list_append.create_schema db
+  | Bank { n_accounts; _ } -> Workload_bank.create_schema db n_accounts
+  | Set -> Workload_set.create_schema db
+  | Counter { key_range } -> Workload_counter.create_schema db key_range
+
+(* ----------------------------------------------------------------- *)
+(* Single-op executor per workload (returns invoke+ok/fail entries)   *)
+(* ----------------------------------------------------------------- *)
+
+let run_one_op db workload worker_id idx _nem_state =
+  match workload with
+  | ListAppend ->
+    let txn = Workload_list_append.gen_txn 10 idx in
+    Workload_list_append.run_and_record db txn worker_id idx
+  | Bank { n_accounts; max_amount } ->
+    let (f, t, a) = Workload_bank.gen_transfer n_accounts max_amount in
+    Workload_bank.run_and_record db f t a worker_id idx
+  | Set ->
+    Workload_set.run_and_record db idx worker_id idx
+  | Counter { key_range } ->
+    let k = Workload_counter.gen_incr key_range in
+    Workload_counter.run_and_record db k worker_id idx
+
+(* ----------------------------------------------------------------- *)
+(* Worker loop                                                        *)
+(* ----------------------------------------------------------------- *)
+
+let worker_loop db workload st ops_per_worker nem_state pause_config =
+  let rec loop () =
+    if st.count >= ops_per_worker then Lwt.return_unit
+    else
+      let idx = st.count in
+      let* invoke_e, outcome_e = run_one_op db workload idx idx nem_state in
+      st.entries <- outcome_e :: invoke_e :: st.entries;
+      st.count <- idx + 1;
+      (* Handle nemesis pause *)
+      (match Nemesis.check_pause nem_state with
+       | Some ev -> st.entries <- ev :: st.entries
+       | None -> ());
+      (* Trigger process-pause nemesis if configured *)
+      (match pause_config with
+       | Some (after, dur) when st.count = after ->
+         let ev = Nemesis.start_pause nem_state dur in
+         st.entries <- ev :: st.entries
+       | _ -> ());
+      let* () = Lwt.pause () in
+      loop ()
   in
-  (* Create schema *)
-  let* () = Workload_list_append.create_schema db in
-  (* Launch workers — each runs exactly ops_per_worker txns and stops *)
-  let states = Array.init n_workers (fun _ -> make_worker_state ()) in
-  let workers = Array.to_list (Array.mapi (fun _ st ->
-    let rec work () =
-      if st.count >= ops_per_worker
-      then Lwt.return_unit
+  loop ()
+
+(* ----------------------------------------------------------------- *)
+(* Final read phases                                                  *)
+(* ----------------------------------------------------------------- *)
+
+let final_read db workload =
+  let open Lwt.Syntax in
+  match workload with
+  | Set ->
+    let* elements = Workload_set.read_all db in
+    Lwt.return [
+      Edn_history.make_invoke ~f:"read" ~value:(SetRead []) ~process:(-2) ~index:0;
+      Edn_history.make_result ~typ:Ok ~f:"read"
+        ~value:(SetRead elements) ~process:(-2) ~index:0;
+    ]
+  | Counter { key_range } ->
+    let rec read_keys i acc =
+      if i >= key_range then Lwt.return (List.rev acc)
       else
-        let txn = Workload_list_append.gen_txn key_range st.count in
-        let idx = st.count in
-        let* invoke_e, outcome_e =
-          Workload_list_append.run_and_record db txn 0 idx
-        in
-        st.entries <- outcome_e :: invoke_e :: st.entries;
-        st.count <- idx + 1;
-        let* () = Lwt.pause () in
-        work ()
+        let* val_opt = Workload_counter.read_key db i in
+        let inv = Edn_history.make_invoke ~f:"read"
+                    ~value:(Read (i, None)) ~process:(-2) ~index:i in
+        let ok = Edn_history.make_result ~typ:Ok ~f:"read"
+                   ~value:(Read (i, val_opt)) ~process:(-2) ~index:i in
+        read_keys (i + 1) (ok :: inv :: acc)
     in
-    work ()
-  ) states) in
-  (* Wait for all workers to complete *)
-  let* () = Lwt.join workers in
-  (* Collect history *)
+    read_keys 0 []
+  | Bank { n_accounts = _; _ } ->
+    let* r = Db.query db "SELECT id, balance FROM accounts ORDER BY id" in
+    (match r with
+     | Error _ ->
+       Lwt.return [
+         Edn_history.make_invoke ~f:"read" ~value:(BankRead []) ~process:(-2) ~index:0;
+         Edn_history.make_result ~typ:Fail ~f:"read"
+           ~value:(BankRead []) ~process:(-2) ~index:0;
+       ]
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       let balances = List.map (fun row ->
+         let id = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> 0 in
+         let bal = match row.(1) with Db.V_int n -> n | _ -> 0L in
+         (id, bal)
+       ) rows in
+       Lwt.return [
+         Edn_history.make_invoke ~f:"read" ~value:(BankRead []) ~process:(-2) ~index:0;
+         Edn_history.make_result ~typ:Ok ~f:"read"
+           ~value:(BankRead balances) ~process:(-2) ~index:0;
+       ])
+  | ListAppend -> Lwt.return []
+
+(* ----------------------------------------------------------------- *)
+(* Collect history from all workers + final reads                     *)
+(* ----------------------------------------------------------------- *)
+
+let collect_history states final_entries =
   let all_entries =
     Array.fold_left (fun acc st ->
       List.rev_append (List.rev st.entries) acc
-    ) [] states
+    ) final_entries states
   in
-  let history = List.rev all_entries in
-  Printf.printf "Completed %d txns across %d workers\n" (List.length history / 2) n_workers;
-  (* Write history *)
+  List.rev all_entries
+
+(* ----------------------------------------------------------------- *)
+(* Clean up database files                                            *)
+(* ----------------------------------------------------------------- *)
+
+let cleanup_files = function
+  | File path | WAL path ->
+    (try Unix.unlink path with _ -> ());
+    (try Unix.unlink (path ^ "-wal") with _ -> ())
+  | Mem -> ()
+
+(* ----------------------------------------------------------------- *)
+(* Main harness: no-crash path                                        *)
+(* ----------------------------------------------------------------- *)
+
+let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_path =
+  let nem_state = Nemesis.create () in
+  let pause_config =
+    match nemesis with
+    | ProcessPause { pause_after_ops; pause_duration_s } ->
+      Some (pause_after_ops, pause_duration_s)
+    | _ -> None
+  in
+  let* db = open_db backend in
+  let* () = create_schema db workload in
+  let states = Array.init n_workers (fun _ -> make_worker_state ()) in
+  let workers = Array.to_list (Array.mapi (fun _worker_id st ->
+    worker_loop db workload st ops_per_worker nem_state pause_config
+  ) states) in
+  let* () = Lwt.join workers in
+  let* final_entries = final_read db workload in
+  let history = collect_history states final_entries in
+  Printf.printf "Completed %d operations across %d workers\n"
+    (List.length history) n_workers;
   Edn_history.write_history history_path history;
-  Printf.printf "Wrote %d history entries to %s\n" (List.length history) history_path;
-  (* Close *)
+  Printf.printf "Wrote %d history entries to %s\n"
+    (List.length history) history_path;
   let* () = Db.close db in
-  (* Clean up file if needed *)
-  (match backend with
-   | File path | WAL path ->
-     (try Unix.unlink path with _ -> ());
-     (try Unix.unlink (path ^ "-wal") with _ -> ())
-   | Mem -> ());
+  cleanup_files backend;
   Lwt.return_unit
 
 (* ----------------------------------------------------------------- *)
-(* CLI entry point *)
+(* Crash-restart harness                                              *)
+(* ----------------------------------------------------------------- *)
+
+let run_crash_restart ~backend ~workload ~n_workers ~ops_before ~ops_after ~history_path =
+  let nem_state = Nemesis.create () in
+  let* db = open_db backend in
+  let* () = create_schema db workload in
+  let states = Array.init n_workers (fun _ -> make_worker_state ()) in
+  let workers_before = Array.to_list (Array.mapi (fun _worker_id st ->
+    worker_loop db workload st ops_before nem_state None
+  ) states) in
+  let* () = Lwt.join workers_before in
+  (* Crash *)
+  let crash_entry = Nemesis.record_crash nem_state in
+  let* () = Db.close db in
+  (* Restart *)
+  let restart_entry = Nemesis.record_restart nem_state in
+  let* db2 = open_db backend in
+  let states2 = Array.init n_workers (fun _ -> make_worker_state ()) in
+  let workers_after = Array.to_list (Array.mapi (fun _worker_id st ->
+    worker_loop db2 workload st ops_after nem_state None
+  ) states2) in
+  let* () = Lwt.join workers_after in
+  let* final_entries = final_read db2 workload in
+  let history =
+    crash_entry :: restart_entry ::
+    collect_history states (collect_history states2 final_entries)
+  in
+  Printf.printf "Crash-restart: %d entries total\n" (List.length history);
+  Edn_history.write_history history_path history;
+  Printf.printf "Wrote %d history entries to %s\n"
+    (List.length history) history_path;
+  let* () = Db.close db2 in
+  cleanup_files backend;
+  Lwt.return_unit
+
+(* ----------------------------------------------------------------- *)
+(* CLI entry point                                                    *)
 (* ----------------------------------------------------------------- *)
 
 let () =
@@ -113,24 +273,63 @@ let () =
   let ops_per_worker = ref 100 in
   let key_range = ref 10 in
   let history_path = ref "/tmp/sqlocaml_jepsen_history.edn" in
+  let workload_name = ref "list-append" in
+  let nemesis_name = ref "none" in
+  let crash_after = ref 50 in
+  let pause_after = ref 30 in
+  let pause_dur = ref 2.0 in
   let args = [
     ("--backend", Arg.Set_string backend, " Backend (mem|file|wal)");
-    ("--path", Arg.Set_string path, " Database file path (for file/wal)");
-    ("--workers", Arg.Set_int n_workers, " Number of concurrent worker fibers");
-    ("--ops", Arg.Set_int ops_per_worker, " Ops per worker (total ops = workers * ops)");
-    ("--keys", Arg.Set_int key_range, " Number of distinct keys");
-    ("--history", Arg.Set_string history_path, " Output EDN history path");
+    ("--path", Arg.Set_string path, " Database file path");
+    ("--workload", Arg.Set_string workload_name,
+     " Workload: list-append|bank|set|counter");
+    ("--nemesis", Arg.Set_string nemesis_name,
+     " Nemesis: none|crash-restart|pause");
+    ("--workers", Arg.Set_int n_workers, " Concurrent workers");
+    ("--ops", Arg.Set_int ops_per_worker, " Ops per worker");
+    ("--keys", Arg.Set_int key_range, " Distinct keys/accounts");
+    ("--history", Arg.Set_string history_path, " Output EDN path");
+    ("--crash-after", Arg.Set_int crash_after,
+     " Ops per worker before crash");
+    ("--pause-after", Arg.Set_int pause_after,
+     " Ops before pause");
+    ("--pause-dur", Arg.Set_float pause_dur,
+     " Pause duration (seconds)");
   ] in
   Arg.parse (Arg.align args)
     (fun _ -> ())
-    "sqlocaml Jepsen harness — concurrent list-append workload driver";
-  Lwt_main.run (run_harness
-    ~backend:(match !backend with
-      | "mem" -> Mem
-      | "file" -> File !path
-      | "wal" -> WAL !path
-      | _ -> failwith (Printf.sprintf "unknown backend: %s" !backend))
-    ~n_workers:!n_workers
-    ~ops_per_worker:!ops_per_worker
-    ~key_range:!key_range
-    ~history_path:!history_path)
+    "sqlocaml Jepsen harness";
+  let backend_val =
+    match !backend with
+    | "mem" -> Mem | "file" -> File !path | "wal" -> WAL !path
+    | s -> failwith (Printf.sprintf "unknown backend: %s" s)
+  in
+  let workload_val =
+    match !workload_name with
+    | "list-append" -> ListAppend
+    | "bank" -> Bank { n_accounts = !key_range; max_amount = 10 }
+    | "set" -> Set
+    | "counter" -> Counter { key_range = !key_range }
+    | s -> failwith (Printf.sprintf "unknown workload: %s" s)
+  in
+  let nemesis_val =
+    match !nemesis_name with
+    | "none" -> NoNemesis
+    | "crash-restart" -> CrashRestart { crash_after_ops = !crash_after }
+    | "pause" ->
+      ProcessPause { pause_after_ops = !pause_after;
+                     pause_duration_s = !pause_dur }
+    | s -> failwith (Printf.sprintf "unknown nemesis: %s" s)
+  in
+  (match nemesis_val with
+   | CrashRestart { crash_after_ops } ->
+     Lwt_main.run (run_crash_restart
+       ~backend:backend_val ~workload:workload_val ~n_workers:!n_workers
+       ~ops_before:crash_after_ops
+       ~ops_after:(!ops_per_worker - crash_after_ops)
+       ~history_path:!history_path)
+   | _ ->
+     Lwt_main.run (run_harness
+       ~backend:backend_val ~workload:workload_val ~nemesis:nemesis_val
+       ~n_workers:!n_workers ~ops_per_worker:!ops_per_worker
+       ~history_path:!history_path))

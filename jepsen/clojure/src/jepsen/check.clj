@@ -16,6 +16,7 @@
             [clojure.java.io :as io]
             [clojure.edn :as edn]
             [clojure.pprint :as pp]
+            [clojure.set :as set]
             [elle.list-append :as elle-la]
             [jepsen.checker :as checker]
             [jepsen.history :as history]))
@@ -25,13 +26,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn parse-history
-  "Read one EDN entry per line from `path` into a vector of Jepsen history maps.
-
-   The OCaml harness emits each operation as a single-line EDN map:
-     {:type :invoke/:ok/:fail/:info, :f <string>, :value <...>,
-      :process <int>, :index <int>, :time <int64-ns>}
-
-   Elle expects :time in nanoseconds (Long), :index as Long, :process as Long."
+  "Read one EDN entry per line from path into a vector of Jepsen history maps."
   [path]
   (with-open [rdr (io/reader path)]
     (doall
@@ -51,23 +46,141 @@
 ;; ---------------------------------------------------------------------------
 
 (defn check-list-append
-  "Run Elle's list-append checker with snapshot-isolation consistency model.
-   Returns a map of analysis results."
+  "Run Elle's list-append checker with snapshot-isolation consistency model."
   [history opts]
   (let [checker (elle-la/checker
-                  {:consistency-models [:snapshot-isolation]})}
+                  {:consistency-models [:snapshot-isolation]})]
     (checker/check checker {:test {:clock :real}} history nil)))
 
+;; ---------------------------------------------------------------------------
+;; Bank checker: total-conservation invariant
+;; ---------------------------------------------------------------------------
+
+(defn- bank-total-invariant
+  [history]
+  (let [reads (filter #(and (= :ok (:type %))
+                            (= :read (:f %))
+                            (vector? (:value %)))
+                      history)
+        totals (map (fn [op]
+                      (let [pairs (:value op)]
+                        (reduce + (map second pairs))))
+                    reads)]
+    (if (empty? totals)
+      {:valid? true :note "no read operations found"}
+      (let [expected (first totals)
+            all-match (every? #(= expected %) totals)]
+        {:valid? all-match
+         :expected-total expected
+         :totals-seen (distinct totals)
+         :reads-checked (count totals)
+         :anomaly (when-not all-match
+                    "total balance changed across reads")}))))
+
+(defn check-bank
+  [history opts]
+  (let [result (bank-total-invariant history)]
+    {:valid? (:valid? result)
+     :workload "bank"
+     :checker "total-conservation"
+     :details result}))
+
+;; ---------------------------------------------------------------------------
+;; Set checker: acked elements present, no fabricated elements
+;; ---------------------------------------------------------------------------
+
+(defn- set-durability-check
+  [history]
+  (let [acked (set (for [op history
+                         :when (and (= :ok (:type op))
+                                    (= :add (:f op)))]
+                     (:value op)))
+        final-reads (filter #(and (= :ok (:type %))
+                                  (= :read (:f %))
+                                  (vector? (:value %)))
+                            history)
+        final-set (if (seq final-reads)
+                    (set (:value (last final-reads)))
+                    #{})
+        lost (set/difference acked final-set)
+        fabricated (set/difference final-set acked)]
+    {:valid? (and (empty? lost) (empty? fabricated))
+     :acked-count (count acked)
+     :final-count (count final-set)
+     :lost (seq lost)
+     :fabricated (seq fabricated)
+     :anomaly (cond
+                (and (seq lost) (seq fabricated))
+                (str "Lost " (count lost) " elements, fabricated "
+                     (count fabricated))
+                (seq lost)
+                (str "Lost " (count lost) " acked elements")
+                (seq fabricated)
+                (str "Fabricated " (count fabricated) " elements"))}))
+
+(defn check-set
+  [history opts]
+  (let [result (set-durability-check history)]
+    {:valid? (:valid? result)
+     :workload "set"
+     :checker "durability"
+     :details result}))
+
+;; ---------------------------------------------------------------------------
+;; Counter checker: monotonic reads, final value within bounds
+;; ---------------------------------------------------------------------------
+
+(defn- counter-check
+  [history]
+  (let [adds (filter #(and (= :ok (:type %)) (= :add (:f %))) history)
+        reads (filter #(and (= :ok (:type %)) (= :read (:f %))) history)
+        acked (count adds)
+        read-vals (keep (fn [op]
+                          (let [v (:value op)]
+                            (when (and (vector? v) (= 2 (count v)))
+                              (second v))))
+                        reads)
+        read-vals (remove nil? read-vals)
+        monotonic (or (empty? read-vals)
+                      (apply <= read-vals))
+        final-val (last read-vals)
+        in-bounds (if final-val
+                    (<= 0 final-val acked)
+                    true)]
+    {:valid? (and monotonic in-bounds)
+     :acked acked
+     :reads-checked (count read-vals)
+     :monotonic monotonic
+     :final-value final-val
+     :in-bounds in-bounds
+     :anomaly (cond
+                (not monotonic) "reads not monotonic"
+                (not in-bounds) (str "final value " final-val
+                                     " not in [0, " acked "]"))}))
+
+(defn check-counter
+  [history opts]
+  (let [result (counter-check history)]
+    {:valid? (:valid? result)
+     :workload "counter"
+     :checker "monotonic-bounds"
+     :details result}))
+
+;; ---------------------------------------------------------------------------
+;; Checker registry
+;; ---------------------------------------------------------------------------
+
 (def checkers
-  "Map of workload name -> checker function"
-  {:list-append check-list-append})
+  {:list-append check-list-append
+   :bank        check-bank
+   :set         check-set
+   :counter     check-counter})
 
 ;; ---------------------------------------------------------------------------
 ;; Reporting
 ;; ---------------------------------------------------------------------------
 
 (defn report-result
-  "Pretty-print the checker result."
   [result output-file]
   (let [out (if output-file (io/writer output-file) *out*)]
     (binding [*out* out]

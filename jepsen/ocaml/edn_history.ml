@@ -9,15 +9,18 @@
 type op_type = Invoke | Ok | Fail | Info
 
 type value =
-  | Txn of txn_op list       (* list-append / mixed workloads *)
-  | Add of int * int         (* counter: [k, delta] *)
-  | Read of int * int option (* counter: [k, expected?] *)
-  | Transfer of int * int * int  (* bank: [from, to, amount] *)
-  | Nemesis of string        (* nemesis event name *)
+  | Txn of txn_op list           (** list-append / mixed workloads *)
+  | Add of int * int             (** counter: [k, delta] *)
+  | Read of int * int option     (** counter: [k, expected?] *)
+  | Transfer of int * int * int  (** bank: [from, to, amount] *)
+  | BankRead of (int * int64) list  (** bank read: [(account_id, balance)] *)
+  | SetAdd of int                (** set: [element] *)
+  | SetRead of int list          (** set read: [elements] *)
+  | Nemesis of string            (** nemesis event name *)
 
 and txn_op =
-  | Append of int * int      (* key, value *)
-  | Read of int * int list   (* key, values seen *)
+  | Append of int * int          (** key, value *)
+  | Read of int * int list       (** key, values seen *)
 
 type entry = {
   typ : op_type;
@@ -58,6 +61,19 @@ let pp_value ppf = function
      | None -> Format.fprintf ppf "[%d nil]" k
      | Some n -> Format.fprintf ppf "[%d %d]" k n)
   | Transfer (f, t, a) -> Format.fprintf ppf "[%d %d %d]" f t a
+  | BankRead balances ->
+    Format.fprintf ppf "[";
+    List.iteri (fun i (id, bal) ->
+      if i > 0 then Format.fprintf ppf " ";
+      Format.fprintf ppf "[%d %Ld]" id bal) balances;
+    Format.fprintf ppf "]"
+  | SetAdd e -> Format.fprintf ppf "%d" e
+  | SetRead es ->
+    Format.fprintf ppf "[";
+    List.iteri (fun i e ->
+      if i > 0 then Format.fprintf ppf " ";
+      Format.fprintf ppf "%d" e) es;
+    Format.fprintf ppf "]"
   | Nemesis s -> Format.fprintf ppf "%S" s
 
 let pp_entry ppf (e : entry) =
@@ -79,3 +95,19 @@ let write_history path entries =
   let ch = open_out path in
   List.iter (write_entry ch) entries;
   close_out ch
+
+(** Convenience: create an invoke entry with the current timestamp. *)
+let make_invoke ~f ~value ~process ~index =
+  let time = Int64.of_float (Unix.gettimeofday () *. 1e9) in
+  { typ = Invoke; f; value; process; index; time_ns = time }
+
+(** Convenience: create an ok/fail entry with timestamp. *)
+let make_result ~typ ~f ~value ~process ~index =
+  let time = Int64.of_float (Unix.gettimeofday () *. 1e9) in
+  { typ; f; value; process; index; time_ns = time }
+
+(** Convenience: create a nemesis info entry. *)
+let make_nemesis ~nemesis_name ~process ~index =
+  let time = Int64.of_float (Unix.gettimeofday () *. 1e9) in
+  { typ = Info; f = nemesis_name; value = Nemesis nemesis_name;
+    process; index; time_ns = time }
