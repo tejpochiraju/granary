@@ -44,67 +44,99 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- list-append-check
-  "Pure-Clojure list-append checker: verifies per-key monotonic reads.
-   Each read on key K must contain all values that were acked on K
-   before that read was invoked."
+  "Pure-Clojure list-append checker with temporal ordering.
+   For each key:
+   1. No dirty reads: a read's values must all be acked at or before that read.
+   2. No lost updates: the final read for each key must contain all acked values
+      (union covers all committed appends).
+   Catches dirty_read and lost_update negative controls."
   [history]
-  (let [;; group ops by process to track per-key state
-        ;; Collect all (key, value) pairs acked via append
+  (let [;; Per-key acked appends with timestamps
         acked (for [op history
                     :when (and (= :ok (:type op))
                                (= :txn (:f op)))
-                    :let [v (:value op)]
+                    :let [v (:value op)
+                          ts (or (:time op) 0)]
                     :when (vector? v)
                     [act k val] v
                     :when (= act :append)]
-                [k val])
-        ;; Collect all read results: (key, values-seen)
+                {:k k :val val :ts ts})
+        ;; Per-key reads with timestamps
         reads (for [op history
                     :when (and (= :ok (:type op))
                                (= :txn (:f op)))
-                    :let [v (:value op)]
+                    :let [v (:value op)
+                          ts (or (:time op) 0)]
                     :when (vector? v)
                     [act k val] v
                     :when (= act :r)]
-                [k (if (vector? val) (set val) #{})])
-        ;; Build per-key union of all reads
-        read-union (reduce (fn [m [k vals]]
-                             (update m k (fn [old] (set/union (or old #{}) vals))))
-                           {}
-                           reads)
+                {:k k :vals (if (vector? val) (set val) #{}) :ts ts})
+        ;; All keys referenced
+        keys (set (concat (map :k acked) (map :k reads)))
+        ;; Per-key sorted acks
+        acked-by-key (reduce (fn [m {:keys [k val ts]}]
+                               (update m k (fn [vs] (conj (or vs []) {:val val :ts ts}))))
+                             {} acked)
+        ;; Build per-key union of all reads (for lost-update check)
+        read-union (reduce (fn [m {:keys [k vals]}]
+                             (update m k set/union (or (get m k) #{}) vals))
+                           {} reads)
         ;; Build per-key set of all acked values
-        acked-per-key (reduce (fn [m [k val]]
-                                (update m k (fn [old] (conj (or old #{}) val))))
-                              {}
-                              acked)
+        acked-set (reduce (fn [m {:keys [k val]}]
+                             (update m k (fn [s] (conj (or s #{}) val))))
+                           {} acked)
         ;; Check each key
-        keys (set (concat (keys acked-per-key) (keys read-union)))
-        anomalies (for [k keys
-                        :let [acked-k (get acked-per-key k #{})
-                              seen-k (get read-union k #{})
-                              lost (set/difference acked-k seen-k)
-                              fabricated (set/difference seen-k acked-k)]
-                        :when (or (seq lost) (seq fabricated))]
-                    {:key k :lost (seq lost) :fabricated (seq fabricated)})
-        total-lost (reduce + 0 (map #(count (:lost %)) anomalies))
-        total-fab (reduce + 0 (map #(count (:fabricated %)) anomalies))]
+        anomalies (mapcat
+                    (fn [k]
+                      (let [reads-k (sort-by :ts (filter #(= k (:k %)) reads))
+                            acks-k (sort-by :ts (get acked-by-key k []))
+                            last-read-vals (if (seq reads-k) (:vals (last reads-k)) #{})
+                            ;; Values acked at or before time T
+                            acked-before (fn [t]
+                                           (set (map :val (filter #(<= (:ts %) t) acks-k))))
+                            ;; Check 1: dirty reads — each read only sees values acked at or before its time
+                            dirty-reads (for [{:keys [vals ts]} reads-k
+                                              :let [valid (acked-before ts)
+                                                    extras (set/difference vals valid)]
+                                              :when (seq extras)]
+                                          {:key k :type :dirty-read
+                                           :read-vals (seq vals)
+                                           :extras (seq extras)
+                                           :read-ts ts
+                                           :acked-until (seq (acked-before ts))})
+                            ;; Check 2: lost updates — last read must cover all acked values
+                            acked-all (get acked-set k #{})
+                            lost (set/difference acked-all last-read-vals)
+                            lost-update (when (seq lost)
+                                          {:key k :type :lost-update
+                                           :lost (seq lost)
+                                           :acked-all (seq acked-all)
+                                           :last-read-vals (seq last-read-vals)})
+                            ;; Check 3: fabricated — anything in reads never acked at all
+                            union-k (get read-union k #{})
+                            fabricated (set/difference union-k acked-all)
+                            fab (when (seq fabricated)
+                                  {:key k :type :fabricated
+                                   :fabricated (seq fabricated)})]
+                        (remove nil? (concat dirty-reads [lost-update fab]))))
+                    keys)]
     {:valid? (empty? anomalies)
      :keys-checked (count keys)
-     :keys-with-anomalies (count anomalies)
-     :total-lost total-lost
-     :total-fabricated total-fab
      :anomalies anomalies
      :anomaly (when (seq anomalies)
-                (str "Found " (count anomalies) " keys with anomalies: "
-                     total-lost " lost, " total-fab " fabricated"))}))
+                (let [by-type (group-by :type anomalies)]
+                  (str (count anomalies) " anomalies: "
+                       (count (get by-type :dirty-read)) " dirty-reads, "
+                       (count (get by-type :lost-update)) " lost-updates, "
+                       (count (get by-type :fabricated)) " fabricated")))}))
 
 (defn check-list-append
-  "Pure-Clojure append-visibility checker (no Elle dependency)."
+  "Pure-Clojure append-temporal checker (no Elle dependency)."
   [history opts]
   (let [result (list-append-check history)]
     {:valid? (:valid? result)
      :workload "list-append"
-     :checker "append-visibility"
+     :checker "append-temporal"
      :details result}))
 
 ;; ---------------------------------------------------------------------------

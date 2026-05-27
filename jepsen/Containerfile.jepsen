@@ -13,4 +13,3 @@ COPY jepsen/clojure/deps.edn ./
 RUN clojure -P && rm -rf /deps
 
 WORKDIR /workspace
-ENTRYPOINT ["clojure"]
