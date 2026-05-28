@@ -59,16 +59,17 @@ let run_transfer db from_acc to_acc amount =
    | Error e -> failwith (Printf.sprintf "CREDIT failed: %s" (pp_error e)));
   (* Read back full snapshot *)
   let* r_query = Db.query db "SELECT id, balance FROM accounts ORDER BY id" in
-  let balances =
+  let* rows =
     match r_query with
     | Error e -> failwith (Printf.sprintf "SELECT failed: %s" (pp_error e))
-    | Ok stream ->
-      let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-      List.map (fun row ->
-        let id = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> 0 in
-        let bal = match row.(1) with Db.V_int n -> n | _ -> 0L in
-        (id, bal)
-      ) rows
+    | Ok stream -> Lwt_stream.to_list stream
+  in
+  let balances =
+    List.map (fun row ->
+      let id = match row.(0) with Db.V_int n -> Int64.to_int n | _ -> 0 in
+      let bal = match row.(1) with Db.V_int n -> n | _ -> 0L in
+      (id, bal)
+    ) rows
   in
   let* r_commit = Db.execute db "COMMIT" in
   (match r_commit with

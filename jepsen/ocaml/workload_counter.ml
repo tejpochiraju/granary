@@ -41,14 +41,15 @@ let run_incr db key =
      failwith (Printf.sprintf "UPDATE failed: %s" (pp_error e)));
   let* r_read = Db.query db
     (Printf.sprintf "SELECT n FROM c WHERE k = %d" key) in
-  let new_val =
+  let* rows =
     match r_read with
     | Error e -> failwith (Printf.sprintf "SELECT failed: %s" (pp_error e))
-    | Ok stream ->
-      let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-      match rows with
-      | [| Db.V_int n |] :: _ -> Int64.to_int n
-      | _ -> failwith "unexpected counter read result"
+    | Ok stream -> Lwt_stream.to_list stream
+  in
+  let new_val =
+    match rows with
+    | [| Db.V_int n |] :: _ -> Int64.to_int n
+    | _ -> failwith "unexpected counter read result"
   in
   Lwt.return (key, new_val)
 
