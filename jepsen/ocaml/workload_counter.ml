@@ -3,11 +3,14 @@
     Schema:
       CREATE TABLE c (k INTEGER PRIMARY KEY, n INTEGER)
 
-    Each transaction:
-      BEGIN;
+    Each operation:
       UPDATE c SET n = n + 1 WHERE k = ?key;
       SELECT n FROM c WHERE k = ?key;
-      COMMIT;
+
+    Both statements run in auto-commit mode so multiple workers sharing
+    a single [Db.t] handle don't collide on [explicit_txn].  The UPDATE
+    is atomic (implicit txn inside [execute_with_count]); the SELECT
+    observes the committed state.
 
     Jepsen's counter checker verifies:
       - Reads are monotonic non-decreasing.
@@ -22,14 +25,13 @@ module Db = Sqlocaml.Db
 let gen_incr key_range =
   Random.int key_range
 
-(** Run a counter increment transaction. Returns (key, new_value). *)
+(** Run a counter increment.  Each statement runs in auto-commit mode
+    so multiple workers sharing a single [Db.t] handle don't collide
+    on [explicit_txn].  The UPDATE is atomic (implicit txn inside
+    [execute_with_count]); the SELECT observes the committed state. *)
 let run_incr db key =
   let open Lwt.Syntax in
   let pp_error e = Format.asprintf "%a" Db.pp_error e in
-  let* r_begin = Db.execute db "BEGIN" in
-  (match r_begin with
-   | Ok () -> ()
-   | Error e -> failwith (Printf.sprintf "BEGIN failed: %s" (pp_error e)));
   let update_sql = Printf.sprintf
     "UPDATE c SET n = n + 1 WHERE k = %d" key in
   let* r_update = Db.execute db update_sql in
@@ -48,12 +50,7 @@ let run_incr db key =
       | [| Db.V_int n |] :: _ -> Int64.to_int n
       | _ -> failwith "unexpected counter read result"
   in
-  let* r_commit = Db.execute db "COMMIT" in
-  (match r_commit with
-   | Ok () -> Lwt.return (key, new_val)
-   | Error e ->
-     let* _ = Db.execute db "ROLLBACK" in
-     failwith (Printf.sprintf "COMMIT failed: %s" (pp_error e)))
+  Lwt.return (key, new_val)
 
 (** Run an increment and produce invoke/ok|fail entries. *)
 let run_and_record db key process_id index =
