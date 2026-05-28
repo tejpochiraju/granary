@@ -134,12 +134,16 @@ type backend =
 type t =
   { backend : backend
   ; lock : Rwlock.t
-  ; (* Snapshot of Mem backend tree contents taken at rw_begin.
-     Used to implement rollback for the in-memory backend.
-     None when no RW transaction is active. *)
-    mutable mem_rw_snapshot : (tree_id * Bytes.t Bytes_map.t) list option
+  ; (* Shadow copies of Mem backend tree contents for the active RW txn.
+       Writes during the txn go to the shadow — the live tree is NEVER
+       modified until commit.  This prevents readers (both RO snapshots
+       and subsequent RW txns) from ever seeing uncommitted state.
+       None when no RW transaction is active.
+       #178: without shadow writes, concurrent RO reads could observe
+       uncommitted mutations because Rwlock's acquire_read never blocks. *)
+    mutable mem_rw_shadow : (tree_id * Bytes.t Bytes_map.t) list option
   ; (* Savepoint stack for the Mem backend; newest entry at front.
-     Each entry is (savepoint_name, snapshot_of_all_trees). *)
+       Each entry is (savepoint_name, snapshot_of_shadow). *)
     mutable mem_savepoints : (string * (tree_id * Bytes.t Bytes_map.t) list) list
   }
 
@@ -227,6 +231,27 @@ let mem_tree_snap (snap : (tree_id * Bytes.t Bytes_map.t) list) (tid : tree_id) 
   | Some map -> map
   | None -> Bytes_map.empty
 ;;
+
+(* Shadow helpers for the in-memory backend (#178).
+   During a RW transaction, all writes go to a per-txn shadow.
+   The live tree is never mutated until commit, so RO txn
+   snapshots always capture committed-only state. *)
+
+(* Get a tree's content from the shadow, falling back to the live
+   tree when the tree hasn't been touched by this txn yet. *)
+let shadow_get (shadow : (tree_id * Bytes.t Bytes_map.t) list) (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t) (tid : tree_id) =
+  match List.assoc_opt tid shadow with
+  | Some map -> map
+  | None -> !(mem_tree trees tid)
+;;
+
+(* Update a tree in the shadow.  The tree is lazy-copied from the live
+   tree on first access (via [shadow_get]). *)
+let shadow_update (shadow : (tree_id * Bytes.t Bytes_map.t) list) (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t) (tid : tree_id) (f : Bytes.t Bytes_map.t -> Bytes.t Bytes_map.t) =
+  let map = shadow_get shadow trees tid in
+  (tid, f map) :: List.remove_assoc tid shadow
+;;
+
 
 (* ------------------------------------------------------------------ *)
 (* Backend helpers — Btree                                              *)
@@ -405,7 +430,7 @@ let read_freelist_pages pager ~first_page : Freelist.t Lwt.t =
 let create () : t =
   { backend = Mem (Hashtbl.create 16)
   ; lock = Rwlock.create ()
-  ; mem_rw_snapshot = None
+  ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
 ;;
@@ -452,7 +477,7 @@ let make_btree_store
   in
   { backend = Btree st
   ; lock = Rwlock.create ()
-  ; mem_rw_snapshot = None
+  ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
 ;;
@@ -721,7 +746,7 @@ let rw_begin t =
    | Mem trees ->
      (* Snapshot all currently-existing trees so rollback can restore them. *)
      let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-     t.mem_rw_snapshot <- Some snap;
+     t.mem_rw_shadow <- Some snap;
      t.mem_savepoints <- []
    | Btree st ->
      let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
@@ -1146,8 +1171,20 @@ let commit_wal t st =
 
 let commit (Rw t : rw txn) : unit Lwt.t =
   match t.backend with
-  | Mem _ ->
-    t.mem_rw_snapshot <- None;
+  | Mem trees ->
+    (* #178: merge the shadow back into the live tree.  The live tree was
+       never mutated during the txn — only the shadow was touched — so
+       commit is the first and only time the live tree sees the txn's
+       writes. *)
+    (match t.mem_rw_shadow with
+     | None -> ()
+     | Some shadow ->
+       List.iter
+         (fun (tid, map) ->
+            let r = mem_tree trees tid in
+            r := map)
+         shadow);
+    t.mem_rw_shadow <- None;
     t.mem_savepoints <- [];
     Rwlock.release_write t.lock;
     Lwt.return_unit
@@ -1165,8 +1202,9 @@ let commit (Rw t : rw txn) : unit Lwt.t =
 ;;
 
 (* rollback:
-   - Mem: restore the snapshot of tree contents taken at rw_begin, so that
-     mutations made during this txn are undone.
+   - Mem: discard the per-txn shadow.  With shadow writes (#178) the live
+     tree is never mutated during a RW txn, so rollback does not need to
+     restore anything — it just drops the uncommitted shadow.
    - Btree: drop cached tree handles so subsequent reads pick up
      last-committed roots from the meta-tree, then restore the freelist
      snapshot taken at rw_begin and clear dirty pages.
@@ -1176,25 +1214,10 @@ let commit (Rw t : rw txn) : unit Lwt.t =
      corrupt future allocations. *)
 let rollback (Rw t : rw txn) : unit Lwt.t =
   (match t.backend with
-   | Mem trees ->
-     (* Restore tree contents to the snapshot taken at rw_begin. *)
-     (match t.mem_rw_snapshot with
-      | None -> () (* no snapshot (shouldn't happen) *)
-      | Some snap ->
-        (* Restore each tree that existed at snapshot time. *)
-        List.iter
-          (fun (tid, map) ->
-             match Hashtbl.find_opt trees tid with
-             | None -> () (* tree was added after snapshot; skip *)
-             | Some r -> r := map)
-          snap;
-        (* Remove trees that were created during this txn (tid not in snap). *)
-        let snap_tids = List.map fst snap in
-        Hashtbl.iter
-          (fun tid _ -> if not (List.mem tid snap_tids) then Hashtbl.remove trees tid)
-          (Hashtbl.copy trees);
-        t.mem_rw_snapshot <- None;
-        t.mem_savepoints <- [])
+   | Mem _ ->
+     (* #178: just discard the shadow — the live tree was never touched. *)
+     t.mem_rw_shadow <- None;
+     t.mem_savepoints <- []
    | Btree st ->
      (* Drop the per-tree cache so subsequent reads pick up the
         last-committed roots from the meta-tree.  Note: the meta-tree
@@ -1281,11 +1304,15 @@ let live_read_locks (t : t) : int = Rwlock.readers t.lock
 (* Savepoints (Mem backend only; B-tree deferred)                      *)
 (* ------------------------------------------------------------------ *)
 
-(** Push a named savepoint: snapshot current state. *)
+(** Push a named savepoint: snapshot the current shadow state (#178). *)
 let savepoint_begin (Rw t : rw txn) name =
   match t.backend with
   | Mem trees ->
-    let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+    let snap =
+      match t.mem_rw_shadow with
+      | None -> Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees []
+      | Some shadow -> shadow
+    in
     t.mem_savepoints <- (name, snap) :: t.mem_savepoints;
     Lwt.return_unit
   | Btree st ->
@@ -1330,23 +1357,13 @@ let savepoint_release (Rw t : rw txn) name =
     keep the named savepoint so it can be rolled back to again. *)
 let savepoint_rollback (Rw t : rw txn) name =
   match t.backend with
-  | Mem trees ->
+  | Mem _ ->
+    (* #178: restore the shadow to the savepoint snapshot.  The live tree
+       was never mutated, so we just replace the shadow. *)
     let rec find = function
       | [] -> () (* savepoint not found — no-op *)
       | (n, snap) :: rest when String.equal n name ->
-        (* Restore tree contents to this snapshot. *)
-        List.iter
-          (fun (tid, map) ->
-             match Hashtbl.find_opt trees tid with
-             | None -> ()
-             | Some r -> r := map)
-          snap;
-        (* Remove trees that were created after this savepoint. *)
-        let snap_tids = List.map fst snap in
-        Hashtbl.iter
-          (fun tid _ -> if not (List.mem tid snap_tids) then Hashtbl.remove trees tid)
-          (Hashtbl.copy trees);
-        (* Keep the named savepoint at the top so it can be re-used. *)
+        t.mem_rw_shadow <- Some snap;
         t.mem_savepoints <- (name, snap) :: rest
       | _ :: rest -> find rest
     in
@@ -1414,7 +1431,17 @@ let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
           Lwt.fail_with (Format.asprintf "Store.get(ro): %a" pp_error (map_btree_err e))))
   | Rw t ->
     (match t.backend with
-     | Mem trees -> Lwt.return (Bytes_map.find_opt key !(mem_tree trees tid))
+     | Mem trees ->
+       (* #178: read from the active RW shadow, not the live tree.
+          The shadow contains the txn's own writes layered on top of the
+          pre-txn committed state; the live tree is never mutated until
+          commit. *)
+       let map =
+         match t.mem_rw_shadow with
+         | None -> !(mem_tree trees tid)
+         | Some shadow -> shadow_get shadow trees tid
+       in
+       Lwt.return (Bytes_map.find_opt key map)
      | Btree st ->
        let* r = bt_get_tree st tid in
        let* bt = unwrap_error r in
@@ -1428,8 +1455,14 @@ let get : type a. a txn -> tree_id -> bytes -> bytes option Lwt.t =
 let put (Rw t : rw txn) tid key value : unit Lwt.t =
   match t.backend with
   | Mem trees ->
-    let r = mem_tree trees tid in
-    r := Bytes_map.add key value !r;
+    (* #178: write to the shadow, not the live tree. *)
+    (match t.mem_rw_shadow with
+     | None ->
+       let r = mem_tree trees tid in
+       r := Bytes_map.add key value !r
+     | Some shadow ->
+       t.mem_rw_shadow
+       <- Some (shadow_update shadow trees tid (Bytes_map.add key value)));
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
@@ -1447,8 +1480,14 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
 let del (Rw t : rw txn) tid key : unit Lwt.t =
   match t.backend with
   | Mem trees ->
-    let r = mem_tree trees tid in
-    r := Bytes_map.remove key !r;
+    (* #178: remove from the shadow, not the live tree. *)
+    (match t.mem_rw_shadow with
+     | None ->
+       let r = mem_tree trees tid in
+       r := Bytes_map.remove key !r
+     | Some shadow ->
+       t.mem_rw_shadow
+       <- Some (shadow_update shadow trees tid (Bytes_map.remove key)));
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
@@ -1524,7 +1563,13 @@ let cursor_open : type a. a txn -> tree_id -> cursor Lwt.t =
     let t = txn_store tx in
     (match t.backend with
      | Mem trees ->
-       let entries = Bytes_map.bindings !(mem_tree trees tid) in
+       (* #178: cursor materialises from the active RW shadow. *)
+       let map =
+         match t.mem_rw_shadow with
+         | None -> !(mem_tree trees tid)
+         | Some shadow -> shadow_get shadow trees tid
+       in
+       let entries = Bytes_map.bindings map in
        Lwt.return { all = entries; remaining = []; ready = false }
      | Btree st ->
        let* r = bt_get_tree st tid in
