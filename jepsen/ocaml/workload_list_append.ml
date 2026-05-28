@@ -8,11 +8,10 @@
     Schema (created once):
       CREATE TABLE elle (k INTEGER, v INTEGER, rowid INTEGER PRIMARY KEY AUTOINCREMENT)
 
-    Each txn:
-      BEGIN;
+    Each operation (auto-commit, no explicit BEGIN/COMMIT so multiple workers
+    sharing a single [Db.t] handle don't collide on [explicit_txn]):
       INSERT INTO elle (k, v) VALUES (?key, ?val);
       SELECT v FROM elle WHERE k = ?key ORDER BY rowid;
-      COMMIT;
 
     The read-back list is recorded in the EDN history so Elle can reconstruct
     version order. *)
@@ -33,7 +32,7 @@ let gen_txn key_range value =
   let k = Random.int key_range in
   [ Append (k, value); Read (k, []) ]
 
-(** Run a single list-append transaction on the database.
+(** Run a single list-append operation on the database.
     Returns the observed read values. *)
 let run_txn db txn =
   let open Lwt.Syntax in
@@ -63,15 +62,7 @@ let run_txn db txn =
          result := Read (k, vs) :: !result;
          Lwt.return_unit)
   in
-  let* r_begin = Db.execute db "BEGIN" in
-  (match r_begin with
-   | Ok () -> ()
-   | Error e -> failwith (Printf.sprintf "BEGIN failed: %s" (pp_error e)));
   let* () = Lwt_list.iter_s process_op txn in
-  let* r_commit = Db.execute db "COMMIT" in
-  (match r_commit with
-   | Ok () -> ()
-   | Error e -> failwith (Printf.sprintf "COMMIT failed: %s" (pp_error e)));
   Lwt.return (Completed (List.rev !result))
 
 (** Run a single list-append transaction and produce invoke/ok|fail entries. *)

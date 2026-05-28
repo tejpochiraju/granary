@@ -3,10 +3,11 @@
     Schema:
       CREATE TABLE s (e INTEGER PRIMARY KEY)
 
-    Each transaction:
-      BEGIN;
+    Each operation:
       INSERT INTO s (e) VALUES (?element);
-      COMMIT;
+
+    Auto-commit mode (no explicit BEGIN/COMMIT) so multiple workers
+    sharing a single [Db.t] handle don't collide on [explicit_txn].
 
     After all transactions, a final read verifies which elements are present.
     Jepsen's set checker then verifies:
@@ -22,26 +23,16 @@ module Db = Sqlocaml.Db
 let gen_add element =
   element
 
-(** Run a set-add transaction. *)
+(** Run a set-add operation (auto-commit). *)
 let run_add db element =
   let open Lwt.Syntax in
   let pp_error e = Format.asprintf "%a" Db.pp_error e in
-  let* r_begin = Db.execute db "BEGIN" in
-  (match r_begin with
-   | Ok () -> ()
-   | Error e -> failwith (Printf.sprintf "BEGIN failed: %s" (pp_error e)));
   let sql = Printf.sprintf "INSERT INTO s (e) VALUES (%d)" element in
   let* r = Db.execute db sql in
-  (match r with
-   | Ok () -> ()
-   | Error e ->
-    failwith (Printf.sprintf "INSERT %d failed: %s" element (pp_error e)));
-  let* r_commit = Db.execute db "COMMIT" in
-  (match r_commit with
-   | Ok () -> Lwt.return_unit
-   | Error e ->
-     let* _ = Db.execute db "ROLLBACK" in
-     failwith (Printf.sprintf "COMMIT failed: %s" (pp_error e)))
+  match r with
+  | Ok () -> Lwt.return_unit
+  | Error e ->
+    failwith (Printf.sprintf "INSERT %d failed: %s" element (pp_error e))
 
 (** Run a set-add and produce invoke/ok|fail entries. *)
 let run_and_record db element process_id index =
