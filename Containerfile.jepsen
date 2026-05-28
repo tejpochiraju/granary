@@ -1,5 +1,8 @@
 # Jepsen test environment for sqlocaml
 #
+# *** MONOLITHIC IMAGE: OCaml harness + Java/Clojure checker + lazyfs ***
+# For a minimal Clojure-only checker image, see jepsen/Containerfile.jepsen.
+#
 # Extends the dev container with:
 #   - Java (JVM) for Clojure-based Jepsen/Elle checkers
 #   - Clojure CLI (tools.deps) for running the checker runner
@@ -48,12 +51,14 @@ RUN curl -sL https://download.clojure.org/install/linux-install.sh \
 # ------------------------------------------------------------------
 # lazyfs — FUSE filesystem for un-fsynced-write-loss nemesis.
 # Pre-built binary download; requires fuse3 (installed above).
+# SHA-256 verified to guard against supply-chain surprises.
 # ------------------------------------------------------------------
+ENV LAZYFS_SHA256=0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
 RUN curl -sL https://github.com/pkolaczk/lazyfs/releases/download/v0.3.0/lazyfs-x86_64-linux.tar.gz \
     -o /tmp/lazyfs.tar.gz \
+    && echo "${LAZYFS_SHA256}  /tmp/lazyfs.tar.gz" | sha256sum -c - \
     && tar xzf /tmp/lazyfs.tar.gz -C /usr/local/bin lazyfs \
-    && rm /tmp/lazyfs.tar.gz \
-    || echo "lazyfs download skipped (not available for this arch)"
+    && rm /tmp/lazyfs.tar.gz
 
 # ------------------------------------------------------------------
 # Switch back to opam user

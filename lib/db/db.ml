@@ -199,6 +199,10 @@ let close t =
 
 let store t = t.store
 
+let create_worker_handle t =
+  let* () = Lwt.return_unit in
+  of_store t.store
+
 let wal_sync_count t = S.wal_sync_count t.store
 
 (* ------------------------------------------------------------------ *)

@@ -85,6 +85,12 @@ val close : t -> unit Lwt.t
     transactions. *)
 val store : t -> Sqlocaml_store.Store.t
 
+(** Create a lightweight worker handle sharing the same underlying store.
+    Equivalent to [let* () = Lwt.return_unit in of_store (store t)].
+    Used by Jepsen-style concurrent workloads where each worker needs
+    its own [explicit_txn] without exposing the raw store. *)
+val create_worker_handle : t -> t Lwt.t
+
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
     databases.  Exposed for #77 group-commit testing. *)
 val wal_sync_count : t -> int

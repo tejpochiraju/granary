@@ -221,11 +221,10 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
   let* worker_dbs =
     match workload with
     | Bank _ ->
-      let store = Db.store db in
       let rec make n acc =
         if n < 0 then Lwt.return (Array.of_list acc)
         else
-          let* h = Db.of_store store in
+          let* h = Db.create_worker_handle db in
           make (n - 1) (h :: acc)
       in
       make (n_workers - 1) []

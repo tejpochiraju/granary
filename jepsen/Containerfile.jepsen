@@ -1,5 +1,10 @@
 # Jepsen checker container for sqlocaml
-# Provides Java 21 + Clojure CLI + Elle/Jepsen checker deps
+#
+# *** MINIMAL IMAGE: Clojure-only checker (no OCaml, no lazyfs) ***
+# For the full OCaml harness + Java/Clojure + lazyfs image, see
+# the root Containerfile.jepsen.
+#
+# Provides Java 21 + Clojure CLI + Jepsen/Elle checker deps.
 #
 # Build:   podman build -t sqlocaml-jepsen -f jepsen/Containerfile.jepsen .
 # Run:     podman run --rm -v $(pwd):/workspace:z -w /workspace/jepsen/clojure \
