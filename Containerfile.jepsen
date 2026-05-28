@@ -50,15 +50,18 @@ RUN curl -sL https://download.clojure.org/install/linux-install.sh \
 
 # ------------------------------------------------------------------
 # lazyfs — FUSE filesystem for un-fsynced-write-loss nemesis.
-# Pre-built binary download; requires fuse3 (installed above).
-# SHA-256 verified to guard against supply-chain surprises.
+# Built from source (dsrhaslab/lazyfs); requires fuse3-dev + cmake.
 # ------------------------------------------------------------------
-ENV LAZYFS_SHA256=0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
-RUN curl -sL https://github.com/pkolaczk/lazyfs/releases/download/v0.3.0/lazyfs-x86_64-linux.tar.gz \
-    -o /tmp/lazyfs.tar.gz \
-    && echo "${LAZYFS_SHA256}  /tmp/lazyfs.tar.gz" | sha256sum -c - \
-    && tar xzf /tmp/lazyfs.tar.gz -C /usr/local/bin lazyfs \
-    && rm /tmp/lazyfs.tar.gz
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake build-essential libfuse3-dev libspdlog-dev git \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs.git /tmp/lazyfs-src \
+    && cd /tmp/lazyfs-src/lazyfs \
+    && mkdir -p build && cd build \
+    && cmake -DLAZYFS_BUILD_TESTS=OFF .. \
+    && cmake --build . \
+    && cp lazyfs /usr/local/bin/lazyfs \
+    && rm -rf /tmp/lazyfs-src
 
 # ------------------------------------------------------------------
 # Switch back to opam user

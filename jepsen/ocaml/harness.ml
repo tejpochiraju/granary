@@ -211,6 +211,27 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
    | ClockSkew ->
      let _ = Nemesis.record_clock_skew nem_state in ()
    | _ -> ());
+  (* Derive lazyfs mount dir from the backend path *)
+  let lazyfs_mount =
+    match nemesis with
+    | LazyFS _ ->
+      let db_path =
+        match backend with
+        | WAL path | File path -> path
+        | Mem -> failwith "lazyfs nemesis requires file or WAL backend"
+      in
+      let mount_dir = Filename.dirname db_path in
+      (try Unix.mkdir mount_dir 0o755 with Unix.Unix_error (EEXIST, _, _) -> ());
+      Some mount_dir
+    | _ -> None
+  in
+  (* Start lazyfs before opening the database *)
+  let lazyfs_st =
+    match lazyfs_mount with
+    | Some mount_dir ->
+      Some (Nemesis.start_lazyfs mount_dir)
+    | None -> None
+  in
   let* db = open_db backend in
   let* () = create_schema db workload in
   (* For workloads that need multi-statement atomicity (e.g. bank's
@@ -236,23 +257,31 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
     worker_loop wdb workload st ops_per_worker nem_state pause_config
   ) states) in
   let* () = Lwt.join workers in
-  (* Trigger lazyfs lose-unsynced if configured *)
-  let lazyfs_entries =
+  (* If lazyfs: close db, trigger lose-unsynced, reopen *)
+  let* (n_entries, final_db) =
     match nemesis with
     | LazyFS _ ->
-      [ Nemesis.trigger_lose_unsynced nem_state ]
-    | _ -> []
+      let ls = Option.get lazyfs_st in
+      let* () = Db.close db in
+      let entry = Nemesis.trigger_lose_unsynced nem_state ls in
+      let* reopened = open_db backend in
+      Lwt.return ([entry], reopened)
+    | _ -> Lwt.return ([], db)
   in
-  let* final_entries = final_read db workload in
-  let history = collect_history states (lazyfs_entries @ final_entries) in
+  let* final_entries = final_read final_db workload in
+  let history = collect_history states (n_entries @ final_entries) in
   Printf.printf "Completed %d operations across %d workers\n"
     (List.length history) n_workers;
   Edn_history.write_history history_path history;
   Printf.printf "Wrote %d history entries to %s\n"
     (List.length history) history_path;
-  (* Close the main handle (which owns the underlying store).  Per-worker
-     handles share the same store and must NOT be closed again. *)
-  let* () = Db.close db in
+  (* Close the (possibly reopened) db handle *)
+  let* () = Db.close final_db in
+  (* Stop lazyfs if it was started *)
+  begin match lazyfs_st with
+    | Some ls -> Nemesis.stop_lazyfs ls
+    | None -> ()
+  end;
   cleanup_files backend;
   Lwt.return_unit
 

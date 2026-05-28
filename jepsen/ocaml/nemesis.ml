@@ -70,51 +70,82 @@ let record_clock_skew st =
 (** Path to the lazyfs binary. *)
 let lazyfs_binary = ref "/usr/local/bin/lazyfs"
 
-(** HTTP port lazyfs listens on for lose-unsynced commands. *)
-let lazyfs_port = ref 5555
+(** Type holding lazyfs runtime state needed across start/trigger/stop. *)
+type lazyfs_state = {
+  pid : int;
+  mount_dir : string;
+  fifo_path : string;
+  config_path : string;
+}
 
-(** Start a lazyfs FUSE mount.  [mount_dir] is where the fused DB lives;
-    [backing_dir] stores the actual written data.  Returns the lazyfs PID
-    (0 on failure).  Uses Unix.create_process so we get the real PID
-    without racing on pgrep. *)
-let start_lazyfs mount_dir backing_dir =
+(** Generate a minimal TOML config for lazyfs with the given fifo path. *)
+let write_lazyfs_config config_path fifo_path =
+  let oc = open_out config_path in
+  Printf.fprintf oc {|[faults]
+fifo_path="%s"
+[cache]
+apply_eviction=false
+[cache.simple]
+custom_size="256mb"
+blocks_per_page=1
+[filesystem]
+log_all_operations=false
+logfile=""
+|}
+    fifo_path;
+  close_out oc
+
+(** Start a lazyfs FUSE mount.
+    [mount_dir] is where the fused DB lives.  LazyFS 0.3.1+ uses an
+    in-memory page cache — there is no separate backing directory.
+    Returns a [lazyfs_state] record on success, or raises [Failure]
+    on error. *)
+let start_lazyfs mount_dir =
   let prog = !lazyfs_binary in
+  let pid_str = string_of_int (Unix.getpid ()) in
+  let fifo_path = Printf.sprintf "/tmp/lazyfs_fifo_%s" pid_str in
+  let config_path = Printf.sprintf "/tmp/lazyfs_config_%s.toml" pid_str in
+  (* Create the FIFO before starting lazyfs *)
+  (try Unix.mkfifo fifo_path 0o666
+   with Unix.Unix_error (EEXIST, _, _) -> ());
+  write_lazyfs_config config_path fifo_path;
   let argv =
-    [| prog; "--port"; string_of_int !lazyfs_port; mount_dir; backing_dir |]
+    [| prog; "-f"; mount_dir;
+       "-o"; "allow_other";
+       "-o"; "default_permissions";
+       "--config-path"; config_path |]
   in
-  try
-    let pid = Unix.create_process prog argv Unix.stdin Unix.stdout Unix.stderr in
-    (* Give FUSE a moment to mount before handing control back *)
-    Unix.sleep 1;
-    pid
-  with _ -> 0
+  let pid =
+    Unix.create_process prog argv Unix.stdin Unix.stdout Unix.stderr
+  in
+  (* Give FUSE a moment to mount before handing control back *)
+  Unix.sleep 2;
+  if pid = 0 then
+    failwith "lazyfs failed to start"
+  else
+    { pid; mount_dir; fifo_path; config_path }
 
 (** Tell lazyfs to lose all writes that were not fsynced.
-    Sends HTTP GET to lazyfs control port. *)
-let trigger_lose_unsynced st =
-  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, !lazyfs_port) in
-  let buf = Bytes.create 4096 in
+    Writes the 'clear-cache' command to the lazyfs FIFO. *)
+let trigger_lose_unsynced st ls =
   (try
-     let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
-     Unix.connect sock addr;
-     let _ = Unix.send sock (Bytes.of_string "GET /lose-unsynced HTTP/1.0\r\nHost: localhost\r\n\r\n") 0
-               (String.length "GET /lose-unsynced HTTP/1.0\r\nHost: localhost\r\n\r\n") [] in
-     ignore (Unix.recv sock buf 0 4096 []);
-     Unix.close sock
+     let oc = open_out ls.fifo_path in
+     output_string oc "lazyfs::clear-cache\n";
+     close_out oc
    with _ -> ());
   let idx = st.entry_index in
   st.entry_index <- idx + 1;
   make_nemesis ~nemesis_name:"lose-unsynced" ~process:(-1) ~index:idx
 
-(** Stop lazyfs by killing its process and unmounting. *)
-let stop_lazyfs ?mount_dir pid =
-  if pid > 0 then begin
-    (try Unix.kill pid Sys.sigterm with _ -> ());
+(** Stop lazyfs by killing its process, cleaning up FIFO and config,
+    and unmounting. *)
+let stop_lazyfs ls =
+  if ls.pid > 0 then begin
+    (try Unix.kill ls.pid Sys.sigterm with _ -> ());
     Unix.sleep 1;
-    let mount =
-      match mount_dir with Some d -> d | None -> "/tmp/lazyfs_mount"
-    in
-    (* force unmount if it didn't clean up *)
-    (try ignore (Sys.command (Printf.sprintf "fusermount -u %s 2>/dev/null" mount))
+    (try Sys.remove ls.fifo_path with _ -> ());
+    (try Sys.remove ls.config_path with _ -> ());
+    (try ignore (Sys.command
+                   (Printf.sprintf "fusermount -u %s 2>/dev/null" ls.mount_dir))
      with _ -> ())
   end
