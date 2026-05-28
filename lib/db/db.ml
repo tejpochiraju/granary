@@ -197,8 +197,6 @@ let close t =
   S.close t.store
 ;;
 
-let store t = t.store
-
 let create_worker_handle t =
   let* () = Lwt.return_unit in
   of_store t.store
