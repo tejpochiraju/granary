@@ -197,6 +197,8 @@ let close t =
   S.close t.store
 ;;
 
+let store t = t.store
+
 let wal_sync_count t = S.wal_sync_count t.store
 
 (* ------------------------------------------------------------------ *)

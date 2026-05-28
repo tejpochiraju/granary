@@ -80,6 +80,11 @@ val set_file_provider : file_provider -> unit
 (** Close the database, flushing and releasing the underlying store. *)
 val close : t -> unit Lwt.t
 
+(** Expose the underlying store so callers can create additional per-worker
+    handles via {!of_store} for workloads that need concurrent explicit
+    transactions. *)
+val store : t -> Sqlocaml_store.Store.t
+
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
     databases.  Exposed for #77 group-commit testing. *)
 val wal_sync_count : t -> int
