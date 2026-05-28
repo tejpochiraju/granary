@@ -86,14 +86,11 @@ let pp_entry ppf (e : entry) =
     e.index
     e.time_ns
 
-(** Write an entry to the output channel. *)
-let write_entry ch (e : entry) =
-  Format.fprintf (Format.formatter_of_out_channel ch) "%a\n%!" pp_entry e
-
 (** Write a full history (list of entries) to a file. *)
 let write_history path entries =
   let ch = open_out path in
-  List.iter (write_entry ch) entries;
+  let ppf = Format.formatter_of_out_channel ch in
+  List.iter (fun e -> Format.fprintf ppf "%a\n%!" pp_entry e) entries;
   close_out ch
 
 (** Convenience: create an invoke entry with the current timestamp. *)

@@ -179,12 +179,10 @@ let final_read db workload =
 (* ----------------------------------------------------------------- *)
 
 let collect_history states final_entries =
-  let all_entries =
-    Array.fold_left (fun acc st ->
-      List.rev_append (List.rev st.entries) acc
-    ) final_entries states
-  in
-  List.rev all_entries
+  Array.fold_left (fun acc st ->
+    List.rev_append st.entries acc
+  ) final_entries states
+  |> List.rev
 
 (* ----------------------------------------------------------------- *)
 (* Clean up database files                                            *)

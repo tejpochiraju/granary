@@ -74,56 +74,47 @@ let lazyfs_binary = ref "/usr/local/bin/lazyfs"
 let lazyfs_port = ref 5555
 
 (** Start a lazyfs FUSE mount.  [mount_dir] is where the fused DB lives;
-    [backing_dir] stores the actual written data.  Returns the lazyfs PID. *)
+    [backing_dir] stores the actual written data.  Returns the lazyfs PID
+    (0 on failure).  Uses Unix.create_process so we get the real PID
+    without racing on pgrep. *)
 let start_lazyfs mount_dir backing_dir =
-  let cmd =
-    Printf.sprintf "%s --port %d %s %s &"
-      !lazyfs_binary !lazyfs_port mount_dir backing_dir
+  let prog = !lazyfs_binary in
+  let argv =
+    [| prog; "--port"; string_of_int !lazyfs_port; mount_dir; backing_dir |]
   in
-  let _ = Sys.command cmd in
-  (* Give lazyfs a moment to mount *)
-  Unix.sleep 1;
-  (* Return the PID by reading pgrep *)
-  let pid =
-    try
-      let ic = Unix.open_process_in "pgrep -f lazyfs" in
-      let line = input_line ic in
-      let _ = close_in ic in
-      int_of_string line
-    with _ -> 0
-  in
-  pid
+  try
+    let pid = Unix.create_process prog argv Unix.stdin Unix.stdout Unix.stderr in
+    (* Give FUSE a moment to mount before handing control back *)
+    Unix.sleep 1;
+    pid
+  with _ -> 0
 
 (** Tell lazyfs to lose all writes that were not fsynced.
     Sends HTTP GET to lazyfs control port. *)
 let trigger_lose_unsynced st =
-  let cmd =
-    Printf.sprintf "curl -s http://localhost:%d/lose-unsynced 2>/dev/null"
-      !lazyfs_port
-  in
-  let _ = Sys.command cmd in
+  let addr = Unix.ADDR_INET (Unix.inet_addr_loopback, !lazyfs_port) in
+  let buf = Bytes.create 4096 in
+  (try
+     let sock = Unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+     Unix.connect sock addr;
+     let _ = Unix.send sock (Bytes.of_string "GET /lose-unsynced HTTP/1.0\r\nHost: localhost\r\n\r\n") 0
+               (String.length "GET /lose-unsynced HTTP/1.0\r\nHost: localhost\r\n\r\n") [] in
+     ignore (Unix.recv sock buf 0 4096 []);
+     Unix.close sock
+   with _ -> ());
   let idx = st.entry_index in
   st.entry_index <- idx + 1;
   make_nemesis ~nemesis_name:"lose-unsynced" ~process:(-1) ~index:idx
 
-(** Stop lazyfs by killing its process. *)
-let stop_lazyfs pid =
-  if pid > 0 then
-    let _ = Sys.command (Printf.sprintf "kill %d 2>/dev/null" pid) in
+(** Stop lazyfs by killing its process and unmounting. *)
+let stop_lazyfs ?mount_dir pid =
+  if pid > 0 then begin
+    (try Unix.kill pid Sys.sigterm with _ -> ());
     Unix.sleep 1;
-    let _ = Sys.command (Printf.sprintf "fusermount -u /tmp/lazyfs_mount 2>/dev/null") in
-    ()
-
-(* ---- subprocess helper ---- *)
-
-let run_in_child (fn : unit -> unit) : int * (unit -> Unix.process_status) =
-  match Unix.fork () with
-  | 0 ->
-    (try fn () with _ -> ());
-    exit 0
-  | child_pid ->
-    let wait_fn () =
-      match Unix.waitpid [] child_pid with
-      | _, status -> status
+    let mount =
+      match mount_dir with Some d -> d | None -> "/tmp/lazyfs_mount"
     in
-    (child_pid, wait_fn)
+    (* force unmount if it didn't clean up *)
+    (try ignore (Sys.command (Printf.sprintf "fusermount -u %s 2>/dev/null" mount))
+     with _ -> ())
+  end

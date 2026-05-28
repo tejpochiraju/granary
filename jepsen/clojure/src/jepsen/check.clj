@@ -16,8 +16,7 @@
             [clojure.java.io :as io]
             [clojure.edn :as edn]
             [clojure.pprint :as pp]
-            [clojure.set :as set]
-            [jepsen.history :as history]))
+            [clojure.set :as set]))
 
 ;; ---------------------------------------------------------------------------
 ;; History parsing
