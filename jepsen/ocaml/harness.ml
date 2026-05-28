@@ -215,9 +215,22 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
    | _ -> ());
   let* db = open_db backend in
   let* () = create_schema db workload in
+  (* For workloads that need multi-statement atomicity (e.g. bank's
+     debit+credit), create per-worker handles sharing the same store
+     so each worker has its own [explicit_txn] field.  Workers still
+     serialise on the store's write lock but never get "transaction
+     already active". *)
+  let* worker_dbs =
+    match workload with
+    | Bank _ ->
+      let store = Db.store db in
+      Lwt_list.init n_workers (fun _i -> Db.of_store ~file_path:None store)
+    | _ -> Lwt.return (Array.make n_workers db)
+  in
   let states = Array.init n_workers (fun _ -> make_worker_state ()) in
-  let workers = Array.to_list (Array.mapi (fun _worker_id st ->
-    worker_loop db workload st ops_per_worker nem_state pause_config
+  let workers = Array.to_list (Array.mapi (fun worker_id st ->
+    let wdb = worker_dbs.(worker_id) in
+    worker_loop wdb workload st ops_per_worker nem_state pause_config
   ) states) in
   let* () = Lwt.join workers in
   (* Trigger lazyfs lose-unsynced if configured *)
@@ -234,6 +247,8 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
   Edn_history.write_history history_path history;
   Printf.printf "Wrote %d history entries to %s\n"
     (List.length history) history_path;
+  (* Close the main handle (which owns the underlying store).  Per-worker
+     handles share the same store and must NOT be closed again. *)
   let* () = Db.close db in
   cleanup_files backend;
   Lwt.return_unit
