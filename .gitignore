@@ -5,6 +5,5 @@ _cov_*.xml
 _cov_html/
 _runtest.log
 .claude/
-.clinerules
 lazyfs/
 lib/sql/parser.conflicts
