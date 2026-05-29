@@ -1692,7 +1692,77 @@ let list_tree_ids t : tree_id list Lwt.t =
        let* result = loop [] in
        Btree.cursor_close cur;
        Lwt.return result)
+type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
+
+(* One-shot consistent full copy via an RO snapshot + page sink (#93).
+   Every page is resolved through the snapshot's WAL overlay first
+   (bounded to the committed_frames horizon captured at ro_begin),
+   falling back to the main DB.  The iteration is bounded by the
+   snapshot-time page count so growth during the copy does not pull
+   pages outside the snapshot.
+
+   On the Mem backend this is a no-op (there are no pages to copy). *)
+let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
+  match t.backend with
+  | Mem _ -> Lwt.return_unit
+  | Btree st ->
+    with_ro t (fun (Ro snap) ->
+      let horizon = snap.rs_snap_frames in
+      let n =
+        (* Bound by the page count at snapshot time.  Under the
+           cooperative Rwlock the page count is frozen for the
+           snapshot's lifetime (write lock blocks on readers). *)
+        Pager.n_pages st.pager
+      in
+      let rec loop (page_id : int64) =
+        if Int64.compare page_id n >= 0
+        then Lwt.return_unit
+        else
+          let* page_buf =
+            match st.wal with
+            | None ->
+              (* Non-WAL path: read straight from the main DB. *)
+              let* r = Pager.read st.pager page_id in
+              (match r with
+               | Ok buf -> Lwt.return buf
+               | Error e ->
+                 Lwt.fail_with
+                   (Format.asprintf "Store.copy_to(pg=%Ld): %a" page_id Pager.pp_error e))
+            | Some wal ->
+              (* WAL-mode path: snapshot overlay (WAL first, then main DB). *)
+              (match Wal.find_page_at wal page_id ~max_frame:horizon with
+               | Some idx ->
+                 let* r = Wal.read_frame wal idx in
+                 (match r with
+                  | Ok buf -> Lwt.return buf
+                  | Error e ->
+                    Lwt.fail_with
+                      (Format.asprintf
+                         "Store.copy_to(pg=%Ld,frame=%d): %a"
+                         page_id
+                         idx
+                         Wal.pp_error
+                         e))
+               | None ->
+                 let* r =
+                   Pager.read
+                     ~snapshot_frames:horizon
+                     ~pin_set:snap.rs_pinned
+                     st.pager
+                     page_id
+                 in
+                 (match r with
+                  | Ok buf -> Lwt.return buf
+                  | Error e ->
+                    Lwt.fail_with
+                      (Format.asprintf "Store.copy_to(pg=%Ld): %a" page_id Pager.pp_error e)))
+          in
+          let* () = sink ~page_id ~page:page_buf in
+          loop (Int64.add page_id 1L)
+      in
+      loop 0L)
 ;;
+
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
