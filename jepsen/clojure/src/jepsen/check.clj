@@ -18,6 +18,7 @@
             [clojure.pprint :as pp]
             [clojure.set :as set]))
 
+
 ;; ---------------------------------------------------------------------------
 ;; History parsing
 ;; ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@
                        (count (get by-type :lost-update)) " lost-updates, "
                        (count (get by-type :fabricated)) " fabricated")))}))
 
+;; ---------------------------------------------------------------------------
 (defn check-list-append
   "Pure-Clojure append-temporal checker (no Elle dependency)."
   [history opts]
@@ -137,6 +139,8 @@
      :workload "list-append"
      :checker "append-temporal"
      :details result}))
+
+
 
 ;; ---------------------------------------------------------------------------
 ;; Bank checker: total-conservation invariant
@@ -287,6 +291,13 @@
    :set         check-set
    :counter     check-counter})
 
+(defn check-list-append-elle
+  "Run Elle's full SI dependency-graph checker instead of the
+   pure-Clojure temporal checker.  Requires elle 0.2.6+ in deps.edn."
+  [history opts]
+  (require '[jepsen.check-elle :as jce])
+  ((ns-resolve 'jepsen.check-elle 'run-elle) history opts))
+
 ;; ---------------------------------------------------------------------------
 ;; Reporting
 ;; ---------------------------------------------------------------------------
@@ -316,6 +327,7 @@
   [["-w" "--workload NAME" "Checker workload (list-append)"
     :default :list-append
     :parse-fn keyword]
+   ["-e" "--elle"          "Use Elle SI checker for list-append (requires elle 0.2.6+ in deps.edn)"]
    ["-o" "--output PATH"   "Output file for analysis results"]
    ["-h" "--help"          "Show help"]])
 
@@ -347,7 +359,9 @@
           history (parse-history history-path)
           _ (println (str "Parsed " (count history) " history entries"))
           workload (:workload options)
-          checker-fn (get checkers workload)]
+           checker-fn (if (and (= workload :list-append) (:elle options))
+                        check-list-append-elle
+                        (get checkers workload))]
       (if (nil? checker-fn)
         (do (println "Unknown workload:" workload)
             (usage summary)
