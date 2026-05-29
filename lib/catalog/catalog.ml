@@ -2,6 +2,7 @@ module S = Sqlocaml_store.Store
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint
 module Schema_fingerprint = Sqlocaml_encoding.Schema_fingerprint
+module Rowid = Sqlocaml_encoding.Rowid
 
 type fk_action =
   | FA_no_action
@@ -938,6 +939,37 @@ let load_mirror_entries store =
   Lwt.return (List.rev !acc)
 ;;
 
+(* #175: recover next_rowid for tables reconstructed from the mirror.
+   Scan the table's data tree for the maximum integer rowid key (the
+   tree is keyed by [Rowid.encode], so the last key in byte-sorted order
+   is the maximum rowid).  Return [next_rowid = max + 1], or [1L] for an
+   empty or unreadable tree.  WITHOUT ROWID tables are skipped — they
+   don't use rowid keys. *)
+let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
+  if m.without_rowid
+  then Lwt.return m
+  else (
+    S.with_ro store
+    @@ fun tx ->
+    let%lwt cur = S.cursor_open tx m.tree_id in
+    let _sr = S.cursor_first cur in
+    let max_key = ref None in
+    let rec walk () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, _) ->
+        max_key := Some k;
+        walk ()
+    in
+    walk ();
+    S.cursor_close cur;
+    let recovered =
+      match !max_key with
+      | None -> 1L
+      | Some k -> Int64.add (Rowid.decode k) 1L
+    in
+    Lwt.return { m with next_rowid = recovered })
+
 let load_fk_constraints_raw store table_name =
   let key = fk_meta_key table_name in
   S.with_ro store
@@ -1003,10 +1035,21 @@ let open_ store =
   let present_tids =
     Hashtbl.fold (fun _ (m : table_meta) acc -> m.tree_id :: acc) cache []
   in
-  List.iter
-    (fun (m : table_meta) ->
-       if not (List.mem m.tree_id present_tids) then Hashtbl.replace cache m.name m)
-    mirror;
+  let reconstructed =
+    List.filter (fun (m : table_meta) -> not (List.mem m.tree_id present_tids)) mirror
+  in
+  List.iter (fun (m : table_meta) -> Hashtbl.replace cache m.name m) reconstructed;
+  (* #175: for tables reconstructed from the mirror, recover next_rowid by
+     scanning the data tree for the maximum integer rowid key.  WITHOUT ROWID
+     tables are skipped.  Best-effort: defaults to 1L for empty trees. *)
+  let%lwt () =
+    Lwt_list.iter_s
+      (fun (m : table_meta) ->
+         let%lwt recovered = recover_next_rowid store m in
+         Hashtbl.replace cache recovered.name recovered;
+         Lwt.return_unit)
+      reconstructed
+  in
   (* #174: schema-drift check on open.  For tables present in BOTH the primary
      and the mirror, a fingerprint mismatch means one copy is corrupt or drifted
      — warn (but stay openable so recovery tooling can still run).  Reconstructed

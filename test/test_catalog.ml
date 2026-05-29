@@ -10,6 +10,7 @@ module C = Sqlocaml_catalog.Catalog
 module Row = Sqlocaml_encoding.Row
 module Varint = Sqlocaml_encoding.Varint
 module SF = Sqlocaml_encoding.Schema_fingerprint
+module Rowid = Sqlocaml_encoding.Rowid
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -1579,6 +1580,39 @@ let test_mirror_reflects_add_column () =
      Lwt.return_unit)
 ;;
 
+(* #175: when a table is reconstructed from the mirror, the next_rowid
+   counter must be recovered from existing data rows so auto-allocated
+   rowids don't collide. *)
+let test_mirror_recovers_next_rowid () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* tid =
+       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     (* Insert three rows with rowids 1, 7, and 42 into the data tree. *)
+     let* tx = S.rw_begin store in
+     let* () = S.put tx tid (Rowid.encode 1L) (Bytes.of_string "row1") in
+     let* () = S.put tx tid (Rowid.encode 7L) (Bytes.of_string "row7") in
+     let* () = S.put tx tid (Rowid.encode 42L) (Bytes.of_string "row42") in
+     let* () = S.commit tx in
+     (* Delete the primary _sys_tables row to force mirror recovery. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     (* Reopen — the table is recovered from the mirror, and #175
+        recovers next_rowid = max(1,7,42) + 1 = 43. *)
+     let* cat2 = C.open_ store in
+     (match C.find_table_cached cat2 ~name:"t" with
+      | None -> Alcotest.fail "table t should be recovered from mirror"
+      | Some m ->
+        Alcotest.(check int64) "recovered next_rowid is max+1" 43L m.C.next_rowid);
+     (* Allocate one more rowid — should yield 43, not 1. *)
+     let* r = C.next_rowid cat2 ~name:"t" in
+     Alcotest.(check int64) "next allocated rowid is 43" 43L r;
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -1769,6 +1803,8 @@ let () =
             test_mirror_fingerprints_match_primary
         ; Alcotest.test_case "drop_removes_entry" `Quick test_mirror_drop_removes_entry
         ; Alcotest.test_case "reflects_add_column" `Quick test_mirror_reflects_add_column
+        ; Alcotest.test_case
+            "recovers_next_rowid" `Quick test_mirror_recovers_next_rowid
         ] )
     ; ( "drift"
       , [ Alcotest.test_case
