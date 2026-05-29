@@ -1,0 +1,175 @@
+# .clinerules — sqlocaml (tej/sqlite_ocaml_port)
+
+## Project
+
+sqlocaml is a pure-OCaml SQL engine — a concept port of SQLite targeting MirageOS
+unikernels. No C stubs, fresh on-disk format, single-writer/multi-reader MVCC with
+snapshot isolation. OCaml 5.4. Pre-release (0.0.1). **Entirely AI-authored**
+(disclosure level: `ai-generated`). See `README.md` and `ROADMAP.md`.
+
+---
+
+## 1. Worktree discipline — ALWAYS
+
+**The repo root (`/home/tej/projects/sqlite_ocaml_port`) stays on `main` at all times.**
+Never commit directly to `main`. Never work in the repo root.
+
+For every task:
+
+1. Create a feature branch and worktree **before touching any code**:
+   ```
+   git worktree add ../sqlite_ocaml_port-<slug> -b feat/<slug>
+   ```
+   All file edits and command execution happen inside `../sqlite_ocaml_port-<slug>/`.
+
+2. When work is complete and tests are green, open a PR (see §5 Forgejo CLI).
+
+3. After the PR is merged, clean up:
+   ```
+   git worktree remove ../sqlite_ocaml_port-<slug>
+   git branch -d feat/<slug>
+   ```
+
+Slug is a short kebab-case description of the task.
+
+---
+
+## 2. Subagent orchestration — ALWAYS
+
+Break every non-trivial task into independent subtasks and delegate each via
+`new_task`. Do not do multi-step work in a single agent context.
+
+**Orchestrator loop:**
+
+1. **Decompose** — identify independent units (failing test, implementation,
+   formatting fix, lint fix). List them explicitly.
+2. **Delegate** — spawn a `new_task` for each. Each brief must be self-contained:
+   include the worktree path, files to touch, acceptance criterion, and context.
+3. **Review** — when a subtask returns, critically verify the diff:
+   - Did it follow TDD (failing test first, minimum production code)?
+   - Does `dune runtest` pass inside the container?
+   - Does formatting pass (`dune build @fmt`)?
+   - Does lint pass (merlint, zero findings)?
+   - Any unintended changes to other files?
+4. **Reject or accept** — fix or re-delegate if review fails. Never silently accept.
+5. **Integrate** — once all subtasks pass review, assemble the PR.
+
+---
+
+## 3. Strict TDD — non-negotiable
+
+Every change follows **red → green → refactor**:
+
+1. **Red** — write a failing test. Run it. Confirm it fails *for the right reason*.
+2. **Green** — write the minimum production code to make it pass. Nothing more.
+3. **Refactor** — clean up with the suite green.
+
+Rules:
+- No production code without a failing test that demands it.
+- One behavior per test. Tests are the specification.
+- Never weaken, skip, or delete a test to make the suite pass.
+- Tests use **alcotest** (unit/integration) and **qcheck-alcotest** (property).
+  Prefer property tests for invariants.
+- `dune runtest` must be green before every commit.
+
+---
+
+## 4. Build / test / lint / format
+
+All dune commands run inside the **`sqlocaml-dev`** Podman image. Never run dune
+directly on the host. From inside the worktree directory:
+
+```sh
+# Build
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+  opam exec -- dune build
+
+# Test
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+  opam exec -- dune runtest
+
+# Format check (ocamlformat 0.29.0, janestreet profile)
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+  opam exec -- dune build @fmt
+
+# Apply formatting
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+  opam exec -- dune fmt
+
+# Lint (merlint — must be zero findings)
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+  merlint --color=never
+
+# Coverage (threshold 85%)
+./scripts/coverage.sh
+```
+
+If the `sqlocaml-dev` image isn't built yet:
+```sh
+podman build -t sqlocaml-dev .
+```
+
+---
+
+## 5. Forgejo CLI — correct usage
+
+**CLI selection:** This repo is on `git.iotready.com` — use `forgejo`. For repos on `github.com`, use `gh` instead.
+
+**PR analysis:** Post as **comments** (`forgejo issue comment`), not formal reviews — the coder and reviewer are the same user. Do not use the Forgejo review API.
+
+The `forgejo` CLI (`~/.local/bin/forgejo`) is authenticated against
+**https://git.iotready.com** as **tej (admin)**. Repo: `tej/sqlite_ocaml_port`.
+
+**Critical gotcha:** `forgejo issue label …` and label/milestone subcommands
+**misroute to an org endpoint** and return `API error (404): GetOrgByName` for
+user-owned repos like `tej/*`. Never use those subcommands. Use the generic API
+passthrough:
+
+```bash
+# List labels
+forgejo api GET /repos/tej/sqlite_ocaml_port/labels
+
+# Create label
+forgejo api POST /repos/tej/sqlite_ocaml_port/labels \
+  -f name="type:bug" -f color="#d73a4a" -f description="..."
+
+# Create milestone
+forgejo api POST /repos/tej/sqlite_ocaml_port/milestones \
+  -f title="M02" -f description="..."
+
+# Create issue (with milestone id + label ids — use --input for arrays/ints)
+echo '{"title":"...","body":"...","milestone":3,"labels":[1,4]}' \
+  | forgejo api POST /repos/tej/sqlite_ocaml_port/issues --input -
+
+# Read/list issues (native subcommands work fine)
+forgejo issue view tej/sqlite_ocaml_port <n>
+forgejo issue list tej/sqlite_ocaml_port
+
+# Open PR
+echo '{"title":"feat: ...","body":"...","head":"feat/<slug>","base":"main"}' \
+  | forgejo api POST /repos/tej/sqlite_ocaml_port/pulls --input -
+```
+
+The REST API requires the CLI/token — plain `curl` returns 403 (private repo).
+
+---
+
+## 6. Conventions
+
+- `lib/` must remain Mirage-compatible: no `Unix`, `Lwt_unix`, `threads`, or
+  `*-unix` library deps. Unix backends live in `bin/` and test harnesses only.
+- Small, single-purpose modules with `.mli` interfaces.
+- `Printf`/`Format` over `Fmt`. Descriptive identifiers.
+- Flat, behavior-oriented test suite under `test/`.
+- ocamlformat 0.29.0 (janestreet profile) — the `.ocamlformat` `version` field
+  must match exactly.
+- No comments explaining *what* code does. Only add one when the *why* is
+  non-obvious.
+
+---
+
+## 7. Issues & deferred work
+
+File deferred or discovered work as a Forgejo issue **immediately**. Never bury
+it in a code comment or `TODO`. Use `forgejo api POST /repos/tej/sqlite_ocaml_port/issues`
+with the right labels and milestone, then reference it (`#NNN`) where relevant.
