@@ -171,33 +171,28 @@ let scan ~read_page ~n_pages =
     cursor. Returns the list of recovered rows, or an empty list if the
     cursor cannot be opened (corrupt pages). *)
 let extract_one_table (store : Store.t) (tree_id : int) =
-  let* result =
-    Lwt.catch
-      (fun () ->
-        let* rows =
-          Store.with_ro store (fun txn ->
-            let* cursor = Store.cursor_open txn tree_id in
-            let (_ : Store.seek_result) = Store.cursor_first cursor in
-            let rec collect acc =
-              match Store.cursor_next cursor with
-              | None -> Lwt.return (List.rev acc)
-              | Some (k, v) ->
-                collect ({ tree_id; key = k; value = v } :: acc)
-            in
-            collect [])
-        in
-        Lwt.return (Ok rows))
-      (fun exn ->
-        let msg = Printexc.to_string exn in
-        Format.eprintf
-          "recovery: failed to extract tree %d: %s@."
-          tree_id
-          msg;
-        Lwt.return (Ok []))
-  in
-  match result with
-  | Ok rows -> Lwt.return rows
-  | Error _ -> Lwt.return []
+  Lwt.catch
+    (fun () ->
+      let* rows =
+        Store.with_ro store (fun txn ->
+          let* cursor = Store.cursor_open txn tree_id in
+          let (_ : Store.seek_result) = Store.cursor_first cursor in
+          let rec collect acc =
+            match Store.cursor_next cursor with
+            | None -> Lwt.return (List.rev acc)
+            | Some (k, v) ->
+              collect ({ tree_id; key = k; value = v } :: acc)
+          in
+          collect [])
+      in
+      Lwt.return rows)
+    (fun exn ->
+      let msg = Printexc.to_string exn in
+      Format.eprintf
+        "recovery: failed to extract tree %d: %s@."
+        tree_id
+        msg;
+      Lwt.return [])
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -228,7 +223,12 @@ let rec flush_batches write_to rows =
 (* ------------------------------------------------------------------ *)
 
 let recover ~read_page ~n_pages ~open_source ~write_to =
-  (* Phase 1: scan every page *)
+  (* Phase 1: scan every page and collect CRC trust map.
+     Currently informational only (reported in the summary); the
+     Store-layer cursor errors serve as the corruption fallback during
+     extraction.  A follow-up (#85 phase 2) will pass the trust map
+     through to skip known-bad pages proactively without waiting for
+     cursor errors. *)
   let* scan_result = scan ~read_page ~n_pages in
   let pages_scanned = scan_result.n_pages in
   let pages_read = Int64.of_int (List.length scan_result.pages) in
