@@ -1,5 +1,5 @@
 (executables
- (names sqlocaml_cli sqlocaml_repl)
- (libraries sqlocaml sqlocaml.unix lwt lwt.unix)
+ (names sqlocaml_cli sqlocaml_repl sqlocaml_recover)
+ (libraries sqlocaml sqlocaml.unix sqlocaml.recovery lwt lwt.unix)
  (preprocess
   (pps lwt_ppx)))
