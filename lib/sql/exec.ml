@@ -4080,17 +4080,16 @@ let cascade_apply_set_default
 
 (* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
    under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-let drain_matching_rows
-      store
+(* Drain matching rows from the given txn (RO or RW). *)
+let drain_matching_rows_in_tx
+      tx
       (table_meta : Cat.table_meta)
       ~clock
       ~params
       ~(where : Plan.expr option)
   : (int64 * Row.t) list Lwt.t
   =
-  S.with_ro store
-  @@ fun tx_ro ->
-  let* cur = S.cursor_open tx_ro table_meta.tree_id in
+  let* cur = S.cursor_open tx table_meta.tree_id in
   let _sr = S.cursor_first cur in
   let buf = ref [] in
   let rec drain () =
@@ -4110,6 +4109,19 @@ let drain_matching_rows
   drain ();
   S.cursor_close cur;
   Lwt.return (List.rev !buf)
+;;
+
+let drain_matching_rows
+      store
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(where : Plan.expr option)
+  : (int64 * Row.t) list Lwt.t
+  =
+  S.with_ro store
+  @@ fun tx_ro ->
+  drain_matching_rows_in_tx tx_ro table_meta ~clock ~params ~where
 ;;
 
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)
@@ -4571,7 +4583,11 @@ let execute_update
       ~(indexes : Cat.index_info list)
   : int Lwt.t
   =
-  let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
+  let* matches =
+    match mode with
+    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
+    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
+  in
   let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
   if n = 0
@@ -4887,7 +4903,11 @@ let execute_delete
       ~(indexes : Cat.index_info list)
   : int Lwt.t
   =
-  let* matches = drain_matching_rows store table_meta ~clock ~params ~where in
+  let* matches =
+    match mode with
+    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
+    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
+  in
   let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
   let n = List.length matches in
   if n = 0
@@ -8176,7 +8196,11 @@ and stream_update_returning
      NOTE: the RETURNING snapshot and the actual write use separate scans that
      each apply the same order/limit/offset; non-deterministic ORDER BY
      expressions could surface RETURNING values for different rows. *)
-  let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
+  let* matched =
+    match mode with
+    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
+    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
+  in
   let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
   let result_rows =
     List.map
@@ -8224,7 +8248,11 @@ and stream_delete_returning
   =
   (* Snapshot matching rows BEFORE the delete to compute RETURNING values
      (see stream_update_returning re: non-deterministic ORDER BY). *)
-  let* matched = drain_matching_rows store table_meta ~clock ~params ~where in
+  let* matched =
+    match mode with
+    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
+    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
+  in
   let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
   let result_rows =
     List.map
