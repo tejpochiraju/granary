@@ -16,12 +16,10 @@
       - Recovery durability: elements survive crash/restart. *)
 
 open Edn_history
-
 module Db = Sqlocaml.Db
 
 (** Generate a set-add operation with a unique element value. *)
-let gen_add element =
-  element
+let gen_add element = element
 
 (** Run a set-add operation (auto-commit). *)
 let run_add db element =
@@ -31,16 +29,14 @@ let run_add db element =
   let* r = Db.execute db sql in
   match r with
   | Ok () -> Lwt.return_unit
-  | Error e ->
-    failwith (Printf.sprintf "INSERT %d failed: %s" element (pp_error e))
+  | Error e -> failwith (Printf.sprintf "INSERT %d failed: %s" element (pp_error e))
+;;
 
 (** Run a set-add and produce invoke/ok|fail entries. *)
 let run_and_record db element process_id index =
   let open Lwt.Syntax in
   let invoke_entry =
-    make_invoke ~f:"add"
-      ~value:(SetAdd element)
-      ~process:process_id ~index
+    make_invoke ~f:"add" ~value:(SetAdd element) ~process:process_id ~index
   in
   let* result =
     Lwt.catch
@@ -52,18 +48,15 @@ let run_and_record db element process_id index =
   match result with
   | Ok () ->
     let ok_entry =
-      make_result ~typ:Ok ~f:"add"
-        ~value:(SetAdd element)
-        ~process:process_id ~index
+      make_result ~typ:Ok ~f:"add" ~value:(SetAdd element) ~process:process_id ~index
     in
     Lwt.return (invoke_entry, ok_entry)
   | Stdlib.Error _msg ->
     let fail_entry =
-      make_result ~typ:Fail ~f:"add"
-        ~value:(SetAdd element)
-        ~process:process_id ~index
+      make_result ~typ:Fail ~f:"add" ~value:(SetAdd element) ~process:process_id ~index
     in
     Lwt.return (invoke_entry, fail_entry)
+;;
 
 (** Read back all elements currently in the set. *)
 let read_all db =
@@ -74,10 +67,16 @@ let read_all db =
   | Error e -> failwith (Printf.sprintf "SELECT failed: %s" (pp_error e))
   | Ok stream ->
     let* rows = Lwt_stream.to_list stream in
-    let elements = List.map (fun row ->
-      match row.(0) with Db.V_int n -> Int64.to_int n | _ -> 0
-    ) rows in
+    let elements =
+      List.map
+        (fun row ->
+           match row.(0) with
+           | Db.V_int n -> Int64.to_int n
+           | _ -> 0)
+        rows
+    in
     Lwt.return elements
+;;
 
 (** Create the set table. *)
 let create_schema db =
@@ -85,5 +84,7 @@ let create_schema db =
   let* r = Db.execute db "CREATE TABLE s (e INTEGER PRIMARY KEY)" in
   match r with
   | Ok () -> Lwt.return_unit
-  | Error e -> failwith (Printf.sprintf "CREATE TABLE failed: %s"
-                  (Format.asprintf "%a" Db.pp_error e))
+  | Error e ->
+    failwith
+      (Printf.sprintf "CREATE TABLE failed: %s" (Format.asprintf "%a" Db.pp_error e))
+;;

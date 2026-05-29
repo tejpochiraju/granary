@@ -239,7 +239,11 @@ let mem_tree_snap (snap : (tree_id * Bytes.t Bytes_map.t) list) (tid : tree_id) 
 
 (* Get a tree's content from the shadow, falling back to the live
    tree when the tree hasn't been touched by this txn yet. *)
-let shadow_get (shadow : (tree_id * Bytes.t Bytes_map.t) list) (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t) (tid : tree_id) =
+let shadow_get
+      (shadow : (tree_id * Bytes.t Bytes_map.t) list)
+      (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t)
+      (tid : tree_id)
+  =
   match List.assoc_opt tid shadow with
   | Some map -> map
   | None -> !(mem_tree trees tid)
@@ -247,11 +251,15 @@ let shadow_get (shadow : (tree_id * Bytes.t Bytes_map.t) list) (trees : (tree_id
 
 (* Update a tree in the shadow.  The tree is lazy-copied from the live
    tree on first access (via [shadow_get]). *)
-let shadow_update (shadow : (tree_id * Bytes.t Bytes_map.t) list) (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t) (tid : tree_id) (f : Bytes.t Bytes_map.t -> Bytes.t Bytes_map.t) =
+let shadow_update
+      (shadow : (tree_id * Bytes.t Bytes_map.t) list)
+      (trees : (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t)
+      (tid : tree_id)
+      (f : Bytes.t Bytes_map.t -> Bytes.t Bytes_map.t)
+  =
   let map = shadow_get shadow trees tid in
   (tid, f map) :: List.remove_assoc tid shadow
 ;;
-
 
 (* ------------------------------------------------------------------ *)
 (* Backend helpers — Btree                                              *)
@@ -1461,8 +1469,7 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
        let r = mem_tree trees tid in
        r := Bytes_map.add key value !r
      | Some shadow ->
-       t.mem_rw_shadow
-       <- Some (shadow_update shadow trees tid (Bytes_map.add key value)));
+       t.mem_rw_shadow <- Some (shadow_update shadow trees tid (Bytes_map.add key value)));
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
@@ -1486,8 +1493,7 @@ let del (Rw t : rw txn) tid key : unit Lwt.t =
        let r = mem_tree trees tid in
        r := Bytes_map.remove key !r
      | Some shadow ->
-       t.mem_rw_shadow
-       <- Some (shadow_update shadow trees tid (Bytes_map.remove key)));
+       t.mem_rw_shadow <- Some (shadow_update shadow trees tid (Bytes_map.remove key)));
     Lwt.return_unit
   | Btree st ->
     let* r = bt_get_tree st tid in
