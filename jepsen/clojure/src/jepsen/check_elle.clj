@@ -51,22 +51,27 @@
    and :details (the raw Elle result)."
   [history opts]
   (try
-    ;; Dynamically require Elle to avoid hard dependency at load time
-    (require '[elle.list-append :as elle-la])
-    (let [elle-check (ns-resolve 'elle.list-append 'check)
-          _ (when (nil? elle-check)
+    ;; Dynamically require Elle & Jepsen at runtime (use eval to avoid
+    ;; compile-time resolution of elle.list-append and jepsen.history)
+    (eval '(clojure.core/require 'elle.list-append))
+    (eval '(clojure.core/require 'jepsen.history))
+    (let [elle-check-fn (resolve (symbol "elle.list-append" "check"))
+          _ (when (nil? elle-check-fn)
               (throw (Exception.
                        "elle.list-append/check not found — is elle 0.2.6+ in deps.edn?")))
+          jh-history (resolve (symbol "jepsen.history" "history"))
           ;; Filter to client txn completions only
           clients (client-history history)
           _ (println (str "Elle: analyzing " (count clients)
                           " client txn completions"))
+          ;; Wrap in Jepsen History object
+          jepsen-history (jh-history (vec clients))
           ;; Run Elle at the requested consistency model
           consistency (or (:consistency opts) :snapshot-isolation)
           elle-opts (cond-> {:consistency-models [consistency]}
                       (:directory opts)
                       (assoc :directory (:directory opts)))
-          elle-result (elle-check elle-opts (vec clients))
+          elle-result (elle-check-fn elle-opts jepsen-history)
           ;; Extract anomalies
           valid? (:valid? elle-result)
           anomaly-types (:anomaly-types elle-result)
