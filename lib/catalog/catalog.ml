@@ -872,8 +872,9 @@ let encode_mirror_entry (m : table_meta) =
 ;;
 
 (* Decode a mirror entry into a [table_meta] (with [next_rowid = 1L]; the
-   mirror does not persist the rowid counter — recovery is schema-only) and
-   the stored fingerprint. *)
+   mirror does not persist the rowid counter — it is recovered at open-time
+   by scanning the data tree, see [recover_next_rowid]) and the stored
+   fingerprint. *)
 let decode_mirror_entry bytes : table_meta * int64 =
   let _ver, off = Varint.decode_uint64 bytes 0 in
   let nlen, off = Varint.decode_uint64 bytes off in
