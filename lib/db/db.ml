@@ -200,6 +200,7 @@ let close t =
 let create_worker_handle t =
   let* () = Lwt.return_unit in
   of_store t.store
+;;
 
 let wal_sync_count t = S.wal_sync_count t.store
 
