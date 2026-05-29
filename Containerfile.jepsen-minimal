@@ -1,0 +1,29 @@
+# Minimal Jepsen image — layers Java + Clojure + Elle deps on top
+# of the sqlocaml-jepsen base (which has OCaml + lazyfs).
+FROM sqlocaml-jepsen
+
+USER root
+
+# Java + Clojure
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        openjdk-21-jdk-headless \
+        curl \
+        rlwrap \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -sL https://download.clojure.org/install/linux-install.sh \
+        -o /tmp/install-clojure.sh \
+    && chmod +x /tmp/install-clojure.sh \
+    && /tmp/install-clojure.sh --prefix /usr/local \
+    && rm /tmp/install-clojure.sh
+
+# Fetch Elle + Jepsen deps so they're cached in the image
+COPY jepsen/clojure/deps.edn /tmp/jepsen-deps/deps.edn
+RUN cd /tmp/jepsen-deps \
+    && clojure -P -Sdeps '{:deps {elle/elle {:mvn/version "0.2.6"} jepsen/jepsen {:mvn/version "0.3.11"}}}' \
+    && rm -rf /tmp/jepsen-deps
+
+USER opam
+WORKDIR /workspace

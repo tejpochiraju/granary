@@ -1,0 +1,20 @@
+(library
+ (name jepsen_lib)
+ (wrapped false)
+ (modules edn_history workload_list_append workload_bank workload_set
+   workload_counter nemesis)
+ (libraries sqlocaml sqlocaml.unix lwt lwt.unix unix)
+ (preprocess (pps lwt_ppx)))
+
+(executable
+ (name harness)
+ (public_name sqlocaml_jepsen)
+ (modules harness)
+ (libraries jepsen_lib sqlocaml sqlocaml.unix lwt lwt.unix unix)
+ (preprocess (pps lwt_ppx)))
+
+(executable
+ (name negative_control)
+ (public_name sqlocaml_jepsen_negative)
+ (modules negative_control)
+ (libraries jepsen_lib unix))

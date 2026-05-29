@@ -80,10 +80,11 @@ val set_file_provider : file_provider -> unit
 (** Close the database, flushing and releasing the underlying store. *)
 val close : t -> unit Lwt.t
 
-(** Expose the underlying store so callers can create additional per-worker
-    handles via {!of_store} for workloads that need concurrent explicit
-    transactions. *)
-val store : t -> Sqlocaml_store.Store.t
+(** Create a lightweight worker handle sharing the same underlying store.
+    Equivalent to [let* () = Lwt.return_unit in of_store (store t)].
+    Used by Jepsen-style concurrent workloads where each worker needs
+    its own [explicit_txn] without exposing the raw store. *)
+val create_worker_handle : t -> t Lwt.t
 
 (** Number of WAL fsyncs performed since open.  Returns 0 for non-WAL
     databases.  Exposed for #77 group-commit testing. *)
