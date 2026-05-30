@@ -164,11 +164,12 @@ let test_replication_gating_survives_epoch_bump () =
      in
      Alcotest.(check bool) "epoch bumped after ckpt" true (epoch1 > epoch0);
      Alcotest.(check bool) "WAL reset after ckpt" true (frames1 < frames0);
-     (* Epoch 1: pin floor at 0, commit again.
+     (* Epoch 1: commit again WITHOUT explicitly setting the floor.
+        If the re-pin in checkpoint_unlocked is working, the floor was
+        reset to 0 after Wal.reset and the autocheckpoint parks.
         If the re-pin is missing, the floor is stale at max_int and
         the autocheckpoint proceeds without waiting — observable as
-        an epoch bump despite the pin. *)
-     Store.update_replication_position st ~shipped:0;
+        an epoch bump despite no position advance. *)
      let* rw2 = Store.rw_begin st in
      let* () = Store.put rw2 16 (Bytes.of_string "d") (Bytes.of_string "4") in
      let* () = Store.put rw2 16 (Bytes.of_string "e") (Bytes.of_string "5") in
