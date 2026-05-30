@@ -1706,14 +1706,16 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
   | Btree st ->
+    (* Capture the page count BEFORE ro_begin: a concurrent writer
+       could allocate pages between ro_begin and the read inside the
+       callback, making the loop visit post-snapshot pages.  Reading
+       n before ro_begin gives a conservative lower bound — no
+       post-snapshot pages are included, and pages committed after
+       the bound-read but before ro_begin still have their WAL
+       frames visible (< committed_frames captured at ro_begin). *)
+    let n = Pager.n_pages st.pager in
     with_ro t (fun (Ro snap) ->
       let horizon = snap.rs_snap_frames in
-      let n =
-        (* Bound by the page count at snapshot time.  Under the
-           cooperative Rwlock the page count is frozen for the
-           snapshot's lifetime (write lock blocks on readers). *)
-        Pager.n_pages st.pager
-      in
       let rec loop (page_id : int64) =
         if Int64.compare page_id n >= 0
         then Lwt.return_unit
@@ -1721,8 +1723,20 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
           let* page_buf =
             match st.wal with
             | None ->
-              (* Non-WAL path: read straight from the main DB. *)
-              let* r = Pager.read st.pager page_id in
+              (* Non-WAL path: pass ~snapshot_frames:0 so the read
+                 path skips the dirty set entirely (pager.ml:274-276),
+                 avoiding any concurrent-writer uncommitted data.
+                 With no WAL the resolve_wal_page returns Ok None,
+                 falling through to load_main_page which reads the
+                 committed on-disk state.  Also pin the page so the
+                 writer's eviction pressure doesn't drop our copy. *)
+              let* r =
+                Pager.read
+                  ~snapshot_frames:0
+                  ~pin_set:snap.rs_pinned
+                  st.pager
+                  page_id
+              in
               (match r with
                | Ok buf -> Lwt.return buf
                | Error e ->

@@ -168,9 +168,7 @@ let test_copy_empty () =
 
 let test_copy_to_sink () =
   let src_path = fresh_path "sink_src" in
-  let dst_path = fresh_path "sink_dst" in
   cleanup src_path;
-  cleanup dst_path;
   Lwt.finalize
     (fun () ->
        let* src_r = UnixStore.open_file ~path:src_path () in
@@ -192,7 +190,6 @@ let test_copy_to_sink () =
        Lwt.return_unit)
     (fun () ->
        cleanup src_path;
-       cleanup dst_path;
        Lwt.return_unit)
 ;;
 

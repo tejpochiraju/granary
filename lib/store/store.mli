@@ -264,7 +264,7 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 
     The copy is a physical page copy: all features (FTS, secondary
     indexes, schema, freelist) come along as pages.  The iteration
-    is bounded by the snapshot's page count, so growth during the
+    is bounded by a pre-snapshot page count, so growth during the
     copy does not pull in pages outside the snapshot.
 
     On the in-memory backend this is a no-op (there are no pages to
