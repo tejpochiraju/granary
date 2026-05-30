@@ -248,6 +248,8 @@ let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
   match fr with
   | Error e -> Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
   | Ok file ->
+    (* A leftover .tmp from a previous crash may be larger than n pages,
+       but resize(n) calls ftruncate so it cuts back to exactly n. *)
     Unix_file.set_page_size file page_size;
     let* rr =
       if Int64.compare n 0L > 0 then Unix_file.resize file ~n_pages:n else Lwt.return (Ok ())
@@ -282,10 +284,20 @@ let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
              let* _ = Unix_file.close file in
              let* () = Lwt_unix.rename tmp dest in
              let dir_path = Filename.dirname dest in
-             let* dir_fd = Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
-             let* () = Lwt_unix.fsync dir_fd in
-             let* () = Lwt_unix.close dir_fd in
-             Lwt.return_ok ()
+             Lwt.catch
+               (fun () ->
+                  let* dir_fd = Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
+                  let* () = Lwt_unix.fsync dir_fd in
+                  let* () = Lwt_unix.close dir_fd in
+                  Lwt.return_ok ())
+               (fun exn ->
+                  (* rename succeeded — dest is the live file, but the
+                     directory entry may not be durable.  Return an error
+                     rather than silently swallowing the fsync failure. *)
+                  Lwt.return_error
+                    (Core.Block_error
+                       (Printf.sprintf "dir fsync after rename: %s"
+                          (Printexc.to_string exn))))
            | Error e ->
              let* _ = Unix_file.close file in
              let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in

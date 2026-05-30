@@ -243,10 +243,11 @@ let test_copy_concurrent_writer () =
        (match cr with
         | Error e -> Alcotest.failf "copy_to_file: %a" S.pp_error e
         | Ok () -> ());
-       let* src2_r = UnixStore.open_file_wal ~path:src_path () in
-       let src2 = ok_store src2_r in
+       (* Write post-copy data through the same src handle; the copy
+          snapshot is already frozen, so this commit must be absent
+          from the destination. *)
        let* () =
-         let* tx = S.rw_begin src2 in
+         let* tx = S.rw_begin src in
          let* () = S.put tx 16 (bs "post_copy_key") (bs "post_copy_val") in
          S.commit tx
        in
@@ -261,7 +262,6 @@ let test_copy_concurrent_writer () =
            Lwt.return_unit)
        in
        let* () = S.close dst in
-       let* () = S.close src2 in
        let* () = S.close src in
        Lwt.return_unit)
     (fun () ->
