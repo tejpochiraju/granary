@@ -31,8 +31,8 @@ val open_file_wal
   -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
 
 (** One-shot hot copy of [src] to a new file at [dest].
-    Creates [dest], resizes it to match the source's page count,
-    and streams every page via {!Sqlocaml_store.Store.copy_to}.
+    Writes to a temporary file first, then atomically renames to [dest]
+    (with a directory fsync), so [dest] is never left in a partial state.
     The destination is a self-contained DB with no WAL sidecar —
     it opens standalone via {!open_file}.
 

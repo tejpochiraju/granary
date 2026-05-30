@@ -232,27 +232,33 @@ let open_file_wal
             ~wal_close
             ()))
 (** Convenience: copy the entire store to a new file at [dest].
-    Creates the destination file, resizes it to the source's page count,
-    and writes every page via {!Core.copy_to}.  The destination is a
-    self-contained DB with no WAL sidecar — it opens standalone via
-    {!open_file}. *)
+    Writes to a temporary file first, then atomically renames to [dest]
+    (with a directory fsync), so [dest] is never left in a partial state.
+    The destination is a self-contained DB with no WAL sidecar — it opens
+    standalone via {!open_file}. *)
 let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
   let open Lwt.Syntax in
+  let tmp = dest ^ ".tmp" in
   let n = Core.n_pages src in
   let page_size =
     match Core.geometry src with
     | g -> g.Geometry.page_size
   in
-  let* fr = Unix_file.open_ ~path:dest () in
+  let* fr = Unix_file.open_ ~path:tmp () in
   match fr with
   | Error e -> Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
   | Ok file ->
+    (* A leftover .tmp from a previous crash may be larger than n pages,
+       but resize(n) calls ftruncate so it cuts back to exactly n. *)
     Unix_file.set_page_size file page_size;
     let* rr =
       if Int64.compare n 0L > 0 then Unix_file.resize file ~n_pages:n else Lwt.return (Ok ())
     in
     match rr with
-    | Error e -> Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+    | Error e ->
+      let* _ = Unix_file.close file in
+      let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+      Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
     | Ok () ->
       let write_page ~page_id buf =
         let* r = Unix_file.write_page file ~page_id buf in
@@ -276,12 +282,29 @@ let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
            match sr with
            | Ok () ->
              let* _ = Unix_file.close file in
-             Lwt.return_ok ()
+             let* () = Lwt_unix.rename tmp dest in
+             let dir_path = Filename.dirname dest in
+             Lwt.catch
+               (fun () ->
+                  let* dir_fd = Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
+                  let* () = Lwt_unix.fsync dir_fd in
+                  let* () = Lwt_unix.close dir_fd in
+                  Lwt.return_ok ())
+               (fun exn ->
+                  (* rename succeeded — dest is the live file, but the
+                     directory entry may not be durable.  Return an error
+                     rather than silently swallowing the fsync failure. *)
+                  Lwt.return_error
+                    (Core.Block_error
+                       (Printf.sprintf "dir fsync after rename: %s"
+                          (Printexc.to_string exn))))
            | Error e ->
              let* _ = Unix_file.close file in
+             let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
              Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e)))
         (fun exn ->
            let* _ = Unix_file.close file in
+           let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
            let msg = Printexc.to_string exn in
            Lwt.return_error (Core.Block_error msg))
 ;;

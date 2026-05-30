@@ -1706,15 +1706,13 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
   | Btree st ->
-    (* Capture the page count BEFORE ro_begin: a concurrent writer
-       could allocate pages between ro_begin and the read inside the
-       callback, making the loop visit post-snapshot pages.  Reading
-       n before ro_begin gives a conservative lower bound — no
-       post-snapshot pages are included, and pages committed after
-       the bound-read but before ro_begin still have their WAL
-       frames visible (< committed_frames captured at ro_begin). *)
-    let n = Pager.n_pages st.pager in
+    (* Read the page count INSIDE the snapshot (after ro_begin) so that
+       the loop bound n is consistent with the snapshot's WAL horizon.
+       If a writer commits between ro_begin and reading n_pages, the
+       snapshot's WAL horizon already includes those new pages; reading
+       n_pages after ro_begin ensures we copy them too. *)
     with_ro t (fun (Ro snap) ->
+      let n = Pager.n_pages st.pager in
       let horizon = snap.rs_snap_frames in
       let rec loop (page_id : int64) =
         if Int64.compare page_id n >= 0
