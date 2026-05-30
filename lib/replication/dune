@@ -1,0 +1,8 @@
+(library
+ (name sqlocaml_replication)
+ (public_name sqlocaml.replication)
+ (libraries lwt cstruct sqlocaml.storage sqlocaml.store)
+ (preprocess
+  (pps lwt_ppx))
+ (instrumentation
+  (backend bisect_ppx)))

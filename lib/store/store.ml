@@ -123,6 +123,20 @@ type bt_state =
     (* True iff a background autocheckpoint fiber is currently running.
      Used to coalesce: if a commit crosses the threshold while a
      checkpoint is already running, we skip rescheduling. *)
+    mutable replication_shipped_frames : int
+    ;(* WAL frame index up to which the replication consumer (if any) has
+       acknowledged shipment.  Initialized to [max_int] so that when no
+       consumer is active it does not gate checkpoint truncation.  When a
+       consumer registers it sets this to its shipped position; [checkpoint]
+       then waits for this to reach [committed_frames] via the shared
+       [wait_for_readers_past] / [min_active_reader_frames] floor. *)
+    mutable on_committed_frames : ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option)
+    ;(* Optional callback invoked asynchronously after each WAL commit batch.
+       Receives ~epoch, ~base_idx (starting WAL frame index of the batch),
+       ~count (number of frames in the batch).  The application reads the
+       individual frames via [Wal.read_frame] and ships them to the object
+       store.  Fired via [Lwt.async] so it never blocks the commit path.
+       [None] when no sink is registered. *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -343,13 +357,23 @@ let min_active_reader_txn st =
 ;;
 
 let min_active_reader_frames (st : bt_state) : int option =
-  Hashtbl.fold
-    (fun k _ acc ->
-       match acc with
-       | None -> Some k
-       | Some m -> Some (min m k))
-    st.active_reader_frames
-    None
+  let ro_min =
+    Hashtbl.fold
+      (fun k _ acc ->
+         match acc with
+         | None -> Some k
+         | Some m -> Some (min m k))
+      st.active_reader_frames
+      None
+  in
+  (* Include the replication consumer's shipped position as a floor.
+     max_int means no consumer is active (no gating). *)
+  let rep_floor = if st.replication_shipped_frames = max_int then None
+                  else Some st.replication_shipped_frames in
+  match ro_min, rep_floor with
+  | None, None -> None
+  | Some x, None | None, Some x -> Some x
+  | Some x, Some y -> Some (min x y)
 ;;
 
 (* Lookup-or-build the Btree handle for a tree_id using a snapshot's
@@ -481,6 +505,8 @@ let make_btree_store
     ; active_reader_frames = Hashtbl.create 4
     ; reader_done_cond = Lwt_condition.create ()
     ; autockpt_in_flight = false
+    ; replication_shipped_frames = max_int
+    ; on_committed_frames = None
     }
   in
   { backend = Btree st
@@ -1157,6 +1183,9 @@ let commit_wal t st =
       unlocked := true;
       Rwlock.release_write t.lock)
   in
+  (* Capture pre-commit frame count for the frame-sink callback. *)
+  let wal = match st.wal with Some w -> w | None -> assert false in
+  let prev_frames = Wal.committed_frames wal in
   Lwt.catch
     (fun () ->
        let* () = commit_prepare_btree ~header_commit:Header.commit_no_sync st in
@@ -1169,6 +1198,16 @@ let commit_wal t st =
            | Error e ->
              Lwt.fail_with (Format.asprintf "Store.commit: wal_sync: %a" Pager.pp_error e))
        in
+       (* Fire the frame-sink callback asynchronously so the commit path
+          is never blocked by replication I/O. *)
+       (match st.on_committed_frames with
+        | None -> ()
+        | Some cb ->
+          let new_frames = Wal.committed_frames wal in
+          if new_frames > prev_frames then
+            let epoch = Wal.epoch wal in
+            let count = new_frames - prev_frames in
+            Lwt.async (fun () -> cb ~epoch ~base_idx:prev_frames ~count));
        match role with
        | `Joiner -> Lwt.return_unit
        | `Drainer -> maybe_autockpt_after_commit t st)
@@ -1775,6 +1814,42 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
           loop (Int64.add page_id 1L)
       in
       loop 0L)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Replication consumer integration (#92)                                *)
+(* ------------------------------------------------------------------ *)
+
+(** Register the replication consumer's shipped position so checkpoint
+    truncation waits for frames to be shipped before recycling them. *)
+let update_replication_position (t : t) ~shipped =
+  match t.backend with
+  | Mem -> ()
+  | Btree st -> st.replication_shipped_frames <- shipped
+;;
+
+(** Get (epoch, committed_frames) for the active WAL; [None] if no WAL. *)
+let replication_state (t : t) =
+  match t.backend with
+  | Mem -> None
+  | Btree st ->
+    (match st.wal with
+     | None -> None
+     | Some wal -> Some (Wal.epoch wal, Wal.committed_frames wal))
+;;
+
+(** Install an asynchronous callback invoked after each WAL commit batch.
+    The callback receives ~epoch, ~base_idx (starting WAL frame index),
+    and ~count (number of committed frames).  Fired via [Lwt.async] so
+    the commit path is never blocked by replication I/O.
+    Pass [None] to unregister. *)
+let set_commit_callback
+    (t : t)
+    (cb : ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option))
+  =
+  match t.backend with
+  | Mem -> ()
+  | Btree st -> st.on_committed_frames <- cb
 ;;
 
 

@@ -224,6 +224,30 @@ let test_recovery_drops_uncommitted_batch () =
      Lwt.return_unit)
 ;;
 
+let test_epoch () =
+  Lwt_main.run
+    (let* _, w = fresh_wal () in
+     (* Epoch starts at 0 after open. *)
+     Alcotest.(check int64) "epoch starts at 0" 0L (Wal.epoch w);
+     (* Epoch does NOT change on regular append_commit. *)
+     let* _ = Wal.append_commit w [ 7L, page_with 'A' ] in
+     Alcotest.(check int64) "epoch unchanged after commit" 0L (Wal.epoch w);
+     let* _ = Wal.append_commit w [ 9L, page_with 'B' ] in
+     Alcotest.(check int64) "epoch unchanged after 2nd commit" 0L (Wal.epoch w);
+     (* Epoch bumps after reset. *)
+     Wal.reset w;
+     Alcotest.(check int64) "epoch bumped to 1" 1L (Wal.epoch w);
+     (* Multiple resets keep bumping. *)
+     Wal.reset w;
+     Alcotest.(check int64) "epoch bumped to 2" 2L (Wal.epoch w);
+     Wal.reset w;
+     Alcotest.(check int64) "epoch bumped to 3" 3L (Wal.epoch w);
+     (* Append after reset does not bump epoch. *)
+     let* _ = Wal.append_commit w [ 5L, page_with 'C' ] in
+     Alcotest.(check int64) "epoch unchanged after post-reset commit" 3L (Wal.epoch w);
+     Lwt.return_unit)
+;;
+
 let test_reset_clears_index () =
   Lwt_main.run
     (let* _, w = fresh_wal () in
@@ -354,7 +378,8 @@ let () =
             test_recovery_drops_uncommitted_batch
         ] )
     ; ( "reset"
-      , [ Alcotest.test_case "clears index" `Quick test_reset_clears_index
+      , [ Alcotest.test_case "epoch starts, bumps, survives commit" `Quick test_epoch
+        ; Alcotest.test_case "clears index" `Quick test_reset_clears_index
         ; Alcotest.test_case
             "overwrites old frames"
             `Quick

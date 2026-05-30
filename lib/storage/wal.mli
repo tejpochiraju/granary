@@ -117,8 +117,15 @@ val flush_sync : t -> (unit, error) result Lwt.t
 (** Reset the WAL: discards all committed frames and the in-memory index.
     Used by checkpointing to truncate the log after migrating its
     contents to the main DB. The on-disk WAL is not physically truncated;
-    later appends overwrite from the beginning. *)
+    later appends overwrite from the beginning.  Bumps {!epoch} so that
+    replication consumers can detect that their snapshot has been
+    invalidated. *)
 val reset : t -> unit
+
+(** WAL generation counter — bumped every time [reset] is called (i.e. after
+    each checkpoint).  Starts at 0 on open.  Replication can use this to
+    detect whether a checkpoint expired its snapshot. *)
+val epoch : t -> int64
 
 (** Iterate over every (page_id, frame_idx) currently in the WAL index.
     Order is unspecified. *)
