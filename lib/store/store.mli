@@ -250,8 +250,10 @@ val n_pages : t -> int64
     of the per-tree hashtable.  Used by VACUUM (phase 37). *)
 val list_tree_ids : t -> tree_id list Lwt.t
 
-(** A page sink: receives [(page_id, page_bytes)] pairs.  The application
-    owns the destination (file, object store, network). *)
+(** A page sink: receives [(page_id, page_bytes)] pairs.  The page
+    buffer is a fresh copy — the callee owns it and may mutate or
+    retain it freely beyond the returned Lwt.  No defensive copy is
+    needed. *)
 type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 
 (** One-shot, consistent, point-in-time full copy of an open database
@@ -262,9 +264,11 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
     fully-materialised DB with empty/absent WAL state — it opens
     standalone with a plain [open_file]/[open_block].
 
+    Each page buffer passed to [sink] is a fresh copy; the sink owns it.
+
     The copy is a physical page copy: all features (FTS, secondary
     indexes, schema, freelist) come along as pages.  The iteration
-    is bounded by a pre-snapshot page count, so growth during the
+    is bounded by a snapshot-time page count, so growth during the
     copy does not pull in pages outside the snapshot.
 
     On the in-memory backend this is a no-op (there are no pages to
