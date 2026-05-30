@@ -959,6 +959,13 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   | Error e -> Lwt.fail_with (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
   | Ok () ->
     Wal.reset wal;
+    (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
+       committed_frames, but [replication_shipped_frames] still refers to the
+       old epoch's absolute count.  Without re-pinning, the next checkpoint
+       would see a stale floor that appears to be past the new target,
+       silently allowing frame recycling before the sink ships them. *)
+    if st.on_committed_frames <> None then
+      st.replication_shipped_frames <- Wal.committed_frames wal;
     Lwt.return_unit
 ;;
 

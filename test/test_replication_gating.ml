@@ -131,6 +131,73 @@ let test_replication_gating_blocks_checkpoint () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Test: gating survives epoch bump after checkpoint                     *)
+(* ------------------------------------------------------------------ *)
+
+(** Verify that after a checkpoint resets the WAL (epoch++, committed→0),
+    the replication floor is re-pinned so the next checkpoint still waits
+    for the sink to ship new-epoch frames. *)
+let test_replication_gating_survives_epoch_bump () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st = match sr with
+       | Ok s -> s | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     (* Register callback so checkpoint_unlocked re-pins the floor. *)
+     Store.set_commit_callback st
+       (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit));
+     Store.set_wal_autocheckpoint st 3;
+     (* Epoch 0: commit, ship, let checkpoint proceed. *)
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let* () = Store.put rw 16 (Bytes.of_string "b") (Bytes.of_string "2") in
+     let* () = Store.put rw 16 (Bytes.of_string "c") (Bytes.of_string "3") in
+     let* () = Store.commit rw in
+     let epoch0, frames0 = match Store.replication_state st with
+       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     in
+     Store.update_replication_position st ~shipped:max_int;
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let epoch1, frames1 = match Store.replication_state st with
+       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check bool) "epoch bumped after ckpt" true (epoch1 > epoch0);
+     Alcotest.(check bool) "WAL reset after ckpt" true (frames1 < frames0);
+     (* Epoch 1: pin floor at 0, commit again.
+        If the re-pin is missing, the floor is stale at max_int and
+        the autocheckpoint proceeds without waiting — observable as
+        an epoch bump despite the pin. *)
+     Store.update_replication_position st ~shipped:0;
+     let* rw2 = Store.rw_begin st in
+     let* () = Store.put rw2 16 (Bytes.of_string "d") (Bytes.of_string "4") in
+     let* () = Store.put rw2 16 (Bytes.of_string "e") (Bytes.of_string "5") in
+     let* () = Store.put rw2 16 (Bytes.of_string "f") (Bytes.of_string "6") in
+     let* () = Store.commit rw2 in
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let epoch2, frames2 = match Store.replication_state st with
+       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check int64) "epoch unchanged (gated after epoch bump)" epoch1 epoch2;
+     Alcotest.(check bool) "frames not reset (gated)" true (frames2 > 0);
+     (* Unblock and verify checkpoint completes. *)
+     Store.update_replication_position st ~shipped:max_int;
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let epoch3, frames3 = match Store.replication_state st with
+       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check bool) "epoch bumped after unblock" true (epoch3 > epoch2);
+     Alcotest.(check bool) "WAL reset after unblock" true (frames3 < frames2);
+     Store.set_commit_callback st None;
+     let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Test: commit callback fired                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -165,6 +232,8 @@ let () =
     [ ( "gating"
       , [ Alcotest.test_case "position blocks checkpoint" `Quick
             test_replication_gating_blocks_checkpoint
+        ; Alcotest.test_case "survives epoch bump" `Quick
+            test_replication_gating_survives_epoch_bump
         ; Alcotest.test_case "commit callback fires" `Quick
             test_commit_callback_fired
         ] )
