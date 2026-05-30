@@ -1825,7 +1825,9 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
 let update_replication_position (t : t) ~shipped =
   match t.backend with
   | Mem -> ()
-  | Btree st -> st.replication_shipped_frames <- shipped
+  | Btree st ->
+    st.replication_shipped_frames <- shipped;
+    Lwt_condition.broadcast st.reader_done_cond ()
 ;;
 
 (** Get (epoch, committed_frames) for the active WAL; [None] if no WAL. *)
@@ -1842,14 +1844,32 @@ let replication_state (t : t) =
     The callback receives ~epoch, ~base_idx (starting WAL frame index),
     and ~count (number of committed frames).  Fired via [Lwt.async] so
     the commit path is never blocked by replication I/O.
-    Pass [None] to unregister. *)
+
+    When a callback is registered, the replication shipped-position
+    floor is initialised to the WAL's current [committed_frames] so
+    that checkpoint cannot recycle already-acknowledged frames before
+    the async sink ships its first batch.  The consumer must still
+    call {!update_replication_position} to advance the floor as
+    frames are shipped.
+
+    Pass [None] to unregister (resets the floor to [max_int]). *)
 let set_commit_callback
     (t : t)
     (cb : ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option))
   =
   match t.backend with
   | Mem -> ()
-  | Btree st -> st.on_committed_frames <- cb
+  | Btree st ->
+    st.on_committed_frames <- cb;
+    (match cb with
+     | None -> st.replication_shipped_frames <- max_int
+     | Some _ ->
+       (* Pin the current committed_frames so the async sink can safely
+          read frames before advancing the position. *)
+       match st.wal with
+       | None -> ()
+       | Some wal ->
+         st.replication_shipped_frames <- Wal.committed_frames wal)
 ;;
 
 

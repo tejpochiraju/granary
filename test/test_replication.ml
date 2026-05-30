@@ -160,7 +160,7 @@ let test_apply_grows_device () =
       | Ok () ->
         Alcotest.(check int) "1 committed frame" 1 (Wal.committed_frames wal);
         let new_pages = Sqlocaml_storage.Pager.n_pages pager in
-        Alcotest.(check bool) "device grew" true (new_pages >= 50L)
+        Alcotest.(check bool) "device grew" true (new_pages >= 51L)
       | Error (`Apply_error msg) -> Alcotest.failf "apply_frames: %s" msg);
      Lwt.return_unit)
 ;;

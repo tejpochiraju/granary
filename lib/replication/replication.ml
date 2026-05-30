@@ -54,7 +54,10 @@ let apply_frames ~wal ~pager frames =
       frames
   in
   let current_pages = Pager.n_pages pager in
-  if max_pid > current_pages then Pager.set_n_pages pager max_pid;
+  (* Page ids are 0-indexed and n_pages is a count: to hold page
+     [max_pid] we need at least [max_pid + 1] pages. *)
+  let needed = Int64.succ max_pid in
+  if needed > current_pages then Pager.set_n_pages pager needed;
   (* 2. Group frames into commit batches *)
   let batches = group_into_batches frames in
   (* 3. Apply each batch via append_commit *)
@@ -107,7 +110,10 @@ let cold_restore
             Lwt.return_error (`Restore_error msg))
         else Lwt.return_ok ()
       | Some frames ->
-        (* Flush at the first commit boundary; carry remainder forward *)
+        (* Flush at the first commit boundary; carry remainder forward.
+           Note: apply_frames internally calls group_into_batches which
+           re-splits multi-commit batches, so we don't need to split
+           further here — we just hand the batch off at each commit. *)
         let rec take_until_commit buf = function
           | [] -> List.rev buf, []
           | f :: rest ->

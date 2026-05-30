@@ -76,7 +76,7 @@ let open_test_store () =
 
 
 (* ------------------------------------------------------------------ *)
-(* Test: replication position blocks checkpoint                        *)
+(* Test: replication position blocks and unblocks checkpoint            *)
 (* ------------------------------------------------------------------ *)
 
 let test_replication_gating_blocks_checkpoint () =
@@ -86,6 +86,7 @@ let test_replication_gating_blocks_checkpoint () =
        | Ok s -> s | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
      Store.set_wal_autocheckpoint st 3;
+     (* Commit some data to build up WAL frames. *)
      let* rw = Store.rw_begin st in
      let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
      let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
@@ -94,27 +95,37 @@ let test_replication_gating_blocks_checkpoint () =
        | Some s -> s | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check bool) "WAL has frames" true (frames_before > 0);
-     (* Register replication consumer at position 0 -> blocks checkpoint *)
+     (* Pin replication position at 0 so checkpoint cannot proceed. *)
      Store.update_replication_position st ~shipped:0;
+     (* Commit enough to cross threshold — the background autocheckpoint
+        (dispatched via Lwt.async in maybe_autockpt_after_commit) will park
+        on wait_for_readers_past because shipped=0 < committed_frames. *)
      let* rw2 = Store.rw_begin st in
      let* () = Store.put rw2 16 (Bytes.of_string "k3") (Bytes.of_string "v3") in
      let* () = Store.put rw2 16 (Bytes.of_string "k4") (Bytes.of_string "v4") in
      let* () = Store.commit rw2 in
-     let epoch_after, frames_after = match Store.replication_state st with
+     (* Yield several times to let any pending Lwt.async fibers (including
+        the parked autocheckpoint) run. *)
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     (* Verify checkpoint is still blocked — epoch unchanged, frames present. *)
+     let epoch_blocked, frames_blocked = match Store.replication_state st with
        | Some s -> s | None -> Alcotest.failf "expected WAL mode"
      in
-     Alcotest.(check int64) "epoch unchanged" epoch_before epoch_after;
-     Alcotest.(check bool) "frames grew" true (frames_after > frames_before);
-     (* Advance replication position -> checkpoint can proceed *)
+     Alcotest.(check int64) "epoch unchanged (checkpoint parked)" epoch_before epoch_blocked;
+     Alcotest.(check bool) "frames not reset (checkpoint parked)" true (frames_blocked >= frames_before);
+     (* Now advance replication position — this broadcasts reader_done_cond
+        and wakes the parked checkpoint. *)
      Store.update_replication_position st ~shipped:max_int;
-     let* rw3 = Store.rw_begin st in
-     let* () = Store.put rw3 16 (Bytes.of_string "k5") (Bytes.of_string "v5") in
-     let* () = Store.commit rw3 in
-     let* () = Store.checkpoint st in
-     let _, frames_final = match Store.replication_state st with
+     (* Yield to let the checkpoint complete. *)
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let _, frames_after = match Store.replication_state st with
        | Some s -> s | None -> Alcotest.failf "expected WAL mode"
      in
-     Alcotest.(check bool) "WAL reset after checkpoint" true (frames_final < 10);
+     Alcotest.(check bool) "WAL reset after unblock" true (frames_after < frames_before);
      let* () = Store.close st in
      Lwt.return_unit)
 ;;

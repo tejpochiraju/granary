@@ -39,9 +39,15 @@ val apply_frames
       last [is_commit] frame form one append_commit batch.
       Trailing non-commit frames are silently ignored (the caller
       should ensure the input list ends at a commit boundary).
-    - Updates the pager's logical page count via [Pager.set_n_pages]
-      if any frame's [page_id] exceeds the current device capacity.
-    - Returns [Ok ()] when all committed batches are applied. *)
+    - Grows the device via [Pager.set_n_pages] to accommodate the
+      highest [page_id] in the batch (page ids are 0-indexed, so
+      a frame for page N needs at least N+1 pages).
+    - Returns [Ok ()] when all committed batches are applied.
+
+    Note: this initial implementation does not inspect [epoch] for
+    re-anchoring; it assumes all frames belong to a single WAL
+    generation.  Epoch-aware apply (with re-anchor from a fresh
+    base snapshot) is deferred to the standby-apply driver in #172. *)
 
 val cold_restore
   :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -56,6 +62,10 @@ val cold_restore
 (** One-shot cold restore: open a WAL over [read_at]/[write_at]/[sync],
     then consume the [wal_frames] stream, accumulating frames into
     commit batches (up to each [is_commit] frame) and replaying them
-    via {!apply_frames}.  The [base_snapshot_path] identifies the
-    pre-downloaded base snapshot (application-specific; this module
-    does not download snapshots itself). *)
+    via {!apply_frames}.
+
+    [base_snapshot_path] is informational only — the caller must
+    have already loaded the base snapshot into the [pager] before
+    calling this function.  This module does not download or apply
+    snapshots itself; it only replays WAL frames on top of the
+    already-prepared pager state. *)
