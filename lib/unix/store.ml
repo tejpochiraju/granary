@@ -231,8 +231,62 @@ let open_file_wal
             ~close
             ~wal_close
             ()))
+(** Convenience: copy the entire store to a new file at [dest].
+    Creates the destination file, resizes it to the source's page count,
+    and writes every page via {!Core.copy_to}.  The destination is a
+    self-contained DB with no WAL sidecar — it opens standalone via
+    {!open_file}. *)
+let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
+  let open Lwt.Syntax in
+  let n = Core.n_pages src in
+  let page_size =
+    match Core.geometry src with
+    | g -> g.Geometry.page_size
+  in
+  let* fr = Unix_file.open_ ~path:dest () in
+  match fr with
+  | Error e -> Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+  | Ok file ->
+    Unix_file.set_page_size file page_size;
+    let* rr =
+      if Int64.compare n 0L > 0 then Unix_file.resize file ~n_pages:n else Lwt.return (Ok ())
+    in
+    match rr with
+    | Error e -> Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+    | Ok () ->
+      let write_page ~page_id buf =
+        let* r = Unix_file.write_page file ~page_id buf in
+        match r with
+        | Ok () -> Lwt.return_ok ()
+        | Error e -> Lwt.return_error (Format.asprintf "%a" Unix_file.pp_error e)
+      in
+      let sink : Core.page_sink =
+       fun ~page_id ~page ->
+        let open Lwt.Syntax in
+        let* r = write_page ~page_id page in
+        match r with
+        | Ok () -> Lwt.return_unit
+        | Error msg ->
+          Lwt.fail_with (Printf.sprintf "copy_to_file write pg=%Ld: %s" page_id msg)
+      in
+      Lwt.catch
+        (fun () ->
+           let* () = Core.copy_to src sink in
+           let* sr = Unix_file.sync file in
+           match sr with
+           | Ok () ->
+             let* _ = Unix_file.close file in
+             Lwt.return_ok ()
+           | Error e ->
+             let* _ = Unix_file.close file in
+             Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e)))
+        (fun exn ->
+           let* _ = Unix_file.close file in
+           let msg = Printexc.to_string exn in
+           Lwt.return_error (Core.Block_error msg))
 ;;
 
 [@@@ai_disclosure "ai-generated"]
+
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]

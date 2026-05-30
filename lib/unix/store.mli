@@ -29,3 +29,17 @@ val open_file_wal
   -> path:string
   -> unit
   -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
+
+(** One-shot hot copy of [src] to a new file at [dest].
+    Creates [dest], resizes it to match the source's page count,
+    and streams every page via {!Sqlocaml_store.Store.copy_to}.
+    The destination is a self-contained DB with no WAL sidecar —
+    it opens standalone via {!open_file}.
+
+    Handles both non-WAL and WAL-mode sources (the copy resolves
+    pages through the snapshot WAL overlay, so recently committed
+    but un-checkpointed data is included). *)
+val copy_to_file
+  :  Sqlocaml_store.Store.t
+  -> dest:string
+  -> (unit, Sqlocaml_store.Store.error) result Lwt.t

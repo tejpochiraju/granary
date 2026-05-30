@@ -166,6 +166,18 @@
   unix))
 
 (test
+ (name test_online_backup)
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.unix
+  alcotest
+  cstruct
+  lwt.unix
+  unix))
+
+(test
  (name test_crash_property)
  (libraries
   sqlocaml.store
