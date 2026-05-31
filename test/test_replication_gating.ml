@@ -8,9 +8,14 @@ module Store = Sqlocaml_store.Store
 (* iteration.  Replace fixed-count Lwt.pause() chains for robustness.  *)
 (* ------------------------------------------------------------------ *)
 let rec wait_for f max_pauses =
-  if max_pauses <= 0 then Lwt.return_unit
-  else if f () then Lwt.return_unit
-  else (let* () = Lwt.pause () in wait_for f (max_pauses - 1))
+  if max_pauses <= 0
+  then Lwt.return_unit
+  else if f ()
+  then Lwt.return_unit
+  else
+    let* () = Lwt.pause () in
+    wait_for f (max_pauses - 1)
+;;
 
 (* ------------------------------------------------------------------ *)
 (* WAL-backed in-memory store helpers                                  *)

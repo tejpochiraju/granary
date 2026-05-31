@@ -61,21 +61,21 @@ let verify_checksum f =
 (* ------------------------------------------------------------------ *)
 
 let apply_frames ~wal ~pager frames =
-  (* 1. Grow the device if any page_id exceeds current capacity *)
-  let max_pid = List.fold_left (fun acc f -> Int64.max acc f.page_id) 0L frames in
-  let current_pages = Pager.n_pages pager in
-  (* Page ids are 0-indexed and n_pages is a count: to hold page
-     [max_pid] we need at least [max_pid + 1] pages. *)
-  let needed = Int64.succ max_pid in
-  if needed > current_pages then Pager.set_n_pages pager needed;
-  (* Verify transport checksums before applying *)
+  (* 1. Verify transport checksums before any side effects *)
   let all_valid = List.for_all verify_checksum frames in
   if not all_valid
   then Lwt.return_error (`Apply_error "transport checksum verification failed")
   else (
-    (* 2. Group frames into commit batches *)
+    (* 2. Grow the device if any page_id exceeds current capacity *)
+    let max_pid = List.fold_left (fun acc f -> Int64.max acc f.page_id) 0L frames in
+    let current_pages = Pager.n_pages pager in
+    (* Page ids are 0-indexed and n_pages is a count: to hold page
+       [max_pid] we need at least [max_pid + 1] pages. *)
+    let needed = Int64.succ max_pid in
+    if needed > current_pages then Pager.set_n_pages pager needed;
+    (* 3. Group frames into commit batches *)
     let batches = group_into_batches frames in
-    (* 3. Apply each batch via append_commit *)
+    (* 4. Apply each batch via append_commit *)
     let rec apply = function
       | [] -> Lwt.return_ok ()
       | batch :: rest ->
