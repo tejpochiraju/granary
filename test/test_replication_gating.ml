@@ -4,6 +4,15 @@ open Lwt.Syntax
 module Store = Sqlocaml_store.Store
 
 (* ------------------------------------------------------------------ *)
+(* Bounded yield helper: polls f up to max_pauses times, yielding each *)
+(* iteration.  Replace fixed-count Lwt.pause() chains for robustness.  *)
+(* ------------------------------------------------------------------ *)
+let rec wait_for f max_pauses =
+  if max_pauses <= 0 then Lwt.return_unit
+  else if f () then Lwt.return_unit
+  else (let* () = Lwt.pause () in wait_for f (max_pauses - 1))
+
+(* ------------------------------------------------------------------ *)
 (* WAL-backed in-memory store helpers                                  *)
 (* ------------------------------------------------------------------ *)
 
@@ -122,9 +131,7 @@ let test_replication_gating_blocks_checkpoint () =
      let* () = Store.commit rw2 in
      (* Yield several times to let any pending Lwt.async fibers (including
         the parked autocheckpoint) run. *)
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
+     let* () = wait_for (fun () -> false) 10 in
      (* Verify checkpoint is still blocked — epoch unchanged, frames present. *)
      let epoch_blocked, frames_blocked =
        match Store.replication_state st with
@@ -143,9 +150,7 @@ let test_replication_gating_blocks_checkpoint () =
         and wakes the parked checkpoint. *)
      Store.update_replication_position st ~shipped:max_int;
      (* Yield to let the checkpoint complete. *)
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
+     let* () = wait_for (fun () -> false) 10 in
      let _, frames_after =
        match Store.replication_state st with
        | Some s -> s
@@ -188,8 +193,7 @@ let test_replication_gating_survives_epoch_bump () =
        | None -> Alcotest.failf "expected WAL mode"
      in
      Store.update_replication_position st ~shipped:max_int;
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
+     let* () = wait_for (fun () -> false) 10 in
      let epoch1, frames1 =
        match Store.replication_state st with
        | Some s -> s
@@ -208,9 +212,7 @@ let test_replication_gating_survives_epoch_bump () =
      let* () = Store.put rw2 16 (Bytes.of_string "e") (Bytes.of_string "5") in
      let* () = Store.put rw2 16 (Bytes.of_string "f") (Bytes.of_string "6") in
      let* () = Store.commit rw2 in
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
+     let* () = wait_for (fun () -> false) 10 in
      let epoch2, frames2 =
        match Store.replication_state st with
        | Some s -> s
@@ -220,9 +222,7 @@ let test_replication_gating_survives_epoch_bump () =
      Alcotest.(check bool) "frames not reset (gated)" true (frames2 > 0);
      (* Unblock and verify checkpoint completes. *)
      Store.update_replication_position st ~shipped:max_int;
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
-     let* () = Lwt.pause () in
+     let* () = wait_for (fun () -> false) 10 in
      let epoch3, frames3 =
        match Store.replication_state st with
        | Some s -> s

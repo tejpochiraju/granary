@@ -12,6 +12,9 @@ type replicated_frame =
   ; page_id : int64
   ; is_commit : bool
   ; page : Cstruct.t
+  ; checksum : int64
+  ; source_salt : int64
+  ; source_seed : int64
   }
 
 type frame_sink = replicated_frame list -> unit Lwt.t
@@ -40,6 +43,19 @@ let group_into_batches frames =
   go [] [] frames
 ;;
 
+let verify_checksum f =
+  let flags = if f.is_commit then 1L else 0L in
+  let computed =
+    Wal.frame_checksum
+      ~salt:f.source_salt
+      ~seed:f.source_seed
+      ~page_id:f.page_id
+      ~flags
+      ~page:f.page
+  in
+  Int64.equal computed f.checksum
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Apply primitive                                                      *)
 (* ------------------------------------------------------------------ *)
@@ -52,21 +68,26 @@ let apply_frames ~wal ~pager frames =
      [max_pid] we need at least [max_pid + 1] pages. *)
   let needed = Int64.succ max_pid in
   if needed > current_pages then Pager.set_n_pages pager needed;
-  (* 2. Group frames into commit batches *)
-  let batches = group_into_batches frames in
-  (* 3. Apply each batch via append_commit *)
-  let rec apply = function
-    | [] -> Lwt.return_ok ()
-    | batch :: rest ->
-      let entries = List.map (fun f -> f.page_id, f.page) batch in
-      let* r = Wal.append_commit wal entries in
-      (match r with
-       | Error e ->
-         Lwt.return_error
-           (`Apply_error (Format.asprintf "append_commit: %a" Wal.pp_error e))
-       | Ok () -> apply rest)
-  in
-  apply batches
+  (* Verify transport checksums before applying *)
+  let all_valid = List.for_all verify_checksum frames in
+  if not all_valid
+  then Lwt.return_error (`Apply_error "transport checksum verification failed")
+  else (
+    (* 2. Group frames into commit batches *)
+    let batches = group_into_batches frames in
+    (* 3. Apply each batch via append_commit *)
+    let rec apply = function
+      | [] -> Lwt.return_ok ()
+      | batch :: rest ->
+        let entries = List.map (fun f -> f.page_id, f.page) batch in
+        let* r = Wal.append_commit wal entries in
+        (match r with
+         | Error e ->
+           Lwt.return_error
+             (`Apply_error (Format.asprintf "append_commit: %a" Wal.pp_error e))
+         | Ok () -> apply rest)
+    in
+    apply batches)
 ;;
 
 (* ------------------------------------------------------------------ *)
