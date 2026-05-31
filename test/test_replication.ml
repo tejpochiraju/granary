@@ -2,7 +2,7 @@
 
 open Lwt.Syntax
 module Wal = Sqlocaml_storage.Wal
-module Replication = Sqlocaml_replication
+module Replication = Sqlocaml_replication.Replication
 
 (* ------------------------------------------------------------------ *)
 (* In-memory byte-addressable device (same pattern as test_wal.ml)      *)
@@ -79,6 +79,7 @@ let minimal_pager ?(n_pages = 10L) () =
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
     ~freelist:Sqlocaml_storage.Freelist.empty
+;;
 
 (* ------------------------------------------------------------------ *)
 (* apply_frames tests                                                   *)
@@ -90,11 +91,23 @@ let test_apply_single_batch () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.{ epoch = 0L; frame_idx = 0; page_id = 1L; is_commit = false; page = page_with 'A' }
-       ; Replication.{ epoch = 0L; frame_idx = 1; page_id = 2L; is_commit = true;  page = page_with 'B' }
+       [ Replication.
+           { epoch = 0L
+           ; frame_idx = 0
+           ; page_id = 1L
+           ; is_commit = false
+           ; page = page_with 'A'
+           }
+       ; Replication.
+           { epoch = 0L
+           ; frame_idx = 1
+           ; page_id = 2L
+           ; is_commit = true
+           ; page = page_with 'B'
+           }
        ]
      in
-     let r = Replication.apply_frames ~wal ~pager frames in
+     let* r = Replication.apply_frames ~wal ~pager frames in
      (match r with
       | Ok () ->
         Alcotest.(check int) "2 committed frames" 2 (Wal.committed_frames wal);
@@ -110,12 +123,30 @@ let test_apply_multiple_batches () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.{ epoch = 0L; frame_idx = 0; page_id = 1L; is_commit = false; page = page_with 'A' }
-       ; Replication.{ epoch = 0L; frame_idx = 1; page_id = 2L; is_commit = true;  page = page_with 'B' }
-       ; Replication.{ epoch = 0L; frame_idx = 2; page_id = 3L; is_commit = true;  page = page_with 'C' }
+       [ Replication.
+           { epoch = 0L
+           ; frame_idx = 0
+           ; page_id = 1L
+           ; is_commit = false
+           ; page = page_with 'A'
+           }
+       ; Replication.
+           { epoch = 0L
+           ; frame_idx = 1
+           ; page_id = 2L
+           ; is_commit = true
+           ; page = page_with 'B'
+           }
+       ; Replication.
+           { epoch = 0L
+           ; frame_idx = 2
+           ; page_id = 3L
+           ; is_commit = true
+           ; page = page_with 'C'
+           }
        ]
      in
-     let r = Replication.apply_frames ~wal ~pager frames in
+     let* r = Replication.apply_frames ~wal ~pager frames in
      (match r with
       | Ok () ->
         Alcotest.(check int) "3 committed frames" 3 (Wal.committed_frames wal);
@@ -131,12 +162,30 @@ let test_apply_trailing_non_commit_ignored () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.{ epoch = 0L; frame_idx = 0; page_id = 1L; is_commit = true;  page = page_with 'A' }
-       ; Replication.{ epoch = 0L; frame_idx = 1; page_id = 2L; is_commit = false; page = page_with 'B' }
-       ; Replication.{ epoch = 0L; frame_idx = 2; page_id = 3L; is_commit = false; page = page_with 'C' }
+       [ Replication.
+           { epoch = 0L
+           ; frame_idx = 0
+           ; page_id = 1L
+           ; is_commit = true
+           ; page = page_with 'A'
+           }
+       ; Replication.
+           { epoch = 0L
+           ; frame_idx = 1
+           ; page_id = 2L
+           ; is_commit = false
+           ; page = page_with 'B'
+           }
+       ; Replication.
+           { epoch = 0L
+           ; frame_idx = 2
+           ; page_id = 3L
+           ; is_commit = false
+           ; page = page_with 'C'
+           }
        ]
      in
-     let r = Replication.apply_frames ~wal ~pager frames in
+     let* r = Replication.apply_frames ~wal ~pager frames in
      (match r with
       | Ok () ->
         Alcotest.(check int) "1 committed frame" 1 (Wal.committed_frames wal);
@@ -152,10 +201,16 @@ let test_apply_grows_device () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager ~n_pages:2L () in
      let frames =
-       [ Replication.{ epoch = 0L; frame_idx = 0; page_id = 50L; is_commit = true; page = page_with 'Z' }
+       [ Replication.
+           { epoch = 0L
+           ; frame_idx = 0
+           ; page_id = 50L
+           ; is_commit = true
+           ; page = page_with 'Z'
+           }
        ]
      in
-     let r = Replication.apply_frames ~wal ~pager frames in
+     let* r = Replication.apply_frames ~wal ~pager frames in
      (match r with
       | Ok () ->
         Alcotest.(check int) "1 committed frame" 1 (Wal.committed_frames wal);
@@ -171,10 +226,11 @@ let () =
     [ ( "apply_frames"
       , [ Alcotest.test_case "single batch" `Quick test_apply_single_batch
         ; Alcotest.test_case "multiple batches" `Quick test_apply_multiple_batches
-        ; Alcotest.test_case "trailing non-commit ignored" `Quick test_apply_trailing_non_commit_ignored
+        ; Alcotest.test_case
+            "trailing non-commit ignored"
+            `Quick
+            test_apply_trailing_non_commit_ignored
         ; Alcotest.test_case "grows device" `Quick test_apply_grows_device
         ] )
     ]
-;;
-
 ;;

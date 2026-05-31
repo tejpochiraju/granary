@@ -46,11 +46,11 @@ type t =
      prepended; [find_page_at] walks the list to find the newest idx that is
      strictly less than the reader's [committed_frames] snapshot. *)
     mutable sync_count : int
-    ; (* Number of successful device syncs since open. Exposed for #77
+  ; (* Number of successful device syncs since open. Exposed for #77
          group-commit testing so test_group_commit can prove the fsync
          coalescing behaviour. *)
-      mutable epoch : int64
-      (* Bumped every time [reset] is called (i.e. after checkpoint).  Starts
+    mutable epoch : int64
+    (* Bumped every time [reset] is called (i.e. after checkpoint).  Starts
          at 0 on open.  Used by replication to detect whether a checkpoint
          expired its snapshot. *)
   }

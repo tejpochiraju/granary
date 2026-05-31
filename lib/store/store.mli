@@ -276,7 +276,9 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 val copy_to : t -> page_sink -> unit Lwt.t
 
 (** -------------------------------------------------------------------- *)
+
 (** Replication consumer integration (#92)                                   *)
+
 (** -------------------------------------------------------------------- *)
 
 (** Register the replication consumer's shipped position so checkpoint
@@ -308,5 +310,5 @@ val replication_state : t -> (int64 * int) option
     [max_int], disabling gating). *)
 val set_commit_callback
   :  t
-  -> ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option)
+  -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
   -> unit

@@ -22,7 +22,6 @@
 module Page = Sqlocaml_storage.Page
 module Store = Sqlocaml_store.Store
 module Catalog = Sqlocaml_catalog.Catalog
-
 open Lwt.Syntax
 
 (* ------------------------------------------------------------------ *)
@@ -134,15 +133,11 @@ let scan ~read_page ~n_pages =
   let n_pages_int = Int64.to_int n_pages in
   let rec loop i acc_pages trusted damaged =
     if i >= n_pages_int
-    then
+    then (
       let pages = List.rev acc_pages in
       let n_read = Int64.of_int (List.length pages) in
       Lwt.return
-        { n_pages = n_read
-        ; pages
-        ; trusted_count = trusted
-        ; damaged_count = damaged
-        }
+        { n_pages = n_read; pages; trusted_count = trusted; damaged_count = damaged })
     else (
       let page_id = Int64.of_int i in
       let* page_opt = read_page page_id in
@@ -173,26 +168,22 @@ let scan ~read_page ~n_pages =
 let extract_one_table (store : Store.t) (tree_id : int) =
   Lwt.catch
     (fun () ->
-      let* rows =
-        Store.with_ro store (fun txn ->
-          let* cursor = Store.cursor_open txn tree_id in
-          let (_ : Store.seek_result) = Store.cursor_first cursor in
-          let rec collect acc =
-            match Store.cursor_next cursor with
-            | None -> Lwt.return (List.rev acc)
-            | Some (k, v) ->
-              collect ({ tree_id; key = k; value = v } :: acc)
-          in
-          collect [])
-      in
-      Lwt.return rows)
+       let* rows =
+         Store.with_ro store (fun txn ->
+           let* cursor = Store.cursor_open txn tree_id in
+           let (_ : Store.seek_result) = Store.cursor_first cursor in
+           let rec collect acc =
+             match Store.cursor_next cursor with
+             | None -> Lwt.return (List.rev acc)
+             | Some (k, v) -> collect ({ tree_id; key = k; value = v } :: acc)
+           in
+           collect [])
+       in
+       Lwt.return rows)
     (fun exn ->
-      let msg = Printexc.to_string exn in
-      Format.eprintf
-        "recovery: failed to extract tree %d: %s@."
-        tree_id
-        msg;
-      Lwt.return [])
+       let msg = Printexc.to_string exn in
+       Format.eprintf "recovery: failed to extract tree %d: %s@." tree_id msg;
+       Lwt.return [])
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -213,9 +204,9 @@ let rec flush_batches write_to rows =
   | _ ->
     let batch, rest = take batch_size [] rows in
     let* result = write_to batch in
-    match result with
-    | Error e -> Lwt.return_error e
-    | Ok () -> flush_batches write_to rest
+    (match result with
+     | Error e -> Lwt.return_error e
+     | Ok () -> flush_batches write_to rest)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -247,27 +238,21 @@ let recover ~read_page ~n_pages ~open_source ~write_to =
     let tables_total = List.length tables in
     let rec extract_all acc_rev tables_recovered remaining_tables =
       match remaining_tables with
-      | [] ->
-        Lwt.return (acc_rev, tables_recovered)
+      | [] -> Lwt.return (acc_rev, tables_recovered)
       | table_meta :: rest ->
         let tree_id = table_meta.Catalog.tree_id in
         let* table_rows = extract_one_table store tree_id in
         let n_rows = List.length table_rows in
-        let recovered =
-          if n_rows > 0 then tables_recovered + 1 else tables_recovered
-        in
+        let recovered = if n_rows > 0 then tables_recovered + 1 else tables_recovered in
         extract_all (List.rev_append table_rows acc_rev) recovered rest
     in
-    let* all_rows_rev, tables_recovered =
-      extract_all [] 0 tables
-    in
+    let* all_rows_rev, tables_recovered = extract_all [] 0 tables in
     let all_rows = List.rev all_rows_rev in
     let rows_recovered = List.length all_rows in
     (* Phase 4: write recovered rows to destination *)
     let* write_result = flush_batches write_to all_rows in
     (match write_result with
-     | Error e ->
-       Lwt.return_error (Printf.sprintf "write_to failed: %s" e)
+     | Error e -> Lwt.return_error (Printf.sprintf "write_to failed: %s" e)
      | Ok () ->
        Lwt.return_ok
          { rows_recovered
