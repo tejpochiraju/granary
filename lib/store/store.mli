@@ -274,3 +274,39 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
     On the in-memory backend this is a no-op (there are no pages to
     copy). *)
 val copy_to : t -> page_sink -> unit Lwt.t
+
+(** -------------------------------------------------------------------- *)
+(** Replication consumer integration (#92)                                   *)
+(** -------------------------------------------------------------------- *)
+
+(** Register the replication consumer's shipped position so checkpoint
+    truncation waits for frames to be shipped before recycling them.
+    [~shipped] is the highest acknowledged frame index.  When set to
+    [max_int] (the default), the replication consumer is effectively
+    disabled and does not gate checkpoint.
+
+    Broadcasts [reader_done_cond] so that any checkpoint currently
+    parked in [wait_for_readers_past] is immediately woken. *)
+val update_replication_position : t -> shipped:int -> unit
+
+(** Get (epoch, committed_frames) for the active WAL; [None] if no WAL
+    is in effect or on the in-memory backend. *)
+val replication_state : t -> (int64 * int) option
+
+(** Install an asynchronous callback invoked after each WAL commit batch.
+    The callback receives [~epoch], [~base_idx] (starting WAL frame index
+    of this batch), and [~count] (number of frames committed).  Fired
+    via [Lwt.async] so the commit path is never blocked by replication
+    I/O.
+
+    When a callback is registered, the replication shipped-position
+    floor is initialised to the current [committed_frames] so that
+    an autocheckpoint cannot recycle frames before the async sink
+    reads and ships its first batch.  The consumer must still call
+    {!update_replication_position} to advance the floor as frames
+    are shipped.  Pass [None] to unregister (resets the floor to
+    [max_int], disabling gating). *)
+val set_commit_callback
+  :  t
+  -> ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option)
+  -> unit
