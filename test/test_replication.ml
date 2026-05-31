@@ -202,6 +202,216 @@ let test_apply_trailing_non_commit_ignored () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* verify_checksum unit tests                                          *)
+(* ------------------------------------------------------------------ *)
+
+(** verify_checksum returns true on a well-formed frame. *)
+let test_verify_checksum_valid () =
+  let frame =
+    make_frame
+      ~epoch:0L
+      ~frame_idx:0
+      ~page_id:1L
+      ~is_commit:true
+      ~page:(page_with 'A')
+  in
+  Alcotest.(check bool) "valid frame" true (Replication.verify_checksum frame)
+;;
+
+(** verify_checksum returns false on a frame with corrupted checksum. *)
+let test_verify_checksum_corrupted_checksum () =
+  let frame =
+    make_frame
+      ~epoch:0L
+      ~frame_idx:0
+      ~page_id:1L
+      ~is_commit:true
+      ~page:(page_with 'A')
+  in
+  let corrupted = { frame with checksum = Int64.succ frame.checksum } in
+  Alcotest.(check bool) "corrupted checksum" false (Replication.verify_checksum corrupted)
+;;
+
+(** verify_checksum returns false on a frame with corrupted page bytes. *)
+let test_verify_checksum_corrupted_page () =
+  let frame =
+    make_frame
+      ~epoch:0L
+      ~frame_idx:0
+      ~page_id:1L
+      ~is_commit:true
+      ~page:(page_with 'A')
+  in
+  let bad = Cstruct.create (Cstruct.length frame.page) in
+  Cstruct.blit frame.page 0 bad 0 (Cstruct.length frame.page);
+  Cstruct.set_uint8 bad 0 (Cstruct.get_uint8 bad 0 lxor 0xff);
+  let corrupted = { frame with page = bad } in
+  Alcotest.(check bool) "corrupted page" false (Replication.verify_checksum corrupted)
+;;
+
+(** verify_checksum returns false on a frame with corrupted source_salt. *)
+let test_verify_checksum_corrupted_salt () =
+  let frame =
+    make_frame
+      ~epoch:0L
+      ~frame_idx:0
+      ~page_id:1L
+      ~is_commit:true
+      ~page:(page_with 'A')
+  in
+  let corrupted = { frame with source_salt = Int64.succ frame.source_salt } in
+  Alcotest.(check bool) "corrupted salt" false (Replication.verify_checksum corrupted)
+;;
+
+(** verify_checksum returns false on a frame with corrupted source_seed. *)
+let test_verify_checksum_corrupted_seed () =
+  let frame =
+    make_frame
+      ~epoch:0L
+      ~frame_idx:0
+      ~page_id:1L
+      ~is_commit:true
+      ~page:(page_with 'A')
+  in
+  let corrupted = { frame with source_seed = Int64.succ frame.source_seed } in
+  Alcotest.(check bool) "corrupted seed" false (Replication.verify_checksum corrupted)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* apply_frames: transport checksum error path                         *)
+(* ------------------------------------------------------------------ *)
+
+(** Corrupted checksum → apply_frames returns transport checksum error. *)
+let test_apply_corrupted_checksum () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let pager = minimal_pager () in
+     let frame =
+       make_frame
+         ~epoch:0L
+         ~frame_idx:0
+         ~page_id:1L
+         ~is_commit:true
+         ~page:(page_with 'A')
+     in
+     let corrupted = { frame with checksum = Int64.succ frame.checksum } in
+     let* r = Replication.apply_frames ~wal ~pager [ corrupted ] in
+     (match r with
+      | Error (`Apply_error msg) ->
+        Alcotest.(check string)
+          "error message"
+          "transport checksum verification failed"
+          msg
+      | Ok () -> Alcotest.fail "apply_frames should have rejected corrupted checksum");
+     Lwt.return_unit)
+;;
+
+(** Corrupted page bytes → apply_frames returns transport checksum error. *)
+let test_apply_corrupted_page () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let pager = minimal_pager () in
+     let frame =
+       make_frame
+         ~epoch:0L
+         ~frame_idx:0
+         ~page_id:1L
+         ~is_commit:true
+         ~page:(page_with 'A')
+     in
+     let bad = Cstruct.create (Cstruct.length frame.page) in
+     Cstruct.blit frame.page 0 bad 0 (Cstruct.length frame.page);
+     Cstruct.set_uint8 bad 0 (Cstruct.get_uint8 bad 0 lxor 0xff);
+     let corrupted = { frame with page = bad } in
+     let* r = Replication.apply_frames ~wal ~pager [ corrupted ] in
+     (match r with
+      | Error (`Apply_error msg) ->
+        Alcotest.(check string)
+          "error message"
+          "transport checksum verification failed"
+          msg
+      | Ok () -> Alcotest.fail "apply_frames should have rejected corrupted page");
+     Lwt.return_unit)
+;;
+
+(** Corrupted source_salt → apply_frames returns transport checksum error. *)
+let test_apply_corrupted_salt () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let pager = minimal_pager () in
+     let frame =
+       make_frame
+         ~epoch:0L
+         ~frame_idx:0
+         ~page_id:1L
+         ~is_commit:true
+         ~page:(page_with 'A')
+     in
+     let corrupted = { frame with source_salt = Int64.succ frame.source_salt } in
+     let* r = Replication.apply_frames ~wal ~pager [ corrupted ] in
+     (match r with
+      | Error (`Apply_error msg) ->
+        Alcotest.(check string)
+          "error message"
+          "transport checksum verification failed"
+          msg
+      | Ok () -> Alcotest.fail "apply_frames should have rejected corrupted salt");
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* QCheck property: verify_checksum round-trip                          *)
+(* ------------------------------------------------------------------ *)
+
+let qcheck_verify_checksum =
+  let open QCheck in
+  Test.make
+    ~name:"verify_checksum: valid frame passes, any corruption fails"
+    ~count:1_000
+    (tup5
+       (map Int64.of_int (int_range 0 0xFFFF))
+       (map Int64.of_int (int_range 0 0xFFFF))
+       (map Int64.of_int (int_range 0 0xFFFF))
+       bool
+       (map Cstruct.of_string (string_size Gen.(1 -- 256))))
+    (fun (salt, seed, page_id, is_commit, page) ->
+       let flags = if is_commit then 1L else 0L in
+       let checksum = Wal.frame_checksum ~salt ~seed ~page_id ~flags ~page in
+       let frame =
+         Replication.
+           { epoch = 0L
+           ; frame_idx = 0
+           ; page_id
+           ; is_commit
+           ; page
+           ; checksum
+           ; source_salt = salt
+           ; source_seed = seed
+           }
+       in
+       (* 1. Well-formed frame passes *)
+       let valid = Replication.verify_checksum frame in
+       (* 2. Corrupted checksum fails *)
+       let bad_checksum =
+         not
+           (Replication.verify_checksum { frame with checksum = Int64.succ checksum })
+       in
+       (* 3. Corrupted page byte fails *)
+       let bad_page =
+         let bad = Cstruct.create (Cstruct.length page) in
+         Cstruct.blit page 0 bad 0 (Cstruct.length page);
+         Cstruct.set_uint8 bad 0 (Cstruct.get_uint8 bad 0 lxor 0xff);
+         not (Replication.verify_checksum { frame with page = bad })
+       in
+       (* 4. Corrupted salt fails *)
+       let bad_salt =
+         not
+           (Replication.verify_checksum { frame with source_salt = Int64.succ salt })
+       in
+       valid && bad_checksum && bad_page && bad_salt)
+;;
+
 (** apply_frames should grow the device if page_id exceeds current capacity. *)
 let test_apply_grows_device () =
   Lwt_main.run
@@ -237,6 +447,39 @@ let () =
             `Quick
             test_apply_trailing_non_commit_ignored
         ; Alcotest.test_case "grows device" `Quick test_apply_grows_device
+        ; Alcotest.test_case
+            "corrupted checksum -> error"
+            `Quick
+            test_apply_corrupted_checksum
+        ; Alcotest.test_case
+            "corrupted page -> error"
+            `Quick
+            test_apply_corrupted_page
+        ; Alcotest.test_case
+            "corrupted salt -> error"
+            `Quick
+            test_apply_corrupted_salt
         ] )
+    ; ( "verify_checksum"
+      , [ Alcotest.test_case "valid frame" `Quick test_verify_checksum_valid
+        ; Alcotest.test_case
+            "corrupted checksum"
+            `Quick
+            test_verify_checksum_corrupted_checksum
+        ; Alcotest.test_case
+            "corrupted page"
+            `Quick
+            test_verify_checksum_corrupted_page
+        ; Alcotest.test_case
+            "corrupted salt"
+            `Quick
+            test_verify_checksum_corrupted_salt
+        ; Alcotest.test_case
+            "corrupted seed"
+            `Quick
+            test_verify_checksum_corrupted_seed
+        ] )
+    ; ( "qcheck"
+      , List.map QCheck_alcotest.to_alcotest [ qcheck_verify_checksum ] )
     ]
 ;;
