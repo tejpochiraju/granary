@@ -148,6 +148,72 @@ let cold_restore
     loop []
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Epoch-aware apply for standby (#172)                                *)
+(* ------------------------------------------------------------------ *)
+
+(** Migrate the latest version of every page in the WAL index to the main
+    DB, sync, then reset the WAL (bumping its epoch).  Mirrors the engine's
+    [Store.checkpoint_unlocked] sequence; no reader-gating is needed because
+    a following standby serves no readers. *)
+let checkpoint_wal_to_main ~wal ~pager =
+  let pairs = ref [] in
+  Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+  let rec write_each = function
+    | [] -> Lwt.return_ok ()
+    | (pid, idx) :: rest ->
+      let* r = Wal.read_frame wal idx in
+      (match r with
+       | Error e ->
+         Lwt.return_error
+           (`Apply_error (Format.asprintf "checkpoint read: %a" Wal.pp_error e))
+       | Ok page ->
+         let* wr = Pager.flush_one_to_main pager ~page_id:pid ~buf:page in
+         (match wr with
+          | Error e ->
+            Lwt.return_error
+              (`Apply_error (Format.asprintf "checkpoint write: %a" Pager.pp_error e))
+          | Ok () -> write_each rest))
+  in
+  let* r = write_each !pairs in
+  match r with
+  | Error (`Apply_error _) as e -> Lwt.return e
+  | Ok () ->
+    let* sr = Pager.flush_sync_main pager in
+    (match sr with
+     | Error e ->
+       Lwt.return_error
+         (`Apply_error (Format.asprintf "checkpoint sync: %a" Pager.pp_error e))
+     | Ok () ->
+       Wal.reset wal;
+       Lwt.return_ok ())
+;;
+
+let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
+  match frames with
+  | [] -> Lwt.return_ok (last_epoch, last_idx)
+  | _ ->
+    let first_epoch = (List.hd frames).epoch in
+    let* apply_result =
+      if first_epoch <> last_epoch
+      then
+        let* r = checkpoint_wal_to_main ~wal ~pager in
+        match r with
+        | Error (`Apply_error _) as e -> Lwt.return e
+        | Ok () -> apply_frames ~wal ~pager frames
+      else apply_frames ~wal ~pager frames
+    in
+    (match apply_result with
+     | Error (`Apply_error e) -> Lwt.return_error (`Apply_error e)
+     | Ok () ->
+       let rec last_commit = function
+         | [] -> last_epoch, last_idx
+         | [ f ] -> if f.is_commit then f.epoch, f.frame_idx else last_epoch, last_idx
+         | _ :: rest -> last_commit rest
+       in
+       Lwt.return_ok (last_commit frames))
+;;
+
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]

@@ -324,3 +324,13 @@
 (test
  (name test_replication_gating)
  (libraries sqlocaml sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
+
+(test
+ (name test_standby)
+ (libraries
+  sqlocaml.replication
+  sqlocaml.store
+  sqlocaml.storage
+  alcotest
+  lwt.unix
+  unix))

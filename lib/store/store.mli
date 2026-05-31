@@ -312,3 +312,19 @@ val set_commit_callback
   :  t
   -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
   -> unit
+
+(** -------------------------------------------------------------------- *)
+
+(** Standby-follower integration (#172)                                      *)
+
+(** -------------------------------------------------------------------- *)
+
+(** Enable or disable follower mode.  When [true], {!rw_begin} rejects
+    write transactions on the B+-tree backend with an exception, keeping
+    the standby's WAL from diverging from the master's stream while the
+    follower loop is applying incoming frames.  No-op on the in-memory
+    backend (Mem stores have no standby semantics). *)
+val set_follower : t -> bool -> unit
+
+(** True iff follower mode is active (write transactions are rejected). *)
+val is_follower : t -> bool
