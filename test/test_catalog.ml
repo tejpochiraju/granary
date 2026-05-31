@@ -1803,8 +1803,7 @@ let () =
             test_mirror_fingerprints_match_primary
         ; Alcotest.test_case "drop_removes_entry" `Quick test_mirror_drop_removes_entry
         ; Alcotest.test_case "reflects_add_column" `Quick test_mirror_reflects_add_column
-        ; Alcotest.test_case
-            "recovers_next_rowid" `Quick test_mirror_recovers_next_rowid
+        ; Alcotest.test_case "recovers_next_rowid" `Quick test_mirror_recovers_next_rowid
         ] )
     ; ( "drift"
       , [ Alcotest.test_case

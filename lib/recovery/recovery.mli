@@ -73,6 +73,8 @@ val pp_result : Format.formatter -> recover_result -> unit
 val recover
   :  read_page:(int64 -> Cstruct.t option Lwt.t)
   -> n_pages:int64
-  -> open_source:(unit -> (Sqlocaml_store.Store.t * Sqlocaml_catalog.Catalog.t, string) result Lwt.t)
+  -> open_source:
+       (unit
+        -> (Sqlocaml_store.Store.t * Sqlocaml_catalog.Catalog.t, string) result Lwt.t)
   -> write_to:(recovered_row list -> (unit, string) result Lwt.t)
   -> (recover_result, string) result Lwt.t

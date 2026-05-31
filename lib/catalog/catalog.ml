@@ -949,7 +949,7 @@ let load_mirror_entries store =
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   if m.without_rowid
   then Lwt.return m
-  else (
+  else
     S.with_ro store
     @@ fun tx ->
     let%lwt cur = S.cursor_open tx m.tree_id in
@@ -969,7 +969,8 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
       | None -> 1L
       | Some k -> Int64.add (Rowid.decode k) 1L
     in
-    Lwt.return { m with next_rowid = recovered })
+    Lwt.return { m with next_rowid = recovered }
+;;
 
 let load_fk_constraints_raw store table_name =
   let key = fk_meta_key table_name in

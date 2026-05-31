@@ -123,15 +123,16 @@ type bt_state =
     (* True iff a background autocheckpoint fiber is currently running.
      Used to coalesce: if a commit crosses the threshold while a
      checkpoint is already running, we skip rescheduling. *)
-    mutable replication_shipped_frames : int
-    ;(* WAL frame index up to which the replication consumer (if any) has
+  ; mutable replication_shipped_frames : int
+    (* WAL frame index up to which the replication consumer (if any) has
        acknowledged shipment.  Initialized to [max_int] so that when no
        consumer is active it does not gate checkpoint truncation.  When a
        consumer registers it sets this to its shipped position; [checkpoint]
        then waits for this to reach [committed_frames] via the shared
        [wait_for_readers_past] / [min_active_reader_frames] floor. *)
-    mutable on_committed_frames : ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option)
-    ;(* Optional callback invoked asynchronously after each WAL commit batch.
+  ; mutable on_committed_frames :
+      (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
+    (* Optional callback invoked asynchronously after each WAL commit batch.
        Receives ~epoch, ~base_idx (starting WAL frame index of the batch),
        ~count (number of frames in the batch).  The application reads the
        individual frames via [Wal.read_frame] and ships them to the object
@@ -368,8 +369,11 @@ let min_active_reader_frames (st : bt_state) : int option =
   in
   (* Include the replication consumer's shipped position as a floor.
      max_int means no consumer is active (no gating). *)
-  let rep_floor = if st.replication_shipped_frames = max_int then None
-                  else Some st.replication_shipped_frames in
+  let rep_floor =
+    if st.replication_shipped_frames = max_int
+    then None
+    else Some st.replication_shipped_frames
+  in
   match ro_min, rep_floor with
   | None, None -> None
   | Some x, None | None, Some x -> Some x
@@ -964,8 +968,8 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
        old epoch's absolute count.  Without re-pinning, the next checkpoint
        would see a stale floor that appears to be past the new target,
        silently allowing frame recycling before the sink ships them. *)
-    if st.on_committed_frames <> None then
-      st.replication_shipped_frames <- Wal.committed_frames wal;
+    if st.on_committed_frames <> None
+    then st.replication_shipped_frames <- Wal.committed_frames wal;
     Lwt.return_unit
 ;;
 
@@ -1191,7 +1195,11 @@ let commit_wal t st =
       Rwlock.release_write t.lock)
   in
   (* Capture pre-commit frame count for the frame-sink callback. *)
-  let wal = match st.wal with Some w -> w | None -> assert false in
+  let wal =
+    match st.wal with
+    | Some w -> w
+    | None -> assert false
+  in
   let prev_frames = Wal.committed_frames wal in
   Lwt.catch
     (fun () ->
@@ -1211,10 +1219,11 @@ let commit_wal t st =
         | None -> ()
         | Some cb ->
           let new_frames = Wal.committed_frames wal in
-          if new_frames > prev_frames then
+          if new_frames > prev_frames
+          then (
             let epoch = Wal.epoch wal in
             let count = new_frames - prev_frames in
-            Lwt.async (fun () -> cb ~epoch ~base_idx:prev_frames ~count));
+            Lwt.async (fun () -> cb ~epoch ~base_idx:prev_frames ~count)));
        match role with
        | `Joiner -> Lwt.return_unit
        | `Drainer -> maybe_autockpt_after_commit t st)
@@ -1738,6 +1747,8 @@ let list_tree_ids t : tree_id list Lwt.t =
        let* result = loop [] in
        Btree.cursor_close cur;
        Lwt.return result)
+;;
+
 type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 
 (* One-shot consistent full copy via an RO snapshot + page sink (#93).
@@ -1775,11 +1786,7 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
                  committed on-disk state.  Also pin the page so the
                  writer's eviction pressure doesn't drop our copy. *)
               let* r =
-                Pager.read
-                  ~snapshot_frames:0
-                  ~pin_set:snap.rs_pinned
-                  st.pager
-                  page_id
+                Pager.read ~snapshot_frames:0 ~pin_set:snap.rs_pinned st.pager page_id
               in
               (match r with
                | Ok buf -> Lwt.return buf
@@ -1813,7 +1820,11 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
                   | Ok buf -> Lwt.return buf
                   | Error e ->
                     Lwt.fail_with
-                      (Format.asprintf "Store.copy_to(pg=%Ld): %a" page_id Pager.pp_error e)))
+                      (Format.asprintf
+                         "Store.copy_to(pg=%Ld): %a"
+                         page_id
+                         Pager.pp_error
+                         e)))
           in
           let* () = sink ~page_id ~page:page_buf in
           loop (Int64.add page_id 1L)
@@ -1829,7 +1840,7 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
     truncation waits for frames to be shipped before recycling them. *)
 let update_replication_position (t : t) ~shipped =
   match t.backend with
-  | Mem -> ()
+  | Mem _ -> ()
   | Btree st ->
     st.replication_shipped_frames <- shipped;
     Lwt_condition.broadcast st.reader_done_cond ()
@@ -1838,7 +1849,7 @@ let update_replication_position (t : t) ~shipped =
 (** Get (epoch, committed_frames) for the active WAL; [None] if no WAL. *)
 let replication_state (t : t) =
   match t.backend with
-  | Mem -> None
+  | Mem _ -> None
   | Btree st ->
     (match st.wal with
      | None -> None
@@ -1859,11 +1870,11 @@ let replication_state (t : t) =
 
     Pass [None] to unregister (resets the floor to [max_int]). *)
 let set_commit_callback
-    (t : t)
-    (cb : ((epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option))
+      (t : t)
+      (cb : (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option)
   =
   match t.backend with
-  | Mem -> ()
+  | Mem _ -> ()
   | Btree st ->
     st.on_committed_frames <- cb;
     (match cb with
@@ -1871,12 +1882,10 @@ let set_commit_callback
      | Some _ ->
        (* Pin the current committed_frames so the async sink can safely
           read frames before advancing the position. *)
-       match st.wal with
-       | None -> ()
-       | Some wal ->
-         st.replication_shipped_frames <- Wal.committed_frames wal)
+       (match st.wal with
+        | None -> ()
+        | Some wal -> st.replication_shipped_frames <- Wal.committed_frames wal))
 ;;
-
 
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]

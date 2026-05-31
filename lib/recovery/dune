@@ -1,10 +1,8 @@
 (library
  (name sqlocaml_recovery)
  (public_name sqlocaml.recovery)
- (libraries sqlocaml.storage sqlocaml.store
-   sqlocaml.catalog cstruct lwt)
+ (libraries sqlocaml.storage sqlocaml.store sqlocaml.catalog cstruct lwt)
  (preprocess
   (pps lwt_ppx))
  (instrumentation
   (backend bisect_ppx)))
-

@@ -9,13 +9,12 @@
 open Lwt.Syntax
 
 let usage_msg = "sqlocaml_recover --in <damaged.db> --out <clean.db>"
-
 let input_path = ref None
 let output_path = ref None
 
 let () =
   Arg.parse
-    [ "--in",  Arg.String (fun s -> input_path := Some s), "Damaged database file"
+    [ "--in", Arg.String (fun s -> input_path := Some s), "Damaged database file"
     ; "--out", Arg.String (fun s -> output_path := Some s), "Output clean file"
     ]
     (fun _ -> ())
@@ -37,7 +36,6 @@ let main () : unit Lwt.t =
       Format.eprintf "Missing --out <path>\n%!";
       exit 1
   in
-
   (* 1. Open the damaged file for raw-page scanning (phase 1 of recovery). *)
   let* damaged_file_result = Sqlocaml_unix.Unix_file.open_ ~path:in_path () in
   let damaged_file =
@@ -48,7 +46,6 @@ let main () : unit Lwt.t =
       exit 1
   in
   let n_pages = Sqlocaml_unix.Unix_file.n_pages damaged_file in
-
   (* read_page callback: reads a single raw page from the damaged file.
      Returns [None] when the page cannot be read (the recovery library
      treats these as silently skipped pages). *)
@@ -60,7 +57,6 @@ let main () : unit Lwt.t =
     | Ok () -> Lwt.return (Some buf)
     | Error _ -> Lwt.return None
   in
-
   (* open_source callback: opens the damaged file via the Store layer
      (which handles crash recovery / WAL replay) and loads the catalog.
      The store handle is kept alive for the extraction phase and closed
@@ -77,7 +73,6 @@ let main () : unit Lwt.t =
       let* catalog = Sqlocaml_catalog.Catalog.open_ store in
       Lwt.return (Ok (store, catalog))
   in
-
   (* write_to callback: creates the output file on the first batch and
      writes recovered rows.  Each batch is written inside its own RW
      transaction.  The output store is kept open across batches and
@@ -102,17 +97,18 @@ let main () : unit Lwt.t =
     | Ok store ->
       let* txn = Sqlocaml_store.Store.rw_begin store in
       let* () =
-        Lwt_list.iter_s (fun (row : Sqlocaml_recovery.recovered_row) ->
-          Sqlocaml_store.Store.put txn row.tree_id row.key row.value)
+        Lwt_list.iter_s
+          (fun (row : Sqlocaml_recovery.Recovery.recovered_row) ->
+             Sqlocaml_store.Store.put txn row.tree_id row.key row.value)
           rows
       in
       let* () = Sqlocaml_store.Store.commit txn in
       Lwt.return (Ok ())
   in
-
   (* Run the full recovery pipeline. *)
-  let* result = Sqlocaml_recovery.recover ~read_page ~n_pages ~open_source ~write_to in
-
+  let* result =
+    Sqlocaml_recovery.Recovery.recover ~read_page ~n_pages ~open_source ~write_to
+  in
   (* Cleanup: close all open handles regardless of success or failure. *)
   let* _ = Sqlocaml_unix.Unix_file.close damaged_file in
   let* () =
@@ -125,13 +121,12 @@ let main () : unit Lwt.t =
     | Some s -> Sqlocaml_store.Store.close s
     | None -> Lwt.return_unit
   in
-
   match result with
   | Error e ->
     Format.eprintf "Recovery failed: %s\n%!" e;
     Lwt.return_unit
   | Ok r ->
-    Format.printf "%a\n%!" Sqlocaml_recovery.pp_result r;
+    Format.printf "%a\n%!" Sqlocaml_recovery.Recovery.pp_result r;
     Lwt.return_unit
 ;;
 

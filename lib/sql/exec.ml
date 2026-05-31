@@ -4120,8 +4120,7 @@ let drain_matching_rows
   : (int64 * Row.t) list Lwt.t
   =
   S.with_ro store
-  @@ fun tx_ro ->
-  drain_matching_rows_in_tx tx_ro table_meta ~clock ~params ~where
+  @@ fun tx_ro -> drain_matching_rows_in_tx tx_ro table_meta ~clock ~params ~where
 ;;
 
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)

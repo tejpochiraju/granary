@@ -5,29 +5,22 @@
     ship frames to an object store, and the apply primitive that replays
     frames into local DB state for cold restore or a standby replica. *)
 
-open Lwt.Syntax
-
-type replicated_frame = {
-  epoch: int64;
-  frame_idx: int;
-  page_id: int64;
-  is_commit: bool;
-  page: Cstruct.t;
-}
 (** A single frame as it travels on the replication stream.  The [epoch]
     identifies the WAL generation this frame belongs to; the consumer uses
     it to detect checkpoint/truncation boundaries and re-anchor. *)
+type replicated_frame =
+  { epoch : int64
+  ; frame_idx : int
+  ; page_id : int64
+  ; is_commit : bool
+  ; page : Cstruct.t
+  }
 
-type frame_sink = replicated_frame list -> unit Lwt.t
 (** Application-implemented callback.  Receives a committed batch of
     frames in order.  The callback MUST be asynchronous and non-blocking
     so the commit path is never stalled. *)
+type frame_sink = replicated_frame list -> unit Lwt.t
 
-val apply_frames
-  :  wal:Sqlocaml_storage.Wal.t
-  -> pager:Sqlocaml_storage.Pager.t
-  -> replicated_frame list
-  -> (unit, [> `Apply_error of string ]) result Lwt.t
 (** Replay a batch of replicated frames into local DB state.
 
     Each frame's page is written via [Wal.append_commit], which
@@ -48,17 +41,12 @@ val apply_frames
     re-anchoring; it assumes all frames belong to a single WAL
     generation.  Epoch-aware apply (with re-anchor from a fresh
     base snapshot) is deferred to the standby-apply driver in #172. *)
-
-val cold_restore
-  :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
-  -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
-  -> sync:(unit -> (unit, string) result Lwt.t)
-  -> wal_size_bytes:int64
+val apply_frames
+  :  wal:Sqlocaml_storage.Wal.t
   -> pager:Sqlocaml_storage.Pager.t
-  -> base_snapshot_path:string
-  -> wal_frames:(replicated_frame list) Lwt_stream.t
-  -> unit
-  -> (unit, [> `Restore_error of string ]) result Lwt.t
+  -> replicated_frame list
+  -> (unit, [> `Apply_error of string ]) result Lwt.t
+
 (** One-shot cold restore: open a WAL over [read_at]/[write_at]/[sync],
     then consume the [wal_frames] stream, accumulating frames into
     commit batches (up to each [is_commit] frame) and replaying them
@@ -69,3 +57,13 @@ val cold_restore
     calling this function.  This module does not download or apply
     snapshots itself; it only replays WAL frames on top of the
     already-prepared pager state. *)
+val cold_restore
+  :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> wal_size_bytes:int64
+  -> pager:Sqlocaml_storage.Pager.t
+  -> base_snapshot_path:string
+  -> wal_frames:replicated_frame list Lwt_stream.t
+  -> unit
+  -> (unit, [> `Restore_error of string ]) result Lwt.t

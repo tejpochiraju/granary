@@ -14,8 +14,10 @@ let mk_dev size = { buf = Bytes.make size '\x00' }
 let dev_grow d need =
   let cur = Bytes.length d.buf in
   if need > cur
-  then (let nb = Bytes.make (max need (cur * 2)) '\x00' in
-        Bytes.blit d.buf 0 nb 0 cur; d.buf <- nb)
+  then (
+    let nb = Bytes.make (max need (cur * 2)) '\x00' in
+    Bytes.blit d.buf 0 nb 0 cur;
+    d.buf <- nb)
 ;;
 
 let read_at d ~offset out =
@@ -23,7 +25,9 @@ let read_at d ~offset out =
   let len = Cstruct.length out in
   if off + len > Bytes.length d.buf
   then Lwt.return (Error "read past EOF")
-  else (Cstruct.blit_from_bytes d.buf off out 0 len; Lwt.return (Ok ()))
+  else (
+    Cstruct.blit_from_bytes d.buf off out 0 len;
+    Lwt.return (Ok ()))
 ;;
 
 let write_at d ~offset src =
@@ -35,7 +39,6 @@ let write_at d ~offset src =
 ;;
 
 let sync_ok () = Lwt.return (Ok ())
-
 
 (* ------------------------------------------------------------------ *)
 (* Open a WAL store in memory                                          *)
@@ -50,7 +53,9 @@ let open_test_store () =
     let len = Cstruct.length buf in
     if off + len > Bytes.length main_dev.buf
     then Lwt.return (Error "read past EOF")
-    else (Cstruct.blit_from_bytes main_dev.buf off buf 0 len; Lwt.return (Ok ()))
+    else (
+      Cstruct.blit_from_bytes main_dev.buf off buf 0 len;
+      Lwt.return (Ok ()))
   in
   let write_page ~page_id buf =
     let off = Int64.to_int (Int64.mul page_id 4096L) in
@@ -60,11 +65,15 @@ let open_test_store () =
     Lwt.return (Ok ())
   in
   let resize ~n_pages =
-    dev_grow main_dev ((Int64.to_int n_pages) * 4096);
+    dev_grow main_dev (Int64.to_int n_pages * 4096);
     Lwt.return (Ok ())
   in
   Store.open_block_wal
-    ~read_page ~write_page ~sync:sync_ok ~resize ~n_pages:main_n_pages
+    ~read_page
+    ~write_page
+    ~sync:sync_ok
+    ~resize
+    ~n_pages:main_n_pages
     ~wal_read_at:(read_at wal_dev)
     ~wal_write_at:(write_at wal_dev)
     ~wal_sync:sync_ok
@@ -74,7 +83,6 @@ let open_test_store () =
     ()
 ;;
 
-
 (* ------------------------------------------------------------------ *)
 (* Test: replication position blocks and unblocks checkpoint            *)
 (* ------------------------------------------------------------------ *)
@@ -82,21 +90,29 @@ let open_test_store () =
 let test_replication_gating_blocks_checkpoint () =
   Lwt_main.run
     (let* sr = open_test_store () in
-     let st = match sr with
-       | Ok s -> s | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
-     Store.set_wal_autocheckpoint st 3;
-     (* Commit some data to build up WAL frames. *)
+     (* Commit some data to build up WAL frames.  Keep the default (high)
+        autocheckpoint threshold for this first commit so it does not trigger
+        an ungated checkpoint that would reset the WAL before we gate it. *)
      let* rw = Store.rw_begin st in
      let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
      let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
      let* () = Store.commit rw in
-     let epoch_before, frames_before = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch_before, frames_before =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check bool) "WAL has frames" true (frames_before > 0);
-     (* Pin replication position at 0 so checkpoint cannot proceed. *)
+     (* Pin replication position at 0 so checkpoint cannot proceed, then lower
+        the autocheckpoint threshold so the following commit crosses it and the
+        (now gated) autocheckpoint parks instead of resetting the WAL. *)
      Store.update_replication_position st ~shipped:0;
+     Store.set_wal_autocheckpoint st 3;
      (* Commit enough to cross threshold — the background autocheckpoint
         (dispatched via Lwt.async in maybe_autockpt_after_commit) will park
         on wait_for_readers_past because shipped=0 < committed_frames. *)
@@ -110,11 +126,19 @@ let test_replication_gating_blocks_checkpoint () =
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
      (* Verify checkpoint is still blocked — epoch unchanged, frames present. *)
-     let epoch_blocked, frames_blocked = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch_blocked, frames_blocked =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
-     Alcotest.(check int64) "epoch unchanged (checkpoint parked)" epoch_before epoch_blocked;
-     Alcotest.(check bool) "frames not reset (checkpoint parked)" true (frames_blocked >= frames_before);
+     Alcotest.(check int64)
+       "epoch unchanged (checkpoint parked)"
+       epoch_before
+       epoch_blocked;
+     Alcotest.(check bool)
+       "frames not reset (checkpoint parked)"
+       true
+       (frames_blocked >= frames_before);
      (* Now advance replication position — this broadcasts reader_done_cond
         and wakes the parked checkpoint. *)
      Store.update_replication_position st ~shipped:max_int;
@@ -122,8 +146,10 @@ let test_replication_gating_blocks_checkpoint () =
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
-     let _, frames_after = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let _, frames_after =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check bool) "WAL reset after unblock" true (frames_after < frames_before);
      let* () = Store.close st in
@@ -140,11 +166,14 @@ let test_replication_gating_blocks_checkpoint () =
 let test_replication_gating_survives_epoch_bump () =
   Lwt_main.run
     (let* sr = open_test_store () in
-     let st = match sr with
-       | Ok s -> s | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
      (* Register callback so checkpoint_unlocked re-pins the floor. *)
-     Store.set_commit_callback st
+     Store.set_commit_callback
+       st
        (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit));
      Store.set_wal_autocheckpoint st 3;
      (* Epoch 0: commit, ship, let checkpoint proceed. *)
@@ -153,14 +182,18 @@ let test_replication_gating_survives_epoch_bump () =
      let* () = Store.put rw 16 (Bytes.of_string "b") (Bytes.of_string "2") in
      let* () = Store.put rw 16 (Bytes.of_string "c") (Bytes.of_string "3") in
      let* () = Store.commit rw in
-     let epoch0, frames0 = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch0, frames0 =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Store.update_replication_position st ~shipped:max_int;
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
-     let epoch1, frames1 = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch1, frames1 =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check bool) "epoch bumped after ckpt" true (epoch1 > epoch0);
      Alcotest.(check bool) "WAL reset after ckpt" true (frames1 < frames0);
@@ -178,8 +211,10 @@ let test_replication_gating_survives_epoch_bump () =
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
-     let epoch2, frames2 = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch2, frames2 =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check int64) "epoch unchanged (gated after epoch bump)" epoch1 epoch2;
      Alcotest.(check bool) "frames not reset (gated)" true (frames2 > 0);
@@ -188,8 +223,10 @@ let test_replication_gating_survives_epoch_bump () =
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
      let* () = Lwt.pause () in
-     let epoch3, frames3 = match Store.replication_state st with
-       | Some s -> s | None -> Alcotest.failf "expected WAL mode"
+     let epoch3, frames3 =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
      in
      Alcotest.(check bool) "epoch bumped after unblock" true (epoch3 > epoch2);
      Alcotest.(check bool) "WAL reset after unblock" true (frames3 < frames2);
@@ -205,17 +242,22 @@ let test_replication_gating_survives_epoch_bump () =
 let test_commit_callback_fired () =
   Lwt_main.run
     (let* sr = open_test_store () in
-     let st = match sr with
-       | Ok s -> s | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
      let cb_fired = ref false in
      let cb_count = ref 0 in
      let cb_promise, cb_resolver = Lwt.wait () in
-     Store.set_commit_callback st
-       (Some (fun ~epoch:_ ~base_idx:_ ~count ->
-          cb_fired := true;
-          cb_count := count;
-          Lwt.wakeup cb_resolver ()));
+     Store.set_commit_callback
+       st
+       (Some
+          (fun ~epoch:_ ~base_idx:_ ~count ->
+            cb_fired := true;
+            cb_count := count;
+            Lwt.wakeup cb_resolver ();
+            Lwt.return_unit));
      let* rw = Store.rw_begin st in
      let* () = Store.put rw 16 (Bytes.of_string "hello") (Bytes.of_string "world") in
      let* () = Store.commit rw in
@@ -231,12 +273,15 @@ let () =
   Alcotest.run
     "replication-gating"
     [ ( "gating"
-      , [ Alcotest.test_case "position blocks checkpoint" `Quick
+      , [ Alcotest.test_case
+            "position blocks checkpoint"
+            `Quick
             test_replication_gating_blocks_checkpoint
-        ; Alcotest.test_case "survives epoch bump" `Quick
+        ; Alcotest.test_case
+            "survives epoch bump"
+            `Quick
             test_replication_gating_survives_epoch_bump
-        ; Alcotest.test_case "commit callback fires" `Quick
-            test_commit_callback_fired
+        ; Alcotest.test_case "commit callback fires" `Quick test_commit_callback_fired
         ] )
     ]
 ;;
