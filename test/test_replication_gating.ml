@@ -136,7 +136,7 @@ let test_replication_gating_blocks_checkpoint () =
      let* () = Store.commit rw2 in
      (* Yield several times to let any pending Lwt.async fibers (including
         the parked autocheckpoint) run. *)
-     let* () = wait_for (fun () -> false) 10 in
+     let* () = wait_for (fun () -> false) 20 in
      (* Verify checkpoint is still blocked — epoch unchanged, frames present. *)
      let epoch_blocked, frames_blocked =
        match Store.replication_state st with
@@ -234,7 +234,7 @@ let test_replication_gating_survives_epoch_bump () =
      let* () = Store.put rw2 16 (Bytes.of_string "e") (Bytes.of_string "5") in
      let* () = Store.put rw2 16 (Bytes.of_string "f") (Bytes.of_string "6") in
      let* () = Store.commit rw2 in
-     let* () = wait_for (fun () -> false) 10 in
+     let* () = wait_for (fun () -> false) 20 in
      let epoch2, frames2 =
        match Store.replication_state st with
        | Some s -> s
