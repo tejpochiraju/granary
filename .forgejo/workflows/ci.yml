@@ -47,9 +47,13 @@ jobs:
 
       - name: Report test count
         run: |
+          # Informational only — `dune runtest` above is the actual gate.
+          # Some exes (e.g. test_sqlite_corpus) need dune's data-dependency
+          # sandbox and exit non-zero when run standalone from the repo root,
+          # so a failure here must not fail the job.
           for exe in _build/default/test/test_*.exe; do
             name=$(basename "$exe" .exe)
-            result=$("$exe" 2>&1 | tail -1)
+            result=$("$exe" 2>&1 | tail -1) || result="(skipped: not standalone-runnable)"
             echo "$name: $result"
           done
 
