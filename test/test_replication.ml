@@ -209,12 +209,7 @@ let test_apply_trailing_non_commit_ignored () =
 (** verify_checksum returns true on a well-formed frame. *)
 let test_verify_checksum_valid () =
   let frame =
-    make_frame
-      ~epoch:0L
-      ~frame_idx:0
-      ~page_id:1L
-      ~is_commit:true
-      ~page:(page_with 'A')
+    make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
   in
   Alcotest.(check bool) "valid frame" true (Replication.verify_checksum frame)
 ;;
@@ -222,12 +217,7 @@ let test_verify_checksum_valid () =
 (** verify_checksum returns false on a frame with corrupted checksum. *)
 let test_verify_checksum_corrupted_checksum () =
   let frame =
-    make_frame
-      ~epoch:0L
-      ~frame_idx:0
-      ~page_id:1L
-      ~is_commit:true
-      ~page:(page_with 'A')
+    make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
   in
   let corrupted = { frame with checksum = Int64.succ frame.checksum } in
   Alcotest.(check bool) "corrupted checksum" false (Replication.verify_checksum corrupted)
@@ -236,12 +226,7 @@ let test_verify_checksum_corrupted_checksum () =
 (** verify_checksum returns false on a frame with corrupted page bytes. *)
 let test_verify_checksum_corrupted_page () =
   let frame =
-    make_frame
-      ~epoch:0L
-      ~frame_idx:0
-      ~page_id:1L
-      ~is_commit:true
-      ~page:(page_with 'A')
+    make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
   in
   let bad = Cstruct.create (Cstruct.length frame.page) in
   Cstruct.blit frame.page 0 bad 0 (Cstruct.length frame.page);
@@ -253,12 +238,7 @@ let test_verify_checksum_corrupted_page () =
 (** verify_checksum returns false on a frame with corrupted source_salt. *)
 let test_verify_checksum_corrupted_salt () =
   let frame =
-    make_frame
-      ~epoch:0L
-      ~frame_idx:0
-      ~page_id:1L
-      ~is_commit:true
-      ~page:(page_with 'A')
+    make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
   in
   let corrupted = { frame with source_salt = Int64.succ frame.source_salt } in
   Alcotest.(check bool) "corrupted salt" false (Replication.verify_checksum corrupted)
@@ -267,12 +247,7 @@ let test_verify_checksum_corrupted_salt () =
 (** verify_checksum returns false on a frame with corrupted source_seed. *)
 let test_verify_checksum_corrupted_seed () =
   let frame =
-    make_frame
-      ~epoch:0L
-      ~frame_idx:0
-      ~page_id:1L
-      ~is_commit:true
-      ~page:(page_with 'A')
+    make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
   in
   let corrupted = { frame with source_seed = Int64.succ frame.source_seed } in
   Alcotest.(check bool) "corrupted seed" false (Replication.verify_checksum corrupted)
@@ -288,12 +263,7 @@ let test_apply_corrupted_checksum () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frame =
-       make_frame
-         ~epoch:0L
-         ~frame_idx:0
-         ~page_id:1L
-         ~is_commit:true
-         ~page:(page_with 'A')
+       make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
      in
      let corrupted = { frame with checksum = Int64.succ frame.checksum } in
      let* r = Replication.apply_frames ~wal ~pager [ corrupted ] in
@@ -313,12 +283,7 @@ let test_apply_corrupted_page () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frame =
-       make_frame
-         ~epoch:0L
-         ~frame_idx:0
-         ~page_id:1L
-         ~is_commit:true
-         ~page:(page_with 'A')
+       make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
      in
      let bad = Cstruct.create (Cstruct.length frame.page) in
      Cstruct.blit frame.page 0 bad 0 (Cstruct.length frame.page);
@@ -341,12 +306,7 @@ let test_apply_corrupted_salt () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frame =
-       make_frame
-         ~epoch:0L
-         ~frame_idx:0
-         ~page_id:1L
-         ~is_commit:true
-         ~page:(page_with 'A')
+       make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
      in
      let corrupted = { frame with source_salt = Int64.succ frame.source_salt } in
      let* r = Replication.apply_frames ~wal ~pager [ corrupted ] in
@@ -394,8 +354,7 @@ let qcheck_verify_checksum =
        let valid = Replication.verify_checksum frame in
        (* 2. Corrupted checksum fails *)
        let bad_checksum =
-         not
-           (Replication.verify_checksum { frame with checksum = Int64.succ checksum })
+         not (Replication.verify_checksum { frame with checksum = Int64.succ checksum })
        in
        (* 3. Corrupted page byte fails *)
        let bad_page =
@@ -406,10 +365,17 @@ let qcheck_verify_checksum =
        in
        (* 4. Corrupted salt fails *)
        let bad_salt =
-         not
-           (Replication.verify_checksum { frame with source_salt = Int64.succ salt })
+         not (Replication.verify_checksum { frame with source_salt = Int64.succ salt })
        in
-       valid && bad_checksum && bad_page && bad_salt)
+       (* 5. Corrupted seed fails *)
+       let bad_seed =
+         not (Replication.verify_checksum { frame with source_seed = Int64.succ seed })
+       in
+       (* 6. Corrupted page_id fails *)
+       let bad_page_id =
+         not (Replication.verify_checksum { frame with page_id = Int64.succ page_id })
+       in
+       valid && bad_checksum && bad_page && bad_salt && bad_seed && bad_page_id)
 ;;
 
 (** apply_frames should grow the device if page_id exceeds current capacity. *)
@@ -451,14 +417,8 @@ let () =
             "corrupted checksum -> error"
             `Quick
             test_apply_corrupted_checksum
-        ; Alcotest.test_case
-            "corrupted page -> error"
-            `Quick
-            test_apply_corrupted_page
-        ; Alcotest.test_case
-            "corrupted salt -> error"
-            `Quick
-            test_apply_corrupted_salt
+        ; Alcotest.test_case "corrupted page -> error" `Quick test_apply_corrupted_page
+        ; Alcotest.test_case "corrupted salt -> error" `Quick test_apply_corrupted_salt
         ] )
     ; ( "verify_checksum"
       , [ Alcotest.test_case "valid frame" `Quick test_verify_checksum_valid
@@ -466,20 +426,10 @@ let () =
             "corrupted checksum"
             `Quick
             test_verify_checksum_corrupted_checksum
-        ; Alcotest.test_case
-            "corrupted page"
-            `Quick
-            test_verify_checksum_corrupted_page
-        ; Alcotest.test_case
-            "corrupted salt"
-            `Quick
-            test_verify_checksum_corrupted_salt
-        ; Alcotest.test_case
-            "corrupted seed"
-            `Quick
-            test_verify_checksum_corrupted_seed
+        ; Alcotest.test_case "corrupted page" `Quick test_verify_checksum_corrupted_page
+        ; Alcotest.test_case "corrupted salt" `Quick test_verify_checksum_corrupted_salt
+        ; Alcotest.test_case "corrupted seed" `Quick test_verify_checksum_corrupted_seed
         ] )
-    ; ( "qcheck"
-      , List.map QCheck_alcotest.to_alcotest [ qcheck_verify_checksum ] )
+    ; "qcheck", List.map QCheck_alcotest.to_alcotest [ qcheck_verify_checksum ]
     ]
 ;;

@@ -313,7 +313,13 @@
 
 (test
  (name test_replication)
- (libraries sqlocaml.replication sqlocaml.storage alcotest qcheck-alcotest lwt.unix unix))
+ (libraries
+  sqlocaml.replication
+  sqlocaml.storage
+  alcotest
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_replication_gating)
