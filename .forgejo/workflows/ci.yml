@@ -8,16 +8,20 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
 
     steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
       - uses: actions/checkout@v4
 
       - name: Install system deps
         run: |
-          sudo apt-get update -q
           sudo apt-get install -y -q pkg-config libgmp-dev
 
       - name: Cache opam packages
@@ -50,7 +54,7 @@ jobs:
           done
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     # Enforcing (#173): the curated merlint set is at zero, so findings now
     # block the build. History: adopted warn-first in #153, ratcheted to zero
     # via #167/#168/#173, flipped to blocking once #171 (ocamlformat) cleared
@@ -59,11 +63,15 @@ jobs:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
 
     steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
       - uses: actions/checkout@v4
 
       - name: Install system deps
         run: |
-          sudo apt-get update -q
           sudo apt-get install -y -q pkg-config libgmp-dev
 
       - name: Cache opam packages
