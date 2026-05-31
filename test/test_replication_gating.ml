@@ -154,8 +154,17 @@ let test_replication_gating_blocks_checkpoint () =
      (* Now advance replication position — this broadcasts reader_done_cond
         and wakes the parked checkpoint. *)
      Store.update_replication_position st ~shipped:max_int;
-     (* Yield to let the checkpoint complete. *)
-     let* () = wait_for (fun () -> false) 10 in
+     (* Wait for checkpoint to complete: frames drained from WAL.
+        With a real predicate the cap can be generous — loop exits
+        the instant the condition holds. *)
+     let* () =
+       wait_for
+         (fun () ->
+            match Store.replication_state st with
+            | Some (_, frames) -> frames < frames_before
+            | None -> false)
+         50
+     in
      let _, frames_after =
        match Store.replication_state st with
        | Some s -> s
@@ -198,7 +207,15 @@ let test_replication_gating_survives_epoch_bump () =
        | None -> Alcotest.failf "expected WAL mode"
      in
      Store.update_replication_position st ~shipped:max_int;
-     let* () = wait_for (fun () -> false) 10 in
+     (* Wait for checkpoint to complete: epoch bumped and WAL reset. *)
+     let* () =
+       wait_for
+         (fun () ->
+            match Store.replication_state st with
+            | Some (epoch, frames) -> epoch > epoch0 && frames < frames0
+            | None -> false)
+         50
+     in
      let epoch1, frames1 =
        match Store.replication_state st with
        | Some s -> s
@@ -227,7 +244,14 @@ let test_replication_gating_survives_epoch_bump () =
      Alcotest.(check bool) "frames not reset (gated)" true (frames2 > 0);
      (* Unblock and verify checkpoint completes. *)
      Store.update_replication_position st ~shipped:max_int;
-     let* () = wait_for (fun () -> false) 10 in
+     let* () =
+       wait_for
+         (fun () ->
+            match Store.replication_state st with
+            | Some (epoch, frames) -> epoch > epoch2 && frames < frames2
+            | None -> false)
+         50
+     in
      let epoch3, frames3 =
        match Store.replication_state st with
        | Some s -> s
