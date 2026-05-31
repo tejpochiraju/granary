@@ -75,9 +75,22 @@
 #
 # Patterns are unquoted: merlint's config parser does not strip surrounding
 # quotes, so "**/*.ml*" would be taken literally.
+#
+# Scoped to jepsen/ (Jepsen verification harness, #177/#179):
+#   E300 - "variant naming convention". The op/workload/nemesis variants
+#          (SetAdd, SetRead, BankRead, NoNemesis, ...) deliberately mirror the
+#          Jepsen/EDN workload protocol names rather than OCaml Snake_case, so
+#          they read 1:1 against the Jepsen side. Same stance as the naming
+#          opinions (E320/E331/E325/E330) declined above.
+#   E505 - "missing .mli". These are internal harness modules (one per workload
+#          / nemesis), not a public API surface; .mli files add ceremony without
+#          encapsulation value here. Same spirit as the E600-series test-layout
+#          exclusions above.
 
 rules:
   - files: **/*.ml*
     exclude: [E205, E320, E410, E600, E605, E606, E610, E618, E331, E325, E332, E330, E005]
   - files: test/*.ml*
     exclude: [E105, E110]
+  - files: jepsen/**/*.ml*
+    exclude: [E300, E505]
