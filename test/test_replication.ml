@@ -67,6 +67,21 @@ let page_with c =
   p
 ;;
 
+let make_frame ~epoch ~frame_idx ~page_id ~is_commit ~page =
+  let flags = if is_commit then 1L else 0L in
+  let checksum = Wal.frame_checksum ~salt:1L ~seed:2L ~page_id ~flags ~page in
+  Replication.
+    { epoch
+    ; frame_idx
+    ; page_id
+    ; is_commit
+    ; page
+    ; checksum
+    ; source_salt = 1L
+    ; source_seed = 2L
+    }
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Helper: create a minimal pager for apply_frames                     *)
 (* ------------------------------------------------------------------ *)
@@ -91,20 +106,18 @@ let test_apply_single_batch () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.
-           { epoch = 0L
-           ; frame_idx = 0
-           ; page_id = 1L
-           ; is_commit = false
-           ; page = page_with 'A'
-           }
-       ; Replication.
-           { epoch = 0L
-           ; frame_idx = 1
-           ; page_id = 2L
-           ; is_commit = true
-           ; page = page_with 'B'
-           }
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:false
+           ~page:(page_with 'A')
+       ; make_frame
+           ~epoch:0L
+           ~frame_idx:1
+           ~page_id:2L
+           ~is_commit:true
+           ~page:(page_with 'B')
        ]
      in
      let* r = Replication.apply_frames ~wal ~pager frames in
@@ -123,27 +136,24 @@ let test_apply_multiple_batches () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.
-           { epoch = 0L
-           ; frame_idx = 0
-           ; page_id = 1L
-           ; is_commit = false
-           ; page = page_with 'A'
-           }
-       ; Replication.
-           { epoch = 0L
-           ; frame_idx = 1
-           ; page_id = 2L
-           ; is_commit = true
-           ; page = page_with 'B'
-           }
-       ; Replication.
-           { epoch = 0L
-           ; frame_idx = 2
-           ; page_id = 3L
-           ; is_commit = true
-           ; page = page_with 'C'
-           }
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:false
+           ~page:(page_with 'A')
+       ; make_frame
+           ~epoch:0L
+           ~frame_idx:1
+           ~page_id:2L
+           ~is_commit:true
+           ~page:(page_with 'B')
+       ; make_frame
+           ~epoch:0L
+           ~frame_idx:2
+           ~page_id:3L
+           ~is_commit:true
+           ~page:(page_with 'C')
        ]
      in
      let* r = Replication.apply_frames ~wal ~pager frames in
@@ -162,27 +172,24 @@ let test_apply_trailing_non_commit_ignored () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let frames =
-       [ Replication.
-           { epoch = 0L
-           ; frame_idx = 0
-           ; page_id = 1L
-           ; is_commit = true
-           ; page = page_with 'A'
-           }
-       ; Replication.
-           { epoch = 0L
-           ; frame_idx = 1
-           ; page_id = 2L
-           ; is_commit = false
-           ; page = page_with 'B'
-           }
-       ; Replication.
-           { epoch = 0L
-           ; frame_idx = 2
-           ; page_id = 3L
-           ; is_commit = false
-           ; page = page_with 'C'
-           }
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'A')
+       ; make_frame
+           ~epoch:0L
+           ~frame_idx:1
+           ~page_id:2L
+           ~is_commit:false
+           ~page:(page_with 'B')
+       ; make_frame
+           ~epoch:0L
+           ~frame_idx:2
+           ~page_id:3L
+           ~is_commit:false
+           ~page:(page_with 'C')
        ]
      in
      let* r = Replication.apply_frames ~wal ~pager frames in
@@ -201,13 +208,12 @@ let test_apply_grows_device () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager ~n_pages:2L () in
      let frames =
-       [ Replication.
-           { epoch = 0L
-           ; frame_idx = 0
-           ; page_id = 50L
-           ; is_commit = true
-           ; page = page_with 'Z'
-           }
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:50L
+           ~is_commit:true
+           ~page:(page_with 'Z')
        ]
      in
      let* r = Replication.apply_frames ~wal ~pager frames in

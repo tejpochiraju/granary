@@ -58,6 +58,8 @@ type t =
 let committed_frames t = t.committed_frames
 let sync_count t = t.sync_count
 let epoch t = t.epoch
+let salt t = t.salt
+let seed t = t.seed
 
 let pp fmt t =
   Format.fprintf

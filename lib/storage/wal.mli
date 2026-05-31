@@ -130,3 +130,19 @@ val epoch : t -> int64
 (** Iterate over every (page_id, frame_idx) currently in the WAL index.
     Order is unspecified. *)
 val iter_index : t -> (int64 -> int -> unit) -> unit
+
+(** Compute the FNV-1a-64 checksum for a single WAL frame, given the source
+    salt and seed.  Used by replication to verify transport integrity. *)
+val frame_checksum
+  :  salt:int64
+  -> seed:int64
+  -> page_id:int64
+  -> flags:int64
+  -> page:Cstruct.t
+  -> int64
+
+(** Return the WAL's salt (assigned at open). *)
+val salt : t -> int64
+
+(** Return the WAL's seed (assigned at open). *)
+val seed : t -> int64

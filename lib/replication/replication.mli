@@ -7,19 +7,31 @@
 
 (** A single frame as it travels on the replication stream.  The [epoch]
     identifies the WAL generation this frame belongs to; the consumer uses
-    it to detect checkpoint/truncation boundaries and re-anchor. *)
+    it to detect checkpoint/truncation boundaries and re-anchor.
+
+    [checksum], [source_salt], and [source_seed] store the transport-level
+    checksum computed at the replication source.  Callers can verify
+    transport integrity with {!verify_checksum}. *)
 type replicated_frame =
   { epoch : int64
   ; frame_idx : int
   ; page_id : int64
   ; is_commit : bool
   ; page : Cstruct.t
+  ; checksum : int64
+  ; source_salt : int64
+  ; source_seed : int64
   }
 
 (** Application-implemented callback.  Receives a committed batch of
     frames in order.  The callback MUST be asynchronous and non-blocking
     so the commit path is never stalled. *)
 type frame_sink = replicated_frame list -> unit Lwt.t
+
+(** Recompute the frame checksum using [source_salt] and [source_seed] and
+    compare against the stored [checksum].  Returns [true] if the frame was
+    not corrupted in transit. *)
+val verify_checksum : replicated_frame -> bool
 
 (** Replay a batch of replicated frames into local DB state.
 
