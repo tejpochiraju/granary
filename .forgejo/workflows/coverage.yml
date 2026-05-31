@@ -42,7 +42,7 @@ jobs:
       - name: Install opam packages (including bisect_ppx)
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx bisect_ppx \
-            mirage-block mirage-block-unix
+            mirage-block mirage-block-unix uutf uucp
 
       - name: Build and run instrumented tests
         run: |
