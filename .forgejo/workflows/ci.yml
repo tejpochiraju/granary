@@ -34,7 +34,7 @@ jobs:
       - name: Install opam packages
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix ocamlformat.0.29.0
+            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0
 
       - name: Build
         run: opam exec -- dune build
@@ -47,9 +47,13 @@ jobs:
 
       - name: Report test count
         run: |
+          # Informational only — `dune runtest` above is the actual gate.
+          # Some exes (e.g. test_sqlite_corpus) need dune's data-dependency
+          # sandbox and exit non-zero when run standalone from the repo root,
+          # so a failure here must not fail the job.
           for exe in _build/default/test/test_*.exe; do
             name=$(basename "$exe" .exe)
-            result=$("$exe" 2>&1 | tail -1)
+            result=$("$exe" 2>&1 | tail -1) || result="(skipped: not standalone-runnable)"
             echo "$name: $result"
           done
 
@@ -84,7 +88,7 @@ jobs:
       - name: Install opam packages + merlint
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix
+            mirage-block mirage-block-unix uutf uucp
           # merlint is git-only (no opam release); pin the known-good commit.
           opam pin add -y -k git merlint \
             "https://github.com/samoht/merlint.git#d5548822dea1ad3b845eabd4b569946a05e42423"
