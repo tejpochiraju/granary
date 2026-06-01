@@ -138,6 +138,11 @@ type bt_state =
        individual frames via [Wal.read_frame] and ships them to the object
        store.  Fired via [Lwt.async] so it never blocks the commit path.
        [None] when no sink is registered. *)
+  ; mutable follower : bool
+    (* When true, [rw_begin] rejects with an error.  Set by the standby
+       consumer while following the master's WAL stream; cleared on
+       promotion or when the follower loop exits.  The in-memory backend
+       ignores this flag (Mem stores have no standby semantics). *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -511,6 +516,7 @@ let make_btree_store
     ; autockpt_in_flight = false
     ; replication_shipped_frames = max_int
     ; on_committed_frames = None
+    ; follower = false
     }
   in
   { backend = Btree st
@@ -780,27 +786,34 @@ let ro_begin t =
 
 let rw_begin t =
   let* () = Rwlock.acquire_write t.lock in
-  (match t.backend with
-   | Mem trees ->
-     (* Snapshot all currently-existing trees so rollback can restore them. *)
-     let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-     t.mem_rw_shadow <- Some snap;
-     t.mem_savepoints <- []
-   | Btree st ->
-     let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
-     Pager.set_txn_id st.pager current_rw_txn_id;
-     (* Safety: readers registered via ro_begin AFTER this rw_begin are visible at the
-        NEXT rw_begin (active_readers is checked at every rw_begin). Pages freed in
-        the current txn (freed_at = current_rw_txn_id) cannot be reused within this
-        txn because freed_at < alloc_min_safe = current_rw_txn_id is false. *)
-     let min_safe =
-       match min_active_reader_txn st with
-       | None -> current_rw_txn_id
-       | Some m -> Int64.min current_rw_txn_id m
-     in
-     Pager.set_alloc_min_safe st.pager min_safe;
-     st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
-  Lwt.return (Rw t)
+  let is_follower =
+    match t.backend with
+    | Btree st -> st.follower
+    | Mem _ -> false
+  in
+  if is_follower
+  then (
+    Rwlock.release_write t.lock;
+    Lwt.fail_with
+      "Store.rw_begin: store is in follower mode — write transactions are rejected while \
+       following")
+  else (
+    (match t.backend with
+     | Mem trees ->
+       let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+       t.mem_rw_shadow <- Some snap;
+       t.mem_savepoints <- []
+     | Btree st ->
+       let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+       Pager.set_txn_id st.pager current_rw_txn_id;
+       let min_safe =
+         match min_active_reader_txn st with
+         | None -> current_rw_txn_id
+         | Some m -> Int64.min current_rw_txn_id m
+       in
+       Pager.set_alloc_min_safe st.pager min_safe;
+       st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
+    Lwt.return (Rw t))
 ;;
 
 let ro_end (Ro snap : ro txn) =
@@ -1885,6 +1898,26 @@ let set_commit_callback
        (match st.wal with
         | None -> ()
         | Some wal -> st.replication_shipped_frames <- Wal.committed_frames wal))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Follower mode (#172)                                                 *)
+(* ------------------------------------------------------------------ *)
+
+(** Enable or disable follower mode on the store.  When [true],
+    [rw_begin] rejects write transactions so the standby's WAL does not
+    diverge from the master's stream.  No-op on the in-memory backend. *)
+let set_follower (t : t) (on : bool) =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.follower <- on
+;;
+
+(** True iff follower mode is active (writes are rejected). *)
+let is_follower (t : t) =
+  match t.backend with
+  | Mem _ -> false
+  | Btree st -> st.follower
 ;;
 
 [@@@ai_disclosure "ai-generated"]

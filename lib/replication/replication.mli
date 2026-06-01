@@ -79,3 +79,51 @@ val cold_restore
   -> wal_frames:replicated_frame list Lwt_stream.t
   -> unit
   -> (unit, [> `Restore_error of string ]) result Lwt.t
+
+(** -------------------------------------------------------------------- *)
+
+(** Standby apply driver (#172)                                            *)
+
+(** -------------------------------------------------------------------- *)
+
+(** Checkpoint the standby's WAL into the main DB and reset it.
+
+    Migrates the latest version of every page in the WAL index to the
+    main DB via [Pager.flush_one_to_main], syncs, then calls [Wal.reset]
+    (which bumps the WAL {!Sqlocaml_storage.Wal.epoch}).  This is the
+    standby-side equivalent of the engine's inline checkpoint
+    ([Sqlocaml_store.Store.checkpoint]) and is the primitive used to
+    drain buffered committed frames to durable storage before the WAL is
+    recycled — both on master-epoch transitions and on promotion. *)
+val checkpoint_wal_to_main
+  :  wal:Sqlocaml_storage.Wal.t
+  -> pager:Sqlocaml_storage.Pager.t
+  -> (unit, [> `Apply_error of string ]) result Lwt.t
+
+(** Apply a batch of replicated frames into the standby's WAL and pager,
+    handling epoch transitions.
+
+    Behaves like {!apply_frames} except that when the incoming frame
+    [epoch] differs from [last_epoch], the standby's local WAL is
+    checkpointed (migrated to the main DB and reset) before the new
+    epoch's frames are applied.  This keeps the standby's WAL frame
+    indices from colliding with recycled indices from the master's
+    checkpoint cycle.
+
+    Returns [Ok (epoch, frame_idx)] of the last applied commit frame,
+    or [Ok (last_epoch, last_idx)] if no new frames were committed
+    (useful for lag-tracking).  Pass [~last_epoch:0L ~last_idx:(-1)]
+    for the initial call.
+
+    The epoch transition is detected from the {e first} frame in the
+    batch, so each call must carry frames from a single master epoch —
+    the master must not bundle frames from before and after one of its
+    checkpoints into the same batch.  A mixed-epoch batch would skip the
+    intervening checkpoint (see follow-up). *)
+val apply_frames_epoch_aware
+  :  wal:Sqlocaml_storage.Wal.t
+  -> pager:Sqlocaml_storage.Pager.t
+  -> last_epoch:int64
+  -> last_idx:int
+  -> replicated_frame list
+  -> (int64 * int, [> `Apply_error of string ]) result Lwt.t
