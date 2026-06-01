@@ -2089,6 +2089,51 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
         | _ -> sink ~page_id ~page))
 ;;
 
+(* #215: offline key rotation.  [t] must have been opened WITH THE OLD KEY so
+   reads decrypt to plaintext; every data page (>= 2) is re-encrypted under a
+   fresh cipher built from [new_key], and each header page (0, 1) has its canary
+   rewritten under the new key (txn parity and all other fields preserved) and
+   its CRC resealed.  The sunk page image is a self-contained encrypted DB under
+   [new_key] with no WAL.  Rejects a plaintext source ([Not_encrypted]) and a
+   wrong-length key ([Block_error]). *)
+let rekey_to (t : t) ~(new_key : string) (sink : page_sink)
+  : (unit, error) result Lwt.t
+  =
+  match t.backend with
+  | Mem _ -> Lwt.return_ok ()
+  | Btree st ->
+    (match st.cipher with
+     | None -> Lwt.return_error Not_encrypted
+     | Some _old ->
+       (match Crypto.create ~key:new_key with
+        | Error `Bad_key_length ->
+          Lwt.return_error (Block_error "encryption key must be 32 bytes")
+        | Ok c' ->
+          let nonce = Mirage_crypto_rng.generate Crypto.nonce_len in
+          let canary_tag = Crypto.make_canary c' ~nonce in
+          let* () =
+            with_ro t (fun ro ->
+              iter_snapshot_pages st ro ~f:(fun ~page_id ~page ->
+                let len = Cstruct.length page in
+                let tmp = Cstruct.create len in
+                Cstruct.blit page 0 tmp 0 len;
+                if Int64.compare page_id 2L < 0
+                then (
+                  (* header page: rewrite the canary under the new key, leaving
+                     enc_magic + every structural field intact, then reseal CRC. *)
+                  let f = Page.read_header_fields tmp in
+                  Page.write_header_fields
+                    tmp
+                    { f with Page.canary_nonce = nonce; canary_tag };
+                  Page.seal tmp;
+                  sink ~page_id ~page:tmp)
+                else (
+                  Crypto.encrypt_page c' ~page_id tmp;
+                  sink ~page_id ~page:tmp)))
+          in
+          Lwt.return_ok ()))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Replication consumer integration (#92)                                *)
 (* ------------------------------------------------------------------ *)

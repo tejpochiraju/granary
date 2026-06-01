@@ -304,6 +304,14 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
     copy). *)
 val copy_to : t -> page_sink -> unit Lwt.t
 
+(** [rekey_to t ~new_key sink] offline-rotates the encryption key (#215).  [t]
+    must have been opened with the OLD key.  Reads every page as plaintext,
+    re-encrypts data pages (>= 2) under a fresh cipher built from [new_key], and
+    rewrites the header canary under the new key, sinking a self-contained
+    encrypted page image (no WAL).  Returns [Not_encrypted] if [t] is not an
+    encrypted store, or a [Block_error] if [new_key] is not 32 bytes. *)
+val rekey_to : t -> new_key:string -> page_sink -> (unit, error) result Lwt.t
+
 (** -------------------------------------------------------------------- *)
 
 (** Replication consumer integration (#92)                                   *)
