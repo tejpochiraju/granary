@@ -228,7 +228,17 @@ let read_frame_raw ?(verify = true) t idx =
           Lwt.return_ok (Some { frame_idx = idx; page_id; is_commit; page = page_copy })
         | Some c ->
           (match Crypto.decrypt_frame c ~page_id payload with
-           | Error `Tag_mismatch -> Lwt.return_ok None
+           | Error `Tag_mismatch ->
+             (* The FNV checksum (over ciphertext) already passed, so this is a
+                structurally-intact frame whose GCM tag fails: not a torn/short
+                tail but an authenticated-frame integrity failure — i.e. genuine
+                tampering (the checksum salt/seed are not key-derived, so an
+                attacker editing ciphertext can repair the checksum; GCM is what
+                catches it; wrong-key is already caught at open by the header
+                canary).  Surface it as a hard error rather than silently
+                treating it as end-of-WAL, which would drop later committed
+                frames and mask the attack as benign truncation (#219). *)
+             Lwt.return_error (Corrupt_frame idx)
            | Ok page_copy ->
              Lwt.return_ok
                (Some { frame_idx = idx; page_id; is_commit; page = page_copy })))

@@ -53,7 +53,10 @@ val header_size_bytes : int
 
 type error =
   | Block_error of string
-  | Corrupt_frame of int (** frame_idx that failed checksum *)
+  | Corrupt_frame of int
+  (** frame_idx of a structurally-present frame that failed integrity: a bad
+      checksum on a directly-addressed read, or (on an encrypted WAL) a frame
+      whose checksum passed but whose GCM tag failed — i.e. tampering (#219) *)
 
 val pp_error : Format.formatter -> error -> unit
 
