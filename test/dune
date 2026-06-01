@@ -44,6 +44,17 @@
   unix))
 
 (test
+ (name test_crypto)
+ (libraries
+  alcotest
+  qcheck-alcotest
+  cstruct
+  sqlocaml.storage
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
  (name test_conformance)
  (libraries
   sqlocaml
