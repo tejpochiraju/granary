@@ -289,7 +289,10 @@ let test_gate_yields_getter_setter () =
      let mem = Store.create () in
      Alcotest.(check int) "Mem reports 0" 0 (Store.replication_gate_max_yields mem);
      Store.set_replication_gate_max_yields mem 9;
-     Alcotest.(check int) "Mem setter is a no-op" 0 (Store.replication_gate_max_yields mem);
+     Alcotest.(check int)
+       "Mem setter is a no-op"
+       0
+       (Store.replication_gate_max_yields mem);
      let* () = Store.close st in
      Lwt.return_unit)
 ;;
@@ -386,7 +389,10 @@ let test_gate_timeout_never_abandons_ro_reader () =
        | Some s -> s
        | None -> Alcotest.failf "expected WAL mode"
      in
-     Alcotest.(check bool) "epoch bumped after reader ended" true (epoch_after > epoch_before);
+     Alcotest.(check bool)
+       "epoch bumped after reader ended"
+       true
+       (epoch_after > epoch_before);
      Alcotest.(check bool) "WAL recycled after reader ended" true (frames_after = 0);
      let* () = Store.close st in
      Lwt.return_unit)

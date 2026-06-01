@@ -578,12 +578,27 @@ let test_epoch_aware_mixed_epoch_batch_checkpoints_between () =
         the epoch-0 page is drained to main and the WAL reset BEFORE the
         epoch-1 frame is appended, so frame indices cannot collide. *)
      let frames =
-       [ make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
-       ; make_frame ~epoch:1L ~frame_idx:0 ~page_id:2L ~is_commit:true ~page:(page_with 'B')
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'A')
+       ; make_frame
+           ~epoch:1L
+           ~frame_idx:0
+           ~page_id:2L
+           ~is_commit:true
+           ~page:(page_with 'B')
        ]
      in
      let* r =
-       Replication.apply_frames_epoch_aware ~wal ~pager ~last_epoch:0L ~last_idx:(-1) frames
+       Replication.apply_frames_epoch_aware
+         ~wal
+         ~pager
+         ~last_epoch:0L
+         ~last_idx:(-1)
+         frames
      in
      match r with
      | Ok (epoch, idx) ->
@@ -814,10 +829,22 @@ let test_rebase_replays_segments_and_discards_stale_wal () =
      Alcotest.(check int) "stale frame seeded" 1 (Wal.committed_frames wal);
      (* Object-store WAL segments spanning two master epochs (5 then 6). *)
      let seg1 =
-       [ make_frame ~epoch:5L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X') ]
+       [ make_frame
+           ~epoch:5L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'X')
+       ]
      in
      let seg2 =
-       [ make_frame ~epoch:6L ~frame_idx:0 ~page_id:2L ~is_commit:true ~page:(page_with 'Y') ]
+       [ make_frame
+           ~epoch:6L
+           ~frame_idx:0
+           ~page_id:2L
+           ~is_commit:true
+           ~page:(page_with 'Y')
+       ]
      in
      let stream, push = Lwt_stream.create () in
      push (Some seg1);
@@ -835,7 +862,10 @@ let test_rebase_replays_segments_and_discards_stale_wal () =
        Alcotest.(check char) "epoch-5 page migrated to main" 'X' x;
        (* Only the live-tail (epoch-6) frame remains in the WAL — the stale
           frame and the drained epoch-5 frame are not counted. *)
-       Alcotest.(check int) "wal holds only the live-tail frame" 1 (Wal.committed_frames wal);
+       Alcotest.(check int)
+         "wal holds only the live-tail frame"
+         1
+         (Wal.committed_frames wal);
        (* The stale frame was discarded, never reaching main. *)
        let* z = main_page_byte main_d 9L in
        Alcotest.(check char) "stale frame discarded (absent from main)" '\x00' z;
@@ -852,7 +882,13 @@ let test_rebase_then_following_resumes_without_double_apply () =
      let st = Standby.create ~store ~pager ~wal in
      (* Re-base to (epoch 6, idx 0). *)
      let seg =
-       [ make_frame ~epoch:6L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X') ]
+       [ make_frame
+           ~epoch:6L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'X')
+       ]
      in
      let rebase_stream, rpush = Lwt_stream.create () in
      rpush (Some seg);
@@ -864,7 +900,13 @@ let test_rebase_then_following_resumes_without_double_apply () =
      (* Resume the live tail from where the re-base left off: the app sends
         only frames beyond the acked position (epoch 6, idx 1+). *)
      let live =
-       [ make_frame ~epoch:6L ~frame_idx:1 ~page_id:3L ~is_commit:true ~page:(page_with 'W') ]
+       [ make_frame
+           ~epoch:6L
+           ~frame_idx:1
+           ~page_id:3L
+           ~is_commit:true
+           ~page:(page_with 'W')
+       ]
      in
      let stream, push = Lwt_stream.create () in
      push (Some live);

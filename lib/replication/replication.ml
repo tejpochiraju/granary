@@ -224,11 +224,11 @@ let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
       let* r =
         if Int64.equal run_epoch current_epoch
         then apply_frames ~wal ~pager run
-        else (
+        else
           let* cr = checkpoint_wal_to_main ~wal ~pager in
           match cr with
           | Error (`Apply_error _) as e -> Lwt.return e
-          | Ok () -> apply_frames ~wal ~pager run)
+          | Ok () -> apply_frames ~wal ~pager run
       in
       (match r with
        | Error _ as e -> Lwt.return e
