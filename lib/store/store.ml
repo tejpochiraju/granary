@@ -36,6 +36,9 @@ type error =
   | Encryption_key_required (** DB is encrypted but no key was supplied *)
   | Encryption_key_mismatch (** supplied key fails the header canary *)
   | Not_encrypted (** a key was supplied for a plaintext DB *)
+  | Encryption_rng_unseeded
+  (** a key was supplied but {!Mirage_crypto_rng} is not seeded, so no per-page
+      nonce can be generated — the application must seed the RNG at boot *)
 
 let pp_error fmt = function
   | Block_error s -> Format.fprintf fmt "Block_error(%s)" s
@@ -46,6 +49,7 @@ let pp_error fmt = function
   | Encryption_key_required -> Format.pp_print_string fmt "Encryption_key_required"
   | Encryption_key_mismatch -> Format.pp_print_string fmt "Encryption_key_mismatch"
   | Not_encrypted -> Format.pp_print_string fmt "Not_encrypted"
+  | Encryption_rng_unseeded -> Format.pp_print_string fmt "Encryption_rng_unseeded"
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -598,22 +602,54 @@ let build_cipher = function
      | Error `Bad_key_length -> Error (Block_error "encryption key must be 32 bytes"))
 ;;
 
+(* When a key is in play we draw a fresh nonce on every encrypted write (and one
+   for the header canary at creation).  [Mirage_crypto_rng.generate] raises if
+   the application never seeded the RNG ([lib/] is Mirage-clean and never seeds):
+   [No_default_generator] when no generator was installed at all (the common
+   forgot-to-seed case) and [Unseeded_generator] when one was installed but not
+   seeded.  Either would otherwise surface as a raw exception on the first write
+   rather than a [Store.error].  Probe once at open time so the foot-gun is
+   caught at the entry point the caller controls; the RNG is process-global, so
+   a seed present here is present for later writes. *)
+let ensure_rng_seeded = function
+  | None -> Ok ()
+  | Some _ ->
+    (try
+       ignore (Mirage_crypto_rng.generate 1 : string);
+       Ok ()
+     with
+     | Mirage_crypto_rng.Unseeded_generator | Mirage_crypto_rng.No_default_generator ->
+       Error Encryption_rng_unseeded)
+;;
+
 (* Force a fresh-creation geometry to carry the crypto overhead in its
-   reserved tail. *)
+   reserved tail.  If bumping [reserved] to [Crypto.overhead] is rejected we
+   surface a clean error rather than silently proceeding with a geometry whose
+   reserved tail is too small — encryption would then write nonce+tag into bytes
+   the B+-tree believes are usable, corrupting the page.  (Unreachable with the
+   4096-multiple page sizes [Geometry.create] permits, since they always leave
+   >= 480 payload after reserving 32 bytes; kept as defense-in-depth.) *)
 let geom_for_cipher cipher (g : Geometry.t) =
   match cipher with
-  | None -> g
+  | None -> Ok g
   | Some _ ->
     if g.reserved_bytes_per_page >= Crypto.overhead
-    then g
+    then Ok g
     else (
       match
         Geometry.create
           ~page_size:g.page_size
           ~reserved_bytes_per_page:(max g.reserved_bytes_per_page Crypto.overhead)
       with
-      | Ok g' -> g'
-      | Error _ -> g (* page_size already valid; bump can't fail for >=480 payload *))
+      | Ok g' -> Ok g'
+      | Error e ->
+        Error
+          (Block_error
+             (Format.asprintf
+                "encryption needs %d reserved bytes/page, but the geometry rejects it: %a"
+                Crypto.overhead
+                Geometry.pp_error
+                e)))
 ;;
 
 let wrap_callbacks cipher ~read_page ~write_page =
@@ -676,10 +712,15 @@ let open_block
       ()
   : (t, error) result Lwt.t
   =
-  match build_cipher key with
+  match
+    let ( let* ) = Result.bind in
+    let* cipher = build_cipher key in
+    let* () = ensure_rng_seeded cipher in
+    let* geom = geom_for_cipher cipher geom in
+    Ok (cipher, geom)
+  with
   | Error e -> Lwt.return_error e
-  | Ok cipher ->
-    let geom = geom_for_cipher cipher geom in
+  | Ok (cipher, geom) ->
     let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
     let pager =
       Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
@@ -807,10 +848,15 @@ let open_block_wal
       ()
   : (t, error) result Lwt.t
   =
-  match build_cipher key with
+  match
+    let ( let* ) = Result.bind in
+    let* cipher = build_cipher key in
+    let* () = ensure_rng_seeded cipher in
+    let* geom = geom_for_cipher cipher geom in
+    Ok (cipher, geom)
+  with
   | Error e -> Lwt.return_error e
-  | Ok cipher ->
-    let geom = geom_for_cipher cipher geom in
+  | Ok (cipher, geom) ->
     let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
     let pager =
       Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty

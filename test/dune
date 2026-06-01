@@ -82,6 +82,10 @@
   mirage-crypto-rng.unix))
 
 (test
+ (name test_store_crypto_unseeded)
+ (libraries alcotest lwt lwt.unix cstruct sqlocaml.store sqlocaml.storage))
+
+(test
  (name test_wal_crypto)
  (libraries
   alcotest

@@ -48,6 +48,10 @@ type error =
   | Encryption_key_required (** DB is encrypted but no key was supplied *)
   | Encryption_key_mismatch (** supplied key fails the header canary *)
   | Not_encrypted (** a key was supplied for a plaintext DB *)
+  | Encryption_rng_unseeded
+  (** a key was supplied but {!Mirage_crypto_rng} is not seeded, so no per-page
+      nonce can be generated — the application must seed the RNG at boot
+      (e.g. [Mirage_crypto_rng_unix.use_default ()] or a Mirage entropy source) *)
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
@@ -75,8 +79,9 @@ val create : unit -> t
     opened — or, if fresh, created — encrypted; pages >= 2 are stored as
     ciphertext while the pager and B+-tree only ever see plaintext.  Absent ⇒
     plaintext, the default.  May return [Encryption_key_required] (encrypted DB,
-    no key), [Encryption_key_mismatch] (wrong key) or [Not_encrypted] (key
-    supplied for a plaintext DB). *)
+    no key), [Encryption_key_mismatch] (wrong key), [Not_encrypted] (key
+    supplied for a plaintext DB) or [Encryption_rng_unseeded] (a key was given
+    but the RNG was never seeded). *)
 val open_block
   :  ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
@@ -99,7 +104,7 @@ val open_block
     opens (or creates) the database encrypted — both the main-DB pages >= 2 and
     the WAL frame payloads — while the pager and B+-tree see only plaintext.
     Absent ⇒ plaintext, the default.  May return [Encryption_key_required],
-    [Encryption_key_mismatch] or [Not_encrypted]. *)
+    [Encryption_key_mismatch], [Not_encrypted] or [Encryption_rng_unseeded]. *)
 val open_block_wal
   :  ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
