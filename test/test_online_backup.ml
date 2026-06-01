@@ -536,7 +536,8 @@ let raw_contains path needle =
   let ic = open_in_bin path in
   let raw = really_input_string ic (in_channel_length ic) in
   close_in ic;
-  let nl = String.length needle and hl = String.length raw in
+  let nl = String.length needle
+  and hl = String.length raw in
   let rec go i = i + nl <= hl && (String.sub raw i nl = needle || go (i + 1)) in
   nl > 0 && go 0
 ;;

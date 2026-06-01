@@ -1993,10 +1993,7 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 
    The buffer handed to [f] may be owned by the pager cache — a caller that
    mutates it MUST copy first. *)
-let iter_snapshot_pages
-      st
-      (Ro snap)
-      ~(f : page_id:int64 -> page:Cstruct.t -> unit Lwt.t)
+let iter_snapshot_pages st (Ro snap) ~(f : page_id:int64 -> page:Cstruct.t -> unit Lwt.t)
   : unit Lwt.t
   =
   (* Read the page count INSIDE the snapshot (after ro_begin) so that the loop
@@ -2019,7 +2016,9 @@ let iter_snapshot_pages
              resolve_wal_page returns Ok None, falling through to
              load_main_page which reads the committed on-disk state.  Also pin
              the page so the writer's eviction pressure doesn't drop our copy. *)
-          let* r = Pager.read ~snapshot_frames:0 ~pin_set:snap.rs_pinned st.pager page_id in
+          let* r =
+            Pager.read ~snapshot_frames:0 ~pin_set:snap.rs_pinned st.pager page_id
+          in
           (match r with
            | Ok buf -> Lwt.return buf
            | Error e ->
@@ -2046,7 +2045,11 @@ let iter_snapshot_pages
                      e))
            | None ->
              let* r =
-               Pager.read ~snapshot_frames:horizon ~pin_set:snap.rs_pinned st.pager page_id
+               Pager.read
+                 ~snapshot_frames:horizon
+                 ~pin_set:snap.rs_pinned
+                 st.pager
+                 page_id
              in
              (match r with
               | Ok buf -> Lwt.return buf
@@ -2096,9 +2099,7 @@ let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
    its CRC resealed.  The sunk page image is a self-contained encrypted DB under
    [new_key] with no WAL.  Rejects a plaintext source ([Not_encrypted]) and a
    wrong-length key ([Block_error]). *)
-let rekey_to (t : t) ~(new_key : string) (sink : page_sink)
-  : (unit, error) result Lwt.t
-  =
+let rekey_to (t : t) ~(new_key : string) (sink : page_sink) : (unit, error) result Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_ok ()
   | Btree st ->

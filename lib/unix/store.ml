@@ -349,9 +349,7 @@ let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
     fsyncs, renames atomically, then fsyncs the directory.  A wrong [old_key]
     surfaces [Encryption_key_mismatch]; a plaintext source surfaces
     [Not_encrypted]. *)
-let rotate_key_file ~src_path ~old_key ~new_key ~dest
-  : (unit, Core.error) result Lwt.t
-  =
+let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) result Lwt.t =
   let has_wal = Sys.file_exists (src_path ^ "-wal") in
   let* src_r =
     if has_wal
@@ -422,9 +420,7 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest
                     let* dir_res =
                       Lwt.catch
                         (fun () ->
-                           let* dir_fd =
-                             Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0
-                           in
+                           let* dir_fd = Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0 in
                            let* () = Lwt_unix.fsync dir_fd in
                            let* () = Lwt_unix.close dir_fd in
                            Lwt.return_ok ())

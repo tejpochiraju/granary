@@ -38,7 +38,8 @@ let raw_contains path needle =
   let ic = open_in_bin path in
   let raw = really_input_string ic (in_channel_length ic) in
   close_in ic;
-  let nl = String.length needle and hl = String.length raw in
+  let nl = String.length needle
+  and hl = String.length raw in
   let rec go i = i + nl <= hl && (String.sub raw i nl = needle || go (i + 1)) in
   nl > 0 && go 0
 ;;
@@ -83,7 +84,8 @@ let test_rotation_round_trip () =
           let* o = UnixStore.open_file ~key:k1 ~path:dst () in
           (match o with
            | Error S.Encryption_key_mismatch -> ()
-           | Error e -> Alcotest.failf "expected mismatch under old key, got %a" S.pp_error e
+           | Error e ->
+             Alcotest.failf "expected mismatch under old key, got %a" S.pp_error e
            | Ok _ -> Alcotest.fail "old key should fail after rotation");
           (* unrelated third key fails *)
           let* o3 = UnixStore.open_file ~key:k3 ~path:dst () in
