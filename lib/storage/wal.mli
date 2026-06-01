@@ -64,9 +64,16 @@ val pp_error : Format.formatter -> error -> unit
     committed batch. A trailing partial batch is silently discarded.
 
     [page_size] (default {!Geometry.default}'s 4096) sets the frame's page
-    payload size; it must match the main DB geometry (#95). *)
+    payload size; it must match the main DB geometry (#95).
+
+    [cipher] (default [None]): when supplied, the page payload of each frame
+    is AES-256-GCM encrypted; the 24-byte meta header stays plaintext so
+    keyless recovery forward-scans still work. The FNV checksum covers the
+    whole payload region (ciphertext + nonce + tag). Encrypted frames are
+    [Crypto.overhead] (32) bytes larger than plaintext frames. *)
 val open_
-  :  ?page_size:int
+  :  ?cipher:Crypto.t option
+  -> ?page_size:int
   -> read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)

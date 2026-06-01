@@ -44,6 +44,56 @@
   unix))
 
 (test
+ (name test_crypto)
+ (libraries
+  alcotest
+  qcheck-alcotest
+  cstruct
+  sqlocaml.storage
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
+ (name test_encryption_e2e)
+ (libraries
+  alcotest
+  lwt
+  lwt.unix
+  unix
+  sqlocaml.store
+  sqlocaml.unix
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
+ (name test_store_crypto)
+ (libraries
+  alcotest
+  lwt
+  lwt.unix
+  cstruct
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.encoding
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
+ (name test_wal_crypto)
+ (libraries
+  alcotest
+  alcotest-lwt
+  lwt
+  cstruct
+  sqlocaml.storage
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
  (name test_conformance)
  (libraries
   sqlocaml

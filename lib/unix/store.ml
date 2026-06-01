@@ -89,6 +89,7 @@ let open_file
       ?(page_size = 4096)
       ?(reserved_bytes_per_page = 0)
       ?(explicit_geometry = false)
+      ?key
       ~path
       ()
   : (Core.t, Core.error) result Lwt.t
@@ -119,6 +120,7 @@ let open_file
             Lwt.return_unit
           in
           Core.open_block
+            ?key
             ~geom
             ~init_if_corrupt:was_fresh
             ~read_page
@@ -174,6 +176,7 @@ let open_file_wal
       ?(page_size = 4096)
       ?(reserved_bytes_per_page = 0)
       ?(explicit_geometry = false)
+      ?key
       ~path
       ()
   : (Core.t, Core.error) result Lwt.t
@@ -218,6 +221,7 @@ let open_file_wal
             Lwt.return_unit
           in
           Core.open_block_wal
+            ?key
             ~geom
             ~read_page
             ~write_page

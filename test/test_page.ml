@@ -227,6 +227,9 @@ let test_header_fields_roundtrip () =
       ; page_size = 4096l
       ; format_version = 1l
       ; reserved_bytes_per_page = 0l
+      ; enc_magic = 0l
+      ; canary_nonce = String.make 16 '\000'
+      ; canary_tag = String.make 16 '\000'
       }
   in
   P.write_header_fields buf hf;

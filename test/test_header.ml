@@ -88,6 +88,7 @@ let zero_header =
     ; schema_version = 0L
     ; format_version = Header.current_format_version
     ; geom = Geometry.default
+    ; enc = None
     }
 ;;
 
@@ -109,6 +110,7 @@ let make_state
     ; schema_version
     ; format_version
     ; geom
+    ; enc = None
     }
 ;;
 
@@ -196,10 +198,10 @@ let test_commit_alternates_pages () =
     (* First commit: write page 1, txn=1 *)
     commit_and_check 1 1L zero_header;
     (* Second commit: write page 0, txn=2 *)
-    let h1 = Header.{ zero_header with txn_id = 1L } in
+    let h1 = Header.{ zero_header with txn_id = 1L; enc = None } in
     commit_and_check 0 2L h1;
     (* Third commit: write page 1, txn=3 *)
-    let h2 = Header.{ zero_header with txn_id = 2L } in
+    let h2 = Header.{ zero_header with txn_id = 2L; enc = None } in
     commit_and_check 1 3L h2
 ;;
 
@@ -240,7 +242,7 @@ let test_corrupt_page1_fallback_to_page0 () =
     in
     commit zero_header;
     (* page 1 ← txn=1 *)
-    commit Header.{ zero_header with txn_id = 1L };
+    commit Header.{ zero_header with txn_id = 1L; enc = None };
     (* page 0 ← txn=2 *)
     corrupt_page mb 1;
     (* Use a fresh pager to bypass the cache and read from the mock store. *)
@@ -331,6 +333,9 @@ let test_unsupported_format_rejected () =
       ; page_size = Int32.of_int Page.page_size
       ; format_version = bad_version
       ; reserved_bytes_per_page = 0l
+      ; enc_magic = 0l
+      ; canary_nonce = String.make 16 '\000'
+      ; canary_tag = String.make 16 '\000'
       };
     Page.seal buf;
     let bytes = Bytes.create Page.page_size in
@@ -430,6 +435,7 @@ let test_commit_flush_error () =
       ; schema_version = 0L
       ; format_version = Header.current_format_version
       ; geom = Geometry.default
+      ; enc = None
       }
   in
   match run (Header.commit pager ~prev_header:zero_header ~new_state) with
@@ -490,6 +496,43 @@ let test_read_live_one_read_error () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Encryption marker + canary (#84)                                    *)
+(* ------------------------------------------------------------------ *)
+
+let test_encrypted_header_roundtrip () =
+  let pager, mb = make_pager () in
+  let nonce = String.init 16 (fun i -> Char.chr (i + 1)) in
+  let tag = String.init 16 (fun i -> Char.chr (i + 100)) in
+  let enc = Some { Header.canary_nonce = nonce; canary_tag = tag } in
+  (match run (Header.init ~enc pager) with
+   | Ok () -> ()
+   | Error _ -> Alcotest.fail "init");
+  let pager2 = fresh_pager_over mb () in
+  match run (Header.read_live pager2) with
+  | Error _ -> Alcotest.fail "read_live"
+  | Ok h ->
+    (match h.Header.enc with
+     | None -> Alcotest.fail "enc field lost across init/read_live"
+     | Some e ->
+       Alcotest.(check string) "canary nonce preserved" nonce e.Header.canary_nonce;
+       Alcotest.(check string) "canary tag preserved" tag e.Header.canary_tag)
+;;
+
+let test_plaintext_header_has_no_enc () =
+  let pager, mb = make_pager () in
+  (match run (Header.init pager) with
+   | Ok () -> ()
+   | Error _ -> Alcotest.fail "init");
+  let pager2 = fresh_pager_over mb () in
+  match run (Header.read_live pager2) with
+  | Ok h ->
+    (match h.Header.enc with
+     | None -> ()
+     | Some _ -> Alcotest.fail "expected enc = None")
+  | Error _ -> Alcotest.fail "read_live"
+;;
+
+(* ------------------------------------------------------------------ *)
 (* QCheck property tests                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -522,6 +565,7 @@ let prop_commit_sequence =
                  ; schema_version = 0L
                  ; format_version = Header.current_format_version
                  ; geom = Geometry.default
+                 ; enc = None
                  }
              in
              match run (Header.commit pager ~prev_header:prev_h ~new_state) with
@@ -574,6 +618,16 @@ let () =
             "unsupported format_version rejected"
             `Quick
             test_unsupported_format_rejected
+        ] )
+    ; ( "encryption"
+      , [ Alcotest.test_case
+            "encrypted header roundtrip"
+            `Quick
+            test_encrypted_header_roundtrip
+        ; Alcotest.test_case
+            "plaintext header has no enc"
+            `Quick
+            test_plaintext_header_has_no_enc
         ] )
     ; ( "errors"
       , [ Alcotest.test_case "pp_error Io" `Quick test_pp_error_io

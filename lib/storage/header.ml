@@ -4,6 +4,13 @@
     header page is overwritten with the new state and the pager is flushed
     (fsync). The header with the higher txn_id and valid CRC is live. *)
 
+type encryption =
+  { canary_nonce : string
+  ; canary_tag : string
+  }
+
+let enc_magic_value = 0x53454E43l
+
 type t =
   { txn_id : int64
   ; root_page : int64
@@ -18,6 +25,9 @@ type t =
     (** Page geometry persisted in the header (#95): page_size at byte 56,
         reserved_bytes_per_page at byte 64.  Chosen at creation, immutable
         thereafter, preserved verbatim across commits. *)
+  ; enc : encryption option
+    (** Encryption marker and key-check canary (#84).  [None] for plaintext
+        databases; [Some _] when enc_magic = 0x53454E43 is set on disk. *)
   }
 
 (* On-disk format versions:
@@ -69,6 +79,18 @@ let build_page (h : t) =
     ; page_size = Int32.of_int h.geom.page_size
     ; format_version = h.format_version
     ; reserved_bytes_per_page = Int32.of_int h.geom.reserved_bytes_per_page
+    ; enc_magic =
+        (match h.enc with
+         | Some _ -> enc_magic_value
+         | None -> 0l)
+    ; canary_nonce =
+        (match h.enc with
+         | Some e -> e.canary_nonce
+         | None -> String.make 16 '\000')
+    ; canary_tag =
+        (match h.enc with
+         | Some e -> e.canary_tag
+         | None -> String.make 16 '\000')
     };
   Page.seal buf;
   buf
@@ -97,6 +119,12 @@ let decode_page buf =
         with
         | Error _ -> None
         | Ok geom ->
+          let enc =
+            if Int32.equal f.Page.enc_magic enc_magic_value
+            then
+              Some { canary_nonce = f.Page.canary_nonce; canary_tag = f.Page.canary_tag }
+            else None
+          in
           Some
             { txn_id = f.Page.txn_id
             ; root_page = f.Page.root_page
@@ -105,6 +133,7 @@ let decode_page buf =
             ; schema_version = f.Page.schema_version
             ; format_version = f.Page.format_version
             ; geom
+            ; enc
             }))
 ;;
 
@@ -192,7 +221,7 @@ let commit_no_sync pager ~prev_header ~new_state =
   | Ok () -> Lwt.return (Ok ())
 ;;
 
-let init pager =
+let init ?(enc = None) pager =
   let zero =
     { txn_id = 0L
     ; root_page = 0L
@@ -201,6 +230,7 @@ let init pager =
     ; schema_version = 0L
     ; format_version = current_format_version
     ; geom = Pager.geom pager
+    ; enc
     }
   in
   let buf0 = build_page zero in

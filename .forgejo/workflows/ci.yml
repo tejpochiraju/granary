@@ -34,7 +34,8 @@ jobs:
       - name: Install opam packages
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0
+            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0 \
+            mirage-crypto mirage-crypto-rng alcotest-lwt
 
       - name: Build
         run: opam exec -- dune build
@@ -97,7 +98,8 @@ jobs:
       - name: Install opam packages + merlint
         run: |
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix uutf uucp
+            mirage-block mirage-block-unix uutf uucp \
+            mirage-crypto mirage-crypto-rng alcotest-lwt
           # merlint is git-only (no opam release); pin the known-good commit.
           opam pin add -y -k git merlint \
             "https://github.com/samoht/merlint.git#d5548822dea1ad3b845eabd4b569946a05e42423"

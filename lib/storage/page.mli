@@ -63,7 +63,7 @@ val write_tag : Cstruct.t -> int32 -> unit
 (** Read the per-tree schema-fingerprint stamp from bytes 12–15 (#174). *)
 val read_tag : Cstruct.t -> int32
 
-(** Header page fields (kind = [Header]; bytes 16–63). *)
+(** Header page fields (kind = [Header]; bytes 16–103, remainder reserved). *)
 type header_fields =
   { txn_id : int64 (** int64 BE; higher = more recent *)
   ; root_page : int64 (** int64 BE; page-id of B+-tree root *)
@@ -74,14 +74,20 @@ type header_fields =
   ; format_version : int32 (** int32 BE; 1 for v1 *)
   ; reserved_bytes_per_page : int32
     (** int32 BE; fixed bytes carved off each page's tail (#95), 0 by default *)
+  ; enc_magic : int32
+    (** uint32 BE at byte 68; 0x53454E43 "SENC" when encrypted, else 0 (#84) *)
+  ; canary_nonce : string
+    (** 16 bytes at bytes 72–87; meaningful only when [enc_magic] is set (#84) *)
+  ; canary_tag : string
+    (** 16 bytes at bytes 88–103; meaningful only when [enc_magic] is set (#84) *)
   }
 
-(** Read header-page fields from [buf] (reads bytes 16–63). *)
+(** Read header-page fields from [buf] (reads bytes 16–103). *)
 val read_header_fields : Cstruct.t -> header_fields
 
-(** Write header-page fields into [buf].  Zeros bytes 16–4095 first (including
-    the reserved area 64–4095) to prevent stale data from corrupting the CRC,
-    then writes the known fields into bytes 16–63. *)
+(** Write header-page fields into [buf].  Zeros bytes 16–(page_size-1) first
+    (including the reserved area 104+) to prevent stale data from corrupting
+    the CRC, then writes the known fields into bytes 16–103. *)
 val write_header_fields : Cstruct.t -> header_fields -> unit
 
 (** A decoded branch page entry. *)

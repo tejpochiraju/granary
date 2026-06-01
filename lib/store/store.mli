@@ -45,6 +45,9 @@ type error =
   | Key_too_large of int
   | Value_too_large of int
   | Header_error of string
+  | Encryption_key_required (** DB is encrypted but no key was supplied *)
+  | Encryption_key_mismatch (** supplied key fails the header canary *)
+  | Not_encrypted (** a key was supplied for a plaintext DB *)
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
@@ -66,9 +69,17 @@ val create : unit -> t
     [geom] (#95, default {!Sqlocaml_storage.Geometry.default}) is the geometry
     used when CREATING a fresh device.  For an existing device the geometry is
     discovered by peeking page 0, and [geom] is ignored.  The block backend's
-    own page size must already match (see [Unix_file.set_page_size]). *)
+    own page size must already match (see [Unix_file.set_page_size]).
+
+    [key] (#84, opt-in): when supplied (a 32-byte AES-256 key) the database is
+    opened — or, if fresh, created — encrypted; pages >= 2 are stored as
+    ciphertext while the pager and B+-tree only ever see plaintext.  Absent ⇒
+    plaintext, the default.  May return [Encryption_key_required] (encrypted DB,
+    no key), [Encryption_key_mismatch] (wrong key) or [Not_encrypted] (key
+    supplied for a plaintext DB). *)
 val open_block
-  :  ?geom:Sqlocaml_storage.Geometry.t
+  :  ?key:string
+  -> ?geom:Sqlocaml_storage.Geometry.t
   -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -82,9 +93,16 @@ val open_block
 (** Open a B+-tree backed store in WAL mode. Commits append dirty pages
     to the WAL device; reads route through the WAL first and fall back
     to the main DB. Crash recovery is performed automatically when the
-    WAL is opened.  [geom] behaves as in {!open_block} (#95). *)
+    WAL is opened.  [geom] behaves as in {!open_block} (#95).
+
+    [key] (#84, opt-in) behaves as in {!open_block}: a 32-byte AES-256 key
+    opens (or creates) the database encrypted — both the main-DB pages >= 2 and
+    the WAL frame payloads — while the pager and B+-tree see only plaintext.
+    Absent ⇒ plaintext, the default.  May return [Encryption_key_required],
+    [Encryption_key_mismatch] or [Not_encrypted]. *)
 val open_block_wal
-  :  ?geom:Sqlocaml_storage.Geometry.t
+  :  ?key:string
+  -> ?geom:Sqlocaml_storage.Geometry.t
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)

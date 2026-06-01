@@ -33,7 +33,10 @@ type t =
   ; write_at : offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t
   ; sync : unit -> (unit, string) result Lwt.t
   ; page_size : int (** page bytes per frame (#95); matches the main DB geometry *)
-  ; frame_size : int (** [frame_meta_bytes + page_size] *)
+  ; frame_size : int (** [frame_meta_bytes + page_size + cipher_overhead] *)
+  ; cipher : Crypto.t option
+    (** When [Some c], frame payloads are AES-256-GCM encrypted. *)
+  ; cipher_overhead : int (** 0 or [Crypto.overhead] depending on [cipher]. *)
   ; mutable size_bytes : int64
   ; (* Tracks the high-water mark of the WAL device — initialised to the
      size at open, grows as we append frames so subsequent reads know
@@ -203,21 +206,32 @@ let read_frame_raw ?(verify = true) t idx =
     | Ok () ->
       let page_id = Cstruct.BE.get_uint64 buf 0 in
       let flags = Cstruct.BE.get_uint64 buf 8 in
-      let page = Cstruct.sub buf frame_meta_bytes t.page_size in
+      let payload_len = t.page_size + t.cipher_overhead in
+      let payload = Cstruct.sub buf frame_meta_bytes payload_len in
       let ok =
         if verify
         then (
           let ck_have = Cstruct.BE.get_uint64 buf 16 in
-          let ck_want = frame_checksum ~salt:t.salt ~seed:t.seed ~page_id ~flags ~page in
+          let ck_want =
+            frame_checksum ~salt:t.salt ~seed:t.seed ~page_id ~flags ~page:payload
+          in
           Int64.equal ck_have ck_want)
         else true
       in
       if ok
       then (
         let is_commit = Int64.logand flags 1L <> 0L in
-        let page_copy = Cstruct.create t.page_size in
-        Cstruct.blit page 0 page_copy 0 t.page_size;
-        Lwt.return_ok (Some { frame_idx = idx; page_id; is_commit; page = page_copy }))
+        match t.cipher with
+        | None ->
+          let page_copy = Cstruct.create t.page_size in
+          Cstruct.blit payload 0 page_copy 0 t.page_size;
+          Lwt.return_ok (Some { frame_idx = idx; page_id; is_commit; page = page_copy })
+        | Some c ->
+          (match Crypto.decrypt_frame c ~page_id payload with
+           | Error `Tag_mismatch -> Lwt.return_ok None
+           | Ok page_copy ->
+             Lwt.return_ok
+               (Some { frame_idx = idx; page_id; is_commit; page = page_copy })))
       else Lwt.return_ok None)
 ;;
 
@@ -267,6 +281,7 @@ let recover_index t =
 ;;
 
 let open_
+      ?(cipher = None)
       ?(page_size = Geometry.default.page_size)
       ~read_at
       ~write_at
@@ -274,7 +289,12 @@ let open_
       ~size_bytes
       ()
   =
-  let frame_size = frame_meta_bytes + page_size in
+  let cipher_overhead =
+    match cipher with
+    | Some _ -> Crypto.overhead
+    | None -> 0
+  in
+  let frame_size = frame_meta_bytes + page_size + cipher_overhead in
   if Int64.compare size_bytes (Int64.of_int header_size_bytes) < 0
   then
     (* Device too small for even a header; treat as fresh and init. *)
@@ -288,6 +308,8 @@ let open_
         ; sync
         ; page_size
         ; frame_size
+        ; cipher
+        ; cipher_overhead
         ; size_bytes
         ; salt
         ; seed
@@ -312,6 +334,8 @@ let open_
            ; sync
            ; page_size
            ; frame_size
+           ; cipher
+           ; cipher_overhead
            ; size_bytes
            ; salt
            ; seed
@@ -327,6 +351,8 @@ let open_
         ; sync
         ; page_size
         ; frame_size
+        ; cipher
+        ; cipher_overhead
         ; size_bytes
         ; salt
         ; seed
@@ -368,14 +394,19 @@ let write_frame t ~idx ~page_id ~is_commit ~page =
   Cstruct.BE.set_uint64 buf 0 page_id;
   let flags = if is_commit then 1L else 0L in
   Cstruct.BE.set_uint64 buf 8 flags;
-  Cstruct.blit page 0 buf frame_meta_bytes t.page_size;
+  let payload_len = t.page_size + t.cipher_overhead in
+  (match t.cipher with
+   | None -> Cstruct.blit page 0 buf frame_meta_bytes t.page_size
+   | Some c ->
+     let enc = Crypto.encrypt_frame c ~page_id ~plaintext:page in
+     Cstruct.blit enc 0 buf frame_meta_bytes payload_len);
   let ck =
     frame_checksum
       ~salt:t.salt
       ~seed:t.seed
       ~page_id
       ~flags
-      ~page:(Cstruct.sub buf frame_meta_bytes t.page_size)
+      ~page:(Cstruct.sub buf frame_meta_bytes payload_len)
   in
   Cstruct.BE.set_uint64 buf 16 ck;
   let off = frame_offset t idx in

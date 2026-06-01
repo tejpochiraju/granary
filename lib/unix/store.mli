@@ -10,22 +10,32 @@
     page geometry when CREATING a fresh file (#95); both are fixed for the life
     of the file.  When reopening, the file's stored geometry is used.  Set
     [explicit_geometry] to [true] to reject a reopen whose stored geometry
-    differs from the supplied one (otherwise the stored geometry silently wins). *)
+    differs from the supplied one (otherwise the stored geometry silently wins).
+
+    When supplied ([key], a 32-byte AES-256 key), the database is created/opened
+    encrypted at rest (AES-256-GCM); absent ⇒ plaintext (opt-in default). Fixed
+    at creation. *)
 val open_file
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?explicit_geometry:bool
+  -> ?key:string
   -> path:string
   -> unit
   -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
 
 (** Open a WAL-mode store using [path] for the main DB and [path ^ "-wal"] for
     the WAL.  Crash recovery on the WAL runs automatically at open.  Geometry
-    arguments behave as in {!open_file} (#95). *)
+    arguments behave as in {!open_file} (#95).
+
+    When supplied ([key], a 32-byte AES-256 key), the database is created/opened
+    encrypted at rest (AES-256-GCM); absent ⇒ plaintext (opt-in default). Fixed
+    at creation. *)
 val open_file_wal
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?explicit_geometry:bool
+  -> ?key:string
   -> path:string
   -> unit
   -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
