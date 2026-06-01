@@ -795,6 +795,141 @@ let test_start_following_on_promoted_keeps_store_writable () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #208: re-base a fallen-behind standby from the object store          *)
+(* ------------------------------------------------------------------ *)
+
+let test_rebase_replays_segments_and_discards_stale_wal () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let st = Standby.create ~store ~pager ~wal in
+     (* Simulate the fallen-behind state: a stale frame sits in the WAL. *)
+     let stale =
+       make_frame ~epoch:0L ~frame_idx:0 ~page_id:9L ~is_commit:true ~page:(page_with 'Z')
+     in
+     let* _ = Replication.apply_frames ~wal ~pager [ stale ] in
+     Alcotest.(check int) "stale frame seeded" 1 (Wal.committed_frames wal);
+     (* Object-store WAL segments spanning two master epochs (5 then 6). *)
+     let seg1 =
+       [ make_frame ~epoch:5L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X') ]
+     in
+     let seg2 =
+       [ make_frame ~epoch:6L ~frame_idx:0 ~page_id:2L ~is_commit:true ~page:(page_with 'Y') ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some seg1);
+     push (Some seg2);
+     push None;
+     let* r = Standby.rebase st stream in
+     match r with
+     | Ok (pos : Standby.acked_position) ->
+       Alcotest.(check int64) "acked epoch is the last segment's" 6L pos.epoch;
+       Alcotest.(check int) "acked idx is the last segment's commit" 0 pos.frame_idx;
+       let ap = Standby.acked_position st in
+       Alcotest.(check int64) "standby tracks the rebased epoch" 6L ap.epoch;
+       (* The epoch 5->6 transition drained the epoch-5 page to main. *)
+       let* x = main_page_byte main_d 1L in
+       Alcotest.(check char) "epoch-5 page migrated to main" 'X' x;
+       (* Only the live-tail (epoch-6) frame remains in the WAL — the stale
+          frame and the drained epoch-5 frame are not counted. *)
+       Alcotest.(check int) "wal holds only the live-tail frame" 1 (Wal.committed_frames wal);
+       (* The stale frame was discarded, never reaching main. *)
+       let* z = main_page_byte main_d 9L in
+       Alcotest.(check char) "stale frame discarded (absent from main)" '\x00' z;
+       Lwt.return_unit
+     | Error (`Apply_error msg) -> Alcotest.failf "rebase: %s" msg)
+;;
+
+let test_rebase_then_following_resumes_without_double_apply () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let st = Standby.create ~store ~pager ~wal in
+     (* Re-base to (epoch 6, idx 0). *)
+     let seg =
+       [ make_frame ~epoch:6L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X') ]
+     in
+     let rebase_stream, rpush = Lwt_stream.create () in
+     rpush (Some seg);
+     rpush None;
+     let* rr = Standby.rebase st rebase_stream in
+     (match rr with
+      | Ok _ -> ()
+      | Error (`Apply_error msg) -> Alcotest.failf "rebase: %s" msg);
+     (* Resume the live tail from where the re-base left off: the app sends
+        only frames beyond the acked position (epoch 6, idx 1+). *)
+     let live =
+       [ make_frame ~epoch:6L ~frame_idx:1 ~page_id:3L ~is_commit:true ~page:(page_with 'W') ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some live);
+     push None;
+     let* r = Standby.start_following st stream in
+     (match r with
+      | Ok () -> ()
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     let ap = Standby.acked_position st in
+     Alcotest.(check int64) "still epoch 6 (no checkpoint on same epoch)" 6L ap.epoch;
+     Alcotest.(check int) "acked advanced to the live frame" 1 ap.frame_idx;
+     (* Both the rebased frame and the live frame are in the WAL — same epoch,
+        so no intervening checkpoint drained the rebased one. *)
+     Alcotest.(check int) "wal holds rebased + live frame" 2 (Wal.committed_frames wal);
+     Lwt.return_unit)
+;;
+
+let test_rebase_rejected_when_promoted () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let st = Standby.create ~store ~pager ~wal in
+     let* () = Standby.promote st in
+     let stream, push = Lwt_stream.create () in
+     push None;
+     let* r = Standby.rebase st stream in
+     (match r with
+      | Error (`Apply_error msg) ->
+        Alcotest.(check bool)
+          "rejects rebase of a promoted standby"
+          true
+          (str_contains msg "promoted")
+      | Ok _ -> Alcotest.fail "expected rebase to reject a promoted standby");
+     Lwt.return_unit)
+;;
+
+let test_rebase_surfaces_segment_error () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let st = Standby.create ~store ~pager ~wal in
+     let good =
+       make_frame ~epoch:5L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X')
+     in
+     let bad =
+       { good with Replication.checksum = Int64.add good.Replication.checksum 1L }
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some [ bad ]);
+     push None;
+     let* r = Standby.rebase st stream in
+     (match r with
+      | Error (`Apply_error msg) ->
+        Alcotest.(check bool)
+          "rebase surfaces a replay checksum error"
+          true
+          (str_contains msg "checksum")
+      | Ok _ -> Alcotest.fail "expected rebase to surface the segment error");
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "standby"
@@ -857,6 +992,24 @@ let () =
             "start_following on promoted keeps store writable"
             `Quick
             test_start_following_on_promoted_keeps_store_writable
+        ] )
+    ; ( "rebase"
+      , [ Alcotest.test_case
+            "replays segments and discards stale WAL"
+            `Quick
+            test_rebase_replays_segments_and_discards_stale_wal
+        ; Alcotest.test_case
+            "following resumes from acked position"
+            `Quick
+            test_rebase_then_following_resumes_without_double_apply
+        ; Alcotest.test_case
+            "rejected when promoted"
+            `Quick
+            test_rebase_rejected_when_promoted
+        ; Alcotest.test_case
+            "surfaces a segment replay error"
+            `Quick
+            test_rebase_surfaces_segment_error
         ] )
     ]
 ;;

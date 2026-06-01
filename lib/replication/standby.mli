@@ -55,6 +55,40 @@ val start_following
     promise (without promoting) if the drain checkpoint errors. *)
 val promote : t -> unit Lwt.t
 
+(** Re-base a fallen-behind standby from the #92 object store (#208).
+
+    When the master checkpoints past a slow or dead standby (see the
+    checkpoint-gate timeout, #207), the frames the standby still needs have
+    been recycled out of the master's live WAL window.  The standby must
+    rebuild from the object store: the application loads a consistent base
+    snapshot into the standby's main DB (the pager passed to {!create}) —
+    exactly {!Replication.cold_restore}'s [base_snapshot_path] contract —
+    then hands this driver [segments], the object-store WAL frame batches to
+    replay on top, in order.
+
+    [rebase] is the standby-side equivalent of {!Replication.cold_restore},
+    reusing the same epoch-aware apply path as the live loop.  It first
+    discards the standby's stale WAL ([Wal.reset]) — the loaded base
+    supersedes it — then replays [segments], which may span several master
+    epochs.  It returns the resulting {!acked_position} (the last replayed
+    committed frame) so the caller can resume the live tail via
+    {!start_following} from exactly that point, applying only frames beyond
+    it and thereby never double-applying what the re-base already
+    materialized.
+
+    Must be called while in [Following] mode and not concurrently with an
+    active follower loop (the typical flow stops following, re-bases, then
+    starts following a fresh live stream).  Returns [Apply_error] if the
+    standby has been promoted or if replaying a segment fails.
+
+    Detecting the gap and fetching the base snapshot and segments from the
+    object store are the application's responsibility — transport and the
+    object store are app-owned. *)
+val rebase
+  :  t
+  -> Replication.replicated_frame list Lwt_stream.t
+  -> (acked_position, [> `Apply_error of string ]) result Lwt.t
+
 (** Current follower state. *)
 val mode : t -> follower_mode
 
