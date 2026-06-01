@@ -95,6 +95,10 @@ let create_commit_queue () = { drainer = false; pending = 0; waiters = [] }
 type bt_state =
   { close_fn : unit -> unit Lwt.t
   ; pager : Pager.t
+  ; cipher : Crypto.t option
+    (** #84: the page cipher when the DB is encrypted, else [None].  Mirrors
+        the cipher captured by the read/write callback closures; retained here
+        so [copy_to]/[rekey_to] can re-encrypt the snapshot page image. *)
   ; mutable meta : Btree.t
   ; trees : (tree_id, Btree.t) Hashtbl.t
   ; tree_tags : (tree_id, int32) Hashtbl.t
@@ -521,6 +525,7 @@ let map_header_err (e : Header.error) : error =
 let make_btree_store
       ?(wal = None)
       ?(wal_close = None)
+      ?(cipher = None)
       ~close_fn
       ~pager
       ~meta
@@ -530,6 +535,7 @@ let make_btree_store
   let st =
     { close_fn
     ; pager
+    ; cipher
     ; meta
     ; trees = Hashtbl.create 16
     ; tree_tags = Hashtbl.create 16
@@ -745,7 +751,7 @@ let open_block
            | Error e -> Lwt.return_error (map_header_err e)
            | Ok h ->
              let meta = Btree.create pager ~root_page:0L in
-             Lwt.return_ok (make_btree_store ~close_fn:close ~pager ~meta ~h ())))
+             Lwt.return_ok (make_btree_store ~cipher ~close_fn:close ~pager ~meta ~h ())))
      | Error e -> Lwt.return_error (map_header_err e)
      | Ok h ->
        (match check_key h cipher with
@@ -755,7 +761,7 @@ let open_block
           let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
           Pager.set_freelist pager fl;
           let meta = Btree.create pager ~root_page:h.root_page in
-          Lwt.return_ok (make_btree_store ~close_fn:close ~pager ~meta ~h ())))
+          Lwt.return_ok (make_btree_store ~cipher ~close_fn:close ~pager ~meta ~h ())))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -822,6 +828,7 @@ let finish_wal_open ~cipher ~close ~wal_close ~pager ~wal ~was_fresh =
        let meta = Btree.create pager ~root_page:h.root_page in
        Lwt.return_ok
          (make_btree_store
+            ~cipher
             ~wal:(Some wal)
             ~wal_close:(Some wal_close)
             ~close_fn:close
@@ -1978,85 +1985,108 @@ let list_tree_ids t : tree_id list Lwt.t =
 
 type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
 
+(* Shared page-image iteration for [copy_to]/[rekey_to].  Under an RO snapshot,
+   yields each PLAINTEXT page (page_id, buf) for page_id in [0, n), resolving the
+   WAL overlay (bounded to the committed_frames horizon captured at ro_begin)
+   before the main DB.  The iteration is bounded by the snapshot-time page count
+   so growth during the copy does not pull pages outside the snapshot.
+
+   The buffer handed to [f] may be owned by the pager cache — a caller that
+   mutates it MUST copy first. *)
+let iter_snapshot_pages
+      st
+      (Ro snap)
+      ~(f : page_id:int64 -> page:Cstruct.t -> unit Lwt.t)
+  : unit Lwt.t
+  =
+  (* Read the page count INSIDE the snapshot (after ro_begin) so that the loop
+     bound n is consistent with the snapshot's WAL horizon.  If a writer commits
+     between ro_begin and reading n_pages, the snapshot's WAL horizon already
+     includes those new pages; reading n_pages after ro_begin ensures we copy
+     them too. *)
+  let n = Pager.n_pages st.pager in
+  let horizon = snap.rs_snap_frames in
+  let rec loop (page_id : int64) =
+    if Int64.compare page_id n >= 0
+    then Lwt.return_unit
+    else
+      let* page_buf =
+        match st.wal with
+        | None ->
+          (* Non-WAL path: pass ~snapshot_frames:0 so the read path skips the
+             dirty set entirely (pager.ml:274-276), avoiding any
+             concurrent-writer uncommitted data.  With no WAL the
+             resolve_wal_page returns Ok None, falling through to
+             load_main_page which reads the committed on-disk state.  Also pin
+             the page so the writer's eviction pressure doesn't drop our copy. *)
+          let* r = Pager.read ~snapshot_frames:0 ~pin_set:snap.rs_pinned st.pager page_id in
+          (match r with
+           | Ok buf -> Lwt.return buf
+           | Error e ->
+             Lwt.fail_with
+               (Format.asprintf
+                  "Store.iter_snapshot_pages(pg=%Ld): %a"
+                  page_id
+                  Pager.pp_error
+                  e))
+        | Some wal ->
+          (* WAL-mode path: snapshot overlay (WAL first, then main DB). *)
+          (match Wal.find_page_at wal page_id ~max_frame:horizon with
+           | Some idx ->
+             let* r = Wal.read_frame wal idx in
+             (match r with
+              | Ok buf -> Lwt.return buf
+              | Error e ->
+                Lwt.fail_with
+                  (Format.asprintf
+                     "Store.iter_snapshot_pages(pg=%Ld,frame=%d): %a"
+                     page_id
+                     idx
+                     Wal.pp_error
+                     e))
+           | None ->
+             let* r =
+               Pager.read ~snapshot_frames:horizon ~pin_set:snap.rs_pinned st.pager page_id
+             in
+             (match r with
+              | Ok buf -> Lwt.return buf
+              | Error e ->
+                Lwt.fail_with
+                  (Format.asprintf
+                     "Store.iter_snapshot_pages(pg=%Ld): %a"
+                     page_id
+                     Pager.pp_error
+                     e)))
+      in
+      let* () = f ~page_id ~page:page_buf in
+      loop (Int64.add page_id 1L)
+  in
+  loop 0L
+;;
+
 (* One-shot consistent full copy via an RO snapshot + page sink (#93).
-   Every page is resolved through the snapshot's WAL overlay first
-   (bounded to the committed_frames horizon captured at ro_begin),
-   falling back to the main DB.  The iteration is bounded by the
-   snapshot-time page count so growth during the copy does not pull
-   pages outside the snapshot.
+
+   When the source is encrypted (#84), data pages (>= 2) are re-encrypted under
+   the source's own key before reaching the sink, so the destination is a
+   faithful, self-contained encrypted DB (open it with the same key) and no
+   user-data plaintext transits the sink.  Pages 0 and 1 are plaintext headers
+   (carrying the enc marker + canary) and are copied verbatim.
 
    On the Mem backend this is a no-op (there are no pages to copy). *)
 let copy_to (t : t) (sink : page_sink) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
   | Btree st ->
-    (* Read the page count INSIDE the snapshot (after ro_begin) so that
-       the loop bound n is consistent with the snapshot's WAL horizon.
-       If a writer commits between ro_begin and reading n_pages, the
-       snapshot's WAL horizon already includes those new pages; reading
-       n_pages after ro_begin ensures we copy them too. *)
-    with_ro t (fun (Ro snap) ->
-      let n = Pager.n_pages st.pager in
-      let horizon = snap.rs_snap_frames in
-      let rec loop (page_id : int64) =
-        if Int64.compare page_id n >= 0
-        then Lwt.return_unit
-        else
-          let* page_buf =
-            match st.wal with
-            | None ->
-              (* Non-WAL path: pass ~snapshot_frames:0 so the read
-                 path skips the dirty set entirely (pager.ml:274-276),
-                 avoiding any concurrent-writer uncommitted data.
-                 With no WAL the resolve_wal_page returns Ok None,
-                 falling through to load_main_page which reads the
-                 committed on-disk state.  Also pin the page so the
-                 writer's eviction pressure doesn't drop our copy. *)
-              let* r =
-                Pager.read ~snapshot_frames:0 ~pin_set:snap.rs_pinned st.pager page_id
-              in
-              (match r with
-               | Ok buf -> Lwt.return buf
-               | Error e ->
-                 Lwt.fail_with
-                   (Format.asprintf "Store.copy_to(pg=%Ld): %a" page_id Pager.pp_error e))
-            | Some wal ->
-              (* WAL-mode path: snapshot overlay (WAL first, then main DB). *)
-              (match Wal.find_page_at wal page_id ~max_frame:horizon with
-               | Some idx ->
-                 let* r = Wal.read_frame wal idx in
-                 (match r with
-                  | Ok buf -> Lwt.return buf
-                  | Error e ->
-                    Lwt.fail_with
-                      (Format.asprintf
-                         "Store.copy_to(pg=%Ld,frame=%d): %a"
-                         page_id
-                         idx
-                         Wal.pp_error
-                         e))
-               | None ->
-                 let* r =
-                   Pager.read
-                     ~snapshot_frames:horizon
-                     ~pin_set:snap.rs_pinned
-                     st.pager
-                     page_id
-                 in
-                 (match r with
-                  | Ok buf -> Lwt.return buf
-                  | Error e ->
-                    Lwt.fail_with
-                      (Format.asprintf
-                         "Store.copy_to(pg=%Ld): %a"
-                         page_id
-                         Pager.pp_error
-                         e)))
-          in
-          let* () = sink ~page_id ~page:page_buf in
-          loop (Int64.add page_id 1L)
-      in
-      loop 0L)
+    with_ro t (fun ro ->
+      iter_snapshot_pages st ro ~f:(fun ~page_id ~page ->
+        match st.cipher with
+        | Some c when Int64.compare page_id 2L >= 0 ->
+          (* Copy first — [page] may be the pager's cached buffer. *)
+          let tmp = Cstruct.create (Cstruct.length page) in
+          Cstruct.blit page 0 tmp 0 (Cstruct.length page);
+          Crypto.encrypt_page c ~page_id tmp;
+          sink ~page_id ~page:tmp
+        | _ -> sink ~page_id ~page))
 ;;
 
 (* ------------------------------------------------------------------ *)

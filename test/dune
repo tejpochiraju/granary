@@ -229,7 +229,9 @@
   alcotest
   cstruct
   lwt.unix
-  unix))
+  unix
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
 
 (test
  (name test_crash_property)

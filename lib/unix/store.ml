@@ -119,17 +119,27 @@ let open_file
             let* _ = Unix_file.close file in
             Lwt.return_unit
           in
-          Core.open_block
-            ?key
-            ~geom
-            ~init_if_corrupt:was_fresh
-            ~read_page
-            ~write_page
-            ~sync
-            ~resize
-            ~n_pages
-            ~close
-            ()))
+          let* r =
+            Core.open_block
+              ?key
+              ~geom
+              ~init_if_corrupt:was_fresh
+              ~read_page
+              ~write_page
+              ~sync
+              ~resize
+              ~n_pages
+              ~close
+              ()
+          in
+          (* On an open error (e.g. wrong/missing key) [Core.open_block] never
+             wires [close] into a store, so close the fd here rather than leak it
+             (otherwise a retry hits "Io already open in this process"). *)
+          (match r with
+           | Ok _ -> Lwt.return r
+           | Error _ ->
+             let* _ = Unix_file.close file in
+             Lwt.return r)))
 ;;
 
 (* [pread]/[pwrite]-style positioned I/O over the raw WAL sidecar fd.  Reading
@@ -220,21 +230,31 @@ let open_file_wal
              | Unix.Unix_error _ -> ());
             Lwt.return_unit
           in
-          Core.open_block_wal
-            ?key
-            ~geom
-            ~read_page
-            ~write_page
-            ~sync
-            ~resize
-            ~n_pages
-            ~wal_read_at:(wal_read_at wal_fd)
-            ~wal_write_at:(wal_write_at wal_fd)
-            ~wal_sync
-            ~wal_size_bytes
-            ~close
-            ~wal_close
-            ()))
+          let* r =
+            Core.open_block_wal
+              ?key
+              ~geom
+              ~read_page
+              ~write_page
+              ~sync
+              ~resize
+              ~n_pages
+              ~wal_read_at:(wal_read_at wal_fd)
+              ~wal_write_at:(wal_write_at wal_fd)
+              ~wal_sync
+              ~wal_size_bytes
+              ~close
+              ~wal_close
+              ()
+          in
+          (* On an open error close both fds rather than leak them (see
+             [open_file]); [Core.open_block_wal] does not wire close on error. *)
+          (match r with
+           | Ok _ -> Lwt.return r
+           | Error _ ->
+             let* () = wal_close () in
+             let* _ = Unix_file.close file in
+             Lwt.return r)))
 ;;
 
 (** Convenience: copy the entire store to a new file at [dest].

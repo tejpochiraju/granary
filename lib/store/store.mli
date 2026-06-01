@@ -294,6 +294,12 @@ type page_sink = page_id:int64 -> page:Cstruct.t -> unit Lwt.t
     is bounded by a snapshot-time page count, so growth during the
     copy does not pull in pages outside the snapshot.
 
+    When the source is encrypted (#84), data pages (>= 2) are re-encrypted
+    under the source's key before reaching the sink, so the destination is a
+    faithful, self-contained encrypted DB (open it with the same key) and no
+    user-data plaintext transits the sink; pages 0 and 1 are the plaintext
+    headers (enc marker + canary) and are copied verbatim.
+
     On the in-memory backend this is a no-op (there are no pages to
     copy). *)
 val copy_to : t -> page_sink -> unit Lwt.t
