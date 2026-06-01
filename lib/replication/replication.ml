@@ -155,7 +155,10 @@ let cold_restore
 (** Migrate the latest version of every page in the WAL index to the main
     DB, sync, then reset the WAL (bumping its epoch).  Mirrors the engine's
     [Store.checkpoint_unlocked] sequence; no reader-gating is needed because
-    a following standby serves no readers. *)
+    a following standby serves no readers.  Unlike [checkpoint_unlocked] it
+    does not re-pin a downstream replication floor (no [replication_shipped_frames]
+    equivalent) — correct for a leaf standby; revisit for cascading
+    replication (see #208). *)
 let checkpoint_wal_to_main ~wal ~pager =
   let pairs = ref [] in
   Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
@@ -204,14 +207,20 @@ let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
       else apply_frames ~wal ~pager frames
     in
     (match apply_result with
-     | Error (`Apply_error e) -> Lwt.return_error (`Apply_error e)
+     | Error _ as e -> Lwt.return e
      | Ok () ->
-       let rec last_commit = function
-         | [] -> last_epoch, last_idx
-         | [ f ] -> if f.is_commit then f.epoch, f.frame_idx else last_epoch, last_idx
-         | _ :: rest -> last_commit rest
+       (* Report the position of the {e last committed} frame actually
+          applied — not just the tail frame.  [apply_frames] drops trailing
+          non-commit frames, so a batch ending in non-commit frames still
+          durably applied the commit frames before them; keying on the tail
+          would under-report the acked position. *)
+       let last_committed =
+         List.fold_left
+           (fun acc f -> if f.is_commit then f.epoch, f.frame_idx else acc)
+           (last_epoch, last_idx)
+           frames
        in
-       Lwt.return_ok (last_commit frames))
+       Lwt.return_ok last_committed)
 ;;
 
 [@@@ai_disclosure "ai-generated"]
