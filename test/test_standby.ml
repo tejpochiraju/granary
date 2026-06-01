@@ -565,6 +565,46 @@ let test_epoch_aware_acked_position_trailing_non_commit () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* #209: a single batch bundling two master epochs checkpoints between  *)
+(* ------------------------------------------------------------------ *)
+
+let test_epoch_aware_mixed_epoch_batch_checkpoints_between () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     (* One batch carrying epoch 0 (page 1) then epoch 1 (page 2).  The epoch
+        boundary inside the batch must trigger an intervening checkpoint:
+        the epoch-0 page is drained to main and the WAL reset BEFORE the
+        epoch-1 frame is appended, so frame indices cannot collide. *)
+     let frames =
+       [ make_frame ~epoch:0L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'A')
+       ; make_frame ~epoch:1L ~frame_idx:0 ~page_id:2L ~is_commit:true ~page:(page_with 'B')
+       ]
+     in
+     let* r =
+       Replication.apply_frames_epoch_aware ~wal ~pager ~last_epoch:0L ~last_idx:(-1) frames
+     in
+     match r with
+     | Ok (epoch, idx) ->
+       Alcotest.(check int64) "acked epoch is the later epoch" 1L epoch;
+       Alcotest.(check int) "acked idx is the epoch-1 commit" 0 idx;
+       (* The intervening checkpoint migrated the epoch-0 page to main... *)
+       let* migrated = main_page_byte main_d 1L in
+       Alcotest.(check char) "epoch-0 page drained to main mid-batch" 'A' migrated;
+       (* ...and only the epoch-1 frame remains in the reset WAL (not 2). *)
+       Alcotest.(check int)
+         "only the epoch-1 frame remains in the reset WAL"
+         1
+         (Wal.committed_frames wal);
+       (* The epoch-1 page is still in the WAL, not yet checkpointed to main. *)
+       let* not_yet = main_page_byte main_d 2L in
+       Alcotest.(check char) "epoch-1 page not yet in main" '\x00' not_yet;
+       Lwt.return_unit
+     | Error (`Apply_error msg) -> Alcotest.failf "apply: %s" msg)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Error branches                                                      *)
 (* ------------------------------------------------------------------ *)
 
@@ -776,6 +816,10 @@ let () =
             "acked position = last committed frame (trailing non-commit)"
             `Quick
             test_epoch_aware_acked_position_trailing_non_commit
+        ; Alcotest.test_case
+            "mixed-epoch batch checkpoints between epochs"
+            `Quick
+            test_epoch_aware_mixed_epoch_batch_checkpoints_between
         ] )
     ; ( "error_paths"
       , [ Alcotest.test_case "checkpoint write error" `Quick test_checkpoint_write_error
