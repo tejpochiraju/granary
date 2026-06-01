@@ -527,10 +527,141 @@ let test_copy_dest_file_size () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Encrypted hot-copy (#214)                                            *)
+(* ------------------------------------------------------------------ *)
+
+let k32 c = String.make 32 c
+
+let raw_contains path needle =
+  let ic = open_in_bin path in
+  let raw = really_input_string ic (in_channel_length ic) in
+  close_in ic;
+  let nl = String.length needle
+  and hl = String.length raw in
+  let rec go i = i + nl <= hl && (String.sub raw i nl = needle || go (i + 1)) in
+  nl > 0 && go 0
+;;
+
+(* An encrypted source must copy to an encrypted destination that round-trips
+   under the same key and leaks no plaintext to disk. *)
+let test_copy_encrypted_round_trip () =
+  let src_path = fresh_path "enc_src" in
+  let dst_path = fresh_path "enc_dst" in
+  cleanup src_path;
+  cleanup dst_path;
+  run
+  @@ Lwt.finalize
+       (fun () ->
+          let key = k32 'a' in
+          let* src_r = UnixStore.open_file ~key ~path:src_path () in
+          let src = ok_store src_r in
+          let* () =
+            let* tx = S.rw_begin src in
+            let* () = S.put tx 16 (bs "secretkey") (bs "PLAINTEXT_MARKER_42") in
+            S.commit tx
+          in
+          let* cr = UnixStore.copy_to_file src ~dest:dst_path in
+          (match cr with
+           | Error e -> Alcotest.failf "copy_to_file error: %a" S.pp_error e
+           | Ok () -> ());
+          let* dst_r = UnixStore.open_file ~key ~path:dst_path () in
+          let dst = ok_store dst_r in
+          let* got = S.with_ro dst (fun tx -> S.get tx 16 (bs "secretkey")) in
+          Alcotest.check bytes_opt_eq "round-trip" (Some (bs "PLAINTEXT_MARKER_42")) got;
+          let* () = S.close dst in
+          let* () = S.close src in
+          Alcotest.(check bool)
+            "no plaintext marker on disk"
+            false
+            (raw_contains dst_path "PLAINTEXT_MARKER_42");
+          Lwt.return_unit)
+       (fun () ->
+          cleanup src_path;
+          cleanup dst_path;
+          Lwt.return_unit)
+;;
+
+(* Same, but the source is a WAL-mode DB with un-checkpointed frames: the merge
+   must re-encrypt WAL-resident pages correctly. *)
+let test_copy_encrypted_wal () =
+  let src_path = fresh_path "enc_wal_src" in
+  let dst_path = fresh_path "enc_wal_dst" in
+  cleanup src_path;
+  cleanup dst_path;
+  run
+  @@ Lwt.finalize
+       (fun () ->
+          let key = k32 'b' in
+          let* src_r = UnixStore.open_file_wal ~key ~path:src_path () in
+          let src = ok_store src_r in
+          let* () =
+            let* tx = S.rw_begin src in
+            let* () = S.put tx 16 (bs "wkey") (bs "WAL_MARKER_77") in
+            S.commit tx
+          in
+          let* cr = UnixStore.copy_to_file src ~dest:dst_path in
+          (match cr with
+           | Error e -> Alcotest.failf "copy_to_file (wal) error: %a" S.pp_error e
+           | Ok () -> ());
+          let* dst_r = UnixStore.open_file ~key ~path:dst_path () in
+          let dst = ok_store dst_r in
+          let* got = S.with_ro dst (fun tx -> S.get tx 16 (bs "wkey")) in
+          Alcotest.check bytes_opt_eq "wal round-trip" (Some (bs "WAL_MARKER_77")) got;
+          let* () = S.close dst in
+          let* () = S.close src in
+          Alcotest.(check bool)
+            "no plaintext marker on disk"
+            false
+            (raw_contains dst_path "WAL_MARKER_77");
+          Lwt.return_unit)
+       (fun () ->
+          cleanup src_path;
+          cleanup dst_path;
+          Lwt.return_unit)
+;;
+
+(* The destination of an encrypted copy refuses a missing/wrong key. *)
+let test_copy_encrypted_needs_key () =
+  let src_path = fresh_path "enc_src2" in
+  let dst_path = fresh_path "enc_dst2" in
+  cleanup src_path;
+  cleanup dst_path;
+  run
+  @@ Lwt.finalize
+       (fun () ->
+          let key = k32 'a' in
+          let* src = UnixStore.open_file ~key ~path:src_path () in
+          let src = ok_store src in
+          let* () =
+            let* tx = S.rw_begin src in
+            let* () = S.put tx 16 (bs "k") (bs "v") in
+            S.commit tx
+          in
+          let* _ = UnixStore.copy_to_file src ~dest:dst_path in
+          let* () = S.close src in
+          let* nr = UnixStore.open_file ~path:dst_path () in
+          (match nr with
+           | Error S.Encryption_key_required -> ()
+           | Error e -> Alcotest.failf "expected key_required, got %a" S.pp_error e
+           | Ok _ -> Alcotest.fail "expected key_required, got Ok");
+          let* wr = UnixStore.open_file ~key:(k32 'z') ~path:dst_path () in
+          (match wr with
+           | Error S.Encryption_key_mismatch -> ()
+           | Error e -> Alcotest.failf "expected key_mismatch, got %a" S.pp_error e
+           | Ok _ -> Alcotest.fail "expected key_mismatch, got Ok");
+          Lwt.return_unit)
+       (fun () ->
+          cleanup src_path;
+          cleanup dst_path;
+          Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Test suite                                                           *)
 (* ------------------------------------------------------------------ *)
 
 let () =
+  Mirage_crypto_rng_unix.use_default ();
   Alcotest.run
     "online_backup"
     [ ( "copy"
@@ -550,6 +681,11 @@ let () =
         ; Alcotest.test_case "sink error" `Quick test_copy_sink_error
         ; Alcotest.test_case "overwrite existing" `Quick test_copy_over_existing_dest
         ; Alcotest.test_case "dest file size" `Quick test_copy_dest_file_size
+        ] )
+    ; ( "encrypted_copy"
+      , [ Alcotest.test_case "round_trip" `Quick test_copy_encrypted_round_trip
+        ; Alcotest.test_case "wal round_trip" `Quick test_copy_encrypted_wal
+        ; Alcotest.test_case "needs_key" `Quick test_copy_encrypted_needs_key
         ] )
     ]
 ;;

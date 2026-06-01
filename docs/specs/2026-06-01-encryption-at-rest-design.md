@@ -208,9 +208,14 @@ pins both. The architecture is independent of which 1.x/2.x lands.
 - **`copy_to` / hot-copy (#93):** in this model `copy_to` sinks *plaintext* pages
   (the pager sees plaintext); a destination becomes encrypted only if it is
   itself opened with a key. File a follow-up to make hot-copy encryption-aware
-  rather than silently widening scope here.
+  rather than silently widening scope here. *Resolved in #214 (approach a):
+  `copy_to` re-encrypts data pages under the source key, so an encrypted source
+  yields an encrypted destination with no user-data plaintext on the sink. See
+  docs/specs/2026-06-01-encryption-copy-rekey-design.md.*
 - **Key rotation:** re-encrypting every page is an offline bulk operation; out of
-  scope for v1. Note the cost.
+  scope for v1. Note the cost. *Resolved in #215: `Store.rekey_to` +
+  `Sqlocaml_unix.Store.rotate_key_file` (crash-safe offline rotation to a new
+  file). See the same design doc.*
 - **Mirage deployment** depends on #170 (platform-agnostic block/store split),
   same as the replication family. The Unix file-backed path (and the tests)
   work today.

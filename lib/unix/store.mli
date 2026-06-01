@@ -53,3 +53,21 @@ val copy_to_file
   :  Sqlocaml_store.Store.t
   -> dest:string
   -> (unit, Sqlocaml_store.Store.error) result Lwt.t
+
+(** [rotate_key_file ~src_path ~old_key ~new_key ~dest] offline-rotates the
+    encryption key of the database at [src_path] (opened with [old_key]),
+    writing a new self-contained file at [dest] encrypted under [new_key] (#215).
+    Crash-safe via a temp file + atomic rename + directory fsync.  WAL-aware: an
+    existing [src_path ^ "-wal"] sidecar is folded in.  Returns
+    [Encryption_key_mismatch] for a wrong [old_key], [Not_encrypted] if the
+    source is not encrypted, or a [Block_error] for I/O / bad key length.
+
+    Note: if the post-rename directory fsync fails, this returns a [Block_error]
+    even though [dest] is already the live, fully-written rotated file (the
+    rename succeeded); only the directory entry's durability is in doubt. *)
+val rotate_key_file
+  :  src_path:string
+  -> old_key:string
+  -> new_key:string
+  -> dest:string
+  -> (unit, Sqlocaml_store.Store.error) result Lwt.t
