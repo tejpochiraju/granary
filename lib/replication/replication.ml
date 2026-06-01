@@ -192,35 +192,67 @@ let checkpoint_wal_to_main ~wal ~pager =
        Lwt.return_ok ())
 ;;
 
-let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
+(** Split a frame list into maximal runs of consecutive same-epoch frames,
+    preserving order.  [[]] -> [[]]; a single-epoch list -> one run. *)
+let split_by_epoch frames =
+  let rec go acc cur cur_epoch = function
+    | [] -> List.rev (List.rev cur :: acc)
+    | f :: rest ->
+      if Int64.equal f.epoch cur_epoch
+      then go acc (f :: cur) cur_epoch rest
+      else go (List.rev cur :: acc) [ f ] f.epoch rest
+  in
   match frames with
-  | [] -> Lwt.return_ok (last_epoch, last_idx)
-  | _ ->
-    let first_epoch = (List.hd frames).epoch in
-    let* apply_result =
-      if first_epoch <> last_epoch
-      then
-        let* r = checkpoint_wal_to_main ~wal ~pager in
-        match r with
-        | Error (`Apply_error _) as e -> Lwt.return e
-        | Ok () -> apply_frames ~wal ~pager frames
-      else apply_frames ~wal ~pager frames
+  | [] -> []
+  | f :: rest -> go [] [ f ] f.epoch rest
+;;
+
+let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
+  (* A single batch may bundle frames from more than one master epoch if the
+     master checkpointed mid-stream (#209).  Split into maximal single-epoch
+     runs and feed each through the epoch-transition logic in order: whenever
+     a run's epoch differs from the epoch currently materialized in the local
+     WAL, checkpoint (drain + reset) {e before} appending the run, so the
+     intervening checkpoint is never skipped and recycled frame indices cannot
+     collide.  An empty batch yields no runs and leaves the position
+     unchanged. *)
+  let runs = split_by_epoch frames in
+  let rec apply_runs current_epoch = function
+    | [] -> Lwt.return_ok ()
+    | run :: rest ->
+      let run_epoch = (List.hd run).epoch in
+      let* r =
+        if Int64.equal run_epoch current_epoch
+        then apply_frames ~wal ~pager run
+        else
+          let* cr = checkpoint_wal_to_main ~wal ~pager in
+          match cr with
+          | Error (`Apply_error _) as e -> Lwt.return e
+          | Ok () -> apply_frames ~wal ~pager run
+      in
+      (match r with
+       | Error _ as e -> Lwt.return e
+       (* Advance [current_epoch] to the run we just materialized even if it
+          committed nothing, so a later same-epoch run does not re-checkpoint
+          a WAL that was already reset for it. *)
+       | Ok () -> apply_runs run_epoch rest)
+  in
+  let* result = apply_runs last_epoch runs in
+  match result with
+  | Error _ as e -> Lwt.return e
+  | Ok () ->
+    (* Report the position of the {e last committed} frame actually applied —
+       not just the tail frame.  [apply_frames] drops trailing non-commit
+       frames, so a batch ending in non-commit frames still durably applied
+       the commit frames before them; keying on the tail would under-report
+       the acked position. *)
+    let last_committed =
+      List.fold_left
+        (fun acc f -> if f.is_commit then f.epoch, f.frame_idx else acc)
+        (last_epoch, last_idx)
+        frames
     in
-    (match apply_result with
-     | Error _ as e -> Lwt.return e
-     | Ok () ->
-       (* Report the position of the {e last committed} frame actually
-          applied — not just the tail frame.  [apply_frames] drops trailing
-          non-commit frames, so a batch ending in non-commit frames still
-          durably applied the commit frames before them; keying on the tail
-          would under-report the acked position. *)
-       let last_committed =
-         List.fold_left
-           (fun acc f -> if f.is_commit then f.epoch, f.frame_idx else acc)
-           (last_epoch, last_idx)
-           frames
-       in
-       Lwt.return_ok last_committed)
+    Lwt.return_ok last_committed
 ;;
 
 [@@@ai_disclosure "ai-generated"]

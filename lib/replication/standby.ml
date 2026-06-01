@@ -134,3 +134,55 @@ let start_following t stream =
     if t.mode = Following then Store.set_follower t.store false;
     Lwt.return result
 ;;
+
+let rebase t segments =
+  match t.mode with
+  | Promoted ->
+    Lwt.return (Error (`Apply_error "Standby.rebase: cannot rebase a promoted standby"))
+  | Following ->
+    (* Take the apply mutex so a rebase never races an in-flight apply from a
+       (stopped, but possibly still draining) follower loop. *)
+    Lwt_mutex.with_lock t.apply_mutex (fun () ->
+      match t.mode with
+      | Promoted ->
+        Lwt.return
+          (Error (`Apply_error "Standby.rebase: cannot rebase a promoted standby"))
+      | Following ->
+        (* The application has overwritten the main DB (the pager passed to
+           [create]) with a fresh, consistent base snapshot from the object
+           store.  The standby's existing WAL index therefore describes a
+           superseded state and must be DISCARDED — not drained, which would
+           corrupt the fresh base.  [Wal.reset] drops the index and bumps the
+           local WAL epoch. *)
+        Wal.reset t.wal;
+        t.last_epoch <- Wal.epoch t.wal;
+        t.last_frame_idx <- -1;
+        (* Replay the object-store WAL segments in order through the
+           epoch-aware apply primitive, threading the position forward.  The
+           segments may span several master epochs; [apply_frames_epoch_aware]
+           checkpoints the local WAL at each transition (#209), so on
+           completion the main DB holds the base plus all-but-the-last epoch
+           and the WAL holds the live tail's epoch — exactly the steady-state
+           a following standby maintains. *)
+        let rec loop () =
+          let* next = Lwt_stream.get segments in
+          match next with
+          | None -> Lwt.return (Ok { epoch = t.last_epoch; frame_idx = t.last_frame_idx })
+          | Some frames ->
+            let* r =
+              Replication.apply_frames_epoch_aware
+                ~wal:t.wal
+                ~pager:t.pager
+                ~last_epoch:t.last_epoch
+                ~last_idx:t.last_frame_idx
+                frames
+            in
+            (match r with
+             | Error _ as e -> Lwt.return e
+             | Ok (epoch, idx) ->
+               t.last_epoch <- epoch;
+               t.last_frame_idx <- idx;
+               loop ())
+        in
+        loop ())
+;;

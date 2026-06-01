@@ -115,11 +115,11 @@ val checkpoint_wal_to_main
     (useful for lag-tracking).  Pass [~last_epoch:0L ~last_idx:(-1)]
     for the initial call.
 
-    The epoch transition is detected from the {e first} frame in the
-    batch, so each call must carry frames from a single master epoch —
-    the master must not bundle frames from before and after one of its
-    checkpoints into the same batch.  A mixed-epoch batch would skip the
-    intervening checkpoint (see follow-up). *)
+    A single batch may safely bundle frames from more than one master
+    epoch (#209): the batch is split into maximal single-epoch runs and
+    each run is fed through the epoch-transition logic in order, so an
+    intervening checkpoint between epoch N and N+1 frames is always
+    honored before the N+1 frames are appended. *)
 val apply_frames_epoch_aware
   :  wal:Sqlocaml_storage.Wal.t
   -> pager:Sqlocaml_storage.Pager.t
