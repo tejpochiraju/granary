@@ -265,6 +265,134 @@ let test_replication_gating_survives_epoch_bump () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* #207: bounded-yield timeout on the checkpoint replication gate       *)
+(* ------------------------------------------------------------------ *)
+
+(** Getter/setter contract: default unbounded on the B+-tree backend, [0]
+    on the in-memory backend, negative inputs clamp to [0], no-op on Mem. *)
+let test_gate_yields_getter_setter () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     Alcotest.(check int)
+       "default unbounded"
+       max_int
+       (Store.replication_gate_max_yields st);
+     Store.set_replication_gate_max_yields st (-5);
+     Alcotest.(check int) "negative clamps to 0" 0 (Store.replication_gate_max_yields st);
+     Store.set_replication_gate_max_yields st 7;
+     Alcotest.(check int) "set to 7" 7 (Store.replication_gate_max_yields st);
+     let mem = Store.create () in
+     Alcotest.(check int) "Mem reports 0" 0 (Store.replication_gate_max_yields mem);
+     Store.set_replication_gate_max_yields mem 9;
+     Alcotest.(check int) "Mem setter is a no-op" 0 (Store.replication_gate_max_yields mem);
+     let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(** With a finite budget, a checkpoint blocked only by a stranded
+    replication floor proceeds anyway once the budget is spent — the
+    standby never advances, yet the WAL is recycled (epoch bumps). *)
+let test_gate_timeout_proceeds_past_stranded_floor () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
+     let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
+     let* () = Store.commit rw in
+     let epoch_before, frames_before =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check bool) "WAL has frames" true (frames_before > 0);
+     (* Pin the floor behind the committed frames so it would gate forever,
+        then give the gate a small finite budget. *)
+     Store.update_replication_position st ~shipped:0;
+     Store.set_replication_gate_max_yields st 5;
+     (* Direct checkpoint: floor (0) < target, so the gate spends its 5-yield
+        budget and then proceeds WITHOUT the floor ever advancing. *)
+     let* () = Store.checkpoint st in
+     let epoch_after, frames_after =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check bool)
+       "epoch bumped despite stranded floor"
+       true
+       (epoch_after > epoch_before);
+     Alcotest.(check bool) "WAL recycled despite stranded floor" true (frames_after = 0);
+     let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(** The #207 budget governs ONLY the replication floor.  A local RO reader
+    pinned below the checkpoint target must never be abandoned: the
+    checkpoint stays parked through a finite budget and only completes once
+    the reader ends. *)
+let test_gate_timeout_never_abandons_ro_reader () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     (* Commit, then open an RO snapshot pinned at this (lower) frame count. *)
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let* () = Store.commit rw in
+     let* snap = Store.ro_begin st in
+     let epoch_before, _ =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     (* Commit more so the checkpoint target moves past the snapshot's pin. *)
+     let* rw2 = Store.rw_begin st in
+     let* () = Store.put rw2 16 (Bytes.of_string "b") (Bytes.of_string "2") in
+     let* () = Store.commit rw2 in
+     (* No replication floor active; a finite budget would let the gate give
+        up on the floor — but the RO reader is an unconditional gate. *)
+     Store.set_replication_gate_max_yields st 3;
+     let ckpt = Store.checkpoint st in
+     (* Let the checkpoint fiber reach its parked state. *)
+     let* () = wait_for (fun () -> false) 20 in
+     let epoch_parked, frames_parked =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check int64)
+       "checkpoint parked on RO reader (epoch unchanged)"
+       epoch_before
+       epoch_parked;
+     Alcotest.(check bool) "WAL not recycled while reader active" true (frames_parked > 0);
+     (* Release the reader: the checkpoint must now complete. *)
+     let* () = Store.ro_end snap in
+     let* () = ckpt in
+     let epoch_after, frames_after =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check bool) "epoch bumped after reader ended" true (epoch_after > epoch_before);
+     Alcotest.(check bool) "WAL recycled after reader ended" true (frames_after = 0);
+     let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Test: commit callback fired                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -311,6 +439,20 @@ let () =
             `Quick
             test_replication_gating_survives_epoch_bump
         ; Alcotest.test_case "commit callback fires" `Quick test_commit_callback_fired
+        ] )
+    ; ( "gate_timeout"
+      , [ Alcotest.test_case
+            "gate yields getter/setter"
+            `Quick
+            test_gate_yields_getter_setter
+        ; Alcotest.test_case
+            "timeout proceeds past stranded floor"
+            `Quick
+            test_gate_timeout_proceeds_past_stranded_floor
+        ; Alcotest.test_case
+            "timeout never abandons RO reader"
+            `Quick
+            test_gate_timeout_never_abandons_ro_reader
         ] )
     ]
 ;;

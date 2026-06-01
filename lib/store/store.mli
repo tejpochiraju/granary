@@ -295,6 +295,26 @@ val update_replication_position : t -> shipped:int -> unit
     is in effect or on the in-memory backend. *)
 val replication_state : t -> (int64 * int) option
 
+(** Bounded-yield "timeout" the checkpoint gate spends waiting for the
+    replication floor (a standby's acked position) to reach the checkpoint
+    target before proceeding anyway (#207).  Returns [max_int] (unbounded,
+    the default) on the B+-tree backend; [0] on the in-memory backend. *)
+val replication_gate_max_yields : t -> int
+
+(** Set the checkpoint gate's bounded-yield budget for the replication
+    floor.  A dead or slow standby must not wedge the master's WAL forever:
+    once the budget is spent the checkpoint proceeds and the now-stranded
+    standby must re-base (#208).
+
+    Pure-Mirage has no ambient clock, so this "timeout" is a count of
+    cooperative [Lwt.pause] yields, not wall-clock time.  [max_int] (the
+    default) means unbounded — wait indefinitely on
+    {!update_replication_position}, exactly as before this knob existed.
+    Negative inputs clamp to [0].  Local RO readers are never abandoned by
+    this budget — only the replication floor.  No-op on the in-memory
+    backend. *)
+val set_replication_gate_max_yields : t -> int -> unit
+
 (** Install an asynchronous callback invoked after each WAL commit batch.
     The callback receives [~epoch], [~base_idx] (starting WAL frame index
     of this batch), and [~count] (number of frames committed).  Fired

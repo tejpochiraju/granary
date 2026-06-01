@@ -113,12 +113,12 @@ type bt_state =
      allocated unconditionally to keep [bt_state] uniform. *)
     active_reader_frames : (int, int) Hashtbl.t
   ; (* WAL committed_frames snapshot value -> refcount of RO snapshots
-     captured at that value.  Lets [min_active_reader_frames] compute
+     captured at that value.  Lets [min_active_ro_reader_frames] compute
      the lowest snapshot bound currently in flight in O(distinct
      snapshots) which is bounded by the number of concurrent readers. *)
     reader_done_cond : unit Lwt_condition.t
   ; (* Broadcast on every [ro_end] so a waiting checkpoint can re-check
-     [min_active_reader_frames] without busy-waiting. *)
+     [min_active_ro_reader_frames] without busy-waiting. *)
     mutable autockpt_in_flight : bool
     (* True iff a background autocheckpoint fiber is currently running.
      Used to coalesce: if a commit crosses the threshold while a
@@ -128,8 +128,22 @@ type bt_state =
        acknowledged shipment.  Initialized to [max_int] so that when no
        consumer is active it does not gate checkpoint truncation.  When a
        consumer registers it sets this to its shipped position; [checkpoint]
-       then waits for this to reach [committed_frames] via the shared
-       [wait_for_readers_past] / [min_active_reader_frames] floor. *)
+       then waits (subject to [replication_gate_max_yields]) for this to
+       reach [committed_frames] via [wait_for_readers_past]. *)
+  ; mutable replication_gate_max_yields : int
+    (* Bounded-yield "timeout" for the checkpoint gate's wait on the
+       replication floor (#207).  When the floor (a standby's acked
+       position, plumbed in by the app via [update_replication_position])
+       is below the checkpoint target, the gate yields up to this many
+       times before proceeding anyway — a dead or slow standby must not
+       wedge the master's WAL forever.  Pure-Mirage has no ambient clock,
+       so the "timeout" is a bounded count of cooperative [Lwt.pause]
+       yields (the project's [wait_for] idiom), not wall-clock time.
+       [max_int] (the default) means unbounded: wait indefinitely on the
+       broadcast condition, exactly as before this knob existed.  Local
+       RO readers are NEVER abandoned by this budget — only the
+       replication floor.  On timeout the standby falls outside the live
+       un-checkpointed window and must re-base (see #208). *)
   ; mutable on_committed_frames :
       (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
     (* Optional callback invoked asynchronously after each WAL commit batch.
@@ -362,27 +376,33 @@ let min_active_reader_txn st =
     None
 ;;
 
-let min_active_reader_frames (st : bt_state) : int option =
-  let ro_min =
-    Hashtbl.fold
-      (fun k _ acc ->
-         match acc with
-         | None -> Some k
-         | Some m -> Some (min m k))
-      st.active_reader_frames
-      None
-  in
-  (* Include the replication consumer's shipped position as a floor.
-     max_int means no consumer is active (no gating). *)
-  let rep_floor =
-    if st.replication_shipped_frames = max_int
-    then None
-    else Some st.replication_shipped_frames
-  in
-  match ro_min, rep_floor with
-  | None, None -> None
-  | Some x, None | None, Some x -> Some x
-  | Some x, Some y -> Some (min x y)
+(* Lowest WAL frame index pinned by an in-flight RO snapshot, ignoring the
+   replication floor.  A checkpoint must NEVER recycle past this (the
+   snapshot would observe a broken WAL), so this gate is honored
+   unconditionally — unlike the replication floor, which the #207 timeout
+   may abandon. *)
+let min_active_ro_reader_frames (st : bt_state) : int option =
+  Hashtbl.fold
+    (fun k _ acc ->
+       match acc with
+       | None -> Some k
+       | Some m -> Some (min m k))
+    st.active_reader_frames
+    None
+;;
+
+(* True iff an in-flight RO snapshot still needs WAL frames below [target].
+   This gate is honored unconditionally by the checkpoint wait. *)
+let ro_readers_below (st : bt_state) ~target =
+  match min_active_ro_reader_frames st with
+  | Some m -> m < target
+  | None -> false
+;;
+
+(* True iff a replication consumer is active and its acked floor is below
+   [target].  This gate is subject to the #207 bounded-yield timeout. *)
+let replication_floor_below (st : bt_state) ~target =
+  st.replication_shipped_frames <> max_int && st.replication_shipped_frames < target
 ;;
 
 (* Lookup-or-build the Btree handle for a tree_id using a snapshot's
@@ -515,6 +535,7 @@ let make_btree_store
     ; reader_done_cond = Lwt_condition.create ()
     ; autockpt_in_flight = false
     ; replication_shipped_frames = max_int
+    ; replication_gate_max_yields = max_int
     ; on_committed_frames = None
     ; follower = false
     }
@@ -931,30 +952,65 @@ let write_freelist_pages pager : int64 Lwt.t =
     Lwt.return pid_arr.(0)
 ;;
 
-(* Block until every active RO snapshot's [committed_frames] bound is at
-   least [target].  Used by [checkpoint_unlocked] before [Wal.reset]
-   truncates the index — otherwise an in-flight reader's [find_page_at]
-   would resolve to a recycled frame index after the next writer's append.
+(* Block until it is safe to recycle WAL frames below [target].  Used by
+   [checkpoint_unlocked] before [Wal.reset] truncates the index — otherwise
+   an in-flight reader's [find_page_at] would resolve to a recycled frame
+   index after the next writer's append.
 
-   No [~mutex] is passed to [Lwt_condition.wait]: under cooperative Lwt
-   the multiset check + wait register atomically (no yield between
-   [min_active_reader_frames] and the wait), so the standard POSIX
-   condvar mutex pairing isn't needed.  Would need revisiting under a
-   preemptive or effect-based multicore runtime. *)
+   Two distinct gates, with different urgency (#207):
+
+   - RO snapshots ([ro_readers_below]): a local reader still needs frames
+     below [target].  Recycling past it corrupts its snapshot, so this gate
+     is honored UNCONDITIONALLY — we wait on the broadcast, which a local
+     reader always eventually fires via [ro_end].
+
+   - Replication floor ([replication_floor_below]): a standby's acked
+     position, plumbed in by the app.  A dead or slow standby must not wedge
+     the master's WAL forever, so when this is the SOLE remaining blocker we
+     honor a bounded-yield budget [max_floor_yields] and then proceed anyway
+     (the standby falls outside the live window and must re-base — #208).
+
+   [max_floor_yields = max_int] means unbounded: we wait on the broadcast
+   ([update_replication_position] fires it when the floor advances), exactly
+   as before this knob existed — no busy-poll.  A finite budget polls via
+   [Lwt.pause] (the project's [wait_for] idiom) because a dead standby
+   produces no broadcast to wake on.
+
+   No [~mutex] is passed to [Lwt_condition.wait]: under cooperative Lwt the
+   gate check + wait register atomically (no yield between them), so the
+   standard POSIX condvar mutex pairing isn't needed.  Would need revisiting
+   under a preemptive or effect-based multicore runtime. *)
 (** Body of [checkpoint] without mutex management. Caller MUST already
     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
     can invoke it via [maybe_autocheckpoint] below. *)
-let rec wait_for_readers_past (st : bt_state) ~target =
-  match min_active_reader_frames st with
-  | Some m when m < target ->
+let rec wait_for_readers_past (st : bt_state) ~target ~max_floor_yields =
+  if ro_readers_below st ~target
+  then
+    (* A local reader blocks: wait unconditionally on the broadcast. *)
     let* () = Lwt_condition.wait st.reader_done_cond in
-    wait_for_readers_past st ~target
-  | _ -> Lwt.return_unit
+    wait_for_readers_past st ~target ~max_floor_yields
+  else if replication_floor_below st ~target
+  then
+    if max_floor_yields = max_int
+    then
+      (* Unbounded: efficient event-driven wait, no busy-poll. *)
+      let* () = Lwt_condition.wait st.reader_done_cond in
+      wait_for_readers_past st ~target ~max_floor_yields
+    else if max_floor_yields <= 0
+    then
+      (* Budget spent: proceed past the stranded replication floor. *)
+      Lwt.return_unit
+    else
+      let* () = Lwt.pause () in
+      wait_for_readers_past st ~target ~max_floor_yields:(max_floor_yields - 1)
+  else Lwt.return_unit
 ;;
 
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let target = Wal.committed_frames wal in
-  let* () = wait_for_readers_past st ~target in
+  let* () =
+    wait_for_readers_past st ~target ~max_floor_yields:st.replication_gate_max_yields
+  in
   let pairs = ref [] in
   Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
   let rec write_each = function
@@ -1857,6 +1913,35 @@ let update_replication_position (t : t) ~shipped =
   | Btree st ->
     st.replication_shipped_frames <- shipped;
     Lwt_condition.broadcast st.reader_done_cond ()
+;;
+
+(** Bounded-yield "timeout" for the checkpoint gate's wait on the
+    replication floor (#207).  Returns [max_int] (unbounded) by default.
+    [0] on the in-memory backend (no checkpoint gating). *)
+let replication_gate_max_yields (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> st.replication_gate_max_yields
+;;
+
+(** Set the bounded-yield budget the checkpoint gate will spend waiting for
+    the replication floor (a standby's acked position) to reach the
+    checkpoint target before proceeding anyway.  See {!update_replication_position}.
+
+    Pure-Mirage has no ambient clock, so this "timeout" is a count of
+    cooperative [Lwt.pause] yields rather than wall-clock time.  [max_int]
+    (the default) means wait indefinitely — a dead standby wedges the WAL,
+    matching the behavior before this knob existed.  A finite value bounds
+    the wait: once spent, the checkpoint proceeds and the now-stranded
+    standby must re-base (#208).  Negative inputs clamp to [0] (proceed
+    immediately if the floor is behind).
+
+    Local RO readers are never abandoned by this budget — only the
+    replication floor.  No-op on the in-memory backend. *)
+let set_replication_gate_max_yields (t : t) (n : int) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.replication_gate_max_yields <- max 0 n
 ;;
 
 (** Get (epoch, committed_frames) for the active WAL; [None] if no WAL. *)
