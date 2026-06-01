@@ -1,7 +1,13 @@
 (library
  (name sqlocaml_store)
  (public_name sqlocaml.store)
- (libraries lwt sqlocaml.block sqlocaml.encoding sqlocaml.storage)
+ (libraries
+  lwt
+  sqlocaml.block
+  sqlocaml.encoding
+  sqlocaml.storage
+  mirage-crypto
+  mirage-crypto-rng)
  (preprocess
   (pps lwt_ppx))
  (instrumentation
