@@ -146,7 +146,10 @@ let read_tag buf : int32 = Cstruct.BE.get_uint32 buf tag_offset
     +56  [4] page_size      (int32 BE)
     +60  [4] format_version (int32 BE)
     +64  [4] reserved_bytes_per_page (int32 BE, #95)
-    +68..(page_size-1) reserved zeros
+    +68  [4] enc_magic      (uint32 BE; 0x53454E43 "SENC" when encrypted, #84)
+    +72  [16] canary_nonce  (16 bytes; meaningful when enc_magic set, #84)
+    +88  [16] canary_tag    (16 bytes; meaningful when enc_magic set, #84)
+    +104..(page_size-1) reserved zeros
 *)
 
 type header_fields =
@@ -158,6 +161,9 @@ type header_fields =
   ; page_size : int32
   ; format_version : int32
   ; reserved_bytes_per_page : int32
+  ; enc_magic : int32 (** 0x53454E43 "SENC" when encrypted, else 0 (#84) *)
+  ; canary_nonce : string (** 16 bytes; meaningful only when enc_magic set *)
+  ; canary_tag : string (** 16 bytes; meaningful only when enc_magic set *)
   }
 
 let read_header_fields buf =
@@ -169,6 +175,9 @@ let read_header_fields buf =
   let page_size = Cstruct.BE.get_uint32 buf 56 in
   let format_version = Cstruct.BE.get_uint32 buf 60 in
   let reserved_bytes_per_page = Cstruct.BE.get_uint32 buf 64 in
+  let enc_magic = Cstruct.BE.get_uint32 buf 68 in
+  let canary_nonce = Cstruct.to_string buf ~off:72 ~len:16 in
+  let canary_tag = Cstruct.to_string buf ~off:88 ~len:16 in
   { txn_id
   ; root_page
   ; freelist_page
@@ -177,6 +186,9 @@ let read_header_fields buf =
   ; page_size
   ; format_version
   ; reserved_bytes_per_page
+  ; enc_magic
+  ; canary_nonce
+  ; canary_tag
   }
 ;;
 
@@ -191,7 +203,13 @@ let write_header_fields buf hf =
   Cstruct.BE.set_uint64 buf 48 hf.schema_version;
   Cstruct.BE.set_uint32 buf 56 hf.page_size;
   Cstruct.BE.set_uint32 buf 60 hf.format_version;
-  Cstruct.BE.set_uint32 buf 64 hf.reserved_bytes_per_page
+  Cstruct.BE.set_uint32 buf 64 hf.reserved_bytes_per_page;
+  Cstruct.BE.set_uint32 buf 68 hf.enc_magic;
+  if Int32.equal hf.enc_magic 0l
+  then ()
+  else (
+    Cstruct.blit_from_string hf.canary_nonce 0 buf 72 16;
+    Cstruct.blit_from_string hf.canary_tag 0 buf 88 16)
 ;;
 
 (* ------------------------------------------------------------------ *)

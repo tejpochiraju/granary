@@ -1188,6 +1188,8 @@ let commit_prepare_btree
       format_version = st.current_header.format_version
     ; (* Preserve the file's page geometry (#95); fixed at creation. *)
       geom = st.current_header.geom
+    ; (* Preserve the encryption marker/canary across commits (#84). *)
+      enc = st.current_header.enc
     }
   in
   let* r = header_commit st.pager ~prev_header:st.current_header ~new_state in

@@ -2,6 +2,12 @@
     Pages 0 and 1 hold the two alternating file headers.
     The header with the higher txn_id and valid CRC is the live state. *)
 
+(** Encryption marker and key-check canary persisted in the header (#84). *)
+type encryption =
+  { canary_nonce : string (** 16 bytes at header bytes 72–87 *)
+  ; canary_tag : string (** 16 bytes at header bytes 88–103 *)
+  }
+
 type t =
   { txn_id : int64
   ; root_page : int64
@@ -14,6 +20,9 @@ type t =
   ; geom : Geometry.t
     (** Page geometry persisted in the header (#95): page_size + reserved bytes,
         fixed at creation, preserved verbatim across commits. *)
+  ; enc : encryption option
+    (** Encryption marker and key-check canary (#84).  [None] for plaintext
+        databases; [Some _] when the "SENC" magic is present on disk. *)
   }
 
 (** On-disk format version this build writes for freshly-initialised
@@ -68,5 +77,7 @@ val commit_no_sync : Pager.t -> prev_header:t -> new_state:t -> (unit, error) re
 
 (** Initialise a brand-new empty file: write both header pages with txn_id=0
     and zeroed root/freelist. Called once on new file creation.
-    After init, a subsequent read_live returns the zeroed header. *)
-val init : Pager.t -> (unit, error) result Lwt.t
+    After init, a subsequent read_live returns the zeroed header.
+    [?enc] sets the encryption marker and canary on the freshly-created DB
+    ([None] by default — plaintext). *)
+val init : ?enc:encryption option -> Pager.t -> (unit, error) result Lwt.t
