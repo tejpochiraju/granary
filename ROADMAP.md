@@ -126,7 +126,7 @@ some may be reconsidered in v2+.
 - [ ] Cost-based query planner (v1 is rule-based)
 - [ ] Statistics collection (table sizes, index selectivity)
 - [ ] Eio support (alternative to Lwt) — revisit when Mirage canonical
-- [ ] Encryption at rest
+- [x] Encryption at rest (#84 — opt-in AES-256-GCM, main DB + WAL; follow-ups #214 hot-copy, #215 key rotation)
 - [ ] Compression (page-level or column-level)
 - [ ] Multi-process access (currently single-process by design)
 - [ ] Network access (server mode) — non-goal for MirageOS embedded use
