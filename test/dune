@@ -55,6 +55,18 @@
   mirage-crypto-rng.unix))
 
 (test
+ (name test_wal_crypto)
+ (libraries
+  alcotest
+  alcotest-lwt
+  lwt
+  cstruct
+  sqlocaml.storage
+  mirage-crypto
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
+(test
  (name test_conformance)
  (libraries
   sqlocaml
