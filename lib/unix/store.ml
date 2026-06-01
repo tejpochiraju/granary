@@ -340,6 +340,110 @@ let copy_to_file (src : Core.t) ~dest : (unit, Core.error) result Lwt.t =
             Lwt.return_error (Core.Block_error msg)))
 ;;
 
+(** [rotate_key_file ~src_path ~old_key ~new_key ~dest] offline-rotates the
+    encryption key of the database at [src_path] (#215).  Opens the source with
+    [old_key] (WAL-aware: if a [src_path ^ "-wal"] sidecar exists it opens the
+    WAL form so any uncheckpointed committed frames are folded in), re-encrypts
+    every page under [new_key] via {!Core.rekey_to}, and writes a self-contained
+    encrypted file at [dest] (no WAL sidecar).  Crash-safe: writes [dest ^ ".tmp"],
+    fsyncs, renames atomically, then fsyncs the directory.  A wrong [old_key]
+    surfaces [Encryption_key_mismatch]; a plaintext source surfaces
+    [Not_encrypted]. *)
+let rotate_key_file ~src_path ~old_key ~new_key ~dest
+  : (unit, Core.error) result Lwt.t
+  =
+  let has_wal = Sys.file_exists (src_path ^ "-wal") in
+  let* src_r =
+    if has_wal
+    then open_file_wal ~key:old_key ~path:src_path ()
+    else open_file ~key:old_key ~path:src_path ()
+  in
+  match src_r with
+  | Error e -> Lwt.return_error e
+  | Ok src ->
+    let close_src () = Core.close src in
+    let tmp = dest ^ ".tmp" in
+    let n = Core.n_pages src in
+    let page_size = (Core.geometry src).Geometry.page_size in
+    let* fr = Unix_file.open_ ~path:tmp () in
+    (match fr with
+     | Error e ->
+       let* () = close_src () in
+       Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+     | Ok file ->
+       Unix_file.set_page_size file page_size;
+       let* rr =
+         if Int64.compare n 0L > 0
+         then Unix_file.resize file ~n_pages:n
+         else Lwt.return (Ok ())
+       in
+       (match rr with
+        | Error e ->
+          let* _ = Unix_file.close file in
+          let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+          let* () = close_src () in
+          Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+        | Ok () ->
+          let sink : Core.page_sink =
+            fun ~page_id ~page ->
+            let* r = Unix_file.write_page file ~page_id page in
+            match r with
+            | Ok () -> Lwt.return_unit
+            | Error e ->
+              Lwt.fail_with
+                (Format.asprintf
+                   "rotate_key_file write pg=%Ld: %a"
+                   page_id
+                   Unix_file.pp_error
+                   e)
+          in
+          Lwt.catch
+            (fun () ->
+               let* rk = Core.rekey_to src ~new_key sink in
+               match rk with
+               | Error e ->
+                 let* _ = Unix_file.close file in
+                 let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+                 let* () = close_src () in
+                 Lwt.return_error e
+               | Ok () ->
+                 let* sr = Unix_file.sync file in
+                 (match sr with
+                  | Error e ->
+                    let* _ = Unix_file.close file in
+                    let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+                    let* () = close_src () in
+                    Lwt.return_error
+                      (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
+                  | Ok () ->
+                    let* _ = Unix_file.close file in
+                    let* () = Lwt_unix.rename tmp dest in
+                    let dir_path = Filename.dirname dest in
+                    let* dir_res =
+                      Lwt.catch
+                        (fun () ->
+                           let* dir_fd =
+                             Lwt_unix.openfile dir_path [ Unix.O_RDONLY ] 0
+                           in
+                           let* () = Lwt_unix.fsync dir_fd in
+                           let* () = Lwt_unix.close dir_fd in
+                           Lwt.return_ok ())
+                        (fun exn ->
+                           Lwt.return_error
+                             (Core.Block_error
+                                (Printf.sprintf
+                                   "dir fsync after rename: %s"
+                                   (Printexc.to_string exn))))
+                    in
+                    let* () = close_src () in
+                    Lwt.return dir_res))
+            (fun exn ->
+               let* _ = Unix_file.close file in
+               let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+               let* () = close_src () in
+               Lwt.return_error (Core.Block_error (Printexc.to_string exn)))))
+;;
+
 [@@@ai_disclosure "ai-generated"]
-[@@@ai_model "claude-opus-4-7"]
+[@@@ai_model "claude-opus-4-8"]
 [@@@ai_provider "Anthropic"]
