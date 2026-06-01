@@ -81,49 +81,56 @@ let promote t =
 ;;
 
 let start_following t stream =
-  Store.set_follower t.store true;
-  let* result =
-    Lwt.catch
-      (fun () ->
-         let rec loop () =
-           let* next = Lwt_stream.get stream in
-           match next with
-           | None -> Lwt.return (Ok ())
-           | Some frames ->
-             (* [with_lock] releases the mutex even if [apply_frames_epoch_aware]
+  match t.mode with
+  | Promoted ->
+    (* Never re-enter follower mode on a promoted node: doing so would leave
+       the store rejecting writes (the exit clause below only clears follower
+       mode when still [Following]).  Promotion is terminal. *)
+    Lwt.return (Ok ())
+  | Following ->
+    Store.set_follower t.store true;
+    let* result =
+      Lwt.catch
+        (fun () ->
+           let rec loop () =
+             let* next = Lwt_stream.get stream in
+             match next with
+             | None -> Lwt.return (Ok ())
+             | Some frames ->
+               (* [with_lock] releases the mutex even if [apply_frames_epoch_aware]
                 raises, so a faulting batch can never wedge a later [promote].
                 Re-check the mode under the lock: a [promote] may have won the
                 race while we were blocked, in which case the WAL has been
                 recycled and we must not apply this batch into the promoted
                 node. *)
-             let* outcome =
-               Lwt_mutex.with_lock t.apply_mutex (fun () ->
-                 match t.mode with
-                 | Promoted -> Lwt.return (`Stop (Ok ()))
-                 | Following ->
-                   let* r =
-                     Replication.apply_frames_epoch_aware
-                       ~wal:t.wal
-                       ~pager:t.pager
-                       ~last_epoch:t.last_epoch
-                       ~last_idx:t.last_frame_idx
-                       frames
-                   in
-                   (match r with
-                    | Error _ as e -> Lwt.return (`Stop e)
-                    | Ok (epoch, idx) ->
-                      t.last_epoch <- epoch;
-                      t.last_frame_idx <- idx;
-                      Lwt.return `Continue))
-             in
-             (match outcome with
-              | `Stop result -> Lwt.return result
-              | `Continue -> loop ())
-         in
-         loop ())
-      (fun exn -> Lwt.return (Error (`Apply_error (Printexc.to_string exn))))
-  in
-  (* Clear follower mode on any exit path unless we have been promoted. *)
-  if t.mode = Following then Store.set_follower t.store false;
-  Lwt.return result
+               let* outcome =
+                 Lwt_mutex.with_lock t.apply_mutex (fun () ->
+                   match t.mode with
+                   | Promoted -> Lwt.return (`Stop (Ok ()))
+                   | Following ->
+                     let* r =
+                       Replication.apply_frames_epoch_aware
+                         ~wal:t.wal
+                         ~pager:t.pager
+                         ~last_epoch:t.last_epoch
+                         ~last_idx:t.last_frame_idx
+                         frames
+                     in
+                     (match r with
+                      | Error _ as e -> Lwt.return (`Stop e)
+                      | Ok (epoch, idx) ->
+                        t.last_epoch <- epoch;
+                        t.last_frame_idx <- idx;
+                        Lwt.return `Continue))
+               in
+               (match outcome with
+                | `Stop result -> Lwt.return result
+                | `Continue -> loop ())
+           in
+           loop ())
+        (fun exn -> Lwt.return (Error (`Apply_error (Printexc.to_string exn))))
+    in
+    (* Clear follower mode on any exit path unless we have been promoted. *)
+    if t.mode = Following then Store.set_follower t.store false;
+    Lwt.return result
 ;;

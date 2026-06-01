@@ -720,6 +720,41 @@ let test_apply_exception_does_not_wedge_promote () =
      Lwt.return_unit)
 ;;
 
+let test_start_following_on_promoted_keeps_store_writable () =
+  Lwt_main.run
+    (let* store, _, _ = store_with_wal () in
+     (* B-tree backend: set_follower / is_follower are real (not no-ops). *)
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let* _, wal = fresh_wal () in
+     let st = Standby.create ~store ~pager ~wal in
+     let* () = Standby.promote st in
+     Alcotest.(check bool) "follower cleared by promote" false (Store.is_follower store);
+     (* Re-invoking start_following on an already-promoted standby must NOT
+        flip the store back into follower mode (which would reject writes). *)
+     let frames =
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'A')
+       ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some frames);
+     push None;
+     let* r = Standby.start_following st stream in
+     (match r with
+      | Ok () -> ()
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     Alcotest.(check bool)
+       "promoted node still writable after start_following"
+       false
+       (Store.is_follower store);
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "standby"
@@ -774,6 +809,10 @@ let () =
             "apply exception does not wedge promote"
             `Quick
             test_apply_exception_does_not_wedge_promote
+        ; Alcotest.test_case
+            "start_following on promoted keeps store writable"
+            `Quick
+            test_start_following_on_promoted_keeps_store_writable
         ] )
     ]
 ;;
