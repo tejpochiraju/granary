@@ -361,6 +361,12 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
   | Ok src ->
     let close_src () = Core.close src in
     let tmp = dest ^ ".tmp" in
+    (* Await tmp removal on every error path (swallowing any unlink error) so
+       cleanup is deterministic — the function never returns before [dest.tmp]
+       is gone. *)
+    let cleanup_tmp () =
+      Lwt.catch (fun () -> Lwt_unix.unlink tmp) (fun _ -> Lwt.return_unit)
+    in
     let n = Core.n_pages src in
     let page_size = (Core.geometry src).Geometry.page_size in
     let* fr = Unix_file.open_ ~path:tmp () in
@@ -378,7 +384,7 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
        (match rr with
         | Error e ->
           let* _ = Unix_file.close file in
-          let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+          let* () = cleanup_tmp () in
           let* () = close_src () in
           Lwt.return_error (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
         | Ok () ->
@@ -401,7 +407,7 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
                match rk with
                | Error e ->
                  let* _ = Unix_file.close file in
-                 let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+                 let* () = cleanup_tmp () in
                  let* () = close_src () in
                  Lwt.return_error e
                | Ok () ->
@@ -409,7 +415,7 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
                  (match sr with
                   | Error e ->
                     let* _ = Unix_file.close file in
-                    let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+                    let* () = cleanup_tmp () in
                     let* () = close_src () in
                     Lwt.return_error
                       (Core.Block_error (Format.asprintf "%a" Unix_file.pp_error e))
@@ -425,6 +431,12 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
                            let* () = Lwt_unix.close dir_fd in
                            Lwt.return_ok ())
                         (fun exn ->
+                           (* rename succeeded — [dest] is already the live,
+                              fully-written rotated file, but its directory entry
+                              may not be durable.  We return an error rather than
+                              silently swallow the fsync failure (matching
+                              [copy_to_file]); a caller seeing this error should
+                              note [dest] exists and may survive a crash. *)
                            Lwt.return_error
                              (Core.Block_error
                                 (Printf.sprintf
@@ -435,7 +447,7 @@ let rotate_key_file ~src_path ~old_key ~new_key ~dest : (unit, Core.error) resul
                     Lwt.return dir_res))
             (fun exn ->
                let* _ = Unix_file.close file in
-               let (_ : unit Lwt.t) = Lwt_unix.unlink tmp in
+               let* () = cleanup_tmp () in
                let* () = close_src () in
                Lwt.return_error (Core.Block_error (Printexc.to_string exn)))))
 ;;

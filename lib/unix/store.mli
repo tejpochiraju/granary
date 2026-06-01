@@ -60,7 +60,11 @@ val copy_to_file
     Crash-safe via a temp file + atomic rename + directory fsync.  WAL-aware: an
     existing [src_path ^ "-wal"] sidecar is folded in.  Returns
     [Encryption_key_mismatch] for a wrong [old_key], [Not_encrypted] if the
-    source is not encrypted, or a [Block_error] for I/O / bad key length. *)
+    source is not encrypted, or a [Block_error] for I/O / bad key length.
+
+    Note: if the post-rename directory fsync fails, this returns a [Block_error]
+    even though [dest] is already the live, fully-written rotated file (the
+    rename succeeded); only the directory entry's durability is in doubt. *)
 val rotate_key_file
   :  src_path:string
   -> old_key:string

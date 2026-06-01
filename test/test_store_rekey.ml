@@ -104,6 +104,66 @@ let test_rotation_round_trip () =
           Lwt.return_unit)
 ;;
 
+(* Rotate a WAL-mode source with uncheckpointed committed frames: exercises
+   rotate_key_file's has_wal branch (open_file_wal) and rekey_to's WAL-overlay
+   page resolution.  The destination is a self-contained non-WAL encrypted file
+   under the new key. *)
+let test_rotation_wal_source () =
+  let src = fresh_path "wal_src" in
+  let dst = fresh_path "wal_dst" in
+  cleanup src;
+  cleanup dst;
+  run
+  @@ Lwt.finalize
+       (fun () ->
+          let k1 = k32 'a'
+          and k2 = k32 'b' in
+          let* s = UnixStore.open_file_wal ~key:k1 ~path:src () in
+          let s = ok_store s in
+          let* () =
+            let* tx = S.rw_begin s in
+            let* () = S.put tx 16 (bs "wk1") (bs "WAL_ROT_MARKER_55") in
+            let* () = S.put tx 16 (bs "wk2") (bs "v2") in
+            let* () = S.put tx 16 (bs "wk3") (bs "v3") in
+            S.commit tx
+          in
+          (* frames are committed but un-checkpointed (still in the WAL) *)
+          Alcotest.(check bool) "src in wal mode" true (S.wal_mode s);
+          let* () = S.close s in
+          let* rr =
+            UnixStore.rotate_key_file ~src_path:src ~old_key:k1 ~new_key:k2 ~dest:dst
+          in
+          (match rr with
+           | Error e -> Alcotest.failf "rotate (wal) error: %a" S.pp_error e
+           | Ok () -> ());
+          let* d = UnixStore.open_file ~key:k2 ~path:dst () in
+          let d = ok_store d in
+          Alcotest.(check bool) "dst not wal" false (S.wal_mode d);
+          let* got = S.with_ro d (fun tx -> S.get tx 16 (bs "wk1")) in
+          Alcotest.check
+            bytes_opt_eq
+            "value under new key"
+            (Some (bs "WAL_ROT_MARKER_55"))
+            got;
+          let* () = S.close d in
+          (* old key fails on the rotated file *)
+          let* o = UnixStore.open_file ~key:k1 ~path:dst () in
+          (match o with
+           | Error S.Encryption_key_mismatch -> ()
+           | Error e ->
+             Alcotest.failf "expected mismatch under old key, got %a" S.pp_error e
+           | Ok _ -> Alcotest.fail "old key should fail after rotation");
+          Alcotest.(check bool)
+            "no plaintext on disk"
+            false
+            (raw_contains dst "WAL_ROT_MARKER_55");
+          Lwt.return_unit)
+       (fun () ->
+          cleanup src;
+          cleanup dst;
+          Lwt.return_unit)
+;;
+
 (* A wrong old_key surfaces Encryption_key_mismatch from the source open. *)
 let test_rotation_wrong_old_key () =
   let src = fresh_path "wsrc" in
@@ -199,6 +259,7 @@ let () =
     "store_rekey"
     [ ( "rotation"
       , [ Alcotest.test_case "round_trip" `Quick test_rotation_round_trip
+        ; Alcotest.test_case "wal_source" `Quick test_rotation_wal_source
         ; Alcotest.test_case "wrong_old_key" `Quick test_rotation_wrong_old_key
         ; Alcotest.test_case "reject_plaintext" `Quick test_reject_plaintext
         ; Alcotest.test_case "reject_bad_key_len" `Quick test_reject_bad_key_len
