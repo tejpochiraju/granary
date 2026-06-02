@@ -4111,18 +4111,6 @@ let drain_matching_rows_in_tx
   Lwt.return (List.rev !buf)
 ;;
 
-let drain_matching_rows
-      store
-      (table_meta : Cat.table_meta)
-      ~clock
-      ~params
-      ~(where : Plan.expr option)
-  : (int64 * Row.t) list Lwt.t
-  =
-  S.with_ro store
-  @@ fun tx_ro -> drain_matching_rows_in_tx tx_ro table_meta ~clock ~params ~where
-;;
-
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)
 let apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches =
   let sorted =
@@ -4515,7 +4503,7 @@ let apply_update_row
       ~indexes
       ~assignments
       (rowid, old_row)
-  : unit Lwt.t
+  : Row.t Lwt.t
   =
   let new_row = apply_assignments ~clock ~params assignments old_row in
   compute_stored_generated_cols clock params table_meta new_row;
@@ -4539,7 +4527,11 @@ let apply_update_row
   let* () = reindex_row tx table_meta ~clock ~params ~old_row ~new_row ~rowid indexes in
   let new_bytes = Row.encode table_meta.Cat.columns new_row in
   let* () = S.del tx table_meta.tree_id key in
-  S.put tx table_meta.tree_id key new_bytes
+  let* () = S.put tx table_meta.tree_id key new_bytes in
+  (* Return the row as actually stored (generated columns included) so callers
+     such as UPDATE ... RETURNING can project committed values, not a pre-lock
+     snapshot (#226). *)
+  Lwt.return new_row
 ;;
 
 (* Fire an UPDATE row-hook (BEFORE/AFTER) for each matched row, recomputing
@@ -4571,6 +4563,7 @@ let execute_update
       ?(after_hook :
           (tx:S.rw S.txn -> old_row:Row.t -> new_row:Row.t -> unit Lwt.t) option =
         None)
+      ?(collect : (Row.t -> unit) option = None)
       (store : S.t)
       (cat : Cat.t)
       ~(table_meta : Cat.table_meta)
@@ -4635,15 +4628,24 @@ let execute_update
          in
          let* () =
            Lwt_list.iter_s
-             (apply_update_row
-                tx
-                cat
-                table_meta
-                ~clock
-                ~params
-                ~child_refs
-                ~indexes
-                ~assignments)
+             (fun m ->
+                let* new_row =
+                  apply_update_row
+                    tx
+                    cat
+                    table_meta
+                    ~clock
+                    ~params
+                    ~child_refs
+                    ~indexes
+                    ~assignments
+                    m
+                in
+                (* RETURNING / row collection sees the committed row (#226). *)
+                (match collect with
+                 | Some f -> f new_row
+                 | None -> ());
+                Lwt.return_unit)
              matches
          in
          let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
@@ -4899,6 +4901,7 @@ let execute_delete
       ?(clock : (unit -> float) option = None)
       ?(before_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
       ?(after_hook : (tx:S.rw S.txn -> old_row:Row.t -> unit Lwt.t) option = None)
+      ?(collect : (Row.t -> unit) option = None)
       (store : S.t)
       (cat : Cat.t)
       ~(table_meta : Cat.table_meta)
@@ -4944,7 +4947,16 @@ let execute_delete
          in
          let* () =
            Lwt_list.iter_s
-             (apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes)
+             (fun ((_rowid, old_row) as m) ->
+                let* () =
+                  apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes m
+                in
+                (* RETURNING / row collection sees the row as deleted under the
+                   write lock, not a pre-lock snapshot (#226). *)
+                (match collect with
+                 | Some f -> f old_row
+                 | None -> ());
+                Lwt.return_unit)
              matches
          in
          let* () =
@@ -8203,34 +8215,26 @@ and stream_update_returning
       indexes
       returning
   =
-  (* Snapshot matching rows BEFORE the update to compute RETURNING values.
-     NOTE: the RETURNING snapshot and the actual write use separate scans that
-     each apply the same order/limit/offset; non-deterministic ORDER BY
-     expressions could surface RETURNING values for different rows. *)
-  let* matched =
-    match mode with
-    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
-    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
-  in
-  let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
-  let result_rows =
-    List.map
-      (fun (_, old_row) ->
-         let new_row = apply_assignments ~clock ~params assignments old_row in
-         compute_stored_generated_cols clock params table_meta new_row;
-         Array.of_list (List.map (eval_expr clock params new_row) returning))
-      matched
-  in
+  (* Project RETURNING from the rows actually written INSIDE the update's write
+     txn (via [collect]), not a separate pre-lock RO snapshot — so concurrent
+     `UPDATE ... RETURNING` callers see read-from-the-write values, never stale
+     or duplicated ones (#226).  Rows arrive in update order (post
+     order/offset/limit), which is also the RETURNING order. *)
   let c =
     match cat with
     | Some c -> c
     | None -> failwith "Exec.to_stream: UPDATE RETURNING requires catalog context"
+  in
+  let acc = ref [] in
+  let collect new_row =
+    acc := Array.of_list (List.map (eval_expr clock params new_row) returning) :: !acc
   in
   let* _ =
     execute_update
       ~mode
       ~params
       ~clock
+      ~collect:(Some collect)
       store
       c
       ~table_meta
@@ -8241,7 +8245,7 @@ and stream_update_returning
       ~offset
       ~indexes
   in
-  Lwt.return (Lwt_stream.of_list result_rows)
+  Lwt.return (Lwt_stream.of_list (List.rev !acc))
 
 and stream_delete_returning
       clock
@@ -8257,30 +8261,23 @@ and stream_delete_returning
       indexes
       returning
   =
-  (* Snapshot matching rows BEFORE the delete to compute RETURNING values
-     (see stream_update_returning re: non-deterministic ORDER BY). *)
-  let* matched =
-    match mode with
-    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
-    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
-  in
-  let matched = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matched in
-  let result_rows =
-    List.map
-      (fun (_, old_row) ->
-         Array.of_list (List.map (eval_expr clock params old_row) returning))
-      matched
-  in
+  (* Project RETURNING from the rows actually deleted INSIDE the delete's write
+     txn (via [collect]), not a separate pre-lock RO snapshot (#226). *)
   let c =
     match cat with
     | Some c -> c
     | None -> failwith "Exec.to_stream: DELETE RETURNING requires catalog context"
+  in
+  let acc = ref [] in
+  let collect old_row =
+    acc := Array.of_list (List.map (eval_expr clock params old_row) returning) :: !acc
   in
   let* _ =
     execute_delete
       ~mode
       ~params
       ~clock
+      ~collect:(Some collect)
       store
       c
       ~table_meta
@@ -8290,7 +8287,7 @@ and stream_delete_returning
       ~offset
       ~indexes
   in
-  Lwt.return (Lwt_stream.of_list result_rows)
+  Lwt.return (Lwt_stream.of_list (List.rev !acc))
 
 and stream_const_select clock params store cat exprs =
   let raw_exprs = List.map fst exprs in

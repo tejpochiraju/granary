@@ -49,6 +49,20 @@ let select_int db sql =
         | _ -> Alcotest.failf "unexpected result for %s" sql))
 ;;
 
+(* Run a statement that returns exactly one row of one int (e.g.
+   [UPDATE ... RETURNING n]) as an Lwt promise, for use inside worker fibers. *)
+let query_int_lwt db sql =
+  let open Lwt.Infix in
+  Db.query db sql
+  >>= function
+  | Error e -> Alcotest.failf "query failed (%s): %a" sql Db.pp_error e
+  | Ok stream ->
+    Lwt_stream.to_list stream
+    >|= (function
+     | [| Db.V_int n |] :: _ -> Int64.to_int n
+     | _ -> Alcotest.failf "unexpected RETURNING result for %s" sql)
+;;
+
 let unlink p =
   (try Unix.unlink p with
    | _ -> ());
@@ -146,6 +160,51 @@ let test_wal_concurrent_deletes () =
   Alcotest.(check int) "WAL: shared counter exact under mixed keyspace" 200 final
 ;;
 
+(* #226 — UPDATE ... RETURNING must read-from-the-write: under concurrency the
+   multiset of returned values must be exactly {1, …, N*M} with no duplicates or
+   gaps (each acked increment returns its own committed value).  Before the fix
+   RETURNING was projected from a pre-lock RO snapshot, so concurrent callers
+   could be handed the same/stale n even though the table ended correct. *)
+let test_wal_returning_reads_from_write () =
+  let path = "/tmp/sqlocaml_226_returning_wal.db" in
+  unlink path;
+  let db =
+    match run (Db.open_file_wal ~path ()) with
+    | Ok d -> d
+    | Error e -> Alcotest.failf "open failed: %a" Db.pp_error e
+  in
+  exec db "CREATE TABLE c (k INTEGER PRIMARY KEY, n INTEGER)";
+  exec db "INSERT INTO c (k, n) VALUES (0, 0)";
+  let n_fibers = 4
+  and m_each = 50 in
+  let returned = ref [] in
+  let open Lwt.Infix in
+  let worker () =
+    let rec loop i =
+      if i >= m_each
+      then Lwt.return_unit
+      else
+        query_int_lwt db "UPDATE c SET n = n + 1 WHERE k = 0 RETURNING n"
+        >>= fun v ->
+        returned := v :: !returned;
+        Lwt.pause () >>= fun () -> loop (i + 1)
+    in
+    loop 0
+  in
+  run (Lwt.join (List.init n_fibers (fun _ -> worker ())));
+  let total = n_fibers * m_each in
+  let got = List.sort compare !returned in
+  let expected = List.init total (fun i -> i + 1) in
+  let final = select_int db "SELECT n FROM c WHERE k = 0" in
+  run (Db.close db);
+  unlink path;
+  Alcotest.(check int) "RETURNING: final counter" total final;
+  Alcotest.(check (list int))
+    "RETURNING: each value returned exactly once (no dupes/gaps)"
+    expected
+    got
+;;
+
 let () =
   Alcotest.run
     "concurrent_rmw_223"
@@ -153,6 +212,10 @@ let () =
       , [ Alcotest.test_case "WAL: no lost increments" `Slow test_wal_no_lost_increments
         ; Alcotest.test_case "file: no lost increments" `Slow test_file_no_lost_increments
         ; Alcotest.test_case "WAL: shared counter exact" `Slow test_wal_concurrent_deletes
+        ; Alcotest.test_case
+            "WAL: RETURNING reads-from-write (#226)"
+            `Slow
+            test_wal_returning_reads_from_write
         ] )
     ]
 ;;
