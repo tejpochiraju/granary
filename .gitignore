@@ -11,3 +11,4 @@ bench/data/
 bench/profiling/perf.data
 bench/profiling/folded.txt
 bench/profiling/*.svg
+.worktrees/
