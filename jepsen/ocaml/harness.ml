@@ -277,14 +277,16 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
       Some (pause_after_ops, pause_duration_s)
     | _ -> None
   in
-  (* Record clock-skew if FAKETIME is set *)
-  (match nemesis with
-   | ClockSkew ->
-     let _ = Nemesis.record_clock_skew nem_state in
-     ()
-   | _ -> ());
-  (* Derive lazyfs mount dir from the backend path *)
-  let lazyfs_mount =
+  (* Record clock-skew if FAKETIME is set (kept so it lands in the history) *)
+  let clock_skew_entries =
+    match nemesis with
+    | ClockSkew -> [ Nemesis.record_clock_skew nem_state ]
+    | _ -> []
+  in
+  (* Derive lazyfs mount + backing-root dirs from the backend path.  The DB
+     lives at [mount_dir]/<file> (the FUSE mountpoint); lazyfs serves a real,
+     writable [root_dir] there so writes hit actual disk through the cache. *)
+  let lazyfs_dirs =
     match nemesis with
     | LazyFS _ ->
       let db_path =
@@ -293,15 +295,19 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
         | Mem -> failwith "lazyfs nemesis requires file or WAL backend"
       in
       let mount_dir = Filename.dirname db_path in
-      (try Unix.mkdir mount_dir 0o755 with
-       | Unix.Unix_error (EEXIST, _, _) -> ());
-      Some mount_dir
+      let root_dir = mount_dir ^ "_root" in
+      List.iter
+        (fun d ->
+           try Unix.mkdir d 0o755 with
+           | Unix.Unix_error (EEXIST, _, _) -> ())
+        [ mount_dir; root_dir ];
+      Some (mount_dir, root_dir)
     | _ -> None
   in
   (* Start lazyfs before opening the database *)
   let lazyfs_st =
-    match lazyfs_mount with
-    | Some mount_dir -> Some (Nemesis.start_lazyfs mount_dir)
+    match lazyfs_dirs with
+    | Some (mount_dir, root_dir) -> Some (Nemesis.start_lazyfs mount_dir root_dir)
     | None -> None
   in
   let* db = open_db backend in
@@ -346,7 +352,7 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
     | _ -> Lwt.return ([], db)
   in
   let* final_entries = final_read final_db workload in
-  let history = collect_history states (n_entries @ final_entries) in
+  let history = collect_history states (clock_skew_entries @ n_entries @ final_entries) in
   Printf.printf
     "Completed %d operations across %d workers\n"
     (List.length history)

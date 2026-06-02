@@ -5,9 +5,13 @@ encrypted-WAL backend (`--backend enc-wal`, #84/#214/#215).
 
 | Script | Container | Purpose |
 |--------|-----------|---------|
-| `gen_177.sh` | `sqlocaml-dev` | Build the harness and generate every workload/nemesis history into `jepsen/run/histories/`, plus the 5 negative controls. |
+| `gen_177.sh` | `sqlocaml-dev` | Build the harness and generate every workload + crash/pause-nemesis history into `jepsen/run/histories/`, plus the 5 negative controls. |
+| `run_nemeses_fuse.sh` | `sqlocaml-jepsen` (host-side) | Run the privileged nemeses that `gen_177.sh` can't: **lazyfs** (un-fsynced write loss; needs `--device /dev/fuse --cap-add SYS_ADMIN`) on WAL + enc-WAL, and **clock-skew** (needs `libfaketime` via `LD_PRELOAD`). |
 | `check_177.sh` | `sqlocaml-jepsen-elle2` | Check every history (Clojure temporal + Elle SI), reporting VALID/INVALID and catching the negative controls. |
 | `detail_177.sh` | `sqlocaml-jepsen-elle2` | Dump full anomaly detail for the four counter/list-append histories that flag INVALID. |
+
+The `sqlocaml-jepsen` image (built from the root `Containerfile.jepsen`) carries
+the OCaml harness, lazyfs (+ its `libpcache`), and `libfaketime`.
 
 ## Usage
 
@@ -31,5 +35,11 @@ podman run --rm -v "$PWD":/workspace:z sqlocaml-jepsen-elle2 \
   `list_append_mem` is the known non-unique-append workload artifact (#180).
 - `counter_wal` / `counter_encwal` are expected INVALID until **#223** (WAL
   concurrent-`UPDATE` lost-update) is fixed; `counter_mem` is correct.
+- `set_wal_lazyfs` / `set_encwal_lazyfs` are VALID: acked elements survive
+  un-fsynced write loss (durability holds, including encrypted). The lazyfs
+  console lines `BEHAVE AS` / `terminate called…` are its benign SIGTERM
+  shutdown chatter, not a harness failure.
+- `list_append_clockskew` is VALID under a +5d skewed clock and carries one
+  recorded `clock-skew` nemesis marker.
 - `histories/` holds a committed reference run (main @ `e1fa6eb`, 2026-06-01).
-  Re-running `gen_177.sh` overwrites them.
+  Re-running `gen_177.sh` (+ `run_nemeses_fuse.sh`) overwrites them.
