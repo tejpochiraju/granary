@@ -209,6 +209,129 @@ module Sqlocaml : ENGINE = struct
   let close t = run (Db.close t.db)
 end
 
+(* ── reference C SQLite engine (in-process bindings) ──────────────────────── *)
+module Ref_sqlite : ENGINE = struct
+  type t = { db : Sqlite3.db }
+
+  let name = "sqlite"
+
+  let ok rc =
+    match rc with
+    | Sqlite3.Rc.OK | Sqlite3.Rc.DONE | Sqlite3.Rc.ROW -> ()
+    | r -> failwith ("sqlite3: " ^ Sqlite3.Rc.to_string r)
+
+  let exec t sql = ok (Sqlite3.exec t.db sql)
+
+  let open_db ~dir ~key =
+    (match key with
+    | Some _ ->
+      failwith "Ref_sqlite: encrypted reference not supported (no sqlcipher)"
+    | None -> ());
+    let path = Filename.concat dir "ref.db" in
+    (try Unix.unlink path with _ -> ());
+    let db = Sqlite3.db_open path in
+    let t = { db } in
+    (* parity: same page size + cache page count as sqlocaml; WAL like sqlocaml. *)
+    exec t "PRAGMA page_size=4096";
+    exec t (Printf.sprintf "PRAGMA cache_size=%d" page_cache);
+    exec t "PRAGMA journal_mode=WAL";
+    exec t "PRAGMA synchronous=FULL";
+    (* match sqlocaml's fsync-per-commit durability *)
+    t
+
+  let seed t ~rows =
+    exec t "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)";
+    exec t "BEGIN";
+    let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
+    for i = 0 to rows - 1 do
+      ok (Sqlite3.reset stmt);
+      ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int i));
+      ok (Sqlite3.bind_int64 stmt 2 (Int64.of_int (i * 7 mod rows)));
+      ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "payload-row-%d" i));
+      ok (Sqlite3.step stmt)
+    done;
+    ok (Sqlite3.finalize stmt);
+    exec t "COMMIT"
+
+  let drain stmt =
+    let n = ref 0 in
+    let rec loop () =
+      match Sqlite3.step stmt with
+      | Sqlite3.Rc.ROW ->
+        incr n;
+        loop ()
+      | Sqlite3.Rc.DONE -> ()
+      | r -> failwith ("sqlite3 step: " ^ Sqlite3.Rc.to_string r)
+    in
+    loop ();
+    !n
+
+  let w_point_lookup t ~keys =
+    let stmt = Sqlite3.prepare t.db "SELECT payload FROM t WHERE id = ?" in
+    Array.iter
+      (fun pk ->
+        ok (Sqlite3.reset stmt);
+        ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int pk));
+        ignore (drain stmt))
+      keys;
+    ok (Sqlite3.finalize stmt);
+    Array.length keys
+
+  let w_scan_agg t ~repeats =
+    let n = ref 0 in
+    for _ = 1 to repeats do
+      let stmt = Sqlite3.prepare t.db "SELECT COUNT(*), SUM(k) FROM t" in
+      n := !n + drain stmt;
+      ok (Sqlite3.finalize stmt)
+    done;
+    !n
+
+  let w_insert_one t ~n ~base =
+    let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
+    for i = 0 to n - 1 do
+      let id = base + i in
+      ok (Sqlite3.reset stmt);
+      ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int id));
+      ok (Sqlite3.bind_int64 stmt 2 (Int64.of_int id));
+      ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "ins-%d" id));
+      ok (Sqlite3.step stmt)
+    done;
+    ok (Sqlite3.finalize stmt);
+    n
+
+  let w_insert_batch t ~rows ~base =
+    exec t "BEGIN";
+    let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
+    for i = 0 to rows - 1 do
+      let id = base + i in
+      ok (Sqlite3.reset stmt);
+      ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int id));
+      ok (Sqlite3.bind_int64 stmt 2 (Int64.of_int id));
+      ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "batch-%d" id));
+      ok (Sqlite3.step stmt)
+    done;
+    ok (Sqlite3.finalize stmt);
+    exec t "COMMIT";
+    rows
+
+  let w_commit_n t ~n ~base =
+    let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
+    for i = 0 to n - 1 do
+      let id = base + i in
+      exec t "BEGIN";
+      ok (Sqlite3.reset stmt);
+      ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int id));
+      ok (Sqlite3.bind_int64 stmt 2 (Int64.of_int id));
+      ok (Sqlite3.bind_text stmt 3 (Printf.sprintf "commit-%d" id));
+      ok (Sqlite3.step stmt);
+      exec t "COMMIT"
+    done;
+    ok (Sqlite3.finalize stmt);
+    n
+
+  let close t = ignore (Sqlite3.db_close t.db)
+end
+
 (* ── timing harness ───────────────────────────────────────────────────────── *)
 type sample = { ops : int; wall : float; cpu : float }
 
@@ -284,5 +407,6 @@ let () =
   (* pin sqlocaml page cache for parity (SQLite mirrored in Ref_sqlite, Task 3) *)
   Unix.putenv "SQLOCAML_PAGE_CACHE" (string_of_int page_cache);
   print_string (csv_header ^ "\n");
+  run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
   run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
   run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))

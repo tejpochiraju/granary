@@ -411,6 +411,7 @@
   sqlocaml
   sqlocaml.store
   sqlocaml.unix
+  sqlite3
   alcotest
   lwt.unix
   unix
