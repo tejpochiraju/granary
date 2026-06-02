@@ -220,6 +220,27 @@ val cursor_next : cursor -> (bytes * bytes) option
     or [None] if the cursor is not positioned (exhausted or before first). *)
 val cursor_value : cursor -> bytes option
 
+(** A lazy, streaming forward cursor positioned by {!seek_ge}.  Unlike
+    {!cursor}, it does NOT materialise the whole tree: it descends the
+    B+-tree in O(log n) and reads only the entries the caller consumes.
+    Use for point/prefix probes (index lookups, UNIQUE/FK pre-checks)
+    where draining the full tree would be O(n) per probe (#228, #229). *)
+type seek_cursor
+
+(** Open a streaming cursor positioned at the first entry whose key is
+    [>= key], in O(log n).  Sees the same snapshot as {!get}/{!cursor_open}
+    on the same transaction (committed state + this txn's own writes for an
+    RW txn; the captured snapshot for an RO txn). *)
+val seek_ge : _ txn -> tree_id -> bytes -> seek_cursor Lwt.t
+
+(** Return the next [(key, value)] in ascending key order, or [None] when
+    exhausted.  The first call after {!seek_ge} returns the positioned entry
+    (the first with key [>=] the seek key), not the one after it. *)
+val seek_next : seek_cursor -> (bytes * bytes) option Lwt.t
+
+(** Release any resources held by a {!seek_cursor}. *)
+val seek_close : seek_cursor -> unit
+
 (** True if the store is operating in WAL mode (opened via
     [open_block_wal]). *)
 val wal_mode : t -> bool

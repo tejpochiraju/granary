@@ -1932,6 +1932,98 @@ let cursor_value c =
   | _ -> None
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Native streaming seek (#228, #229)                                   *)
+(*                                                                       *)
+(* The materialised [cursor] above drains the WHOLE tree at open time so *)
+(* it can offer a synchronous [cursor_seek]/[cursor_next] API.  For      *)
+(* point/prefix probes (index lookups, UNIQUE pre-checks, FK checks)     *)
+(* that O(n) drain dominates — it turns an O(log n) seek into a full     *)
+(* table scan, and an n-row bulk insert into O(n^2).  [seek_ge] instead  *)
+(* descends the B+-tree natively in O(log n) and streams matches lazily, *)
+(* never materialising more than the entries the caller actually reads.  *)
+(* Semantics match [cursor_open]+[cursor_seek]+[cursor_next]: the first  *)
+(* [seek_next] returns the first entry with key >= [key], then ascending.*)
+(* ------------------------------------------------------------------ *)
+type seek_cursor =
+  | SC_mem of (bytes * bytes) Seq.t ref
+  | SC_bt of Btree.cursor
+
+let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
+  fun tx tid key ->
+  match tx with
+  | Ro snap ->
+    (match snap.rs_store.backend with
+     | Mem _ ->
+       let map =
+         match snap.rs_mem_snap with
+         | Some snap -> mem_tree_snap snap tid
+         | None -> Bytes_map.empty
+       in
+       Lwt.return (SC_mem (ref (Bytes_map.to_seq_from key map)))
+     | Btree st ->
+       let* r = bt_get_tree_ro snap st tid in
+       let* bt = unwrap_error r in
+       let* co = Btree.cursor_open bt in
+       (match co with
+        | Error e ->
+          Lwt.fail_with
+            (Format.asprintf "Store.seek_ge(ro): %a" pp_error (map_btree_err e))
+        | Ok c ->
+          let* sr = Btree.cursor_seek c key in
+          (match sr with
+           | Error e ->
+             Lwt.fail_with
+               (Format.asprintf "Store.seek_ge(ro): %a" pp_error (map_btree_err e))
+           | Ok _ -> Lwt.return (SC_bt c))))
+  | Rw _ ->
+    let t = txn_store tx in
+    (match t.backend with
+     | Mem trees ->
+       let map =
+         match t.mem_rw_shadow with
+         | None -> !(mem_tree trees tid)
+         | Some shadow -> shadow_get shadow trees tid
+       in
+       Lwt.return (SC_mem (ref (Bytes_map.to_seq_from key map)))
+     | Btree st ->
+       let* r = bt_get_tree st tid in
+       let* bt = unwrap_error r in
+       let* co = Btree.cursor_open bt in
+       (match co with
+        | Error e ->
+          Lwt.fail_with (Format.asprintf "Store.seek_ge: %a" pp_error (map_btree_err e))
+        | Ok c ->
+          let* sr = Btree.cursor_seek c key in
+          (match sr with
+           | Error e ->
+             Lwt.fail_with
+               (Format.asprintf "Store.seek_ge: %a" pp_error (map_btree_err e))
+           | Ok _ -> Lwt.return (SC_bt c))))
+;;
+
+(* Return the next (key, value) >= the seek key in ascending order, or [None]
+   when exhausted.  The first call returns the positioned entry. *)
+let seek_next : seek_cursor -> (bytes * bytes) option Lwt.t = function
+  | SC_mem r ->
+    (match !r () with
+     | Seq.Nil -> Lwt.return_none
+     | Seq.Cons (kv, rest) ->
+       r := rest;
+       Lwt.return_some kv)
+  | SC_bt c ->
+    let* r = Btree.cursor_next c in
+    (match r with
+     | Ok kv -> Lwt.return kv
+     | Error e ->
+       Lwt.fail_with (Format.asprintf "Store.seek_next: %a" pp_error (map_btree_err e)))
+;;
+
+let seek_close : seek_cursor -> unit = function
+  | SC_mem _ -> ()
+  | SC_bt c -> Btree.cursor_close c
+;;
+
 let wal_mode t =
   match t.backend with
   | Mem _ -> false

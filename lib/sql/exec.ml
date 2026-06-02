@@ -2372,15 +2372,15 @@ let fk_child_has_ref_multi_in_tx
     let ivs = List.map row_value_to_index_value parent_vals in
     let prefix, plen = encode_index_key_prefix ivs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
-    let _sr = S.cursor_seek cur seek_key in
+    (* O(log n) native seek; stop at the first non-matching prefix (#228/#229). *)
+    let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
     let found = ref false in
     let exhausted = ref false in
     let rec walk () =
       if !found || !exhausted
       then Lwt.return_unit
       else (
-        match S.cursor_next cur with
+        match%lwt S.seek_next cur with
         | None ->
           exhausted := true;
           Lwt.return_unit
@@ -2409,7 +2409,7 @@ let fk_child_has_ref_multi_in_tx
             Lwt.return_unit))
     in
     let* () = walk () in
-    S.cursor_close cur;
+    S.seek_close cur;
     Lwt.return !found
   | _ ->
     full_scan_exists tx child_meta (fun row ->
@@ -2678,10 +2678,12 @@ let check_insert_unique
          in
          let prefix, plen = encode_index_key_prefix iks in
          let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-         let* cur = S.cursor_open tx idx.idx_tree_id in
-         let _ = S.cursor_seek cur seek_key in
+         (* O(log n) native probe: only the first entry >= seek_key is needed
+            to detect a duplicate prefix — never drain the whole index (#229). *)
+         let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+         let* first = S.seek_next cur in
          let conflict_rowid_opt =
-           match S.cursor_next cur with
+           match first with
            | None -> None
            | Some (ikey, _) ->
              if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
@@ -2690,7 +2692,7 @@ let check_insert_unique
                Some (Rowid.decode rid_bytes))
              else None
          in
-         S.cursor_close cur;
+         S.seek_close cur;
          match conflict_rowid_opt with
          | None -> Lwt.return (false, dels, upsert_rid)
          | Some old_rowid ->
@@ -3145,12 +3147,12 @@ let unique_violation_on_update
   in
   let plen = Bytes.length prefix in
   let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-  let* cur = S.cursor_open tx idx.idx_tree_id in
-  let _sr = S.cursor_seek cur seek_key in
+  (* O(log n) native seek; scan only the matching prefix range (#229). *)
+  let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
   (* Scan entries while the value prefix matches.  A different rowid
      with the same full value sequence is a UNIQUE violation. *)
   let rec scan () =
-    match S.cursor_next cur with
+    match%lwt S.seek_next cur with
     | None -> Lwt.return false
     | Some (ikey, _) ->
       if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
@@ -3167,7 +3169,7 @@ let unique_violation_on_update
       else Lwt.return false
   in
   let* result = scan () in
-  S.cursor_close cur;
+  S.seek_close cur;
   Lwt.return result
 ;;
 
@@ -3210,15 +3212,15 @@ let scan_child_rows_multi_tx
     let ivs = List.map row_value_to_index_value parent_vals in
     let prefix, plen = encode_index_key_prefix ivs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* cur = S.cursor_open tx idx.Cat.idx_tree_id in
-    let _sr = S.cursor_seek cur seek_key in
+    (* O(log n) native seek; scan only the matching prefix range (#228/#229). *)
+    let* cur = S.seek_ge tx idx.Cat.idx_tree_id seek_key in
     let buf = ref [] in
     let exhausted = ref false in
     let rec walk () =
       if !exhausted
       then Lwt.return_unit
       else (
-        match S.cursor_next cur with
+        match%lwt S.seek_next cur with
         | None ->
           exhausted := true;
           Lwt.return_unit
@@ -3244,7 +3246,7 @@ let scan_child_rows_multi_tx
             Lwt.return_unit))
     in
     let* () = walk () in
-    S.cursor_close cur;
+    S.seek_close cur;
     Lwt.return (List.rev !buf)
   | _ ->
     full_scan_collect tx child_meta (fun row ->
@@ -7343,71 +7345,78 @@ and stream_index_lookup
       lookup_val
       (table_meta : Cat.table_meta)
   =
-  let lookup_v =
-    let v = eval_expr clock params [||] lookup_val in
-    match v, col_type with
-    | Row.V_null, _ -> Index_key.IK_null
-    | Row.V_int n, Row.Integer -> Index_key.IK_int n
-    | Row.V_text s, Row.Text -> Index_key.IK_text s
-    | Row.V_real f, Row.Real -> Index_key.IK_real f
-    | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
-    | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *)
-  in
-  let prefix = Index_key.encode_value lookup_v in
-  let plen = Bytes.length prefix in
-  let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-  let* tx = S.ro_begin store in
-  let* cur = S.cursor_open tx idx_tree in
-  let _sr = S.cursor_seek cur seek_key in
-  let exhausted = ref false in
-  let ended = ref false in
-  let finish () =
-    if !ended
-    then Lwt.return_unit
-    else (
-      ended := true;
-      S.cursor_close cur;
-      S.ro_end tx)
-  in
-  let stream =
-    Lwt_stream.from (fun () ->
-      if !exhausted
-      then Lwt.return_none
-      else
-        Lwt.catch
-          (fun () ->
-             let rec next () =
-               match S.cursor_next cur with
-               | None ->
-                 exhausted := true;
-                 let%lwt () = finish () in
-                 Lwt.return_none
-               | Some (ikey, _ival) ->
-                 if
-                   Bytes.length ikey >= plen + 8
-                   && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-                 then (
-                   let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-                   let rowid = Rowid.decode rowid_bytes in
-                   let table_key = Rowid.encode rowid in
-                   let%lwt vrow = S.get tx table_tree table_key in
-                   match vrow with
-                   | None -> next ()
-                   | Some vbytes ->
-                     let row = decode_with_virtual clock params table_meta vbytes in
-                     Lwt.return_some row)
-                 else (
+  let v = eval_expr clock params [||] lookup_val in
+  (* [WHERE col = NULL] never matches (SQL three-valued logic).  A bound
+     parameter may be NULL at run time (#228: [col = ?] is now index-eligible);
+     return no rows rather than seeking the index's NULL entries. *)
+  match v with
+  | Row.V_null -> Lwt.return (Lwt_stream.of_list [])
+  | _ ->
+    let lookup_v =
+      match v, col_type with
+      | Row.V_null, _ -> Index_key.IK_null
+      | Row.V_int n, Row.Integer -> Index_key.IK_int n
+      | Row.V_text s, Row.Text -> Index_key.IK_text s
+      | Row.V_real f, Row.Real -> Index_key.IK_real f
+      | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
+      | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *)
+    in
+    let prefix = Index_key.encode_value lookup_v in
+    let plen = Bytes.length prefix in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    let* tx = S.ro_begin store in
+    (* O(log n) native seek + lazy streaming of just the matching prefix range,
+     instead of draining the entire index tree per lookup (#228). *)
+    let* cur = S.seek_ge tx idx_tree seek_key in
+    let exhausted = ref false in
+    let ended = ref false in
+    let finish () =
+      if !ended
+      then Lwt.return_unit
+      else (
+        ended := true;
+        S.seek_close cur;
+        S.ro_end tx)
+    in
+    let stream =
+      Lwt_stream.from (fun () ->
+        if !exhausted
+        then Lwt.return_none
+        else
+          Lwt.catch
+            (fun () ->
+               let rec next () =
+                 match%lwt S.seek_next cur with
+                 | None ->
                    exhausted := true;
                    let%lwt () = finish () in
-                   Lwt.return_none)
-             in
-             next ())
-          (fun exn ->
-             exhausted := true;
-             let%lwt () = finish () in
-             Lwt.fail exn))
-  in
-  Lwt.return stream
+                   Lwt.return_none
+                 | Some (ikey, _ival) ->
+                   if
+                     Bytes.length ikey >= plen + 8
+                     && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                   then (
+                     let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+                     let rowid = Rowid.decode rowid_bytes in
+                     let table_key = Rowid.encode rowid in
+                     let%lwt vrow = S.get tx table_tree table_key in
+                     match vrow with
+                     | None -> next ()
+                     | Some vbytes ->
+                       let row = decode_with_virtual clock params table_meta vbytes in
+                       Lwt.return_some row)
+                   else (
+                     exhausted := true;
+                     let%lwt () = finish () in
+                     Lwt.return_none)
+               in
+               next ())
+            (fun exn ->
+               exhausted := true;
+               let%lwt () = finish () in
+               Lwt.fail exn))
+    in
+    Lwt.return stream
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)
@@ -7435,11 +7444,12 @@ and nlj_probe_left
     let prefix = Index_key.encode_value ik_value in
     let plen = Bytes.length prefix in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* cur = S.cursor_open tx idx_tree in
-    let _sr = S.cursor_seek cur seek_key in
+    (* O(log n) native seek per probe — avoids draining the whole index per
+       left row, which made indexed nested-loop joins O(n^2) (#228/#229). *)
+    let* cur = S.seek_ge tx idx_tree seek_key in
     let found = ref false in
     let rec scan () =
-      match S.cursor_next cur with
+      match%lwt S.seek_next cur with
       | None -> Lwt.return_unit
       | Some (ikey, _) ->
         if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
@@ -7458,7 +7468,7 @@ and nlj_probe_left
         else Lwt.return_unit
     in
     let* () = scan () in
-    S.cursor_close cur;
+    S.seek_close cur;
     (match join_kind with
      | `Left when not !found ->
        out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out

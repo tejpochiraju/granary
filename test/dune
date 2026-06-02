@@ -336,6 +336,10 @@
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
+ (name test_insert_scaling)
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
+
+(test
  (name test_attach)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 

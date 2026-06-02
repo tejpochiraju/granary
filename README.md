@@ -50,6 +50,24 @@ both sides, WAL, fsync-per-commit, matched page cache), run on two hosts — an 
 [docs/benchmarks/2026-06-02-bench-222-results.md](docs/benchmarks/2026-06-02-bench-222-results.md)
 (also on the [wiki](https://git.iotready.com/tej/sqlite_ocaml_port/wiki/Benchmarks)).
 
+> **Performance update (2026-06-02) — #228 / #229 fixed.** The two
+> *complexity* bugs called out below are resolved:
+> - **Point lookup `WHERE pk=?`** is now an **O(log n) B-tree seek** (was an
+>   O(n) full table scan). Per-op time is flat across table size and ~**120–280×**
+>   SQLite — down from ~**7,700×**.
+> - **Bulk insert** is now **O(n)** (was **O(n²)**): per-row time is flat
+>   (~1.3 ms/row from 1k to 8k rows) instead of doubling with each table
+>   doubling, so seeding no longer falls off a cliff.
+>
+> The root cause was **not** the B-tree leaf-walk the profiling first suspected
+> (the tree fans out fine) but three layers above it: a Store cursor that
+> drained the *whole* tree into a list per probe, a query planner that didn't
+> lower `col = ?` (a bound parameter) to an index seek, and an O(n) freelist
+> scan on every page allocation. See [[Profiling]] / the
+> [results doc](docs/benchmarks/2026-06-02-profiling.md) for the corrected
+> analysis. The remaining **constant-factor** gap (~200–800× vs SQLite) is the
+> next target (#230 / #231). The tables below are the **pre-fix** #222 baseline.
+
 **These are honest, early numbers.** sqlocaml is a young pure-OCaml engine and is currently far
 slower than C SQLite, especially on reads:
 
@@ -64,11 +82,12 @@ AES-256-GCM encryption-at-rest adds **~2× (≈ +100%)** to the read path; write
 affected.
 
 **Verdict (gating the read-side multicore epic #156):** the read path is **CPU-bound**
-(`cpu/wall ≈ 1.0` on both disks), writes are **fsync/I-O-bound**. A point lookup currently costs
-as much as a full table scan — the `WHERE pk=?` predicate is not lowered to a B-tree seek — so
-the highest-leverage next step is fixing that single-threaded O(n) read path (worth ~40–90× at
-this scale and more as data grows, filed as #228), *before* multicore. #156 stays deferred until
-then. See the results doc for the full analysis.
+(`cpu/wall ≈ 1.0` on both disks), writes are **fsync/I-O-bound**. In this baseline a point
+lookup cost as much as a full table scan — the `WHERE pk=?` predicate was not lowered to a B-tree
+seek. **That single-threaded O(n) read path (and the O(n²) insert path) is now fixed** — see the
+performance update above — which was the highest-leverage step *before* multicore. #156 stays
+deferred until the constant factor is brought down (#230). See the results doc for the full
+analysis.
 
 Reproduce: `scripts/bench222.sh` (builds the bench image and runs the suite; cross-host steps in
 the results doc).
