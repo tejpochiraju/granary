@@ -196,22 +196,36 @@ module Sqlocaml : ENGINE = struct
     !n
   ;;
 
+  (* Prepare once, bind+run per row — same shape as the SQLite reference, so the
+     comparison isolates engine cost rather than sqlocaml's re-parse/re-plan. *)
+  let insert_sql = "INSERT INTO t (id, k, payload) VALUES (?, ?, ?)"
+
+  let run_insert stmt ~id ~tag =
+    let open Lwt.Syntax in
+    let* _ =
+      Lwt.map
+        unwrap
+        (Db.run
+           stmt
+           ~params:
+             [ Db.V_int (Int64.of_int id)
+             ; Db.V_int (Int64.of_int id)
+             ; Db.V_text (Printf.sprintf "%s-%d" tag id)
+             ])
+    in
+    Lwt.return_unit
+  ;;
+
   let w_insert_one t ~n ~base =
     run
       (let open Lwt.Syntax in
+       let* stmt = Lwt.map unwrap (Db.prepare t.db insert_sql) in
        let* () =
          Lwt_list.iter_s
-           (fun i ->
-              let id = base + i in
-              exec_lwt
-                t.db
-                (Printf.sprintf
-                   "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'ins-%d')"
-                   id
-                   id
-                   id))
+           (fun i -> run_insert stmt ~id:(base + i) ~tag:"ins")
            (List.init n Fun.id)
        in
+       let* () = Db.finalize stmt in
        Lwt.return n)
   ;;
 
@@ -219,19 +233,13 @@ module Sqlocaml : ENGINE = struct
     run
       (let open Lwt.Syntax in
        let* () = exec_lwt t.db "BEGIN" in
+       let* stmt = Lwt.map unwrap (Db.prepare t.db insert_sql) in
        let* () =
          Lwt_list.iter_s
-           (fun i ->
-              let id = base + i in
-              exec_lwt
-                t.db
-                (Printf.sprintf
-                   "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'batch-%d')"
-                   id
-                   id
-                   id))
+           (fun i -> run_insert stmt ~id:(base + i) ~tag:"batch")
            (List.init rows Fun.id)
        in
+       let* () = Db.finalize stmt in
        let* () = exec_lwt t.db "COMMIT" in
        Lwt.return rows)
   ;;
@@ -239,23 +247,16 @@ module Sqlocaml : ENGINE = struct
   let w_commit_n t ~n ~base =
     run
       (let open Lwt.Syntax in
+       let* stmt = Lwt.map unwrap (Db.prepare t.db insert_sql) in
        let* () =
          Lwt_list.iter_s
            (fun i ->
-              let id = base + i in
               let* () = exec_lwt t.db "BEGIN" in
-              let* () =
-                exec_lwt
-                  t.db
-                  (Printf.sprintf
-                     "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'commit-%d')"
-                     id
-                     id
-                     id)
-              in
+              let* () = run_insert stmt ~id:(base + i) ~tag:"commit" in
               exec_lwt t.db "COMMIT")
            (List.init n Fun.id)
        in
+       let* () = Db.finalize stmt in
        Lwt.return n)
   ;;
 
