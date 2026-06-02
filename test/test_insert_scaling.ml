@@ -142,24 +142,42 @@ let test_insert_not_quadratic () =
       (second /. first < 2.5))
 ;;
 
+(* Time [reps] executions of [sql] (each drained to completion); return the
+   mean wall-clock per execution in seconds. *)
+let time_query db sql ~reps =
+  let t0 = now () in
+  run
+    (let open Lwt.Syntax in
+     let rec loop i =
+       if i >= reps
+       then Lwt.return_unit
+       else
+         let* s = Lwt.map unwrap (Db.query db sql) in
+         let* _ = Lwt_stream.to_list s in
+         loop (i + 1)
+     in
+     loop 0);
+  (now () -. t0) /. float_of_int reps
+;;
+
 let test_point_lookup_fast () =
   with_db (fun db ->
     run (exec_lwt db "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)");
     let total = 6000 in
     bulk_insert db ~total;
-    (* Correctness + speed: every probed row returns its exact payload, and a
-       batch of point lookups across a 6k-row table is far cheaper than a scan. *)
+    (* Correctness: a parameterised point lookup (the prepared-statement path
+       #228 fixed) returns each probed row's exact payload. *)
     let m = 300 in
     let t0 = now () in
     run
       (let open Lwt.Syntax in
+       let* stmt = Lwt.map unwrap (Db.prepare db "SELECT payload FROM t WHERE id = ?") in
        let rec loop i =
          if i >= m
          then Lwt.return_unit
          else (
            let k = i * 2654435761 mod total in
-           let sql = Printf.sprintf "SELECT payload FROM t WHERE id = %d" k in
-           let* s = Lwt.map unwrap (Db.query db sql) in
+           let* s = Lwt.map unwrap (Db.iter stmt ~params:[ Db.V_int (Int64.of_int k) ]) in
            let* rows = Lwt_stream.to_list s in
            (match rows with
             | [ [| Db.V_text p |] ] ->
@@ -170,19 +188,26 @@ let test_point_lookup_fast () =
             | _ -> Alcotest.failf "lookup id=%d returned %d rows" k (List.length rows));
            loop (i + 1))
        in
-       loop 0);
-    let per_op_ms = (now () -. t0) *. 1000. /. float_of_int m in
+       let* () = loop 0 in
+       Db.finalize stmt);
+    let lookup_s = (now () -. t0) /. float_of_int m in
+    (* Speed, machine-independently (#228: "point-lookup time << full-scan
+       time"): compare the lookup against a genuine full-table aggregate scan of
+       the SAME table.  An O(log n) seek touches a handful of pages; an O(n)
+       scan touches all 6000 rows.  If the lookup regressed to a scan the ratio
+       collapses to ~1.  Require the seek to be at least 4x cheaper — the real
+       ratio is ~15-50x, so this is a wide margin with no absolute threshold. *)
+    let scan_s = time_query db "SELECT COUNT(*), SUM(k) FROM t" ~reps:20 in
+    let ratio = scan_s /. lookup_s in
     Printf.eprintf
-      "SCALING: point lookup %.3f ms/op over %d-row table\n%!"
-      per_op_ms
-      total;
-    (* A full scan of 6k rows costs well over 1 ms; an O(log n) seek is a tiny
-       fraction.  Assert < 2 ms/op — orders of magnitude above the ~0.3 ms we
-       observe, but far below the O(n) scan cost. *)
+      "SCALING: point lookup %.3f ms/op vs full scan %.3f ms/op = %.1fx cheaper\n%!"
+      (lookup_s *. 1000.)
+      (scan_s *. 1000.)
+      ratio;
     Alcotest.(check bool)
-      (Printf.sprintf "point lookup %.3f ms/op < 2.0" per_op_ms)
+      (Printf.sprintf "point lookup >=4x cheaper than full scan (got %.1fx)" ratio)
       true
-      (per_op_ms < 2.0))
+      (ratio >= 4.0))
 ;;
 
 let () =
