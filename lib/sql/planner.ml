@@ -64,19 +64,26 @@ let rec plan_expr = function
   | Sema.BE_collate (be, c) -> Plan.P_collate (plan_expr be, c)
 ;;
 
-(** Try to recognise an equality predicate of the form
-    [col = lit] (or [lit = col]) at the top level of the WHERE clause.
-    Returns [Some (col_idx, lit_expr)] if matched, [None] otherwise.
-    [col = NULL] is intentionally NOT matched here because the SQL
-    semantics for [WHERE col = NULL] are "never matches" — falling back
-    to [Op_filter] (which short-circuits on NULL) gives correct
-    behaviour. *)
+(** Try to recognise an equality predicate of the form [col = v] (or
+    [v = col]) where [v] is a literal or a bound parameter, at the top level
+    of the WHERE clause.  Returns [Some (col_idx, value_expr)] if matched,
+    [None] otherwise.
+
+    A literal [col = NULL] is intentionally NOT matched: [WHERE col = NULL]
+    "never matches", and falling back to [Op_filter] (which short-circuits on
+    NULL) gives correct behaviour.  A bound parameter ([col = ?]) IS matched —
+    this is the common prepared-statement point lookup (#228) — but because the
+    bound value is unknown at plan time and may be NULL at run time,
+    [Op_index_lookup] execution must return no rows when the value evaluates to
+    NULL (see [stream_index_lookup]). *)
 let recognise_eq_col_lit = function
   | Sema.BE_binop (Sema.Eq, Sema.BE_col i, (Sema.BE_lit l as e))
   | Sema.BE_binop (Sema.Eq, (Sema.BE_lit l as e), Sema.BE_col i) ->
     (match l with
      | Ast.L_null -> None
      | _ -> Some (i, e))
+  | Sema.BE_binop (Sema.Eq, Sema.BE_col i, (Sema.BE_param _ as e))
+  | Sema.BE_binop (Sema.Eq, (Sema.BE_param _ as e), Sema.BE_col i) -> Some (i, e)
   | _ -> None
 ;;
 
