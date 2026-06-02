@@ -29,10 +29,6 @@ podman run --rm -v "$PWD":/workspace:z sqlocaml-jepsen-elle2 \
 - The runtime container user can't write the mounted tree or its own
   `~/.clojure`, so `check_177.sh` copies the Clojure project into `/tmp` and
   uses `HOME=/tmp/clj-home` for the dep cache (`clojure -P` once, then check).
-- The pure-Clojure **temporal** checker flags benign `:dirty-read`s on WAL
-  list-append (`:ok`-timestamp inversion under concurrent fibers); **Elle SI**
-  is authoritative and reports VALID. Elle's `:duplicate-elements` on
-  `list_append_mem` is the known non-unique-append workload artifact (#180).
 - `counter_mem` / `counter_wal` / `counter_encwal` are all VALID since the WAL
   concurrent-`UPDATE` lost-update (**#223**) was fixed (PR #225): final value
   equals the acked increment count on every backend.

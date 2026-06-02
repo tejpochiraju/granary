@@ -437,9 +437,14 @@ let () =
   let key = ref "" in
   (* Accept a 32-byte raw key or a 64-char hex string; AES-256 needs 32 bytes. *)
   let decode_key s =
+    let is_hex c =
+      (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+    in
     match String.length s with
     | 32 -> s
     | 64 ->
+      if not (String.for_all is_hex s)
+      then failwith "--key of length 64 must be hex (0-9a-fA-F)";
       let buf = Bytes.create 32 in
       for i = 0 to 31 do
         Bytes.set buf i (Char.chr (int_of_string ("0x" ^ String.sub s (i * 2) 2)))
