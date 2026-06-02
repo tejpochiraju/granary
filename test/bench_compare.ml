@@ -26,8 +26,11 @@ let run = Lwt_main.run
 
 let env_int key default =
   match Sys.getenv_opt key with
-  | Some s -> ( try int_of_string s with _ -> default)
+  | Some s ->
+    (try int_of_string s with
+     | _ -> default)
   | None -> default
+;;
 
 let rows_n = env_int "SQLOCAML_BENCH_ROWS" 10000
 let ops_n = env_int "SQLOCAML_BENCH_OPS" 5000
@@ -39,7 +42,10 @@ let page_cache = env_int "SQLOCAML_BENCH_PAGE_CACHE" 1024
 let host_label =
   match Sys.getenv_opt "SQLOCAML_BENCH_HOST" with
   | Some h when h <> "" -> h
-  | _ -> ( try Unix.gethostname () with _ -> "unknown")
+  | _ ->
+    (try Unix.gethostname () with
+     | _ -> "unknown")
+;;
 
 (* Deterministic pk sequence for point lookups — no wall-clock/random seed so
    both engines hit the SAME keys in the SAME order. Simple LCG mod rows. *)
@@ -51,6 +57,7 @@ let lookup_keys ~rows ~n =
     a.(i) <- !x mod rows
   done;
   a
+;;
 
 (* ── Common engine interface (synchronous from the harness's view) ────────── *)
 module type ENGINE = sig
@@ -69,6 +76,7 @@ module type ENGINE = sig
   val w_insert_one : t -> n:int -> base:int -> int (* n autocommit inserts *)
   val w_insert_batch : t -> rows:int -> base:int -> int (* one txn of [rows] inserts *)
   val w_commit_n : t -> n:int -> base:int -> int (* n single-row txns (fsync each) *)
+  val fingerprint : t -> string (* canonical table digest for cross-engine equality *)
   val close : t -> unit
 end
 
@@ -83,20 +91,24 @@ module Sqlocaml : ENGINE = struct
   let unwrap = function
     | Ok v -> v
     | Error e -> Alcotest.failf "sqlocaml: %a" Db.pp_error e
+  ;;
 
   let open_db ~dir ~key =
     let path = Filename.concat dir "bench.db" in
-    (try Unix.unlink path with _ -> ());
-    (try Unix.unlink (path ^ "-wal") with _ -> ());
+    (try Unix.unlink path with
+     | _ -> ());
+    (try Unix.unlink (path ^ "-wal") with
+     | _ -> ());
     let db =
       match key with
       | None -> unwrap (run (Sqlocaml_unix.open_file_wal ~path ()))
-      | Some k -> (
-        match run (Sqlocaml_unix.Store.open_file_wal ~key:k ~path ()) with
-        | Error _ -> Alcotest.fail "sqlocaml: encrypted open failed"
-        | Ok store -> run (Db.of_store ~file_path:path store))
+      | Some k ->
+        (match run (Sqlocaml_unix.Store.open_file_wal ~key:k ~path ()) with
+         | Error _ -> Alcotest.fail "sqlocaml: encrypted open failed"
+         | Ok store -> run (Db.of_store ~file_path:path store))
     in
     { db }
+  ;;
 
   let exec t sql = ignore (unwrap (run (Db.execute t.db sql)))
 
@@ -109,17 +121,47 @@ module Sqlocaml : ENGINE = struct
     match r with
     | Ok () -> Lwt.return_unit
     | Error e -> Alcotest.failf "sqlocaml: %a" Db.pp_error e
+  ;;
 
   let seed t ~rows =
     exec t "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)";
     exec t "BEGIN";
     for i = 0 to rows - 1 do
-      exec t
+      exec
+        t
         (Printf.sprintf
-           "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'payload-row-%d')" i
-           (i * 7 mod rows) i)
+           "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'payload-row-%d')"
+           i
+           (i * 7 mod rows)
+           i)
     done;
     exec t "COMMIT"
+  ;;
+
+  let scalar_str t sql =
+    run
+      (let open Lwt.Syntax in
+       let* s = Lwt.map unwrap (Db.query t.db sql) in
+       let* rows = Lwt_stream.to_list s in
+       match rows with
+       | r :: _ when Array.length r > 0 ->
+         Lwt.return
+           (match r.(0) with
+            | Db.V_int i -> Int64.to_string i
+            | Db.V_text s -> s
+            | Db.V_null -> "NULL"
+            | Db.V_real f -> Printf.sprintf "%.0f" f
+            | Db.V_blob _ -> "<blob>")
+       | _ -> Lwt.return "NULL")
+  ;;
+
+  let fingerprint t =
+    Printf.sprintf
+      "count=%s sum=%s p0=%s"
+      (scalar_str t "SELECT COUNT(*) FROM t")
+      (scalar_str t "SELECT SUM(k) FROM t")
+      (scalar_str t "SELECT payload FROM t WHERE id = 0")
+  ;;
 
   let w_point_lookup t ~keys =
     run
@@ -130,30 +172,29 @@ module Sqlocaml : ENGINE = struct
        let* () =
          Lwt_list.iter_s
            (fun pk ->
-             let* stream =
-               Lwt.map unwrap
-                 (Db.iter stmt ~params:[ Db.V_int (Int64.of_int pk) ])
-             in
-             let* _ = Lwt_stream.to_list stream in
-             Lwt.return_unit)
+              let* stream =
+                Lwt.map unwrap (Db.iter stmt ~params:[ Db.V_int (Int64.of_int pk) ])
+              in
+              let* _ = Lwt_stream.to_list stream in
+              Lwt.return_unit)
            (Array.to_list keys)
        in
        let* () = Db.finalize stmt in
        Lwt.return (Array.length keys))
+  ;;
 
   let w_scan_agg t ~repeats =
     let n = ref 0 in
     for _ = 1 to repeats do
       run
         (let open Lwt.Syntax in
-         let* stream =
-           Lwt.map unwrap (Db.query t.db "SELECT COUNT(*), SUM(k) FROM t")
-         in
+         let* stream = Lwt.map unwrap (Db.query t.db "SELECT COUNT(*), SUM(k) FROM t") in
          let* rows = Lwt_stream.to_list stream in
          n := !n + List.length rows;
          Lwt.return_unit)
     done;
     !n
+  ;;
 
   let w_insert_one t ~n ~base =
     run
@@ -161,14 +202,18 @@ module Sqlocaml : ENGINE = struct
        let* () =
          Lwt_list.iter_s
            (fun i ->
-             let id = base + i in
-             exec_lwt t.db
-               (Printf.sprintf
-                  "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'ins-%d')" id id
-                  id))
+              let id = base + i in
+              exec_lwt
+                t.db
+                (Printf.sprintf
+                   "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'ins-%d')"
+                   id
+                   id
+                   id))
            (List.init n Fun.id)
        in
        Lwt.return n)
+  ;;
 
   let w_insert_batch t ~rows ~base =
     run
@@ -177,15 +222,19 @@ module Sqlocaml : ENGINE = struct
        let* () =
          Lwt_list.iter_s
            (fun i ->
-             let id = base + i in
-             exec_lwt t.db
-               (Printf.sprintf
-                  "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'batch-%d')" id
-                  id id))
+              let id = base + i in
+              exec_lwt
+                t.db
+                (Printf.sprintf
+                   "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'batch-%d')"
+                   id
+                   id
+                   id))
            (List.init rows Fun.id)
        in
        let* () = exec_lwt t.db "COMMIT" in
        Lwt.return rows)
+  ;;
 
   let w_commit_n t ~n ~base =
     run
@@ -193,18 +242,22 @@ module Sqlocaml : ENGINE = struct
        let* () =
          Lwt_list.iter_s
            (fun i ->
-             let id = base + i in
-             let* () = exec_lwt t.db "BEGIN" in
-             let* () =
-               exec_lwt t.db
-                 (Printf.sprintf
-                    "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'commit-%d')"
-                    id id id)
-             in
-             exec_lwt t.db "COMMIT")
+              let id = base + i in
+              let* () = exec_lwt t.db "BEGIN" in
+              let* () =
+                exec_lwt
+                  t.db
+                  (Printf.sprintf
+                     "INSERT INTO t (id, k, payload) VALUES (%d, %d, 'commit-%d')"
+                     id
+                     id
+                     id)
+              in
+              exec_lwt t.db "COMMIT")
            (List.init n Fun.id)
        in
        Lwt.return n)
+  ;;
 
   let close t = run (Db.close t.db)
 end
@@ -219,16 +272,17 @@ module Ref_sqlite : ENGINE = struct
     match rc with
     | Sqlite3.Rc.OK | Sqlite3.Rc.DONE | Sqlite3.Rc.ROW -> ()
     | r -> failwith ("sqlite3: " ^ Sqlite3.Rc.to_string r)
+  ;;
 
   let exec t sql = ok (Sqlite3.exec t.db sql)
 
   let open_db ~dir ~key =
     (match key with
-    | Some _ ->
-      failwith "Ref_sqlite: encrypted reference not supported (no sqlcipher)"
-    | None -> ());
+     | Some _ -> failwith "Ref_sqlite: encrypted reference not supported (no sqlcipher)"
+     | None -> ());
     let path = Filename.concat dir "ref.db" in
-    (try Unix.unlink path with _ -> ());
+    (try Unix.unlink path with
+     | _ -> ());
     let db = Sqlite3.db_open path in
     let t = { db } in
     (* parity: same page size + cache page count as sqlocaml; WAL like sqlocaml. *)
@@ -238,6 +292,7 @@ module Ref_sqlite : ENGINE = struct
     exec t "PRAGMA synchronous=FULL";
     (* match sqlocaml's fsync-per-commit durability *)
     t
+  ;;
 
   let seed t ~rows =
     exec t "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, payload TEXT)";
@@ -252,6 +307,7 @@ module Ref_sqlite : ENGINE = struct
     done;
     ok (Sqlite3.finalize stmt);
     exec t "COMMIT"
+  ;;
 
   let drain stmt =
     let n = ref 0 in
@@ -265,17 +321,19 @@ module Ref_sqlite : ENGINE = struct
     in
     loop ();
     !n
+  ;;
 
   let w_point_lookup t ~keys =
     let stmt = Sqlite3.prepare t.db "SELECT payload FROM t WHERE id = ?" in
     Array.iter
       (fun pk ->
-        ok (Sqlite3.reset stmt);
-        ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int pk));
-        ignore (drain stmt))
+         ok (Sqlite3.reset stmt);
+         ok (Sqlite3.bind_int64 stmt 1 (Int64.of_int pk));
+         ignore (drain stmt))
       keys;
     ok (Sqlite3.finalize stmt);
     Array.length keys
+  ;;
 
   let w_scan_agg t ~repeats =
     let n = ref 0 in
@@ -285,6 +343,7 @@ module Ref_sqlite : ENGINE = struct
       ok (Sqlite3.finalize stmt)
     done;
     !n
+  ;;
 
   let w_insert_one t ~n ~base =
     let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
@@ -298,6 +357,7 @@ module Ref_sqlite : ENGINE = struct
     done;
     ok (Sqlite3.finalize stmt);
     n
+  ;;
 
   let w_insert_batch t ~rows ~base =
     exec t "BEGIN";
@@ -313,6 +373,7 @@ module Ref_sqlite : ENGINE = struct
     ok (Sqlite3.finalize stmt);
     exec t "COMMIT";
     rows
+  ;;
 
   let w_commit_n t ~n ~base =
     let stmt = Sqlite3.prepare t.db "INSERT INTO t (id,k,payload) VALUES (?,?,?)" in
@@ -328,16 +389,44 @@ module Ref_sqlite : ENGINE = struct
     done;
     ok (Sqlite3.finalize stmt);
     n
+  ;;
+
+  let scalar_str t sql =
+    let stmt = Sqlite3.prepare t.db sql in
+    let v =
+      match Sqlite3.step stmt with
+      | Sqlite3.Rc.ROW ->
+        (match Sqlite3.column stmt 0 with
+         | Sqlite3.Data.NULL -> "NULL"
+         | d -> Sqlite3.Data.to_string_coerce d)
+      | _ -> "NULL"
+    in
+    ok (Sqlite3.finalize stmt);
+    v
+  ;;
+
+  let fingerprint t =
+    Printf.sprintf
+      "count=%s sum=%s p0=%s"
+      (scalar_str t "SELECT COUNT(*) FROM t")
+      (scalar_str t "SELECT SUM(k) FROM t")
+      (scalar_str t "SELECT payload FROM t WHERE id = 0")
+  ;;
 
   let close t = ignore (Sqlite3.db_close t.db)
 end
 
 (* ── timing harness ───────────────────────────────────────────────────────── *)
-type sample = { ops : int; wall : float; cpu : float }
+type sample =
+  { ops : int
+  ; wall : float
+  ; cpu : float
+  }
 
 let cpu_now () =
   let tm = Unix.times () in
   tm.Unix.tms_utime +. tm.Unix.tms_stime
+;;
 
 (* [warmup]: run [f] once (discarded) before timing.  Disabled for the
    single-shot write workloads, whose fixed id range would otherwise be
@@ -346,7 +435,8 @@ let measure ?(warmup = true) ~repeats (f : unit -> int) : sample =
   if warmup then ignore (f ());
   let best = ref None in
   for _ = 1 to repeats do
-    let c0 = cpu_now () and t0 = Unix.gettimeofday () in
+    let c0 = cpu_now ()
+    and t0 = Unix.gettimeofday () in
     let ops = f () in
     let wall = Unix.gettimeofday () -. t0 in
     let cpu = cpu_now () -. c0 in
@@ -355,17 +445,32 @@ let measure ?(warmup = true) ~repeats (f : unit -> int) : sample =
     | Some b when b.wall <= wall -> ()
     | _ -> best := Some s
   done;
-  match !best with Some s -> s | None -> { ops = 0; wall = 0.; cpu = 0. }
+  match !best with
+  | Some s -> s
+  | None -> { ops = 0; wall = 0.; cpu = 0. }
+;;
 
 (* ── CSV emission ─────────────────────────────────────────────────────────── *)
 let csv_header =
   "host,engine,workload,variant,rows,ops,wall_s,cpu_s,cpu_wall_ratio,ops_per_s"
+;;
 
 let emit_row ~engine ~workload ~variant ~rows (s : sample) =
   let ratio = if s.wall > 0. then s.cpu /. s.wall else 0. in
   let ops_s = if s.wall > 0. then float_of_int s.ops /. s.wall else 0. in
-  Printf.printf "%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.3f,%.1f\n%!" host_label engine
-    workload variant rows s.ops s.wall s.cpu ratio ops_s
+  Printf.printf
+    "%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.3f,%.1f\n%!"
+    host_label
+    engine
+    workload
+    variant
+    rows
+    s.ops
+    s.wall
+    s.cpu
+    ratio
+    ops_s
+;;
 
 (* ── workload driver for one engine ───────────────────────────────────────── *)
 let run_engine (module E : ENGINE) ~variant ~key =
@@ -374,30 +479,83 @@ let run_engine (module E : ENGINE) ~variant ~key =
   Unix.mkdir dir 0o755;
   let cleanup () =
     Array.iter
-      (fun f -> try Sys.remove (Filename.concat dir f) with _ -> ())
-      (try Sys.readdir dir with _ -> [||]);
-    try Unix.rmdir dir with _ -> ()
+      (fun f ->
+         try Sys.remove (Filename.concat dir f) with
+         | _ -> ())
+      (try Sys.readdir dir with
+       | _ -> [||]);
+    try Unix.rmdir dir with
+    | _ -> ()
   in
   Fun.protect ~finally:cleanup (fun () ->
-      let t = E.open_db ~dir ~key in
-      E.seed t ~rows:rows_n;
-      let keys = lookup_keys ~rows:rows_n ~n:ops_n in
-      emit_row ~engine:E.name ~workload:"point_lookup" ~variant ~rows:rows_n
-        (measure ~repeats:repeats_n (fun () -> E.w_point_lookup t ~keys));
-      emit_row ~engine:E.name ~workload:"scan_agg" ~variant ~rows:rows_n
-        (measure ~repeats:repeats_n (fun () -> E.w_scan_agg t ~repeats:scans_n));
-      (* write workloads use disjoint id ranges per repeat to avoid PK clashes;
+    let t = E.open_db ~dir ~key in
+    E.seed t ~rows:rows_n;
+    let keys = lookup_keys ~rows:rows_n ~n:ops_n in
+    emit_row
+      ~engine:E.name
+      ~workload:"point_lookup"
+      ~variant
+      ~rows:rows_n
+      (measure ~repeats:repeats_n (fun () -> E.w_point_lookup t ~keys));
+    emit_row
+      ~engine:E.name
+      ~workload:"scan_agg"
+      ~variant
+      ~rows:rows_n
+      (measure ~repeats:repeats_n (fun () -> E.w_scan_agg t ~repeats:scans_n));
+    (* write workloads use disjoint id ranges per repeat to avoid PK clashes;
          measured single-shot (repeats=1) since they mutate state. *)
-      emit_row ~engine:E.name ~workload:"insert_one" ~variant ~rows:ops_n
-        (measure ~warmup:false ~repeats:1 (fun () ->
-             E.w_insert_one t ~n:ops_n ~base:rows_n));
-      emit_row ~engine:E.name ~workload:"insert_batch" ~variant ~rows:rows_n
-        (measure ~warmup:false ~repeats:1 (fun () ->
-             E.w_insert_batch t ~rows:rows_n ~base:(rows_n + ops_n)));
-      emit_row ~engine:E.name ~workload:"commit_n" ~variant ~rows:commits_n
-        (measure ~warmup:false ~repeats:1 (fun () ->
-             E.w_commit_n t ~n:commits_n ~base:((2 * rows_n) + ops_n)));
-      E.close t)
+    emit_row
+      ~engine:E.name
+      ~workload:"insert_one"
+      ~variant
+      ~rows:ops_n
+      (measure ~warmup:false ~repeats:1 (fun () -> E.w_insert_one t ~n:ops_n ~base:rows_n));
+    emit_row
+      ~engine:E.name
+      ~workload:"insert_batch"
+      ~variant
+      ~rows:rows_n
+      (measure ~warmup:false ~repeats:1 (fun () ->
+         E.w_insert_batch t ~rows:rows_n ~base:(rows_n + ops_n)));
+    emit_row
+      ~engine:E.name
+      ~workload:"commit_n"
+      ~variant
+      ~rows:commits_n
+      (measure ~warmup:false ~repeats:1 (fun () ->
+         E.w_commit_n t ~n:commits_n ~base:((2 * rows_n) + ops_n)));
+    E.close t)
+;;
+
+(* ── cross-engine correctness smoke check (SQLOCAML_BENCH_SMOKE=1) ─────────── *)
+let smoke () =
+  let mk (module E : ENGINE) =
+    let dir = Filename.temp_file "bench222smoke-" "" in
+    Sys.remove dir;
+    Unix.mkdir dir 0o755;
+    let t = E.open_db ~dir ~key:None in
+    E.seed t ~rows:100;
+    let fp = E.fingerprint t in
+    E.close t;
+    E.name, fp
+  in
+  let _, a = mk (module Sqlocaml) in
+  let _, b = mk (module Ref_sqlite) in
+  if a <> b
+  then (
+    Printf.eprintf "SMOKE FAIL: sqlocaml=[%s] sqlite=[%s]\n%!" a b;
+    exit 1);
+  let cols = String.split_on_char ',' csv_header in
+  if List.length cols <> 10
+  then (
+    Printf.eprintf "SMOKE FAIL: csv header has %d cols\n%!" (List.length cols);
+    exit 1);
+  Printf.eprintf
+    "SMOKE OK: engines agree [%s]; csv header %d cols\n%!"
+    a
+    (List.length cols)
+;;
 
 (* ── main ─────────────────────────────────────────────────────────────────── *)
 let () =
@@ -406,7 +564,11 @@ let () =
   Mirage_crypto_rng_unix.use_default ();
   (* pin sqlocaml page cache for parity (SQLite mirrored in Ref_sqlite, Task 3) *)
   Unix.putenv "SQLOCAML_PAGE_CACHE" (string_of_int page_cache);
-  print_string (csv_header ^ "\n");
-  run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
-  run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
-  run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
+  match Sys.getenv_opt "SQLOCAML_BENCH_SMOKE" with
+  | Some ("1" | "true") -> smoke ()
+  | _ ->
+    print_string (csv_header ^ "\n");
+    run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
+    run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
+    run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
+;;
