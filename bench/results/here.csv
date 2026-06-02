@@ -1,0 +1,16 @@
+host,engine,workload,variant,rows,ops,wall_s,cpu_s,cpu_wall_ratio,ops_per_s
+here,sqlite,point_lookup,plaintext,5000,500,0.001391,0.001393,1.001,359470.7
+here,sqlite,scan_agg,plaintext,5000,20,0.004366,0.004368,1.000,4580.9
+here,sqlite,insert_one,plaintext,500,500,45.762051,0.077165,0.002,10.9
+here,sqlite,insert_batch,plaintext,5000,5000,0.066957,0.004878,0.073,74674.8
+here,sqlite,commit_n,plaintext,50,50,4.476394,0.007808,0.002,11.2
+here,sqlocaml,point_lookup,plaintext,5000,500,23.536108,23.524112,0.999,21.2
+here,sqlocaml,scan_agg,plaintext,5000,20,0.921728,0.921609,1.000,21.7
+here,sqlocaml,insert_one,plaintext,500,500,104.964399,49.440300,0.471,4.8
+here,sqlocaml,insert_batch,plaintext,5000,5000,202.975878,201.728809,0.994,24.6
+here,sqlocaml,commit_n,plaintext,50,50,13.420816,5.482916,0.409,3.7
+here,sqlocaml,point_lookup,encrypted,5000,500,48.434451,48.414316,1.000,10.3
+here,sqlocaml,scan_agg,encrypted,5000,20,1.843600,1.841510,0.999,10.8
+here,sqlocaml,insert_one,encrypted,500,500,104.726789,51.731167,0.494,4.8
+here,sqlocaml,insert_batch,encrypted,5000,5000,210.947936,209.118317,0.991,23.7
+here,sqlocaml,commit_n,encrypted,50,50,12.775952,6.154162,0.482,3.9
