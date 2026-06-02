@@ -4582,39 +4582,46 @@ let execute_update
       ~(indexes : Cat.index_info list)
   : int Lwt.t
   =
-  let* matches =
-    match mode with
-    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
-    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
-  in
-  let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
-  let n = List.length matches in
-  if n = 0
-  then Lwt.return 0
-  else
-    let* child_refs =
-      if Cat.get_fk_enforcement cat
-      then build_child_refs cat ~parent_table_name:table_meta.Cat.name
-      else Lwt.return []
-    in
-    (* FK pre-check: fail for RESTRICT/NO_ACTION when a referenced key changes.
-       CASCADE/SET_NULL/SET_DEFAULT are applied inside the RW transaction below. *)
-    let* () =
-      precheck_update_fk_restrict
-        store
-        cat
-        table_meta
-        ~clock
-        ~params
-        ~assignments
-        ~child_refs
-        matches
-    in
-    (* Phase 38: BEFORE/AFTER UPDATE fire inside the parent txn so nested DML
-       shares it (atomic rollback on failure; no nested-trigger deadlock). *)
-    let* tx, owned = acquire_txn store mode in
-    Lwt.catch
-      (fun () ->
+  (* Acquire the write lock BEFORE draining so the read-modify-write is atomic.
+     Draining via a separate RO snapshot first (the old [Auto] path) let a
+     concurrent commit land between the row read and the lock acquisition, so
+     the new row was computed from a stale value and clobbered that commit —
+     a lost update on backends whose commit yields, e.g. WAL/file (#223).
+     [In_txn] already drained under the caller's lock; this makes [Auto] match. *)
+  let* tx, owned = acquire_txn store mode in
+  Lwt.catch
+    (fun () ->
+       let* matches = drain_matching_rows_in_tx tx table_meta ~clock ~params ~where in
+       let matches =
+         apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
+       in
+       let n = List.length matches in
+       if n = 0
+       then
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.return 0
+       else
+         let* child_refs =
+           if Cat.get_fk_enforcement cat
+           then build_child_refs cat ~parent_table_name:table_meta.Cat.name
+           else Lwt.return []
+         in
+         (* FK pre-check: fail for RESTRICT/NO_ACTION when a referenced key
+            changes.  CASCADE/SET_NULL/SET_DEFAULT are applied in the txn below. *)
+         let* () =
+           precheck_update_fk_restrict
+             store
+             cat
+             table_meta
+             ~clock
+             ~params
+             ~assignments
+             ~child_refs
+             matches
+         in
+         (* Phase 38: BEFORE/AFTER UPDATE fire inside the parent txn so nested
+            DML shares it (atomic rollback on failure; no nested-trigger
+            deadlock). *)
          let* () = run_update_hook ~clock ~params ~assignments ~tx before_hook matches in
          let* () =
            validate_update_unique
@@ -4642,9 +4649,9 @@ let execute_update
          let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
          let* () = release_txn tx owned in
          Lwt.return n)
-      (fun exn ->
-         let* () = if owned then S.rollback tx else Lwt.return_unit in
-         Lwt.fail exn)
+    (fun exn ->
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
 ;;
 
 (* Pre-write RESTRICT/NO ACTION FK check for one DELETE row's [fk]: if a
@@ -4902,29 +4909,34 @@ let execute_delete
       ~(indexes : Cat.index_info list)
   : int Lwt.t
   =
-  let* matches =
-    match mode with
-    | Auto -> drain_matching_rows store table_meta ~clock ~params ~where
-    | In_txn tx -> drain_matching_rows_in_tx tx table_meta ~clock ~params ~where
-  in
-  let matches = apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches in
-  let n = List.length matches in
-  if n = 0
-  then Lwt.return 0
-  else
-    (* FK pre-check: fail for RESTRICT/NO_ACTION; CASCADE/SET_NULL/SET_DEFAULT
-       are applied inside the RW transaction below. *)
-    let* child_refs =
-      if Cat.get_fk_enforcement cat
-      then build_child_refs cat ~parent_table_name:table_meta.Cat.name
-      else Lwt.return []
-    in
-    let* () = precheck_delete_fk_restrict store cat table_meta ~child_refs matches in
-    (* Phase 38: BEFORE/AFTER DELETE fire inside the parent txn so nested DML
-       shares it and trigger failures roll back the DELETE. *)
-    let* tx, owned = acquire_txn store mode in
-    Lwt.catch
-      (fun () ->
+  (* Acquire the write lock BEFORE draining so the match set can't go stale
+     between the read and the delete (same TOCTOU as the UPDATE path, #223):
+     otherwise a row matched on a separate RO snapshot could be concurrently
+     modified to no longer match — yet still be deleted.  [In_txn] already
+     drained under the caller's lock; this makes [Auto] match. *)
+  let* tx, owned = acquire_txn store mode in
+  Lwt.catch
+    (fun () ->
+       let* matches = drain_matching_rows_in_tx tx table_meta ~clock ~params ~where in
+       let matches =
+         apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
+       in
+       let n = List.length matches in
+       if n = 0
+       then
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.return 0
+       else
+         (* FK pre-check: fail for RESTRICT/NO_ACTION; CASCADE/SET_NULL/SET_DEFAULT
+            are applied inside the RW transaction below. *)
+         let* child_refs =
+           if Cat.get_fk_enforcement cat
+           then build_child_refs cat ~parent_table_name:table_meta.Cat.name
+           else Lwt.return []
+         in
+         let* () = precheck_delete_fk_restrict store cat table_meta ~child_refs matches in
+         (* Phase 38: BEFORE/AFTER DELETE fire inside the parent txn so nested
+            DML shares it and trigger failures roll back the DELETE. *)
          let* () =
            match before_hook with
            | None -> Lwt.return_unit
@@ -4942,9 +4954,9 @@ let execute_delete
          in
          let* () = release_txn tx owned in
          Lwt.return n)
-      (fun exn ->
-         let* () = if owned then S.rollback tx else Lwt.return_unit in
-         Lwt.fail exn)
+    (fun exn ->
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
 ;;
 
 (** Run [Op_drop_table]: remove catalog entries for the table and all
