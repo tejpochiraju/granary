@@ -7,3 +7,4 @@ _runtest.log
 .claude/
 lazyfs/
 lib/sql/parser.conflicts
+bench/data/

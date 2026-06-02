@@ -1,0 +1,7 @@
+host=here
+date=2026-06-02T13:17:38Z
+nproc=8
+disk=sda      1 HGST HUS724020AL;sdb      1 HGST HUS724020AL;
+sqlite_version=3.45.1
+sqlocaml_sha=358b2b9
+rows=5000 ops=500 scans=20 commits=50 repeats=2 page_cache=1024

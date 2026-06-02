@@ -407,3 +407,17 @@
   alcotest
   lwt.unix
   unix))
+
+(executable
+ (name bench_compare)
+ (modules bench_compare)
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.unix
+  sqlite3
+  alcotest
+  lwt.unix
+  unix
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
