@@ -8,3 +8,6 @@ _runtest.log
 lazyfs/
 lib/sql/parser.conflicts
 bench/data/
+bench/profiling/perf.data
+bench/profiling/folded.txt
+bench/profiling/*.svg

@@ -1,0 +1,4 @@
+# rows   point_lookup_ms  scan_ms  insert_per_row_ms
+1000     9.78             10.25    9.72
+2000     22.42            26.25    19.27
+4000     49.26            45.45    41.62

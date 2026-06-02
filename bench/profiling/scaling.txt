@@ -1,0 +1,12 @@
+### rows=1000 ###
+scale1000,sqlocaml,point_lookup,plaintext,1000,100,0.977682,0.977577,1.000,102.3
+scale1000,sqlocaml,scan_agg,plaintext,1000,10,0.102477,0.102468,1.000,97.6
+scale1000,sqlocaml,insert_batch,plaintext,1000,1000,9.723381,9.466484,0.974,102.8
+### rows=2000 ###
+scale2000,sqlocaml,point_lookup,plaintext,2000,100,2.243220,2.237700,0.998,44.6
+scale2000,sqlocaml,scan_agg,plaintext,2000,10,0.262244,0.261257,0.996,38.1
+scale2000,sqlocaml,insert_batch,plaintext,2000,2000,38.548397,37.608688,0.976,51.9
+### rows=4000 ###
+scale4000,sqlocaml,point_lookup,plaintext,4000,100,4.924604,4.919915,0.999,20.3
+scale4000,sqlocaml,scan_agg,plaintext,4000,10,0.454629,0.454341,0.999,22.0
+scale4000,sqlocaml,insert_batch,plaintext,4000,4000,166.473977,159.766937,0.960,24.0
