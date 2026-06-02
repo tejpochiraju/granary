@@ -181,4 +181,4 @@ jepsen/
 - [x] **Negative controls:** dirty read, lost update, bank lost transfer, set lost element, counter non-monotonic — for every workload
 - [x] **More workloads:** bank (transfer + total-conservation), set (durability), counter (monotonic bounds)
 - [x] **Nemeses:** crash-restart, process pause, lazyfs, clock-skew
-- [ ] **CI wiring:** per-workload+nemesis gates
+- [x] **CI wiring:** nightly full-matrix gate — `jepsen/run/ci_full.sh` driven by `.forgejo/workflows/jepsen-nightly.yml` (per-workload+nemesis expected-verdict gate). The OCaml lost-update regression runs per-PR via `dune runtest`.
