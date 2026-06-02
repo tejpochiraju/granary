@@ -112,8 +112,8 @@ point lookups — far more than the ≤ N-cores× ceiling that #156 could ever d
 benefits every single-threaded query immediately. Multicore multiplies throughput, but
 multiplying an O(n)-per-lookup path is the wrong order of operations.
 
-**Therefore:** (1) treat the missing PK-seek as the priority read-path fix (filed as a
-follow-up); (2) re-run this benchmark after that fix; (3) reconsider #156 then — the CPU-bound
+**Therefore:** (1) treat the missing PK-seek as the priority read-path fix (filed as **#228**);
+(2) re-run this benchmark after that fix; (3) reconsider #156 then — the CPU-bound
 nature will still hold, and at that point multicore becomes the natural next multiplier,
 especially for the encrypted read path (~2× decrypt CPU). Until the per-core read cost is
 reasonable, #156 stays gated.
