@@ -1,6 +1,7 @@
 host=otp-prod-1
+date=2026-06-02T13:26:23Z
 nproc=12
 disk=nvme0n1    0 SAMSUNG MZVL2512HCJQ-00B07;nvme1n1    0 SAMSUNG MZVL2512HCJQ-00B07;
 sqlite_version=3.45.1
-sqlocaml_sha=f5f6861
+sqlocaml_sha=358b2b9
 rows=5000 ops=500 scans=20 commits=50 repeats=2 page_cache=1024

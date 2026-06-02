@@ -55,20 +55,20 @@ slower than C SQLite, especially on reads:
 
 | workload (NVMe, plaintext) | sqlocaml vs SQLite |
 |----------------------------|--------------------|
-| point lookup `WHERE pk=?`  | ~6,400× slower |
+| point lookup `WHERE pk=?`  | ~7,700× slower |
 | range scan / aggregate     | ~200× slower |
 | commit throughput          | ~8× slower |
-| insert (autocommit, on HDD)| ~2–3× slower (both fsync-bound) |
+| insert (autocommit, on HDD)| ~2× slower (both fsync-bound) |
 
-AES-256-GCM encryption-at-rest adds **~2.1× (≈ +105%)** to the read path; writes are barely
+AES-256-GCM encryption-at-rest adds **~2× (≈ +100%)** to the read path; writes are barely
 affected.
 
 **Verdict (gating the read-side multicore epic #156):** the read path is **CPU-bound**
 (`cpu/wall ≈ 1.0` on both disks), writes are **fsync/I-O-bound**. A point lookup currently costs
 as much as a full table scan — the `WHERE pk=?` predicate is not lowered to a B-tree seek — so
-the highest-leverage next step is fixing that single-threaded O(n) read path (worth ~1000×,
-filed as #228), *before* multicore. #156 stays deferred until then. See the results doc for the
-full analysis.
+the highest-leverage next step is fixing that single-threaded O(n) read path (worth ~40–90× at
+this scale and more as data grows, filed as #228), *before* multicore. #156 stays deferred until
+then. See the results doc for the full analysis.
 
 Reproduce: `scripts/bench222.sh` (builds the bench image and runs the suite; cross-host steps in
 the results doc).
