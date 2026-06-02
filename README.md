@@ -42,6 +42,35 @@ Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
   `Mirage_crypto_rng_unix.use_default ()`); the core library never seeds, to
   stay Mirage-clean.
 
+## Benchmarks
+
+In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements
+both sides, WAL, fsync-per-commit, matched page cache), run on two hosts — an **HDD** box and an
+**NVMe** box — to separate the CPU term from the I/O term. Full method and tables:
+[docs/benchmarks/2026-06-02-bench-222-results.md](docs/benchmarks/2026-06-02-bench-222-results.md).
+
+**These are honest, early numbers.** sqlocaml is a young pure-OCaml engine and is currently far
+slower than C SQLite, especially on reads:
+
+| workload (NVMe, plaintext) | sqlocaml vs SQLite |
+|----------------------------|--------------------|
+| point lookup `WHERE pk=?`  | ~6,400× slower |
+| range scan / aggregate     | ~200× slower |
+| commit throughput          | ~8× slower |
+| insert (autocommit, on HDD)| ~2–3× slower (both fsync-bound) |
+
+AES-256-GCM encryption-at-rest adds **~2.1× (≈ +105%)** to the read path; writes are barely
+affected.
+
+**Verdict (gating the read-side multicore epic #156):** the read path is **CPU-bound**
+(`cpu/wall ≈ 1.0` on both disks), writes are **fsync/I-O-bound**. A point lookup currently costs
+as much as a full table scan — the `WHERE pk=?` predicate is not lowered to a B-tree seek — so
+the highest-leverage next step is fixing that single-threaded O(n) read path (worth ~1000×),
+*before* multicore. #156 stays deferred until then. See the results doc for the full analysis.
+
+Reproduce: `scripts/bench222.sh` (builds the bench image and runs the suite; cross-host steps in
+the results doc).
+
 ## AI authorship
 
 **This codebase is entirely AI-written.** Per the
