@@ -324,6 +324,10 @@
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
+ (name test_concurrent_rmw_223)
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
+
+(test
  (name test_soak)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
