@@ -47,7 +47,8 @@ Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
 In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements
 both sides, WAL, fsync-per-commit, matched page cache), run on two hosts — an **HDD** box and an
 **NVMe** box — to separate the CPU term from the I/O term. Full method and tables:
-[docs/benchmarks/2026-06-02-bench-222-results.md](docs/benchmarks/2026-06-02-bench-222-results.md).
+[docs/benchmarks/2026-06-02-bench-222-results.md](docs/benchmarks/2026-06-02-bench-222-results.md)
+(also on the [wiki](https://git.iotready.com/tej/sqlite_ocaml_port/wiki/Benchmarks)).
 
 **These are honest, early numbers.** sqlocaml is a young pure-OCaml engine and is currently far
 slower than C SQLite, especially on reads:
