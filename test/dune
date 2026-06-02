@@ -412,8 +412,14 @@
   lwt.unix
   unix))
 
+; Cross-engine benchmark vs C SQLite — needs the `sqlite3` opam library.
+; `(optional)` lets builds where `sqlite3` is absent (e.g. `dune build @install`)
+; skip it instead of failing; CI and the bench image install `sqlite3` so it is
+; still compiled and type-checked there.
+
 (executable
  (name bench_compare)
+ (optional)
  (modules bench_compare)
  (libraries
   sqlocaml
