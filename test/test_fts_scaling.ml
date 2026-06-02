@@ -6,10 +6,17 @@
     query (the same drain that made #228/#229 O(n)).  They now use the native
     streaming [Store.seek_ge].
 
-    The assertion is machine-independent: it times the *same* rare-term query
-    (one matching document) against two index sizes (1x and 3x) and requires the
-    per-op cost to stay roughly flat.  A query that drains the whole index would
-    grow ~linearly with size; an O(log n) seek does not. *)
+    The assertions are machine-independent: each times the *same* query against
+    two index sizes (1x and 3x) and requires the per-op cost to stay roughly
+    flat.  A query that drains the whole index grows ~linearly with size; an
+    O(log n) seek does not.  Two paths are covered:
+      - exact term ([fts_posting_list]) via [MATCH 'unique<k>'] (one match);
+      - prefix ([fts_prefix_posting_list]) via [MATCH 'zebra*'] over a FIXED
+        small set of zebra docs present in both tables (so the match count is
+        constant and only the surrounding index size varies).
+
+    Validated: reverting either site to the old [cursor_open] drain makes the
+    corresponding ratio ~3.0x (1x->3x index), tripping the < 2.0x gate. *)
 
 module Db = Sqlocaml.Db
 
@@ -57,14 +64,39 @@ let query_rowids db sql =
      Lwt_stream.to_list s)
 ;;
 
-(* Build an FTS index of [docs] documents; each body has a shared term [alpha]
-   plus a unique term [unique<i>].  Returns the mean per-op wall-clock (seconds)
-   of a rare-term query (one match), and asserts that query's correctness. *)
+(* A fixed, size-independent set of docs matched by the prefix query, so
+   [MATCH 'zebra*'] returns the same count regardless of the index size. *)
+let n_zebra = 5
+
+let mean_per_op f ~reps =
+  let t0 = now () in
+  for i = 0 to reps - 1 do
+    f i
+  done;
+  (now () -. t0) /. float_of_int reps
+;;
+
+(* Build an FTS index: [n_zebra] fixed zebra docs (matched by the prefix query)
+   plus [docs] padding docs each with a shared term [alpha] and a unique term
+   [unique<i>].  Returns (term_query_per_op, prefix_query_per_op) in seconds,
+   asserting correctness of both. *)
 let build_and_time db ~docs =
   run (exec_lwt db "CREATE VIRTUAL TABLE docs USING FTS5(body)");
   run
     (let open Lwt.Syntax in
      let* () = exec_lwt db "BEGIN" in
+     let* () =
+       let rec loop j =
+         if j >= n_zebra
+         then Lwt.return_unit
+         else
+           let* () =
+             exec_lwt db (Printf.sprintf "INSERT INTO docs (body) VALUES ('zebra%d')" j)
+           in
+           loop (j + 1)
+       in
+       loop 0
+     in
      let rec loop i =
        if i >= docs
        then Lwt.return_unit
@@ -78,50 +110,68 @@ let build_and_time db ~docs =
      in
      let* () = loop 0 in
      exec_lwt db "COMMIT");
-  (* Correctness: a rare term matches exactly its one document; the shared term
-     matches all of them. *)
+  (* Correctness: a rare term matches its one doc; the shared term matches all
+     padding docs; the prefix matches exactly the fixed zebra set. *)
   let one = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'unique7'" in
   Alcotest.(check int) "rare term matches exactly 1 doc" 1 (List.length one);
   let all = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'alpha'" in
-  Alcotest.(check int) "shared term matches all docs" docs (List.length all);
-  (* Speed: time M rare-term queries (each one match), varying the term. *)
-  let m = 100 in
-  let t0 = now () in
-  for i = 0 to m - 1 do
-    let k = i * 2654435761 mod docs in
-    let rows =
-      query_rowids
-        db
-        (Printf.sprintf "SELECT body FROM docs WHERE docs MATCH 'unique%d'" k)
-    in
-    if List.length rows <> 1
-    then Alcotest.failf "rare term unique%d matched %d docs" k (List.length rows)
-  done;
-  (now () -. t0) /. float_of_int m
+  Alcotest.(check int) "shared term matches all padding docs" docs (List.length all);
+  let zs = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'zebra*'" in
+  Alcotest.(check int) "prefix matches the fixed zebra set" n_zebra (List.length zs);
+  (* Speed: exact-term path (one match, varying term) and prefix path (fixed
+     match set). *)
+  let term_per_op =
+    mean_per_op ~reps:100 (fun i ->
+      let k = i * 2654435761 mod docs in
+      let rows =
+        query_rowids
+          db
+          (Printf.sprintf "SELECT body FROM docs WHERE docs MATCH 'unique%d'" k)
+      in
+      if List.length rows <> 1
+      then Alcotest.failf "rare term unique%d matched %d docs" k (List.length rows))
+  in
+  let prefix_per_op =
+    mean_per_op ~reps:100 (fun _ ->
+      let rows = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'zebra*'" in
+      if List.length rows <> n_zebra
+      then Alcotest.failf "prefix zebra* matched %d docs" (List.length rows))
+  in
+  term_per_op, prefix_per_op
 ;;
 
-let test_term_query_flat () =
-  let small = with_db (fun db -> build_and_time db ~docs:1000) in
-  let large = with_db (fun db -> build_and_time db ~docs:3000) in
+let assert_flat label small large =
   let ratio = large /. small in
   Printf.eprintf
-    "FTS-SCALING: rare-term query 1k=%.3f ms/op  3k=%.3f ms/op  ratio=%.2f\n%!"
+    "FTS-SCALING: %s 1k=%.3f ms/op  3k=%.3f ms/op  ratio=%.2f\n%!"
+    label
     (small *. 1000.)
     (large *. 1000.)
     ratio;
-  (* 3x the index. A drain would cost ~3x; an O(log n) seek is ~flat.  Require
-     < 2.0x (wide margin against GC/scheduler noise, but far below the ~3x a
-     re-introduced full drain would produce). *)
+  (* 3x the surrounding index.  A full drain costs ~3x (validated); an O(log n)
+     seek is ~flat.  Gate at < 2.0x: wide margin vs GC/scheduler noise, well
+     below the ~3x a re-introduced drain produces. *)
   Alcotest.(check bool)
-    (Printf.sprintf "3x-index rare-term query < 2x slower (got %.2fx)" ratio)
+    (Printf.sprintf "%s: 3x index < 2x slower (got %.2fx)" label ratio)
     true
     (ratio < 2.0)
+;;
+
+let test_fts_queries_flat () =
+  let term_s, prefix_s = with_db (fun db -> build_and_time db ~docs:1000) in
+  let term_l, prefix_l = with_db (fun db -> build_and_time db ~docs:3000) in
+  assert_flat "exact-term query" term_s term_l;
+  assert_flat "prefix query" prefix_s prefix_l
 ;;
 
 let () =
   Alcotest.run
     "fts_scaling"
     [ ( "scaling"
-      , [ Alcotest.test_case "FTS term query is O(log n)" `Slow test_term_query_flat ] )
+      , [ Alcotest.test_case
+            "FTS term + prefix queries are O(log n)"
+            `Slow
+            test_fts_queries_flat
+        ] )
     ]
 ;;
