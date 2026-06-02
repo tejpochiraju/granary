@@ -9,6 +9,7 @@ encrypted-WAL backend (`--backend enc-wal`, #84/#214/#215).
 | `run_nemeses_fuse.sh` | `sqlocaml-jepsen` (host-side) | Run the privileged nemeses that `gen_177.sh` can't: **lazyfs** (un-fsynced write loss; needs `--device /dev/fuse --cap-add SYS_ADMIN`) on WAL + enc-WAL, and **clock-skew** (needs `libfaketime` via `LD_PRELOAD`). |
 | `check_177.sh` | `sqlocaml-jepsen-elle2` | Check every history (Clojure temporal + Elle SI), reporting VALID/INVALID and catching the negative controls. |
 | `detail_177.sh` | `sqlocaml-jepsen-elle2` | Dump full anomaly detail for the four counter/list-append histories that flag INVALID. |
+| `ci_full.sh` | `sqlocaml-jepsen` (one container, +FUSE) | Self-contained gen + nemeses + check with a pass/fail **gate** (expected verdict per history). Generates into `/tmp` (never touches the committed run). Driven by the nightly workflow `.forgejo/workflows/jepsen-nightly.yml`. |
 
 The `sqlocaml-jepsen` image (built from the root `Containerfile.jepsen`) carries
 the OCaml harness, lazyfs (+ its `libpcache`), and `libfaketime`.

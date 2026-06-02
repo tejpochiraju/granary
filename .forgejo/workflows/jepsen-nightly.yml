@@ -1,0 +1,37 @@
+name: Jepsen nightly (#177)
+
+# Full single-node Jepsen suite (all workloads × mem/file/wal/enc-wal, plus the
+# crash-restart / process-pause / lazyfs / clock-skew nemeses) and the Elle/Clojure
+# checkers, gated by jepsen/run/ci_full.sh. Heavy (~8-10 min once the image layers
+# are cached; the first run builds the lazyfs + Clojure + harness image, ~20 min),
+# so it runs nightly rather than per-PR. The OCaml lost-update regression
+# (test_concurrent_rmw_223) already runs per-PR inside `dune runtest`.
+#
+# Runs on the host runner (not inside a job container) so it can drive podman and
+# grant lazyfs the FUSE device + CAP_SYS_ADMIN it needs. Requires the self-hosted
+# runner host to allow `podman run --device /dev/fuse --cap-add SYS_ADMIN`.
+
+on:
+  schedule:
+    # 03:00 UTC daily (08:30 IST).
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: jepsen-nightly
+  cancel-in-progress: false
+
+jobs:
+  jepsen-full:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Jepsen image (cached by podman layers across runs)
+        run: podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
+
+      - name: Run full #177 suite + gate
+        run: |
+          podman run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+            -v "$PWD":/workspace:z -w /workspace --entrypoint bash \
+            sqlocaml-jepsen jepsen/run/ci_full.sh
