@@ -1,0 +1,804 @@
+{:type :ok :f "txn" :value [[:append 5 99] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88 89 90 92 99]]] :process 99 :index 99 :time 1780346781506882048}
+{:type :invoke :f "txn" :value [[:append 5 99] [:r 5 []]] :process 99 :index 99 :time 1780346781506787072}
+{:type :ok :f "txn" :value [[:append 6 98] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73 76 76 78 88 98]]] :process 98 :index 98 :time 1780346781506472192}
+{:type :invoke :f "txn" :value [[:append 6 98] [:r 6 []]] :process 98 :index 98 :time 1780346781506377984}
+{:type :ok :f "txn" :value [[:append 7 97] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93 94 94 96 96 97]]] :process 97 :index 97 :time 1780346781506000128}
+{:type :invoke :f "txn" :value [[:append 7 97] [:r 7 []]] :process 97 :index 97 :time 1780346781505844992}
+{:type :ok :f "txn" :value [[:append 7 96] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93 94 94 96]]] :process 96 :index 96 :time 1780346781505500928}
+{:type :invoke :f "txn" :value [[:append 7 96] [:r 7 []]] :process 96 :index 96 :time 1780346781505400832}
+{:type :ok :f "txn" :value [[:append 8 95] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83 84 90 92 95]]] :process 95 :index 95 :time 1780346781504910080}
+{:type :invoke :f "txn" :value [[:append 8 95] [:r 8 []]] :process 95 :index 95 :time 1780346781504796928}
+{:type :ok :f "txn" :value [[:append 7 94] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93 94]]] :process 94 :index 94 :time 1780346781504494848}
+{:type :invoke :f "txn" :value [[:append 7 94] [:r 7 []]] :process 94 :index 94 :time 1780346781504386048}
+{:type :ok :f "txn" :value [[:append 4 93] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92 93]]] :process 93 :index 93 :time 1780346781504004864}
+{:type :invoke :f "txn" :value [[:append 4 93] [:r 4 []]] :process 93 :index 93 :time 1780346781503911936}
+{:type :ok :f "txn" :value [[:append 5 92] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88 89 90 92]]] :process 92 :index 92 :time 1780346781503578880}
+{:type :invoke :f "txn" :value [[:append 5 92] [:r 5 []]] :process 92 :index 92 :time 1780346781503426048}
+{:type :ok :f "txn" :value [[:append 4 91] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91]]] :process 91 :index 91 :time 1780346781503074816}
+{:type :invoke :f "txn" :value [[:append 4 91] [:r 4 []]] :process 91 :index 91 :time 1780346781502809088}
+{:type :ok :f "txn" :value [[:append 7 90] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90]]] :process 90 :index 90 :time 1780346781502172928}
+{:type :invoke :f "txn" :value [[:append 7 90] [:r 7 []]] :process 90 :index 90 :time 1780346781501885952}
+{:type :ok :f "txn" :value [[:append 5 89] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88 89]]] :process 89 :index 89 :time 1780346781501132032}
+{:type :invoke :f "txn" :value [[:append 5 89] [:r 5 []]] :process 89 :index 89 :time 1780346781501008896}
+{:type :ok :f "txn" :value [[:append 4 88] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88]]] :process 88 :index 88 :time 1780346781500699904}
+{:type :invoke :f "txn" :value [[:append 4 88] [:r 4 []]] :process 88 :index 88 :time 1780346781500598784}
+{:type :ok :f "txn" :value [[:append 9 87] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81 87]]] :process 87 :index 87 :time 1780346781500276992}
+{:type :invoke :f "txn" :value [[:append 9 87] [:r 9 []]] :process 87 :index 87 :time 1780346781500134912}
+{:type :ok :f "txn" :value [[:append 2 86] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86]]] :process 86 :index 86 :time 1780346781499852800}
+{:type :invoke :f "txn" :value [[:append 2 86] [:r 2 []]] :process 86 :index 86 :time 1780346781499737856}
+{:type :ok :f "txn" :value [[:append 7 85] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85]]] :process 85 :index 85 :time 1780346781499439104}
+{:type :invoke :f "txn" :value [[:append 7 85] [:r 7 []]] :process 85 :index 85 :time 1780346781499273984}
+{:type :ok :f "txn" :value [[:append 3 84] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84]]] :process 84 :index 84 :time 1780346781498544896}
+{:type :invoke :f "txn" :value [[:append 3 84] [:r 3 []]] :process 84 :index 84 :time 1780346781498449152}
+{:type :ok :f "txn" :value [[:append 1 83] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80 83]]] :process 83 :index 83 :time 1780346781497776128}
+{:type :invoke :f "txn" :value [[:append 1 83] [:r 1 []]] :process 83 :index 83 :time 1780346781497595136}
+{:type :ok :f "txn" :value [[:append 7 82] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82]]] :process 82 :index 82 :time 1780346781497020928}
+{:type :invoke :f "txn" :value [[:append 7 82] [:r 7 []]] :process 82 :index 82 :time 1780346781496931072}
+{:type :ok :f "txn" :value [[:append 2 81] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81]]] :process 81 :index 81 :time 1780346781496403968}
+{:type :invoke :f "txn" :value [[:append 2 81] [:r 2 []]] :process 81 :index 81 :time 1780346781496314112}
+{:type :ok :f "txn" :value [[:append 1 80] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80]]] :process 80 :index 80 :time 1780346781495773184}
+{:type :invoke :f "txn" :value [[:append 1 80] [:r 1 []]] :process 80 :index 80 :time 1780346781495693056}
+{:type :ok :f "txn" :value [[:append 5 79] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79]]] :process 79 :index 79 :time 1780346781495394048}
+{:type :invoke :f "txn" :value [[:append 5 79] [:r 5 []]] :process 79 :index 79 :time 1780346781495294976}
+{:type :ok :f "txn" :value [[:append 0 78] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78]]] :process 78 :index 78 :time 1780346781494833920}
+{:type :invoke :f "txn" :value [[:append 0 78] [:r 0 []]] :process 78 :index 78 :time 1780346781494710016}
+{:type :ok :f "txn" :value [[:append 1 77] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77]]] :process 77 :index 77 :time 1780346781494309888}
+{:type :invoke :f "txn" :value [[:append 1 77] [:r 1 []]] :process 77 :index 77 :time 1780346781494173952}
+{:type :ok :f "txn" :value [[:append 6 76] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73 76]]] :process 76 :index 76 :time 1780346781493894144}
+{:type :invoke :f "txn" :value [[:append 6 76] [:r 6 []]] :process 76 :index 76 :time 1780346781493819904}
+{:type :ok :f "txn" :value [[:append 0 75] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75]]] :process 75 :index 75 :time 1780346781493563904}
+{:type :invoke :f "txn" :value [[:append 0 75] [:r 0 []]] :process 75 :index 75 :time 1780346781493491968}
+{:type :ok :f "txn" :value [[:append 3 74] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74]]] :process 74 :index 74 :time 1780346781493155840}
+{:type :invoke :f "txn" :value [[:append 3 74] [:r 3 []]] :process 74 :index 74 :time 1780346781493073920}
+{:type :ok :f "txn" :value [[:append 4 73] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73]]] :process 73 :index 73 :time 1780346781492795904}
+{:type :invoke :f "txn" :value [[:append 4 73] [:r 4 []]] :process 73 :index 73 :time 1780346781492723968}
+{:type :ok :f "txn" :value [[:append 4 72] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72]]] :process 72 :index 72 :time 1780346781492433152}
+{:type :invoke :f "txn" :value [[:append 4 72] [:r 4 []]] :process 72 :index 72 :time 1780346781492325120}
+{:type :ok :f "txn" :value [[:append 2 71] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71]]] :process 71 :index 71 :time 1780346781491923200}
+{:type :invoke :f "txn" :value [[:append 2 71] [:r 2 []]] :process 71 :index 71 :time 1780346781491852032}
+{:type :ok :f "txn" :value [[:append 2 70] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70]]] :process 70 :index 70 :time 1780346781491508992}
+{:type :invoke :f "txn" :value [[:append 2 70] [:r 2 []]] :process 70 :index 70 :time 1780346781491439104}
+{:type :ok :f "txn" :value [[:append 7 69] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69]]] :process 69 :index 69 :time 1780346781491172096}
+{:type :invoke :f "txn" :value [[:append 7 69] [:r 7 []]] :process 69 :index 69 :time 1780346781491080960}
+{:type :ok :f "txn" :value [[:append 4 68] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68]]] :process 68 :index 68 :time 1780346781490839040}
+{:type :invoke :f "txn" :value [[:append 4 68] [:r 4 []]] :process 68 :index 68 :time 1780346781490765056}
+{:type :ok :f "txn" :value [[:append 9 67] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67]]] :process 67 :index 67 :time 1780346781490523136}
+{:type :invoke :f "txn" :value [[:append 9 67] [:r 9 []]] :process 67 :index 67 :time 1780346781490458880}
+{:type :ok :f "txn" :value [[:append 5 66] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66]]] :process 66 :index 66 :time 1780346781490200064}
+{:type :invoke :f "txn" :value [[:append 5 66] [:r 5 []]] :process 66 :index 66 :time 1780346781490135808}
+{:type :ok :f "txn" :value [[:append 8 65] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65]]] :process 65 :index 65 :time 1780346781489923072}
+{:type :invoke :f "txn" :value [[:append 8 65] [:r 8 []]] :process 65 :index 65 :time 1780346781489828096}
+{:type :ok :f "txn" :value [[:append 3 64] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64]]] :process 64 :index 64 :time 1780346781489623040}
+{:type :invoke :f "txn" :value [[:append 3 64] [:r 3 []]] :process 64 :index 64 :time 1780346781489556992}
+{:type :ok :f "txn" :value [[:append 4 63] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63]]] :process 63 :index 63 :time 1780346781489298944}
+{:type :invoke :f "txn" :value [[:append 4 63] [:r 4 []]] :process 63 :index 63 :time 1780346781489172992}
+{:type :ok :f "txn" :value [[:append 8 62] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62]]] :process 62 :index 62 :time 1780346781488794112}
+{:type :invoke :f "txn" :value [[:append 8 62] [:r 8 []]] :process 62 :index 62 :time 1780346781488732928}
+{:type :ok :f "txn" :value [[:append 3 61] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61]]] :process 61 :index 61 :time 1780346781488473856}
+{:type :invoke :f "txn" :value [[:append 3 61] [:r 3 []]] :process 61 :index 61 :time 1780346781488409088}
+{:type :ok :f "txn" :value [[:append 8 60] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60]]] :process 60 :index 60 :time 1780346781488131072}
+{:type :invoke :f "txn" :value [[:append 8 60] [:r 8 []]] :process 60 :index 60 :time 1780346781487778048}
+{:type :ok :f "txn" :value [[:append 4 59] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59]]] :process 59 :index 59 :time 1780346781487166976}
+{:type :invoke :f "txn" :value [[:append 4 59] [:r 4 []]] :process 59 :index 59 :time 1780346781487045120}
+{:type :ok :f "txn" :value [[:append 1 58] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58]]] :process 58 :index 58 :time 1780346781486611968}
+{:type :invoke :f "txn" :value [[:append 1 58] [:r 1 []]] :process 58 :index 58 :time 1780346781486375168}
+{:type :ok :f "txn" :value [[:append 3 57] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57]]] :process 57 :index 57 :time 1780346781485858048}
+{:type :invoke :f "txn" :value [[:append 3 57] [:r 3 []]] :process 57 :index 57 :time 1780346781485747200}
+{:type :ok :f "txn" :value [[:append 8 56] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56]]] :process 56 :index 56 :time 1780346781485367040}
+{:type :invoke :f "txn" :value [[:append 8 56] [:r 8 []]] :process 56 :index 56 :time 1780346781485254144}
+{:type :ok :f "txn" :value [[:append 1 55] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55]]] :process 55 :index 55 :time 1780346781484896000}
+{:type :invoke :f "txn" :value [[:append 1 55] [:r 1 []]] :process 55 :index 55 :time 1780346781484813056}
+{:type :ok :f "txn" :value [[:append 1 54] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54]]] :process 54 :index 54 :time 1780346781484527104}
+{:type :invoke :f "txn" :value [[:append 1 54] [:r 1 []]] :process 54 :index 54 :time 1780346781484442112}
+{:type :ok :f "txn" :value [[:append 2 53] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53]]] :process 53 :index 53 :time 1780346781484108032}
+{:type :invoke :f "txn" :value [[:append 2 53] [:r 2 []]] :process 53 :index 53 :time 1780346781484015104}
+{:type :ok :f "txn" :value [[:append 6 52] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52]]] :process 52 :index 52 :time 1780346781483714048}
+{:type :invoke :f "txn" :value [[:append 6 52] [:r 6 []]] :process 52 :index 52 :time 1780346781483614976}
+{:type :ok :f "txn" :value [[:append 3 51] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51]]] :process 51 :index 51 :time 1780346781483303168}
+{:type :invoke :f "txn" :value [[:append 3 51] [:r 3 []]] :process 51 :index 51 :time 1780346781483191040}
+{:type :ok :f "txn" :value [[:append 9 50] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50]]] :process 50 :index 50 :time 1780346781482789888}
+{:type :invoke :f "txn" :value [[:append 9 50] [:r 9 []]] :process 50 :index 50 :time 1780346781482678016}
+{:type :ok :f "txn" :value [[:append 3 49] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49]]] :process 49 :index 49 :time 1780346781482283008}
+{:type :invoke :f "txn" :value [[:append 3 49] [:r 3 []]] :process 49 :index 49 :time 1780346781482171136}
+{:type :ok :f "txn" :value [[:append 8 48] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48]]] :process 48 :index 48 :time 1780346781481904896}
+{:type :invoke :f "txn" :value [[:append 8 48] [:r 8 []]] :process 48 :index 48 :time 1780346781481821184}
+{:type :ok :f "txn" :value [[:append 1 47] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47]]] :process 47 :index 47 :time 1780346781481508864}
+{:type :invoke :f "txn" :value [[:append 1 47] [:r 1 []]] :process 47 :index 47 :time 1780346781481426944}
+{:type :ok :f "txn" :value [[:append 2 46] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46]]] :process 46 :index 46 :time 1780346781481126912}
+{:type :invoke :f "txn" :value [[:append 2 46] [:r 2 []]] :process 46 :index 46 :time 1780346781480954880}
+{:type :ok :f "txn" :value [[:append 7 45] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45]]] :process 45 :index 45 :time 1780346781480532992}
+{:type :invoke :f "txn" :value [[:append 7 45] [:r 7 []]] :process 45 :index 45 :time 1780346781480474880}
+{:type :ok :f "txn" :value [[:append 3 44] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44]]] :process 44 :index 44 :time 1780346781480206080}
+{:type :invoke :f "txn" :value [[:append 3 44] [:r 3 []]] :process 44 :index 44 :time 1780346781480158976}
+{:type :ok :f "txn" :value [[:append 6 43] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43]]] :process 43 :index 43 :time 1780346781479960064}
+{:type :invoke :f "txn" :value [[:append 6 43] [:r 6 []]] :process 43 :index 43 :time 1780346781479915008}
+{:type :ok :f "txn" :value [[:append 6 42] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42]]] :process 42 :index 42 :time 1780346781479741952}
+{:type :invoke :f "txn" :value [[:append 6 42] [:r 6 []]] :process 42 :index 42 :time 1780346781479696128}
+{:type :ok :f "txn" :value [[:append 9 41] [:r 9 [0 5 12 14 14 23 23 24 28 29 41]]] :process 41 :index 41 :time 1780346781479526144}
+{:type :invoke :f "txn" :value [[:append 9 41] [:r 9 []]] :process 41 :index 41 :time 1780346781479484160}
+{:type :ok :f "txn" :value [[:append 2 40] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40]]] :process 40 :index 40 :time 1780346781479316992}
+{:type :invoke :f "txn" :value [[:append 2 40] [:r 2 []]] :process 40 :index 40 :time 1780346781479180032}
+{:type :info :f "start-pause" :value "start-pause" :process -1 :index 0 :time 1780346781479051008}
+{:type :ok :f "txn" :value [[:append 3 39] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39]]] :process 39 :index 39 :time 1780346781479051008}
+{:type :invoke :f "txn" :value [[:append 3 39] [:r 3 []]] :process 39 :index 39 :time 1780346781479002880}
+{:type :ok :f "txn" :value [[:append 0 38] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38]]] :process 38 :index 38 :time 1780346781478842880}
+{:type :invoke :f "txn" :value [[:append 0 38] [:r 0 []]] :process 38 :index 38 :time 1780346781478759936}
+{:type :ok :f "txn" :value [[:append 7 37] [:r 7 [1 3 6 6 11 15 24 29 35 37]]] :process 37 :index 37 :time 1780346781478637056}
+{:type :invoke :f "txn" :value [[:append 7 37] [:r 7 []]] :process 37 :index 37 :time 1780346781478595072}
+{:type :ok :f "txn" :value [[:append 5 36] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36]]] :process 36 :index 36 :time 1780346781478470144}
+{:type :invoke :f "txn" :value [[:append 5 36] [:r 5 []]] :process 36 :index 36 :time 1780346781478390016}
+{:type :ok :f "txn" :value [[:append 5 35] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35]]] :process 35 :index 35 :time 1780346781478247936}
+{:type :invoke :f "txn" :value [[:append 5 35] [:r 5 []]] :process 35 :index 35 :time 1780346781478121984}
+{:type :ok :f "txn" :value [[:append 0 34] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34]]] :process 34 :index 34 :time 1780346781477832960}
+{:type :invoke :f "txn" :value [[:append 0 34] [:r 0 []]] :process 34 :index 34 :time 1780346781477794816}
+{:type :ok :f "txn" :value [[:append 0 33] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33]]] :process 33 :index 33 :time 1780346781477644800}
+{:type :invoke :f "txn" :value [[:append 0 33] [:r 0 []]] :process 33 :index 33 :time 1780346781477608960}
+{:type :ok :f "txn" :value [[:append 2 32] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32]]] :process 32 :index 32 :time 1780346781477494016}
+{:type :invoke :f "txn" :value [[:append 2 32] [:r 2 []]] :process 32 :index 32 :time 1780346781477457920}
+{:type :ok :f "txn" :value [[:append 5 31] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31]]] :process 31 :index 31 :time 1780346781477299968}
+{:type :invoke :f "txn" :value [[:append 5 31] [:r 5 []]] :process 31 :index 31 :time 1780346781477256960}
+{:type :ok :f "txn" :value [[:append 4 30] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30]]] :process 30 :index 30 :time 1780346781477093888}
+{:type :invoke :f "txn" :value [[:append 4 30] [:r 4 []]] :process 30 :index 30 :time 1780346781477060096}
+{:type :ok :f "txn" :value [[:append 9 29] [:r 9 [0 5 12 14 14 23 23 24 28 29]]] :process 29 :index 29 :time 1780346781476919808}
+{:type :invoke :f "txn" :value [[:append 9 29] [:r 9 []]] :process 29 :index 29 :time 1780346781476888064}
+{:type :ok :f "txn" :value [[:append 5 28] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28]]] :process 28 :index 28 :time 1780346781476787968}
+{:type :invoke :f "txn" :value [[:append 5 28] [:r 5 []]] :process 28 :index 28 :time 1780346781476754944}
+{:type :ok :f "txn" :value [[:append 4 27] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27]]] :process 27 :index 27 :time 1780346781476658944}
+{:type :invoke :f "txn" :value [[:append 4 27] [:r 4 []]] :process 27 :index 27 :time 1780346781476627200}
+{:type :ok :f "txn" :value [[:append 3 26] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26]]] :process 26 :index 26 :time 1780346781476519936}
+{:type :invoke :f "txn" :value [[:append 3 26] [:r 3 []]] :process 26 :index 26 :time 1780346781476488192}
+{:type :ok :f "txn" :value [[:append 4 25] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25]]] :process 25 :index 25 :time 1780346781476396032}
+{:type :invoke :f "txn" :value [[:append 4 25] [:r 4 []]] :process 25 :index 25 :time 1780346781476365056}
+{:type :ok :f "txn" :value [[:append 0 24] [:r 0 [3 3 5 5 8 8 11 13 19 24]]] :process 24 :index 24 :time 1780346781476258048}
+{:type :invoke :f "txn" :value [[:append 0 24] [:r 0 []]] :process 24 :index 24 :time 1780346781476200960}
+{:type :ok :f "txn" :value [[:append 9 23] [:r 9 [0 5 12 14 14 23]]] :process 23 :index 23 :time 1780346781476084992}
+{:type :invoke :f "txn" :value [[:append 9 23] [:r 9 []]] :process 23 :index 23 :time 1780346781476057088}
+{:type :ok :f "txn" :value [[:append 3 22] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22]]] :process 22 :index 22 :time 1780346781475964160}
+{:type :invoke :f "txn" :value [[:append 3 22] [:r 3 []]] :process 22 :index 22 :time 1780346781475934976}
+{:type :ok :f "txn" :value [[:append 2 21] [:r 2 [0 5 9 10 13 17 17 18 21]]] :process 21 :index 21 :time 1780346781475847936}
+{:type :invoke :f "txn" :value [[:append 2 21] [:r 2 []]] :process 21 :index 21 :time 1780346781475819008}
+{:type :ok :f "txn" :value [[:append 6 20] [:r 6 [0 1 4 9 12 17 19 20]]] :process 20 :index 20 :time 1780346781475624192}
+{:type :invoke :f "txn" :value [[:append 6 20] [:r 6 []]] :process 20 :index 20 :time 1780346781475578112}
+{:type :ok :f "txn" :value [[:append 1 19] [:r 1 [4 6 7 8 10 15 18 19]]] :process 19 :index 19 :time 1780346781475485952}
+{:type :invoke :f "txn" :value [[:append 1 19] [:r 1 []]] :process 19 :index 19 :time 1780346781475441920}
+{:type :ok :f "txn" :value [[:append 3 18] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18]]] :process 18 :index 18 :time 1780346781475356928}
+{:type :invoke :f "txn" :value [[:append 3 18] [:r 3 []]] :process 18 :index 18 :time 1780346781475329024}
+{:type :ok :f "txn" :value [[:append 6 17] [:r 6 [0 1 4 9 12 17]]] :process 17 :index 17 :time 1780346781475176960}
+{:type :invoke :f "txn" :value [[:append 6 17] [:r 6 []]] :process 17 :index 17 :time 1780346781475152896}
+{:type :ok :f "txn" :value [[:append 4 16] [:r 4 [1 2 2 4 4 7 10 13 15 16]]] :process 16 :index 16 :time 1780346781475075840}
+{:type :invoke :f "txn" :value [[:append 4 16] [:r 4 []]] :process 16 :index 16 :time 1780346781475052032}
+{:type :ok :f "txn" :value [[:append 7 15] [:r 7 [1 3 6 6 11 15]]] :process 15 :index 15 :time 1780346781474929920}
+{:type :invoke :f "txn" :value [[:append 7 15] [:r 7 []]] :process 15 :index 15 :time 1780346781474905856}
+{:type :ok :f "txn" :value [[:append 3 14] [:r 3 [0 2 2 7 8 9 9 10 12 13 14]]] :process 14 :index 14 :time 1780346781474829824}
+{:type :invoke :f "txn" :value [[:append 3 14] [:r 3 []]] :process 14 :index 14 :time 1780346781474806016}
+{:type :ok :f "txn" :value [[:append 0 13] [:r 0 [3 3 5 5 8 8 11 13]]] :process 13 :index 13 :time 1780346781474700032}
+{:type :invoke :f "txn" :value [[:append 0 13] [:r 0 []]] :process 13 :index 13 :time 1780346781474678016}
+{:type :ok :f "txn" :value [[:append 6 12] [:r 6 [0 1 4 9 12]]] :process 12 :index 12 :time 1780346781474610944}
+{:type :invoke :f "txn" :value [[:append 6 12] [:r 6 []]] :process 12 :index 12 :time 1780346781474589952}
+{:type :ok :f "txn" :value [[:append 0 11] [:r 0 [3 3 5 5 8 8 11]]] :process 11 :index 11 :time 1780346781474528000}
+{:type :invoke :f "txn" :value [[:append 0 11] [:r 0 []]] :process 11 :index 11 :time 1780346781474505984}
+{:type :ok :f "txn" :value [[:append 2 10] [:r 2 [0 5 9 10]]] :process 10 :index 10 :time 1780346781474368000}
+{:type :invoke :f "txn" :value [[:append 2 10] [:r 2 []]] :process 10 :index 10 :time 1780346781474350080}
+{:type :ok :f "txn" :value [[:append 6 9] [:r 6 [0 1 4 9]]] :process 9 :index 9 :time 1780346781474289920}
+{:type :invoke :f "txn" :value [[:append 6 9] [:r 6 []]] :process 9 :index 9 :time 1780346781474270976}
+{:type :ok :f "txn" :value [[:append 0 8] [:r 0 [3 3 5 5 8]]] :process 8 :index 8 :time 1780346781474155008}
+{:type :invoke :f "txn" :value [[:append 0 8] [:r 0 []]] :process 8 :index 8 :time 1780346781474114816}
+{:type :ok :f "txn" :value [[:append 4 7] [:r 4 [1 2 2 4 4 7]]] :process 7 :index 7 :time 1780346781473378048}
+{:type :invoke :f "txn" :value [[:append 4 7] [:r 4 []]] :process 7 :index 7 :time 1780346781473330944}
+{:type :ok :f "txn" :value [[:append 5 6] [:r 5 [1 3 6]]] :process 6 :index 6 :time 1780346781473142016}
+{:type :invoke :f "txn" :value [[:append 5 6] [:r 5 []]] :process 6 :index 6 :time 1780346781473102080}
+{:type :ok :f "txn" :value [[:append 0 5] [:r 0 [3 3 5]]] :process 5 :index 5 :time 1780346781472980992}
+{:type :invoke :f "txn" :value [[:append 0 5] [:r 0 []]] :process 5 :index 5 :time 1780346781472943104}
+{:type :ok :f "txn" :value [[:append 4 4] [:r 4 [1 2 2 4]]] :process 4 :index 4 :time 1780346781472829952}
+{:type :invoke :f "txn" :value [[:append 4 4] [:r 4 []]] :process 4 :index 4 :time 1780346781472795136}
+{:type :ok :f "txn" :value [[:append 0 3] [:r 0 [3]]] :process 3 :index 3 :time 1780346781472691968}
+{:type :invoke :f "txn" :value [[:append 0 3] [:r 0 []]] :process 3 :index 3 :time 1780346781472660992}
+{:type :ok :f "txn" :value [[:append 4 2] [:r 4 [1 2]]] :process 2 :index 2 :time 1780346781472566016}
+{:type :invoke :f "txn" :value [[:append 4 2] [:r 4 []]] :process 2 :index 2 :time 1780346781472538112}
+{:type :ok :f "txn" :value [[:append 5 1] [:r 5 [1]]] :process 1 :index 1 :time 1780346781472453120}
+{:type :invoke :f "txn" :value [[:append 5 1] [:r 5 []]] :process 1 :index 1 :time 1780346781472427008}
+{:type :ok :f "txn" :value [[:append 3 0] [:r 3 [0]]] :process 0 :index 0 :time 1780346781472340224}
+{:type :invoke :f "txn" :value [[:append 3 0] [:r 3 []]] :process 0 :index 0 :time 1780346781472182016}
+{:type :ok :f "txn" :value [[:append 5 99] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88 89 90 92 99 99]]] :process 99 :index 99 :time 1780346781506973952}
+{:type :invoke :f "txn" :value [[:append 5 99] [:r 5 []]] :process 99 :index 99 :time 1780346781506882048}
+{:type :ok :f "txn" :value [[:append 0 98] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83 84 86 91 97 98]]] :process 98 :index 98 :time 1780346781506575104}
+{:type :invoke :f "txn" :value [[:append 0 98] [:r 0 []]] :process 98 :index 98 :time 1780346781506472960}
+{:type :ok :f "txn" :value [[:append 0 97] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83 84 86 91 97]]] :process 97 :index 97 :time 1780346781506093056}
+{:type :invoke :f "txn" :value [[:append 0 97] [:r 0 []]] :process 97 :index 97 :time 1780346781506000896}
+{:type :ok :f "txn" :value [[:append 8 96] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83 84 90 92 95 96]]] :process 96 :index 96 :time 1780346781505632000}
+{:type :invoke :f "txn" :value [[:append 8 96] [:r 8 []]] :process 96 :index 96 :time 1780346781505501952}
+{:type :ok :f "txn" :value [[:append 1 95] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80 83 85 85 95]]] :process 95 :index 95 :time 1780346781505069056}
+{:type :invoke :f "txn" :value [[:append 1 95] [:r 1 []]] :process 95 :index 95 :time 1780346781504910848}
+{:type :ok :f "txn" :value [[:append 4 94] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92 93 94]]] :process 94 :index 94 :time 1780346781504587008}
+{:type :invoke :f "txn" :value [[:append 4 94] [:r 4 []]] :process 94 :index 94 :time 1780346781504496128}
+{:type :ok :f "txn" :value [[:append 2 93] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89 89 93]]] :process 93 :index 93 :time 1780346781504100096}
+{:type :invoke :f "txn" :value [[:append 2 93] [:r 2 []]] :process 93 :index 93 :time 1780346781504004864}
+{:type :ok :f "txn" :value [[:append 8 92] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83 84 90 92]]] :process 92 :index 92 :time 1780346781503667968}
+{:type :invoke :f "txn" :value [[:append 8 92] [:r 8 []]] :process 92 :index 92 :time 1780346781503580160}
+{:type :ok :f "txn" :value [[:append 0 91] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83 84 86 91]]] :process 91 :index 91 :time 1780346781503164928}
+{:type :invoke :f "txn" :value [[:append 0 91] [:r 0 []]] :process 91 :index 91 :time 1780346781503076096}
+{:type :ok :f "txn" :value [[:append 9 90] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81 87 87 90]]] :process 90 :index 90 :time 1780346781502407936}
+{:type :invoke :f "txn" :value [[:append 9 90] [:r 9 []]] :process 90 :index 90 :time 1780346781502173952}
+{:type :ok :f "txn" :value [[:append 2 89] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89]]] :process 89 :index 89 :time 1780346781501404160}
+{:type :invoke :f "txn" :value [[:append 2 89] [:r 2 []]] :process 89 :index 89 :time 1780346781501133056}
+{:type :ok :f "txn" :value [[:append 2 88] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88]]] :process 88 :index 88 :time 1780346781500808960}
+{:type :invoke :f "txn" :value [[:append 2 88] [:r 2 []]] :process 88 :index 88 :time 1780346781500699904}
+{:type :ok :f "txn" :value [[:append 3 87] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86 87]]] :process 87 :index 87 :time 1780346781500365056}
+{:type :invoke :f "txn" :value [[:append 3 87] [:r 3 []]] :process 87 :index 87 :time 1780346781500276992}
+{:type :ok :f "txn" :value [[:append 3 86] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86]]] :process 86 :index 86 :time 1780346781499942144}
+{:type :invoke :f "txn" :value [[:append 3 86] [:r 3 []]] :process 86 :index 86 :time 1780346781499854080}
+{:type :ok :f "txn" :value [[:append 1 85] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80 83 85]]] :process 85 :index 85 :time 1780346781499527936}
+{:type :invoke :f "txn" :value [[:append 1 85] [:r 1 []]] :process 85 :index 85 :time 1780346781499439104}
+{:type :ok :f "txn" :value [[:append 7 84] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84]]] :process 84 :index 84 :time 1780346781498828032}
+{:type :invoke :f "txn" :value [[:append 7 84] [:r 7 []]] :process 84 :index 84 :time 1780346781498545920}
+{:type :ok :f "txn" :value [[:append 0 83] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83]]] :process 83 :index 83 :time 1780346781498100992}
+{:type :invoke :f "txn" :value [[:append 0 83] [:r 0 []]] :process 83 :index 83 :time 1780346781497777920}
+{:type :ok :f "txn" :value [[:append 5 82] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82]]] :process 82 :index 82 :time 1780346781497176832}
+{:type :invoke :f "txn" :value [[:append 5 82] [:r 5 []]] :process 82 :index 82 :time 1780346781497021952}
+{:type :ok :f "txn" :value [[:append 9 81] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81]]] :process 81 :index 81 :time 1780346781496728832}
+{:type :invoke :f "txn" :value [[:append 9 81] [:r 9 []]] :process 81 :index 81 :time 1780346781496404992}
+{:type :ok :f "txn" :value [[:append 2 80] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80]]] :process 80 :index 80 :time 1780346781495926016}
+{:type :invoke :f "txn" :value [[:append 2 80] [:r 2 []]] :process 80 :index 80 :time 1780346781495773184}
+{:type :ok :f "txn" :value [[:append 1 79] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79]]] :process 79 :index 79 :time 1780346781495488768}
+{:type :invoke :f "txn" :value [[:append 1 79] [:r 1 []]] :process 79 :index 79 :time 1780346781495395072}
+{:type :ok :f "txn" :value [[:append 3 78] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78]]] :process 78 :index 78 :time 1780346781494945024}
+{:type :invoke :f "txn" :value [[:append 3 78] [:r 3 []]] :process 78 :index 78 :time 1780346781494834944}
+{:type :ok :f "txn" :value [[:append 4 77] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77]]] :process 77 :index 77 :time 1780346781494407936}
+{:type :invoke :f "txn" :value [[:append 4 77] [:r 4 []]] :process 77 :index 77 :time 1780346781494309888}
+{:type :ok :f "txn" :value [[:append 9 76] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76]]] :process 76 :index 76 :time 1780346781493974016}
+{:type :invoke :f "txn" :value [[:append 9 76] [:r 9 []]] :process 76 :index 76 :time 1780346781493894144}
+{:type :ok :f "txn" :value [[:append 5 75] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75]]] :process 75 :index 75 :time 1780346781493645824}
+{:type :invoke :f "txn" :value [[:append 5 75] [:r 5 []]] :process 75 :index 75 :time 1780346781493573888}
+{:type :ok :f "txn" :value [[:append 3 74] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74]]] :process 74 :index 74 :time 1780346781493288960}
+{:type :invoke :f "txn" :value [[:append 3 74] [:r 3 []]] :process 74 :index 74 :time 1780346781493155840}
+{:type :ok :f "txn" :value [[:append 4 73] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73]]] :process 73 :index 73 :time 1780346781492867840}
+{:type :invoke :f "txn" :value [[:append 4 73] [:r 4 []]] :process 73 :index 73 :time 1780346781492795904}
+{:type :ok :f "txn" :value [[:append 5 72] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72]]] :process 72 :index 72 :time 1780346781492506112}
+{:type :invoke :f "txn" :value [[:append 5 72] [:r 5 []]] :process 72 :index 72 :time 1780346781492433920}
+{:type :ok :f "txn" :value [[:append 9 71] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71]]] :process 71 :index 71 :time 1780346781492145152}
+{:type :invoke :f "txn" :value [[:append 9 71] [:r 9 []]] :process 71 :index 71 :time 1780346781491923968}
+{:type :ok :f "txn" :value [[:append 7 70] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70]]] :process 70 :index 70 :time 1780346781491646976}
+{:type :invoke :f "txn" :value [[:append 7 70] [:r 7 []]] :process 70 :index 70 :time 1780346781491510016}
+{:type :ok :f "txn" :value [[:append 7 69] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69]]] :process 69 :index 69 :time 1780346781491247872}
+{:type :invoke :f "txn" :value [[:append 7 69] [:r 7 []]] :process 69 :index 69 :time 1780346781491172096}
+{:type :ok :f "txn" :value [[:append 1 68] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68]]] :process 68 :index 68 :time 1780346781490904064}
+{:type :invoke :f "txn" :value [[:append 1 68] [:r 1 []]] :process 68 :index 68 :time 1780346781490839040}
+{:type :ok :f "txn" :value [[:append 7 67] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67]]] :process 67 :index 67 :time 1780346781490628864}
+{:type :invoke :f "txn" :value [[:append 7 67] [:r 7 []]] :process 67 :index 67 :time 1780346781490523136}
+{:type :ok :f "txn" :value [[:append 7 66] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66]]] :process 66 :index 66 :time 1780346781490313984}
+{:type :invoke :f "txn" :value [[:append 7 66] [:r 7 []]] :process 66 :index 66 :time 1780346781490201088}
+{:type :ok :f "txn" :value [[:append 6 65] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65]]] :process 65 :index 65 :time 1780346781489988096}
+{:type :invoke :f "txn" :value [[:append 6 65] [:r 6 []]] :process 65 :index 65 :time 1780346781489923840}
+{:type :ok :f "txn" :value [[:append 6 64] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64]]] :process 64 :index 64 :time 1780346781489700096}
+{:type :invoke :f "txn" :value [[:append 6 64] [:r 6 []]] :process 64 :index 64 :time 1780346781489623040}
+{:type :ok :f "txn" :value [[:append 6 63] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63]]] :process 63 :index 63 :time 1780346781489375232}
+{:type :invoke :f "txn" :value [[:append 6 63] [:r 6 []]] :process 63 :index 63 :time 1780346781489298944}
+{:type :ok :f "txn" :value [[:append 6 62] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62]]] :process 62 :index 62 :time 1780346781488854784}
+{:type :invoke :f "txn" :value [[:append 6 62] [:r 6 []]] :process 62 :index 62 :time 1780346781488795136}
+{:type :ok :f "txn" :value [[:append 2 61] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61]]] :process 61 :index 61 :time 1780346781488604160}
+{:type :invoke :f "txn" :value [[:append 2 61] [:r 2 []]] :process 61 :index 61 :time 1780346781488473856}
+{:type :ok :f "txn" :value [[:append 0 60] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60]]] :process 60 :index 60 :time 1780346781488253184}
+{:type :invoke :f "txn" :value [[:append 0 60] [:r 0 []]] :process 60 :index 60 :time 1780346781488132864}
+{:type :ok :f "txn" :value [[:append 0 59] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59]]] :process 59 :index 59 :time 1780346781487448064}
+{:type :invoke :f "txn" :value [[:append 0 59] [:r 0 []]] :process 59 :index 59 :time 1780346781487168000}
+{:type :ok :f "txn" :value [[:append 6 58] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58]]] :process 58 :index 58 :time 1780346781486769920}
+{:type :invoke :f "txn" :value [[:append 6 58] [:r 6 []]] :process 58 :index 58 :time 1780346781486612992}
+{:type :ok :f "txn" :value [[:append 9 57] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57]]] :process 57 :index 57 :time 1780346781486011904}
+{:type :invoke :f "txn" :value [[:append 9 57] [:r 9 []]] :process 57 :index 57 :time 1780346781485858816}
+{:type :ok :f "txn" :value [[:append 2 56] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56]]] :process 56 :index 56 :time 1780346781485477888}
+{:type :invoke :f "txn" :value [[:append 2 56] [:r 2 []]] :process 56 :index 56 :time 1780346781485368064}
+{:type :ok :f "txn" :value [[:append 9 55] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55]]] :process 55 :index 55 :time 1780346781485048064}
+{:type :invoke :f "txn" :value [[:append 9 55] [:r 9 []]] :process 55 :index 55 :time 1780346781484897024}
+{:type :ok :f "txn" :value [[:append 6 54] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54]]] :process 54 :index 54 :time 1780346781484610048}
+{:type :invoke :f "txn" :value [[:append 6 54] [:r 6 []]] :process 54 :index 54 :time 1780346781484528128}
+{:type :ok :f "txn" :value [[:append 2 53] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53]]] :process 53 :index 53 :time 1780346781484195840}
+{:type :invoke :f "txn" :value [[:append 2 53] [:r 2 []]] :process 53 :index 53 :time 1780346781484108800}
+{:type :ok :f "txn" :value [[:append 0 52] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52]]] :process 52 :index 52 :time 1780346781483835904}
+{:type :invoke :f "txn" :value [[:append 0 52] [:r 0 []]] :process 52 :index 52 :time 1780346781483715072}
+{:type :ok :f "txn" :value [[:append 8 51] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51]]] :process 51 :index 51 :time 1780346781483401984}
+{:type :invoke :f "txn" :value [[:append 8 51] [:r 8 []]] :process 51 :index 51 :time 1780346781483303936}
+{:type :ok :f "txn" :value [[:append 9 50] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50]]] :process 50 :index 50 :time 1780346781482892032}
+{:type :invoke :f "txn" :value [[:append 9 50] [:r 9 []]] :process 50 :index 50 :time 1780346781482790912}
+{:type :ok :f "txn" :value [[:append 0 49] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49]]] :process 49 :index 49 :time 1780346781482480896}
+{:type :invoke :f "txn" :value [[:append 0 49] [:r 0 []]] :process 49 :index 49 :time 1780346781482284032}
+{:type :ok :f "txn" :value [[:append 8 48] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48]]] :process 48 :index 48 :time 1780346781481987840}
+{:type :invoke :f "txn" :value [[:append 8 48] [:r 8 []]] :process 48 :index 48 :time 1780346781481905920}
+{:type :ok :f "txn" :value [[:append 5 47] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47]]] :process 47 :index 47 :time 1780346781481594112}
+{:type :invoke :f "txn" :value [[:append 5 47] [:r 5 []]] :process 47 :index 47 :time 1780346781481509888}
+{:type :ok :f "txn" :value [[:append 2 46] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46]]] :process 46 :index 46 :time 1780346781481216000}
+{:type :invoke :f "txn" :value [[:append 2 46] [:r 2 []]] :process 46 :index 46 :time 1780346781481127936}
+{:type :ok :f "txn" :value [[:append 7 45] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45]]] :process 45 :index 45 :time 1780346781480670976}
+{:type :invoke :f "txn" :value [[:append 7 45] [:r 7 []]] :process 45 :index 45 :time 1780346781480534016}
+{:type :ok :f "txn" :value [[:append 3 44] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44]]] :process 44 :index 44 :time 1780346781480374016}
+{:type :invoke :f "txn" :value [[:append 3 44] [:r 3 []]] :process 44 :index 44 :time 1780346781480206848}
+{:type :ok :f "txn" :value [[:append 0 43] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43]]] :process 43 :index 43 :time 1780346781480005120}
+{:type :invoke :f "txn" :value [[:append 0 43] [:r 0 []]] :process 43 :index 43 :time 1780346781479960832}
+{:type :ok :f "txn" :value [[:append 9 42] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42]]] :process 42 :index 42 :time 1780346781479784960}
+{:type :invoke :f "txn" :value [[:append 9 42] [:r 9 []]] :process 42 :index 42 :time 1780346781479741952}
+{:type :ok :f "txn" :value [[:append 9 41] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41]]] :process 41 :index 41 :time 1780346781479568896}
+{:type :invoke :f "txn" :value [[:append 9 41] [:r 9 []]] :process 41 :index 41 :time 1780346781479526912}
+{:type :ok :f "txn" :value [[:append 1 40] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40]]] :process 40 :index 40 :time 1780346781479363072}
+{:type :invoke :f "txn" :value [[:append 1 40] [:r 1 []]] :process 40 :index 40 :time 1780346781479318016}
+{:type :info :f "start-pause" :value "start-pause" :process -1 :index 1 :time 1780346781479094016}
+{:type :ok :f "txn" :value [[:append 1 39] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39]]] :process 39 :index 39 :time 1780346781479092992}
+{:type :invoke :f "txn" :value [[:append 1 39] [:r 1 []]] :process 39 :index 39 :time 1780346781479052032}
+{:type :ok :f "txn" :value [[:append 7 38] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38]]] :process 38 :index 38 :time 1780346781478884864}
+{:type :invoke :f "txn" :value [[:append 7 38] [:r 7 []]] :process 38 :index 38 :time 1780346781478843904}
+{:type :ok :f "txn" :value [[:append 4 37] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37]]] :process 37 :index 37 :time 1780346781478678016}
+{:type :invoke :f "txn" :value [[:append 4 37] [:r 4 []]] :process 37 :index 37 :time 1780346781478637056}
+{:type :ok :f "txn" :value [[:append 4 36] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36]]] :process 36 :index 36 :time 1780346781478512128}
+{:type :invoke :f "txn" :value [[:append 4 36] [:r 4 []]] :process 36 :index 36 :time 1780346781478470144}
+{:type :ok :f "txn" :value [[:append 7 35] [:r 7 [1 3 6 6 11 15 24 29 35]]] :process 35 :index 35 :time 1780346781478307072}
+{:type :invoke :f "txn" :value [[:append 7 35] [:r 7 []]] :process 35 :index 35 :time 1780346781478248960}
+{:type :ok :f "txn" :value [[:append 8 34] [:r 8 [11 20 23 25 26 27 29 32 34]]] :process 34 :index 34 :time 1780346781477915136}
+{:type :invoke :f "txn" :value [[:append 8 34] [:r 8 []]] :process 34 :index 34 :time 1780346781477833984}
+{:type :ok :f "txn" :value [[:append 4 33] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33]]] :process 33 :index 33 :time 1780346781477682944}
+{:type :invoke :f "txn" :value [[:append 4 33] [:r 4 []]] :process 33 :index 33 :time 1780346781477646080}
+{:type :ok :f "txn" :value [[:append 1 32] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32]]] :process 32 :index 32 :time 1780346781477530880}
+{:type :invoke :f "txn" :value [[:append 1 32] [:r 1 []]] :process 32 :index 32 :time 1780346781477495040}
+{:type :ok :f "txn" :value [[:append 6 31] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31]]] :process 31 :index 31 :time 1780346781477335808}
+{:type :invoke :f "txn" :value [[:append 6 31] [:r 6 []]] :process 31 :index 31 :time 1780346781477300992}
+{:type :ok :f "txn" :value [[:append 2 30] [:r 2 [0 5 9 10 13 17 17 18 21 30]]] :process 30 :index 30 :time 1780346781477127168}
+{:type :invoke :f "txn" :value [[:append 2 30] [:r 2 []]] :process 30 :index 30 :time 1780346781477093888}
+{:type :ok :f "txn" :value [[:append 1 29] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29]]] :process 29 :index 29 :time 1780346781476989952}
+{:type :invoke :f "txn" :value [[:append 1 29] [:r 1 []]] :process 29 :index 29 :time 1780346781476921088}
+{:type :ok :f "txn" :value [[:append 9 28] [:r 9 [0 5 12 14 14 23 23 24 28]]] :process 28 :index 28 :time 1780346781476819968}
+{:type :invoke :f "txn" :value [[:append 9 28] [:r 9 []]] :process 28 :index 28 :time 1780346781476788992}
+{:type :ok :f "txn" :value [[:append 8 27] [:r 8 [11 20 23 25 26 27]]] :process 27 :index 27 :time 1780346781476689152}
+{:type :invoke :f "txn" :value [[:append 8 27] [:r 8 []]] :process 27 :index 27 :time 1780346781476658944}
+{:type :ok :f "txn" :value [[:append 6 26] [:r 6 [0 1 4 9 12 17 19 20 22 26]]] :process 26 :index 26 :time 1780346781476551168}
+{:type :invoke :f "txn" :value [[:append 6 26] [:r 6 []]] :process 26 :index 26 :time 1780346781476520960}
+{:type :ok :f "txn" :value [[:append 8 25] [:r 8 [11 20 23 25]]] :process 25 :index 25 :time 1780346781476424960}
+{:type :invoke :f "txn" :value [[:append 8 25] [:r 8 []]] :process 25 :index 25 :time 1780346781476396032}
+{:type :ok :f "txn" :value [[:append 9 24] [:r 9 [0 5 12 14 14 23 23 24]]] :process 24 :index 24 :time 1780346781476303104}
+{:type :invoke :f "txn" :value [[:append 9 24] [:r 9 []]] :process 24 :index 24 :time 1780346781476259072}
+{:type :ok :f "txn" :value [[:append 9 23] [:r 9 [0 5 12 14 14 23 23]]] :process 23 :index 23 :time 1780346781476113152}
+{:type :invoke :f "txn" :value [[:append 9 23] [:r 9 []]] :process 23 :index 23 :time 1780346781476084992}
+{:type :ok :f "txn" :value [[:append 6 22] [:r 6 [0 1 4 9 12 17 19 20 22]]] :process 22 :index 22 :time 1780346781475995904}
+{:type :invoke :f "txn" :value [[:append 6 22] [:r 6 []]] :process 22 :index 22 :time 1780346781475964160}
+{:type :ok :f "txn" :value [[:append 1 21] [:r 1 [4 6 7 8 10 15 18 19 20 21]]] :process 21 :index 21 :time 1780346781475876096}
+{:type :invoke :f "txn" :value [[:append 1 21] [:r 1 []]] :process 21 :index 21 :time 1780346781475848960}
+{:type :ok :f "txn" :value [[:append 3 20] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20]]] :process 20 :index 20 :time 1780346781475655936}
+{:type :invoke :f "txn" :value [[:append 3 20] [:r 3 []]] :process 20 :index 20 :time 1780346781475624960}
+{:type :ok :f "txn" :value [[:append 4 19] [:r 4 [1 2 2 4 4 7 10 13 15 16 19]]] :process 19 :index 19 :time 1780346781475512064}
+{:type :invoke :f "txn" :value [[:append 4 19] [:r 4 []]] :process 19 :index 19 :time 1780346781475485952}
+{:type :ok :f "txn" :value [[:append 5 18] [:r 5 [1 3 6 7 11 12 14 16 16 17 18]]] :process 18 :index 18 :time 1780346781475384832}
+{:type :invoke :f "txn" :value [[:append 5 18] [:r 5 []]] :process 18 :index 18 :time 1780346781475357952}
+{:type :ok :f "txn" :value [[:append 2 17] [:r 2 [0 5 9 10 13 17]]] :process 17 :index 17 :time 1780346781475258112}
+{:type :invoke :f "txn" :value [[:append 2 17] [:r 2 []]] :process 17 :index 17 :time 1780346781475177984}
+{:type :ok :f "txn" :value [[:append 5 16] [:r 5 [1 3 6 7 11 12 14 16]]] :process 16 :index 16 :time 1780346781475100160}
+{:type :invoke :f "txn" :value [[:append 5 16] [:r 5 []]] :process 16 :index 16 :time 1780346781475075840}
+{:type :ok :f "txn" :value [[:append 1 15] [:r 1 [4 6 7 8 10 15]]] :process 15 :index 15 :time 1780346781474999040}
+{:type :invoke :f "txn" :value [[:append 1 15] [:r 1 []]] :process 15 :index 15 :time 1780346781474930944}
+{:type :ok :f "txn" :value [[:append 9 14] [:r 9 [0 5 12 14]]] :process 14 :index 14 :time 1780346781474853120}
+{:type :invoke :f "txn" :value [[:append 9 14] [:r 9 []]] :process 14 :index 14 :time 1780346781474831104}
+{:type :ok :f "txn" :value [[:append 2 13] [:r 2 [0 5 9 10 13]]] :process 13 :index 13 :time 1780346781474754048}
+{:type :invoke :f "txn" :value [[:append 2 13] [:r 2 []]] :process 13 :index 13 :time 1780346781474700032}
+{:type :ok :f "txn" :value [[:append 3 12] [:r 3 [0 2 2 7 8 9 9 10 12]]] :process 12 :index 12 :time 1780346781474633984}
+{:type :invoke :f "txn" :value [[:append 3 12] [:r 3 []]] :process 12 :index 12 :time 1780346781474610944}
+{:type :ok :f "txn" :value [[:append 8 11] [:r 8 [11]]] :process 11 :index 11 :time 1780346781474546944}
+{:type :invoke :f "txn" :value [[:append 8 11] [:r 8 []]] :process 11 :index 11 :time 1780346781474529024}
+{:type :ok :f "txn" :value [[:append 1 10] [:r 1 [4 6 7 8 10]]] :process 10 :index 10 :time 1780346781474387968}
+{:type :invoke :f "txn" :value [[:append 1 10] [:r 1 []]] :process 10 :index 10 :time 1780346781474369024}
+{:type :ok :f "txn" :value [[:append 3 9] [:r 3 [0 2 2 7 8 9]]] :process 9 :index 9 :time 1780346781474308864}
+{:type :invoke :f "txn" :value [[:append 3 9] [:r 3 []]] :process 9 :index 9 :time 1780346781474289920}
+{:type :ok :f "txn" :value [[:append 3 8] [:r 3 [0 2 2 7 8]]] :process 8 :index 8 :time 1780346781474199040}
+{:type :invoke :f "txn" :value [[:append 3 8] [:r 3 []]] :process 8 :index 8 :time 1780346781474155776}
+{:type :ok :f "txn" :value [[:append 1 7] [:r 1 [4 6 7]]] :process 7 :index 7 :time 1780346781473423104}
+{:type :invoke :f "txn" :value [[:append 1 7] [:r 1 []]] :process 7 :index 7 :time 1780346781473378048}
+{:type :ok :f "txn" :value [[:append 7 6] [:r 7 [1 3 6]]] :process 6 :index 6 :time 1780346781473184000}
+{:type :invoke :f "txn" :value [[:append 7 6] [:r 7 []]] :process 6 :index 6 :time 1780346781473143040}
+{:type :ok :f "txn" :value [[:append 9 5] [:r 9 [0 5]]] :process 5 :index 5 :time 1780346781473018880}
+{:type :invoke :f "txn" :value [[:append 9 5] [:r 9 []]] :process 5 :index 5 :time 1780346781472982016}
+{:type :ok :f "txn" :value [[:append 1 4] [:r 1 [4]]] :process 4 :index 4 :time 1780346781472865024}
+{:type :invoke :f "txn" :value [[:append 1 4] [:r 1 []]] :process 4 :index 4 :time 1780346781472829952}
+{:type :ok :f "txn" :value [[:append 7 3] [:r 7 [1 3]]] :process 3 :index 3 :time 1780346781472723968}
+{:type :invoke :f "txn" :value [[:append 7 3] [:r 7 []]] :process 3 :index 3 :time 1780346781472691968}
+{:type :ok :f "txn" :value [[:append 4 2] [:r 4 [1 2 2]]] :process 2 :index 2 :time 1780346781472595968}
+{:type :invoke :f "txn" :value [[:append 4 2] [:r 4 []]] :process 2 :index 2 :time 1780346781472567040}
+{:type :ok :f "txn" :value [[:append 7 1] [:r 7 [1]]] :process 1 :index 1 :time 1780346781472479232}
+{:type :invoke :f "txn" :value [[:append 7 1] [:r 7 []]] :process 1 :index 1 :time 1780346781472454144}
+{:type :ok :f "txn" :value [[:append 2 0] [:r 2 [0]]] :process 0 :index 0 :time 1780346781472367104}
+{:type :invoke :f "txn" :value [[:append 2 0] [:r 2 []]] :process 0 :index 0 :time 1780346781472340992}
+{:type :ok :f "txn" :value [[:append 2 99] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89 89 93 93 94 99]]] :process 99 :index 99 :time 1780346781507090944}
+{:type :invoke :f "txn" :value [[:append 2 99] [:r 2 []]] :process 99 :index 99 :time 1780346781506974976}
+{:type :ok :f "txn" :value [[:append 3 98] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86 87 89 95 97 98]]] :process 98 :index 98 :time 1780346781506669056}
+{:type :invoke :f "txn" :value [[:append 3 98] [:r 3 []]] :process 98 :index 98 :time 1780346781506576128}
+{:type :ok :f "txn" :value [[:append 3 97] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86 87 89 95 97]]] :process 97 :index 97 :time 1780346781506215168}
+{:type :invoke :f "txn" :value [[:append 3 97] [:r 3 []]] :process 97 :index 97 :time 1780346781506093056}
+{:type :ok :f "txn" :value [[:append 4 96] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92 93 94 95 96]]] :process 96 :index 96 :time 1780346781505744896}
+{:type :invoke :f "txn" :value [[:append 4 96] [:r 4 []]] :process 96 :index 96 :time 1780346781505632000}
+{:type :ok :f "txn" :value [[:append 4 95] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92 93 94 95]]] :process 95 :index 95 :time 1780346781505164032}
+{:type :invoke :f "txn" :value [[:append 4 95] [:r 4 []]] :process 95 :index 95 :time 1780346781505070080}
+{:type :ok :f "txn" :value [[:append 7 94] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93 94 94]]] :process 94 :index 94 :time 1780346781504702976}
+{:type :invoke :f "txn" :value [[:append 7 94] [:r 7 []]] :process 94 :index 94 :time 1780346781504587008}
+{:type :ok :f "txn" :value [[:append 2 93] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89 89 93 93]]] :process 93 :index 93 :time 1780346781504275200}
+{:type :invoke :f "txn" :value [[:append 2 93] [:r 2 []]] :process 93 :index 93 :time 1780346781504101120}
+{:type :ok :f "txn" :value [[:append 9 92] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81 87 87 90 92]]] :process 92 :index 92 :time 1780346781503773952}
+{:type :invoke :f "txn" :value [[:append 9 92] [:r 9 []]] :process 92 :index 92 :time 1780346781503668992}
+{:type :ok :f "txn" :value [[:append 4 91] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91]]] :process 91 :index 91 :time 1780346781503326976}
+{:type :invoke :f "txn" :value [[:append 4 91] [:r 4 []]] :process 91 :index 91 :time 1780346781503165952}
+{:type :ok :f "txn" :value [[:append 5 90] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88 89 90]]] :process 90 :index 90 :time 1780346781502712064}
+{:type :invoke :f "txn" :value [[:append 5 90] [:r 5 []]] :process 90 :index 90 :time 1780346781502409984}
+{:type :ok :f "txn" :value [[:append 2 89] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89 89]]] :process 89 :index 89 :time 1780346781501626112}
+{:type :invoke :f "txn" :value [[:append 2 89] [:r 2 []]] :process 89 :index 89 :time 1780346781501405952}
+{:type :ok :f "txn" :value [[:append 5 88] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82 88]]] :process 88 :index 88 :time 1780346781500896000}
+{:type :invoke :f "txn" :value [[:append 5 88] [:r 5 []]] :process 88 :index 88 :time 1780346781500809984}
+{:type :ok :f "txn" :value [[:append 9 87] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81 87 87]]] :process 87 :index 87 :time 1780346781500460032}
+{:type :invoke :f "txn" :value [[:append 9 87] [:r 9 []]] :process 87 :index 87 :time 1780346781500366080}
+{:type :ok :f "txn" :value [[:append 7 86] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86]]] :process 86 :index 86 :time 1780346781500046080}
+{:type :invoke :f "txn" :value [[:append 7 86] [:r 7 []]] :process 86 :index 86 :time 1780346781499942144}
+{:type :ok :f "txn" :value [[:append 1 85] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80 83 85 85]]] :process 85 :index 85 :time 1780346781499645952}
+{:type :invoke :f "txn" :value [[:append 1 85] [:r 1 []]] :process 85 :index 85 :time 1780346781499528960}
+{:type :ok :f "txn" :value [[:append 8 84] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83 84]]] :process 84 :index 84 :time 1780346781499090944}
+{:type :invoke :f "txn" :value [[:append 8 84] [:r 8 []]] :process 84 :index 84 :time 1780346781498828800}
+{:type :ok :f "txn" :value [[:append 8 83] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83]]] :process 83 :index 83 :time 1780346781498317056}
+{:type :invoke :f "txn" :value [[:append 8 83] [:r 8 []]] :process 83 :index 83 :time 1780346781498102016}
+{:type :ok :f "txn" :value [[:append 2 82] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82]]] :process 82 :index 82 :time 1780346781497371904}
+{:type :invoke :f "txn" :value [[:append 2 82] [:r 2 []]] :process 82 :index 82 :time 1780346781497178112}
+{:type :ok :f "txn" :value [[:append 9 81] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81]]] :process 81 :index 81 :time 1780346781496818176}
+{:type :invoke :f "txn" :value [[:append 9 81] [:r 9 []]] :process 81 :index 81 :time 1780346781496731136}
+{:type :ok :f "txn" :value [[:append 1 80] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80]]] :process 80 :index 80 :time 1780346781496043008}
+{:type :invoke :f "txn" :value [[:append 1 80] [:r 1 []]] :process 80 :index 80 :time 1780346781495927040}
+{:type :ok :f "txn" :value [[:append 1 79] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79]]] :process 79 :index 79 :time 1780346781495569920}
+{:type :invoke :f "txn" :value [[:append 1 79] [:r 1 []]] :process 79 :index 79 :time 1780346781495488768}
+{:type :ok :f "txn" :value [[:append 6 78] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73 76 76 78]]] :process 78 :index 78 :time 1780346781495035904}
+{:type :invoke :f "txn" :value [[:append 6 78] [:r 6 []]] :process 78 :index 78 :time 1780346781494946048}
+{:type :ok :f "txn" :value [[:append 1 77] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77]]] :process 77 :index 77 :time 1780346781494482944}
+{:type :invoke :f "txn" :value [[:append 1 77] [:r 1 []]] :process 77 :index 77 :time 1780346781494408960}
+{:type :ok :f "txn" :value [[:append 6 76] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73 76 76]]] :process 76 :index 76 :time 1780346781494048000}
+{:type :invoke :f "txn" :value [[:append 6 76] [:r 6 []]] :process 76 :index 76 :time 1780346781493974016}
+{:type :ok :f "txn" :value [[:append 7 75] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75]]] :process 75 :index 75 :time 1780346781493718016}
+{:type :invoke :f "txn" :value [[:append 7 75] [:r 7 []]] :process 75 :index 75 :time 1780346781493647104}
+{:type :ok :f "txn" :value [[:append 0 74] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74]]] :process 74 :index 74 :time 1780346781493415168}
+{:type :invoke :f "txn" :value [[:append 0 74] [:r 0 []]] :process 74 :index 74 :time 1780346781493289984}
+{:type :ok :f "txn" :value [[:append 8 73] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73]]] :process 73 :index 73 :time 1780346781492996864}
+{:type :invoke :f "txn" :value [[:append 8 73] [:r 8 []]] :process 73 :index 73 :time 1780346781492868864}
+{:type :ok :f "txn" :value [[:append 3 72] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72]]] :process 72 :index 72 :time 1780346781492646912}
+{:type :invoke :f "txn" :value [[:append 3 72] [:r 3 []]] :process 72 :index 72 :time 1780346781492506880}
+{:type :ok :f "txn" :value [[:append 1 71] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71]]] :process 71 :index 71 :time 1780346781492222976}
+{:type :invoke :f "txn" :value [[:append 1 71] [:r 1 []]] :process 71 :index 71 :time 1780346781492145920}
+{:type :ok :f "txn" :value [[:append 1 70] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70]]] :process 70 :index 70 :time 1780346781491715840}
+{:type :invoke :f "txn" :value [[:append 1 70] [:r 1 []]] :process 70 :index 70 :time 1780346781491648000}
+{:type :ok :f "txn" :value [[:append 2 69] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69]]] :process 69 :index 69 :time 1780346781491318016}
+{:type :invoke :f "txn" :value [[:append 2 69] [:r 2 []]] :process 69 :index 69 :time 1780346781491249152}
+{:type :ok :f "txn" :value [[:append 8 68] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68]]] :process 68 :index 68 :time 1780346781491010048}
+{:type :invoke :f "txn" :value [[:append 8 68] [:r 8 []]] :process 68 :index 68 :time 1780346781490905088}
+{:type :ok :f "txn" :value [[:append 7 67] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67]]] :process 67 :index 67 :time 1780346781490694912}
+{:type :invoke :f "txn" :value [[:append 7 67] [:r 7 []]] :process 67 :index 67 :time 1780346781490629888}
+{:type :ok :f "txn" :value [[:append 7 66] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66]]] :process 66 :index 66 :time 1780346781490381056}
+{:type :invoke :f "txn" :value [[:append 7 66] [:r 7 []]] :process 66 :index 66 :time 1780346781490315008}
+{:type :ok :f "txn" :value [[:append 4 65] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65]]] :process 65 :index 65 :time 1780346781490071040}
+{:type :invoke :f "txn" :value [[:append 4 65] [:r 4 []]] :process 65 :index 65 :time 1780346781489989120}
+{:type :ok :f "txn" :value [[:append 6 64] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64]]] :process 64 :index 64 :time 1780346781489763072}
+{:type :invoke :f "txn" :value [[:append 6 64] [:r 6 []]] :process 64 :index 64 :time 1780346781489700096}
+{:type :ok :f "txn" :value [[:append 3 63] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63]]] :process 63 :index 63 :time 1780346781489438976}
+{:type :invoke :f "txn" :value [[:append 3 63] [:r 3 []]] :process 63 :index 63 :time 1780346781489375232}
+{:type :ok :f "txn" :value [[:append 6 62] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62]]] :process 62 :index 62 :time 1780346781488997888}
+{:type :invoke :f "txn" :value [[:append 6 62] [:r 6 []]] :process 62 :index 62 :time 1780346781488856064}
+{:type :ok :f "txn" :value [[:append 3 61] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61]]] :process 61 :index 61 :time 1780346781488667904}
+{:type :invoke :f "txn" :value [[:append 3 61] [:r 3 []]] :process 61 :index 61 :time 1780346781488604928}
+{:type :ok :f "txn" :value [[:append 3 60] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60]]] :process 60 :index 60 :time 1780346781488336128}
+{:type :invoke :f "txn" :value [[:append 3 60] [:r 3 []]] :process 60 :index 60 :time 1780346781488253952}
+{:type :ok :f "txn" :value [[:append 2 59] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59]]] :process 59 :index 59 :time 1780346781487615232}
+{:type :invoke :f "txn" :value [[:append 2 59] [:r 2 []]] :process 59 :index 59 :time 1780346781487448832}
+{:type :ok :f "txn" :value [[:append 5 58] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58]]] :process 58 :index 58 :time 1780346781486877952}
+{:type :invoke :f "txn" :value [[:append 5 58] [:r 5 []]] :process 58 :index 58 :time 1780346781486771200}
+{:type :ok :f "txn" :value [[:append 1 57] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57]]] :process 57 :index 57 :time 1780346781486159104}
+{:type :invoke :f "txn" :value [[:append 1 57] [:r 1 []]] :process 57 :index 57 :time 1780346781486011904}
+{:type :ok :f "txn" :value [[:append 5 56] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56]]] :process 56 :index 56 :time 1780346781485629184}
+{:type :invoke :f "txn" :value [[:append 5 56] [:r 5 []]] :process 56 :index 56 :time 1780346781485477888}
+{:type :ok :f "txn" :value [[:append 0 55] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55]]] :process 55 :index 55 :time 1780346781485146880}
+{:type :invoke :f "txn" :value [[:append 0 55] [:r 0 []]] :process 55 :index 55 :time 1780346781485049088}
+{:type :ok :f "txn" :value [[:append 5 54] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54]]] :process 54 :index 54 :time 1780346781484726016}
+{:type :invoke :f "txn" :value [[:append 5 54] [:r 5 []]] :process 54 :index 54 :time 1780346781484611072}
+{:type :ok :f "txn" :value [[:append 8 53] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53]]] :process 53 :index 53 :time 1780346781484292864}
+{:type :invoke :f "txn" :value [[:append 8 53] [:r 8 []]] :process 53 :index 53 :time 1780346781484195840}
+{:type :ok :f "txn" :value [[:append 5 52] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52]]] :process 52 :index 52 :time 1780346781483922944}
+{:type :invoke :f "txn" :value [[:append 5 52] [:r 5 []]] :process 52 :index 52 :time 1780346781483836928}
+{:type :ok :f "txn" :value [[:append 6 51] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51]]] :process 51 :index 51 :time 1780346781483511808}
+{:type :invoke :f "txn" :value [[:append 6 51] [:r 6 []]] :process 51 :index 51 :time 1780346781483403008}
+{:type :ok :f "txn" :value [[:append 4 50] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50]]] :process 50 :index 50 :time 1780346781483004928}
+{:type :invoke :f "txn" :value [[:append 4 50] [:r 4 []]] :process 50 :index 50 :time 1780346781482893056}
+{:type :ok :f "txn" :value [[:append 5 49] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49]]] :process 49 :index 49 :time 1780346781482584064}
+{:type :invoke :f "txn" :value [[:append 5 49] [:r 5 []]] :process 49 :index 49 :time 1780346781482481920}
+{:type :ok :f "txn" :value [[:append 7 48] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48]]] :process 48 :index 48 :time 1780346781482078976}
+{:type :invoke :f "txn" :value [[:append 7 48] [:r 7 []]] :process 48 :index 48 :time 1780346781481988864}
+{:type :ok :f "txn" :value [[:append 7 47] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47]]] :process 47 :index 47 :time 1780346781481672960}
+{:type :invoke :f "txn" :value [[:append 7 47] [:r 7 []]] :process 47 :index 47 :time 1780346781481595136}
+{:type :ok :f "txn" :value [[:append 9 46] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46]]] :process 46 :index 46 :time 1780346781481331200}
+{:type :invoke :f "txn" :value [[:append 9 46] [:r 9 []]] :process 46 :index 46 :time 1780346781481217024}
+{:type :ok :f "txn" :value [[:append 6 45] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45]]] :process 45 :index 45 :time 1780346781480807936}
+{:type :invoke :f "txn" :value [[:append 6 45] [:r 6 []]] :process 45 :index 45 :time 1780346781480672000}
+{:type :ok :f "txn" :value [[:append 8 44] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44]]] :process 44 :index 44 :time 1780346781480423936}
+{:type :invoke :f "txn" :value [[:append 8 44] [:r 8 []]] :process 44 :index 44 :time 1780346781480375040}
+{:type :ok :f "txn" :value [[:append 9 43] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43]]] :process 43 :index 43 :time 1780346781480109056}
+{:type :invoke :f "txn" :value [[:append 9 43] [:r 9 []]] :process 43 :index 43 :time 1780346781480005888}
+{:type :ok :f "txn" :value [[:append 4 42] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42]]] :process 42 :index 42 :time 1780346781479830016}
+{:type :invoke :f "txn" :value [[:append 4 42] [:r 4 []]] :process 42 :index 42 :time 1780346781479785984}
+{:type :ok :f "txn" :value [[:append 2 41] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41]]] :process 41 :index 41 :time 1780346781479613184}
+{:type :invoke :f "txn" :value [[:append 2 41] [:r 2 []]] :process 41 :index 41 :time 1780346781479569920}
+{:type :ok :f "txn" :value [[:append 7 40] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40]]] :process 40 :index 40 :time 1780346781479404800}
+{:type :invoke :f "txn" :value [[:append 7 40] [:r 7 []]] :process 40 :index 40 :time 1780346781479363072}
+{:type :info :f "start-pause" :value "start-pause" :process -1 :index 2 :time 1780346781479136000}
+{:type :ok :f "txn" :value [[:append 0 39] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39]]] :process 39 :index 39 :time 1780346781479136000}
+{:type :invoke :f "txn" :value [[:append 0 39] [:r 0 []]] :process 39 :index 39 :time 1780346781479094016}
+{:type :ok :f "txn" :value [[:append 2 38] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38]]] :process 38 :index 38 :time 1780346781478939904}
+{:type :invoke :f "txn" :value [[:append 2 38] [:r 2 []]] :process 38 :index 38 :time 1780346781478884864}
+{:type :ok :f "txn" :value [[:append 5 37] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37]]] :process 37 :index 37 :time 1780346781478717952}
+{:type :invoke :f "txn" :value [[:append 5 37] [:r 5 []]] :process 37 :index 37 :time 1780346781478678016}
+{:type :ok :f "txn" :value [[:append 4 36] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36]]] :process 36 :index 36 :time 1780346781478552064}
+{:type :invoke :f "txn" :value [[:append 4 36] [:r 4 []]] :process 36 :index 36 :time 1780346781478512128}
+{:type :ok :f "txn" :value [[:append 3 35] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35]]] :process 35 :index 35 :time 1780346781478348032}
+{:type :invoke :f "txn" :value [[:append 3 35] [:r 3 []]] :process 35 :index 35 :time 1780346781478307840}
+{:type :ok :f "txn" :value [[:append 4 34] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34]]] :process 34 :index 34 :time 1780346781478017024}
+{:type :invoke :f "txn" :value [[:append 4 34] [:r 4 []]] :process 34 :index 34 :time 1780346781477915904}
+{:type :ok :f "txn" :value [[:append 5 33] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33]]] :process 33 :index 33 :time 1780346781477720064}
+{:type :invoke :f "txn" :value [[:append 5 33] [:r 5 []]] :process 33 :index 33 :time 1780346781477682944}
+{:type :ok :f "txn" :value [[:append 8 32] [:r 8 [11 20 23 25 26 27 29 32]]] :process 32 :index 32 :time 1780346781477565952}
+{:type :invoke :f "txn" :value [[:append 8 32] [:r 8 []]] :process 32 :index 32 :time 1780346781477530880}
+{:type :ok :f "txn" :value [[:append 6 31] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31]]] :process 31 :index 31 :time 1780346781477417984}
+{:type :invoke :f "txn" :value [[:append 6 31] [:r 6 []]] :process 31 :index 31 :time 1780346781477336832}
+{:type :ok :f "txn" :value [[:append 6 30] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30]]] :process 30 :index 30 :time 1780346781477161984}
+{:type :invoke :f "txn" :value [[:append 6 30] [:r 6 []]] :process 30 :index 30 :time 1780346781477127936}
+{:type :ok :f "txn" :value [[:append 7 29] [:r 7 [1 3 6 6 11 15 24 29]]] :process 29 :index 29 :time 1780346781477024000}
+{:type :invoke :f "txn" :value [[:append 7 29] [:r 7 []]] :process 29 :index 29 :time 1780346781476990976}
+{:type :ok :f "txn" :value [[:append 1 28] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28]]] :process 28 :index 28 :time 1780346781476851968}
+{:type :invoke :f "txn" :value [[:append 1 28] [:r 1 []]] :process 28 :index 28 :time 1780346781476820992}
+{:type :ok :f "txn" :value [[:append 0 27] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27]]] :process 27 :index 27 :time 1780346781476721152}
+{:type :invoke :f "txn" :value [[:append 0 27] [:r 0 []]] :process 27 :index 27 :time 1780346781476690176}
+{:type :ok :f "txn" :value [[:append 8 26] [:r 8 [11 20 23 25 26]]] :process 26 :index 26 :time 1780346781476592128}
+{:type :invoke :f "txn" :value [[:append 8 26] [:r 8 []]] :process 26 :index 26 :time 1780346781476551168}
+{:type :ok :f "txn" :value [[:append 0 25] [:r 0 [3 3 5 5 8 8 11 13 19 24 25]]] :process 25 :index 25 :time 1780346781476454912}
+{:type :invoke :f "txn" :value [[:append 0 25] [:r 0 []]] :process 25 :index 25 :time 1780346781476424960}
+{:type :ok :f "txn" :value [[:append 7 24] [:r 7 [1 3 6 6 11 15 24]]] :process 24 :index 24 :time 1780346781476332800}
+{:type :invoke :f "txn" :value [[:append 7 24] [:r 7 []]] :process 24 :index 24 :time 1780346781476304128}
+{:type :ok :f "txn" :value [[:append 3 23] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23]]] :process 23 :index 23 :time 1780346781476142848}
+{:type :invoke :f "txn" :value [[:append 3 23] [:r 3 []]] :process 23 :index 23 :time 1780346781476113152}
+{:type :ok :f "txn" :value [[:append 5 22] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22]]] :process 22 :index 22 :time 1780346781476026112}
+{:type :invoke :f "txn" :value [[:append 5 22] [:r 5 []]] :process 22 :index 22 :time 1780346781475996928}
+{:type :ok :f "txn" :value [[:append 1 21] [:r 1 [4 6 7 8 10 15 18 19 20 21 21]]] :process 21 :index 21 :time 1780346781475904000}
+{:type :invoke :f "txn" :value [[:append 1 21] [:r 1 []]] :process 21 :index 21 :time 1780346781475876096}
+{:type :ok :f "txn" :value [[:append 8 20] [:r 8 [11 20]]] :process 20 :index 20 :time 1780346781475682048}
+{:type :invoke :f "txn" :value [[:append 8 20] [:r 8 []]] :process 20 :index 20 :time 1780346781475655936}
+{:type :ok :f "txn" :value [[:append 6 19] [:r 6 [0 1 4 9 12 17 19]]] :process 19 :index 19 :time 1780346781475537152}
+{:type :invoke :f "txn" :value [[:append 6 19] [:r 6 []]] :process 19 :index 19 :time 1780346781475513088}
+{:type :ok :f "txn" :value [[:append 2 18] [:r 2 [0 5 9 10 13 17 17 18]]] :process 18 :index 18 :time 1780346781475410944}
+{:type :invoke :f "txn" :value [[:append 2 18] [:r 2 []]] :process 18 :index 18 :time 1780346781475384832}
+{:type :ok :f "txn" :value [[:append 2 17] [:r 2 [0 5 9 10 13 17 17]]] :process 17 :index 17 :time 1780346781475298816}
+{:type :invoke :f "txn" :value [[:append 2 17] [:r 2 []]] :process 17 :index 17 :time 1780346781475258112}
+{:type :ok :f "txn" :value [[:append 3 16] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16]]] :process 16 :index 16 :time 1780346781475126016}
+{:type :invoke :f "txn" :value [[:append 3 16] [:r 3 []]] :process 16 :index 16 :time 1780346781475100928}
+{:type :ok :f "txn" :value [[:append 3 15] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15]]] :process 15 :index 15 :time 1780346781475024896}
+{:type :invoke :f "txn" :value [[:append 3 15] [:r 3 []]] :process 15 :index 15 :time 1780346781474999040}
+{:type :ok :f "txn" :value [[:append 9 14] [:r 9 [0 5 12 14 14]]] :process 14 :index 14 :time 1780346781474877952}
+{:type :invoke :f "txn" :value [[:append 9 14] [:r 9 []]] :process 14 :index 14 :time 1780346781474853888}
+{:type :ok :f "txn" :value [[:append 4 13] [:r 4 [1 2 2 4 4 7 10 13]]] :process 13 :index 13 :time 1780346781474778880}
+{:type :invoke :f "txn" :value [[:append 4 13] [:r 4 []]] :process 13 :index 13 :time 1780346781474755072}
+{:type :ok :f "txn" :value [[:append 9 12] [:r 9 [0 5 12]]] :process 12 :index 12 :time 1780346781474653952}
+{:type :invoke :f "txn" :value [[:append 9 12] [:r 9 []]] :process 12 :index 12 :time 1780346781474633984}
+{:type :ok :f "txn" :value [[:append 5 11] [:r 5 [1 3 6 7 11]]] :process 11 :index 11 :time 1780346781474566912}
+{:type :invoke :f "txn" :value [[:append 5 11] [:r 5 []]] :process 11 :index 11 :time 1780346781474548224}
+{:type :ok :f "txn" :value [[:append 3 10] [:r 3 [0 2 2 7 8 9 9 10]]] :process 10 :index 10 :time 1780346781474409216}
+{:type :invoke :f "txn" :value [[:append 3 10] [:r 3 []]] :process 10 :index 10 :time 1780346781474388992}
+{:type :ok :f "txn" :value [[:append 2 9] [:r 2 [0 5 9]]] :process 9 :index 9 :time 1780346781474327040}
+{:type :invoke :f "txn" :value [[:append 2 9] [:r 2 []]] :process 9 :index 9 :time 1780346781474308864}
+{:type :ok :f "txn" :value [[:append 0 8] [:r 0 [3 3 5 5 8 8]]] :process 8 :index 8 :time 1780346781474245120}
+{:type :invoke :f "txn" :value [[:append 0 8] [:r 0 []]] :process 8 :index 8 :time 1780346781474200064}
+{:type :ok :f "txn" :value [[:append 3 7] [:r 3 [0 2 2 7]]] :process 7 :index 7 :time 1780346781473468160}
+{:type :invoke :f "txn" :value [[:append 3 7] [:r 3 []]] :process 7 :index 7 :time 1780346781473423104}
+{:type :ok :f "txn" :value [[:append 7 6] [:r 7 [1 3 6 6]]] :process 6 :index 6 :time 1780346781473256192}
+{:type :invoke :f "txn" :value [[:append 7 6] [:r 7 []]] :process 6 :index 6 :time 1780346781473184000}
+{:type :ok :f "txn" :value [[:append 2 5] [:r 2 [0 5]]] :process 5 :index 5 :time 1780346781473058048}
+{:type :invoke :f "txn" :value [[:append 2 5] [:r 2 []]] :process 5 :index 5 :time 1780346781473020160}
+{:type :ok :f "txn" :value [[:append 4 4] [:r 4 [1 2 2 4 4]]] :process 4 :index 4 :time 1780346781472902144}
+{:type :invoke :f "txn" :value [[:append 4 4] [:r 4 []]] :process 4 :index 4 :time 1780346781472865024}
+{:type :ok :f "txn" :value [[:append 0 3] [:r 0 [3 3]]] :process 3 :index 3 :time 1780346781472756992}
+{:type :invoke :f "txn" :value [[:append 0 3] [:r 0 []]] :process 3 :index 3 :time 1780346781472724992}
+{:type :ok :f "txn" :value [[:append 3 2] [:r 3 [0 2]]] :process 2 :index 2 :time 1780346781472624896}
+{:type :invoke :f "txn" :value [[:append 3 2] [:r 3 []]] :process 2 :index 2 :time 1780346781472598016}
+{:type :ok :f "txn" :value [[:append 6 1] [:r 6 [0 1]]] :process 1 :index 1 :time 1780346781472506112}
+{:type :invoke :f "txn" :value [[:append 6 1] [:r 6 []]] :process 1 :index 1 :time 1780346781472481024}
+{:type :ok :f "txn" :value [[:append 6 0] [:r 6 [0]]] :process 0 :index 0 :time 1780346781472392960}
+{:type :invoke :f "txn" :value [[:append 6 0] [:r 6 []]] :process 0 :index 0 :time 1780346781472368896}
+{:type :ok :f "txn" :value [[:append 9 99] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71 76 81 81 87 87 90 92 99]]] :process 99 :index 99 :time 1780346781507211008}
+{:type :invoke :f "txn" :value [[:append 9 99] [:r 9 []]] :process 99 :index 99 :time 1780346781507091968}
+{:type :ok :f "txn" :value [[:append 4 98] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92 93 94 95 96 98]]] :process 98 :index 98 :time 1780346781506784000}
+{:type :invoke :f "txn" :value [[:append 4 98] [:r 4 []]] :process 98 :index 98 :time 1780346781506669056}
+{:type :ok :f "txn" :value [[:append 1 97] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74 77 77 79 79 80 80 83 85 85 95 97]]] :process 97 :index 97 :time 1780346781506375168}
+{:type :invoke :f "txn" :value [[:append 1 97] [:r 1 []]] :process 97 :index 97 :time 1780346781506215168}
+{:type :ok :f "txn" :value [[:append 7 96] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93 94 94 96 96]]] :process 96 :index 96 :time 1780346781505841920}
+{:type :invoke :f "txn" :value [[:append 7 96] [:r 7 []]] :process 96 :index 96 :time 1780346781505744896}
+{:type :ok :f "txn" :value [[:append 3 95] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86 87 89 95]]] :process 95 :index 95 :time 1780346781505396992}
+{:type :invoke :f "txn" :value [[:append 3 95] [:r 3 []]] :process 95 :index 95 :time 1780346781505164032}
+{:type :ok :f "txn" :value [[:append 2 94] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63 69 70 71 80 81 82 86 88 89 89 93 93 94]]] :process 94 :index 94 :time 1780346781504793856}
+{:type :invoke :f "txn" :value [[:append 2 94] [:r 2 []]] :process 94 :index 94 :time 1780346781504702976}
+{:type :ok :f "txn" :value [[:append 7 93] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87 90 93]]] :process 93 :index 93 :time 1780346781504382976}
+{:type :invoke :f "txn" :value [[:append 7 93] [:r 7 []]] :process 93 :index 93 :time 1780346781504275968}
+{:type :ok :f "txn" :value [[:append 4 92] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91 92]]] :process 92 :index 92 :time 1780346781503907840}
+{:type :invoke :f "txn" :value [[:append 4 92] [:r 4 []]] :process 92 :index 92 :time 1780346781503774976}
+{:type :ok :f "txn" :value [[:append 4 91] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76 77 88 91 91 91]]] :process 91 :index 91 :time 1780346781503421952}
+{:type :invoke :f "txn" :value [[:append 4 91] [:r 4 []]] :process 91 :index 91 :time 1780346781503328000}
+{:type :ok :f "txn" :value [[:append 8 90] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81 83 84 90]]] :process 90 :index 90 :time 1780346781502803968}
+{:type :invoke :f "txn" :value [[:append 8 90] [:r 8 []]] :process 90 :index 90 :time 1780346781502713088}
+{:type :ok :f "txn" :value [[:append 3 89] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79 84 86 87 89]]] :process 89 :index 89 :time 1780346781501879808}
+{:type :invoke :f "txn" :value [[:append 3 89] [:r 3 []]] :process 89 :index 89 :time 1780346781501626880}
+{:type :ok :f "txn" :value [[:append 6 88] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73 76 76 78 88]]] :process 88 :index 88 :time 1780346781501007104}
+{:type :invoke :f "txn" :value [[:append 6 88] [:r 6 []]] :process 88 :index 88 :time 1780346781500897024}
+{:type :ok :f "txn" :value [[:append 7 87] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85 86 87]]] :process 87 :index 87 :time 1780346781500595968}
+{:type :invoke :f "txn" :value [[:append 7 87] [:r 7 []]] :process 87 :index 87 :time 1780346781500461056}
+{:type :ok :f "txn" :value [[:append 0 86] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83 84 86]]] :process 86 :index 86 :time 1780346781500132096}
+{:type :invoke :f "txn" :value [[:append 0 86] [:r 0 []]] :process 86 :index 86 :time 1780346781500046080}
+{:type :ok :f "txn" :value [[:append 7 85] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83 84 85 85]]] :process 85 :index 85 :time 1780346781499735040}
+{:type :invoke :f "txn" :value [[:append 7 85] [:r 7 []]] :process 85 :index 85 :time 1780346781499646976}
+{:type :ok :f "txn" :value [[:append 0 84] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75 78 83 84]]] :process 84 :index 84 :time 1780346781499269120}
+{:type :invoke :f "txn" :value [[:append 0 84] [:r 0 []]] :process 84 :index 84 :time 1780346781499092224}
+{:type :ok :f "txn" :value [[:append 7 83] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80 82 83]]] :process 83 :index 83 :time 1780346781498443008}
+{:type :invoke :f "txn" :value [[:append 7 83] [:r 7 []]] :process 83 :index 83 :time 1780346781498318848}
+{:type :ok :f "txn" :value [[:append 5 82] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69 72 75 79 82 82]]] :process 82 :index 82 :time 1780346781497590016}
+{:type :invoke :f "txn" :value [[:append 5 82] [:r 5 []]] :process 82 :index 82 :time 1780346781497373184}
+{:type :ok :f "txn" :value [[:append 8 81] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53 56 60 62 65 68 73 81]]] :process 81 :index 81 :time 1780346781496926976}
+{:type :invoke :f "txn" :value [[:append 8 81] [:r 8 []]] :process 81 :index 81 :time 1780346781496818176}
+{:type :ok :f "txn" :value [[:append 7 80] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78 80]]] :process 80 :index 80 :time 1780346781496310016}
+{:type :invoke :f "txn" :value [[:append 7 80] [:r 7 []]] :process 80 :index 80 :time 1780346781496044032}
+{:type :ok :f "txn" :value [[:append 3 79] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67 72 74 74 78 79]]] :process 79 :index 79 :time 1780346781495688960}
+{:type :invoke :f "txn" :value [[:append 3 79] [:r 3 []]] :process 79 :index 79 :time 1780346781495569920}
+{:type :ok :f "txn" :value [[:append 7 78] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77 78]]] :process 78 :index 78 :time 1780346781495289088}
+{:type :invoke :f "txn" :value [[:append 7 78] [:r 7 []]] :process 78 :index 78 :time 1780346781495037184}
+{:type :ok :f "txn" :value [[:append 7 77] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65 66 66 67 67 69 69 70 75 77]]] :process 77 :index 77 :time 1780346781494705920}
+{:type :invoke :f "txn" :value [[:append 7 77] [:r 7 []]] :process 77 :index 77 :time 1780346781494482944}
+{:type :ok :f "txn" :value [[:append 4 76] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72 73 73 76]]] :process 76 :index 76 :time 1780346781494170880}
+{:type :invoke :f "txn" :value [[:append 4 76] [:r 4 []]] :process 76 :index 76 :time 1780346781494049024}
+{:type :ok :f "txn" :value [[:append 0 75] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61 74 75 75]]] :process 75 :index 75 :time 1780346781493818112}
+{:type :invoke :f "txn" :value [[:append 0 75] [:r 0 []]] :process 75 :index 75 :time 1780346781493719040}
+{:type :ok :f "txn" :value [[:append 1 74] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70 71 74]]] :process 74 :index 74 :time 1780346781493489152}
+{:type :invoke :f "txn" :value [[:append 1 74] [:r 1 []]] :process 74 :index 74 :time 1780346781493416192}
+{:type :ok :f "txn" :value [[:append 6 73] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49 51 52 54 58 62 62 63 64 64 65 73]]] :process 73 :index 73 :time 1780346781493071104}
+{:type :invoke :f "txn" :value [[:append 6 73] [:r 6 []]] :process 73 :index 73 :time 1780346781492997888}
+{:type :ok :f "txn" :value [[:append 4 72] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66 68 72 72]]] :process 72 :index 72 :time 1780346781492719872}
+{:type :invoke :f "txn" :value [[:append 4 72] [:r 4 []]] :process 72 :index 72 :time 1780346781492647936}
+{:type :ok :f "txn" :value [[:append 9 71] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47 50 50 55 57 67 71 71]]] :process 71 :index 71 :time 1780346781492321024}
+{:type :invoke :f "txn" :value [[:append 9 71] [:r 9 []]] :process 71 :index 71 :time 1780346781492224000}
+{:type :ok :f "txn" :value [[:append 1 70] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68 70 70]]] :process 70 :index 70 :time 1780346781491848960}
+{:type :invoke :f "txn" :value [[:append 1 70] [:r 1 []]] :process 70 :index 70 :time 1780346781491715840}
+{:type :ok :f "txn" :value [[:append 5 69] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55 56 58 66 69]]] :process 69 :index 69 :time 1780346781491436032}
+{:type :invoke :f "txn" :value [[:append 5 69] [:r 5 []]] :process 69 :index 69 :time 1780346781491318016}
+{:type :ok :f "txn" :value [[:append 1 68] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64 68 68]]] :process 68 :index 68 :time 1780346781491077888}
+{:type :invoke :f "txn" :value [[:append 1 68] [:r 1 []]] :process 68 :index 68 :time 1780346781491010816}
+{:type :ok :f "txn" :value [[:append 3 67] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41 44 44 49 51 57 60 61 61 63 64 67]]] :process 67 :index 67 :time 1780346781490761984}
+{:type :invoke :f "txn" :value [[:append 3 67] [:r 3 []]] :process 67 :index 67 :time 1780346781490695936}
+{:type :ok :f "txn" :value [[:append 4 66] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62 63 65 66]]] :process 66 :index 66 :time 1780346781490456064}
+{:type :invoke :f "txn" :value [[:append 4 66] [:r 4 []]] :process 66 :index 66 :time 1780346781490382080}
+{:type :ok :f "txn" :value [[:append 7 65] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59 65]]] :process 65 :index 65 :time 1780346781490134016}
+{:type :invoke :f "txn" :value [[:append 7 65] [:r 7 []]] :process 65 :index 65 :time 1780346781490071040}
+{:type :ok :f "txn" :value [[:append 1 64] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33 39 40 47 54 55 57 58 64]]] :process 64 :index 64 :time 1780346781489825024}
+{:type :invoke :f "txn" :value [[:append 1 64] [:r 1 []]] :process 64 :index 64 :time 1780346781489764096}
+{:type :ok :f "txn" :value [[:append 2 63] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60 61 63]]] :process 63 :index 63 :time 1780346781489553920}
+{:type :invoke :f "txn" :value [[:append 2 63] [:r 2 []]] :process 63 :index 63 :time 1780346781489440000}
+{:type :ok :f "txn" :value [[:append 4 62] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57 59 62]]] :process 62 :index 62 :time 1780346781489167872}
+{:type :invoke :f "txn" :value [[:append 4 62] [:r 4 []]] :process 62 :index 62 :time 1780346781488998912}
+{:type :ok :f "txn" :value [[:append 0 61] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50 52 55 59 60 61]]] :process 61 :index 61 :time 1780346781488729856}
+{:type :invoke :f "txn" :value [[:append 0 61] [:r 0 []]] :process 61 :index 61 :time 1780346781488668928}
+{:type :ok :f "txn" :value [[:append 2 60] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58 59 60]]] :process 60 :index 60 :time 1780346781488404992}
+{:type :invoke :f "txn" :value [[:append 2 60] [:r 2 []]] :process 60 :index 60 :time 1780346781488337152}
+{:type :ok :f "txn" :value [[:append 7 59] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48 59]]] :process 59 :index 59 :time 1780346781487772928}
+{:type :invoke :f "txn" :value [[:append 7 59] [:r 7 []]] :process 59 :index 59 :time 1780346781487616000}
+{:type :ok :f "txn" :value [[:append 2 58] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56 58]]] :process 58 :index 58 :time 1780346781487040000}
+{:type :invoke :f "txn" :value [[:append 2 58] [:r 2 []]] :process 58 :index 58 :time 1780346781486879232}
+{:type :ok :f "txn" :value [[:append 4 57] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52 57]]] :process 57 :index 57 :time 1780346781486370048}
+{:type :invoke :f "txn" :value [[:append 4 57] [:r 4 []]] :process 57 :index 57 :time 1780346781486160128}
+{:type :ok :f "txn" :value [[:append 2 56] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54 56 56]]] :process 56 :index 56 :time 1780346781485742080}
+{:type :invoke :f "txn" :value [[:append 2 56] [:r 2 []]] :process 56 :index 56 :time 1780346781485629952}
+{:type :ok :f "txn" :value [[:append 5 55] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45 47 49 52 54 55]]] :process 55 :index 55 :time 1780346781485249024}
+{:type :invoke :f "txn" :value [[:append 5 55] [:r 5 []]] :process 55 :index 55 :time 1780346781485147904}
+{:type :ok :f "txn" :value [[:append 2 54] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40 41 46 46 53 53 54]]] :process 54 :index 54 :time 1780346781484808960}
+{:type :invoke :f "txn" :value [[:append 2 54] [:r 2 []]] :process 54 :index 54 :time 1780346781484726784}
+{:type :ok :f "txn" :value [[:append 8 53] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51 53 53]]] :process 53 :index 53 :time 1780346781484436992}
+{:type :invoke :f "txn" :value [[:append 8 53] [:r 8 []]] :process 53 :index 53 :time 1780346781484293888}
+{:type :ok :f "txn" :value [[:append 4 52] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42 50 52]]] :process 52 :index 52 :time 1780346781484011008}
+{:type :invoke :f "txn" :value [[:append 4 52] [:r 4 []]] :process 52 :index 52 :time 1780346781483923968}
+{:type :ok :f "txn" :value [[:append 8 51] [:r 8 [11 20 23 25 26 27 29 32 34 35 38 44 48 48 51 51]]] :process 51 :index 51 :time 1780346781483609856}
+{:type :invoke :f "txn" :value [[:append 8 51] [:r 8 []]] :process 51 :index 51 :time 1780346781483511808}
+{:type :ok :f "txn" :value [[:append 0 50] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43 49 50]]] :process 50 :index 50 :time 1780346781483185920}
+{:type :invoke :f "txn" :value [[:append 0 50] [:r 0 []]] :process 50 :index 50 :time 1780346781483005952}
+{:type :ok :f "txn" :value [[:append 6 49] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28 30 31 31 42 43 45 49]]] :process 49 :index 49 :time 1780346781482672896}
+{:type :invoke :f "txn" :value [[:append 6 49] [:r 6 []]] :process 49 :index 49 :time 1780346781482584832}
+{:type :ok :f "txn" :value [[:append 7 48] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46 47 48 48]]] :process 48 :index 48 :time 1780346781482166016}
+{:type :invoke :f "txn" :value [[:append 7 48] [:r 7 []]] :process 48 :index 48 :time 1780346781482078976}
+{:type :ok :f "txn" :value [[:append 9 47] [:r 9 [0 5 12 14 14 23 23 24 28 29 41 41 42 43 46 47]]] :process 47 :index 47 :time 1780346781481816064}
+{:type :invoke :f "txn" :value [[:append 9 47] [:r 9 []]] :process 47 :index 47 :time 1780346781481672960}
+{:type :ok :f "txn" :value [[:append 7 46] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44 45 45 46]]] :process 46 :index 46 :time 1780346781481420032}
+{:type :invoke :f "txn" :value [[:append 7 46] [:r 7 []]] :process 46 :index 46 :time 1780346781481331968}
+{:type :ok :f "txn" :value [[:append 5 45] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22 28 31 33 35 36 37 45]]] :process 45 :index 45 :time 1780346781480950016}
+{:type :invoke :f "txn" :value [[:append 5 45] [:r 5 []]] :process 45 :index 45 :time 1780346781480808960}
+{:type :ok :f "txn" :value [[:append 7 44] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39 40 44]]] :process 44 :index 44 :time 1780346781480470784}
+{:type :invoke :f "txn" :value [[:append 7 44] [:r 7 []]] :process 44 :index 44 :time 1780346781480424960}
+{:type :ok :f "txn" :value [[:append 0 43] [:r 0 [3 3 5 5 8 8 11 13 19 24 25 27 33 34 38 39 43 43]]] :process 43 :index 43 :time 1780346781480155904}
+{:type :invoke :f "txn" :value [[:append 0 43] [:r 0 []]] :process 43 :index 43 :time 1780346781480109824}
+{:type :ok :f "txn" :value [[:append 4 42] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25 27 30 33 34 36 36 37 42 42]]] :process 42 :index 42 :time 1780346781479912960}
+{:type :invoke :f "txn" :value [[:append 4 42] [:r 4 []]] :process 42 :index 42 :time 1780346781479831040}
+{:type :ok :f "txn" :value [[:append 3 41] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21 22 23 26 35 39 41]]] :process 41 :index 41 :time 1780346781479693056}
+{:type :invoke :f "txn" :value [[:append 3 41] [:r 3 []]] :process 41 :index 41 :time 1780346781479613952}
+{:type :ok :f "txn" :value [[:append 2 40] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36 38 40 40]]] :process 40 :index 40 :time 1780346781479481088}
+{:type :invoke :f "txn" :value [[:append 2 40] [:r 2 []]] :process 40 :index 40 :time 1780346781479406080}
+{:type :info :f "start-pause" :value "start-pause" :process -1 :index 3 :time 1780346781479176960}
+{:type :ok :f "txn" :value [[:append 7 39] [:r 7 [1 3 6 6 11 15 24 29 35 37 37 38 39]]] :process 39 :index 39 :time 1780346781479176960}
+{:type :invoke :f "txn" :value [[:append 7 39] [:r 7 []]] :process 39 :index 39 :time 1780346781479136000}
+{:type :ok :f "txn" :value [[:append 8 38] [:r 8 [11 20 23 25 26 27 29 32 34 35 38]]] :process 38 :index 38 :time 1780346781478998784}
+{:type :invoke :f "txn" :value [[:append 8 38] [:r 8 []]] :process 38 :index 38 :time 1780346781478940928}
+{:type :ok :f "txn" :value [[:append 7 37] [:r 7 [1 3 6 6 11 15 24 29 35 37 37]]] :process 37 :index 37 :time 1780346781478756864}
+{:type :invoke :f "txn" :value [[:append 7 37] [:r 7 []]] :process 37 :index 37 :time 1780346781478718976}
+{:type :ok :f "txn" :value [[:append 2 36] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34 36]]] :process 36 :index 36 :time 1780346781478592000}
+{:type :invoke :f "txn" :value [[:append 2 36] [:r 2 []]] :process 36 :index 36 :time 1780346781478553088}
+{:type :ok :f "txn" :value [[:append 8 35] [:r 8 [11 20 23 25 26 27 29 32 34 35]]] :process 35 :index 35 :time 1780346781478385920}
+{:type :invoke :f "txn" :value [[:append 8 35] [:r 8 []]] :process 35 :index 35 :time 1780346781478348032}
+{:type :ok :f "txn" :value [[:append 2 34] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32 34]]] :process 34 :index 34 :time 1780346781478116864}
+{:type :invoke :f "txn" :value [[:append 2 34] [:r 2 []]] :process 34 :index 34 :time 1780346781478018048}
+{:type :ok :f "txn" :value [[:append 1 33] [:r 1 [4 6 7 8 10 15 18 19 20 21 21 28 29 32 33]]] :process 33 :index 33 :time 1780346781477792000}
+{:type :invoke :f "txn" :value [[:append 1 33] [:r 1 []]] :process 33 :index 33 :time 1780346781477721088}
+{:type :ok :f "txn" :value [[:append 2 32] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31 32 32]]] :process 32 :index 32 :time 1780346781477606144}
+{:type :invoke :f "txn" :value [[:append 2 32] [:r 2 []]] :process 32 :index 32 :time 1780346781477565952}
+{:type :ok :f "txn" :value [[:append 2 31] [:r 2 [0 5 9 10 13 17 17 18 21 30 30 31]]] :process 31 :index 31 :time 1780346781477454848}
+{:type :invoke :f "txn" :value [[:append 2 31] [:r 2 []]] :process 31 :index 31 :time 1780346781477419008}
+{:type :ok :f "txn" :value [[:append 2 30] [:r 2 [0 5 9 10 13 17 17 18 21 30 30]]] :process 30 :index 30 :time 1780346781477252096}
+{:type :invoke :f "txn" :value [[:append 2 30] [:r 2 []]] :process 30 :index 30 :time 1780346781477163008}
+{:type :ok :f "txn" :value [[:append 8 29] [:r 8 [11 20 23 25 26 27 29]]] :process 29 :index 29 :time 1780346781477057024}
+{:type :invoke :f "txn" :value [[:append 8 29] [:r 8 []]] :process 29 :index 29 :time 1780346781477025024}
+{:type :ok :f "txn" :value [[:append 6 28] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27 28]]] :process 28 :index 28 :time 1780346781476884992}
+{:type :invoke :f "txn" :value [[:append 6 28] [:r 6 []]] :process 28 :index 28 :time 1780346781476852992}
+{:type :ok :f "txn" :value [[:append 6 27] [:r 6 [0 1 4 9 12 17 19 20 22 26 26 27]]] :process 27 :index 27 :time 1780346781476752896}
+{:type :invoke :f "txn" :value [[:append 6 27] [:r 6 []]] :process 27 :index 27 :time 1780346781476721152}
+{:type :ok :f "txn" :value [[:append 6 26] [:r 6 [0 1 4 9 12 17 19 20 22 26 26]]] :process 26 :index 26 :time 1780346781476624128}
+{:type :invoke :f "txn" :value [[:append 6 26] [:r 6 []]] :process 26 :index 26 :time 1780346781476592896}
+{:type :ok :f "txn" :value [[:append 4 25] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24 25 25]]] :process 25 :index 25 :time 1780346781476485888}
+{:type :invoke :f "txn" :value [[:append 4 25] [:r 4 []]] :process 25 :index 25 :time 1780346781476455936}
+{:type :ok :f "txn" :value [[:append 4 24] [:r 4 [1 2 2 4 4 7 10 13 15 16 19 24]]] :process 24 :index 24 :time 1780346781476361984}
+{:type :invoke :f "txn" :value [[:append 4 24] [:r 4 []]] :process 24 :index 24 :time 1780346781476332800}
+{:type :ok :f "txn" :value [[:append 8 23] [:r 8 [11 20 23]]] :process 23 :index 23 :time 1780346781476198912}
+{:type :invoke :f "txn" :value [[:append 8 23] [:r 8 []]] :process 23 :index 23 :time 1780346781476144128}
+{:type :ok :f "txn" :value [[:append 5 22] [:r 5 [1 3 6 7 11 12 14 16 16 17 18 22 22]]] :process 22 :index 22 :time 1780346781476054016}
+{:type :invoke :f "txn" :value [[:append 5 22] [:r 5 []]] :process 22 :index 22 :time 1780346781476026112}
+{:type :ok :f "txn" :value [[:append 3 21] [:r 3 [0 2 2 7 8 9 9 10 12 13 14 15 16 18 20 21]]] :process 21 :index 21 :time 1780346781475931904}
+{:type :invoke :f "txn" :value [[:append 3 21] [:r 3 []]] :process 21 :index 21 :time 1780346781475904000}
+{:type :ok :f "txn" :value [[:append 1 20] [:r 1 [4 6 7 8 10 15 18 19 20]]] :process 20 :index 20 :time 1780346781475815168}
+{:type :invoke :f "txn" :value [[:append 1 20] [:r 1 []]] :process 20 :index 20 :time 1780346781475682048}
+{:type :ok :f "txn" :value [[:append 0 19] [:r 0 [3 3 5 5 8 8 11 13 19]]] :process 19 :index 19 :time 1780346781475575040}
+{:type :invoke :f "txn" :value [[:append 0 19] [:r 0 []]] :process 19 :index 19 :time 1780346781475537920}
+{:type :ok :f "txn" :value [[:append 1 18] [:r 1 [4 6 7 8 10 15 18]]] :process 18 :index 18 :time 1780346781475439104}
+{:type :invoke :f "txn" :value [[:append 1 18] [:r 1 []]] :process 18 :index 18 :time 1780346781475411968}
+{:type :ok :f "txn" :value [[:append 5 17] [:r 5 [1 3 6 7 11 12 14 16 16 17]]] :process 17 :index 17 :time 1780346781475325952}
+{:type :invoke :f "txn" :value [[:append 5 17] [:r 5 []]] :process 17 :index 17 :time 1780346781475300096}
+{:type :ok :f "txn" :value [[:append 5 16] [:r 5 [1 3 6 7 11 12 14 16 16]]] :process 16 :index 16 :time 1780346781475150080}
+{:type :invoke :f "txn" :value [[:append 5 16] [:r 5 []]] :process 16 :index 16 :time 1780346781475126016}
+{:type :ok :f "txn" :value [[:append 4 15] [:r 4 [1 2 2 4 4 7 10 13 15]]] :process 15 :index 15 :time 1780346781475048960}
+{:type :invoke :f "txn" :value [[:append 4 15] [:r 4 []]] :process 15 :index 15 :time 1780346781475025920}
+{:type :ok :f "txn" :value [[:append 5 14] [:r 5 [1 3 6 7 11 12 14]]] :process 14 :index 14 :time 1780346781474903040}
+{:type :invoke :f "txn" :value [[:append 5 14] [:r 5 []]] :process 14 :index 14 :time 1780346781474878976}
+{:type :ok :f "txn" :value [[:append 3 13] [:r 3 [0 2 2 7 8 9 9 10 12 13]]] :process 13 :index 13 :time 1780346781474802944}
+{:type :invoke :f "txn" :value [[:append 3 13] [:r 3 []]] :process 13 :index 13 :time 1780346781474778880}
+{:type :ok :f "txn" :value [[:append 5 12] [:r 5 [1 3 6 7 11 12]]] :process 12 :index 12 :time 1780346781474674944}
+{:type :invoke :f "txn" :value [[:append 5 12] [:r 5 []]] :process 12 :index 12 :time 1780346781474653952}
+{:type :ok :f "txn" :value [[:append 7 11] [:r 7 [1 3 6 6 11]]] :process 11 :index 11 :time 1780346781474587904}
+{:type :invoke :f "txn" :value [[:append 7 11] [:r 7 []]] :process 11 :index 11 :time 1780346781474567936}
+{:type :ok :f "txn" :value [[:append 4 10] [:r 4 [1 2 2 4 4 7 10]]] :process 10 :index 10 :time 1780346781474503168}
+{:type :invoke :f "txn" :value [[:append 4 10] [:r 4 []]] :process 10 :index 10 :time 1780346781474409216}
+{:type :ok :f "txn" :value [[:append 3 9] [:r 3 [0 2 2 7 8 9 9]]] :process 9 :index 9 :time 1780346781474347008}
+{:type :invoke :f "txn" :value [[:append 3 9] [:r 3 []]] :process 9 :index 9 :time 1780346781474327040}
+{:type :ok :f "txn" :value [[:append 1 8] [:r 1 [4 6 7 8]]] :process 8 :index 8 :time 1780346781474266112}
+{:type :invoke :f "txn" :value [[:append 1 8] [:r 1 []]] :process 8 :index 8 :time 1780346781474246144}
+{:type :ok :f "txn" :value [[:append 5 7] [:r 5 [1 3 6 7]]] :process 7 :index 7 :time 1780346781473516032}
+{:type :invoke :f "txn" :value [[:append 5 7] [:r 5 []]] :process 7 :index 7 :time 1780346781473468160}
+{:type :ok :f "txn" :value [[:append 1 6] [:r 1 [4 6]]] :process 6 :index 6 :time 1780346781473328128}
+{:type :invoke :f "txn" :value [[:append 1 6] [:r 1 []]] :process 6 :index 6 :time 1780346781473256960}
+{:type :ok :f "txn" :value [[:append 0 5] [:r 0 [3 3 5 5]]] :process 5 :index 5 :time 1780346781473099008}
+{:type :invoke :f "txn" :value [[:append 0 5] [:r 0 []]] :process 5 :index 5 :time 1780346781473058816}
+{:type :ok :f "txn" :value [[:append 6 4] [:r 6 [0 1 4]]] :process 4 :index 4 :time 1780346781472940800}
+{:type :invoke :f "txn" :value [[:append 6 4] [:r 6 []]] :process 4 :index 4 :time 1780346781472903936}
+{:type :ok :f "txn" :value [[:append 5 3] [:r 5 [1 3]]] :process 3 :index 3 :time 1780346781472791040}
+{:type :invoke :f "txn" :value [[:append 5 3] [:r 5 []]] :process 3 :index 3 :time 1780346781472758016}
+{:type :ok :f "txn" :value [[:append 3 2] [:r 3 [0 2 2]]] :process 2 :index 2 :time 1780346781472657920}
+{:type :invoke :f "txn" :value [[:append 3 2] [:r 3 []]] :process 2 :index 2 :time 1780346781472625920}
+{:type :ok :f "txn" :value [[:append 4 1] [:r 4 [1]]] :process 1 :index 1 :time 1780346781472532992}
+{:type :invoke :f "txn" :value [[:append 4 1] [:r 4 []]] :process 1 :index 1 :time 1780346781472506112}
+{:type :ok :f "txn" :value [[:append 9 0] [:r 9 [0]]] :process 0 :index 0 :time 1780346781472416000}
+{:type :invoke :f "txn" :value [[:append 9 0] [:r 9 []]] :process 0 :index 0 :time 1780346781472392960}

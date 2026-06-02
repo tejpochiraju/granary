@@ -27,6 +27,10 @@ type backend =
   | Mem
   | File of string
   | WAL of string
+  | EncWAL of
+      { path : string
+      ; key : string (* 32-byte AES-256 key (#84) *)
+      }
 
 type workload =
   | ListAppend
@@ -85,6 +89,19 @@ let open_db backend =
             "open_file_wal(%s) failed: %s"
             path
             (Format.asprintf "%a" Db.pp_error e)))
+  | EncWAL { path; key } ->
+    (* Encrypted-at-rest WAL backend (#84): open through the Store layer with a
+       32-byte AES-256 key, then wrap in a Db.t exactly as Sqlocaml_unix does. *)
+    Sqlocaml_unix.install ();
+    let* r = Sqlocaml_unix.Store.open_file_wal ~key ~path () in
+    (match r with
+     | Ok store -> Sqlocaml.Db.of_store ~file_path:path store
+     | Error e ->
+       failwith
+         (Printf.sprintf
+            "open_file_wal(enc,%s) failed: %s"
+            path
+            (Format.asprintf "%a" Sqlocaml_store.Store.pp_error e)))
 ;;
 
 (* ----------------------------------------------------------------- *)
@@ -240,7 +257,7 @@ let collect_history states final_entries =
 (* ----------------------------------------------------------------- *)
 
 let cleanup_files = function
-  | File path | WAL path ->
+  | File path | WAL path | EncWAL { path; _ } ->
     (try Unix.unlink path with
      | _ -> ());
     (try Unix.unlink (path ^ "-wal") with
@@ -272,7 +289,7 @@ let run_harness ~backend ~workload ~nemesis ~n_workers ~ops_per_worker ~history_
     | LazyFS _ ->
       let db_path =
         match backend with
-        | WAL path | File path -> path
+        | WAL path | File path | EncWAL { path; _ } -> path
         | Mem -> failwith "lazyfs nemesis requires file or WAL backend"
       in
       let mount_dir = Filename.dirname db_path in
@@ -396,6 +413,10 @@ let run_crash_restart ~backend ~workload ~n_workers ~ops_before ~ops_after ~hist
 
 let () =
   Random.self_init ();
+  (* Seed the mirage-crypto RNG so encrypted backends can mint per-page nonces
+     (#84/#217): [lib/] is Mirage-clean and never seeds, so the application
+     must. Harmless for plaintext backends. *)
+  Mirage_crypto_rng_unix.use_default ();
   let backend = ref "mem" in
   let path = ref "/tmp/sqlocaml_jepsen.db" in
   let n_workers = ref 4 in
@@ -407,8 +428,22 @@ let () =
   let crash_after = ref 50 in
   let pause_after = ref 30 in
   let pause_dur = ref 2.0 in
+  let key = ref "" in
+  (* Accept a 32-byte raw key or a 64-char hex string; AES-256 needs 32 bytes. *)
+  let decode_key s =
+    match String.length s with
+    | 32 -> s
+    | 64 ->
+      let buf = Bytes.create 32 in
+      for i = 0 to 31 do
+        Bytes.set buf i (Char.chr (int_of_string ("0x" ^ String.sub s (i * 2) 2)))
+      done;
+      Bytes.to_string buf
+    | n ->
+      failwith (Printf.sprintf "--key must be 32 raw bytes or 64 hex chars (got %d)" n)
+  in
   let args =
-    [ "--backend", Arg.Set_string backend, " Backend (mem|file|wal)"
+    [ "--backend", Arg.Set_string backend, " Backend (mem|file|wal|enc-wal)"
     ; "--path", Arg.Set_string path, " Database file path"
     ; ( "--workload"
       , Arg.Set_string workload_name
@@ -423,6 +458,7 @@ let () =
     ; "--crash-after", Arg.Set_int crash_after, " Ops per worker before crash"
     ; "--pause-after", Arg.Set_int pause_after, " Ops before pause"
     ; "--pause-dur", Arg.Set_float pause_dur, " Pause duration (seconds)"
+    ; "--key", Arg.Set_string key, " AES-256 key for enc-wal (32 bytes or 64 hex)"
     ]
   in
   Arg.parse (Arg.align args) (fun _ -> ()) "sqlocaml Jepsen harness";
@@ -431,6 +467,7 @@ let () =
     | "mem" -> Mem
     | "file" -> File !path
     | "wal" -> WAL !path
+    | "enc-wal" -> EncWAL { path = !path; key = decode_key !key }
     | s -> failwith (Printf.sprintf "unknown backend: %s" s)
   in
   let workload_val =

@@ -1,0 +1,4 @@
+{:type :invoke :f "txn" :value [[:append 0 1] [:r 0 []]] :process 0 :index 0 :time 0}
+{:type :ok :f "txn" :value [[:append 0 1] [:r 0 [1]]] :process 0 :index 1 :time 100000}
+{:type :invoke :f "txn" :value [[:append 0 2] [:r 0 []]] :process 1 :index 2 :time 200000}
+{:type :ok :f "txn" :value [[:append 0 2] [:r 0 [2]]] :process 1 :index 3 :time 300000}

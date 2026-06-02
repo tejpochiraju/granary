@@ -1,0 +1,6 @@
+{:type :invoke :f "add" :value 1 :process 0 :index 0 :time 0}
+{:type :ok :f "add" :value 1 :process 0 :index 1 :time 100000}
+{:type :invoke :f "add" :value 2 :process 0 :index 2 :time 200000}
+{:type :ok :f "add" :value 2 :process 0 :index 3 :time 300000}
+{:type :invoke :f "read" :value [] :process -2 :index 0 :time 400000}
+{:type :ok :f "read" :value [2] :process -2 :index 1 :time 500000}

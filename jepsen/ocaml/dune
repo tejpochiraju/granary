@@ -16,7 +16,16 @@
  (name harness)
  (public_name sqlocaml_jepsen)
  (modules harness)
- (libraries jepsen_lib sqlocaml sqlocaml.unix lwt lwt.unix unix)
+ (libraries
+  jepsen_lib
+  sqlocaml
+  sqlocaml.unix
+  sqlocaml.store
+  mirage-crypto-rng
+  mirage-crypto-rng.unix
+  lwt
+  lwt.unix
+  unix)
  (preprocess
   (pps lwt_ppx)))
 
