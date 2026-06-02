@@ -108,11 +108,11 @@ logfile=""
 ;;
 
 (** Start a lazyfs FUSE mount.
-    [mount_dir] is where the fused DB lives.  LazyFS 0.3.1+ uses an
-    in-memory page cache — there is no separate backing directory.
-    Returns a [lazyfs_state] record on success, or raises [Failure]
-    on error. *)
-let start_lazyfs mount_dir =
+    [mount_dir] is the FUSE mountpoint where the fused DB lives; [root_dir]
+    is a real, writable backing directory whose contents lazyfs serves (via
+    the FUSE [subdir] module).  Both must exist before calling.  Returns a
+    [lazyfs_state] record on success, or raises [Failure] on error. *)
+let start_lazyfs mount_dir root_dir =
   let prog = !lazyfs_binary in
   let pid_str = string_of_int (Unix.getpid ()) in
   let fifo_path = Printf.sprintf "/tmp/lazyfs_fifo_%s" pid_str in
@@ -121,16 +121,21 @@ let start_lazyfs mount_dir =
   (try Unix.mkfifo fifo_path 0o666 with
    | Unix.Unix_error (EEXIST, _, _) -> ());
   write_lazyfs_config config_path fifo_path;
+  (* lazyfs serves [root_dir] at [mount_dir] via the [subdir] module — without
+     it lazyfs falls back to serving "/" (read-only as a non-root user, which
+     caused "Io Permission denied").  The harness forks lazyfs as the SAME user
+     that then opens the DB, so [allow_other] / [default_permissions] are not
+     needed (and would re-trigger the perm error rootless). *)
   let argv =
     [| prog
      ; "-f"
      ; mount_dir
-     ; "-o"
-     ; "allow_other"
-     ; "-o"
-     ; "default_permissions"
      ; "--config-path"
      ; config_path
+     ; "-o"
+     ; "modules=subdir"
+     ; "-o"
+     ; "subdir=" ^ root_dir
     |]
   in
   let pid = Unix.create_process prog argv Unix.stdin Unix.stdout Unix.stderr in

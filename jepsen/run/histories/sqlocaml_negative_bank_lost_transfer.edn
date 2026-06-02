@@ -1,0 +1,4 @@
+{:type :invoke :f "transfer" :value [0 1 10] :process 0 :index 0 :time 0}
+{:type :ok :f "transfer" :value [[0 90] [1 120]] :process 0 :index 1 :time 100000}
+{:type :invoke :f "read" :value [] :process -2 :index 0 :time 200000}
+{:type :ok :f "read" :value [[0 90] [1 110]] :process -2 :index 1 :time 300000}

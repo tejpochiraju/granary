@@ -1,0 +1,802 @@
+{:type :ok :f "read" :value [[0 73] [1 -61] [2 109] [3 184] [4 195]] :process -2 :index 0 :time 1780375432957312000}
+{:type :invoke :f "read" :value [] :process -2 :index 0 :time 1780375432957312000}
+{:type :ok :f "transfer" :value [[0 67] [1 -59] [2 119] [3 177] [4 196]] :process 99 :index 99 :time 1780375432957252096}
+{:type :invoke :f "transfer" :value [2 1 4] :process 99 :index 99 :time 1780375432957230080}
+{:type :ok :f "transfer" :value [[0 58] [1 -61] [2 126] [3 181] [4 196]] :process 98 :index 98 :time 1780375432957134848}
+{:type :invoke :f "transfer" :value [2 0 9] :process 98 :index 98 :time 1780375432957117184}
+{:type :ok :f "transfer" :value [[0 41] [1 -55] [2 119] [3 181] [4 214]] :process 97 :index 97 :time 1780375432957062912}
+{:type :invoke :f "transfer" :value [4 0 10] :process 97 :index 97 :time 1780375432957044992}
+{:type :ok :f "transfer" :value [[0 42] [1 -56] [2 116] [3 181] [4 217]] :process 96 :index 96 :time 1780375432956990976}
+{:type :invoke :f "transfer" :value [0 1 1] :process 96 :index 96 :time 1780375432956974080}
+{:type :ok :f "transfer" :value [[0 49] [1 -60] [2 116] [3 183] [4 212]] :process 95 :index 95 :time 1780375432956919808}
+{:type :invoke :f "transfer" :value [3 1 6] :process 95 :index 95 :time 1780375432956898816}
+{:type :ok :f "transfer" :value [[0 58] [1 -69] [2 123] [3 183] [4 205]] :process 94 :index 94 :time 1780375432956814080}
+{:type :invoke :f "transfer" :value [0 1 3] :process 94 :index 94 :time 1780375432956795904}
+{:type :ok :f "transfer" :value [[0 56] [1 -65] [2 123] [3 183] [4 203]] :process 93 :index 93 :time 1780375432956742912}
+{:type :invoke :f "transfer" :value [3 0 8] :process 93 :index 93 :time 1780375432956726016}
+{:type :ok :f "transfer" :value [[0 55] [1 -60] [2 115] [3 186] [4 204]] :process 92 :index 92 :time 1780375432956673024}
+{:type :invoke :f "transfer" :value [4 2 3] :process 92 :index 92 :time 1780375432956655104}
+{:type :ok :f "transfer" :value [[0 63] [1 -64] [2 116] [3 181] [4 204]] :process 91 :index 91 :time 1780375432956584960}
+{:type :invoke :f "transfer" :value [4 3 5] :process 91 :index 91 :time 1780375432956567040}
+{:type :ok :f "transfer" :value [[0 63] [1 -63] [2 117] [3 183] [4 200]] :process 90 :index 90 :time 1780375432956513024}
+{:type :invoke :f "transfer" :value [1 4 9] :process 90 :index 90 :time 1780375432956496128}
+{:type :ok :f "transfer" :value [[0 70] [1 -61] [2 117] [3 183] [4 191]] :process 89 :index 89 :time 1780375432956443136}
+{:type :invoke :f "transfer" :value [3 0 10] :process 89 :index 89 :time 1780375432956424960}
+{:type :ok :f "transfer" :value [[0 58] [1 -44] [2 117] [3 178] [4 191]] :process 88 :index 88 :time 1780375432956371968}
+{:type :invoke :f "transfer" :value [1 3 10] :process 88 :index 88 :time 1780375432956353792}
+{:type :ok :f "transfer" :value [[0 66] [1 -56] [2 122] [3 181] [4 187]] :process 87 :index 87 :time 1780375432956296960}
+{:type :invoke :f "transfer" :value [0 4 8] :process 87 :index 87 :time 1780375432956279040}
+{:type :ok :f "transfer" :value [[0 65] [1 -43] [2 110] [3 181] [4 187]] :process 86 :index 86 :time 1780375432956207872}
+{:type :invoke :f "transfer" :value [1 0 4] :process 86 :index 86 :time 1780375432956190976}
+{:type :ok :f "transfer" :value [[0 69] [1 -43] [2 120] [3 183] [4 171]] :process 85 :index 85 :time 1780375432956136960}
+{:type :invoke :f "transfer" :value [3 4 8] :process 85 :index 85 :time 1780375432956120064}
+{:type :ok :f "transfer" :value [[0 64] [1 -43] [2 131] [3 177] [4 171]] :process 84 :index 84 :time 1780375432956065792}
+{:type :invoke :f "transfer" :value [0 1 4] :process 84 :index 84 :time 1780375432956048896}
+{:type :ok :f "transfer" :value [[0 62] [1 -46] [2 131] [3 194] [4 159]] :process 83 :index 83 :time 1780375432955959040}
+{:type :invoke :f "transfer" :value [3 1 3] :process 83 :index 83 :time 1780375432955940864}
+{:type :ok :f "transfer" :value [[0 59] [1 -35] [2 127] [3 190] [4 159]] :process 82 :index 82 :time 1780375432955888128}
+{:type :invoke :f "transfer" :value [1 3 10] :process 82 :index 82 :time 1780375432955869952}
+{:type :ok :f "transfer" :value [[0 65] [1 -25] [2 126] [3 174] [4 160]] :process 81 :index 81 :time 1780375432955815936}
+{:type :invoke :f "transfer" :value [0 3 6] :process 81 :index 81 :time 1780375432955798016}
+{:type :ok :f "transfer" :value [[0 69] [1 -25] [2 135] [3 163] [4 158]] :process 80 :index 80 :time 1780375432955744000}
+{:type :invoke :f "transfer" :value [0 3 5] :process 80 :index 80 :time 1780375432955727104}
+{:type :ok :f "transfer" :value [[0 69] [1 -16] [2 140] [3 149] [4 158]] :process 79 :index 79 :time 1780375432955667968}
+{:type :invoke :f "transfer" :value [2 3 10] :process 79 :index 79 :time 1780375432955650048}
+{:type :ok :f "transfer" :value [[0 69] [1 -8] [2 125] [3 159] [4 155]] :process 78 :index 78 :time 1780375432955595008}
+{:type :invoke :f "transfer" :value [2 1 3] :process 78 :index 78 :time 1780375432955576832}
+{:type :ok :f "transfer" :value [[0 71] [1 -11] [2 128] [3 159] [4 153]] :process 77 :index 77 :time 1780375432955523072}
+{:type :invoke :f "transfer" :value [2 4 2] :process 77 :index 77 :time 1780375432955504896}
+{:type :ok :f "transfer" :value [[0 84] [1 -1] [2 118] [3 144] [4 155]] :process 76 :index 76 :time 1780375432955450112}
+{:type :invoke :f "transfer" :value [0 3 10] :process 76 :index 76 :time 1780375432955431936}
+{:type :ok :f "transfer" :value [[0 80] [1 5] [2 113] [3 144] [4 158]] :process 75 :index 75 :time 1780375432955336192}
+{:type :invoke :f "transfer" :value [1 2 5] :process 75 :index 75 :time 1780375432955318016}
+{:type :ok :f "transfer" :value [[0 88] [1 6] [2 113] [3 143] [4 150]] :process 74 :index 74 :time 1780375432955264000}
+{:type :invoke :f "transfer" :value [3 1 5] :process 74 :index 74 :time 1780375432955245056}
+{:type :ok :f "transfer" :value [[0 80] [1 13] [2 106] [3 141] [4 160]] :process 73 :index 73 :time 1780375432955174912}
+{:type :invoke :f "transfer" :value [4 0 1] :process 73 :index 73 :time 1780375432955156992}
+{:type :ok :f "transfer" :value [[0 79] [1 4] [2 106] [3 148] [4 163]] :process 72 :index 72 :time 1780375432955102976}
+{:type :invoke :f "transfer" :value [1 0 1] :process 72 :index 72 :time 1780375432955085056}
+{:type :ok :f "transfer" :value [[0 75] [1 2] [2 114] [3 153] [4 156]] :process 71 :index 71 :time 1780375432955024896}
+{:type :invoke :f "transfer" :value [3 0 4] :process 71 :index 71 :time 1780375432955006976}
+{:type :ok :f "transfer" :value [[0 76] [1 2] [2 113] [3 164] [4 145]] :process 70 :index 70 :time 1780375432954953984}
+{:type :invoke :f "transfer" :value [4 3 3] :process 70 :index 70 :time 1780375432954936064}
+{:type :ok :f "transfer" :value [[0 71] [1 9] [2 120] [3 154] [4 146]] :process 69 :index 69 :time 1780375432954881024}
+{:type :invoke :f "transfer" :value [3 4 4] :process 69 :index 69 :time 1780375432954863104}
+{:type :ok :f "transfer" :value [[0 75] [1 9] [2 115] [3 147] [4 154]] :process 68 :index 68 :time 1780375432954808064}
+{:type :invoke :f "transfer" :value [1 2 5] :process 68 :index 68 :time 1780375432954788096}
+{:type :ok :f "transfer" :value [[0 76] [1 4] [2 115] [3 142] [4 163]] :process 67 :index 67 :time 1780375432954695936}
+{:type :invoke :f "transfer" :value [4 3 3] :process 67 :index 67 :time 1780375432954678016}
+{:type :ok :f "transfer" :value [[0 76] [1 15] [2 118] [3 133] [4 158]] :process 66 :index 66 :time 1780375432954622976}
+{:type :invoke :f "transfer" :value [1 3 7] :process 66 :index 66 :time 1780375432954605056}
+{:type :ok :f "transfer" :value [[0 82] [1 17] [2 110] [3 137] [4 154]] :process 65 :index 65 :time 1780375432954550016}
+{:type :invoke :f "transfer" :value [1 2 6] :process 65 :index 65 :time 1780375432954533120}
+{:type :ok :f "transfer" :value [[0 79] [1 30] [2 100] [3 146] [4 145]] :process 64 :index 64 :time 1780375432954477056}
+{:type :invoke :f "transfer" :value [1 0 8] :process 64 :index 64 :time 1780375432954454784}
+{:type :ok :f "transfer" :value [[0 76] [1 34] [2 103] [3 147] [4 140]] :process 63 :index 63 :time 1780375432954400000}
+{:type :invoke :f "transfer" :value [4 3 2] :process 63 :index 63 :time 1780375432954381824}
+{:type :ok :f "transfer" :value [[0 69] [1 39] [2 108] [3 141] [4 143]] :process 62 :index 62 :time 1780375432954326016}
+{:type :invoke :f "transfer" :value [4 1 3] :process 62 :index 62 :time 1780375432954307072}
+{:type :ok :f "transfer" :value [[0 65] [1 34] [2 109] [3 141] [4 151]] :process 61 :index 61 :time 1780375432954247936}
+{:type :invoke :f "transfer" :value [0 1 5] :process 61 :index 61 :time 1780375432954201856}
+{:type :ok :f "transfer" :value [[0 81] [1 22] [2 101] [3 145] [4 151]] :process 60 :index 60 :time 1780375432954065152}
+{:type :invoke :f "transfer" :value [0 1 2] :process 60 :index 60 :time 1780375432954020864}
+{:type :ok :f "transfer" :value [[0 77] [1 15] [2 106] [3 151] [4 151]] :process 59 :index 59 :time 1780375432953936128}
+{:type :invoke :f "transfer" :value [2 3 5] :process 59 :index 59 :time 1780375432953917952}
+{:type :ok :f "transfer" :value [[0 77] [1 31] [2 97] [3 143] [4 152]] :process 58 :index 58 :time 1780375432953862912}
+{:type :invoke :f "transfer" :value [4 3 4] :process 58 :index 58 :time 1780375432953843968}
+{:type :ok :f "transfer" :value [[0 77] [1 31] [2 82] [3 143] [4 167]] :process 57 :index 57 :time 1780375432953697792}
+{:type :invoke :f "transfer" :value [4 1 9] :process 57 :index 57 :time 1780375432953649152}
+{:type :ok :f "transfer" :value [[0 82] [1 42] [2 81] [3 128] [4 167]] :process 56 :index 56 :time 1780375432953545216}
+{:type :invoke :f "transfer" :value [1 0 2] :process 56 :index 56 :time 1780375432953506048}
+{:type :ok :f "transfer" :value [[0 68] [1 43] [2 81] [3 128] [4 180]] :process 55 :index 55 :time 1780375432953414912}
+{:type :invoke :f "transfer" :value [4 1 5] :process 55 :index 55 :time 1780375432953389824}
+{:type :ok :f "transfer" :value [[0 59] [1 41] [2 84] [3 136] [4 180]] :process 54 :index 54 :time 1780375432953264896}
+{:type :invoke :f "transfer" :value [2 0 9] :process 54 :index 54 :time 1780375432953214976}
+{:type :ok :f "transfer" :value [[0 67] [1 50] [2 74] [3 138] [4 171]] :process 53 :index 53 :time 1780375432953090816}
+{:type :invoke :f "transfer" :value [2 3 1] :process 53 :index 53 :time 1780375432953051136}
+{:type :ok :f "transfer" :value [[0 77] [1 45] [2 92] [3 138] [4 148]] :process 52 :index 52 :time 1780375432952857088}
+{:type :invoke :f "transfer" :value [2 4 8] :process 52 :index 52 :time 1780375432952817920}
+{:type :ok :f "transfer" :value [[0 84] [1 45] [2 101] [3 124] [4 146]] :process 51 :index 51 :time 1780375432952696064}
+{:type :invoke :f "transfer" :value [4 0 5] :process 51 :index 51 :time 1780375432952656128}
+{:type :ok :f "transfer" :value [[0 90] [1 40] [2 99] [3 124] [4 147]] :process 50 :index 50 :time 1780375432952532992}
+{:type :invoke :f "transfer" :value [2 1 6] :process 50 :index 50 :time 1780375432952493056}
+{:type :ok :f "transfer" :value [[0 83] [1 52] [2 100] [3 117] [4 148]] :process 49 :index 49 :time 1780375432952370944}
+{:type :invoke :f "transfer" :value [4 0 1] :process 49 :index 49 :time 1780375432952331008}
+{:type :ok :f "transfer" :value [[0 83] [1 62] [2 109] [3 113] [4 133]] :process 48 :index 48 :time 1780375432952194816}
+{:type :invoke :f "transfer" :value [2 3 4] :process 48 :index 48 :time 1780375432952155136}
+{:type :ok :f "transfer" :value [[0 81] [1 75] [2 108] [3 103] [4 133]] :process 47 :index 47 :time 1780375432952033024}
+{:type :invoke :f "transfer" :value [0 3 10] :process 47 :index 47 :time 1780375432951993088}
+{:type :ok :f "transfer" :value [[0 69] [1 75] [2 105] [3 121] [4 130]] :process 46 :index 46 :time 1780375432951870976}
+{:type :invoke :f "transfer" :value [3 4 3] :process 46 :index 46 :time 1780375432951831040}
+{:type :ok :f "transfer" :value [[0 69] [1 74] [2 116] [3 113] [4 128]] :process 45 :index 45 :time 1780375432951706880}
+{:type :invoke :f "transfer" :value [2 4 2] :process 45 :index 45 :time 1780375432951667968}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 119] [3 113] [4 137]] :process 44 :index 44 :time 1780375432951514112}
+{:type :invoke :f "transfer" :value [2 3 3] :process 44 :index 44 :time 1780375432951473920}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 133] [3 109] [4 127]] :process 43 :index 43 :time 1780375432951351808}
+{:type :invoke :f "transfer" :value [3 2 1] :process 43 :index 43 :time 1780375432951312896}
+{:type :ok :f "transfer" :value [[0 78] [1 57] [2 127] [3 109] [4 129]] :process 42 :index 42 :time 1780375432951163136}
+{:type :invoke :f "transfer" :value [0 1 4] :process 42 :index 42 :time 1780375432951108864}
+{:type :ok :f "transfer" :value [[0 71] [1 57] [2 131] [3 123] [4 118]] :process 41 :index 41 :time 1780375432950979072}
+{:type :invoke :f "transfer" :value [3 0 8] :process 41 :index 41 :time 1780375432950927104}
+{:type :ok :f "transfer" :value [[0 77] [1 42] [2 146] [3 123] [4 112]] :process 40 :index 40 :time 1780375432950786048}
+{:type :invoke :f "transfer" :value [2 0 10] :process 40 :index 40 :time 1780375432950737920}
+{:type :ok :f "transfer" :value [[0 77] [1 46] [2 141] [3 116] [4 120]] :process 39 :index 39 :time 1780375432950597120}
+{:type :invoke :f "transfer" :value [4 3 5] :process 39 :index 39 :time 1780375432950550016}
+{:type :ok :f "transfer" :value [[0 69] [1 46] [2 140] [3 111] [4 134]] :process 38 :index 38 :time 1780375432950396160}
+{:type :invoke :f "transfer" :value [4 3 9] :process 38 :index 38 :time 1780375432950365184}
+{:type :ok :f "transfer" :value [[0 60] [1 49] [2 147] [3 114] [4 130]] :process 37 :index 37 :time 1780375432950252032}
+{:type :invoke :f "transfer" :value [4 0 9] :process 37 :index 37 :time 1780375432950149120}
+{:type :ok :f "transfer" :value [[0 67] [1 42] [2 129] [3 112] [4 150]] :process 36 :index 36 :time 1780375432950063104}
+{:type :invoke :f "transfer" :value [3 2 8] :process 36 :index 36 :time 1780375432950028032}
+{:type :ok :f "transfer" :value [[0 72] [1 34] [2 125] [3 112] [4 157]] :process 35 :index 35 :time 1780375432949972992}
+{:type :invoke :f "transfer" :value [0 4 1] :process 35 :index 35 :time 1780375432949955072}
+{:type :ok :f "transfer" :value [[0 68] [1 43] [2 132] [3 99] [4 158]] :process 34 :index 34 :time 1780375432949899008}
+{:type :invoke :f "transfer" :value [2 3 7] :process 34 :index 34 :time 1780375432949881088}
+{:type :ok :f "transfer" :value [[0 84] [1 35] [2 132] [3 87] [4 162]] :process 33 :index 33 :time 1780375432949825024}
+{:type :invoke :f "transfer" :value [3 1 8] :process 33 :index 33 :time 1780375432949799936}
+{:type :ok :f "transfer" :value [[0 93] [1 35] [2 132] [3 88] [4 152]] :process 32 :index 32 :time 1780375432949744896}
+{:type :invoke :f "transfer" :value [4 2 10] :process 32 :index 32 :time 1780375432949728000}
+{:type :ok :f "transfer" :value [[0 98] [1 37] [2 133] [3 78] [4 154]] :process 31 :index 31 :time 1780375432949672960}
+{:type :invoke :f "transfer" :value [1 3 10] :process 31 :index 31 :time 1780375432949655040}
+{:type :ok :f "transfer" :value [[0 98] [1 41] [2 127] [3 81] [4 153]] :process 30 :index 30 :time 1780375432949598976}
+{:type :invoke :f "transfer" :value [1 3 7] :process 30 :index 30 :time 1780375432949580800}
+{:type :ok :f "transfer" :value [[0 98] [1 40] [2 142] [3 82] [4 138]] :process 29 :index 29 :time 1780375432949413888}
+{:type :invoke :f "transfer" :value [3 4 7] :process 29 :index 29 :time 1780375432949395968}
+{:type :ok :f "transfer" :value [[0 102] [1 42] [2 137] [3 76] [4 143]] :process 28 :index 28 :time 1780375432949340160}
+{:type :invoke :f "transfer" :value [2 0 2] :process 28 :index 28 :time 1780375432949321984}
+{:type :ok :f "transfer" :value [[0 106] [1 44] [2 132] [3 75] [4 143]] :process 27 :index 27 :time 1780375432949264896}
+{:type :invoke :f "transfer" :value [3 1 1] :process 27 :index 27 :time 1780375432949248000}
+{:type :ok :f "transfer" :value [[0 97] [1 57] [2 123] [3 78] [4 145]] :process 26 :index 26 :time 1780375432949182976}
+{:type :invoke :f "transfer" :value [4 0 9] :process 26 :index 26 :time 1780375432949165056}
+{:type :ok :f "transfer" :value [[0 94] [1 57] [2 118] [3 80] [4 151]] :process 25 :index 25 :time 1780375432949081856}
+{:type :invoke :f "transfer" :value [4 2 7] :process 25 :index 25 :time 1780375432949063168}
+{:type :ok :f "transfer" :value [[0 102] [1 65] [2 118] [3 74] [4 141]] :process 24 :index 24 :time 1780375432949006080}
+{:type :invoke :f "transfer" :value [0 4 8] :process 24 :index 24 :time 1780375432948987904}
+{:type :ok :f "transfer" :value [[0 110] [1 79] [2 114] [3 55] [4 142]] :process 23 :index 23 :time 1780375432948913152}
+{:type :invoke :f "transfer" :value [1 2 4] :process 23 :index 23 :time 1780375432948872192}
+{:type :ok :f "transfer" :value [[0 129] [1 79] [2 90] [3 65] [4 137]] :process 22 :index 22 :time 1780375432948740096}
+{:type :invoke :f "transfer" :value [0 4 10] :process 22 :index 22 :time 1780375432948698880}
+{:type :ok :f "transfer" :value [[0 133] [1 71] [2 89] [3 76] [4 131]] :process 21 :index 21 :time 1780375432948529920}
+{:type :invoke :f "transfer" :value [3 4 6] :process 21 :index 21 :time 1780375432948489984}
+{:type :ok :f "transfer" :value [[0 131] [1 83] [2 90] [3 71] [4 125]] :process 20 :index 20 :time 1780375432948365056}
+{:type :invoke :f "transfer" :value [2 0 1] :process 20 :index 20 :time 1780375432948322048}
+{:type :ok :f "transfer" :value [[0 129] [1 87] [2 90] [3 78] [4 116]] :process 19 :index 19 :time 1780375432948146944}
+{:type :invoke :f "transfer" :value [4 0 2] :process 19 :index 19 :time 1780375432948103936}
+{:type :ok :f "transfer" :value [[0 136] [1 88] [2 90] [3 70] [4 116]] :process 18 :index 18 :time 1780375432947977984}
+{:type :invoke :f "transfer" :value [4 3 1] :process 18 :index 18 :time 1780375432947938048}
+{:type :ok :f "transfer" :value [[0 128] [1 97] [2 90] [3 72] [4 113]] :process 17 :index 17 :time 1780375432947756032}
+{:type :invoke :f "transfer" :value [3 0 1] :process 17 :index 17 :time 1780375432947716096}
+{:type :ok :f "transfer" :value [[0 119] [1 88] [2 98] [3 83] [4 112]] :process 16 :index 16 :time 1780375432947592960}
+{:type :invoke :f "transfer" :value [3 0 2] :process 16 :index 16 :time 1780375432947554048}
+{:type :ok :f "transfer" :value [[0 126] [1 91] [2 89] [3 82] [4 112]] :process 15 :index 15 :time 1780375432947431168}
+{:type :invoke :f "transfer" :value [4 2 6] :process 15 :index 15 :time 1780375432947390976}
+{:type :ok :f "transfer" :value [[0 131] [1 91] [2 89] [3 81] [4 108]] :process 14 :index 14 :time 1780375432947254784}
+{:type :invoke :f "transfer" :value [3 4 4] :process 14 :index 14 :time 1780375432947226112}
+{:type :ok :f "transfer" :value [[0 134] [1 91] [2 98] [3 79] [4 98]] :process 13 :index 13 :time 1780375432947079936}
+{:type :invoke :f "transfer" :value [2 4 4] :process 13 :index 13 :time 1780375432947055104}
+{:type :ok :f "transfer" :value [[0 130] [1 89] [2 104] [3 80] [4 97]] :process 12 :index 12 :time 1780375432946966016}
+{:type :invoke :f "transfer" :value [4 0 6] :process 12 :index 12 :time 1780375432946937088}
+{:type :ok :f "transfer" :value [[0 124] [1 96] [2 96] [3 78] [4 106]] :process 11 :index 11 :time 1780375432946824960}
+{:type :invoke :f "transfer" :value [4 3 2] :process 11 :index 11 :time 1780375432946775040}
+{:type :ok :f "transfer" :value [[0 126] [1 88] [2 103] [3 69] [4 114]] :process 10 :index 10 :time 1780375432946650880}
+{:type :invoke :f "transfer" :value [1 3 7] :process 10 :index 10 :time 1780375432946630912}
+{:type :ok :f "transfer" :value [[0 108] [1 100] [2 109] [3 65] [4 118]] :process 9 :index 9 :time 1780375432946492928}
+{:type :invoke :f "transfer" :value [1 0 8] :process 9 :index 9 :time 1780375432946473984}
+{:type :ok :f "transfer" :value [[0 109] [1 93] [2 117] [3 57] [4 124]] :process 8 :index 8 :time 1780375432946417152}
+{:type :invoke :f "transfer" :value [2 3 5] :process 8 :index 8 :time 1780375432946397952}
+{:type :ok :f "transfer" :value [[0 109] [1 87] [2 122] [3 61] [4 121]] :process 7 :index 7 :time 1780375432946340096}
+{:type :invoke :f "transfer" :value [2 3 6] :process 7 :index 7 :time 1780375432946320128}
+{:type :ok :f "transfer" :value [[0 104] [1 99] [2 111] [3 62] [4 124]] :process 6 :index 6 :time 1780375432946232064}
+{:type :invoke :f "transfer" :value [1 2 8] :process 6 :index 6 :time 1780375432946160128}
+{:type :ok :f "transfer" :value [[0 103] [1 93] [2 104] [3 76] [4 124]] :process 5 :index 5 :time 1780375432945307904}
+{:type :invoke :f "transfer" :value [0 2 9] :process 5 :index 5 :time 1780375432945234176}
+{:type :ok :f "transfer" :value [[0 104] [1 92] [2 95] [3 84] [4 125]] :process 4 :index 4 :time 1780375432945003008}
+{:type :invoke :f "transfer" :value [3 1 8] :process 4 :index 4 :time 1780375432944935168}
+{:type :ok :f "transfer" :value [[0 116] [1 92] [2 100] [3 80] [4 112]] :process 3 :index 3 :time 1780375432944719104}
+{:type :invoke :f "transfer" :value [0 4 2] :process 3 :index 3 :time 1780375432944654080}
+{:type :ok :f "transfer" :value [[0 103] [1 93] [2 115] [3 80] [4 109]] :process 2 :index 2 :time 1780375432944444928}
+{:type :invoke :f "transfer" :value [2 1 4] :process 2 :index 2 :time 1780375432944376832}
+{:type :ok :f "transfer" :value [[0 98] [1 106] [2 105] [3 88] [4 103]] :process 1 :index 1 :time 1780375432944153088}
+{:type :invoke :f "transfer" :value [1 2 10] :process 1 :index 1 :time 1780375432944084992}
+{:type :ok :f "transfer" :value [[0 100] [1 100] [2 100] [3 100] [4 100]] :process 0 :index 0 :time 1780375432943859200}
+{:type :invoke :f "transfer" :value [3 4 3] :process 0 :index 0 :time 1780375432943746048}
+{:type :ok :f "transfer" :value [[0 67] [1 -55] [2 115] [3 177] [4 196]] :process 99 :index 99 :time 1780375432957268992}
+{:type :invoke :f "transfer" :value [1 3 7] :process 99 :index 99 :time 1780375432957252096}
+{:type :ok :f "transfer" :value [[0 67] [1 -61] [2 117] [3 181] [4 196]] :process 98 :index 98 :time 1780375432957152000}
+{:type :invoke :f "transfer" :value [2 3 5] :process 98 :index 98 :time 1780375432957134848}
+{:type :ok :f "transfer" :value [[0 51] [1 -55] [2 119] [3 181] [4 204]] :process 97 :index 97 :time 1780375432957079808}
+{:type :invoke :f "transfer" :value [1 0 7] :process 97 :index 97 :time 1780375432957062912}
+{:type :ok :f "transfer" :value [[0 41] [1 -55] [2 116] [3 181] [4 217]] :process 96 :index 96 :time 1780375432957007872}
+{:type :invoke :f "transfer" :value [2 3 9] :process 96 :index 96 :time 1780375432956992000}
+{:type :ok :f "transfer" :value [[0 49] [1 -54] [2 116] [3 177] [4 212]] :process 95 :index 95 :time 1780375432956936960}
+{:type :invoke :f "transfer" :value [3 4 5] :process 95 :index 95 :time 1780375432956919808}
+{:type :ok :f "transfer" :value [[0 55] [1 -66] [2 123] [3 183] [4 205]] :process 94 :index 94 :time 1780375432956837888}
+{:type :invoke :f "transfer" :value [0 4 6] :process 94 :index 94 :time 1780375432956814080}
+{:type :ok :f "transfer" :value [[0 64] [1 -65] [2 123] [3 175] [4 203]] :process 93 :index 93 :time 1780375432956759808}
+{:type :invoke :f "transfer" :value [4 3 4] :process 93 :index 93 :time 1780375432956743936}
+{:type :ok :f "transfer" :value [[0 55] [1 -60] [2 118] [3 186] [4 201]] :process 92 :index 92 :time 1780375432956690176}
+{:type :invoke :f "transfer" :value [1 2 5] :process 92 :index 92 :time 1780375432956673024}
+{:type :ok :f "transfer" :value [[0 63] [1 -64] [2 116] [3 186] [4 199]] :process 91 :index 91 :time 1780375432956619008}
+{:type :invoke :f "transfer" :value [2 0 1] :process 91 :index 91 :time 1780375432956584960}
+{:type :ok :f "transfer" :value [[0 63] [1 -72] [2 117] [3 183] [4 209]] :process 90 :index 90 :time 1780375432956530176}
+{:type :invoke :f "transfer" :value [4 1 8] :process 90 :index 90 :time 1780375432956513792}
+{:type :ok :f "transfer" :value [[0 80] [1 -61] [2 117] [3 173] [4 191]] :process 89 :index 89 :time 1780375432956460032}
+{:type :invoke :f "transfer" :value [1 4 2] :process 89 :index 89 :time 1780375432956443136}
+{:type :ok :f "transfer" :value [[0 58] [1 -54] [2 117] [3 188] [4 191]] :process 88 :index 88 :time 1780375432956388864}
+{:type :invoke :f "transfer" :value [0 3 5] :process 88 :index 88 :time 1780375432956371968}
+{:type :ok :f "transfer" :value [[0 58] [1 -56] [2 122] [3 181] [4 195]] :process 87 :index 87 :time 1780375432956316928}
+{:type :invoke :f "transfer" :value [3 2 3] :process 87 :index 87 :time 1780375432956296960}
+{:type :ok :f "transfer" :value [[0 69] [1 -47] [2 110] [3 181] [4 187]] :process 86 :index 86 :time 1780375432956239872}
+{:type :invoke :f "transfer" :value [1 2 5] :process 86 :index 86 :time 1780375432956208896}
+{:type :ok :f "transfer" :value [[0 69] [1 -43] [2 120] [3 175] [4 179]] :process 85 :index 85 :time 1780375432956154112}
+{:type :invoke :f "transfer" :value [0 3 6] :process 85 :index 85 :time 1780375432956137984}
+{:type :ok :f "transfer" :value [[0 60] [1 -39] [2 131] [3 177] [4 171]] :process 84 :index 84 :time 1780375432956082944}
+{:type :invoke :f "transfer" :value [2 3 6] :process 84 :index 84 :time 1780375432956067072}
+{:type :ok :f "transfer" :value [[0 62] [1 -43] [2 131] [3 191] [4 159]] :process 83 :index 83 :time 1780375432955975936}
+{:type :invoke :f "transfer" :value [3 4 10] :process 83 :index 83 :time 1780375432955959040}
+{:type :ok :f "transfer" :value [[0 59] [1 -45] [2 127] [3 200] [4 159]] :process 82 :index 82 :time 1780375432955905024}
+{:type :invoke :f "transfer" :value [1 2 1] :process 82 :index 82 :time 1780375432955888128}
+{:type :ok :f "transfer" :value [[0 59] [1 -25] [2 126] [3 180] [4 160]] :process 81 :index 81 :time 1780375432955832832}
+{:type :invoke :f "transfer" :value [1 3 10] :process 81 :index 81 :time 1780375432955815936}
+{:type :ok :f "transfer" :value [[0 64] [1 -25] [2 135] [3 168] [4 158]] :process 80 :index 80 :time 1780375432955760896}
+{:type :invoke :f "transfer" :value [2 3 9] :process 80 :index 80 :time 1780375432955744000}
+{:type :ok :f "transfer" :value [[0 69] [1 -16] [2 130] [3 159] [4 158]] :process 79 :index 79 :time 1780375432955684864}
+{:type :invoke :f "transfer" :value [3 2 1] :process 79 :index 79 :time 1780375432955667968}
+{:type :ok :f "transfer" :value [[0 69] [1 -5] [2 122] [3 159] [4 155]] :process 78 :index 78 :time 1780375432955611904}
+{:type :invoke :f "transfer" :value [1 4 3] :process 78 :index 78 :time 1780375432955596032}
+{:type :ok :f "transfer" :value [[0 71] [1 -11] [2 126] [3 159] [4 155]] :process 77 :index 77 :time 1780375432955539968}
+{:type :invoke :f "transfer" :value [2 0 5] :process 77 :index 77 :time 1780375432955523072}
+{:type :ok :f "transfer" :value [[0 74] [1 -1] [2 118] [3 154] [4 155]] :process 76 :index 76 :time 1780375432955467008}
+{:type :invoke :f "transfer" :value [4 3 2] :process 76 :index 76 :time 1780375432955450112}
+{:type :ok :f "transfer" :value [[0 80] [1 0] [2 118] [3 144] [4 158]] :process 75 :index 75 :time 1780375432955353088}
+{:type :invoke :f "transfer" :value [1 4 5] :process 75 :index 75 :time 1780375432955336192}
+{:type :ok :f "transfer" :value [[0 88] [1 11] [2 113] [3 138] [4 150]] :process 74 :index 74 :time 1780375432955280896}
+{:type :invoke :f "transfer" :value [1 3 6] :process 74 :index 74 :time 1780375432955264000}
+{:type :ok :f "transfer" :value [[0 81] [1 13] [2 106] [3 141] [4 159]] :process 73 :index 73 :time 1780375432955193088}
+{:type :invoke :f "transfer" :value [1 2 7] :process 73 :index 73 :time 1780375432955176192}
+{:type :ok :f "transfer" :value [[0 80] [1 3] [2 106] [3 148] [4 163]] :process 72 :index 72 :time 1780375432955120128}
+{:type :invoke :f "transfer" :value [3 4 6] :process 72 :index 72 :time 1780375432955102976}
+{:type :ok :f "transfer" :value [[0 79] [1 2] [2 114] [3 149] [4 156]] :process 71 :index 71 :time 1780375432955041792}
+{:type :invoke :f "transfer" :value [1 4 7] :process 71 :index 71 :time 1780375432955025920}
+{:type :ok :f "transfer" :value [[0 76] [1 2] [2 113] [3 167] [4 142]] :process 70 :index 70 :time 1780375432954969856}
+{:type :invoke :f "transfer" :value [3 4 9] :process 70 :index 70 :time 1780375432954953984}
+{:type :ok :f "transfer" :value [[0 71] [1 9] [2 120] [3 150] [4 150]] :process 69 :index 69 :time 1780375432954898176}
+{:type :invoke :f "transfer" :value [4 0 5] :process 69 :index 69 :time 1780375432954881024}
+{:type :ok :f "transfer" :value [[0 75] [1 4] [2 120] [3 147] [4 154]] :process 68 :index 68 :time 1780375432954824960}
+{:type :invoke :f "transfer" :value [0 1 5] :process 68 :index 68 :time 1780375432954808064}
+{:type :ok :f "transfer" :value [[0 76] [1 4] [2 115] [3 145] [4 160]] :process 67 :index 67 :time 1780375432954713088}
+{:type :invoke :f "transfer" :value [4 3 7] :process 67 :index 67 :time 1780375432954695936}
+{:type :ok :f "transfer" :value [[0 76] [1 8] [2 118] [3 140] [4 158]] :process 66 :index 66 :time 1780375432954641152}
+{:type :invoke :f "transfer" :value [2 1 3] :process 66 :index 66 :time 1780375432954624000}
+{:type :ok :f "transfer" :value [[0 82] [1 11] [2 116] [3 137] [4 154]] :process 65 :index 65 :time 1780375432954567936}
+{:type :invoke :f "transfer" :value [2 4 4] :process 65 :index 65 :time 1780375432954551040}
+{:type :ok :f "transfer" :value [[0 87] [1 22] [2 100] [3 146] [4 145]] :process 64 :index 64 :time 1780375432954494976}
+{:type :invoke :f "transfer" :value [3 4 9] :process 64 :index 64 :time 1780375432954478080}
+{:type :ok :f "transfer" :value [[0 76] [1 34] [2 103] [3 149] [4 138]] :process 63 :index 63 :time 1780375432954417920}
+{:type :invoke :f "transfer" :value [3 4 3] :process 63 :index 63 :time 1780375432954400000}
+{:type :ok :f "transfer" :value [[0 69] [1 42] [2 108] [3 141] [4 140]] :process 62 :index 62 :time 1780375432954343936}
+{:type :invoke :f "transfer" :value [1 0 8] :process 62 :index 62 :time 1780375432954326016}
+{:type :ok :f "transfer" :value [[0 60] [1 39] [2 109] [3 141] [4 151]] :process 61 :index 61 :time 1780375432954267136}
+{:type :invoke :f "transfer" :value [4 2 5] :process 61 :index 61 :time 1780375432954247936}
+{:type :ok :f "transfer" :value [[0 79] [1 24] [2 101] [3 145] [4 151]] :process 60 :index 60 :time 1780375432954158080}
+{:type :invoke :f "transfer" :value [0 1 6] :process 60 :index 60 :time 1780375432954065920}
+{:type :ok :f "transfer" :value [[0 77] [1 15] [2 101] [3 156] [4 151]] :process 59 :index 59 :time 1780375432953953024}
+{:type :invoke :f "transfer" :value [3 1 7] :process 59 :index 59 :time 1780375432953936128}
+{:type :ok :f "transfer" :value [[0 77] [1 31] [2 97] [3 147] [4 148]] :process 58 :index 58 :time 1780375432953881088}
+{:type :invoke :f "transfer" :value [3 4 3] :process 58 :index 58 :time 1780375432953864192}
+{:type :ok :f "transfer" :value [[0 77] [1 40] [2 82] [3 143] [4 158]] :process 57 :index 57 :time 1780375432953736192}
+{:type :invoke :f "transfer" :value [4 2 9] :process 57 :index 57 :time 1780375432953699072}
+{:type :ok :f "transfer" :value [[0 84] [1 40] [2 81] [3 128] [4 167]] :process 56 :index 56 :time 1780375432953583872}
+{:type :invoke :f "transfer" :value [0 2 1] :process 56 :index 56 :time 1780375432953545984}
+{:type :ok :f "transfer" :value [[0 68] [1 48] [2 81] [3 128] [4 175]] :process 55 :index 55 :time 1780375432953434880}
+{:type :invoke :f "transfer" :value [4 0 10] :process 55 :index 55 :time 1780375432953416192}
+{:type :ok :f "transfer" :value [[0 68] [1 41] [2 75] [3 136] [4 180]] :process 54 :index 54 :time 1780375432953305088}
+{:type :invoke :f "transfer" :value [3 2 6] :process 54 :index 54 :time 1780375432953265920}
+{:type :ok :f "transfer" :value [[0 67] [1 50] [2 73] [3 139] [4 171]] :process 53 :index 53 :time 1780375432953132032}
+{:type :invoke :f "transfer" :value [3 2 3] :process 53 :index 53 :time 1780375432953092096}
+{:type :ok :f "transfer" :value [[0 77] [1 45] [2 84] [3 138] [4 156]] :process 52 :index 52 :time 1780375432952897024}
+{:type :invoke :f "transfer" :value [2 1 5] :process 52 :index 52 :time 1780375432952857856}
+{:type :ok :f "transfer" :value [[0 89] [1 45] [2 101] [3 124] [4 141]] :process 51 :index 51 :time 1780375432952734976}
+{:type :invoke :f "transfer" :value [2 3 9] :process 51 :index 51 :time 1780375432952696064}
+{:type :ok :f "transfer" :value [[0 90] [1 46] [2 93] [3 124] [4 147]] :process 50 :index 50 :time 1780375432952573184}
+{:type :invoke :f "transfer" :value [1 2 8] :process 50 :index 50 :time 1780375432952534016}
+{:type :ok :f "transfer" :value [[0 84] [1 52] [2 100] [3 117] [4 147]] :process 49 :index 49 :time 1780375432952409856}
+{:type :invoke :f "transfer" :value [1 0 6] :process 49 :index 49 :time 1780375432952371968}
+{:type :ok :f "transfer" :value [[0 83] [1 62] [2 105] [3 117] [4 133]] :process 48 :index 48 :time 1780375432952246016}
+{:type :invoke :f "transfer" :value [2 4 10] :process 48 :index 48 :time 1780375432952195840}
+{:type :ok :f "transfer" :value [[0 71] [1 75] [2 108] [3 113] [4 133]] :process 47 :index 47 :time 1780375432952073216}
+{:type :invoke :f "transfer" :value [1 0 9] :process 47 :index 47 :time 1780375432952034048}
+{:type :ok :f "transfer" :value [[0 69] [1 75] [2 105] [3 118] [4 133]] :process 46 :index 46 :time 1780375432951910144}
+{:type :invoke :f "transfer" :value [3 0 10] :process 46 :index 46 :time 1780375432951870976}
+{:type :ok :f "transfer" :value [[0 69] [1 74] [2 114] [3 113] [4 130]] :process 45 :index 45 :time 1780375432951747840}
+{:type :invoke :f "transfer" :value [1 2 6] :process 45 :index 45 :time 1780375432951708160}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 116] [3 116] [4 137]] :process 44 :index 44 :time 1780375432951554048}
+{:type :invoke :f "transfer" :value [3 0 3] :process 44 :index 44 :time 1780375432951514880}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 134] [3 108] [4 127]] :process 43 :index 43 :time 1780375432951392000}
+{:type :invoke :f "transfer" :value [2 3 10] :process 43 :index 43 :time 1780375432951353088}
+{:type :ok :f "transfer" :value [[0 74] [1 61] [2 127] [3 109] [4 129]] :process 42 :index 42 :time 1780375432951215872}
+{:type :invoke :f "transfer" :value [2 1 3] :process 42 :index 42 :time 1780375432951163904}
+{:type :ok :f "transfer" :value [[0 79] [1 57] [2 131] [3 115] [4 118]] :process 41 :index 41 :time 1780375432951031040}
+{:type :invoke :f "transfer" :value [2 4 5] :process 41 :index 41 :time 1780375432950979840}
+{:type :ok :f "transfer" :value [[0 87] [1 42] [2 136] [3 123] [4 112]] :process 40 :index 40 :time 1780375432950827008}
+{:type :invoke :f "transfer" :value [0 4 6] :process 40 :index 40 :time 1780375432950787072}
+{:type :ok :f "transfer" :value [[0 77] [1 46] [2 141] [3 121] [4 115]] :process 39 :index 39 :time 1780375432950640896}
+{:type :invoke :f "transfer" :value [4 2 5] :process 39 :index 39 :time 1780375432950597888}
+{:type :ok :f "transfer" :value [[0 69] [1 46] [2 140] [3 120] [4 125]] :process 38 :index 38 :time 1780375432950444032}
+{:type :invoke :f "transfer" :value [3 4 4] :process 38 :index 38 :time 1780375432950396160}
+{:type :ok :f "transfer" :value [[0 69] [1 49] [2 147] [3 114] [4 121]] :process 37 :index 37 :time 1780375432950295808}
+{:type :invoke :f "transfer" :value [2 4 10] :process 37 :index 37 :time 1780375432950253056}
+{:type :ok :f "transfer" :value [[0 67] [1 42] [2 137] [3 104] [4 150]] :process 36 :index 36 :time 1780375432950091008}
+{:type :invoke :f "transfer" :value [0 1 7] :process 36 :index 36 :time 1780375432950063872}
+{:type :ok :f "transfer" :value [[0 71] [1 34] [2 125] [3 112] [4 158]] :process 35 :index 35 :time 1780375432949990912}
+{:type :invoke :f "transfer" :value [4 2 4] :process 35 :index 35 :time 1780375432949972992}
+{:type :ok :f "transfer" :value [[0 68] [1 43] [2 125] [3 106] [4 158]] :process 34 :index 34 :time 1780375432949917184}
+{:type :invoke :f "transfer" :value [1 0 9] :process 34 :index 34 :time 1780375432949900032}
+{:type :ok :f "transfer" :value [[0 84] [1 43] [2 132] [3 79] [4 162]] :process 33 :index 33 :time 1780375432949843968}
+{:type :invoke :f "transfer" :value [4 3 4] :process 33 :index 33 :time 1780375432949826048}
+{:type :ok :f "transfer" :value [[0 93] [1 35] [2 142] [3 88] [4 142]] :process 32 :index 32 :time 1780375432949763072}
+{:type :invoke :f "transfer" :value [3 4 10] :process 32 :index 32 :time 1780375432949745920}
+{:type :ok :f "transfer" :value [[0 98] [1 27] [2 133] [3 88] [4 154]] :process 31 :index 31 :time 1780375432949690112}
+{:type :invoke :f "transfer" :value [4 2 7] :process 31 :index 31 :time 1780375432949673984}
+{:type :ok :f "transfer" :value [[0 98] [1 34] [2 127] [3 88] [4 153]] :process 30 :index 30 :time 1780375432949616896}
+{:type :invoke :f "transfer" :value [3 2 7] :process 30 :index 30 :time 1780375432949600000}
+{:type :ok :f "transfer" :value [[0 98] [1 40] [2 142] [3 75] [4 145]] :process 29 :index 29 :time 1780375432949541120}
+{:type :invoke :f "transfer" :value [3 1 1] :process 29 :index 29 :time 1780375432949413888}
+{:type :ok :f "transfer" :value [[0 104] [1 42] [2 135] [3 76] [4 143]] :process 28 :index 28 :time 1780375432949358080}
+{:type :invoke :f "transfer" :value [0 3 6] :process 28 :index 28 :time 1780375432949340160}
+{:type :ok :f "transfer" :value [[0 106] [1 45] [2 132] [3 74] [4 143]] :process 27 :index 27 :time 1780375432949284096}
+{:type :invoke :f "transfer" :value [0 3 2] :process 27 :index 27 :time 1780375432949265920}
+{:type :ok :f "transfer" :value [[0 106] [1 57] [2 123] [3 78] [4 136]] :process 26 :index 26 :time 1780375432949201152}
+{:type :invoke :f "transfer" :value [3 1 3] :process 26 :index 26 :time 1780375432949184000}
+{:type :ok :f "transfer" :value [[0 94] [1 57] [2 125] [3 80] [4 144]] :process 25 :index 25 :time 1780375432949125888}
+{:type :invoke :f "transfer" :value [2 0 2] :process 25 :index 25 :time 1780375432949081856}
+{:type :ok :f "transfer" :value [[0 94] [1 65] [2 118] [3 74] [4 149]] :process 24 :index 24 :time 1780375432949025024}
+{:type :invoke :f "transfer" :value [4 3 6] :process 24 :index 24 :time 1780375432949007104}
+{:type :ok :f "transfer" :value [[0 110] [1 75] [2 118] [3 55] [4 142]] :process 23 :index 23 :time 1780375432948945920}
+{:type :invoke :f "transfer" :value [0 3 9] :process 23 :index 23 :time 1780375432948914176}
+{:type :ok :f "transfer" :value [[0 119] [1 79] [2 90] [3 65] [4 147]] :process 22 :index 22 :time 1780375432948782848}
+{:type :invoke :f "transfer" :value [4 2 5] :process 22 :index 22 :time 1780375432948740096}
+{:type :ok :f "transfer" :value [[0 133] [1 71] [2 89] [3 70] [4 137]] :process 21 :index 21 :time 1780375432948569088}
+{:type :invoke :f "transfer" :value [3 2 5] :process 21 :index 21 :time 1780375432948530944}
+{:type :ok :f "transfer" :value [[0 132] [1 83] [2 89] [3 71] [4 125]] :process 20 :index 20 :time 1780375432948407040}
+{:type :invoke :f "transfer" :value [1 3 6] :process 20 :index 20 :time 1780375432948365824}
+{:type :ok :f "transfer" :value [[0 131] [1 87] [2 90] [3 78] [4 114]] :process 19 :index 19 :time 1780375432948187136}
+{:type :invoke :f "transfer" :value [1 4 4] :process 19 :index 19 :time 1780375432948147968}
+{:type :ok :f "transfer" :value [[0 136] [1 88] [2 90] [3 71] [4 115]] :process 18 :index 18 :time 1780375432948018176}
+{:type :invoke :f "transfer" :value [1 0 1] :process 18 :index 18 :time 1780375432947979008}
+{:type :ok :f "transfer" :value [[0 129] [1 97] [2 90] [3 71] [4 113]] :process 17 :index 17 :time 1780375432947794944}
+{:type :invoke :f "transfer" :value [1 0 7] :process 17 :index 17 :time 1780375432947756032}
+{:type :ok :f "transfer" :value [[0 121] [1 88] [2 98] [3 81] [4 112]] :process 16 :index 16 :time 1780375432947633152}
+{:type :invoke :f "transfer" :value [2 0 8] :process 16 :index 16 :time 1780375432947593984}
+{:type :ok :f "transfer" :value [[0 126] [1 91] [2 95] [3 82] [4 106]] :process 15 :index 15 :time 1780375432947470848}
+{:type :invoke :f "transfer" :value [0 3 7] :process 15 :index 15 :time 1780375432947431168}
+{:type :ok :f "transfer" :value [[0 131] [1 91] [2 89] [3 77] [4 112]] :process 14 :index 14 :time 1780375432947303936}
+{:type :invoke :f "transfer" :value [1 2 6] :process 14 :index 14 :time 1780375432947256064}
+{:type :ok :f "transfer" :value [[0 134] [1 91] [2 94] [3 79] [4 102]] :process 13 :index 13 :time 1780375432947105792}
+{:type :invoke :f "transfer" :value [2 4 5] :process 13 :index 13 :time 1780375432947081216}
+{:type :ok :f "transfer" :value [[0 136] [1 89] [2 104] [3 80] [4 91]] :process 12 :index 12 :time 1780375432946996992}
+{:type :invoke :f "transfer" :value [3 4 1] :process 12 :index 12 :time 1780375432946966784}
+{:type :ok :f "transfer" :value [[0 124] [1 96] [2 96] [3 80] [4 104]] :process 11 :index 11 :time 1780375432946872064}
+{:type :invoke :f "transfer" :value [1 0 7] :process 11 :index 11 :time 1780375432946825984}
+{:type :ok :f "transfer" :value [[0 126] [1 81] [2 103] [3 76] [4 114]] :process 10 :index 10 :time 1780375432946670080}
+{:type :invoke :f "transfer" :value [0 3 2] :process 10 :index 10 :time 1780375432946651904}
+{:type :ok :f "transfer" :value [[0 116] [1 92] [2 109] [3 65] [4 118]] :process 9 :index 9 :time 1780375432946511104}
+{:type :invoke :f "transfer" :value [4 0 4] :process 9 :index 9 :time 1780375432946492928}
+{:type :ok :f "transfer" :value [[0 109] [1 93] [2 112] [3 62] [4 124]] :process 8 :index 8 :time 1780375432946435072}
+{:type :invoke :f "transfer" :value [4 1 6] :process 8 :index 8 :time 1780375432946417152}
+{:type :ok :f "transfer" :value [[0 109] [1 87] [2 116] [3 67] [4 121]] :process 7 :index 7 :time 1780375432946359040}
+{:type :invoke :f "transfer" :value [1 2 1] :process 7 :index 7 :time 1780375432946340096}
+{:type :ok :f "transfer" :value [[0 104] [1 91] [2 119] [3 62] [4 124]] :process 6 :index 6 :time 1780375432946275072}
+{:type :invoke :f "transfer" :value [3 0 1] :process 6 :index 6 :time 1780375432946234112}
+{:type :ok :f "transfer" :value [[0 94] [1 93] [2 113] [3 76] [4 124]] :process 5 :index 5 :time 1780375432945382144}
+{:type :invoke :f "transfer" :value [2 0 10] :process 5 :index 5 :time 1780375432945312000}
+{:type :ok :f "transfer" :value [[0 104] [1 100] [2 95] [3 76] [4 125]] :process 4 :index 4 :time 1780375432945074944}
+{:type :invoke :f "transfer" :value [0 2 9] :process 4 :index 4 :time 1780375432945004032}
+{:type :ok :f "transfer" :value [[0 114] [1 92] [2 100] [3 80] [4 114]] :process 3 :index 3 :time 1780375432944789760}
+{:type :invoke :f "transfer" :value [0 4 10] :process 3 :index 3 :time 1780375432944719104}
+{:type :ok :f "transfer" :value [[0 103] [1 97] [2 111] [3 80] [4 109]] :process 2 :index 2 :time 1780375432944513024}
+{:type :invoke :f "transfer" :value [1 0 5] :process 2 :index 2 :time 1780375432944446208}
+{:type :ok :f "transfer" :value [[0 98] [1 96] [2 115] [3 88] [4 103]] :process 1 :index 1 :time 1780375432944231936}
+{:type :invoke :f "transfer" :value [1 4 3] :process 1 :index 1 :time 1780375432944154112}
+{:type :ok :f "transfer" :value [[0 100] [1 100] [2 100] [3 97] [4 103]] :process 0 :index 0 :time 1780375432943932160}
+{:type :invoke :f "transfer" :value [0 1 6] :process 0 :index 0 :time 1780375432943860992}
+{:type :ok :f "transfer" :value [[0 67] [1 -62] [2 115] [3 184] [4 196]] :process 99 :index 99 :time 1780375432957285888}
+{:type :invoke :f "transfer" :value [2 0 6] :process 99 :index 99 :time 1780375432957268992}
+{:type :ok :f "transfer" :value [[0 67] [1 -61] [2 112] [3 186] [4 196]] :process 98 :index 98 :time 1780375432957169152}
+{:type :invoke :f "transfer" :value [3 1 9] :process 98 :index 98 :time 1780375432957152000}
+{:type :ok :f "transfer" :value [[0 58] [1 -62] [2 119] [3 181] [4 204]] :process 97 :index 97 :time 1780375432957096960}
+{:type :invoke :f "transfer" :value [4 2 7] :process 97 :index 97 :time 1780375432957081088}
+{:type :ok :f "transfer" :value [[0 41] [1 -55] [2 107] [3 190] [4 217]] :process 96 :index 96 :time 1780375432957026048}
+{:type :invoke :f "transfer" :value [3 2 9] :process 96 :index 96 :time 1780375432957009152}
+{:type :ok :f "transfer" :value [[0 49] [1 -54] [2 116] [3 172] [4 217]] :process 95 :index 95 :time 1780375432956954112}
+{:type :invoke :f "transfer" :value [1 3 2] :process 95 :index 95 :time 1780375432956937984}
+{:type :ok :f "transfer" :value [[0 49] [1 -66] [2 123] [3 183] [4 211]] :process 94 :index 94 :time 1780375432956873984}
+{:type :invoke :f "transfer" :value [4 1 6] :process 94 :index 94 :time 1780375432956839168}
+{:type :ok :f "transfer" :value [[0 64] [1 -65] [2 123] [3 179] [4 199]] :process 93 :index 93 :time 1780375432956777216}
+{:type :invoke :f "transfer" :value [0 4 6] :process 93 :index 93 :time 1780375432956760832}
+{:type :ok :f "transfer" :value [[0 55] [1 -65] [2 123] [3 186] [4 201]] :process 92 :index 92 :time 1780375432956706048}
+{:type :invoke :f "transfer" :value [4 0 1] :process 92 :index 92 :time 1780375432956690176}
+{:type :ok :f "transfer" :value [[0 64] [1 -64] [2 115] [3 186] [4 199]] :process 91 :index 91 :time 1780375432956635904}
+{:type :invoke :f "transfer" :value [0 4 5] :process 91 :index 91 :time 1780375432956619008}
+{:type :ok :f "transfer" :value [[0 63] [1 -64] [2 117] [3 183] [4 201]] :process 90 :index 90 :time 1780375432956547072}
+{:type :invoke :f "transfer" :value [2 4 1] :process 90 :index 90 :time 1780375432956530944}
+{:type :ok :f "transfer" :value [[0 80] [1 -63] [2 117] [3 173] [4 193]] :process 89 :index 89 :time 1780375432956476928}
+{:type :invoke :f "transfer" :value [0 3 10] :process 89 :index 89 :time 1780375432956460032}
+{:type :ok :f "transfer" :value [[0 53] [1 -54] [2 117] [3 193] [4 191]] :process 88 :index 88 :time 1780375432956406016}
+{:type :invoke :f "transfer" :value [1 0 7] :process 88 :index 88 :time 1780375432956388864}
+{:type :ok :f "transfer" :value [[0 58] [1 -56] [2 125] [3 178] [4 195]] :process 87 :index 87 :time 1780375432956335104}
+{:type :invoke :f "transfer" :value [4 1 4] :process 87 :index 87 :time 1780375432956317952}
+{:type :ok :f "transfer" :value [[0 69] [1 -52] [2 115] [3 181] [4 187]] :process 86 :index 86 :time 1780375432956259072}
+{:type :invoke :f "transfer" :value [0 2 7] :process 86 :index 86 :time 1780375432956240896}
+{:type :ok :f "transfer" :value [[0 63] [1 -43] [2 120] [3 181] [4 179]] :process 85 :index 85 :time 1780375432956171008}
+{:type :invoke :f "transfer" :value [0 4 8] :process 85 :index 85 :time 1780375432956155136}
+{:type :ok :f "transfer" :value [[0 60] [1 -39] [2 125] [3 183] [4 171]] :process 84 :index 84 :time 1780375432956100096}
+{:type :invoke :f "transfer" :value [2 0 9] :process 84 :index 84 :time 1780375432956082944}
+{:type :ok :f "transfer" :value [[0 62] [1 -43] [2 131] [3 181] [4 169]] :process 83 :index 83 :time 1780375432956028928}
+{:type :invoke :f "transfer" :value [3 4 4] :process 83 :index 83 :time 1780375432955975936}
+{:type :ok :f "transfer" :value [[0 59] [1 -46] [2 128] [3 200] [4 159]] :process 82 :index 82 :time 1780375432955921920}
+{:type :invoke :f "transfer" :value [0 2 3] :process 82 :index 82 :time 1780375432955905024}
+{:type :ok :f "transfer" :value [[0 59] [1 -35] [2 126] [3 190] [4 160]] :process 81 :index 81 :time 1780375432955849984}
+{:type :invoke :f "transfer" :value [2 4 7] :process 81 :index 81 :time 1780375432955832832}
+{:type :ok :f "transfer" :value [[0 64] [1 -25] [2 126] [3 177] [4 158]] :process 80 :index 80 :time 1780375432955777792}
+{:type :invoke :f "transfer" :value [3 4 3] :process 80 :index 80 :time 1780375432955761920}
+{:type :ok :f "transfer" :value [[0 69] [1 -16] [2 131] [3 158] [4 158]] :process 79 :index 79 :time 1780375432955705856}
+{:type :invoke :f "transfer" :value [1 3 9] :process 79 :index 79 :time 1780375432955686144}
+{:type :ok :f "transfer" :value [[0 69] [1 -8] [2 122] [3 159] [4 158]] :process 78 :index 78 :time 1780375432955630080}
+{:type :invoke :f "transfer" :value [3 2 10] :process 78 :index 78 :time 1780375432955612928}
+{:type :ok :f "transfer" :value [[0 76] [1 -11] [2 121] [3 159] [4 155]] :process 77 :index 77 :time 1780375432955557120}
+{:type :invoke :f "transfer" :value [0 1 7] :process 77 :index 77 :time 1780375432955539968}
+{:type :ok :f "transfer" :value [[0 74] [1 -1] [2 118] [3 156] [4 153]] :process 76 :index 76 :time 1780375432955485184}
+{:type :invoke :f "transfer" :value [1 2 10] :process 76 :index 76 :time 1780375432955468032}
+{:type :ok :f "transfer" :value [[0 80] [1 -5] [2 118] [3 144] [4 163]] :process 75 :index 75 :time 1780375432955371008}
+{:type :invoke :f "transfer" :value [4 1 4] :process 75 :index 75 :time 1780375432955353856}
+{:type :ok :f "transfer" :value [[0 88] [1 5] [2 113] [3 144] [4 150]] :process 74 :index 74 :time 1780375432955298048}
+{:type :invoke :f "transfer" :value [3 4 8] :process 74 :index 74 :time 1780375432955280896}
+{:type :ok :f "transfer" :value [[0 81] [1 6] [2 113] [3 141] [4 159]] :process 73 :index 73 :time 1780375432955209984}
+{:type :invoke :f "transfer" :value [4 0 7] :process 73 :index 73 :time 1780375432955193088}
+{:type :ok :f "transfer" :value [[0 80] [1 3] [2 106] [3 142] [4 169]] :process 72 :index 72 :time 1780375432955138048}
+{:type :invoke :f "transfer" :value [4 3 9] :process 72 :index 72 :time 1780375432955121152}
+{:type :ok :f "transfer" :value [[0 79] [1 -5] [2 114] [3 149] [4 163]] :process 71 :index 71 :time 1780375432955058944}
+{:type :invoke :f "transfer" :value [2 3 8] :process 71 :index 71 :time 1780375432955043072}
+{:type :ok :f "transfer" :value [[0 76] [1 2] [2 113] [3 158] [4 151]] :process 70 :index 70 :time 1780375432954987008}
+{:type :invoke :f "transfer" :value [3 4 5] :process 70 :index 70 :time 1780375432954971136}
+{:type :ok :f "transfer" :value [[0 76] [1 9] [2 120] [3 150] [4 145]] :process 69 :index 69 :time 1780375432954916096}
+{:type :invoke :f "transfer" :value [2 3 7] :process 69 :index 69 :time 1780375432954899200}
+{:type :ok :f "transfer" :value [[0 70] [1 9] [2 120] [3 147] [4 154]] :process 68 :index 68 :time 1780375432954842112}
+{:type :invoke :f "transfer" :value [0 3 7] :process 68 :index 68 :time 1780375432954824960}
+{:type :ok :f "transfer" :value [[0 76] [1 4] [2 115] [3 152] [4 153]] :process 67 :index 67 :time 1780375432954729984}
+{:type :invoke :f "transfer" :value [3 1 5] :process 67 :index 67 :time 1780375432954713088}
+{:type :ok :f "transfer" :value [[0 76] [1 11] [2 115] [3 140] [4 158]] :process 66 :index 66 :time 1780375432954659072}
+{:type :invoke :f "transfer" :value [1 3 2] :process 66 :index 66 :time 1780375432954641152}
+{:type :ok :f "transfer" :value [[0 82] [1 11] [2 112] [3 137] [4 158]] :process 65 :index 65 :time 1780375432954585088}
+{:type :invoke :f "transfer" :value [0 2 6] :process 65 :index 65 :time 1780375432954567936}
+{:type :ok :f "transfer" :value [[0 87] [1 22] [2 100] [3 137] [4 154]] :process 64 :index 64 :time 1780375432954513152}
+{:type :invoke :f "transfer" :value [0 2 10] :process 64 :index 64 :time 1780375432954494976}
+{:type :ok :f "transfer" :value [[0 76] [1 34] [2 103] [3 146] [4 141]] :process 63 :index 63 :time 1780375432954435072}
+{:type :invoke :f "transfer" :value [1 4 4] :process 63 :index 63 :time 1780375432954417920}
+{:type :ok :f "transfer" :value [[0 77] [1 34] [2 108] [3 141] [4 140]] :process 62 :index 62 :time 1780375432954361088}
+{:type :invoke :f "transfer" :value [2 0 5] :process 62 :index 62 :time 1780375432954343936}
+{:type :ok :f "transfer" :value [[0 60] [1 39] [2 114] [3 141] [4 146]] :process 61 :index 61 :time 1780375432954286080}
+{:type :invoke :f "transfer" :value [4 0 9] :process 61 :index 61 :time 1780375432954267904}
+{:type :ok :f "transfer" :value [[0 73] [1 30] [2 101] [3 145] [4 151]] :process 60 :index 60 :time 1780375432954179072}
+{:type :invoke :f "transfer" :value [0 2 8] :process 60 :index 60 :time 1780375432954159104}
+{:type :ok :f "transfer" :value [[0 77] [1 22] [2 101] [3 149] [4 151]] :process 59 :index 59 :time 1780375432953970944}
+{:type :invoke :f "transfer" :value [0 3 5] :process 59 :index 59 :time 1780375432953954048}
+{:type :ok :f "transfer" :value [[0 77] [1 31] [2 97] [3 144] [4 151]] :process 58 :index 58 :time 1780375432953897984}
+{:type :invoke :f "transfer" :value [1 3 7] :process 58 :index 58 :time 1780375432953881088}
+{:type :ok :f "transfer" :value [[0 77] [1 40] [2 91] [3 143] [4 149]] :process 57 :index 57 :time 1780375432953789952}
+{:type :invoke :f "transfer" :value [1 2 9] :process 57 :index 57 :time 1780375432953736960}
+{:type :ok :f "transfer" :value [[0 83] [1 40] [2 82] [3 128] [4 167]] :process 56 :index 56 :time 1780375432953604096}
+{:type :invoke :f "transfer" :value [0 3 6] :process 56 :index 56 :time 1780375432953584896}
+{:type :ok :f "transfer" :value [[0 78] [1 48] [2 81] [3 128] [4 165]] :process 55 :index 55 :time 1780375432953454848}
+{:type :invoke :f "transfer" :value [1 4 2] :process 55 :index 55 :time 1780375432953434880}
+{:type :ok :f "transfer" :value [[0 68] [1 41] [2 81] [3 130] [4 180]] :process 54 :index 54 :time 1780375432953345024}
+{:type :invoke :f "transfer" :value [3 1 1] :process 54 :index 54 :time 1780375432953305856}
+{:type :ok :f "transfer" :value [[0 67] [1 50] [2 76] [3 136] [4 171]] :process 53 :index 53 :time 1780375432953171968}
+{:type :invoke :f "transfer" :value [0 2 8] :process 53 :index 53 :time 1780375432953132032}
+{:type :ok :f "transfer" :value [[0 77] [1 50] [2 79] [3 138] [4 156]] :process 52 :index 52 :time 1780375432953007104}
+{:type :invoke :f "transfer" :value [2 4 5] :process 52 :index 52 :time 1780375432952898048}
+{:type :ok :f "transfer" :value [[0 89] [1 45] [2 92] [3 133] [4 141]] :process 51 :index 51 :time 1780375432952774144}
+{:type :invoke :f "transfer" :value [0 4 7] :process 51 :index 51 :time 1780375432952736000}
+{:type :ok :f "transfer" :value [[0 90] [1 38] [2 101] [3 124] [4 147]] :process 50 :index 50 :time 1780375432952613120}
+{:type :invoke :f "transfer" :value [4 1 7] :process 50 :index 50 :time 1780375432952573952}
+{:type :ok :f "transfer" :value [[0 90] [1 46] [2 100] [3 117] [4 147]] :process 49 :index 49 :time 1780375432952450048}
+{:type :invoke :f "transfer" :value [2 3 7] :process 49 :index 49 :time 1780375432952410880}
+{:type :ok :f "transfer" :value [[0 83] [1 62] [2 95] [3 117] [4 143]] :process 48 :index 48 :time 1780375432952288000}
+{:type :invoke :f "transfer" :value [1 4 10] :process 48 :index 48 :time 1780375432952246784}
+{:type :ok :f "transfer" :value [[0 80] [1 66] [2 108] [3 113] [4 133]] :process 47 :index 47 :time 1780375432952111872}
+{:type :invoke :f "transfer" :value [1 2 4] :process 47 :index 47 :time 1780375432952073216}
+{:type :ok :f "transfer" :value [[0 79] [1 75] [2 105] [3 108] [4 133]] :process 46 :index 46 :time 1780375432951950080}
+{:type :invoke :f "transfer" :value [3 2 3] :process 46 :index 46 :time 1780375432951910912}
+{:type :ok :f "transfer" :value [[0 69] [1 68] [2 120] [3 113] [4 130]] :process 45 :index 45 :time 1780375432951788032}
+{:type :invoke :f "transfer" :value [2 1 7] :process 45 :index 45 :time 1780375432951747840}
+{:type :ok :f "transfer" :value [[0 70] [1 64] [2 116] [3 113] [4 137]] :process 44 :index 44 :time 1780375432951592960}
+{:type :invoke :f "transfer" :value [0 1 10] :process 44 :index 44 :time 1780375432951555072}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 124] [3 118] [4 127]] :process 43 :index 43 :time 1780375432951431936}
+{:type :invoke :f "transfer" :value [3 4 10] :process 43 :index 43 :time 1780375432951392768}
+{:type :ok :f "transfer" :value [[0 74] [1 64] [2 124] [3 109] [4 129]] :process 42 :index 42 :time 1780375432951267840}
+{:type :invoke :f "transfer" :value [0 4 7] :process 42 :index 42 :time 1780375432951216896}
+{:type :ok :f "transfer" :value [[0 79] [1 57] [2 126] [3 115] [4 123]] :process 41 :index 41 :time 1780375432951070976}
+{:type :invoke :f "transfer" :value [0 2 1] :process 41 :index 41 :time 1780375432951033088}
+{:type :ok :f "transfer" :value [[0 81] [1 42] [2 136] [3 123] [4 118]] :process 40 :index 40 :time 1780375432950875136}
+{:type :invoke :f "transfer" :value [2 1 5] :process 40 :index 40 :time 1780375432950828032}
+{:type :ok :f "transfer" :value [[0 77] [1 46] [2 146] [3 121] [4 110]] :process 39 :index 39 :time 1780375432950684928}
+{:type :invoke :f "transfer" :value [1 4 2] :process 39 :index 39 :time 1780375432950642176}
+{:type :ok :f "transfer" :value [[0 69] [1 46] [2 140] [3 116] [4 129]] :process 38 :index 38 :time 1780375432950496000}
+{:type :invoke :f "transfer" :value [2 0 8] :process 38 :index 38 :time 1780375432950445824}
+{:type :ok :f "transfer" :value [[0 69] [1 49] [2 137] [3 114] [4 131]] :process 37 :index 37 :time 1780375432950329088}
+{:type :invoke :f "transfer" :value [1 2 3] :process 37 :index 37 :time 1780375432950297088}
+{:type :ok :f "transfer" :value [[0 60] [1 49] [2 137] [3 104] [4 150]] :process 36 :index 36 :time 1780375432950118912}
+{:type :invoke :f "transfer" :value [4 2 10] :process 36 :index 36 :time 1780375432950092032}
+{:type :ok :f "transfer" :value [[0 71] [1 34] [2 129] [3 112] [4 154]] :process 35 :index 35 :time 1780375432950007808}
+{:type :invoke :f "transfer" :value [0 1 8] :process 35 :index 35 :time 1780375432949990912}
+{:type :ok :f "transfer" :value [[0 77] [1 34] [2 125] [3 106] [4 158]] :process 34 :index 34 :time 1780375432949934080}
+{:type :invoke :f "transfer" :value [0 3 6] :process 34 :index 34 :time 1780375432949917184}
+{:type :ok :f "transfer" :value [[0 84] [1 43] [2 132] [3 83] [4 158]] :process 33 :index 33 :time 1780375432949861120}
+{:type :invoke :f "transfer" :value [0 3 10] :process 33 :index 33 :time 1780375432949843968}
+{:type :ok :f "transfer" :value [[0 93] [1 35] [2 142] [3 78] [4 152]] :process 32 :index 32 :time 1780375432949779968}
+{:type :invoke :f "transfer" :value [2 4 10] :process 32 :index 32 :time 1780375432949763072}
+{:type :ok :f "transfer" :value [[0 98] [1 27] [2 140] [3 88] [4 147]] :process 31 :index 31 :time 1780375432949708032}
+{:type :invoke :f "transfer" :value [0 4 5] :process 31 :index 31 :time 1780375432949691136}
+{:type :ok :f "transfer" :value [[0 98] [1 34] [2 134] [3 81] [4 153]] :process 30 :index 30 :time 1780375432949635072}
+{:type :invoke :f "transfer" :value [3 1 3] :process 30 :index 30 :time 1780375432949618176}
+{:type :ok :f "transfer" :value [[0 98] [1 41] [2 142] [3 74] [4 145]] :process 29 :index 29 :time 1780375432949559040}
+{:type :invoke :f "transfer" :value [2 4 8] :process 29 :index 29 :time 1780375432949542144}
+{:type :ok :f "transfer" :value [[0 98] [1 42] [2 135] [3 82] [4 143]] :process 28 :index 28 :time 1780375432949374976}
+{:type :invoke :f "transfer" :value [4 2 5] :process 28 :index 28 :time 1780375432949358080}
+{:type :ok :f "transfer" :value [[0 104] [1 45] [2 132] [3 76] [4 143]] :process 27 :index 27 :time 1780375432949302016}
+{:type :invoke :f "transfer" :value [1 0 3] :process 27 :index 27 :time 1780375432949284096}
+{:type :ok :f "transfer" :value [[0 106] [1 60] [2 123] [3 75] [4 136]] :process 26 :index 26 :time 1780375432949223936}
+{:type :invoke :f "transfer" :value [1 4 7] :process 26 :index 26 :time 1780375432949201152}
+{:type :ok :f "transfer" :value [[0 96] [1 57] [2 123] [3 80] [4 144]] :process 25 :index 25 :time 1780375432949143808}
+{:type :invoke :f "transfer" :value [3 0 2] :process 25 :index 25 :time 1780375432949125888}
+{:type :ok :f "transfer" :value [[0 94] [1 65] [2 118] [3 80] [4 143]] :process 24 :index 24 :time 1780375432949042944}
+{:type :invoke :f "transfer" :value [1 0 8] :process 24 :index 24 :time 1780375432949025024}
+{:type :ok :f "transfer" :value [[0 101] [1 75] [2 118] [3 64] [4 142]] :process 23 :index 23 :time 1780375432948966144}
+{:type :invoke :f "transfer" :value [1 3 10] :process 23 :index 23 :time 1780375432948946944}
+{:type :ok :f "transfer" :value [[0 119] [1 79] [2 95] [3 65] [4 142]] :process 22 :index 22 :time 1780375432948824832}
+{:type :invoke :f "transfer" :value [0 2 9] :process 22 :index 22 :time 1780375432948784128}
+{:type :ok :f "transfer" :value [[0 133] [1 71] [2 94] [3 65] [4 137]] :process 21 :index 21 :time 1780375432948654848}
+{:type :invoke :f "transfer" :value [2 0 4] :process 21 :index 21 :time 1780375432948570112}
+{:type :ok :f "transfer" :value [[0 132] [1 77] [2 89] [3 77] [4 125]] :process 20 :index 20 :time 1780375432948446976}
+{:type :invoke :f "transfer" :value [3 0 1] :process 20 :index 20 :time 1780375432948407808}
+{:type :ok :f "transfer" :value [[0 131] [1 83] [2 90] [3 78] [4 118]] :process 19 :index 19 :time 1780375432948275200}
+{:type :invoke :f "transfer" :value [3 0 7] :process 19 :index 19 :time 1780375432948188160}
+{:type :ok :f "transfer" :value [[0 137] [1 87] [2 90] [3 71] [4 115]] :process 18 :index 18 :time 1780375432948056832}
+{:type :invoke :f "transfer" :value [0 4 8] :process 18 :index 18 :time 1780375432948018944}
+{:type :ok :f "transfer" :value [[0 136] [1 90] [2 90] [3 71] [4 113]] :process 17 :index 17 :time 1780375432947892992}
+{:type :invoke :f "transfer" :value [3 4 3] :process 17 :index 17 :time 1780375432947796224}
+{:type :ok :f "transfer" :value [[0 129] [1 88] [2 90] [3 81] [4 112]] :process 16 :index 16 :time 1780375432947673088}
+{:type :invoke :f "transfer" :value [3 1 9] :process 16 :index 16 :time 1780375432947633920}
+{:type :ok :f "transfer" :value [[0 119] [1 91] [2 95] [3 89] [4 106]] :process 15 :index 15 :time 1780375432947511040}
+{:type :invoke :f "transfer" :value [3 4 6] :process 15 :index 15 :time 1780375432947472128}
+{:type :ok :f "transfer" :value [[0 131] [1 85] [2 95] [3 77] [4 112]] :process 14 :index 14 :time 1780375432947345920}
+{:type :invoke :f "transfer" :value [2 1 6] :process 14 :index 14 :time 1780375432947304960}
+{:type :ok :f "transfer" :value [[0 134] [1 91] [2 89] [3 79] [4 107]] :process 13 :index 13 :time 1780375432947132160}
+{:type :invoke :f "transfer" :value [0 3 3] :process 13 :index 13 :time 1780375432947107072}
+{:type :ok :f "transfer" :value [[0 136] [1 89] [2 104] [3 79] [4 92]] :process 12 :index 12 :time 1780375432947025152}
+{:type :invoke :f "transfer" :value [0 1 2] :process 12 :index 12 :time 1780375432946997760}
+{:type :ok :f "transfer" :value [[0 131] [1 89] [2 96] [3 80] [4 104]] :process 11 :index 11 :time 1780375432946904064}
+{:type :invoke :f "transfer" :value [0 4 1] :process 11 :index 11 :time 1780375432946872064}
+{:type :ok :f "transfer" :value [[0 124] [1 81] [2 103] [3 78] [4 114]] :process 10 :index 10 :time 1780375432946716928}
+{:type :invoke :f "transfer" :value [2 1 7] :process 10 :index 10 :time 1780375432946671104}
+{:type :ok :f "transfer" :value [[0 120] [1 92] [2 109] [3 65] [4 114]] :process 9 :index 9 :time 1780375432946529024}
+{:type :invoke :f "transfer" :value [1 3 4] :process 9 :index 9 :time 1780375432946511104}
+{:type :ok :f "transfer" :value [[0 109] [1 99] [2 112] [3 62] [4 118]] :process 8 :index 8 :time 1780375432946452992}
+{:type :invoke :f "transfer" :value [0 1 1] :process 8 :index 8 :time 1780375432946435072}
+{:type :ok :f "transfer" :value [[0 109] [1 86] [2 117] [3 67] [4 121]] :process 7 :index 7 :time 1780375432946376960}
+{:type :invoke :f "transfer" :value [3 4 10] :process 7 :index 7 :time 1780375432946359040}
+{:type :ok :f "transfer" :value [[0 105] [1 91] [2 119] [3 61] [4 124]] :process 6 :index 6 :time 1780375432946296064}
+{:type :invoke :f "transfer" :value [1 0 4] :process 6 :index 6 :time 1780375432946275840}
+{:type :ok :f "transfer" :value [[0 104] [1 93] [2 103] [3 76] [4 124]] :process 5 :index 5 :time 1780375432945446912}
+{:type :invoke :f "transfer" :value [3 2 8] :process 5 :index 5 :time 1780375432945383168}
+{:type :ok :f "transfer" :value [[0 95] [1 100] [2 104] [3 76] [4 125]] :process 4 :index 4 :time 1780375432945147904}
+{:type :invoke :f "transfer" :value [4 0 1] :process 4 :index 4 :time 1780375432945074944}
+{:type :ok :f "transfer" :value [[0 104] [1 92] [2 100] [3 80] [4 124]] :process 3 :index 3 :time 1780375432944856832}
+{:type :invoke :f "transfer" :value [3 4 1] :process 3 :index 3 :time 1780375432944791040}
+{:type :ok :f "transfer" :value [[0 108] [1 92] [2 111] [3 80] [4 109]] :process 2 :index 2 :time 1780375432944578816}
+{:type :invoke :f "transfer" :value [2 0 8] :process 2 :index 2 :time 1780375432944514048}
+{:type :ok :f "transfer" :value [[0 98] [1 93] [2 115] [3 88] [4 106]] :process 1 :index 1 :time 1780375432944303872}
+{:type :invoke :f "transfer" :value [3 0 5] :process 1 :index 1 :time 1780375432944232960}
+{:type :ok :f "transfer" :value [[0 94] [1 106] [2 100] [3 97] [4 103]] :process 0 :index 0 :time 1780375432944006912}
+{:type :invoke :f "transfer" :value [3 2 5] :process 0 :index 0 :time 1780375432943933952}
+{:type :ok :f "transfer" :value [[0 73] [1 -62] [2 109] [3 184] [4 196]] :process 99 :index 99 :time 1780375432957303040}
+{:type :invoke :f "transfer" :value [4 1 1] :process 99 :index 99 :time 1780375432957285888}
+{:type :ok :f "transfer" :value [[0 67] [1 -52] [2 112] [3 177] [4 196]] :process 98 :index 98 :time 1780375432957186816}
+{:type :invoke :f "transfer" :value [1 2 7] :process 98 :index 98 :time 1780375432957169920}
+{:type :ok :f "transfer" :value [[0 58] [1 -62] [2 126] [3 181] [4 197]] :process 97 :index 97 :time 1780375432957113856}
+{:type :invoke :f "transfer" :value [4 1 1] :process 97 :index 97 :time 1780375432957097984}
+{:type :ok :f "transfer" :value [[0 41] [1 -55] [2 116] [3 181] [4 217]] :process 96 :index 96 :time 1780375432957042944}
+{:type :invoke :f "transfer" :value [4 2 3] :process 96 :index 96 :time 1780375432957026048}
+{:type :ok :f "transfer" :value [[0 49] [1 -56] [2 116] [3 174] [4 217]] :process 95 :index 95 :time 1780375432956971008}
+{:type :invoke :f "transfer" :value [0 3 7] :process 95 :index 95 :time 1780375432956954880}
+{:type :ok :f "transfer" :value [[0 49] [1 -60] [2 123] [3 183] [4 205]] :process 94 :index 94 :time 1780375432956896000}
+{:type :invoke :f "transfer" :value [2 4 7] :process 94 :index 94 :time 1780375432956875008}
+{:type :ok :f "transfer" :value [[0 58] [1 -65] [2 123] [3 179] [4 205]] :process 93 :index 93 :time 1780375432956794112}
+{:type :invoke :f "transfer" :value [1 3 4] :process 93 :index 93 :time 1780375432956777216}
+{:type :ok :f "transfer" :value [[0 56] [1 -65] [2 123] [3 186] [4 200]] :process 92 :index 92 :time 1780375432956722944}
+{:type :invoke :f "transfer" :value [3 4 3] :process 92 :index 92 :time 1780375432956707072}
+{:type :ok :f "transfer" :value [[0 59] [1 -64] [2 115] [3 186] [4 204]] :process 91 :index 91 :time 1780375432956652032}
+{:type :invoke :f "transfer" :value [0 1 4] :process 91 :index 91 :time 1780375432956635904}
+{:type :ok :f "transfer" :value [[0 63] [1 -64] [2 116] [3 183] [4 202]] :process 90 :index 90 :time 1780375432956563968}
+{:type :invoke :f "transfer" :value [3 4 2] :process 90 :index 90 :time 1780375432956548096}
+{:type :ok :f "transfer" :value [[0 70] [1 -63] [2 117] [3 183] [4 193]] :process 89 :index 89 :time 1780375432956492800}
+{:type :invoke :f "transfer" :value [0 4 7] :process 89 :index 89 :time 1780375432956476928}
+{:type :ok :f "transfer" :value [[0 60] [1 -61] [2 117] [3 193] [4 191]] :process 88 :index 88 :time 1780375432956422144}
+{:type :invoke :f "transfer" :value [3 0 10] :process 88 :index 88 :time 1780375432956406016}
+{:type :ok :f "transfer" :value [[0 58] [1 -52] [2 125] [3 178] [4 191]] :process 87 :index 87 :time 1780375432956352000}
+{:type :invoke :f "transfer" :value [2 1 8] :process 87 :index 87 :time 1780375432956335104}
+{:type :ok :f "transfer" :value [[0 62] [1 -52] [2 122] [3 181] [4 187]] :process 86 :index 86 :time 1780375432956275968}
+{:type :invoke :f "transfer" :value [1 0 4] :process 86 :index 86 :time 1780375432956259072}
+{:type :ok :f "transfer" :value [[0 55] [1 -43] [2 120] [3 181] [4 187]] :process 85 :index 85 :time 1780375432956187904}
+{:type :invoke :f "transfer" :value [2 0 10] :process 85 :index 85 :time 1780375432956172032}
+{:type :ok :f "transfer" :value [[0 69] [1 -39] [2 116] [3 183] [4 171]] :process 84 :index 84 :time 1780375432956116992}
+{:type :invoke :f "transfer" :value [1 2 4] :process 84 :index 84 :time 1780375432956100864}
+{:type :ok :f "transfer" :value [[0 62] [1 -43] [2 131] [3 177] [4 173]] :process 83 :index 83 :time 1780375432956046080}
+{:type :invoke :f "transfer" :value [4 0 2] :process 83 :index 83 :time 1780375432956028928}
+{:type :ok :f "transfer" :value [[0 56] [1 -46] [2 131] [3 200] [4 159]] :process 82 :index 82 :time 1780375432955939072}
+{:type :invoke :f "transfer" :value [3 0 6] :process 82 :index 82 :time 1780375432955921920}
+{:type :ok :f "transfer" :value [[0 59] [1 -35] [2 119] [3 190] [4 167]] :process 81 :index 81 :time 1780375432955867904}
+{:type :invoke :f "transfer" :value [4 2 8] :process 81 :index 81 :time 1780375432955851008}
+{:type :ok :f "transfer" :value [[0 64] [1 -25] [2 126] [3 174] [4 161]] :process 80 :index 80 :time 1780375432955795968}
+{:type :invoke :f "transfer" :value [4 0 1] :process 80 :index 80 :time 1780375432955779072}
+{:type :ok :f "transfer" :value [[0 69] [1 -25] [2 131] [3 167] [4 158]] :process 79 :index 79 :time 1780375432955724032}
+{:type :invoke :f "transfer" :value [3 2 4] :process 79 :index 79 :time 1780375432955707136}
+{:type :ok :f "transfer" :value [[0 69] [1 -8] [2 132] [3 149] [4 158]] :process 78 :index 78 :time 1780375432955646976}
+{:type :invoke :f "transfer" :value [1 2 8] :process 78 :index 78 :time 1780375432955630080}
+{:type :ok :f "transfer" :value [[0 69] [1 -4] [2 121] [3 159] [4 155]] :process 77 :index 77 :time 1780375432955575040}
+{:type :invoke :f "transfer" :value [1 2 4] :process 77 :index 77 :time 1780375432955558144}
+{:type :ok :f "transfer" :value [[0 74] [1 -11] [2 128] [3 156] [4 153]] :process 76 :index 76 :time 1780375432955502080}
+{:type :invoke :f "transfer" :value [0 3 3] :process 76 :index 76 :time 1780375432955485184}
+{:type :ok :f "transfer" :value [[0 80] [1 -1] [2 118] [3 144] [4 159]] :process 75 :index 75 :time 1780375432955429120}
+{:type :invoke :f "transfer" :value [4 0 4] :process 75 :index 75 :time 1780375432955371008}
+{:type :ok :f "transfer" :value [[0 88] [1 5] [2 113] [3 136] [4 158]] :process 74 :index 74 :time 1780375432955315200}
+{:type :invoke :f "transfer" :value [0 3 8] :process 74 :index 74 :time 1780375432955298048}
+{:type :ok :f "transfer" :value [[0 88] [1 6] [2 113] [3 141] [4 152]] :process 73 :index 73 :time 1780375432955241984}
+{:type :invoke :f "transfer" :value [4 3 2] :process 73 :index 73 :time 1780375432955209984}
+{:type :ok :f "transfer" :value [[0 80] [1 3] [2 106] [3 151] [4 160]] :process 72 :index 72 :time 1780375432955154944}
+{:type :invoke :f "transfer" :value [3 1 10] :process 72 :index 72 :time 1780375432955138048}
+{:type :ok :f "transfer" :value [[0 79] [1 -5] [2 106] [3 157] [4 163]] :process 71 :index 71 :time 1780375432955081984}
+{:type :invoke :f "transfer" :value [3 1 9] :process 71 :index 71 :time 1780375432955059968}
+{:type :ok :f "transfer" :value [[0 76] [1 2] [2 113] [3 153] [4 156]] :process 70 :index 70 :time 1780375432955004928}
+{:type :invoke :f "transfer" :value [0 2 1] :process 70 :index 70 :time 1780375432954988032}
+{:type :ok :f "transfer" :value [[0 76] [1 9] [2 113] [3 157] [4 145]] :process 69 :index 69 :time 1780375432954932992}
+{:type :invoke :f "transfer" :value [1 3 7] :process 69 :index 69 :time 1780375432954916096}
+{:type :ok :f "transfer" :value [[0 63] [1 9] [2 120] [3 154] [4 154]] :process 68 :index 68 :time 1780375432954860032}
+{:type :invoke :f "transfer" :value [4 0 8] :process 68 :index 68 :time 1780375432954843136}
+{:type :ok :f "transfer" :value [[0 76] [1 9] [2 115] [3 147] [4 153]] :process 67 :index 67 :time 1780375432954747904}
+{:type :invoke :f "transfer" :value [0 4 1] :process 67 :index 67 :time 1780375432954731008}
+{:type :ok :f "transfer" :value [[0 76] [1 9] [2 115] [3 142] [4 158]] :process 66 :index 66 :time 1780375432954675968}
+{:type :invoke :f "transfer" :value [1 4 5] :process 66 :index 66 :time 1780375432954659072}
+{:type :ok :f "transfer" :value [[0 76] [1 11] [2 118] [3 137] [4 158]] :process 65 :index 65 :time 1780375432954603008}
+{:type :invoke :f "transfer" :value [3 1 4] :process 65 :index 65 :time 1780375432954586112}
+{:type :ok :f "transfer" :value [[0 77] [1 22] [2 110] [3 137] [4 154]] :process 64 :index 64 :time 1780375432954530048}
+{:type :invoke :f "transfer" :value [1 0 5] :process 64 :index 64 :time 1780375432954513152}
+{:type :ok :f "transfer" :value [[0 76] [1 30] [2 103] [3 146] [4 145]] :process 63 :index 63 :time 1780375432954451968}
+{:type :invoke :f "transfer" :value [2 0 3] :process 63 :index 63 :time 1780375432954435072}
+{:type :ok :f "transfer" :value [[0 82] [1 34] [2 103] [3 141] [4 140]] :process 62 :index 62 :time 1780375432954379008}
+{:type :invoke :f "transfer" :value [0 3 6] :process 62 :index 62 :time 1780375432954361088}
+{:type :ok :f "transfer" :value [[0 69] [1 39] [2 114] [3 141] [4 137]] :process 61 :index 61 :time 1780375432954304000}
+{:type :invoke :f "transfer" :value [2 4 6] :process 61 :index 61 :time 1780375432954286080}
+{:type :ok :f "transfer" :value [[0 65] [1 30] [2 109] [3 145] [4 151]] :process 60 :index 60 :time 1780375432954197760}
+{:type :invoke :f "transfer" :value [3 1 4] :process 60 :index 60 :time 1780375432954180096}
+{:type :ok :f "transfer" :value [[0 72] [1 22] [2 101] [3 154] [4 151]] :process 59 :index 59 :time 1780375432954016000}
+{:type :invoke :f "transfer" :value [3 0 9] :process 59 :index 59 :time 1780375432953970944}
+{:type :ok :f "transfer" :value [[0 77] [1 24] [2 97] [3 151] [4 151]] :process 58 :index 58 :time 1780375432953915136}
+{:type :invoke :f "transfer" :value [1 2 9] :process 58 :index 58 :time 1780375432953899008}
+{:type :ok :f "transfer" :value [[0 77] [1 31] [2 100] [3 143] [4 149]] :process 57 :index 57 :time 1780375432953828096}
+{:type :invoke :f "transfer" :value [2 4 3] :process 57 :index 57 :time 1780375432953790976}
+{:type :ok :f "transfer" :value [[0 77] [1 40] [2 82] [3 134] [4 167]] :process 56 :index 56 :time 1780375432953644032}
+{:type :invoke :f "transfer" :value [1 3 9] :process 56 :index 56 :time 1780375432953604096}
+{:type :ok :f "transfer" :value [[0 78] [1 46] [2 81] [3 128] [4 167]] :process 55 :index 55 :time 1780375432953500928}
+{:type :invoke :f "transfer" :value [1 0 4] :process 55 :index 55 :time 1780375432953455872}
+{:type :ok :f "transfer" :value [[0 68] [1 42] [2 81] [3 129] [4 180]] :process 54 :index 54 :time 1780375432953385984}
+{:type :invoke :f "transfer" :value [3 1 1] :process 54 :index 54 :time 1780375432953345024}
+{:type :ok :f "transfer" :value [[0 59] [1 50] [2 84] [3 136] [4 171]] :process 53 :index 53 :time 1780375432953211136}
+{:type :invoke :f "transfer" :value [1 4 9] :process 53 :index 53 :time 1780375432953171968}
+{:type :ok :f "transfer" :value [[0 77] [1 50] [2 74] [3 138] [4 161]] :process 52 :index 52 :time 1780375432953047040}
+{:type :invoke :f "transfer" :value [0 4 10] :process 52 :index 52 :time 1780375432953007872}
+{:type :ok :f "transfer" :value [[0 82] [1 45] [2 92] [3 133] [4 148]] :process 51 :index 51 :time 1780375432952814080}
+{:type :invoke :f "transfer" :value [0 3 5] :process 51 :index 51 :time 1780375432952774912}
+{:type :ok :f "transfer" :value [[0 90] [1 45] [2 101] [3 124] [4 140]] :process 50 :index 50 :time 1780375432952652032}
+{:type :invoke :f "transfer" :value [0 4 6] :process 50 :index 50 :time 1780375432952614144}
+{:type :ok :f "transfer" :value [[0 90] [1 46] [2 93] [3 124] [4 147]] :process 49 :index 49 :time 1780375432952488960}
+{:type :invoke :f "transfer" :value [1 2 6] :process 49 :index 49 :time 1780375432952451072}
+{:type :ok :f "transfer" :value [[0 83] [1 52] [2 95] [3 117] [4 153]] :process 48 :index 48 :time 1780375432952327936}
+{:type :invoke :f "transfer" :value [4 2 5] :process 48 :index 48 :time 1780375432952288000}
+{:type :ok :f "transfer" :value [[0 80] [1 62] [2 112] [3 113] [4 133]] :process 47 :index 47 :time 1780375432952152064}
+{:type :invoke :f "transfer" :value [2 0 3] :process 47 :index 47 :time 1780375432952112896}
+{:type :ok :f "transfer" :value [[0 79] [1 75] [2 108] [3 105] [4 133]] :process 46 :index 46 :time 1780375432951990016}
+{:type :invoke :f "transfer" :value [3 0 2] :process 46 :index 46 :time 1780375432951951104}
+{:type :ok :f "transfer" :value [[0 69] [1 75] [2 113] [3 113] [4 130]] :process 45 :index 45 :time 1780375432951826944}
+{:type :invoke :f "transfer" :value [2 3 8] :process 45 :index 45 :time 1780375432951788032}
+{:type :ok :f "transfer" :value [[0 60] [1 74] [2 116] [3 113] [4 137]] :process 44 :index 44 :time 1780375432951663872}
+{:type :invoke :f "transfer" :value [4 0 9] :process 44 :index 44 :time 1780375432951594240}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 124] [3 108] [4 137]] :process 43 :index 43 :time 1780375432951471104}
+{:type :invoke :f "transfer" :value [2 3 5] :process 43 :index 43 :time 1780375432951431936}
+{:type :ok :f "transfer" :value [[0 67] [1 64] [2 124] [3 109] [4 136]] :process 42 :index 42 :time 1780375432951308032}
+{:type :invoke :f "transfer" :value [4 2 9] :process 42 :index 42 :time 1780375432951268864}
+{:type :ok :f "transfer" :value [[0 78] [1 57] [2 127] [3 115] [4 123]] :process 41 :index 41 :time 1780375432951105024}
+{:type :invoke :f "transfer" :value [3 4 6] :process 41 :index 41 :time 1780375432951072000}
+{:type :ok :f "transfer" :value [[0 81] [1 47] [2 131] [3 123] [4 118]] :process 40 :index 40 :time 1780375432950923008}
+{:type :invoke :f "transfer" :value [0 1 10] :process 40 :index 40 :time 1780375432950875904}
+{:type :ok :f "transfer" :value [[0 77] [1 44] [2 146] [3 121] [4 112]] :process 39 :index 39 :time 1780375432950733824}
+{:type :invoke :f "transfer" :value [1 3 2] :process 39 :index 39 :time 1780375432950685952}
+{:type :ok :f "transfer" :value [[0 77] [1 46] [2 132] [3 116] [4 129]] :process 38 :index 38 :time 1780375432950545152}
+{:type :invoke :f "transfer" :value [4 2 9] :process 38 :index 38 :time 1780375432950498048}
+{:type :ok :f "transfer" :value [[0 69] [1 46] [2 140] [3 114] [4 131]] :process 37 :index 37 :time 1780375432950360064}
+{:type :invoke :f "transfer" :value [3 4 3] :process 37 :index 37 :time 1780375432950330112}
+{:type :ok :f "transfer" :value [[0 60] [1 49] [2 147] [3 104] [4 140]] :process 36 :index 36 :time 1780375432950145024}
+{:type :invoke :f "transfer" :value [4 3 10] :process 36 :index 36 :time 1780375432950118912}
+{:type :ok :f "transfer" :value [[0 63] [1 42] [2 129] [3 112] [4 154]] :process 35 :index 35 :time 1780375432950025984}
+{:type :invoke :f "transfer" :value [4 0 4] :process 35 :index 35 :time 1780375432950009088}
+{:type :ok :f "transfer" :value [[0 71] [1 34] [2 125] [3 112] [4 158]] :process 34 :index 34 :time 1780375432949952000}
+{:type :invoke :f "transfer" :value [4 0 1] :process 34 :index 34 :time 1780375432949934848}
+{:type :ok :f "transfer" :value [[0 74] [1 43] [2 132] [3 93] [4 158]] :process 33 :index 33 :time 1780375432949879040}
+{:type :invoke :f "transfer" :value [0 3 6] :process 33 :index 33 :time 1780375432949861888}
+{:type :ok :f "transfer" :value [[0 93] [1 35] [2 132] [3 78] [4 162]] :process 32 :index 32 :time 1780375432949796864}
+{:type :invoke :f "transfer" :value [0 3 9] :process 32 :index 32 :time 1780375432949779968}
+{:type :ok :f "transfer" :value [[0 93] [1 27] [2 140] [3 88] [4 152]] :process 31 :index 31 :time 1780375432949724928}
+{:type :invoke :f "transfer" :value [2 1 8] :process 31 :index 31 :time 1780375432949708032}
+{:type :ok :f "transfer" :value [[0 98] [1 37] [2 134] [3 78] [4 153]] :process 30 :index 30 :time 1780375432949651968}
+{:type :invoke :f "transfer" :value [2 4 1] :process 30 :index 30 :time 1780375432949635072}
+{:type :ok :f "transfer" :value [[0 98] [1 41] [2 134] [3 74] [4 153]] :process 29 :index 29 :time 1780375432949577984}
+{:type :invoke :f "transfer" :value [2 3 7] :process 29 :index 29 :time 1780375432949559808}
+{:type :ok :f "transfer" :value [[0 98] [1 42] [2 140] [3 82] [4 138]] :process 28 :index 28 :time 1780375432949393152}
+{:type :invoke :f "transfer" :value [1 2 2] :process 28 :index 28 :time 1780375432949376000}
+{:type :ok :f "transfer" :value [[0 107] [1 42] [2 132] [3 76] [4 143]] :process 27 :index 27 :time 1780375432949318912}
+{:type :invoke :f "transfer" :value [0 2 5] :process 27 :index 27 :time 1780375432949302016}
+{:type :ok :f "transfer" :value [[0 106] [1 53] [2 123] [3 75] [4 143]] :process 26 :index 26 :time 1780375432949243904}
+{:type :invoke :f "transfer" :value [1 2 9] :process 26 :index 26 :time 1780375432949224960}
+{:type :ok :f "transfer" :value [[0 98] [1 57] [2 123] [3 78] [4 144]] :process 25 :index 25 :time 1780375432949161984}
+{:type :invoke :f "transfer" :value [0 4 1] :process 25 :index 25 :time 1780375432949145088}
+{:type :ok :f "transfer" :value [[0 102] [1 57] [2 118] [3 80] [4 143]] :process 24 :index 24 :time 1780375432949060864}
+{:type :invoke :f "transfer" :value [0 4 8] :process 24 :index 24 :time 1780375432949042944}
+{:type :ok :f "transfer" :value [[0 101] [1 65] [2 118] [3 74] [4 142]] :process 23 :index 23 :time 1780375432948985088}
+{:type :invoke :f "transfer" :value [4 0 1] :process 23 :index 23 :time 1780375432948966912}
+{:type :ok :f "transfer" :value [[0 110] [1 79] [2 104] [3 65] [4 142]] :process 22 :index 22 :time 1780375432948868096}
+{:type :invoke :f "transfer" :value [3 2 10] :process 22 :index 22 :time 1780375432948824832}
+{:type :ok :f "transfer" :value [[0 137] [1 71] [2 90] [3 65] [4 137]] :process 21 :index 21 :time 1780375432948695040}
+{:type :invoke :f "transfer" :value [0 1 8] :process 21 :index 21 :time 1780375432948656128}
+{:type :ok :f "transfer" :value [[0 133] [1 77] [2 89] [3 76] [4 125]] :process 20 :index 20 :time 1780375432948486144}
+{:type :invoke :f "transfer" :value [1 4 6] :process 20 :index 20 :time 1780375432948448000}
+{:type :ok :f "transfer" :value [[0 138] [1 83] [2 90] [3 71] [4 118]] :process 19 :index 19 :time 1780375432948317952}
+{:type :invoke :f "transfer" :value [0 4 7] :process 19 :index 19 :time 1780375432948275968}
+{:type :ok :f "transfer" :value [[0 129] [1 87] [2 90] [3 71] [4 123]] :process 18 :index 18 :time 1780375432948098816}
+{:type :invoke :f "transfer" :value [4 3 7] :process 18 :index 18 :time 1780375432948057856}
+{:type :ok :f "transfer" :value [[0 136] [1 90] [2 90] [3 68] [4 116]] :process 17 :index 17 :time 1780375432947933952}
+{:type :invoke :f "transfer" :value [1 3 2] :process 17 :index 17 :time 1780375432947894016}
+{:type :ok :f "transfer" :value [[0 129] [1 97] [2 90] [3 72] [4 112]] :process 16 :index 16 :time 1780375432947713024}
+{:type :invoke :f "transfer" :value [0 4 1] :process 16 :index 16 :time 1780375432947674112}
+{:type :ok :f "transfer" :value [[0 119] [1 91] [2 95] [3 83] [4 112]] :process 15 :index 15 :time 1780375432947549952}
+{:type :invoke :f "transfer" :value [1 2 3] :process 15 :index 15 :time 1780375432947511040}
+{:type :ok :f "transfer" :value [[0 131] [1 91] [2 89] [3 77] [4 112]] :process 14 :index 14 :time 1780375432947386112}
+{:type :invoke :f "transfer" :value [0 3 5] :process 14 :index 14 :time 1780375432947346944}
+{:type :ok :f "transfer" :value [[0 131] [1 91] [2 89] [3 82] [4 107]] :process 13 :index 13 :time 1780375432947215104}
+{:type :invoke :f "transfer" :value [3 4 1] :process 13 :index 13 :time 1780375432947133184}
+{:type :ok :f "transfer" :value [[0 134] [1 91] [2 104] [3 79] [4 92]] :process 12 :index 12 :time 1780375432947051008}
+{:type :invoke :f "transfer" :value [2 4 6] :process 12 :index 12 :time 1780375432947025920}
+{:type :ok :f "transfer" :value [[0 130] [1 89] [2 96] [3 80] [4 105]] :process 11 :index 11 :time 1780375432946932992}
+{:type :invoke :f "transfer" :value [4 2 8] :process 11 :index 11 :time 1780375432946904832}
+{:type :ok :f "transfer" :value [[0 124] [1 88] [2 96] [3 78] [4 114]] :process 10 :index 10 :time 1780375432946770944}
+{:type :invoke :f "transfer" :value [4 1 8] :process 10 :index 10 :time 1780375432946717952}
+{:type :ok :f "transfer" :value [[0 120] [1 88] [2 109] [3 69] [4 114]] :process 9 :index 9 :time 1780375432946628096}
+{:type :invoke :f "transfer" :value [2 0 6] :process 9 :index 9 :time 1780375432946530048}
+{:type :ok :f "transfer" :value [[0 108] [1 100] [2 112] [3 62] [4 118]] :process 8 :index 8 :time 1780375432946471936}
+{:type :invoke :f "transfer" :value [2 3 3] :process 8 :index 8 :time 1780375432946454016}
+{:type :ok :f "transfer" :value [[0 109] [1 86] [2 117] [3 57] [4 131]] :process 7 :index 7 :time 1780375432946394880}
+{:type :invoke :f "transfer" :value [4 1 7] :process 7 :index 7 :time 1780375432946377984}
+{:type :ok :f "transfer" :value [[0 109] [1 87] [2 119] [3 61] [4 124]] :process 6 :index 6 :time 1780375432946315008}
+{:type :invoke :f "transfer" :value [4 2 3] :process 6 :index 6 :time 1780375432946296064}
+{:type :ok :f "transfer" :value [[0 104] [1 93] [2 111] [3 68] [4 124]] :process 5 :index 5 :time 1780375432945516032}
+{:type :invoke :f "transfer" :value [3 1 6] :process 5 :index 5 :time 1780375432945449984}
+{:type :ok :f "transfer" :value [[0 96] [1 100] [2 104] [3 76] [4 124]] :process 4 :index 4 :time 1780375432945228032}
+{:type :invoke :f "transfer" :value [1 0 7] :process 4 :index 4 :time 1780375432945148928}
+{:type :ok :f "transfer" :value [[0 104] [1 92] [2 100] [3 79] [4 125]] :process 3 :index 3 :time 1780375432944930048}
+{:type :invoke :f "transfer" :value [2 3 5] :process 3 :index 3 :time 1780375432944858112}
+{:type :ok :f "transfer" :value [[0 116] [1 92] [2 103] [3 80] [4 109]] :process 2 :index 2 :time 1780375432944647936}
+{:type :invoke :f "transfer" :value [2 4 3] :process 2 :index 2 :time 1780375432944580096}
+{:type :ok :f "transfer" :value [[0 103] [1 93] [2 115] [3 83] [4 106]] :process 1 :index 1 :time 1780375432944371968}
+{:type :invoke :f "transfer" :value [3 4 3] :process 1 :index 1 :time 1780375432944304896}
+{:type :ok :f "transfer" :value [[0 94] [1 106] [2 105] [3 92] [4 103]] :process 0 :index 0 :time 1780375432944073984}
+{:type :invoke :f "transfer" :value [3 0 4] :process 0 :index 0 :time 1780375432944008192}

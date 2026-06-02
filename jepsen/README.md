@@ -138,10 +138,11 @@ opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--backend` | `mem` | Backend: `mem` \| `file` \| `wal` |
+| `--backend` | `mem` | Backend: `mem` \| `file` \| `wal` \| `enc-wal` |
 | `--workload` | `list-append` | Workload: `list-append` \| `bank` \| `set` \| `counter` |
-| `--nemesis` | `none` | Nemesis: `none` \| `crash-restart` \| `pause` |
-| `--path` | `/tmp/sqlocaml_jepsen.db` | DB file path (for file/wal) |
+| `--nemesis` | `none` | Nemesis: `none` \| `crash-restart` \| `pause` \| `lazyfs` \| `clock-skew` |
+| `--path` | `/tmp/sqlocaml_jepsen.db` | DB file path (for file/wal/enc-wal) |
+| `--key` | — | AES-256 key for `enc-wal` (32 raw bytes or 64 hex chars, #84) |
 | `--workers` | `4` | Number of concurrent worker fibers |
 | `--ops` | `100` | Operations per worker |
 | `--keys` | `10` | Number of distinct keys/accounts |
@@ -149,6 +150,11 @@ opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 | `--crash-after` | `50` | Ops per worker before crash (crash-restart) |
 | `--pause-after` | `30` | Ops per worker before pause (pause) |
 | `--pause-dur` | `2.0` | Pause duration in seconds (pause) |
+
+The `enc-wal` backend opens through `Store.open_file_wal ~key`, exercising
+encryption at rest (#84/#214/#215). The harness seeds `Mirage_crypto_rng` at
+boot (`Mirage_crypto_rng_unix.use_default ()`, #217) so encrypted opens can mint
+per-page nonces. End-to-end orchestration scripts live in [`run/`](run/).
 
 ## File layout
 

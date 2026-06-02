@@ -55,13 +55,17 @@ RUN curl -sL https://download.clojure.org/install/linux-install.sh \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake build-essential libfuse3-dev libspdlog-dev git \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs.git /tmp/lazyfs-src \
-    && cd /tmp/lazyfs-src/lazyfs \
-    && mkdir -p build && cd build \
-    && cmake -DLAZYFS_BUILD_TESTS=OFF .. \
-    && cmake --build . \
-    && cp lazyfs /usr/local/bin/lazyfs \
-    && rm -rf /tmp/lazyfs-src
+# lazyfs links the caching library libpcache, which must be built FIRST
+# (lazyfs's own build.sh expects the sibling libs/libpcache/build/ to exist).
+# The lazyfs binary keeps an rpath into that sibling dir, so we leave the
+# source tree at /tmp/lazyfs and also install libpcache.so into /usr/local/lib.
+RUN git clone --depth 1 --branch 0.3.1 https://github.com/dsrhaslab/lazyfs.git /tmp/lazyfs \
+    && cd /tmp/lazyfs/libs/libpcache && ./build.sh \
+    && cp -av build/libpcache.so* /usr/local/lib/ \
+    && ldconfig \
+    && cd /tmp/lazyfs/lazyfs && ./build.sh \
+    && cp build/lazyfs /usr/local/bin/lazyfs \
+    && ldconfig
 
 # ------------------------------------------------------------------
 # Switch back to opam user
@@ -72,7 +76,10 @@ WORKDIR /workspace
 # ------------------------------------------------------------------
 # OCaml dependencies for sqlocaml
 # ------------------------------------------------------------------
-RUN opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx mirage-block mirage-block-unix
+# mirage-crypto / mirage-crypto-rng power encryption at rest (#84); uutf/uucp
+# back the SQL text layer.  Kept in sync with .forgejo/workflows/ci.yml.
+RUN opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+    mirage-block mirage-block-unix uutf uucp mirage-crypto mirage-crypto-rng
 
 # ------------------------------------------------------------------
 # Copy the project and build the Jepsen harness
