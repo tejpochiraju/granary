@@ -33,13 +33,18 @@ podman run --rm -v "$PWD":/workspace:z sqlocaml-jepsen-elle2 \
   list-append (`:ok`-timestamp inversion under concurrent fibers); **Elle SI**
   is authoritative and reports VALID. Elle's `:duplicate-elements` on
   `list_append_mem` is the known non-unique-append workload artifact (#180).
-- `counter_wal` / `counter_encwal` are expected INVALID until **#223** (WAL
-  concurrent-`UPDATE` lost-update) is fixed; `counter_mem` is correct.
+- `counter_mem` / `counter_wal` / `counter_encwal` are all VALID since the WAL
+  concurrent-`UPDATE` lost-update (**#223**) was fixed (PR #225): final value
+  equals the acked increment count on every backend.
 - `set_wal_lazyfs` / `set_encwal_lazyfs` are VALID: acked elements survive
   un-fsynced write loss (durability holds, including encrypted). The lazyfs
   console lines `BEHAVE AS` / `terminate called…` are its benign SIGTERM
   shutdown chatter, not a harness failure.
 - `list_append_clockskew` is VALID under a +5d skewed clock and carries one
   recorded `clock-skew` nemesis marker.
-- `histories/` holds a committed reference run (main @ `e1fa6eb`, 2026-06-01).
-  Re-running `gen_177.sh` (+ `run_nemeses_fuse.sh`) overwrites them.
+- `list_append_wal` / `list_append_encwal` show INVALID under the pure-Clojure
+  *temporal* checker (benign `:ok`-completion-timestamp inversion); **Elle SI is
+  authoritative and reports VALID** for both. Elle's `:duplicate-elements` on
+  `list_append_mem` is the known non-unique-append workload artifact (#180).
+- `histories/` holds a committed reference run (post-#223 `main`). Re-running
+  `gen_177.sh` (+ `run_nemeses_fuse.sh`) overwrites them.
