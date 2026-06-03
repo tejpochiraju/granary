@@ -145,6 +145,13 @@ type op =
       ; lookup_val : expr (** value to look up *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
+  | Op_rowid_lookup of
+      { table_meta : Cat.table_meta
+      ; lookup_val : expr
+        (** #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias.  The
+            alias column IS the table key, so this is a single table-tree seek by
+            [Rowid.encode <int value>] — no separate index, no double fetch. *)
+      }
   | Op_update of
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)

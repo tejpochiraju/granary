@@ -1111,14 +1111,25 @@ let column_of_def (c : Ast.column_def) : Row.column =
 ;;
 
 (* Auto-generated UNIQUE/PK index specs from table- and column-level
-   constraints (table-level first, then column-level PRIMARY KEY). *)
-let auto_unique_indexes ~name ~constraints ~columns =
+   constraints (table-level first, then column-level PRIMARY KEY).
+
+   #243 (T1): when the table has an INTEGER PRIMARY KEY rowid alias, that column
+   IS the rowid and the table tree enforces its uniqueness directly, so we must
+   NOT also build a separate __pk index for it.  [rowid_alias_col_name] names
+   that column (single-column PK only); its __pk entry is skipped. *)
+let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
+  let is_alias cols =
+    match rowid_alias_col_name, cols with
+    | Some n, [ c ] -> String.equal n c
+    | _ -> false
+  in
   let tbl_uniq_idxs =
     List.filter_map
       (fun (i, tc) ->
          match tc with
          | Ast.TC_unique cols ->
            Some (Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i, cols)
+         | Ast.TC_primary_key cols when is_alias cols -> None
          | Ast.TC_primary_key cols ->
            Some (Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i, cols)
          | Ast.TC_foreign_key _ -> None)
@@ -1127,7 +1138,7 @@ let auto_unique_indexes ~name ~constraints ~columns =
   let col_pk_idxs =
     List.filter_map
       (fun (c : Ast.column_def) ->
-         if c.primary_key
+         if c.primary_key && not (is_alias [ c.name ])
          then Some (Printf.sprintf "__pk_%s_%s" name c.name, [ c.name ])
          else None)
       columns
@@ -1294,7 +1305,16 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
                   col.name)))
      | None ->
        let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
-       let uniq_idxs = auto_unique_indexes ~name ~constraints ~columns in
+       (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
+          index — the table tree is keyed by it and enforces uniqueness. *)
+       let rowid_alias_col_name =
+         Option.map
+           (fun i -> (List.nth row_cols i).Row.name)
+           (Cat.compute_rowid_alias_col row_cols ~without_rowid)
+       in
+       let uniq_idxs =
+         auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
+       in
        (match extract_fk_constraints cat ~columns ~constraints with
         | Error e -> Lwt.return (Error e)
         | Ok fk_constraints ->
@@ -1527,7 +1547,11 @@ let bind_insert_row
             in
             i, bexpr)
       in
-      (* NOT NULL enforcement (params checked at runtime, not here). *)
+      (* NOT NULL enforcement (params checked at runtime, not here).
+         #243 (T1): the INTEGER PRIMARY KEY rowid-alias column is exempt — a
+         NULL/omitted value is auto-assigned the next rowid by [insert_rowid],
+         so it can never be stored NULL (SQLite parity). *)
+      let alias_col = Cat.rowid_alias_col meta in
       let nn_result =
         List.fold_left
           (fun acc (i, bexpr) ->
@@ -1536,7 +1560,7 @@ let bind_insert_row
              | Ok () ->
                let col = List.nth meta.columns i in
                (match bexpr with
-                | BE_lit Ast.L_null when col.Row.not_null ->
+                | BE_lit Ast.L_null when col.Row.not_null && Some i <> alias_col ->
                   Error (Not_null_violation col.Row.name)
                 | _ -> Ok ()))
           (Ok ())

@@ -120,6 +120,11 @@ type t =
   ; mutable pending_fk_checks : pending_fk_check list
     (** Queued deferred FK violations; drained at commit. The list is in
         reverse insertion order; drain reverses again before returning. *)
+  ; mutable last_inserted_rowid : int64
+    (** #243 (T1): rowid of the most recently INSERTed row, set by the executor.
+        Read by the db layer for [last_insert_rowid()].  Required because with
+        INTEGER PRIMARY KEY rowid aliases an explicit id need not equal
+        [next_rowid - 1] (e.g. inserting id=5 after id=100). *)
   }
 
 let pp fmt t =
@@ -130,6 +135,33 @@ let pp fmt t =
     (Hashtbl.length t.indexes)
     (Hashtbl.length t.fts)
     t.fk_enforcement
+;;
+
+(* #243 (T1): SQLite's "INTEGER PRIMARY KEY is an alias for the rowid".  When a
+   rowid table has exactly one PRIMARY KEY column whose type is INTEGER, that
+   column IS the rowid: the table tree is keyed by its value, no separate __pk
+   index exists, and uniqueness is enforced by the table tree itself.  Returns
+   the column index of that alias column, or None for every other shape
+   (WITHOUT ROWID, composite PK, non-INTEGER PK, no PK).
+
+   Note: this port's AST collapses every integer type spelling (INT, INTEGER,
+   BIGINT, ...) to a single [Row.Integer], so unlike SQLite — which aliases only
+   the exact spelling "INTEGER" — any integer-typed single-column PK qualifies.
+   The distinction is not representable here and was already absent. *)
+let compute_rowid_alias_col (columns : Row.column list) ~without_rowid : int option =
+  if without_rowid
+  then None
+  else (
+    let indexed = List.mapi (fun i (c : Row.column) -> i, c) columns in
+    let pks = List.filter (fun (_, (c : Row.column)) -> c.primary_key) indexed in
+    match pks with
+    | [ (i, (c : Row.column)) ] when c.ty = Row.Integer -> Some i
+    | _ -> None)
+;;
+
+(* Convenience: the rowid-alias column of a loaded table, if any. *)
+let rowid_alias_col (m : table_meta) : int option =
+  compute_rowid_alias_col m.columns ~without_rowid:m.without_rowid
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1082,8 +1114,13 @@ let open_ store =
     ; recursive_triggers = true
     ; defer_fks_pragma = false
     ; pending_fk_checks = []
+    ; last_inserted_rowid = 0L
     }
 ;;
+
+(* #243 (T1): last-inserted rowid accessors for [last_insert_rowid()]. *)
+let set_last_inserted_rowid t rowid = t.last_inserted_rowid <- rowid
+let last_inserted_rowid t = t.last_inserted_rowid
 
 (** Allocate and return the next available user tree ID, atomically incrementing the counter. *)
 let next_user_tid t =
@@ -1214,6 +1251,24 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     Hashtbl.replace t.cache name m';
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
+;;
+
+(** #243 (T1): after an INSERT supplies an explicit INTEGER PRIMARY KEY value,
+    advance the autoincrement counter so a later NULL/omitted insert receives a
+    fresh, non-colliding id (SQLite parity: rowid becomes max(existing)+1).
+    [at_least] is the smallest value the next allocation must be (= id + 1).
+    No-op (and never lowers the counter) when already past [at_least]; the
+    overflow case (id = max_int ⇒ at_least wraps negative) safely no-ops. *)
+let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
+  match Hashtbl.find_opt t.cache name with
+  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | Some m ->
+    if Int64.compare at_least m.next_rowid <= 0
+    then Lwt.return_unit
+    else (
+      let m' = { m with next_rowid = at_least } in
+      Hashtbl.replace t.cache name m';
+      S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
 ;;
 
 let create_index t ~name ~table ~columns ~unique ~expr_flags ~where_sql =
