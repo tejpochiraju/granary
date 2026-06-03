@@ -79,10 +79,12 @@ val compute_rowid_alias_col
 (** [rowid_alias_col m] = [compute_rowid_alias_col m.columns ~without_rowid]. *)
 val rowid_alias_col : table_meta -> int option
 
-(** #243 (T1): rowid of the most recently INSERTed row (for [last_insert_rowid()]).
-    Set by the executor after each successful insert; read by the db layer. *)
+(** #243 (T1): record the rowid of the most recently INSERTed row (for
+    [last_insert_rowid()]).  Set by the executor after each successful insert. *)
 val set_last_inserted_rowid : t -> int64 -> unit
 
+(** #243 (T1): the rowid recorded by the last {!set_last_inserted_rowid}; read by
+    the db layer to answer [last_insert_rowid()]. *)
 val last_inserted_rowid : t -> int64
 
 type index_info =
