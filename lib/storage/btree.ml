@@ -1052,6 +1052,13 @@ type cursor =
     mutable path : cursor_frame list
   ; mutable leaf_page : int64
   ; mutable offset : int
+  ; (* #230: index (0-based) of the entry at [offset] within the current leaf.
+       Invariant: [leaf_idx] entries have already been consumed in this leaf, so
+       end-of-leaf is exactly [leaf_idx >= common.n_keys].  Tracking the count
+       lets the scan/seek loops detect leaf exhaustion in O(1) instead of
+       re-decoding the whole leaf into a list on every [cursor_next] (the
+       O(K^2)-per-leaf hotspot behind #230). *)
+    mutable leaf_idx : int
   ; mutable finished : bool
   }
 
@@ -1107,6 +1114,7 @@ let cursor_open t : (cursor, error) result Lwt.t =
       ; path = []
       ; leaf_page = 0L
       ; offset = Page.data_offset
+      ; leaf_idx = 0
       ; finished = true
       }
   else
@@ -1128,6 +1136,7 @@ let cursor_open t : (cursor, error) result Lwt.t =
         ; path
         ; leaf_page = leaf_pid
         ; offset = Page.data_offset
+        ; leaf_idx = 0
         ; finished = false
         }
 ;;
@@ -1167,6 +1176,7 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
         c.path <- sub_path @ c.path;
         c.leaf_page <- leaf_pid;
         c.offset <- Page.data_offset;
+        c.leaf_idx <- 0;
         return_ok true)
 ;;
 
@@ -1188,8 +1198,11 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
     in
     bind_pager r (fun buf ->
       let common = Page.read_common buf in
-      let _entries, end_offset = decode_leaf_entries buf common in
-      if c.offset >= end_offset
+      (* #230: detect end-of-leaf by entry count, not by re-decoding the whole
+         leaf into a list every call.  Trailing bytes past the last entry are
+         zeros that [leaf_entry_at] would mis-read as a spurious empty entry, so
+         the count guard ([leaf_idx >= n_keys]) is what bounds the walk. *)
+      if c.leaf_idx >= common.n_keys
       then
         (* Exhausted this leaf — advance via the path. *)
         let* a = advance_to_next_leaf c in
@@ -1207,6 +1220,7 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
            | Ok true -> cursor_next c)
         | `Entry e ->
           c.offset <- e.next_offset;
+          c.leaf_idx <- c.leaf_idx + 1;
           let* dv =
             decode_leaf_value
               ?snapshot_frames:c.c_snapshot_frames
@@ -1262,8 +1276,7 @@ let rec cursor_scan_for_key c key =
     in
     bind_pager rr (fun buf ->
       let common = Page.read_common buf in
-      let _entries, end_offset = decode_leaf_entries buf common in
-      if c.offset >= end_offset
+      if c.leaf_idx >= common.n_keys
       then
         let* a = advance_to_next_leaf c in
         match a with
@@ -1286,6 +1299,7 @@ let rec cursor_scan_for_key c key =
           then return_ok (`Not_found_after key)
           else (
             c.offset <- e.next_offset;
+            c.leaf_idx <- c.leaf_idx + 1;
             cursor_scan_for_key c key)))
 ;;
 
@@ -1309,6 +1323,7 @@ let cursor_seek c key : ([ `Found | `Not_found_after of bytes ], error) result L
       c.path <- path;
       c.leaf_page <- leaf_pid;
       c.offset <- Page.data_offset;
+      c.leaf_idx <- 0;
       c.finished <- false;
       cursor_scan_for_key c key
 ;;
