@@ -333,7 +333,14 @@ let leaf_append_entry ?(reserved = 0) buf ~offset ~key ~value =
    loop is a TOP-LEVEL recursive function taking all state as parameters: a
    nested [let rec] would capture its free variables into a closure that OCaml
    heap-allocates on every call (measured ~72 B per comparison — O(n_keys) of
-   them per page, which would defeat the point of avoiding the entry list). *)
+   them per page, which would defeat the point of avoiding the entry list).
+
+   MUST STAY IN SYNC with the entry layout encoded in [leaf_entry_at] /
+   [branch_entry_at] above: these duplicate the byte offsets (key_len/val_len
+   positions, bounds checks) to read in place instead of decoding to records.
+   Any format change (e.g. the deferred cell-pointer directory) must touch both
+   sides; the [prop_leaf_lookup_matches] / [prop_branch_pick_matches] QCheck
+   equivalence tests are the backstop that catches drift. *)
 
 (* Byte loop for [compare_key_at]: compare [key.[0..n)] against [buf] bytes at
    [kstart..kstart+n) as UNSIGNED.  Returns 0 if the [n]-byte prefixes are
@@ -358,7 +365,7 @@ let compare_key_at buf ~kstart ~klen ~key =
   let kb = Bytes.length key in
   let n = if kb < klen then kb else klen in
   let c = compare_key_loop buf kstart key n 0 in
-  if c <> 0 then c else compare kb klen
+  if c <> 0 then c else Int.compare kb klen
 ;;
 
 let rec leaf_lookup_loop buf page_size n_keys key offset i =
