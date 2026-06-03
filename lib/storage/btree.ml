@@ -887,7 +887,7 @@ let put_into_leaf t key value =
          free-before-alloc ordering that [put] used to get from [get_raw]). *)
       let old_value =
         List.find_map
-          (fun (k, v) -> if Bytes.compare k key = 0 then Some v else None)
+          (fun (k, v) -> if Bytes.equal k key then Some v else None)
           plain_entries
       in
       let* free_r =
