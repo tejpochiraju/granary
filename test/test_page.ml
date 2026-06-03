@@ -772,6 +772,139 @@ let prop_common_roundtrip =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* 11. #245 in-place search == list-based search (byte-identical)      *)
+(* ------------------------------------------------------------------ *)
+
+(* Reference leaf lookup: the OLD list-materializing path, expressed directly
+   over [leaf_entry_at].  [leaf_lookup] must agree with this for every key. *)
+let ref_leaf_lookup buf n_keys key : bytes option =
+  let rec loop offset i =
+    if i >= n_keys
+    then None
+    else (
+      match P.leaf_entry_at buf ~offset with
+      | `End -> None
+      | `Entry (e : P.leaf_entry) ->
+        let c = Bytes.compare key e.key in
+        if c = 0 then Some e.value else if c < 0 then None else loop e.next_offset (i + 1))
+  in
+  loop P.data_offset 0
+;;
+
+(* Reference branch pick: the OLD [pick_branch_child] over [branch_entry_at]. *)
+let ref_branch_pick buf n_keys right_page key : int32 =
+  let rec loop offset i =
+    if i >= n_keys
+    then right_page
+    else (
+      match P.branch_entry_at buf ~offset with
+      | `End -> right_page
+      | `Entry (e : P.branch_entry) ->
+        if Bytes.compare key e.key < 0 then e.left_child else loop e.next_offset (i + 1))
+  in
+  loop P.data_offset 0
+;;
+
+(* Sort by Bytes.compare and drop duplicate keys (keep first), as the B-tree
+   page invariant guarantees: entries strictly ascending by key. *)
+let sort_unique_by_key pairs =
+  let sorted = List.stable_sort (fun (a, _) (b, _) -> Bytes.compare a b) pairs in
+  let rec dedup = function
+    | (k1, v1) :: ((k2, _) :: _ as rest) ->
+      if Bytes.equal k1 k2
+      then dedup ((k1, v1) :: List.tl rest)
+      else (k1, v1) :: dedup rest
+    | xs -> xs
+  in
+  dedup sorted
+;;
+
+(* Synthesise a key guaranteed to sort strictly after every key in [su]. *)
+let after_all su =
+  match su with
+  | [] -> Bytes.of_string "\xff"
+  | _ ->
+    let last, _ = List.nth su (List.length su - 1) in
+    Bytes.cat last (Bytes.of_string "\xff")
+;;
+
+(* QCheck: leaf_lookup agrees with the list-based lookup for present, absent,
+   and boundary keys (empty = before-all, [after_all] = past-the-end). *)
+let prop_leaf_lookup_matches =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 60 in
+      let* raw =
+        list_size
+          (return n)
+          (pair (bytes_size (int_range 0 20)) (bytes_size (int_range 0 30)))
+      in
+      let* probe = bytes_size (int_range 0 20) in
+      return (raw, probe))
+  in
+  QCheck.Test.make
+    ~name:"prop_leaf_lookup_matches_list"
+    ~count:10_000
+    (QCheck.make gen)
+    (fun (raw, probe) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, v) -> P.leaf_append_entry buf ~offset:off ~key:k ~value:v)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       let agree key =
+         match P.leaf_lookup buf ~n_keys:n ~key, ref_leaf_lookup buf n key with
+         | None, None -> true
+         | Some a, Some b -> Bytes.equal a b
+         | _ -> false
+       in
+       List.for_all (fun (k, _) -> agree k) su
+       && agree probe
+       && agree Bytes.empty
+       && agree (after_all su))
+;;
+
+(* QCheck: branch_pick agrees with the list-based child pick for present,
+   absent, and boundary keys. *)
+let prop_branch_pick_matches =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 80 in
+      let* raw = list_size (return n) (pair (bytes_size (int_range 0 20)) int32) in
+      let* right_page = int32 in
+      let* probe = bytes_size (int_range 0 20) in
+      return (raw, right_page, probe))
+  in
+  QCheck.Test.make
+    ~name:"prop_branch_pick_matches_list"
+    ~count:10_000
+    (QCheck.make gen)
+    (fun (raw, right_page, probe) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, left_child) ->
+              P.branch_append_entry buf ~offset:off ~key:k ~left_child)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       let agree key =
+         P.branch_pick buf ~n_keys:n ~right_page ~key
+         = ref_branch_pick buf n right_page key
+       in
+       List.for_all (fun (k, _) -> agree k) su
+       && agree probe
+       && agree Bytes.empty
+       && agree (after_all su))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* RUNNER                                                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -784,6 +917,8 @@ let () =
       ; prop_crc_detects_flip
       ; prop_freelist_roundtrip
       ; prop_common_roundtrip
+      ; prop_leaf_lookup_matches
+      ; prop_branch_pick_matches
       ]
   in
   Alcotest.run

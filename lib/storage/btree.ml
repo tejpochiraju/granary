@@ -417,22 +417,6 @@ let branch_entries_total_size entries =
 (* Tree traversal helpers                                               *)
 (* ------------------------------------------------------------------ *)
 
-(* Pick the child page-id of a branch page that should be followed for [key].
-   Returns the page-id (int64).  Walks entries in order. *)
-let pick_branch_child
-      (branch_entries : Page.branch_entry list)
-      (common : Page.common)
-      (key : bytes)
-  : int64
-  =
-  let rec loop = function
-    | [] -> page_id_of_int32 common.right_page
-    | (e : Page.branch_entry) :: rest ->
-      if Bytes.compare key e.key < 0 then page_id_of_int32 e.left_child else loop rest
-  in
-  loop branch_entries
-;;
-
 (* ------------------------------------------------------------------ *)
 (* GET                                                                  *)
 (* ------------------------------------------------------------------ *)
@@ -442,9 +426,9 @@ let get t key : (bytes option, error) result Lwt.t =
   then return_ok None
   else (
     let rec descend page_id =
-      (* #244: borrow the page for the decode only.  The leaf lookup returns the
-         stored value bytes (owned, copied out by [leaf_entry_at]); the overflow
-         decode and the branch recursion happen OUTSIDE the borrow scope. *)
+      (* #244/#245: borrow the page for the in-place search only.  [leaf_lookup]
+         returns the matched stored value bytes (freshly owned copy); the
+         overflow decode and the branch recursion happen OUTSIDE the borrow. *)
       let* r =
         Pager.read_borrow
           ?snapshot_frames:t.snapshot_frames
@@ -455,21 +439,25 @@ let get t key : (bytes option, error) result Lwt.t =
              let common = Page.read_common buf in
              match common.kind with
              | Page.Leaf ->
-               let entries, _ = decode_leaf_entries buf common in
-               let rec lookup = function
-                 | [] -> `Not_found
-                 | (e : Page.leaf_entry) :: rest ->
-                   let c = Bytes.compare key e.key in
-                   if c = 0
-                   then `Found e.value
-                   else if c < 0
-                   then `Not_found
-                   else lookup rest
-               in
-               Lwt.return (Ok (lookup entries))
+               (* #245: in-place leaf scan — no entry list, no per-entry bytes
+                  for skipped entries; allocates only the matched (stored) value,
+                  decoded for overflow OUTSIDE the borrow below. *)
+               Lwt.return
+                 (Ok
+                    (match Page.leaf_lookup buf ~n_keys:common.n_keys ~key with
+                     | None -> `Not_found
+                     | Some stored -> `Found stored))
              | Page.Branch ->
-               let entries, _ = decode_branch_entries buf common in
-               Lwt.return (Ok (`Descend (pick_branch_child entries common key)))
+               (* #245: in-place branch child pick — no entry list. *)
+               let child =
+                 page_id_of_int32
+                   (Page.branch_pick
+                      buf
+                      ~n_keys:common.n_keys
+                      ~right_page:common.right_page
+                      ~key)
+               in
+               Lwt.return (Ok (`Descend child))
              | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
       in
       bind_pager r (function

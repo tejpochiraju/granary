@@ -147,6 +147,20 @@ val leaf_append_entry
   -> value:bytes
   -> int
 
+(** In-place point lookup on a sorted leaf page ([n_keys] = [common.n_keys]).
+    Returns the matching value (freshly copied) or [None].  Equivalent to
+    decoding the full entry list and scanning it, but allocates ONLY the
+    matched value — no entry list, and no key/value bytes for the entries it
+    skips (#245).  Bounds handling mirrors {!leaf_entry_at}. *)
+val leaf_lookup : Cstruct.t -> n_keys:int -> key:bytes -> bytes option
+
+(** In-place branch child selection on a sorted branch page.  Returns the
+    child page-id (int32) to descend into for [key] — the [left_child] of the
+    first entry whose key strictly exceeds [key], else [right_page]
+    (= [common.right_page]).  Allocates nothing; byte-identical to the
+    list-based pick (#245). *)
+val branch_pick : Cstruct.t -> n_keys:int -> right_page:int32 -> key:bytes -> int32
+
 (** [4080 / 12 = 340] freelist entries per page for the DEFAULT 4096 geometry.
     For a runtime geometry use {!Geometry.max_freelist_entries_per_page}. *)
 val max_freelist_entries_per_page : int
