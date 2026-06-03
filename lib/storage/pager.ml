@@ -276,6 +276,79 @@ let read ?snapshot_frames ?pin_set t page_id =
     load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
 ;;
 
+(* ---------------------------------------------------------------------- *)
+(* #244: scoped zero-copy borrow read path                                *)
+(* ---------------------------------------------------------------------- *)
+
+(* Like [resolve_wal_page] but hands back the frame buffer WITHOUT a defensive
+   copy.  Safe because [Wal.read_frame] allocates a fresh, unshared buffer per
+   call (wal.ml), so the borrowed view aliases nothing the WAL retains. *)
+let resolve_wal_page_borrow t finder =
+  let open Lwt.Syntax in
+  match t.wal with
+  | None -> Lwt.return_ok None
+  | Some cb ->
+    (match finder cb with
+     | None -> Lwt.return_ok None
+     | Some frame_idx ->
+       let* r = cb.wal_read_frame frame_idx in
+       (match r with
+        | Error s -> Lwt.return_error (Block_error s)
+        | Ok page -> Lwt.return_ok (Some page)))
+;;
+
+(* Like [load_main_page] but returns the cache's own buffer WITHOUT a defensive
+   copy, and on a miss caches (and returns) the very buffer it read into rather
+   than caching a separate copy.  Sound ONLY under the borrow contract: the
+   buffer is decoded-and-discarded inside the callback and never mutated or
+   retained.  Cache/dirty buffers are immutable once stored (only ever replaced,
+   never written in place — see [write]/[write_owned]/[cache_add]), so a
+   concurrent writer dirtying the same page during a yielding callback installs
+   a NEW buffer and leaves this borrowed one untouched; eviction merely drops
+   the hashtbl entry, the buffer itself stays live while the callback holds it. *)
+let load_main_page_borrow t pin_set page_id =
+  let open Lwt.Syntax in
+  let key = cache_key_main page_id in
+  match Hashtbl.find_opt t.cache key with
+  | Some buf ->
+    pin_page t pin_set page_id;
+    Lwt.return_ok buf
+  | None ->
+    let buf = Cstruct.create t.geom.page_size in
+    let* result = t.read_page ~page_id buf in
+    (match result with
+     | Error msg -> Lwt.return_error (Block_error msg)
+     | Ok () ->
+       cache_add t key buf;
+       pin_page t pin_set page_id;
+       Lwt.return_ok buf)
+;;
+
+let read_borrow ?snapshot_frames ?pin_set t page_id f =
+  let open Lwt.Syntax in
+  let borrow buf =
+    let* v = f buf in
+    Lwt.return_ok v
+  in
+  let load_after_wal finder =
+    let* wal_r = resolve_wal_page_borrow t finder in
+    match wal_r with
+    | Error e -> Lwt.return_error e
+    | Ok (Some page) -> borrow page
+    | Ok None ->
+      let* r = load_main_page_borrow t pin_set page_id in
+      (match r with
+       | Error e -> Lwt.return_error e
+       | Ok buf -> borrow buf)
+  in
+  match snapshot_frames with
+  | None ->
+    (match Hashtbl.find_opt t.dirty page_id with
+     | Some buf -> borrow buf
+     | None -> load_after_wal (fun cb -> cb.wal_find_page page_id))
+  | Some max_frame -> load_after_wal (fun cb -> cb.wal_find_page_at page_id ~max_frame)
+;;
+
 let write t page_id buf =
   let copy = cstruct_dup buf in
   Hashtbl.replace t.dirty page_id copy

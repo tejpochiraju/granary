@@ -30,6 +30,7 @@
   test_join
   test_aggregate
   test_write_alloc
+  test_read_alloc
   test_rowid_alias)
  (libraries
   alcotest
