@@ -70,6 +70,31 @@ val read
   -> int64
   -> (Cstruct.t, error) result Lwt.t
 
+(** Scoped zero-copy read (#244).  Resolves [page_id] exactly as {!read}
+    (dirty / WAL / cache / main, honouring [snapshot_frames] and [pin_set])
+    but hands the callback a {b borrowed} view of the underlying page buffer —
+    no per-call ~4 KB copy.  Returns [Ok] of the callback's result, or [Error]
+    if the page read itself fails (the callback is then not invoked).
+
+    {b Borrow contract — the callback MUST:}
+    - treat the buffer as read-only (never mutate it); and
+    - not retain it past the callback (don't store it in cursor/tree state, don't
+      return it or any [Cstruct.sub] of it).
+
+    Decode the bytes you need into owned values inside the callback and return
+    those.  The buffer aliases the shared cache / dirty / WAL-frame buffer;
+    those are only ever replaced wholesale, never written in place, so a
+    concurrent writer dirtying the same page during a yielding callback cannot
+    corrupt the borrowed view.  Use {!read} (which copies) for any caller that
+    needs to mutate or keep the page. *)
+val read_borrow
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> t
+  -> int64
+  -> (Cstruct.t -> 'a Lwt.t)
+  -> ('a, error) result Lwt.t
+
 (** Release every page pinned into [pin_set] by a snapshot's reads.
     Decrements the shared pin refcount per page; pages reaching zero
     become evictable again.  Called from [Store.ro_end]. *)

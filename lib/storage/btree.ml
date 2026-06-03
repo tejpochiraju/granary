@@ -188,26 +188,33 @@ let read_overflow_chain ?snapshot_frames ?pin_set pager ~head_pid ~total_size
           (Tree_corrupt
              (Printf.sprintf "overflow chain short: got %d of %d bytes" offset total_size))
     else
-      let* r = Pager.read ?snapshot_frames ?pin_set pager pid in
-      bind_pager r (fun buf ->
-        let common = Page.read_common buf in
-        if common.kind <> Page.Overflow
-        then return_error (Tree_corrupt "overflow chain points to non-overflow page")
-        else (
-          let payload_len = Page.overflow_payload_len buf in
-          let remaining = total_size - offset in
-          if payload_len > remaining
+      let* r =
+        Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
+          let common = Page.read_common buf in
+          if common.kind <> Page.Overflow
           then
-            return_error
-              (Tree_corrupt
-                 (Printf.sprintf
-                    "overflow chain page payload %d exceeds remaining %d"
-                    payload_len
-                    remaining))
+            Lwt.return (Error (Tree_corrupt "overflow chain points to non-overflow page"))
           else (
-            Cstruct.blit_to_bytes buf (Page.data_offset + 2) out offset payload_len;
-            let next_pid = page_id_of_int32 common.right_page in
-            loop next_pid (offset + payload_len))))
+            let payload_len = Page.overflow_payload_len buf in
+            let remaining = total_size - offset in
+            if payload_len > remaining
+            then
+              Lwt.return
+                (Error
+                   (Tree_corrupt
+                      (Printf.sprintf
+                         "overflow chain page payload %d exceeds remaining %d"
+                         payload_len
+                         remaining)))
+            else (
+              (* Copies OUT into the owned [out] buffer — buf is not retained. *)
+              Cstruct.blit_to_bytes buf (Page.data_offset + 2) out offset payload_len;
+              let next_pid = page_id_of_int32 common.right_page in
+              Lwt.return (Ok (next_pid, offset + payload_len)))))
+      in
+      bind_pager r (function
+        | Error e -> return_error e
+        | Ok (next_pid, new_offset) -> loop next_pid new_offset)
   in
   loop head_pid 0
 ;;
@@ -219,17 +226,20 @@ let free_overflow_chain pager ~head_pid : (unit, error) result Lwt.t =
     if Int64.equal pid 0L
     then return_ok ()
     else
-      let* r = Pager.read pager pid in
-      bind_pager r (fun buf ->
-        let common = Page.read_common buf in
-        if common.kind <> Page.Overflow
-        then
-          (* Defensive: don't free non-overflow pages. *)
-          return_ok ()
-        else (
-          let next_pid = page_id_of_int32 common.right_page in
+      let* r =
+        Pager.read_borrow pager pid (fun buf ->
+          let common = Page.read_common buf in
+          if common.kind <> Page.Overflow
+          then (* Defensive: don't free non-overflow pages. *)
+            Lwt.return (Ok `Stop)
+          else Lwt.return (Ok (`Next (page_id_of_int32 common.right_page))))
+      in
+      bind_pager r (function
+        | Error e -> return_error e
+        | Ok `Stop -> return_ok ()
+        | Ok (`Next next_pid) ->
           Pager.free pager ~page_id:pid ~freed_at_txn_id:(Pager.get_txn_id pager);
-          loop next_pid))
+          loop next_pid)
   in
   loop head_pid
 ;;
@@ -432,40 +442,51 @@ let get t key : (bytes option, error) result Lwt.t =
   then return_ok None
   else (
     let rec descend page_id =
+      (* #244: borrow the page for the decode only.  The leaf lookup returns the
+         stored value bytes (owned, copied out by [leaf_entry_at]); the overflow
+         decode and the branch recursion happen OUTSIDE the borrow scope. *)
       let* r =
-        Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager page_id
+        Pager.read_borrow
+          ?snapshot_frames:t.snapshot_frames
+          ?pin_set:t.pin_set
+          t.pager
+          page_id
+          (fun buf ->
+             let common = Page.read_common buf in
+             match common.kind with
+             | Page.Leaf ->
+               let entries, _ = decode_leaf_entries buf common in
+               let rec lookup = function
+                 | [] -> `Not_found
+                 | (e : Page.leaf_entry) :: rest ->
+                   let c = Bytes.compare key e.key in
+                   if c = 0
+                   then `Found e.value
+                   else if c < 0
+                   then `Not_found
+                   else lookup rest
+               in
+               Lwt.return (Ok (lookup entries))
+             | Page.Branch ->
+               let entries, _ = decode_branch_entries buf common in
+               Lwt.return (Ok (`Descend (pick_branch_child entries common key)))
+             | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
       in
-      bind_pager r (fun buf ->
-        let common = Page.read_common buf in
-        match common.kind with
-        | Page.Leaf ->
-          let entries, _ = decode_leaf_entries buf common in
-          let rec lookup = function
-            | [] -> return_ok None
-            | (e : Page.leaf_entry) :: rest ->
-              let c = Bytes.compare key e.key in
-              if c = 0
-              then
-                let* dv =
-                  decode_leaf_value
-                    ?snapshot_frames:t.snapshot_frames
-                    ?pin_set:t.pin_set
-                    t.pager
-                    e.value
-                in
-                match dv with
-                | Ok v -> return_ok (Some v)
-                | Error e -> return_error e
-              else if c < 0
-              then return_ok None
-              else lookup rest
+      bind_pager r (function
+        | Error e -> return_error e
+        | Ok `Not_found -> return_ok None
+        | Ok (`Found stored) ->
+          let* dv =
+            decode_leaf_value
+              ?snapshot_frames:t.snapshot_frames
+              ?pin_set:t.pin_set
+              t.pager
+              stored
           in
-          lookup entries
-        | Page.Branch ->
-          let entries, _ = decode_branch_entries buf common in
-          let child = pick_branch_child entries common key in
-          descend child
-        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+          (match dv with
+           | Ok v -> return_ok (Some v)
+           | Error e -> return_error e)
+        | Ok (`Descend child) -> descend child)
     in
     descend t.root_page)
 ;;
@@ -512,19 +533,29 @@ let pick_branch_child_with_idx
 let find_leaf t key : (path_step list * int64, error) result Lwt.t =
   let rec loop path page_id =
     let* r =
-      Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager page_id
+      Pager.read_borrow
+        ?snapshot_frames:t.snapshot_frames
+        ?pin_set:t.pin_set
+        t.pager
+        page_id
+        (fun buf ->
+           let common = Page.read_common buf in
+           match common.kind with
+           | Page.Leaf -> Lwt.return (Ok `Leaf)
+           | Page.Branch ->
+             let entries, _ = decode_branch_entries buf common in
+             let right_page = page_id_of_int32 common.right_page in
+             let idx, child = pick_branch_child_with_idx entries common key in
+             let step =
+               { page_id; branch_entries = entries; right_page; child_idx = idx }
+             in
+             Lwt.return (Ok (`Branch (step, child)))
+           | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
     in
-    bind_pager r (fun buf ->
-      let common = Page.read_common buf in
-      match common.kind with
-      | Page.Leaf -> return_ok (List.rev path, page_id)
-      | Page.Branch ->
-        let entries, _ = decode_branch_entries buf common in
-        let right_page = page_id_of_int32 common.right_page in
-        let idx, child = pick_branch_child_with_idx entries common key in
-        let step = { page_id; branch_entries = entries; right_page; child_idx = idx } in
-        loop (step :: path) child
-      | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+    bind_pager r (function
+      | Error e -> return_error e
+      | Ok `Leaf -> return_ok (List.rev path, page_id)
+      | Ok (`Branch (step, child)) -> loop (step :: path) child)
   in
   loop [] t.root_page
 ;;
@@ -1075,26 +1106,31 @@ let leftmost_leaf_with_path ?snapshot_frames ?pin_set pager page_id
   : (cursor_frame list * int64, error) result Lwt.t
   =
   let rec loop pid acc =
-    let* r = Pager.read ?snapshot_frames ?pin_set pager pid in
-    bind_pager r (fun buf ->
-      let common = Page.read_common buf in
-      match common.kind with
-      | Page.Leaf -> return_ok (acc, pid)
-      | Page.Branch ->
-        let entries, _ = decode_branch_entries buf common in
-        let right_page = page_id_of_int32 common.right_page in
-        let child =
-          match entries with
-          | [] -> right_page
-          | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
-        in
-        let frame =
-          { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = 0 }
-        in
-        (* New frame goes on TOP of acc (acc is deepest-first; we're going
-             deeper, so this new one becomes the new head). *)
-        loop child (frame :: acc)
-      | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+    let* r =
+      Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
+        let common = Page.read_common buf in
+        match common.kind with
+        | Page.Leaf -> Lwt.return (Ok `Leaf)
+        | Page.Branch ->
+          let entries, _ = decode_branch_entries buf common in
+          let right_page = page_id_of_int32 common.right_page in
+          let child =
+            match entries with
+            | [] -> right_page
+            | (e : Page.branch_entry) :: _ -> page_id_of_int32 e.left_child
+          in
+          let frame =
+            { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = 0 }
+          in
+          Lwt.return (Ok (`Branch (frame, child)))
+        | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
+    in
+    bind_pager r (function
+      | Error e -> return_error e
+      | Ok `Leaf -> return_ok (acc, pid)
+      (* New frame goes on TOP of acc (acc is deepest-first; we're going deeper,
+         so this new one becomes the new head). *)
+      | Ok (`Branch (frame, child)) -> loop child (frame :: acc))
   in
   loop page_id []
 ;;
@@ -1255,20 +1291,28 @@ let descend_with_path_for_key ?snapshot_frames ?pin_set pager page_id key
   : (cursor_frame list * int64, error) result Lwt.t
   =
   let rec loop pid acc =
-    let* r = Pager.read ?snapshot_frames ?pin_set pager pid in
-    bind_pager r (fun buf ->
-      let common = Page.read_common buf in
-      match common.kind with
-      | Page.Leaf -> return_ok (acc, pid)
-      | Page.Branch ->
-        let entries, _ = decode_branch_entries buf common in
-        let right_page = page_id_of_int32 common.right_page in
-        let idx, child = pick_branch_child_with_idx entries common key in
-        let frame =
-          { cf_branch_entries = entries; cf_right_page = right_page; cf_child_idx = idx }
-        in
-        loop child (frame :: acc)
-      | _ -> return_error (Tree_corrupt "non-tree page in tree"))
+    let* r =
+      Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
+        let common = Page.read_common buf in
+        match common.kind with
+        | Page.Leaf -> Lwt.return (Ok `Leaf)
+        | Page.Branch ->
+          let entries, _ = decode_branch_entries buf common in
+          let right_page = page_id_of_int32 common.right_page in
+          let idx, child = pick_branch_child_with_idx entries common key in
+          let frame =
+            { cf_branch_entries = entries
+            ; cf_right_page = right_page
+            ; cf_child_idx = idx
+            }
+          in
+          Lwt.return (Ok (`Branch (frame, child)))
+        | _ -> Lwt.return (Error (Tree_corrupt "non-tree page in tree")))
+    in
+    bind_pager r (function
+      | Error e -> return_error e
+      | Ok `Leaf -> return_ok (acc, pid)
+      | Ok (`Branch (frame, child)) -> loop child (frame :: acc))
   in
   loop page_id []
 ;;
