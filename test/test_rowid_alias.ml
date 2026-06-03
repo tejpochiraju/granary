@@ -298,6 +298,48 @@ let test_update_nonkey_inplace () =
        | _ -> "??"))
 ;;
 
+(* #249 (sibling path a): UPSERT DO UPDATE SET id = <new> must MOVE the row, not
+   rewrite it at the old key. *)
+let test_upsert_rekeys () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    exec db "INSERT INTO t VALUES (1, 'b') ON CONFLICT(id) DO UPDATE SET id = 99";
+    Alcotest.(check (list int64))
+      "row moved to id=99"
+      [ 99L ]
+      (ints db "SELECT id FROM t");
+    Alcotest.(check string)
+      "found by new id, original value kept"
+      "a"
+      (match query_rows db "SELECT v FROM t WHERE id = 99" with
+       | [ [| Db.V_text s |] ] -> s
+       | _ -> "MISSING"))
+;;
+
+(* #249 (sibling path b): FK ON UPDATE CASCADE onto a child whose FK column IS
+   its own INTEGER PRIMARY KEY must re-key the child row, not rewrite in place. *)
+let test_cascade_rekeys_shared_pk_child () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec db "CREATE TABLE parent (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE child (id INTEGER PRIMARY KEY REFERENCES parent(id) ON UPDATE \
+       CASCADE)";
+    exec db "INSERT INTO parent VALUES (1)";
+    exec db "INSERT INTO child VALUES (1)";
+    exec db "UPDATE parent SET id = 2 WHERE id = 1";
+    Alcotest.(check (list int64))
+      "child cascaded AND re-keyed to 2"
+      [ 2L ]
+      (ints db "SELECT id FROM child WHERE id = 2");
+    Alcotest.(check (list int64))
+      "old child key gone"
+      []
+      (ints db "SELECT id FROM child WHERE id = 1"))
+;;
+
 let () =
   Alcotest.run
     "rowid_alias"
@@ -329,6 +371,11 @@ let () =
             `Quick
             test_update_rekey_reindexes
         ; Alcotest.test_case "non-key UPDATE in place" `Quick test_update_nonkey_inplace
+        ; Alcotest.test_case "UPSERT DO UPDATE re-keys (#249)" `Quick test_upsert_rekeys
+        ; Alcotest.test_case
+            "ON UPDATE CASCADE re-keys shared-PK child (#249)"
+            `Quick
+            test_cascade_rekeys_shared_pk_child
         ] )
     ]
 ;;
