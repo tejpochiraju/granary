@@ -1945,9 +1945,30 @@ let cursor_value c =
 (* Semantics match [cursor_open]+[cursor_seek]+[cursor_next]: the first  *)
 (* [seek_next] returns the first entry with key >= [key], then ascending.*)
 (* ------------------------------------------------------------------ *)
-type seek_cursor =
+type seek_impl =
   | SC_mem of (bytes * bytes) Seq.t ref
   | SC_bt of Btree.cursor
+
+(* #235: when the backing promise is already determined — the [Mem] backend, or *)
+(* a B+-tree page already resident in the pager cache — [Lwt.bind] runs the     *)
+(* caller's continuation synchronously, so a recursive [seek_next] consumer     *)
+(* (the [gather]/[scan] loops in exec.ml) nests one OCaml frame per call         *)
+(* instead of returning to a trampoline.  Streaming a pathologically common      *)
+(* term/value (millions of cache-resident postings) would then overflow the      *)
+(* stack.  To bound stack growth regardless of consumer shape, [seek_next]       *)
+(* splices an [Lwt.pause] every [seek_pause_interval] calls: that defers the     *)
+(* continuation to the scheduler, unwinding the stack.  The cost is one          *)
+(* cooperative yield per N calls — negligible. *)
+type seek_cursor =
+  { mutable sc_calls : int
+  ; sc_impl : seek_impl
+  }
+
+(* Bounds the synchronous recursion depth to <= this many frames; the yield then
+   amortises to one [Lwt.pause] per that many reads.  256 trades a tiny, fixed
+   per-scan overhead for a shallow stack ceiling. *)
+let seek_pause_interval = 256
+let mk_seek_cursor sc_impl = { sc_calls = 0; sc_impl }
 
 let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
   fun tx tid key ->
@@ -1960,7 +1981,7 @@ let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
          | Some snap -> mem_tree_snap snap tid
          | None -> Bytes_map.empty
        in
-       Lwt.return (SC_mem (ref (Bytes_map.to_seq_from key map)))
+       Lwt.return (mk_seek_cursor (SC_mem (ref (Bytes_map.to_seq_from key map))))
      | Btree st ->
        let* r = bt_get_tree_ro snap st tid in
        let* bt = unwrap_error r in
@@ -1975,7 +1996,7 @@ let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
            | Error e ->
              Lwt.fail_with
                (Format.asprintf "Store.seek_ge(ro): %a" pp_error (map_btree_err e))
-           | Ok _ -> Lwt.return (SC_bt c))))
+           | Ok _ -> Lwt.return (mk_seek_cursor (SC_bt c)))))
   | Rw _ ->
     let t = txn_store tx in
     (match t.backend with
@@ -1985,7 +2006,7 @@ let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
          | None -> !(mem_tree trees tid)
          | Some shadow -> shadow_get shadow trees tid
        in
-       Lwt.return (SC_mem (ref (Bytes_map.to_seq_from key map)))
+       Lwt.return (mk_seek_cursor (SC_mem (ref (Bytes_map.to_seq_from key map))))
      | Btree st ->
        let* r = bt_get_tree st tid in
        let* bt = unwrap_error r in
@@ -1999,27 +2020,48 @@ let seek_ge : type a. a txn -> tree_id -> bytes -> seek_cursor Lwt.t =
            | Error e ->
              Lwt.fail_with
                (Format.asprintf "Store.seek_ge: %a" pp_error (map_btree_err e))
-           | Ok _ -> Lwt.return (SC_bt c))))
+           | Ok _ -> Lwt.return (mk_seek_cursor (SC_bt c)))))
 ;;
 
 (* Return the next (key, value) >= the seek key in ascending order, or [None]
    when exhausted.  The first call returns the positioned entry. *)
-let seek_next : seek_cursor -> (bytes * bytes) option Lwt.t = function
-  | SC_mem r ->
-    (match !r () with
-     | Seq.Nil -> Lwt.return_none
-     | Seq.Cons (kv, rest) ->
-       r := rest;
-       Lwt.return_some kv)
-  | SC_bt c ->
-    let* r = Btree.cursor_next c in
-    (match r with
-     | Ok kv -> Lwt.return kv
-     | Error e ->
-       Lwt.fail_with (Format.asprintf "Store.seek_next: %a" pp_error (map_btree_err e)))
+let seek_next : seek_cursor -> (bytes * bytes) option Lwt.t =
+  fun sc ->
+  let result =
+    match sc.sc_impl with
+    | SC_mem r ->
+      (match !r () with
+       | Seq.Nil -> Lwt.return_none
+       | Seq.Cons (kv, rest) ->
+         r := rest;
+         Lwt.return_some kv)
+    | SC_bt c ->
+      let* r = Btree.cursor_next c in
+      (match r with
+       | Ok kv -> Lwt.return kv
+       | Error e ->
+         Lwt.fail_with (Format.asprintf "Store.seek_next: %a" pp_error (map_btree_err e)))
+  in
+  (* The cursor is advanced eagerly above; [result] already holds this call's
+     entry (or [None]), so splicing a pause here only defers the *return*, never
+     reordering or dropping a match (#235).  We count calls, not matches: every
+     recursive consumer call nests a frame whether or not it yields a row, so the
+     terminal [None] call is counted too.
+
+     Yielding mid-stream is safe under the current concurrency model: a paused RO
+     seek streams from an immutable snapshot, and a paused RW seek holds the
+     single-writer lock — so no other fiber can mutate the tree under the cursor
+     between pause and resume.  If that invariant is ever relaxed (concurrent
+     writers), revisit this yield point. *)
+  sc.sc_calls <- sc.sc_calls + 1;
+  if sc.sc_calls mod seek_pause_interval = 0
+  then Lwt.bind (Lwt.pause ()) (fun () -> result)
+  else result
 ;;
 
-let seek_close : seek_cursor -> unit = function
+let seek_close : seek_cursor -> unit =
+  fun sc ->
+  match sc.sc_impl with
   | SC_mem _ -> ()
   | SC_bt c -> Btree.cursor_close c
 ;;
