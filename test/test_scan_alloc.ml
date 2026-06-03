@@ -27,6 +27,7 @@ module S = struct
   include Sqlocaml_store.Store
 
   let open_file = Sqlocaml_unix.Store.open_file
+  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -42,19 +43,27 @@ let ok_store : (S.t, S.error) result -> S.t = function
   | Error e -> Alcotest.failf "open_file error: %a" S.pp_error e
 ;;
 
-let with_store ~f =
+let with_store_gen ~open_db ~f =
   let path = Filename.temp_file "sqlocaml_scan_alloc" ".db" in
   (try Unix.unlink path with
    | _ -> ());
   Lwt.finalize
     (fun () ->
-       let* r = S.open_file ~path () in
+       let* r = open_db ~path () in
        let s = ok_store r in
        Lwt.finalize (fun () -> f s) (fun () -> S.close s))
     (fun () ->
        (try Unix.unlink path with
         | _ -> ());
+       (try Unix.unlink (path ^ "-wal") with
+        | _ -> ());
        Lwt.return_unit)
+;;
+
+let with_store ~f = with_store_gen ~open_db:(fun ~path () -> S.open_file ~path ()) ~f
+
+let with_wal_store ~f =
+  with_store_gen ~open_db:(fun ~path () -> S.open_file_wal ~path ()) ~f
 ;;
 
 let populate s ~n =
@@ -118,6 +127,37 @@ let test_scan_allocation_bounded () =
        Lwt.return_unit))
 ;;
 
+(* #238: a WAL-backed scan must not re-read (and re-[cstruct_dup]) the current
+   leaf page on every [seek_next].  [Pager.read] returns a fresh page-sized copy
+   on EVERY call (even a cache hit), so before the cursor cached its leaf buffer
+   each K-entry leaf allocated K full page buffers (~4 KB each) to yield K small
+   rows — the dominant per-row scan allocation.  Measured over 4000 rows on a
+   WAL store: pre-fix ~7.1 KB/row, post-fix ~1.4 KB/row (a ~5x reduction).  The
+   WAL path is the one a real [Db] uses, and its per-row cost is larger than the
+   plaintext-file floor above, so the ceiling here is the tighter guard against
+   a reintroduced per-row page re-dup. *)
+let test_wal_scan_allocation_bounded () =
+  run
+    (with_wal_store ~f:(fun s ->
+       let* () = populate s ~n in
+       let* warm, _, _ = drain s ~from_key:(Bytes.of_string "") in
+       Alcotest.(check int) "warm WAL drain streamed every row" n warm;
+       let a0 = Gc.allocated_bytes () in
+       let* count, _, _ = drain s ~from_key:(Bytes.of_string "") in
+       let a1 = Gc.allocated_bytes () in
+       Alcotest.(check int) "measured WAL drain streamed every row" n count;
+       let per_row = (a1 -. a0) /. float_of_int count in
+       Printf.eprintf "WAL-SCAN-ALLOC: %.0f bytes/row over %d rows\n%!" per_row count;
+       (* Pre-fix ~7140 bytes/row; post-fix ~1390.  The ceiling sits between so a
+          reintroduced per-row page re-read/dup fails the test, with headroom for
+          genuine drift. *)
+       Alcotest.(check bool)
+         (Printf.sprintf "WAL scan allocates < 3500 bytes/row (got %.0f)" per_row)
+         true
+         (per_row < 3500.0);
+       Lwt.return_unit))
+;;
+
 (* Guards the [leaf_idx] bookkeeping in BOTH read paths: a mid-tree [seek_ge]
    (which sets [leaf_idx] via [cursor_scan_for_key]) must stream exactly the
    tail [from..n), in order, with no drops or duplicates across leaf
@@ -153,6 +193,10 @@ let () =
             "full scan allocation is bounded"
             `Slow
             test_scan_allocation_bounded
+        ; Alcotest.test_case
+            "WAL full scan allocation is bounded"
+            `Slow
+            test_wal_scan_allocation_bounded
         ; Alcotest.test_case
             "scan correct after mid-tree seek"
             `Quick
