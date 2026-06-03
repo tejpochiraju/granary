@@ -7232,8 +7232,16 @@ and compute_window_for_partition
 
 and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
   let* tx = S.ro_begin store in
-  let* cur = S.cursor_open tx table_meta.tree_id in
-  let _sr = S.cursor_first cur in
+  (* #238: stream the leaves natively via [seek_ge ""] instead of
+     [cursor_open], which drains the WHOLE tree into an OCaml list at open time
+     (every (key,value) pair held simultaneously) before the first row is read.
+     That eager drain — not value boxing — was the bulk of the scan pipeline's
+     per-row allocation (~9.2 KB/row, vs ~1.5 KB at the streaming storage floor
+     and ~0.6 KB for the row decode itself).  [seek_ge ""] descends in O(log n)
+     and materialises only the entries actually pulled.  [Bytes.empty] is the
+     minimum key, so the first [seek_next] returns the first row — matching the
+     old [cursor_first]+[cursor_next] semantics. *)
+  let* cur = S.seek_ge tx table_meta.tree_id Bytes.empty in
   (* Snapshot lifetime tied to the stream: end on exhaustion OR a mid-scan read
      error so a corrupt page can't leak locks/refcounts/pins (#164). Idempotent. *)
   let ended = ref false in
@@ -7242,14 +7250,15 @@ and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
     then Lwt.return_unit
     else (
       ended := true;
-      S.cursor_close cur;
+      S.seek_close cur;
       S.ro_end tx)
   in
   let stream =
     Lwt_stream.from (fun () ->
       Lwt.catch
         (fun () ->
-           match S.cursor_next cur with
+           let* kv = S.seek_next cur in
+           match kv with
            | None ->
              let%lwt () = finish () in
              Lwt.return_none

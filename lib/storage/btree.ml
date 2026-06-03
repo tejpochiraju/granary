@@ -1059,6 +1059,16 @@ type cursor =
        re-decoding the whole leaf into a list on every [cursor_next] (the
        O(K^2)-per-leaf hotspot behind #230). *)
     mutable leaf_idx : int
+  ; (* #238: the page buffer for [leaf_page], cached across the K [cursor_next]
+       calls that consume one leaf.  Without it every [cursor_next] re-read the
+       same leaf via [Pager.read], and [Pager.read] returns a fresh page-sized
+       [cstruct_dup] on EVERY call (even a cache hit) — so a K-entry leaf
+       allocated K full page buffers (~4 KB each) to yield K small rows.  That
+       per-row page re-dup, not value boxing, was the dominant scan-pipeline
+       allocation (the WAL read floor measured ~7 KB/row).  Invalidated to
+       [None] wherever [leaf_page] changes (leaf advance / seek), so it always
+       matches the current leaf and a fixed snapshot never sees stale bytes. *)
+    mutable leaf_buf : Cstruct.t option
   ; mutable finished : bool
   }
 
@@ -1115,6 +1125,7 @@ let cursor_open t : (cursor, error) result Lwt.t =
       ; leaf_page = 0L
       ; offset = Page.data_offset
       ; leaf_idx = 0
+      ; leaf_buf = None
       ; finished = true
       }
   else
@@ -1137,8 +1148,32 @@ let cursor_open t : (cursor, error) result Lwt.t =
         ; leaf_page = leaf_pid
         ; offset = Page.data_offset
         ; leaf_idx = 0
+        ; leaf_buf = None
         ; finished = false
         }
+;;
+
+(* #238: read the cursor's current leaf page, caching the buffer across the
+   repeated [cursor_next]/[cursor_scan_for_key] calls that walk a single leaf.
+   The cache is invalidated ([leaf_buf <- None]) whenever [leaf_page] changes,
+   so it always reflects the current leaf; under a fixed snapshot the page is
+   immutable, so reusing the buffer cannot observe stale bytes. *)
+let read_cur_leaf c : (Cstruct.t, Pager.error) result Lwt.t =
+  match c.leaf_buf with
+  | Some buf -> return_ok buf
+  | None ->
+    let* r =
+      Pager.read
+        ?snapshot_frames:c.c_snapshot_frames
+        ?pin_set:c.c_pin_set
+        c.c_pager
+        c.leaf_page
+    in
+    (match r with
+     | Error _ as e -> Lwt.return e
+     | Ok buf ->
+       c.leaf_buf <- Some buf;
+       return_ok buf)
 ;;
 
 (* Walk back up the path, finding the first frame whose child_idx can be
@@ -1175,6 +1210,7 @@ let rec advance_to_next_leaf c : (bool, error) result Lwt.t =
            Splice: new_path = sub_path @ [top; rest...] *)
         c.path <- sub_path @ c.path;
         c.leaf_page <- leaf_pid;
+        c.leaf_buf <- None (* #238: new leaf — drop the cached buffer. *);
         c.offset <- Page.data_offset;
         c.leaf_idx <- 0;
         return_ok true)
@@ -1189,13 +1225,7 @@ let rec cursor_next c : ((bytes * bytes) option, error) result Lwt.t =
   if c.finished
   then return_ok None
   else
-    let* r =
-      Pager.read
-        ?snapshot_frames:c.c_snapshot_frames
-        ?pin_set:c.c_pin_set
-        c.c_pager
-        c.leaf_page
-    in
+    let* r = read_cur_leaf c in
     bind_pager r (fun buf ->
       let common = Page.read_common buf in
       (* #230: detect end-of-leaf by entry count, not by re-decoding the whole
@@ -1267,13 +1297,7 @@ let rec cursor_scan_for_key c key =
   if c.finished
   then return_ok (`Not_found_after key)
   else
-    let* rr =
-      Pager.read
-        ?snapshot_frames:c.c_snapshot_frames
-        ?pin_set:c.c_pin_set
-        c.c_pager
-        c.leaf_page
-    in
+    let* rr = read_cur_leaf c in
     bind_pager rr (fun buf ->
       let common = Page.read_common buf in
       if c.leaf_idx >= common.n_keys
@@ -1322,6 +1346,7 @@ let cursor_seek c key : ([ `Found | `Not_found_after of bytes ], error) result L
     | Ok (path, leaf_pid) ->
       c.path <- path;
       c.leaf_page <- leaf_pid;
+      c.leaf_buf <- None (* #238: seeked to a new leaf — drop the cache. *);
       c.offset <- Page.data_offset;
       c.leaf_idx <- 0;
       c.finished <- false;
