@@ -1362,7 +1362,9 @@ let run_dml t op ~on_ok =
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
-             | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+             (* #243 (T1): the executor records the actual inserted rowid; an
+                explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
+             | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
              | None -> ())
           | _ -> ());
          on_ok n)
@@ -1573,7 +1575,9 @@ let run st ~params =
          (match insert_table_name with
           | Some tbl when n > 0 ->
             (match Cat.find_table_cached t.catalog ~name:tbl with
-             | Some m -> t.last_insert_rowid <- Int64.sub m.Cat.next_rowid 1L
+             (* #243 (T1): the executor records the actual inserted rowid; an
+                explicit INTEGER PRIMARY KEY need not equal next_rowid - 1. *)
+             | Some _ -> t.last_insert_rowid <- Cat.last_inserted_rowid t.catalog
              | None -> ())
           | _ -> ());
          if t.explicit_txn = None

@@ -261,6 +261,10 @@ let plan_base cat ~table_meta ~where ~has_joins =
     | None -> make_scan table_meta
     | Some e ->
       (match recognise_eq_col_lit e with
+       | Some (col_idx, lit_expr) when Cat.rowid_alias_col table_meta = Some col_idx ->
+         (* #243 (T1): the alias column IS the table key — a single rowid seek,
+            no index. *)
+         Plan.Op_rowid_lookup { table_meta; lookup_val = plan_expr lit_expr }
        | Some (col_idx, lit_expr) ->
          (match find_index_on_col cat table_meta col_idx with
           | Some idx ->

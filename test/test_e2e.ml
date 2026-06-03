@@ -7870,20 +7870,25 @@ let test_pk_col_allows_distinct () =
   Alcotest.(check int) "two rows" 2 (List.length rows)
 ;;
 
-let test_pk_col_rejects_null () =
+(* #243 (T1): in SQLite, NULL in an INTEGER PRIMARY KEY requests an
+   auto-assigned rowid — it is NOT a NOT NULL violation.  (Pre-T1 this port
+   incorrectly rejected it; the rowid-alias change brings it to parity.  The
+   NOT NULL rejection still applies to composite / non-INTEGER primary keys.) *)
+let test_pk_col_null_autoincrements () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
-  match Lwt_main.run (Db.execute db "INSERT INTO t VALUES (NULL, 1)") with
-  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "id")) -> ()
-  | Error (Db.Runtime _) -> () (* also acceptable: runtime enforcement *)
-  | Ok () -> Alcotest.fail "expected NOT NULL violation on PK"
-  | Error e -> Alcotest.failf "unexpected error kind: %a" Db.pp_error e
+  exec db "INSERT INTO t VALUES (NULL, 1)";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check int) "one row inserted" 1 (List.length rows);
+  match (List.hd rows).(0) with
+  | Db.V_int n -> Alcotest.(check bool) "id auto-assigned (>= 1)" true (n >= 1L)
+  | _ -> Alcotest.fail "expected an auto-assigned integer rowid"
 ;;
 
 let pk_enforcement_tests =
   [ Alcotest.test_case "rejects_duplicate" `Quick test_pk_col_rejects_duplicate
   ; Alcotest.test_case "allows_distinct" `Quick test_pk_col_allows_distinct
-  ; Alcotest.test_case "rejects_null" `Quick test_pk_col_rejects_null
+  ; Alcotest.test_case "null_autoincrements" `Quick test_pk_col_null_autoincrements
   ]
 ;;
 

@@ -2650,7 +2650,37 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
            (Printf.sprintf
               "WITHOUT ROWID table '%s': PRIMARY KEY column must be INTEGER"
               table_meta.Cat.name)))
-  else Cat.next_rowid_in_txn cat ~name:table_meta.name tx
+  else (
+    match Cat.rowid_alias_col table_meta with
+    | Some pk_idx ->
+      (* #243 (T1): INTEGER PRIMARY KEY IS the rowid.  Use the supplied integer
+         as the table key; on NULL/omitted, auto-allocate and write it back so
+         [SELECT id] / RETURNING observe the assigned value.  An explicit value
+         advances the autoincrement counter past it (SQLite parity: a later NULL
+         insert gets max(existing)+1). *)
+      (match row.(pk_idx) with
+       | Row.V_int n ->
+         let* () =
+           if Int64.compare n Int64.max_int < 0
+           then
+             Cat.bump_next_rowid_in_txn
+               cat
+               ~name:table_meta.name
+               ~at_least:(Int64.add n 1L)
+               tx
+           else Lwt.return_unit
+         in
+         Lwt.return n
+       | Row.V_null ->
+         let* id = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
+         row.(pk_idx) <- Row.V_int id;
+         Lwt.return id
+       | _ ->
+         Lwt.fail_with
+           (Printf.sprintf
+              "datatype mismatch: INTEGER PRIMARY KEY column '%s' requires an integer"
+              (List.nth table_meta.columns pk_idx).Row.name))
+    | None -> Cat.next_rowid_in_txn cat ~name:table_meta.name tx)
 ;;
 
 (* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
@@ -2715,6 +2745,41 @@ let check_insert_unique
                    (String.concat ", " idx.idx_columns)))))
     (false, [], None)
     idxs
+;;
+
+(* #243 (T1): conflict handling for an INTEGER PRIMARY KEY rowid alias.  The
+   alias has no __pk index, so [check_insert_unique] never sees it; this probes
+   the TABLE tree directly for a collision on the explicit id and folds the
+   result into the same (skip, to_delete, upsert_rowid) the index pre-check
+   produces.  Only called when an EXPLICIT integer id was supplied
+   (auto-allocated rowids are monotonic and cannot collide). *)
+let check_alias_pk_conflict
+      tx
+      (table_meta : Cat.table_meta)
+      ~rowid
+      ~alias_col_name
+      ~(on_conflict : Ast.conflict_action option)
+      ~(upsert_update : (string list * (int * Plan.expr) list) option)
+      (skip, to_delete, upsert_rowid)
+  : (bool * int64 list * int64 option) Lwt.t
+  =
+  let* existing = S.get tx table_meta.Cat.tree_id (Rowid.encode rowid) in
+  match existing with
+  | None -> Lwt.return (skip, to_delete, upsert_rowid)
+  | Some _ ->
+    (match on_conflict, upsert_update with
+     | Some Ast.CA_ignore, _ -> Lwt.return (true, to_delete, upsert_rowid)
+     | Some Ast.CA_replace, _ -> Lwt.return (skip, rowid :: to_delete, upsert_rowid)
+     | _, Some (conflict_cols, _)
+       when List.sort String.compare [ alias_col_name ]
+            = List.sort String.compare conflict_cols ->
+       Lwt.return (skip, to_delete, Some rowid)
+     | _ ->
+       Lwt.fail_with
+         (Printf.sprintf
+            "UNIQUE constraint failed: %s.%s"
+            table_meta.Cat.name
+            alias_col_name))
 ;;
 
 (* Write [row]'s index entries (honoring each index's WHERE predicate). *)
@@ -2792,6 +2857,94 @@ let delete_replace_conflicts
   Lwt.return (List.rev !displaced_rows)
 ;;
 
+(* #243/#249: write [new_row] for the row currently stored at [old_rowid],
+   MOVING it to a new table-tree key when the INTEGER PRIMARY KEY alias column
+   changed — with a uniqueness probe on the new key — and re-keying its
+   secondary-index entries (the rowid is their key suffix) old->new.  For a
+   non-alias table or an unchanged alias this is an in-place rewrite.  Returns
+   the (possibly new) rowid.
+
+   Every single-row UPDATE path (UPDATE, UPSERT DO UPDATE, ON UPDATE CASCADE)
+   funnels through this so none can independently re-introduce the divergence
+   between the stored key and the id column (#249). *)
+let write_row_rekeyed
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(old_row : Row.t)
+      ~(new_row : Row.t)
+      ~old_rowid
+      ~indexes
+  : int64 Lwt.t
+  =
+  let alias_col = Cat.rowid_alias_col table_meta in
+  let* new_rowid =
+    match alias_col with
+    | None -> Lwt.return old_rowid
+    | Some i ->
+      (match new_row.(i) with
+       | Row.V_int n -> Lwt.return n
+       | _ ->
+         Lwt.fail_with
+           (Printf.sprintf
+              "datatype mismatch: INTEGER PRIMARY KEY column '%s' requires an integer"
+              (List.nth table_meta.Cat.columns i).Row.name))
+  in
+  let* () =
+    if Int64.equal new_rowid old_rowid
+    then Lwt.return_unit
+    else
+      let* existing = S.get tx table_meta.Cat.tree_id (Rowid.encode new_rowid) in
+      match existing with
+      | None -> Lwt.return_unit
+      | Some _ ->
+        let col_name =
+          match alias_col with
+          | Some i -> (List.nth table_meta.Cat.columns i).Row.name
+          | None -> "rowid"
+        in
+        Lwt.fail_with
+          (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name)
+  in
+  let schema = table_meta.Cat.columns in
+  let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
+  let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
+  let* () =
+    Lwt_list.iter_s
+      (fun (idx : Cat.index_info) ->
+         let old_matches =
+           row_matches_index_where clock params idx schema old_row_for_idx
+         in
+         let new_matches =
+           row_matches_index_where clock params idx schema new_row_for_idx
+         in
+         let old_iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx schema old_row_for_idx)
+         in
+         let new_iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx schema new_row_for_idx)
+         in
+         let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
+         let new_ikey = Index_key.encode new_iks ~rowid:new_rowid in
+         let* () =
+           if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
+         in
+         if new_matches
+         then S.put tx idx.idx_tree_id new_ikey Bytes.empty
+         else Lwt.return_unit)
+      indexes
+  in
+  let new_bytes = Row.encode schema new_row in
+  let* () = S.del tx table_meta.Cat.tree_id (Rowid.encode old_rowid) in
+  let* () = S.put tx table_meta.Cat.tree_id (Rowid.encode new_rowid) new_bytes in
+  Lwt.return new_rowid
+;;
+
 (* UPSERT DO UPDATE: apply [assigns] to conflicting row [old_rowid], refresh
    indexes, fire BEFORE/AFTER UPDATE hooks, commit if we own the txn. *)
 let execute_upsert_update
@@ -2829,39 +2982,19 @@ let execute_upsert_update
       | None -> Lwt.return_unit
       | Some f -> f ~tx ~old_row ~new_row
     in
-    let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-    let* () =
-      Lwt_list.iter_s
-        (fun (idx : Cat.index_info) ->
-           let old_matches =
-             row_matches_index_where clock params idx table_meta.columns old_row
-           in
-           let new_matches =
-             row_matches_index_where clock params idx table_meta.columns new_row_for_idx
-           in
-           let old_iks =
-             List.map
-               row_value_to_index_value
-               (get_index_key_values clock params idx table_meta.columns old_row)
-           in
-           let new_iks =
-             List.map
-               row_value_to_index_value
-               (get_index_key_values clock params idx table_meta.columns new_row_for_idx)
-           in
-           let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
-           let new_ikey = Index_key.encode new_iks ~rowid:old_rowid in
-           let* () =
-             if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
-           in
-           if new_matches
-           then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-           else Lwt.return_unit)
-        (Cat.indexes_for_table cat ~table:table_meta.name)
+    (* #249: SET id = N in a DO UPDATE must move the row (and check uniqueness),
+       same as a plain UPDATE — funnel through the shared re-key helper. *)
+    let* (_ : int64) =
+      write_row_rekeyed
+        tx
+        table_meta
+        ~clock
+        ~params
+        ~old_row
+        ~new_row
+        ~old_rowid
+        ~indexes:(Cat.indexes_for_table cat ~table:table_meta.name)
     in
-    let new_bytes = Row.encode table_meta.columns new_row in
-    let* () = S.del tx table_meta.tree_id old_key in
-    let* () = S.put tx table_meta.tree_id old_key new_bytes in
     let* () =
       match on_upsert_update with
       | None -> Lwt.return_unit
@@ -2994,6 +3127,17 @@ let execute_insert
          | None -> Lwt.return_unit
          | Some f -> f ~tx ~new_row:(Array.copy row)
        in
+       (* #243 (T1): capture whether an EXPLICIT integer id was supplied for the
+          rowid-alias column BEFORE [insert_rowid] writes back an auto value. *)
+       let alias_idx = Cat.rowid_alias_col table_meta in
+       let alias_explicit =
+         match alias_idx with
+         | Some i ->
+           (match row.(i) with
+            | Row.V_int _ -> true
+            | _ -> false)
+         | None -> false
+       in
        let* rowid = insert_rowid tx cat table_meta row in
        let idxs = Cat.indexes_for_table cat ~table:table_meta.name in
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
@@ -3010,6 +3154,21 @@ let execute_insert
            ~upsert_update
            idxs
        in
+       (* #243 (T1): fold in the rowid-alias collision (no __pk index to catch
+          it).  Only for an explicit id — an auto-allocated rowid cannot clash. *)
+       let* skip, to_delete, upsert_rowid =
+         match alias_idx with
+         | Some i when alias_explicit ->
+           check_alias_pk_conflict
+             tx
+             table_meta
+             ~rowid
+             ~alias_col_name:(List.nth table_meta.columns i).Row.name
+             ~on_conflict
+             ~upsert_update
+             (skip, to_delete, upsert_rowid)
+         | _ -> Lwt.return (skip, to_delete, upsert_rowid)
+       in
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
          execute_upsert_update
@@ -3025,21 +3184,28 @@ let execute_insert
            ~on_upsert_update_before
            ~on_upsert_update
        | _ ->
-         execute_insert_write
-           tx
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~row_for_idx
-           ~rowid
-           ~idxs
-           ~skip
-           ~to_delete
-           ~on_replace_delete_before
-           ~on_replace_delete
-           ~after_hook)
+         let* inserted =
+           execute_insert_write
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~owned
+             ~row
+             ~row_for_idx
+             ~rowid
+             ~idxs
+             ~skip
+             ~to_delete
+             ~on_replace_delete_before
+             ~on_replace_delete
+             ~after_hook
+         in
+         (* #243 (T1): record the rowid actually written so [last_insert_rowid()]
+            is correct even when an explicit id differs from [next_rowid - 1].
+            Skipped inserts (ON CONFLICT IGNORE ⇒ [inserted=false]) leave it. *)
+         if inserted then Cat.set_last_inserted_rowid cat rowid;
+         Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise. *)
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -3295,66 +3461,24 @@ let update_col_in_tx
       ~col_idx
       ~new_val
   =
-  let schema = meta.Cat.columns in
-  let rowid_key = Rowid.encode rowid in
   let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
-  let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
-  let* () =
-    Lwt_list.iter_s
-      (fun (idx : Cat.index_info) ->
-         let has_where = idx.idx_where_sql <> None in
-         (* For expression indexes, we always update (can't cheaply determine dependency).
-       For plain indexes, only skip if col is not indexed AND no WHERE clause. *)
-         let has_expr_col = List.exists Fun.id idx.idx_expr_flags in
-         let col_is_plain =
-           List.filter_map
-             Fun.id
-             (List.mapi
-                (fun i col_sql ->
-                   let is_expr =
-                     if i < List.length idx.idx_expr_flags
-                     then List.nth idx.idx_expr_flags i
-                     else false
-                   in
-                   if is_expr then None else Some (find_col_idx_by_name schema col_sql))
-                idx.idx_columns)
-         in
-         (* Only skip if: no expr cols, col is not in plain indexed cols, no WHERE *)
-         if (not has_expr_col) && (not (List.mem col_idx col_is_plain)) && not has_where
-         then Lwt.return_unit
-         else (
-           (* Phase 35 Task 2: populate VIRTUAL gen cols on the new row before
-         extracting index keys.  [row] was decoded with virtuals already. *)
-           let row_for_idx = with_computed_virtuals None [||] meta row in
-           let new_row_for_idx = with_computed_virtuals None [||] meta new_row in
-           let old_matches = row_matches_index_where None [||] idx schema row_for_idx in
-           let new_matches =
-             row_matches_index_where None [||] idx schema new_row_for_idx
-           in
-           let old_iks =
-             List.map
-               row_value_to_index_value
-               (get_index_key_values None [||] idx schema row_for_idx)
-           in
-           let new_iks =
-             List.map
-               row_value_to_index_value
-               (get_index_key_values None [||] idx schema new_row_for_idx)
-           in
-           let old_ikey = Index_key.encode old_iks ~rowid in
-           let new_ikey = Index_key.encode new_iks ~rowid in
-           let* () =
-             if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
-           in
-           if new_matches
-           then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-           else Lwt.return_unit))
-      child_idxs
+  (* #249: a cascade that lands on the child's own INTEGER PRIMARY KEY column
+     must MOVE the child row (re-key + reindex), like any other alias-column
+     UPDATE — funnel through the shared helper. *)
+  let* (_ : int64) =
+    write_row_rekeyed
+      tx
+      meta
+      ~clock:None
+      ~params:[||]
+      ~old_row:row
+      ~new_row
+      ~old_rowid:rowid
+      ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
   in
-  let new_bytes = Row.encode schema new_row in
-  S.put tx meta.Cat.tree_id rowid_key new_bytes
+  Lwt.return_unit
 ;;
 
 (* Build the commit-time recheck for a deferred FK violation: it still stands
@@ -4336,50 +4460,6 @@ let validate_update_unique
     matches
 ;;
 
-(* Delete [row]'s old index entries and insert the new ones for an UPDATE. *)
-let reindex_row
-      tx
-      (table_meta : Cat.table_meta)
-      ~clock
-      ~params
-      ~(old_row : Row.t)
-      ~(new_row : Row.t)
-      ~rowid
-      indexes
-  : unit Lwt.t
-  =
-  let schema = table_meta.Cat.columns in
-  let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
-  let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
-  Lwt_list.iter_s
-    (fun (idx : Cat.index_info) ->
-       let old_matches =
-         row_matches_index_where clock params idx schema old_row_for_idx
-       in
-       let new_matches =
-         row_matches_index_where clock params idx schema new_row_for_idx
-       in
-       let old_iks =
-         List.map
-           row_value_to_index_value
-           (get_index_key_values clock params idx schema old_row_for_idx)
-       in
-       let new_iks =
-         List.map
-           row_value_to_index_value
-           (get_index_key_values clock params idx schema new_row_for_idx)
-       in
-       let old_ikey = Index_key.encode old_iks ~rowid in
-       let new_ikey = Index_key.encode new_iks ~rowid in
-       let* () =
-         if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
-       in
-       if new_matches
-       then S.put tx idx.idx_tree_id new_ikey Bytes.empty
-       else Lwt.return_unit)
-    indexes
-;;
-
 (* Apply the ON UPDATE cascade of one [fk] for a parent row changing
    [old_row] -> [new_row], within the RW txn (RESTRICT handled in precheck). *)
 let apply_update_cascade_fk
@@ -4529,11 +4609,20 @@ let apply_update_row
       ~old_row
       ~new_row
   in
-  let key = Rowid.encode rowid in
-  let* () = reindex_row tx table_meta ~clock ~params ~old_row ~new_row ~rowid indexes in
-  let new_bytes = Row.encode table_meta.Cat.columns new_row in
-  let* () = S.del tx table_meta.tree_id key in
-  let* () = S.put tx table_meta.tree_id key new_bytes in
+  (* #243/#249: re-keys the row when the UPDATE changed the INTEGER PRIMARY KEY
+     alias column (uniqueness probe + del-old/put-new + reindex), else rewrites
+     in place.  Shared with the UPSERT and ON UPDATE CASCADE paths. *)
+  let* (_ : int64) =
+    write_row_rekeyed
+      tx
+      table_meta
+      ~clock
+      ~params
+      ~old_row
+      ~new_row
+      ~old_rowid:rowid
+      ~indexes
+  in
   (* Return the row as actually stored (generated columns included) so callers
      such as UPDATE ... RETURNING can project committed values, not a pre-lock
      snapshot (#226). *)
@@ -5040,6 +5129,7 @@ let op_name = function
      | `Inner -> "NestedLoopJoin(" ^ right_meta.Cat.name ^ ")"
      | `Left -> "LeftNestedLoopJoin(" ^ right_meta.Cat.name ^ ")")
   | Plan.Op_index_lookup { table_meta; _ } -> "IndexLookup(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_rowid_lookup { table_meta; _ } -> "RowidLookup(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_union { all; _ } -> if all then "UnionAll" else "Union"
   | Plan.Op_intersect _ -> "Intersect"
   | Plan.Op_except _ -> "Except"
@@ -6003,6 +6093,7 @@ let execute_with_count
   | Plan.Op_sort _
   | Plan.Op_limit _
   | Plan.Op_index_lookup _
+  | Plan.Op_rowid_lookup _
   | Plan.Op_nested_loop_join _
   | Plan.Op_hash_join _
   | Plan.Op_aggregate _
@@ -6499,6 +6590,7 @@ let rec get_outer_scan_meta : Plan.op -> Cat.table_meta option = function
   | Plan.Op_sort { child; _ } -> get_outer_scan_meta child
   | Plan.Op_limit { child; _ } -> get_outer_scan_meta child
   | Plan.Op_index_lookup { table_meta; _ } -> Some table_meta
+  | Plan.Op_rowid_lookup { table_meta; _ } -> Some table_meta
   | _ -> None
 ;;
 
@@ -7430,6 +7522,25 @@ and stream_index_lookup
                Lwt.fail exn))
     in
     Lwt.return stream
+
+(* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
+   the table key, so this is a single O(log n) table-tree seek, no index and no
+   second fetch.  A NULL or non-integer probe matches nothing, mirroring the
+   old __pk Op_index_lookup path (which mapped a type-mismatched value to
+   IK_null ⇒ empty), so behavior is unchanged. *)
+and stream_rowid_lookup clock params store lookup_val (table_meta : Cat.table_meta) =
+  let v = eval_expr clock params [||] lookup_val in
+  match v with
+  | Row.V_int n ->
+    let* tx = S.ro_begin store in
+    let* vrow = S.get tx table_meta.Cat.tree_id (Rowid.encode n) in
+    let* () = S.ro_end tx in
+    (match vrow with
+     | None -> Lwt.return (Lwt_stream.of_list [])
+     | Some vbytes ->
+       let row = decode_with_virtual clock params table_meta vbytes in
+       Lwt.return (Lwt_stream.of_list [ row ]))
+  | _ -> Lwt.return (Lwt_stream.of_list [])
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)
@@ -8508,6 +8619,8 @@ and to_stream
       col_type
       lookup_val
       table_meta
+  | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
+    stream_rowid_lookup clock params store lookup_val table_meta
   | Plan.Op_nested_loop_join
       { left
       ; right_meta

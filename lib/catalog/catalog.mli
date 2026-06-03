@@ -67,6 +67,26 @@ type table_meta =
         as the row's storage key (no auto-allocated rowid).  Phase 37. *)
   }
 
+(** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
+    if the table qualifies (rowid table, single INTEGER PRIMARY KEY column).
+    For such tables the table tree is keyed by this column's value and no
+    separate __pk index exists.  None for every other shape. *)
+val compute_rowid_alias_col
+  :  Sqlocaml_encoding.Row.column list
+  -> without_rowid:bool
+  -> int option
+
+(** [rowid_alias_col m] = [compute_rowid_alias_col m.columns ~without_rowid]. *)
+val rowid_alias_col : table_meta -> int option
+
+(** #243 (T1): record the rowid of the most recently INSERTed row (for
+    [last_insert_rowid()]).  Set by the executor after each successful insert. *)
+val set_last_inserted_rowid : t -> int64 -> unit
+
+(** #243 (T1): the rowid recorded by the last {!set_last_inserted_rowid}; read by
+    the db layer to answer [last_insert_rowid()]. *)
+val last_inserted_rowid : t -> int64
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -174,6 +194,16 @@ val next_rowid_in_txn
   -> name:string
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> int64 Lwt.t
+
+(** #243 (T1): advance a table's autoincrement counter so the next allocation is
+    at least [at_least] (= an explicitly-inserted INTEGER PRIMARY KEY value + 1),
+    matching SQLite. Never lowers the counter; does NOT commit. *)
+val bump_next_rowid_in_txn
+  :  t
+  -> name:string
+  -> at_least:int64
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
 
 (** Create a new index on a single column of an existing table.
     The new index gets its own [tree_id] (separate from the table tree).
