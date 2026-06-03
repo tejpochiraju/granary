@@ -72,9 +72,14 @@ val read
 
 (** Scoped zero-copy read (#244).  Resolves [page_id] exactly as {!read}
     (dirty / WAL / cache / main, honouring [snapshot_frames] and [pin_set])
-    but hands the callback a {b borrowed} view of the underlying page buffer —
-    no per-call ~4 KB copy.  Returns [Ok] of the callback's result, or [Error]
-    if the page read itself fails (the callback is then not invoked).
+    but hands the callback a {b borrowed} view of the underlying page buffer,
+    shedding the per-call defensive ~4 KB [cstruct_dup] that {!read} always
+    pays.  On the cache / dirty paths this is fully copy-free.  On the WAL path
+    the frame is still freshly read into its own buffer ({!Wal.read_frame}
+    allocates per call) — there is no shared buffer to borrow there — so the
+    borrow only avoids the second, defensive copy {!read} would add.  Returns
+    [Ok] of the callback's result, or [Error] if the page read itself fails
+    (the callback is then not invoked).
 
     {b Borrow contract — the callback MUST:}
     - treat the buffer as read-only (never mutate it); and
