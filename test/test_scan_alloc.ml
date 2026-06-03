@@ -141,10 +141,7 @@ let test_scan_correct_after_seek () =
        let* c2, f2, l2 = drain s ~from_key:(Bytes.of_string "") in
        Alcotest.(check int) "full scan count = n" n c2;
        Alcotest.(check bool) "full scan starts at row 0" true (f2 = Some (key_of 0));
-       Alcotest.(check bool)
-         "full scan ends at row n-1"
-         true
-         (l2 = Some (key_of (n - 1)));
+       Alcotest.(check bool) "full scan ends at row n-1" true (l2 = Some (key_of (n - 1)));
        Lwt.return_unit))
 ;;
 
@@ -152,8 +149,14 @@ let () =
   Alcotest.run
     "scan_alloc"
     [ ( "scan"
-      , [ Alcotest.test_case "full scan allocation is bounded" `Slow test_scan_allocation_bounded
-        ; Alcotest.test_case "scan correct after mid-tree seek" `Quick test_scan_correct_after_seek
+      , [ Alcotest.test_case
+            "full scan allocation is bounded"
+            `Slow
+            test_scan_allocation_bounded
+        ; Alcotest.test_case
+            "scan correct after mid-tree seek"
+            `Quick
+            test_scan_correct_after_seek
         ] )
     ]
 ;;
