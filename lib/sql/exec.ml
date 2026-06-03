@@ -2000,18 +2000,18 @@ let fts_deindex_document tx ~(fts_meta : Cat.fts_table_meta) ~rowid ~col_texts =
 
 (** Fetch the posting list for an exact term: [(rowid, positions)] *)
 let fts_posting_list tx ~index_tree term =
-  (* Scan keys from term\x00 onwards (sorted order) *)
+  (* Scan keys from term\x00 onwards (sorted order).  Native O(log n) seek +
+     lazy streaming of the matching prefix range, instead of draining the whole
+     FTS index tree per query (#233; same fix class as #228/#229). *)
   let prefix = Bytes.cat (Bytes.of_string term) (Bytes.of_string "\x00") in
-  let* cur = S.cursor_open tx index_tree in
-  let _sr = S.cursor_seek cur prefix in
+  let plen = Bytes.length prefix in
+  let* cur = S.seek_ge tx index_tree prefix in
   let entries = ref [] in
   let rec gather () =
-    match S.cursor_next cur with
-    | None -> ()
+    match%lwt S.seek_next cur with
+    | None -> Lwt.return_unit
     | Some (key, value) ->
-      if
-        Bytes.length key >= Bytes.length prefix
-        && Bytes.equal (Bytes.sub key 0 (Bytes.length prefix)) prefix
+      if Bytes.length key >= plen && Bytes.equal (Bytes.sub key 0 plen) prefix
       then (
         (* Extract rowid from last 8 bytes (sign-bit-flipped) *)
         let rowid_off = Bytes.length key - 8 in
@@ -2026,9 +2026,10 @@ let fts_posting_list tx ~index_tree term =
         let positions = decode_positions value in
         entries := (rowid, positions) :: !entries;
         gather ())
+      else Lwt.return_unit (* keys are sorted: first non-match ends the range *)
   in
-  gather ();
-  S.cursor_close cur;
+  let* () = gather () in
+  S.seek_close cur;
   Lwt.return (List.rev !entries)
 ;;
 
@@ -2036,12 +2037,13 @@ let fts_posting_list tx ~index_tree term =
 let fts_prefix_posting_list tx ~index_tree prefix_str =
   let prefix_bytes = Bytes.of_string prefix_str in
   let plen = Bytes.length prefix_bytes in
-  let* cur = S.cursor_open tx index_tree in
-  let _sr = S.cursor_seek cur prefix_bytes in
+  (* Native O(log n) seek + lazy streaming of the matching prefix range,
+     instead of draining the whole FTS index tree per query (#233). *)
+  let* cur = S.seek_ge tx index_tree prefix_bytes in
   let by_rowid : (int64, (int * int) list) Hashtbl.t = Hashtbl.create 16 in
   let rec gather () =
-    match S.cursor_next cur with
-    | None -> ()
+    match%lwt S.seek_next cur with
+    | None -> Lwt.return_unit
     | Some (key, value) ->
       (* Find the null byte separating term from rowid *)
       let null_pos = ref (-1) in
@@ -2071,11 +2073,13 @@ let fts_prefix_posting_list tx ~index_tree prefix_str =
             let positions = decode_positions value in
             let existing = Option.value ~default:[] (Hashtbl.find_opt by_rowid rowid) in
             Hashtbl.replace by_rowid rowid (existing @ positions);
-            gather ()
-            (* if term no longer has the prefix, stop — keys are sorted *))))
+            gather ())
+          else Lwt.return_unit)
+        else Lwt.return_unit (* term no longer has the prefix, stop — keys are sorted *))
+      else Lwt.return_unit
   in
-  gather ();
-  S.cursor_close cur;
+  let* () = gather () in
+  S.seek_close cur;
   Lwt.return
     (Hashtbl.fold (fun rowid positions acc -> (rowid, positions) :: acc) by_rowid [])
 ;;
