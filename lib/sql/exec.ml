@@ -4442,10 +4442,15 @@ let reindex_row
       ~params
       ~(old_row : Row.t)
       ~(new_row : Row.t)
-      ~rowid
+      ~old_rowid
+      ~new_rowid
       indexes
   : unit Lwt.t
   =
+  (* #243/#249: index entry keys carry the rowid as a suffix.  When an UPDATE
+     re-keys an INTEGER PRIMARY KEY alias row ([old_rowid] <> [new_rowid]), the
+     old entries must be removed under the old rowid and re-inserted under the
+     new one.  For an ordinary in-place update both rowids are equal. *)
   let schema = table_meta.Cat.columns in
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
   let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
@@ -4467,8 +4472,8 @@ let reindex_row
            row_value_to_index_value
            (get_index_key_values clock params idx schema new_row_for_idx)
        in
-       let old_ikey = Index_key.encode old_iks ~rowid in
-       let new_ikey = Index_key.encode new_iks ~rowid in
+       let old_ikey = Index_key.encode old_iks ~rowid:old_rowid in
+       let new_ikey = Index_key.encode new_iks ~rowid:new_rowid in
        let* () =
          if old_matches then S.del tx idx.idx_tree_id old_ikey else Lwt.return_unit
        in
@@ -4627,11 +4632,54 @@ let apply_update_row
       ~old_row
       ~new_row
   in
-  let key = Rowid.encode rowid in
-  let* () = reindex_row tx table_meta ~clock ~params ~old_row ~new_row ~rowid indexes in
+  (* #243/#249: for an INTEGER PRIMARY KEY alias the table-tree key IS the id
+     value.  If this UPDATE changed it, the row must MOVE to the new key (with a
+     uniqueness check on it), not be rewritten in place — otherwise the stored
+     key and the id column diverge and PK uniqueness is lost. *)
+  let alias_col = Cat.rowid_alias_col table_meta in
+  let* new_rowid =
+    match alias_col with
+    | None -> Lwt.return rowid
+    | Some i ->
+      (match new_row.(i) with
+       | Row.V_int n -> Lwt.return n
+       | _ ->
+         Lwt.fail_with
+           (Printf.sprintf
+              "datatype mismatch: INTEGER PRIMARY KEY column '%s' requires an integer"
+              (List.nth table_meta.Cat.columns i).Row.name))
+  in
+  let* () =
+    if Int64.equal new_rowid rowid
+    then Lwt.return_unit
+    else
+      let* existing = S.get tx table_meta.tree_id (Rowid.encode new_rowid) in
+      match existing with
+      | None -> Lwt.return_unit
+      | Some _ ->
+        let col_name =
+          match alias_col with
+          | Some i -> (List.nth table_meta.Cat.columns i).Row.name
+          | None -> "rowid"
+        in
+        Lwt.fail_with
+          (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name)
+  in
+  let* () =
+    reindex_row
+      tx
+      table_meta
+      ~clock
+      ~params
+      ~old_row
+      ~new_row
+      ~old_rowid:rowid
+      ~new_rowid
+      indexes
+  in
   let new_bytes = Row.encode table_meta.Cat.columns new_row in
-  let* () = S.del tx table_meta.tree_id key in
-  let* () = S.put tx table_meta.tree_id key new_bytes in
+  let* () = S.del tx table_meta.tree_id (Rowid.encode rowid) in
+  let* () = S.put tx table_meta.tree_id (Rowid.encode new_rowid) new_bytes in
   (* Return the row as actually stored (generated columns included) so callers
      such as UPDATE ... RETURNING can project committed values, not a pre-lock
      snapshot (#226). *)

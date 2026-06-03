@@ -234,6 +234,70 @@ let test_table_level_pk_alias () =
        | _ -> "??"))
 ;;
 
+(* #249: UPDATE of the alias column must MOVE the row to the new key, not rewrite
+   in place — otherwise the stored key and the id column diverge. *)
+let test_update_rekeys () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    exec db "UPDATE t SET id = 2 WHERE id = 1";
+    (* old key gone, new key present, exactly one row, value carried over *)
+    Alcotest.(check (list int64)) "row moved to id=2" [ 2L ] (ints db "SELECT id FROM t");
+    Alcotest.(check string)
+      "lookup by new id returns the row"
+      "a"
+      (match query_rows db "SELECT v FROM t WHERE id = 2" with
+       | [ [| Db.V_text s |] ] -> s
+       | _ -> "MISSING");
+    Alcotest.(check (list int64))
+      "old id no longer found"
+      []
+      (ints db "SELECT id FROM t WHERE id = 1"))
+;;
+
+(* UPDATE of the alias to an id that already exists must raise UNIQUE, not
+   silently create a duplicate. *)
+let test_update_to_existing_id_errors () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    exec db "INSERT INTO t VALUES (2, 'b')";
+    exec_expect_error db "UPDATE t SET id = 2 WHERE id = 1";
+    (* both rows intact and distinct *)
+    Alcotest.(check (list int64))
+      "both rows survive"
+      [ 1L; 2L ]
+      (ints db "SELECT id FROM t ORDER BY id"))
+;;
+
+(* After a re-key, a secondary index still finds the row by its non-key column
+   (index entries must be re-keyed to the new rowid). *)
+let test_update_rekey_reindexes () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "CREATE INDEX iv ON t (v)";
+    exec db "UPDATE t SET id = 5 WHERE id = 1";
+    Alcotest.(check (list int64))
+      "secondary index lookup after re-key"
+      [ 5L ]
+      (ints db "SELECT id FROM t WHERE v = 'x'"))
+;;
+
+(* A non-key UPDATE is unaffected (in-place, no move). *)
+let test_update_nonkey_inplace () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    exec db "UPDATE t SET v = 'b' WHERE id = 1";
+    Alcotest.(check string)
+      "value updated, key unchanged"
+      "b"
+      (match query_rows db "SELECT v FROM t WHERE id = 1" with
+       | [ [| Db.V_text s |] ] -> s
+       | _ -> "??"))
+;;
+
 let () =
   Alcotest.run
     "rowid_alias"
@@ -255,6 +319,16 @@ let () =
         ; Alcotest.test_case "FK to alias parent" `Quick test_fk_to_alias_parent
         ; Alcotest.test_case "negative and large ids" `Quick test_negative_and_large_ids
         ; Alcotest.test_case "table-level PK alias" `Quick test_table_level_pk_alias
+        ; Alcotest.test_case "UPDATE re-keys the row (#249)" `Quick test_update_rekeys
+        ; Alcotest.test_case
+            "UPDATE to existing id errors (#249)"
+            `Quick
+            test_update_to_existing_id_errors
+        ; Alcotest.test_case
+            "UPDATE re-key re-indexes (#249)"
+            `Quick
+            test_update_rekey_reindexes
+        ; Alcotest.test_case "non-key UPDATE in place" `Quick test_update_nonkey_inplace
         ] )
     ]
 ;;
