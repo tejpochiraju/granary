@@ -325,6 +325,109 @@ let leaf_append_entry ?(reserved = 0) buf ~offset ~key ~value =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* In-place B-tree search (no per-entry allocation, #245)              *)
+(* ------------------------------------------------------------------ *)
+
+(* These searches are called once per entry / once per page on the hot point-
+   lookup path, so they must allocate NOTHING beyond the matched value.  Each
+   loop is a TOP-LEVEL recursive function taking all state as parameters: a
+   nested [let rec] would capture its free variables into a closure that OCaml
+   heap-allocates on every call (measured ~72 B per comparison — O(n_keys) of
+   them per page, which would defeat the point of avoiding the entry list). *)
+
+(* Byte loop for [compare_key_at]: compare [key.[0..n)] against [buf] bytes at
+   [kstart..kstart+n) as UNSIGNED.  Returns 0 if the [n]-byte prefixes are
+   equal, else the sign of the first differing byte. *)
+let rec compare_key_loop buf kstart key n i =
+  if i >= n
+  then 0
+  else (
+    let a = Char.code (Bytes.unsafe_get key i) in
+    let b = Cstruct.get_uint8 buf (kstart + i) in
+    if a <> b then if a < b then -1 else 1 else compare_key_loop buf kstart key n (i + 1))
+;;
+
+(* Compare a target [key] against the entry key stored in [buf] at byte range
+   [kstart .. kstart+klen), WITHOUT copying the stored key out.  Same sign
+   convention as [Bytes.compare key stored_key]: negative if [key] sorts
+   before, 0 if equal, positive if after.  Bytes compared as UNSIGNED, then the
+   shorter key sorts first — byte-identical to [Bytes.compare].  Both leaf and
+   branch entries start with [key_len: uint16][key: key_len], so this serves
+   both.  Allocates nothing. *)
+let compare_key_at buf ~kstart ~klen ~key =
+  let kb = Bytes.length key in
+  let n = if kb < klen then kb else klen in
+  let c = compare_key_loop buf kstart key n 0 in
+  if c <> 0 then c else compare kb klen
+;;
+
+let rec leaf_lookup_loop buf page_size n_keys key offset i =
+  if i >= n_keys || offset + 4 > page_size
+  then None
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    let val_off = offset + 2 + key_len in
+    if val_off + 2 > page_size
+    then None
+    else (
+      let val_len = Cstruct.BE.get_uint16 buf val_off in
+      if val_off + 2 + val_len > page_size
+      then None
+      else (
+        let c = compare_key_at buf ~kstart:(offset + 2) ~klen:key_len ~key in
+        if c = 0
+        then (
+          let value = Bytes.create val_len in
+          Cstruct.blit_to_bytes buf (val_off + 2) value 0 val_len;
+          Some value)
+        else if c < 0
+        then None (* target sorts before this entry: not present *)
+        else leaf_lookup_loop buf page_size n_keys key (val_off + 2 + val_len) (i + 1))))
+;;
+
+(* In-place point lookup on a sorted leaf page ([n_keys] = [common.n_keys]).
+   Walks entries by offset, comparing each key against the page bytes directly;
+   returns the matching value (freshly copied) or [None].  Allocates ONLY the
+   matched value — no entry list, no per-entry key/value bytes, no closure.
+   Bounds handling and the sorted short-circuit exactly mirror
+   [decode]-then-linear-scan over {!leaf_entry_at}, so results are
+   byte-identical (#245). *)
+let leaf_lookup buf ~n_keys ~key : bytes option =
+  leaf_lookup_loop buf (Cstruct.length buf) n_keys key data_offset 0
+;;
+
+let rec branch_pick_loop buf page_size n_keys right_page key offset i =
+  if i >= n_keys || offset + 6 > page_size
+  then right_page
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    if offset + 2 + key_len + 4 > page_size
+    then right_page
+    else (
+      let c = compare_key_at buf ~kstart:(offset + 2) ~klen:key_len ~key in
+      if c < 0
+      then Cstruct.BE.get_uint32 buf (offset + 2 + key_len)
+      else
+        branch_pick_loop
+          buf
+          page_size
+          n_keys
+          right_page
+          key
+          (offset + 2 + key_len + 4)
+          (i + 1)))
+;;
+
+(* In-place branch child selection on a sorted branch page.  Returns the child
+   page-id (int32) to descend into for [key] — the [left_child] of the first
+   entry whose key is strictly greater than [key], else [right_page]
+   (= [common.right_page]).  Allocates nothing; byte-identical to the
+   list-based pick (#245). *)
+let branch_pick buf ~n_keys ~right_page ~key : int32 =
+  branch_pick_loop buf (Cstruct.length buf) n_keys right_page key data_offset 0
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Freelist page entries                                               *)
 (* ------------------------------------------------------------------ *)
 
