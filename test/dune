@@ -28,7 +28,8 @@
   test_update
   test_delete
   test_join
-  test_aggregate)
+  test_aggregate
+  test_write_alloc)
  (libraries
   alcotest
   qcheck-alcotest

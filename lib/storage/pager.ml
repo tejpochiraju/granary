@@ -281,6 +281,14 @@ let write t page_id buf =
   Hashtbl.replace t.dirty page_id copy
 ;;
 
+(* #231: like [write], but takes OWNERSHIP of [buf] — no defensive copy.  The
+   caller must never mutate [buf] after this call.  Used by the B+-tree
+   build-and-write helpers, which create a fresh page buffer per write and drop
+   it immediately; the [write]-path [cstruct_dup] was a pure ~4KB alloc+memcpy
+   per page written (one per tree level per insert).  Reads still hand out
+   copies of dirty pages, so stored buffers are never aliased to readers. *)
+let write_owned t page_id buf = Hashtbl.replace t.dirty page_id buf
+
 (* Previously also injected into the shared cache here for
      read-after-write inside the same txn.  Removed (#149): a concurrent
      reader at an older snapshot would see uncommitted bytes.  The

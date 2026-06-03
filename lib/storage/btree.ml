@@ -161,7 +161,8 @@ let write_overflow_chain pager (value : bytes) : (int64 * int, error) result Lwt
           ~payload_off:offset
           ~payload_len;
         Page.seal buf;
-        Pager.write pager pid buf;
+        (* #231: per-overflow-page buffer is freshly built, never reused. *)
+        Pager.write_owned pager pid buf;
         write_chain (idx + 1) rest (offset + payload_len)
     in
     let* w = write_chain 0 pids 0 in
@@ -344,7 +345,9 @@ let build_and_write_leaf pager ~page_id ~entries ~right_page : (unit, error) res
   (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
   Page.write_tag buf (Pager.write_tag pager);
   Page.seal buf;
-  Pager.write pager page_id buf;
+  (* #231: [buf] is freshly built here and never touched again — hand it to the
+     pager without the defensive copy that [Pager.write] would make. *)
+  Pager.write_owned pager page_id buf;
   return_ok ()
 ;;
 
@@ -380,7 +383,8 @@ let build_and_write_branch pager ~page_id ~entries ~right_page
   (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
   Page.write_tag buf (Pager.write_tag pager);
   Page.seal buf;
-  Pager.write pager page_id buf;
+  (* #231: freshly-built buffer, never reused — transfer ownership, no copy. *)
+  Pager.write_owned pager page_id buf;
   return_ok ()
 ;;
 
@@ -452,42 +456,6 @@ let get t key : (bytes option, error) result Lwt.t =
                 match dv with
                 | Ok v -> return_ok (Some v)
                 | Error e -> return_error e
-              else if c < 0
-              then return_ok None
-              else lookup rest
-          in
-          lookup entries
-        | Page.Branch ->
-          let entries, _ = decode_branch_entries buf common in
-          let child = pick_branch_child entries common key in
-          descend child
-        | _ -> return_error (Tree_corrupt "non-tree page in tree"))
-    in
-    descend t.root_page)
-;;
-
-(* Return the raw stored bytes for [key] (still tagged) without decoding
-   overflow chains.  Used by [put] / [del] to detect and free an existing
-   overflow chain before overwriting it. *)
-let get_raw t key : (bytes option, error) result Lwt.t =
-  if Int64.compare t.root_page 0L = 0
-  then return_ok None
-  else (
-    let rec descend page_id =
-      let* r =
-        Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager page_id
-      in
-      bind_pager r (fun buf ->
-        let common = Page.read_common buf in
-        match common.kind with
-        | Page.Leaf ->
-          let entries, _ = decode_leaf_entries buf common in
-          let rec lookup = function
-            | [] -> return_ok None
-            | (e : Page.leaf_entry) :: rest ->
-              let c = Bytes.compare key e.key in
-              if c = 0
-              then return_ok (Some e.value)
               else if c < 0
               then return_ok None
               else lookup rest
@@ -893,8 +861,11 @@ let put_into_empty_tree t key stored_value =
     | Ok () -> return_ok { t with root_page = new_pid })
 ;;
 
-(* Non-empty tree → find the target leaf, insert-or-replace, write back. *)
-let put_into_leaf t key stored_value =
+(* Non-empty tree → find the target leaf, insert-or-replace, write back.
+   Takes the RAW [value]: the target leaf is read here anyway, so the stale
+   overflow chain under [key] (if any) is freed and the new value prepared
+   inside this single descent — see [put]'s #231 note. *)
+let put_into_leaf t key value =
   let* path_r = find_leaf t key in
   match path_r with
   | Error e -> return_error e
@@ -909,9 +880,34 @@ let put_into_leaf t key stored_value =
       let plain_entries =
         List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
       in
-      let new_entries = leaf_insert_or_replace plain_entries key stored_value in
-      Pager.free t.pager ~page_id:leaf_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-      write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right)
+      (* #231: free any existing overflow chain under [key] using the value we
+         already decoded from this leaf — the B+-tree is sorted, so if [key]
+         exists it is in THIS leaf.  Done BEFORE [prepare_stored_value] so the
+         freed pages can back the new chain (preserves the original
+         free-before-alloc ordering that [put] used to get from [get_raw]). *)
+      let old_value =
+        List.find_map
+          (fun (k, v) -> if Bytes.compare k key = 0 then Some v else None)
+          plain_entries
+      in
+      let* free_r =
+        match old_value with
+        | None -> return_ok ()
+        | Some v -> maybe_free_overflow_of t.pager v
+      in
+      match free_r with
+      | Error e -> return_error e
+      | Ok () ->
+        let* prep_r = prepare_stored_value t.pager value in
+        (match prep_r with
+         | Error e -> return_error e
+         | Ok stored_value ->
+           let new_entries = leaf_insert_or_replace plain_entries key stored_value in
+           Pager.free
+             t.pager
+             ~page_id:leaf_pid
+             ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+           write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right))
 ;;
 
 let put t key value : (t, error) result Lwt.t =
@@ -921,31 +917,21 @@ let put t key value : (t, error) result Lwt.t =
   then return_error (Key_too_large key_len)
   else if val_len > max_value_size
   then return_error (Value_too_large val_len)
-  else
-    (* Before installing the new value, free any existing overflow chain
-       under [key].  Doing this BEFORE allocating the new chain keeps the
-       freelist available for reuse where possible. *)
-    let* existing_r =
-      if Int64.compare t.root_page 0L = 0 then return_ok None else get_raw t key
-    in
-    match existing_r with
+  else if Int64.compare t.root_page 0L = 0
+  then
+    (* Empty tree: no existing entry, so nothing to free; just prepare the
+       value and seed the root leaf. *)
+    let* prep_r = prepare_stored_value t.pager value in
+    match prep_r with
     | Error e -> return_error e
-    | Ok existing_opt ->
-      let* free_r =
-        match existing_opt with
-        | None -> return_ok ()
-        | Some stored -> maybe_free_overflow_of t.pager stored
-      in
-      (match free_r with
-       | Error e -> return_error e
-       | Ok () ->
-         let* prep_r = prepare_stored_value t.pager value in
-         (match prep_r with
-          | Error e -> return_error e
-          | Ok stored_value ->
-            if Int64.compare t.root_page 0L = 0
-            then put_into_empty_tree t key stored_value
-            else put_into_leaf t key stored_value))
+    | Ok stored_value -> put_into_empty_tree t key stored_value
+  else
+    (* #231: the old code did a full [get_raw] tree descent here purely to free
+       a stale overflow chain under [key].  That descent duplicated the one
+       [put_into_leaf]/[find_leaf] already performs (~25% of per-insert
+       allocation, measured).  The overflow free is now folded into
+       [put_into_leaf], which reads the target leaf regardless. *)
+    put_into_leaf t key value
 ;;
 
 (* ------------------------------------------------------------------ *)

@@ -79,6 +79,12 @@ val unpin_all : t -> (int64, unit) Hashtbl.t -> unit
     Does not write to BLOCK immediately. The Cstruct.t is copied internally. *)
 val write : t -> int64 -> Cstruct.t -> unit
 
+(** Like {!write}, but takes ownership of the buffer instead of copying it.
+    The caller MUST NOT mutate the buffer afterwards.  Saves a full page-sized
+    alloc+memcpy per call; used on the B+-tree write path where each page buffer
+    is freshly built and never reused. *)
+val write_owned : t -> int64 -> Cstruct.t -> unit
+
 (** Allocate a new page ID. Tries freelist first (reusing pages where
     freed_at_txn_id < alloc_min_safe); extends file if none available. *)
 val alloc : t -> (int64, error) result Lwt.t
