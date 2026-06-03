@@ -344,6 +344,10 @@
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
+ (name test_seek_stack)
+ (libraries sqlocaml.store alcotest lwt.unix))
+
+(test
  (name test_attach)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
