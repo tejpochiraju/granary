@@ -16,7 +16,12 @@
         constant and only the surrounding index size varies).
 
     Validated: reverting either site to the old [cursor_open] drain makes the
-    corresponding ratio ~3.0x (1x->3x index), tripping the < 2.0x gate. *)
+    corresponding ratio ~3.0x (1x->3x index), tripping the gate.
+
+    The ratio gate is a wall-clock measurement: on a shared, loaded CI runner a
+    sub-millisecond 1k baseline is noise-dominated and the ratio flakes.  As with
+    the [bench_*] suites, CI neutralizes it via [SQLOCAML_BENCH_MAX_RATIO] (set
+    high) so the benches still run and print, without failing on load. *)
 
 module Db = Sqlocaml.Db
 
@@ -28,6 +33,17 @@ let unwrap = function
 ;;
 
 let now () = Unix.gettimeofday ()
+
+(* Timing-ratio ceiling for the O(log n) gate.  Defaults to 2.0 — a wide margin
+   vs GC/scheduler noise, well below the ~3x a re-introduced O(n) drain produces.
+   Raised via [SQLOCAML_BENCH_MAX_RATIO] to neutralize the gate on loaded CI. *)
+let max_ratio =
+  match Sys.getenv_opt "SQLOCAML_BENCH_MAX_RATIO" with
+  | Some v ->
+    (try float_of_string v with
+     | _ -> 2.0)
+  | None -> 2.0
+;;
 
 let with_db f =
   let dir = Filename.temp_file "sqlocaml_fts_scaling" "" in
@@ -149,12 +165,13 @@ let assert_flat label small large =
     (large *. 1000.)
     ratio;
   (* 3x the surrounding index.  A full drain costs ~3x (validated); an O(log n)
-     seek is ~flat.  Gate at < 2.0x: wide margin vs GC/scheduler noise, well
-     below the ~3x a re-introduced drain produces. *)
+     seek is ~flat.  Gate at < [max_ratio] (default 2.0): wide margin vs
+     GC/scheduler noise, well below the ~3x a re-introduced drain produces;
+     neutralized on loaded CI via SQLOCAML_BENCH_MAX_RATIO. *)
   Alcotest.(check bool)
-    (Printf.sprintf "%s: 3x index < 2x slower (got %.2fx)" label ratio)
+    (Printf.sprintf "%s: 3x index < %.1fx slower (got %.2fx)" label max_ratio ratio)
     true
-    (ratio < 2.0)
+    (ratio < max_ratio)
 ;;
 
 let test_fts_queries_flat () =

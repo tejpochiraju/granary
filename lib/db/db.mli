@@ -155,7 +155,13 @@ val prepare : t -> string -> (stmt, error) result Lwt.t
 val run : stmt -> params:value list -> (int, error) result Lwt.t
 
 (** Execute a read statement (SELECT) with the given positional
-    parameter values.  Returns a stream of result rows. *)
+    parameter values.  Returns a stream of result rows.
+
+    Inside an explicit transaction the stream observes the transaction's own
+    uncommitted writes (read-your-own-writes, #262).  The stream is a stable
+    snapshot taken when iteration begins: rows written to the same table later
+    in the transaction are not retroactively seen by an in-flight stream, and
+    the stream remains safe to drain after a subsequent write or [COMMIT]. *)
 val iter : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
 
 (** #239: like {!iter}, but also returns a per-query cost/stats record populated

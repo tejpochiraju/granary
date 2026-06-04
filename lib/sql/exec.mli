@@ -130,6 +130,11 @@ val make_query_stats : unit -> query_stats
     [params] are the positional parameter values for [?] placeholders.
     [clock] supplies the current Unix timestamp for SQL date/time
     functions invoked with the literal ['now'].
+    [mode] selects the read's transaction context: [Auto] reads a fresh RO
+    snapshot of the committed state, whereas [In_txn tx] reads through [tx] so
+    the result reflects the transaction's own uncommitted writes
+    (read-your-own-writes, #262) — across scans, index/rowid lookups, the
+    aggregate fast path, indexed joins, FTS scans, and subqueries.
     [stats], when supplied, is populated as the returned stream is consumed
     (#239); omit it and the read path is entirely unaffected. *)
 val query

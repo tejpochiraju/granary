@@ -1631,10 +1631,19 @@ let iter_impl ?stats st ~params =
   else (
     let params_arr = Array.of_list params in
     let t = st.db_ref in
+    (* #262: thread the active explicit transaction into the read so a prepared
+       SELECT iterated inside [BEGIN … COMMIT] sees the txn's own uncommitted
+       writes (read-your-own-writes), matching the one-shot [query] path. *)
+    let mode =
+      match t.explicit_txn with
+      | None -> Sql.Exec.Auto
+      | Some tx -> Sql.Exec.In_txn tx
+    in
     Lwt.catch
       (fun () ->
          let* stream =
            Sql.Exec.query
+             ~mode
              ~clock:t.clock
              ~params:params_arr
              ?stats
