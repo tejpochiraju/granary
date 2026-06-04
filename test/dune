@@ -453,6 +453,7 @@
  (modules test_agg_fastpath_247)
  (libraries
   alcotest
+  qcheck-core
   sqlocaml
   sqlocaml.unix
   lwt

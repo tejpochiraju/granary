@@ -140,12 +140,109 @@ let test_alloc_reduced () =
       (on < off *. 0.85))
 ;;
 
+(* #247 (review): a VIRTUAL generated column forces the [can_prune=false] ->
+   [decode_with_virtual] branch even without a filter; a BLOB column exercises
+   GROUP_CONCAT's blob->"" path.  Both must stay identical fast vs general. *)
+let test_virtual_and_blob () =
+  with_db (fun db ->
+    exec
+      db
+      "CREATE TABLE tv (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) \
+       VIRTUAL)";
+    exec db "BEGIN";
+    for i = 0 to 49 do
+      exec db (Printf.sprintf "INSERT INTO tv (a,b) VALUES (%d,%d)" i (i * 2))
+    done;
+    exec db "COMMIT";
+    exec db "CREATE TABLE tb (id INTEGER PRIMARY KEY, b BLOB)";
+    List.iter
+      (fun s -> exec db (Printf.sprintf "INSERT INTO tb (id,b) VALUES %s" s))
+      [ "(0, X'deadbeef')"; "(1, X'00')"; "(2, NULL)"; "(3, X'cafe')" ];
+    List.iter
+      (fun sql ->
+         set_fastpath false;
+         let off = rows_of db sql in
+         set_fastpath true;
+         let on = rows_of db sql in
+         Alcotest.(check (list string)) ("fast==general: " ^ sql) off on)
+      [ "SELECT SUM(c), MIN(c), MAX(c), COUNT(c), AVG(c) FROM tv"
+      ; "SELECT GROUP_CONCAT(b) FROM tb"
+      ; "SELECT COUNT(b), COUNT(*) FROM tb"
+      ])
+;;
+
+(* #247 (review, finding 1): the incremental [make_agg_acc] fold and the batch
+   [aggregate_one]/[agg_sum] must stay byte-identical, but the fixed-shape
+   equivalence test above can't catch a semantic bugfix applied to one path only.
+   This property hammers BOTH paths over random tables (random length, random
+   values, random NULL distribution) across every [Ast.agg_func], so a divergence
+   outside the enumerated shapes fails CI. *)
+let agg_battery_q =
+  [ "SELECT COUNT(*) FROM q"
+  ; "SELECT COUNT(k) FROM q"
+  ; "SELECT SUM(k) FROM q"
+  ; "SELECT SUM(f) FROM q"
+  ; "SELECT AVG(k) FROM q"
+  ; "SELECT AVG(f) FROM q"
+  ; "SELECT MIN(k), MAX(k) FROM q"
+  ; "SELECT MIN(s), MAX(s) FROM q"
+  ; "SELECT GROUP_CONCAT(s) FROM q"
+  ; "SELECT COUNT(*), SUM(k), AVG(f), MIN(k), MAX(k), GROUP_CONCAT(s) FROM q"
+  ; "SELECT COUNT(*), SUM(k) FROM q WHERE k > 0"
+  ]
+;;
+
+(* nz = 0 => NULL k and f, exercising null-skip in every accumulator *)
+let insert_random_row db i (v, nz) =
+  let k = if nz = 0 then "NULL" else string_of_int v in
+  let f = if nz = 0 then "NULL" else Printf.sprintf "%.1f" (float_of_int v +. 0.5) in
+  exec db (Printf.sprintf "INSERT INTO q (id,k,f,s) VALUES (%d,%s,%s,'v%d')" i k f v)
+;;
+
+let rebuild_random_table db rows =
+  exec db "DELETE FROM q";
+  exec db "BEGIN";
+  List.iteri (insert_random_row db) rows;
+  exec db "COMMIT"
+;;
+
+let battery_agrees db sql =
+  set_fastpath false;
+  let off = rows_of db sql in
+  set_fastpath true;
+  let on = rows_of db sql in
+  off = on
+;;
+
+let test_qcheck_equiv () =
+  with_db (fun db ->
+    exec db "CREATE TABLE q (id INTEGER PRIMARY KEY, k INTEGER, f REAL, s TEXT)";
+    let prop rows =
+      rebuild_random_table db rows;
+      List.for_all (battery_agrees db) agg_battery_q
+    in
+    QCheck.Test.check_exn
+      (QCheck.Test.make
+         ~count:200
+         ~name:"agg fast == general over random tables"
+         QCheck.(list_size Gen.(0 -- 30) (pair (-100 -- 100) (0 -- 6)))
+         prop))
+;;
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   Alcotest.run
     "agg_fastpath_247"
     [ ( "fast-path"
       , [ Alcotest.test_case "fast == general (equivalence)" `Quick test_equivalence
+        ; Alcotest.test_case
+            "virtual generated col + blob group_concat"
+            `Quick
+            test_virtual_and_blob
+        ; Alcotest.test_case
+            "fast == general over random tables (QCheck)"
+            `Quick
+            test_qcheck_equiv
         ; Alcotest.test_case
             "fast path allocates less (Gc gate)"
             `Quick
