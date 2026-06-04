@@ -9147,6 +9147,10 @@ let rec op_uses_index (op : Plan.op) : bool =
   | Plan.Op_intersect { left; right }
   | Plan.Op_except { left; right } -> op_uses_index left || op_uses_index right
   | Plan.Op_with_cte { query; _ } -> op_uses_index query
+  (* Conservative: anything not recognised as a seek-bearing base access (or a
+     wrapper over one) reports [false].  KEEP IN SYNC: a NEW index/seek-bearing
+     plan op added here would silently report [used_index = false] until a case
+     is added above. *)
   | _ -> false
 ;;
 
