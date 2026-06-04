@@ -123,6 +123,62 @@ let test_last_insert_rowid_non_monotonic () =
       (scalar_int db "SELECT last_insert_rowid()"))
 ;;
 
+(* #250: a NULL insert into a still-empty table allocates 1, even though the
+   counter now starts at the [empty] sentinel rather than 1.  Guards the common
+   case against the seeding change. *)
+let test_empty_table_null_is_one () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t (id) VALUES (NULL)";
+    Alcotest.(check (list int64)) "first NULL gets 1" [ 1L ] (ints db "SELECT id FROM t"))
+;;
+
+(* #250: the bug case.  An explicit id BELOW the start (here negative) into an
+   empty table must seed the counter from that id, so a later NULL gets max+1
+   (= -4), matching SQLite — NOT 1 as the old [1L]-clamped counter produced. *)
+let test_below_counter_seed () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (-5)";
+    exec db "INSERT INTO t (id) VALUES (NULL)";
+    Alcotest.(check (list int64))
+      "NULL after explicit -5 gets -4 (max+1), not 1"
+      [ -5L; -4L ]
+      (ints db "SELECT id FROM t ORDER BY id");
+    Alcotest.(check int64)
+      "last_insert_rowid is the auto -4"
+      (-4L)
+      (scalar_int db "SELECT last_insert_rowid()"))
+;;
+
+(* #250: explicit 0 then NULL → max(0)+1 = 1 (rowid 0 is legal in SQLite). *)
+let test_zero_seed () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (0)";
+    exec db "INSERT INTO t (id) VALUES (NULL)";
+    Alcotest.(check (list int64))
+      "NULL after explicit 0 gets 1"
+      [ 0L; 1L ]
+      (ints db "SELECT id FROM t ORDER BY id"))
+;;
+
+(* #250: multiple below-start explicit ids — the counter tracks the running max,
+   so a NULL after {-5, -3} gets -2; a further explicit -10 does not lower it. *)
+let test_multiple_negative_seed () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (-5)";
+    exec db "INSERT INTO t VALUES (-3)";
+    exec db "INSERT INTO t (id) VALUES (NULL)";
+    exec db "INSERT INTO t VALUES (-10)";
+    exec db "INSERT INTO t (id) VALUES (NULL)";
+    Alcotest.(check (list int64))
+      "NULLs get -2 then -1 (max+1), unaffected by the lower -10"
+      [ -10L; -5L; -3L; -2L; -1L ]
+      (ints db "SELECT id FROM t ORDER BY id"))
+;;
+
 (* WHERE id = <lit> on the alias returns the exact row (routed through
    Op_rowid_lookup, but we assert the observable result). *)
 let test_pk_point_lookup () =
@@ -350,6 +406,19 @@ let () =
             "explicit id seeds autoincrement"
             `Quick
             test_explicit_then_null_seed
+        ; Alcotest.test_case
+            "empty-table NULL is 1 (#250)"
+            `Quick
+            test_empty_table_null_is_one
+        ; Alcotest.test_case
+            "below-counter explicit id seeds (#250)"
+            `Quick
+            test_below_counter_seed
+        ; Alcotest.test_case "explicit 0 then NULL is 1 (#250)" `Quick test_zero_seed
+        ; Alcotest.test_case
+            "multiple negative seeds track max (#250)"
+            `Quick
+            test_multiple_negative_seed
         ; Alcotest.test_case
             "last_insert_rowid non-monotonic"
             `Quick

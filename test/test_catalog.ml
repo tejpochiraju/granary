@@ -1613,6 +1613,55 @@ let test_mirror_recovers_next_rowid () =
      Lwt.return_unit)
 ;;
 
+(* #250: mirror recovery must track the literal max rowid, including when the
+   only rows are negative — so the recovered counter is max+1 (= -2), and the
+   next auto-allocated rowid is -2, matching SQLite and the in-session path (not
+   the old [1L] clamp). *)
+let test_mirror_recovers_negative_next_rowid () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* tid =
+       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.put tx tid (Rowid.encode (-5L)) (Bytes.of_string "row-5") in
+     let* () = S.put tx tid (Rowid.encode (-3L)) (Bytes.of_string "row-3") in
+     let* () = S.commit tx in
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     (match C.find_table_cached cat2 ~name:"t" with
+      | None -> Alcotest.fail "table t should be recovered from mirror"
+      | Some m ->
+        Alcotest.(check int64)
+          "recovered next_rowid is max(-5,-3)+1 = -2"
+          (-2L)
+          m.C.next_rowid);
+     let* r = C.next_rowid cat2 ~name:"t" in
+     Alcotest.(check int64) "next allocated rowid is -2, not 1" (-2L) r;
+     Lwt.return_unit)
+;;
+
+(* #250: mirror recovery of a table with NO data rows leaves the counter at the
+   [empty] sentinel, so the first auto-allocated rowid is 1 (SQLite: empty -> 1). *)
+let test_mirror_recovers_empty_next_rowid () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _tid =
+       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+     in
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     let* r = C.next_rowid cat2 ~name:"t" in
+     Alcotest.(check int64) "first rowid after empty-table recovery is 1" 1L r;
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group: schema-drift detection (#174)                                 *)
 (* ------------------------------------------------------------------ *)
@@ -1804,6 +1853,14 @@ let () =
         ; Alcotest.test_case "drop_removes_entry" `Quick test_mirror_drop_removes_entry
         ; Alcotest.test_case "reflects_add_column" `Quick test_mirror_reflects_add_column
         ; Alcotest.test_case "recovers_next_rowid" `Quick test_mirror_recovers_next_rowid
+        ; Alcotest.test_case
+            "recovers_negative_next_rowid (#250)"
+            `Quick
+            test_mirror_recovers_negative_next_rowid
+        ; Alcotest.test_case
+            "recovers_empty_next_rowid (#250)"
+            `Quick
+            test_mirror_recovers_empty_next_rowid
         ] )
     ; ( "drift"
       , [ Alcotest.test_case

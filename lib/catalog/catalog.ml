@@ -83,9 +83,22 @@ type table_meta =
   ; tree_id : S.tree_id
   ; columns : Row.column list
   ; next_rowid : int64
+    (** Next rowid to auto-allocate, maintained as [max existing rowid + 1].
+        The sentinel [empty_next_rowid] marks a table that has never had a
+        rowid seeded (conceptually [max = -inf]) so the FIRST row seeds the
+        counter from its actual value — see #250. *)
   ; fk_constraints : fk_constraint list
   ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
   }
+
+(** #250: sentinel [next_rowid] for an alias table with no rowid seeded yet.  A
+    fresh/empty INTEGER PRIMARY KEY table starts here so the first row — an
+    explicit id (even <= 0) OR an auto NULL — seeds the counter from the real
+    value (explicit: id+1; NULL: 1), matching SQLite ([max(existing)+1], empty
+    -> 1) and [recover_next_rowid].  The live counter is always
+    [max(rowid)+1 >= Int64.min_int + 1], so it can never collide with this
+    sentinel (allocation guards the [max_int] overflow that would wrap to it). *)
+let empty_next_rowid = Int64.min_int
 
 type index_info =
   { idx_name : string
@@ -903,10 +916,10 @@ let encode_mirror_entry (m : table_meta) =
   Buffer.to_bytes buf
 ;;
 
-(* Decode a mirror entry into a [table_meta] (with [next_rowid = 1L]; the
-   mirror does not persist the rowid counter — it is recovered at open-time
-   by scanning the data tree, see [recover_next_rowid]) and the stored
-   fingerprint. *)
+(* Decode a mirror entry into a [table_meta] (with [next_rowid =
+   empty_next_rowid]; the mirror does not persist the rowid counter — it is
+   recovered at open-time by scanning the data tree, see [recover_next_rowid])
+   and the stored fingerprint. *)
 let decode_mirror_entry bytes : table_meta * int64 =
   let _ver, off = Varint.decode_uint64 bytes 0 in
   let nlen, off = Varint.decode_uint64 bytes off in
@@ -934,7 +947,7 @@ let decode_mirror_entry bytes : table_meta * int64 =
   ( { name
     ; tree_id = Int64.to_int tid
     ; columns
-    ; next_rowid = 1L
+    ; next_rowid = empty_next_rowid
     ; fk_constraints
     ; without_rowid
     }
@@ -974,10 +987,12 @@ let load_mirror_entries store =
 
 (* #175: recover next_rowid for tables reconstructed from the mirror.
    Scan the table's data tree for the maximum integer rowid key (the
-   tree is keyed by [Rowid.encode], so the last key in byte-sorted order
-   is the maximum rowid).  Return [next_rowid = max + 1], or [1L] for an
-   empty or unreadable tree.  WITHOUT ROWID tables are skipped — they
-   don't use rowid keys. *)
+   tree is keyed by [Rowid.encode], whose offset-binary encoding sorts
+   negatives correctly, so the last key in byte-sorted order is the maximum
+   rowid).  Return [next_rowid = max + 1], or [empty_next_rowid] for an empty or
+   unreadable tree (#250: so a subsequent NULL insert seeds at 1 and an explicit
+   below-counter id seeds from its own value, exactly as in-session).  WITHOUT
+   ROWID tables are skipped — they don't use rowid keys. *)
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   if m.without_rowid
   then Lwt.return m
@@ -998,7 +1013,7 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
     S.cursor_close cur;
     let recovered =
       match !max_key with
-      | None -> 1L
+      | None -> empty_next_rowid
       | Some k -> Int64.add (Rowid.decode k) 1L
     in
     Lwt.return { m with next_rowid = recovered }
@@ -1134,7 +1149,13 @@ let create_table t ~name ~columns ~without_rowid =
   then failwith (Printf.sprintf "table '%s' already exists" name);
   let%lwt tid = next_user_tid t in
   let m =
-    { name; tree_id = tid; columns; next_rowid = 1L; fk_constraints = []; without_rowid }
+    { name
+    ; tree_id = tid
+    ; columns
+    ; next_rowid = empty_next_rowid
+    ; fk_constraints = []
+    ; without_rowid
+    }
   in
   let%lwt tx = S.rw_begin t.store in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
@@ -1225,12 +1246,25 @@ let register_ephemeral t (meta : table_meta) = Hashtbl.replace t.cache meta.name
 let unregister_ephemeral t ~name = Hashtbl.remove t.cache name
 let list_tables t = Lwt.return (Hashtbl.fold (fun _ v acc -> v :: acc) t.cache [])
 
+(* #250: pick the rowid to auto-allocate for a NULL/omitted id, and the new
+   counter.  An unseeded table ([empty_next_rowid]) allocates 1 (SQLite: empty
+   table -> rowid 1); a seeded one allocates the running [max+1] counter.  The
+   new counter is [id+1], except at the [max_int] ceiling we hold at [max_int]
+   rather than wrap to [Int64.min_int] (which is the empty sentinel) — a further
+   NULL insert then re-tries [max_int] and collides, instead of silently
+   resetting the table to "empty". *)
+let alloc_rowid (m : table_meta) : int64 * int64 =
+  let id = if Int64.equal m.next_rowid empty_next_rowid then 1L else m.next_rowid in
+  let next = if Int64.equal id Int64.max_int then Int64.max_int else Int64.add id 1L in
+  id, next
+;;
+
 let next_rowid t ~name =
   match Hashtbl.find_opt t.cache name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let id = m.next_rowid in
-    let m' = { m with next_rowid = Int64.add id 1L } in
+    let id, next = alloc_rowid m in
+    let m' = { m with next_rowid = next } in
     Hashtbl.replace t.cache name m';
     let%lwt tx = S.rw_begin t.store in
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
@@ -1246,8 +1280,8 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
   match Hashtbl.find_opt t.cache name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let id = m.next_rowid in
-    let m' = { m with next_rowid = Int64.add id 1L } in
+    let id, next = alloc_rowid m in
+    let m' = { m with next_rowid = next } in
     Hashtbl.replace t.cache name m';
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
@@ -1257,13 +1291,19 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     advance the autoincrement counter so a later NULL/omitted insert receives a
     fresh, non-colliding id (SQLite parity: rowid becomes max(existing)+1).
     [at_least] is the smallest value the next allocation must be (= id + 1).
-    No-op (and never lowers the counter) when already past [at_least]; the
-    overflow case (id = max_int ⇒ at_least wraps negative) safely no-ops. *)
+
+    #250: an UNSEEDED table ([empty_next_rowid]) seeds directly from [at_least],
+    even when that is <= 1 — the explicit id IS the table's max, so a below-1 id
+    (e.g. -5) correctly makes the next NULL insert -4 instead of 1.  A seeded
+    counter only ever rises and never lowers.  [at_least] is always [id+1] with
+    [id < max_int] (the caller guards the ceiling), so it can never be the empty
+    sentinel. *)
 let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
   match Hashtbl.find_opt t.cache name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    if Int64.compare at_least m.next_rowid <= 0
+    let unseeded = Int64.equal m.next_rowid empty_next_rowid in
+    if (not unseeded) && Int64.compare at_least m.next_rowid <= 0
     then Lwt.return_unit
     else (
       let m' = { m with next_rowid = at_least } in
