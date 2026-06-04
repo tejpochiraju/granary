@@ -12,3 +12,6 @@ bench/profiling/perf.data
 bench/profiling/folded.txt
 bench/profiling/*.svg
 .worktrees/
+
+# stray compiler/format stderr captures (never commit)
+*.err

@@ -1,8 +1,0 @@
-File "lib/sql/parser.mly", line 658, characters 0-11:
-Warning: symbol insert_expr is unreachable from any of the start symbols.
-File "lib/sql/parser.mly", line 105, characters 0-9:
-Warning: the precedence level assigned to COLLATE_PREC is never useful.
-File "lib/sql/parser.mly", line 1140, characters 45-57:
-Warning: this %prec declaration is never useful.
-Warning: 34 states have shift/reduce conflicts.
-Warning: 278 shift/reduce conflicts were arbitrarily resolved.
