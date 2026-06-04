@@ -10,6 +10,16 @@ module Varint = Sqlocaml_encoding.Varint
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
 
+(* #247: kill-switch for the cursor-level aggregate fast path.  Defaults on;
+   [SQLOCAML_AGG_FASTPATH=0] forces the general [stream_aggregate] path (a safety
+   valve, and the foil the Gc-gate regression test compares against).  Read
+   per-call — an aggregate runs it once per query, never in a tight loop. *)
+let agg_fastpath_enabled () =
+  match Sys.getenv_opt "SQLOCAML_AGG_FASTPATH" with
+  | Some ("0" | "false" | "off") -> false
+  | _ -> true
+;;
+
 let lit_to_value : Ast.literal -> Row.value = function
   | Ast.L_int n -> Row.V_int n
   | Ast.L_text s -> Row.V_text s
@@ -7891,6 +7901,229 @@ and aggregate_apply_windows clock params agg_windows after_having =
          Array.append row (Array.of_list extras))
       after_having)
 
+(* #247: build an incremental accumulator for one aggregate [spec]: an
+   [(update, finalize)] pair folded over scanned rows.  Returns [None] for any
+   spec the fast-path doesn't handle (e.g. a non-COUNT aggregate with no column),
+   which makes the caller fall back to the general [stream_aggregate] path.  The
+   per-type logic here MUST stay byte-identical to [aggregate_one]/[agg_sum]. *)
+and make_agg_acc (spec : Plan.agg_spec) : ((Row.t -> unit) * (unit -> Row.value)) option =
+  match spec.Plan.func, spec.Plan.col_ord with
+  | Ast.Agg_count, None ->
+    let c = ref 0 in
+    Some ((fun _ -> incr c), fun () -> Row.V_int (Int64.of_int !c))
+  | Ast.Agg_count, Some i ->
+    let c = ref 0 in
+    Some
+      ( (fun row ->
+          match row.(i) with
+          | Row.V_null -> ()
+          | _ -> incr c)
+      , fun () -> Row.V_int (Int64.of_int !c) )
+  | Ast.Agg_sum, Some i ->
+    (* INT vs REAL preserved exactly like [agg_sum]: REAL iff any real seen;
+       NULL iff no non-null seen. *)
+    let si = ref 0L
+    and sf = ref 0.0
+    and any_real = ref false
+    and any_nn = ref false in
+    Some
+      ( (fun row ->
+          match row.(i) with
+          | Row.V_null -> ()
+          | Row.V_int n ->
+            any_nn := true;
+            si := Int64.add !si n;
+            sf := !sf +. Int64.to_float n
+          | Row.V_real f ->
+            any_nn := true;
+            any_real := true;
+            sf := !sf +. f
+          | _ -> failwith "SUM on non-numeric value")
+      , fun () ->
+          if not !any_nn
+          then Row.V_null
+          else if !any_real
+          then Row.V_real !sf
+          else Row.V_int !si )
+  | Ast.Agg_avg, Some i ->
+    let sf = ref 0.0
+    and n = ref 0 in
+    Some
+      ( (fun row ->
+          match row.(i) with
+          | Row.V_null -> ()
+          | Row.V_int x ->
+            sf := !sf +. Int64.to_float x;
+            incr n
+          | Row.V_real f ->
+            sf := !sf +. f;
+            incr n
+          | _ -> failwith "AVG on non-numeric value")
+      , fun () -> if !n = 0 then Row.V_null else Row.V_real (!sf /. float_of_int !n) )
+  | Ast.Agg_min, Some i ->
+    let best = ref Row.V_null in
+    Some
+      ( (fun row ->
+          match row.(i), !best with
+          | Row.V_null, _ -> ()
+          | v, Row.V_null -> best := v
+          | v, cur -> if compare_values v cur < 0 then best := v)
+      , fun () -> !best )
+  | Ast.Agg_max, Some i ->
+    let best = ref Row.V_null in
+    Some
+      ( (fun row ->
+          match row.(i), !best with
+          | Row.V_null, _ -> ()
+          | v, Row.V_null -> best := v
+          | v, cur -> if compare_values v cur > 0 then best := v)
+      , fun () -> !best )
+  | Ast.Agg_group_concat sep, Some i ->
+    let separator = Option.value sep ~default:"," in
+    let parts = ref [] in
+    (* newest-first; reversed at finalize to preserve scan order *)
+    Some
+      ( (fun row ->
+          match row.(i) with
+          | Row.V_null -> ()
+          | Row.V_int n -> parts := Int64.to_string n :: !parts
+          | Row.V_real f -> parts := Printf.sprintf "%.17g" f :: !parts
+          | Row.V_text s -> parts := s :: !parts
+          | Row.V_blob _ -> parts := "" :: !parts)
+      , fun () ->
+          match !parts with
+          | [] -> Row.V_null
+          | l -> Row.V_text (String.concat separator (List.rev l)) )
+  | (Ast.Agg_sum | Ast.Agg_avg | Ast.Agg_min | Ast.Agg_max | Ast.Agg_group_concat _), None
+    -> None
+
+(* #247: cursor-level fast path for a no-GROUP-BY aggregate directly over a
+   (optionally filtered) sequential scan.  Folds the accumulators over the scan
+   cursor in a single pass, bypassing the child's per-row [Lwt_stream] layers and
+   the [Lwt_stream.to_list] full-table materialisation the general path pays.
+   Returns [Some stream] (always exactly one output row, matching
+   [aggregate_build_groups]'s single implicit group) when applicable, else [None]
+   to fall back.  Preserves the streaming/stack-bound property: the fold holds
+   only the accumulators, never the rows. *)
+and aggregate_fast_path
+      clock
+      params
+      store
+      cat
+      child
+      group_cols
+      aggs
+      having
+      proj
+      agg_windows
+  : Row.t Lwt_stream.t option Lwt.t
+  =
+  if not (agg_fastpath_enabled ())
+  then Lwt.return None
+  else if group_cols <> [] || having <> None || agg_windows <> []
+  then Lwt.return None
+  else if
+    not
+      (List.for_all
+         (function
+           | Plan.PI_agg_slot _ -> true
+           | _ -> false)
+         proj)
+  then Lwt.return None
+  else (
+    match child with
+    | Plan.Op_seq_scan { table_meta } ->
+      run_aggregate_fast_path clock params store cat table_meta None aggs proj
+    | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta } }
+      when not (plan_expr_has_subquery pred) ->
+      run_aggregate_fast_path clock params store cat table_meta (Some pred) aggs proj
+    | _ -> Lwt.return None)
+
+and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj =
+  match
+    let accs = List.map make_agg_acc aggs in
+    if List.exists Option.is_none accs
+    then None
+    else Some (Array.of_list (List.map Option.get accs))
+  with
+  | None -> Lwt.return None
+  | Some accs ->
+    let* pred' =
+      match pred_opt with
+      | None -> Lwt.return None
+      | Some p ->
+        let* p' = pre_eval_subquery clock store params cat p in
+        Lwt.return (Some p')
+    in
+    (* No decode needed when nothing reads a column and there is no filter: a
+       pure COUNT-star loop runs at storage-cursor speed. *)
+    let max_col =
+      List.fold_left
+        (fun m (s : Plan.agg_spec) ->
+           match s.Plan.col_ord with
+           | Some i when i > m -> i
+           | _ -> m)
+        (-1)
+        aggs
+    in
+    let need_decode = pred_opt <> None || max_col >= 0 in
+    (* #247: when no filter reads other columns and there are no virtual columns
+       to recompute, decode only the [0, max_col] prefix — skipping trailing
+       columns (e.g. a TEXT payload) the aggregate never touches. *)
+    let can_prune = pred_opt = None && not (has_virtual_cols table_meta.Cat.columns) in
+    let decode_row vbytes =
+      if can_prune
+      then Row.decode_prefix table_meta.Cat.columns vbytes ~upto:max_col
+      else decode_with_virtual clock params table_meta vbytes
+    in
+    let* tx = S.ro_begin store in
+    let* cur = S.seek_ge tx table_meta.Cat.tree_id Bytes.empty in
+    let ended = ref false in
+    let finish () =
+      if !ended
+      then Lwt.return_unit
+      else (
+        ended := true;
+        S.seek_close cur;
+        S.ro_end tx)
+    in
+    let dummy = [||] in
+    Lwt.catch
+      (fun () ->
+         let rec loop () =
+           let* kv = S.seek_next cur in
+           match kv with
+           | None ->
+             let* () = finish () in
+             let agg_vals = Array.map (fun (_, fin) -> fin ()) accs in
+             let out =
+               Array.of_list
+                 (List.map
+                    (function
+                      | Plan.PI_agg_slot k -> agg_vals.(k)
+                      | Plan.PI_group_col _ | Plan.PI_window_slot _ ->
+                        assert false (* excluded above *))
+                    proj)
+             in
+             Lwt.return (Some (Lwt_stream.of_list [ out ]))
+           | Some (_key, vbytes) ->
+             if need_decode
+             then (
+               let row = decode_row vbytes in
+               let keep =
+                 match pred' with
+                 | None -> true
+                 | Some p -> value_truthy (eval_expr clock params row p)
+               in
+               if keep then Array.iter (fun (upd, _) -> upd row) accs)
+             else Array.iter (fun (upd, _) -> upd dummy) accs;
+             loop ()
+         in
+         loop ())
+      (fun exn ->
+         let* () = finish () in
+         Lwt.fail exn)
+
 and stream_aggregate
       clock
       params
@@ -7904,38 +8137,56 @@ and stream_aggregate
       proj
       agg_windows
   =
-  let* inner = to_stream clock params store ~mode ~cat child in
-  let* rows = Lwt_stream.to_list inner in
-  let n_group_cols = List.length group_cols in
-  let groups = aggregate_build_groups group_cols rows in
-  let agg_output_rows =
-    List.map
-      (fun (group_key, group_rows) ->
-         let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
-         Array.of_list (group_key @ agg_vals))
-      groups
+  let* fast =
+    aggregate_fast_path
+      clock
+      params
+      store
+      cat
+      child
+      group_cols
+      aggs
+      having
+      proj
+      agg_windows
   in
-  let after_having =
-    match having with
-    | None -> agg_output_rows
-    | Some pred ->
-      List.filter (fun r -> value_truthy (eval_expr clock params r pred)) agg_output_rows
-  in
-  let n_agg_cols = n_group_cols + List.length aggs in
-  let with_windows = aggregate_apply_windows clock params agg_windows after_having in
-  let final_rows =
-    List.map
-      (fun agg_row ->
-         Array.of_list
-           (List.map
-              (function
-                | Plan.PI_group_col i -> agg_row.(i)
-                | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
-                | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j))
-              proj))
-      with_windows
-  in
-  Lwt.return (Lwt_stream.of_list final_rows)
+  match fast with
+  | Some stream -> Lwt.return stream
+  | None ->
+    let* inner = to_stream clock params store ~mode ~cat child in
+    let* rows = Lwt_stream.to_list inner in
+    let n_group_cols = List.length group_cols in
+    let groups = aggregate_build_groups group_cols rows in
+    let agg_output_rows =
+      List.map
+        (fun (group_key, group_rows) ->
+           let agg_vals = List.map (fun spec -> aggregate_one spec group_rows) aggs in
+           Array.of_list (group_key @ agg_vals))
+        groups
+    in
+    let after_having =
+      match having with
+      | None -> agg_output_rows
+      | Some pred ->
+        List.filter
+          (fun r -> value_truthy (eval_expr clock params r pred))
+          agg_output_rows
+    in
+    let n_agg_cols = n_group_cols + List.length aggs in
+    let with_windows = aggregate_apply_windows clock params agg_windows after_having in
+    let final_rows =
+      List.map
+        (fun agg_row ->
+           Array.of_list
+             (List.map
+                (function
+                  | Plan.PI_group_col i -> agg_row.(i)
+                  | Plan.PI_agg_slot k -> agg_row.(n_group_cols + k)
+                  | Plan.PI_window_slot j -> agg_row.(n_agg_cols + j))
+                proj))
+        with_windows
+    in
+    Lwt.return (Lwt_stream.of_list final_rows)
 
 and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where =
   let* tx = S.ro_begin store in
