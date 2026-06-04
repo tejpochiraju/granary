@@ -230,7 +230,8 @@ let test_qcheck_equiv () =
 ;;
 
 let () =
-  Mirage_crypto_rng_unix.use_default ();
+  (* Plaintext DBs only — no encryption, so no RNG seeding needed
+     ([ensure_rng_seeded] is a no-op when the store has no cipher). *)
   Alcotest.run
     "agg_fastpath_247"
     [ ( "fast-path"

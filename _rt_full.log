@@ -1,7 +1,0 @@
-Testing `fts_scaling'.
-This run has ID `1PF3CD5K'.
-
-  [OK]          scaling          0   FTS term + prefix queries are O(log n).
-
-Full test results in `/workspace/_build/default/test/_build/_tests/fts_scaling'.
-Test Successful in 5.146s. 1 test run.
