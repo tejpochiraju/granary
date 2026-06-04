@@ -56,7 +56,34 @@ type t =
     (* Bumped every time [reset] is called (i.e. after checkpoint).  Starts
          at 0 on open.  Used by replication to detect whether a checkpoint
          expired its snapshot. *)
+  ; frame_cache : (int, Cstruct.t) Hashtbl.t
+  ; (* #246: frame_idx -> decrypted plaintext page.  A committed frame's bytes
+       are immutable within a WAL generation (the WAL is append-only and
+       [read_frame] only ever serves idx < committed_frames), so caching the
+       decrypted result lets repeated reads of a WAL-resident page skip BOTH the
+       device re-read and the AES-GCM re-decrypt.  Authentication (the GCM tag
+       check) still runs on the first, filling read of each frame — exactly like
+       the pager's main page cache authenticates once on fill.  This is RAM-only
+       and does not weaken the at-rest guarantee (the WAL on disk stays
+       encrypted).  MUST be cleared in [reset]: a checkpoint recycles frame
+       indices, so a stale (idx -> bytes) entry from the previous generation
+       would otherwise be served for a different page. *)
+    frame_cache_fifo : int Queue.t (* insertion order for bounded FIFO eviction *)
   }
+
+(* #246: bound on the decrypted-frame cache.  Defaults to one full WAL
+   generation's worth of frames (the default auto-checkpoint threshold is
+   1000), so a hot working set that fits the un-checkpointed window never
+   re-decrypts; configurable down for memory-tight unikernels (0 disables the
+   cache entirely, restoring decrypt-on-every-read). *)
+let frame_cache_capacity =
+  match Sys.getenv_opt "SQLOCAML_WAL_FRAME_CACHE" with
+  | Some s ->
+    (match int_of_string_opt s with
+     | Some n when n >= 0 -> n
+     | _ -> 1024)
+  | None -> 1024
+;;
 
 let committed_frames t = t.committed_frames
 let sync_count t = t.sync_count
@@ -327,6 +354,8 @@ let open_
         ; sync_count = 0
         ; epoch = 0L
         ; index = Hashtbl.create 64
+        ; frame_cache = Hashtbl.create 64
+        ; frame_cache_fifo = Queue.create ()
         }
   else
     let* hr = read_header ~read_at in
@@ -353,6 +382,8 @@ let open_
            ; sync_count = 0
            ; epoch = 0L
            ; index = Hashtbl.create 64
+           ; frame_cache = Hashtbl.create 64
+           ; frame_cache_fifo = Queue.create ()
            })
     | Ok (Some (salt, seed)) ->
       let t =
@@ -370,6 +401,8 @@ let open_
         ; sync_count = 0
         ; epoch = 0L
         ; index = Hashtbl.create 64
+        ; frame_cache = Hashtbl.create 64
+        ; frame_cache_fifo = Queue.create ()
         }
       in
       let* r = recover_index t in
@@ -382,17 +415,43 @@ let open_
 (* read_frame                                                          *)
 (* ----------------------------------------------------------------- *)
 
+(* #246: install a decrypted frame into the bounded cache.  The buffer is the
+   freshly-decrypted page from [read_frame_raw]; it is never mutated in place
+   afterwards (callers either [cstruct_dup] it or borrow it read-only under the
+   pager's borrow contract), so sharing it across repeated reads is sound — the
+   same immutability invariant the main page cache relies on. *)
+let cache_frame t idx page =
+  if frame_cache_capacity > 0 && not (Hashtbl.mem t.frame_cache idx)
+  then (
+    while
+      Hashtbl.length t.frame_cache >= frame_cache_capacity
+      && not (Queue.is_empty t.frame_cache_fifo)
+    do
+      Hashtbl.remove t.frame_cache (Queue.pop t.frame_cache_fifo)
+    done;
+    Hashtbl.replace t.frame_cache idx page;
+    Queue.push idx t.frame_cache_fifo)
+;;
+
 let read_frame t idx =
   if idx < 0 || idx >= t.committed_frames
   then Lwt.return_error (Corrupt_frame idx)
-  else
-    (* Skip checksum: frames < committed_frames were validated at recovery
-       and the WAL is append-only thereafter. *)
-    let* r = read_frame_raw ~verify:false t idx in
-    match r with
-    | Error e -> Lwt.return_error e
-    | Ok None -> Lwt.return_error (Corrupt_frame idx)
-    | Ok (Some f) -> Lwt.return_ok f.page
+  else (
+    match Hashtbl.find_opt t.frame_cache idx with
+    | Some page ->
+      (* Cache hit: skip the device re-read and the AES-GCM re-decrypt.  Auth
+         already ran on the filling read below. *)
+      Lwt.return_ok page
+    | None ->
+      (* Skip checksum: frames < committed_frames were validated at recovery
+         and the WAL is append-only thereafter. *)
+      let* r = read_frame_raw ~verify:false t idx in
+      (match r with
+       | Error e -> Lwt.return_error e
+       | Ok None -> Lwt.return_error (Corrupt_frame idx)
+       | Ok (Some f) ->
+         cache_frame t idx f.page;
+         Lwt.return_ok f.page))
 ;;
 
 (* ----------------------------------------------------------------- *)
@@ -504,6 +563,11 @@ let append_commit t pages =
 
 let reset t =
   Hashtbl.reset t.index;
+  (* #246: a checkpoint recycles frame indices, so every cached (idx -> bytes)
+     entry now refers to a frame slot that will be overwritten by the next
+     generation.  Drop them all; failing to do so would serve a stale page. *)
+  Hashtbl.reset t.frame_cache;
+  Queue.clear t.frame_cache_fifo;
   t.committed_frames <- 0;
   t.epoch <- Int64.succ t.epoch
 ;;

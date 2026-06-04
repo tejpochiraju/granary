@@ -32,7 +32,15 @@ let encrypt_page t ~page_id buf =
   Cstruct.blit_from_string tag 0 buf (region + nonce_len) tag_len
 ;;
 
+(* Observability counters (#246): private refs, exposed only through the
+   [decrypt_*_count] accessors so the mutable state stays encapsulated. *)
+let n_decrypt_page = ref 0
+let n_decrypt_frame = ref 0
+let decrypt_page_count () = !n_decrypt_page
+let decrypt_frame_count () = !n_decrypt_frame
+
 let decrypt_page t ~page_id buf =
+  incr n_decrypt_page;
   let n = Cstruct.length buf in
   let region = n - overhead in
   let ct = Cstruct.to_string buf ~off:0 ~len:region in
@@ -63,6 +71,7 @@ let encrypt_frame t ~page_id ~plaintext =
 ;;
 
 let decrypt_frame t ~page_id payload =
+  incr n_decrypt_frame;
   let total = Cstruct.length payload in
   let len = total - overhead in
   let ct = Cstruct.to_string payload ~off:0 ~len in

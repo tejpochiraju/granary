@@ -179,6 +179,77 @@ let test_tamper_detected _ () =
   | Ok _ -> Alcotest.fail "expected tamper to be detected, got Ok"
 ;;
 
+(* #246: the decrypted-frame cache must serve a repeated read of a WAL-resident
+   frame WITHOUT re-running AES-GCM, while still authenticating once on the
+   filling read.  We assert this by counting [Crypto.decrypt_frame] calls. *)
+let test_frame_cache_no_redecrypt _ () =
+  let read_at, write_at, sync, size = make_dev () in
+  let* w = open_enc read_at write_at sync size in
+  let p = mk_page 9 in
+  let* () =
+    let* r = Wal.append_commit w [ 3L, p ] in
+    match r with
+    | Ok () -> Lwt.return_unit
+    | Error _ -> Alcotest.fail "append"
+  in
+  let read0 () =
+    let* r = Wal.read_frame w 0 in
+    match r with
+    | Ok pg -> Lwt.return pg
+    | Error _ -> Alcotest.fail "read"
+  in
+  let before = C.decrypt_frame_count () in
+  let* g1 = read0 () in
+  let after_fill = C.decrypt_frame_count () in
+  let* g2 = read0 () in
+  let after_hit = C.decrypt_frame_count () in
+  Alcotest.(check bool) "fill returns correct plaintext" true (Cstruct.equal p g1);
+  Alcotest.(check bool) "cache hit returns correct plaintext" true (Cstruct.equal p g2);
+  Alcotest.(check int) "fill authenticates exactly once" 1 (after_fill - before);
+  Alcotest.(check int) "repeated read does 0 extra decrypts" 0 (after_hit - after_fill);
+  Lwt.return_unit
+;;
+
+(* #246: [reset] (checkpoint) recycles frame indices.  A cached (idx -> bytes)
+   entry from the previous generation MUST NOT be served for the new frame that
+   reuses that index — otherwise a reader sees a stale page.  Commit page A at
+   idx 0, read it (caching it), reset, commit a DIFFERENT page B at idx 0, and
+   require the read to return B (and to re-decrypt, proving the cache was
+   dropped). *)
+let test_frame_cache_reset_invalidates _ () =
+  let read_at, write_at, sync, size = make_dev () in
+  let* w = open_enc read_at write_at sync size in
+  let pa = mk_page 11
+  and pb = mk_page 22 in
+  let commit p =
+    let* r = Wal.append_commit w [ 4L, p ] in
+    match r with
+    | Ok () -> Lwt.return_unit
+    | Error _ -> Alcotest.fail "append"
+  in
+  let read0 () =
+    let* r = Wal.read_frame w 0 in
+    match r with
+    | Ok pg -> Lwt.return pg
+    | Error _ -> Alcotest.fail "read"
+  in
+  let* () = commit pa in
+  let* a = read0 () in
+  Alcotest.(check bool) "pre-reset reads A" true (Cstruct.equal pa a);
+  Wal.reset w;
+  let* () = commit pb in
+  let before = C.decrypt_frame_count () in
+  let* b = read0 () in
+  let after = C.decrypt_frame_count () in
+  Alcotest.(check bool)
+    "post-reset idx 0 returns the NEW page B (not stale A)"
+    true
+    (Cstruct.equal pb b);
+  Alcotest.(check bool) "A and B differ (test is meaningful)" false (Cstruct.equal pa pb);
+  Alcotest.(check int) "post-reset read re-decrypts (cache was dropped)" 1 (after - before);
+  Lwt.return_unit
+;;
+
 let () =
   seed ();
   Lwt_main.run
@@ -192,6 +263,14 @@ let () =
                `Quick
                test_recovery_after_reopen
            ; Alcotest_lwt.test_case "tamper detected (#219)" `Quick test_tamper_detected
+           ; Alcotest_lwt.test_case
+               "frame cache: no re-decrypt on hit (#246)"
+               `Quick
+               test_frame_cache_no_redecrypt
+           ; Alcotest_lwt.test_case
+               "frame cache: reset invalidates (#246)"
+               `Quick
+               test_frame_cache_reset_invalidates
            ] )
        ])
 ;;
