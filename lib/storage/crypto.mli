@@ -33,6 +33,12 @@ val create : key:string -> (t, [ `Bad_key_length ]) result
     > [overhead]. *)
 val encrypt_page : t -> page_id:int64 -> Cstruct.t -> unit
 
+(** Total WAL-frame decrypt invocations since process start.  Observability hook
+    used by tests to assert the #246 decrypted-frame cache serves repeated reads
+    with zero extra decrypts and that authentication still runs on every fresh
+    WAL fill.  Monotonic; never reset. *)
+val decrypt_frame_count : unit -> int
+
 (** Decrypt the page in place: verifies the tag over [0 .. len-overhead) using
     the tail nonce and [page_id] AAD, writes plaintext back, and zeroes the
     reserved tail (so the page's pre-seal CRC over a zeroed tail still

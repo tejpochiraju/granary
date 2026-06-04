@@ -75,9 +75,11 @@ val read
     but hands the callback a {b borrowed} view of the underlying page buffer,
     shedding the per-call defensive ~4 KB [cstruct_dup] that {!read} always
     pays.  On the cache / dirty paths this is fully copy-free.  On the WAL path
-    the frame is still freshly read into its own buffer ({!Wal.read_frame}
-    allocates per call) — there is no shared buffer to borrow there — so the
-    borrow only avoids the second, defensive copy {!read} would add.  Returns
+    (#246) {!Wal.read_frame} may now hand back a buffer the WAL retains in its
+    decrypted-frame cache (shared across readers, immutable for the life of the
+    WAL generation), so the borrow is copy-free there too on a cache hit; it
+    stays memory-safe under the same read-only borrow contract, not on any
+    per-call freshness.  Returns
     [Ok] of the callback's result, or [Error] if the page read itself fails
     (the callback is then not invoked).
 

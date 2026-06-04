@@ -1,0 +1,2 @@
+File "lib/storage/wal.ml", line 1, characters 0-0:
+fatal: not a git repository: /home/tej/projects/sqlite_ocaml_port/.git/worktrees/t4-decrypt-cache

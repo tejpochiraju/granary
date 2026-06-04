@@ -77,6 +77,9 @@ val pp_error : Format.formatter -> error -> unit
 val open_
   :  ?cipher:Crypto.t option
   -> ?page_size:int
+  -> ?frame_cache_capacity:int
+       (** Max decrypted frames cached for re-read (#246); 0 disables.
+           Defaults from [SQLOCAML_WAL_FRAME_CACHE] (else 1024). *)
   -> read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -101,8 +104,15 @@ val find_page : t -> int64 -> int option
     Returns [None] if no frame for [page_id] satisfies the bound. *)
 val find_page_at : t -> int64 -> max_frame:int -> int option
 
-(** Read the page bytes at a given frame index. The caller must not modify
-    the returned Cstruct; it is a fresh allocation per call. *)
+(** Read the decrypted page bytes at a given frame index.
+
+    {b Ownership (#246):} the returned Cstruct {b may be a cache-shared buffer}
+    that the WAL retains in its decrypted-frame cache and hands to other readers.
+    The caller MUST treat it as read-only — [cstruct_dup] it before any in-place
+    mutation, or only borrow it read-only and drop it before the next
+    {!reset}/checkpoint.  Mutating it in place would corrupt the cache and every
+    concurrent borrower.  (The buffer is immutable for the life of the WAL
+    generation; the cache is dropped wholesale on {!reset}.) *)
 val read_frame : t -> int -> (Cstruct.t, error) result Lwt.t
 
 (** Append a batch of pages; the LAST entry in the list is automatically
