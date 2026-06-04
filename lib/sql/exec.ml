@@ -8363,8 +8363,10 @@ and stream_fts_match_scan
       include_rank
       snippets
   =
-  (* #257: each FTS index match whose content row we then fetch counts as one
-     examined row (the index seek + content read is the work this scan does). *)
+  (* #257: each matched FTS index row counts as one examined row — the index
+     seek (and the content fetch it drives) is the work this scan does.  The
+     increment sits on the match, ahead of the content [S.get], so a match whose
+     content row is absent still counts: the seek happened regardless. *)
   let s_opt = Lwt.get query_stats_key in
   S.with_ro store
   @@ fun tx ->
