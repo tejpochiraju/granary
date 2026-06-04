@@ -2224,6 +2224,53 @@ let acquire_txn store mode =
 
 let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
 
+(* #262: a read handle for a base scanner.  Inside an explicit transaction
+   ([In_txn tx]) reads must go THROUGH [tx] so they observe the transaction's
+   own uncommitted writes (read-your-own-writes).  A scanner that instead opens
+   a fresh RO snapshot ([S.ro_begin]) is, by snapshot-isolation design (#178),
+   blind to the active writer's in-flight mutations — so a [SELECT] after
+   [BEGIN; INSERT] would see the pre-[BEGIN] committed state.  In [Auto] mode
+   (no explicit txn) the scanner owns a fresh RO snapshot and ends it when the
+   read finishes; the borrowed txn is never ended here — Db owns its lifecycle. *)
+type read_handle =
+  | RH_borrowed of S.rw S.txn (* active explicit txn; lifecycle owned by Db *)
+  | RH_owned of S.ro S.txn (* scanner-owned RO snapshot; ended on finish *)
+
+let rh_begin store = function
+  | In_txn tx -> Lwt.return (RH_borrowed tx)
+  | Auto ->
+    let* tx = S.ro_begin store in
+    Lwt.return (RH_owned tx)
+;;
+
+let rh_finish = function
+  | RH_borrowed _ -> Lwt.return_unit
+  | RH_owned tx -> S.ro_end tx
+;;
+
+let rh_get = function
+  | RH_borrowed tx -> S.get tx
+  | RH_owned tx -> S.get tx
+;;
+
+let rh_seek_ge = function
+  | RH_borrowed tx -> S.seek_ge tx
+  | RH_owned tx -> S.seek_ge tx
+;;
+
+let rh_cursor_open = function
+  | RH_borrowed tx -> S.cursor_open tx
+  | RH_owned tx -> S.cursor_open tx
+;;
+
+(* [with_read store mode f] runs [f] over a read handle, ending it afterwards
+   only when the scanner owns it (Auto).  The txn-aware analogue of [S.with_ro];
+   like it, the handle is released even if [f] raises (#164). *)
+let with_read store mode f =
+  let* rh = rh_begin store mode in
+  Lwt.finalize (fun () -> f rh) (fun () -> rh_finish rh)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* execute: write operations only                                       *)
 (* ------------------------------------------------------------------ *)
@@ -5266,6 +5313,20 @@ let make_query_stats () = { rows_examined = 0; rows_returned = 0; used_index = f
    safe across interleaved fibres because each query has its own record. *)
 let query_stats_key : query_stats Lwt.key = Lwt.new_key ()
 
+(* #262: the active transaction mode for the query currently executing, carried
+   in Lwt sequence-associated storage.  Subquery evaluation ([pre_eval_subquery]
+   and the correlated re-eval at pull time) reads it to run inner reads under the
+   same txn, so [SELECT … WHERE x IN (SELECT …)] inside an open transaction sees
+   the transaction's own uncommitted writes — not just the top-level scan.  The
+   base scanners take [mode] as an explicit argument and do not consult this. *)
+let txn_mode_key : txn_mode Lwt.key = Lwt.new_key ()
+
+let current_txn_mode () =
+  match Lwt.get txn_mode_key with
+  | Some mode -> mode
+  | None -> Auto
+;;
+
 (* Increment via the closure-captured option; never calls [Lwt.get] at pull time
    (the consumer drains outside the [with_value] scope).  [None] for the common
    no-stats query is a single predicted branch with no per-row cost. *)
@@ -6747,6 +6808,67 @@ let rec substitute_cte ~(cte_name : string) ~(rows : Row.t list) (op : Plan.op) 
   | _ -> op
 ;;
 
+(* BM25-score FTS [matches] against [query] when rank is requested; otherwise
+   tag each with score 0.0.  Each term's own per-doc term-frequency is used.
+   Standalone (not in the [to_stream] rec group) so it stays polymorphic in the
+   txn kind — #262 calls it with either a borrowed RW txn or a fresh RO snap. *)
+let fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_rank =
+  if not include_rank
+  then Lwt.return (List.map (fun (rowid, positions) -> rowid, positions, 0.0) matches)
+  else
+    let* total_docs, total_tokens = read_fts_stats tx fts_meta.Cat.fts_index_tree in
+    let query_terms = fts_query_terms query in
+    let* term_data =
+      Lwt_list.map_s
+        (fun term ->
+           let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
+           Lwt.return (List.length pl, pl))
+        query_terms
+    in
+    let* doc_lengths =
+      Lwt_list.map_s
+        (fun (rowid, positions) ->
+           let dlen_key = fts_doclen_key rowid in
+           let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
+           let dl =
+             match v with
+             | None -> 1
+             | Some b ->
+               let n, _ = Varint.decode_uint64 b 0 in
+               Int64.to_int n
+           in
+           Lwt.return (rowid, positions, dl))
+        matches
+    in
+    let scored =
+      List.map
+        (fun (rowid, positions, dl) ->
+           let score =
+             List.fold_left
+               (fun acc (n_docs, term_pl) ->
+                  let tf =
+                    match List.assoc_opt rowid term_pl with
+                    | None -> 0
+                    | Some pos -> List.length pos
+                  in
+                  acc
+                  +. bm25_score
+                       ~k1:1.2
+                       ~b:0.75
+                       ~total_docs
+                       ~total_tokens
+                       ~n_docs_with_term:n_docs
+                       ~term_freq:tf
+                       ~doc_length:dl)
+               0.0
+               term_data
+           in
+           rowid, positions, score)
+        doc_lengths
+    in
+    Lwt.return scored
+;;
+
 let rec pre_eval_subquery
           (clock : (unit -> float) option)
           (store : S.t)
@@ -6837,7 +6959,10 @@ and eval_scalar_subquery clock store params cat_opt (e : Plan.expr) inner_ast
      | Error _ -> Lwt.return e
      | Ok bound ->
        let op = Planner.plan ~cat bound in
-       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       (* #262: run the subquery under the active txn (read-your-own-writes). *)
+       let* stream =
+         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
+       in
        let* rows = Lwt_stream.to_list stream in
        let v =
          match rows with
@@ -6859,7 +6984,10 @@ and eval_exists_subquery clock store params cat_opt (e : Plan.expr) inner_ast
      | Error _ -> Lwt.return e
      | Ok bound ->
        let op = Planner.plan ~cat bound in
-       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       (* #262: run the subquery under the active txn (read-your-own-writes). *)
+       let* stream =
+         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
+       in
        let* first = Lwt_stream.get stream in
        Lwt.return (Plan.P_lit (Ast.L_int (if first = None then 0L else 1L))))
 
@@ -6875,7 +7003,10 @@ and eval_in_select clock store params cat_opt (e : Plan.expr) x inner_ast
      | Error _ -> Lwt.return e
      | Ok bound ->
        let op = Planner.plan ~cat bound in
-       let* stream = to_stream clock params store ~mode:Auto ~cat:(Some cat) op in
+       (* #262: run the subquery under the active txn (read-your-own-writes). *)
+       let* stream =
+         to_stream clock params store ~mode:(current_txn_mode ()) ~cat:(Some cat) op
+       in
        let* rows = Lwt_stream.to_list stream in
        let vals =
          List.filter_map
@@ -7365,10 +7496,12 @@ and compute_window_for_partition
      win_aggregate clock params wplan sorted_rows sorted_orig_idxs results n agg_func);
   results
 
-and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
+and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
   (* #239: captured at construction (inside [query]'s [with_value] scope). *)
   let s_opt = Lwt.get query_stats_key in
-  let* tx = S.ro_begin store in
+  (* #262: read through the active txn when one is open, so the scan observes
+     the transaction's own uncommitted writes. *)
+  let* rh = rh_begin store mode in
   (* #238: stream the leaves natively via [seek_ge ""] instead of
      [cursor_open], which drains the WHOLE tree into an OCaml list at open time
      (every (key,value) pair held simultaneously) before the first row is read.
@@ -7378,7 +7511,7 @@ and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
      and materialises only the entries actually pulled.  [Bytes.empty] is the
      minimum key, so the first [seek_next] returns the first row — matching the
      old [cursor_first]+[cursor_next] semantics. *)
-  let* cur = S.seek_ge tx table_meta.tree_id Bytes.empty in
+  let* cur = rh_seek_ge rh table_meta.tree_id Bytes.empty in
   (* Snapshot lifetime tied to the stream: end on exhaustion OR a mid-scan read
      error so a corrupt page can't leak locks/refcounts/pins (#164). Idempotent. *)
   let ended = ref false in
@@ -7388,7 +7521,7 @@ and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
     else (
       ended := true;
       S.seek_close cur;
-      S.ro_end tx)
+      rh_finish rh)
   in
   let stream =
     Lwt_stream.from (fun () ->
@@ -7434,6 +7567,10 @@ and stream_filter clock params store mode cat pred child =
               let subst_pred = substitute_outer_in_plan_expr meta row pred' in
               let* resolved =
                 Lwt.with_value query_stats_key s_opt
+                @@ fun () ->
+                (* #262: also re-establish the txn mode so a correlated subquery
+                   evaluated at pull time reads under the active transaction. *)
+                Lwt.with_value txn_mode_key (Some mode)
                 @@ fun () -> pre_eval_subquery clock store params cat subst_pred
               in
               Lwt.return (value_truthy (eval_expr clock params row resolved)))
@@ -7468,6 +7605,10 @@ and stream_expr_project clock params store mode cat exprs child =
                      let e_subst = substitute_outer_in_plan_expr meta row e in
                      let* resolved =
                        Lwt.with_value query_stats_key s_opt
+                       @@ fun () ->
+                       (* #262: re-establish the txn mode for a correlated
+                          subquery in a projected expression (see stream_filter). *)
+                       Lwt.with_value txn_mode_key (Some mode)
                        @@ fun () -> pre_eval_subquery clock store params cat e_subst
                      in
                      Lwt.return (eval_expr clock params row resolved))
@@ -7504,6 +7645,7 @@ and stream_index_lookup
       clock
       params
       store
+      mode
       table_tree
       idx_tree
       col_type
@@ -7530,10 +7672,12 @@ and stream_index_lookup
     let prefix = Index_key.encode_value lookup_v in
     let plen = Bytes.length prefix in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-    let* tx = S.ro_begin store in
+    (* #262: read through the active txn so an index lookup sees rows the open
+       transaction has inserted/updated but not yet committed. *)
+    let* rh = rh_begin store mode in
     (* O(log n) native seek + lazy streaming of just the matching prefix range,
      instead of draining the entire index tree per lookup (#228). *)
-    let* cur = S.seek_ge tx idx_tree seek_key in
+    let* cur = rh_seek_ge rh idx_tree seek_key in
     let exhausted = ref false in
     let ended = ref false in
     let finish () =
@@ -7542,7 +7686,7 @@ and stream_index_lookup
       else (
         ended := true;
         S.seek_close cur;
-        S.ro_end tx)
+        rh_finish rh)
     in
     let stream =
       Lwt_stream.from (fun () ->
@@ -7565,7 +7709,7 @@ and stream_index_lookup
                      let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
                      let rowid = Rowid.decode rowid_bytes in
                      let table_key = Rowid.encode rowid in
-                     let%lwt vrow = S.get tx table_tree table_key in
+                     let%lwt vrow = rh_get rh table_tree table_key in
                      match vrow with
                      | None -> next ()
                      | Some vbytes ->
@@ -7590,14 +7734,16 @@ and stream_index_lookup
    second fetch.  A NULL or non-integer probe matches nothing, mirroring the
    old __pk Op_index_lookup path (which mapped a type-mismatched value to
    IK_null ⇒ empty), so behavior is unchanged. *)
-and stream_rowid_lookup clock params store lookup_val (table_meta : Cat.table_meta) =
+and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
   match v with
   | Row.V_int n ->
-    let* tx = S.ro_begin store in
-    let* vrow = S.get tx table_meta.Cat.tree_id (Rowid.encode n) in
-    let* () = S.ro_end tx in
+    (* #262: read through the active txn so a primary-key point lookup sees the
+       row when it was written earlier in the same open transaction. *)
+    let* rh = rh_begin store mode in
+    let* vrow = rh_get rh table_meta.Cat.tree_id (Rowid.encode n) in
+    let* () = rh_finish rh in
     (match vrow with
      | None -> Lwt.return (Lwt_stream.of_list [])
      | Some vbytes ->
@@ -7612,7 +7758,7 @@ and nlj_probe_left
       clock
       params
       s_opt
-      tx
+      rh
       (right_meta : Cat.table_meta)
       idx_tree
       left_col_idx
@@ -7635,7 +7781,7 @@ and nlj_probe_left
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     (* O(log n) native seek per probe — avoids draining the whole index per
        left row, which made indexed nested-loop joins O(n^2) (#228/#229). *)
-    let* cur = S.seek_ge tx idx_tree seek_key in
+    let* cur = rh_seek_ge rh idx_tree seek_key in
     let found = ref false in
     let rec scan () =
       match%lwt S.seek_next cur with
@@ -7646,7 +7792,7 @@ and nlj_probe_left
           let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
           let rowid = Rowid.decode rowid_bytes in
           let table_key = Rowid.encode rowid in
-          let* vrow = S.get tx right_meta.Cat.tree_id table_key in
+          let* vrow = rh_get rh right_meta.Cat.tree_id table_key in
           match vrow with
           | None -> scan ()
           | Some vbytes ->
@@ -7683,8 +7829,10 @@ and stream_nested_loop_join
   let s_opt = Lwt.get query_stats_key in
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* left_rows = Lwt_stream.to_list left_stream in
-  S.with_ro store
-  @@ fun tx ->
+  (* #262: probe the inner index through the active txn so the join sees inner
+     rows written earlier in the same open transaction. *)
+  with_read store mode
+  @@ fun rh ->
   let out = ref [] in
   let* () =
     Lwt_list.iter_s
@@ -7692,7 +7840,7 @@ and stream_nested_loop_join
          clock
          params
          s_opt
-         tx
+         rh
          right_meta
          idx_tree
          left_col_idx
@@ -8069,6 +8217,7 @@ and aggregate_fast_path
       clock
       params
       store
+      mode
       cat
       child
       group_cols
@@ -8093,13 +8242,13 @@ and aggregate_fast_path
   else (
     match child with
     | Plan.Op_seq_scan { table_meta } ->
-      run_aggregate_fast_path clock params store cat table_meta None aggs proj
+      run_aggregate_fast_path clock params store mode cat table_meta None aggs proj
     | Plan.Op_filter { pred; child = Plan.Op_seq_scan { table_meta } }
       when not (plan_expr_has_subquery pred) ->
-      run_aggregate_fast_path clock params store cat table_meta (Some pred) aggs proj
+      run_aggregate_fast_path clock params store mode cat table_meta (Some pred) aggs proj
     | _ -> Lwt.return None)
 
-and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj =
+and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs proj =
   match
     let accs = List.map make_agg_acc aggs in
     if List.exists Option.is_none accs
@@ -8136,8 +8285,10 @@ and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj
       then Row.decode_prefix table_meta.Cat.columns vbytes ~upto:max_col
       else decode_with_virtual clock params table_meta vbytes
     in
-    let* tx = S.ro_begin store in
-    let* cur = S.seek_ge tx table_meta.Cat.tree_id Bytes.empty in
+    (* #262: fold over the active txn when one is open, so a COUNT/SUM reflects
+       rows written earlier in the same uncommitted transaction. *)
+    let* rh = rh_begin store mode in
+    let* cur = rh_seek_ge rh table_meta.Cat.tree_id Bytes.empty in
     let ended = ref false in
     let finish () =
       if !ended
@@ -8145,7 +8296,7 @@ and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj
       else (
         ended := true;
         S.seek_close cur;
-        S.ro_end tx)
+        rh_finish rh)
     in
     let dummy = [||] in
     let s_opt = Lwt.get query_stats_key in
@@ -8204,6 +8355,7 @@ and stream_aggregate
       clock
       params
       store
+      mode
       cat
       child
       group_cols
@@ -8250,13 +8402,15 @@ and stream_aggregate
     in
     Lwt.return (Lwt_stream.of_list final_rows)
 
-and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where =
+and stream_fts_seq_scan clock params store mode (fts_meta : Cat.fts_table_meta) where =
   (* #257: captured at construction (inside [query]'s [with_value] scope), same
      pattern as the table scanners; every content row scanned counts as examined
      regardless of the WHERE filter. *)
   let s_opt = Lwt.get query_stats_key in
-  let* tx = S.ro_begin store in
-  let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
+  (* #262: scan the content tree through the active txn so an in-transaction
+     write to the FTS table is visible to the scan. *)
+  let* rh = rh_begin store mode in
+  let* cur = rh_cursor_open rh fts_meta.Cat.fts_content_tree in
   let _sr = S.cursor_first cur in
   let exhausted = ref false in
   let ended = ref false in
@@ -8266,7 +8420,7 @@ and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where
     else (
       ended := true;
       S.cursor_close cur;
-      S.ro_end tx)
+      rh_finish rh)
   in
   let rec read_next () =
     if !exhausted
@@ -8295,68 +8449,11 @@ and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where
          let%lwt () = finish () in
          Lwt.fail exn)))
 
-(* BM25-score FTS [matches] against [query] when rank is requested; otherwise
-   tag each with score 0.0.  Each term's own per-doc term-frequency is used. *)
-and fts_score_matches tx (fts_meta : Cat.fts_table_meta) query matches include_rank =
-  if not include_rank
-  then Lwt.return (List.map (fun (rowid, positions) -> rowid, positions, 0.0) matches)
-  else
-    let* total_docs, total_tokens = read_fts_stats tx fts_meta.Cat.fts_index_tree in
-    let query_terms = fts_query_terms query in
-    let* term_data =
-      Lwt_list.map_s
-        (fun term ->
-           let* pl = fts_posting_list tx ~index_tree:fts_meta.Cat.fts_index_tree term in
-           Lwt.return (List.length pl, pl))
-        query_terms
-    in
-    let* doc_lengths =
-      Lwt_list.map_s
-        (fun (rowid, positions) ->
-           let dlen_key = fts_doclen_key rowid in
-           let* v = S.get tx fts_meta.Cat.fts_index_tree dlen_key in
-           let dl =
-             match v with
-             | None -> 1
-             | Some b ->
-               let n, _ = Varint.decode_uint64 b 0 in
-               Int64.to_int n
-           in
-           Lwt.return (rowid, positions, dl))
-        matches
-    in
-    let scored =
-      List.map
-        (fun (rowid, positions, dl) ->
-           let score =
-             List.fold_left
-               (fun acc (n_docs, term_pl) ->
-                  let tf =
-                    match List.assoc_opt rowid term_pl with
-                    | None -> 0
-                    | Some pos -> List.length pos
-                  in
-                  acc
-                  +. bm25_score
-                       ~k1:1.2
-                       ~b:0.75
-                       ~total_docs
-                       ~total_tokens
-                       ~n_docs_with_term:n_docs
-                       ~term_freq:tf
-                       ~doc_length:dl)
-               0.0
-               term_data
-           in
-           rowid, positions, score)
-        doc_lengths
-    in
-    Lwt.return scored
-
 and stream_fts_match_scan
       _clock
       _params
       store
+      mode
       (fts_meta : Cat.fts_table_meta)
       query
       proj
@@ -8368,55 +8465,64 @@ and stream_fts_match_scan
      increment sits on the match, ahead of the content [S.get], so a match whose
      content row is absent still counts: the seek happened regardless. *)
   let s_opt = Lwt.get query_stats_key in
-  S.with_ro store
-  @@ fun tx ->
-  let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
-  let* scored_matches = fts_score_matches tx fts_meta query matches include_rank in
-  let sorted =
-    if include_rank
-    then List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
-    else scored_matches
-  in
-  let snippet_terms = fts_query_terms_with_kind query in
-  let* rows =
-    Lwt_list.filter_map_s
-      (fun (rowid, _positions, score) ->
-         incr_examined s_opt;
-         let key = Rowid.encode rowid in
-         let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
-         match val_opt with
-         | None -> Lwt.return None
-         | Some bytes ->
-           let texts = fts_decode_content bytes in
-           let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
-           let projected =
-             if proj = [] && snippets = []
-             then Array.to_list full_row
-             else List.map (fun i -> full_row.(i)) proj
-           in
-           let snippet_vals =
-             List.map
-               (fun (spec : Plan.snippet_spec) ->
-                  let col_text =
-                    let idx =
-                      if spec.Plan.col_idx < 0
-                      then 0
-                      else min spec.Plan.col_idx (max 0 (List.length texts - 1))
+  (* #262: run the index query and content fetches through the active txn (when
+     one is open) so an in-transaction write to the FTS table is matched and
+     returned.  The body delegates the raw txn to the FTS helpers, so it is made
+     polymorphic over the txn kind rather than using a [read_handle]. *)
+  let body : type a. a S.txn -> Row.t Lwt_stream.t Lwt.t =
+    fun tx ->
+    let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
+    let* scored_matches = fts_score_matches tx fts_meta query matches include_rank in
+    let sorted =
+      if include_rank
+      then List.sort (fun (_, _, s1) (_, _, s2) -> Float.compare s2 s1) scored_matches
+      else scored_matches
+    in
+    let snippet_terms = fts_query_terms_with_kind query in
+    let* rows =
+      Lwt_list.filter_map_s
+        (fun (rowid, _positions, score) ->
+           incr_examined s_opt;
+           let key = Rowid.encode rowid in
+           let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
+           match val_opt with
+           | None -> Lwt.return None
+           | Some bytes ->
+             let texts = fts_decode_content bytes in
+             let full_row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
+             let projected =
+               if proj = [] && snippets = []
+               then Array.to_list full_row
+               else List.map (fun i -> full_row.(i)) proj
+             in
+             let snippet_vals =
+               List.map
+                 (fun (spec : Plan.snippet_spec) ->
+                    let col_text =
+                      let idx =
+                        if spec.Plan.col_idx < 0
+                        then 0
+                        else min spec.Plan.col_idx (max 0 (List.length texts - 1))
+                      in
+                      if texts = [] then "" else List.nth texts idx
                     in
-                    if texts = [] then "" else List.nth texts idx
-                  in
-                  Row.V_text (compute_snippet ~col_text ~query_terms:snippet_terms ~spec))
-               snippets
-           in
-           let row_values =
-             projected
-             @ (if include_rank then [ Row.V_real score ] else [])
-             @ snippet_vals
-           in
-           Lwt.return (Some (Array.of_list row_values)))
-      sorted
+                    Row.V_text
+                      (compute_snippet ~col_text ~query_terms:snippet_terms ~spec))
+                 snippets
+             in
+             let row_values =
+               projected
+               @ (if include_rank then [ Row.V_real score ] else [])
+               @ snippet_vals
+             in
+             Lwt.return (Some (Array.of_list row_values)))
+        sorted
+    in
+    Lwt.return (Lwt_stream.of_list rows)
   in
-  Lwt.return (Lwt_stream.of_list rows)
+  match mode with
+  | In_txn tx -> body tx
+  | Auto -> S.with_ro store body
 
 and stream_pragma_integrity_check store cat =
   let cat_val =
@@ -8906,7 +9012,7 @@ and to_stream
   : Row.t Lwt_stream.t Lwt.t
   =
   match op with
-  | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store table_meta
+  | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
@@ -8938,13 +9044,14 @@ and to_stream
       clock
       params
       store
+      mode
       table_tree
       idx_tree
       col_type
       lookup_val
       table_meta
   | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
-    stream_rowid_lookup clock params store lookup_val table_meta
+    stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
       { left
       ; right_meta
@@ -8996,9 +9103,18 @@ and to_stream
       proj
       agg_windows
   | Plan.Op_fts_seq_scan { fts_meta; where } ->
-    stream_fts_seq_scan clock params store fts_meta where
+    stream_fts_seq_scan clock params store mode fts_meta where
   | Plan.Op_fts_match_scan { fts_meta; query; proj; include_rank; snippets } ->
-    stream_fts_match_scan clock params store fts_meta query proj include_rank snippets
+    stream_fts_match_scan
+      clock
+      params
+      store
+      mode
+      fts_meta
+      query
+      proj
+      include_rank
+      snippets
   | Plan.Op_pragma_rows { rows } -> Lwt.return (Lwt_stream.of_list rows)
   | Plan.Op_pragma_get_user_version ->
     S.with_ro store
@@ -9189,22 +9305,31 @@ let query
       (op : Plan.op)
   : Row.t Lwt_stream.t Lwt.t
   =
-  match stats with
-  | None -> to_stream clock params store ~mode ~cat:(Some cat) op
-  | Some s ->
-    s.used_index <- op_uses_index op;
-    (* Run the whole stream construction under the stats record so the base
-       scanners capture it (Lwt sequence-associated storage); wrap the result
-       to count rows actually delivered once the caller drains it. *)
-    Lwt.with_value query_stats_key (Some s)
-    @@ fun () ->
-    let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
-    Lwt.return
-      (Lwt_stream.map
-         (fun row ->
-            s.rows_returned <- s.rows_returned + 1;
-            row)
-         stream)
+  let body () =
+    match stats with
+    | None -> to_stream clock params store ~mode ~cat:(Some cat) op
+    | Some s ->
+      s.used_index <- op_uses_index op;
+      (* Run the whole stream construction under the stats record so the base
+         scanners capture it (Lwt sequence-associated storage); wrap the result
+         to count rows actually delivered once the caller drains it. *)
+      Lwt.with_value query_stats_key (Some s)
+      @@ fun () ->
+      let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+      Lwt.return
+        (Lwt_stream.map
+           (fun row ->
+              s.rows_returned <- s.rows_returned + 1;
+              row)
+           stream)
+  in
+  (* #262: publish the txn mode to subquery evaluation only when inside an
+     explicit transaction.  In [Auto] mode [current_txn_mode] already defaults to
+     [Auto], so the common read path pays no [with_value] — preserving the
+     zero-overhead scan path (#259). *)
+  match mode with
+  | Auto -> body ()
+  | In_txn _ -> Lwt.with_value txn_mode_key (Some mode) body
 ;;
 
 [@@@ai_disclosure "ai-generated"]
