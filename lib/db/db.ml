@@ -1441,7 +1441,14 @@ let execute_change_count top sql =
      | None -> execute_dml_op_count t op)
 ;;
 
-let query top sql =
+(* #259: single source of truth for the control-op dispatch shared by [query]
+   and [query_with_stats].  The canned control ops (changes / last_insert_rowid
+   / database_list / ...) do no scan; only the real-op branch touches [stats],
+   forwarding it to [Sql.Exec.query].  When [stats] is omitted the call is
+   [Sql.Exec.query] with no [~stats] — byte-for-byte the pre-#239 read path
+   (no [with_value], no [Lwt_stream.map] wrapper), so existing callers pay
+   nothing. *)
+let query_impl ?stats top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
@@ -1484,68 +1491,24 @@ let query top sql =
       | None -> Sql.Exec.Auto
       | Some tx -> Sql.Exec.In_txn tx
     in
-    (match Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op with
+    (match Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
      | lwt_stream ->
        let* stream = lwt_stream in
        Lwt.return (Ok stream))
 ;;
 
+let query top sql = query_impl top sql
+
 (* #239: [query] plus a per-query cost/stats record for an external cost-based
-   cache.  Identical to [query] on the real read path but populates [stats] as
-   the stream drains; the canned control ops (changes / last_insert_rowid /
-   database_list / ...) do no scan, so they return a zeroed record. *)
+   cache.  Populates [stats] as the stream drains; the canned control ops do no
+   scan, so they leave the freshly-zeroed record untouched. *)
 let query_with_stats top sql =
-  let op_promise, t = compile_routed top sql in
-  let* op = op_promise in
-  let zeroed s = Ok (s, Sql.Exec.make_query_stats ()) in
-  match op with
+  let stats = Sql.Exec.make_query_stats () in
+  let* r = query_impl ~stats top sql in
+  match r with
   | Error e -> Lwt.return (Error e)
-  | Ok Sql.Plan.Op_changes ->
-    Lwt.return
-      (zeroed (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int t.last_changes) |] ]))
-  | Ok Sql.Plan.Op_last_insert_rowid ->
-    Lwt.return (zeroed (Lwt_stream.of_list [ [| Row.V_int t.last_insert_rowid |] ]))
-  | Ok Sql.Plan.Op_total_changes ->
-    Lwt.return
-      (zeroed (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int t.total_changes) |] ]))
-  | Ok Sql.Plan.Op_database_list ->
-    let path_str p = Option.value p ~default:"" in
-    let main_row =
-      [| Row.V_int 0L; Row.V_text "main"; Row.V_text (path_str top.file_path) |]
-    in
-    let _, rev_extra =
-      Hashtbl.fold
-        (fun name sub (i, acc) ->
-           let row =
-             [| Row.V_int (Int64.of_int i)
-              ; Row.V_text name
-              ; Row.V_text (path_str sub.file_path)
-             |]
-           in
-           i + 1, row :: acc)
-        top.attached
-        (1, [])
-    in
-    Lwt.return (zeroed (Lwt_stream.of_list (main_row :: List.rev rev_extra)))
-  | Ok Sql.Plan.Op_active_database_get ->
-    Lwt.return (zeroed (Lwt_stream.of_list [ [| Row.V_text top.active_schema |] ]))
-  | Ok (Sql.Plan.Op_attach _ | Sql.Plan.Op_detach _ | Sql.Plan.Op_active_database_set _)
-    ->
-    Lwt.return
-      (Error (Runtime "ATTACH/DETACH/active_database = ... is a write op; use Db.execute"))
-  | Ok op ->
-    let mode =
-      match t.explicit_txn with
-      | None -> Sql.Exec.Auto
-      | Some tx -> Sql.Exec.In_txn tx
-    in
-    let stats = Sql.Exec.make_query_stats () in
-    (match Sql.Exec.query ~mode ~clock:t.clock ~stats t.store t.catalog op with
-     | exception Failure msg -> Lwt.return (Error (Runtime msg))
-     | lwt_stream ->
-       let* stream = lwt_stream in
-       Lwt.return (Ok (stream, stats)))
+  | Ok stream -> Lwt.return (Ok (stream, stats))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1660,7 +1623,9 @@ let run st ~params =
         | exn -> Lwt.fail exn))
 ;;
 
-let iter st ~params =
+(* #259: shared body for [iter] / [iter_with_stats].  As with [query_impl],
+   omitting [stats] yields the unchanged zero-overhead read path. *)
+let iter_impl ?stats st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
   else (
@@ -1669,7 +1634,13 @@ let iter st ~params =
     Lwt.catch
       (fun () ->
          let* stream =
-           Sql.Exec.query ~clock:t.clock ~params:params_arr t.store t.catalog st.plan
+           Sql.Exec.query
+             ~clock:t.clock
+             ~params:params_arr
+             ?stats
+             t.store
+             t.catalog
+             st.plan
          in
          Lwt.return (Ok stream))
       (function
@@ -1677,30 +1648,16 @@ let iter st ~params =
         | exn -> Lwt.fail exn))
 ;;
 
+let iter st ~params = iter_impl st ~params
+
 (* #239: [iter] plus a per-query cost/stats record populated as the stream
    drains, for an external cost-based cache. *)
 let iter_with_stats st ~params =
-  if st.finalized
-  then Lwt.return (Error (Runtime "statement already finalized"))
-  else (
-    let params_arr = Array.of_list params in
-    let t = st.db_ref in
-    let stats = Sql.Exec.make_query_stats () in
-    Lwt.catch
-      (fun () ->
-         let* stream =
-           Sql.Exec.query
-             ~clock:t.clock
-             ~params:params_arr
-             ~stats
-             t.store
-             t.catalog
-             st.plan
-         in
-         Lwt.return (Ok (stream, stats)))
-      (function
-        | Failure msg -> Lwt.return (Error (Runtime msg))
-        | exn -> Lwt.fail exn))
+  let stats = Sql.Exec.make_query_stats () in
+  let* r = iter_impl ~stats st ~params in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok stream -> Lwt.return (Ok (stream, stats))
 ;;
 
 let finalize st =
