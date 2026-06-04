@@ -69,7 +69,8 @@ type t =
        indices, so a stale (idx -> bytes) entry from the previous generation
        would otherwise be served for a different page. *)
     frame_cache_fifo : int Queue.t (* insertion order for bounded FIFO eviction *)
-  ; frame_cache_capacity : int (* max cached frames; 0 disables.  See [default_frame_cache_capacity]. *)
+  ; frame_cache_capacity : int
+    (* max cached frames; 0 disables.  See [default_frame_cache_capacity]. *)
   }
 
 (* #246: default bound on the decrypted-frame cache.  One full WAL generation's
