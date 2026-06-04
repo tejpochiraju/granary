@@ -92,6 +92,30 @@ let query_int db sql =
 
 let check name expected got = Alcotest.(check int) name expected got
 
+(* Open a lazy [iter] stream for [sql], pull [k] rows, run [between] (typically a
+   write or COMMIT), then drain the rest; return the total rows delivered.  Used
+   to pin the borrowed-txn cursor's snapshot-stability (#262). *)
+let iter_interleave db sql ~k ~between =
+  run
+    (let* sr = Db.prepare db sql in
+     let st = unwrap sr in
+     let* r = Db.iter st ~params:[] in
+     let stream = unwrap r in
+     let rec pull n =
+       if n >= k
+       then Lwt.return n
+       else
+         let* row = Lwt_stream.get stream in
+         match row with
+         | None -> Lwt.return n
+         | Some _ -> pull (n + 1)
+     in
+     let* before = pull 0 in
+     between ();
+     let* rest = Lwt_stream.to_list stream in
+     Lwt.return (before + List.length rest))
+;;
+
 (* Both read paths see rows inserted earlier in the same open transaction. *)
 let test_ryw_seq_scan () =
   with_db (fun db ->
@@ -256,6 +280,51 @@ let test_ryw_file_backend () =
     check "file post-commit" 2 (query_count db "SELECT id FROM t"))
 ;;
 
+(* Borrowed-txn cursor is snapshot-stable: a write to the same table BETWEEN two
+   pulls of a live in-txn stream is NOT observed by the in-flight scan (the
+   cursor snapshots the tree as of open — store cursor contract), and nothing
+   raises.  Pins both reviewer-raised edges (mid-scan mutation / Halloween).
+   Runs on both backends; the file backend also churns multiple B-tree pages so
+   CoW + freelist reuse during the open cursor can't corrupt it. *)
+let midscan_stable seed db =
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+  for i = 1 to seed do
+    exec db (Printf.sprintf "INSERT INTO t VALUES (%d, %d)" i (i * 7))
+  done;
+  exec db "BEGIN";
+  let total =
+    iter_interleave db "SELECT id FROM t" ~k:(min 2 seed) ~between:(fun () ->
+      exec db (Printf.sprintf "INSERT INTO t VALUES (%d, 0)" (seed + 1));
+      exec db "DELETE FROM t WHERE id = 1")
+  in
+  check "mid-scan write not seen by live scan" seed total;
+  exec db "COMMIT";
+  (* the writes did land — visible to a fresh scan after the stream closed *)
+  check "post-interleave fresh scan" seed (query_count db "SELECT id FROM t")
+;;
+
+let test_midscan_stable_mem () = with_db (midscan_stable 5)
+let test_midscan_stable_file () = with_file_db (midscan_stable 800)
+
+(* A stream opened inside a txn keeps delivering its snapshot rows after the txn
+   COMMITs mid-drain — the borrowed handle is never ended by the scanner, and the
+   cursor's snapshot stays valid.  No use-after-free, no row loss. *)
+let drain_after_commit db =
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)";
+  for i = 1 to 5 do
+    exec db (Printf.sprintf "INSERT INTO t VALUES (%d, %d)" i (i * 7))
+  done;
+  exec db "BEGIN";
+  exec db "INSERT INTO t VALUES (6, 60)";
+  let total =
+    iter_interleave db "SELECT id FROM t" ~k:2 ~between:(fun () -> exec db "COMMIT")
+  in
+  check "stream drains 6 rows across COMMIT" 6 total
+;;
+
+let test_drain_after_commit_mem () = with_db drain_after_commit
+let test_drain_after_commit_file () = with_file_db drain_after_commit
+
 (* ROLLBACK still discards in-txn writes — the read after rollback sees the
    pre-BEGIN committed state, confirming the fix did not leak writes. *)
 let test_rollback_discards () =
@@ -285,6 +354,13 @@ let () =
         ; Alcotest.test_case "IN-subquery" `Quick test_ryw_in_subquery
         ; Alcotest.test_case "correlated EXISTS" `Quick test_ryw_correlated_exists
         ; Alcotest.test_case "file backend" `Quick test_ryw_file_backend
+        ; Alcotest.test_case "mid-scan stable (mem)" `Quick test_midscan_stable_mem
+        ; Alcotest.test_case "mid-scan stable (file)" `Quick test_midscan_stable_file
+        ; Alcotest.test_case "drain after commit (mem)" `Quick test_drain_after_commit_mem
+        ; Alcotest.test_case
+            "drain after commit (file)"
+            `Quick
+            test_drain_after_commit_file
         ; Alcotest.test_case "rollback discards" `Quick test_rollback_discards
         ] )
     ]

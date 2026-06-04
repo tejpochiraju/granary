@@ -5327,6 +5327,17 @@ let current_txn_mode () =
   | None -> Auto
 ;;
 
+(* #262: re-establish BOTH per-query Lwt-storage contexts (the stats record and
+   the txn mode) for work that runs at pull time — outside [query]'s
+   construction-time [with_value] scope — currently the correlated-subquery
+   re-eval in [stream_filter] / [stream_expr_project].  Bundling the pair here
+   keeps them in lock-step: a future pull-time site cannot restore one and
+   silently drop the other (the exact omission #262 corrected for the mode). *)
+let with_pull_context ~stats ~mode f =
+  Lwt.with_value query_stats_key stats
+  @@ fun () -> Lwt.with_value txn_mode_key (Some mode) f
+;;
+
 (* Increment via the closure-captured option; never calls [Lwt.get] at pull time
    (the consumer drains outside the [with_value] scope).  [None] for the common
    no-stats query is a single predicted branch with no per-row cost. *)
@@ -7566,12 +7577,8 @@ and stream_filter clock params store mode cat pred child =
            (fun row ->
               let subst_pred = substitute_outer_in_plan_expr meta row pred' in
               let* resolved =
-                Lwt.with_value query_stats_key s_opt
-                @@ fun () ->
-                (* #262: also re-establish the txn mode so a correlated subquery
-                   evaluated at pull time reads under the active transaction. *)
-                Lwt.with_value txn_mode_key (Some mode)
-                @@ fun () -> pre_eval_subquery clock store params cat subst_pred
+                with_pull_context ~stats:s_opt ~mode (fun () ->
+                  pre_eval_subquery clock store params cat subst_pred)
               in
               Lwt.return (value_truthy (eval_expr clock params row resolved)))
            child_stream))
@@ -7604,12 +7611,8 @@ and stream_expr_project clock params store mode cat exprs child =
                   (fun e ->
                      let e_subst = substitute_outer_in_plan_expr meta row e in
                      let* resolved =
-                       Lwt.with_value query_stats_key s_opt
-                       @@ fun () ->
-                       (* #262: re-establish the txn mode for a correlated
-                          subquery in a projected expression (see stream_filter). *)
-                       Lwt.with_value txn_mode_key (Some mode)
-                       @@ fun () -> pre_eval_subquery clock store params cat e_subst
+                       with_pull_context ~stats:s_opt ~mode (fun () ->
+                         pre_eval_subquery clock store params cat e_subst)
                      in
                      Lwt.return (eval_expr clock params row resolved))
                   exprs'
