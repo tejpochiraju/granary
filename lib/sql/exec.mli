@@ -113,9 +113,10 @@ val execute_with_count
     Mutable counters updated as the stream is consumed: pass a fresh record to
     {!query} via [?stats], drain the stream, then read the fields.  Mirage-pure
     (no clock/Unix dependency).  [rows_examined] covers seq scans, index/rowid
-    lookups (incl. nested-loop-join right-side probes), the count fast path, and
-    both inputs of a hash join; FTS internal seeks and rows read inside scalar/
-    correlated subqueries are not yet counted (#257). *)
+    lookups (incl. nested-loop-join right-side probes), the count fast path,
+    both inputs of a hash join, FTS scans (content rows in a plain scan, matched
+    index rows in a MATCH query), and rows read inside scalar/correlated
+    subqueries (#257). *)
 type query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int

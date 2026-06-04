@@ -33,7 +33,8 @@
   test_read_alloc
   test_get_alloc
   test_rowid_alias
-  test_query_stats_239)
+  test_query_stats_239
+  test_query_stats_257)
  (libraries
   alcotest
   qcheck-alcotest

@@ -7410,6 +7410,11 @@ and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
   Lwt.return stream
 
 and stream_filter clock params store mode cat pred child =
+  (* #257: a correlated subquery in the predicate is re-evaluated per row at
+     pull time — outside [query]'s [with_value] scope — so capture the active
+     stats here and re-establish the scope around the inner evaluation, letting
+     the subquery's leaf scanners attribute their reads to this query. *)
+  let s_opt = Lwt.get query_stats_key in
   let* child_stream = to_stream clock params store ~mode ~cat child in
   let* pred' = pre_eval_subquery clock store params cat pred in
   if not (plan_expr_has_subquery pred')
@@ -7427,11 +7432,17 @@ and stream_filter clock params store mode cat pred child =
         (Lwt_stream.filter_s
            (fun row ->
               let subst_pred = substitute_outer_in_plan_expr meta row pred' in
-              let* resolved = pre_eval_subquery clock store params cat subst_pred in
+              let* resolved =
+                Lwt.with_value query_stats_key s_opt
+                @@ fun () -> pre_eval_subquery clock store params cat subst_pred
+              in
               Lwt.return (value_truthy (eval_expr clock params row resolved)))
            child_stream))
 
 and stream_expr_project clock params store mode cat exprs child =
+  (* #257: as in [stream_filter], re-establish the stats scope around per-row
+     correlated-subquery evaluation in a projected expression. *)
+  let s_opt = Lwt.get query_stats_key in
   let* inner = to_stream clock params store ~mode ~cat child in
   let* exprs' =
     Lwt_list.map_s (fun (e, _alias) -> pre_eval_subquery clock store params cat e) exprs
@@ -7455,7 +7466,10 @@ and stream_expr_project clock params store mode cat exprs child =
                 Lwt_list.map_s
                   (fun e ->
                      let e_subst = substitute_outer_in_plan_expr meta row e in
-                     let* resolved = pre_eval_subquery clock store params cat e_subst in
+                     let* resolved =
+                       Lwt.with_value query_stats_key s_opt
+                       @@ fun () -> pre_eval_subquery clock store params cat e_subst
+                     in
                      Lwt.return (eval_expr clock params row resolved))
                   exprs'
               in
@@ -8237,6 +8251,10 @@ and stream_aggregate
     Lwt.return (Lwt_stream.of_list final_rows)
 
 and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where =
+  (* #257: captured at construction (inside [query]'s [with_value] scope), same
+     pattern as the table scanners; every content row scanned counts as examined
+     regardless of the WHERE filter. *)
+  let s_opt = Lwt.get query_stats_key in
   let* tx = S.ro_begin store in
   let* cur = S.cursor_open tx fts_meta.Cat.fts_content_tree in
   let _sr = S.cursor_first cur in
@@ -8260,6 +8278,7 @@ and stream_fts_seq_scan clock params store (fts_meta : Cat.fts_table_meta) where
         let%lwt () = finish () in
         Lwt.return_none
       | Some (_key, val_bytes) ->
+        incr_examined s_opt;
         let texts = fts_decode_content val_bytes in
         let row = Array.of_list (List.map (fun s -> Row.V_text s) texts) in
         let emit =
@@ -8344,6 +8363,11 @@ and stream_fts_match_scan
       include_rank
       snippets
   =
+  (* #257: each matched FTS index row counts as one examined row — the index
+     seek (and the content fetch it drives) is the work this scan does.  The
+     increment sits on the match, ahead of the content [S.get], so a match whose
+     content row is absent still counts: the seek happened regardless. *)
+  let s_opt = Lwt.get query_stats_key in
   S.with_ro store
   @@ fun tx ->
   let* matches = fts_execute_query tx ~index_tree:fts_meta.Cat.fts_index_tree query in
@@ -8357,6 +8381,7 @@ and stream_fts_match_scan
   let* rows =
     Lwt_list.filter_map_s
       (fun (rowid, _positions, score) ->
+         incr_examined s_opt;
          let key = Rowid.encode rowid in
          let* val_opt = S.get tx fts_meta.Cat.fts_content_tree key in
          match val_opt with
