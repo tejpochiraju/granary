@@ -250,6 +250,63 @@ let test_frame_cache_reset_invalidates _ () =
   Lwt.return_unit
 ;;
 
+(* #246: the bounded FIFO must evict the OLDEST-inserted frame once full, so an
+   evicted frame re-decrypts on its next read while a still-resident one does
+   not.  Open with a tiny capacity (2), fill three distinct frames (idx 0 is
+   evicted when idx 2 is inserted), then probe: the newest stays cached (0 extra
+   decrypts), the evicted oldest re-decrypts (+1).  Locks the dual-structure
+   eviction loop against silent regression. *)
+let test_frame_cache_eviction _ () =
+  let read_at, write_at, sync, size = make_dev () in
+  let* w =
+    let* r =
+      Wal.open_
+        ~cipher:(Some (cipher ()))
+        ~frame_cache_capacity:2
+        ~read_at
+        ~write_at
+        ~sync
+        ~size_bytes:(size ())
+        ()
+    in
+    match r with
+    | Ok w -> Lwt.return w
+    | Error _ -> Alcotest.fail "open"
+  in
+  let pages = [| mk_page 30; mk_page 31; mk_page 32 |] in
+  let* () =
+    Lwt_list.iteri_s
+      (fun i p ->
+         let* r = Wal.append_commit w [ Int64.of_int (10 + i), p ] in
+         match r with
+         | Ok () -> Lwt.return_unit
+         | Error _ -> Alcotest.fail "append")
+      (Array.to_list pages)
+  in
+  let read idx =
+    let* r = Wal.read_frame w idx in
+    match r with
+    | Ok pg -> Lwt.return pg
+    | Error _ -> Alcotest.fail "read"
+  in
+  (* Fill: read 0,1,2 with cap 2 -> cache holds {1,2}, idx 0 evicted. *)
+  let* _ = read 0 in
+  let* _ = read 1 in
+  let* _ = read 2 in
+  (* Newest (idx 2) is still cached: 0 extra decrypts, correct bytes. *)
+  let b0 = C.decrypt_frame_count () in
+  let* g2 = read 2 in
+  let b1 = C.decrypt_frame_count () in
+  Alcotest.(check int) "resident newest frame: no re-decrypt" 0 (b1 - b0);
+  Alcotest.(check bool) "resident frame bytes correct" true (Cstruct.equal pages.(2) g2);
+  (* Evicted oldest (idx 0) re-decrypts and still returns the right page. *)
+  let* g0 = read 0 in
+  let b2 = C.decrypt_frame_count () in
+  Alcotest.(check int) "evicted oldest frame: re-decrypts once" 1 (b2 - b1);
+  Alcotest.(check bool) "evicted frame bytes correct" true (Cstruct.equal pages.(0) g0);
+  Lwt.return_unit
+;;
+
 let () =
   seed ();
   Lwt_main.run
@@ -271,6 +328,10 @@ let () =
                "frame cache: reset invalidates (#246)"
                `Quick
                test_frame_cache_reset_invalidates
+           ; Alcotest_lwt.test_case
+               "frame cache: FIFO eviction (#246)"
+               `Quick
+               test_frame_cache_eviction
            ] )
        ])
 ;;

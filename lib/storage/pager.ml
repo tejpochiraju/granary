@@ -281,8 +281,16 @@ let read ?snapshot_frames ?pin_set t page_id =
 (* ---------------------------------------------------------------------- *)
 
 (* Like [resolve_wal_page] but hands back the frame buffer WITHOUT a defensive
-   copy.  Safe because [Wal.read_frame] allocates a fresh, unshared buffer per
-   call (wal.ml), so the borrowed view aliases nothing the WAL retains. *)
+   copy.  Memory-safe under the borrow contract: the page is decoded-and-
+   discarded inside the callback and never mutated or retained.  NOTE (#246):
+   on a cache hit [Wal.read_frame] now returns a buffer the WAL RETAINS in its
+   decrypted-frame cache, shared across readers — so this no longer rests on the
+   old "fresh, unshared buffer per call" property.  It is sound because that
+   cached buffer is immutable for the life of the WAL generation (frames are
+   append-only; the cache is dropped wholesale on [Wal.reset], never mutated in
+   place), exactly like the main page cache's borrow invariant above.  A future
+   in-place mutation of a [Wal.read_frame] result would corrupt the cache and
+   every concurrent borrower — see [Wal.read_frame]'s contract. *)
 let resolve_wal_page_borrow t finder =
   let open Lwt.Syntax in
   match t.wal with

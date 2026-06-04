@@ -69,14 +69,17 @@ type t =
        indices, so a stale (idx -> bytes) entry from the previous generation
        would otherwise be served for a different page. *)
     frame_cache_fifo : int Queue.t (* insertion order for bounded FIFO eviction *)
+  ; frame_cache_capacity : int (* max cached frames; 0 disables.  See [default_frame_cache_capacity]. *)
   }
 
-(* #246: bound on the decrypted-frame cache.  Defaults to one full WAL
-   generation's worth of frames (the default auto-checkpoint threshold is
-   1000), so a hot working set that fits the un-checkpointed window never
-   re-decrypts; configurable down for memory-tight unikernels (0 disables the
-   cache entirely, restoring decrypt-on-every-read). *)
-let frame_cache_capacity =
+(* #246: default bound on the decrypted-frame cache.  One full WAL generation's
+   worth of frames (the default auto-checkpoint threshold is 1000), so a hot
+   working set that fits the un-checkpointed window never re-decrypts.
+   Configurable down via [SQLOCAML_WAL_FRAME_CACHE] for memory-tight unikernels
+   (0 disables the cache entirely, restoring decrypt-on-every-read).  This is
+   per-WAL RAM (~4 KB/frame plaintext) and stacks ON TOP of the pager's main
+   page cache — size both together when budgeting a unikernel. *)
+let default_frame_cache_capacity =
   match Sys.getenv_opt "SQLOCAML_WAL_FRAME_CACHE" with
   | Some s ->
     (match int_of_string_opt s with
@@ -320,6 +323,7 @@ let recover_index t =
 let open_
       ?(cipher = None)
       ?(page_size = Geometry.default.page_size)
+      ?(frame_cache_capacity = default_frame_cache_capacity)
       ~read_at
       ~write_at
       ~sync
@@ -356,6 +360,7 @@ let open_
         ; index = Hashtbl.create 64
         ; frame_cache = Hashtbl.create 64
         ; frame_cache_fifo = Queue.create ()
+        ; frame_cache_capacity
         }
   else
     let* hr = read_header ~read_at in
@@ -384,6 +389,7 @@ let open_
            ; index = Hashtbl.create 64
            ; frame_cache = Hashtbl.create 64
            ; frame_cache_fifo = Queue.create ()
+           ; frame_cache_capacity
            })
     | Ok (Some (salt, seed)) ->
       let t =
@@ -403,6 +409,7 @@ let open_
         ; index = Hashtbl.create 64
         ; frame_cache = Hashtbl.create 64
         ; frame_cache_fifo = Queue.create ()
+        ; frame_cache_capacity
         }
       in
       let* r = recover_index t in
@@ -421,10 +428,10 @@ let open_
    pager's borrow contract), so sharing it across repeated reads is sound — the
    same immutability invariant the main page cache relies on. *)
 let cache_frame t idx page =
-  if frame_cache_capacity > 0 && not (Hashtbl.mem t.frame_cache idx)
+  if t.frame_cache_capacity > 0 && not (Hashtbl.mem t.frame_cache idx)
   then (
     while
-      Hashtbl.length t.frame_cache >= frame_cache_capacity
+      Hashtbl.length t.frame_cache >= t.frame_cache_capacity
       && not (Queue.is_empty t.frame_cache_fifo)
     do
       Hashtbl.remove t.frame_cache (Queue.pop t.frame_cache_fifo)
