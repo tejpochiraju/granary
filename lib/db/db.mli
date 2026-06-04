@@ -20,6 +20,19 @@ type error =
   | Sema of Sqlocaml_sql.Sema.error (** name/type error *)
   | Runtime of string (** unexpected internal error *)
 
+(** #239: per-query cost/stats signal for an external cost-based cache,
+    re-exported from {!Sqlocaml_sql.Exec.query_stats}.  [rows_examined] is the
+    rows pulled from a base table/index scan (the work signal — a full scan
+    behind a selective filter reads [rows_examined = N] returning one row);
+    [rows_returned] is the result size once the stream is drained; [used_index]
+    is the plan-time fact that the base access is an index/rowid/FTS seek rather
+    than a full scan.  See {!query_with_stats} / {!iter_with_stats}. *)
+type query_stats = Sqlocaml_sql.Exec.query_stats =
+  { mutable rows_examined : int
+  ; mutable rows_returned : int
+  ; mutable used_index : bool
+  }
+
 (** Open a fresh in-memory database.  [clock] is an optional Unix-timestamp
     provider used by SQL date/time functions when invoked with the literal
     ['now'].  Omit for MirageOS-friendly cores that have no Unix dependency. *)
@@ -119,6 +132,13 @@ val execute_change_count : t -> string -> (int, error) result Lwt.t
     The stream is lazy — rows are produced on demand. *)
 val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
 
+(** #239: like {!query}, but also returns a per-query cost/stats record
+    ([rows_examined], [rows_returned], [used_index]) for an external cost-based
+    cache.  The record's counters are populated as the returned stream is
+    consumed — read them once it is fully drained.  See
+    {!Sqlocaml_sql.Exec.query_stats}. *)
+val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
+
 (** Format an [error] value for human-readable output. *)
 val pp_error : Format.formatter -> error -> unit
 
@@ -137,6 +157,13 @@ val run : stmt -> params:value list -> (int, error) result Lwt.t
 (** Execute a read statement (SELECT) with the given positional
     parameter values.  Returns a stream of result rows. *)
 val iter : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
+
+(** #239: like {!iter}, but also returns a per-query cost/stats record populated
+    as the returned stream is consumed.  See {!Sqlocaml_sql.Exec.query_stats}. *)
+val iter_with_stats
+  :  stmt
+  -> params:value list
+  -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
 (** Release resources held by a prepared statement.  No-op in this
     implementation, but should be called for forward compatibility. *)

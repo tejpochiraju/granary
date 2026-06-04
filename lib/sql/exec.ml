@@ -5242,6 +5242,39 @@ let explain_plan op =
   walk (-1) op
 ;;
 
+(* #239: per-query cost/stats signal for an external cost-based cache.
+   [rows_examined] counts rows the executor pulled from a base table/index scan
+   (the true work signal: a query that scans a million rows to return one reads
+   examined=1_000_000, returned=1); [rows_returned] is the size of the result
+   stream once drained; [used_index] is the plan-time fact that the base access
+   is an index/rowid seek rather than a full scan.  Mirage-pure — plain counters
+   the executor already has, no clock/Unix dependency. *)
+type query_stats =
+  { mutable rows_examined : int
+  ; mutable rows_returned : int
+  ; mutable used_index : bool
+  }
+
+let make_query_stats () = { rows_examined = 0; rows_returned = 0; used_index = false }
+
+(* The active query's stats record, propagated to the base scanners via Lwt
+   sequence-associated storage rather than threaded through the ~50 mutually
+   recursive [to_stream] helpers.  A leaf scanner reads it ONCE at stream
+   construction (which runs inside [query]'s [with_value] scope, carried across
+   binds), captures the result in its row-producing closure, and increments per
+   row pulled — correct regardless of when the lazy stream is later drained, and
+   safe across interleaved fibres because each query has its own record. *)
+let query_stats_key : query_stats Lwt.key = Lwt.new_key ()
+
+(* Increment via the closure-captured option; never calls [Lwt.get] at pull time
+   (the consumer drains outside the [with_value] scope).  [None] for the common
+   no-stats query is a single predicted branch with no per-row cost. *)
+let incr_examined (s_opt : query_stats option) =
+  match s_opt with
+  | Some s -> s.rows_examined <- s.rows_examined + 1
+  | None -> ()
+;;
+
 (** Forward reference to [to_stream], which is defined in the mutually-recursive
     block starting at [pre_eval_subquery].  [execute_with_count] needs this to
     implement [Op_insert_select] (read source, then write rows). *)
@@ -7333,6 +7366,8 @@ and compute_window_for_partition
   results
 
 and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
+  (* #239: captured at construction (inside [query]'s [with_value] scope). *)
+  let s_opt = Lwt.get query_stats_key in
   let* tx = S.ro_begin store in
   (* #238: stream the leaves natively via [seek_ge ""] instead of
      [cursor_open], which drains the WHOLE tree into an OCaml list at open time
@@ -7365,6 +7400,7 @@ and stream_seq_scan clock params store (table_meta : Cat.table_meta) =
              let%lwt () = finish () in
              Lwt.return_none
            | Some (_key, vbytes) ->
+             incr_examined s_opt;
              let row = decode_with_virtual clock params table_meta vbytes in
              Lwt.return_some row)
         (fun exn ->
@@ -7460,6 +7496,7 @@ and stream_index_lookup
       lookup_val
       (table_meta : Cat.table_meta)
   =
+  let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
   (* [WHERE col = NULL] never matches (SQL three-valued logic).  A bound
      parameter may be NULL at run time (#228: [col = ?] is now index-eligible);
@@ -7518,6 +7555,7 @@ and stream_index_lookup
                      match vrow with
                      | None -> next ()
                      | Some vbytes ->
+                       incr_examined s_opt;
                        let row = decode_with_virtual clock params table_meta vbytes in
                        Lwt.return_some row)
                    else (
@@ -7539,6 +7577,7 @@ and stream_index_lookup
    old __pk Op_index_lookup path (which mapped a type-mismatched value to
    IK_null ⇒ empty), so behavior is unchanged. *)
 and stream_rowid_lookup clock params store lookup_val (table_meta : Cat.table_meta) =
+  let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
   match v with
   | Row.V_int n ->
@@ -7548,6 +7587,7 @@ and stream_rowid_lookup clock params store lookup_val (table_meta : Cat.table_me
     (match vrow with
      | None -> Lwt.return (Lwt_stream.of_list [])
      | Some vbytes ->
+       incr_examined s_opt;
        let row = decode_with_virtual clock params table_meta vbytes in
        Lwt.return (Lwt_stream.of_list [ row ]))
   | _ -> Lwt.return (Lwt_stream.of_list [])
@@ -7557,6 +7597,7 @@ and stream_rowid_lookup clock params store lookup_val (table_meta : Cat.table_me
 and nlj_probe_left
       clock
       params
+      s_opt
       tx
       (right_meta : Cat.table_meta)
       idx_tree
@@ -7595,6 +7636,7 @@ and nlj_probe_left
           match vrow with
           | None -> scan ()
           | Some vbytes ->
+            incr_examined s_opt;
             let rrow = decode_with_virtual clock params right_meta vbytes in
             out := Array.append lrow rrow :: !out;
             found := true;
@@ -7622,6 +7664,9 @@ and stream_nested_loop_join
       join_kind
       n_right_cols
   =
+  (* #239: captured under [query]'s [with_value] scope; counts right-side index
+     probes (the left input's base scan is counted via [to_stream] below). *)
+  let s_opt = Lwt.get query_stats_key in
   let* left_stream = to_stream clock params store ~mode ~cat left in
   let* left_rows = Lwt_stream.to_list left_stream in
   S.with_ro store
@@ -7632,6 +7677,7 @@ and stream_nested_loop_join
       (nlj_probe_left
          clock
          params
+         s_opt
          tx
          right_meta
          idx_tree
@@ -8088,6 +8134,7 @@ and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj
         S.ro_end tx)
     in
     let dummy = [||] in
+    let s_opt = Lwt.get query_stats_key in
     Lwt.catch
       (fun () ->
          let rec loop () =
@@ -8107,6 +8154,7 @@ and run_aggregate_fast_path clock params store cat table_meta pred_opt aggs proj
              in
              Lwt.return (Some (Lwt_stream.of_list [ out ]))
            | Some (_key, vbytes) ->
+             incr_examined s_opt;
              if need_decode
              then (
                let row = decode_row vbytes in
@@ -9077,16 +9125,57 @@ let () = to_stream_ref := to_stream
 (* Public query entry point                                             *)
 (* ------------------------------------------------------------------ *)
 
+(* #239: [used_index] is a plan-time fact — does the query's base access reach
+   the data through an index/rowid/FTS seek, or a full table scan?  Descends
+   through the row-shaping wrappers to the base; [true] if ANY base uses a seek.
+   A nested-loop join always probes its right table by index, so it counts. *)
+let rec op_uses_index (op : Plan.op) : bool =
+  match op with
+  | Plan.Op_index_lookup _ | Plan.Op_rowid_lookup _ | Plan.Op_fts_match_scan _ -> true
+  | Plan.Op_seq_scan _ | Plan.Op_fts_seq_scan _ -> false
+  | Plan.Op_filter { child; _ }
+  | Plan.Op_project { child; _ }
+  | Plan.Op_expr_project { child; _ }
+  | Plan.Op_sort { child; _ }
+  | Plan.Op_limit { child; _ }
+  | Plan.Op_distinct { child }
+  | Plan.Op_aggregate { child; _ }
+  | Plan.Op_window { child; _ } -> op_uses_index child
+  | Plan.Op_nested_loop_join _ -> true
+  | Plan.Op_hash_join { left; right; _ } -> op_uses_index left || op_uses_index right
+  | Plan.Op_union { left; right; _ }
+  | Plan.Op_intersect { left; right }
+  | Plan.Op_except { left; right } -> op_uses_index left || op_uses_index right
+  | Plan.Op_with_cte { query; _ } -> op_uses_index query
+  | _ -> false
+;;
+
 let query
       ?(mode = Auto)
       ?(clock : (unit -> float) option = None)
       ?(params = [||])
+      ?(stats : query_stats option)
       (store : S.t)
       (cat : Cat.t)
       (op : Plan.op)
   : Row.t Lwt_stream.t Lwt.t
   =
-  to_stream clock params store ~mode ~cat:(Some cat) op
+  match stats with
+  | None -> to_stream clock params store ~mode ~cat:(Some cat) op
+  | Some s ->
+    s.used_index <- op_uses_index op;
+    (* Run the whole stream construction under the stats record so the base
+       scanners capture it (Lwt sequence-associated storage); wrap the result
+       to count rows actually delivered once the caller drains it. *)
+    Lwt.with_value query_stats_key (Some s)
+    @@ fun () ->
+    let* stream = to_stream clock params store ~mode ~cat:(Some cat) op in
+    Lwt.return
+      (Lwt_stream.map
+         (fun row ->
+            s.rows_returned <- s.rows_returned + 1;
+            row)
+         stream)
 ;;
 
 [@@@ai_disclosure "ai-generated"]

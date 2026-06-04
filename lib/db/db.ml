@@ -62,6 +62,15 @@ type trigger_meta =
   ; trig_body : Sql.Ast.stmt list
   }
 
+(* #239: re-export the executor's per-query cost/stats record so cache callers
+   read [Db.rows_examined] / [Db.used_index] without reaching into the SQL
+   internals.  Same type as {!Sql.Exec.query_stats}. *)
+type query_stats = Sql.Exec.query_stats =
+  { mutable rows_examined : int
+  ; mutable rows_returned : int
+  ; mutable used_index : bool
+  }
+
 type error =
   | Parse of string
   | Sema of Sql.Sema.error
@@ -1482,6 +1491,63 @@ let query top sql =
        Lwt.return (Ok stream))
 ;;
 
+(* #239: [query] plus a per-query cost/stats record for an external cost-based
+   cache.  Identical to [query] on the real read path but populates [stats] as
+   the stream drains; the canned control ops (changes / last_insert_rowid /
+   database_list / ...) do no scan, so they return a zeroed record. *)
+let query_with_stats top sql =
+  let op_promise, t = compile_routed top sql in
+  let* op = op_promise in
+  let zeroed s = Ok (s, Sql.Exec.make_query_stats ()) in
+  match op with
+  | Error e -> Lwt.return (Error e)
+  | Ok Sql.Plan.Op_changes ->
+    Lwt.return
+      (zeroed (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int t.last_changes) |] ]))
+  | Ok Sql.Plan.Op_last_insert_rowid ->
+    Lwt.return (zeroed (Lwt_stream.of_list [ [| Row.V_int t.last_insert_rowid |] ]))
+  | Ok Sql.Plan.Op_total_changes ->
+    Lwt.return
+      (zeroed (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int t.total_changes) |] ]))
+  | Ok Sql.Plan.Op_database_list ->
+    let path_str p = Option.value p ~default:"" in
+    let main_row =
+      [| Row.V_int 0L; Row.V_text "main"; Row.V_text (path_str top.file_path) |]
+    in
+    let _, rev_extra =
+      Hashtbl.fold
+        (fun name sub (i, acc) ->
+           let row =
+             [| Row.V_int (Int64.of_int i)
+              ; Row.V_text name
+              ; Row.V_text (path_str sub.file_path)
+             |]
+           in
+           i + 1, row :: acc)
+        top.attached
+        (1, [])
+    in
+    Lwt.return (zeroed (Lwt_stream.of_list (main_row :: List.rev rev_extra)))
+  | Ok Sql.Plan.Op_active_database_get ->
+    Lwt.return (zeroed (Lwt_stream.of_list [ [| Row.V_text top.active_schema |] ]))
+  | Ok (Sql.Plan.Op_attach _ | Sql.Plan.Op_detach _ | Sql.Plan.Op_active_database_set _)
+    ->
+    Lwt.return
+      (Error (Runtime "ATTACH/DETACH/active_database = ... is a write op; use Db.execute"))
+  | Ok op ->
+    let mode =
+      match t.explicit_txn with
+      | None -> Sql.Exec.Auto
+      | Some tx -> Sql.Exec.In_txn tx
+    in
+    let stats = Sql.Exec.make_query_stats () in
+    (match Sql.Exec.query ~mode ~clock:t.clock ~stats t.store t.catalog op with
+     | exception Failure msg -> Lwt.return (Error (Runtime msg))
+     | lwt_stream ->
+       let* stream = lwt_stream in
+       Lwt.return (Ok (stream, stats)))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Prepared statement API                                               *)
 (* ------------------------------------------------------------------ *)
@@ -1606,6 +1672,32 @@ let iter st ~params =
            Sql.Exec.query ~clock:t.clock ~params:params_arr t.store t.catalog st.plan
          in
          Lwt.return (Ok stream))
+      (function
+        | Failure msg -> Lwt.return (Error (Runtime msg))
+        | exn -> Lwt.fail exn))
+;;
+
+(* #239: [iter] plus a per-query cost/stats record populated as the stream
+   drains, for an external cost-based cache. *)
+let iter_with_stats st ~params =
+  if st.finalized
+  then Lwt.return (Error (Runtime "statement already finalized"))
+  else (
+    let params_arr = Array.of_list params in
+    let t = st.db_ref in
+    let stats = Sql.Exec.make_query_stats () in
+    Lwt.catch
+      (fun () ->
+         let* stream =
+           Sql.Exec.query
+             ~clock:t.clock
+             ~params:params_arr
+             ~stats
+             t.store
+             t.catalog
+             st.plan
+         in
+         Lwt.return (Ok (stream, stats)))
       (function
         | Failure msg -> Lwt.return (Error (Runtime msg))
         | exn -> Lwt.fail exn))
