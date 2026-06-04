@@ -209,6 +209,52 @@ let decode schema encoded =
   result
 ;;
 
+(* #247: decode only columns [0, upto] (inclusive); later columns are left
+   [V_null].  Columns are variable-length and stored in order, so reaching column
+   [upto] still requires walking (and decoding) every earlier column, but the
+   trailing columns — typically a large TEXT/BLOB payload an aggregate never
+   reads — are never decoded or allocated.  Columns in [0, upto] keep exact
+   [decode] semantics; callers MUST guarantee no consumer reads a column index
+   > [upto] (the aggregate fast path enforces this: it only reads up to the
+   max referenced column, and only prunes when there is no row filter). *)
+let decode_prefix schema encoded ~upto =
+  let n = List.length schema in
+  let n', off = Varint.decode_uint64 encoded 0 in
+  let n_encoded = Int64.to_int n' in
+  if n_encoded > n
+  then
+    invalid_arg
+      (Printf.sprintf
+         "Row.decode_prefix: expected at most %d columns, got %d"
+         n
+         n_encoded);
+  let bitmap_bytes = (n_encoded + 7) / 8 in
+  let bitmap = Bytes.sub encoded off bitmap_bytes in
+  let off = ref (off + bitmap_bytes) in
+  let result = Array.make n V_null in
+  let limit = if upto >= n then n - 1 else upto in
+  (try
+     List.iteri
+       (fun i col ->
+          if i > limit
+          then raise Exit (* nothing past [limit] is needed; stop walking *)
+          else if i < n_encoded
+          then (
+            let byte_idx = i / 8
+            and bit_idx = i mod 8 in
+            let is_null = (Bytes.get_uint8 bitmap byte_idx lsr bit_idx) land 1 = 1 in
+            if not is_null
+            then (
+              let v, off' = decode_col_value encoded !off col in
+              result.(i) <- v;
+              off := off'))
+          else result.(i) <- default_col_value col)
+       schema
+   with
+   | Exit -> ());
+  result
+;;
+
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]

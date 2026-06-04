@@ -15,3 +15,4 @@ bench/profiling/*.svg
 
 # stray compiler/format stderr captures (never commit)
 *.err
+*.log

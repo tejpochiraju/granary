@@ -53,3 +53,10 @@ val encode : schema -> t -> bytes
 (** [decode schema bytes] reconstructs a row from its on-disk representation
     according to [schema]. *)
 val decode : schema -> bytes -> t
+
+(** [decode_prefix schema bytes ~upto] decodes only columns [0, upto]; columns
+    beyond [upto] are left [V_null] and never decoded/allocated (#247).  Use only
+    when no consumer reads a column index > [upto] — it skips trailing columns
+    (e.g. a large TEXT payload) an aggregate over a column prefix never needs.
+    Columns in [0, upto] are identical to {!decode}. *)
+val decode_prefix : schema -> bytes -> upto:int -> t
