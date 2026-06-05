@@ -273,7 +273,10 @@ let () =
   Alcotest.run
     "schema_cache_283"
     [ ( "create_table"
-      , [ Alcotest.test_case "rollback frees name in cache" `Quick test_create_table_rollback
+      , [ Alcotest.test_case
+            "rollback frees name in cache"
+            `Quick
+            test_create_table_rollback
         ] )
     ; ( "drop_table_with_index"
       , [ Alcotest.test_case

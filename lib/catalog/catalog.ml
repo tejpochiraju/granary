@@ -229,7 +229,6 @@ end = struct
      physically identical (==) — the invariant [savepoint_rollback] relies on. *)
   let push_undo t f = t.undo <- f :: t.undo
   let register_undo = push_undo
-
   let find_table t name = Hashtbl.find_opt t.tables name
   let mem_table t name = Hashtbl.mem t.tables name
   let find_index t name = Hashtbl.find_opt t.indexes name
@@ -328,9 +327,10 @@ end = struct
     t.undo <- [];
     t.savepoints <- [];
     t.poisoned <- false
-    (* #293: [rowid_bumped] is intentionally NOT cleared here — the db layer calls
-       the recompute step right after, which reads it via [take_rowid_bumped]. *)
   ;;
+
+  (* #293: [rowid_bumped] is intentionally NOT cleared here — the db layer calls
+       the recompute step right after, which reads it via [take_rowid_bumped]. *)
 
   let savepoint_begin t name = t.savepoints <- (name, t.undo, t.poisoned) :: t.savepoints
 
@@ -1375,7 +1375,10 @@ let set_fk_constraints t ~table_name ~fks =
   match Schema_cache.find_table t.sc table_name with
   | None -> ()
   | Some meta ->
-    Schema_cache.put_table_durable t.sc ~name:table_name { meta with fk_constraints = fks }
+    Schema_cache.put_table_durable
+      t.sc
+      ~name:table_name
+      { meta with fk_constraints = fks }
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1697,7 +1700,10 @@ let register_ephemeral t (meta : table_meta) =
 ;;
 
 let unregister_ephemeral t ~name = Schema_cache.remove_table_durable t.sc ~name
-let list_tables t = Lwt.return (Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [])
+
+let list_tables t =
+  Lwt.return (Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [])
+;;
 
 (* #250: pick the rowid to auto-allocate for a NULL/omitted id, and the new
    counter.  An unseeded table ([empty_next_rowid]) allocates 1 (SQLite: empty
