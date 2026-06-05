@@ -551,6 +551,29 @@ let test_poison_persists_through_later_success () =
     Alcotest.(check bool) "u discarded" true (table_absent db "u"))
 ;;
 
+(* The poison also blocks the savepoint-release auto-commit path: a bare
+   [SAVEPOINT] (no [BEGIN]) auto-begins a transaction, and [RELEASE]ing the last
+   savepoint would auto-commit it.  A failed in-txn DDL must force that RELEASE to
+   roll back instead.  Covers the second of the two commit paths this fix touches. *)
+let test_failed_in_txn_ddl_poisons_savepoint_release () =
+  with_db (fun db ->
+    exec db "SAVEPOINT sp";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    let _ = exec_err db "ALTER TABLE t RENAME TO u" in
+    let release_err = exec_err db "RELEASE sp" in
+    Alcotest.(check bool)
+      "RELEASE auto-commit rejected: transaction was uncommittable"
+      true
+      (contains ~needle:"uncommittable" release_err);
+    Alcotest.(check bool) "t discarded by forced rollback" true (table_absent db "t");
+    Alcotest.(check bool) "u discarded by forced rollback" true (table_absent db "u");
+    (* The connection is clean: a fresh autocommit CREATE of the same name works. *)
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (3)";
+    Alcotest.(check (list string)) "recreated table usable" [ "i:3" ] (rows db "SELECT a FROM t"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -636,6 +659,10 @@ let () =
             "poison persists through a later successful statement"
             `Quick
             test_poison_persists_through_later_success
+        ; Alcotest.test_case
+            "failed in-txn DDL poisons SAVEPOINT release auto-commit"
+            `Quick
+            test_failed_in_txn_ddl_poisons_savepoint_release
         ] )
     ]
 ;;

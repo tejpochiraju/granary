@@ -464,10 +464,11 @@ let drain_pending_fks_autocommit t : (unit, error) result Lwt.t =
          Lwt.return_unit)
 ;;
 
-(* #286: forcibly roll back the active explicit transaction and reset connection
-   state.  Used when a COMMIT cannot proceed because the transaction was poisoned
-   by a failed in-txn DDL statement (partial on-disk effects remain).  Mirrors
-   [rollback_txn]'s cleanup. *)
+(* Roll back the active explicit transaction and reset all connection txn state
+   (store rollback + #269 schema-undo replay + FK/defer cleanup).  Shared by the
+   user-issued [rollback_txn] and #286's forced rollback when a COMMIT cannot
+   proceed because the transaction was poisoned by a failed in-txn DDL statement
+   (partial on-disk effects remain). *)
 let force_rollback_txn t tx =
   let* () = S.rollback tx in
   Cat.rollback_schema_changes t.catalog;
@@ -516,14 +517,9 @@ let rollback_txn t =
   match t.explicit_txn with
   | None -> Lwt.return (Error (Runtime "no active transaction"))
   | Some tx ->
-    let* () = S.rollback tx in
-    (* #269: revert any in-txn DDL's in-memory cache changes. *)
-    Cat.rollback_schema_changes t.catalog;
-    t.explicit_txn <- None;
-    t.savepoint_names <- [];
-    t.auto_began <- false;
-    Cat.clear_pending_fk_checks t.catalog;
-    Cat.set_defer_fks_pragma t.catalog false;
+    (* #269: [force_rollback_txn] reverts any in-txn DDL's in-memory cache
+       changes (schema-undo log) along with the store. *)
+    let* () = force_rollback_txn t tx in
     Lwt.return (Ok ())
 ;;
 
@@ -533,6 +529,10 @@ let savepoint_txn t name =
     | Some tx -> Lwt.return tx
     | None ->
       let* tx = S.rw_begin t.store in
+      (* #269/#286: harden the auto-begin path the same way [begin_txn] does —
+         clear any stale schema-undo log AND poison flag so a fresh auto-began
+         savepoint transaction never inherits a prior transaction's state. *)
+      Cat.commit_schema_changes t.catalog;
       t.explicit_txn <- Some tx;
       t.auto_began <- true;
       Lwt.return tx
