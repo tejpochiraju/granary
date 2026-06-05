@@ -36,7 +36,8 @@
   test_query_stats_239
   test_query_stats_257
   test_txn_ryw_262
-  test_dump_264)
+  test_dump_264
+  test_ddl_txn_269)
  (libraries
   alcotest
   qcheck-alcotest

@@ -133,9 +133,16 @@ val write_user_version_tx
   -> unit Lwt.t
 
 (** Create a new table, returning its assigned tree_id.
-    Raises [Failure] if a table with that name already exists. *)
+    Raises [Failure] if a table with that name already exists.
+
+    [?txn] (#269): run the creation — tree-ID allocation, catalog rows, and
+    cache insertion — through this already-held explicit writer transaction
+    instead of opening (and committing) a fresh one.  This lets [CREATE TABLE]
+    participate in an ambient [BEGIN … COMMIT] (no self-deadlock) and be undone
+    by [rollback_schema_changes] on [ROLLBACK]. *)
 val create_table
-  :  t
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
   -> name:string
   -> columns:Sqlocaml_encoding.Row.column list
   -> without_rowid:bool
@@ -228,9 +235,13 @@ val bump_next_rowid_in_txn
     Errors:
     - [`Error msg] if a table with [table] does not exist.
     - [`Error msg] if an index named [name] already exists.
-    - [`Error msg] if any column in [columns] is not a column of [table]. *)
+    - [`Error msg] if any column in [columns] is not a column of [table].
+
+    [?txn] (#269): run through this already-held explicit writer transaction
+    instead of opening (and committing) a fresh one. *)
 val create_index
-  :  t
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
   -> name:string
   -> table:string
   -> columns:string list
@@ -323,8 +334,16 @@ val list_fts_tables : t -> fts_table_meta list
 
 (** Create a new FTS virtual table.  Allocates two new tree IDs (content tree
     and inverted-index tree) and persists the entry in the [_sys_fts_tables]
-    system tree.  Raises [Failure] if a table with that name already exists. *)
-val create_fts_table : t -> name:string -> columns:string list -> fts_table_meta Lwt.t
+    system tree.  Raises [Failure] if a table with that name already exists.
+
+    [?txn] (#269): run the creation through this already-held explicit writer
+    transaction instead of opening (and committing) a fresh one. *)
+val create_fts_table
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> name:string
+  -> columns:string list
+  -> fts_table_meta Lwt.t
 
 (** Allocate and return the next rowid for an FTS table within an already-held
     RW transaction.  Does NOT commit; the caller owns the commit. *)
@@ -334,31 +353,78 @@ val next_fts_rowid_in_txn
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> int64 Lwt.t
 
-(** Persist FK constraints for a table to the sys_meta B-tree. *)
-val save_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> unit Lwt.t
+(** Persist FK constraints for a table to the sys_meta B-tree.
+
+    [?txn] (#269): write through this already-held explicit writer transaction
+    instead of opening (and committing) a fresh one. *)
+val save_fk_constraints
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> table_name:string
+  -> fks:fk_constraint list
+  -> unit Lwt.t
 
 (** Update FK constraints in the in-memory cache for a table. *)
 val set_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> unit
 
+(** #269: register an in-memory schema-cache reversal for DDL run through an
+    explicit transaction.  The closure is invoked by [rollback_schema_changes]
+    if the transaction is rolled back; it is discarded by [commit_schema_changes]
+    on commit.  Used by the db layer for view/trigger caches it owns. *)
+val register_schema_undo : t -> (unit -> unit) -> unit
+
+(** #269: discard the pending schema-undo closures — the transaction's DDL is now
+    durable.  Call at COMMIT (and savepoint-release auto-commit). *)
+val commit_schema_changes : t -> unit
+
+(** #269: run the pending schema-undo closures (most-recent-first), reverting the
+    in-memory cache mutations of DDL whose store writes were just rolled back.
+    Call at ROLLBACK. *)
+val rollback_schema_changes : t -> unit
+
 (** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
 val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
 
-(** Persist a view's SQL text to the sys_views B-tree. *)
-val persist_view : Sqlocaml_store.Store.t -> name:string -> sql:string -> unit Lwt.t
+(** Persist a view's SQL text to the sys_views B-tree.
 
-(** Remove a view's SQL text from the sys_views B-tree. *)
-val remove_view : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
+    [?txn] (#269): write through this already-held explicit writer transaction
+    instead of opening (and committing) a fresh one. *)
+val persist_view
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> sql:string
+  -> unit Lwt.t
+
+(** Remove a view's SQL text from the sys_views B-tree.  [?txn] as above (#269). *)
+val remove_view
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> unit Lwt.t
 
 (** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
 val load_all_triggers : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
 
 (** Persist a trigger's CREATE TRIGGER SQL to the sys_triggers B-tree.
-    Call this whenever CREATE TRIGGER is executed. *)
-val persist_trigger : Sqlocaml_store.Store.t -> name:string -> sql:string -> unit Lwt.t
+    Call this whenever CREATE TRIGGER is executed.
+
+    [?txn] (#269): write through this already-held explicit writer transaction
+    instead of opening (and committing) a fresh one. *)
+val persist_trigger
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> sql:string
+  -> unit Lwt.t
 
 (** Remove a trigger's SQL from the sys_triggers B-tree.
-    Call this whenever DROP TRIGGER is executed. *)
-val remove_trigger : Sqlocaml_store.Store.t -> name:string -> unit Lwt.t
+    Call this whenever DROP TRIGGER is executed.  [?txn] as above (#269). *)
+val remove_trigger
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> unit Lwt.t
 
 (** Get the current FK enforcement flag (default false). *)
 val get_fk_enforcement : t -> bool

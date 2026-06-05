@@ -2260,6 +2260,44 @@ let acquire_txn store mode =
 
 let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
 
+(* #269: run a DDL body [f tx] under a transaction chosen by [mode], threading
+   the writer txn into the catalog so DDL participates in any ambient explicit
+   transaction instead of opening its own (which would self-deadlock against the
+   single-writer lock the explicit txn already holds).
+
+   Ownership decides who finalizes:
+   - [Auto] (we opened the txn): commit on success / rollback on failure, and
+     correspondingly clear or run the catalog's schema-cache undo log — the DDL
+     mutated the in-memory cache before this commit, so a rollback must revert it.
+   - [In_txn] (borrowed): leave commit/rollback AND schema-undo finalization to
+     the db layer's COMMIT/ROLLBACK; an error here propagates with the ambient
+     transaction left open (a failed statement does not abort the transaction). *)
+let with_ddl_txn store (cat : Cat.t) mode f =
+  let* tx, owned = acquire_txn store mode in
+  Lwt.catch
+    (fun () ->
+       let* r = f tx in
+       let* () =
+         if owned
+         then (
+           let* () = S.commit tx in
+           Cat.commit_schema_changes cat;
+           Lwt.return_unit)
+         else Lwt.return_unit
+       in
+       Lwt.return r)
+    (fun exn ->
+       let* () =
+         if owned
+         then (
+           let* () = S.rollback tx in
+           Cat.rollback_schema_changes cat;
+           Lwt.return_unit)
+         else Lwt.return_unit
+       in
+       Lwt.fail exn)
+;;
+
 (* #262: a read handle for a base scanner.  Inside an explicit transaction
    ([In_txn tx]) reads must go THROUGH [tx] so they observe the transaction's
    own uncommitted writes (read-your-own-writes).  A scanner that instead opens
@@ -3322,57 +3360,56 @@ let execute_create_index
       ~(columns : Row.column list)
   : unit Lwt.t
   =
-  let* res =
-    Cat.create_index
-      cat
-      ~name
-      ~table
-      ~columns:col_sqls
-      ~unique
-      ~expr_flags:col_expr_flags
-      ~where_sql
-      ~origin:`User
-  in
-  match res with
-  | Error msg -> failwith msg
-  | Ok info ->
-    let* tx, owned = acquire_txn store mode in
-    Lwt.catch
-      (fun () ->
-         let* cur = S.cursor_open tx tree_id in
-         let _sr = S.cursor_first cur in
-         let rec walk () =
-           match S.cursor_next cur with
-           | None -> Lwt.return_unit
-           | Some (kbytes, vbytes) ->
-             let rowid = Rowid.decode kbytes in
-             let row =
-               decode_with_virtual_cols None [||] ~table_name:table columns vbytes
-             in
-             let skip =
-               match where_expr with
-               | None -> false
-               | Some we -> not (value_truthy (eval_expr None [||] row we))
-             in
-             if skip
-             then walk ()
-             else (
-               let iks =
-                 List.map
-                   row_value_to_index_value
-                   (get_index_key_values None [||] info columns row)
-               in
-               let ikey = Index_key.encode iks ~rowid in
-               let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
-               walk ())
-         in
-         let* () = walk () in
-         S.cursor_close cur;
-         release_txn tx owned)
-      (fun exn ->
-         (* On any exception: rollback if we own the txn, then re-raise. *)
-         let* () = if owned then S.rollback tx else Lwt.return_unit in
-         Lwt.fail exn)
+  (* #269: register the index in the catalog AND populate the index tree through
+     ONE writer txn.  Previously [Cat.create_index] opened (and committed) its
+     own txn before this scan acquired another — which self-deadlocks when an
+     explicit transaction already holds the writer lock.  [with_ddl_txn] threads
+     a single txn through both so the whole CREATE INDEX participates in (and
+     rolls back with) any ambient explicit transaction. *)
+  with_ddl_txn store cat mode (fun tx ->
+    let* res =
+      Cat.create_index
+        ~txn:tx
+        cat
+        ~name
+        ~table
+        ~columns:col_sqls
+        ~unique
+        ~expr_flags:col_expr_flags
+        ~where_sql
+        ~origin:`User
+    in
+    match res with
+    | Error msg -> failwith msg
+    | Ok info ->
+      let* cur = S.cursor_open tx tree_id in
+      let _sr = S.cursor_first cur in
+      let rec walk () =
+        match S.cursor_next cur with
+        | None -> Lwt.return_unit
+        | Some (kbytes, vbytes) ->
+          let rowid = Rowid.decode kbytes in
+          let row = decode_with_virtual_cols None [||] ~table_name:table columns vbytes in
+          let skip =
+            match where_expr with
+            | None -> false
+            | Some we -> not (value_truthy (eval_expr None [||] row we))
+          in
+          if skip
+          then walk ()
+          else (
+            let iks =
+              List.map
+                row_value_to_index_value
+                (get_index_key_values None [||] info columns row)
+            in
+            let ikey = Index_key.encode iks ~rowid in
+            let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
+            walk ())
+      in
+      let* () = walk () in
+      S.cursor_close cur;
+      Lwt.return_unit)
 ;;
 
 (** Check whether inserting a new index entry for [new_row] with
@@ -5406,7 +5443,9 @@ let to_stream_ref
     write ops this is 1 (INSERT) or 0 (DDL); for UPDATE it is the
     number of rows whose contents were modified. *)
 let execute_create_table_op
+      (store : S.t)
       (cat : Cat.t)
+      ~mode
       ~name
       ~columns
       ~uniq_idxs
@@ -5415,51 +5454,60 @@ let execute_create_table_op
       ~without_rowid
   : int Lwt.t
   =
-  if if_not_exists && Cat.table_exists cat ~name
-  then Lwt.return 0
+  if Cat.table_exists cat ~name
+  then
+    if if_not_exists
+    then Lwt.return 0
+    else (* Raise synchronously (before acquiring any txn), as callers expect. *)
+      failwith (Printf.sprintf "table '%s' already exists" name)
   else
-    let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
-    let* () =
-      Lwt_list.iter_s
-        (fun (idx_name, col_names, origin) ->
-           let* result =
-             Cat.create_index
-               cat
-               ~name:idx_name
-               ~table:name
-               ~columns:col_names
-               ~unique:true
-               ~expr_flags:(List.map (fun _ -> false) col_names)
-               ~where_sql:None
-               ~origin
-           in
-           match result with
-           | Error msg -> Lwt.fail_with msg
-           | Ok _ -> Lwt.return_unit)
-        uniq_idxs
-    in
-    let* () =
-      if fk_constraints = []
-      then Lwt.return_unit
-      else (
-        let fk_list =
-          List.map
-            (fun (lcs, pt, pcs, od, ou, def) ->
-               Cat.
-                 { fk_local_cols = lcs
-                 ; fk_parent_table = pt
-                 ; fk_parent_cols = pcs
-                 ; fk_on_delete = od
-                 ; fk_on_update = ou
-                 ; fk_deferrable = def
-                 })
-            fk_constraints
-        in
-        let* () = Cat.save_fk_constraints cat ~table_name:name ~fks:fk_list in
-        Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
-        Lwt.return_unit)
-    in
-    Lwt.return 0
+    (* #269: the table, its implicit UNIQUE indexes, and its FK rows all go
+       through one writer txn (the ambient explicit one if any), so the whole
+       CREATE TABLE is atomic and never self-deadlocks. *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* _tid = Cat.create_table ~txn:tx cat ~name ~columns ~without_rowid in
+      let* () =
+        Lwt_list.iter_s
+          (fun (idx_name, col_names, origin) ->
+             let* result =
+               Cat.create_index
+                 ~txn:tx
+                 cat
+                 ~name:idx_name
+                 ~table:name
+                 ~columns:col_names
+                 ~unique:true
+                 ~expr_flags:(List.map (fun _ -> false) col_names)
+                 ~where_sql:None
+                 ~origin
+             in
+             match result with
+             | Error msg -> Lwt.fail_with msg
+             | Ok _ -> Lwt.return_unit)
+          uniq_idxs
+      in
+      let* () =
+        if fk_constraints = []
+        then Lwt.return_unit
+        else (
+          let fk_list =
+            List.map
+              (fun (lcs, pt, pcs, od, ou, def) ->
+                 Cat.
+                   { fk_local_cols = lcs
+                   ; fk_parent_table = pt
+                   ; fk_parent_cols = pcs
+                   ; fk_on_delete = od
+                   ; fk_on_update = ou
+                   ; fk_deferrable = def
+                   })
+              fk_constraints
+          in
+          let* () = Cat.save_fk_constraints ~txn:tx cat ~table_name:name ~fks:fk_list in
+          Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
+          Lwt.return_unit)
+      in
+      Lwt.return 0)
 ;;
 
 (* Op_insert: insert each VALUES row, counting successful inserts. *)
@@ -6064,7 +6112,9 @@ let execute_with_count
   | Plan.Op_create_table
       { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
     execute_create_table_op
+      store
       cat
+      ~mode
       ~name
       ~columns
       ~uniq_idxs
@@ -6171,8 +6221,11 @@ let execute_with_count
     let* () = execute_drop_index ~mode store cat ~idx_info in
     Lwt.return 0
   | Plan.Op_create_fts_table { name; columns } ->
-    let* _ = Cat.create_fts_table cat ~name ~columns in
-    Lwt.return 0
+    (* #269: thread any ambient explicit txn so CREATE VIRTUAL TABLE … USING fts5
+       does not self-deadlock and rolls back atomically. *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* _ = Cat.create_fts_table ~txn:tx cat ~name ~columns in
+      Lwt.return 0)
   | Plan.Op_fts_insert { fts_meta; col_names; col_values } ->
     execute_fts_insert store cat ~mode ~clock ~params fts_meta ~col_names ~col_values
   | Plan.Op_fts_delete { fts_meta; where } ->
