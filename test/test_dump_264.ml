@@ -301,6 +301,14 @@ let test_int64_min_literal () =
     (match run (Db.query db "SELECT 9223372036854775808") with
      | Ok _ -> Alcotest.fail "bare positive 2^63 in SELECT should be rejected"
      | Error _ -> ());
+    (* a negative magnitude beyond 2^63 is genuinely out of range: the unary
+       minus has nothing representable to fold onto, so it is rejected too *)
+    (match run (Db.execute db "INSERT INTO t (i) VALUES (-99999999999999999999)") with
+     | Ok () -> Alcotest.fail "negative magnitude > 2^63 should be rejected"
+     | Error _ -> ());
+    (match run (Db.query db "SELECT -99999999999999999999") with
+     | Ok _ -> Alcotest.fail "negative magnitude > 2^63 in SELECT should be rejected"
+     | Error _ -> ());
     (* the row must survive a logical-dump round-trip *)
     assert_roundtrip db)
 ;;
