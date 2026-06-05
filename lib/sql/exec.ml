@@ -2271,7 +2271,14 @@ let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
      mutated the in-memory cache before this commit, so a rollback must revert it.
    - [In_txn] (borrowed): leave commit/rollback AND schema-undo finalization to
      the db layer's COMMIT/ROLLBACK; an error here propagates with the ambient
-     transaction left open (a failed statement does not abort the transaction). *)
+     transaction left open.  A failed in-txn DDL statement may have already
+     applied partial on-disk effects (e.g. [alter_drop_column] dropping a
+     dependent index, then rewriting rows, before [Cat.drop_column] raises), and
+     we have no statement-level savepoint to undo just this statement (#280/#283).
+     So we poison the catalog (#286): the db layer forces a later COMMIT to roll
+     the whole transaction back instead of persisting the half-applied DDL — the
+     transaction is uncommittable, matching SQLite.  A ROLLBACK still unwinds
+     cleanly via the whole-txn schema-undo log + store rollback. *)
 let with_ddl_txn store (cat : Cat.t) mode f =
   let* tx, owned = acquire_txn store mode in
   Lwt.catch
@@ -2293,7 +2300,10 @@ let with_ddl_txn store (cat : Cat.t) mode f =
            let* () = S.rollback tx in
            Cat.rollback_schema_changes cat;
            Lwt.return_unit)
-         else Lwt.return_unit
+         else (
+           (* #286: borrowed txn — partial effects remain; mark uncommittable. *)
+           Cat.mark_schema_txn_poisoned cat;
+           Lwt.return_unit)
        in
        Lwt.fail exn)
 ;;

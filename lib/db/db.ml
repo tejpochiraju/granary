@@ -464,9 +464,35 @@ let drain_pending_fks_autocommit t : (unit, error) result Lwt.t =
          Lwt.return_unit)
 ;;
 
+(* #286: forcibly roll back the active explicit transaction and reset connection
+   state.  Used when a COMMIT cannot proceed because the transaction was poisoned
+   by a failed in-txn DDL statement (partial on-disk effects remain).  Mirrors
+   [rollback_txn]'s cleanup. *)
+let force_rollback_txn t tx =
+  let* () = S.rollback tx in
+  Cat.rollback_schema_changes t.catalog;
+  t.explicit_txn <- None;
+  t.savepoint_names <- [];
+  t.auto_began <- false;
+  Cat.clear_pending_fk_checks t.catalog;
+  Cat.set_defer_fks_pragma t.catalog false;
+  Lwt.return_unit
+;;
+
 let commit_txn t =
   match t.explicit_txn with
   | None -> Lwt.return (Error (Runtime "no active transaction"))
+  | Some tx when Cat.schema_txn_poisoned t.catalog ->
+    (* #286: an in-txn DDL statement failed partway through, leaving partial
+       on-disk effects under this borrowed txn.  The transaction is
+       uncommittable — roll it back (schema-undo log + store rollback unwind
+       cleanly) and surface an error rather than persist half-applied DDL. *)
+    let* () = force_rollback_txn t tx in
+    Lwt.return
+      (Error
+         (Runtime
+            "cannot commit transaction - a DDL statement failed partway through; \
+             the transaction was uncommittable and has been rolled back"))
   | Some tx ->
     (* Drain deferred FK checks first; if any still violate, this raises
        and the txn has already been rolled back. *)
@@ -530,13 +556,25 @@ let release_savepoint t name =
       in
       t.savepoint_names <- drop t.savepoint_names);
     if t.auto_began && t.savepoint_names = []
-    then (
-      let* () = S.commit tx in
-      (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
-      Cat.commit_schema_changes t.catalog;
-      t.explicit_txn <- None;
-      t.auto_began <- false;
-      Lwt.return (Ok ()))
+    then
+      if Cat.schema_txn_poisoned t.catalog
+      then (
+        (* #286: releasing the last savepoint would auto-commit, but a failed
+           in-txn DDL poisoned the transaction — roll back instead. *)
+        let* () = force_rollback_txn t tx in
+        Lwt.return
+          (Error
+             (Runtime
+                "cannot commit transaction - a DDL statement failed partway \
+                 through; the transaction was uncommittable and has been rolled \
+                 back")))
+      else (
+        let* () = S.commit tx in
+        (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
+        Cat.commit_schema_changes t.catalog;
+        t.explicit_txn <- None;
+        t.auto_began <- false;
+        Lwt.return (Ok ()))
     else Lwt.return (Ok ())
 ;;
 
