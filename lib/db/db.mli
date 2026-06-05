@@ -139,6 +139,57 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
+(** #264: stream a logical SQL dump (a {{:https://sqlite.org/cli.html#dump}.dump}-style
+    export) of the database to [sink], one chunk at a time.
+
+    The output is a self-contained SQL script that recreates the database when
+    replayed statement-by-statement through {!execute}: [PRAGMA foreign_keys=OFF;],
+    then for each table its [CREATE TABLE] followed by [INSERT] statements for
+    its rows, then FTS virtual tables, explicit indexes, views (in dependency
+    order) and triggers. Tables are emitted in creation order. Generated-column
+    values are omitted (recomputed on insert); implicit PRIMARY KEY indexes the
+    [CREATE TABLE] already implies are not re-emitted.
+
+    The script is {e not} wrapped in [BEGIN]/[COMMIT]: DDL cannot currently run
+    inside an explicit transaction (Forgejo #269), so a schema-bearing dump
+    relies on per-statement autocommit. A [data_only] dump {e is} wrapped, since
+    it is pure DML.
+
+    {b Not a point-in-time snapshot.} Each table is read in its own read
+    transaction, so a concurrent commit between two tables' reads can produce a
+    dump that reflects no single committed state. Dump from a quiescent database,
+    or one with no concurrent writers, for a consistent result.
+
+    {b FTS5 content is not dumped.} An FTS5 table's [CREATE VIRTUAL TABLE] is
+    emitted but its rows are not (content-dumping is a planned follow-up), so a
+    database whose data lives in FTS5 tables restores with those tables {e empty}
+    — be aware before relying on this as a backup.
+
+    Composite / table-level PRIMARY KEYs round-trip as plain [UNIQUE] indexes
+    (this engine's internal representation): the data is preserved, but the
+    restored schema reports no PRIMARY KEY and permits NULLs in those columns.
+
+    [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
+    [INSERT]s, wrapped in a transaction). Passing both yields an essentially
+    empty dump. *)
+val dump
+  :  t
+  -> ?schema_only:bool
+  -> ?data_only:bool
+  -> sink:(string -> unit Lwt.t)
+  -> unit
+  -> (unit, error) result Lwt.t
+
+(** #264: like {!dump}, but collects the whole dump into a single string.
+    Convenient for small databases; for large ones prefer {!dump} with a
+    streaming [sink] to avoid materializing the entire script in memory. *)
+val dump_to_string
+  :  t
+  -> ?schema_only:bool
+  -> ?data_only:bool
+  -> unit
+  -> (string, error) result Lwt.t
+
 (** Format an [error] value for human-readable output. *)
 val pp_error : Format.formatter -> error -> unit
 

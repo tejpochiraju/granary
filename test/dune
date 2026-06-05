@@ -35,7 +35,8 @@
   test_rowid_alias
   test_query_stats_239
   test_query_stats_257
-  test_txn_ryw_262)
+  test_txn_ryw_262
+  test_dump_264)
  (libraries
   alcotest
   qcheck-alcotest

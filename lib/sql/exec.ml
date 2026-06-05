@@ -124,11 +124,12 @@ let sql_of_row_type = function
   | Row.Blob -> "BLOB"
 ;;
 
+(* A SQL single-quoted string literal with embedded quotes doubled. *)
+let quote_text_literal s = "'" ^ String.concat "''" (String.split_on_char '\'' s) ^ "'"
+
 let sql_of_default_value = function
   | Row.DV_int n -> Int64.to_string n
-  | Row.DV_text s ->
-    let escaped = String.concat "''" (String.split_on_char '\'' s) in
-    Printf.sprintf "'%s'" escaped
+  | Row.DV_text s -> quote_text_literal s
   | Row.DV_real f -> Printf.sprintf "%g" f
   | Row.DV_blob b ->
     let hex =
@@ -219,9 +220,10 @@ let ddl_of_table (meta : Cat.table_meta) =
       meta.Cat.fk_constraints
   in
   Printf.sprintf
-    "CREATE TABLE %s (%s)"
+    "CREATE TABLE %s (%s)%s"
     (quote_ident meta.Cat.name)
     (String.concat ", " (col_parts @ fk_parts))
+    (if meta.Cat.without_rowid then " WITHOUT ROWID" else "")
 ;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -566,6 +568,40 @@ let hex_encode_str s =
   let buf = Buffer.create (String.length s * 2) in
   String.iter (fun c -> Buffer.add_string buf (Printf.sprintf "%02X" (Char.code c))) s;
   Buffer.contents buf
+;;
+
+(* #264: render a value as a standalone SQL literal for a logical dump.
+   The output must parse back to the identical value through our own executor:
+   - text is single-quoted with embedded quotes doubled;
+   - blobs use the [X'..'] hex syntax;
+   - a finite float always carries a '.' or exponent so it re-reads as REAL
+     (not INTEGER), and uses the shortest decimal that round-trips bit-for-bit;
+   - non-finite floats map to [1e999]/[-1e999] (overflow to ±inf, as SQLite's
+     own .dump emits) and NaN to NULL (SQLite cannot store a NaN). *)
+let sql_literal_of_value : Row.value -> string = function
+  | Row.V_null -> "NULL"
+  | Row.V_int n -> Int64.to_string n
+  | Row.V_text s -> quote_text_literal s
+  | Row.V_blob b -> "X'" ^ hex_encode_str (Bytes.to_string b) ^ "'"
+  | Row.V_real f ->
+    if Float.is_nan f
+    then "NULL"
+    else if f = Float.infinity
+    then "1e999"
+    else if f = Float.neg_infinity
+    then "-1e999"
+    else (
+      let rec shortest p =
+        if p >= 17
+        then Printf.sprintf "%.17g" f
+        else (
+          let s = Printf.sprintf "%.*g" p f in
+          if float_of_string s = f then s else shortest (p + 1))
+      in
+      let s = shortest 1 in
+      if String.contains s '.' || String.contains s 'e' || String.contains s 'E'
+      then s
+      else s ^ ".0")
 ;;
 
 (* UTF-8 encode each in-range integer codepoint, mirroring SQLite's char(). *)

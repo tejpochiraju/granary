@@ -126,6 +126,31 @@ type query_stats =
 (** A zeroed {!query_stats} ([used_index = false]). *)
 val make_query_stats : unit -> query_stats
 
+(** #264: quote a SQL identifier with double-quotes when it is not a plain
+    [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
+    otherwise. *)
+val quote_ident : string -> string
+
+(** #264: reconstruct a [CREATE TABLE] statement from catalog metadata (used by
+    both [sqlite_master] and the logical dump). Emits column types, constraints
+    (NOT NULL, column-level PRIMARY KEY, DEFAULT, CHECK, GENERATED), foreign
+    keys, and the [WITHOUT ROWID] clause. UNIQUE and composite/table-level
+    PRIMARY KEY constraints are carried by their backing indexes
+    ({!ddl_of_index}), not inline. *)
+val ddl_of_table : Sqlocaml_catalog.Catalog.table_meta -> string
+
+(** #264: reconstruct a [CREATE [UNIQUE] INDEX] statement from index metadata. *)
+val ddl_of_index : Sqlocaml_catalog.Catalog.index_info -> string
+
+(** #264: reconstruct a [CREATE VIRTUAL TABLE .. USING fts5(..)] statement. *)
+val ddl_of_fts : Sqlocaml_catalog.Catalog.fts_table_meta -> string
+
+(** #264: render a {!Sqlocaml_encoding.Row.value} as a standalone SQL literal
+    that re-reads to the identical value (text quoted, blob as [X'..'], float as
+    the shortest round-tripping REAL literal, non-finite floats as
+    [1e999]/[-1e999]/[NULL]). Used to serialize rows as [INSERT] statements. *)
+val sql_literal_of_value : Sqlocaml_encoding.Row.value -> string
+
 (** Execute read operations; returns a lazy stream of result rows.
     [params] are the positional parameter values for [?] placeholders.
     [clock] supplies the current Unix timestamp for SQL date/time
