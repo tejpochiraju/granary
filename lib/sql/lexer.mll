@@ -32,14 +32,14 @@ rule token = parse
   | "&"        { AMPERSAND }
   | "~"        { TILDE }
   | "."        { DOT }
-  (* float with an exponent: [123e4], [12.5e-3], [.5E+9] — the mantissa may be
-     an integer, since the exponent alone makes it a REAL.  Must precede the
-     INT rule so [1e308] is not lexed as INT 1 followed by IDENT e308. *)
-  | ((digit+ '.' digit*) | ('.' digit+) | digit+) (['e' 'E'] ['+' '-']? digit+) as f
+  (* REAL literals — must precede the INT rule so [1e308] is not lexed as INT 1
+     followed by IDENT e308.  A dotted mantissa ([12.5], [.5], [3.]) carries an
+     optional exponent; an undotted mantissa ([1e308]) requires one (otherwise
+     it is an INT). *)
+  | ((digit+ '.' digit*) | ('.' digit+)) (['e' 'E'] ['+' '-']? digit+)? as f
     { FLOAT_LIT (float_of_string f) }
-  | (digit+ as i) '.' (digit* as f)
-    { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }
-  | ('.' digit+) as f       { FLOAT_LIT (float_of_string f) }
+  | (digit+ ['e' 'E'] ['+' '-']? digit+) as f
+    { FLOAT_LIT (float_of_string f) }
   | digit+ as n             { INT_LIT (Int64.of_string n) }
   | ['x' 'X'] '\'' (['0'-'9' 'a'-'f' 'A'-'F']* as h) '\''
     { (* X'...' blob literal — convert hex pairs to bytes *)

@@ -145,18 +145,29 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     The output is a self-contained SQL script that recreates the database when
     replayed statement-by-statement through {!execute}: [PRAGMA foreign_keys=OFF;],
     then for each table its [CREATE TABLE] followed by [INSERT] statements for
-    its rows, then FTS virtual tables, explicit indexes, views and triggers.
-    Tables are emitted in creation order. Generated-column values are omitted
-    (recomputed on insert); implicit PRIMARY KEY indexes the [CREATE TABLE]
-    already implies are not re-emitted.
+    its rows, then FTS virtual tables, explicit indexes, views (in dependency
+    order) and triggers. Tables are emitted in creation order. Generated-column
+    values are omitted (recomputed on insert); implicit PRIMARY KEY indexes the
+    [CREATE TABLE] already implies are not re-emitted.
 
     The script is {e not} wrapped in [BEGIN]/[COMMIT]: DDL cannot currently run
     inside an explicit transaction (Forgejo #269), so a schema-bearing dump
     relies on per-statement autocommit. A [data_only] dump {e is} wrapped, since
     it is pure DML.
 
-    FTS5 tables are recreated empty (their [CREATE VIRTUAL TABLE] is emitted but
-    their content is not — that is a planned follow-up).
+    {b Not a point-in-time snapshot.} Each table is read in its own read
+    transaction, so a concurrent commit between two tables' reads can produce a
+    dump that reflects no single committed state. Dump from a quiescent database,
+    or one with no concurrent writers, for a consistent result.
+
+    {b FTS5 content is not dumped.} An FTS5 table's [CREATE VIRTUAL TABLE] is
+    emitted but its rows are not (content-dumping is a planned follow-up), so a
+    database whose data lives in FTS5 tables restores with those tables {e empty}
+    — be aware before relying on this as a backup.
+
+    Composite / table-level PRIMARY KEYs round-trip as plain [UNIQUE] indexes
+    (this engine's internal representation): the data is preserved, but the
+    restored schema reports no PRIMARY KEY and permits NULLs in those columns.
 
     [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
     [INSERT]s, wrapped in a transaction). Passing both yields an essentially

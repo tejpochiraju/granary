@@ -124,11 +124,12 @@ let sql_of_row_type = function
   | Row.Blob -> "BLOB"
 ;;
 
+(* A SQL single-quoted string literal with embedded quotes doubled. *)
+let quote_text_literal s = "'" ^ String.concat "''" (String.split_on_char '\'' s) ^ "'"
+
 let sql_of_default_value = function
   | Row.DV_int n -> Int64.to_string n
-  | Row.DV_text s ->
-    let escaped = String.concat "''" (String.split_on_char '\'' s) in
-    Printf.sprintf "'%s'" escaped
+  | Row.DV_text s -> quote_text_literal s
   | Row.DV_real f -> Printf.sprintf "%g" f
   | Row.DV_blob b ->
     let hex =
@@ -580,7 +581,7 @@ let hex_encode_str s =
 let sql_literal_of_value : Row.value -> string = function
   | Row.V_null -> "NULL"
   | Row.V_int n -> Int64.to_string n
-  | Row.V_text s -> "'" ^ String.concat "''" (String.split_on_char '\'' s) ^ "'"
+  | Row.V_text s -> quote_text_literal s
   | Row.V_blob b -> "X'" ^ hex_encode_str (Bytes.to_string b) ^ "'"
   | Row.V_real f ->
     if Float.is_nan f

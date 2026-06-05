@@ -1695,16 +1695,23 @@ let dump_table_order (tables : Cat.table_meta list) =
    column-level PRIMARY KEY (our executor rebuilds it from that clause).  Every
    other index — user indexes, [__uniq_*] constraints, and multi-column [__pk_*]
    backing composite/table-level keys — encodes a constraint the table DDL omits
-   and so must be emitted, or restoring would silently drop it. *)
+   and so must be emitted, or restoring would silently drop it.
+
+   A multi-column (composite / table-level) PRIMARY KEY therefore round-trips as
+   a plain [CREATE UNIQUE INDEX]: faithful to this engine's internal
+   representation (so the data round-trips), but the restored schema reports no
+   PRIMARY KEY and permits NULLs — an intentional downgrade.
+
+   The check keys on the [__pk_] name prefix, which [sema.ml] owns for
+   auto-created PK indexes; a user index deliberately named [__pk_*] on a PK
+   column would be misclassified.  That namespace collision is tracked by #273
+   (give [index_info] an explicit origin flag). *)
 let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
   idx.Cat.idx_unique
   &&
   match idx.Cat.idx_columns with
   | [ col ] ->
-    let has_prefix p s =
-      String.length s >= String.length p && String.sub s 0 (String.length p) = p
-    in
-    has_prefix "__pk_" idx.Cat.idx_name
+    String.starts_with ~prefix:"__pk_" idx.Cat.idx_name
     && List.exists
          (fun (c : Row.column) -> c.Row.name = col && c.Row.primary_key)
          meta.Cat.columns
@@ -1752,6 +1759,61 @@ let dump_table_rows t (meta : Cat.table_meta) ~stmt =
            in
            stmt (Printf.sprintf "%s(%s)" prefix vals))
         stream)
+;;
+
+(* Whole-word, case-insensitive occurrence of [word] in [s] (identifier-bounded
+   so view "a" does not match inside "table"). *)
+let mentions_ident ~word s =
+  let s = String.lowercase_ascii s
+  and word = String.lowercase_ascii word in
+  let wl = String.length word
+  and sl = String.length s in
+  let is_id c = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c = '_' in
+  let rec go i =
+    if i + wl > sl
+    then false
+    else if
+      String.sub s i wl = word
+      && (i = 0 || not (is_id s.[i - 1]))
+      && (i + wl = sl || not (is_id s.[i + wl]))
+    then true
+    else go (i + 1)
+  in
+  wl > 0 && go 0
+;;
+
+(* Order views so each appears after every other view it references.  A view's
+   SELECT body is bound at CREATE time (sema binds it against the catalog and the
+   already-created views), so a view selecting from another view fails to restore
+   unless that dependency was emitted first.  [Cat.load_all_views] returns name
+   order, not dependency order, so we topologically sort: an edge v -> w means
+   v's body mentions view w's name (over-detection only adds a harmless edge).
+   On an unexpected cycle (illegal for valid schemas) we fall back to input order
+   for the remainder. *)
+let order_views_by_dependency (views : (string * string) list) =
+  let names = List.map fst views in
+  let deps =
+    List.map
+      (fun (n, sql) ->
+         n, List.filter (fun m -> m <> n && mentions_ident ~word:m sql) names)
+      views
+  in
+  let rec loop done_ remaining =
+    if remaining = []
+    then done_
+    else (
+      (* a view is ready once none of its view-dependencies are still pending *)
+      let ready =
+        List.filter
+          (fun n ->
+             List.for_all (fun d -> not (List.mem d remaining)) (List.assoc n deps))
+          remaining
+      in
+      let ready = if ready = [] then remaining else ready in
+      loop (done_ @ ready) (List.filter (fun n -> not (List.mem n ready)) remaining))
+  in
+  let ordered = loop [] names in
+  List.map (fun n -> n, List.assoc n views) ordered
 ;;
 
 let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
@@ -1802,14 +1864,20 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                tables
            in
            let* views = Cat.load_all_views t.store in
-           let* () = Lwt_list.iter_s (fun (_n, sql) -> stmt sql) views in
+           let* () =
+             Lwt_list.iter_s (fun (_n, sql) -> stmt sql) (order_views_by_dependency views)
+           in
            let* triggers = Cat.load_all_triggers t.store in
            Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
        in
        let* () = if data_only then stmt "COMMIT" else Lwt.return_unit in
        Lwt.return (Ok ()))
     (function
-      | Failure msg -> Lwt.return (Error (Runtime msg))
+      | Failure msg ->
+        (* A [data_only] dump has already sunk an unterminated [BEGIN]; close it
+           so a streaming sink is not left mid-transaction. *)
+        let* () = if data_only then stmt "ROLLBACK" else Lwt.return_unit in
+        Lwt.return (Error (Runtime msg))
       | exn -> Lwt.fail exn)
 ;;
 

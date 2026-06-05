@@ -371,6 +371,21 @@ let test_unique_enforced_after_restore () =
          | Error _ -> ()))
 ;;
 
+(* A view that selects from another view must be emitted AFTER its dependency:
+   view bodies are bound at CREATE time, so the wrong order aborts the restore.
+   The dependency view is named to sort LAST alphabetically, so a naive
+   name-ordered dump would emit the dependent view first and fail. *)
+let test_view_on_view () =
+  with_db (fun db ->
+    exec db "CREATE TABLE base (x INTEGER)";
+    exec db "INSERT INTO base VALUES (1)";
+    exec db "INSERT INTO base VALUES (2)";
+    (* 'z_inner' sorts after 'a_outer', yet a_outer depends on z_inner *)
+    exec db "CREATE VIEW z_inner AS SELECT x FROM base WHERE x > 0";
+    exec db "CREATE VIEW a_outer AS SELECT x FROM z_inner";
+    assert_roundtrip db)
+;;
+
 (* FTS5 virtual tables: the dump recreates them (empty) via DDL and emits no row
    INSERTs against them (content dump is a planned follow-up). *)
 let test_fts_ddl_only () =
@@ -409,6 +424,7 @@ let () =
             "unique enforced after restore"
             `Quick
             test_unique_enforced_after_restore
+        ; Alcotest.test_case "view depending on view" `Quick test_view_on_view
         ; Alcotest.test_case "fts ddl only" `Quick test_fts_ddl_only
         ] )
     ]
