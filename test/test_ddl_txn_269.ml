@@ -901,6 +901,93 @@ let test_auto_began_savepoint_ddl_release_commits () =
     Alcotest.(check (list string)) "fresh autocommit works" [] (rows db "SELECT c FROM u"))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* ROLLBACK TO SAVEPOINT restores the per-savepoint poison flag (#295)   *)
+(*                                                                       *)
+(* #286 poisons the txn when an in-txn DDL fails partway through; #280    *)
+(* made [ROLLBACK TO s] unwind the schema-undo log back to [s] but left   *)
+(* the poison flag set, so a COMMIT was wrongly forced to roll back even  *)
+(* when the failed statement (and its partial effects) lay in the         *)
+(* rolled-back range.  The fix snapshots the poison state at [SAVEPOINT s] *)
+(* and restores it on [ROLLBACK TO s] — so a failure BEFORE [s] keeps the *)
+(* txn poisoned, while a failure AFTER [s] is recovered.                  *)
+(* ------------------------------------------------------------------ *)
+
+(* Recovery case: a failed in-txn DDL inside a savepoint, then ROLLBACK TO that
+   savepoint (which predates the failure) clears the poison and restores the
+   committable txn.  The pre-savepoint committed state is intact and COMMIT
+   succeeds.  Pre-#295 the COMMIT was wrongly forced to roll back. *)
+let test_rollback_to_savepoint_clears_poison_recovers_commit () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE keep (a INTEGER)";
+    exec db "INSERT INTO keep VALUES (1)";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE u (b TEXT)";
+    (* poison: rename onto a name created earlier in this same txn. *)
+    let _ = exec_err db "ALTER TABLE keep RENAME TO u" in
+    (* ROLLBACK TO s predates the failure: its partial effects unwind, so the
+       txn becomes committable again. *)
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "u (post-savepoint) gone" true (table_absent db "u");
+    exec db "COMMIT";
+    (* The pre-savepoint state survived the recovered COMMIT. *)
+    Alcotest.(check (list string))
+      "pre-savepoint state intact after recovered COMMIT"
+      [ "i:1" ]
+      (rows db "SELECT a FROM keep"))
+;;
+
+(* Must-stay-poisoned case: the DDL failure happens BEFORE the savepoint [s] is
+   opened, so ROLLBACK TO s does NOT unwind the failure's partial effects.  The
+   poison snapshotted at [s] was already set, so COMMIT must still be forced to
+   roll back.  Clearing the poison unconditionally would wrongly commit here. *)
+let test_rollback_to_savepoint_after_failure_stays_poisoned () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    (* poison FIRST … *)
+    let _ = exec_err db "ALTER TABLE t RENAME TO u" in
+    (* … then open a savepoint AFTER the failure and roll back to it. *)
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE w (c INTEGER)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "w (post-savepoint) gone" true (table_absent db "w");
+    (* The failure predates [s]; its partial effects are NOT unwound, so the
+       txn stays poisoned and COMMIT is forced to roll back. *)
+    let commit_err = exec_err db "COMMIT" in
+    Alcotest.(check bool)
+      "COMMIT still rejected: failure predates the savepoint"
+      true
+      (contains ~needle:"uncommittable" commit_err);
+    Alcotest.(check bool) "t discarded by forced rollback" true (table_absent db "t");
+    Alcotest.(check bool) "u discarded by forced rollback" true (table_absent db "u"))
+;;
+
+(* Nested savepoints: a failure between [s1] and [s2].  ROLLBACK TO s2 (which
+   postdates the failure) leaves the txn poisoned; a subsequent ROLLBACK TO s1
+   (which predates it) recovers the txn so COMMIT succeeds. *)
+let test_rollback_to_inner_stays_poisoned_outer_recovers () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE base (a INTEGER)";
+    exec db "INSERT INTO base VALUES (9)";
+    exec db "SAVEPOINT s1";
+    exec db "CREATE TABLE u (b TEXT)";
+    let _ = exec_err db "ALTER TABLE base RENAME TO u" in
+    exec db "SAVEPOINT s2";
+    (* ROLLBACK TO s2 postdates the failure: still poisoned. *)
+    exec db "ROLLBACK TO s2";
+    let commit_err = exec_err db "COMMIT" in
+    Alcotest.(check bool)
+      "inner ROLLBACK TO leaves txn poisoned"
+      true
+      (contains ~needle:"uncommittable" commit_err);
+    (* The forced rollback discarded the whole txn (base is gone). *)
+    Alcotest.(check bool) "base discarded" true (table_absent db "base"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -1044,6 +1131,20 @@ let () =
             "auto-began savepoint DDL, RELEASE auto-commits"
             `Quick
             test_auto_began_savepoint_ddl_release_commits
+        ] )
+    ; ( "savepoint_poison_295"
+      , [ Alcotest.test_case
+            "ROLLBACK TO predating-savepoint clears poison, recovers COMMIT"
+            `Quick
+            test_rollback_to_savepoint_clears_poison_recovers_commit
+        ; Alcotest.test_case
+            "ROLLBACK TO savepoint opened after failure stays poisoned"
+            `Quick
+            test_rollback_to_savepoint_after_failure_stays_poisoned
+        ; Alcotest.test_case
+            "nested: inner ROLLBACK TO stays poisoned"
+            `Quick
+            test_rollback_to_inner_stays_poisoned_outer_recovers
         ] )
     ]
 ;;

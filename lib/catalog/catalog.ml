@@ -154,16 +154,18 @@ type t =
         runs them most-recent-first, [commit_schema_changes] discards them.
         Empty in autocommit mode (where each DDL self-commits and cannot roll
         back). *)
-  ; mutable schema_savepoints : (string * (unit -> unit) list) list
-    (** #280: savepoint markers over [schema_undo].  Each entry records a
-        savepoint name and the [schema_undo] list AS IT WAS when the savepoint
-        was opened (a physical suffix of the current list, since the log only
-        grows by prepending).  Newest savepoint at the front, mirroring the
-        store's savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
-        registered since [s] (the prefix down to its recorded snapshot) and
-        keeps [s]; [RELEASE s] merges them into the enclosing scope (drops the
-        marker, leaves [schema_undo] untouched).  Cleared at every outer txn
-        boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
+  ; mutable schema_savepoints : (string * (unit -> unit) list * bool) list
+    (** #280/#295: savepoint markers over [schema_undo].  Each entry records a
+        savepoint name, the [schema_undo] list AS IT WAS when the savepoint was
+        opened (a physical suffix of the current list, since the log only grows
+        by prepending), and the [schema_txn_poisoned] flag AS IT WAS at that
+        moment (#295).  Newest savepoint at the front, mirroring the store's
+        savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
+        registered since [s] (the prefix down to its recorded snapshot),
+        restores the poison flag to the snapshot, and keeps [s]; [RELEASE s]
+        merges them into the enclosing scope (drops the marker, leaves
+        [schema_undo] and the poison flag untouched).  Cleared at every outer
+        txn boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
   ; mutable schema_txn_poisoned : bool
     (** #286: set when an in-txn DDL statement fails partway through, leaving
         partial on-disk effects under the ambient explicit transaction.  The db
@@ -1267,27 +1269,37 @@ let rollback_schema_changes t =
   t.schema_txn_poisoned <- false
 ;;
 
-(* #280: open a savepoint over the schema-undo log.  Records the current
+(* #280/#295: open a savepoint over the schema-undo log.  Records the current
    [schema_undo] list so [ROLLBACK TO]/[RELEASE] of this savepoint can find the
-   boundary between entries registered before and after it. *)
+   boundary between entries registered before and after it, and the current
+   [schema_txn_poisoned] flag (#295) so [ROLLBACK TO] can restore the poison
+   state as it was when this savepoint opened. *)
 let savepoint_begin_schema t name =
-  t.schema_savepoints <- (name, t.schema_undo) :: t.schema_savepoints
+  t.schema_savepoints
+  <- (name, t.schema_undo, t.schema_txn_poisoned) :: t.schema_savepoints
 ;;
 
-(* #280: ROLLBACK TO a savepoint.  Run+drop the undo closures registered since
-   the savepoint (the prefix of [schema_undo] down to its recorded snapshot,
-   most-recent-first), reset [schema_undo] to that snapshot, drop newer
-   savepoint markers, and keep this savepoint so it can be rolled back to again
-   (mirroring [Store.savepoint_rollback]).  Unknown name: no-op. *)
+(* #280/#295: ROLLBACK TO a savepoint.  Run+drop the undo closures registered
+   since the savepoint (the prefix of [schema_undo] down to its recorded
+   snapshot, most-recent-first), reset [schema_undo] to that snapshot, restore
+   [schema_txn_poisoned] to its snapshot (#295), drop newer savepoint markers,
+   and keep this savepoint so it can be rolled back to again (mirroring
+   [Store.savepoint_rollback]).  Unknown name: no-op.
+
+   #295: the poison restore is what un-poisons a txn whose failed in-txn DDL
+   lay AFTER this savepoint (its partial effects are in the unwound range).  A
+   failure that PREDATES the savepoint left the poison flag already set when
+   this savepoint opened, so the snapshot is [true] and the txn stays poisoned —
+   exactly correct, since those partial effects are NOT unwound here. *)
 let savepoint_rollback_schema t name =
   let rec find = function
     | [] -> None
-    | (n, snap) :: older when String.equal n name -> Some (snap, older)
+    | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
     | _ :: rest -> find rest
   in
   match find t.schema_savepoints with
   | None -> ()
-  | Some (snap, older) ->
+  | Some (snap, poison, older) ->
     (* [snap] is a physical suffix of [t.schema_undo]; run closures ahead of it. *)
     let rec run lst =
       if lst == snap
@@ -1301,17 +1313,21 @@ let savepoint_rollback_schema t name =
     in
     run t.schema_undo;
     t.schema_undo <- snap;
-    t.schema_savepoints <- (name, snap) :: older
+    t.schema_txn_poisoned <- poison;
+    t.schema_savepoints <- (name, snap, poison) :: older
 ;;
 
-(* #280: RELEASE a savepoint.  The since-savepoint undo entries merge into the
-   enclosing scope, so [schema_undo] is untouched — only the marker (and any
-   newer markers) is dropped (mirroring [Store.savepoint_release]).  An outer
-   ROLLBACK still unwinds the merged entries.  Unknown name: no-op. *)
+(* #280/#295: RELEASE a savepoint.  The since-savepoint undo entries merge into
+   the enclosing scope, so [schema_undo] is untouched — only the marker (and any
+   newer markers, including their recorded poison snapshots) is dropped
+   (mirroring [Store.savepoint_release]).  The poison flag itself is left as-is:
+   a poison raised since the savepoint survives the RELEASE into the enclosing
+   scope.  An outer ROLLBACK still unwinds the merged entries.  Unknown name:
+   no-op. *)
 let savepoint_release_schema t name =
   let rec drop = function
     | [] -> []
-    | (n, _) :: older when String.equal n name -> older
+    | (n, _, _) :: older when String.equal n name -> older
     | _ :: rest -> drop rest
   in
   t.schema_savepoints <- drop t.schema_savepoints
