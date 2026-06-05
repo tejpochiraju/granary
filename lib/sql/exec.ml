@@ -5576,6 +5576,9 @@ let execute_create_table_op
               fk_constraints
           in
           let* () = Cat.save_fk_constraints ~txn:tx cat ~table_name:name ~fks:fk_list in
+          (* Raw, undo-free cache update by design — reverted on ROLLBACK by
+             [create_table]'s schema-cache undo, which removes the whole table
+             entry.  See [Cat.set_fk_constraints]. *)
           Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
           Lwt.return_unit)
       in
