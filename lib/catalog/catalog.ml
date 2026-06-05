@@ -431,18 +431,6 @@ let idx_origin_of_byte = function
   | _ -> `User
 ;;
 
-(* Reconstruct an origin for an index persisted before the explicit [idx_origin]
-   field existed (extended-fields version < 3).  Falls back to the [__pk_] /
-   [__uniq_] name prefixes the binder assigns to auto-created indexes — the very
-   coupling #273 removes from the live path, kept here only to read legacy data. *)
-let legacy_idx_origin_of_name name =
-  if String.starts_with ~prefix:"__pk_" name
-  then `Implicit_pk
-  else if String.starts_with ~prefix:"__uniq_" name
-  then `Implicit_unique
-  else `User
-;;
-
 (* Index value encoding:
    varint(name_len) ++ name ++ varint(table_len) ++ table
    ++ varint(n_cols) ++ (varint(col_len) ++ col)*n_cols
@@ -478,9 +466,10 @@ let encode_index_value (idx : index_info) =
   Buffer.to_bytes buf
 ;;
 
-(* Returns [(expr_flags, where_sql, origin)].  [origin] is [None] for formats
-   predating the explicit field (version < 3); the caller reconstructs it from
-   the index name.  Decode of expr flags + WHERE is shared by versions 2 and 3. *)
+(* Returns [(expr_flags, where_sql, origin)].  The current encoder always writes
+   version 3 (with an explicit origin); the pre-v3 branches default [origin] to
+   [`User] — the dump-safe "emit it" choice — since the format is pre-release and
+   no v<3 data exists.  Decode of expr flags + WHERE is shared by versions 2/3. *)
 let decode_index_ext_fields bytes off2 cols =
   let decode_flags_and_where off_start =
     let off_ref = ref off_start in
@@ -503,7 +492,7 @@ let decode_index_ext_fields bytes off2 cols =
     expr_flags, where_sql
   in
   if off2 >= Bytes.length bytes
-  then List.map (fun _ -> false) cols, None, None (* old format: no extended fields *)
+  then List.map (fun _ -> false) cols, None, `User (* old format: no extended fields *)
   else (
     let version, off3 = Varint.decode_uint64 bytes off2 in
     match Int64.to_int version with
@@ -517,17 +506,17 @@ let decode_index_ext_fields bytes off2 cols =
           let sql_len, off5 = Varint.decode_uint64 bytes off4 in
           Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
       in
-      List.map (fun _ -> false) cols, where_sql, None
+      List.map (fun _ -> false) cols, where_sql, `User
     | 2 ->
       (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
       let expr_flags, where_sql = decode_flags_and_where off3 in
-      expr_flags, where_sql, None
+      expr_flags, where_sql, `User
     | 3 ->
       (* Version 3 (#273): origin byte, then expr flags, then WHERE clause *)
       let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
       let expr_flags, where_sql = decode_flags_and_where (off3 + 1) in
-      expr_flags, where_sql, Some origin
-    | _ -> List.map (fun _ -> false) cols, None, None)
+      expr_flags, where_sql, origin
+    | _ -> List.map (fun _ -> false) cols, None, `User)
 ;;
 
 let decode_index_value bytes =
@@ -551,11 +540,8 @@ let decode_index_value bytes =
   in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
-  let idx_expr_flags, idx_where_sql, origin = decode_index_ext_fields bytes off2 cols in
-  let idx_origin =
-    match origin with
-    | Some o -> o
-    | None -> legacy_idx_origin_of_name name
+  let idx_expr_flags, idx_where_sql, idx_origin =
+    decode_index_ext_fields bytes off2 cols
   in
   { idx_name = name
   ; idx_table = tbl
