@@ -40,7 +40,15 @@ rule token = parse
     { FLOAT_LIT (float_of_string f) }
   | (digit+ ['e' 'E'] ['+' '-']? digit+) as f
     { FLOAT_LIT (float_of_string f) }
-  | digit+ as n             { INT_LIT (Int64.of_string n) }
+  | digit+ as n             {
+      (* A magnitude one past [Int64.max_int] (2^63 = 9223372036854775808) is
+         not representable as a positive int64, yet it is exactly [-Int64.min_int]:
+         emit it as a raw-string token so the parser can fold a leading unary
+         minus into [Int64.min_int].  A bare positive of that size is rejected
+         later by the parser (no production accepts INT_LIT_OVERFLOW alone). *)
+      match Int64.of_string_opt n with
+      | Some v -> INT_LIT v
+      | None   -> INT_LIT_OVERFLOW n }
   | ['x' 'X'] '\'' (['0'-'9' 'a'-'f' 'A'-'F']* as h) '\''
     { (* X'...' blob literal — convert hex pairs to bytes *)
       let n = String.length h in
