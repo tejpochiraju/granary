@@ -3436,7 +3436,10 @@ let execute_create_index
                [check_insert_unique], so build-time and insert-time uniqueness
                agree (including multi-column, partial-WHERE and NULL handling).
                A raise here unwinds through [with_ddl_txn]: an owned txn rolls
-               back (no partial entries), a borrowed one is poisoned (#286). *)
+               back (no partial entries), a borrowed one is poisoned (#286).
+               The raise skips the outer [S.cursor_close cur] below, but
+               [cursor_close] is a no-op (no OS handle) and the txn unwind
+               reclaims all store state — so no leak. *)
             let* () =
               if not unique
               then Lwt.return_unit
