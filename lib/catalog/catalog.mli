@@ -404,7 +404,14 @@ val set_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> uni
 (** #269: register an in-memory schema-cache reversal for DDL run through an
     explicit transaction.  The closure is invoked by [rollback_schema_changes]
     if the transaction is rolled back; it is discarded by [commit_schema_changes]
-    on commit.  Used by the db layer for view/trigger caches it owns. *)
+    on commit.  Used by the db layer for view/trigger caches it owns.
+
+    The closure MUST be idempotent (e.g. [Hashtbl.replace]/[remove] over values
+    captured at registration, not read-modify-write of live state).  #280's
+    [savepoint_rollback_schema] reverts the cache by re-running the closures
+    registered since a savepoint; its defensive "snapshot not reached" branch
+    can also leave an already-run closure queued for the outer ROLLBACK.  Both
+    rely on a second invocation being a no-op. *)
 val register_schema_undo : t -> (unit -> unit) -> unit
 
 (** #269: discard the pending schema-undo closures — the transaction's DDL is now
@@ -415,6 +422,24 @@ val commit_schema_changes : t -> unit
     in-memory cache mutations of DDL whose store writes were just rolled back.
     Call at ROLLBACK. *)
 val rollback_schema_changes : t -> unit
+
+(** #280: open a schema-undo savepoint named [name].  Records the current
+    undo-log position so a later [savepoint_rollback_schema]/
+    [savepoint_release_schema] of [name] can act on only the entries registered
+    since this point.  Call from the db layer's SAVEPOINT handler. *)
+val savepoint_begin_schema : t -> string -> unit
+
+(** #280: ROLLBACK TO savepoint [name] — run (most-recent-first) and drop the
+    schema-undo closures registered since [name] was opened, reverting their
+    in-memory cache mutations to agree with the store rolled back to [name].
+    Keeps [name] (re-rollback-able) and drops newer savepoints.  No-op if [name]
+    is unknown. *)
+val savepoint_rollback_schema : t -> string -> unit
+
+(** #280: RELEASE savepoint [name] — drop the marker (and newer ones) without
+    running any undo; the since-[name] entries merge into the enclosing scope so
+    an outer ROLLBACK still unwinds them.  No-op if [name] is unknown. *)
+val savepoint_release_schema : t -> string -> unit
 
 (** #286: mark the ambient explicit transaction uncommittable.  Called when an
     in-txn DDL statement fails partway through — its borrowed txn is left open

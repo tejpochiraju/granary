@@ -720,6 +720,187 @@ let test_drop_in_txn_then_poison_restores () =
     Alcotest.(check (list string)) "keep intact" [] (rows db "SELECT b FROM keep"))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* ROLLBACK TO SAVEPOINT partially unwinds the schema-undo log (#280)     *)
+(*                                                                       *)
+(* The #269 schema-cache undo log was finalized only at the OUTER txn     *)
+(* boundary (COMMIT clears, ROLLBACK runs).  It was not keyed by          *)
+(* savepoint, so [ROLLBACK TO s] reverted the store back to [s] but left  *)
+(* the in-memory cache holding DDL created after [s] — a stale entry that *)
+(* disagreed with the store until the outer COMMIT/ROLLBACK.  These tests *)
+(* pin that a [ROLLBACK TO s] runs+drops only the undo entries registered *)
+(* since [s], keeping earlier ones, and that [RELEASE s] merges the       *)
+(* since-[s] entries into the enclosing scope (so a later outer ROLLBACK  *)
+(* still unwinds them).                                                   *)
+(* ------------------------------------------------------------------ *)
+
+(* The canonical #280 repro: a CREATE inside a savepoint, then ROLLBACK TO
+   that savepoint.  The table must be gone from BOTH the store and the cache,
+   so the name is free to recreate within the same transaction. *)
+let test_create_in_savepoint_rollback_to_unwinds_cache () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "ROLLBACK TO s";
+    (* Cache must agree with the rolled-back store: t is gone. *)
+    Alcotest.(check bool) "t gone after ROLLBACK TO s" true (table_absent db "t");
+    (* … and the name is free again — pre-#280 this failed "already exists". *)
+    exec db "CREATE TABLE t (b TEXT)";
+    exec db "INSERT INTO t VALUES ('new')";
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "recreated table committed"
+      [ "t:new" ]
+      (rows db "SELECT b FROM t"))
+;;
+
+(* A DROP inside a savepoint, then ROLLBACK TO: the table and its rows must be
+   restored in cache+store (symmetric with the #279 outer-ROLLBACK case). *)
+let test_drop_in_savepoint_rollback_to_restores () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "INSERT INTO t VALUES (2)";
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "DROP TABLE t";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check (list string))
+      "rolled-back-to-savepoint DROP restores table+rows"
+      [ "i:1"; "i:2" ]
+      (rows db "SELECT a FROM t");
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "restored table survives COMMIT"
+      [ "i:1"; "i:2" ]
+      (rows db "SELECT a FROM t"))
+;;
+
+(* ROLLBACK TO unwinds only the entries registered SINCE the savepoint; DDL from
+   before the savepoint survives.  Then COMMIT keeps the survivor. *)
+let test_rollback_to_keeps_earlier_ddl () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE a (x INTEGER)";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE b (y INTEGER)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "b (post-savepoint) gone" true (table_absent db "b");
+    Alcotest.(check (list string))
+      "a (pre-savepoint) survives in cache"
+      []
+      (rows db "SELECT x FROM a");
+    exec db "INSERT INTO a VALUES (7)";
+    exec db "COMMIT";
+    Alcotest.(check bool) "b still gone after commit" true (table_absent db "b");
+    Alcotest.(check (list string)) "a committed" [ "i:7" ] (rows db "SELECT x FROM a"))
+;;
+
+(* Nested savepoints: ROLLBACK TO the OUTER savepoint unwinds DDL from both the
+   inner savepoint and between the two. *)
+let test_rollback_to_outer_savepoint_unwinds_nested () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s1";
+    exec db "CREATE TABLE a (x INTEGER)";
+    exec db "SAVEPOINT s2";
+    exec db "CREATE TABLE b (y INTEGER)";
+    exec db "ROLLBACK TO s1";
+    Alcotest.(check bool) "a gone" true (table_absent db "a");
+    Alcotest.(check bool) "b gone" true (table_absent db "b");
+    (* Both names free again inside the same txn. *)
+    exec db "CREATE TABLE a (z TEXT)";
+    exec db "COMMIT";
+    Alcotest.(check (list string)) "a recreated" [] (rows db "SELECT z FROM a"))
+;;
+
+(* RELEASE merges the since-savepoint undo entries into the enclosing scope: they
+   are NOT run, so a later OUTER ROLLBACK still unwinds them. *)
+let test_release_savepoint_merges_undo_to_outer () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "RELEASE s";
+    (* After RELEASE the table is still present (writes kept). *)
+    Alcotest.(check (list string))
+      "t present after RELEASE"
+      []
+      (rows db "SELECT a FROM t");
+    (* The outer ROLLBACK must still discard it — the undo entry survived RELEASE. *)
+    exec db "ROLLBACK";
+    Alcotest.(check bool) "t discarded by outer ROLLBACK" true (table_absent db "t"))
+;;
+
+(* A savepoint can be rolled back to repeatedly; each ROLLBACK TO re-runs the
+   undo for DDL created since the last ROLLBACK TO the same savepoint. *)
+let test_rollback_to_savepoint_is_repeatable () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "t gone (1st)" true (table_absent db "t");
+    exec db "CREATE TABLE t (b TEXT)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "t gone (2nd)" true (table_absent db "t");
+    exec db "CREATE TABLE t (c INTEGER)";
+    exec db "COMMIT";
+    Alcotest.(check (list string)) "final t committed" [] (rows db "SELECT c FROM t"))
+;;
+
+(* Duplicate savepoint names (SQLite allows them; the newest wins).  RELEASE s
+   drops the inner [s] and its since-marker entries merge outward; ROLLBACK TO s
+   then targets the OUTER [s], unwinding DDL from BOTH savepoints.  The
+   newest-first [find]/[drop] walk gives this for free. *)
+let test_duplicate_savepoint_names () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE a (x INTEGER)";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE b (y INTEGER)";
+    exec db "RELEASE s";
+    (* Inner RELEASE keeps both tables (writes merge outward). *)
+    Alcotest.(check (list string))
+      "a present after inner RELEASE"
+      []
+      (rows db "SELECT x FROM a");
+    Alcotest.(check (list string))
+      "b present after inner RELEASE"
+      []
+      (rows db "SELECT y FROM b");
+    exec db "ROLLBACK TO s";
+    (* ROLLBACK TO the outer [s] unwinds both. *)
+    Alcotest.(check bool) "a gone after ROLLBACK TO outer s" true (table_absent db "a");
+    Alcotest.(check bool) "b gone after ROLLBACK TO outer s" true (table_absent db "b");
+    exec db "COMMIT")
+;;
+
+(* Auto-began savepoint (no BEGIN): SAVEPOINT auto-opens a txn, DDL participates,
+   ROLLBACK TO unwinds the cache, and RELEASE of the last savepoint auto-commits
+   — the auto-commit path's [commit_schema_changes] must also clear the savepoint
+   stack so no stale marker leaks into the next statement. *)
+let test_auto_began_savepoint_ddl_release_commits () =
+  with_db (fun db ->
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "t gone after ROLLBACK TO s" true (table_absent db "t");
+    (* Recreate inside the still-open auto-began txn, then RELEASE auto-commits. *)
+    exec db "CREATE TABLE t (b TEXT)";
+    exec db "INSERT INTO t VALUES ('x')";
+    exec db "RELEASE s";
+    Alcotest.(check (list string))
+      "t durable after RELEASE auto-commit"
+      [ "t:x" ]
+      (rows db "SELECT b FROM t");
+    (* The stack was cleared: a fresh autocommit CREATE works. *)
+    exec db "CREATE TABLE u (c INTEGER)";
+    Alcotest.(check (list string)) "fresh autocommit works" [] (rows db "SELECT c FROM u"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -829,6 +1010,40 @@ let () =
             "drop in-txn then poison restores on forced rollback"
             `Quick
             test_drop_in_txn_then_poison_restores
+        ] )
+    ; ( "savepoint_schema_undo_280"
+      , [ Alcotest.test_case
+            "CREATE in savepoint, ROLLBACK TO unwinds cache"
+            `Quick
+            test_create_in_savepoint_rollback_to_unwinds_cache
+        ; Alcotest.test_case
+            "DROP in savepoint, ROLLBACK TO restores"
+            `Quick
+            test_drop_in_savepoint_rollback_to_restores
+        ; Alcotest.test_case
+            "ROLLBACK TO keeps earlier (pre-savepoint) DDL"
+            `Quick
+            test_rollback_to_keeps_earlier_ddl
+        ; Alcotest.test_case
+            "ROLLBACK TO outer savepoint unwinds nested DDL"
+            `Quick
+            test_rollback_to_outer_savepoint_unwinds_nested
+        ; Alcotest.test_case
+            "RELEASE merges since-savepoint undo into outer scope"
+            `Quick
+            test_release_savepoint_merges_undo_to_outer
+        ; Alcotest.test_case
+            "ROLLBACK TO same savepoint is repeatable"
+            `Quick
+            test_rollback_to_savepoint_is_repeatable
+        ; Alcotest.test_case
+            "duplicate savepoint names (newest wins)"
+            `Quick
+            test_duplicate_savepoint_names
+        ; Alcotest.test_case
+            "auto-began savepoint DDL, RELEASE auto-commits"
+            `Quick
+            test_auto_began_savepoint_ddl_release_commits
         ] )
     ]
 ;;
