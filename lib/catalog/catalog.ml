@@ -604,36 +604,12 @@ let decode_fts_value fts_name bytes =
 (* next_user_tid / next_index_id management                              *)
 (* ------------------------------------------------------------------ *)
 
-let read_uint64_key store key default =
-  S.with_ro store
-  @@ fun tx ->
-  let%lwt v = S.get tx sys_meta_tid key in
-  match v with
-  | Some b ->
-    let n, _ = Varint.decode_uint64 b 0 in
-    Lwt.return (Int64.to_int n)
-  | None -> Lwt.return default
-;;
-
-let write_uint64_key store key n =
-  let%lwt tx = S.rw_begin store in
-  let buf = Buffer.create 8 in
-  Varint.encode_uint64 buf (Int64.of_int n);
-  let%lwt () = S.put tx sys_meta_tid key (Buffer.to_bytes buf) in
-  S.commit tx
-;;
-
-let read_next_user_tid store = read_uint64_key store next_user_tid_key next_user_tid_init
-let write_next_user_tid store tid = write_uint64_key store next_user_tid_key tid
-let read_next_index_id store = read_uint64_key store next_index_id_key 0
-let write_next_index_id store id = write_uint64_key store next_index_id_key id
-
-(* #269: tx-threaded counter access.  [read_uint64_key]/[write_uint64_key] open
-   their own RO snapshot / RW txn, which (a) self-deadlocks when an explicit
-   writer txn is already held and (b) cannot see that txn's uncommitted counter
-   bumps — two CREATEs in one transaction would alloc the SAME tree-ID.  These
-   variants read and write through the supplied [tx], so counter allocation is
-   read-your-own-writes and rolls back with the transaction. *)
+(* #269: the tx-threaded forms are the primitives — they read/write the counter
+   through a supplied [tx], so allocation is read-your-own-writes (two CREATEs in
+   one transaction never alloc the SAME tree-ID) and rolls back with the txn.
+   The store-level forms below wrap them in their own RO snapshot / RW txn for
+   the autocommit path; those must NOT be used while an explicit writer txn is
+   held (the nested [rw_begin] would self-deadlock — that was the #269 bug). *)
 let read_uint64_key_tx tx key default =
   let%lwt v = S.get tx sys_meta_tid key in
   match v with
@@ -649,6 +625,20 @@ let write_uint64_key_tx tx key n =
   S.put tx sys_meta_tid key (Buffer.to_bytes buf)
 ;;
 
+let read_uint64_key store key default =
+  S.with_ro store @@ fun tx -> read_uint64_key_tx tx key default
+;;
+
+let write_uint64_key store key n =
+  let%lwt tx = S.rw_begin store in
+  let%lwt () = write_uint64_key_tx tx key n in
+  S.commit tx
+;;
+
+let read_next_user_tid store = read_uint64_key store next_user_tid_key next_user_tid_init
+let write_next_user_tid store tid = write_uint64_key store next_user_tid_key tid
+let read_next_index_id store = read_uint64_key store next_index_id_key 0
+let write_next_index_id store id = write_uint64_key store next_index_id_key id
 let read_next_user_tid_tx tx = read_uint64_key_tx tx next_user_tid_key next_user_tid_init
 let write_next_user_tid_tx tx tid = write_uint64_key_tx tx next_user_tid_key tid
 let read_next_index_id_tx tx = read_uint64_key_tx tx next_index_id_key 0
@@ -809,24 +799,29 @@ let load_all_views store =
   Lwt.return (List.rev !pairs)
 ;;
 
-(* [?txn] (#269): persist/remove through the ambient explicit transaction when
-   one is active, else autocommit. *)
-let persist_view ?txn store ~name ~sql =
+(* #269: run [f tx] through the ambient explicit transaction ([?txn = Some tx],
+   left uncommitted — the db layer owns its lifecycle) or, in autocommit, a fresh
+   writer txn committed here.  Shared by the view/trigger persistence and the FK
+   save so the borrow-or-autocommit plumbing lives in one place. *)
+let borrow_or_autocommit ?txn store f =
   match txn with
-  | Some tx -> S.put tx sys_views_tid (Bytes.of_string name) (Bytes.of_string sql)
+  | Some tx -> f tx
   | None ->
     let%lwt tx = S.rw_begin store in
-    let%lwt () = S.put tx sys_views_tid (Bytes.of_string name) (Bytes.of_string sql) in
+    let%lwt () = f tx in
     S.commit tx
 ;;
 
+(* [?txn] (#269): persist/remove through the ambient explicit transaction when
+   one is active, else autocommit. *)
+let persist_view ?txn store ~name ~sql =
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.put tx sys_views_tid (Bytes.of_string name) (Bytes.of_string sql))
+;;
+
 let remove_view ?txn store ~name =
-  match txn with
-  | Some tx -> S.del tx sys_views_tid (Bytes.of_string name)
-  | None ->
-    let%lwt tx = S.rw_begin store in
-    let%lwt () = S.del tx sys_views_tid (Bytes.of_string name) in
-    S.commit tx
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.del tx sys_views_tid (Bytes.of_string name))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -854,21 +849,13 @@ let load_all_triggers store =
 (* [?txn] (#269): persist/remove through the ambient explicit transaction when
    one is active, else autocommit. *)
 let persist_trigger ?txn store ~name ~sql =
-  match txn with
-  | Some tx -> S.put tx sys_triggers_tid (Bytes.of_string name) (Bytes.of_string sql)
-  | None ->
-    let%lwt tx = S.rw_begin store in
-    let%lwt () = S.put tx sys_triggers_tid (Bytes.of_string name) (Bytes.of_string sql) in
-    S.commit tx
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.put tx sys_triggers_tid (Bytes.of_string name) (Bytes.of_string sql))
 ;;
 
 let remove_trigger ?txn store ~name =
-  match txn with
-  | Some tx -> S.del tx sys_triggers_tid (Bytes.of_string name)
-  | None ->
-    let%lwt tx = S.rw_begin store in
-    let%lwt () = S.del tx sys_triggers_tid (Bytes.of_string name) in
-    S.commit tx
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.del tx sys_triggers_tid (Bytes.of_string name))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1128,7 +1115,7 @@ let load_fk_constraints_raw store table_name =
    transaction; otherwise an autocommit writer txn is used. *)
 let save_fk_constraints ?txn t ~table_name ~fks =
   let key = fk_meta_key table_name in
-  let body tx =
+  borrow_or_autocommit ?txn t.store (fun tx ->
     let%lwt () =
       if fks = []
       then S.del tx sys_meta_tid key
@@ -1138,14 +1125,7 @@ let save_fk_constraints ?txn t ~table_name ~fks =
        constraints, not just columns. *)
     match Hashtbl.find_opt t.cache table_name with
     | Some m -> put_mirror_tx tx { m with fk_constraints = fks }
-    | None -> Lwt.return_unit
-  in
-  match txn with
-  | Some tx -> body tx
-  | None ->
-    let%lwt tx = S.rw_begin t.store in
-    let%lwt () = body tx in
-    S.commit tx
+    | None -> Lwt.return_unit)
 ;;
 
 let set_fk_constraints t ~table_name ~fks =
@@ -1290,6 +1270,13 @@ let create_table ?txn t ~name ~columns ~without_rowid =
     let%lwt tid = next_user_tid_tx tx in
     let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~tid in
     Hashtbl.replace t.cache name m;
+    (* [register_tag] stamps the store-global in-memory [tree_tags] for [tid].
+       On ROLLBACK we revert only the cache entry, not the tag — but that is
+       safe: the txn also rolls back [tid]'s allocation (the user-tid counter is
+       restored), leaving [tid] unallocated, so no table_meta references it and
+       nothing writes pages to it.  The next CREATE reuses [tid] and overwrites
+       the tag.  A lingering stamp for an unreferenced tree therefore cannot
+       mis-stamp any page (#174). *)
     register_tag t.store m;
     register_schema_undo t (fun () -> Hashtbl.remove t.cache name);
     Lwt.return tid

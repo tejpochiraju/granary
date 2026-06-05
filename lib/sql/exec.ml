@@ -6025,20 +6025,34 @@ let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name : i
 ;;
 
 (* Op_alter_table: dispatch on the ALTER action. *)
-let execute_alter_table store (cat : Cat.t) ~(table_meta : Cat.table_meta) action
+let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta) action
   : int Lwt.t
   =
-  match action with
-  | Ast.AA_add_column col_def -> alter_add_column cat ~table_meta col_def
-  | Ast.AA_rename_table new_name -> alter_rename_table cat ~table_meta new_name
-  | Ast.AA_rename_column (old_col, new_col) ->
-    let* result =
-      Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col
-    in
-    (match result with
-     | Error msg -> Lwt.fail_with msg
-     | Ok () -> Lwt.return 0)
-  | Ast.AA_drop_column col_name -> alter_drop_column store cat ~table_meta col_name
+  (* #269/#282: the ALTER mutators still open their own writer txns (and
+     [alter_drop_column] interleaves a read snapshot + row-rewrite txn), so
+     running them inside an explicit transaction would self-deadlock against the
+     writer lock the txn already holds.  Threading the ambient txn through the
+     ALTER path is delicate (in-txn row migration must be read-your-own-writes,
+     and the corruption rollback paths must not abort a borrowed txn) and is
+     deferred to #282.  Until then, reject ALTER inside an explicit transaction
+     with a clean error instead of hanging.  Autocommit ALTER is unaffected. *)
+  match mode with
+  | In_txn _ ->
+    Lwt.fail_with
+      "ALTER TABLE within an explicit transaction is not yet supported (#282); run it in \
+       autocommit (outside BEGIN…COMMIT)"
+  | Auto ->
+    (match action with
+     | Ast.AA_add_column col_def -> alter_add_column cat ~table_meta col_def
+     | Ast.AA_rename_table new_name -> alter_rename_table cat ~table_meta new_name
+     | Ast.AA_rename_column (old_col, new_col) ->
+       let* result =
+         Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col
+       in
+       (match result with
+        | Error msg -> Lwt.fail_with msg
+        | Ok () -> Lwt.return 0)
+     | Ast.AA_drop_column col_name -> alter_drop_column store cat ~table_meta col_name)
 ;;
 
 (* Op_create_index: create the index unless IF NOT EXISTS finds it present. *)
@@ -6231,7 +6245,7 @@ let execute_with_count
   | Plan.Op_fts_delete { fts_meta; where } ->
     execute_fts_delete store cat ~mode ~clock ~params fts_meta ~where
   | Plan.Op_alter_table { table_meta; action } ->
-    execute_alter_table store cat ~table_meta action
+    execute_alter_table store cat ~mode ~table_meta action
   | Plan.Op_begin
   | Plan.Op_commit
   | Plan.Op_rollback

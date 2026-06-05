@@ -391,6 +391,10 @@ let begin_txn t =
   | Some _ -> Lwt.return (Error (Runtime "transaction already active"))
   | None ->
     let* tx = S.rw_begin t.store in
+    (* #269: defensive — start with an empty schema-undo log so a stale entry
+       from a prior op can never leak into this transaction's rollback. (It is
+       already cleared by every commit/rollback path; this just hardens it.) *)
+    Cat.commit_schema_changes t.catalog;
     t.explicit_txn <- Some tx;
     Lwt.return (Ok ())
 ;;
@@ -1211,12 +1215,18 @@ let execute_instead_of t view_name ast =
    [undo] is registered to revert the cache on ROLLBACK; otherwise [persist None]
    self-commits, as before. *)
 let staged_schema_change t ~apply ~undo ~persist =
-  apply ();
+  (* Persist to the store FIRST, then mutate the in-memory cache: if the store
+     write raises, the cache is left untouched (no orphaned cache entry / undo). *)
   match t.explicit_txn with
   | Some tx ->
+    let* () = persist (Some tx) in
+    apply ();
     Cat.register_schema_undo t.catalog undo;
-    persist (Some tx)
-  | None -> persist None
+    Lwt.return_unit
+  | None ->
+    let* () = persist None in
+    apply ();
+    Lwt.return_unit
 ;;
 
 (* Handle non-DML control / DDL ops (txn control, ATTACH/DETACH, schema

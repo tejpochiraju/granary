@@ -50,6 +50,13 @@ let exec_err db sql =
   | Error e -> Format.asprintf "%a" Db.pp_error e
 ;;
 
+let contains_substr ~needle hay =
+  let nl = String.length needle
+  and hl = String.length hay in
+  let rec go i = i + nl <= hl && (String.sub hay i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+;;
+
 let vstr = function
   | Db.V_int i -> Printf.sprintf "i:%Ld" i
   | Db.V_real f -> Printf.sprintf "r:%.17g" f
@@ -235,6 +242,32 @@ let test_schema_dump_replays_in_txn () =
     Alcotest.(check (list string)) "view restored" [ "t:two" ] (rows db "SELECT b FROM v"))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* ALTER TABLE — deferred to #282; must error cleanly, not deadlock.    *)
+(* ------------------------------------------------------------------ *)
+
+let test_alter_in_txn_clean_error () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "BEGIN";
+    (* ALTER inside the txn is rejected with a clean error (it would otherwise
+       self-deadlock — see #282), NOT a hang. *)
+    let msg = exec_err db "ALTER TABLE t ADD COLUMN b TEXT" in
+    Alcotest.(check bool)
+      "error mentions transaction"
+      true
+      (contains_substr ~needle:"transaction" msg);
+    (* The transaction is still usable and rolls back cleanly. *)
+    exec db "ROLLBACK";
+    (* And ALTER in autocommit (outside a txn) still works. *)
+    exec db "ALTER TABLE t ADD COLUMN b TEXT";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    Alcotest.(check (list string))
+      "autocommit ALTER works"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, b FROM t"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -260,5 +293,7 @@ let () =
         ] )
     ; ( "schema_dump"
       , [ Alcotest.test_case "replays in txn" `Quick test_schema_dump_replays_in_txn ] )
+    ; ( "alter_table"
+      , [ Alcotest.test_case "in-txn clean error" `Quick test_alter_in_txn_clean_error ] )
     ]
 ;;
