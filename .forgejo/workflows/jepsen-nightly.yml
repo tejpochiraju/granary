@@ -15,6 +15,7 @@ on:
   schedule:
     # 03:00 UTC daily (08:30 IST).
     - cron: "0 3 * * *"
+  # Allow ad-hoc manual runs (so the suite can be triggered on demand to test).
   workflow_dispatch: {}
 
 concurrency:
@@ -25,6 +26,18 @@ jobs:
   jepsen-full:
     runs-on: self-hosted
     steps:
+      # actions/checkout@v4 is a JS action and needs `node` in PATH. This job
+      # runs directly on the host runner (no job container), unlike ci.yml whose
+      # node lives inside the opam container, so install it on the host only if
+      # it is missing — avoids re-running apt on every nightly when it is already
+      # present. Mirrors the "Install Node.js" fix applied to ci.yml.
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          command -v node >/dev/null 2>&1 || {
+            sudo apt-get update -q
+            sudo apt-get install -y -q nodejs
+          }
+
       - uses: actions/checkout@v4
 
       - name: Build Jepsen image (cached by podman layers across runs)
@@ -35,3 +48,38 @@ jobs:
           podman run --rm --device /dev/fuse --cap-add SYS_ADMIN \
             -v "$PWD":/workspace:z -w /workspace --entrypoint bash \
             sqlocaml-jepsen jepsen/run/ci_full.sh
+
+      # On any failure above, open a Forgejo issue so the nightly does not fail
+      # silently. Deduped by title marker: if an open issue already exists for a
+      # previous failing nightly, comment on it instead of opening a duplicate
+      # (the scheduled job runs unattended every night).
+      - name: File issue on failure
+        if: failure()
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_number }}
+          MARKER: "Jepsen nightly failed"
+        run: |
+          set -eu
+          body="The Jepsen nightly suite (#177) failed.\n\n- Run: ${RUN_URL}\n- Commit: ${GITHUB_SHA}\n- Ref: ${GITHUB_REF}\n\nSee the workflow logs for the failing workload/nemesis and the Elle checker output."
+          # Look for an existing open failure issue (dedup by title marker).
+          existing=$(curl -sS \
+            -H "Authorization: token ${TOKEN}" \
+            "${API}/issues?state=open&type=issues&q=$(printf '%s' "${MARKER}" | tr ' ' '+')")
+          number=$(printf '%s' "${existing}" | grep -o "\"number\":[0-9]*" | head -n1 | grep -o "[0-9]*" || true)
+          if printf '%s' "${existing}" | grep -q "${MARKER}" && [ -n "${number}" ]; then
+            echo "Open failure issue #${number} exists; adding a comment."
+            curl -sSf -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"body\": \"Failed again on run ${RUN_URL} (commit ${GITHUB_SHA}).\"}" \
+              "${API}/issues/${number}/comments" >/dev/null
+          else
+            echo "No open failure issue; opening one."
+            curl -sSf -X POST \
+              -H "Authorization: token ${TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"title\": \"${MARKER} (run ${{ github.run_number }})\", \"body\": \"${body}\"}" \
+              "${API}/issues" >/dev/null
+          fi
