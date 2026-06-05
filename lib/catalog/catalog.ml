@@ -154,6 +154,15 @@ type t =
         runs them most-recent-first, [commit_schema_changes] discards them.
         Empty in autocommit mode (where each DDL self-commits and cannot roll
         back). *)
+  ; mutable schema_txn_poisoned : bool
+    (** #286: set when an in-txn DDL statement fails partway through, leaving
+        partial on-disk effects under the ambient explicit transaction.  The db
+        layer leaves a failed statement's borrowed txn open (teardown is the
+        COMMIT/ROLLBACK's job), so a subsequent COMMIT would otherwise persist
+        the half-applied DDL.  When poisoned, the db layer forces COMMIT to roll
+        back instead (the transaction is uncommittable, matching SQLite).  Both
+        [commit_schema_changes] and [rollback_schema_changes] clear it — they
+        bracket the schema-change transaction. *)
   }
 
 let pp fmt t =
@@ -1211,6 +1220,7 @@ let open_ store =
     ; pending_fk_checks = []
     ; last_inserted_rowid = 0L
     ; schema_undo = []
+    ; schema_txn_poisoned = false
     }
 ;;
 
@@ -1227,11 +1237,21 @@ let next_user_tid t =
 
 (* #269: schema-cache undo log for DDL run inside an explicit transaction. *)
 let register_schema_undo t f = t.schema_undo <- f :: t.schema_undo
-let commit_schema_changes t = t.schema_undo <- []
+
+(* #286: mark the ambient explicit transaction uncommittable because an in-txn
+   DDL statement failed partway through (partial on-disk effects remain). *)
+let mark_schema_txn_poisoned t = t.schema_txn_poisoned <- true
+let schema_txn_poisoned t = t.schema_txn_poisoned
+
+let commit_schema_changes t =
+  t.schema_undo <- [];
+  t.schema_txn_poisoned <- false
+;;
 
 let rollback_schema_changes t =
   List.iter (fun f -> f ()) t.schema_undo;
-  t.schema_undo <- []
+  t.schema_undo <- [];
+  t.schema_txn_poisoned <- false
 ;;
 
 (* Write a table's catalog rows (primary + columns + mirror) through [tx] and

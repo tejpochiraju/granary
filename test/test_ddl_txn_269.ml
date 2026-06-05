@@ -453,6 +453,132 @@ let test_multi_alter_same_table_rollback () =
     exec db "ALTER TABLE t ADD COLUMN b TEXT")
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #286: a DDL statement that fails inside an explicit transaction       *)
+(* leaves the transaction UNCOMMITTABLE — a later COMMIT is forced to    *)
+(* roll back rather than persist partial DDL effects.                    *)
+(*                                                                       *)
+(* Trigger: [ALTER TABLE t RENAME TO u] where [u] was created earlier in *)
+(* the SAME uncommitted transaction.  Semantic analysis validates against*)
+(* the committed catalog and does not see the in-txn [u], so it passes;  *)
+(* the catalog mutator then raises "table already exists: u" from inside *)
+(* [with_ddl_txn]'s borrowed-txn path, which poisons the txn.            *)
+(* ------------------------------------------------------------------ *)
+
+let contains ~needle haystack =
+  let nl = String.length needle
+  and hl = String.length haystack in
+  let rec go i =
+    i + nl <= hl && (String.equal (String.sub haystack i nl) needle || go (i + 1))
+  in
+  nl = 0 || go 0
+;;
+
+(* COMMIT after a poisoned in-txn DDL is rejected, and the WHOLE transaction
+   is rolled back: every change made in the txn (both [CREATE TABLE]s) is gone,
+   and the catalog cache agrees with the store (the names are free to recreate). *)
+let test_failed_in_txn_ddl_poisons_commit () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    (* sema passes (committed catalog has no [u]); catalog raises → poison. *)
+    let alter_err = exec_err db "ALTER TABLE t RENAME TO u" in
+    Alcotest.(check bool)
+      "rename failed because target exists"
+      true
+      (contains ~needle:"already exists" alter_err);
+    let commit_err = exec_err db "COMMIT" in
+    Alcotest.(check bool)
+      "COMMIT rejected: transaction was uncommittable"
+      true
+      (contains ~needle:"uncommittable" commit_err);
+    (* The forced rollback discarded the entire txn: both tables are gone … *)
+    Alcotest.(check bool) "t discarded by forced rollback" true (table_absent db "t");
+    Alcotest.(check bool) "u discarded by forced rollback" true (table_absent db "u");
+    (* … and the connection is clean: a fresh autocommit CREATE of the same
+       names succeeds (a stale cache entry would raise "already exists"). *)
+    exec db "CREATE TABLE t (a INTEGER, c TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'ok')";
+    Alcotest.(check (list string))
+      "recreated table is usable"
+      [ "i:1,t:ok" ]
+      (rows db "SELECT a, c FROM t"))
+;;
+
+(* An explicit ROLLBACK after a poisoned in-txn DDL also unwinds cleanly (the
+   poison flag must not interfere with the normal ROLLBACK path), and the
+   connection remains usable for a fresh transaction. *)
+let test_failed_in_txn_ddl_then_rollback_clean () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    let _ = exec_err db "ALTER TABLE t RENAME TO u" in
+    exec db "ROLLBACK";
+    Alcotest.(check bool) "t gone after rollback" true (table_absent db "t");
+    Alcotest.(check bool) "u gone after rollback" true (table_absent db "u");
+    (* The poison flag was cleared by ROLLBACK: a fresh txn commits normally. *)
+    exec db "BEGIN";
+    exec db "CREATE TABLE w (a INTEGER)";
+    exec db "INSERT INTO w VALUES (5)";
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "next transaction commits normally"
+      [ "i:5" ]
+      (rows db "SELECT a FROM w"))
+;;
+
+(* Once poisoned, the transaction stays uncommittable even if later statements
+   succeed — matching SQLite's "transaction is uncommittable" semantics.  A
+   successful DML after the failed DDL does not clear the poison. *)
+let test_poison_persists_through_later_success () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    let _ = exec_err db "ALTER TABLE t RENAME TO u" in
+    (* A perfectly valid statement still runs … *)
+    exec db "INSERT INTO u VALUES ('still works')";
+    Alcotest.(check (list string))
+      "DML after poison still executes in-txn"
+      [ "t:still works" ]
+      (rows db "SELECT b FROM u");
+    (* … but COMMIT is still rejected: the txn never became committable again. *)
+    let commit_err = exec_err db "COMMIT" in
+    Alcotest.(check bool)
+      "COMMIT still rejected after a later successful statement"
+      true
+      (contains ~needle:"uncommittable" commit_err);
+    Alcotest.(check bool) "u discarded" true (table_absent db "u"))
+;;
+
+(* The poison also blocks the savepoint-release auto-commit path: a bare
+   [SAVEPOINT] (no [BEGIN]) auto-begins a transaction, and [RELEASE]ing the last
+   savepoint would auto-commit it.  A failed in-txn DDL must force that RELEASE to
+   roll back instead.  Covers the second of the two commit paths this fix touches. *)
+let test_failed_in_txn_ddl_poisons_savepoint_release () =
+  with_db (fun db ->
+    exec db "SAVEPOINT sp";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE TABLE u (b TEXT)";
+    let _ = exec_err db "ALTER TABLE t RENAME TO u" in
+    let release_err = exec_err db "RELEASE sp" in
+    Alcotest.(check bool)
+      "RELEASE auto-commit rejected: transaction was uncommittable"
+      true
+      (contains ~needle:"uncommittable" release_err);
+    Alcotest.(check bool) "t discarded by forced rollback" true (table_absent db "t");
+    Alcotest.(check bool) "u discarded by forced rollback" true (table_absent db "u");
+    (* The connection is clean: a fresh autocommit CREATE of the same name works. *)
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (3)";
+    Alcotest.(check (list string))
+      "recreated table usable"
+      [ "i:3" ]
+      (rows db "SELECT a FROM t"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -524,6 +650,24 @@ let () =
             "multi-alter same table rollback (LIFO undo)"
             `Quick
             test_multi_alter_same_table_rollback
+        ] )
+    ; ( "uncommittable_286"
+      , [ Alcotest.test_case
+            "failed in-txn DDL poisons COMMIT (forced rollback)"
+            `Quick
+            test_failed_in_txn_ddl_poisons_commit
+        ; Alcotest.test_case
+            "failed in-txn DDL then explicit ROLLBACK is clean"
+            `Quick
+            test_failed_in_txn_ddl_then_rollback_clean
+        ; Alcotest.test_case
+            "poison persists through a later successful statement"
+            `Quick
+            test_poison_persists_through_later_success
+        ; Alcotest.test_case
+            "failed in-txn DDL poisons SAVEPOINT release auto-commit"
+            `Quick
+            test_failed_in_txn_ddl_poisons_savepoint_release
         ] )
     ]
 ;;

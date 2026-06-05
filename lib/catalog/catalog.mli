@@ -410,6 +410,17 @@ val commit_schema_changes : t -> unit
     Call at ROLLBACK. *)
 val rollback_schema_changes : t -> unit
 
+(** #286: mark the ambient explicit transaction uncommittable.  Called when an
+    in-txn DDL statement fails partway through — its borrowed txn is left open
+    with partial on-disk effects, so a subsequent COMMIT must be forced to roll
+    back instead.  Cleared by [commit_schema_changes]/[rollback_schema_changes]. *)
+val mark_schema_txn_poisoned : t -> unit
+
+(** #286: whether the active explicit transaction has been poisoned by a failed
+    in-txn DDL statement.  The db layer checks this at COMMIT and rolls back
+    (returning an error) instead of persisting partial DDL effects. *)
+val schema_txn_poisoned : t -> bool
+
 (** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
 val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
 
