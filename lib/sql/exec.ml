@@ -3414,6 +3414,38 @@ let execute_create_index
                 (get_index_key_values None [||] info columns row)
             in
             let ikey = Index_key.encode iks ~rowid in
+            (* #288: for a UNIQUE index, the build must detect pre-existing
+               duplicate values.  The encoded key includes the rowid suffix, so
+               two rows sharing the indexed value produce DISTINCT keys and never
+               collide in the tree — uniqueness would otherwise only be enforced
+               at INSERT time, letting pre-existing duplicates slip through.
+               Probe the partially-built index for an entry already carrying this
+               value prefix (rowid excluded) using the SAME mechanism as
+               [check_insert_unique], so build-time and insert-time uniqueness
+               agree (including multi-column, partial-WHERE and NULL handling).
+               A raise here unwinds through [with_ddl_txn]: an owned txn rolls
+               back (no partial entries), a borrowed one is poisoned (#286). *)
+            let* () =
+              if not unique
+              then Lwt.return_unit
+              else (
+                let prefix, plen = encode_index_key_prefix iks in
+                let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+                let* probe = S.seek_ge tx info.idx_tree_id seek_key in
+                let* first = S.seek_next probe in
+                S.seek_close probe;
+                match first with
+                | Some (existing, _)
+                  when Bytes.length existing >= plen
+                       && Bytes.equal (Bytes.sub existing 0 plen) prefix ->
+                  Lwt.fail_with
+                    (Printf.sprintf
+                       "UNIQUE constraint failed: %s"
+                       (String.concat
+                          ", "
+                          (List.map (fun c -> table ^ "." ^ c) info.idx_columns)))
+                | _ -> Lwt.return_unit)
+            in
             let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
             walk ())
       in
