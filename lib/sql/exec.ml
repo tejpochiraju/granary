@@ -5249,7 +5249,17 @@ let execute_delete
 ;;
 
 (** Run [Op_drop_table]: remove catalog entries for the table and all
-    its indexes.  The B+-tree pages are NOT reclaimed in Phase 2. *)
+    its indexes.  The B+-tree pages are NOT reclaimed in Phase 2.
+
+    #279: runs through [with_ddl_txn] so it participates in any ambient explicit
+    transaction (borrowed [In_txn]) or owns its own auto-committed txn ([Auto]),
+    inheriting the same poison-on-failure / no-partial-effect-COMMIT behaviour as
+    CREATE/ALTER (#286).  [drop_table] removes the table AND its dependent
+    indexes from the in-memory cache before the caller commits, so a schema-cache
+    undo is registered to restore both on a [ROLLBACK] (the store reverts the
+    _sys_* row deletes; this re-syncs the cache).  The dependent indexes are
+    captured fresh here — through the same catalog used by [drop_table] — so an
+    index created earlier in this same transaction is restored too. *)
 let execute_drop_table
       ?(mode = Auto)
       (store : S.t)
@@ -5258,19 +5268,22 @@ let execute_drop_table
       ~(_indexes : Cat.index_info list)
   : unit Lwt.t
   =
-  let* tx, owned = acquire_txn store mode in
-  Lwt.catch
-    (fun () ->
-       let* () = Cat.drop_table cat tx ~name:table_meta.Cat.name in
-       release_txn tx owned)
-    (fun exn ->
-       (* On any exception: rollback if we own the txn, then re-raise. *)
-       let* () = if owned then S.rollback tx else Lwt.return_unit in
-       Lwt.fail exn)
+  with_ddl_txn store cat mode (fun tx ->
+    (* Capture the table + its dependent indexes and arm the undo BEFORE the
+       mutation, so even a partial failure mid-[drop_table] is reverted by
+       [rollback_schema_changes] (restore is idempotent — [Hashtbl.replace]). *)
+    let dropped_idxs = Cat.indexes_for_table cat ~table:table_meta.Cat.name in
+    Cat.register_schema_undo cat (fun () ->
+      Cat.restore_table_cache cat table_meta;
+      List.iter (Cat.restore_index_cache cat) dropped_idxs);
+    Cat.drop_table cat tx ~name:table_meta.Cat.name)
 ;;
 
 (** Run [Op_drop_index]: remove catalog entry for the index.
-    The B+-tree pages are NOT reclaimed in Phase 2. *)
+    The B+-tree pages are NOT reclaimed in Phase 2.
+
+    #279: as for [execute_drop_table] — runs through [with_ddl_txn] and registers
+    a schema-cache undo so a [ROLLBACK] restores the dropped index entry. *)
 let execute_drop_index
       ?(mode = Auto)
       (store : S.t)
@@ -5278,15 +5291,9 @@ let execute_drop_index
       ~(idx_info : Cat.index_info)
   : unit Lwt.t
   =
-  let* tx, owned = acquire_txn store mode in
-  Lwt.catch
-    (fun () ->
-       let* () = Cat.drop_index cat tx ~name:idx_info.Cat.idx_name in
-       release_txn tx owned)
-    (fun exn ->
-       (* On any exception: rollback if we own the txn, then re-raise. *)
-       let* () = if owned then S.rollback tx else Lwt.return_unit in
-       Lwt.fail exn)
+  with_ddl_txn store cat mode (fun tx ->
+    Cat.register_schema_undo cat (fun () -> Cat.restore_index_cache cat idx_info);
+    Cat.drop_index cat tx ~name:idx_info.Cat.idx_name)
 ;;
 
 (* ------------------------------------------------------------------ *)

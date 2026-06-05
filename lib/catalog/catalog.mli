@@ -295,6 +295,12 @@ val drop_index
     dependent indexes it dropped. *)
 val restore_index_cache : t -> index_info -> unit
 
+(** Re-insert a [table_meta] into the in-memory table cache (#279).  Inverse of
+    the cache side of [drop_table]; used to build a schema-cache undo so a
+    DROP TABLE rolled back inside an explicit transaction restores the catalog
+    cache (the dependent indexes are restored via [restore_index_cache]). *)
+val restore_table_cache : t -> table_meta -> unit
+
 (** Add a new column to an existing table.
     Updates the catalog's persistent storage and in-memory cache.
     Returns [Error msg] if the table does not exist or the column already exists.
