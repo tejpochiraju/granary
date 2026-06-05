@@ -2824,6 +2824,18 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
     | None -> Cat.next_rowid_in_txn cat ~name:table_meta.name tx)
 ;;
 
+(* SQLite-faithful UNIQUE violation message: "UNIQUE constraint failed: t.a"
+   (each column listed as "<table>.<col>", comma-separated for composite keys).
+   Shared by every secondary-index uniqueness check — INSERT-time
+   ([check_insert_unique]), UPDATE-time ([check_index_unique_on_update]) and the
+   CREATE UNIQUE INDEX build (#288) — so all three report identically, and match
+   the rowid-alias/PRIMARY KEY paths that already use this exact wording. *)
+let unique_constraint_failed_msg ~(table : string) ~(columns : string list) : string =
+  Printf.sprintf
+    "UNIQUE constraint failed: %s"
+    (String.concat ", " (List.map (fun c -> table ^ "." ^ c) columns))
+;;
+
 (* UNIQUE pre-check for INSERT: fold over [idxs] returning (skip, rowids to
    delete for REPLACE, optional rowid to update for UPSERT). Raises on a plain
    UNIQUE violation. *)
@@ -2881,9 +2893,9 @@ let check_insert_unique
               Lwt.return (false, dels, Some old_rowid)
             | _ ->
               Lwt.fail_with
-                (Printf.sprintf
-                   "UNIQUE constraint violated: duplicate value in columns (%s)"
-                   (String.concat ", " idx.idx_columns)))))
+                (unique_constraint_failed_msg
+                   ~table:table_meta.Cat.name
+                   ~columns:idx.idx_columns))))
     (false, [], None)
     idxs
 ;;
@@ -3439,11 +3451,7 @@ let execute_create_index
                   when Bytes.length existing >= plen
                        && Bytes.equal (Bytes.sub existing 0 plen) prefix ->
                   Lwt.fail_with
-                    (Printf.sprintf
-                       "UNIQUE constraint failed: %s"
-                       (String.concat
-                          ", "
-                          (List.map (fun c -> table ^ "." ^ c) info.idx_columns)))
+                    (unique_constraint_failed_msg ~table ~columns:info.idx_columns)
                 | _ -> Lwt.return_unit)
             in
             let* () = S.put tx info.idx_tree_id ikey Bytes.empty in
@@ -4594,9 +4602,7 @@ let check_index_unique_on_update
       if dup
       then
         Lwt.fail_with
-          (Printf.sprintf
-             "UNIQUE constraint violated: duplicate value in columns (%s)"
-             (String.concat ", " idx.idx_columns))
+          (unique_constraint_failed_msg ~table:idx.Cat.idx_table ~columns:idx.idx_columns)
       else Lwt.return_unit)
 ;;
 
