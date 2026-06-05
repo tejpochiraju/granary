@@ -130,6 +130,7 @@ let make_two_table_cat ?(orders_idx = false) () =
              ~unique:false
              ~expr_flags:[ false ]
              ~where_sql:None
+             ~origin:`User
          in
          (match r with
           | Ok _ -> ()

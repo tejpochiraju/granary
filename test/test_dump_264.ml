@@ -408,6 +408,37 @@ let test_unique_enforced_after_restore () =
          | Error _ -> ()))
 ;;
 
+(* #273: a user index whose name collides with the [__pk_] prefix that the
+   engine assigns to auto-created PRIMARY KEY indexes must NOT be mistaken for an
+   implicit index and silently dropped from the dump.  The implicit-vs-user
+   distinction is now an explicit [idx_origin] field on [index_info], so the
+   classifier is name-independent.  The decoy index sits on the PK column (the
+   only place the old name-sniffing heuristic fired), proving origin — not name —
+   now decides what the dump omits. *)
+let test_user_index_pk_prefix_survives () =
+  with_db (fun db ->
+    exec db "CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO kv VALUES ('a', '1')";
+    exec db "CREATE UNIQUE INDEX __pk_kv_decoy ON kv (k)";
+    let s = dump db in
+    Alcotest.(check bool)
+      "user index with __pk_ prefix is emitted in the dump"
+      true
+      (contains_substr ~needle:"__pk_kv_decoy" s);
+    let restored = restore s in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close restored) with
+        | _ -> ())
+      (fun () ->
+         let names =
+           rows
+             restored
+             "SELECT name FROM sqlite_master WHERE type='index' AND name='__pk_kv_decoy'"
+         in
+         Alcotest.(check int) "user index survived dump/restore" 1 (List.length names)))
+;;
+
 (* A view that selects from another view must be emitted AFTER its dependency:
    view bodies are bound at CREATE time, so the wrong order aborts the restore.
    The dependency view is named to sort LAST alphabetically, so a naive
@@ -462,6 +493,10 @@ let () =
             "unique enforced after restore"
             `Quick
             test_unique_enforced_after_restore
+        ; Alcotest.test_case
+            "user index with __pk_ prefix survives"
+            `Quick
+            test_user_index_pk_prefix_survives
         ; Alcotest.test_case "view depending on view" `Quick test_view_on_view
         ; Alcotest.test_case "fts ddl only" `Quick test_fts_ddl_only
         ] )

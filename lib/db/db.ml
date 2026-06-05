@@ -1691,31 +1691,30 @@ let dump_table_order (tables : Cat.table_meta list) =
 ;;
 
 (* True for an implicit index that replaying the [CREATE TABLE] already
-   recreates: a single-column UNIQUE [__pk_*] index whose column carries a
-   column-level PRIMARY KEY (our executor rebuilds it from that clause).  Every
-   other index — user indexes, [__uniq_*] constraints, and multi-column [__pk_*]
-   backing composite/table-level keys — encodes a constraint the table DDL omits
-   and so must be emitted, or restoring would silently drop it.
+   recreates: a single-column auto-created PRIMARY KEY index whose column carries
+   a column-level PRIMARY KEY (our executor rebuilds it from that clause).  Every
+   other index — user indexes, UNIQUE-constraint indexes, and multi-column PK
+   indexes backing composite/table-level keys — encodes a constraint the table
+   DDL omits and so must be emitted, or restoring would silently drop it.
 
    A multi-column (composite / table-level) PRIMARY KEY therefore round-trips as
    a plain [CREATE UNIQUE INDEX]: faithful to this engine's internal
    representation (so the data round-trips), but the restored schema reports no
    PRIMARY KEY and permits NULLs — an intentional downgrade.
 
-   The check keys on the [__pk_] name prefix, which [sema.ml] owns for
-   auto-created PK indexes; a user index deliberately named [__pk_*] on a PK
-   column would be misclassified.  That namespace collision is tracked by #273
-   (give [index_info] an explicit origin flag). *)
+   The check keys on [idx_origin] (#273), set when the index is created, not on
+   the [__pk_] name prefix [sema.ml] assigns: a user index deliberately named
+   [__pk_*] on a PK column is [`User] origin and so is correctly still emitted. *)
 let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
-  idx.Cat.idx_unique
-  &&
-  match idx.Cat.idx_columns with
-  | [ col ] ->
-    String.starts_with ~prefix:"__pk_" idx.Cat.idx_name
-    && List.exists
+  match idx.Cat.idx_origin with
+  | `Implicit_unique | `User -> false
+  | `Implicit_pk ->
+    (match idx.Cat.idx_columns with
+     | [ col ] ->
+       List.exists
          (fun (c : Row.column) -> c.Row.name = col && c.Row.primary_key)
          meta.Cat.columns
-  | _ -> false
+     | _ -> false)
 ;;
 
 (* Emit [INSERT] statements for every row of [meta] (skipping generated columns,

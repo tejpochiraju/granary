@@ -962,7 +962,8 @@ let bind_create_index_duplicate () =
          ~columns:[ "id" ]
          ~unique:false
          ~expr_flags:[ false ]
-         ~where_sql:None)
+         ~where_sql:None
+         ~origin:`User)
   in
   let stmt =
     Ast.S_create_index
@@ -1443,7 +1444,8 @@ let bind_drop_index_basic () =
          ~columns:[ "id" ]
          ~unique:false
          ~expr_flags:[ false ]
-         ~where_sql:None)
+         ~where_sql:None
+         ~origin:`User)
   in
   let stmt = Ast.S_drop_index { name = "idx"; if_exists = false } in
   match bind cat stmt with

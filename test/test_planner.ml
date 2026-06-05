@@ -713,6 +713,7 @@ let make_cat_with_index ~col_name =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      Lwt.return cat)
 ;;

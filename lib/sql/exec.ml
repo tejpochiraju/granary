@@ -3331,6 +3331,7 @@ let execute_create_index
       ~unique
       ~expr_flags:col_expr_flags
       ~where_sql
+      ~origin:`User
   in
   match res with
   | Error msg -> failwith msg
@@ -5420,7 +5421,7 @@ let execute_create_table_op
     let* _tid = Cat.create_table cat ~name ~columns ~without_rowid in
     let* () =
       Lwt_list.iter_s
-        (fun (idx_name, col_names) ->
+        (fun (idx_name, col_names, origin) ->
            let* result =
              Cat.create_index
                cat
@@ -5430,6 +5431,7 @@ let execute_create_table_op
                ~unique:true
                ~expr_flags:(List.map (fun _ -> false) col_names)
                ~where_sql:None
+               ~origin
            in
            match result with
            | Error msg -> Lwt.fail_with msg

@@ -73,7 +73,7 @@ type op =
   | Op_create_table of
       { name : string
       ; columns : Sqlocaml_encoding.Row.column list
-      ; uniq_idxs : (string * string list) list
+      ; uniq_idxs : (string * string list * Cat.idx_origin) list
       ; if_not_exists : bool
       ; fk_constraints :
           (string list
