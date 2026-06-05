@@ -472,6 +472,12 @@ let drain_pending_fks_autocommit t : (unit, error) result Lwt.t =
 let force_rollback_txn t tx =
   let* () = S.rollback tx in
   Cat.rollback_schema_changes t.catalog;
+  (* #293: an in-txn INSERT bumped the in-memory next_rowid counter; the store
+     row reverted with [S.rollback] above but the cache did not.  Re-derive each
+     rowid table's counter from the rolled-back data tree so the next allocation
+     reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
+     after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
+  let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
   t.explicit_txn <- None;
   t.savepoint_names <- [];
   t.auto_began <- false;

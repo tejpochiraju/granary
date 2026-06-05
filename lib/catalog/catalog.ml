@@ -175,6 +175,16 @@ type t =
         back instead (the transaction is uncommittable, matching SQLite).  Both
         [commit_schema_changes] and [rollback_schema_changes] clear it — they
         bracket the schema-change transaction. *)
+  ; rowid_bumped_in_txn : (string, unit) Hashtbl.t
+    (** #293: set of rowid tables whose cached [next_rowid] counter was bumped
+        via [next_rowid_in_txn]/[bump_next_rowid_in_txn] during the CURRENT
+        explicit transaction.  On ROLLBACK only THESE tables need their counter
+        re-derived from the rolled-back data tree (see
+        [recompute_rowid_counters_after_rollback]) — recomputing every cached
+        rowid table would make rollback O(total rows) by full-scanning each
+        tree.  Cleared on every txn boundary (commit keeps the bumped counter
+        but clears the set; rollback recomputes then clears) so it only ever
+        names tables bumped within the current txn. *)
   }
 
 let pp fmt t =
@@ -1234,6 +1244,7 @@ let open_ store =
     ; schema_undo = []
     ; schema_savepoints = []
     ; schema_txn_poisoned = false
+    ; rowid_bumped_in_txn = Hashtbl.create 8
     }
 ;;
 
@@ -1259,7 +1270,12 @@ let schema_txn_poisoned t = t.schema_txn_poisoned
 let commit_schema_changes t =
   t.schema_undo <- [];
   t.schema_savepoints <- [];
-  t.schema_txn_poisoned <- false
+  t.schema_txn_poisoned <- false;
+  (* #293: COMMIT keeps the bumped next_rowid counter, so do NOT recompute — but
+     clear the dirty set so a later unrelated ROLLBACK won't wrongly recompute a
+     table that wasn't bumped in that later txn.  Also called at txn begin to
+     harden against a stale set leaking in. *)
+  Hashtbl.reset t.rowid_bumped_in_txn
 ;;
 
 let rollback_schema_changes t =
@@ -1267,6 +1283,57 @@ let rollback_schema_changes t =
   t.schema_undo <- [];
   t.schema_savepoints <- [];
   t.schema_txn_poisoned <- false
+;;
+
+(* #293: the rowid dirty set is intentionally NOT cleared here.  The db layer
+     calls [recompute_rowid_counters_after_rollback] right after this on the
+     rollback path, and that function reads the set then clears it. *)
+
+(* #293: re-derive the cached [next_rowid] from the (now rolled-back) data tree,
+   using the same max(rowid)+1 logic as [recover_next_rowid], for ONLY the tables
+   whose counter was bumped during the rolled-back transaction.  An INSERT run
+   THROUGH an explicit transaction bumps the in-memory counter via
+   [next_rowid_in_txn]/[bump_next_rowid_in_txn] (which also record the table in
+   [rowid_bumped_in_txn] and write the bumped value to [_sys_tables] under the
+   txn).  On ROLLBACK the store row reverts but the in-memory counter does not,
+   so the next allocation would SKIP the rolled-back rowid instead of reusing it.
+   SQLite, for a plain (non-AUTOINCREMENT) rowid table, recomputes max(rowid)+1
+   from the data after a rollback and so reuses it; recomputing here matches that.
+
+   Option (b) from the issue: rather than snapshot/restore each DML's counter
+   delta, we drop straight to the authoritative source (the data tree).  This
+   leans on the store having already been rolled back — the db layer calls this
+   only AFTER [S.rollback], so the trees show the last-committed state and the
+   RW lock is released (so [recover_next_rowid]'s own RO txn cannot deadlock).
+
+   We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
+   rather than every cached rowid table.  [recover_next_rowid] is an O(n) tree
+   walk to find max(rowid); scanning every table would make a rollback cost
+   O(total rows across ALL tables), a regression on a perf-sensitive engine
+   (cf. #228/#229 driving cursor_open O(n)->O(log n)).  Restricting to the
+   bumped set keeps rollback ~O(1) in the common case.  A bumped name that is no
+   longer cached (e.g. its CREATE TABLE rolled back in the same txn) or that is
+   WITHOUT ROWID is skipped.  The set is CLEARED here so it never leaks into a
+   later transaction; commit clears it too (via [commit_schema_changes]), which
+   is why a COMMIT keeps the bumped counter yet a subsequent unrelated ROLLBACK
+   does not wrongly recompute it.
+
+   AUTOINCREMENT is unaffected: this engine does not implement that keyword
+   (CREATE … AUTOINCREMENT fails to parse), so there is no sticky high-water
+   counter for this recompute to clobber. *)
+let recompute_rowid_counters_after_rollback t =
+  let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped_in_txn [] in
+  Hashtbl.reset t.rowid_bumped_in_txn;
+  Lwt_list.iter_s
+    (fun name ->
+       match Hashtbl.find_opt t.cache name with
+       | None -> Lwt.return_unit
+       | Some m when m.without_rowid -> Lwt.return_unit
+       | Some m ->
+         let%lwt recovered = recover_next_rowid t.store m in
+         Hashtbl.replace t.cache name recovered;
+         Lwt.return_unit)
+    names
 ;;
 
 (* #280/#295: open a savepoint over the schema-undo log.  Records the current
@@ -1501,6 +1568,8 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     let id, next = alloc_rowid m in
     let m' = { m with next_rowid = next } in
     Hashtbl.replace t.cache name m';
+    (* #293: mark this table's counter dirty so a ROLLBACK recomputes only it. *)
+    Hashtbl.replace t.rowid_bumped_in_txn name ();
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 ;;
@@ -1526,6 +1595,9 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
     else (
       let m' = { m with next_rowid = at_least } in
       Hashtbl.replace t.cache name m';
+      (* #293: mark dirty only when the counter actually moved (the early-return
+         no-op above leaves the cached counter untouched, so nothing to recompute). *)
+      Hashtbl.replace t.rowid_bumped_in_txn name ();
       S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
 ;;
 

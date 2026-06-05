@@ -51,6 +51,142 @@ let query_ints db sql =
 
 let execute db sql = run (Db.execute db sql)
 
+(* Rows as (int, string) pairs for asserting (rowid, value) shapes. *)
+let query_int_text db sql =
+  match run (Db.query db sql) with
+  | Error _ -> []
+  | Ok stream ->
+    List.map
+      (fun row ->
+         match row.(0), row.(1) with
+         | Db.V_int n, Db.V_text s -> Int64.to_int n, s
+         | _ -> -1, "?")
+      (rows_of stream)
+;;
+
+(* #293: an INSERT inside an explicit txn bumps the in-memory next_rowid
+   counter; a ROLLBACK must revert it so the next allocation re-derives
+   max(rowid)+1 from the (now rolled-back) data tree — matching SQLite, which
+   reuses the rolled-back rowid for a plain (non-AUTOINCREMENT) rowid table. *)
+let test_rollback_reuses_rowid_empty () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* rowid 1 *)
+  exec db "ROLLBACK";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  let rows = query_int_text db "SELECT a, b FROM t" in
+  Alcotest.(check (list (pair int string)))
+    "rolled-back rowid 1 is reused"
+    [ 1, "y" ]
+    rows
+;;
+
+(* Non-empty variant: a table already holding rowids 1,2 should reuse rowid 3
+   after an in-txn INSERT (rowid 3) is rolled back. *)
+let test_rollback_reuses_rowid_nonempty () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "INSERT INTO t (b) VALUES ('a')";
+  (* rowid 1 *)
+  exec db "INSERT INTO t (b) VALUES ('b')";
+  (* rowid 2 *)
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('c')";
+  (* rowid 3 *)
+  exec db "ROLLBACK";
+  exec db "INSERT INTO t (b) VALUES ('d')";
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "rolled-back rowid 3 is reused as max(existing)+1"
+    [ 1, "a"; 2, "b"; 3, "d" ]
+    rows
+;;
+
+(* COMMIT path unaffected: an in-txn INSERT that COMMITs advances the counter
+   durably, so the next allocation continues past it (no spurious recompute that
+   would re-issue a now-duplicate rowid). *)
+let test_commit_advances_rowid () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* rowid 1 *)
+  exec db "COMMIT";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  (* rowid 2 *)
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "committed counter continues to rowid 2"
+    [ 1, "x"; 2, "y" ]
+    rows
+;;
+
+(* #293: AUTOINCREMENT must NOT reuse a rolled-back rowid — SQLite keeps the
+   high-water mark sticky in sqlite_sequence, distinct from the recompute-from-
+   data behaviour of a plain rowid table.  This engine does not implement the
+   AUTOINCREMENT keyword at all (it fails to parse), so the test takes the skip
+   branch; it stands as a guard so the #293 fix can never silently introduce
+   rowid reuse for an AUTOINCREMENT column should that keyword be added later. *)
+let test_rollback_autoincrement_sticky () =
+  let db = fresh_db () in
+  match execute db "CREATE TABLE s (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)" with
+  | Error _ ->
+    (* This engine does not support the AUTOINCREMENT keyword (CREATE fails to
+       parse), so there is no separate sticky-counter path for the #293 fix to
+       regress.  The skip pins that fact: if AUTOINCREMENT is ever added it must
+       arrive with its own non-reuse test.  *)
+    ()
+  | Ok () ->
+    exec db "BEGIN";
+    exec db "INSERT INTO s (b) VALUES ('x')";
+    (* rowid 1 *)
+    exec db "ROLLBACK";
+    exec db "INSERT INTO s (b) VALUES ('y')";
+    let rows = query_int_text db "SELECT a, b FROM s" in
+    Alcotest.(check (list (pair int string)))
+      "AUTOINCREMENT does not reuse the rolled-back rowid"
+      [ 2, "y" ]
+      rows
+;;
+
+(* #293 (perf-fix scoping): the rollback recompute must be restricted to tables
+   bumped IN the rolled-back txn, NOT every cached rowid table.  This is both the
+   perf fix and a correctness guard: recompute lowers a counter to max(rowid)+1,
+   which is WRONG for a table that has a trailing gap (its top rows were deleted)
+   and was not actually bumped in the rolled-back txn.
+
+   Table A is committed with rowids 1,2,3 then has 3 DELETEd, so its counter sits
+   at 4 while max(rowid) is 2.  A second, unrelated txn touches only table B and
+   ROLLBACKs.  If the rollback recomputed A (the pre-fix all-tables behaviour) it
+   would drop A's counter from 4 to 3, and the next INSERT would REUSE rowid 3.
+   With per-txn scoping A is untouched, so the next INSERT correctly gets rowid 4.
+   This proves the dirty set is scoped per-txn and cleared on commit (the second
+   rollback's set names only B). *)
+let test_rollback_does_not_disturb_committed_other_table () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)";
+  exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)";
+  (* A gets rowids 1,2,3 then drops 3, leaving counter=4 but max(rowid)=2. *)
+  exec db "INSERT INTO a (v) VALUES ('a1')";
+  exec db "INSERT INTO a (v) VALUES ('a2')";
+  exec db "INSERT INTO a (v) VALUES ('a3')";
+  exec db "DELETE FROM a WHERE id = 3";
+  (* Txn 2: touch only B, then ROLLBACK.  A is untouched here. *)
+  exec db "BEGIN";
+  exec db "INSERT INTO b (v) VALUES ('b1')";
+  exec db "ROLLBACK";
+  (* A's next allocation must be rowid 4 (committed counter undisturbed).  A
+     recompute-all rollback would have lowered it to 3 and wrongly reused it. *)
+  exec db "INSERT INTO a (v) VALUES ('a4')";
+  let rows = query_int_text db "SELECT id, v FROM a ORDER BY id ASC" in
+  Alcotest.(check (list (pair int string)))
+    "committed table A keeps its high-water counter across an unrelated rollback"
+    [ 1, "a1"; 2, "a2"; 4, "a4" ]
+    rows
+;;
+
 let test_begin_commit_visible () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
@@ -382,6 +518,25 @@ let () =
             "create_index_in_txn_limitation"
             `Quick
             test_create_index_in_txn_limitation
+        ] )
+    ; ( "rollback_rowid"
+      , [ Alcotest.test_case
+            "rollback_reuses_rowid_empty"
+            `Quick
+            test_rollback_reuses_rowid_empty
+        ; Alcotest.test_case
+            "rollback_reuses_rowid_nonempty"
+            `Quick
+            test_rollback_reuses_rowid_nonempty
+        ; Alcotest.test_case "commit_advances_rowid" `Quick test_commit_advances_rowid
+        ; Alcotest.test_case
+            "rollback_autoincrement_sticky"
+            `Quick
+            test_rollback_autoincrement_sticky
+        ; Alcotest.test_case
+            "rollback_does_not_disturb_committed_other_table"
+            `Quick
+            test_rollback_does_not_disturb_committed_other_table
         ] )
     ; "parse", [ Alcotest.test_case "parse_begin" `Quick test_parse_begin ]
     ; ( "execute_change_count"
