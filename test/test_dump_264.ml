@@ -397,8 +397,7 @@ let test_user_index_pk_prefix_survives () =
          let names =
            rows
              restored
-             "SELECT name FROM sqlite_master WHERE type='index' AND \
-              name='__pk_kv_decoy'"
+             "SELECT name FROM sqlite_master WHERE type='index' AND name='__pk_kv_decoy'"
          in
          Alcotest.(check int) "user index survived dump/restore" 1 (List.length names)))
 ;;

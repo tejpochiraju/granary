@@ -104,8 +104,7 @@ type bound_stmt =
   | BS_create_table of
       { name : string
       ; columns : Sqlocaml_encoding.Row.column list
-      ; uniq_idxs :
-          (string * string list * Sqlocaml_catalog.Catalog.idx_origin) list
+      ; uniq_idxs : (string * string list * Sqlocaml_catalog.Catalog.idx_origin) list
         (** Auto-generated UNIQUE index specs: (index_name, [col_name; ...], origin).
             [origin] is [`Implicit_pk] for PRIMARY KEY constraints, [`Implicit_unique]
             for UNIQUE constraints.  Planner creates Op_create_index for each. *)
