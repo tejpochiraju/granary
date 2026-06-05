@@ -388,6 +388,71 @@ let test_alter_then_more_dml_in_txn () =
       (rows db "SELECT a, b, c FROM t ORDER BY a"))
 ;;
 
+(* An index CREATED in the same txn must have its [idx_table] back-reference
+   remapped by a RENAME TABLE later in that txn — [finish_rename] scans
+   _sys_indexes THROUGH the txn so the still-uncommitted index entry is caught. *)
+let test_alter_rename_table_remaps_in_txn_index_commit () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "BEGIN";
+    exec db "CREATE UNIQUE INDEX t_b ON t (b)";
+    exec db "ALTER TABLE t RENAME TO u";
+    exec db "COMMIT";
+    (* The in-txn index is live on the new table name: uniqueness enforced … *)
+    let _ = exec_err db "INSERT INTO u VALUES (2, 'x')" in
+    (* … and it serves lookups by the indexed column. *)
+    Alcotest.(check (list string))
+      "in-txn index usable under new table name"
+      [ "i:1" ]
+      (rows db "SELECT a FROM u WHERE b = 'x'");
+    (* The index name is taken under the new table — recreating it must fail. *)
+    let _ = exec_err db "CREATE INDEX t_b ON u (b)" in
+    ())
+;;
+
+let test_alter_rename_table_remaps_in_txn_index_rollback () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "BEGIN";
+    exec db "CREATE INDEX t_b ON t (b)";
+    exec db "ALTER TABLE t RENAME TO u";
+    exec db "ROLLBACK";
+    (* LIFO undo replay unwinds the rename then the index: u is gone, t is back,
+       and the index name is free to be recreated on t. *)
+    Alcotest.(check bool) "renamed-away name gone" true (table_absent db "u");
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    Alcotest.(check (list string))
+      "original table intact"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, b FROM t");
+    exec db "CREATE INDEX t_b ON t (b)")
+;;
+
+(* Multiple ALTERs on the SAME table in one txn, then ROLLBACK: the undo log is
+   replayed most-recent-first, so each closure's captured [table_meta] is
+   overwritten by the next until the original shape is restored exactly. *)
+let test_multi_alter_same_table_rollback () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t ADD COLUMN b TEXT";
+    exec db "ALTER TABLE t ADD COLUMN c INTEGER";
+    exec db "ALTER TABLE t RENAME COLUMN a TO id";
+    exec db "ROLLBACK";
+    (* None of the three changes survive. *)
+    let _ = exec_err db "SELECT b FROM t" in
+    let _ = exec_err db "SELECT c FROM t" in
+    let _ = exec_err db "SELECT id FROM t" in
+    Alcotest.(check (list string))
+      "original single-column shape restored"
+      [ "i:1" ]
+      (rows db "SELECT a FROM t");
+    (* The names are free again — re-adding the column succeeds. *)
+    exec db "ALTER TABLE t ADD COLUMN b TEXT")
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -447,6 +512,18 @@ let () =
             `Quick
             test_alter_rename_column_in_txn_rollback_discards
         ; Alcotest.test_case "alter then more dml" `Quick test_alter_then_more_dml_in_txn
+        ; Alcotest.test_case
+            "rename table remaps in-txn index (commit)"
+            `Quick
+            test_alter_rename_table_remaps_in_txn_index_commit
+        ; Alcotest.test_case
+            "rename table remaps in-txn index (rollback)"
+            `Quick
+            test_alter_rename_table_remaps_in_txn_index_rollback
+        ; Alcotest.test_case
+            "multi-alter same table rollback (LIFO undo)"
+            `Quick
+            test_multi_alter_same_table_rollback
         ] )
     ]
 ;;
