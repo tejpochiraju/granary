@@ -5257,9 +5257,11 @@ let execute_delete
     CREATE/ALTER (#286).  [drop_table] removes the table AND its dependent
     indexes from the in-memory cache before the caller commits, so a schema-cache
     undo is registered to restore both on a [ROLLBACK] (the store reverts the
-    _sys_* row deletes; this re-syncs the cache).  The dependent indexes are
-    captured fresh here — through the same catalog used by [drop_table] — so an
-    index created earlier in this same transaction is restored too. *)
+    _sys_* row deletes; this re-syncs the cache).  The undo restores EXACTLY the
+    entries [drop_table] removes; if an index was itself created earlier in the
+    same transaction, this DROP undo restores it but the earlier CREATE INDEX's
+    undo — running later in LIFO order — removes it again, netting the correct
+    "absent after ROLLBACK" outcome. *)
 let execute_drop_table
       ?(mode = Auto)
       (store : S.t)
@@ -5269,14 +5271,22 @@ let execute_drop_table
   : unit Lwt.t
   =
   with_ddl_txn store cat mode (fun tx ->
-    (* Capture the table + its dependent indexes and arm the undo BEFORE the
-       mutation, so even a partial failure mid-[drop_table] is reverted by
-       [rollback_schema_changes] (restore is idempotent — [Hashtbl.replace]). *)
-    let dropped_idxs = Cat.indexes_for_table cat ~table:table_meta.Cat.name in
+    let name = table_meta.Cat.name in
+    (* Capture the live cache entry + its dependent indexes and arm the undo
+       BEFORE the mutation, so a partial failure mid-[drop_table] in [Auto] is
+       also reverted by [rollback_schema_changes] (restore is idempotent —
+       [Hashtbl.replace]).  Both snapshots are read from the catalog here (not the
+       planner's [table_meta]) so they stay symmetric and correct should plan- and
+       exec-time ever diverge (e.g. prepared statements); fall back to the
+       planner's copy only if the cache somehow lacks the entry. *)
+    let restore_meta =
+      Option.value (Cat.find_table_cached cat ~name) ~default:table_meta
+    in
+    let dropped_idxs = Cat.indexes_for_table cat ~table:name in
     Cat.register_schema_undo cat (fun () ->
-      Cat.restore_table_cache cat table_meta;
+      Cat.restore_table_cache cat restore_meta;
       List.iter (Cat.restore_index_cache cat) dropped_idxs);
-    Cat.drop_table cat tx ~name:table_meta.Cat.name)
+    Cat.drop_table cat tx ~name)
 ;;
 
 (** Run [Op_drop_index]: remove catalog entry for the index.

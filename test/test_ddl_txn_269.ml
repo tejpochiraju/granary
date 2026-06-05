@@ -633,6 +633,24 @@ let test_drop_table_in_txn_rollback_restores () =
       (contains ~needle:"already exists" err))
 ;;
 
+let test_drop_index_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE UNIQUE INDEX t_a ON t (a)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "DROP INDEX t_a";
+    exec db "COMMIT";
+    (* Index is durably gone: uniqueness is no longer enforced … *)
+    exec db "INSERT INTO t VALUES (1)";
+    Alcotest.(check (list string))
+      "duplicate allowed after committed DROP INDEX"
+      [ "i:1"; "i:1" ]
+      (rows db "SELECT a FROM t");
+    (* … and the name is free to recreate. *)
+    exec db "CREATE INDEX t_a ON t (a)")
+;;
+
 let test_drop_index_in_txn_rollback_restores () =
   with_db (fun db ->
     exec db "CREATE TABLE t (a INTEGER)";
@@ -798,6 +816,7 @@ let () =
             "drop table rollback restores"
             `Quick
             test_drop_table_in_txn_rollback_restores
+        ; Alcotest.test_case "drop index commit" `Quick test_drop_index_in_txn_commits
         ; Alcotest.test_case
             "drop index rollback restores"
             `Quick
