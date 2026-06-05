@@ -264,7 +264,18 @@ let test_build_insert_agreement () =
   check_agreement "distinct ints" [ "1"; "2"; "3" ];
   check_agreement "duplicate ints" [ "1"; "2"; "1" ];
   check_agreement "single null" [ "1"; "NULL"; "2" ];
-  check_agreement "two nulls" [ "1"; "NULL"; "NULL" ]
+  check_agreement "two nulls" [ "1"; "NULL"; "NULL" ];
+  (* #290: SQLite treats every NULL as distinct in a UNIQUE index, so two NULLs
+     are NOT a violation — build-time and insert-time must BOTH accept (agreement
+     alone is necessary but not sufficient; pin the absolute outcome here). *)
+  Alcotest.(check bool)
+    "two nulls: build over multiple NULLs is accepted (NULLs distinct)"
+    true
+    (build_after_insert_ok [ "1"; "NULL"; "NULL" ]);
+  Alcotest.(check bool)
+    "two nulls: insert under a live unique index accepts multiple NULLs"
+    true
+    (insert_after_build_ok [ "1"; "NULL"; "NULL" ])
 ;;
 
 let () =
