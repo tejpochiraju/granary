@@ -492,8 +492,8 @@ let commit_txn t =
     Lwt.return
       (Error
          (Runtime
-            "cannot commit transaction - a DDL statement failed partway through; \
-             the transaction was uncommittable and has been rolled back"))
+            "cannot commit transaction - a DDL statement failed partway through; the \
+             transaction was uncommittable and has been rolled back"))
   | Some tx ->
     (* Drain deferred FK checks first; if any still violate, this raises
        and the txn has already been rolled back. *)
@@ -556,19 +556,18 @@ let release_savepoint t name =
       in
       t.savepoint_names <- drop t.savepoint_names);
     if t.auto_began && t.savepoint_names = []
-    then
+    then (
       if Cat.schema_txn_poisoned t.catalog
-      then (
+      then
         (* #286: releasing the last savepoint would auto-commit, but a failed
            in-txn DDL poisoned the transaction — roll back instead. *)
         let* () = force_rollback_txn t tx in
         Lwt.return
           (Error
              (Runtime
-                "cannot commit transaction - a DDL statement failed partway \
-                 through; the transaction was uncommittable and has been rolled \
-                 back")))
-      else (
+                "cannot commit transaction - a DDL statement failed partway through; the \
+                 transaction was uncommittable and has been rolled back"))
+      else
         let* () = S.commit tx in
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;

@@ -468,7 +468,9 @@ let test_multi_alter_same_table_rollback () =
 let contains ~needle haystack =
   let nl = String.length needle
   and hl = String.length haystack in
-  let rec go i = i + nl <= hl && (String.equal (String.sub haystack i nl) needle || go (i + 1)) in
+  let rec go i =
+    i + nl <= hl && (String.equal (String.sub haystack i nl) needle || go (i + 1))
+  in
   nl = 0 || go 0
 ;;
 
@@ -571,7 +573,10 @@ let test_failed_in_txn_ddl_poisons_savepoint_release () =
     (* The connection is clean: a fresh autocommit CREATE of the same name works. *)
     exec db "CREATE TABLE t (a INTEGER)";
     exec db "INSERT INTO t VALUES (3)";
-    Alcotest.(check (list string)) "recreated table usable" [ "i:3" ] (rows db "SELECT a FROM t"))
+    Alcotest.(check (list string))
+      "recreated table usable"
+      [ "i:3" ]
+      (rows db "SELECT a FROM t"))
 ;;
 
 let () =
