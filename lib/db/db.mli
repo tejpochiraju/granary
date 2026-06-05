@@ -139,6 +139,46 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
+(** #264: stream a logical SQL dump (a {{:https://sqlite.org/cli.html#dump}.dump}-style
+    export) of the database to [sink], one chunk at a time.
+
+    The output is a self-contained SQL script that recreates the database when
+    replayed statement-by-statement through {!execute}: [PRAGMA foreign_keys=OFF;],
+    then for each table its [CREATE TABLE] followed by [INSERT] statements for
+    its rows, then FTS virtual tables, explicit indexes, views and triggers.
+    Tables are emitted in creation order. Generated-column values are omitted
+    (recomputed on insert); implicit PRIMARY KEY indexes the [CREATE TABLE]
+    already implies are not re-emitted.
+
+    The script is {e not} wrapped in [BEGIN]/[COMMIT]: DDL cannot currently run
+    inside an explicit transaction (Forgejo #269), so a schema-bearing dump
+    relies on per-statement autocommit. A [data_only] dump {e is} wrapped, since
+    it is pure DML.
+
+    FTS5 tables are recreated empty (their [CREATE VIRTUAL TABLE] is emitted but
+    their content is not — that is a planned follow-up).
+
+    [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
+    [INSERT]s, wrapped in a transaction). Passing both yields an essentially
+    empty dump. *)
+val dump
+  :  t
+  -> ?schema_only:bool
+  -> ?data_only:bool
+  -> sink:(string -> unit Lwt.t)
+  -> unit
+  -> (unit, error) result Lwt.t
+
+(** #264: like {!dump}, but collects the whole dump into a single string.
+    Convenient for small databases; for large ones prefer {!dump} with a
+    streaming [sink] to avoid materializing the entire script in memory. *)
+val dump_to_string
+  :  t
+  -> ?schema_only:bool
+  -> ?data_only:bool
+  -> unit
+  -> (string, error) result Lwt.t
+
 (** Format an [error] value for human-readable output. *)
 val pp_error : Format.formatter -> error -> unit
 

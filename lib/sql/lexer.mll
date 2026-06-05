@@ -32,8 +32,14 @@ rule token = parse
   | "&"        { AMPERSAND }
   | "~"        { TILDE }
   | "."        { DOT }
+  (* float with an exponent: [123e4], [12.5e-3], [.5E+9] — the mantissa may be
+     an integer, since the exponent alone makes it a REAL.  Must precede the
+     INT rule so [1e308] is not lexed as INT 1 followed by IDENT e308. *)
+  | ((digit+ '.' digit*) | ('.' digit+) | digit+) (['e' 'E'] ['+' '-']? digit+) as f
+    { FLOAT_LIT (float_of_string f) }
   | (digit+ as i) '.' (digit* as f)
     { FLOAT_LIT (float_of_string (i ^ "." ^ f)) }
+  | ('.' digit+) as f       { FLOAT_LIT (float_of_string f) }
   | digit+ as n             { INT_LIT (Int64.of_string n) }
   | ['x' 'X'] '\'' (['0'-'9' 'a'-'f' 'A'-'F']* as h) '\''
     { (* X'...' blob literal — convert hex pairs to bytes *)
@@ -45,8 +51,7 @@ rule token = parse
         Bytes.set b k (Char.chr (int_of_string ("0x" ^ pair)))
       done;
       BLOB_LIT b }
-  | '\'' ([^ '\'']* as s) '\''  { STRING_LIT s }
-  | '\'' [^ '\'']*          { failwith "unterminated string literal" }
+  | '\''  { read_single_quoted (Buffer.create 16) lexbuf }
   | '?' (digit+ as n) { IPARAM (int_of_string n) }
   | '?'               { QUESTION }
   | ':' (ident as id) { NAMED_PARAM id }
@@ -249,6 +254,15 @@ rule token = parse
     }
   | eof                     { EOF }
   | _ as c                  { failwith (Printf.sprintf "unexpected char: '%c'" c) }
+
+(* SQL string literal: a doubled single-quote ('') is an escaped quote, per the
+   SQL standard.  Mirrors the quoted-identifier readers below. *)
+and read_single_quoted buf = parse
+  | '\'' '\''  { Buffer.add_char buf '\''; read_single_quoted buf lexbuf }
+  | '\''       { STRING_LIT (Buffer.contents buf) }
+  | [^ '\'']+  { Buffer.add_string buf (Lexing.lexeme lexbuf);
+                 read_single_quoted buf lexbuf }
+  | eof        { failwith "unterminated string literal" }
 
 and read_double_quoted buf = parse
   | '"' '"'    { Buffer.add_char buf '"'; read_double_quoted buf lexbuf }

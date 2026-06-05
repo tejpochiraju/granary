@@ -1680,6 +1680,156 @@ let pp_error fmt = function
   | Runtime m -> Format.fprintf fmt "runtime error: %s" m
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #264: logical SQL dump (.dump-style export)                          *)
+(* ------------------------------------------------------------------ *)
+
+(* Deterministic emission order: tables in creation order (tree_id ascending),
+   which also lets FK parents precede children for the common case. *)
+let dump_table_order (tables : Cat.table_meta list) =
+  List.sort (fun (a : Cat.table_meta) b -> compare a.Cat.tree_id b.Cat.tree_id) tables
+;;
+
+(* True for an implicit index that replaying the [CREATE TABLE] already
+   recreates: a single-column UNIQUE [__pk_*] index whose column carries a
+   column-level PRIMARY KEY (our executor rebuilds it from that clause).  Every
+   other index — user indexes, [__uniq_*] constraints, and multi-column [__pk_*]
+   backing composite/table-level keys — encodes a constraint the table DDL omits
+   and so must be emitted, or restoring would silently drop it. *)
+let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
+  idx.Cat.idx_unique
+  &&
+  match idx.Cat.idx_columns with
+  | [ col ] ->
+    let has_prefix p s =
+      String.length s >= String.length p && String.sub s 0 (String.length p) = p
+    in
+    has_prefix "__pk_" idx.Cat.idx_name
+    && List.exists
+         (fun (c : Row.column) -> c.Row.name = col && c.Row.primary_key)
+         meta.Cat.columns
+  | _ -> false
+;;
+
+(* Emit [INSERT] statements for every row of [meta] (skipping generated columns,
+   whose values are derived).  Reads through the executor so the rowid-alias
+   column resolves to its stored value. *)
+let dump_table_rows t (meta : Cat.table_meta) ~stmt =
+  let dump_cols =
+    List.filter (fun (c : Row.column) -> c.Row.generated_as = None) meta.Cat.columns
+  in
+  if dump_cols = []
+  then Lwt.return_unit
+  else (
+    let has_generated = List.length dump_cols <> List.length meta.Cat.columns in
+    let qname = Sql.Exec.quote_ident meta.Cat.name in
+    let col_idents =
+      List.map (fun (c : Row.column) -> Sql.Exec.quote_ident c.Row.name) dump_cols
+    in
+    let select_sql =
+      Printf.sprintf "SELECT %s FROM %s" (String.concat ", " col_idents) qname
+    in
+    let* r = query_impl t select_sql in
+    match r with
+    | Error e ->
+      Lwt.fail (Failure (Format.asprintf "dump %s: %a" meta.Cat.name pp_error e))
+    | Ok stream ->
+      let prefix =
+        if has_generated
+        then
+          Printf.sprintf
+            "INSERT INTO %s (%s) VALUES"
+            qname
+            (String.concat ", " col_idents)
+        else Printf.sprintf "INSERT INTO %s VALUES" qname
+      in
+      Lwt_stream.iter_s
+        (fun (row : Row.t) ->
+           let vals =
+             Array.to_list row
+             |> List.map Sql.Exec.sql_literal_of_value
+             |> String.concat ","
+           in
+           stmt (Printf.sprintf "%s(%s)" prefix vals))
+        stream)
+;;
+
+let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
+  let stmt s = sink (s ^ ";\n") in
+  let cat = t.catalog in
+  Lwt.catch
+    (fun () ->
+       let* tables = Cat.list_tables cat in
+       let tables = dump_table_order tables in
+       let* () = sink "PRAGMA foreign_keys=OFF;\n" in
+       (* DDL cannot run inside an explicit transaction yet — the catalog opens
+          its own writer txn and deadlocks against the ambient one (Forgejo
+          #269).  So only the DML-only [data_only] dump is wrapped in
+          BEGIN/COMMIT (for atomicity and speed); a schema-bearing dump relies
+          on per-statement autocommit. *)
+       let* () = if data_only then stmt "BEGIN" else Lwt.return_unit in
+       (* Base tables: DDL immediately followed by that table's data. *)
+       let* () =
+         Lwt_list.iter_s
+           (fun (meta : Cat.table_meta) ->
+              let* () =
+                if data_only then Lwt.return_unit else stmt (Sql.Exec.ddl_of_table meta)
+              in
+              if schema_only then Lwt.return_unit else dump_table_rows t meta ~stmt)
+           tables
+       in
+       (* Schema objects emitted after all data: FTS virtual tables (DDL only —
+          content is rebuilt on insert; full content dump is a follow-up),
+          explicit indexes, then views and triggers. *)
+       let* () =
+         if data_only
+         then Lwt.return_unit
+         else
+           let* () =
+             Lwt_list.iter_s
+               (fun (m : Cat.fts_table_meta) -> stmt (Sql.Exec.ddl_of_fts m))
+               (Cat.list_fts_tables cat)
+           in
+           let* () =
+             Lwt_list.iter_s
+               (fun (meta : Cat.table_meta) ->
+                  Lwt_list.iter_s
+                    (fun idx ->
+                       if dump_index_is_implied meta idx
+                       then Lwt.return_unit
+                       else stmt (Sql.Exec.ddl_of_index idx))
+                    (Cat.indexes_for_table cat ~table:meta.Cat.name))
+               tables
+           in
+           let* views = Cat.load_all_views t.store in
+           let* () = Lwt_list.iter_s (fun (_n, sql) -> stmt sql) views in
+           let* triggers = Cat.load_all_triggers t.store in
+           Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
+       in
+       let* () = if data_only then stmt "COMMIT" else Lwt.return_unit in
+       Lwt.return (Ok ()))
+    (function
+      | Failure msg -> Lwt.return (Error (Runtime msg))
+      | exn -> Lwt.fail exn)
+;;
+
+let dump_to_string t ?(schema_only = false) ?(data_only = false) () =
+  let buf = Buffer.create 4096 in
+  let* r =
+    dump
+      t
+      ~schema_only
+      ~data_only
+      ~sink:(fun s ->
+        Buffer.add_string buf s;
+        Lwt.return_unit)
+      ()
+  in
+  match r with
+  | Error _ as e -> Lwt.return e
+  | Ok () -> Lwt.return (Ok (Buffer.contents buf))
+;;
+
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]
