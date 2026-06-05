@@ -23,10 +23,19 @@
       let right' = Ast.S_select { s with order = []; limit = None; offset = None } in
       (right', s.order, s.limit, s.offset)
     | _ -> (right, [], None, None)
+
+  (* Fold a leading unary minus onto an integer magnitude that overflowed a
+     positive int64 (carried verbatim as INT_LIT_OVERFLOW).  Only 2^63, the
+     magnitude of [Int64.min_int], is representable once negated; any larger
+     magnitude is genuinely out of range.  See #270. *)
+  let neg_int_overflow (mag : string) : int64 =
+    if mag = "9223372036854775808" then Int64.min_int
+    else failwith ("integer literal out of range: -" ^ mag)
 %}
 
 %token <string> IDENT
 %token <int64>  INT_LIT
+%token <string> INT_LIT_OVERFLOW
 %token <string> STRING_LIT
 %token <float>  FLOAT_LIT
 %token <bytes>  BLOB_LIT
@@ -590,6 +599,7 @@ def_value:
   | NULL                     { L_null }
   | f = FLOAT_LIT            { L_real f }
   | MINUS n = INT_LIT        { L_int (Int64.neg n) }
+  | MINUS n = INT_LIT_OVERFLOW { L_int (neg_int_overflow n) }
   | MINUS f = FLOAT_LIT      { L_real (-. f) }
   | id = any_ident           { match String.uppercase_ascii id with
                                | "CURRENT_TIMESTAMP" -> L_current_timestamp
@@ -658,6 +668,7 @@ literal:
 insert_expr:
   | l = literal            { E_lit l }
   | MINUS n = INT_LIT      { E_lit (L_int (Int64.neg n)) }
+  | MINUS n = INT_LIT_OVERFLOW { E_lit (L_int (neg_int_overflow n)) }
   | MINUS f = FLOAT_LIT    { E_lit (L_real (-. f)) }
   | QUESTION        { E_param Param_anon }
   | i = IPARAM      { E_param (Param_index i) }
@@ -1071,6 +1082,7 @@ between_bound:
   | a = between_bound LSHIFT    b = between_bound { E_binop (Lshift, a, b) }
   | a = between_bound RSHIFT    b = between_bound { E_binop (Rshift, a, b) }
   | TILDE e = between_bound %prec TILDE    { E_bitnot e }
+  | MINUS n = INT_LIT_OVERFLOW %prec UMINUS { E_lit (L_int (neg_int_overflow n)) }
   | MINUS e = between_bound %prec UMINUS   { E_neg e }
   | a = between_bound LIKE b = between_bound { E_binop (Like, a, b) }
   | a = between_bound GLOB b = between_bound { E_binop (Glob, a, b) }
@@ -1108,6 +1120,7 @@ expr:
   | a = expr LSHIFT    b = expr       { E_binop (Lshift, a, b) }
   | a = expr RSHIFT    b = expr       { E_binop (Rshift, a, b) }
   | TILDE e = expr %prec TILDE        { E_bitnot e }
+  | MINUS n = INT_LIT_OVERFLOW %prec UMINUS { E_lit (L_int (neg_int_overflow n)) }
   | MINUS e = expr %prec UMINUS       { E_neg e }
   | a = expr LIKE b = expr             { E_binop (Like, a, b) }
   | a = expr NOT LIKE b = expr %prec LIKE { E_not (E_binop (Like, a, b)) }

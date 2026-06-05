@@ -275,6 +275,44 @@ let test_without_rowid () =
 (* Every value shape survives the literal encoder bit-for-bit.  Columns are
    strictly typed, so each literal is inserted into a column of its own storage
    class; unfilled columns default to NULL (also exercised). *)
+
+(* #270: -9223372036854775808 is Int64.min_int and must parse, store, and
+   round-trip exactly, even though its bare magnitude (2^63) is one past
+   Int64.max_int.  The bare positive magnitude stays out of range. *)
+let test_int64_min_literal () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (i INTEGER)";
+    exec db "INSERT INTO t (i) VALUES (-9223372036854775808)";
+    Alcotest.(check (list string))
+      "INT64_MIN stored exactly"
+      [ Printf.sprintf "i:%Ld" Int64.min_int ]
+      (rows db "SELECT i FROM t");
+    (* the same fold applies in a general SELECT expression (distinct grammar
+       production from INSERT ... VALUES) *)
+    Alcotest.(check (list string))
+      "INT64_MIN as a SELECT expression"
+      [ Printf.sprintf "i:%Ld" Int64.min_int ]
+      (rows db "SELECT -9223372036854775808");
+    (* the bare positive magnitude 2^63 is out of Int64 range and is rejected
+       in both INSERT and SELECT contexts *)
+    (match run (Db.execute db "INSERT INTO t (i) VALUES (9223372036854775808)") with
+     | Ok () -> Alcotest.fail "bare positive 2^63 should be rejected, not accepted"
+     | Error _ -> ());
+    (match run (Db.query db "SELECT 9223372036854775808") with
+     | Ok _ -> Alcotest.fail "bare positive 2^63 in SELECT should be rejected"
+     | Error _ -> ());
+    (* a negative magnitude beyond 2^63 is genuinely out of range: the unary
+       minus has nothing representable to fold onto, so it is rejected too *)
+    (match run (Db.execute db "INSERT INTO t (i) VALUES (-99999999999999999999)") with
+     | Ok () -> Alcotest.fail "negative magnitude > 2^63 should be rejected"
+     | Error _ -> ());
+    (match run (Db.query db "SELECT -99999999999999999999") with
+     | Ok _ -> Alcotest.fail "negative magnitude > 2^63 in SELECT should be rejected"
+     | Error _ -> ());
+    (* the row must survive a logical-dump round-trip *)
+    assert_roundtrip db)
+;;
+
 let test_value_literals () =
   with_db (fun db ->
     exec db "CREATE TABLE lit (k INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, b BLOB)";
@@ -286,8 +324,7 @@ let test_value_literals () =
       ; "i", "-1"
       ; "i", "9223372036854775807" (* Int64.max_int *)
       ; "i", "-9223372036854775807"
-        (* Int64.min_int (-9223372036854775808) can't be written as a literal
-           yet — see #270 — so we stop one short of it. *)
+      ; "i", "-9223372036854775808" (* Int64.min_int — see #270 *)
       ; "r", "0.0"
       ; "r", "-0.5"
       ; "r", "1.7976931348623157e308"
@@ -416,6 +453,7 @@ let () =
         ; Alcotest.test_case "empty database" `Quick test_roundtrip_empty
         ; Alcotest.test_case "without rowid" `Quick test_without_rowid
         ; Alcotest.test_case "value literals" `Quick test_value_literals
+        ; Alcotest.test_case "int64 min literal (#270)" `Quick test_int64_min_literal
         ] )
     ; ( "serialization"
       , [ Alcotest.test_case "schema_only / data_only" `Quick test_schema_only_data_only
