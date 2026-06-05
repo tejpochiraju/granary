@@ -124,6 +124,253 @@ type fts_table_meta =
   ; fts_columns : string list
   }
 
+(* #283: the in-memory schema cache and its rollback ledger, sealed behind a
+   signature so the ONLY way to mutate the three catalog hashtables is through a
+   mutator that registers its own reversal.  "Mutate the cache without recording
+   how to undo it" is therefore unrepresentable outside this module.
+
+   Two reversal strategies, both explicit (no raw, unprotected write exists):
+   - undo-tracked mutators ([put_*]/[remove_*]) capture the prior binding and push
+     the synthesized inverse onto [undo]; replayed by [rollback]/[savepoint_rollback],
+     discarded by [commit].  Used for DDL run THROUGH [Exec.with_ddl_txn] (the undo is
+     discarded on COMMIT in either Auto or explicit mode, replayed on ROLLBACK / a
+     mid-statement failure — see exec.ml).
+   - durable mutators ([*_durable]) apply with NO undo, for a catalog function's own
+     autocommit path that self-commits its own writer txn (so the write is already
+     durable and a [?txn=None] branch can never be inside an ambient writer txn — a
+     nested rw_begin would deadlock).  Also used for ephemeral CTE sentinels.
+
+   The rowid counter keeps the #293 recompute-on-rollback strategy: [bump_rowid]
+   records the table in the dirty set instead of pushing a closure, and the db layer
+   re-derives max(rowid)+1 from the rolled-back tree for exactly those tables. *)
+module Schema_cache : sig [@warning "-32"]
+  type t
+
+  (** [stamp] re-stamps the #174 tree-tag for a [table_meta]; wired to
+      [register_tag store].  Every [table_meta] entering the cache is stamped so the
+      page-stamp stays consistent automatically, and an undo re-stamps the prior. *)
+  val create : stamp:(table_meta -> unit) -> t
+
+  (* reads — never touch the undo log *)
+  val find_table : t -> string -> table_meta option
+  val mem_table : t -> string -> bool
+  val find_index : t -> string -> index_info option
+  val mem_index : t -> string -> bool
+  val find_fts : t -> string -> fts_table_meta option
+  val fold_tables : (string -> table_meta -> 'a -> 'a) -> t -> 'a -> 'a
+  val fold_indexes : (string -> index_info -> 'a -> 'a) -> t -> 'a -> 'a
+  val fold_fts : (string -> fts_table_meta -> 'a -> 'a) -> t -> 'a -> 'a
+  val count_tables : t -> int
+  val count_indexes : t -> int
+  val count_fts : t -> int
+
+  (* undo-tracked mutators (DDL under with_ddl_txn) *)
+  val put_table : t -> name:string -> table_meta -> unit
+  val remove_table : t -> name:string -> unit
+  val put_index : t -> name:string -> index_info -> unit
+  val remove_index : t -> name:string -> unit
+  val put_fts : t -> name:string -> fts_table_meta -> unit
+  val remove_fts : t -> name:string -> unit
+
+  (* durable mutators (catalog-internal autocommit / ephemeral — no undo) *)
+  val put_table_durable : t -> name:string -> table_meta -> unit
+  val remove_table_durable : t -> name:string -> unit
+  val put_index_durable : t -> name:string -> index_info -> unit
+  val put_fts_durable : t -> name:string -> fts_table_meta -> unit
+
+  (* rowid counter: in-txn bump (dirty-set tracked) and post-rollback/autocommit
+     durable set; [take_rowid_bumped] returns the dirty names and clears the set. *)
+  val bump_rowid : t -> name:string -> table_meta -> unit
+  val set_rowid_durable : t -> name:string -> table_meta -> unit
+  val take_rowid_bumped : t -> string list
+
+  (* lifecycle — drive by the db layer at txn / savepoint boundaries *)
+  val commit : t -> unit
+  val rollback : t -> unit
+  val savepoint_begin : t -> string -> unit
+  val savepoint_rollback : t -> string -> unit
+  val savepoint_release : t -> string -> unit
+  val mark_poisoned : t -> unit
+  val is_poisoned : t -> bool
+end = struct
+  type t =
+    { tables : (string, table_meta) Hashtbl.t
+    ; indexes : (string, index_info) Hashtbl.t
+    ; fts : (string, fts_table_meta) Hashtbl.t
+    ; stamp : table_meta -> unit
+    ; mutable undo : (unit -> unit) list
+    ; mutable savepoints : (string * (unit -> unit) list * bool) list
+    ; mutable poisoned : bool
+    ; rowid_bumped : (string, unit) Hashtbl.t
+    }
+
+  let create ~stamp =
+    { tables = Hashtbl.create 16
+    ; indexes = Hashtbl.create 16
+    ; fts = Hashtbl.create 8
+    ; stamp
+    ; undo = []
+    ; savepoints = []
+    ; poisoned = false
+    ; rowid_bumped = Hashtbl.create 8
+    }
+  ;;
+
+  (* The undo log only ever grows by prepending, so a saved suffix stays
+     physically identical (==) — the invariant [savepoint_rollback] relies on. *)
+  let push_undo t f = t.undo <- f :: t.undo
+
+  let find_table t name = Hashtbl.find_opt t.tables name
+  let mem_table t name = Hashtbl.mem t.tables name
+  let find_index t name = Hashtbl.find_opt t.indexes name
+  let mem_index t name = Hashtbl.mem t.indexes name
+  let find_fts t name = Hashtbl.find_opt t.fts name
+  let fold_tables f t acc = Hashtbl.fold f t.tables acc
+  let fold_indexes f t acc = Hashtbl.fold f t.indexes acc
+  let fold_fts f t acc = Hashtbl.fold f t.fts acc
+  let count_tables t = Hashtbl.length t.tables
+  let count_indexes t = Hashtbl.length t.indexes
+  let count_fts t = Hashtbl.length t.fts
+
+  let put_table t ~name meta =
+    let prior = Hashtbl.find_opt t.tables name in
+    Hashtbl.replace t.tables name meta;
+    t.stamp meta;
+    push_undo t (fun () ->
+      match prior with
+      | Some m ->
+        Hashtbl.replace t.tables name m;
+        t.stamp m
+      | None -> Hashtbl.remove t.tables name)
+  ;;
+
+  let remove_table t ~name =
+    let prior = Hashtbl.find_opt t.tables name in
+    Hashtbl.remove t.tables name;
+    push_undo t (fun () ->
+      match prior with
+      | Some m ->
+        Hashtbl.replace t.tables name m;
+        t.stamp m
+      | None -> ())
+  ;;
+
+  let put_index t ~name info =
+    let prior = Hashtbl.find_opt t.indexes name in
+    Hashtbl.replace t.indexes name info;
+    push_undo t (fun () ->
+      match prior with
+      | Some i -> Hashtbl.replace t.indexes name i
+      | None -> Hashtbl.remove t.indexes name)
+  ;;
+
+  let remove_index t ~name =
+    let prior = Hashtbl.find_opt t.indexes name in
+    Hashtbl.remove t.indexes name;
+    push_undo t (fun () ->
+      match prior with
+      | Some i -> Hashtbl.replace t.indexes name i
+      | None -> ())
+  ;;
+
+  let put_fts t ~name meta =
+    let prior = Hashtbl.find_opt t.fts name in
+    Hashtbl.replace t.fts name meta;
+    push_undo t (fun () ->
+      match prior with
+      | Some m -> Hashtbl.replace t.fts name m
+      | None -> Hashtbl.remove t.fts name)
+  ;;
+
+  let remove_fts t ~name =
+    let prior = Hashtbl.find_opt t.fts name in
+    Hashtbl.remove t.fts name;
+    push_undo t (fun () ->
+      match prior with
+      | Some m -> Hashtbl.replace t.fts name m
+      | None -> ())
+  ;;
+
+  let put_table_durable t ~name meta =
+    Hashtbl.replace t.tables name meta;
+    t.stamp meta
+  ;;
+
+  let remove_table_durable t ~name = Hashtbl.remove t.tables name
+  let put_index_durable t ~name info = Hashtbl.replace t.indexes name info
+  let put_fts_durable t ~name meta = Hashtbl.replace t.fts name meta
+
+  let bump_rowid t ~name meta =
+    Hashtbl.replace t.tables name meta;
+    Hashtbl.replace t.rowid_bumped name ()
+  ;;
+
+  let set_rowid_durable t ~name meta = Hashtbl.replace t.tables name meta
+
+  let take_rowid_bumped t =
+    let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped [] in
+    Hashtbl.reset t.rowid_bumped;
+    names
+  ;;
+
+  let commit t =
+    t.undo <- [];
+    t.savepoints <- [];
+    t.poisoned <- false;
+    (* #293: COMMIT keeps the bumped next_rowid counter but clears the dirty set so
+       a later unrelated ROLLBACK won't recompute a table not bumped in that txn. *)
+    Hashtbl.reset t.rowid_bumped
+  ;;
+
+  let rollback t =
+    List.iter (fun f -> f ()) t.undo;
+    t.undo <- [];
+    t.savepoints <- [];
+    t.poisoned <- false
+    (* #293: [rowid_bumped] is intentionally NOT cleared here — the db layer calls
+       the recompute step right after, which reads it via [take_rowid_bumped]. *)
+  ;;
+
+  let savepoint_begin t name = t.savepoints <- (name, t.undo, t.poisoned) :: t.savepoints
+
+  let savepoint_rollback t name =
+    let rec find = function
+      | [] -> None
+      | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
+      | _ :: rest -> find rest
+    in
+    match find t.savepoints with
+    | None -> ()
+    | Some (snap, poison, older) ->
+      let rec run lst =
+        if lst == snap
+        then ()
+        else (
+          match lst with
+          | [] -> ()
+          | f :: tl ->
+            f ();
+            run tl)
+      in
+      run t.undo;
+      t.undo <- snap;
+      t.poisoned <- poison;
+      t.savepoints <- (name, snap, poison) :: older
+  ;;
+
+  let savepoint_release t name =
+    let rec drop = function
+      | [] -> []
+      | (n, _, _) :: older when String.equal n name -> older
+      | _ :: rest -> drop rest
+    in
+    t.savepoints <- drop t.savepoints
+  ;;
+
+  let mark_poisoned t = t.poisoned <- true
+  let is_poisoned t = t.poisoned
+end
+
 type t =
   { store : S.t
   ; cache : (string, table_meta) Hashtbl.t
