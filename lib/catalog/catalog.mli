@@ -404,7 +404,14 @@ val set_fk_constraints : t -> table_name:string -> fks:fk_constraint list -> uni
 (** #269: register an in-memory schema-cache reversal for DDL run through an
     explicit transaction.  The closure is invoked by [rollback_schema_changes]
     if the transaction is rolled back; it is discarded by [commit_schema_changes]
-    on commit.  Used by the db layer for view/trigger caches it owns. *)
+    on commit.  Used by the db layer for view/trigger caches it owns.
+
+    The closure MUST be idempotent (e.g. [Hashtbl.replace]/[remove] over values
+    captured at registration, not read-modify-write of live state).  #280's
+    [savepoint_rollback_schema] reverts the cache by re-running the closures
+    registered since a savepoint; its defensive "snapshot not reached" branch
+    can also leave an already-run closure queued for the outer ROLLBACK.  Both
+    rely on a second invocation being a no-op. *)
 val register_schema_undo : t -> (unit -> unit) -> unit
 
 (** #269: discard the pending schema-undo closures — the transaction's DDL is now

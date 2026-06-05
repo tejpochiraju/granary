@@ -850,6 +850,57 @@ let test_rollback_to_savepoint_is_repeatable () =
     Alcotest.(check (list string)) "final t committed" [] (rows db "SELECT c FROM t"))
 ;;
 
+(* Duplicate savepoint names (SQLite allows them; the newest wins).  RELEASE s
+   drops the inner [s] and its since-marker entries merge outward; ROLLBACK TO s
+   then targets the OUTER [s], unwinding DDL from BOTH savepoints.  The
+   newest-first [find]/[drop] walk gives this for free. *)
+let test_duplicate_savepoint_names () =
+  with_db (fun db ->
+    exec db "BEGIN";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE a (x INTEGER)";
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE b (y INTEGER)";
+    exec db "RELEASE s";
+    (* Inner RELEASE keeps both tables (writes merge outward). *)
+    Alcotest.(check (list string))
+      "a present after inner RELEASE"
+      []
+      (rows db "SELECT x FROM a");
+    Alcotest.(check (list string))
+      "b present after inner RELEASE"
+      []
+      (rows db "SELECT y FROM b");
+    exec db "ROLLBACK TO s";
+    (* ROLLBACK TO the outer [s] unwinds both. *)
+    Alcotest.(check bool) "a gone after ROLLBACK TO outer s" true (table_absent db "a");
+    Alcotest.(check bool) "b gone after ROLLBACK TO outer s" true (table_absent db "b");
+    exec db "COMMIT")
+;;
+
+(* Auto-began savepoint (no BEGIN): SAVEPOINT auto-opens a txn, DDL participates,
+   ROLLBACK TO unwinds the cache, and RELEASE of the last savepoint auto-commits
+   — the auto-commit path's [commit_schema_changes] must also clear the savepoint
+   stack so no stale marker leaks into the next statement. *)
+let test_auto_began_savepoint_ddl_release_commits () =
+  with_db (fun db ->
+    exec db "SAVEPOINT s";
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "ROLLBACK TO s";
+    Alcotest.(check bool) "t gone after ROLLBACK TO s" true (table_absent db "t");
+    (* Recreate inside the still-open auto-began txn, then RELEASE auto-commits. *)
+    exec db "CREATE TABLE t (b TEXT)";
+    exec db "INSERT INTO t VALUES ('x')";
+    exec db "RELEASE s";
+    Alcotest.(check (list string))
+      "t durable after RELEASE auto-commit"
+      [ "t:x" ]
+      (rows db "SELECT b FROM t");
+    (* The stack was cleared: a fresh autocommit CREATE works. *)
+    exec db "CREATE TABLE u (c INTEGER)";
+    Alcotest.(check (list string)) "fresh autocommit works" [] (rows db "SELECT c FROM u"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -985,6 +1036,14 @@ let () =
             "ROLLBACK TO same savepoint is repeatable"
             `Quick
             test_rollback_to_savepoint_is_repeatable
+        ; Alcotest.test_case
+            "duplicate savepoint names (newest wins)"
+            `Quick
+            test_duplicate_savepoint_names
+        ; Alcotest.test_case
+            "auto-began savepoint DDL, RELEASE auto-commits"
+            `Quick
+            test_auto_began_savepoint_ddl_release_commits
         ] )
     ]
 ;;
