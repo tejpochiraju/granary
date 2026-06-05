@@ -416,6 +416,24 @@ val commit_schema_changes : t -> unit
     Call at ROLLBACK. *)
 val rollback_schema_changes : t -> unit
 
+(** #280: open a schema-undo savepoint named [name].  Records the current
+    undo-log position so a later [savepoint_rollback_schema]/
+    [savepoint_release_schema] of [name] can act on only the entries registered
+    since this point.  Call from the db layer's SAVEPOINT handler. *)
+val savepoint_begin_schema : t -> string -> unit
+
+(** #280: ROLLBACK TO savepoint [name] — run (most-recent-first) and drop the
+    schema-undo closures registered since [name] was opened, reverting their
+    in-memory cache mutations to agree with the store rolled back to [name].
+    Keeps [name] (re-rollback-able) and drops newer savepoints.  No-op if [name]
+    is unknown. *)
+val savepoint_rollback_schema : t -> string -> unit
+
+(** #280: RELEASE savepoint [name] — drop the marker (and newer ones) without
+    running any undo; the since-[name] entries merge into the enclosing scope so
+    an outer ROLLBACK still unwinds them.  No-op if [name] is unknown. *)
+val savepoint_release_schema : t -> string -> unit
+
 (** #286: mark the ambient explicit transaction uncommittable.  Called when an
     in-txn DDL statement fails partway through — its borrowed txn is left open
     with partial on-disk effects, so a subsequent COMMIT must be forced to roll

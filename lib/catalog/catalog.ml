@@ -154,6 +154,16 @@ type t =
         runs them most-recent-first, [commit_schema_changes] discards them.
         Empty in autocommit mode (where each DDL self-commits and cannot roll
         back). *)
+  ; mutable schema_savepoints : (string * (unit -> unit) list) list
+    (** #280: savepoint markers over [schema_undo].  Each entry records a
+        savepoint name and the [schema_undo] list AS IT WAS when the savepoint
+        was opened (a physical suffix of the current list, since the log only
+        grows by prepending).  Newest savepoint at the front, mirroring the
+        store's savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
+        registered since [s] (the prefix down to its recorded snapshot) and
+        keeps [s]; [RELEASE s] merges them into the enclosing scope (drops the
+        marker, leaves [schema_undo] untouched).  Cleared at every outer txn
+        boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
   ; mutable schema_txn_poisoned : bool
     (** #286: set when an in-txn DDL statement fails partway through, leaving
         partial on-disk effects under the ambient explicit transaction.  The db
@@ -1220,6 +1230,7 @@ let open_ store =
     ; pending_fk_checks = []
     ; last_inserted_rowid = 0L
     ; schema_undo = []
+    ; schema_savepoints = []
     ; schema_txn_poisoned = false
     }
 ;;
@@ -1245,13 +1256,65 @@ let schema_txn_poisoned t = t.schema_txn_poisoned
 
 let commit_schema_changes t =
   t.schema_undo <- [];
+  t.schema_savepoints <- [];
   t.schema_txn_poisoned <- false
 ;;
 
 let rollback_schema_changes t =
   List.iter (fun f -> f ()) t.schema_undo;
   t.schema_undo <- [];
+  t.schema_savepoints <- [];
   t.schema_txn_poisoned <- false
+;;
+
+(* #280: open a savepoint over the schema-undo log.  Records the current
+   [schema_undo] list so [ROLLBACK TO]/[RELEASE] of this savepoint can find the
+   boundary between entries registered before and after it. *)
+let savepoint_begin_schema t name =
+  t.schema_savepoints <- (name, t.schema_undo) :: t.schema_savepoints
+;;
+
+(* #280: ROLLBACK TO a savepoint.  Run+drop the undo closures registered since
+   the savepoint (the prefix of [schema_undo] down to its recorded snapshot,
+   most-recent-first), reset [schema_undo] to that snapshot, drop newer
+   savepoint markers, and keep this savepoint so it can be rolled back to again
+   (mirroring [Store.savepoint_rollback]).  Unknown name: no-op. *)
+let savepoint_rollback_schema t name =
+  let rec find = function
+    | [] -> None
+    | (n, snap) :: older when String.equal n name -> Some (snap, older)
+    | _ :: rest -> find rest
+  in
+  match find t.schema_savepoints with
+  | None -> ()
+  | Some (snap, older) ->
+    (* [snap] is a physical suffix of [t.schema_undo]; run closures ahead of it. *)
+    let rec run lst =
+      if lst == snap
+      then ()
+      else (
+        match lst with
+        | [] -> () (* defensive: snapshot not reached *)
+        | f :: tl ->
+          f ();
+          run tl)
+    in
+    run t.schema_undo;
+    t.schema_undo <- snap;
+    t.schema_savepoints <- (name, snap) :: older
+;;
+
+(* #280: RELEASE a savepoint.  The since-savepoint undo entries merge into the
+   enclosing scope, so [schema_undo] is untouched — only the marker (and any
+   newer markers) is dropped (mirroring [Store.savepoint_release]).  An outer
+   ROLLBACK still unwinds the merged entries.  Unknown name: no-op. *)
+let savepoint_release_schema t name =
+  let rec drop = function
+    | [] -> []
+    | (n, _) :: older when String.equal n name -> older
+    | _ :: rest -> drop rest
+  in
+  t.schema_savepoints <- drop t.schema_savepoints
 ;;
 
 (* Write a table's catalog rows (primary + columns + mirror) through [tx] and

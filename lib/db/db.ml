@@ -538,6 +538,9 @@ let savepoint_txn t name =
       Lwt.return tx
   in
   let* () = S.savepoint_begin tx name in
+  (* #280: mark the schema-undo log so [ROLLBACK TO]/[RELEASE] of this savepoint
+     can unwind only the DDL cache-changes registered since here. *)
+  Cat.savepoint_begin_schema t.catalog name;
   t.savepoint_names <- name :: t.savepoint_names;
   Lwt.return (Ok ())
 ;;
@@ -547,6 +550,9 @@ let release_savepoint t name =
   | None -> Lwt.return (Error (Runtime "no active transaction for RELEASE"))
   | Some tx ->
     let* () = S.savepoint_release tx name in
+    (* #280: merge this savepoint's schema-undo entries into the enclosing scope
+       (no undo runs; an outer ROLLBACK still unwinds them). *)
+    Cat.savepoint_release_schema t.catalog name;
     if List.mem name t.savepoint_names
     then (
       let rec drop = function
@@ -582,6 +588,9 @@ let rollback_to_savepoint t name =
   | None -> Lwt.return (Error (Runtime "no active transaction for ROLLBACK TO"))
   | Some tx ->
     let* () = S.savepoint_rollback tx name in
+    (* #280: revert the in-memory cache mutations of DDL registered since this
+       savepoint so the catalog agrees with the store rolled back to [name]. *)
+    Cat.savepoint_rollback_schema t.catalog name;
     if List.mem name t.savepoint_names
     then (
       let rec trim = function
