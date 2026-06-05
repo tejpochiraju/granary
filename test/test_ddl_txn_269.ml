@@ -579,6 +579,147 @@ let test_failed_in_txn_ddl_poisons_savepoint_release () =
       (rows db "SELECT a FROM t"))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* DROP TABLE / DROP INDEX inside an explicit transaction (#279)         *)
+(*                                                                       *)
+(* DROP removes the catalog cache entry BEFORE the caller commits, but   *)
+(* (pre-#279) registered no schema-undo.  A [ROLLBACK] then restored the *)
+(* table/index on disk (the store reverts the _sys_* deletes — DROP does *)
+(* not reclaim the B+-tree pages) but left the in-memory cache           *)
+(* disagreeing: the name read as absent until reopen.  These tests pin   *)
+(* the symmetry with CREATE — a rolled-back DROP leaves the catalog cache *)
+(* agreeing with the store (the object is back AND usable), and a DROP   *)
+(* now participates in the poison/forced-rollback machinery (#286).      *)
+(* ------------------------------------------------------------------ *)
+
+let test_drop_table_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "DROP TABLE t";
+    exec db "COMMIT";
+    (* Table is gone and the name is free to recreate. *)
+    Alcotest.(check bool) "table dropped by commit" true (table_absent db "t");
+    exec db "CREATE TABLE t (b TEXT)";
+    exec db "INSERT INTO t VALUES ('new')";
+    Alcotest.(check (list string))
+      "recreated table is the new one"
+      [ "t:new" ]
+      (rows db "SELECT b FROM t"))
+;;
+
+let test_drop_table_in_txn_rollback_restores () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "INSERT INTO t VALUES (2, 'y')";
+    exec db "BEGIN";
+    exec db "DROP TABLE t";
+    exec db "ROLLBACK";
+    (* The table — and its data — must be back, AND the catalog cache must agree
+       with the store: SELECT works without a reopen.  Pre-#279 the cache lost
+       the entry, so this SELECT failed ("no such table"). *)
+    Alcotest.(check (list string))
+      "rolled-back DROP restores the table and its rows"
+      [ "i:1,t:x"; "i:2,t:y" ]
+      (rows db "SELECT a, b FROM t");
+    (* The name is occupied again: a fresh CREATE of the same name must fail
+       (a cache that lost the entry would wrongly accept it). *)
+    let err = exec_err db "CREATE TABLE t (z INTEGER)" in
+    Alcotest.(check bool)
+      "name still taken after rolled-back DROP"
+      true
+      (contains ~needle:"already exists" err))
+;;
+
+let test_drop_index_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE UNIQUE INDEX t_a ON t (a)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "DROP INDEX t_a";
+    exec db "COMMIT";
+    (* Index is durably gone: uniqueness is no longer enforced … *)
+    exec db "INSERT INTO t VALUES (1)";
+    Alcotest.(check (list string))
+      "duplicate allowed after committed DROP INDEX"
+      [ "i:1"; "i:1" ]
+      (rows db "SELECT a FROM t");
+    (* … and the name is free to recreate. *)
+    exec db "CREATE INDEX t_a ON t (a)")
+;;
+
+let test_drop_index_in_txn_rollback_restores () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "CREATE INDEX t_a ON t (a)";
+    exec db "BEGIN";
+    exec db "DROP INDEX t_a";
+    exec db "ROLLBACK";
+    (* The index is back in the cache: re-creating it by name must fail
+       ("already exists").  Pre-#279 the cache lost the index, so this CREATE
+       wrongly succeeded. *)
+    let err = exec_err db "CREATE INDEX t_a ON t (a)" in
+    Alcotest.(check bool)
+      "index name still taken after rolled-back DROP"
+      true
+      (contains ~needle:"already exists" err);
+    (* And it is genuinely present: DROP INDEX succeeds (no "no such index"). *)
+    exec db "DROP INDEX t_a")
+;;
+
+let test_drop_table_in_txn_rollback_restores_indexes () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "CREATE INDEX t_a ON t (a)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "BEGIN";
+    (* DROP TABLE drops [t] AND its dependent index [t_a] from the cache. *)
+    exec db "DROP TABLE t";
+    exec db "ROLLBACK";
+    (* Table restored with data … *)
+    Alcotest.(check (list string))
+      "table restored after rolled-back DROP TABLE"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, b FROM t");
+    (* … and its dependent index restored too (re-CREATE by name fails). *)
+    let err = exec_err db "CREATE INDEX t_a ON t (a)" in
+    Alcotest.(check bool)
+      "dependent index name still taken after rolled-back DROP TABLE"
+      true
+      (contains ~needle:"already exists" err))
+;;
+
+(* A DROP whose cache mutation is later undone by a FORCED rollback (the txn was
+   poisoned by an unrelated failed DDL) must come back.  Exercises the DROP
+   schema-undo on the poisoned-COMMIT path, not just explicit ROLLBACK. *)
+let test_drop_in_txn_then_poison_restores () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "CREATE TABLE keep (b TEXT)";
+    exec db "BEGIN";
+    exec db "DROP TABLE t";
+    exec db "CREATE TABLE z (c INTEGER)";
+    (* poison: rename onto a name created earlier in this same txn. *)
+    let _ = exec_err db "ALTER TABLE keep RENAME TO z" in
+    let commit_err = exec_err db "COMMIT" in
+    Alcotest.(check bool)
+      "COMMIT rejected: transaction uncommittable"
+      true
+      (contains ~needle:"uncommittable" commit_err);
+    (* The forced rollback restored the dropped table (cache + store agree). *)
+    Alcotest.(check (list string))
+      "dropped table restored by forced rollback"
+      [ "i:1" ]
+      (rows db "SELECT a FROM t");
+    (* [z] (created in the txn) is gone; [keep] was never renamed. *)
+    Alcotest.(check bool) "z discarded" true (table_absent db "z");
+    Alcotest.(check (list string)) "keep intact" [] (rows db "SELECT b FROM keep"))
+;;
+
 let () =
   Alcotest.run
     "ddl_txn_269"
@@ -668,6 +809,26 @@ let () =
             "failed in-txn DDL poisons SAVEPOINT release auto-commit"
             `Quick
             test_failed_in_txn_ddl_poisons_savepoint_release
+        ] )
+    ; ( "drop_table_index"
+      , [ Alcotest.test_case "drop table commit" `Quick test_drop_table_in_txn_commits
+        ; Alcotest.test_case
+            "drop table rollback restores"
+            `Quick
+            test_drop_table_in_txn_rollback_restores
+        ; Alcotest.test_case "drop index commit" `Quick test_drop_index_in_txn_commits
+        ; Alcotest.test_case
+            "drop index rollback restores"
+            `Quick
+            test_drop_index_in_txn_rollback_restores
+        ; Alcotest.test_case
+            "drop table rollback restores dependent indexes"
+            `Quick
+            test_drop_table_in_txn_rollback_restores_indexes
+        ; Alcotest.test_case
+            "drop in-txn then poison restores on forced rollback"
+            `Quick
+            test_drop_in_txn_then_poison_restores
         ] )
     ]
 ;;

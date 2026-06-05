@@ -1663,6 +1663,14 @@ let restore_index_cache t (info : index_info) =
   Hashtbl.replace t.indexes info.idx_name info
 ;;
 
+(* #279: re-insert a table_meta into the in-memory table cache.  Inverse of the
+   cache side of [drop_table]; used by the executor to register a ROLLBACK undo
+   so a DROP TABLE inside an explicit transaction restores the catalog cache when
+   the transaction is rolled back (the store reverts the _sys_* row deletes, this
+   re-syncs the cache).  The dependent indexes [drop_table] also removed are
+   restored separately via [restore_index_cache]. *)
+let restore_table_cache t (m : table_meta) = Hashtbl.replace t.cache m.name m
+
 let drop_table t tx ~name =
   (* 0. Remove the mirror entry (keyed by tree_id), if we know the tree_id. *)
   let%lwt () =
