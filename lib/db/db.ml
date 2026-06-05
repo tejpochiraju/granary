@@ -391,6 +391,10 @@ let begin_txn t =
   | Some _ -> Lwt.return (Error (Runtime "transaction already active"))
   | None ->
     let* tx = S.rw_begin t.store in
+    (* #269: defensive — start with an empty schema-undo log so a stale entry
+       from a prior op can never leak into this transaction's rollback. (It is
+       already cleared by every commit/rollback path; this just hardens it.) *)
+    Cat.commit_schema_changes t.catalog;
     t.explicit_txn <- Some tx;
     Lwt.return (Ok ())
 ;;
@@ -412,6 +416,8 @@ let drain_pending_fks_or_fail t (tx : S.rw S.txn) : unit Lwt.t =
       then (
         (* Rollback the underlying txn so the caller gets a clean state. *)
         let* () = S.rollback tx in
+        (* #269: revert any in-txn DDL's in-memory cache changes too. *)
+        Cat.rollback_schema_changes t.catalog;
         t.explicit_txn <- None;
         t.savepoint_names <- [];
         t.auto_began <- false;
@@ -468,6 +474,8 @@ let commit_txn t =
       (fun () ->
          let* () = drain_pending_fks_or_fail t tx in
          let* () = S.commit tx in
+         (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
+         Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
          t.savepoint_names <- [];
          t.auto_began <- false;
@@ -483,6 +491,8 @@ let rollback_txn t =
   | None -> Lwt.return (Error (Runtime "no active transaction"))
   | Some tx ->
     let* () = S.rollback tx in
+    (* #269: revert any in-txn DDL's in-memory cache changes. *)
+    Cat.rollback_schema_changes t.catalog;
     t.explicit_txn <- None;
     t.savepoint_names <- [];
     t.auto_began <- false;
@@ -522,6 +532,8 @@ let release_savepoint t name =
     if t.auto_began && t.savepoint_names = []
     then (
       let* () = S.commit tx in
+      (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
+      Cat.commit_schema_changes t.catalog;
       t.explicit_txn <- None;
       t.auto_began <- false;
       Lwt.return (Ok ()))
@@ -1196,6 +1208,27 @@ let execute_instead_of t view_name ast =
    [fire_trigger_stmt] / [make_trigger_hook] recursive group above so that
    nested trigger bodies can install REPLACE/UPSERT secondary hooks. *)
 
+(* #269: apply a view/trigger schema change that lives in a db-owned cache
+   ([t.views] / [t.triggers]).  [apply] performs the in-memory mutation; when an
+   explicit transaction is active, the matching store write goes THROUGH it (so
+   CREATE/DROP VIEW/TRIGGER no longer self-deadlocks inside BEGIN … COMMIT) and
+   [undo] is registered to revert the cache on ROLLBACK; otherwise [persist None]
+   self-commits, as before. *)
+let staged_schema_change t ~apply ~undo ~persist =
+  (* Persist to the store FIRST, then mutate the in-memory cache: if the store
+     write raises, the cache is left untouched (no orphaned cache entry / undo). *)
+  match t.explicit_txn with
+  | Some tx ->
+    let* () = persist (Some tx) in
+    apply ();
+    Cat.register_schema_undo t.catalog undo;
+    Lwt.return_unit
+  | None ->
+    let* () = persist None in
+    apply ();
+    Lwt.return_unit
+;;
+
 (* Handle non-DML control / DDL ops (txn control, ATTACH/DETACH, schema
    switch, CREATE/DROP VIEW/TRIGGER, VACUUM).  Returns [Some result] for ops
    it owns and [None] for DML / catch-all ops the caller routes to
@@ -1263,27 +1296,63 @@ let execute_control_op top t sql op =
     (* No rows produced via execute; use [query]/[Db.query] to read. *)
     Some (Lwt.return (Ok ()))
   | Sql.Plan.Op_create_view { name; query } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
+    (* #269: participates in an ambient explicit txn (rolls back atomically);
+       autocommits otherwise. *)
     Some
-      (Hashtbl.replace t.views name query;
-       let* () = Cat.persist_view t.store ~name ~sql in
+      (let prev = Hashtbl.find_opt t.views name in
+       let* () =
+         staged_schema_change
+           t
+           ~apply:(fun () -> Hashtbl.replace t.views name query)
+           ~undo:(fun () ->
+             match prev with
+             | Some q -> Hashtbl.replace t.views name q
+             | None -> Hashtbl.remove t.views name)
+           ~persist:(fun txn -> Cat.persist_view ?txn t.store ~name ~sql)
+       in
        Lwt.return (Ok ()))
   | Sql.Plan.Op_drop_view { name } ->
-    (* DDL is not transactional — persist_view commits immediately regardless of any open explicit txn *)
     Some
-      (Hashtbl.remove t.views name;
-       let* () = Cat.remove_view t.store ~name in
+      (let prev = Hashtbl.find_opt t.views name in
+       let* () =
+         staged_schema_change
+           t
+           ~apply:(fun () -> Hashtbl.remove t.views name)
+           ~undo:(fun () ->
+             match prev with
+             | Some q -> Hashtbl.replace t.views name q
+             | None -> Hashtbl.remove t.views name)
+           ~persist:(fun txn -> Cat.remove_view ?txn t.store ~name)
+       in
        Lwt.return (Ok ()))
   | Sql.Plan.Op_create_trigger { name; timing; event; table; when_; body } ->
     Some
       (let ast = Sql.Ast.S_create_trigger { name; timing; event; table; when_; body } in
-       Hashtbl.replace t.triggers name ast;
-       let* () = Cat.persist_trigger t.store ~name ~sql in
+       let prev = Hashtbl.find_opt t.triggers name in
+       let* () =
+         staged_schema_change
+           t
+           ~apply:(fun () -> Hashtbl.replace t.triggers name ast)
+           ~undo:(fun () ->
+             match prev with
+             | Some a -> Hashtbl.replace t.triggers name a
+             | None -> Hashtbl.remove t.triggers name)
+           ~persist:(fun txn -> Cat.persist_trigger ?txn t.store ~name ~sql)
+       in
        Lwt.return (Ok ()))
   | Sql.Plan.Op_drop_trigger { name } ->
     Some
-      (Hashtbl.remove t.triggers name;
-       let* () = Cat.remove_trigger t.store ~name in
+      (let prev = Hashtbl.find_opt t.triggers name in
+       let* () =
+         staged_schema_change
+           t
+           ~apply:(fun () -> Hashtbl.remove t.triggers name)
+           ~undo:(fun () ->
+             match prev with
+             | Some a -> Hashtbl.replace t.triggers name a
+             | None -> Hashtbl.remove t.triggers name)
+           ~persist:(fun txn -> Cat.remove_trigger ?txn t.store ~name)
+       in
        Lwt.return (Ok ()))
   | Sql.Plan.Op_vacuum ->
     Some
