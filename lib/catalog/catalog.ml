@@ -1490,7 +1490,13 @@ let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~or
             Lwt.return (Ok info))))
 ;;
 
-let add_column t ~table_name ~(column : Row.column) =
+(* [?txn] (#282): when an explicit transaction is active the executor threads it
+   here so the column's catalog row and mirror refresh participate in it (no
+   nested [rw_begin], which would self-deadlock against the writer lock the txn
+   already holds).  A schema-cache undo restores the prior [table_meta] AND its
+   tree-tag fingerprint on [ROLLBACK] — unlike a fresh CREATE the tree_id stays
+   allocated, so the #174 page-stamp must revert to the old schema too. *)
+let add_column ?txn t ~table_name ~(column : Row.column) =
   match Hashtbl.find_opt t.cache table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
@@ -1505,12 +1511,19 @@ let add_column t ~table_name ~(column : Row.column) =
       let ordinal = List.length meta.columns in
       let col_k = column_key table_name ordinal in
       let col_v = encode_column column in
-      let%lwt tx = S.rw_begin t.store in
-      let%lwt () = S.put tx sys_columns_tid col_k col_v in
-      let%lwt () = put_mirror_tx tx new_meta in
-      let%lwt () = S.commit tx in
+      let%lwt () =
+        borrow_or_autocommit ?txn t.store (fun tx ->
+          let%lwt () = S.put tx sys_columns_tid col_k col_v in
+          put_mirror_tx tx new_meta)
+      in
       Hashtbl.replace t.cache table_name new_meta;
       register_tag t.store new_meta;
+      (match txn with
+       | Some _ ->
+         register_schema_undo t (fun () ->
+           Hashtbl.replace t.cache table_name meta;
+           register_tag t.store meta)
+       | None -> ());
       Lwt.return (Ok ()))
 ;;
 
@@ -1622,6 +1635,14 @@ let drop_index t tx ~name =
   Lwt.return_unit
 ;;
 
+(* #282: re-insert an index_info into the in-memory cache.  Used by the executor
+   to register a ROLLBACK undo when [drop_index] is run for a dependent index
+   inside an ALTER … DROP COLUMN that participates in an explicit transaction —
+   the on-disk row is reverted by the store, this re-syncs the cache. *)
+let restore_index_cache t (info : index_info) =
+  Hashtbl.replace t.indexes info.idx_name info
+;;
+
 let drop_table t tx ~name =
   (* 0. Remove the mirror entry (keyed by tree_id), if we know the tree_id. *)
   let%lwt () =
@@ -1654,6 +1675,11 @@ let drop_table t tx ~name =
   Lwt.return_unit
 ;;
 
+(* #282: on a corrupt-catalog Error this no longer rolls [tx] back itself — the
+   caller decides.  In autocommit the caller aborts its own writer txn; when the
+   txn is borrowed from an ambient explicit transaction, aborting it here would
+   tear down the user's whole transaction, so we surface the Error and let the
+   db layer's [ROLLBACK] (or [with_ddl_txn] in [Auto]) handle teardown. *)
 let rekey_table_columns tx ~old_name ~new_name ~n_cols =
   let rec loop i =
     if i >= n_cols
@@ -1664,7 +1690,6 @@ let rekey_table_columns tx ~old_name ~new_name ~n_cols =
       let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
       match bytes_opt with
       | None ->
-        let%lwt () = S.rollback tx in
         Lwt.return
           (Error
              (Printf.sprintf "catalog corrupt: column %d missing for table %s" i old_name))
@@ -1676,38 +1701,44 @@ let rekey_table_columns tx ~old_name ~new_name ~n_cols =
   loop 0
 ;;
 
-let finish_rename t tx ~old_name ~new_name ~meta =
-  (* Re-write sys_indexes entries that reference old_name *)
-  let%lwt idx_updates =
-    S.with_ro t.store
-    @@ fun tx_ro_idx ->
-    let%lwt cur = S.cursor_open tx_ro_idx sys_indexes_tid in
-    let _sr = S.cursor_first cur in
-    let idx_updates = ref [] in
-    let rec scan_idxs () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, v) ->
-        let info = decode_index_value v in
-        if String.equal info.idx_table old_name
-        then idx_updates := (k, info) :: !idx_updates;
-        scan_idxs ()
-    in
-    scan_idxs ();
-    S.cursor_close cur;
-    Lwt.return !idx_updates
+(* [~txn] (#282): [Some] when the surrounding rename is borrowing an ambient
+   explicit transaction; the entry is committed (and the cache undo registered)
+   only on the borrowed path, otherwise the autocommit caller commits its own
+   writer txn.  The sys_indexes scan runs THROUGH [tx] (read-your-own-writes) so
+   an index created earlier in the same transaction is remapped too, not just
+   pre-txn indexes. *)
+let finish_rename t tx ~txn ~old_name ~new_name ~meta =
+  (* Re-write sys_indexes entries that reference old_name, reading through the
+     active txn so uncommitted in-txn index entries are also caught. *)
+  let%lwt cur = S.cursor_open tx sys_indexes_tid in
+  let _sr = S.cursor_first cur in
+  let idx_updates = ref [] in
+  let rec scan_idxs () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (k, v) ->
+      let info = decode_index_value v in
+      if String.equal info.idx_table old_name
+      then idx_updates := (k, info) :: !idx_updates;
+      scan_idxs ()
   in
+  scan_idxs ();
+  S.cursor_close cur;
   let%lwt () =
     Lwt_list.iter_s
       (fun (k, (info : index_info)) ->
          let new_info = { info with idx_table = new_name } in
          S.put tx sys_indexes_tid k (encode_index_value new_info))
-      idx_updates
+      !idx_updates
   in
   (* Refresh the mirror entry (keyed by the unchanged tree_id) with the new
      name; the schema shape — hence the fingerprint — is unchanged. *)
   let%lwt () = put_mirror_tx tx { meta with name = new_name } in
-  let%lwt () = S.commit tx in
+  let%lwt () =
+    match txn with
+    | Some _ -> Lwt.return_unit
+    | None -> S.commit tx
+  in
   (* Update in-memory cache *)
   Hashtbl.remove t.cache old_name;
   Hashtbl.replace t.cache new_name { meta with name = new_name };
@@ -1721,64 +1752,117 @@ let finish_rename t tx ~old_name ~new_name ~meta =
   List.iter
     (fun (k, v) -> Hashtbl.replace t.indexes k { v with idx_table = new_name })
     to_update;
+  (* On ROLLBACK restore the cache key and the in-memory index back-references.
+     The fingerprint is unchanged by a rename, so no tree-tag undo is needed. *)
+  (match txn with
+   | Some _ ->
+     register_schema_undo t (fun () ->
+       Hashtbl.remove t.cache new_name;
+       Hashtbl.replace t.cache old_name meta;
+       List.iter (fun (k, v) -> Hashtbl.replace t.indexes k v) to_update)
+   | None -> ());
   Lwt.return (Ok ())
 ;;
 
-let rename_table t ~old_name ~new_name =
+let rename_table ?txn t ~old_name ~new_name =
   match Hashtbl.find_opt t.cache old_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
   | Some meta ->
     if Hashtbl.mem t.cache new_name
     then Lwt.return (Error (Printf.sprintf "table already exists: %s" new_name))
     else (
-      let%lwt tx = S.rw_begin t.store in
-      (* Remove old sys_tables entry *)
-      let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
-      (* Insert new sys_tables entry *)
-      let%lwt () =
-        S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
+      let body tx =
+        (* Remove old sys_tables entry *)
+        let%lwt () = S.del tx sys_tables_tid (Bytes.of_string old_name) in
+        (* Insert new sys_tables entry *)
+        let%lwt () =
+          S.put tx sys_tables_tid (Bytes.of_string new_name) (encode_table_value meta)
+        in
+        (* Re-key all column entries; return Error if any entry is missing *)
+        let%lwt col_result =
+          rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
+        in
+        match col_result with
+        | Error msg -> Lwt.return (Error msg)
+        | Ok () -> finish_rename t tx ~txn ~old_name ~new_name ~meta
       in
-      (* Re-key all column entries; return Error if any entry is missing *)
-      let%lwt col_result =
-        rekey_table_columns tx ~old_name ~new_name ~n_cols:(List.length meta.columns)
-      in
-      match col_result with
-      | Error msg -> Lwt.return (Error msg)
-      | Ok () -> finish_rename t tx ~old_name ~new_name ~meta)
+      match txn with
+      | Some tx -> body tx
+      | None ->
+        let%lwt tx = S.rw_begin t.store in
+        let%lwt r = body tx in
+        (match r with
+         | Ok () -> Lwt.return (Ok ()) (* finish_rename committed on the None path *)
+         | Error msg ->
+           let%lwt () = S.rollback tx in
+           Lwt.return (Error msg)))
 ;;
 
-let rename_column t ~table_name ~old_col ~new_col =
+(* [?txn] (#282): mirrors [add_column].  Renaming a column changes the schema
+   fingerprint (it is computed over column names), so the undo restores both the
+   prior [table_meta] and its tree-tag stamp.  The corrupt-catalog error path no
+   longer rolls a borrowed txn back — it surfaces an Error and leaves teardown to
+   the caller. *)
+let rename_column ?txn t ~table_name ~old_col ~new_col =
   match Hashtbl.find_opt t.cache table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
     (match List.find_index (fun c -> String.equal c.Row.name old_col) meta.columns with
      | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" old_col))
      | Some i ->
-       let%lwt tx = S.rw_begin t.store in
        let col_k = column_key table_name i in
-       let%lwt bytes_opt = S.get tx sys_columns_tid col_k in
-       (match bytes_opt with
+       let body tx =
+         let%lwt bytes_opt = S.get tx sys_columns_tid col_k in
+         match bytes_opt with
+         | None -> Lwt.return (Error "column entry missing from catalog")
+         | Some old_bytes ->
+           let old_col_rec = decode_column old_bytes in
+           let new_col_rec = { old_col_rec with Row.name = new_col } in
+           let%lwt () = S.put tx sys_columns_tid col_k (encode_column new_col_rec) in
+           let new_columns =
+             List.mapi
+               (fun j c -> if j = i then { c with Row.name = new_col } else c)
+               meta.columns
+           in
+           let new_meta = { meta with columns = new_columns } in
+           let%lwt () = put_mirror_tx tx new_meta in
+           Lwt.return (Ok new_meta)
+       in
+       let finalize new_meta =
+         Hashtbl.replace t.cache table_name new_meta;
+         register_tag t.store new_meta;
+         match txn with
+         | Some _ ->
+           register_schema_undo t (fun () ->
+             Hashtbl.replace t.cache table_name meta;
+             register_tag t.store meta)
+         | None -> ()
+       in
+       (match txn with
+        | Some tx ->
+          (match%lwt body tx with
+           | Error msg -> Lwt.return (Error msg)
+           | Ok new_meta ->
+             finalize new_meta;
+             Lwt.return (Ok ()))
         | None ->
-          let%lwt () = S.rollback tx in
-          Lwt.return (Error "column entry missing from catalog")
-        | Some old_bytes ->
-          let old_col_rec = decode_column old_bytes in
-          let new_col_rec = { old_col_rec with Row.name = new_col } in
-          let%lwt () = S.put tx sys_columns_tid col_k (encode_column new_col_rec) in
-          let new_columns =
-            List.mapi
-              (fun j c -> if j = i then { c with Row.name = new_col } else c)
-              meta.columns
-          in
-          let new_meta = { meta with columns = new_columns } in
-          let%lwt () = put_mirror_tx tx new_meta in
-          let%lwt () = S.commit tx in
-          Hashtbl.replace t.cache table_name new_meta;
-          register_tag t.store new_meta;
-          Lwt.return (Ok ())))
+          let%lwt tx = S.rw_begin t.store in
+          (match%lwt body tx with
+           | Error msg ->
+             let%lwt () = S.rollback tx in
+             Lwt.return (Error msg)
+           | Ok new_meta ->
+             let%lwt () = S.commit tx in
+             finalize new_meta;
+             Lwt.return (Ok ()))))
 ;;
 
-let drop_column t ~table_name ~col_name =
+(* [?txn] (#282): mirrors [add_column].  Dropping a column changes the schema
+   fingerprint, so the undo restores the prior [table_meta] and re-stamps its
+   tree-tag.  Only the catalog's _sys_columns re-keying happens here; the
+   executor ([alter_drop_column]) is responsible for migrating the row data
+   through the same txn. *)
+let drop_column ?txn t ~table_name ~col_name =
   match Hashtbl.find_opt t.cache table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
@@ -1791,33 +1875,40 @@ let drop_column t ~table_name ~col_name =
      | None -> Lwt.return (Error (Printf.sprintf "column not found: %s" col_name))
      | Some drop_idx ->
        let n_cols = List.length meta.columns in
-       let%lwt tx = S.rw_begin t.store in
-       (* Delete the dropped column's entry *)
-       let%lwt () = S.del tx sys_columns_tid (column_key table_name drop_idx) in
-       (* Re-key all columns after drop_idx: shift ordinal down by 1 *)
-       let%lwt () =
-         let rec shift i =
-           if i >= n_cols
-           then Lwt.return_unit
-           else (
-             let old_k = column_key table_name i in
-             let new_k = column_key table_name (i - 1) in
-             let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
-             match bytes_opt with
-             | None -> shift (i + 1)
-             | Some bytes ->
-               let%lwt () = S.del tx sys_columns_tid old_k in
-               let%lwt () = S.put tx sys_columns_tid new_k bytes in
-               shift (i + 1))
-         in
-         shift (drop_idx + 1)
-       in
        let new_columns = List.filteri (fun i _ -> i <> drop_idx) meta.columns in
        let new_meta = { meta with columns = new_columns } in
-       let%lwt () = put_mirror_tx tx new_meta in
-       let%lwt () = S.commit tx in
+       let%lwt () =
+         borrow_or_autocommit ?txn t.store (fun tx ->
+           (* Delete the dropped column's entry *)
+           let%lwt () = S.del tx sys_columns_tid (column_key table_name drop_idx) in
+           (* Re-key all columns after drop_idx: shift ordinal down by 1 *)
+           let%lwt () =
+             let rec shift i =
+               if i >= n_cols
+               then Lwt.return_unit
+               else (
+                 let old_k = column_key table_name i in
+                 let new_k = column_key table_name (i - 1) in
+                 let%lwt bytes_opt = S.get tx sys_columns_tid old_k in
+                 match bytes_opt with
+                 | None -> shift (i + 1)
+                 | Some bytes ->
+                   let%lwt () = S.del tx sys_columns_tid old_k in
+                   let%lwt () = S.put tx sys_columns_tid new_k bytes in
+                   shift (i + 1))
+             in
+             shift (drop_idx + 1)
+           in
+           put_mirror_tx tx new_meta)
+       in
        Hashtbl.replace t.cache table_name new_meta;
        register_tag t.store new_meta;
+       (match txn with
+        | Some _ ->
+          register_schema_undo t (fun () ->
+            Hashtbl.replace t.cache table_name meta;
+            register_tag t.store meta)
+        | None -> ());
        Lwt.return (Ok ()))
 ;;
 

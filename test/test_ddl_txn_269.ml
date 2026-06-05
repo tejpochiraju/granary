@@ -50,13 +50,6 @@ let exec_err db sql =
   | Error e -> Format.asprintf "%a" Db.pp_error e
 ;;
 
-let contains_substr ~needle hay =
-  let nl = String.length needle
-  and hl = String.length hay in
-  let rec go i = i + nl <= hl && (String.sub hay i nl = needle || go (i + 1)) in
-  nl = 0 || go 0
-;;
-
 let vstr = function
   | Db.V_int i -> Printf.sprintf "i:%Ld" i
   | Db.V_real f -> Printf.sprintf "r:%.17g" f
@@ -243,29 +236,156 @@ let test_schema_dump_replays_in_txn () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* ALTER TABLE — deferred to #282; must error cleanly, not deadlock.    *)
+(* ALTER TABLE — #282: must execute inside an explicit transaction      *)
+(* (commit durable, rollback discards), no longer reject or deadlock.   *)
 (* ------------------------------------------------------------------ *)
 
-let test_alter_in_txn_clean_error () =
+let test_alter_add_column_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t ADD COLUMN b TEXT";
+    exec db "INSERT INTO t VALUES (2, 'y')";
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "added column durable after commit"
+      [ "i:1,null"; "i:2,t:y" ]
+      (rows db "SELECT a, b FROM t ORDER BY a"))
+;;
+
+let test_alter_add_column_in_txn_rollback_discards () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t ADD COLUMN b TEXT";
+    exec db "ROLLBACK";
+    (* Column is gone: a 2-value insert must fail, a 1-value insert works, and
+       the column name is free to be re-added. *)
+    let _ = exec_err db "INSERT INTO t VALUES (9, 'z')" in
+    exec db "INSERT INTO t VALUES (2)";
+    Alcotest.(check (list string))
+      "rolled-back column absent"
+      [ "i:1"; "i:2" ]
+      (rows db "SELECT a FROM t ORDER BY a");
+    (* Cache agrees with the store: re-adding the same column succeeds. *)
+    exec db "ALTER TABLE t ADD COLUMN b TEXT")
+;;
+
+let test_alter_drop_column_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT, c INTEGER)";
+    exec db "INSERT INTO t VALUES (1, 'x', 10)";
+    exec db "BEGIN";
+    (* A row inserted earlier in the SAME txn must be migrated too (RYW). *)
+    exec db "INSERT INTO t VALUES (2, 'y', 20)";
+    exec db "ALTER TABLE t DROP COLUMN b";
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "dropped column gone, all rows reshaped"
+      [ "i:1,i:10"; "i:2,i:20" ]
+      (rows db "SELECT a, c FROM t ORDER BY a"))
+;;
+
+let test_alter_drop_column_in_txn_rollback_discards () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "CREATE INDEX t_b ON t (b)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t DROP COLUMN b";
+    exec db "ROLLBACK";
+    (* Column and its dependent index are both restored: the indexed lookup
+       still works and the row keeps its original shape. *)
+    Alcotest.(check (list string))
+      "rolled-back drop restores column data"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, b FROM t");
+    Alcotest.(check (list string))
+      "dependent index restored (lookup by b)"
+      [ "i:1" ]
+      (rows db "SELECT a FROM t WHERE b = 'x'");
+    (* Index name is still taken — recreating it must fail, proving the cache
+       undo re-registered it. *)
+    let _ = exec_err db "CREATE INDEX t_b ON t (b)" in
+    ())
+;;
+
+let test_alter_rename_table_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t RENAME TO u";
+    exec db "INSERT INTO u VALUES (2)";
+    exec db "COMMIT";
+    Alcotest.(check bool) "old name gone" true (table_absent db "t");
+    Alcotest.(check (list string))
+      "data under new name"
+      [ "i:1"; "i:2" ]
+      (rows db "SELECT a FROM u ORDER BY a"))
+;;
+
+let test_alter_rename_table_in_txn_rollback_discards () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    exec db "INSERT INTO t VALUES (1)";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t RENAME TO u";
+    exec db "ROLLBACK";
+    (* New name gone, old name intact. *)
+    Alcotest.(check bool) "new name gone after rollback" true (table_absent db "u");
+    Alcotest.(check (list string))
+      "old name and data intact"
+      [ "i:1" ]
+      (rows db "SELECT a FROM t"))
+;;
+
+let test_alter_rename_column_in_txn_commits () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t RENAME COLUMN b TO c";
+    exec db "COMMIT";
+    Alcotest.(check (list string))
+      "renamed column queryable under new name"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, c FROM t"))
+;;
+
+let test_alter_rename_column_in_txn_rollback_discards () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER, b TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "BEGIN";
+    exec db "ALTER TABLE t RENAME COLUMN b TO c";
+    exec db "ROLLBACK";
+    (* Old column name is back; the new name does not resolve. *)
+    Alcotest.(check (list string))
+      "rolled-back rename restores old column name"
+      [ "i:1,t:x" ]
+      (rows db "SELECT a, b FROM t");
+    let _ = exec_err db "SELECT c FROM t" in
+    ())
+;;
+
+(* The whole transaction stays usable after an ALTER, and autocommit ALTER is
+   of course still fine. *)
+let test_alter_then_more_dml_in_txn () =
   with_db (fun db ->
     exec db "CREATE TABLE t (a INTEGER)";
     exec db "BEGIN";
-    (* ALTER inside the txn is rejected with a clean error (it would otherwise
-       self-deadlock — see #282), NOT a hang. *)
-    let msg = exec_err db "ALTER TABLE t ADD COLUMN b TEXT" in
-    Alcotest.(check bool)
-      "error mentions transaction"
-      true
-      (contains_substr ~needle:"transaction" msg);
-    (* The transaction is still usable and rolls back cleanly. *)
-    exec db "ROLLBACK";
-    (* And ALTER in autocommit (outside a txn) still works. *)
     exec db "ALTER TABLE t ADD COLUMN b TEXT";
-    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "INSERT INTO t VALUES (1, 'p')";
+    exec db "ALTER TABLE t ADD COLUMN c INTEGER";
+    exec db "INSERT INTO t VALUES (2, 'q', 7)";
+    exec db "COMMIT";
     Alcotest.(check (list string))
-      "autocommit ALTER works"
-      [ "i:1,t:x" ]
-      (rows db "SELECT a, b FROM t"))
+      "two ALTERs + DML in one txn"
+      [ "i:1,t:p,null"; "i:2,t:q,i:7" ]
+      (rows db "SELECT a, b, c FROM t ORDER BY a"))
 ;;
 
 let () =
@@ -294,6 +414,39 @@ let () =
     ; ( "schema_dump"
       , [ Alcotest.test_case "replays in txn" `Quick test_schema_dump_replays_in_txn ] )
     ; ( "alter_table"
-      , [ Alcotest.test_case "in-txn clean error" `Quick test_alter_in_txn_clean_error ] )
+      , [ Alcotest.test_case
+            "add column commit"
+            `Quick
+            test_alter_add_column_in_txn_commits
+        ; Alcotest.test_case
+            "add column rollback discards"
+            `Quick
+            test_alter_add_column_in_txn_rollback_discards
+        ; Alcotest.test_case
+            "drop column commit"
+            `Quick
+            test_alter_drop_column_in_txn_commits
+        ; Alcotest.test_case
+            "drop column rollback discards"
+            `Quick
+            test_alter_drop_column_in_txn_rollback_discards
+        ; Alcotest.test_case
+            "rename table commit"
+            `Quick
+            test_alter_rename_table_in_txn_commits
+        ; Alcotest.test_case
+            "rename table rollback discards"
+            `Quick
+            test_alter_rename_table_in_txn_rollback_discards
+        ; Alcotest.test_case
+            "rename column commit"
+            `Quick
+            test_alter_rename_column_in_txn_commits
+        ; Alcotest.test_case
+            "rename column rollback discards"
+            `Quick
+            test_alter_rename_column_in_txn_rollback_discards
+        ; Alcotest.test_case "alter then more dml" `Quick test_alter_then_more_dml_in_txn
+        ] )
     ]
 ;;

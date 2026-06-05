@@ -289,11 +289,22 @@ val drop_index
   -> name:string
   -> unit Lwt.t
 
+(** Re-insert an [index_info] into the in-memory index cache (#282).  Inverse of
+    the cache side of [drop_index]; used to build a schema-cache undo so an
+    ALTER … DROP COLUMN rolled back inside an explicit transaction restores the
+    dependent indexes it dropped. *)
+val restore_index_cache : t -> index_info -> unit
+
 (** Add a new column to an existing table.
     Updates the catalog's persistent storage and in-memory cache.
-    Returns [Error msg] if the table does not exist or the column already exists. *)
+    Returns [Error msg] if the table does not exist or the column already exists.
+
+    [?txn] (#282): write through this already-held explicit writer transaction
+    instead of opening a fresh one, and register a schema-cache undo so a
+    [ROLLBACK] restores the prior table shape. *)
 val add_column
-  :  t
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
   -> table_name:string
   -> column:Sqlocaml_encoding.Row.column
   -> (unit, string) result Lwt.t
@@ -301,14 +312,24 @@ val add_column
 (** Rename a table.
     Updates _sys_tables, re-keys all _sys_columns entries, and refreshes the
     in-memory cache and any index entries that reference the old table name.
-    Returns [Error msg] if [old_name] does not exist or [new_name] already exists. *)
-val rename_table : t -> old_name:string -> new_name:string -> (unit, string) result Lwt.t
+    Returns [Error msg] if [old_name] does not exist or [new_name] already exists.
+
+    [?txn] (#282): as for [add_column]. *)
+val rename_table
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> old_name:string
+  -> new_name:string
+  -> (unit, string) result Lwt.t
 
 (** Rename a column within a table.
     Updates the _sys_columns entry and refreshes the in-memory cache.
-    Returns [Error msg] if the table or column does not exist. *)
+    Returns [Error msg] if the table or column does not exist.
+
+    [?txn] (#282): as for [add_column]. *)
 val rename_column
-  :  t
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
   -> table_name:string
   -> old_col:string
   -> new_col:string
@@ -317,8 +338,15 @@ val rename_column
 (** Remove a column from an existing table.
     Re-keys all column entries with ordinal > drop_idx (shift down by 1).
     Does NOT migrate existing row data — caller (the executor) is responsible.
-    Returns [Error msg] if the table or column does not exist. *)
-val drop_column : t -> table_name:string -> col_name:string -> (unit, string) result Lwt.t
+    Returns [Error msg] if the table or column does not exist.
+
+    [?txn] (#282): as for [add_column]. *)
+val drop_column
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> table_name:string
+  -> col_name:string
+  -> (unit, string) result Lwt.t
 
 (** True if a table with [name] exists in the catalog. *)
 val table_exists : t -> name:string -> bool

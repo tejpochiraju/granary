@@ -5888,9 +5888,10 @@ let column_of_col_def col_def : Row.column =
 
 (* ALTER TABLE ADD COLUMN: add [col_def] to the catalog and persist any inline
    FK reference it declares. *)
-let alter_add_column (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def : int Lwt.t =
+let alter_add_column ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def : int Lwt.t
+  =
   let col = column_of_col_def col_def in
-  let* result = Cat.add_column cat ~table_name:table_meta.Cat.name ~column:col in
+  let* result = Cat.add_column ?txn cat ~table_name:table_meta.Cat.name ~column:col in
   match result with
   | Error msg -> Lwt.fail_with msg
   | Ok () ->
@@ -5926,16 +5927,25 @@ let alter_add_column (cat : Cat.t) ~(table_meta : Cat.table_meta) col_def : int 
        in
        let new_fks = existing_fks @ [ new_fk ] in
        let* () =
-         Cat.save_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks
+         Cat.save_fk_constraints ?txn cat ~table_name:table_meta.Cat.name ~fks:new_fks
        in
+       (* The in-memory FK mutation is reverted on ROLLBACK by [add_column]'s
+          schema-cache undo, which restores the whole prior [table_meta]. *)
        Cat.set_fk_constraints cat ~table_name:table_meta.Cat.name ~fks:new_fks;
        Lwt.return 0)
 ;;
 
 (* ALTER TABLE DROP COLUMN: drop dependent indexes, migrate rows to the new
-   shape, drop the catalog column, and invalidate cached expressions. *)
-let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name
-  : int Lwt.t
+   shape, drop the catalog column, and invalidate cached expressions.
+
+   #282: everything runs through the single writer transaction [tx] supplied by
+   [with_ddl_txn] (borrowed from the ambient explicit transaction, or owned in
+   autocommit) — no longer three separate [rw_begin]/[with_ro] phases (which
+   would self-deadlock inside an explicit transaction).  The row scan reads
+   THROUGH [tx] so rows inserted earlier in the same transaction are migrated
+   (read-your-own-writes).  Dropped dependent indexes register a schema-cache
+   undo so a [ROLLBACK] restores them. *)
+let alter_drop_column tx (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name : int Lwt.t
   =
   let table_name = table_meta.Cat.name in
   let col_idx = find_col_idx_by_name table_meta.Cat.columns col_name in
@@ -5946,48 +5956,40 @@ let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_nam
       (Cat.indexes_for_table cat ~table:table_name)
   in
   let* () =
-    if idxs_on_col = []
-    then Lwt.return_unit
-    else
-      let* tx_idx = S.rw_begin store in
-      let* () =
-        Lwt_list.iter_s
-          (fun (idx : Cat.index_info) -> Cat.drop_index cat tx_idx ~name:idx.idx_name)
-          idxs_on_col
+    Lwt_list.iter_s
+      (fun (idx : Cat.index_info) -> Cat.drop_index cat tx ~name:idx.idx_name)
+      idxs_on_col
+  in
+  if idxs_on_col <> []
+  then
+    Cat.register_schema_undo cat (fun () ->
+      List.iter (Cat.restore_index_cache cat) idxs_on_col);
+  (* Drain every row through [tx] (read-your-own-writes) before rewriting, so the
+     cursor is closed before we put back the reshaped rows into the same tree. *)
+  let* cur = S.cursor_open tx table_meta.Cat.tree_id in
+  let _sr = S.cursor_first cur in
+  let rows = ref [] in
+  let rec drain () =
+    match S.cursor_next cur with
+    | None -> ()
+    | Some (k, v) ->
+      let old_row = decode_with_virtual None [||] table_meta v in
+      let new_row =
+        Array.of_list (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row))
       in
-      S.commit tx_idx
+      rows := (Bytes.copy k, new_row) :: !rows;
+      drain ()
   in
-  let* rows =
-    S.with_ro store
-    @@ fun tx_ro ->
-    let* cur = S.cursor_open tx_ro table_meta.Cat.tree_id in
-    let _sr = S.cursor_first cur in
-    let rows = ref [] in
-    let rec drain () =
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (k, v) ->
-        let old_row = decode_with_virtual None [||] table_meta v in
-        let new_row =
-          Array.of_list (List.filteri (fun i _ -> i <> col_idx) (Array.to_list old_row))
-        in
-        rows := (Bytes.copy k, new_row) :: !rows;
-        drain ()
-    in
-    drain ();
-    S.cursor_close cur;
-    Lwt.return !rows
-  in
-  let* tx = S.rw_begin store in
+  drain ();
+  S.cursor_close cur;
   let* () =
     Lwt_list.iter_s
       (fun (k, new_row) ->
          let new_bytes = Row.encode new_columns new_row in
          S.put tx table_meta.Cat.tree_id k new_bytes)
-      rows
+      !rows
   in
-  let* () = S.commit tx in
-  let* result = Cat.drop_column cat ~table_name ~col_name in
+  let* result = Cat.drop_column ~txn:tx cat ~table_name ~col_name in
   match result with
   | Error msg -> Lwt.fail_with msg
   | Ok () ->
@@ -5997,8 +5999,10 @@ let alter_drop_column store (cat : Cat.t) ~(table_meta : Cat.table_meta) col_nam
 
 (* ALTER TABLE RENAME TABLE: rename in the catalog and remap cached CHECK /
    generated-column entries from the old name to the new one. *)
-let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name : int Lwt.t =
-  let* result = Cat.rename_table cat ~old_name:table_meta.Cat.name ~new_name in
+let alter_rename_table ?txn (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name
+  : int Lwt.t
+  =
+  let* result = Cat.rename_table ?txn cat ~old_name:table_meta.Cat.name ~new_name in
   match result with
   | Error msg -> Lwt.fail_with msg
   | Ok () ->
@@ -6024,35 +6028,29 @@ let alter_rename_table (cat : Cat.t) ~(table_meta : Cat.table_meta) new_name : i
     Lwt.return 0
 ;;
 
-(* Op_alter_table: dispatch on the ALTER action. *)
+(* Op_alter_table: dispatch on the ALTER action.
+
+   #282: the ALTER mutators run through [with_ddl_txn], which supplies a single
+   writer transaction — borrowed from the ambient explicit transaction
+   ([In_txn]) or owned and auto-committed ([Auto]).  Each catalog mutator threads
+   that txn (no nested [rw_begin], which previously self-deadlocked inside
+   [BEGIN…COMMIT]) and registers a schema-cache undo so a [ROLLBACK] reverts the
+   in-memory catalog along with the store. *)
 let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta) action
   : int Lwt.t
   =
-  (* #269/#282: the ALTER mutators still open their own writer txns (and
-     [alter_drop_column] interleaves a read snapshot + row-rewrite txn), so
-     running them inside an explicit transaction would self-deadlock against the
-     writer lock the txn already holds.  Threading the ambient txn through the
-     ALTER path is delicate (in-txn row migration must be read-your-own-writes,
-     and the corruption rollback paths must not abort a borrowed txn) and is
-     deferred to #282.  Until then, reject ALTER inside an explicit transaction
-     with a clean error instead of hanging.  Autocommit ALTER is unaffected. *)
-  match mode with
-  | In_txn _ ->
-    Lwt.fail_with
-      "ALTER TABLE within an explicit transaction is not yet supported (#282); run it in \
-       autocommit (outside BEGIN…COMMIT)"
-  | Auto ->
-    (match action with
-     | Ast.AA_add_column col_def -> alter_add_column cat ~table_meta col_def
-     | Ast.AA_rename_table new_name -> alter_rename_table cat ~table_meta new_name
-     | Ast.AA_rename_column (old_col, new_col) ->
-       let* result =
-         Cat.rename_column cat ~table_name:table_meta.Cat.name ~old_col ~new_col
-       in
-       (match result with
-        | Error msg -> Lwt.fail_with msg
-        | Ok () -> Lwt.return 0)
-     | Ast.AA_drop_column col_name -> alter_drop_column store cat ~table_meta col_name)
+  with_ddl_txn store cat mode (fun tx ->
+    match action with
+    | Ast.AA_add_column col_def -> alter_add_column ~txn:tx cat ~table_meta col_def
+    | Ast.AA_rename_table new_name -> alter_rename_table ~txn:tx cat ~table_meta new_name
+    | Ast.AA_rename_column (old_col, new_col) ->
+      let* result =
+        Cat.rename_column ~txn:tx cat ~table_name:table_meta.Cat.name ~old_col ~new_col
+      in
+      (match result with
+       | Error msg -> Lwt.fail_with msg
+       | Ok () -> Lwt.return 0)
+    | Ast.AA_drop_column col_name -> alter_drop_column tx cat ~table_meta col_name)
 ;;
 
 (* Op_create_index: create the index unless IF NOT EXISTS finds it present. *)
