@@ -2858,44 +2858,49 @@ let check_insert_unique
          not (row_matches_index_where clock params idx table_meta.columns row_for_idx)
        then Lwt.return (skip, dels, upsert_rid)
        else (
-         let iks =
-           List.map
-             row_value_to_index_value
-             (get_index_key_values clock params idx table_meta.columns row_for_idx)
+         let key_vals =
+           get_index_key_values clock params idx table_meta.columns row_for_idx
          in
-         let prefix, plen = encode_index_key_prefix iks in
-         let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-         (* O(log n) native probe: only the first entry >= seek_key is needed
+         (* #290: SQLite treats every NULL as distinct in a UNIQUE index — a row
+            whose key has ANY NULL column is exempt from the uniqueness probe (it
+            is still inserted into the index tree, it just never conflicts). *)
+         if any_null_val key_vals
+         then Lwt.return (false, dels, upsert_rid)
+         else (
+           let iks = List.map row_value_to_index_value key_vals in
+           let prefix, plen = encode_index_key_prefix iks in
+           let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+           (* O(log n) native probe: only the first entry >= seek_key is needed
             to detect a duplicate prefix — never drain the whole index (#229). *)
-         let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
-         let* first = S.seek_next cur in
-         let conflict_rowid_opt =
-           match first with
-           | None -> None
-           | Some (ikey, _) ->
-             if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-             then (
-               let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
-               Some (Rowid.decode rid_bytes))
-             else None
-         in
-         S.seek_close cur;
-         match conflict_rowid_opt with
-         | None -> Lwt.return (false, dels, upsert_rid)
-         | Some old_rowid ->
-           (match on_conflict, upsert_update with
-            | Some Ast.CA_ignore, _ ->
-              Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
-            | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
-            | _, Some (conflict_cols, _)
-              when List.sort String.compare idx.idx_columns
-                   = List.sort String.compare conflict_cols ->
-              Lwt.return (false, dels, Some old_rowid)
-            | _ ->
-              Lwt.fail_with
-                (unique_constraint_failed_msg
-                   ~table:table_meta.Cat.name
-                   ~columns:idx.idx_columns))))
+           let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+           let* first = S.seek_next cur in
+           let conflict_rowid_opt =
+             match first with
+             | None -> None
+             | Some (ikey, _) ->
+               if Bytes.length ikey >= plen && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+               then (
+                 let rid_bytes = Bytes.sub ikey plen (Bytes.length ikey - plen) in
+                 Some (Rowid.decode rid_bytes))
+               else None
+           in
+           S.seek_close cur;
+           match conflict_rowid_opt with
+           | None -> Lwt.return (false, dels, upsert_rid)
+           | Some old_rowid ->
+             (match on_conflict, upsert_update with
+              | Some Ast.CA_ignore, _ ->
+                Lwt.return (true, dels, upsert_rid) (* skip=true, stop checking *)
+              | Some Ast.CA_replace, _ -> Lwt.return (false, old_rowid :: dels, upsert_rid)
+              | _, Some (conflict_cols, _)
+                when List.sort String.compare idx.idx_columns
+                     = List.sort String.compare conflict_cols ->
+                Lwt.return (false, dels, Some old_rowid)
+              | _ ->
+                Lwt.fail_with
+                  (unique_constraint_failed_msg
+                     ~table:table_meta.Cat.name
+                     ~columns:idx.idx_columns)))))
     (false, [], None)
     idxs
 ;;
@@ -3420,11 +3425,8 @@ let execute_create_index
           if skip
           then walk ()
           else (
-            let iks =
-              List.map
-                row_value_to_index_value
-                (get_index_key_values None [||] info columns row)
-            in
+            let key_vals = get_index_key_values None [||] info columns row in
+            let iks = List.map row_value_to_index_value key_vals in
             let ikey = Index_key.encode iks ~rowid in
             (* #288: for a UNIQUE index, the build must detect pre-existing
                duplicate values.  The encoded key includes the rowid suffix, so
@@ -3435,13 +3437,16 @@ let execute_create_index
                value prefix (rowid excluded) using the SAME mechanism as
                [check_insert_unique], so build-time and insert-time uniqueness
                agree (including multi-column, partial-WHERE and NULL handling).
+               #290: a key with ANY NULL column is exempt from the conflict
+               probe (NULLs are distinct in SQLite) — but is STILL inserted into
+               the index tree below, exactly as [check_insert_unique] does.
                A raise here unwinds through [with_ddl_txn]: an owned txn rolls
                back (no partial entries), a borrowed one is poisoned (#286).
                The raise skips the outer [S.cursor_close cur] below, but
                [cursor_close] is a no-op (no OS handle) and the txn unwind
                reclaims all store state — so no leak. *)
             let* () =
-              if not unique
+              if (not unique) || any_null_val key_vals
               then Lwt.return_unit
               else (
                 let prefix, plen = encode_index_key_prefix iks in
@@ -3486,45 +3491,47 @@ let unique_violation_on_update
   let new_row_for_idx =
     with_computed_virtuals_cols None [||] ~table_name:idx.Cat.idx_table schema new_row
   in
-  let ik_values =
-    List.map
-      row_value_to_index_value
-      (get_index_key_values None [||] idx schema new_row_for_idx)
-  in
-  (* Encode all values (no rowid) as the exact-match key; [encode_index_key_prefix]
+  let key_vals = get_index_key_values None [||] idx schema new_row_for_idx in
+  (* #290: a key with ANY NULL column is exempt — NULLs are distinct in a SQLite
+     UNIQUE index, so it can never collide.  Short-circuit before probing. *)
+  if any_null_val key_vals
+  then Lwt.return false
+  else (
+    let ik_values = List.map row_value_to_index_value key_vals in
+    (* Encode all values (no rowid) as the exact-match key; [encode_index_key_prefix]
      concatenates each value's encoding in order, same as the index key body. *)
-  let full_key_no_rowid, full_klen = encode_index_key_prefix ik_values in
-  let prefix =
-    match ik_values with
-    | [] -> Bytes.empty
-    | ik :: _ -> Index_key.encode_value ik
-  in
-  let plen = Bytes.length prefix in
-  let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
-  (* O(log n) native seek; scan only the matching prefix range (#229). *)
-  let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
-  (* Scan entries while the value prefix matches.  A different rowid
+    let full_key_no_rowid, full_klen = encode_index_key_prefix ik_values in
+    let prefix =
+      match ik_values with
+      | [] -> Bytes.empty
+      | ik :: _ -> Index_key.encode_value ik
+    in
+    let plen = Bytes.length prefix in
+    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    (* O(log n) native seek; scan only the matching prefix range (#229). *)
+    let* cur = S.seek_ge tx idx.idx_tree_id seek_key in
+    (* Scan entries while the value prefix matches.  A different rowid
      with the same full value sequence is a UNIQUE violation. *)
-  let rec scan () =
-    match%lwt S.seek_next cur with
-    | None -> Lwt.return false
-    | Some (ikey, _) ->
-      if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-      then
-        (* Check that the full value prefix (all columns) also matches *)
-        if
-          Bytes.length ikey >= full_klen + 8
-          && Bytes.equal (Bytes.sub ikey 0 full_klen) full_key_no_rowid
-        then (
-          let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
-          let other = Rowid.decode rowid_bytes in
-          if Int64.equal other rowid then scan () else Lwt.return true)
-        else scan ()
-      else Lwt.return false
-  in
-  let* result = scan () in
-  S.seek_close cur;
-  Lwt.return result
+    let rec scan () =
+      match%lwt S.seek_next cur with
+      | None -> Lwt.return false
+      | Some (ikey, _) ->
+        if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+        then
+          (* Check that the full value prefix (all columns) also matches *)
+          if
+            Bytes.length ikey >= full_klen + 8
+            && Bytes.equal (Bytes.sub ikey 0 full_klen) full_key_no_rowid
+          then (
+            let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
+            let other = Rowid.decode rowid_bytes in
+            if Int64.equal other rowid then scan () else Lwt.return true)
+          else scan ()
+        else Lwt.return false
+    in
+    let* result = scan () in
+    S.seek_close cur;
+    Lwt.return result)
 ;;
 
 (** Build the list of (child_table_meta, relevant_fk_constraints) pairs
@@ -4588,25 +4595,33 @@ let check_index_unique_on_update
   else (
     let old_vs = get_index_key_values clock params idx schema old_row in
     let new_vs = get_index_key_values clock params idx schema new_row_for_idx in
-    let values_equal a b =
-      match a, b with
-      | Row.V_null, Row.V_null -> true
-      | Row.V_int x, Row.V_int y -> Int64.equal x y
-      | Row.V_text x, Row.V_text y -> String.equal x y
-      | Row.V_real x, Row.V_real y -> Float.equal x y
-      | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
-      | _ -> false
-    in
-    let unchanged = List.for_all2 values_equal old_vs new_vs in
-    if unchanged
+    (* #290: a new key with ANY NULL column is exempt — NULLs are distinct in a
+       SQLite UNIQUE index, so the updated row can never conflict.  (The index
+       entry itself is still maintained by the regular update path.) *)
+    if any_null_val new_vs
     then Lwt.return_unit
-    else
-      let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
-      if dup
-      then
-        Lwt.fail_with
-          (unique_constraint_failed_msg ~table:idx.Cat.idx_table ~columns:idx.idx_columns)
-      else Lwt.return_unit)
+    else (
+      let values_equal a b =
+        match a, b with
+        | Row.V_null, Row.V_null -> true
+        | Row.V_int x, Row.V_int y -> Int64.equal x y
+        | Row.V_text x, Row.V_text y -> String.equal x y
+        | Row.V_real x, Row.V_real y -> Float.equal x y
+        | Row.V_blob x, Row.V_blob y -> Bytes.equal x y
+        | _ -> false
+      in
+      let unchanged = List.for_all2 values_equal old_vs new_vs in
+      if unchanged
+      then Lwt.return_unit
+      else
+        let* dup = unique_violation_on_update tx idx new_vs ~rowid ~new_row ~schema in
+        if dup
+        then
+          Lwt.fail_with
+            (unique_constraint_failed_msg
+               ~table:idx.Cat.idx_table
+               ~columns:idx.idx_columns)
+        else Lwt.return_unit))
 ;;
 
 let validate_update_unique

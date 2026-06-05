@@ -154,16 +154,18 @@ type t =
         runs them most-recent-first, [commit_schema_changes] discards them.
         Empty in autocommit mode (where each DDL self-commits and cannot roll
         back). *)
-  ; mutable schema_savepoints : (string * (unit -> unit) list) list
-    (** #280: savepoint markers over [schema_undo].  Each entry records a
-        savepoint name and the [schema_undo] list AS IT WAS when the savepoint
-        was opened (a physical suffix of the current list, since the log only
-        grows by prepending).  Newest savepoint at the front, mirroring the
-        store's savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
-        registered since [s] (the prefix down to its recorded snapshot) and
-        keeps [s]; [RELEASE s] merges them into the enclosing scope (drops the
-        marker, leaves [schema_undo] untouched).  Cleared at every outer txn
-        boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
+  ; mutable schema_savepoints : (string * (unit -> unit) list * bool) list
+    (** #280/#295: savepoint markers over [schema_undo].  Each entry records a
+        savepoint name, the [schema_undo] list AS IT WAS when the savepoint was
+        opened (a physical suffix of the current list, since the log only grows
+        by prepending), and the [schema_txn_poisoned] flag AS IT WAS at that
+        moment (#295).  Newest savepoint at the front, mirroring the store's
+        savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
+        registered since [s] (the prefix down to its recorded snapshot),
+        restores the poison flag to the snapshot, and keeps [s]; [RELEASE s]
+        merges them into the enclosing scope (drops the marker, leaves
+        [schema_undo] and the poison flag untouched).  Cleared at every outer
+        txn boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
   ; mutable schema_txn_poisoned : bool
     (** #286: set when an in-txn DDL statement fails partway through, leaving
         partial on-disk effects under the ambient explicit transaction.  The db
@@ -173,6 +175,16 @@ type t =
         back instead (the transaction is uncommittable, matching SQLite).  Both
         [commit_schema_changes] and [rollback_schema_changes] clear it — they
         bracket the schema-change transaction. *)
+  ; rowid_bumped_in_txn : (string, unit) Hashtbl.t
+    (** #293: set of rowid tables whose cached [next_rowid] counter was bumped
+        via [next_rowid_in_txn]/[bump_next_rowid_in_txn] during the CURRENT
+        explicit transaction.  On ROLLBACK only THESE tables need their counter
+        re-derived from the rolled-back data tree (see
+        [recompute_rowid_counters_after_rollback]) — recomputing every cached
+        rowid table would make rollback O(total rows) by full-scanning each
+        tree.  Cleared on every txn boundary (commit keeps the bumped counter
+        but clears the set; rollback recomputes then clears) so it only ever
+        names tables bumped within the current txn. *)
   }
 
 let pp fmt t =
@@ -1232,6 +1244,7 @@ let open_ store =
     ; schema_undo = []
     ; schema_savepoints = []
     ; schema_txn_poisoned = false
+    ; rowid_bumped_in_txn = Hashtbl.create 8
     }
 ;;
 
@@ -1257,7 +1270,12 @@ let schema_txn_poisoned t = t.schema_txn_poisoned
 let commit_schema_changes t =
   t.schema_undo <- [];
   t.schema_savepoints <- [];
-  t.schema_txn_poisoned <- false
+  t.schema_txn_poisoned <- false;
+  (* #293: COMMIT keeps the bumped next_rowid counter, so do NOT recompute — but
+     clear the dirty set so a later unrelated ROLLBACK won't wrongly recompute a
+     table that wasn't bumped in that later txn.  Also called at txn begin to
+     harden against a stale set leaking in. *)
+  Hashtbl.reset t.rowid_bumped_in_txn
 ;;
 
 let rollback_schema_changes t =
@@ -1267,27 +1285,88 @@ let rollback_schema_changes t =
   t.schema_txn_poisoned <- false
 ;;
 
-(* #280: open a savepoint over the schema-undo log.  Records the current
-   [schema_undo] list so [ROLLBACK TO]/[RELEASE] of this savepoint can find the
-   boundary between entries registered before and after it. *)
-let savepoint_begin_schema t name =
-  t.schema_savepoints <- (name, t.schema_undo) :: t.schema_savepoints
+(* #293: the rowid dirty set is intentionally NOT cleared here.  The db layer
+     calls [recompute_rowid_counters_after_rollback] right after this on the
+     rollback path, and that function reads the set then clears it. *)
+
+(* #293: re-derive the cached [next_rowid] from the (now rolled-back) data tree,
+   using the same max(rowid)+1 logic as [recover_next_rowid], for ONLY the tables
+   whose counter was bumped during the rolled-back transaction.  An INSERT run
+   THROUGH an explicit transaction bumps the in-memory counter via
+   [next_rowid_in_txn]/[bump_next_rowid_in_txn] (which also record the table in
+   [rowid_bumped_in_txn] and write the bumped value to [_sys_tables] under the
+   txn).  On ROLLBACK the store row reverts but the in-memory counter does not,
+   so the next allocation would SKIP the rolled-back rowid instead of reusing it.
+   SQLite, for a plain (non-AUTOINCREMENT) rowid table, recomputes max(rowid)+1
+   from the data after a rollback and so reuses it; recomputing here matches that.
+
+   Option (b) from the issue: rather than snapshot/restore each DML's counter
+   delta, we drop straight to the authoritative source (the data tree).  This
+   leans on the store having already been rolled back — the db layer calls this
+   only AFTER [S.rollback], so the trees show the last-committed state and the
+   RW lock is released (so [recover_next_rowid]'s own RO txn cannot deadlock).
+
+   We recompute ONLY the [rowid_bumped_in_txn] set — usually a single table —
+   rather than every cached rowid table.  [recover_next_rowid] is an O(n) tree
+   walk to find max(rowid); scanning every table would make a rollback cost
+   O(total rows across ALL tables), a regression on a perf-sensitive engine
+   (cf. #228/#229 driving cursor_open O(n)->O(log n)).  Restricting to the
+   bumped set keeps rollback ~O(1) in the common case.  A bumped name that is no
+   longer cached (e.g. its CREATE TABLE rolled back in the same txn) or that is
+   WITHOUT ROWID is skipped.  The set is CLEARED here so it never leaks into a
+   later transaction; commit clears it too (via [commit_schema_changes]), which
+   is why a COMMIT keeps the bumped counter yet a subsequent unrelated ROLLBACK
+   does not wrongly recompute it.
+
+   AUTOINCREMENT is unaffected: this engine does not implement that keyword
+   (CREATE … AUTOINCREMENT fails to parse), so there is no sticky high-water
+   counter for this recompute to clobber. *)
+let recompute_rowid_counters_after_rollback t =
+  let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped_in_txn [] in
+  Hashtbl.reset t.rowid_bumped_in_txn;
+  Lwt_list.iter_s
+    (fun name ->
+       match Hashtbl.find_opt t.cache name with
+       | None -> Lwt.return_unit
+       | Some m when m.without_rowid -> Lwt.return_unit
+       | Some m ->
+         let%lwt recovered = recover_next_rowid t.store m in
+         Hashtbl.replace t.cache name recovered;
+         Lwt.return_unit)
+    names
 ;;
 
-(* #280: ROLLBACK TO a savepoint.  Run+drop the undo closures registered since
-   the savepoint (the prefix of [schema_undo] down to its recorded snapshot,
-   most-recent-first), reset [schema_undo] to that snapshot, drop newer
-   savepoint markers, and keep this savepoint so it can be rolled back to again
-   (mirroring [Store.savepoint_rollback]).  Unknown name: no-op. *)
+(* #280/#295: open a savepoint over the schema-undo log.  Records the current
+   [schema_undo] list so [ROLLBACK TO]/[RELEASE] of this savepoint can find the
+   boundary between entries registered before and after it, and the current
+   [schema_txn_poisoned] flag (#295) so [ROLLBACK TO] can restore the poison
+   state as it was when this savepoint opened. *)
+let savepoint_begin_schema t name =
+  t.schema_savepoints
+  <- (name, t.schema_undo, t.schema_txn_poisoned) :: t.schema_savepoints
+;;
+
+(* #280/#295: ROLLBACK TO a savepoint.  Run+drop the undo closures registered
+   since the savepoint (the prefix of [schema_undo] down to its recorded
+   snapshot, most-recent-first), reset [schema_undo] to that snapshot, restore
+   [schema_txn_poisoned] to its snapshot (#295), drop newer savepoint markers,
+   and keep this savepoint so it can be rolled back to again (mirroring
+   [Store.savepoint_rollback]).  Unknown name: no-op.
+
+   #295: the poison restore is what un-poisons a txn whose failed in-txn DDL
+   lay AFTER this savepoint (its partial effects are in the unwound range).  A
+   failure that PREDATES the savepoint left the poison flag already set when
+   this savepoint opened, so the snapshot is [true] and the txn stays poisoned —
+   exactly correct, since those partial effects are NOT unwound here. *)
 let savepoint_rollback_schema t name =
   let rec find = function
     | [] -> None
-    | (n, snap) :: older when String.equal n name -> Some (snap, older)
+    | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
     | _ :: rest -> find rest
   in
   match find t.schema_savepoints with
   | None -> ()
-  | Some (snap, older) ->
+  | Some (snap, poison, older) ->
     (* [snap] is a physical suffix of [t.schema_undo]; run closures ahead of it. *)
     let rec run lst =
       if lst == snap
@@ -1301,17 +1380,21 @@ let savepoint_rollback_schema t name =
     in
     run t.schema_undo;
     t.schema_undo <- snap;
-    t.schema_savepoints <- (name, snap) :: older
+    t.schema_txn_poisoned <- poison;
+    t.schema_savepoints <- (name, snap, poison) :: older
 ;;
 
-(* #280: RELEASE a savepoint.  The since-savepoint undo entries merge into the
-   enclosing scope, so [schema_undo] is untouched — only the marker (and any
-   newer markers) is dropped (mirroring [Store.savepoint_release]).  An outer
-   ROLLBACK still unwinds the merged entries.  Unknown name: no-op. *)
+(* #280/#295: RELEASE a savepoint.  The since-savepoint undo entries merge into
+   the enclosing scope, so [schema_undo] is untouched — only the marker (and any
+   newer markers, including their recorded poison snapshots) is dropped
+   (mirroring [Store.savepoint_release]).  The poison flag itself is left as-is:
+   a poison raised since the savepoint survives the RELEASE into the enclosing
+   scope.  An outer ROLLBACK still unwinds the merged entries.  Unknown name:
+   no-op. *)
 let savepoint_release_schema t name =
   let rec drop = function
     | [] -> []
-    | (n, _) :: older when String.equal n name -> older
+    | (n, _, _) :: older when String.equal n name -> older
     | _ :: rest -> drop rest
   in
   t.schema_savepoints <- drop t.schema_savepoints
@@ -1485,6 +1568,8 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     let id, next = alloc_rowid m in
     let m' = { m with next_rowid = next } in
     Hashtbl.replace t.cache name m';
+    (* #293: mark this table's counter dirty so a ROLLBACK recomputes only it. *)
+    Hashtbl.replace t.rowid_bumped_in_txn name ();
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 ;;
@@ -1510,6 +1595,9 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
     else (
       let m' = { m with next_rowid = at_least } in
       Hashtbl.replace t.cache name m';
+      (* #293: mark dirty only when the counter actually moved (the early-return
+         no-op above leaves the cached counter untouched, so nothing to recompute). *)
+      Hashtbl.replace t.rowid_bumped_in_txn name ();
       S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
 ;;
 

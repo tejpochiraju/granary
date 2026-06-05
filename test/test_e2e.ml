@@ -1115,6 +1115,98 @@ let test_multi_col_unique_index () =
   | Error _ -> ()
 ;;
 
+(* #290: SQLite treats every NULL as DISTINCT in a UNIQUE index, so any number
+   of NULL-keyed rows are permitted; non-null duplicates still conflict. *)
+let unique_index_allows_multiple_nulls () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER)";
+  exec db "CREATE UNIQUE INDEX ix ON t (a)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  (* second NULL must succeed: NULLs are distinct under SQLite semantics *)
+  (match run (Db.execute db "INSERT INTO t VALUES (NULL)") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "second NULL should be allowed, got: %s" (fmt_err e));
+  (* a third one too *)
+  (match run (Db.execute db "INSERT INTO t VALUES (NULL)") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "third NULL should be allowed, got: %s" (fmt_err e));
+  Alcotest.(check int)
+    "all three NULL rows present"
+    3
+    (List.length (query_ok db "SELECT * FROM t"));
+  (* a non-null value still inserts, and its duplicate still conflicts *)
+  exec db "INSERT INTO t VALUES (7)";
+  match run (Db.execute db "INSERT INTO t VALUES (7)") with
+  | Ok () -> Alcotest.fail "duplicate non-null 7 must still conflict"
+  | Error _ -> ()
+;;
+
+(* #290: in a MULTI-column UNIQUE index, a row with ANY key column NULL is
+   exempt from the uniqueness check (even when the other column repeats); a
+   fully non-null tuple still conflicts on a full-tuple duplicate. *)
+let unique_index_multicol_null_exempt () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
+  exec db "CREATE UNIQUE INDEX ix ON t (a, b)";
+  exec db "INSERT INTO t VALUES (1, NULL)";
+  (* same a=1, b NULL again: exempt (b is NULL) -> allowed *)
+  (match run (Db.execute db "INSERT INTO t VALUES (1, NULL)") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "(1, NULL) repeat should be allowed, got: %s" (fmt_err e));
+  (* NULL in the first column, repeated other column: exempt -> allowed *)
+  exec db "INSERT INTO t VALUES (NULL, 5)";
+  (match run (Db.execute db "INSERT INTO t VALUES (NULL, 5)") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "(NULL, 5) repeat should be allowed, got: %s" (fmt_err e));
+  (* fully non-null tuple: first insert ok, duplicate conflicts *)
+  exec db "INSERT INTO t VALUES (2, 3)";
+  (match run (Db.execute db "INSERT INTO t VALUES (2, 3)") with
+   | Ok () -> Alcotest.fail "full-tuple duplicate (2,3) must conflict"
+   | Error _ -> ());
+  Alcotest.(check int)
+    "5 rows present (4 null-exempt + 1 non-null)"
+    5
+    (List.length (query_ok db "SELECT * FROM t"))
+;;
+
+(* #290 UPDATE path: updating an indexed column to NULL must not spuriously
+   conflict, and a second row updated to NULL is also exempt. *)
+let unique_index_update_to_null_exempt () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER, a INTEGER)";
+  exec db "CREATE UNIQUE INDEX ix ON t (a)";
+  exec db "INSERT INTO t VALUES (1, 10)";
+  exec db "INSERT INTO t VALUES (2, 20)";
+  (* update row 1's indexed col to NULL -> must succeed *)
+  (match run (Db.execute db "UPDATE t SET a = NULL WHERE id = 1") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "UPDATE a=NULL should succeed, got: %s" (fmt_err e));
+  (* update row 2 to NULL as well -> still exempt, must succeed *)
+  (match run (Db.execute db "UPDATE t SET a = NULL WHERE id = 2") with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "second UPDATE a=NULL should succeed, got: %s" (fmt_err e));
+  (* but updating to a value held by a live row still conflicts *)
+  exec db "INSERT INTO t VALUES (3, 30)";
+  exec db "INSERT INTO t VALUES (4, 40)";
+  match run (Db.execute db "UPDATE t SET a = 30 WHERE id = 4") with
+  | Ok () -> Alcotest.fail "UPDATE to duplicate non-null 30 must conflict"
+  | Error _ -> ()
+;;
+
+(* #290 build-time: CREATE UNIQUE INDEX over existing data with multiple NULLs
+   must succeed (NULLs are distinct); pre-existing non-null dups still reject. *)
+let unique_index_build_over_nulls () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES (NULL)";
+  exec db "INSERT INTO t VALUES (1)";
+  match run (Db.execute db "CREATE UNIQUE INDEX ix ON t (a)") with
+  | Ok () -> ()
+  | Error e ->
+    Alcotest.failf "build over multiple NULLs should succeed, got: %s" (fmt_err e)
+;;
+
 (* QCheck: random integer inserts + CREATE INDEX; index lookup must
    match sequential scan for every distinct value. *)
 let qcheck_index_lookup_matches_seq_scan =
@@ -11573,6 +11665,22 @@ let () =
             index_lookup_where_null_no_match
         ; Alcotest.test_case "multi_col_index" `Quick test_multi_col_index
         ; Alcotest.test_case "multi_col_unique_index" `Quick test_multi_col_unique_index
+        ; Alcotest.test_case
+            "unique_index_allows_multiple_nulls"
+            `Quick
+            unique_index_allows_multiple_nulls
+        ; Alcotest.test_case
+            "unique_index_multicol_null_exempt"
+            `Quick
+            unique_index_multicol_null_exempt
+        ; Alcotest.test_case
+            "unique_index_update_to_null_exempt"
+            `Quick
+            unique_index_update_to_null_exempt
+        ; Alcotest.test_case
+            "unique_index_build_over_nulls"
+            `Quick
+            unique_index_build_over_nulls
         ] )
     ; ( "qcheck_create_index"
       , List.map

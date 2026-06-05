@@ -423,6 +423,18 @@ val commit_schema_changes : t -> unit
     Call at ROLLBACK. *)
 val rollback_schema_changes : t -> unit
 
+(** #293: re-derive the cached [next_rowid] from the data tree (max(rowid)+1, as
+    at open-time) for ONLY the rowid tables bumped during the rolled-back
+    transaction, discarding the in-memory counter bump made by INSERTs run
+    through it.  This makes the next rowid allocation reuse a rolled-back rowid,
+    matching SQLite for plain (non-AUTOINCREMENT) rowid tables.  Restricting to
+    the bumped set (usually one table) keeps rollback ~O(1) instead of scanning
+    every table's tree.  Clears the bumped set.  Must be called by the db layer
+    AFTER the store rollback (so the trees show last-committed state and the RW
+    lock is free), and after [rollback_schema_changes] (which leaves the bumped
+    set intact for this call to consume). *)
+val recompute_rowid_counters_after_rollback : t -> unit Lwt.t
+
 (** #280: open a schema-undo savepoint named [name].  Records the current
     undo-log position so a later [savepoint_rollback_schema]/
     [savepoint_release_schema] of [name] can act on only the entries registered

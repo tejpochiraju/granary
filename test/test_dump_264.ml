@@ -313,6 +313,37 @@ let test_int64_min_literal () =
     assert_roundtrip db)
 ;;
 
+(* #284: a leading zero on the INT64_MIN magnitude (09223372036854775808) must
+   not defeat the 2^63 overflow-fold.  The magnitude is numerically still 2^63
+   and, once negated, is exactly Int64.min_int — just like the no-leading-zero
+   form.  Over-range magnitudes stay rejected even with leading zeros. *)
+let test_int64_min_literal_leading_zero () =
+  with_db (fun db ->
+    Alcotest.(check (list string))
+      "leading-zero INT64_MIN folds to min_int"
+      [ Printf.sprintf "i:%Ld" Int64.min_int ]
+      (rows db "SELECT -09223372036854775808");
+    Alcotest.(check (list string))
+      "many leading zeros INT64_MIN folds to min_int"
+      [ Printf.sprintf "i:%Ld" Int64.min_int ]
+      (rows db "SELECT -0009223372036854775808");
+    (* regression: the no-leading-zero form still folds to min_int *)
+    Alcotest.(check (list string))
+      "no-leading-zero INT64_MIN still folds to min_int"
+      [ Printf.sprintf "i:%Ld" Int64.min_int ]
+      (rows db "SELECT -9223372036854775808");
+    (* regression: over-by-one with a leading zero is still genuinely out of
+       range and must be rejected *)
+    (match run (Db.query db "SELECT -09223372036854775809") with
+     | Ok _ -> Alcotest.fail "leading-zero magnitude 2^63+1 in SELECT should be rejected"
+     | Error _ -> ());
+    (* sanity: a small leading-zero int is unaffected and parses normally *)
+    Alcotest.(check (list string))
+      "small leading-zero int parses as its value"
+      [ "i:-7" ]
+      (rows db "SELECT -007"))
+;;
+
 let test_value_literals () =
   with_db (fun db ->
     exec db "CREATE TABLE lit (k INTEGER PRIMARY KEY, i INTEGER, r REAL, t TEXT, b BLOB)";
@@ -485,6 +516,10 @@ let () =
         ; Alcotest.test_case "without rowid" `Quick test_without_rowid
         ; Alcotest.test_case "value literals" `Quick test_value_literals
         ; Alcotest.test_case "int64 min literal (#270)" `Quick test_int64_min_literal
+        ; Alcotest.test_case
+            "int64 min literal leading zero (#284)"
+            `Quick
+            test_int64_min_literal_leading_zero
         ] )
     ; ( "serialization"
       , [ Alcotest.test_case "schema_only / data_only" `Quick test_schema_only_data_only

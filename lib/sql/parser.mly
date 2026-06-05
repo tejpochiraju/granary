@@ -29,7 +29,18 @@
      magnitude of [Int64.min_int], is representable once negated; any larger
      magnitude is genuinely out of range.  See #270. *)
   let neg_int_overflow (mag : string) : int64 =
-    if mag = "9223372036854775808" then Int64.min_int
+    (* Leading zeros are not significant: 09223372036854775808 is numerically
+       2^63 just like 9223372036854775808, so strip them before the magnitude
+       compare (#284).  Guard the all-zeros case so we never compare against an
+       empty string; an all-zeros magnitude fits in int64 and never reaches
+       this overflow branch in practice. *)
+    let mag' =
+      let i = ref 0 in
+      let n = String.length mag in
+      while !i < n - 1 && mag.[!i] = '0' do incr i done;
+      String.sub mag !i (n - !i)
+    in
+    if mag' = "9223372036854775808" then Int64.min_int
     else failwith ("integer literal out of range: -" ^ mag)
 %}
 
