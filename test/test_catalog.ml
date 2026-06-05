@@ -865,6 +865,7 @@ let test_create_index_basic () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (match result with
       | Error msg -> Alcotest.failf "expected Ok, got Error %s" msg
@@ -900,6 +901,7 @@ let test_indexes_for_table () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let* _ =
        C.create_index
@@ -910,6 +912,7 @@ let test_indexes_for_table () =
          ~unique:true
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let after = C.indexes_for_table cat ~table:"users" in
      Alcotest.(check int) "two indexes" 2 (List.length after);
@@ -931,6 +934,7 @@ let test_create_index_unknown_table () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (match r with
       | Error _ -> ()
@@ -954,6 +958,7 @@ let test_create_index_unknown_column () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (match r with
       | Error _ -> ()
@@ -977,6 +982,7 @@ let test_create_index_duplicate () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let* r =
        C.create_index
@@ -987,6 +993,7 @@ let test_create_index_duplicate () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (match r with
       | Error _ -> ()
@@ -1014,6 +1021,7 @@ let test_index_persists_across_reopen () =
          ~unique:true
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (* Reopen *)
      let* cat2 = C.open_ store in
@@ -1024,6 +1032,57 @@ let test_index_persists_across_reopen () =
      Alcotest.(check string) "table preserved" "users" i.C.idx_table;
      Alcotest.(check (list string)) "columns preserved" [ "id" ] i.C.idx_columns;
      Alcotest.(check bool) "unique preserved" true i.C.idx_unique;
+     Alcotest.(check bool) "origin preserved" true (i.C.idx_origin = `User);
+     Lwt.return_unit)
+;;
+
+(* #273: the [idx_origin] field must survive the on-disk encode/decode round-trip
+   for every variant — especially the implicit ones, which the logical dump uses
+   to decide what a replayed [CREATE TABLE] already recreates.  A [`User] index
+   that merely happens to be unique must NOT decode back as implicit. *)
+let test_index_origin_persists_across_reopen () =
+  run
+    (let store = S.create () in
+     let* cat1 = C.open_ store in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "a"; int_col "b"; int_col "c" ]
+         ~without_rowid:false
+     in
+     let mk name col origin =
+       let* r =
+         C.create_index
+           cat1
+           ~name
+           ~table:"t"
+           ~columns:[ col ]
+           ~unique:true
+           ~expr_flags:[ false ]
+           ~where_sql:None
+           ~origin
+       in
+       match r with
+       | Ok _ -> Lwt.return_unit
+       | Error e -> Alcotest.failf "create_index %s: %s" name e
+     in
+     let* () = mk "i_pk" "a" `Implicit_pk in
+     let* () = mk "i_uniq" "b" `Implicit_unique in
+     let* () = mk "i_user" "c" `User in
+     (* Reopen forces a decode from the persisted bytes. *)
+     let* cat2 = C.open_ store in
+     let origin_of name =
+       match C.find_index cat2 ~name with
+       | Some i -> i.C.idx_origin
+       | None -> Alcotest.failf "index %s missing after reopen" name
+     in
+     Alcotest.(check bool) "implicit_pk round-trips" true (origin_of "i_pk" = `Implicit_pk);
+     Alcotest.(check bool)
+       "implicit_unique round-trips"
+       true
+       (origin_of "i_uniq" = `Implicit_unique);
+     Alcotest.(check bool) "user round-trips" true (origin_of "i_user" = `User);
      Lwt.return_unit)
 ;;
 
@@ -1047,6 +1106,7 @@ let test_find_index () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (match C.find_index cat ~name:"idx" with
       | None -> Alcotest.fail "expected Some"
@@ -1113,6 +1173,7 @@ let test_drop_table_also_drops_indexes () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let* _ =
        C.create_index
@@ -1123,6 +1184,7 @@ let test_drop_table_also_drops_indexes () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (* Verify indexes exist before drop *)
      Alcotest.(check int)
@@ -1176,6 +1238,7 @@ let test_drop_index_basic () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let* tx = S.rw_begin store in
      let* () = C.drop_index cat tx ~name:"idx" in
@@ -1203,6 +1266,7 @@ let test_drop_index_persists () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      let* tx = S.rw_begin store in
      let* () = C.drop_index cat1 tx ~name:"idx" in
@@ -1236,6 +1300,7 @@ let test_drop_index_empty_sys_indexes () =
          ~unique:false
          ~expr_flags:[ false ]
          ~where_sql:None
+         ~origin:`User
      in
      (* Delete all entries from sys_indexes_tid (tree_id=2) directly. *)
      let sys_indexes_tid = 2 in
@@ -1807,6 +1872,10 @@ let () =
             "index_persists_across_reopen"
             `Quick
             test_index_persists_across_reopen
+        ; Alcotest.test_case
+            "index_origin_persists_across_reopen"
+            `Quick
+            test_index_origin_persists_across_reopen
         ; Alcotest.test_case "find_index" `Quick test_find_index
         ] )
     ; ( "drop"

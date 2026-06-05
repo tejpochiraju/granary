@@ -100,6 +100,12 @@ type table_meta =
     sentinel (allocation guards the [max_int] overflow that would wrap to it). *)
 let empty_next_rowid = Int64.min_int
 
+type idx_origin =
+  [ `Implicit_pk
+  | `Implicit_unique
+  | `User
+  ]
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -108,6 +114,7 @@ type index_info =
   ; idx_tree_id : S.tree_id
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
+  ; idx_origin : idx_origin
   }
 
 type fts_table_meta =
@@ -412,6 +419,30 @@ let decode_column bytes =
       })
 ;;
 
+let byte_of_idx_origin : idx_origin -> char = function
+  | `Implicit_pk -> '\x00'
+  | `Implicit_unique -> '\x01'
+  | `User -> '\x02'
+;;
+
+let idx_origin_of_byte = function
+  | 0 -> `Implicit_pk
+  | 1 -> `Implicit_unique
+  | _ -> `User
+;;
+
+(* Reconstruct an origin for an index persisted before the explicit [idx_origin]
+   field existed (extended-fields version < 3).  Falls back to the [__pk_] /
+   [__uniq_] name prefixes the binder assigns to auto-created indexes — the very
+   coupling #273 removes from the live path, kept here only to read legacy data. *)
+let legacy_idx_origin_of_name name =
+  if String.starts_with ~prefix:"__pk_" name
+  then `Implicit_pk
+  else if String.starts_with ~prefix:"__uniq_" name
+  then `Implicit_unique
+  else `User
+;;
+
 (* Index value encoding:
    varint(name_len) ++ name ++ varint(table_len) ++ table
    ++ varint(n_cols) ++ (varint(col_len) ++ col)*n_cols
@@ -430,8 +461,9 @@ let encode_index_value (idx : index_info) =
     idx.idx_columns;
   Buffer.add_char buf (if idx.idx_unique then '\x01' else '\x00');
   Varint.encode_uint64 buf (Int64.of_int idx.idx_tree_id);
-  (* Extended fields version 2: expr flags + optional WHERE *)
-  Varint.encode_uint64 buf 2L;
+  (* Extended fields version 3: origin byte + expr flags + optional WHERE *)
+  Varint.encode_uint64 buf 3L;
+  Buffer.add_char buf (byte_of_idx_origin idx.idx_origin);
   (* One varint per column: 0 = plain column, 1 = expression column *)
   List.iter
     (fun is_expr -> Varint.encode_uint64 buf (if is_expr then 1L else 0L))
@@ -446,9 +478,32 @@ let encode_index_value (idx : index_info) =
   Buffer.to_bytes buf
 ;;
 
+(* Returns [(expr_flags, where_sql, origin)].  [origin] is [None] for formats
+   predating the explicit field (version < 3); the caller reconstructs it from
+   the index name.  Decode of expr flags + WHERE is shared by versions 2 and 3. *)
 let decode_index_ext_fields bytes off2 cols =
+  let decode_flags_and_where off_start =
+    let off_ref = ref off_start in
+    let expr_flags =
+      List.map
+        (fun _ ->
+           let flag, next = Varint.decode_uint64 bytes !off_ref in
+           off_ref := next;
+           Int64.to_int flag = 1)
+        cols
+    in
+    let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
+    let where_sql =
+      if Int64.to_int has_where = 0
+      then None
+      else (
+        let sql_len, off5 = Varint.decode_uint64 bytes off4 in
+        Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
+    in
+    expr_flags, where_sql
+  in
   if off2 >= Bytes.length bytes
-  then List.map (fun _ -> false) cols, None (* old format: no extended fields *)
+  then List.map (fun _ -> false) cols, None, None (* old format: no extended fields *)
   else (
     let version, off3 = Varint.decode_uint64 bytes off2 in
     match Int64.to_int version with
@@ -462,28 +517,17 @@ let decode_index_ext_fields bytes off2 cols =
           let sql_len, off5 = Varint.decode_uint64 bytes off4 in
           Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
       in
-      List.map (fun _ -> false) cols, where_sql
+      List.map (fun _ -> false) cols, where_sql, None
     | 2 ->
       (* Version 2 (Task 2): n_cols expr flags, then WHERE clause *)
-      let off_ref = ref off3 in
-      let expr_flags =
-        List.map
-          (fun _ ->
-             let flag, next = Varint.decode_uint64 bytes !off_ref in
-             off_ref := next;
-             Int64.to_int flag = 1)
-          cols
-      in
-      let has_where, off4 = Varint.decode_uint64 bytes !off_ref in
-      let where_sql =
-        if Int64.to_int has_where = 0
-        then None
-        else (
-          let sql_len, off5 = Varint.decode_uint64 bytes off4 in
-          Some (Bytes.sub_string bytes off5 (Int64.to_int sql_len)))
-      in
-      expr_flags, where_sql
-    | _ -> List.map (fun _ -> false) cols, None)
+      let expr_flags, where_sql = decode_flags_and_where off3 in
+      expr_flags, where_sql, None
+    | 3 ->
+      (* Version 3 (#273): origin byte, then expr flags, then WHERE clause *)
+      let origin = idx_origin_of_byte (Bytes.get_uint8 bytes off3) in
+      let expr_flags, where_sql = decode_flags_and_where (off3 + 1) in
+      expr_flags, where_sql, Some origin
+    | _ -> List.map (fun _ -> false) cols, None, None)
 ;;
 
 let decode_index_value bytes =
@@ -507,7 +551,12 @@ let decode_index_value bytes =
   in
   let unique_byte = Bytes.get_uint8 bytes !off in
   let tree_id, off2 = Varint.decode_uint64 bytes (!off + 1) in
-  let idx_expr_flags, idx_where_sql = decode_index_ext_fields bytes off2 cols in
+  let idx_expr_flags, idx_where_sql, origin = decode_index_ext_fields bytes off2 cols in
+  let idx_origin =
+    match origin with
+    | Some o -> o
+    | None -> legacy_idx_origin_of_name name
+  in
   { idx_name = name
   ; idx_table = tbl
   ; idx_columns = cols
@@ -515,6 +564,7 @@ let decode_index_value bytes =
   ; idx_tree_id = Int64.to_int tree_id
   ; idx_expr_flags
   ; idx_where_sql
+  ; idx_origin
   }
 ;;
 
@@ -1311,7 +1361,7 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
       S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
 ;;
 
-let create_index t ~name ~table ~columns ~unique ~expr_flags ~where_sql =
+let create_index t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~origin =
   if Hashtbl.mem t.indexes name
   then Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))
   else (
@@ -1342,6 +1392,7 @@ let create_index t ~name ~table ~columns ~unique ~expr_flags ~where_sql =
            ; idx_tree_id = tid
            ; idx_expr_flags = expr_flags
            ; idx_where_sql = where_sql
+           ; idx_origin = origin
            }
          in
          let%lwt tx = S.rw_begin t.store in

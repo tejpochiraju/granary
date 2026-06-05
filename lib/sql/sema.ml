@@ -141,7 +141,7 @@ type bound_stmt =
   | BS_create_table of
       { name : string
       ; columns : Row.column list
-      ; uniq_idxs : (string * string list) list
+      ; uniq_idxs : (string * string list * Cat.idx_origin) list
       ; if_not_exists : bool
       ; fk_constraints :
           (string list * string * string list * Cat.fk_action * Cat.fk_action * bool) list
@@ -1128,10 +1128,16 @@ let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
       (fun (i, tc) ->
          match tc with
          | Ast.TC_unique cols ->
-           Some (Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i, cols)
+           Some
+             ( Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i
+             , cols
+             , `Implicit_unique )
          | Ast.TC_primary_key cols when is_alias cols -> None
          | Ast.TC_primary_key cols ->
-           Some (Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i, cols)
+           Some
+             ( Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i
+             , cols
+             , `Implicit_pk )
          | Ast.TC_foreign_key _ -> None)
       (List.mapi (fun i tc -> i, tc) constraints)
   in
@@ -1139,7 +1145,7 @@ let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
     List.filter_map
       (fun (c : Ast.column_def) ->
          if c.primary_key && not (is_alias [ c.name ])
-         then Some (Printf.sprintf "__pk_%s_%s" name c.name, [ c.name ])
+         then Some (Printf.sprintf "__pk_%s_%s" name c.name, [ c.name ], `Implicit_pk)
          else None)
       columns
   in

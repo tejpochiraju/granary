@@ -87,6 +87,18 @@ val set_last_inserted_rowid : t -> int64 -> unit
     the db layer to answer [last_insert_rowid()]. *)
 val last_inserted_rowid : t -> int64
 
+(** How an index came to exist.  [`Implicit_pk] and [`Implicit_unique] are
+    auto-created from a table's PRIMARY KEY / UNIQUE constraints at
+    {!create_table} time; [`User] is an explicit [CREATE INDEX].  The logical
+    dump (#264) keys on this field to decide which indexes a replayed
+    [CREATE TABLE] already recreates, rather than sniffing the [__pk_]/[__uniq_]
+    name prefix the binder assigns (which a user index could collide with). *)
+type idx_origin =
+  [ `Implicit_pk
+  | `Implicit_unique
+  | `User
+  ]
+
 type index_info =
   { idx_name : string
   ; idx_table : string
@@ -95,6 +107,7 @@ type index_info =
   ; idx_tree_id : Sqlocaml_store.Store.tree_id
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
+  ; idx_origin : idx_origin
   }
 
 type fts_table_meta =
@@ -224,6 +237,7 @@ val create_index
   -> unique:bool
   -> expr_flags:bool list
   -> where_sql:string option
+  -> origin:idx_origin
   -> (index_info, string) result Lwt.t
 
 (** Return the list of indexes on the given table.  Order is unspecified. *)
