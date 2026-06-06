@@ -1609,9 +1609,14 @@ let query_impl ?stats ?mode top sql =
   | Ok op ->
     let mode =
       match mode with
-      | Some m ->
-        m (* #274: caller-supplied ambient read mode (e.g. dump's shared RO snapshot) *)
-      | None ->
+      (* #274: a caller-supplied ambient read mode (e.g. dump's shared RO
+         snapshot of [top.store]) is only valid when routing kept the plan on
+         [top]'s store.  If [active_database] flips mid-dump so [compile_routed]
+         routes this statement to an attached sub-handle, applying [top]'s
+         snapshot to the sub's tree-ids would read the wrong store; fall back to
+         the routed handle's own context instead. *)
+      | Some m when t == top -> m
+      | Some _ | None ->
         (match t.explicit_txn with
          | None -> Sql.Exec.Auto
          | Some tx -> Sql.Exec.In_txn tx)
