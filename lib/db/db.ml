@@ -1943,20 +1943,26 @@ let order_views_by_dependency (views : (string * string) list) =
 let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
   let stmt s = sink (s ^ ";\n") in
   let cat = t.catalog in
-  (* #274: read every table under one snapshot so the source side is a single
-     point-in-time committed view, like sqlite3's [.dump] (which reads the whole
-     database under one transaction).  Without this, each table's read opened its
-     own fresh RO snapshot, so a commit landing between two tables' reads yielded
-     a torn dump reflecting no single committed state.  When an explicit txn is
-     already active, reads already go through it (consistent + read-your-own-
-     writes); otherwise we open one shared RO snapshot for the whole dump and end
-     it when finished — even on error (#164). *)
+  (* #274: read every table's data under one snapshot so the source side is a
+     single point-in-time committed view, like sqlite3's [.dump] (which reads the
+     whole database under one transaction).  Without this, each table's read
+     opened its own fresh RO snapshot, so a commit landing between two tables'
+     reads yielded a torn dump reflecting no single committed state.
+
+     The shared snapshot only applies when the dump's [SELECT]s actually read
+     [t.store]: that is, when no explicit txn is active (an explicit txn already
+     gives all reads one consistent read-your-own-writes view) and the active
+     schema is [main] (otherwise [compile_routed] routes the unqualified
+     per-table [SELECT] to an attached sub-handle's store, for which a snapshot
+     of [t.store] would be the wrong store — that path keeps its prior
+     per-statement behavior).  The snapshot is ended when finished, even on
+     error (#164). *)
   let* read_mode, finish_snapshot =
     match t.explicit_txn with
-    | Some tx -> Lwt.return (Sql.Exec.In_txn tx, fun () -> Lwt.return_unit)
-    | None ->
+    | None when String.equal t.active_schema "main" ->
       let* snap = S.ro_begin t.store in
-      Lwt.return (Sql.Exec.In_ro_txn snap, fun () -> S.ro_end snap)
+      Lwt.return (Some (Sql.Exec.In_ro_txn snap), fun () -> S.ro_end snap)
+    | _ -> Lwt.return (None, fun () -> Lwt.return_unit)
   in
   Lwt.finalize
     (fun () ->
@@ -1987,7 +1993,7 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                    in
                    if schema_only
                    then Lwt.return_unit
-                   else dump_table_rows ~mode:read_mode t meta ~stmt)
+                   else dump_table_rows ?mode:read_mode t meta ~stmt)
                 tables
             in
             (* Schema objects emitted after all data: FTS virtual tables (DDL only —
