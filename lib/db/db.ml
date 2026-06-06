@@ -418,6 +418,14 @@ let drain_pending_fks_or_fail t (tx : S.rw S.txn) : unit Lwt.t =
         let* () = S.rollback tx in
         (* #269: revert any in-txn DDL's in-memory cache changes too. *)
         Cat.rollback_schema_changes t.catalog;
+        (* #301: like [force_rollback_txn] (#293), an in-txn INSERT bumped the
+           in-memory next_rowid counter; the store row reverted with
+           [S.rollback] above but the cache did not.  Re-derive each bumped
+           rowid table's counter from the rolled-back data tree so the next
+           allocation reuses a rolled-back rowid (SQLite parity).  Safe here:
+           [S.rollback] already released the RW lock, so the recompute's fresh
+           RO snapshot sees the last-committed tree. *)
+        let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
         t.explicit_txn <- None;
         t.savepoint_names <- [];
         t.auto_began <- false;

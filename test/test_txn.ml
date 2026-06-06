@@ -262,6 +262,47 @@ let test_rollback_to_outer_savepoint_reuses_rowid_nested () =
     rows
 ;;
 
+(* #301: a COMMIT aborted by a still-violated DEFERRED foreign-key constraint
+   takes the [drain_pending_fks_or_fail] COMMIT-rollback path, which rolls the
+   store back but (pre-fix) did NOT recompute the in-memory next_rowid counters
+   the way the full-ROLLBACK path (#293) does.  An INSERT into a plain rowid
+   table T inside the doomed txn bumps T's cached counter; after the COMMIT
+   fails and the txn is rolled back, the next NULL/omitted-rowid INSERT into T
+   must REUSE the rolled-back rowid (max(rowid)+1 from the committed data), not
+   skip past it.  This mirrors #293 on the deferred-FK COMMIT-rollback path. *)
+let test_deferred_fk_commit_rollback_reuses_rowid () =
+  let db = fresh_db () in
+  exec db "PRAGMA foreign_keys = 1";
+  exec db "CREATE TABLE fk_par (id INTEGER PRIMARY KEY)";
+  exec db
+    "CREATE TABLE fk_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES \
+     fk_par(id) DEFERRABLE INITIALLY DEFERRED)";
+  (* Plain rowid table T, committed with rowids 1,2 (counter sits at 3). *)
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "INSERT INTO t (b) VALUES ('a')";
+  (* rowid 1 *)
+  exec db "INSERT INTO t (b) VALUES ('b')";
+  (* rowid 2 *)
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('c')";
+  (* rowid 3, bumps T's cached counter to 4 *)
+  (* Deferred FK violation: child references a non-existent parent key.  The
+     check is postponed, so this INSERT itself succeeds; the violation only
+     surfaces at COMMIT. *)
+  exec db "INSERT INTO fk_chi VALUES (100, 999)";
+  (match execute db "COMMIT" with
+   | Error _ -> ()
+   | Ok () -> Alcotest.fail "expected deferred FK violation to abort COMMIT");
+  (* The aborted COMMIT rolled the txn back: T's rowid 3 is gone, committed
+     state is {1,2}.  The next allocation must REUSE rowid 3, not gap to 4. *)
+  exec db "INSERT INTO t (b) VALUES ('d')";
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "rolled-back rowid 3 is reused after deferred-FK COMMIT abort"
+    [ 1, "a"; 2, "b"; 3, "d" ]
+    rows
+;;
+
 let test_begin_commit_visible () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
@@ -624,6 +665,10 @@ let () =
             "rollback_to_outer_savepoint_reuses_rowid_nested"
             `Quick
             test_rollback_to_outer_savepoint_reuses_rowid_nested
+        ; Alcotest.test_case
+            "deferred_fk_commit_rollback_reuses_rowid"
+            `Quick
+            test_deferred_fk_commit_rollback_reuses_rowid
         ] )
     ; "parse", [ Alcotest.test_case "parse_begin" `Quick test_parse_begin ]
     ; ( "execute_change_count"
