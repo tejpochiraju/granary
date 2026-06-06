@@ -399,12 +399,12 @@ let begin_txn t =
     Lwt.return (Ok ())
 ;;
 
-(* Roll back the active explicit transaction and reset all connection txn state
-   (store rollback + #269 schema-undo replay + FK/defer cleanup).  Shared by the
-   user-issued [rollback_txn], #286's forced rollback when a COMMIT cannot
-   proceed because the transaction was poisoned by a failed in-txn DDL statement
-   (partial on-disk effects remain), and the COMMIT-time deferred-FK rollback arm
-   in [drain_pending_fks_or_fail]. *)
+(* Roll back the active explicit transaction and reset ALL connection txn state
+   in one place: store rollback + #269 schema-undo replay + #293/#301 rowid-
+   counter recompute + the [explicit_txn]/[savepoint_names]/[auto_began] resets +
+   FK/defer cleanup.  Every rollback path (user-issued, #286's poisoned-COMMIT
+   force, the COMMIT-time deferred-FK arm) routes through here so the reset
+   sequence can't drift between them — #301 was exactly that drift. *)
 let force_rollback_txn t tx =
   let* () = S.rollback tx in
   Cat.rollback_schema_changes t.catalog;
