@@ -202,13 +202,29 @@ module Schema_cache : sig
   val mark_poisoned : t -> unit
   val is_poisoned : t -> bool
 end = struct
+  (* #280/#293/#303: one frame per open SAVEPOINT.  [sp_undo] is the [undo] list
+     as it stood when the savepoint opened (a physical suffix — see [push_undo]),
+     so ROLLBACK TO can run+drop exactly the DDL undos registered since.
+     [sp_poison] restores the #295 poison flag.  [sp_rowids] snapshots every
+     table's cached [next_rowid] at SAVEPOINT so ROLLBACK TO can restore the
+     in-memory counter (#303): the full-ROLLBACK recompute-from-tree path
+     ([recompute_rowid_counters_after_rollback]) is unusable mid-transaction —
+     the RW txn is still open, so a fresh RO snapshot reads the last-committed
+     tree, not the savepoint state — so we snapshot/restore in memory instead. *)
+  type savepoint =
+    { sp_name : string
+    ; sp_undo : (unit -> unit) list
+    ; sp_poison : bool
+    ; sp_rowids : (string * int64) list
+    }
+
   type t =
     { tables : (string, table_meta) Hashtbl.t
     ; indexes : (string, index_info) Hashtbl.t
     ; fts : (string, fts_table_meta) Hashtbl.t
     ; stamp : table_meta -> unit
     ; mutable undo : (unit -> unit) list
-    ; mutable savepoints : (string * (unit -> unit) list * bool) list
+    ; mutable savepoints : savepoint list
     ; mutable poisoned : bool
     ; rowid_bumped : (string, unit) Hashtbl.t
     }
@@ -332,19 +348,50 @@ end = struct
   (* #293: [rowid_bumped] is intentionally NOT cleared here — the db layer calls
        the recompute step right after, which reads it via [take_rowid_bumped]. *)
 
-  let savepoint_begin t name = t.savepoints <- (name, t.undo, t.poisoned) :: t.savepoints
+  (* #303: snapshot every table's cached [next_rowid] so ROLLBACK TO can restore
+     the in-memory counter to its value at SAVEPOINT.  Tables created after the
+     savepoint are absent here and their CREATE is undone by [sp_undo]; tables
+     dropped/altered after it are restored by [sp_undo] first, then their counter
+     is corrected to this snapshot value. *)
+  let snapshot_rowids t =
+    Hashtbl.fold
+      (fun name (m : table_meta) acc -> (name, m.next_rowid) :: acc)
+      t.tables
+      []
+  ;;
+
+  let savepoint_begin t name =
+    t.savepoints
+    <- { sp_name = name
+       ; sp_undo = t.undo
+       ; sp_poison = t.poisoned
+       ; sp_rowids = snapshot_rowids t
+       }
+       :: t.savepoints
+  ;;
+
+  (* #303: restore each snapshotted counter onto the (already DDL-undone) cached
+     meta.  Skip names no longer cached (their CREATE was rolled back). *)
+  let restore_rowids t rowids =
+    List.iter
+      (fun (name, next_rowid) ->
+         match Hashtbl.find_opt t.tables name with
+         | Some m -> Hashtbl.replace t.tables name { m with next_rowid }
+         | None -> ())
+      rowids
+  ;;
 
   let savepoint_rollback t name =
     let rec find = function
       | [] -> None
-      | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
+      | ({ sp_name; _ } as sp) :: older when String.equal sp_name name -> Some (sp, older)
       | _ :: rest -> find rest
     in
     match find t.savepoints with
     | None -> ()
-    | Some (snap, poison, older) ->
+    | Some (sp, older) ->
       let rec run lst =
-        if lst == snap
+        if lst == sp.sp_undo
         then ()
         else (
           match lst with
@@ -354,15 +401,18 @@ end = struct
             run tl)
       in
       run t.undo;
-      t.undo <- snap;
-      t.poisoned <- poison;
-      t.savepoints <- (name, snap, poison) :: older
+      t.undo <- sp.sp_undo;
+      t.poisoned <- sp.sp_poison;
+      (* After the DDL undos above, correct the cached rowid counters to their
+         savepoint values (#303). *)
+      restore_rowids t sp.sp_rowids;
+      t.savepoints <- sp :: older
   ;;
 
   let savepoint_release t name =
     let rec drop = function
       | [] -> []
-      | (n, _, _) :: older when String.equal n name -> older
+      | { sp_name; _ } :: older when String.equal sp_name name -> older
       | _ :: rest -> drop rest
     in
     t.savepoints <- drop t.savepoints
