@@ -1347,91 +1347,107 @@ let validate_autoincrement ~without_rowid (columns : Ast.column_def list) row_co
 ;;
 
 let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
-  let* existing = Cat.find_table cat ~name in
-  match existing with
-  | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-  | Some _ (* if_not_exists = true: silently succeed *) ->
+  (* #317.1: SQLite reserves the [sqlite_] prefix for its own internal objects
+     (sqlite_master/schema, sqlite_sequence, and the sqlite_stat / sqlite_autoindex
+     families).  Creating such a table used to succeed and then be shadowed by the
+     synthesized view for SELECT and intercepted for DML — an unusable, confusing
+     table.  Reject it up front, matching SQLite's "object name reserved for
+     internal use".  The engine's own system tables use the [_sys_] prefix, and
+     the synthesized sqlite_master/sqlite_sequence are never created via this
+     path, so nothing internal is blocked. *)
+  if String.starts_with ~prefix:"sqlite_" (String.lowercase_ascii name)
+  then
     Lwt.return
-      (Ok
-         (BS_create_table
-            { name
-            ; columns = []
-            ; uniq_idxs = []
-            ; if_not_exists = true
-            ; fk_constraints = []
-            ; without_rowid
-            ; autoincrement = false
-            }))
-  | None ->
-    let unsupported_check =
-      List.find_opt
-        (fun (c : Ast.column_def) ->
-           match c.check with
-           | None -> false
-           | Some e -> check_expr_unsupported e)
-        columns
-    in
-    (match unsupported_check with
-     | Some col ->
-       Lwt.return
-         (Error
-            (Unsupported
-               (Printf.sprintf
-                  "CHECK constraint on column '%s' contains unsupported expression form \
-                   (aggregates, subqueries, and parameters are not allowed)"
-                  col.name)))
-     | None ->
-       (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
+      (Error
+         (Unsupported (Printf.sprintf "object name reserved for internal use: %s" name)))
+  else
+    let* existing = Cat.find_table cat ~name in
+    match existing with
+    | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+    | Some _ (* if_not_exists = true: silently succeed *) ->
+      Lwt.return
+        (Ok
+           (BS_create_table
+              { name
+              ; columns = []
+              ; uniq_idxs = []
+              ; if_not_exists = true
+              ; fk_constraints = []
+              ; without_rowid
+              ; autoincrement = false
+              }))
+    | None ->
+      let unsupported_check =
+        List.find_opt
+          (fun (c : Ast.column_def) ->
+             match c.check with
+             | None -> false
+             | Some e -> check_expr_unsupported e)
+          columns
+      in
+      (match unsupported_check with
+       | Some col ->
+         Lwt.return
+           (Error
+              (Unsupported
+                 (Printf.sprintf
+                    "CHECK constraint on column '%s' contains unsupported expression \
+                     form (aggregates, subqueries, and parameters are not allowed)"
+                    col.name)))
+       | None ->
+         (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
           column_def, so validation/derivation reuse the column-form path.  A
           composite or non-INTEGER PK is still rejected downstream because the
           marked column will not be the rowid alias. *)
-       let tc_ai_cols =
-         List.concat_map
-           (function
-             | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
-             | _ -> [])
-           constraints
-       in
-       let columns =
-         if tc_ai_cols = []
-         then columns
-         else
-           List.map
-             (fun (c : Ast.column_def) ->
-                if List.mem c.name tc_ai_cols then { c with autoincrement = true } else c)
-             columns
-       in
-       let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
-       (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
+         let tc_ai_cols =
+           List.concat_map
+             (function
+               | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
+               | _ -> [])
+             constraints
+         in
+         let columns =
+           if tc_ai_cols = []
+           then columns
+           else
+             List.map
+               (fun (c : Ast.column_def) ->
+                  if List.mem c.name tc_ai_cols
+                  then { c with autoincrement = true }
+                  else c)
+               columns
+         in
+         let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
+         (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)
-       let rowid_alias_col_name =
-         Option.map
-           (fun i -> (List.nth row_cols i).Row.name)
-           (Cat.compute_rowid_alias_col row_cols ~without_rowid)
-       in
-       let uniq_idxs =
-         auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
-       in
-       (match extract_fk_constraints cat ~columns ~constraints with
-        | Error e -> Lwt.return (Error e)
-        | Ok fk_constraints ->
-          (match validate_without_rowid ~name ~without_rowid row_cols with
-           | Error e -> Lwt.return (Error e)
-           | Ok () ->
-             (match validate_autoincrement ~without_rowid columns row_cols with
-              | Error e -> Lwt.return (Error e)
-              | Ok autoincrement ->
-                Lwt.return
-                  (Ok
-                     (BS_create_table
-                        { name
-                        ; columns = row_cols
-                        ; uniq_idxs
-                        ; if_not_exists
-                        ; fk_constraints
-                        ; without_rowid
-                        ; autoincrement
-                        }))))))
+         let rowid_alias_col_name =
+           Option.map
+             (fun i -> (List.nth row_cols i).Row.name)
+             (Cat.compute_rowid_alias_col row_cols ~without_rowid)
+         in
+         let uniq_idxs =
+           auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
+         in
+         (match extract_fk_constraints cat ~columns ~constraints with
+          | Error e -> Lwt.return (Error e)
+          | Ok fk_constraints ->
+            (match validate_without_rowid ~name ~without_rowid row_cols with
+             | Error e -> Lwt.return (Error e)
+             | Ok () ->
+               (match validate_autoincrement ~without_rowid columns row_cols with
+                | Error e -> Lwt.return (Error e)
+                | Ok autoincrement ->
+                  Lwt.return
+                    (Ok
+                       (BS_create_table
+                          { name
+                          ; columns = row_cols
+                          ; uniq_idxs
+                          ; if_not_exists
+                          ; fk_constraints
+                          ; without_rowid
+                          ; autoincrement
+                          }))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3196,10 +3212,25 @@ let text_lit_of_expr = function
   | _ -> None
 ;;
 
+(* #317.2: identifiers in the sqlite_sequence write matchers are matched
+   case-insensitively, and column references may carry the [sqlite_sequence.]
+   table qualifier — SQLite treats both forms identically.  [seq_col_is col e]
+   is true when [e] references the (unqualified or sqlite_sequence-qualified)
+   column [col], comparing names case-insensitively. *)
+let seq_ident_eq a b = String.equal (String.lowercase_ascii a) b
+
+let seq_col_is col = function
+  | Ast.E_col c -> seq_ident_eq c col
+  | Ast.E_tbl_col (t, c) -> is_sqlite_sequence t && seq_ident_eq c col
+  | _ -> false
+;;
+
 (* Match a [name = '<text literal>'] WHERE predicate -> [Some table]. *)
 let seq_where_name = function
-  | Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", rhs)) -> text_lit_of_expr rhs
-  | Some (Ast.E_binop (Ast.Eq, lhs, Ast.E_col "name")) -> text_lit_of_expr lhs
+  | Some (Ast.E_binop (Ast.Eq, col, rhs)) when seq_col_is "name" col ->
+    text_lit_of_expr rhs
+  | Some (Ast.E_binop (Ast.Eq, lhs, col)) when seq_col_is "name" col ->
+    text_lit_of_expr lhs
   | _ -> None
 ;;
 
@@ -3212,7 +3243,7 @@ let seq_unsupported what =
    = '<table>'] form; reject anything else. *)
 let bind_seq_update ~assignments ~where ~order ~limit ~offset ~returning =
   match assignments, order, limit, offset, returning with
-  | [ ("seq", seq_expr) ], [], None, None, [] ->
+  | [ (col, seq_expr) ], [], None, None, [] when seq_ident_eq col "seq" ->
     (match int_lit_of_expr seq_expr, seq_where_name where with
      | Some seq, Some table -> Lwt.return (Ok (BS_seq_write (Seq_set { table; seq })))
      | _ -> seq_unsupported "UPDATE")
@@ -3242,7 +3273,7 @@ let bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update =
   let cols_ok =
     match columns with
     | [] -> true
-    | [ "name"; "seq" ] -> true
+    | [ c1; c2 ] -> seq_ident_eq c1 "name" && seq_ident_eq c2 "seq"
     | _ -> false
   in
   match cols_ok, on_conflict, returning, upsert_update, values with

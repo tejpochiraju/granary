@@ -6362,7 +6362,10 @@ let execute_with_count
        — reverts on ROLLBACK) or owns its own auto-committed txn ([Auto]). *)
     with_ddl_txn store cat mode (fun tx ->
       let* () = Cat.set_next_rowid_in_txn cat ~name:table ~requested:seq tx in
-      Lwt.return 0)
+      (* #317.3: the UPDATE/INSERT form touches exactly one sqlite_sequence row,
+         so [changes()] reports 1 — SQLite parity.  (The DELETE/reset form below
+         still reports 0: we do not materialise per-table rows to count.) *)
+      Lwt.return 1)
   | Plan.Op_seq_reset { table } ->
     (* #312.1: writable sqlite_sequence DELETE.  [None] (bare DELETE, no WHERE)
        resets every AUTOINCREMENT counter — SQLite parity, and what a real

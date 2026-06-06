@@ -12073,6 +12073,71 @@ let sqlite_sequence_rejects_unsupported () =
     "sqlite_sequence"
 ;;
 
+(* #317.1: SQLite reserves the [sqlite_] prefix for internal objects; CREATE
+   TABLE on such a name must be rejected (it used to silently succeed and then be
+   shadowed by the synthesized sqlite_master/sqlite_sequence views). *)
+let sqlite_sequence_reserved_create_rejected () =
+  let db = fresh_db () in
+  assert_exec_rejected db "CREATE TABLE sqlite_sequence (a INTEGER)" "reserved";
+  assert_exec_rejected db "CREATE TABLE sqlite_master (a INTEGER)" "reserved";
+  assert_exec_rejected db "CREATE TABLE sqlite_foo (a INTEGER)" "reserved";
+  (* case-insensitive prefix *)
+  assert_exec_rejected db "CREATE TABLE SQLITE_Bar (a INTEGER)" "reserved";
+  (* even with IF NOT EXISTS *)
+  assert_exec_rejected db "CREATE TABLE IF NOT EXISTS sqlite_baz (a INTEGER)" "reserved";
+  (* a non-reserved name that merely contains the substring still works *)
+  exec db "CREATE TABLE not_sqlite_x (a INTEGER)";
+  Alcotest.(check int)
+    "non-reserved table created"
+    1
+    (List.length
+       (query_ok db "SELECT name FROM sqlite_master WHERE name = 'not_sqlite_x'"))
+;;
+
+(* #317.2: identifiers in the sqlite_sequence write matchers are case-insensitive
+   and accept the [sqlite_sequence.] qualifier — both forms behave identically in
+   SQLite. *)
+let sqlite_sequence_case_and_qualified () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  (* a=1 *)
+  (* uppercase column identifiers in UPDATE *)
+  exec db "UPDATE sqlite_sequence SET SEQ = 10 WHERE NAME = 't'";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=11 *)
+  (* table-qualified name in WHERE *)
+  exec db "UPDATE sqlite_sequence SET seq = 20 WHERE sqlite_sequence.name = 't'";
+  exec db "INSERT INTO t(b) VALUES ('z')";
+  (* a=21 *)
+  (* uppercase column list in INSERT *)
+  exec db "INSERT INTO sqlite_sequence(NAME, SEQ) VALUES('t', 30)";
+  exec db "INSERT INTO t(b) VALUES ('w')";
+  (* a=31 *)
+  Alcotest.(check (list int64))
+    "case/qualified writes raised the counter each time"
+    [ 1L; 11L; 21L; 31L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+(* #317.3: the UPDATE/INSERT form of a sqlite_sequence write reports changes()=1
+   (it touches one sequence row), matching SQLite. *)
+let sqlite_sequence_write_reports_changes () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "UPDATE sqlite_sequence SET seq = 99 WHERE name = 't'";
+  Alcotest.(check row_testable)
+    "changes after sqlite_sequence UPDATE"
+    [| Db.V_int 1L |]
+    (List.nth (query_ok db "SELECT CHANGES()") 0);
+  exec db "INSERT INTO sqlite_sequence(name, seq) VALUES('t', 200)";
+  Alcotest.(check row_testable)
+    "changes after sqlite_sequence INSERT"
+    [| Db.V_int 1L |]
+    (List.nth (query_ok db "SELECT CHANGES()") 0)
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -13010,6 +13075,18 @@ let () =
             "rejects_unsupported"
             `Quick
             sqlite_sequence_rejects_unsupported
+        ; Alcotest.test_case
+            "reserved_create_rejected"
+            `Quick
+            sqlite_sequence_reserved_create_rejected
+        ; Alcotest.test_case
+            "case_and_qualified"
+            `Quick
+            sqlite_sequence_case_and_qualified
+        ; Alcotest.test_case
+            "write_reports_changes"
+            `Quick
+            sqlite_sequence_write_reports_changes
         ] )
     ]
 ;;
