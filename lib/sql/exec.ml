@@ -5287,20 +5287,9 @@ let execute_drop_table
   =
   with_ddl_txn store cat mode (fun tx ->
     let name = table_meta.Cat.name in
-    (* Capture the live cache entry + its dependent indexes and arm the undo
-       BEFORE the mutation, so a partial failure mid-[drop_table] in [Auto] is
-       also reverted by [rollback_schema_changes] (restore is idempotent —
-       [Hashtbl.replace]).  Both snapshots are read from the catalog here (not the
-       planner's [table_meta]) so they stay symmetric and correct should plan- and
-       exec-time ever diverge (e.g. prepared statements); fall back to the
-       planner's copy only if the cache somehow lacks the entry. *)
-    let restore_meta =
-      Option.value (Cat.find_table_cached cat ~name) ~default:table_meta
-    in
-    let dropped_idxs = Cat.indexes_for_table cat ~table:name in
-    Cat.register_schema_undo cat (fun () ->
-      Cat.restore_table_cache cat restore_meta;
-      List.iter (Cat.restore_index_cache cat) dropped_idxs);
+    (* #283: [Cat.drop_table] self-registers the cache undo for the table and each
+       dependent index (via [Schema_cache.remove_table]/[remove_index]), so no
+       external snapshot+undo is needed here. *)
     Cat.drop_table cat tx ~name)
 ;;
 
@@ -5317,7 +5306,7 @@ let execute_drop_index
   : unit Lwt.t
   =
   with_ddl_txn store cat mode (fun tx ->
-    Cat.register_schema_undo cat (fun () -> Cat.restore_index_cache cat idx_info);
+    (* #283: [Cat.drop_index] self-registers the cache undo. *)
     Cat.drop_index cat tx ~name:idx_info.Cat.idx_name)
 ;;
 
@@ -5587,6 +5576,9 @@ let execute_create_table_op
               fk_constraints
           in
           let* () = Cat.save_fk_constraints ~txn:tx cat ~table_name:name ~fks:fk_list in
+          (* Raw, undo-free cache update by design — reverted on ROLLBACK by
+             [create_table]'s schema-cache undo, which removes the whole table
+             entry.  See [Cat.set_fk_constraints]. *)
           Cat.set_fk_constraints cat ~table_name:name ~fks:fk_list;
           Lwt.return_unit)
       in
@@ -6043,10 +6035,8 @@ let alter_drop_column tx (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name :
       (fun (idx : Cat.index_info) -> Cat.drop_index cat tx ~name:idx.idx_name)
       idxs_on_col
   in
-  if idxs_on_col <> []
-  then
-    Cat.register_schema_undo cat (fun () ->
-      List.iter (Cat.restore_index_cache cat) idxs_on_col);
+  (* #283: each [Cat.drop_index] above self-registers its own cache undo, so the
+     dropped dependent indexes are restored on ROLLBACK without an external block. *)
   (* Drain every row through [tx] (read-your-own-writes) before rewriting, so the
      cursor is closed before we put back the reshaped rows into the same tree. *)
   let* cur = S.cursor_open tx table_meta.Cat.tree_id in

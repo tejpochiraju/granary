@@ -38,7 +38,8 @@
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
-  test_unique_build_288)
+  test_unique_build_288
+  test_schema_cache_283)
  (libraries
   alcotest
   qcheck-alcotest

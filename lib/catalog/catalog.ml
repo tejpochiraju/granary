@@ -124,13 +124,260 @@ type fts_table_meta =
   ; fts_columns : string list
   }
 
+(* #283: the in-memory schema cache and its rollback ledger, sealed behind a
+   signature so the ONLY way to mutate the three catalog hashtables is through a
+   mutator that registers its own reversal.  "Mutate the cache without recording
+   how to undo it" is therefore unrepresentable outside this module.
+
+   Two reversal strategies, both explicit (no raw, unprotected write exists):
+   - undo-tracked mutators ([put_*]/[remove_*]) capture the prior binding and push
+     the synthesized inverse onto [undo]; replayed by [rollback]/[savepoint_rollback],
+     discarded by [commit].  Used for DDL run THROUGH [Exec.with_ddl_txn] (the undo is
+     discarded on COMMIT in either Auto or explicit mode, replayed on ROLLBACK / a
+     mid-statement failure — see exec.ml).
+   - durable mutators ([*_durable]) apply with NO undo, for a catalog function's own
+     autocommit path that self-commits its own writer txn (so the write is already
+     durable and a [?txn=None] branch can never be inside an ambient writer txn — a
+     nested rw_begin would deadlock).  Also used for ephemeral CTE sentinels.
+
+   The rowid counter keeps the #293 recompute-on-rollback strategy: [bump_rowid]
+   records the table in the dirty set instead of pushing a closure, and the db layer
+   re-derives max(rowid)+1 from the rolled-back tree for exactly those tables. *)
+module Schema_cache : sig
+  type t
+
+  (** [stamp] re-stamps the #174 tree-tag for a [table_meta]; wired to
+      [register_tag store].  Every [table_meta] entering the cache is stamped so the
+      page-stamp stays consistent automatically, and an undo re-stamps the prior. *)
+  val create : stamp:(table_meta -> unit) -> t
+
+  (* reads — never touch the undo log *)
+  val find_table : t -> string -> table_meta option
+  val mem_table : t -> string -> bool
+  val find_index : t -> string -> index_info option
+  val mem_index : t -> string -> bool
+  val find_fts : t -> string -> fts_table_meta option
+  val fold_tables : (string -> table_meta -> 'a -> 'a) -> t -> 'a -> 'a
+  val fold_indexes : (string -> index_info -> 'a -> 'a) -> t -> 'a -> 'a
+  val fold_fts : (string -> fts_table_meta -> 'a -> 'a) -> t -> 'a -> 'a
+  val count_tables : t -> int
+  val count_indexes : t -> int
+  val count_fts : t -> int
+
+  (* undo-tracked mutators (DDL under with_ddl_txn) *)
+  val put_table : t -> name:string -> table_meta -> unit
+  val remove_table : t -> name:string -> unit
+  val put_index : t -> name:string -> index_info -> unit
+  val remove_index : t -> name:string -> unit
+  val put_fts : t -> name:string -> fts_table_meta -> unit
+
+  (* durable mutators (catalog-internal autocommit / ephemeral — no undo) *)
+  val put_table_durable : t -> name:string -> table_meta -> unit
+  val remove_table_durable : t -> name:string -> unit
+  val put_index_durable : t -> name:string -> index_info -> unit
+  val put_fts_durable : t -> name:string -> fts_table_meta -> unit
+
+  (* rowid counter: in-txn bump (dirty-set tracked) and post-rollback/autocommit
+     durable set; [take_rowid_bumped] returns the dirty names and clears the set. *)
+  val bump_rowid : t -> name:string -> table_meta -> unit
+  val set_rowid_durable : t -> name:string -> table_meta -> unit
+  val take_rowid_bumped : t -> string list
+
+  (** Append an arbitrary reversal to the undo log.  The ONLY way an external
+      owner (the db layer's view/trigger caches, #269) can enroll a rollback in
+      this ledger so it replays in order with the catalog's own DDL undos at
+      ROLLBACK / ROLLBACK TO SAVEPOINT.  Note this appends to the undo LOG only —
+      it cannot reach the sealed cache hashtables, so the structural guarantee is
+      preserved.  The closure MUST be idempotent (re-run as a no-op): #280's
+      [savepoint_rollback] can leave an already-run closure queued for the outer
+      ROLLBACK. *)
+  val register_undo : t -> (unit -> unit) -> unit
+
+  (* lifecycle — drive by the db layer at txn / savepoint boundaries *)
+  val commit : t -> unit
+  val rollback : t -> unit
+  val savepoint_begin : t -> string -> unit
+  val savepoint_rollback : t -> string -> unit
+  val savepoint_release : t -> string -> unit
+  val mark_poisoned : t -> unit
+  val is_poisoned : t -> bool
+end = struct
+  type t =
+    { tables : (string, table_meta) Hashtbl.t
+    ; indexes : (string, index_info) Hashtbl.t
+    ; fts : (string, fts_table_meta) Hashtbl.t
+    ; stamp : table_meta -> unit
+    ; mutable undo : (unit -> unit) list
+    ; mutable savepoints : (string * (unit -> unit) list * bool) list
+    ; mutable poisoned : bool
+    ; rowid_bumped : (string, unit) Hashtbl.t
+    }
+
+  let create ~stamp =
+    { tables = Hashtbl.create 16
+    ; indexes = Hashtbl.create 16
+    ; fts = Hashtbl.create 8
+    ; stamp
+    ; undo = []
+    ; savepoints = []
+    ; poisoned = false
+    ; rowid_bumped = Hashtbl.create 8
+    }
+  ;;
+
+  (* The undo log only ever grows by prepending, so a saved suffix stays
+     physically identical (==) — the invariant [savepoint_rollback] relies on. *)
+  let push_undo t f = t.undo <- f :: t.undo
+  let register_undo = push_undo
+  let find_table t name = Hashtbl.find_opt t.tables name
+  let mem_table t name = Hashtbl.mem t.tables name
+  let find_index t name = Hashtbl.find_opt t.indexes name
+  let mem_index t name = Hashtbl.mem t.indexes name
+  let find_fts t name = Hashtbl.find_opt t.fts name
+  let fold_tables f t acc = Hashtbl.fold f t.tables acc
+  let fold_indexes f t acc = Hashtbl.fold f t.indexes acc
+  let fold_fts f t acc = Hashtbl.fold f t.fts acc
+  let count_tables t = Hashtbl.length t.tables
+  let count_indexes t = Hashtbl.length t.indexes
+  let count_fts t = Hashtbl.length t.fts
+
+  let put_table t ~name meta =
+    let prior = Hashtbl.find_opt t.tables name in
+    Hashtbl.replace t.tables name meta;
+    t.stamp meta;
+    push_undo t (fun () ->
+      match prior with
+      | Some m ->
+        Hashtbl.replace t.tables name m;
+        t.stamp m
+      | None -> Hashtbl.remove t.tables name)
+  ;;
+
+  let remove_table t ~name =
+    let prior = Hashtbl.find_opt t.tables name in
+    Hashtbl.remove t.tables name;
+    push_undo t (fun () ->
+      match prior with
+      | Some m ->
+        Hashtbl.replace t.tables name m;
+        t.stamp m
+      | None -> ())
+  ;;
+
+  let put_index t ~name info =
+    let prior = Hashtbl.find_opt t.indexes name in
+    Hashtbl.replace t.indexes name info;
+    push_undo t (fun () ->
+      match prior with
+      | Some i -> Hashtbl.replace t.indexes name i
+      | None -> Hashtbl.remove t.indexes name)
+  ;;
+
+  let remove_index t ~name =
+    let prior = Hashtbl.find_opt t.indexes name in
+    Hashtbl.remove t.indexes name;
+    push_undo t (fun () ->
+      match prior with
+      | Some i -> Hashtbl.replace t.indexes name i
+      | None -> ())
+  ;;
+
+  let put_fts t ~name meta =
+    let prior = Hashtbl.find_opt t.fts name in
+    Hashtbl.replace t.fts name meta;
+    push_undo t (fun () ->
+      match prior with
+      | Some m -> Hashtbl.replace t.fts name m
+      | None -> Hashtbl.remove t.fts name)
+  ;;
+
+  let put_table_durable t ~name meta =
+    Hashtbl.replace t.tables name meta;
+    t.stamp meta
+  ;;
+
+  let remove_table_durable t ~name = Hashtbl.remove t.tables name
+  let put_index_durable t ~name info = Hashtbl.replace t.indexes name info
+  let put_fts_durable t ~name meta = Hashtbl.replace t.fts name meta
+
+  let bump_rowid t ~name meta =
+    Hashtbl.replace t.tables name meta;
+    Hashtbl.replace t.rowid_bumped name ()
+  ;;
+
+  let set_rowid_durable t ~name meta = Hashtbl.replace t.tables name meta
+
+  let take_rowid_bumped t =
+    let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped [] in
+    Hashtbl.reset t.rowid_bumped;
+    names
+  ;;
+
+  let commit t =
+    t.undo <- [];
+    t.savepoints <- [];
+    t.poisoned <- false;
+    (* #293: COMMIT keeps the bumped next_rowid counter but clears the dirty set so
+       a later unrelated ROLLBACK won't recompute a table not bumped in that txn. *)
+    Hashtbl.reset t.rowid_bumped
+  ;;
+
+  let rollback t =
+    List.iter (fun f -> f ()) t.undo;
+    t.undo <- [];
+    t.savepoints <- [];
+    t.poisoned <- false
+  ;;
+
+  (* #293: [rowid_bumped] is intentionally NOT cleared here — the db layer calls
+       the recompute step right after, which reads it via [take_rowid_bumped]. *)
+
+  let savepoint_begin t name = t.savepoints <- (name, t.undo, t.poisoned) :: t.savepoints
+
+  let savepoint_rollback t name =
+    let rec find = function
+      | [] -> None
+      | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
+      | _ :: rest -> find rest
+    in
+    match find t.savepoints with
+    | None -> ()
+    | Some (snap, poison, older) ->
+      let rec run lst =
+        if lst == snap
+        then ()
+        else (
+          match lst with
+          | [] -> ()
+          | f :: tl ->
+            f ();
+            run tl)
+      in
+      run t.undo;
+      t.undo <- snap;
+      t.poisoned <- poison;
+      t.savepoints <- (name, snap, poison) :: older
+  ;;
+
+  let savepoint_release t name =
+    let rec drop = function
+      | [] -> []
+      | (n, _, _) :: older when String.equal n name -> older
+      | _ :: rest -> drop rest
+    in
+    t.savepoints <- drop t.savepoints
+  ;;
+
+  let mark_poisoned t = t.poisoned <- true
+  let is_poisoned t = t.poisoned
+end
+
 type t =
   { store : S.t
-  ; cache : (string, table_meta) Hashtbl.t
-  ; (* index_name -> index_info *)
-    indexes : (string, index_info) Hashtbl.t
-  ; (* fts_name -> fts_table_meta *)
-    fts : (string, fts_table_meta) Hashtbl.t
+  ; sc : Schema_cache.t
+    (** #283: the sealed in-memory schema cache (tables/indexes/fts) and its
+        rollback ledger.  The only path to a cache mutation, so a write that does
+        not record its reversal is unrepresentable. *)
   ; mutable fk_enforcement : bool
   ; mutable recursive_triggers : bool
   ; mutable defer_fks_pragma : bool
@@ -145,55 +392,15 @@ type t =
         Read by the db layer for [last_insert_rowid()].  Required because with
         INTEGER PRIMARY KEY rowid aliases an explicit id need not equal
         [next_rowid - 1] (e.g. inserting id=5 after id=100). *)
-  ; mutable schema_undo : (unit -> unit) list
-    (** #269: in-memory cache reversals for DDL run THROUGH an explicit
-        transaction.  When DDL participates in an ambient [BEGIN … COMMIT] it
-        mutates these hashtables before the store commits; a [ROLLBACK] must
-        therefore undo those mutations so the cache agrees with the rolled-back
-        store.  Closures are in reverse-registration order; [rollback_schema_changes]
-        runs them most-recent-first, [commit_schema_changes] discards them.
-        Empty in autocommit mode (where each DDL self-commits and cannot roll
-        back). *)
-  ; mutable schema_savepoints : (string * (unit -> unit) list * bool) list
-    (** #280/#295: savepoint markers over [schema_undo].  Each entry records a
-        savepoint name, the [schema_undo] list AS IT WAS when the savepoint was
-        opened (a physical suffix of the current list, since the log only grows
-        by prepending), and the [schema_txn_poisoned] flag AS IT WAS at that
-        moment (#295).  Newest savepoint at the front, mirroring the store's
-        savepoint stack.  [ROLLBACK TO s] runs+drops the undo closures
-        registered since [s] (the prefix down to its recorded snapshot),
-        restores the poison flag to the snapshot, and keeps [s]; [RELEASE s]
-        merges them into the enclosing scope (drops the marker, leaves
-        [schema_undo] and the poison flag untouched).  Cleared at every outer
-        txn boundary by [commit_schema_changes]/[rollback_schema_changes]. *)
-  ; mutable schema_txn_poisoned : bool
-    (** #286: set when an in-txn DDL statement fails partway through, leaving
-        partial on-disk effects under the ambient explicit transaction.  The db
-        layer leaves a failed statement's borrowed txn open (teardown is the
-        COMMIT/ROLLBACK's job), so a subsequent COMMIT would otherwise persist
-        the half-applied DDL.  When poisoned, the db layer forces COMMIT to roll
-        back instead (the transaction is uncommittable, matching SQLite).  Both
-        [commit_schema_changes] and [rollback_schema_changes] clear it — they
-        bracket the schema-change transaction. *)
-  ; rowid_bumped_in_txn : (string, unit) Hashtbl.t
-    (** #293: set of rowid tables whose cached [next_rowid] counter was bumped
-        via [next_rowid_in_txn]/[bump_next_rowid_in_txn] during the CURRENT
-        explicit transaction.  On ROLLBACK only THESE tables need their counter
-        re-derived from the rolled-back data tree (see
-        [recompute_rowid_counters_after_rollback]) — recomputing every cached
-        rowid table would make rollback O(total rows) by full-scanning each
-        tree.  Cleared on every txn boundary (commit keeps the bumped counter
-        but clears the set; rollback recomputes then clears) so it only ever
-        names tables bumped within the current txn. *)
   }
 
 let pp fmt t =
   Format.fprintf
     fmt
     "@[<hv>Catalog.t { tables = %d;@ indexes = %d;@ fts = %d;@ fk_enforcement = %b }@]"
-    (Hashtbl.length t.cache)
-    (Hashtbl.length t.indexes)
-    (Hashtbl.length t.fts)
+    (Schema_cache.count_tables t.sc)
+    (Schema_cache.count_indexes t.sc)
+    (Schema_cache.count_fts t.sc)
     t.fk_enforcement
 ;;
 
@@ -1154,15 +1361,24 @@ let save_fk_constraints ?txn t ~table_name ~fks =
     in
     (* Keep the mirror's FK list current so a mirror reconstruction restores
        constraints, not just columns. *)
-    match Hashtbl.find_opt t.cache table_name with
+    match Schema_cache.find_table t.sc table_name with
     | Some m -> put_mirror_tx tx { m with fk_constraints = fks }
     | None -> Lwt.return_unit)
 ;;
 
+(* #269/#282: this is a RAW, undo-free cache update by design — the FK mutation's
+   ROLLBACK is handled by the enclosing operation (the txn store-rollback, or
+   [add_column]'s schema-cache undo which restores the whole prior [table_meta]),
+   never by this call.  Hence [put_table_durable] (no undo), matching the original
+   [Hashtbl.replace] semantics exactly. *)
 let set_fk_constraints t ~table_name ~fks =
-  match Hashtbl.find_opt t.cache table_name with
+  match Schema_cache.find_table t.sc table_name with
   | None -> ()
-  | Some meta -> Hashtbl.replace t.cache table_name { meta with fk_constraints = fks }
+  | Some meta ->
+    Schema_cache.put_table_durable
+      t.sc
+      ~name:table_name
+      { meta with fk_constraints = fks }
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1228,23 +1444,21 @@ let open_ store =
            m.name
        | _ -> ())
     mirror;
-  (* #174: register every table's page-header stamp so subsequent writes
-     stamp the tree's schema fingerprint. *)
-  Hashtbl.iter (fun _ (m : table_meta) -> register_tag store m) cache;
+  (* #283: seed the sealed cache durably (no undo, this is open-time state).
+     [put_table_durable] re-stamps each table's #174 page-header tag, replacing
+     the old explicit [register_tag] iteration. *)
+  let sc = Schema_cache.create ~stamp:(fun m -> register_tag store m) in
+  Hashtbl.iter (fun name m -> Schema_cache.put_table_durable sc ~name m) cache;
+  Hashtbl.iter (fun name i -> Schema_cache.put_index_durable sc ~name i) indexes;
+  Hashtbl.iter (fun name m -> Schema_cache.put_fts_durable sc ~name m) fts;
   Lwt.return
     { store
-    ; cache
-    ; indexes
-    ; fts
+    ; sc
     ; fk_enforcement = false
     ; recursive_triggers = true
     ; defer_fks_pragma = false
     ; pending_fk_checks = []
     ; last_inserted_rowid = 0L
-    ; schema_undo = []
-    ; schema_savepoints = []
-    ; schema_txn_poisoned = false
-    ; rowid_bumped_in_txn = Hashtbl.create 8
     }
 ;;
 
@@ -1259,35 +1473,27 @@ let next_user_tid t =
   Lwt.return tid
 ;;
 
-(* #269: schema-cache undo log for DDL run inside an explicit transaction. *)
-let register_schema_undo t f = t.schema_undo <- f :: t.schema_undo
+(* #269: register an in-memory schema-cache reversal for a change run through an
+   explicit transaction.  Delegates to the sealed [Schema_cache] undo log so the
+   db layer's view/trigger-cache reversals replay in order with the catalog's own
+   DDL undos.  (Catalog DDL self-registers; this entry point is for the db layer's
+   own [t.views]/[t.triggers] caches, which live outside the catalog.) *)
+let register_schema_undo t f = Schema_cache.register_undo t.sc f
 
 (* #286: mark the ambient explicit transaction uncommittable because an in-txn
    DDL statement failed partway through (partial on-disk effects remain). *)
-let mark_schema_txn_poisoned t = t.schema_txn_poisoned <- true
-let schema_txn_poisoned t = t.schema_txn_poisoned
+let mark_schema_txn_poisoned t = Schema_cache.mark_poisoned t.sc
+let schema_txn_poisoned t = Schema_cache.is_poisoned t.sc
 
-let commit_schema_changes t =
-  t.schema_undo <- [];
-  t.schema_savepoints <- [];
-  t.schema_txn_poisoned <- false;
-  (* #293: COMMIT keeps the bumped next_rowid counter, so do NOT recompute — but
-     clear the dirty set so a later unrelated ROLLBACK won't wrongly recompute a
-     table that wasn't bumped in that later txn.  Also called at txn begin to
-     harden against a stale set leaking in. *)
-  Hashtbl.reset t.rowid_bumped_in_txn
-;;
+(* #293: COMMIT keeps the bumped next_rowid counter, so do NOT recompute — but
+   clears the dirty set so a later unrelated ROLLBACK won't wrongly recompute a
+   table that wasn't bumped in that later txn. *)
+let commit_schema_changes t = Schema_cache.commit t.sc
 
-let rollback_schema_changes t =
-  List.iter (fun f -> f ()) t.schema_undo;
-  t.schema_undo <- [];
-  t.schema_savepoints <- [];
-  t.schema_txn_poisoned <- false
-;;
-
-(* #293: the rowid dirty set is intentionally NOT cleared here.  The db layer
-     calls [recompute_rowid_counters_after_rollback] right after this on the
-     rollback path, and that function reads the set then clears it. *)
+(* #293: the rowid dirty set is intentionally NOT cleared on rollback here — the
+   db layer calls [recompute_rowid_counters_after_rollback] right after, which
+   reads the set then clears it. *)
+let rollback_schema_changes t = Schema_cache.rollback t.sc
 
 (* #293: re-derive the cached [next_rowid] from the (now rolled-back) data tree,
    using the same max(rowid)+1 logic as [recover_next_rowid], for ONLY the tables
@@ -1322,16 +1528,15 @@ let rollback_schema_changes t =
    (CREATE … AUTOINCREMENT fails to parse), so there is no sticky high-water
    counter for this recompute to clobber. *)
 let recompute_rowid_counters_after_rollback t =
-  let names = Hashtbl.fold (fun k _ acc -> k :: acc) t.rowid_bumped_in_txn [] in
-  Hashtbl.reset t.rowid_bumped_in_txn;
+  let names = Schema_cache.take_rowid_bumped t.sc in
   Lwt_list.iter_s
     (fun name ->
-       match Hashtbl.find_opt t.cache name with
+       match Schema_cache.find_table t.sc name with
        | None -> Lwt.return_unit
        | Some m when m.without_rowid -> Lwt.return_unit
        | Some m ->
          let%lwt recovered = recover_next_rowid t.store m in
-         Hashtbl.replace t.cache name recovered;
+         Schema_cache.set_rowid_durable t.sc ~name recovered;
          Lwt.return_unit)
     names
 ;;
@@ -1341,10 +1546,7 @@ let recompute_rowid_counters_after_rollback t =
    boundary between entries registered before and after it, and the current
    [schema_txn_poisoned] flag (#295) so [ROLLBACK TO] can restore the poison
    state as it was when this savepoint opened. *)
-let savepoint_begin_schema t name =
-  t.schema_savepoints
-  <- (name, t.schema_undo, t.schema_txn_poisoned) :: t.schema_savepoints
-;;
+let savepoint_begin_schema t name = Schema_cache.savepoint_begin t.sc name
 
 (* #280/#295: ROLLBACK TO a savepoint.  Run+drop the undo closures registered
    since the savepoint (the prefix of [schema_undo] down to its recorded
@@ -1358,31 +1560,7 @@ let savepoint_begin_schema t name =
    failure that PREDATES the savepoint left the poison flag already set when
    this savepoint opened, so the snapshot is [true] and the txn stays poisoned —
    exactly correct, since those partial effects are NOT unwound here. *)
-let savepoint_rollback_schema t name =
-  let rec find = function
-    | [] -> None
-    | (n, snap, poison) :: older when String.equal n name -> Some (snap, poison, older)
-    | _ :: rest -> find rest
-  in
-  match find t.schema_savepoints with
-  | None -> ()
-  | Some (snap, poison, older) ->
-    (* [snap] is a physical suffix of [t.schema_undo]; run closures ahead of it. *)
-    let rec run lst =
-      if lst == snap
-      then ()
-      else (
-        match lst with
-        | [] -> () (* defensive: snapshot not reached *)
-        | f :: tl ->
-          f ();
-          run tl)
-    in
-    run t.schema_undo;
-    t.schema_undo <- snap;
-    t.schema_txn_poisoned <- poison;
-    t.schema_savepoints <- (name, snap, poison) :: older
-;;
+let savepoint_rollback_schema t name = Schema_cache.savepoint_rollback t.sc name
 
 (* #280/#295: RELEASE a savepoint.  The since-savepoint undo entries merge into
    the enclosing scope, so [schema_undo] is untouched — only the marker (and any
@@ -1391,14 +1569,7 @@ let savepoint_rollback_schema t name =
    a poison raised since the savepoint survives the RELEASE into the enclosing
    scope.  An outer ROLLBACK still unwinds the merged entries.  Unknown name:
    no-op. *)
-let savepoint_release_schema t name =
-  let rec drop = function
-    | [] -> []
-    | (n, _, _) :: older when String.equal n name -> older
-    | _ :: rest -> drop rest
-  in
-  t.schema_savepoints <- drop t.schema_savepoints
-;;
+let savepoint_release_schema t name = Schema_cache.savepoint_release t.sc name
 
 (* Write a table's catalog rows (primary + columns + mirror) through [tx] and
    return its meta.  Shared by the autocommit and in-transaction paths. *)
@@ -1429,46 +1600,43 @@ let put_table_rows tx ~name ~columns ~without_rowid ~tid =
    autocommit path opens and commits its own writer txn (counter bump first, as
    before). *)
 let create_table ?txn t ~name ~columns ~without_rowid =
-  if Hashtbl.mem t.cache name
+  if Schema_cache.mem_table t.sc name
   then failwith (Printf.sprintf "table '%s' already exists" name);
   match txn with
   | Some tx ->
     let%lwt tid = next_user_tid_tx tx in
     let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~tid in
-    Hashtbl.replace t.cache name m;
-    (* [register_tag] stamps the store-global in-memory [tree_tags] for [tid].
+    (* [put_table] also stamps the store-global in-memory [tree_tags] for [tid].
        On ROLLBACK we revert only the cache entry, not the tag — but that is
        safe: the txn also rolls back [tid]'s allocation (the user-tid counter is
        restored), leaving [tid] unallocated, so no table_meta references it and
        nothing writes pages to it.  The next CREATE reuses [tid] and overwrites
        the tag.  A lingering stamp for an unreferenced tree therefore cannot
        mis-stamp any page (#174). *)
-    register_tag t.store m;
-    register_schema_undo t (fun () -> Hashtbl.remove t.cache name);
+    Schema_cache.put_table t.sc ~name m;
     Lwt.return tid
   | None ->
     let%lwt tid = next_user_tid t in
     let%lwt tx = S.rw_begin t.store in
     let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~tid in
     let%lwt () = S.commit tx in
-    Hashtbl.replace t.cache name m;
-    register_tag t.store m;
+    Schema_cache.put_table_durable t.sc ~name m;
     Lwt.return tid
 ;;
 
-let find_table t ~name = Lwt.return (Hashtbl.find_opt t.cache name)
-let find_table_cached t ~name = Hashtbl.find_opt t.cache name
+let find_table t ~name = Lwt.return (Schema_cache.find_table t.sc name)
+let find_table_cached t ~name = Schema_cache.find_table t.sc name
 
 let table_fingerprint t ~name =
-  Option.map fingerprint_of_meta (Hashtbl.find_opt t.cache name)
+  Option.map fingerprint_of_meta (Schema_cache.find_table t.sc name)
 ;;
 
 let fingerprints_by_tree_id t =
-  Hashtbl.fold
+  Schema_cache.fold_tables
     (fun _ (m : table_meta) acc ->
        (* Skip the ephemeral CTE sentinel (tree_id = -1): no real on-disk tree. *)
        if m.tree_id >= 0 then (m.tree_id, fingerprint_of_meta m) :: acc else acc)
-    t.cache
+    t.sc
     []
 ;;
 
@@ -1527,9 +1695,15 @@ let verify_against_mirror t =
   Lwt.return (List.rev !findings)
 ;;
 
-let register_ephemeral t (meta : table_meta) = Hashtbl.replace t.cache meta.name meta
-let unregister_ephemeral t ~name = Hashtbl.remove t.cache name
-let list_tables t = Lwt.return (Hashtbl.fold (fun _ v acc -> v :: acc) t.cache [])
+let register_ephemeral t (meta : table_meta) =
+  Schema_cache.put_table_durable t.sc ~name:meta.name meta
+;;
+
+let unregister_ephemeral t ~name = Schema_cache.remove_table_durable t.sc ~name
+
+let list_tables t =
+  Lwt.return (Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [])
+;;
 
 (* #250: pick the rowid to auto-allocate for a NULL/omitted id, and the new
    counter.  An unseeded table ([empty_next_rowid]) allocates 1 (SQLite: empty
@@ -1545,12 +1719,15 @@ let alloc_rowid (m : table_meta) : int64 * int64 =
 ;;
 
 let next_rowid t ~name =
-  match Hashtbl.find_opt t.cache name with
+  match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let id, next = alloc_rowid m in
     let m' = { m with next_rowid = next } in
-    Hashtbl.replace t.cache name m';
+    (* Update the cache BEFORE [rw_begin] (which yields), matching the original
+       order: find -> alloc -> cache-write stays atomic under Lwt so two
+       concurrent autocommit callers cannot read the same stale counter. *)
+    Schema_cache.set_rowid_durable t.sc ~name m';
     let%lwt tx = S.rw_begin t.store in
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     let%lwt () = S.commit tx in
@@ -1562,14 +1739,14 @@ let next_rowid t ~name =
     Use this when an explicit transaction is already held to avoid
     deadlocking on the store's RW mutex. *)
 let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
-  match Hashtbl.find_opt t.cache name with
+  match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let id, next = alloc_rowid m in
     let m' = { m with next_rowid = next } in
-    Hashtbl.replace t.cache name m';
-    (* #293: mark this table's counter dirty so a ROLLBACK recomputes only it. *)
-    Hashtbl.replace t.rowid_bumped_in_txn name ();
+    (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
+       ROLLBACK recomputes only it. *)
+    Schema_cache.bump_rowid t.sc ~name m';
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     Lwt.return id
 ;;
@@ -1586,7 +1763,7 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     [id < max_int] (the caller guards the ceiling), so it can never be the empty
     sentinel. *)
 let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
-  match Hashtbl.find_opt t.cache name with
+  match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
     let unseeded = Int64.equal m.next_rowid empty_next_rowid in
@@ -1594,10 +1771,10 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
     then Lwt.return_unit
     else (
       let m' = { m with next_rowid = at_least } in
-      Hashtbl.replace t.cache name m';
-      (* #293: mark dirty only when the counter actually moved (the early-return
-         no-op above leaves the cached counter untouched, so nothing to recompute). *)
-      Hashtbl.replace t.rowid_bumped_in_txn name ();
+      (* #293: [bump_rowid] caches [m'] and marks dirty only when the counter
+         actually moved (the early-return no-op above leaves the cached counter
+         untouched, so nothing to recompute). *)
+      Schema_cache.bump_rowid t.sc ~name m';
       S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
 ;;
 
@@ -1605,10 +1782,10 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
    threaded here so the index's catalog row, tree-ID and index-ID allocation,
    and cache entry all participate in it and roll back together. *)
 let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~origin =
-  if Hashtbl.mem t.indexes name
+  if Schema_cache.mem_index t.sc name
   then Lwt.return (Error (Printf.sprintf "index '%s' already exists" name))
   else (
-    match Hashtbl.find_opt t.cache table with
+    match Schema_cache.find_table t.sc table with
     | None -> Lwt.return (Error (Printf.sprintf "no table '%s'" table))
     | Some tm ->
       (* Validate: for plain columns, check they exist in the table; skip for expression columns *)
@@ -1644,8 +1821,7 @@ let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~or
             let%lwt () =
               S.put tx sys_indexes_tid (index_key id) (encode_index_value info)
             in
-            Hashtbl.replace t.indexes name info;
-            register_schema_undo t (fun () -> Hashtbl.remove t.indexes name);
+            Schema_cache.put_index t.sc ~name info;
             Lwt.return (Ok info)
           | None ->
             let%lwt tid = next_user_tid t in
@@ -1657,7 +1833,7 @@ let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~or
               S.put tx sys_indexes_tid (index_key id) (encode_index_value info)
             in
             let%lwt () = S.commit tx in
-            Hashtbl.replace t.indexes name info;
+            Schema_cache.put_index_durable t.sc ~name info;
             Lwt.return (Ok info))))
 ;;
 
@@ -1668,7 +1844,7 @@ let create_index ?txn t ~name ~table ~columns ~unique ~expr_flags ~where_sql ~or
    tree-tag fingerprint on [ROLLBACK] — unlike a fresh CREATE the tree_id stays
    allocated, so the #174 page-stamp must revert to the old schema too. *)
 let add_column ?txn t ~table_name ~(column : Row.column) =
-  match Hashtbl.find_opt t.cache table_name with
+  match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
     let exists =
@@ -1687,28 +1863,23 @@ let add_column ?txn t ~table_name ~(column : Row.column) =
           let%lwt () = S.put tx sys_columns_tid col_k col_v in
           put_mirror_tx tx new_meta)
       in
-      Hashtbl.replace t.cache table_name new_meta;
-      register_tag t.store new_meta;
       (match txn with
-       | Some _ ->
-         register_schema_undo t (fun () ->
-           Hashtbl.replace t.cache table_name meta;
-           register_tag t.store meta)
-       | None -> ());
+       | Some _ -> Schema_cache.put_table t.sc ~name:table_name new_meta
+       | None -> Schema_cache.put_table_durable t.sc ~name:table_name new_meta);
       Lwt.return (Ok ()))
 ;;
 
 let indexes_for_table t ~table =
-  Hashtbl.fold
+  Schema_cache.fold_indexes
     (fun _ info acc -> if info.idx_table = table then info :: acc else acc)
-    t.indexes
+    t.sc
     []
 ;;
 
-let find_index t ~name = Hashtbl.find_opt t.indexes name
+let find_index t ~name = Schema_cache.find_index t.sc name
 
 let find_index_covering_cols t ~table_name ~col_idxs =
-  match Hashtbl.find_opt t.cache table_name with
+  match Schema_cache.find_table t.sc table_name with
   | None -> None
   | Some meta ->
     let n_target = List.length col_idxs in
@@ -1763,8 +1934,8 @@ let find_index_covering_cols t ~table_name ~col_idxs =
           candidates)
 ;;
 
-let table_exists t ~name = Hashtbl.mem t.cache name
-let index_exists t ~name = Hashtbl.mem t.indexes name
+let table_exists t ~name = Schema_cache.mem_table t.sc name
+let index_exists t ~name = Schema_cache.mem_index t.sc name
 
 (** Scan _sys_indexes (using the given txn) to find the key for [name].
     Returns [None] if not found.
@@ -1801,31 +1972,15 @@ let drop_index t tx ~name =
     | None -> Lwt.return_unit
     | Some key -> S.del tx sys_indexes_tid key
   in
-  (* Update in-memory cache. *)
-  Hashtbl.remove t.indexes name;
+  (* Update in-memory cache.  [remove_index] self-registers a ROLLBACK restore. *)
+  Schema_cache.remove_index t.sc ~name;
   Lwt.return_unit
 ;;
-
-(* #282: re-insert an index_info into the in-memory cache.  Used by the executor
-   to register a ROLLBACK undo when [drop_index] is run for a dependent index
-   inside an ALTER … DROP COLUMN that participates in an explicit transaction —
-   the on-disk row is reverted by the store, this re-syncs the cache. *)
-let restore_index_cache t (info : index_info) =
-  Hashtbl.replace t.indexes info.idx_name info
-;;
-
-(* #279: re-insert a table_meta into the in-memory table cache.  Inverse of the
-   cache side of [drop_table]; used by the executor to register a ROLLBACK undo
-   so a DROP TABLE inside an explicit transaction restores the catalog cache when
-   the transaction is rolled back (the store reverts the _sys_* row deletes, this
-   re-syncs the cache).  The dependent indexes [drop_table] also removed are
-   restored separately via [restore_index_cache]. *)
-let restore_table_cache t (m : table_meta) = Hashtbl.replace t.cache m.name m
 
 let drop_table t tx ~name =
   (* 0. Remove the mirror entry (keyed by tree_id), if we know the tree_id. *)
   let%lwt () =
-    match Hashtbl.find_opt t.cache name with
+    match Schema_cache.find_table t.sc name with
     | Some m -> del_mirror_tx tx m.tree_id
     | None -> Lwt.return_unit
   in
@@ -1833,7 +1988,7 @@ let drop_table t tx ~name =
   let%lwt () = S.del tx sys_tables_tid (Bytes.of_string name) in
   (* 2. Remove all column entries from _sys_columns. *)
   let n_cols =
-    match Hashtbl.find_opt t.cache name with
+    match Schema_cache.find_table t.sc name with
     | None -> 0
     | Some m -> List.length m.columns
   in
@@ -1842,15 +1997,16 @@ let drop_table t tx ~name =
       (fun i -> S.del tx sys_columns_tid (column_key name i))
       (List.init n_cols (fun i -> i))
   in
-  (* 3. Remove all associated indexes. *)
+  (* 3. Remove all associated indexes.  Each [drop_index] self-registers its own
+     ROLLBACK restore. *)
   let idx_list = indexes_for_table t ~table:name in
   let%lwt () =
     Lwt_list.iter_s
       (fun (idx : index_info) -> drop_index t tx ~name:idx.idx_name)
       idx_list
   in
-  (* 4. Update in-memory cache. *)
-  Hashtbl.remove t.cache name;
+  (* 4. Update in-memory cache.  [remove_table] self-registers a ROLLBACK restore. *)
+  Schema_cache.remove_table t.sc ~name;
   Lwt.return_unit
 ;;
 
@@ -1918,36 +2074,39 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
     | Some _ -> Lwt.return_unit
     | None -> S.commit tx
   in
-  (* Update in-memory cache *)
-  Hashtbl.remove t.cache old_name;
-  Hashtbl.replace t.cache new_name { meta with name = new_name };
-  (* Update in-memory index entries that reference old table name *)
+  (* Update in-memory cache + index back-references.  Each mutator self-registers
+     its own ROLLBACK restore (replayed most-recent-first: index back-refs, then
+     the new table removed, then the old table restored — reversing the rename
+     exactly).  The fingerprint is unchanged by a rename, so [put_table]'s re-stamp
+     is a no-op. *)
   let to_update =
-    Hashtbl.fold
+    Schema_cache.fold_indexes
       (fun k v acc -> if String.equal v.idx_table old_name then (k, v) :: acc else acc)
-      t.indexes
+      t.sc
       []
   in
-  List.iter
-    (fun (k, v) -> Hashtbl.replace t.indexes k { v with idx_table = new_name })
-    to_update;
-  (* On ROLLBACK restore the cache key and the in-memory index back-references.
-     The fingerprint is unchanged by a rename, so no tree-tag undo is needed. *)
   (match txn with
    | Some _ ->
-     register_schema_undo t (fun () ->
-       Hashtbl.remove t.cache new_name;
-       Hashtbl.replace t.cache old_name meta;
-       List.iter (fun (k, v) -> Hashtbl.replace t.indexes k v) to_update)
-   | None -> ());
+     Schema_cache.remove_table t.sc ~name:old_name;
+     Schema_cache.put_table t.sc ~name:new_name { meta with name = new_name };
+     List.iter
+       (fun (k, v) -> Schema_cache.put_index t.sc ~name:k { v with idx_table = new_name })
+       to_update
+   | None ->
+     Schema_cache.remove_table_durable t.sc ~name:old_name;
+     Schema_cache.put_table_durable t.sc ~name:new_name { meta with name = new_name };
+     List.iter
+       (fun (k, v) ->
+          Schema_cache.put_index_durable t.sc ~name:k { v with idx_table = new_name })
+       to_update);
   Lwt.return (Ok ())
 ;;
 
 let rename_table ?txn t ~old_name ~new_name =
-  match Hashtbl.find_opt t.cache old_name with
+  match Schema_cache.find_table t.sc old_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" old_name))
   | Some meta ->
-    if Hashtbl.mem t.cache new_name
+    if Schema_cache.mem_table t.sc new_name
     then Lwt.return (Error (Printf.sprintf "table already exists: %s" new_name))
     else (
       let body tx =
@@ -1983,7 +2142,7 @@ let rename_table ?txn t ~old_name ~new_name =
    longer rolls a borrowed txn back — it surfaces an Error and leaves teardown to
    the caller. *)
 let rename_column ?txn t ~table_name ~old_col ~new_col =
-  match Hashtbl.find_opt t.cache table_name with
+  match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
     (match List.find_index (fun c -> String.equal c.Row.name old_col) meta.columns with
@@ -2008,14 +2167,9 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
            Lwt.return (Ok new_meta)
        in
        let finalize new_meta =
-         Hashtbl.replace t.cache table_name new_meta;
-         register_tag t.store new_meta;
          match txn with
-         | Some _ ->
-           register_schema_undo t (fun () ->
-             Hashtbl.replace t.cache table_name meta;
-             register_tag t.store meta)
-         | None -> ()
+         | Some _ -> Schema_cache.put_table t.sc ~name:table_name new_meta
+         | None -> Schema_cache.put_table_durable t.sc ~name:table_name new_meta
        in
        (match txn with
         | Some tx ->
@@ -2042,7 +2196,7 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
    executor ([alter_drop_column]) is responsible for migrating the row data
    through the same txn. *)
 let drop_column ?txn t ~table_name ~col_name =
-  match Hashtbl.find_opt t.cache table_name with
+  match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
   | Some meta ->
     let rec find_idx i = function
@@ -2080,14 +2234,9 @@ let drop_column ?txn t ~table_name ~col_name =
            in
            put_mirror_tx tx new_meta)
        in
-       Hashtbl.replace t.cache table_name new_meta;
-       register_tag t.store new_meta;
        (match txn with
-        | Some _ ->
-          register_schema_undo t (fun () ->
-            Hashtbl.replace t.cache table_name meta;
-            register_tag t.store meta)
-        | None -> ());
+        | Some _ -> Schema_cache.put_table t.sc ~name:table_name new_meta
+        | None -> Schema_cache.put_table_durable t.sc ~name:table_name new_meta);
        Lwt.return (Ok ()))
 ;;
 
@@ -2095,8 +2244,11 @@ let drop_column ?txn t ~table_name ~col_name =
 (* FTS public API                                                       *)
 (* ------------------------------------------------------------------ *)
 
-let find_fts (t : t) name = Hashtbl.find_opt t.fts name
-let list_fts_tables (t : t) = Hashtbl.fold (fun _name meta acc -> meta :: acc) t.fts []
+let find_fts (t : t) name = Schema_cache.find_fts t.sc name
+
+let list_fts_tables (t : t) =
+  Schema_cache.fold_fts (fun _name meta acc -> meta :: acc) t.sc []
+;;
 
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is
    threaded here so the FTS metadata write and both tree-ID allocations
@@ -2120,8 +2272,7 @@ let create_fts_table ?txn (t : t) ~name ~columns : fts_table_meta Lwt.t =
       }
     in
     let%lwt () = S.put tx sys_fts_tid (Bytes.of_string name) (encode_fts_value meta) in
-    Hashtbl.replace t.fts name meta;
-    register_schema_undo t (fun () -> Hashtbl.remove t.fts name);
+    Schema_cache.put_fts t.sc ~name meta;
     Lwt.return meta
   | None ->
     (* Allocate two new tree IDs: one for content, one for the inverted index *)
@@ -2140,7 +2291,7 @@ let create_fts_table ?txn (t : t) ~name ~columns : fts_table_meta Lwt.t =
     let value = encode_fts_value meta in
     let%lwt () = S.put tx sys_fts_tid key value in
     let%lwt () = S.commit tx in
-    Hashtbl.replace t.fts name meta;
+    Schema_cache.put_fts_durable t.sc ~name meta;
     Lwt.return meta
 ;;
 
