@@ -274,9 +274,10 @@ let test_deferred_fk_commit_rollback_reuses_rowid () =
   let db = fresh_db () in
   exec db "PRAGMA foreign_keys = 1";
   exec db "CREATE TABLE fk_par (id INTEGER PRIMARY KEY)";
-  exec db
-    "CREATE TABLE fk_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES \
-     fk_par(id) DEFERRABLE INITIALLY DEFERRED)";
+  exec
+    db
+    "CREATE TABLE fk_chi (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES fk_par(id) \
+     DEFERRABLE INITIALLY DEFERRED)";
   (* Plain rowid table T, committed with rowids 1,2 (counter sits at 3). *)
   exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
   exec db "INSERT INTO t (b) VALUES ('a')";
