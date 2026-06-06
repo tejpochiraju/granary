@@ -7,9 +7,20 @@ name: Jepsen nightly (#177)
 # so it runs nightly rather than per-PR. The OCaml lost-update regression
 # (test_concurrent_rmw_223) already runs per-PR inside `dune runtest`.
 #
-# Runs on the host runner (not inside a job container) so it can drive podman and
-# grant lazyfs the FUSE device + CAP_SYS_ADMIN it needs. Requires the self-hosted
-# runner host to allow `podman run --device /dev/fuse --cap-add SYS_ADMIN`.
+# Runs in act_runner "host mode" (no job container). Note that host mode does NOT
+# mean the bare metal host: the job executes inside the otp-forgejo-runner
+# container (Alpine, non-root uid 1000, no node/sudo/apt). That container has the
+# podman CLI plus the host's rootless podman socket mounted
+# (CONTAINER_HOST=unix:///run/podman/podman.sock), so every `podman ...` below is
+# a REMOTE client call executed by the host's podman. Two consequences (#305):
+#   - JS actions (actions/checkout@v4, actions/cache@v4, ...) cannot run here —
+#     there is no node and no way to install one as uid 1000. Use plain git.
+#   - Bind-mount paths in `podman run -v ...` resolve on the HOST, not in this
+#     job's filesystem, so the suite must not bind-mount the workspace. The
+#     image already bakes the source in via `COPY . /workspace/` (the build
+#     context IS this checkout, tarred over the socket by the remote build).
+# Rootless podman on the host does allow `--device /dev/fuse --cap-add
+# SYS_ADMIN` (verified), which lazyfs needs.
 
 on:
   schedule:
@@ -26,27 +37,34 @@ jobs:
   jepsen-full:
     runs-on: self-hosted
     steps:
-      # actions/checkout@v4 is a JS action and needs `node` in PATH. This job
-      # runs directly on the host runner (no job container), unlike ci.yml whose
-      # node lives inside the opam container, so install it on the host only if
-      # it is missing — avoids re-running apt on every nightly when it is already
-      # present. Mirrors the "Install Node.js" fix applied to ci.yml.
-      - name: Install Node.js (needed by actions/checkout)
+      # Plain-git checkout: actions/checkout@v4 needs node, which the host-mode
+      # environment lacks (see header). act gives each job a fresh random
+      # workdir (<parent>/<16hex>/hostexecutor), so the wipe is only a guard
+      # against leftovers. The repo is private — pass the actions token via
+      # basic auth on the fetch URL only (not persisted in .git/config).
+      - name: Checkout (plain git — no node in host mode)
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVER: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
         run: |
-          command -v node >/dev/null 2>&1 || {
-            sudo apt-get update -q
-            sudo apt-get install -y -q nodejs
-          }
-
-      - uses: actions/checkout@v4
+          set -eu
+          find . -mindepth 1 -delete
+          git init -q .
+          git fetch -q --depth 1 \
+            "https://x-access-token:${TOKEN}@${SERVER#https://}/${REPO}.git" \
+            "${GITHUB_SHA}"
+          git checkout -q FETCH_HEAD
 
       - name: Build Jepsen image (cached by podman layers across runs)
         run: podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
 
+      # No -v bind mount: paths would resolve on the host (remote podman), and
+      # the image already contains this checkout at /workspace via COPY.
       - name: Run full #177 suite + gate
         run: |
           podman run --rm --device /dev/fuse --cap-add SYS_ADMIN \
-            -v "$PWD":/workspace:z -w /workspace --entrypoint bash \
+            -w /workspace --entrypoint bash \
             sqlocaml-jepsen jepsen/run/ci_full.sh
 
       # On any failure above, open a Forgejo issue so the nightly does not fail
