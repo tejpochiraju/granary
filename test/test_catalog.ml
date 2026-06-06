@@ -852,6 +852,47 @@ let corrupt_default_tag () =
     Alcotest.(check bool) "recovered default is None" true (c.Row.default = None)
 ;;
 
+(* #299: the AUTOINCREMENT flag round-trips through the redundant mirror (v2).
+   Delete the primary _sys_tables row so the table is reconstructed solely from
+   the mirror on reopen, then assert the reconstructed meta still carries
+   [autoincrement = true].  (Per #299's mirror limitation, the volatile rowid
+   COUNTER is recomputed from data here — only the flag is mirror-persisted.) *)
+let mirror_preserves_autoincrement () =
+  let store = S.create () in
+  run
+    (let* cat = C.open_ store in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:
+           [ { Row.name = "a"
+             ; ty = Row.Integer
+             ; not_null = false
+             ; primary_key = true
+             ; default = None
+             ; check_sql = None
+             ; generated_as = None
+             }
+           ]
+         ~without_rowid:false
+         ~autoincrement:true
+     in
+     (* Drop the primary _sys_tables row (tid 0, key "t") so the next open
+        cannot load it from the primary and must reconstruct from the mirror. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     S.commit tx);
+  let cat2 = Lwt_main.run (C.open_ store) in
+  match Lwt_main.run (C.find_table cat2 ~name:"t") with
+  | None -> Alcotest.fail "t should be reconstructed from the mirror"
+  | Some m ->
+    Alcotest.(check bool)
+      "mirror-reconstructed table keeps autoincrement=true"
+      true
+      m.C.autoincrement
+;;
+
 let test_default_int_roundtrip () =
   run
     (let store = S.create () in
@@ -2160,6 +2201,10 @@ let () =
         ; Alcotest.test_case "create_empty_columns" `Quick test_create_empty_columns
         ; Alcotest.test_case "corrupt_column_type_tag" `Quick corrupt_column_type_tag
         ; Alcotest.test_case "corrupt_default_tag" `Quick corrupt_default_tag
+        ; Alcotest.test_case
+            "mirror_preserves_autoincrement"
+            `Quick
+            mirror_preserves_autoincrement
         ] )
     ; ( "backward_compat"
       , [ Alcotest.test_case
