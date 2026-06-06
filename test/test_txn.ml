@@ -187,6 +187,81 @@ let test_rollback_does_not_disturb_committed_other_table () =
     rows
 ;;
 
+(* #303: ROLLBACK TO SAVEPOINT must revert the in-memory next_rowid counter the
+   same way a full ROLLBACK does (#293).  An INSERT after the savepoint bumps the
+   cached counter; [ROLLBACK TO s] reverts the store row for that INSERT but must
+   also restore the cached counter so the next allocation REUSES the rolled-back
+   rowid (SQLite parity for a plain rowid table).  Unlike the full-ROLLBACK path,
+   the recompute-from-tree trick is unusable here: the RW txn stays open, so a
+   fresh RO snapshot sees the last-committed tree, not the savepoint state.  The
+   fix snapshots the cached counters at SAVEPOINT and restores them on ROLLBACK
+   TO (Schema_cache, in-memory). *)
+let test_rollback_to_savepoint_reuses_rowid () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* rowid 1 *)
+  exec db "SAVEPOINT s";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  (* rowid 2, bumps the cached counter again *)
+  exec db "ROLLBACK TO s";
+  exec db "INSERT INTO t (b) VALUES ('z')";
+  (* must reuse the rolled-back rowid 2, not skip to 3 *)
+  exec db "COMMIT";
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "ROLLBACK TO reuses the rolled-back rowid 2"
+    [ 1, "x"; 2, "z" ]
+    rows
+;;
+
+(* #303: the table's counter is FIRST bumped AFTER the savepoint opened (the
+   savepoint snapshot must capture the pre-bump counter, here the empty/unseeded
+   sentinel, even though the table was not yet in the rowid dirty set). *)
+let test_rollback_to_savepoint_reuses_rowid_first_bump () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "BEGIN";
+  exec db "SAVEPOINT s";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* rowid 1, first bump of t, after the savepoint *)
+  exec db "ROLLBACK TO s";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  (* must reuse rowid 1 *)
+  exec db "COMMIT";
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "ROLLBACK TO restores the unseeded counter so rowid 1 is reused"
+    [ 1, "y" ]
+    rows
+;;
+
+(* #303: nested savepoints — a bump that happens only inside the INNER savepoint
+   must still be reverted by a ROLLBACK TO the OUTER one (which discards the inner
+   frame).  The outer snapshot captures t's counter as of the outer SAVEPOINT, so
+   the rowid allocated under the inner savepoint is reused after rolling back. *)
+let test_rollback_to_outer_savepoint_reuses_rowid_nested () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO t (b) VALUES ('x')";
+  (* rowid 1 *)
+  exec db "SAVEPOINT sp_out";
+  exec db "SAVEPOINT sp_in";
+  exec db "INSERT INTO t (b) VALUES ('y')";
+  (* rowid 2, bumped only under the inner savepoint *)
+  exec db "ROLLBACK TO sp_out";
+  exec db "INSERT INTO t (b) VALUES ('z')";
+  (* must reuse rowid 2 *)
+  exec db "COMMIT";
+  let rows = query_int_text db "SELECT a, b FROM t ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "ROLLBACK TO sp_out reuses the rowid bumped under the inner savepoint"
+    [ 1, "x"; 2, "z" ]
+    rows
+;;
+
 let test_begin_commit_visible () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (n INTEGER)";
@@ -537,6 +612,18 @@ let () =
             "rollback_does_not_disturb_committed_other_table"
             `Quick
             test_rollback_does_not_disturb_committed_other_table
+        ; Alcotest.test_case
+            "rollback_to_savepoint_reuses_rowid"
+            `Quick
+            test_rollback_to_savepoint_reuses_rowid
+        ; Alcotest.test_case
+            "rollback_to_savepoint_reuses_rowid_first_bump"
+            `Quick
+            test_rollback_to_savepoint_reuses_rowid_first_bump
+        ; Alcotest.test_case
+            "rollback_to_outer_savepoint_reuses_rowid_nested"
+            `Quick
+            test_rollback_to_outer_savepoint_reuses_rowid_nested
         ] )
     ; "parse", [ Alcotest.test_case "parse_begin" `Quick test_parse_begin ]
     ; ( "execute_change_count"
