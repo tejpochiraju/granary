@@ -59,6 +59,37 @@ let sqlite_master_meta : Cat.table_meta =
   }
 ;;
 
+(* #312: synthesized read-only view over the AUTOINCREMENT counters. *)
+let sqlite_sequence_meta : Cat.table_meta =
+  { Cat.name = "sqlite_sequence"
+  ; Cat.tree_id = -3
+  ; Cat.columns =
+      [ { Row.name = "name"
+        ; Row.ty = Row.Text
+        ; Row.not_null = false
+        ; Row.primary_key = false
+        ; Row.pk_desc = false
+        ; Row.default = None
+        ; Row.check_sql = None
+        ; Row.generated_as = None
+        }
+      ; { Row.name = "seq"
+        ; Row.ty = Row.Integer
+        ; Row.not_null = false
+        ; Row.primary_key = false
+        ; Row.pk_desc = false
+        ; Row.default = None
+        ; Row.check_sql = None
+        ; Row.generated_as = None
+        }
+      ]
+  ; Cat.next_rowid = 0L
+  ; Cat.fk_constraints = []
+  ; Cat.without_rowid = false
+  ; Cat.autoincrement = false
+  }
+;;
+
 type binop =
   | Eq
   | Ne
@@ -2738,6 +2769,8 @@ let bind_select
     let tbl_lower = String.lowercase_ascii table in
     if String.equal tbl_lower "sqlite_master" || String.equal tbl_lower "sqlite_schema"
     then Lwt.return (Some sqlite_master_meta)
+    else if String.equal tbl_lower "sqlite_sequence"
+    then Lwt.return (Some sqlite_sequence_meta)
     else Cat.find_table cat ~name:table
   in
   match meta_opt with

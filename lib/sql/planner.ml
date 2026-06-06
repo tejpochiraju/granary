@@ -121,12 +121,17 @@ let recognise_eq_col_col = function
   | _ -> None
 ;;
 
+(* Negative [tree_id]s are sentinels for synthesized scans with no real B-tree:
+   -1 = CTE, -2 = sqlite_master, -3 = sqlite_sequence.  Each is materialized by a
+   dedicated plan op rather than a [Op_seq_scan] over a stored tree. *)
 let make_scan (meta : Cat.table_meta) : Plan.op =
   if meta.Cat.tree_id = -1
   then
     Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
   else if meta.Cat.tree_id = -2
   then Plan.Op_sqlite_master
+  else if meta.Cat.tree_id = -3
+  then Plan.Op_sqlite_sequence
   else Plan.Op_seq_scan { table_meta = meta }
 ;;
 

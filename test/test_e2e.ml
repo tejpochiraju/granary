@@ -11868,6 +11868,51 @@ let qcheck_pk_desc_unique =
           Lwt.return !ok))
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* sqlite_sequence (#312) — queryable read-only view                   *)
+(* ------------------------------------------------------------------ *)
+
+let sqlite_sequence_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  (* absent until first insert *)
+  Alcotest.(check int)
+    "empty before insert"
+    0
+    (List.length (query_ok db "SELECT seq FROM sqlite_sequence"));
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  let rows = query_ok db "SELECT name, seq FROM sqlite_sequence" in
+  match rows with
+  | [ row ] ->
+    Alcotest.(check string)
+      "name"
+      "t"
+      (match row.(0) with
+       | Db.V_text s -> s
+       | _ -> Alcotest.fail "name");
+    Alcotest.(check int64)
+      "seq is high-water (2)"
+      2L
+      (match row.(1) with
+       | Db.V_int n -> n
+       | _ -> Alcotest.fail "seq")
+  | _ -> Alcotest.fail "expected one sqlite_sequence row"
+;;
+
+let sqlite_sequence_in_master () =
+  let db = fresh_db () in
+  let master_has name =
+    let rows =
+      query_ok db (Printf.sprintf "SELECT name FROM sqlite_master WHERE name = '%s'" name)
+    in
+    List.length rows > 0
+  in
+  Alcotest.(check bool) "absent initially" false (master_has "sqlite_sequence");
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)";
+  Alcotest.(check bool) "present after autoinc table" true (master_has "sqlite_sequence")
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12787,5 +12832,9 @@ let () =
             pk_desc_persists_across_reopen
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_pk_desc_unique ] )
+    ; ( "sqlite_sequence (#312)"
+      , [ Alcotest.test_case "select" `Quick sqlite_sequence_select
+        ; Alcotest.test_case "in_master" `Quick sqlite_sequence_in_master
+        ] )
     ]
 ;;

@@ -73,6 +73,12 @@ type table_meta =
         of the top row is never reused. *)
   }
 
+(** Sentinel [next_rowid] for a rowid/alias table that has never seeded its
+    counter — conceptually [max = -inf].  Used to tell "never inserted" apart
+    from a live counter (e.g. an AUTOINCREMENT table absent from
+    [sqlite_sequence] until its first insert).  See #250/#312. *)
+val empty_next_rowid : int64
+
 (** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
     if the table qualifies (rowid table, single INTEGER PRIMARY KEY column).
     For such tables the table tree is keyed by this column's value and no

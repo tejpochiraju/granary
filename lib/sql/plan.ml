@@ -329,6 +329,7 @@ type op =
   | Op_drop_trigger of { name : string }
   | Op_sqlite_master
   (** Virtual scan that reconstructs sqlite_master rows from catalog metadata. *)
+  | Op_sqlite_sequence (** #312: virtual scan over AUTOINCREMENT counters (name, seq). *)
   | Op_no_op (** No-op plan node produced by IF EXISTS DROP when object not found. *)
   | Op_changes
   (** Returns rows affected by last DML. Intercepted in db.ml query — not exec.ml. *)

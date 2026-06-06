@@ -5419,6 +5419,7 @@ let op_name = function
   | Plan.Op_fts_match_scan { fts_meta; _ } ->
     "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_sqlite_master -> "SqliteMaster"
+  | Plan.Op_sqlite_sequence -> "SqliteSequence"
 ;;
 
 let op_children = function
@@ -6425,7 +6426,8 @@ let execute_with_count
   | Plan.Op_fts_seq_scan _
   | Plan.Op_fts_match_scan _
   | Plan.Op_distinct _
-  | Plan.Op_sqlite_master -> failwith "Exec.execute: use Exec.query for read operations"
+  | Plan.Op_sqlite_master
+  | Plan.Op_sqlite_sequence -> failwith "Exec.execute: use Exec.query for read operations"
 ;;
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -8861,8 +8863,45 @@ and stream_sqlite_master store cat =
          |])
       (Cat.list_fts_tables cat_val)
   in
+  (* #312: sqlite_sequence appears in sqlite_master once any AUTOINCREMENT
+     table exists (matching SQLite — independent of whether a row has been
+     inserted yet). *)
+  let seq_rows =
+    if List.exists (fun (m : Cat.table_meta) -> m.Cat.autoincrement) tables
+    then
+      [ [| Row.V_text "table"
+         ; Row.V_text "sqlite_sequence"
+         ; Row.V_text "sqlite_sequence"
+         ; Row.V_int 0L
+         ; Row.V_text "CREATE TABLE sqlite_sequence(name,seq)"
+        |]
+      ]
+    else []
+  in
   Lwt.return
-    (Lwt_stream.of_list (table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+    (Lwt_stream.of_list
+       (table_rows @ seq_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+
+and stream_sqlite_sequence cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_sqlite_sequence requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  let rows =
+    List.filter_map
+      (fun (m : Cat.table_meta) ->
+         if m.Cat.autoincrement && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid)
+         then
+           (* [next_rowid] is the next id to allocate, so the high-water mark
+              (last id handed out — SQLite's [sqlite_sequence.seq]) is
+              [next_rowid - 1]. *)
+           Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub m.Cat.next_rowid 1L) |]
+         else None)
+      tables
+  in
+  Lwt.return (Lwt_stream.of_list rows)
 
 and stream_union clock params store mode cat all left right =
   let* ls = to_stream clock params store ~mode ~cat left in
@@ -9360,6 +9399,7 @@ and to_stream
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check -> stream_pragma_integrity_check store cat
   | Plan.Op_sqlite_master -> stream_sqlite_master store cat
+  | Plan.Op_sqlite_sequence -> stream_sqlite_sequence cat
   | Plan.Op_union { all; left; right } ->
     stream_union clock params store mode cat all left right
   | Plan.Op_intersect { left; right } ->
