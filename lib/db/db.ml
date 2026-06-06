@@ -399,6 +399,29 @@ let begin_txn t =
     Lwt.return (Ok ())
 ;;
 
+(* Roll back the active explicit transaction and reset ALL connection txn state
+   in one place: store rollback + #269 schema-undo replay + #293/#301 rowid-
+   counter recompute + the [explicit_txn]/[savepoint_names]/[auto_began] resets +
+   FK/defer cleanup.  Every rollback path (user-issued, #286's poisoned-COMMIT
+   force, the COMMIT-time deferred-FK arm) routes through here so the reset
+   sequence can't drift between them — #301 was exactly that drift. *)
+let force_rollback_txn t tx =
+  let* () = S.rollback tx in
+  Cat.rollback_schema_changes t.catalog;
+  (* #293: an in-txn INSERT bumped the in-memory next_rowid counter; the store
+     row reverted with [S.rollback] above but the cache did not.  Re-derive each
+     rowid table's counter from the rolled-back data tree so the next allocation
+     reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
+     after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
+  let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
+  t.explicit_txn <- None;
+  t.savepoint_names <- [];
+  t.auto_began <- false;
+  Cat.clear_pending_fk_checks t.catalog;
+  Cat.set_defer_fks_pragma t.catalog false;
+  Lwt.return_unit
+;;
+
 (** Drain any pending deferred FK checks queued during the transaction.
     For each entry, run the recheck closure (passing the active write txn so
     it observes uncommitted writes); on the first one still violated,
@@ -413,24 +436,14 @@ let drain_pending_fks_or_fail t (tx : S.rw S.txn) : unit Lwt.t =
     | check :: rest ->
       let* still = check.Cat.pfk_recheck.Cat.recheck tx in
       if still
-      then (
-        (* Rollback the underlying txn so the caller gets a clean state. *)
-        let* () = S.rollback tx in
-        (* #269: revert any in-txn DDL's in-memory cache changes too. *)
-        Cat.rollback_schema_changes t.catalog;
-        (* #301: like [force_rollback_txn] (#293), an in-txn INSERT bumped the
-           in-memory next_rowid counter; the store row reverted with
-           [S.rollback] above but the cache did not.  Re-derive each bumped
-           rowid table's counter from the rolled-back data tree so the next
-           allocation reuses a rolled-back rowid (SQLite parity).  Safe here:
-           [S.rollback] already released the RW lock, so the recompute's fresh
-           RO snapshot sees the last-committed tree. *)
-        let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
-        t.explicit_txn <- None;
-        t.savepoint_names <- [];
-        t.auto_began <- false;
-        Cat.set_defer_fks_pragma t.catalog false;
-        Lwt.fail_with check.Cat.pfk_message)
+      then
+        (* #309: roll back and reset all connection txn state via the shared
+           [force_rollback_txn] (store rollback + #269 schema-undo + #293/#301
+           rowid recompute + field/FK/defer resets), then surface the violation.
+           The extra [clear_pending_fk_checks] it does is idempotent with this
+           function's [Lwt.finalize] arm below. *)
+        let* () = force_rollback_txn t tx in
+        Lwt.fail_with check.Cat.pfk_message
       else loop rest
   in
   Lwt.finalize
@@ -470,28 +483,6 @@ let drain_pending_fks_autocommit t : (unit, error) result Lwt.t =
       (fun () ->
          Cat.clear_pending_fk_checks t.catalog;
          Lwt.return_unit)
-;;
-
-(* Roll back the active explicit transaction and reset all connection txn state
-   (store rollback + #269 schema-undo replay + FK/defer cleanup).  Shared by the
-   user-issued [rollback_txn] and #286's forced rollback when a COMMIT cannot
-   proceed because the transaction was poisoned by a failed in-txn DDL statement
-   (partial on-disk effects remain). *)
-let force_rollback_txn t tx =
-  let* () = S.rollback tx in
-  Cat.rollback_schema_changes t.catalog;
-  (* #293: an in-txn INSERT bumped the in-memory next_rowid counter; the store
-     row reverted with [S.rollback] above but the cache did not.  Re-derive each
-     rowid table's counter from the rolled-back data tree so the next allocation
-     reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
-     after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
-  let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
-  t.explicit_txn <- None;
-  t.savepoint_names <- [];
-  t.auto_began <- false;
-  Cat.clear_pending_fk_checks t.catalog;
-  Cat.set_defer_fks_pragma t.catalog false;
-  Lwt.return_unit
 ;;
 
 let commit_txn t =
