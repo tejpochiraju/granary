@@ -11574,6 +11574,63 @@ let assert_create_rejected sql needle =
       contains
 ;;
 
+(* #299 property: under any interleaving of committed INSERT/DELETE ops, an
+   AUTOINCREMENT id is strictly greater than every id allocated before it —
+   i.e. ids are never reused, even after the top row (or all rows) are deleted.
+   Right after an INSERT the new id is the current max(a) (AUTOINCREMENT makes
+   it exceed all live AND deleted ids). *)
+let qcheck_autoincrement_monotonic =
+  QCheck.Test.make
+    ~name:"autoincrement: ids strictly increase, never reused"
+    ~count:2000
+    (* each op: [true] = INSERT, [false] = DELETE the current top row *)
+    QCheck.(list_size Gen.(0 -- 30) bool)
+    (fun ops ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ =
+            Db.execute db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)"
+          in
+          let high = ref 0L in
+          let ok = ref true in
+          let read_max () =
+            let* r = Db.query db "SELECT a FROM t ORDER BY a DESC LIMIT 1" in
+            match r with
+            | Error _ ->
+              ok := false;
+              Lwt.return_none
+            | Ok s ->
+              let* rows = Lwt_stream.to_list s in
+              (match rows with
+               | row :: _ ->
+                 (match row.(0) with
+                  | Db.V_int n -> Lwt.return_some n
+                  | _ -> Lwt.return_none)
+               | [] -> Lwt.return_none)
+          in
+          let* () =
+            Lwt_list.iter_s
+              (fun is_insert ->
+                 if is_insert
+                 then (
+                   let* _ = Db.execute db "INSERT INTO t (b) VALUES ('x')" in
+                   let* m = read_max () in
+                   (match m with
+                    | Some n ->
+                      if Int64.compare n !high <= 0 then ok := false;
+                      high := n
+                    | None -> ());
+                   Lwt.return_unit)
+                 else
+                   let* _ =
+                     Db.execute db "DELETE FROM t WHERE a = (SELECT max(a) FROM t)"
+                   in
+                   Lwt.return_unit)
+              ops
+          in
+          Lwt.return !ok))
+;;
+
 (* Tier 1 guardrails: AUTOINCREMENT only on a single-column INTEGER PK rowid
    table — matching SQLite's rejection messages. *)
 let autoincrement_rejections () =
@@ -12483,6 +12540,7 @@ let () =
     ; ( "autoincrement (#299)"
       , [ Alcotest.test_case "create_and_insert" `Quick autoincrement_create_and_insert
         ; Alcotest.test_case "rejections" `Quick autoincrement_rejections
-        ] )
+        ]
+        @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
     ]
 ;;
