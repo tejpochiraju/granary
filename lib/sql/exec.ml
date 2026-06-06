@@ -5420,6 +5420,8 @@ let op_name = function
     "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_sqlite_master -> "SqliteMaster"
   | Plan.Op_sqlite_sequence -> "SqliteSequence"
+  | Plan.Op_seq_set { table; _ } -> "SeqSet(" ^ table ^ ")"
+  | Plan.Op_seq_reset { table } -> "SeqReset(" ^ table ^ ")"
 ;;
 
 let op_children = function
@@ -6335,6 +6337,18 @@ let execute_with_count
       ~limit
       ~offset
       ~indexes
+  | Plan.Op_seq_set { table; seq } ->
+    (* #312.1: writable sqlite_sequence SET/INSERT.  Runs through [with_ddl_txn]
+       so it participates in any ambient explicit transaction (borrowed [In_txn]
+       — reverts on ROLLBACK) or owns its own auto-committed txn ([Auto]). *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* () = Cat.set_next_rowid_in_txn cat ~name:table ~requested:seq tx in
+      Lwt.return 0)
+  | Plan.Op_seq_reset { table } ->
+    (* #312.1: writable sqlite_sequence DELETE. *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* () = Cat.reset_next_rowid_in_txn cat ~name:table tx in
+      Lwt.return 0)
   | Plan.Op_drop_table { table_meta; indexes } ->
     execute_drop_table_op store cat ~mode ~table_meta ~indexes
   | Plan.Op_drop_index { idx_info } ->
@@ -9507,6 +9521,8 @@ and to_stream
   | Plan.Op_database_list | Plan.Op_active_database_get ->
     failwith "Exec.query: routed via Db.query (no Db handle)"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
+    failwith "Exec.query: use Exec.execute for write operations"
+  | Plan.Op_seq_set _ | Plan.Op_seq_reset _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 ;;
 

@@ -938,6 +938,8 @@ let rec plan ?cat = function
     plan_update cat ~table_meta ~assignments ~where ~order ~limit ~offset ~returning
   | Sema.BS_delete { table_meta; where; order; limit; offset; returning } ->
     plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning
+  | Sema.BS_seq_write (Sema.Seq_set { table; seq }) -> Plan.Op_seq_set { table; seq }
+  | Sema.BS_seq_write (Sema.Seq_reset { table }) -> Plan.Op_seq_reset { table }
   | Sema.BS_drop_table { table_meta; _ } ->
     Plan.Op_drop_table { table_meta; indexes = indexes_of cat table_meta }
   | Sema.BS_drop_index { idx_info; _ } -> Plan.Op_drop_index { idx_info }

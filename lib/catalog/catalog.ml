@@ -1963,6 +1963,97 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
       put_table_counter_tx tx m')
 ;;
 
+(* #312.1: largest stored rowid in a table's data tree, computed within an
+   already-open txn.  Used only on the uncommon lower-clamp path of a writable
+   [sqlite_sequence] SET/INSERT, to avoid lowering the counter below the live
+   max(rowid).  The store has no [cursor_last]/[cursor_prev], so this reuses the
+   forward walk from [recover_next_rowid]: [Rowid.encode]'s offset-binary
+   encoding sorts integer rowids correctly, so the last key in byte order is the
+   maximum.  Returns [None] for an empty tree. *)
+let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
+  match Schema_cache.find_table t.sc name with
+  (* Private helper; the sole caller ([set_next_rowid_in_txn]) has already
+     confirmed the table is present, so this arm is unreachable in practice. *)
+  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | Some m ->
+    let%lwt cur = S.cursor_open tx m.tree_id in
+    let _sr = S.cursor_first cur in
+    let max_key = ref None in
+    let rec walk () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, _) ->
+        max_key := Some k;
+        walk ()
+    in
+    walk ();
+    S.cursor_close cur;
+    Lwt.return
+      (match !max_key with
+       | None -> None
+       | Some k -> Some (Rowid.decode k))
+;;
+
+(* #312.1: writable [sqlite_sequence] SET/INSERT for table [name] with the
+   requested seq value [requested].  Faithful to SQLite's effective rule
+   [next = max(requested, max(rowid)) + 1]: the new counter is
+   [max(requested + 1, max(rowid) + 1)].
+   - RAISE path (the common case): when [requested + 1 >= next_rowid] and the
+     counter is already seeded, [next_rowid] already equals [max(rowid) + 1], so
+     just set [next_rowid := requested + 1] — no tree scan needed.
+   - LOWER path: when [requested + 1] would drop below the counter (or the
+     counter is unseeded), clamp to [max(rowid) + 1] so the next insert never
+     collides with a live row.
+   Mutates through [tx] via [put_table_counter_tx] (primary row + #314 mirror)
+   and marks the counter dirty ([Schema_cache.bump_rowid]) so a ROLLBACK reverts
+   it via [recompute_rowid_counters_after_rollback].  The table must exist and
+   be AUTOINCREMENT. *)
+let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
+  match Schema_cache.find_table t.sc name with
+  | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
+  | Some m ->
+    if not m.autoincrement
+    then
+      failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
+    else (
+      let want_next = Int64.add requested 1L in
+      let%lwt clamped =
+        if
+          (not (Int64.equal m.next_rowid empty_next_rowid))
+          && Int64.compare want_next m.next_rowid >= 0
+        then Lwt.return want_next
+        else (
+          let%lwt mx = max_rowid_in_txn t ~name tx in
+          let floor =
+            match mx with
+            | Some k -> Int64.add k 1L
+            | None -> 1L
+          in
+          Lwt.return (if Int64.compare want_next floor > 0 then want_next else floor))
+      in
+      let m' = { m with next_rowid = clamped } in
+      Schema_cache.bump_rowid t.sc ~name m';
+      put_table_counter_tx tx m')
+;;
+
+(* #312.1: writable [sqlite_sequence] DELETE for table [name].  Resets the
+   counter to [empty_next_rowid] so the next insert recomputes from data —
+   matching SQLite removing the [sqlite_sequence] row.  Mutates through [tx] and
+   marks the counter dirty so a ROLLBACK reverts it.  The table must exist and be
+   AUTOINCREMENT. *)
+let reset_next_rowid_in_txn t ~name (tx : S.rw S.txn) =
+  match Schema_cache.find_table t.sc name with
+  | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
+  | Some m ->
+    if not m.autoincrement
+    then
+      failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
+    else (
+      let m' = { m with next_rowid = empty_next_rowid } in
+      Schema_cache.bump_rowid t.sc ~name m';
+      put_table_counter_tx tx m')
+;;
+
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is
    threaded here so the index's catalog row, tree-ID and index-ID allocation,
    and cache entry all participate in it and roll back together. *)

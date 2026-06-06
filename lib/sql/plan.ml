@@ -330,6 +330,12 @@ type op =
   | Op_sqlite_master
   (** Virtual scan that reconstructs sqlite_master rows from catalog metadata. *)
   | Op_sqlite_sequence (** #312: virtual scan over AUTOINCREMENT counters (name, seq). *)
+  | Op_seq_set of
+      { table : string
+      ; seq : int64
+      } (** #312.1: writable sqlite_sequence SET/INSERT -> set [table]'s next_rowid. *)
+  | Op_seq_reset of { table : string }
+  (** #312.1: writable sqlite_sequence DELETE -> reset [table]'s next_rowid. *)
   | Op_no_op (** No-op plan node produced by IF EXISTS DROP when object not found. *)
   | Op_changes
   (** Returns rows affected by last DML. Intercepted in db.ml query — not exec.ml. *)

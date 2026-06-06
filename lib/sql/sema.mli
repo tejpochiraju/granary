@@ -99,6 +99,14 @@ type bound_join =
     (** ordinal of the first right-table column in the combined row *)
   }
 
+(** #312.1: a bound write against the synthesized [sqlite_sequence] table. *)
+type seq_write =
+  | Seq_set of
+      { table : string
+      ; seq : int64
+      }
+  | Seq_reset of { table : string }
+
 type bound_stmt =
   | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)
   | BS_create_table of
@@ -210,6 +218,9 @@ type bound_stmt =
       { name : string
       ; idx_info : Sqlocaml_catalog.Catalog.index_info
       }
+  | BS_seq_write of seq_write
+  (** #312.1: a supported write against the synthesized [sqlite_sequence]
+        table, executed as a [next_rowid] mutation. *)
   | BS_begin
   | BS_commit
   | BS_rollback

@@ -238,6 +238,29 @@ val bump_next_rowid_in_txn
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> unit Lwt.t
 
+(** #312.1: writable [sqlite_sequence] SET/INSERT.  Sets table [name]'s
+    autoincrement counter to [max(requested + 1, max(rowid) + 1)] (SQLite's
+    effective rule).  Mutates through the held RW transaction (does NOT commit)
+    and marks the counter dirty so a ROLLBACK reverts it.  Fails if [name] is
+    unknown or not an AUTOINCREMENT table. *)
+val set_next_rowid_in_txn
+  :  t
+  -> name:string
+  -> requested:int64
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** #312.1: writable [sqlite_sequence] DELETE.  Resets table [name]'s
+    autoincrement counter to the never-seeded sentinel so the next insert
+    recomputes from data.  Mutates through the held RW transaction (does NOT
+    commit) and marks the counter dirty so a ROLLBACK reverts it.  Fails if
+    [name] is unknown or not an AUTOINCREMENT table. *)
+val reset_next_rowid_in_txn
+  :  t
+  -> name:string
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
 (** Create a new index on a single column of an existing table.
     The new index gets its own [tree_id] (separate from the table tree).
     The index metadata is persisted in the [_sys_indexes] tree.

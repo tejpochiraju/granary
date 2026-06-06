@@ -11913,6 +11913,131 @@ let sqlite_sequence_in_master () =
   Alcotest.(check bool) "present after autoinc table" true (master_has "sqlite_sequence")
 ;;
 
+(* #312.1: writable sqlite_sequence — UPDATE/DELETE/INSERT translate to
+   next_rowid mutations through the active transaction. *)
+
+let sqlite_sequence_update () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  (* a=1 *)
+  exec db "UPDATE sqlite_sequence SET seq = 99 WHERE name = 't'";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=100 *)
+  Alcotest.(check (list int64))
+    "raised counter"
+    [ 1L; 100L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_lower_clamps_to_max_rowid () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(a,b) VALUES (10,'x')";
+  (* max rowid 10, seq 10 *)
+  exec db "UPDATE sqlite_sequence SET seq = 3 WHERE name = 't'";
+  (* below max *)
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  Alcotest.(check (list int64))
+    "clamped to max+1"
+    [ 10L; 11L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_delete_resets () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "DELETE FROM t";
+  exec db "DELETE FROM sqlite_sequence WHERE name = 't'";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* reset: a=1 again *)
+  Alcotest.(check (list int64))
+    "reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t"))
+;;
+
+let sqlite_sequence_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO sqlite_sequence(name, seq) VALUES('t', 50)";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=51 *)
+  Alcotest.(check (list int64))
+    "insert set counter"
+    [ 1L; 51L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_insert_positional () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO sqlite_sequence VALUES('t', 70)";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=71 *)
+  Alcotest.(check (list int64))
+    "positional insert set counter"
+    [ 1L; 71L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_rollback_reverts () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "BEGIN";
+  exec db "UPDATE sqlite_sequence SET seq = 500 WHERE name = 't'";
+  exec db "ROLLBACK";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  Alcotest.(check (list int64))
+    "rollback reverted counter"
+    [ 1L; 2L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_rejects_unsupported () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)";
+  exec db "CREATE TABLE plain (a INTEGER PRIMARY KEY, b TEXT)";
+  (* unknown table name *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'nope'"
+    "sqlite_sequence";
+  (* non-AUTOINCREMENT table name *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'plain'"
+    "AUTOINCREMENT";
+  (* non-literal seq (subquery) *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = (SELECT 1) WHERE name = 't'"
+    "sqlite_sequence";
+  (* no WHERE *)
+  assert_exec_rejected db "UPDATE sqlite_sequence SET seq = 1" "sqlite_sequence";
+  (* extra WHERE predicate beyond name = '...' *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 't' AND seq > 0"
+    "sqlite_sequence";
+  (* DELETE with no WHERE *)
+  assert_exec_rejected db "DELETE FROM sqlite_sequence" "sqlite_sequence";
+  (* multi-row INSERT *)
+  assert_exec_rejected
+    db
+    "INSERT INTO sqlite_sequence VALUES ('t', 1), ('u', 2)"
+    "sqlite_sequence";
+  (* wrong-column INSERT *)
+  assert_exec_rejected
+    db
+    "INSERT INTO sqlite_sequence(seq, name) VALUES (1, 't')"
+    "sqlite_sequence"
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12835,6 +12960,19 @@ let () =
     ; ( "sqlite_sequence (#312)"
       , [ Alcotest.test_case "select" `Quick sqlite_sequence_select
         ; Alcotest.test_case "in_master" `Quick sqlite_sequence_in_master
+        ; Alcotest.test_case "update" `Quick sqlite_sequence_update
+        ; Alcotest.test_case
+            "lower_clamps_to_max_rowid"
+            `Quick
+            sqlite_sequence_lower_clamps_to_max_rowid
+        ; Alcotest.test_case "delete_resets" `Quick sqlite_sequence_delete_resets
+        ; Alcotest.test_case "insert" `Quick sqlite_sequence_insert
+        ; Alcotest.test_case "insert_positional" `Quick sqlite_sequence_insert_positional
+        ; Alcotest.test_case "rollback_reverts" `Quick sqlite_sequence_rollback_reverts
+        ; Alcotest.test_case
+            "rejects_unsupported"
+            `Quick
+            sqlite_sequence_rejects_unsupported
         ] )
     ]
 ;;
