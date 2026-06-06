@@ -12022,6 +12022,19 @@ let sqlite_sequence_rollback_reverts () =
     (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
 ;;
 
+(* #312/PR#315 review: [UPDATE sqlite_sequence SET seq = max_int] must pin the
+   counter so the next insert raises SQLITE_FULL — not silently land at
+   max(rowid)+1 via an overflowing [requested + 1].  Matches SQLite. *)
+let sqlite_sequence_set_max_pins_full () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec
+    db
+    (Printf.sprintf "UPDATE sqlite_sequence SET seq = %Ld WHERE name = 't'" Int64.max_int);
+  assert_exec_rejected db "INSERT INTO t(b) VALUES ('y')" "database or disk is full"
+;;
+
 let sqlite_sequence_rejects_unsupported () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)";
@@ -12991,6 +13004,7 @@ let () =
         ; Alcotest.test_case "insert" `Quick sqlite_sequence_insert
         ; Alcotest.test_case "insert_positional" `Quick sqlite_sequence_insert_positional
         ; Alcotest.test_case "delete_all_resets" `Quick sqlite_sequence_delete_all_resets
+        ; Alcotest.test_case "set_max_pins_full" `Quick sqlite_sequence_set_max_pins_full
         ; Alcotest.test_case "rollback_reverts" `Quick sqlite_sequence_rollback_reverts
         ; Alcotest.test_case
             "rejects_unsupported"

@@ -1920,7 +1920,12 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
        SQLITE_FULL here instead of probing for a free rowid; match its wording.
        Use [Lwt.fail_with] so it surfaces as a catchable SQL [Error] like the
        other user-facing insert failures.  Plain rowid tables keep the existing
-       hold-at-max behavior. *)
+       hold-at-max behavior.
+       Known conflation (PR#315 review): [next_rowid = max_int] means both
+       "max_int already handed out" and "max_int is next to hand out", so we
+       raise one id early in the pure auto-increment path (an explicit insert of
+       max_int-1 bumps next to max_int, then the next NULL insert raises instead
+       of allocating max_int).  Unreachable in practice — it needs 2^63 rows. *)
     if m.autoincrement && Int64.equal m.next_rowid Int64.max_int
     then Lwt.fail_with "database or disk is full"
     else (
@@ -2016,7 +2021,15 @@ let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
     then
       failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
     else (
-      let want_next = Int64.add requested 1L in
+      (* Saturating add: [requested = max_int] means "max_int was handed out", so
+         the counter must pin at [max_int] (the next insert then raises
+         SQLITE_FULL).  A plain [requested + 1] would overflow to [min_int] and
+         fall into the lower-clamp path, silently resetting to [max(rowid)+1]. *)
+      let want_next =
+        if Int64.equal requested Int64.max_int
+        then Int64.max_int
+        else Int64.add requested 1L
+      in
       let%lwt clamped =
         if
           (not (Int64.equal m.next_rowid empty_next_rowid))
