@@ -93,6 +93,7 @@ let make_two_table_cat ?(orders_idx = false) () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        Cat.create_table
@@ -117,6 +118,7 @@ let make_two_table_cat ?(orders_idx = false) () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* () =
        if orders_idx
@@ -245,6 +247,7 @@ let sema_ambiguous_column () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          Cat.create_table
@@ -261,6 +264,7 @@ let sema_ambiguous_column () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in
@@ -307,6 +311,7 @@ let sema_qualified_column_resolves () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          Cat.create_table
@@ -323,6 +328,7 @@ let sema_qualified_column_resolves () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in

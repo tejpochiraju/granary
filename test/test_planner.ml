@@ -38,6 +38,7 @@ let make_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;
@@ -56,6 +57,7 @@ let plan_create_table () =
         ; ty = Ty_text
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -66,6 +68,7 @@ let plan_create_table () =
         ; ty = Ty_int
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -703,6 +706,7 @@ let make_cat_with_index ~col_name =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        Cat.create_index
@@ -846,6 +850,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        Cat.create_table
@@ -870,6 +875,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;

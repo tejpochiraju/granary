@@ -50,6 +50,7 @@ let sqlite_master_meta : Cat.table_meta =
   ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
   ; Cat.without_rowid = false
+  ; Cat.autoincrement = false
   }
 ;;
 
@@ -147,6 +148,7 @@ type bound_stmt =
           (string list * string * string list * Cat.fk_action * Cat.fk_action * bool) list
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
       ; without_rowid : bool
+      ; autoincrement : bool (** #299: INTEGER PRIMARY KEY AUTOINCREMENT. *)
       }
   | BS_insert of
       { table_meta : Cat.table_meta
@@ -354,6 +356,7 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
   ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
   ; Cat.without_rowid = false
+  ; Cat.autoincrement = false
   }
 ;;
 
@@ -1276,6 +1279,22 @@ let validate_without_rowid ~name ~without_rowid row_cols =
     | [ _ ] -> Ok ())
 ;;
 
+(* #299: AUTOINCREMENT is legal only on a single-column ascending INTEGER
+   PRIMARY KEY of a rowid table.  [columns] are the AST column_defs (carrying
+   the parsed [autoincrement] bit, only ever set on a column PRIMARY KEY);
+   [row_cols] are the resolved Row.columns, index-aligned with [columns].
+   Returns the table-level flag, or an error matching SQLite's messages. *)
+let validate_autoincrement ~without_rowid (columns : Ast.column_def list) row_cols =
+  if not (List.exists (fun (c : Ast.column_def) -> c.autoincrement) columns)
+  then Ok false
+  else if without_rowid
+  then Error (Unsupported "AUTOINCREMENT not allowed on WITHOUT ROWID tables")
+  else (
+    match Cat.compute_rowid_alias_col row_cols ~without_rowid with
+    | Some i when (List.nth columns i).Ast.autoincrement -> Ok true
+    | _ -> Error (Unsupported "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"))
+;;
+
 let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
   let* existing = Cat.find_table cat ~name in
   match existing with
@@ -1290,6 +1309,7 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
             ; if_not_exists = true
             ; fk_constraints = []
             ; without_rowid
+            ; autoincrement = false
             }))
   | None ->
     let unsupported_check =
@@ -1327,16 +1347,20 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
           (match validate_without_rowid ~name ~without_rowid row_cols with
            | Error e -> Lwt.return (Error e)
            | Ok () ->
-             Lwt.return
-               (Ok
-                  (BS_create_table
-                     { name
-                     ; columns = row_cols
-                     ; uniq_idxs
-                     ; if_not_exists
-                     ; fk_constraints
-                     ; without_rowid
-                     })))))
+             (match validate_autoincrement ~without_rowid columns row_cols with
+              | Error e -> Lwt.return (Error e)
+              | Ok autoincrement ->
+                Lwt.return
+                  (Ok
+                     (BS_create_table
+                        { name
+                        ; columns = row_cols
+                        ; uniq_idxs
+                        ; if_not_exists
+                        ; fk_constraints
+                        ; without_rowid
+                        ; autoincrement
+                        }))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3318,6 +3342,7 @@ let bind_const_select ~param_counter ~named_params exprs =
     ; Cat.next_rowid = 0L
     ; Cat.fk_constraints = []
     ; Cat.without_rowid = false
+    ; Cat.autoincrement = false
     }
   in
   let bound =
@@ -3377,6 +3402,7 @@ let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
   ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
   ; Cat.without_rowid = false
+  ; Cat.autoincrement = false
   }
 ;;
 

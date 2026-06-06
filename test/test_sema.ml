@@ -13,7 +13,14 @@ let make_catalog cols =
   Lwt_main.run
     (let store = S.create () in
      let* cat = C.open_ store in
-     let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      Lwt.return cat)
 ;;
 
@@ -52,6 +59,7 @@ let bind_create_new () =
         ; ty = Ty_text
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -62,6 +70,7 @@ let bind_create_new () =
         ; ty = Ty_int
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -99,6 +108,7 @@ let bind_create_duplicate () =
         ; ty = Ty_int
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -129,6 +139,7 @@ let bind_create_preserves_cols () =
         ; ty = Ty_text
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -139,6 +150,7 @@ let bind_create_preserves_cols () =
         ; ty = Ty_int
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = None
         ; check = None
         ; fk_ref = None
@@ -1492,6 +1504,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_table
@@ -1516,6 +1529,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;
@@ -1569,6 +1583,7 @@ let bind_select_join_ambiguous_col () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          C.create_table
@@ -1585,6 +1600,7 @@ let bind_select_join_ambiguous_col () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in
@@ -3018,6 +3034,7 @@ let bind_create_default_null () =
         ; ty = Ty_int
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = Some Ast.L_null
         ; check = None
         ; fk_ref = None
@@ -3051,6 +3068,7 @@ let bind_create_default_real () =
         ; ty = Ty_real
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = Some (Ast.L_real 3.14)
         ; check = None
         ; fk_ref = None
@@ -3084,6 +3102,7 @@ let bind_create_default_blob () =
         ; ty = Ty_blob
         ; not_null = false
         ; primary_key = false
+        ; autoincrement = false
         ; default = Some (Ast.L_blob (Bytes.of_string "hi"))
         ; check = None
         ; fk_ref = None
@@ -3446,6 +3465,7 @@ let bind_select_join_on_ambiguous () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          C.create_table
@@ -3462,6 +3482,7 @@ let bind_select_join_on_ambiguous () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in

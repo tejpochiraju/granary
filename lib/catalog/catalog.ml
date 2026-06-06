@@ -89,6 +89,10 @@ type table_meta =
         counter from its actual value — see #250. *)
   ; fk_constraints : fk_constraint list
   ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
+  ; autoincrement : bool
+    (** #299: [INTEGER PRIMARY KEY AUTOINCREMENT].  Sticky rowid high-water —
+        ROLLBACK reverts to the committed counter rather than recomputing
+        [max(rowid)+1] from data, so committed DELETEs never get reused. *)
   }
 
 (** #250: sentinel [next_rowid] for an alias table with no rowid seeded yet.  A
@@ -492,20 +496,30 @@ let encode_table_value m =
   (* Trailing without_rowid flag (phase 37).  Old encodings have no trailing
      bytes; the decoder treats their absence as [false]. *)
   Varint.encode_uint64 buf (if m.without_rowid then 1L else 0L);
+  (* #299: trailing autoincrement flag.  Older encodings lack it; the decoder
+     treats its absence as [false]. *)
+  Varint.encode_uint64 buf (if m.autoincrement then 1L else 0L);
   Buffer.to_bytes buf
 ;;
 
 let decode_table_value bytes =
   let tid, off = Varint.decode_uint64 bytes 0 in
   let next, off' = Varint.decode_int64 bytes off in
-  let without_rowid =
+  let without_rowid, off'' =
     if off' >= Bytes.length bytes
+    then false, off'
+    else (
+      let v, o = Varint.decode_uint64 bytes off' in
+      Int64.to_int v <> 0, o)
+  in
+  let autoincrement =
+    if off'' >= Bytes.length bytes
     then false
     else (
-      let v, _ = Varint.decode_uint64 bytes off' in
+      let v, _ = Varint.decode_uint64 bytes off'' in
       Int64.to_int v <> 0)
   in
-  Int64.to_int tid, next, without_rowid
+  Int64.to_int tid, next, without_rowid, autoincrement
 ;;
 
 (* Column key: table_name ++ NUL ++ ordinal_be8 *)
@@ -984,7 +998,7 @@ let load_all_tables store =
         Lwt.catch
           (fun () ->
              let name = Bytes.to_string k in
-             let tid, next_rowid, without_rowid = decode_table_value v in
+             let tid, next_rowid, without_rowid, autoincrement = decode_table_value v in
              let%lwt cols = load_columns tx name in
              Hashtbl.replace
                tbl
@@ -995,6 +1009,7 @@ let load_all_tables store =
                ; next_rowid
                ; fk_constraints = []
                ; without_rowid
+               ; autoincrement
                };
              Lwt.return_unit)
           (fun _exn ->
@@ -1254,7 +1269,9 @@ let register_tag store (m : table_meta) =
    every column (via the same [encode_column] used by the primary), and FK
    constraints.  It carries no volatile state (no [next_rowid]) so it only
    changes on DDL, not on every insert. *)
-let mirror_version = 1
+(* v2 (#299): appends a trailing autoincrement byte after the column/FK blocks.
+   v1 entries lack it; the decoder treats their absence as [false]. *)
+let mirror_version = 2
 
 let mirror_key (tid : S.tree_id) =
   let b = Bytes.create 8 in
@@ -1282,6 +1299,8 @@ let encode_mirror_entry (m : table_meta) =
   let fkb = encode_fks m.fk_constraints in
   Varint.encode_uint64 buf (Int64.of_int (Bytes.length fkb));
   Buffer.add_bytes buf fkb;
+  (* #299 (mirror v2): trailing autoincrement byte. *)
+  Buffer.add_uint8 buf (if m.autoincrement then 1 else 0);
   Buffer.to_bytes buf
 ;;
 
@@ -1290,7 +1309,8 @@ let encode_mirror_entry (m : table_meta) =
    recovered at open-time by scanning the data tree, see [recover_next_rowid])
    and the stored fingerprint. *)
 let decode_mirror_entry bytes : table_meta * int64 =
-  let _ver, off = Varint.decode_uint64 bytes 0 in
+  let ver, off = Varint.decode_uint64 bytes 0 in
+  let ver = Int64.to_int ver in
   let nlen, off = Varint.decode_uint64 bytes off in
   let nlen = Int64.to_int nlen in
   let name = Bytes.sub_string bytes off nlen in
@@ -1313,12 +1333,18 @@ let decode_mirror_entry bytes : table_meta * int64 =
   let fklen, o = Varint.decode_uint64 bytes !off in
   let fkb = Bytes.sub bytes o (Int64.to_int fklen) in
   let fk_constraints = decode_fks fkb in
+  off := o + Int64.to_int fklen;
+  (* #299 (mirror v2): trailing autoincrement byte; absent in v1. *)
+  let autoincrement =
+    ver >= 2 && !off < Bytes.length bytes && Bytes.get_uint8 bytes !off <> 0
+  in
   ( { name
     ; tree_id = Int64.to_int tid
     ; columns
     ; next_rowid = empty_next_rowid
     ; fk_constraints
     ; without_rowid
+    ; autoincrement
     }
   , fp )
 ;;
@@ -1386,6 +1412,26 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
       | Some k -> Int64.add (Rowid.decode k) 1L
     in
     Lwt.return { m with next_rowid = recovered }
+;;
+
+(* #299: read a table's LAST-COMMITTED [next_rowid] straight from its
+   [_sys_tables] row.  Used by the AUTOINCREMENT rollback path: after
+   [S.rollback] the store row has reverted to the committed value (the sticky
+   high-water that a committed DELETE never lowers), so restoring the cached
+   counter from it — rather than recomputing [max(rowid)+1] from data — keeps
+   the counter sticky across committed deletes while still reverting a
+   rolled-back allocation to the committed mark.  Returns [empty_next_rowid] if
+   the row is absent (e.g. the table was created in the rolled-back txn — the
+   caller skips uncached names anyway). *)
+let read_committed_next_rowid store ~name : int64 Lwt.t =
+  S.with_ro store
+  @@ fun tx ->
+  let%lwt v = S.get tx sys_tables_tid (Bytes.of_string name) in
+  match v with
+  | None -> Lwt.return empty_next_rowid
+  | Some bytes ->
+    let _tid, next, _wr, _ai = decode_table_value bytes in
+    Lwt.return next
 ;;
 
 let load_fk_constraints_raw store table_name =
@@ -1574,9 +1620,14 @@ let rollback_schema_changes t = Schema_cache.rollback t.sc
    is why a COMMIT keeps the bumped counter yet a subsequent unrelated ROLLBACK
    does not wrongly recompute it.
 
-   AUTOINCREMENT is unaffected: this engine does not implement that keyword
-   (CREATE … AUTOINCREMENT fails to parse), so there is no sticky high-water
-   counter for this recompute to clobber. *)
+   #299: AUTOINCREMENT tables take a DIFFERENT branch.  Their counter is a
+   sticky high-water that a committed DELETE never lowers, so recomputing
+   [max(rowid)+1] from data would wrongly reissue an id below the high-water.
+   Instead we restore the cached counter to the LAST-COMMITTED value persisted
+   in [_sys_tables] (which [S.rollback] has already reverted to), via
+   [read_committed_next_rowid].  That still reverts a rolled-back allocation to
+   the committed mark (matching SQLite, whose [sqlite_sequence] is itself
+   transactional) while preserving stickiness across committed deletes. *)
 let recompute_rowid_counters_after_rollback t =
   let names = Schema_cache.take_rowid_bumped t.sc in
   Lwt_list.iter_s
@@ -1584,6 +1635,10 @@ let recompute_rowid_counters_after_rollback t =
        match Schema_cache.find_table t.sc name with
        | None -> Lwt.return_unit
        | Some m when m.without_rowid -> Lwt.return_unit
+       | Some m when m.autoincrement ->
+         let%lwt committed = read_committed_next_rowid t.store ~name in
+         Schema_cache.set_rowid_durable t.sc ~name { m with next_rowid = committed };
+         Lwt.return_unit
        | Some m ->
          let%lwt recovered = recover_next_rowid t.store m in
          Schema_cache.set_rowid_durable t.sc ~name recovered;
@@ -1623,7 +1678,7 @@ let savepoint_release_schema t name = Schema_cache.savepoint_release t.sc name
 
 (* Write a table's catalog rows (primary + columns + mirror) through [tx] and
    return its meta.  Shared by the autocommit and in-transaction paths. *)
-let put_table_rows tx ~name ~columns ~without_rowid ~tid =
+let put_table_rows tx ~name ~columns ~without_rowid ~autoincrement ~tid =
   let m =
     { name
     ; tree_id = tid
@@ -1631,6 +1686,7 @@ let put_table_rows tx ~name ~columns ~without_rowid ~tid =
     ; next_rowid = empty_next_rowid
     ; fk_constraints = []
     ; without_rowid
+    ; autoincrement
     }
   in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
@@ -1649,13 +1705,13 @@ let put_table_rows tx ~name ~columns ~without_rowid ~tid =
    [ROLLBACK] discards both the rows and the cache entry.  When absent, the
    autocommit path opens and commits its own writer txn (counter bump first, as
    before). *)
-let create_table ?txn t ~name ~columns ~without_rowid =
+let create_table ?txn t ~name ~columns ~without_rowid ~autoincrement =
   if Schema_cache.mem_table t.sc name
   then failwith (Printf.sprintf "table '%s' already exists" name);
   match txn with
   | Some tx ->
     let%lwt tid = next_user_tid_tx tx in
-    let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~tid in
+    let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~autoincrement ~tid in
     (* [put_table] also stamps the store-global in-memory [tree_tags] for [tid].
        On ROLLBACK we revert only the cache entry, not the tag — but that is
        safe: the txn also rolls back [tid]'s allocation (the user-tid counter is
@@ -1668,7 +1724,7 @@ let create_table ?txn t ~name ~columns ~without_rowid =
   | None ->
     let%lwt tid = next_user_tid t in
     let%lwt tx = S.rw_begin t.store in
-    let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~tid in
+    let%lwt m = put_table_rows tx ~name ~columns ~without_rowid ~autoincrement ~tid in
     let%lwt () = S.commit tx in
     Schema_cache.put_table_durable t.sc ~name m;
     Lwt.return tid

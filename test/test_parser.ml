@@ -30,8 +30,40 @@ let create_primary_key () =
   match parse "CREATE TABLE t (id INTEGER PRIMARY KEY);" with
   | Ast.S_create_table { columns = [ c ]; _ } ->
     Alcotest.(check bool) "pk" true c.primary_key;
+    Alcotest.(check bool) "autoinc default false" false c.autoincrement;
     Alcotest.(check bool) "not null default false" false c.not_null
   | _ -> Alcotest.fail "expected S_create_table"
+;;
+
+(* #299: AUTOINCREMENT / ASC / DESC on a column PRIMARY KEY. *)
+let create_autoincrement () =
+  match parse "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)" with
+  | Ast.S_create_table { columns = [ c ]; _ } ->
+    Alcotest.(check bool) "pk" true c.primary_key;
+    Alcotest.(check bool) "autoincrement" true c.autoincrement
+  | _ -> Alcotest.fail "expected S_create_table with one column"
+;;
+
+let create_pk_asc_autoincrement () =
+  match parse "CREATE TABLE t (a INTEGER PRIMARY KEY ASC AUTOINCREMENT)" with
+  | Ast.S_create_table { columns = [ c ]; _ } ->
+    Alcotest.(check bool) "autoincrement" true c.autoincrement
+  | _ -> Alcotest.fail "expected S_create_table"
+;;
+
+let create_pk_desc_no_autoinc () =
+  match parse "CREATE TABLE t (a INTEGER PRIMARY KEY DESC)" with
+  | Ast.S_create_table { columns = [ c ]; _ } ->
+    Alcotest.(check bool) "pk" true c.primary_key;
+    Alcotest.(check bool) "autoincrement" false c.autoincrement
+  | _ -> Alcotest.fail "expected S_create_table"
+;;
+
+let create_pk_desc_autoinc_rejected () =
+  Alcotest.check_raises
+    "DESC+AUTOINCREMENT rejected"
+    (Failure "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+    (fun () -> ignore (parse "CREATE TABLE t (a INTEGER PRIMARY KEY DESC AUTOINCREMENT)"))
 ;;
 
 let create_not_null () =
@@ -367,6 +399,13 @@ let () =
       , [ Alcotest.test_case "simple" `Quick create_simple
         ; Alcotest.test_case "two-cols" `Quick create_two_cols
         ; Alcotest.test_case "primary-key" `Quick create_primary_key
+        ; Alcotest.test_case "autoincrement" `Quick create_autoincrement
+        ; Alcotest.test_case "pk-asc-autoinc" `Quick create_pk_asc_autoincrement
+        ; Alcotest.test_case "pk-desc" `Quick create_pk_desc_no_autoinc
+        ; Alcotest.test_case
+            "pk-desc-autoinc-reject"
+            `Quick
+            create_pk_desc_autoinc_rejected
         ; Alcotest.test_case "not-null" `Quick create_not_null
         ; Alcotest.test_case "both-constraints" `Quick create_both_constraints
         ; Alcotest.test_case "many-cols" `Quick create_many_cols

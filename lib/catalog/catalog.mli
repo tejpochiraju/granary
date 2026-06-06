@@ -65,6 +65,12 @@ type table_meta =
   ; without_rowid : bool
     (** WITHOUT ROWID — the INTEGER PRIMARY KEY column's value is used
         as the row's storage key (no auto-allocated rowid).  Phase 37. *)
+  ; autoincrement : bool
+    (** #299: [INTEGER PRIMARY KEY AUTOINCREMENT].  When [true] the rowid
+        counter is a sticky high-water mark: on ROLLBACK it reverts to the
+        last-committed value (read back from [_sys_tables]) instead of being
+        recomputed as [max(rowid)+1] from the data tree, so a committed DELETE
+        of the top row is never reused. *)
   }
 
 (** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
@@ -146,6 +152,7 @@ val create_table
   -> name:string
   -> columns:Sqlocaml_encoding.Row.column list
   -> without_rowid:bool
+  -> autoincrement:bool
   -> Sqlocaml_store.Store.tree_id Lwt.t
 
 (** Find a table by name. Returns [None] if not found. *)

@@ -123,32 +123,79 @@ let test_commit_advances_rowid () =
     rows
 ;;
 
-(* #293: AUTOINCREMENT must NOT reuse a rolled-back rowid — SQLite keeps the
-   high-water mark sticky in sqlite_sequence, distinct from the recompute-from-
-   data behaviour of a plain rowid table.  This engine does not implement the
-   AUTOINCREMENT keyword at all (it fails to parse), so the test takes the skip
-   branch; it stands as a guard so the #293 fix can never silently introduce
-   rowid reuse for an AUTOINCREMENT column should that keyword be added later. *)
-let test_rollback_autoincrement_sticky () =
+(* #299: AUTOINCREMENT reverts its counter on ROLLBACK exactly like plain
+   transactional data — [sqlite_sequence] is itself transactional.  When the
+   ONLY insert is the one rolled back (no prior committed high-water), the
+   counter reverts to its committed (unseeded) state, so the rolled-back rowid
+   IS reused.  Verified against SQLite 3.45:
+     BEGIN; INSERT->1; ROLLBACK; INSERT  =>  rowid 1 (reuse).
+   This is distinct from sticky-across-COMMITTED-DELETE — see
+   [test_rollback_autoincrement_high_water]. *)
+let test_rollback_autoincrement_revert () =
   let db = fresh_db () in
-  match execute db "CREATE TABLE s (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)" with
-  | Error _ ->
-    (* This engine does not support the AUTOINCREMENT keyword (CREATE fails to
-       parse), so there is no separate sticky-counter path for the #293 fix to
-       regress.  The skip pins that fact: if AUTOINCREMENT is ever added it must
-       arrive with its own non-reuse test.  *)
-    ()
-  | Ok () ->
-    exec db "BEGIN";
-    exec db "INSERT INTO s (b) VALUES ('x')";
-    (* rowid 1 *)
-    exec db "ROLLBACK";
-    exec db "INSERT INTO s (b) VALUES ('y')";
-    let rows = query_int_text db "SELECT a, b FROM s" in
-    Alcotest.(check (list (pair int string)))
-      "AUTOINCREMENT does not reuse the rolled-back rowid"
-      [ 2, "y" ]
-      rows
+  exec db "CREATE TABLE s (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO s (b) VALUES ('x')";
+  (* rowid 1, rolled back *)
+  exec db "ROLLBACK";
+  exec db "INSERT INTO s (b) VALUES ('y')";
+  let rows = query_int_text db "SELECT a, b FROM s" in
+  Alcotest.(check (list (pair int string)))
+    "AUTOINCREMENT reverts to committed (unseeded) counter on rollback"
+    [ 1, "y" ]
+    rows
+;;
+
+(* #299: the AUTOINCREMENT high-water is sticky across a COMMITTED DELETE — the
+   distinguishing behaviour vs a plain rowid table.  After committing rowids
+   1,2 and DELETEing 2, the counter stays at 3; an in-txn INSERT (rowid 3) that
+   rolls back must revert to the COMMITTED counter (3), NOT recompute
+   max(data)+1 (=2).  So the next insert is rowid 3, never reusing 2.  A plain
+   rowid table on the identical sequence yields rowid 2 (recompute/reuse) —
+   pinned by [test_rollback_reuses_rowid_nonempty].  Verified vs SQLite 3.45. *)
+let test_rollback_autoincrement_high_water () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE s (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO s (b) VALUES ('p')";
+  (* rowid 1 *)
+  exec db "INSERT INTO s (b) VALUES ('q')";
+  (* rowid 2; counter now 3 *)
+  exec db "DELETE FROM s WHERE a = 2";
+  (* committed delete; counter stays 3 *)
+  exec db "BEGIN";
+  exec db "INSERT INTO s (b) VALUES ('r')";
+  (* rowid 3, rolled back *)
+  exec db "ROLLBACK";
+  exec db "INSERT INTO s (b) VALUES ('z')";
+  let rows = query_int_text db "SELECT a, b FROM s ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "AUTOINCREMENT keeps the high-water past a committed delete (rowid 3)"
+    [ 1, "p"; 3, "z" ]
+    rows
+;;
+
+(* #299/#303: ROLLBACK TO SAVEPOINT reverts the AUTOINCREMENT counter to its
+   savepoint-time value via the #303 snapshot/restore path (NOT the full-txn
+   recompute), so the rolled-back-to-savepoint rowid 2 is reused.  Verified vs
+   SQLite 3.45: ... SAVEPOINT; INSERT->2; ROLLBACK TO; INSERT => rowid 2. *)
+let test_rollback_to_savepoint_autoincrement () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE s (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "BEGIN";
+  exec db "INSERT INTO s (b) VALUES ('x')";
+  (* rowid 1 *)
+  exec db "SAVEPOINT sp";
+  exec db "INSERT INTO s (b) VALUES ('y')";
+  (* rowid 2, rolled back to savepoint *)
+  exec db "ROLLBACK TO sp";
+  exec db "INSERT INTO s (b) VALUES ('z')";
+  (* reuses rowid 2 *)
+  exec db "COMMIT";
+  let rows = query_int_text db "SELECT a, b FROM s ORDER BY a ASC" in
+  Alcotest.(check (list (pair int string)))
+    "ROLLBACK TO reuses the savepoint-reverted rowid 2 for AUTOINCREMENT"
+    [ 1, "x"; 2, "z" ]
+    rows
 ;;
 
 (* #293 (perf-fix scoping): the rollback recompute must be restricted to tables
@@ -647,9 +694,17 @@ let () =
             test_rollback_reuses_rowid_nonempty
         ; Alcotest.test_case "commit_advances_rowid" `Quick test_commit_advances_rowid
         ; Alcotest.test_case
-            "rollback_autoincrement_sticky"
+            "rollback_autoincrement_revert"
             `Quick
-            test_rollback_autoincrement_sticky
+            test_rollback_autoincrement_revert
+        ; Alcotest.test_case
+            "rollback_autoincrement_high_water"
+            `Quick
+            test_rollback_autoincrement_high_water
+        ; Alcotest.test_case
+            "rollback_to_savepoint_autoincrement"
+            `Quick
+            test_rollback_to_savepoint_autoincrement
         ; Alcotest.test_case
             "rollback_does_not_disturb_committed_other_table"
             `Quick

@@ -11534,6 +11534,168 @@ let helper_query_ok_lwt_smoke () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #299: AUTOINCREMENT                                                   *)
+(* ------------------------------------------------------------------ *)
+
+let int_of_row row =
+  match (row : Db.value array).(0) with
+  | Db.V_int n -> n
+  | _ -> Alcotest.fail "expected V_int in column 0"
+;;
+
+(* Tier 1: the keyword is accepted and ordinary allocation works. *)
+let autoincrement_create_and_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  let rows = query_ok db "SELECT a FROM t ORDER BY a" in
+  Alcotest.(check (list int64)) "ids" [ 1L; 2L ] (List.map int_of_row rows)
+;;
+
+(* Assert [sql] is rejected and the error message contains [needle]
+   (matching SQLite's own wording). *)
+let assert_create_rejected sql needle =
+  let db = fresh_db () in
+  match Lwt_main.run (Db.execute db sql) with
+  | Ok () -> Alcotest.failf "expected rejection of: %s" sql
+  | Error e ->
+    let msg = fmt_err e in
+    let contains =
+      let nl = String.length needle
+      and hl = String.length msg in
+      let rec go i = i + nl <= hl && (String.sub msg i nl = needle || go (i + 1)) in
+      nl = 0 || go 0
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
+      true
+      contains
+;;
+
+(* #299 property: under any interleaving of committed INSERT/DELETE ops, an
+   AUTOINCREMENT id is strictly greater than every id allocated before it —
+   i.e. ids are never reused, even after the top row (or all rows) are deleted.
+   Right after an INSERT the new id is the current max(a) (AUTOINCREMENT makes
+   it exceed all live AND deleted ids). *)
+let qcheck_autoincrement_monotonic =
+  QCheck.Test.make
+    ~name:"autoincrement: ids strictly increase, never reused"
+    ~count:2000
+    (* each op: [true] = INSERT, [false] = DELETE the current top row *)
+    QCheck.(list_size Gen.(0 -- 30) bool)
+    (fun ops ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ =
+            Db.execute db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)"
+          in
+          let high = ref 0L in
+          let ok = ref true in
+          let read_max () =
+            let* r = Db.query db "SELECT a FROM t ORDER BY a DESC LIMIT 1" in
+            match r with
+            | Error _ ->
+              ok := false;
+              Lwt.return_none
+            | Ok s ->
+              let* rows = Lwt_stream.to_list s in
+              (match rows with
+               | row :: _ ->
+                 (match row.(0) with
+                  | Db.V_int n -> Lwt.return_some n
+                  | _ -> Lwt.return_none)
+               | [] -> Lwt.return_none)
+          in
+          let* () =
+            Lwt_list.iter_s
+              (fun is_insert ->
+                 if is_insert
+                 then (
+                   let* _ = Db.execute db "INSERT INTO t (b) VALUES ('x')" in
+                   let* m = read_max () in
+                   (match m with
+                    | Some n ->
+                      if Int64.compare n !high <= 0 then ok := false;
+                      high := n
+                    | None -> ());
+                   Lwt.return_unit)
+                 else
+                   let* _ =
+                     Db.execute db "DELETE FROM t WHERE a = (SELECT max(a) FROM t)"
+                   in
+                   Lwt.return_unit)
+              ops
+          in
+          Lwt.return !ok))
+;;
+
+(* #299: the AUTOINCREMENT flag persists across a file close+reopen (trailing
+   field of the _sys_tables value encoding), so both the sticky high-water
+   semantics AND the dump keyword survive a reopen rather than silently
+   downgrading to a plain rowid table. *)
+let autoincrement_persists_across_reopen () =
+  with_tempfile (fun path ->
+    run
+      (let open_db () =
+         let* r = Db.open_file ~path () in
+         match r with
+         | Ok d -> Lwt.return d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* db = open_db () in
+       let* _ =
+         Db.execute db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)"
+       in
+       let* _ = Db.execute db "INSERT INTO t (b) VALUES ('x')" in
+       (* rowid 1 *)
+       let* _ = Db.execute db "INSERT INTO t (b) VALUES ('y')" in
+       (* rowid 2; high-water now 3 *)
+       let* _ = Db.execute db "DELETE FROM t WHERE a = 2" in
+       let* () = Db.close db in
+       (* Reopen: the high-water (3) must survive, so the next insert is rowid 3
+          (sticky), and the dump still carries AUTOINCREMENT. *)
+       let* db2 = open_db () in
+       let* _ = Db.execute db2 "INSERT INTO t (b) VALUES ('z')" in
+       let* rq = Db.query db2 "SELECT a FROM t ORDER BY a ASC" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error _ -> Alcotest.fail "query failed after reopen"
+       in
+       Alcotest.(check (list int64))
+         "high-water sticky across reopen (rowid 3, not 2)"
+         [ 1L; 3L ]
+         (List.map int_of_row rows);
+       let* dump = Db.dump_to_string db2 () in
+       let dump =
+         match dump with
+         | Ok s -> s
+         | Error _ -> Alcotest.fail "dump failed"
+       in
+       let has_ai =
+         let needle = "PRIMARY KEY AUTOINCREMENT" in
+         let nl = String.length needle
+         and hl = String.length dump in
+         let rec go i = i + nl <= hl && (String.sub dump i nl = needle || go (i + 1)) in
+         go 0
+       in
+       Alcotest.(check bool) "dump still emits AUTOINCREMENT after reopen" true has_ai;
+       Db.close db2))
+;;
+
+(* Tier 1 guardrails: AUTOINCREMENT only on a single-column INTEGER PK rowid
+   table — matching SQLite's rejection messages. *)
+let autoincrement_rejections () =
+  assert_create_rejected
+    "CREATE TABLE t (a TEXT PRIMARY KEY AUTOINCREMENT)"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
+  assert_create_rejected
+    "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID"
+    "AUTOINCREMENT not allowed on WITHOUT ROWID tables"
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12429,5 +12591,14 @@ let () =
     ; "phase35_task3", phase35_task3_tests
     ; ( "helpers (#161)"
       , [ Alcotest.test_case "query_ok_lwt smoke" `Quick helper_query_ok_lwt_smoke ] )
+    ; ( "autoincrement (#299)"
+      , [ Alcotest.test_case "create_and_insert" `Quick autoincrement_create_and_insert
+        ; Alcotest.test_case "rejections" `Quick autoincrement_rejections
+        ; Alcotest.test_case
+            "persists_across_reopen"
+            `Quick
+            autoincrement_persists_across_reopen
+        ]
+        @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
     ]
 ;;

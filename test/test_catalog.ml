@@ -41,7 +41,14 @@ let test_create_then_find () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id"; txt_col "name" ] in
-     let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* tid =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* result = C.find_table cat ~name:"users" in
      (match result with
       | None -> Alcotest.fail "expected Some, got None"
@@ -73,7 +80,12 @@ let test_create_assigns_tree_id_16 () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid =
-       C.create_table cat ~name:"first" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"first"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      Alcotest.(check int) "first tree_id is 16" 16 tid;
      Lwt.return_unit)
@@ -84,10 +96,20 @@ let test_create_assigns_sequential_ids () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid_a =
-       C.create_table cat ~name:"a" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"a"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tid_b =
-       C.create_table cat ~name:"b" ~columns:[ int_col "y" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"b"
+         ~columns:[ int_col "y" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      Alcotest.(check int) "a gets 16" 16 tid_a;
      Alcotest.(check int) "b gets 17" 17 tid_b;
@@ -99,7 +121,12 @@ let test_duplicate_table () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"users" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      (* failwith is synchronous — raised before any Lwt.t is constructed *)
      (try
@@ -108,7 +135,8 @@ let test_duplicate_table () =
              cat
              ~name:"users"
              ~columns:[ int_col "id" ]
-             ~without_rowid:false);
+             ~without_rowid:false
+             ~autoincrement:false);
         Alcotest.fail "expected Failure for duplicate"
       with
       | Failure _ -> ());
@@ -129,7 +157,12 @@ let test_list_tables_one () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t1" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t1"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tables = C.list_tables cat in
      Alcotest.(check int) "one table" 1 (List.length tables);
@@ -141,10 +174,20 @@ let test_list_tables_two () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t1" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t1"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
-       C.create_table cat ~name:"t2" ~columns:[ txt_col "name" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t2"
+         ~columns:[ txt_col "name" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tables = C.list_tables cat in
      Alcotest.(check int) "two tables" 2 (List.length tables);
@@ -162,7 +205,14 @@ let test_columns_preserved () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id"; txt_col "name" ] in
-     let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* result = C.find_table cat ~name:"users" in
      (match result with
       | None -> Alcotest.fail "expected Some"
@@ -177,7 +227,12 @@ let test_integer_column_type () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* result = C.find_table cat ~name:"t" in
      (match result with
@@ -195,7 +250,12 @@ let test_text_column_type () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ txt_col "s" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ txt_col "s" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* result = C.find_table cat ~name:"t" in
      (match result with
@@ -213,7 +273,12 @@ let test_real_column_type () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ mk_col "r" Row.Real ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ mk_col "r" Row.Real ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* result = C.find_table cat ~name:"t" in
      (match result with
@@ -231,7 +296,12 @@ let test_blob_column_type () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ mk_col "b" Row.Blob ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ mk_col "b" Row.Blob ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* result = C.find_table cat ~name:"t" in
      (match result with
@@ -271,7 +341,14 @@ let test_mixed_column_types_roundtrip () =
             ; mk_col "b" Row.Blob
             ]
           in
-          let* _ = C.create_table cat ~name:"mixed" ~columns:cols ~without_rowid:false in
+          let* _ =
+            C.create_table
+              cat
+              ~name:"mixed"
+              ~columns:cols
+              ~without_rowid:false
+              ~autoincrement:false
+          in
           let* () = S.close store in
           (* Reopen and force the catalog to decode columns from disk *)
           let* sr2 = S.open_file ~path () in
@@ -298,7 +375,12 @@ let test_single_column () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "only" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "only" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* result = C.find_table cat ~name:"t" in
      (match result with
@@ -326,7 +408,14 @@ let test_many_columns () =
        ; txt_col "c9"
        ]
      in
-     let* _ = C.create_table cat ~name:"wide" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"wide"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* result = C.find_table cat ~name:"wide" in
      (match result with
       | None -> Alcotest.fail "expected Some"
@@ -356,7 +445,12 @@ let test_first_rowid_is_1 () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* rid = C.next_rowid cat ~name:"t" in
      Alcotest.(check int64) "first rowid is 1" 1L rid;
@@ -368,7 +462,12 @@ let test_rowid_increments () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* r1 = C.next_rowid cat ~name:"t" in
      let* r2 = C.next_rowid cat ~name:"t" in
@@ -384,10 +483,20 @@ let test_rowids_independent () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"a" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"a"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
-       C.create_table cat ~name:"b" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"b"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* ra1 = C.next_rowid cat ~name:"a" in
      let* rb1 = C.next_rowid cat ~name:"b" in
@@ -425,6 +534,7 @@ let test_metadata_survives_reopen () =
          ~name:"users"
          ~columns:[ int_col "id"; txt_col "name" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      (* Open a second catalog on the same store *)
      let* cat2 = C.open_ store in
@@ -442,7 +552,14 @@ let test_columns_survive_reopen () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let cols = [ int_col "id"; txt_col "email"; int_col "age" ] in
-     let* _ = C.create_table cat1 ~name:"persons" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"persons"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"persons" in
      (match result with
@@ -466,7 +583,12 @@ let test_rowid_survives_reopen () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* _ =
-       C.create_table cat1 ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ = C.next_rowid cat1 ~name:"t" in
      let* _ = C.next_rowid cat1 ~name:"t" in
@@ -483,7 +605,12 @@ let test_tree_id_survives_reopen () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* tid1 =
-       C.create_table cat1 ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
@@ -518,7 +645,14 @@ let test_default_blob_roundtrip () =
          }
        ]
      in
-     let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
@@ -555,7 +689,14 @@ let test_default_real_roundtrip () =
          }
        ]
      in
-     let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
@@ -592,7 +733,14 @@ let test_default_text_roundtrip () =
          }
        ]
      in
-     let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
@@ -621,7 +769,14 @@ let test_default_null_roundtrip () =
          }
        ]
      in
-     let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
@@ -657,6 +812,7 @@ let corrupt_default_tag () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let col_key =
        let tn = Bytes.of_string "t" in
@@ -696,6 +852,47 @@ let corrupt_default_tag () =
     Alcotest.(check bool) "recovered default is None" true (c.Row.default = None)
 ;;
 
+(* #299: the AUTOINCREMENT flag round-trips through the redundant mirror (v2).
+   Delete the primary _sys_tables row so the table is reconstructed solely from
+   the mirror on reopen, then assert the reconstructed meta still carries
+   [autoincrement = true].  (Per #299's mirror limitation, the volatile rowid
+   COUNTER is recomputed from data here — only the flag is mirror-persisted.) *)
+let mirror_preserves_autoincrement () =
+  let store = S.create () in
+  run
+    (let* cat = C.open_ store in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:
+           [ { Row.name = "a"
+             ; ty = Row.Integer
+             ; not_null = false
+             ; primary_key = true
+             ; default = None
+             ; check_sql = None
+             ; generated_as = None
+             }
+           ]
+         ~without_rowid:false
+         ~autoincrement:true
+     in
+     (* Drop the primary _sys_tables row (tid 0, key "t") so the next open
+        cannot load it from the primary and must reconstruct from the mirror. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     S.commit tx);
+  let cat2 = Lwt_main.run (C.open_ store) in
+  match Lwt_main.run (C.find_table cat2 ~name:"t") with
+  | None -> Alcotest.fail "t should be reconstructed from the mirror"
+  | Some m ->
+    Alcotest.(check bool)
+      "mirror-reconstructed table keeps autoincrement=true"
+      true
+      m.C.autoincrement
+;;
+
 let test_default_int_roundtrip () =
   run
     (let store = S.create () in
@@ -711,7 +908,14 @@ let test_default_int_roundtrip () =
          }
        ]
      in
-     let* _ = C.create_table cat1 ~name:"t" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let* cat2 = C.open_ store in
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
@@ -732,10 +936,20 @@ let test_load_all_first_table_not_skipped () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* _ =
-       C.create_table cat1 ~name:"aardvark" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"aardvark"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
-       C.create_table cat1 ~name:"zebra" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"zebra"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      (* Open a fresh catalog — this calls load_all which walks the cursor *)
      let* cat2 = C.open_ store in
@@ -762,7 +976,12 @@ let test_create_empty_name () =
      let* cat = C.open_ store in
      (* Empty name should succeed — no restriction in spec *)
      let* tid =
-       C.create_table cat ~name:"" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:""
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      Alcotest.(check int) "empty name gets tree_id 16" 16 tid;
      let* result = C.find_table cat ~name:"" in
@@ -777,7 +996,14 @@ let test_create_empty_columns () =
     (let store = S.create () in
      let* cat = C.open_ store in
      (* Zero columns should succeed — no column requirement in spec *)
-     let* tid = C.create_table cat ~name:"nocols" ~columns:[] ~without_rowid:false in
+     let* tid =
+       C.create_table
+         cat
+         ~name:"nocols"
+         ~columns:[]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      Alcotest.(check int) "zero-col table gets tree_id 16" 16 tid;
      let* result = C.find_table cat ~name:"nocols" in
      (match result with
@@ -807,6 +1033,7 @@ let corrupt_column_type_tag () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      (* Overwrite the column entry with a corrupt type tag (0) *)
      let col_key =
@@ -855,6 +1082,7 @@ let test_create_index_basic () =
          ~name:"users"
          ~columns:[ int_col "id"; txt_col "name" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* result =
        C.create_index
@@ -889,6 +1117,7 @@ let test_indexes_for_table () =
          ~name:"users"
          ~columns:[ int_col "id"; txt_col "name" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let before = C.indexes_for_table cat ~table:"users" in
      Alcotest.(check int) "no indexes initially" 0 (List.length before);
@@ -947,7 +1176,12 @@ let test_create_index_unknown_column () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* r =
        C.create_index
@@ -971,7 +1205,12 @@ let test_create_index_duplicate () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1011,6 +1250,7 @@ let test_index_persists_across_reopen () =
          ~name:"users"
          ~columns:[ int_col "id"; txt_col "name" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1050,6 +1290,7 @@ let test_index_origin_persists_across_reopen () =
          ~name:"t"
          ~columns:[ int_col "a"; int_col "b"; int_col "c" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let mk name col origin =
        let* r =
@@ -1091,7 +1332,12 @@ let test_find_index () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      Alcotest.(check bool)
        "missing index returns None"
@@ -1125,7 +1371,12 @@ let test_drop_table_basic () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tx = S.rw_begin store in
      let* () = C.drop_table cat tx ~name:"t" in
@@ -1141,7 +1392,12 @@ let test_drop_table_removes_from_disk () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* _ =
-       C.create_table cat1 ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tx = S.rw_begin store in
      let* () = C.drop_table cat1 tx ~name:"t" in
@@ -1163,6 +1419,7 @@ let test_drop_table_also_drops_indexes () =
          ~name:"t"
          ~columns:[ int_col "id"; txt_col "name" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1227,7 +1484,12 @@ let test_drop_index_basic () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1255,7 +1517,12 @@ let test_drop_index_persists () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* _ =
-       C.create_table cat1 ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1289,7 +1556,12 @@ let test_drop_index_empty_sys_indexes () =
     (let store = S.create () in
      let* cat1 = C.open_ store in
      let* _ =
-       C.create_table cat1 ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat1
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_index
@@ -1464,7 +1736,14 @@ let test_fingerprint_matches_compute () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id"; txt_col "name" ] in
-     let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let expected = SF.compute ~columns:cols ~without_rowid:false in
      Alcotest.(check (option int64))
        "fingerprint matches Schema_fingerprint.compute"
@@ -1489,10 +1768,20 @@ let test_fingerprint_distinct_schemas () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"a" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"a"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
-       C.create_table cat ~name:"b" ~columns:[ txt_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"b"
+         ~columns:[ txt_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      Alcotest.(check bool)
        "different column types -> different fingerprints"
@@ -1506,7 +1795,14 @@ let test_fingerprints_by_tree_id () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id" ] in
-     let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* tid =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      let expected = SF.compute ~columns:cols ~without_rowid:false in
      (match List.assoc_opt tid (C.fingerprints_by_tree_id cat) with
       | Some fp -> Alcotest.(check int64) "registry maps tree_id -> fp" expected fp
@@ -1519,7 +1815,12 @@ let test_fingerprint_changes_on_add_column () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"users" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let before = C.table_fingerprint cat ~name:"users" in
      let* r = C.add_column cat ~table_name:"users" ~column:(txt_col "name") in
@@ -1540,7 +1841,9 @@ let test_fingerprint_without_rowid () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id" ] in
-     let* _ = C.create_table cat ~name:"t" ~columns:cols ~without_rowid:true in
+     let* _ =
+       C.create_table cat ~name:"t" ~columns:cols ~without_rowid:true ~autoincrement:false
+     in
      let expected = SF.compute ~columns:cols ~without_rowid:true in
      Alcotest.(check (option int64))
        "without_rowid included in fingerprint"
@@ -1560,7 +1863,14 @@ let test_mirror_recovers_lost_primary_row () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let cols = [ int_col "id"; txt_col "name" ] in
-     let* tid = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* tid =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      (* Lose the primary _sys_tables row (system tree 0). *)
      let* tx = S.rw_begin store in
      let* () = S.del tx 0 (Bytes.of_string "users") in
@@ -1586,7 +1896,12 @@ let test_mirror_fingerprints_match_primary () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"a" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"a"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_table
@@ -1594,6 +1909,7 @@ let test_mirror_fingerprints_match_primary () =
          ~name:"b"
          ~columns:[ txt_col "y"; int_col "z" ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* mirror = C.mirror_fingerprints cat in
      List.iter
@@ -1610,7 +1926,12 @@ let test_mirror_drop_removes_entry () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid =
-       C.create_table cat ~name:"t" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tx = S.rw_begin store in
      let* () = C.drop_table cat tx ~name:"t" in
@@ -1628,7 +1949,12 @@ let test_mirror_reflects_add_column () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid =
-       C.create_table cat ~name:"t" ~columns:[ int_col "x" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "x" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* r = C.add_column cat ~table_name:"t" ~column:(txt_col "y") in
      (match r with
@@ -1653,7 +1979,12 @@ let test_mirror_recovers_next_rowid () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      (* Insert three rows with rowids 1, 7, and 42 into the data tree. *)
      let* tx = S.rw_begin store in
@@ -1687,7 +2018,12 @@ let test_mirror_recovers_negative_next_rowid () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* tid =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tx = S.rw_begin store in
      let* () = S.put tx tid (Rowid.encode (-5L)) (Bytes.of_string "row-5") in
@@ -1716,7 +2052,12 @@ let test_mirror_recovers_empty_next_rowid () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _tid =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* tx = S.rw_begin store in
      let* () = S.del tx 0 (Bytes.of_string "t") in
@@ -1736,10 +2077,20 @@ let test_drift_clean_db_no_discrepancies () =
     (let store = S.create () in
      let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"a" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"a"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
-       C.create_table cat ~name:"b" ~columns:[ txt_col "n" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"b"
+         ~columns:[ txt_col "n" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      let* discrepancies = C.verify_against_mirror cat in
      Alcotest.(check int) "no discrepancies on a clean db" 0 (List.length discrepancies);
@@ -1751,7 +2102,12 @@ let test_drift_detects_primary_mirror_mismatch () =
   run
     (let* cat = C.open_ store in
      let* _ =
-       C.create_table cat ~name:"t" ~columns:[ int_col "id" ] ~without_rowid:false
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
      in
      (* Tamper the PRIMARY column entry so "id" decodes as Text instead of
         Integer (still a valid column, so it loads).  The mirror still records
@@ -1845,6 +2201,10 @@ let () =
         ; Alcotest.test_case "create_empty_columns" `Quick test_create_empty_columns
         ; Alcotest.test_case "corrupt_column_type_tag" `Quick corrupt_column_type_tag
         ; Alcotest.test_case "corrupt_default_tag" `Quick corrupt_default_tag
+        ; Alcotest.test_case
+            "mirror_preserves_autoincrement"
+            `Quick
+            mirror_preserves_autoincrement
         ] )
     ; ( "backward_compat"
       , [ Alcotest.test_case

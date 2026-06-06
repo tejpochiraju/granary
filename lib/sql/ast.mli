@@ -456,6 +456,10 @@ and column_def =
   ; ty : ty
   ; not_null : bool
   ; primary_key : bool
+  ; autoincrement : bool
+    (** [AUTOINCREMENT] on a column [PRIMARY KEY] (#299).  Only ever [true] for
+        a single-column ascending INTEGER PRIMARY KEY on a rowid table; the
+        placement is validated in {!Sqlocaml_sql.Sema}. *)
   ; default : literal option (* None = no DEFAULT *)
   ; check : expr option (* None = no CHECK constraint *)
   ; fk_ref : (string * string * fk_action * fk_action * bool) option

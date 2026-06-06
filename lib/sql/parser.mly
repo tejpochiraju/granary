@@ -3,7 +3,7 @@
 
   type col_constraint =
     | Col_not_null
-    | Col_primary_key
+    | Col_primary_key of bool   (* #299: bool = AUTOINCREMENT present *)
     | Col_default of literal
     | Col_check   of expr
     | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action * bool
@@ -53,6 +53,7 @@
 %token CREATE TABLE INSERT INTO VALUES SELECT FROM WHERE
 %token INTEGER_TY TEXT_TY REAL_TY BLOB_TY
 %token NOT NULL PRIMARY KEY DEFAULT AND OR IS
+%token AUTOINCREMENT
 %token ORDER BY ASC DESC LIMIT OFFSET
 %token INDEX ON UNIQUE
 %token UPDATE SET
@@ -562,7 +563,10 @@ create_index:
 column_def:
   | name = any_ident ty = col_ty cs = column_constraint*
     { let not_null    = List.mem Col_not_null cs in
-      let primary_key = List.mem Col_primary_key cs in
+      let primary_key =
+        List.exists (function Col_primary_key _ -> true | _ -> false) cs in
+      let autoincrement =
+        List.exists (function Col_primary_key true -> true | _ -> false) cs in
       let default     = List.fold_left (fun acc c ->
           match c with Col_default l -> Some l | _ -> acc) None cs in
       let check       = List.fold_left (fun acc c ->
@@ -574,7 +578,7 @@ column_def:
           | _ -> acc) None cs in
       let generated_as = List.fold_left (fun acc c ->
           match c with Col_generated (e, s) -> Some (e, s) | _ -> acc) None cs in
-      { name; ty; not_null; primary_key; default; check; fk_ref; generated_as } }
+      { name; ty; not_null; primary_key; autoincrement; default; check; fk_ref; generated_as } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -584,7 +588,12 @@ col_ty:
 
 column_constraint:
   | NOT NULL              { Col_not_null }
-  | PRIMARY KEY           { Col_primary_key }
+  | PRIMARY KEY is_desc = pk_order_opt ai = autoincrement_opt
+    { if is_desc && ai then
+        (* SQLite: INTEGER PRIMARY KEY DESC is not a rowid alias, so it cannot
+           carry AUTOINCREMENT.  Match its parse-time rejection message. *)
+        failwith "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
+      Col_primary_key ai }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
   | REFERENCES t = any_ident oc = fk_on_clauses deferrable = deferrable_clause
@@ -597,6 +606,19 @@ column_constraint:
       then failwith (Printf.sprintf
              "expected GENERATED ALWAYS AS (...), got: %s %s AS" gen always);
       Col_generated (e, storage) }
+
+(* #299: optional sort order on a column PRIMARY KEY.  SQLite accepts ASC/DESC
+   here; this engine treats them as no-ops for the rowid alias except that DESC
+   disqualifies AUTOINCREMENT (handled in [column_constraint]). *)
+(* Returns [is_desc]: [true] only for an explicit DESC. *)
+pk_order_opt:
+  | ASC  { false }
+  | DESC { true }
+  |      { false }
+
+autoincrement_opt:
+  | AUTOINCREMENT { true }
+  |               { false }
 
 generated_storage:
   | id = any_ident { if String.uppercase_ascii id = "STORED" then `Stored

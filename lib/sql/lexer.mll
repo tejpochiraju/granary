@@ -101,6 +101,7 @@ rule token = parse
       | "BY"         -> BY
       | "ASC"        -> ASC
       | "DESC"       -> DESC
+      | "AUTOINCREMENT" -> AUTOINCREMENT
       | "LIMIT"      -> LIMIT
       | "OFFSET"     -> OFFSET
       | "INDEX"      -> INDEX
