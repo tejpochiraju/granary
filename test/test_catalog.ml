@@ -903,6 +903,72 @@ let mirror_preserves_autoincrement () =
       m.C.autoincrement
 ;;
 
+(* #314: the AUTOINCREMENT high-water (incl. a committed-DELETE high-water) must
+   survive mirror reconstruction, not collapse to max(rowid)+1.  Allocate rowids
+   1 and 2 (counter -> 3), write their data rows, then DELETE the top data row
+   (rowid 2).  The sticky high-water is now 3 while max(rowid) in data is 1.
+   Corrupt the primary _sys_tables row and reopen to force reconstruction from
+   the mirror (v3), then assert the next allocation is 3 — NOT 2 (which is what a
+   max(rowid)+1 recompute would wrongly reissue). *)
+let mirror_preserves_autoincrement_counter () =
+  let store = S.create () in
+  run
+    (let* cat = C.open_ store in
+     let* tid =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:
+           [ { Row.name = "a"
+             ; ty = Row.Integer
+             ; not_null = false
+             ; primary_key = true
+             ; pk_desc = false
+             ; default = None
+             ; check_sql = None
+             ; generated_as = None
+             }
+           ]
+         ~without_rowid:false
+         ~autoincrement:true
+     in
+     (* Allocate rowids 1 and 2 (the cached/mirrored high-water becomes 3) and
+        write the corresponding data rows. *)
+     let* r1 = C.next_rowid cat ~name:"t" in
+     let* r2 = C.next_rowid cat ~name:"t" in
+     Alcotest.(check int64) "first allocated rowid" 1L r1;
+     Alcotest.(check int64) "second allocated rowid" 2L r2;
+     let* tx = S.rw_begin store in
+     let* () = S.put tx tid (Rowid.encode 1L) (Bytes.of_string "row1") in
+     let* () = S.put tx tid (Rowid.encode 2L) (Bytes.of_string "row2") in
+     let* () = S.commit tx in
+     (* DELETE the top data row (rowid 2): the AUTOINCREMENT high-water stays 3,
+        but max(rowid) in data is now 1. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx tid (Rowid.encode 2L) in
+     let* () = S.commit tx in
+     (* Drop the primary _sys_tables row to force mirror reconstruction. *)
+     let* tx = S.rw_begin store in
+     let* () = S.del tx 0 (Bytes.of_string "t") in
+     let* () = S.commit tx in
+     let* cat2 = C.open_ store in
+     (match C.find_table_cached cat2 ~name:"t" with
+      | None -> Alcotest.fail "table t should be reconstructed from mirror"
+      | Some m ->
+        Alcotest.(check bool)
+          "reconstructed table keeps autoincrement=true"
+          true
+          m.C.autoincrement;
+        Alcotest.(check int64)
+          "reconstructed next_rowid is the sticky high-water 3, not max+1=2"
+          3L
+          m.C.next_rowid);
+     (* The next auto-allocated rowid must be 3, not the deleted/reused 2. *)
+     let* r = C.next_rowid cat2 ~name:"t" in
+     Alcotest.(check int64) "next allocated rowid is 3, not reused 2" 3L r;
+     Lwt.return_unit)
+;;
+
 let test_default_int_roundtrip () =
   run
     (let store = S.create () in
@@ -2217,6 +2283,10 @@ let () =
             "mirror_preserves_autoincrement"
             `Quick
             mirror_preserves_autoincrement
+        ; Alcotest.test_case
+            "mirror_preserves_autoincrement_counter"
+            `Quick
+            mirror_preserves_autoincrement_counter
         ] )
     ; ( "backward_compat"
       , [ Alcotest.test_case

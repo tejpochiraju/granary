@@ -1290,7 +1290,12 @@ let register_tag store (m : table_meta) =
    changes on DDL, not on every insert. *)
 (* v2 (#299): appends a trailing autoincrement byte after the column/FK blocks.
    v1 entries lack it; the decoder treats their absence as [false]. *)
-let mirror_version = 2
+(* v3 (#314): for an AUTOINCREMENT table ONLY, appends a presence byte + int64
+   carrying the volatile [next_rowid] high-water, so mirror reconstruction can
+   restore the sticky counter instead of recomputing max(rowid)+1 (which would
+   make a committed-DELETE high-water reusable).  Non-AUTOINCREMENT tables write
+   a presence byte of 0 and incur no per-insert mirror write. *)
+let mirror_version = 3
 
 let mirror_key (tid : S.tree_id) =
   let b = Bytes.create 8 in
@@ -1320,6 +1325,15 @@ let encode_mirror_entry (m : table_meta) =
   Buffer.add_bytes buf fkb;
   (* #299 (mirror v2): trailing autoincrement byte. *)
   Buffer.add_uint8 buf (if m.autoincrement then 1 else 0);
+  (* #314 (mirror v3): for an AUTOINCREMENT table, persist the volatile rowid
+     high-water so mirror reconstruction restores it instead of recomputing
+     max(rowid)+1.  Non-AUTOINCREMENT tables omit it (no per-insert mirror
+     write).  Encoded as a presence byte + int64. *)
+  if m.autoincrement
+  then (
+    Buffer.add_uint8 buf 1;
+    Varint.encode_int64 buf m.next_rowid)
+  else Buffer.add_uint8 buf 0;
   Buffer.to_bytes buf
 ;;
 
@@ -1354,13 +1368,27 @@ let decode_mirror_entry bytes : table_meta * int64 =
   let fk_constraints = decode_fks fkb in
   off := o + Int64.to_int fklen;
   (* #299 (mirror v2): trailing autoincrement byte; absent in v1. *)
-  let autoincrement =
-    ver >= 2 && !off < Bytes.length bytes && Bytes.get_uint8 bytes !off <> 0
+  let ai_present = ver >= 2 && !off < Bytes.length bytes in
+  let autoincrement = ai_present && Bytes.get_uint8 bytes !off <> 0 in
+  if ai_present then incr off;
+  (* #314 (mirror v3): for an AUTOINCREMENT table, a presence byte followed (when
+     nonzero) by the persisted [next_rowid] high-water.  v1/v2 blobs lack this;
+     a v3 non-AUTOINCREMENT blob has presence byte 0.  Either way [next_rowid]
+     defaults to [empty_next_rowid], so [recover_next_rowid] still recomputes
+     max(rowid)+1 for those. *)
+  let next_rowid =
+    if ver >= 3 && !off < Bytes.length bytes && Bytes.get_uint8 bytes !off <> 0
+    then (
+      incr off;
+      let v, o = Varint.decode_int64 bytes !off in
+      off := o;
+      v)
+    else empty_next_rowid
   in
   ( { name
     ; tree_id = Int64.to_int tid
     ; columns
-    ; next_rowid = empty_next_rowid
+    ; next_rowid
     ; fk_constraints
     ; without_rowid
     ; autoincrement
@@ -1371,6 +1399,17 @@ let decode_mirror_entry bytes : table_meta * int64 =
 (* Write/replace a table's mirror entry inside an already-open RW txn. *)
 let put_mirror_tx tx (m : table_meta) =
   S.put tx sys_mirror_tid (mirror_key m.tree_id) (encode_mirror_entry m)
+;;
+
+(* Persist [m]'s rowid counter to the primary [_sys_tables] row, and — for
+   AUTOINCREMENT tables (#314) — keep the redundant mirror's high-water in step
+   so a later mirror reconstruction restores the sticky counter.  Non-
+   AUTOINCREMENT tables skip the mirror write (no per-insert mirror amplification).
+   Single home for the "mirror tracks primary" invariant shared by every
+   counter-mutation path. *)
+let put_table_counter_tx tx (m : table_meta) =
+  let%lwt () = S.put tx sys_tables_tid (Bytes.of_string m.name) (encode_table_value m) in
+  if m.autoincrement then put_mirror_tx tx m else Lwt.return_unit
 ;;
 
 (* Remove a table's mirror entry inside an already-open RW txn. *)
@@ -1410,6 +1449,15 @@ let load_mirror_entries store =
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   if m.without_rowid
   then Lwt.return m
+  else if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+  then
+    (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
+       tables; trust it instead of recomputing max(rowid)+1, which would make a
+       committed-DELETE high-water reusable.  Only a v3 AUTOINCREMENT mirror
+       entry decodes to a non-empty [next_rowid], so the rollback-recompute
+       caller (which passes live-cache, non-AUTOINCREMENT metas) never trips
+       this branch. *)
+    Lwt.return m
   else
     S.with_ro store
     @@ fun tx ->
@@ -1854,7 +1902,7 @@ let next_rowid t ~name =
        concurrent autocommit callers cannot read the same stale counter. *)
     Schema_cache.set_rowid_durable t.sc ~name m';
     let%lwt tx = S.rw_begin t.store in
-    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
+    let%lwt () = put_table_counter_tx tx m' in
     let%lwt () = S.commit tx in
     Lwt.return id
 ;;
@@ -1881,9 +1929,7 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
       (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
          ROLLBACK recomputes only it. *)
       Schema_cache.bump_rowid t.sc ~name m';
-      let%lwt () =
-        S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m')
-      in
+      let%lwt () = put_table_counter_tx tx m' in
       Lwt.return id)
 ;;
 
@@ -1911,7 +1957,10 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
          actually moved (the early-return no-op above leaves the cached counter
          untouched, so nothing to recompute). *)
       Schema_cache.bump_rowid t.sc ~name m';
-      S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
+      (* #314: [put_table_counter_tx] mirrors the high-water for AUTOINCREMENT
+         tables.  The no-op early-return path above never reaches here, so a
+         non-moving bump leaves both primary and mirror untouched. *)
+      put_table_counter_tx tx m')
 ;;
 
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is
