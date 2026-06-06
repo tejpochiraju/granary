@@ -11562,16 +11562,10 @@ let assert_create_rejected sql needle =
   | Ok () -> Alcotest.failf "expected rejection of: %s" sql
   | Error e ->
     let msg = fmt_err e in
-    let contains =
-      let nl = String.length needle
-      and hl = String.length msg in
-      let rec go i = i + nl <= hl && (String.sub msg i nl = needle || go (i + 1)) in
-      nl = 0 || go 0
-    in
     Alcotest.(check bool)
       (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
       true
-      contains
+      (contains_pat needle msg)
 ;;
 
 (* #299 property: under any interleaving of committed INSERT/DELETE ops, an
@@ -11708,6 +11702,37 @@ let autoincrement_table_constraint () =
   (* sticky high-water: the deleted top rowid is NOT reused *)
   let rows = query_ok db "SELECT a FROM t ORDER BY a" in
   Alcotest.(check (list int64)) "ids" [ 2L ] (List.map int_of_row rows)
+;;
+
+(* Assert [sql] run against [db] is rejected and the error message contains
+   [needle] (matching SQLite's own wording). Generic statement variant of
+   [assert_create_rejected], for asserting INSERT-time errors against a db that
+   already has state set up. *)
+let assert_exec_rejected db sql needle =
+  match Lwt_main.run (Db.execute db sql) with
+  | Ok () -> Alcotest.failf "expected rejection of: %s" sql
+  | Error e ->
+    let msg = fmt_err e in
+    Alcotest.(check bool)
+      (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
+      true
+      (contains_pat needle msg)
+;;
+
+(* #312: an AUTOINCREMENT table whose counter is already pinned at max_int (an
+   explicit Int64.max_int rowid exists) cannot auto-allocate another id. SQLite
+   raises SQLITE_FULL (database or disk is full) rather than silently holding
+   the counter and risking a collision. *)
+let autoincrement_full_on_exhaustion () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  (* seed the counter at the maximum: an explicit max_int rowid *)
+  exec db (Printf.sprintf "INSERT INTO t(a, b) VALUES (%Ld, 'top')" Int64.max_int);
+  (* the next auto-allocation must fail with SQLITE_FULL wording *)
+  assert_exec_rejected
+    db
+    "INSERT INTO t(b) VALUES ('overflow')"
+    "database or disk is full"
 ;;
 
 (* #312: the table-constraint form is still only legal on a single-column
@@ -12628,6 +12653,7 @@ let () =
             "table_constraint_rejections"
             `Quick
             autoincrement_table_constraint_rejections
+        ; Alcotest.test_case "full_on_exhaustion" `Quick autoincrement_full_on_exhaustion
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
     ]

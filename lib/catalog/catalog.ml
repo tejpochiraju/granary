@@ -1848,13 +1848,24 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let id, next = alloc_rowid m in
-    let m' = { m with next_rowid = next } in
-    (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
-       ROLLBACK recomputes only it. *)
-    Schema_cache.bump_rowid t.sc ~name m';
-    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
-    Lwt.return id
+    (* #312: an AUTOINCREMENT table whose counter is already pinned at max_int
+       (a max_int rowid exists) cannot allocate another id.  SQLite raises
+       SQLITE_FULL here instead of probing for a free rowid; match its wording.
+       Use [Lwt.fail_with] so it surfaces as a catchable SQL [Error] like the
+       other user-facing insert failures.  Plain rowid tables keep the existing
+       hold-at-max behavior. *)
+    if m.autoincrement && Int64.equal m.next_rowid Int64.max_int
+    then Lwt.fail_with "database or disk is full"
+    else (
+      let id, next = alloc_rowid m in
+      let m' = { m with next_rowid = next } in
+      (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
+         ROLLBACK recomputes only it. *)
+      Schema_cache.bump_rowid t.sc ~name m';
+      let%lwt () =
+        S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m')
+      in
+      Lwt.return id)
 ;;
 
 (** #243 (T1): after an INSERT supplies an explicit INTEGER PRIMARY KEY value,

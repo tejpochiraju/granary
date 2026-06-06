@@ -2819,6 +2819,15 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
                ~name:table_meta.name
                ~at_least:(Int64.add n 1L)
                tx
+           else if table_meta.Cat.autoincrement
+           then
+             (* #312: pin the AUTOINCREMENT counter at max_int so the next
+                auto-allocation detects exhaustion and raises SQLITE_FULL. *)
+             Cat.bump_next_rowid_in_txn
+               cat
+               ~name:table_meta.name
+               ~at_least:Int64.max_int
+               tx
            else Lwt.return_unit
          in
          Lwt.return n
