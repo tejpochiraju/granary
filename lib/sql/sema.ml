@@ -1346,108 +1346,116 @@ let validate_autoincrement ~without_rowid (columns : Ast.column_def list) row_co
     | _ -> Error (Unsupported "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"))
 ;;
 
-let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
-  (* #317.1: SQLite reserves the [sqlite_] prefix for its own internal objects
-     (sqlite_master/schema, sqlite_sequence, and the sqlite_stat / sqlite_autoindex
-     families).  Creating such a table used to succeed and then be shadowed by the
-     synthesized view for SELECT and intercepted for DML — an unusable, confusing
-     table.  Reject it up front, matching SQLite's "object name reserved for
-     internal use".  The engine's own system tables use the [_sys_] prefix, and
-     the synthesized sqlite_master/sqlite_sequence are never created via this
-     path, so nothing internal is blocked. *)
+(* #317.1 / #325 / #326: SQLite reserves the [sqlite_] prefix for its own
+   internal objects (sqlite_master/schema, sqlite_sequence, and the sqlite_stat
+   / sqlite_autoindex families).  Naming a user object with this prefix used to
+   succeed and then be shadowed by the synthesized view for SELECT and
+   intercepted for DML — an unusable, confusing object.  The rule applies to
+   *every* schema-object namespace (tables, indexes, views, triggers, virtual
+   tables and RENAME TO targets alike), so this guard is called from each DDL
+   binder that lands a user-supplied name, matching SQLite's "object name
+   reserved for internal use".  The engine's own system tables use the [_sys_]
+   prefix, FTS shadow tables go through [Cat.create_fts_table] (not these
+   binders), and the synthesized sqlite_master/sqlite_sequence are never created
+   via these paths, so nothing internal is blocked. *)
+let reject_reserved_name name =
   if String.starts_with ~prefix:"sqlite_" (String.lowercase_ascii name)
   then
-    Lwt.return
-      (Error
-         (Unsupported (Printf.sprintf "object name reserved for internal use: %s" name)))
-  else
+    Error (Unsupported (Printf.sprintf "object name reserved for internal use: %s" name))
+  else Ok ()
+;;
+
+let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
+  match reject_reserved_name name with
+  | Error e -> Lwt.return (Error e)
+  | Ok () ->
     let* existing = Cat.find_table cat ~name in
-    match existing with
-    | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-    | Some _ (* if_not_exists = true: silently succeed *) ->
-      Lwt.return
-        (Ok
-           (BS_create_table
-              { name
-              ; columns = []
-              ; uniq_idxs = []
-              ; if_not_exists = true
-              ; fk_constraints = []
-              ; without_rowid
-              ; autoincrement = false
-              }))
-    | None ->
-      let unsupported_check =
-        List.find_opt
-          (fun (c : Ast.column_def) ->
-             match c.check with
-             | None -> false
-             | Some e -> check_expr_unsupported e)
-          columns
-      in
-      (match unsupported_check with
-       | Some col ->
-         Lwt.return
-           (Error
-              (Unsupported
-                 (Printf.sprintf
-                    "CHECK constraint on column '%s' contains unsupported expression \
-                     form (aggregates, subqueries, and parameters are not allowed)"
-                    col.name)))
-       | None ->
-         (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
+    (match existing with
+     | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+     | Some _ (* if_not_exists = true: silently succeed *) ->
+       Lwt.return
+         (Ok
+            (BS_create_table
+               { name
+               ; columns = []
+               ; uniq_idxs = []
+               ; if_not_exists = true
+               ; fk_constraints = []
+               ; without_rowid
+               ; autoincrement = false
+               }))
+     | None ->
+       let unsupported_check =
+         List.find_opt
+           (fun (c : Ast.column_def) ->
+              match c.check with
+              | None -> false
+              | Some e -> check_expr_unsupported e)
+           columns
+       in
+       (match unsupported_check with
+        | Some col ->
+          Lwt.return
+            (Error
+               (Unsupported
+                  (Printf.sprintf
+                     "CHECK constraint on column '%s' contains unsupported expression \
+                      form (aggregates, subqueries, and parameters are not allowed)"
+                     col.name)))
+        | None ->
+          (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
           column_def, so validation/derivation reuse the column-form path.  A
           composite or non-INTEGER PK is still rejected downstream because the
           marked column will not be the rowid alias. *)
-         let tc_ai_cols =
-           List.concat_map
-             (function
-               | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
-               | _ -> [])
-             constraints
-         in
-         let columns =
-           if tc_ai_cols = []
-           then columns
-           else
-             List.map
-               (fun (c : Ast.column_def) ->
-                  if List.mem c.name tc_ai_cols
-                  then { c with autoincrement = true }
-                  else c)
-               columns
-         in
-         let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
-         (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
+          let tc_ai_cols =
+            List.concat_map
+              (function
+                | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
+                | _ -> [])
+              constraints
+          in
+          let columns =
+            if tc_ai_cols = []
+            then columns
+            else
+              List.map
+                (fun (c : Ast.column_def) ->
+                   if List.mem c.name tc_ai_cols
+                   then { c with autoincrement = true }
+                   else c)
+                columns
+          in
+          let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
+          (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)
-         let rowid_alias_col_name =
-           Option.map
-             (fun i -> (List.nth row_cols i).Row.name)
-             (Cat.compute_rowid_alias_col row_cols ~without_rowid)
-         in
-         let uniq_idxs =
-           auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
-         in
-         (match extract_fk_constraints cat ~columns ~constraints with
-          | Error e -> Lwt.return (Error e)
-          | Ok fk_constraints ->
-            (match validate_without_rowid ~name ~without_rowid row_cols with
-             | Error e -> Lwt.return (Error e)
-             | Ok () ->
-               (match validate_autoincrement ~without_rowid columns row_cols with
-                | Error e -> Lwt.return (Error e)
-                | Ok autoincrement ->
-                  Lwt.return
-                    (Ok
-                       (BS_create_table
-                          { name
-                          ; columns = row_cols
-                          ; uniq_idxs
-                          ; if_not_exists
-                          ; fk_constraints
-                          ; without_rowid
-                          ; autoincrement
-                          }))))))
+          let rowid_alias_col_name =
+            Option.map
+              (fun i -> (List.nth row_cols i).Row.name)
+              (Cat.compute_rowid_alias_col row_cols ~without_rowid)
+          in
+          let uniq_idxs =
+            auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
+          in
+          (match extract_fk_constraints cat ~columns ~constraints with
+           | Error e -> Lwt.return (Error e)
+           | Ok fk_constraints ->
+             (match validate_without_rowid ~name ~without_rowid row_cols with
+              | Error e -> Lwt.return (Error e)
+              | Ok () ->
+                (match validate_autoincrement ~without_rowid columns row_cols with
+                 | Error e -> Lwt.return (Error e)
+                 | Ok autoincrement ->
+                   Lwt.return
+                     (Ok
+                        (BS_create_table
+                           { name
+                           ; columns = row_cols
+                           ; uniq_idxs
+                           ; if_not_exists
+                           ; fk_constraints
+                           ; without_rowid
+                           ; autoincrement
+                           })))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -2910,75 +2918,78 @@ let rec infer_type (cols : Row.column list) : bound_expr -> Row.ty option = func
 (* ------------------------------------------------------------------ *)
 
 let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_exists =
-  let* meta_opt = Cat.find_table cat ~name:table in
-  match meta_opt with
-  | None -> Lwt.return (Error (Unknown_table table))
-  | Some meta ->
-    let pc = ref 0 in
-    let np = Hashtbl.create 0 in
-    (* Bind each column expression to validate it; discard the bound forms —
+  match reject_reserved_name name with
+  | Error e -> Lwt.return (Error e)
+  | Ok () ->
+    let* meta_opt = Cat.find_table cat ~name:table in
+    (match meta_opt with
+     | None -> Lwt.return (Error (Unknown_table table))
+     | Some meta ->
+       let pc = ref 0 in
+       let np = Hashtbl.create 0 in
+       (* Bind each column expression to validate it; discard the bound forms —
        the SQL strings in col_sqls are sufficient for runtime eval. *)
-    let col_results =
-      List.map
-        (fun col_ast ->
-           match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
-           | Error e -> Error e
-           | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
-        columns
-    in
-    let errors =
-      List.filter_map
-        (function
-          | Error e -> Some e
-          | Ok _ -> None)
-        col_results
-    in
-    (match errors with
-     | e :: _ -> Lwt.return (Error e)
-     | [] ->
-       (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
+       let col_results =
+         List.map
+           (fun col_ast ->
+              match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
+              | Error e -> Error e
+              | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
+           columns
+       in
+       let errors =
+         List.filter_map
+           (function
+             | Error e -> Some e
+             | Ok _ -> None)
+           col_results
+       in
+       (match errors with
+        | e :: _ -> Lwt.return (Error e)
+        | [] ->
+          (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
           supported.  The exec.ml index-write paths recompute virtuals into
           a scratch row before extracting index keys, so VIRTUAL cells
           contribute their up-to-date value instead of NULL. *)
-       (* Compute col_sqls and col_expr_flags from the original AST *)
-       let col_sqls, col_expr_flags =
-         List.split
-           (List.map
-              (fun col_ast ->
-                 match col_ast with
-                 | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
-                 | _ -> Ast.expr_to_sql col_ast, true)
-              columns)
-       in
-       (* Bind WHERE clause *)
-       let where_result =
-         match where_clause with
-         | None -> Ok (None, None)
-         | Some w_ast ->
-           (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
-            | Error e -> Error e
-            | Ok bw -> Ok (Some bw, Some w_ast))
-       in
-       (match where_result with
-        | Error e -> Lwt.return (Error e)
-        | Ok (where_expr, where_ast) ->
-          (match Cat.find_index cat ~name with
-           | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-           | _ ->
-             (* Some _ reaches here only with if_not_exists=true (silent
+          (* Compute col_sqls and col_expr_flags from the original AST *)
+          let col_sqls, col_expr_flags =
+            List.split
+              (List.map
+                 (fun col_ast ->
+                    match col_ast with
+                    | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
+                    | _ -> Ast.expr_to_sql col_ast, true)
+                 columns)
+          in
+          (* Bind WHERE clause *)
+          let where_result =
+            match where_clause with
+            | None -> Ok (None, None)
+            | Some w_ast ->
+              (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
+               | Error e -> Error e
+               | Ok bw -> Ok (Some bw, Some w_ast))
+          in
+          (match where_result with
+           | Error e -> Lwt.return (Error e)
+           | Ok (where_expr, where_ast) ->
+             (match Cat.find_index cat ~name with
+              | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+              | _ ->
+                (* Some _ reaches here only with if_not_exists=true (silent
                 success); None creates.  Both carry the param's if_not_exists. *)
-             Lwt.return
-               (Ok
-                  (BS_create_index
-                     { name
-                     ; table_meta = meta
-                     ; col_sqls
-                     ; col_expr_flags
-                     ; where_expr
-                     ; where_ast
-                     ; unique
-                     ; if_not_exists
-                     })))))
+                Lwt.return
+                  (Ok
+                     (BS_create_index
+                        { name
+                        ; table_meta = meta
+                        ; col_sqls
+                        ; col_expr_flags
+                        ; where_expr
+                        ; where_ast
+                        ; unique
+                        ; if_not_exists
+                        }))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3355,7 +3366,10 @@ let bind_alter_table cat ~table ~action =
   | Some table_meta ->
     (match action with
      | Ast.AA_add_column col_def -> bind_add_column cat ~table_meta ~action col_def
-     | Ast.AA_rename_table _ -> Lwt.return (Ok (BS_alter_table { table_meta; action }))
+     | Ast.AA_rename_table new_name ->
+       (match reject_reserved_name new_name with
+        | Error e -> Lwt.return (Error e)
+        | Ok () -> Lwt.return (Ok (BS_alter_table { table_meta; action })))
      | Ast.AA_rename_column (old_col, _new_col) ->
        let exists =
          List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns
@@ -3715,11 +3729,14 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   | Ast.S_release name -> Lwt.return (Ok (BS_release name))
   | Ast.S_rollback_to name -> Lwt.return (Ok (BS_rollback_to name))
   | Ast.S_create_fts_table { name; columns } ->
-    let* tbl = Cat.find_table cat ~name in
-    let fts_existing = Cat.find_fts cat name in
-    (match tbl, fts_existing with
-     | Some _, _ | _, Some _ -> Lwt.return (Error (Already_exists name))
-     | None, None -> Lwt.return (Ok (BS_create_fts_table { name; columns })))
+    (match reject_reserved_name name with
+     | Error e -> Lwt.return (Error e)
+     | Ok () ->
+       let* tbl = Cat.find_table cat ~name in
+       let fts_existing = Cat.find_fts cat name in
+       (match tbl, fts_existing with
+        | Some _, _ | _, Some _ -> Lwt.return (Error (Already_exists name))
+        | None, None -> Lwt.return (Ok (BS_create_fts_table { name; columns }))))
   | Ast.S_pragma kind -> Lwt.return (Ok (BS_pragma { kind }))
   | Ast.S_vacuum -> Lwt.return (Ok BS_vacuum)
   | Ast.S_attach { path; schema } -> Lwt.return (Ok (BS_attach { path; schema }))
@@ -3728,13 +3745,19 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   | Ast.S_with_cte { name; def; query; recursive } ->
     bind_with_cte ~views ~named_params ~param_counter cat ~name ~def ~query ~recursive
   | Ast.S_create_view { name; query } ->
-    let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
-    (match bound_r with
+    (match reject_reserved_name name with
      | Error e -> Lwt.return (Error e)
-     | Ok _ -> Lwt.return (Ok (BS_create_view { name; query })))
+     | Ok () ->
+       let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
+       (match bound_r with
+        | Error e -> Lwt.return (Error e)
+        | Ok _ -> Lwt.return (Ok (BS_create_view { name; query }))))
   | Ast.S_drop_view { name; if_exists = _ } -> Lwt.return (Ok (BS_drop_view { name }))
   | Ast.S_create_trigger { name; timing; event; table; when_; body } ->
-    Lwt.return (Ok (BS_create_trigger { name; timing; event; table; when_; body }))
+    (match reject_reserved_name name with
+     | Error e -> Lwt.return (Error e)
+     | Ok () ->
+       Lwt.return (Ok (BS_create_trigger { name; timing; event; table; when_; body })))
   | Ast.S_drop_trigger { name; if_exists = _ } ->
     Lwt.return (Ok (BS_drop_trigger { name }))
   | Ast.S_explain { analyze; stmt = inner_ast } ->

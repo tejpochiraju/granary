@@ -12094,6 +12094,38 @@ let sqlite_sequence_reserved_create_rejected () =
        (query_ok db "SELECT name FROM sqlite_master WHERE name = 'not_sqlite_x'"))
 ;;
 
+(* #325/#326: the reserved-[sqlite_] prefix rule applies to every schema-object
+   namespace, not just CREATE TABLE.  Each DDL binder that lands a user-supplied
+   name must reject the prefix, otherwise the shadowed-unusable-object state
+   #317.1 eliminated is reachable again (e.g. RENAME TO sqlite_sequence lands a
+   real table that the synthesized view then masks). *)
+let sqlite_reserved_name_all_ddl_rejected () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+  (* 1. ALTER TABLE ... RENAME TO sqlite_* *)
+  assert_exec_rejected db "ALTER TABLE t RENAME TO sqlite_sequence" "reserved";
+  assert_exec_rejected db "ALTER TABLE t RENAME TO sqlite_foo" "reserved";
+  (* case-insensitive prefix *)
+  assert_exec_rejected db "ALTER TABLE t RENAME TO SQLITE_Bar" "reserved";
+  (* 2. CREATE INDEX sqlite_* *)
+  assert_exec_rejected db "CREATE INDEX sqlite_idx ON t (a)" "reserved";
+  (* 3. CREATE VIEW sqlite_* *)
+  assert_exec_rejected db "CREATE VIEW sqlite_v AS SELECT a FROM t" "reserved";
+  (* 4. CREATE TRIGGER sqlite_* *)
+  assert_exec_rejected
+    db
+    "CREATE TRIGGER sqlite_trig AFTER INSERT ON t BEGIN UPDATE t SET b = 'x'; END"
+    "reserved";
+  (* 5. CREATE VIRTUAL TABLE sqlite_* USING fts5 *)
+  assert_exec_rejected db "CREATE VIRTUAL TABLE sqlite_fts USING fts5(body)" "reserved";
+  (* a non-reserved rename still succeeds and is the only object present *)
+  exec db "ALTER TABLE t RENAME TO ok_table";
+  Alcotest.(check int)
+    "non-reserved rename succeeded"
+    1
+    (List.length (query_ok db "SELECT name FROM sqlite_master WHERE name = 'ok_table'"))
+;;
+
 (* #317.2: identifiers in the sqlite_sequence write matchers are case-insensitive
    and accept the [sqlite_sequence.] qualifier — both forms behave identically in
    SQLite. *)
@@ -13079,6 +13111,10 @@ let () =
             "reserved_create_rejected"
             `Quick
             sqlite_sequence_reserved_create_rejected
+        ; Alcotest.test_case
+            "reserved_name_all_ddl_rejected"
+            `Quick
+            sqlite_reserved_name_all_ddl_rejected
         ; Alcotest.test_case
             "case_and_qualified"
             `Quick
