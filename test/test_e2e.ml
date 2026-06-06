@@ -11631,6 +11631,60 @@ let qcheck_autoincrement_monotonic =
           Lwt.return !ok))
 ;;
 
+(* #299: the AUTOINCREMENT flag persists across a file close+reopen (trailing
+   field of the _sys_tables value encoding), so both the sticky high-water
+   semantics AND the dump keyword survive a reopen rather than silently
+   downgrading to a plain rowid table. *)
+let autoincrement_persists_across_reopen () =
+  with_tempfile (fun path ->
+    run
+      (let open_db () =
+         let* r = Db.open_file ~path () in
+         match r with
+         | Ok d -> Lwt.return d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* db = open_db () in
+       let* _ =
+         Db.execute db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)"
+       in
+       let* _ = Db.execute db "INSERT INTO t (b) VALUES ('x')" in
+       (* rowid 1 *)
+       let* _ = Db.execute db "INSERT INTO t (b) VALUES ('y')" in
+       (* rowid 2; high-water now 3 *)
+       let* _ = Db.execute db "DELETE FROM t WHERE a = 2" in
+       let* () = Db.close db in
+       (* Reopen: the high-water (3) must survive, so the next insert is rowid 3
+          (sticky), and the dump still carries AUTOINCREMENT. *)
+       let* db2 = open_db () in
+       let* _ = Db.execute db2 "INSERT INTO t (b) VALUES ('z')" in
+       let* rq = Db.query db2 "SELECT a FROM t ORDER BY a ASC" in
+       let* rows =
+         match rq with
+         | Ok stream -> Lwt_stream.to_list stream
+         | Error _ -> Alcotest.fail "query failed after reopen"
+       in
+       Alcotest.(check (list int64))
+         "high-water sticky across reopen (rowid 3, not 2)"
+         [ 1L; 3L ]
+         (List.map int_of_row rows);
+       let* dump = Db.dump_to_string db2 () in
+       let dump =
+         match dump with
+         | Ok s -> s
+         | Error _ -> Alcotest.fail "dump failed"
+       in
+       let has_ai =
+         let needle = "PRIMARY KEY AUTOINCREMENT" in
+         let nl = String.length needle
+         and hl = String.length dump in
+         let rec go i = i + nl <= hl && (String.sub dump i nl = needle || go (i + 1)) in
+         go 0
+       in
+       Alcotest.(check bool) "dump still emits AUTOINCREMENT after reopen" true has_ai;
+       Db.close db2))
+;;
+
 (* Tier 1 guardrails: AUTOINCREMENT only on a single-column INTEGER PK rowid
    table — matching SQLite's rejection messages. *)
 let autoincrement_rejections () =
@@ -12540,6 +12594,10 @@ let () =
     ; ( "autoincrement (#299)"
       , [ Alcotest.test_case "create_and_insert" `Quick autoincrement_create_and_insert
         ; Alcotest.test_case "rejections" `Quick autoincrement_rejections
+        ; Alcotest.test_case
+            "persists_across_reopen"
+            `Quick
+            autoincrement_persists_across_reopen
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
     ]
