@@ -158,10 +158,11 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     consequence: replay the script as-is — do {e not} wrap it in your own
     [BEGIN]/[COMMIT], as the engine rejects a nested transaction.
 
-    {b Not a point-in-time snapshot.} Each table is read in its own read
-    transaction, so a concurrent commit between two tables' reads can produce a
-    dump that reflects no single committed state. Dump from a quiescent database,
-    or one with no concurrent writers, for a consistent result.
+    {b Point-in-time snapshot (#274).} The whole dump reads through one
+    read-only snapshot of the committed state — taken when the dump begins (or
+    the ambient explicit transaction, if one is active) — so it reflects a
+    single consistent moment even if other writers commit concurrently while it
+    runs, matching [sqlite3 .dump].
 
     {b FTS5 content is not dumped.} An FTS5 table's [CREATE VIRTUAL TABLE] is
     emitted but its rows are not (content-dumping is a planned follow-up), so a

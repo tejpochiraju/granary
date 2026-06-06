@@ -2262,6 +2262,11 @@ let list_find_index pred lst =
 type txn_mode =
   | Auto (** Each DML op starts and commits its own RW txn. *)
   | In_txn of S.rw S.txn (** Use this txn; skip auto begin/commit. *)
+  | In_ro_txn of S.ro S.txn
+  (** #274: read every scan through this one RO snapshot so a multi-statement
+        read (e.g. [Db.dump] sweeping every table) observes a single
+        point-in-time committed state.  Read-only: never reaches a write path;
+        its lifecycle is owned by the caller, not ended by a scanner. *)
 
 let acquire_txn store mode =
   match mode with
@@ -2269,6 +2274,10 @@ let acquire_txn store mode =
     let* tx = S.rw_begin store in
     Lwt.return (tx, true)
   | In_txn tx -> Lwt.return (tx, false)
+  | In_ro_txn _ ->
+    (* A write was attempted under a read-only ambient snapshot — a caller bug,
+       not a runtime condition: [In_ro_txn] is only ever set on read paths. *)
+    Lwt.fail (Failure "write attempted under a read-only transaction (In_ro_txn)")
 ;;
 
 let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
@@ -2331,32 +2340,37 @@ let with_ddl_txn store (cat : Cat.t) mode f =
    read finishes; the borrowed txn is never ended here — Db owns its lifecycle. *)
 type read_handle =
   | RH_borrowed of S.rw S.txn (* active explicit txn; lifecycle owned by Db *)
+  | RH_borrowed_ro of S.ro S.txn (* #274: shared RO snapshot; lifecycle owned by caller *)
   | RH_owned of S.ro S.txn (* scanner-owned RO snapshot; ended on finish *)
 
 let rh_begin store = function
   | In_txn tx -> Lwt.return (RH_borrowed tx)
+  | In_ro_txn tx -> Lwt.return (RH_borrowed_ro tx)
   | Auto ->
     let* tx = S.ro_begin store in
     Lwt.return (RH_owned tx)
 ;;
 
 let rh_finish = function
-  | RH_borrowed _ -> Lwt.return_unit
+  | RH_borrowed _ | RH_borrowed_ro _ -> Lwt.return_unit
   | RH_owned tx -> S.ro_end tx
 ;;
 
 let rh_get = function
   | RH_borrowed tx -> S.get tx
+  | RH_borrowed_ro tx -> S.get tx
   | RH_owned tx -> S.get tx
 ;;
 
 let rh_seek_ge = function
   | RH_borrowed tx -> S.seek_ge tx
+  | RH_borrowed_ro tx -> S.seek_ge tx
   | RH_owned tx -> S.seek_ge tx
 ;;
 
 let rh_cursor_open = function
   | RH_borrowed tx -> S.cursor_open tx
+  | RH_borrowed_ro tx -> S.cursor_open tx
   | RH_owned tx -> S.cursor_open tx
 ;;
 
@@ -8762,6 +8776,7 @@ and stream_fts_match_scan
   in
   match mode with
   | In_txn tx -> body tx
+  | In_ro_txn tx -> body tx
   | Auto -> S.with_ro store body
 
 and stream_pragma_integrity_check store cat =
@@ -9609,7 +9624,7 @@ let query
      zero-overhead scan path (#259). *)
   match mode with
   | Auto -> body ()
-  | In_txn _ -> Lwt.with_value txn_mode_key (Some mode) body
+  | In_txn _ | In_ro_txn _ -> Lwt.with_value txn_mode_key (Some mode) body
 ;;
 
 [@@@ai_disclosure "ai-generated"]

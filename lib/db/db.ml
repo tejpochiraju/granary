@@ -1569,7 +1569,7 @@ let execute_change_count top sql =
    [Sql.Exec.query] with no [~stats] — byte-for-byte the pre-#239 read path
    (no [with_value], no [Lwt_stream.map] wrapper), so existing callers pay
    nothing. *)
-let query_impl ?stats top sql =
+let query_impl ?stats ?mode top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
@@ -1608,9 +1608,13 @@ let query_impl ?stats top sql =
       (Error (Runtime "ATTACH/DETACH/active_database = ... is a write op; use Db.execute"))
   | Ok op ->
     let mode =
-      match t.explicit_txn with
-      | None -> Sql.Exec.Auto
-      | Some tx -> Sql.Exec.In_txn tx
+      match mode with
+      | Some m ->
+        m (* #274: caller-supplied ambient read mode (e.g. dump's shared RO snapshot) *)
+      | None ->
+        (match t.explicit_txn with
+         | None -> Sql.Exec.Auto
+         | Some tx -> Sql.Exec.In_txn tx)
     in
     (match Sql.Exec.query ~mode ~clock:t.clock ?stats t.store t.catalog op with
      | exception Failure msg -> Lwt.return (Error (Runtime msg))
@@ -1841,7 +1845,7 @@ let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
 (* Emit [INSERT] statements for every row of [meta] (skipping generated columns,
    whose values are derived).  Reads through the executor so the rowid-alias
    column resolves to its stored value. *)
-let dump_table_rows t (meta : Cat.table_meta) ~stmt =
+let dump_table_rows ?mode t (meta : Cat.table_meta) ~stmt =
   let dump_cols =
     List.filter (fun (c : Row.column) -> c.Row.generated_as = None) meta.Cat.columns
   in
@@ -1856,7 +1860,7 @@ let dump_table_rows t (meta : Cat.table_meta) ~stmt =
     let select_sql =
       Printf.sprintf "SELECT %s FROM %s" (String.concat ", " col_idents) qname
     in
-    let* r = query_impl t select_sql in
+    let* r = query_impl ?mode t select_sql in
     match r with
     | Error e ->
       Lwt.fail (Failure (Format.asprintf "dump %s: %a" meta.Cat.name pp_error e))
@@ -1939,12 +1943,29 @@ let order_views_by_dependency (views : (string * string) list) =
 let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
   let stmt s = sink (s ^ ";\n") in
   let cat = t.catalog in
-  Lwt.catch
+  (* #274: read every table under one snapshot so the source side is a single
+     point-in-time committed view, like sqlite3's [.dump] (which reads the whole
+     database under one transaction).  Without this, each table's read opened its
+     own fresh RO snapshot, so a commit landing between two tables' reads yielded
+     a torn dump reflecting no single committed state.  When an explicit txn is
+     already active, reads already go through it (consistent + read-your-own-
+     writes); otherwise we open one shared RO snapshot for the whole dump and end
+     it when finished — even on error (#164). *)
+  let* read_mode, finish_snapshot =
+    match t.explicit_txn with
+    | Some tx -> Lwt.return (Sql.Exec.In_txn tx, fun () -> Lwt.return_unit)
+    | None ->
+      let* snap = S.ro_begin t.store in
+      Lwt.return (Sql.Exec.In_ro_txn snap, fun () -> S.ro_end snap)
+  in
+  Lwt.finalize
     (fun () ->
-       let* tables = Cat.list_tables cat in
-       let tables = dump_table_order tables in
-       let* () = sink "PRAGMA foreign_keys=OFF;\n" in
-       (* #281: every dump is wrapped in [BEGIN] … [COMMIT], like sqlite3 .dump,
+       Lwt.catch
+         (fun () ->
+            let* tables = Cat.list_tables cat in
+            let tables = dump_table_order tables in
+            let* () = sink "PRAGMA foreign_keys=OFF;\n" in
+            (* #281: every dump is wrapped in [BEGIN] … [COMMIT], like sqlite3 .dump,
           so a restore applies atomically (and faster).  This used to be limited
           to the DML-only [data_only] dump because DDL inside an explicit
           transaction deadlocked the catalog's writer txn (#269); #269 (PR #278)
@@ -1954,85 +1975,92 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
           transactional, so there is no per-statement-autocommit fallback to
           keep.  The [PRAGMA foreign_keys=OFF] stays outside the transaction,
           matching sqlite. *)
-       let* () = stmt "BEGIN" in
-       (* Base tables: DDL immediately followed by that table's data. *)
-       let* () =
-         Lwt_list.iter_s
-           (fun (meta : Cat.table_meta) ->
-              let* () =
-                if data_only then Lwt.return_unit else stmt (Sql.Exec.ddl_of_table meta)
-              in
-              if schema_only then Lwt.return_unit else dump_table_rows t meta ~stmt)
-           tables
-       in
-       (* Schema objects emitted after all data: FTS virtual tables (DDL only —
+            let* () = stmt "BEGIN" in
+            (* Base tables: DDL immediately followed by that table's data. *)
+            let* () =
+              Lwt_list.iter_s
+                (fun (meta : Cat.table_meta) ->
+                   let* () =
+                     if data_only
+                     then Lwt.return_unit
+                     else stmt (Sql.Exec.ddl_of_table meta)
+                   in
+                   if schema_only
+                   then Lwt.return_unit
+                   else dump_table_rows ~mode:read_mode t meta ~stmt)
+                tables
+            in
+            (* Schema objects emitted after all data: FTS virtual tables (DDL only —
           content is rebuilt on insert; full content dump is a follow-up),
           explicit indexes, then views and triggers. *)
-       let* () =
-         if data_only
-         then Lwt.return_unit
-         else
-           let* () =
-             Lwt_list.iter_s
-               (fun (m : Cat.fts_table_meta) -> stmt (Sql.Exec.ddl_of_fts m))
-               (Cat.list_fts_tables cat)
-           in
-           let* () =
-             Lwt_list.iter_s
-               (fun (meta : Cat.table_meta) ->
+            let* () =
+              if data_only
+              then Lwt.return_unit
+              else
+                let* () =
                   Lwt_list.iter_s
-                    (fun idx ->
-                       if dump_index_is_implied meta idx
-                       then Lwt.return_unit
-                       else stmt (Sql.Exec.ddl_of_index idx))
-                    (Cat.indexes_for_table cat ~table:meta.Cat.name))
-               tables
-           in
-           let* views = Cat.load_all_views t.store in
-           let* () =
-             Lwt_list.iter_s (fun (_n, sql) -> stmt sql) (order_views_by_dependency views)
-           in
-           let* triggers = Cat.load_all_triggers t.store in
-           Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
-       in
-       (* #312: emit the AUTOINCREMENT high-water like SQLite's [.dump], so a
+                    (fun (m : Cat.fts_table_meta) -> stmt (Sql.Exec.ddl_of_fts m))
+                    (Cat.list_fts_tables cat)
+                in
+                let* () =
+                  Lwt_list.iter_s
+                    (fun (meta : Cat.table_meta) ->
+                       Lwt_list.iter_s
+                         (fun idx ->
+                            if dump_index_is_implied meta idx
+                            then Lwt.return_unit
+                            else stmt (Sql.Exec.ddl_of_index idx))
+                         (Cat.indexes_for_table cat ~table:meta.Cat.name))
+                    tables
+                in
+                let* views = Cat.load_all_views t.store in
+                let* () =
+                  Lwt_list.iter_s
+                    (fun (_n, sql) -> stmt sql)
+                    (order_views_by_dependency views)
+                in
+                let* triggers = Cat.load_all_triggers t.store in
+                Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
+            in
+            (* #312: emit the AUTOINCREMENT high-water like SQLite's [.dump], so a
           committed-DELETE high-water round-trips — replaying the data rows alone
           only restores [max(rowid)+1].  This is data, so it is skipped in
           [schema_only]; it is emitted before [COMMIT] so a [data_only] dump
           carries it too.  Only tables with a seeded counter appear. *)
-       let* () =
-         if schema_only
-         then Lwt.return_unit
-         else (
-           let seeded =
-             List.filter
-               (fun (m : Cat.table_meta) ->
-                  m.Cat.autoincrement
-                  && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid))
-               tables
-           in
-           if seeded = []
-           then Lwt.return_unit
-           else
-             let* () = stmt "DELETE FROM sqlite_sequence" in
-             Lwt_list.iter_s
-               (fun (m : Cat.table_meta) ->
-                  stmt
-                    (Printf.sprintf
-                       "INSERT INTO sqlite_sequence VALUES(%s,%Ld)"
-                       (Sql.Exec.sql_literal_of_value (Row.V_text m.Cat.name))
-                       (Int64.sub m.Cat.next_rowid 1L)))
-               seeded)
-       in
-       let* () = stmt "COMMIT" in
-       Lwt.return (Ok ()))
-    (function
-      | Failure msg ->
-        (* The dump has already sunk an unterminated [BEGIN]; close it with a
-           [ROLLBACK] so a streaming sink is not left mid-transaction. *)
-        let* () = stmt "ROLLBACK" in
-        Lwt.return (Error (Runtime msg))
-      | exn -> Lwt.fail exn)
+            let* () =
+              if schema_only
+              then Lwt.return_unit
+              else (
+                let seeded =
+                  List.filter
+                    (fun (m : Cat.table_meta) ->
+                       m.Cat.autoincrement
+                       && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid))
+                    tables
+                in
+                if seeded = []
+                then Lwt.return_unit
+                else
+                  let* () = stmt "DELETE FROM sqlite_sequence" in
+                  Lwt_list.iter_s
+                    (fun (m : Cat.table_meta) ->
+                       stmt
+                         (Printf.sprintf
+                            "INSERT INTO sqlite_sequence VALUES(%s,%Ld)"
+                            (Sql.Exec.sql_literal_of_value (Row.V_text m.Cat.name))
+                            (Int64.sub m.Cat.next_rowid 1L)))
+                    seeded)
+            in
+            let* () = stmt "COMMIT" in
+            Lwt.return (Ok ()))
+         (function
+           | Failure msg ->
+             (* The dump has already sunk an unterminated [BEGIN]; close it with a
+                [ROLLBACK] so a streaming sink is not left mid-transaction. *)
+             let* () = stmt "ROLLBACK" in
+             Lwt.return (Error (Runtime msg))
+           | exn -> Lwt.fail exn))
+    finish_snapshot
 ;;
 
 let dump_to_string t ?(schema_only = false) ?(data_only = false) () =

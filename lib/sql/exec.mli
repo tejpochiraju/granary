@@ -3,10 +3,14 @@
 (** Transaction mode for DML operations.
     [Auto] wraps each DML operation in its own RW transaction (autocommit).
     [In_txn tx] reuses an externally managed transaction; the caller is
-    responsible for committing or rolling back. *)
+    responsible for committing or rolling back.
+    [In_ro_txn tx] (#274) reads every scan through one externally managed RO
+    snapshot so a multi-statement read sees a single point-in-time committed
+    state; read-only — using it on a write path raises. *)
 type txn_mode =
   | Auto
   | In_txn of Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  | In_ro_txn of Sqlocaml_store.Store.ro Sqlocaml_store.Store.txn
 
 (** Execute a write operation ([Plan.op]) against the store and catalog.
     Runs in its own autocommit RW transaction unless [?mode] supplies an
