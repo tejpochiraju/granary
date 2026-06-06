@@ -610,6 +610,60 @@ let test_schema_dump_wrapped_in_txn () =
     assert_roundtrip db)
 ;;
 
+(* #274: the source-side reads must observe one consistent point-in-time
+   snapshot across every table, like sqlite3's [.dump] (which reads the whole
+   database under one transaction).  We prove this by committing a mutation
+   *during* the dump — right after the first table's data has been emitted and
+   before the second table is read — and asserting the dump reflects the
+   pre-mutation state for {e both} tables (no torn dump).  Without a single
+   shared snapshot, each table read opens its own fresh RO snapshot, so the
+   second table would pick up the concurrent commit while the first would not. *)
+let test_single_snapshot_across_tables () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t1 (x INTEGER)";
+    exec db "CREATE TABLE t2 (x INTEGER)";
+    exec db "INSERT INTO t1 VALUES (1)";
+    exec db "INSERT INTO t2 VALUES (10)";
+    let buf = Buffer.create 256 in
+    let mutated = ref false in
+    (* [t1] is created first, so it dumps first (tables are ordered by tree_id);
+       [t2]'s CREATE TABLE is therefore emitted after [t1]'s data and before
+       [t2]'s rows are read — the exact window a concurrent commit must not
+       leak into the dump. *)
+    let sink line =
+      Buffer.add_string buf line;
+      if (not !mutated) && contains_substr ~needle:"CREATE TABLE t2" line
+      then (
+        mutated := true;
+        let* r1 = Db.execute db "INSERT INTO t1 VALUES (2)" in
+        let () = unwrap r1 in
+        let* r2 = Db.execute db "INSERT INTO t2 VALUES (20)" in
+        Lwt.return (unwrap r2))
+      else Lwt.return_unit
+    in
+    unwrap (run (Db.dump db ~sink ()));
+    let s = Buffer.contents buf in
+    (* the mid-dump commit really happened *)
+    Alcotest.(check bool) "mutation fired mid-dump" true !mutated;
+    Alcotest.(check bool)
+      "t1 dumped its pre-mutation row"
+      true
+      (contains_substr ~needle:"INSERT INTO t1 VALUES(1)" s);
+    Alcotest.(check bool)
+      "t2 dumped its pre-mutation row"
+      true
+      (contains_substr ~needle:"INSERT INTO t2 VALUES(10)" s);
+    (* the concurrent commit must be invisible to the whole dump *)
+    Alcotest.(check bool)
+      "t1's concurrent insert is not in the dump"
+      false
+      (contains_substr ~needle:"INSERT INTO t1 VALUES(2)" s);
+    Alcotest.(check bool)
+      "t2's concurrent insert is not in the dump (no torn dump)"
+      false
+      (contains_substr ~needle:"INSERT INTO t2 VALUES(20)" s))
+;;
+
 (* schema_only is also schema-bearing, so it too is wrapped. *)
 let test_schema_only_wrapped_in_txn () =
   with_db (fun db ->
@@ -667,6 +721,10 @@ let () =
             "schema_only wrapped in txn (#281)"
             `Quick
             test_schema_only_wrapped_in_txn
+        ; Alcotest.test_case
+            "single snapshot across tables (#274)"
+            `Quick
+            test_single_snapshot_across_tables
         ] )
     ]
 ;;
