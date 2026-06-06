@@ -38,6 +38,7 @@ let make_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;
@@ -705,6 +706,7 @@ let make_cat_with_index ~col_name =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        Cat.create_index
@@ -848,6 +850,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        Cat.create_table
@@ -872,6 +875,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;

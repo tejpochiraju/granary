@@ -834,9 +834,23 @@ let plan_pragma cat kind =
 
 let rec plan ?cat = function
   | Sema.BS_create_table
-      { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
+      { name
+      ; columns
+      ; uniq_idxs
+      ; if_not_exists
+      ; fk_constraints
+      ; without_rowid
+      ; autoincrement
+      } ->
     Plan.Op_create_table
-      { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid }
+      { name
+      ; columns
+      ; uniq_idxs
+      ; if_not_exists
+      ; fk_constraints
+      ; without_rowid
+      ; autoincrement
+      }
   | Sema.BS_insert_select { table_meta; ordinals; source; on_conflict } ->
     Plan.Op_insert_select { table_meta; ordinals; source = plan ?cat source; on_conflict }
   | Sema.BS_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }

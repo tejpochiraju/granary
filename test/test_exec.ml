@@ -104,6 +104,7 @@ let exec_create_table () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* result = Cat.find_table cat ~name:"items" in
@@ -127,6 +128,7 @@ let exec_create_table_tree_id () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* result = Cat.find_table cat ~name:"first" in
@@ -150,6 +152,7 @@ let exec_create_table_columns () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* result = Cat.find_table cat ~name:"items" in
@@ -175,6 +178,7 @@ let exec_create_duplicate () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Second create should raise Failure *)
@@ -190,6 +194,7 @@ let exec_create_duplicate () =
                 ; if_not_exists = false
                 ; fk_constraints = []
                 ; without_rowid = false
+                ; autoincrement = false
                 }));
         Alcotest.fail "expected Failure for duplicate table"
       with
@@ -215,6 +220,7 @@ let exec_insert_one_row () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"t" in
@@ -239,6 +245,7 @@ let exec_insert_two_rows () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"t" in
@@ -264,6 +271,7 @@ let exec_insert_row_content () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"t" in
@@ -298,6 +306,7 @@ let exec_insert_null () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"t" in
@@ -330,6 +339,7 @@ let exec_insert_increments_rowid () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"t" in
@@ -360,6 +370,7 @@ let exec_insert_text_only () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta = Cat.find_table cat ~name:"words" in
@@ -394,6 +405,7 @@ let query_seqscan_empty () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -418,6 +430,7 @@ let query_seqscan_one_row () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -443,6 +456,7 @@ let query_seqscan_three_rows () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -484,6 +498,7 @@ let query_filter_eq_int () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -517,6 +532,7 @@ let query_filter_eq_string () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -550,6 +566,7 @@ let query_filter_no_match () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -579,6 +596,7 @@ let query_filter_all_match () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -611,6 +629,7 @@ let query_filter_null_col () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Insert a row with only name set; id stays NULL *)
@@ -644,6 +663,7 @@ let query_project_all () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "alice" ]);
@@ -674,6 +694,7 @@ let query_project_single_col () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 42L; Ast.L_text "alice" ]);
@@ -708,6 +729,7 @@ let query_project_reversed () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 7L; Ast.L_text "hat" ]);
@@ -746,6 +768,7 @@ let query_project_star_where () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -793,6 +816,7 @@ let execute_read_op_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -820,6 +844,7 @@ let execute_filter_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"tf" in
@@ -853,6 +878,7 @@ let execute_project_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"tp" in
@@ -886,6 +912,7 @@ let query_write_op_raises () =
                 ; if_not_exists = false
                 ; fk_constraints = []
                 ; without_rowid = false
+                ; autoincrement = false
                 }));
         Alcotest.fail "expected Failure"
       with
@@ -907,6 +934,7 @@ let query_insert_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"ti" in
@@ -945,6 +973,7 @@ let query_filter_nonnull_eq_null () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "tn" ([ 0; 1 ], [ Ast.L_int 5L; Ast.L_text "ghost" ]);
@@ -975,6 +1004,7 @@ let query_filter_type_mismatch () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "tm" ([ 0; 1 ], [ Ast.L_int 5L; Ast.L_text "hi" ]);
@@ -1007,6 +1037,7 @@ let query_sort_asc () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 3L; Ast.L_text "c" ]);
@@ -1051,6 +1082,7 @@ let query_sort_desc () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 2L; Ast.L_text "b" ]);
@@ -1096,6 +1128,7 @@ let query_sort_nulls_first () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_int 5L ]);
@@ -1142,6 +1175,7 @@ let query_sort_empty () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1178,6 +1212,7 @@ let query_limit_basic () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1225,6 +1260,7 @@ let query_limit_with_offset () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1272,6 +1308,7 @@ let query_limit_exceeds_rows () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1307,6 +1344,7 @@ let query_limit_offset_exceeds () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1342,6 +1380,7 @@ let execute_sort_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"ts" in
@@ -1375,6 +1414,7 @@ let execute_limit_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"tl" in
@@ -1407,6 +1447,7 @@ let execute_union_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1439,6 +1480,7 @@ let execute_distinct_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -1499,6 +1541,7 @@ let exec_create_index_basic () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Insert a row so the index-population path runs *)
@@ -1542,6 +1585,7 @@ let query_create_index_raises () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"tci" in
@@ -1587,6 +1631,7 @@ let query_index_lookup_basic () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1648,6 +1693,7 @@ let query_index_lookup_type_mismatch () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -1706,6 +1752,7 @@ let query_index_lookup_multiple_matches () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Three rows all with id = 7 -> a non-unique index will list all *)
@@ -1764,6 +1811,7 @@ let query_index_lookup_text () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "alice" ]);
@@ -1829,6 +1877,7 @@ let query_index_lookup_real () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_real 1.5 ]);
@@ -1894,6 +1943,7 @@ let query_index_lookup_blob () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_blob (Bytes.of_string "AAAA") ]);
@@ -1950,6 +2000,7 @@ let query_index_lookup_null () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "x" ]);
@@ -2014,6 +2065,7 @@ let query_filter_eq_real () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_real 1.5 ]);
@@ -2051,6 +2103,7 @@ let query_filter_eq_blob () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_blob (Bytes.of_string "AA") ]);
@@ -2091,6 +2144,7 @@ let query_sort_real () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_real 3.0 ]);
@@ -2133,6 +2187,7 @@ let query_sort_blob () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_blob (Bytes.of_string "CC") ]);
@@ -2168,6 +2223,7 @@ let exec_create_index_unknown_table () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* outcome =
@@ -2212,6 +2268,7 @@ let query_sort_multiple_nulls () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Two rows with NULL in the id column *)
@@ -2248,6 +2305,7 @@ let unique_index_first_insert_succeeds () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2294,6 +2352,7 @@ let exec_update_no_match_returns_zero () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -2333,6 +2392,7 @@ let exec_update_match_returns_count () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -2373,6 +2433,7 @@ let exec_update_raises_in_query () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2416,6 +2477,7 @@ let exec_delete_no_match_returns_zero () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -2454,6 +2516,7 @@ let exec_delete_all_returns_count () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -2493,6 +2556,7 @@ let exec_delete_raises_in_query () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2535,6 +2599,7 @@ let exec_drop_table_basic () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2561,6 +2626,7 @@ let exec_drop_table_returns_zero () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2589,6 +2655,7 @@ let exec_drop_table_raises_in_query () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -2616,6 +2683,7 @@ let exec_drop_index_basic () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2659,6 +2727,7 @@ let exec_drop_index_returns_zero () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2699,6 +2768,7 @@ let exec_drop_index_raises_in_query () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2749,6 +2819,7 @@ let query_hash_join_inner () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2762,6 +2833,7 @@ let query_hash_join_inner () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* users_opt = Cat.find_table cat ~name:"users" in
@@ -2812,6 +2884,7 @@ let query_hash_join_left () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2825,6 +2898,7 @@ let query_hash_join_left () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* users_opt = Cat.find_table cat ~name:"users" in
@@ -2883,6 +2957,7 @@ let query_hash_join_cartesian () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2896,6 +2971,7 @@ let query_hash_join_cartesian () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* um = Cat.find_table cat ~name:"u2" in
@@ -2942,6 +3018,7 @@ let query_hash_join_null_key_excluded () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* () =
@@ -2955,6 +3032,7 @@ let query_hash_join_null_key_excluded () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* lm = Cat.find_table cat ~name:"l3" in
@@ -3002,6 +3080,7 @@ let query_aggregate_count_star () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -3042,6 +3121,7 @@ let query_aggregate_sum_int () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_int 10L ]);
@@ -3093,6 +3173,7 @@ let query_aggregate_sum_real () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_real 1.5 ]);
@@ -3132,6 +3213,7 @@ let query_aggregate_avg () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_int 10L ]);
@@ -3171,6 +3253,7 @@ let query_aggregate_min_max () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0 ], [ Ast.L_int 5L ]);
@@ -3219,6 +3302,7 @@ let query_aggregate_count_col_skips_null () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -3259,6 +3343,7 @@ let query_aggregate_with_group_by () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -3297,6 +3382,7 @@ let query_aggregate_with_having () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
@@ -3338,6 +3424,7 @@ let query_aggregate_raises_in_execute () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -3375,6 +3462,7 @@ let query_nlj_raises_in_execute () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -3414,6 +3502,7 @@ let query_hash_join_raises_in_execute () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      let* meta_opt = Cat.find_table cat ~name:"t" in
@@ -3466,6 +3555,7 @@ let query_distinct_blob () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Two identical blob values and one distinct one. *)
@@ -3497,6 +3587,7 @@ let query_multikey_sort () =
             ; if_not_exists = false
             ; fk_constraints = []
             ; without_rowid = false
+            ; autoincrement = false
             })
      in
      (* Four rows with id=1 or id=2; name used as tiebreaker. *)

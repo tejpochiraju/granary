@@ -11534,6 +11534,57 @@ let helper_query_ok_lwt_smoke () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #299: AUTOINCREMENT                                                   *)
+(* ------------------------------------------------------------------ *)
+
+let int_of_row row =
+  match (row : Db.value array).(0) with
+  | Db.V_int n -> n
+  | _ -> Alcotest.fail "expected V_int in column 0"
+;;
+
+(* Tier 1: the keyword is accepted and ordinary allocation works. *)
+let autoincrement_create_and_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  let rows = query_ok db "SELECT a FROM t ORDER BY a" in
+  Alcotest.(check (list int64)) "ids" [ 1L; 2L ] (List.map int_of_row rows)
+;;
+
+(* Assert [sql] is rejected and the error message contains [needle]
+   (matching SQLite's own wording). *)
+let assert_create_rejected sql needle =
+  let db = fresh_db () in
+  match Lwt_main.run (Db.execute db sql) with
+  | Ok () -> Alcotest.failf "expected rejection of: %s" sql
+  | Error e ->
+    let msg = fmt_err e in
+    let contains =
+      let nl = String.length needle
+      and hl = String.length msg in
+      let rec go i = i + nl <= hl && (String.sub msg i nl = needle || go (i + 1)) in
+      nl = 0 || go 0
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
+      true
+      contains
+;;
+
+(* Tier 1 guardrails: AUTOINCREMENT only on a single-column INTEGER PK rowid
+   table — matching SQLite's rejection messages. *)
+let autoincrement_rejections () =
+  assert_create_rejected
+    "CREATE TABLE t (a TEXT PRIMARY KEY AUTOINCREMENT)"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
+  assert_create_rejected
+    "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID"
+    "AUTOINCREMENT not allowed on WITHOUT ROWID tables"
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12429,5 +12480,9 @@ let () =
     ; "phase35_task3", phase35_task3_tests
     ; ( "helpers (#161)"
       , [ Alcotest.test_case "query_ok_lwt smoke" `Quick helper_query_ok_lwt_smoke ] )
+    ; ( "autoincrement (#299)"
+      , [ Alcotest.test_case "create_and_insert" `Quick autoincrement_create_and_insert
+        ; Alcotest.test_case "rejections" `Quick autoincrement_rejections
+        ] )
     ]
 ;;

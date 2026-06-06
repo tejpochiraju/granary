@@ -89,6 +89,7 @@ type op =
             list
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
       ; without_rowid : bool
+      ; autoincrement : bool (** #299: INTEGER PRIMARY KEY AUTOINCREMENT. *)
       }
   | Op_insert of
       { table_meta : Cat.table_meta

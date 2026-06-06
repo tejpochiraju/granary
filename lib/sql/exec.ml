@@ -177,15 +177,25 @@ let quote_ident s =
 ;;
 
 let ddl_of_table (meta : Cat.table_meta) =
+  (* #299: the rowid-alias column carries the AUTOINCREMENT keyword in the dump. *)
+  let autoinc_idx =
+    if meta.Cat.autoincrement
+    then
+      Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid:meta.Cat.without_rowid
+    else None
+  in
   let col_parts =
-    List.map
-      (fun (col : Row.column) ->
+    List.mapi
+      (fun i (col : Row.column) ->
          let buf = Buffer.create 64 in
          Buffer.add_string buf (quote_ident col.Row.name);
          Buffer.add_char buf ' ';
          Buffer.add_string buf (sql_of_row_type col.Row.ty);
          if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-         if col.Row.primary_key then Buffer.add_string buf " PRIMARY KEY";
+         if col.Row.primary_key
+         then (
+           Buffer.add_string buf " PRIMARY KEY";
+           if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT");
          (match col.Row.default with
           | None -> ()
           | Some dv ->
@@ -5524,6 +5534,7 @@ let execute_create_table_op
       ~if_not_exists
       ~fk_constraints
       ~without_rowid
+      ~autoincrement
   : int Lwt.t
   =
   if Cat.table_exists cat ~name
@@ -5537,7 +5548,9 @@ let execute_create_table_op
        through one writer txn (the ambient explicit one if any), so the whole
        CREATE TABLE is atomic and never self-deadlocks. *)
     with_ddl_txn store cat mode (fun tx ->
-      let* _tid = Cat.create_table ~txn:tx cat ~name ~columns ~without_rowid in
+      let* _tid =
+        Cat.create_table ~txn:tx cat ~name ~columns ~without_rowid ~autoincrement
+      in
       let* () =
         Lwt_list.iter_s
           (fun (idx_name, col_names, origin) ->
@@ -6195,7 +6208,14 @@ let execute_with_count
   =
   match op with
   | Plan.Op_create_table
-      { name; columns; uniq_idxs; if_not_exists; fk_constraints; without_rowid } ->
+      { name
+      ; columns
+      ; uniq_idxs
+      ; if_not_exists
+      ; fk_constraints
+      ; without_rowid
+      ; autoincrement
+      } ->
     execute_create_table_op
       store
       cat
@@ -6206,6 +6226,7 @@ let execute_with_count
       ~if_not_exists
       ~fk_constraints
       ~without_rowid
+      ~autoincrement
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     execute_insert_values

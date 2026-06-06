@@ -13,7 +13,14 @@ let make_catalog cols =
   Lwt_main.run
     (let store = S.create () in
      let* cat = C.open_ store in
-     let* _ = C.create_table cat ~name:"users" ~columns:cols ~without_rowid:false in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"users"
+         ~columns:cols
+         ~without_rowid:false
+         ~autoincrement:false
+     in
      Lwt.return cat)
 ;;
 
@@ -1497,6 +1504,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      let* _ =
        C.create_table
@@ -1521,6 +1529,7 @@ let make_join_cat () =
              }
            ]
          ~without_rowid:false
+         ~autoincrement:false
      in
      Lwt.return cat)
 ;;
@@ -1574,6 +1583,7 @@ let bind_select_join_ambiguous_col () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          C.create_table
@@ -1590,6 +1600,7 @@ let bind_select_join_ambiguous_col () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in
@@ -3454,6 +3465,7 @@ let bind_select_join_on_ambiguous () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        let* _ =
          C.create_table
@@ -3470,6 +3482,7 @@ let bind_select_join_on_ambiguous () =
                }
              ]
            ~without_rowid:false
+           ~autoincrement:false
        in
        Lwt.return cat)
   in

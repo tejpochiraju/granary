@@ -268,6 +268,21 @@ let test_without_rowid () =
     assert_roundtrip db)
 ;;
 
+(* #299: AUTOINCREMENT round-trips faithfully through a dump — the keyword is
+   emitted on the rowid-alias column and the replayed schema re-parses. *)
+let test_autoincrement () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+    exec db "INSERT INTO t(b) VALUES ('x')";
+    exec db "INSERT INTO t(b) VALUES ('y')";
+    let script = dump db in
+    Alcotest.(check bool)
+      "dump carries PRIMARY KEY AUTOINCREMENT"
+      true
+      (contains_substr ~needle:"PRIMARY KEY AUTOINCREMENT" script);
+    assert_roundtrip db)
+;;
+
 (* ---------------------------------------------------------------- *)
 (* Targeted serialization & toggle behaviour                         *)
 (* ---------------------------------------------------------------- *)
@@ -514,6 +529,7 @@ let () =
         ; Alcotest.test_case "rich schema (file)" `Quick test_roundtrip_file
         ; Alcotest.test_case "empty database" `Quick test_roundtrip_empty
         ; Alcotest.test_case "without rowid" `Quick test_without_rowid
+        ; Alcotest.test_case "autoincrement (#299)" `Quick test_autoincrement
         ; Alcotest.test_case "value literals" `Quick test_value_literals
         ; Alcotest.test_case "int64 min literal (#270)" `Quick test_int64_min_literal
         ; Alcotest.test_case

@@ -122,6 +122,9 @@ type bound_stmt =
         (** When true, the table's INTEGER PRIMARY KEY column's value is
             used directly as the rowid (no auto-allocation).  Sema enforces
             that exactly one INTEGER PRIMARY KEY column exists. *)
+      ; autoincrement : bool
+        (** #299: INTEGER PRIMARY KEY AUTOINCREMENT.  Sema validates placement
+            (single-column ascending INTEGER PK, rowid table). *)
       }
   | BS_insert of
       { table_meta : Sqlocaml_catalog.Catalog.table_meta
