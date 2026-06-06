@@ -73,6 +73,12 @@ type table_meta =
         of the top row is never reused. *)
   }
 
+(** Sentinel [next_rowid] for a rowid/alias table that has never seeded its
+    counter — conceptually [max = -inf].  Used to tell "never inserted" apart
+    from a live counter (e.g. an AUTOINCREMENT table absent from
+    [sqlite_sequence] until its first insert).  See #250/#312. *)
+val empty_next_rowid : int64
+
 (** #243 (T1): index of the INTEGER PRIMARY KEY column that aliases the rowid,
     if the table qualifies (rowid table, single INTEGER PRIMARY KEY column).
     For such tables the table tree is keyed by this column's value and no
@@ -229,6 +235,37 @@ val bump_next_rowid_in_txn
   :  t
   -> name:string
   -> at_least:int64
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** #312.1: writable [sqlite_sequence] SET/INSERT.  Sets table [name]'s
+    autoincrement counter to [max(requested + 1, max(rowid) + 1)] (SQLite's
+    effective rule).  Mutates through the held RW transaction (does NOT commit)
+    and marks the counter dirty so a ROLLBACK reverts it.  Fails if [name] is
+    unknown or not an AUTOINCREMENT table. *)
+val set_next_rowid_in_txn
+  :  t
+  -> name:string
+  -> requested:int64
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** #312.1: writable [sqlite_sequence] DELETE.  Resets table [name]'s
+    autoincrement counter to the never-seeded sentinel so the next insert
+    recomputes from data.  Mutates through the held RW transaction (does NOT
+    commit) and marks the counter dirty so a ROLLBACK reverts it.  Fails if
+    [name] is unknown or not an AUTOINCREMENT table. *)
+val reset_next_rowid_in_txn
+  :  t
+  -> name:string
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** #312.1: writable [sqlite_sequence] [DELETE] with no WHERE — reset every
+    seeded AUTOINCREMENT counter (SQLite parity; what [sqlite3 .dump] emits).
+    Mutates through the held RW transaction (does NOT commit). *)
+val reset_all_next_rowid_in_txn
+  :  t
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> unit Lwt.t
 

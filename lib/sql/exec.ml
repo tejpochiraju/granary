@@ -195,6 +195,9 @@ let ddl_of_table (meta : Cat.table_meta) =
          if col.Row.primary_key
          then (
            Buffer.add_string buf " PRIMARY KEY";
+           (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
+              the non-alias shape (hidden rowid + __pk index). *)
+           if col.Row.pk_desc then Buffer.add_string buf " DESC";
            if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT");
          (match col.Row.default with
           | None -> ()
@@ -2819,6 +2822,15 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
                ~name:table_meta.name
                ~at_least:(Int64.add n 1L)
                tx
+           else if table_meta.Cat.autoincrement
+           then
+             (* #312: pin the AUTOINCREMENT counter at max_int so the next
+                auto-allocation detects exhaustion and raises SQLITE_FULL. *)
+             Cat.bump_next_rowid_in_txn
+               cat
+               ~name:table_meta.name
+               ~at_least:Int64.max_int
+               tx
            else Lwt.return_unit
          in
          Lwt.return n
@@ -5407,6 +5419,14 @@ let op_name = function
   | Plan.Op_fts_match_scan { fts_meta; _ } ->
     "FtsMatchScan(" ^ fts_meta.Cat.fts_name ^ ")"
   | Plan.Op_sqlite_master -> "SqliteMaster"
+  | Plan.Op_sqlite_sequence -> "SqliteSequence"
+  | Plan.Op_seq_set { table; _ } -> "SeqSet(" ^ table ^ ")"
+  | Plan.Op_seq_reset { table } ->
+    "SeqReset("
+    ^ (match table with
+       | Some t -> t
+       | None -> "*")
+    ^ ")"
 ;;
 
 let op_children = function
@@ -5957,6 +5977,7 @@ let column_of_col_def col_def : Row.column =
        | Ast.Ty_blob -> Row.Blob)
   ; Row.not_null = col_def.Ast.not_null
   ; Row.primary_key = col_def.Ast.primary_key
+  ; Row.pk_desc = col_def.Ast.pk_desc
   ; Row.default =
       (match col_def.Ast.default with
        | None -> None
@@ -6321,6 +6342,24 @@ let execute_with_count
       ~limit
       ~offset
       ~indexes
+  | Plan.Op_seq_set { table; seq } ->
+    (* #312.1: writable sqlite_sequence SET/INSERT.  Runs through [with_ddl_txn]
+       so it participates in any ambient explicit transaction (borrowed [In_txn]
+       — reverts on ROLLBACK) or owns its own auto-committed txn ([Auto]). *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* () = Cat.set_next_rowid_in_txn cat ~name:table ~requested:seq tx in
+      Lwt.return 0)
+  | Plan.Op_seq_reset { table } ->
+    (* #312.1: writable sqlite_sequence DELETE.  [None] (bare DELETE, no WHERE)
+       resets every AUTOINCREMENT counter — SQLite parity, and what a real
+       [sqlite3 .dump] emits before re-INSERTing. *)
+    with_ddl_txn store cat mode (fun tx ->
+      let* () =
+        match table with
+        | Some name -> Cat.reset_next_rowid_in_txn cat ~name tx
+        | None -> Cat.reset_all_next_rowid_in_txn cat tx
+      in
+      Lwt.return 0)
   | Plan.Op_drop_table { table_meta; indexes } ->
     execute_drop_table_op store cat ~mode ~table_meta ~indexes
   | Plan.Op_drop_index { idx_info } ->
@@ -6412,7 +6451,8 @@ let execute_with_count
   | Plan.Op_fts_seq_scan _
   | Plan.Op_fts_match_scan _
   | Plan.Op_distinct _
-  | Plan.Op_sqlite_master -> failwith "Exec.execute: use Exec.query for read operations"
+  | Plan.Op_sqlite_master
+  | Plan.Op_sqlite_sequence -> failwith "Exec.execute: use Exec.query for read operations"
 ;;
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -8848,8 +8888,45 @@ and stream_sqlite_master store cat =
          |])
       (Cat.list_fts_tables cat_val)
   in
+  (* #312: sqlite_sequence appears in sqlite_master once any AUTOINCREMENT
+     table exists (matching SQLite — independent of whether a row has been
+     inserted yet). *)
+  let seq_rows =
+    if List.exists (fun (m : Cat.table_meta) -> m.Cat.autoincrement) tables
+    then
+      [ [| Row.V_text "table"
+         ; Row.V_text "sqlite_sequence"
+         ; Row.V_text "sqlite_sequence"
+         ; Row.V_int 0L
+         ; Row.V_text "CREATE TABLE sqlite_sequence(name,seq)"
+        |]
+      ]
+    else []
+  in
   Lwt.return
-    (Lwt_stream.of_list (table_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+    (Lwt_stream.of_list
+       (table_rows @ seq_rows @ index_rows @ view_rows @ trigger_rows @ fts_rows))
+
+and stream_sqlite_sequence cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_sqlite_sequence requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  let rows =
+    List.filter_map
+      (fun (m : Cat.table_meta) ->
+         if m.Cat.autoincrement && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid)
+         then
+           (* [next_rowid] is the next id to allocate, so the high-water mark
+              (last id handed out — SQLite's [sqlite_sequence.seq]) is
+              [next_rowid - 1]. *)
+           Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub m.Cat.next_rowid 1L) |]
+         else None)
+      tables
+  in
+  Lwt.return (Lwt_stream.of_list rows)
 
 and stream_union clock params store mode cat all left right =
   let* ls = to_stream clock params store ~mode ~cat left in
@@ -9347,6 +9424,7 @@ and to_stream
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check -> stream_pragma_integrity_check store cat
   | Plan.Op_sqlite_master -> stream_sqlite_master store cat
+  | Plan.Op_sqlite_sequence -> stream_sqlite_sequence cat
   | Plan.Op_union { all; left; right } ->
     stream_union clock params store mode cat all left right
   | Plan.Op_intersect { left; right } ->
@@ -9454,6 +9532,8 @@ and to_stream
   | Plan.Op_database_list | Plan.Op_active_database_get ->
     failwith "Exec.query: routed via Db.query (no Db handle)"
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
+    failwith "Exec.query: use Exec.execute for write operations"
+  | Plan.Op_seq_set _ | Plan.Op_seq_reset _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 ;;
 

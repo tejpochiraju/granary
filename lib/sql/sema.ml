@@ -10,6 +10,7 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.ty = Row.Text
         ; Row.not_null = false
         ; Row.primary_key = false
+        ; Row.pk_desc = false
         ; Row.default = None
         ; Row.check_sql = None
         ; Row.generated_as = None
@@ -18,6 +19,7 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.ty = Row.Text
         ; Row.not_null = false
         ; Row.primary_key = false
+        ; Row.pk_desc = false
         ; Row.default = None
         ; Row.check_sql = None
         ; Row.generated_as = None
@@ -26,6 +28,7 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.ty = Row.Text
         ; Row.not_null = false
         ; Row.primary_key = false
+        ; Row.pk_desc = false
         ; Row.default = None
         ; Row.check_sql = None
         ; Row.generated_as = None
@@ -34,6 +37,7 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.ty = Row.Integer
         ; Row.not_null = false
         ; Row.primary_key = false
+        ; Row.pk_desc = false
         ; Row.default = None
         ; Row.check_sql = None
         ; Row.generated_as = None
@@ -42,6 +46,38 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.ty = Row.Text
         ; Row.not_null = false
         ; Row.primary_key = false
+        ; Row.pk_desc = false
+        ; Row.default = None
+        ; Row.check_sql = None
+        ; Row.generated_as = None
+        }
+      ]
+  ; Cat.next_rowid = 0L
+  ; Cat.fk_constraints = []
+  ; Cat.without_rowid = false
+  ; Cat.autoincrement = false
+  }
+;;
+
+(* #312: synthesized read-only view over the AUTOINCREMENT counters. *)
+let sqlite_sequence_meta : Cat.table_meta =
+  { Cat.name = "sqlite_sequence"
+  ; Cat.tree_id = -3
+  ; Cat.columns =
+      [ { Row.name = "name"
+        ; Row.ty = Row.Text
+        ; Row.not_null = false
+        ; Row.primary_key = false
+        ; Row.pk_desc = false
+        ; Row.default = None
+        ; Row.check_sql = None
+        ; Row.generated_as = None
+        }
+      ; { Row.name = "seq"
+        ; Row.ty = Row.Integer
+        ; Row.not_null = false
+        ; Row.primary_key = false
+        ; Row.pk_desc = false
         ; Row.default = None
         ; Row.check_sql = None
         ; Row.generated_as = None
@@ -137,6 +173,16 @@ type bound_join =
   ; right_col_offset : int
   }
 
+(* #312.1: a bound write against the synthesized [sqlite_sequence] table.
+   Translated from the supported UPDATE/DELETE/INSERT forms; executed as a
+   [next_rowid] mutation rather than a real row write. *)
+type seq_write =
+  | Seq_set of
+      { table : string
+      ; seq : int64
+      }
+  | Seq_reset of { table : string option (** [None] = DELETE with no WHERE: reset all *) }
+
 type bound_stmt =
   | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)
   | BS_create_table of
@@ -221,6 +267,9 @@ type bound_stmt =
       { name : string
       ; idx_info : Cat.index_info
       }
+  | BS_seq_write of seq_write
+  (** #312.1: a supported write against the synthesized [sqlite_sequence]
+        table, executed as a [next_rowid] mutation. *)
   | BS_begin
   | BS_commit
   | BS_rollback
@@ -344,6 +393,7 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
            ; ty = Row.Text
            ; not_null = true
            ; primary_key = false
+           ; pk_desc = false
            ; default = None
            ; check_sql = None
            ; generated_as = None
@@ -1106,6 +1156,7 @@ let column_of_def (c : Ast.column_def) : Row.column =
          | Ast.Ty_blob -> Row.Blob)
     ; not_null = c.not_null || c.primary_key
     ; primary_key = c.primary_key
+    ; pk_desc = c.pk_desc
     ; default = Option.map ast_lit_to_dv c.default
     ; check_sql = Option.map Ast.expr_to_sql c.check
     ; generated_as =
@@ -1135,8 +1186,8 @@ let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
              ( Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i
              , cols
              , `Implicit_unique )
-         | Ast.TC_primary_key cols when is_alias cols -> None
-         | Ast.TC_primary_key cols ->
+         | Ast.TC_primary_key { pk_cols = cols; _ } when is_alias cols -> None
+         | Ast.TC_primary_key { pk_cols = cols; _ } ->
            Some
              ( Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i
              , cols
@@ -1160,7 +1211,7 @@ let mark_table_pk constraints row_cols =
   List.fold_left
     (fun cols c ->
        match c with
-       | Ast.TC_primary_key [ pk_col ] ->
+       | Ast.TC_primary_key { pk_cols = [ pk_col ]; _ } ->
          List.map
            (fun (col : Row.column) ->
               if String.equal col.name pk_col
@@ -1330,6 +1381,26 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
                    (aggregates, subqueries, and parameters are not allowed)"
                   col.name)))
      | None ->
+       (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
+          column_def, so validation/derivation reuse the column-form path.  A
+          composite or non-INTEGER PK is still rejected downstream because the
+          marked column will not be the rowid alias. *)
+       let tc_ai_cols =
+         List.concat_map
+           (function
+             | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
+             | _ -> [])
+           constraints
+       in
+       let columns =
+         if tc_ai_cols = []
+         then columns
+         else
+           List.map
+             (fun (c : Ast.column_def) ->
+                if List.mem c.name tc_ai_cols then { c with autoincrement = true } else c)
+             columns
+       in
        let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
        (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)
@@ -2711,6 +2782,8 @@ let bind_select
     let tbl_lower = String.lowercase_ascii table in
     if String.equal tbl_lower "sqlite_master" || String.equal tbl_lower "sqlite_schema"
     then Lwt.return (Some sqlite_master_meta)
+    else if String.equal tbl_lower "sqlite_sequence"
+    then Lwt.return (Some sqlite_sequence_meta)
     else Cat.find_table cat ~name:table
   in
   match meta_opt with
@@ -3103,6 +3176,84 @@ let bind_delete
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* sqlite_sequence writes (#312.1)                                      *)
+(* ------------------------------------------------------------------ *)
+
+(* True when [table] names the synthesized [sqlite_sequence] table. *)
+let is_sqlite_sequence table =
+  String.equal (String.lowercase_ascii table) "sqlite_sequence"
+;;
+
+(* Match an integer literal expr -> [Some n]. *)
+let int_lit_of_expr = function
+  | Ast.E_lit (Ast.L_int n) -> Some n
+  | _ -> None
+;;
+
+(* Match a text literal expr -> [Some s]. *)
+let text_lit_of_expr = function
+  | Ast.E_lit (Ast.L_text s) -> Some s
+  | _ -> None
+;;
+
+(* Match a [name = '<text literal>'] WHERE predicate -> [Some table]. *)
+let seq_where_name = function
+  | Some (Ast.E_binop (Ast.Eq, Ast.E_col "name", rhs)) -> text_lit_of_expr rhs
+  | Some (Ast.E_binop (Ast.Eq, lhs, Ast.E_col "name")) -> text_lit_of_expr lhs
+  | _ -> None
+;;
+
+let seq_unsupported what =
+  Lwt.return
+    (Error (Unsupported (Printf.sprintf "unsupported %s on sqlite_sequence" what)))
+;;
+
+(* #312.1: bind the supported [UPDATE sqlite_sequence SET seq = <int> WHERE name
+   = '<table>'] form; reject anything else. *)
+let bind_seq_update ~assignments ~where ~order ~limit ~offset ~returning =
+  match assignments, order, limit, offset, returning with
+  | [ ("seq", seq_expr) ], [], None, None, [] ->
+    (match int_lit_of_expr seq_expr, seq_where_name where with
+     | Some seq, Some table -> Lwt.return (Ok (BS_seq_write (Seq_set { table; seq })))
+     | _ -> seq_unsupported "UPDATE")
+  | _ -> seq_unsupported "UPDATE"
+;;
+
+(* #312.1: bind the supported DELETE forms — [DELETE FROM sqlite_sequence WHERE
+   name = '<table>'] (reset one) and the bare [DELETE FROM sqlite_sequence]
+   (reset all, SQLite parity / what [sqlite3 .dump] emits); reject anything
+   else. *)
+let bind_seq_delete ~where ~order ~limit ~offset ~returning =
+  match order, limit, offset, returning with
+  | [], None, None, [] ->
+    (match where with
+     | None -> Lwt.return (Ok (BS_seq_write (Seq_reset { table = None })))
+     | Some _ ->
+       (match seq_where_name where with
+        | Some table -> Lwt.return (Ok (BS_seq_write (Seq_reset { table = Some table })))
+        | None -> seq_unsupported "DELETE"))
+  | _ -> seq_unsupported "DELETE"
+;;
+
+(* #312.1: bind the supported [INSERT INTO sqlite_sequence(name, seq)
+   VALUES('<table>', <int>)] form (and the positional [VALUES('<table>',
+   <int>)]); reject anything else. *)
+let bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update =
+  let cols_ok =
+    match columns with
+    | [] -> true
+    | [ "name"; "seq" ] -> true
+    | _ -> false
+  in
+  match cols_ok, on_conflict, returning, upsert_update, values with
+  | true, None, [], None, [ [ name_expr; seq_expr ] ] ->
+    (match text_lit_of_expr name_expr, int_lit_of_expr seq_expr with
+     | Some table, Some seq -> Lwt.return (Ok (BS_seq_write (Seq_set { table; seq })))
+     | _ -> seq_unsupported "INSERT")
+  | _ -> seq_unsupported "INSERT"
+;;
+
+(* ------------------------------------------------------------------ *)
 (* ALTER TABLE                                                          *)
 (* ------------------------------------------------------------------ *)
 
@@ -3390,6 +3541,7 @@ let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
          ; Row.ty = Row.Integer
          ; Row.not_null = false
          ; Row.primary_key = false
+         ; Row.pk_desc = false
          ; Row.default = None
          ; Row.check_sql = None
          ; Row.generated_as = None
@@ -3410,6 +3562,9 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
   match stmt with
   | Ast.S_create_table { name; columns; constraints; if_not_exists; without_rowid } ->
     bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid
+  | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update }
+    when is_sqlite_sequence table ->
+    bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update } ->
     bind_insert
       cat
@@ -3490,6 +3645,9 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
             ~offset))
   | Ast.S_create_index { name; table; columns; where_clause; unique; if_not_exists } ->
     bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_exists
+  | Ast.S_update { table; assignments; where; order; limit; offset; returning }
+    when is_sqlite_sequence table ->
+    bind_seq_update ~assignments ~where ~order ~limit ~offset ~returning
   | Ast.S_update { table; assignments; where; order; limit; offset; returning } ->
     bind_update
       cat
@@ -3502,6 +3660,9 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
       ~limit
       ~offset
       ~returning
+  | Ast.S_delete { table; where; order; limit; offset; returning }
+    when is_sqlite_sequence table ->
+    bind_seq_delete ~where ~order ~limit ~offset ~returning
   | Ast.S_delete { table; where; order; limit; offset; returning } ->
     bind_delete
       cat

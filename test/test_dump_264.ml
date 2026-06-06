@@ -283,6 +283,50 @@ let test_autoincrement () =
     assert_roundtrip db)
 ;;
 
+(* #312: the AUTOINCREMENT high-water (which survives a committed DELETE) is
+   restored via emitted sqlite_sequence rows.  Data replay alone only restores
+   max(rowid)+1, so without this a deleted-tail rowid would be reused. *)
+let test_autoincrement_highwater () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+    exec db "INSERT INTO t(b) VALUES ('x')";
+    (* a=1 *)
+    exec db "INSERT INTO t(b) VALUES ('y')";
+    (* a=2 *)
+    exec db "DELETE FROM t WHERE a = 2";
+    (* high-water stays 2 *)
+    let script = dump db in
+    Alcotest.(check bool)
+      "dump has sqlite_sequence INSERT"
+      true
+      (contains_substr ~needle:"INSERT INTO sqlite_sequence VALUES('t',2)" script);
+    let restored = restore script in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close restored) with
+        | _ -> ())
+      (fun () ->
+         exec restored "INSERT INTO t(b) VALUES ('z')";
+         (* the new row must NOT reuse rowid 2; the high-water makes it 3 *)
+         Alcotest.(check (list string))
+           "no rowid reuse after restore"
+           [ "i:1"; "i:3" ]
+           (rows restored "SELECT a FROM t ORDER BY a")))
+;;
+
+(* schema_only is metadata-free of data: it must NOT carry sqlite_sequence rows. *)
+let test_autoincrement_highwater_schema_only () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+    exec db "INSERT INTO t(b) VALUES ('x')";
+    exec db "INSERT INTO t(b) VALUES ('y')";
+    let s = dump ~schema_only:true db in
+    Alcotest.(check bool)
+      "schema_only omits sqlite_sequence"
+      false
+      (contains_substr ~needle:"sqlite_sequence" s))
+;;
+
 (* ---------------------------------------------------------------- *)
 (* Targeted serialization & toggle behaviour                         *)
 (* ---------------------------------------------------------------- *)
@@ -530,6 +574,14 @@ let () =
         ; Alcotest.test_case "empty database" `Quick test_roundtrip_empty
         ; Alcotest.test_case "without rowid" `Quick test_without_rowid
         ; Alcotest.test_case "autoincrement (#299)" `Quick test_autoincrement
+        ; Alcotest.test_case
+            "autoincrement high-water (#312)"
+            `Quick
+            test_autoincrement_highwater
+        ; Alcotest.test_case
+            "autoincrement high-water schema_only (#312)"
+            `Quick
+            test_autoincrement_highwater_schema_only
         ; Alcotest.test_case "value literals" `Quick test_value_literals
         ; Alcotest.test_case "int64 min literal (#270)" `Quick test_int64_min_literal
         ; Alcotest.test_case

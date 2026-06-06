@@ -476,7 +476,10 @@ let compute_rowid_alias_col (columns : Row.column list) ~without_rowid : int opt
     let indexed = List.mapi (fun i (c : Row.column) -> i, c) columns in
     let pks = List.filter (fun (_, (c : Row.column)) -> c.primary_key) indexed in
     match pks with
-    | [ (i, (c : Row.column)) ] when c.ty = Row.Integer -> Some i
+    (* #312: an INTEGER PRIMARY KEY DESC is NOT a rowid alias in SQLite — the
+       column gets a hidden auto rowid plus a real unique index, exactly like a
+       non-INTEGER PK.  So [pk_desc] disqualifies the alias. *)
+    | [ (i, (c : Row.column)) ] when c.ty = Row.Integer && not c.pk_desc -> Some i
     | _ -> None)
 ;;
 
@@ -657,6 +660,8 @@ let encode_column (col : Row.column) =
      Varint.encode_uint64 buf (if is_stored then 1L else 0L);
      Varint.encode_uint64 buf (Int64.of_int (String.length sql));
      Buffer.add_string buf sql);
+  (* #312: trailing pk_desc flag — appended for backward compat (absent ⇒ false). *)
+  Varint.encode_uint64 buf (if col.pk_desc then 1L else 0L);
   Buffer.to_bytes buf
 ;;
 
@@ -673,18 +678,29 @@ let decode_check_sql bytes off =
       Some sql, off3 + Int64.to_int sql_len))
 ;;
 
+(* Returns the decoded [generated_as] AND the offset just past it, so the
+   caller can continue decoding trailing fields (#312 pk_desc). *)
 let decode_generated_as bytes off =
   if Bytes.length bytes - off <= 0
-  then None
+  then None, off
   else (
     let has_gen, off2 = Varint.decode_uint64 bytes off in
     if Int64.to_int has_gen = 0
-    then None
+    then None, off2
     else (
       let is_stored, off3 = Varint.decode_uint64 bytes off2 in
       let sql_len, off4 = Varint.decode_uint64 bytes off3 in
       let sql = Bytes.sub_string bytes off4 (Int64.to_int sql_len) in
-      Some (sql, Int64.to_int is_stored = 1)))
+      Some (sql, Int64.to_int is_stored = 1), off4 + Int64.to_int sql_len))
+;;
+
+(* #312: optional trailing pk_desc flag.  Absent (old encodings) ⇒ false. *)
+let decode_pk_desc bytes off =
+  if off >= Bytes.length bytes
+  then false
+  else (
+    let flag, _ = Varint.decode_uint64 bytes off in
+    Int64.to_int flag <> 0)
 ;;
 
 let decode_column bytes =
@@ -702,6 +718,7 @@ let decode_column bytes =
       ; ty = type_of_tag (Int64.to_int tag)
       ; not_null = false
       ; primary_key = false
+      ; pk_desc = false
       ; default = None
       ; check_sql = None
       ; generated_as = None
@@ -718,12 +735,14 @@ let decode_column bytes =
         Some dv, off')
     in
     let check_sql, final_off = decode_check_sql bytes off in
-    let generated_as = decode_generated_as bytes final_off in
+    let generated_as, off = decode_generated_as bytes final_off in
+    let pk_desc = decode_pk_desc bytes off in
     Row.
       { name
       ; ty = type_of_tag (Int64.to_int tag)
       ; not_null = Int64.to_int nn <> 0
       ; primary_key = Int64.to_int pk <> 0
+      ; pk_desc
       ; default
       ; check_sql
       ; generated_as
@@ -1271,7 +1290,12 @@ let register_tag store (m : table_meta) =
    changes on DDL, not on every insert. *)
 (* v2 (#299): appends a trailing autoincrement byte after the column/FK blocks.
    v1 entries lack it; the decoder treats their absence as [false]. *)
-let mirror_version = 2
+(* v3 (#314): for an AUTOINCREMENT table ONLY, appends a presence byte + int64
+   carrying the volatile [next_rowid] high-water, so mirror reconstruction can
+   restore the sticky counter instead of recomputing max(rowid)+1 (which would
+   make a committed-DELETE high-water reusable).  Non-AUTOINCREMENT tables write
+   a presence byte of 0 and incur no per-insert mirror write. *)
+let mirror_version = 3
 
 let mirror_key (tid : S.tree_id) =
   let b = Bytes.create 8 in
@@ -1301,6 +1325,15 @@ let encode_mirror_entry (m : table_meta) =
   Buffer.add_bytes buf fkb;
   (* #299 (mirror v2): trailing autoincrement byte. *)
   Buffer.add_uint8 buf (if m.autoincrement then 1 else 0);
+  (* #314 (mirror v3): for an AUTOINCREMENT table, persist the volatile rowid
+     high-water so mirror reconstruction restores it instead of recomputing
+     max(rowid)+1.  Non-AUTOINCREMENT tables omit it (no per-insert mirror
+     write).  Encoded as a presence byte + int64. *)
+  if m.autoincrement
+  then (
+    Buffer.add_uint8 buf 1;
+    Varint.encode_int64 buf m.next_rowid)
+  else Buffer.add_uint8 buf 0;
   Buffer.to_bytes buf
 ;;
 
@@ -1335,13 +1368,27 @@ let decode_mirror_entry bytes : table_meta * int64 =
   let fk_constraints = decode_fks fkb in
   off := o + Int64.to_int fklen;
   (* #299 (mirror v2): trailing autoincrement byte; absent in v1. *)
-  let autoincrement =
-    ver >= 2 && !off < Bytes.length bytes && Bytes.get_uint8 bytes !off <> 0
+  let ai_present = ver >= 2 && !off < Bytes.length bytes in
+  let autoincrement = ai_present && Bytes.get_uint8 bytes !off <> 0 in
+  if ai_present then incr off;
+  (* #314 (mirror v3): for an AUTOINCREMENT table, a presence byte followed (when
+     nonzero) by the persisted [next_rowid] high-water.  v1/v2 blobs lack this;
+     a v3 non-AUTOINCREMENT blob has presence byte 0.  Either way [next_rowid]
+     defaults to [empty_next_rowid], so [recover_next_rowid] still recomputes
+     max(rowid)+1 for those. *)
+  let next_rowid =
+    if ver >= 3 && !off < Bytes.length bytes && Bytes.get_uint8 bytes !off <> 0
+    then (
+      incr off;
+      let v, o = Varint.decode_int64 bytes !off in
+      off := o;
+      v)
+    else empty_next_rowid
   in
   ( { name
     ; tree_id = Int64.to_int tid
     ; columns
-    ; next_rowid = empty_next_rowid
+    ; next_rowid
     ; fk_constraints
     ; without_rowid
     ; autoincrement
@@ -1352,6 +1399,17 @@ let decode_mirror_entry bytes : table_meta * int64 =
 (* Write/replace a table's mirror entry inside an already-open RW txn. *)
 let put_mirror_tx tx (m : table_meta) =
   S.put tx sys_mirror_tid (mirror_key m.tree_id) (encode_mirror_entry m)
+;;
+
+(* Persist [m]'s rowid counter to the primary [_sys_tables] row, and — for
+   AUTOINCREMENT tables (#314) — keep the redundant mirror's high-water in step
+   so a later mirror reconstruction restores the sticky counter.  Non-
+   AUTOINCREMENT tables skip the mirror write (no per-insert mirror amplification).
+   Single home for the "mirror tracks primary" invariant shared by every
+   counter-mutation path. *)
+let put_table_counter_tx tx (m : table_meta) =
+  let%lwt () = S.put tx sys_tables_tid (Bytes.of_string m.name) (encode_table_value m) in
+  if m.autoincrement then put_mirror_tx tx m else Lwt.return_unit
 ;;
 
 (* Remove a table's mirror entry inside an already-open RW txn. *)
@@ -1391,6 +1449,15 @@ let load_mirror_entries store =
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   if m.without_rowid
   then Lwt.return m
+  else if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+  then
+    (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
+       tables; trust it instead of recomputing max(rowid)+1, which would make a
+       committed-DELETE high-water reusable.  Only a v3 AUTOINCREMENT mirror
+       entry decodes to a non-empty [next_rowid], so the rollback-recompute
+       caller (which passes live-cache, non-AUTOINCREMENT metas) never trips
+       this branch. *)
+    Lwt.return m
   else
     S.with_ro store
     @@ fun tx ->
@@ -1835,7 +1902,7 @@ let next_rowid t ~name =
        concurrent autocommit callers cannot read the same stale counter. *)
     Schema_cache.set_rowid_durable t.sc ~name m';
     let%lwt tx = S.rw_begin t.store in
-    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
+    let%lwt () = put_table_counter_tx tx m' in
     let%lwt () = S.commit tx in
     Lwt.return id
 ;;
@@ -1848,13 +1915,27 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let id, next = alloc_rowid m in
-    let m' = { m with next_rowid = next } in
-    (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
-       ROLLBACK recomputes only it. *)
-    Schema_cache.bump_rowid t.sc ~name m';
-    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
-    Lwt.return id
+    (* #312: an AUTOINCREMENT table whose counter is already pinned at max_int
+       (a max_int rowid exists) cannot allocate another id.  SQLite raises
+       SQLITE_FULL here instead of probing for a free rowid; match its wording.
+       Use [Lwt.fail_with] so it surfaces as a catchable SQL [Error] like the
+       other user-facing insert failures.  Plain rowid tables keep the existing
+       hold-at-max behavior.
+       Known conflation (PR#315 review): [next_rowid = max_int] means both
+       "max_int already handed out" and "max_int is next to hand out", so we
+       raise one id early in the pure auto-increment path (an explicit insert of
+       max_int-1 bumps next to max_int, then the next NULL insert raises instead
+       of allocating max_int).  Unreachable in practice — it needs 2^63 rows. *)
+    if m.autoincrement && Int64.equal m.next_rowid Int64.max_int
+    then Lwt.fail_with "database or disk is full"
+    else (
+      let id, next = alloc_rowid m in
+      let m' = { m with next_rowid = next } in
+      (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
+         ROLLBACK recomputes only it. *)
+      Schema_cache.bump_rowid t.sc ~name m';
+      let%lwt () = put_table_counter_tx tx m' in
+      Lwt.return id)
 ;;
 
 (** #243 (T1): after an INSERT supplies an explicit INTEGER PRIMARY KEY value,
@@ -1881,7 +1962,126 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
          actually moved (the early-return no-op above leaves the cached counter
          untouched, so nothing to recompute). *)
       Schema_cache.bump_rowid t.sc ~name m';
-      S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m'))
+      (* #314: [put_table_counter_tx] mirrors the high-water for AUTOINCREMENT
+         tables.  The no-op early-return path above never reaches here, so a
+         non-moving bump leaves both primary and mirror untouched. *)
+      put_table_counter_tx tx m')
+;;
+
+(* #312.1: largest stored rowid in a table's data tree, computed within an
+   already-open txn.  Used only on the uncommon lower-clamp path of a writable
+   [sqlite_sequence] SET/INSERT, to avoid lowering the counter below the live
+   max(rowid).  The store has no [cursor_last]/[cursor_prev], so this reuses the
+   forward walk from [recover_next_rowid]: [Rowid.encode]'s offset-binary
+   encoding sorts integer rowids correctly, so the last key in byte order is the
+   maximum.  Returns [None] for an empty tree. *)
+let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
+  match Schema_cache.find_table t.sc name with
+  (* Private helper; the sole caller ([set_next_rowid_in_txn]) has already
+     confirmed the table is present, so this arm is unreachable in practice. *)
+  | None -> failwith (Printf.sprintf "no table '%s'" name)
+  | Some m ->
+    let%lwt cur = S.cursor_open tx m.tree_id in
+    let _sr = S.cursor_first cur in
+    let max_key = ref None in
+    let rec walk () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, _) ->
+        max_key := Some k;
+        walk ()
+    in
+    walk ();
+    S.cursor_close cur;
+    Lwt.return
+      (match !max_key with
+       | None -> None
+       | Some k -> Some (Rowid.decode k))
+;;
+
+(* #312.1: writable [sqlite_sequence] SET/INSERT for table [name] with the
+   requested seq value [requested].  Faithful to SQLite's effective rule
+   [next = max(requested, max(rowid)) + 1]: the new counter is
+   [max(requested + 1, max(rowid) + 1)].
+   - RAISE path (the common case): when [requested + 1 >= next_rowid] and the
+     counter is already seeded, [next_rowid] already equals [max(rowid) + 1], so
+     just set [next_rowid := requested + 1] — no tree scan needed.
+   - LOWER path: when [requested + 1] would drop below the counter (or the
+     counter is unseeded), clamp to [max(rowid) + 1] so the next insert never
+     collides with a live row.
+   Mutates through [tx] via [put_table_counter_tx] (primary row + #314 mirror)
+   and marks the counter dirty ([Schema_cache.bump_rowid]) so a ROLLBACK reverts
+   it via [recompute_rowid_counters_after_rollback].  The table must exist and
+   be AUTOINCREMENT. *)
+let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
+  match Schema_cache.find_table t.sc name with
+  | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
+  | Some m ->
+    if not m.autoincrement
+    then
+      failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
+    else (
+      (* Saturating add: [requested = max_int] means "max_int was handed out", so
+         the counter must pin at [max_int] (the next insert then raises
+         SQLITE_FULL).  A plain [requested + 1] would overflow to [min_int] and
+         fall into the lower-clamp path, silently resetting to [max(rowid)+1]. *)
+      let want_next =
+        if Int64.equal requested Int64.max_int
+        then Int64.max_int
+        else Int64.add requested 1L
+      in
+      let%lwt clamped =
+        if
+          (not (Int64.equal m.next_rowid empty_next_rowid))
+          && Int64.compare want_next m.next_rowid >= 0
+        then Lwt.return want_next
+        else (
+          let%lwt mx = max_rowid_in_txn t ~name tx in
+          let floor =
+            match mx with
+            | Some k -> Int64.add k 1L
+            | None -> 1L
+          in
+          Lwt.return (if Int64.compare want_next floor > 0 then want_next else floor))
+      in
+      let m' = { m with next_rowid = clamped } in
+      Schema_cache.bump_rowid t.sc ~name m';
+      put_table_counter_tx tx m')
+;;
+
+(* #312.1: writable [sqlite_sequence] DELETE for table [name].  Resets the
+   counter to [empty_next_rowid] so the next insert recomputes from data —
+   matching SQLite removing the [sqlite_sequence] row.  Mutates through [tx] and
+   marks the counter dirty so a ROLLBACK reverts it.  The table must exist and be
+   AUTOINCREMENT. *)
+let reset_next_rowid_in_txn t ~name (tx : S.rw S.txn) =
+  match Schema_cache.find_table t.sc name with
+  | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
+  | Some m ->
+    if not m.autoincrement
+    then
+      failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
+    else (
+      let m' = { m with next_rowid = empty_next_rowid } in
+      Schema_cache.bump_rowid t.sc ~name m';
+      put_table_counter_tx tx m')
+;;
+
+(* #312.1: [DELETE FROM sqlite_sequence] with no WHERE — reset EVERY seeded
+   AUTOINCREMENT counter (SQLite parity, and what a real [sqlite3 .dump] emits
+   before re-INSERTing).  Non-AUTOINCREMENT and already-unseeded tables are left
+   untouched (no spurious mirror writes). *)
+let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
+  let%lwt tables = list_tables t in
+  Lwt_list.iter_s
+    (fun (m : table_meta) ->
+       if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+       then (
+         let m' = { m with next_rowid = empty_next_rowid } in
+         Schema_cache.bump_rowid t.sc ~name:m.name m';
+         put_table_counter_tx tx m')
+       else Lwt.return_unit)
+    tables
 ;;
 
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is

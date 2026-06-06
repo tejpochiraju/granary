@@ -121,12 +121,17 @@ let recognise_eq_col_col = function
   | _ -> None
 ;;
 
+(* Negative [tree_id]s are sentinels for synthesized scans with no real B-tree:
+   -1 = CTE, -2 = sqlite_master, -3 = sqlite_sequence.  Each is materialized by a
+   dedicated plan op rather than a [Op_seq_scan] over a stored tree. *)
 let make_scan (meta : Cat.table_meta) : Plan.op =
   if meta.Cat.tree_id = -1
   then
     Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
   else if meta.Cat.tree_id = -2
   then Plan.Op_sqlite_master
+  else if meta.Cat.tree_id = -3
+  then Plan.Op_sqlite_sequence
   else Plan.Op_seq_scan { table_meta = meta }
 ;;
 
@@ -933,6 +938,8 @@ let rec plan ?cat = function
     plan_update cat ~table_meta ~assignments ~where ~order ~limit ~offset ~returning
   | Sema.BS_delete { table_meta; where; order; limit; offset; returning } ->
     plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning
+  | Sema.BS_seq_write (Sema.Seq_set { table; seq }) -> Plan.Op_seq_set { table; seq }
+  | Sema.BS_seq_write (Sema.Seq_reset { table }) -> Plan.Op_seq_reset { table }
   | Sema.BS_drop_table { table_meta; _ } ->
     Plan.Op_drop_table { table_meta; indexes = indexes_of cat table_meta }
   | Sema.BS_drop_index { idx_info; _ } -> Plan.Op_drop_index { idx_info }

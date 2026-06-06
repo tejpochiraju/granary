@@ -184,7 +184,13 @@ type fk_action = Sqlocaml_catalog.Catalog.fk_action =
 
 type table_constraint =
   | TC_unique of string list (** UNIQUE(col1, col2, ...) *)
-  | TC_primary_key of string list (** PRIMARY KEY(col1, col2, ...) *)
+  | TC_primary_key of
+      { pk_cols : string list (** PRIMARY KEY(col1, col2, ...) *)
+      ; autoincrement : bool
+        (** #312: AUTOINCREMENT appeared on a column inside the table-level
+            PRIMARY KEY(...).  Only legal on a single-column INTEGER PK
+            (validated in {!Sqlocaml_sql.Sema}); composite is rejected. *)
+      }
   | TC_foreign_key of
       { local_cols : string list
       ; parent_table : string
@@ -460,6 +466,10 @@ and column_def =
     (** [AUTOINCREMENT] on a column [PRIMARY KEY] (#299).  Only ever [true] for
         a single-column ascending INTEGER PRIMARY KEY on a rowid table; the
         placement is validated in {!Sqlocaml_sql.Sema}. *)
+  ; pk_desc : bool
+    (** #312: [PRIMARY KEY DESC] on this column.  SQLite treats an
+        [INTEGER PRIMARY KEY DESC] as a NON-alias (hidden rowid + real index),
+        not the rowid alias.  Only meaningful when [primary_key] is set. *)
   ; default : literal option (* None = no DEFAULT *)
   ; check : expr option (* None = no CHECK constraint *)
   ; fk_ref : (string * string * fk_action * fk_action * bool) option

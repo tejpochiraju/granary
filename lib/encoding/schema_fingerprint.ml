@@ -68,6 +68,12 @@ let add_column buf (c : Row.column) =
   add_u8 buf (type_tag c.ty);
   add_u8 buf (if c.not_null then 1 else 0);
   add_u8 buf (if c.primary_key then 1 else 0);
+  (* #312: a DESC PK (non-alias: hidden rowid + __pk index) is a different
+     decode shape than the alias, so it must change the fingerprint.  Emit a
+     marker ONLY when [pk_desc] is set, so v1 on-disk fingerprints (and the
+     per-page stamps derived from them, #174) of every existing schema stay
+     byte-identical — no false corruption mismatch on reopen. *)
+  if c.pk_desc then add_u8 buf 0xD5;
   (match c.default with
    | None -> add_u8 buf 0
    | Some dv ->

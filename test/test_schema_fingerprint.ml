@@ -15,6 +15,7 @@ module Row = Sqlocaml_encoding.Row
 let col
       ?(not_null = false)
       ?(primary_key = false)
+      ?(pk_desc = false)
       ?(default = None)
       ?(check_sql = None)
       ?(generated_as = None)
@@ -22,7 +23,7 @@ let col
       ty
   : Row.column
   =
-  { name; ty; not_null; primary_key; default; check_sql; generated_as }
+  { name; ty; not_null; primary_key; pk_desc; default; check_sql; generated_as }
 ;;
 
 let fp ?(without_rowid = false) columns = SF.compute ~columns ~without_rowid
@@ -68,6 +69,15 @@ let test_primary_key_sensitive () =
     "primary_key flag"
     (fp [ col "a" Row.Integer ~primary_key:false ])
     (fp [ col "a" Row.Integer ~primary_key:true ])
+;;
+
+(* #312: pk_desc (INTEGER PRIMARY KEY DESC, a non-alias) changes the decode
+   shape, so it must change the fingerprint. *)
+let test_pk_desc_sensitive () =
+  differ
+    "pk_desc flag"
+    (fp [ col "a" Row.Integer ~primary_key:true ~pk_desc:false ])
+    (fp [ col "a" Row.Integer ~primary_key:true ~pk_desc:true ])
 ;;
 
 let test_default_presence_sensitive () =
@@ -142,19 +152,20 @@ let test_low32 () =
 let gen_column : Row.column QCheck.Gen.t =
   QCheck.Gen.(
     map3
-      (fun name ty (nn, pk) ->
+      (fun name ty (nn, pk, desc) ->
          Row.
            { name
            ; ty
            ; not_null = nn
            ; primary_key = pk
+           ; pk_desc = pk && desc (* DESC only meaningful on a PRIMARY KEY column *)
            ; default = None
            ; check_sql = None
            ; generated_as = None
            })
       (string_size ~gen:(char_range 'a' 'z') (int_range 1 6))
       (oneof_list [ Row.Integer; Row.Text; Row.Real; Row.Blob ])
-      (pair bool bool))
+      (triple bool bool bool))
 ;;
 
 let arb_schema = QCheck.make QCheck.Gen.(pair (list_size (int_range 0 8) gen_column) bool)
@@ -180,6 +191,7 @@ let () =
         ; Alcotest.test_case "type" `Quick test_type_sensitive
         ; Alcotest.test_case "not_null" `Quick test_not_null_sensitive
         ; Alcotest.test_case "primary_key" `Quick test_primary_key_sensitive
+        ; Alcotest.test_case "pk_desc" `Quick test_pk_desc_sensitive
         ; Alcotest.test_case "default presence" `Quick test_default_presence_sensitive
         ; Alcotest.test_case "default value" `Quick test_default_value_sensitive
         ; Alcotest.test_case "check" `Quick test_check_sensitive

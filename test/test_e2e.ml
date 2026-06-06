@@ -11562,16 +11562,10 @@ let assert_create_rejected sql needle =
   | Ok () -> Alcotest.failf "expected rejection of: %s" sql
   | Error e ->
     let msg = fmt_err e in
-    let contains =
-      let nl = String.length needle
-      and hl = String.length msg in
-      let rec go i = i + nl <= hl && (String.sub msg i nl = needle || go (i + 1)) in
-      nl = 0 || go 0
-    in
     Alcotest.(check bool)
       (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
       true
-      contains
+      (contains_pat needle msg)
 ;;
 
 (* #299 property: under any interleaving of committed INSERT/DELETE ops, an
@@ -11694,6 +11688,389 @@ let autoincrement_rejections () =
   assert_create_rejected
     "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT) WITHOUT ROWID"
     "AUTOINCREMENT not allowed on WITHOUT ROWID tables"
+;;
+
+(* #312: table-constraint form PRIMARY KEY(col AUTOINCREMENT). The flag is
+   propagated onto the column so it reuses the single-column INTEGER-PK path:
+   sticky high-water survives DELETE of the top rowid. *)
+let autoincrement_table_constraint () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY(a AUTOINCREMENT))";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "DELETE FROM t WHERE a = 1";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* sticky high-water: the deleted top rowid is NOT reused *)
+  let rows = query_ok db "SELECT a FROM t ORDER BY a" in
+  Alcotest.(check (list int64)) "ids" [ 2L ] (List.map int_of_row rows)
+;;
+
+(* Assert [sql] run against [db] is rejected and the error message contains
+   [needle] (matching SQLite's own wording). Generic statement variant of
+   [assert_create_rejected], for asserting INSERT-time errors against a db that
+   already has state set up. *)
+let assert_exec_rejected db sql needle =
+  match Lwt_main.run (Db.execute db sql) with
+  | Ok () -> Alcotest.failf "expected rejection of: %s" sql
+  | Error e ->
+    let msg = fmt_err e in
+    Alcotest.(check bool)
+      (Printf.sprintf "error for %S mentions %S (got: %s)" sql needle msg)
+      true
+      (contains_pat needle msg)
+;;
+
+(* #312: an AUTOINCREMENT table whose counter is already pinned at max_int (an
+   explicit Int64.max_int rowid exists) cannot auto-allocate another id. SQLite
+   raises SQLITE_FULL (database or disk is full) rather than silently holding
+   the counter and risking a collision. *)
+let autoincrement_full_on_exhaustion () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  (* seed the counter at the maximum: an explicit max_int rowid *)
+  exec db (Printf.sprintf "INSERT INTO t(a, b) VALUES (%Ld, 'top')" Int64.max_int);
+  (* the next auto-allocation must fail with SQLITE_FULL wording *)
+  assert_exec_rejected
+    db
+    "INSERT INTO t(b) VALUES ('overflow')"
+    "database or disk is full"
+;;
+
+(* #312: the table-constraint form is still only legal on a single-column
+   INTEGER PK; composite and non-INTEGER PKs are rejected. *)
+let autoincrement_table_constraint_rejections () =
+  assert_create_rejected
+    "CREATE TABLE c (a INTEGER, b INTEGER, PRIMARY KEY(a, b AUTOINCREMENT))"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
+  assert_create_rejected
+    "CREATE TABLE n (a TEXT, PRIMARY KEY(a AUTOINCREMENT))"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #312: INTEGER PRIMARY KEY DESC is a NON-alias                        *)
+(*                                                                     *)
+(* SQLite treats [INTEGER PRIMARY KEY DESC] NOT as the rowid alias but *)
+(* like any other non-INTEGER PK: the column gets a hidden auto rowid  *)
+(* plus a real (here ascending) unique [__pk] index.  Observable       *)
+(* consequences vs. an alias (this engine has no [SELECT rowid]):      *)
+(*   - omitting the PK column on INSERT does NOT auto-fill it (alias    *)
+(*     would); the column is NOT NULL, so the INSERT is rejected;       *)
+(*   - duplicate explicit PK values are rejected by the implicit __pk  *)
+(*     UNIQUE index.                                                    *)
+(* ------------------------------------------------------------------ *)
+
+let pk_desc_is_non_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)";
+  exec db "INSERT INTO t(id, v) VALUES (10, 'a')";
+  (* Non-alias: the PK column is NOT auto-filled when omitted (an alias would
+     allocate the next rowid).  It is NOT NULL, so omitting it is rejected. *)
+  assert_exec_rejected db "INSERT INTO t(v) VALUES ('x')" "NOT NULL";
+  (* The stored value is preserved, and uniqueness on id is still enforced via
+     the implicit __pk index. *)
+  let rows = query_ok db "SELECT id, v FROM t" in
+  (match rows with
+   | [ row ] ->
+     let id =
+       match row.(0) with
+       | Db.V_int n -> n
+       | _ -> Alcotest.fail "id"
+     in
+     Alcotest.(check int64) "id is the stored value" 10L id
+   | _ -> Alcotest.fail "expected one row");
+  assert_exec_rejected db "INSERT INTO t(id, v) VALUES (10, 'dup')" "UNIQUE"
+;;
+
+(* Sanity: a plain (ASC) INTEGER PK still IS the alias — omitting it auto-fills,
+   to contrast with the DESC case above. *)
+let pk_asc_is_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+  exec db "INSERT INTO t(v) VALUES ('x')";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check (list int64)) "alias auto-filled id" [ 1L ] (List.map int_of_row rows)
+;;
+
+(* #312: the non-alias shape survives a file close+reopen — the DESC bit is a
+   trailing field of the column encoding, and the dump DDL re-emits DESC.  After
+   reopen the table must STILL be a non-alias (omitting id rejected, dup id
+   rejected), not silently downgraded to an alias. *)
+let pk_desc_persists_across_reopen () =
+  with_tempfile (fun path ->
+    run
+      (let open_db () =
+         let* r = Db.open_file ~path () in
+         match r with
+         | Ok d -> Lwt.return d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* db = open_db () in
+       let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)" in
+       let* _ = Db.execute db "INSERT INTO t(id, v) VALUES (10, 'a')" in
+       let* () = Db.close db in
+       let* db2 = open_db () in
+       (* Still a non-alias: omitting id is rejected (NOT NULL, no auto-fill). *)
+       let* r_omit = Db.execute db2 "INSERT INTO t(v) VALUES ('x')" in
+       Alcotest.(check bool)
+         "omit-id still rejected after reopen (non-alias)"
+         true
+         (match r_omit with
+          | Ok () -> false
+          | Error e -> contains_pat "NOT NULL" (fmt_err e));
+       (* Still a non-alias: dup id rejected by the implicit __pk index. *)
+       let* r_dup = Db.execute db2 "INSERT INTO t(id, v) VALUES (10, 'dup')" in
+       Alcotest.(check bool)
+         "dup id still rejected after reopen (non-alias)"
+         true
+         (match r_dup with
+          | Ok () -> false
+          | Error e -> contains_pat "UNIQUE" (fmt_err e));
+       (* The dump DDL re-emits DESC so a re-load reproduces the non-alias. *)
+       let* dump = Db.dump_to_string db2 () in
+       let dump =
+         match dump with
+         | Ok s -> s
+         | Error _ -> Alcotest.fail "dump failed"
+       in
+       Alcotest.(check bool)
+         "dump re-emits PRIMARY KEY DESC"
+         true
+         (contains_pat "PRIMARY KEY DESC" dump);
+       Db.close db2))
+;;
+
+(* #312 property: an INTEGER PRIMARY KEY DESC (a non-alias) enforces uniqueness
+   on the key via its implicit __pk index — distinct keys are accepted, a repeat
+   of any already-inserted key is rejected. *)
+let qcheck_pk_desc_unique =
+  QCheck.Test.make
+    ~name:"pk_desc: distinct keys accepted, duplicates rejected"
+    ~count:1000
+    QCheck.(list_size Gen.(1 -- 12) (0 -- 30))
+    (fun keys ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)" in
+          let seen = Hashtbl.create 16 in
+          let ok = ref true in
+          let* () =
+            Lwt_list.iter_s
+              (fun k ->
+                 let sql = Printf.sprintf "INSERT INTO t(id, v) VALUES (%d, 'x')" k in
+                 let* r = Db.execute db sql in
+                 let is_dup = Hashtbl.mem seen k in
+                 (match r with
+                  | Ok () -> if is_dup then ok := false else Hashtbl.replace seen k ()
+                  | Error _ -> if not is_dup then ok := false);
+                 Lwt.return_unit)
+              keys
+          in
+          Lwt.return !ok))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* sqlite_sequence (#312) — queryable read-only view                   *)
+(* ------------------------------------------------------------------ *)
+
+let sqlite_sequence_select () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  (* absent until first insert *)
+  Alcotest.(check int)
+    "empty before insert"
+    0
+    (List.length (query_ok db "SELECT seq FROM sqlite_sequence"));
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  let rows = query_ok db "SELECT name, seq FROM sqlite_sequence" in
+  match rows with
+  | [ row ] ->
+    Alcotest.(check string)
+      "name"
+      "t"
+      (match row.(0) with
+       | Db.V_text s -> s
+       | _ -> Alcotest.fail "name");
+    Alcotest.(check int64)
+      "seq is high-water (2)"
+      2L
+      (match row.(1) with
+       | Db.V_int n -> n
+       | _ -> Alcotest.fail "seq")
+  | _ -> Alcotest.fail "expected one sqlite_sequence row"
+;;
+
+let sqlite_sequence_in_master () =
+  let db = fresh_db () in
+  let master_has name =
+    let rows =
+      query_ok db (Printf.sprintf "SELECT name FROM sqlite_master WHERE name = '%s'" name)
+    in
+    List.length rows > 0
+  in
+  Alcotest.(check bool) "absent initially" false (master_has "sqlite_sequence");
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)";
+  Alcotest.(check bool) "present after autoinc table" true (master_has "sqlite_sequence")
+;;
+
+(* #312.1: writable sqlite_sequence — UPDATE/DELETE/INSERT translate to
+   next_rowid mutations through the active transaction. *)
+
+let sqlite_sequence_update () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  (* a=1 *)
+  exec db "UPDATE sqlite_sequence SET seq = 99 WHERE name = 't'";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=100 *)
+  Alcotest.(check (list int64))
+    "raised counter"
+    [ 1L; 100L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_lower_clamps_to_max_rowid () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(a,b) VALUES (10,'x')";
+  (* max rowid 10, seq 10 *)
+  exec db "UPDATE sqlite_sequence SET seq = 3 WHERE name = 't'";
+  (* below max *)
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  Alcotest.(check (list int64))
+    "clamped to max+1"
+    [ 10L; 11L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_delete_resets () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "DELETE FROM t";
+  exec db "DELETE FROM sqlite_sequence WHERE name = 't'";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* reset: a=1 again *)
+  Alcotest.(check (list int64))
+    "reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t"))
+;;
+
+let sqlite_sequence_insert () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO sqlite_sequence(name, seq) VALUES('t', 50)";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=51 *)
+  Alcotest.(check (list int64))
+    "insert set counter"
+    [ 1L; 51L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+let sqlite_sequence_insert_positional () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO sqlite_sequence VALUES('t', 70)";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* a=71 *)
+  Alcotest.(check (list int64))
+    "positional insert set counter"
+    [ 1L; 71L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+(* #312: bare [DELETE FROM sqlite_sequence] (no WHERE) resets EVERY AUTOINCREMENT
+   counter — SQLite parity, and required so a [sqlite3 .dump] (which emits this
+   line) round-trips into this engine. *)
+let sqlite_sequence_delete_all_resets () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "CREATE TABLE u (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO u(b) VALUES ('p')";
+  exec db "DELETE FROM t";
+  exec db "DELETE FROM u";
+  exec db "DELETE FROM sqlite_sequence";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  exec db "INSERT INTO u(b) VALUES ('q')";
+  Alcotest.(check (list int64))
+    "t reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t"));
+  Alcotest.(check (list int64))
+    "u reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM u"))
+;;
+
+let sqlite_sequence_rollback_reverts () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "BEGIN";
+  exec db "UPDATE sqlite_sequence SET seq = 500 WHERE name = 't'";
+  exec db "ROLLBACK";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  Alcotest.(check (list int64))
+    "rollback reverted counter"
+    [ 1L; 2L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
+;;
+
+(* #312/PR#315 review: [UPDATE sqlite_sequence SET seq = max_int] must pin the
+   counter so the next insert raises SQLITE_FULL — not silently land at
+   max(rowid)+1 via an overflowing [requested + 1].  Matches SQLite. *)
+let sqlite_sequence_set_max_pins_full () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec
+    db
+    (Printf.sprintf "UPDATE sqlite_sequence SET seq = %Ld WHERE name = 't'" Int64.max_int);
+  assert_exec_rejected db "INSERT INTO t(b) VALUES ('y')" "database or disk is full"
+;;
+
+let sqlite_sequence_rejects_unsupported () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT)";
+  exec db "CREATE TABLE plain (a INTEGER PRIMARY KEY, b TEXT)";
+  (* unknown table name *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'nope'"
+    "sqlite_sequence";
+  (* non-AUTOINCREMENT table name *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'plain'"
+    "AUTOINCREMENT";
+  (* non-literal seq (subquery) *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = (SELECT 1) WHERE name = 't'"
+    "sqlite_sequence";
+  (* no WHERE *)
+  assert_exec_rejected db "UPDATE sqlite_sequence SET seq = 1" "sqlite_sequence";
+  (* extra WHERE predicate beyond name = '...' *)
+  assert_exec_rejected
+    db
+    "UPDATE sqlite_sequence SET seq = 1 WHERE name = 't' AND seq > 0"
+    "sqlite_sequence";
+  (* multi-row INSERT *)
+  assert_exec_rejected
+    db
+    "INSERT INTO sqlite_sequence VALUES ('t', 1), ('u', 2)"
+    "sqlite_sequence";
+  (* wrong-column INSERT *)
+  assert_exec_rejected
+    db
+    "INSERT INTO sqlite_sequence(seq, name) VALUES (1, 't')"
+    "sqlite_sequence"
 ;;
 
 (* Runner                                                               *)
@@ -12598,7 +12975,41 @@ let () =
             "persists_across_reopen"
             `Quick
             autoincrement_persists_across_reopen
+        ; Alcotest.test_case "table_constraint" `Quick autoincrement_table_constraint
+        ; Alcotest.test_case
+            "table_constraint_rejections"
+            `Quick
+            autoincrement_table_constraint_rejections
+        ; Alcotest.test_case "full_on_exhaustion" `Quick autoincrement_full_on_exhaustion
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
+    ; ( "primary key desc (#312)"
+      , [ Alcotest.test_case "is_non_alias" `Quick pk_desc_is_non_alias
+        ; Alcotest.test_case "asc_is_alias" `Quick pk_asc_is_alias
+        ; Alcotest.test_case
+            "persists_across_reopen"
+            `Quick
+            pk_desc_persists_across_reopen
+        ]
+        @ List.map QCheck_alcotest.to_alcotest [ qcheck_pk_desc_unique ] )
+    ; ( "sqlite_sequence (#312)"
+      , [ Alcotest.test_case "select" `Quick sqlite_sequence_select
+        ; Alcotest.test_case "in_master" `Quick sqlite_sequence_in_master
+        ; Alcotest.test_case "update" `Quick sqlite_sequence_update
+        ; Alcotest.test_case
+            "lower_clamps_to_max_rowid"
+            `Quick
+            sqlite_sequence_lower_clamps_to_max_rowid
+        ; Alcotest.test_case "delete_resets" `Quick sqlite_sequence_delete_resets
+        ; Alcotest.test_case "insert" `Quick sqlite_sequence_insert
+        ; Alcotest.test_case "insert_positional" `Quick sqlite_sequence_insert_positional
+        ; Alcotest.test_case "delete_all_resets" `Quick sqlite_sequence_delete_all_resets
+        ; Alcotest.test_case "set_max_pins_full" `Quick sqlite_sequence_set_max_pins_full
+        ; Alcotest.test_case "rollback_reverts" `Quick sqlite_sequence_rollback_reverts
+        ; Alcotest.test_case
+            "rejects_unsupported"
+            `Quick
+            sqlite_sequence_rejects_unsupported
+        ] )
     ]
 ;;
