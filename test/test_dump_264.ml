@@ -31,6 +31,16 @@ let contains_substr ~needle hay =
   nl = 0 || go 0
 ;;
 
+(* Index of the first occurrence of [needle] in [hay], or -1 if absent. *)
+let index_of ~needle hay =
+  let nl = String.length needle
+  and hl = String.length hay in
+  let rec go i =
+    if i + nl > hl then -1 else if String.sub hay i nl = needle then i else go (i + 1)
+  in
+  go 0
+;;
+
 let with_db f =
   let db = run (Db.open_in_memory ()) in
   Fun.protect
@@ -565,6 +575,53 @@ let test_fts_ddl_only () =
     | _ -> ())
 ;;
 
+(* #281: now that #269 removed the DDL-in-txn deadlock, a schema-bearing dump is
+   wrapped in [BEGIN] … [COMMIT] (like sqlite3 .dump), so restores apply
+   atomically.  The [PRAGMA foreign_keys=OFF] stays OUTSIDE the transaction,
+   matching sqlite.  The trigger body in [populate] contains "BEGIN " (with a
+   trailing space), so the bare-statement needles "BEGIN;"/"COMMIT;" only match
+   the transaction framing, never the trigger. *)
+let test_schema_dump_wrapped_in_txn () =
+  with_db (fun db ->
+    populate db;
+    let s = dump db in
+    let i_pragma = index_of ~needle:"PRAGMA foreign_keys=OFF" s in
+    let i_begin = index_of ~needle:"BEGIN;" s in
+    let i_create = index_of ~needle:"CREATE TABLE" s in
+    let i_commit = index_of ~needle:"COMMIT;" s in
+    Alcotest.(check bool) "schema dump opens a transaction" true (i_begin >= 0);
+    Alcotest.(check bool) "schema dump commits" true (i_commit >= 0);
+    Alcotest.(check bool)
+      "PRAGMA foreign_keys=OFF precedes BEGIN"
+      true
+      (i_pragma >= 0 && i_pragma < i_begin);
+    Alcotest.(check bool) "BEGIN precedes the first CREATE TABLE" true (i_begin < i_create);
+    Alcotest.(check bool) "COMMIT follows the schema/data" true (i_create < i_commit);
+    (* COMMIT really is the final statement — the dump ends with it, so no
+       statement leaks out after the transaction closes. *)
+    Alcotest.(check string)
+      "COMMIT is the last statement"
+      "COMMIT;"
+      (let t = String.trim s in
+       let n = String.length "COMMIT;" in
+       if String.length t >= n then String.sub t (String.length t - n) n else t);
+    (* and the wrapped script still round-trips: it replays atomically inside the
+       transaction it now carries. *)
+    assert_roundtrip db)
+;;
+
+(* schema_only is also schema-bearing, so it too is wrapped. *)
+let test_schema_only_wrapped_in_txn () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)";
+    let s = dump ~schema_only:true db in
+    Alcotest.(check bool)
+      "schema_only opens a transaction"
+      true
+      (index_of ~needle:"BEGIN;" s >= 0);
+    Alcotest.(check bool) "schema_only commits" true (index_of ~needle:"COMMIT;" s >= 0))
+;;
+
 let () =
   Alcotest.run
     "dump_264"
@@ -602,6 +659,14 @@ let () =
             test_user_index_pk_prefix_survives
         ; Alcotest.test_case "view depending on view" `Quick test_view_on_view
         ; Alcotest.test_case "fts ddl only" `Quick test_fts_ddl_only
+        ; Alcotest.test_case
+            "schema dump wrapped in txn (#281)"
+            `Quick
+            test_schema_dump_wrapped_in_txn
+        ; Alcotest.test_case
+            "schema_only wrapped in txn (#281)"
+            `Quick
+            test_schema_only_wrapped_in_txn
         ] )
     ]
 ;;

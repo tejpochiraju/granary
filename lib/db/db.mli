@@ -150,10 +150,13 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     values are omitted (recomputed on insert); implicit PRIMARY KEY indexes the
     [CREATE TABLE] already implies are not re-emitted.
 
-    The script is {e not} wrapped in [BEGIN]/[COMMIT]: DDL cannot currently run
-    inside an explicit transaction (Forgejo #269), so a schema-bearing dump
-    relies on per-statement autocommit. A [data_only] dump {e is} wrapped, since
-    it is pure DML.
+    The whole script is wrapped in [BEGIN]/[COMMIT] (after the leading [PRAGMA
+    foreign_keys=OFF;], which stays outside the transaction), so a restore
+    applies atomically — matching [sqlite3 .dump] (#281). This became possible
+    once #269 removed the DDL-in-transaction deadlock; every statement the dump
+    emits is transactional, so there is no per-statement-autocommit fallback. A
+    consequence: replay the script as-is — do {e not} wrap it in your own
+    [BEGIN]/[COMMIT], as the engine rejects a nested transaction.
 
     {b Not a point-in-time snapshot.} Each table is read in its own read
     transaction, so a concurrent commit between two tables' reads can produce a
@@ -170,8 +173,8 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     restored schema reports no PRIMARY KEY and permits NULLs in those columns.
 
     [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
-    [INSERT]s, wrapped in a transaction). Passing both yields an essentially
-    empty dump. *)
+    the row [INSERT]s). Both modes carry the same [BEGIN]/[COMMIT] wrapper as a
+    full dump. Passing both yields an essentially empty dump. *)
 val dump
   :  t
   -> ?schema_only:bool

@@ -201,8 +201,9 @@ let test_create_trigger_in_txn_commits () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* The downstream goal (#264): a schema-bearing dump wrapped in          *)
-(* BEGIN … COMMIT now replays atomically.                                *)
+(* The downstream goal (#264/#281): a schema-bearing dump is itself wrapped in *)
+(* BEGIN … COMMIT (#281, now that #269 removed the deadlock) and replays       *)
+(* atomically as-is, with no externally-supplied transaction framing.          *)
 (* ------------------------------------------------------------------ *)
 
 let test_schema_dump_replays_in_txn () =
@@ -216,18 +217,26 @@ let test_schema_dump_replays_in_txn () =
       exec db "CREATE VIEW v AS SELECT b FROM t WHERE a = 2";
       unwrap (run (Db.dump_to_string db ())))
   in
-  (* Replay the WHOLE schema dump wrapped in an explicit transaction.
-     [Db.execute] runs one statement per call.  This schema has no triggers and
+  (* #281: the dump carries its own BEGIN … COMMIT, so the replay must NOT add
+     another (a nested BEGIN is rejected).  Replaying the statements as-is drives
+     the schema in through the dump's own transaction. *)
+  let has needle =
+    let nl = String.length needle
+    and hl = String.length script in
+    let rec go i = i + nl <= hl && (String.sub script i nl = needle || go (i + 1)) in
+    go 0
+  in
+  Alcotest.(check bool) "dump opens its own transaction" true (has "BEGIN;");
+  Alcotest.(check bool) "dump commits its own transaction" true (has "COMMIT;");
+  (* [Db.execute] runs one statement per call.  This schema has no triggers and
      no semicolons inside string literals, so a plain split on ';' is a faithful
      statement boundary here. *)
   with_db (fun db ->
-    exec db "BEGIN";
     List.iter
       (fun stmt ->
          let s = String.trim stmt in
          if s <> "" then exec db s)
       (String.split_on_char ';' script);
-    exec db "COMMIT";
     Alcotest.(check (list string))
       "data restored under txn"
       [ "i:1,t:one"; "i:2,t:two" ]
