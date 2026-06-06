@@ -1724,10 +1724,13 @@ let next_rowid t ~name =
   | Some m ->
     let id, next = alloc_rowid m in
     let m' = { m with next_rowid = next } in
+    (* Update the cache BEFORE [rw_begin] (which yields), matching the original
+       order: find -> alloc -> cache-write stays atomic under Lwt so two
+       concurrent autocommit callers cannot read the same stale counter. *)
+    Schema_cache.set_rowid_durable t.sc ~name m';
     let%lwt tx = S.rw_begin t.store in
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m') in
     let%lwt () = S.commit tx in
-    Schema_cache.set_rowid_durable t.sc ~name m';
     Lwt.return id
 ;;
 
