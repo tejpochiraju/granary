@@ -1944,12 +1944,16 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
        let* tables = Cat.list_tables cat in
        let tables = dump_table_order tables in
        let* () = sink "PRAGMA foreign_keys=OFF;\n" in
-       (* DDL cannot run inside an explicit transaction yet — the catalog opens
-          its own writer txn and deadlocks against the ambient one (Forgejo
-          #269).  So only the DML-only [data_only] dump is wrapped in
-          BEGIN/COMMIT (for atomicity and speed); a schema-bearing dump relies
-          on per-statement autocommit. *)
-       let* () = if data_only then stmt "BEGIN" else Lwt.return_unit in
+       (* #281: every dump is wrapped in [BEGIN] … [COMMIT], like sqlite3 .dump,
+          so a restore applies atomically (and faster).  This used to be limited
+          to the DML-only [data_only] dump because DDL inside an explicit
+          transaction deadlocked the catalog's writer txn (#269); #269 (PR #278)
+          removed that deadlock, so a schema-bearing dump now replays atomically
+          too — every statement the dump emits (CREATE TABLE/INDEX/VIEW/TRIGGER,
+          CREATE VIRTUAL TABLE, ALTER, INSERT, DELETE) is transactional, so there
+          is no per-statement-autocommit fallback to keep.  The [PRAGMA
+          foreign_keys=OFF] stays outside the transaction, matching sqlite. *)
+       let* () = stmt "BEGIN" in
        (* Base tables: DDL immediately followed by that table's data. *)
        let* () =
          Lwt_list.iter_s
@@ -2019,13 +2023,13 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                        (Int64.sub m.Cat.next_rowid 1L)))
                seeded)
        in
-       let* () = if data_only then stmt "COMMIT" else Lwt.return_unit in
+       let* () = stmt "COMMIT" in
        Lwt.return (Ok ()))
     (function
       | Failure msg ->
-        (* A [data_only] dump has already sunk an unterminated [BEGIN]; close it
-           so a streaming sink is not left mid-transaction. *)
-        let* () = if data_only then stmt "ROLLBACK" else Lwt.return_unit in
+        (* The dump has already sunk an unterminated [BEGIN]; close it with a
+           [ROLLBACK] so a streaming sink is not left mid-transaction. *)
+        let* () = stmt "ROLLBACK" in
         Lwt.return (Error (Runtime msg))
       | exn -> Lwt.fail exn)
 ;;
