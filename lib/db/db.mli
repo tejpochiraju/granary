@@ -173,8 +173,8 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     restored schema reports no PRIMARY KEY and permits NULLs in those columns.
 
     [schema_only] omits all [INSERT]s; [data_only] omits all DDL (leaving only
-    [INSERT]s, wrapped in a transaction). Passing both yields an essentially
-    empty dump. *)
+    the row [INSERT]s). Both modes carry the same [BEGIN]/[COMMIT] wrapper as a
+    full dump. Passing both yields an essentially empty dump. *)
 val dump
   :  t
   -> ?schema_only:bool

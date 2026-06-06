@@ -596,7 +596,15 @@ let test_schema_dump_wrapped_in_txn () =
       true
       (i_pragma >= 0 && i_pragma < i_begin);
     Alcotest.(check bool) "BEGIN precedes the first CREATE TABLE" true (i_begin < i_create);
-    Alcotest.(check bool) "COMMIT is the last statement" true (i_create < i_commit);
+    Alcotest.(check bool) "COMMIT follows the schema/data" true (i_create < i_commit);
+    (* COMMIT really is the final statement — the dump ends with it, so no
+       statement leaks out after the transaction closes. *)
+    Alcotest.(check string)
+      "COMMIT is the last statement"
+      "COMMIT;"
+      (let t = String.trim s in
+       let n = String.length "COMMIT;" in
+       if String.length t >= n then String.sub t (String.length t - n) n else t);
     (* and the wrapped script still round-trips: it replays atomically inside the
        transaction it now carries. *)
     assert_roundtrip db)

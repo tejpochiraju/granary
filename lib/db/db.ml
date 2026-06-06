@@ -1950,9 +1950,10 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
           transaction deadlocked the catalog's writer txn (#269); #269 (PR #278)
           removed that deadlock, so a schema-bearing dump now replays atomically
           too — every statement the dump emits (CREATE TABLE/INDEX/VIEW/TRIGGER,
-          CREATE VIRTUAL TABLE, ALTER, INSERT, DELETE) is transactional, so there
-          is no per-statement-autocommit fallback to keep.  The [PRAGMA
-          foreign_keys=OFF] stays outside the transaction, matching sqlite. *)
+          CREATE VIRTUAL TABLE, INSERT, and the sqlite_sequence DELETE/INSERT) is
+          transactional, so there is no per-statement-autocommit fallback to
+          keep.  The [PRAGMA foreign_keys=OFF] stays outside the transaction,
+          matching sqlite. *)
        let* () = stmt "BEGIN" in
        (* Base tables: DDL immediately followed by that table's data. *)
        let* () =
