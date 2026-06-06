@@ -184,7 +184,13 @@ type fk_action = Sqlocaml_catalog.Catalog.fk_action =
 
 type table_constraint =
   | TC_unique of string list (** UNIQUE(col1, col2, ...) *)
-  | TC_primary_key of string list (** PRIMARY KEY(col1, col2, ...) *)
+  | TC_primary_key of
+      { pk_cols : string list (** PRIMARY KEY(col1, col2, ...) *)
+      ; autoincrement : bool
+        (** #312: AUTOINCREMENT appeared on a column inside the table-level
+            PRIMARY KEY(...).  Only legal on a single-column INTEGER PK
+            (validated in {!Sqlocaml_sql.Sema}); composite is rejected. *)
+      }
   | TC_foreign_key of
       { local_cols : string list
       ; parent_table : string

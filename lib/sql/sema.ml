@@ -1135,8 +1135,8 @@ let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
              ( Printf.sprintf "__uniq_%s_%s_%d" name (String.concat "_" cols) i
              , cols
              , `Implicit_unique )
-         | Ast.TC_primary_key cols when is_alias cols -> None
-         | Ast.TC_primary_key cols ->
+         | Ast.TC_primary_key { pk_cols = cols; _ } when is_alias cols -> None
+         | Ast.TC_primary_key { pk_cols = cols; _ } ->
            Some
              ( Printf.sprintf "__pk_%s_%s_%d" name (String.concat "_" cols) i
              , cols
@@ -1160,7 +1160,7 @@ let mark_table_pk constraints row_cols =
   List.fold_left
     (fun cols c ->
        match c with
-       | Ast.TC_primary_key [ pk_col ] ->
+       | Ast.TC_primary_key { pk_cols = [ pk_col ]; _ } ->
          List.map
            (fun (col : Row.column) ->
               if String.equal col.name pk_col
@@ -1330,6 +1330,26 @@ let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
                    (aggregates, subqueries, and parameters are not allowed)"
                   col.name)))
      | None ->
+       (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
+          column_def, so validation/derivation reuse the column-form path.  A
+          composite or non-INTEGER PK is still rejected downstream because the
+          marked column will not be the rowid alias. *)
+       let tc_ai_cols =
+         List.concat_map
+           (function
+             | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
+             | _ -> [])
+           constraints
+       in
+       let columns =
+         if tc_ai_cols = []
+         then columns
+         else
+           List.map
+             (fun (c : Ast.column_def) ->
+                if List.mem c.name tc_ai_cols then { c with autoincrement = true } else c)
+             columns
+       in
        let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
        (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)

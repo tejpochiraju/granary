@@ -514,8 +514,10 @@ table_item:
     { TI_col col }
   | UNIQUE LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
     { TI_constraint (Ast.TC_unique cols) }
-  | PRIMARY KEY LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
-    { TI_constraint (Ast.TC_primary_key cols) }
+  | PRIMARY KEY LPAREN specs = separated_nonempty_list(COMMA, pk_col_spec) RPAREN
+    { let pk_cols = List.map fst specs in
+      let autoincrement = List.exists snd specs in
+      TI_constraint (Ast.TC_primary_key { pk_cols; autoincrement }) }
   | FOREIGN KEY LPAREN local_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       REFERENCES parent_table = any_ident LPAREN parent_cols = separated_nonempty_list(COMMA, any_ident) RPAREN
       oc = fk_on_clauses deferrable = deferrable_clause
@@ -615,6 +617,12 @@ pk_order_opt:
   | ASC  { false }
   | DESC { true }
   |      { false }
+
+(* #312: a column inside a table-level PRIMARY KEY(...), optionally AUTOINCREMENT.
+   Returns (col_name, has_autoincrement). *)
+pk_col_spec:
+  | c = any_ident                 { (c, false) }
+  | c = any_ident AUTOINCREMENT   { (c, true) }
 
 autoincrement_opt:
   | AUTOINCREMENT { true }

@@ -11696,6 +11696,31 @@ let autoincrement_rejections () =
     "AUTOINCREMENT not allowed on WITHOUT ROWID tables"
 ;;
 
+(* #312: table-constraint form PRIMARY KEY(col AUTOINCREMENT). The flag is
+   propagated onto the column so it reuses the single-column INTEGER-PK path:
+   sticky high-water survives DELETE of the top rowid. *)
+let autoincrement_table_constraint () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER, b TEXT, PRIMARY KEY(a AUTOINCREMENT))";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "DELETE FROM t WHERE a = 1";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  (* sticky high-water: the deleted top rowid is NOT reused *)
+  let rows = query_ok db "SELECT a FROM t ORDER BY a" in
+  Alcotest.(check (list int64)) "ids" [ 2L ] (List.map int_of_row rows)
+;;
+
+(* #312: the table-constraint form is still only legal on a single-column
+   INTEGER PK; composite and non-INTEGER PKs are rejected. *)
+let autoincrement_table_constraint_rejections () =
+  assert_create_rejected
+    "CREATE TABLE c (a INTEGER, b INTEGER, PRIMARY KEY(a, b AUTOINCREMENT))"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
+  assert_create_rejected
+    "CREATE TABLE n (a TEXT, PRIMARY KEY(a AUTOINCREMENT))"
+    "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12598,6 +12623,11 @@ let () =
             "persists_across_reopen"
             `Quick
             autoincrement_persists_across_reopen
+        ; Alcotest.test_case "table_constraint" `Quick autoincrement_table_constraint
+        ; Alcotest.test_case
+            "table_constraint_rejections"
+            `Quick
+            autoincrement_table_constraint_rejections
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
     ]
