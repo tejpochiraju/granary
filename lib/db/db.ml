@@ -1016,6 +1016,7 @@ let make_col_schema names =
        ; Row.ty = Row.Text
        ; Row.not_null = false
        ; Row.primary_key = false
+       ; Row.pk_desc = false
        ; Row.default = None
        ; Row.check_sql = None
        ; Row.generated_as = None

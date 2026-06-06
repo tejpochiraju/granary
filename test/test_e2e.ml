@@ -11746,6 +11746,128 @@ let autoincrement_table_constraint_rejections () =
     "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY"
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #312: INTEGER PRIMARY KEY DESC is a NON-alias                        *)
+(*                                                                     *)
+(* SQLite treats [INTEGER PRIMARY KEY DESC] NOT as the rowid alias but *)
+(* like any other non-INTEGER PK: the column gets a hidden auto rowid  *)
+(* plus a real (here ascending) unique [__pk] index.  Observable       *)
+(* consequences vs. an alias (this engine has no [SELECT rowid]):      *)
+(*   - omitting the PK column on INSERT does NOT auto-fill it (alias    *)
+(*     would); the column is NOT NULL, so the INSERT is rejected;       *)
+(*   - duplicate explicit PK values are rejected by the implicit __pk  *)
+(*     UNIQUE index.                                                    *)
+(* ------------------------------------------------------------------ *)
+
+let pk_desc_is_non_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)";
+  exec db "INSERT INTO t(id, v) VALUES (10, 'a')";
+  (* Non-alias: the PK column is NOT auto-filled when omitted (an alias would
+     allocate the next rowid).  It is NOT NULL, so omitting it is rejected. *)
+  assert_exec_rejected db "INSERT INTO t(v) VALUES ('x')" "NOT NULL";
+  (* The stored value is preserved, and uniqueness on id is still enforced via
+     the implicit __pk index. *)
+  let rows = query_ok db "SELECT id, v FROM t" in
+  (match rows with
+   | [ row ] ->
+     let id =
+       match row.(0) with
+       | Db.V_int n -> n
+       | _ -> Alcotest.fail "id"
+     in
+     Alcotest.(check int64) "id is the stored value" 10L id
+   | _ -> Alcotest.fail "expected one row");
+  assert_exec_rejected db "INSERT INTO t(id, v) VALUES (10, 'dup')" "UNIQUE"
+;;
+
+(* Sanity: a plain (ASC) INTEGER PK still IS the alias — omitting it auto-fills,
+   to contrast with the DESC case above. *)
+let pk_asc_is_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+  exec db "INSERT INTO t(v) VALUES ('x')";
+  let rows = query_ok db "SELECT id FROM t" in
+  Alcotest.(check (list int64)) "alias auto-filled id" [ 1L ] (List.map int_of_row rows)
+;;
+
+(* #312: the non-alias shape survives a file close+reopen — the DESC bit is a
+   trailing field of the column encoding, and the dump DDL re-emits DESC.  After
+   reopen the table must STILL be a non-alias (omitting id rejected, dup id
+   rejected), not silently downgraded to an alias. *)
+let pk_desc_persists_across_reopen () =
+  with_tempfile (fun path ->
+    run
+      (let open_db () =
+         let* r = Db.open_file ~path () in
+         match r with
+         | Ok d -> Lwt.return d
+         | Error _ -> Alcotest.fail "open_file failed"
+       in
+       let* db = open_db () in
+       let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)" in
+       let* _ = Db.execute db "INSERT INTO t(id, v) VALUES (10, 'a')" in
+       let* () = Db.close db in
+       let* db2 = open_db () in
+       (* Still a non-alias: omitting id is rejected (NOT NULL, no auto-fill). *)
+       let* r_omit = Db.execute db2 "INSERT INTO t(v) VALUES ('x')" in
+       Alcotest.(check bool)
+         "omit-id still rejected after reopen (non-alias)"
+         true
+         (match r_omit with
+          | Ok () -> false
+          | Error e -> contains_pat "NOT NULL" (fmt_err e));
+       (* Still a non-alias: dup id rejected by the implicit __pk index. *)
+       let* r_dup = Db.execute db2 "INSERT INTO t(id, v) VALUES (10, 'dup')" in
+       Alcotest.(check bool)
+         "dup id still rejected after reopen (non-alias)"
+         true
+         (match r_dup with
+          | Ok () -> false
+          | Error e -> contains_pat "UNIQUE" (fmt_err e));
+       (* The dump DDL re-emits DESC so a re-load reproduces the non-alias. *)
+       let* dump = Db.dump_to_string db2 () in
+       let dump =
+         match dump with
+         | Ok s -> s
+         | Error _ -> Alcotest.fail "dump failed"
+       in
+       Alcotest.(check bool)
+         "dump re-emits PRIMARY KEY DESC"
+         true
+         (contains_pat "PRIMARY KEY DESC" dump);
+       Db.close db2))
+;;
+
+(* #312 property: an INTEGER PRIMARY KEY DESC (a non-alias) enforces uniqueness
+   on the key via its implicit __pk index — distinct keys are accepted, a repeat
+   of any already-inserted key is rejected. *)
+let qcheck_pk_desc_unique =
+  QCheck.Test.make
+    ~name:"pk_desc: distinct keys accepted, duplicates rejected"
+    ~count:1000
+    QCheck.(list_size Gen.(1 -- 12) (0 -- 30))
+    (fun keys ->
+       let db = Lwt_main.run (Db.open_in_memory ()) in
+       Lwt_main.run
+         (let* _ = Db.execute db "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v TEXT)" in
+          let seen = Hashtbl.create 16 in
+          let ok = ref true in
+          let* () =
+            Lwt_list.iter_s
+              (fun k ->
+                 let sql = Printf.sprintf "INSERT INTO t(id, v) VALUES (%d, 'x')" k in
+                 let* r = Db.execute db sql in
+                 let is_dup = Hashtbl.mem seen k in
+                 (match r with
+                  | Ok () -> if is_dup then ok := false else Hashtbl.replace seen k ()
+                  | Error _ -> if not is_dup then ok := false);
+                 Lwt.return_unit)
+              keys
+          in
+          Lwt.return !ok))
+;;
+
 (* Runner                                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -12656,5 +12778,14 @@ let () =
         ; Alcotest.test_case "full_on_exhaustion" `Quick autoincrement_full_on_exhaustion
         ]
         @ List.map QCheck_alcotest.to_alcotest [ qcheck_autoincrement_monotonic ] )
+    ; ( "primary key desc (#312)"
+      , [ Alcotest.test_case "is_non_alias" `Quick pk_desc_is_non_alias
+        ; Alcotest.test_case "asc_is_alias" `Quick pk_asc_is_alias
+        ; Alcotest.test_case
+            "persists_across_reopen"
+            `Quick
+            pk_desc_persists_across_reopen
+        ]
+        @ List.map QCheck_alcotest.to_alcotest [ qcheck_pk_desc_unique ] )
     ]
 ;;

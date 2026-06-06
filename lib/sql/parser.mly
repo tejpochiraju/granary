@@ -3,7 +3,9 @@
 
   type col_constraint =
     | Col_not_null
-    | Col_primary_key of bool   (* #299: bool = AUTOINCREMENT present *)
+    | Col_primary_key of bool * bool
+      (* #299/#312: (autoincrement_present, is_desc). [is_desc] = an explicit
+         [PRIMARY KEY DESC], which makes an INTEGER PK a NON-alias (#312). *)
     | Col_default of literal
     | Col_check   of expr
     | Col_fk_ref  of string * string option * Ast.fk_action * Ast.fk_action * bool
@@ -568,7 +570,9 @@ column_def:
       let primary_key =
         List.exists (function Col_primary_key _ -> true | _ -> false) cs in
       let autoincrement =
-        List.exists (function Col_primary_key true -> true | _ -> false) cs in
+        List.exists (function Col_primary_key (true, _) -> true | _ -> false) cs in
+      let pk_desc =
+        List.exists (function Col_primary_key (_, true) -> true | _ -> false) cs in
       let default     = List.fold_left (fun acc c ->
           match c with Col_default l -> Some l | _ -> acc) None cs in
       let check       = List.fold_left (fun acc c ->
@@ -580,7 +584,7 @@ column_def:
           | _ -> acc) None cs in
       let generated_as = List.fold_left (fun acc c ->
           match c with Col_generated (e, s) -> Some (e, s) | _ -> acc) None cs in
-      { name; ty; not_null; primary_key; autoincrement; default; check; fk_ref; generated_as } }
+      { name; ty; not_null; primary_key; autoincrement; pk_desc; default; check; fk_ref; generated_as } }
 
 col_ty:
   | INTEGER_TY { Ty_int }
@@ -595,7 +599,7 @@ column_constraint:
         (* SQLite: INTEGER PRIMARY KEY DESC is not a rowid alias, so it cannot
            carry AUTOINCREMENT.  Match its parse-time rejection message. *)
         failwith "AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY";
-      Col_primary_key ai }
+      Col_primary_key (ai, is_desc) }
   | DEFAULT l = def_value { Col_default l }
   | CHECK LPAREN e = expr RPAREN { Col_check e }
   | REFERENCES t = any_ident oc = fk_on_clauses deferrable = deferrable_clause

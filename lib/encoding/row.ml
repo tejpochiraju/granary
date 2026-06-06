@@ -19,6 +19,11 @@ type column =
   ; ty : ty
   ; not_null : bool
   ; primary_key : bool
+  ; pk_desc : bool
+    (** #312: this PK column was declared [PRIMARY KEY DESC].  A single-column
+      INTEGER PK with [pk_desc = true] is a NON-alias (hidden rowid + implicit
+      [__pk] unique index), matching SQLite.  Only meaningful when
+      [primary_key] is set. *)
   ; default : default_value option (* None = no DEFAULT *)
   ; check_sql : string option (* None = no CHECK constraint *)
   ; generated_as : (string * bool) option

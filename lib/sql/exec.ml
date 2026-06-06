@@ -195,6 +195,9 @@ let ddl_of_table (meta : Cat.table_meta) =
          if col.Row.primary_key
          then (
            Buffer.add_string buf " PRIMARY KEY";
+           (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
+              the non-alias shape (hidden rowid + __pk index). *)
+           if col.Row.pk_desc then Buffer.add_string buf " DESC";
            if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT");
          (match col.Row.default with
           | None -> ()
@@ -5966,6 +5969,7 @@ let column_of_col_def col_def : Row.column =
        | Ast.Ty_blob -> Row.Blob)
   ; Row.not_null = col_def.Ast.not_null
   ; Row.primary_key = col_def.Ast.primary_key
+  ; Row.pk_desc = col_def.Ast.pk_desc
   ; Row.default =
       (match col_def.Ast.default with
        | None -> None

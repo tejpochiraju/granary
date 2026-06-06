@@ -476,7 +476,10 @@ let compute_rowid_alias_col (columns : Row.column list) ~without_rowid : int opt
     let indexed = List.mapi (fun i (c : Row.column) -> i, c) columns in
     let pks = List.filter (fun (_, (c : Row.column)) -> c.primary_key) indexed in
     match pks with
-    | [ (i, (c : Row.column)) ] when c.ty = Row.Integer -> Some i
+    (* #312: an INTEGER PRIMARY KEY DESC is NOT a rowid alias in SQLite — the
+       column gets a hidden auto rowid plus a real unique index, exactly like a
+       non-INTEGER PK.  So [pk_desc] disqualifies the alias. *)
+    | [ (i, (c : Row.column)) ] when c.ty = Row.Integer && not c.pk_desc -> Some i
     | _ -> None)
 ;;
 
@@ -657,6 +660,8 @@ let encode_column (col : Row.column) =
      Varint.encode_uint64 buf (if is_stored then 1L else 0L);
      Varint.encode_uint64 buf (Int64.of_int (String.length sql));
      Buffer.add_string buf sql);
+  (* #312: trailing pk_desc flag — appended for backward compat (absent ⇒ false). *)
+  Varint.encode_uint64 buf (if col.pk_desc then 1L else 0L);
   Buffer.to_bytes buf
 ;;
 
@@ -673,18 +678,29 @@ let decode_check_sql bytes off =
       Some sql, off3 + Int64.to_int sql_len))
 ;;
 
+(* Returns the decoded [generated_as] AND the offset just past it, so the
+   caller can continue decoding trailing fields (#312 pk_desc). *)
 let decode_generated_as bytes off =
   if Bytes.length bytes - off <= 0
-  then None
+  then None, off
   else (
     let has_gen, off2 = Varint.decode_uint64 bytes off in
     if Int64.to_int has_gen = 0
-    then None
+    then None, off2
     else (
       let is_stored, off3 = Varint.decode_uint64 bytes off2 in
       let sql_len, off4 = Varint.decode_uint64 bytes off3 in
       let sql = Bytes.sub_string bytes off4 (Int64.to_int sql_len) in
-      Some (sql, Int64.to_int is_stored = 1)))
+      Some (sql, Int64.to_int is_stored = 1), off4 + Int64.to_int sql_len))
+;;
+
+(* #312: optional trailing pk_desc flag.  Absent (old encodings) ⇒ false. *)
+let decode_pk_desc bytes off =
+  if off >= Bytes.length bytes
+  then false
+  else (
+    let flag, _ = Varint.decode_uint64 bytes off in
+    Int64.to_int flag <> 0)
 ;;
 
 let decode_column bytes =
@@ -702,6 +718,7 @@ let decode_column bytes =
       ; ty = type_of_tag (Int64.to_int tag)
       ; not_null = false
       ; primary_key = false
+      ; pk_desc = false
       ; default = None
       ; check_sql = None
       ; generated_as = None
@@ -718,12 +735,14 @@ let decode_column bytes =
         Some dv, off')
     in
     let check_sql, final_off = decode_check_sql bytes off in
-    let generated_as = decode_generated_as bytes final_off in
+    let generated_as, off = decode_generated_as bytes final_off in
+    let pk_desc = decode_pk_desc bytes off in
     Row.
       { name
       ; ty = type_of_tag (Int64.to_int tag)
       ; not_null = Int64.to_int nn <> 0
       ; primary_key = Int64.to_int pk <> 0
+      ; pk_desc
       ; default
       ; check_sql
       ; generated_as

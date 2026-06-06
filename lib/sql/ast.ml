@@ -463,6 +463,10 @@ and column_def =
     (** [AUTOINCREMENT] on a column [PRIMARY KEY] (#299).  Only ever [true] for
         a single-column ascending INTEGER PRIMARY KEY on a rowid table; the
         placement is validated in {!Sqlocaml_sql.Sema}. *)
+  ; pk_desc : bool
+    (** #312: [PRIMARY KEY DESC] on this column.  SQLite treats an
+        [INTEGER PRIMARY KEY DESC] as a NON-alias (hidden rowid + real index),
+        not the rowid alias.  Only meaningful when [primary_key] is set. *)
   ; default : literal option (* None = no DEFAULT *)
   ; check : expr option (* None = no CHECK constraint *)
   ; fk_ref : (string * string * fk_action * fk_action * bool) option
