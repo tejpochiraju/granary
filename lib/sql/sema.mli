@@ -105,7 +105,7 @@ type seq_write =
       { table : string
       ; seq : int64
       }
-  | Seq_reset of { table : string }
+  | Seq_reset of { table : string option (** [None] = DELETE with no WHERE: reset all *) }
 
 type bound_stmt =
   | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)

@@ -2054,6 +2054,23 @@ let reset_next_rowid_in_txn t ~name (tx : S.rw S.txn) =
       put_table_counter_tx tx m')
 ;;
 
+(* #312.1: [DELETE FROM sqlite_sequence] with no WHERE — reset EVERY seeded
+   AUTOINCREMENT counter (SQLite parity, and what a real [sqlite3 .dump] emits
+   before re-INSERTing).  Non-AUTOINCREMENT and already-unseeded tables are left
+   untouched (no spurious mirror writes). *)
+let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
+  let%lwt tables = list_tables t in
+  Lwt_list.iter_s
+    (fun (m : table_meta) ->
+       if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+       then (
+         let m' = { m with next_rowid = empty_next_rowid } in
+         Schema_cache.bump_rowid t.sc ~name:m.name m';
+         put_table_counter_tx tx m')
+       else Lwt.return_unit)
+    tables
+;;
+
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is
    threaded here so the index's catalog row, tree-ID and index-ID allocation,
    and cache entry all participate in it and roll back together. *)

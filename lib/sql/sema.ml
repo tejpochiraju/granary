@@ -181,7 +181,7 @@ type seq_write =
       { table : string
       ; seq : int64
       }
-  | Seq_reset of { table : string }
+  | Seq_reset of { table : string option (** [None] = DELETE with no WHERE: reset all *) }
 
 type bound_stmt =
   | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)
@@ -3219,14 +3219,19 @@ let bind_seq_update ~assignments ~where ~order ~limit ~offset ~returning =
   | _ -> seq_unsupported "UPDATE"
 ;;
 
-(* #312.1: bind the supported [DELETE FROM sqlite_sequence WHERE name =
-   '<table>'] form; reject anything else. *)
+(* #312.1: bind the supported DELETE forms — [DELETE FROM sqlite_sequence WHERE
+   name = '<table>'] (reset one) and the bare [DELETE FROM sqlite_sequence]
+   (reset all, SQLite parity / what [sqlite3 .dump] emits); reject anything
+   else. *)
 let bind_seq_delete ~where ~order ~limit ~offset ~returning =
   match order, limit, offset, returning with
   | [], None, None, [] ->
-    (match seq_where_name where with
-     | Some table -> Lwt.return (Ok (BS_seq_write (Seq_reset { table })))
-     | None -> seq_unsupported "DELETE")
+    (match where with
+     | None -> Lwt.return (Ok (BS_seq_write (Seq_reset { table = None })))
+     | Some _ ->
+       (match seq_where_name where with
+        | Some table -> Lwt.return (Ok (BS_seq_write (Seq_reset { table = Some table })))
+        | None -> seq_unsupported "DELETE"))
   | _ -> seq_unsupported "DELETE"
 ;;
 

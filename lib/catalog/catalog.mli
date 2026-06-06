@@ -261,6 +261,14 @@ val reset_next_rowid_in_txn
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> unit Lwt.t
 
+(** #312.1: writable [sqlite_sequence] [DELETE] with no WHERE — reset every
+    seeded AUTOINCREMENT counter (SQLite parity; what [sqlite3 .dump] emits).
+    Mutates through the held RW transaction (does NOT commit). *)
+val reset_all_next_rowid_in_txn
+  :  t
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
 (** Create a new index on a single column of an existing table.
     The new index gets its own [tree_id] (separate from the table tree).
     The index metadata is persisted in the [_sys_indexes] tree.

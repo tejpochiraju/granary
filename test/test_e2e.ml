@@ -11984,6 +11984,30 @@ let sqlite_sequence_insert_positional () =
     (List.map int_of_row (query_ok db "SELECT a FROM t ORDER BY a"))
 ;;
 
+(* #312: bare [DELETE FROM sqlite_sequence] (no WHERE) resets EVERY AUTOINCREMENT
+   counter — SQLite parity, and required so a [sqlite3 .dump] (which emits this
+   line) round-trips into this engine. *)
+let sqlite_sequence_delete_all_resets () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "CREATE TABLE u (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
+  exec db "INSERT INTO t(b) VALUES ('x')";
+  exec db "INSERT INTO u(b) VALUES ('p')";
+  exec db "DELETE FROM t";
+  exec db "DELETE FROM u";
+  exec db "DELETE FROM sqlite_sequence";
+  exec db "INSERT INTO t(b) VALUES ('y')";
+  exec db "INSERT INTO u(b) VALUES ('q')";
+  Alcotest.(check (list int64))
+    "t reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM t"));
+  Alcotest.(check (list int64))
+    "u reset to 1"
+    [ 1L ]
+    (List.map int_of_row (query_ok db "SELECT a FROM u"))
+;;
+
 let sqlite_sequence_rollback_reverts () =
   let db = fresh_db () in
   exec db "CREATE TABLE t (a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT)";
@@ -12024,8 +12048,6 @@ let sqlite_sequence_rejects_unsupported () =
     db
     "UPDATE sqlite_sequence SET seq = 1 WHERE name = 't' AND seq > 0"
     "sqlite_sequence";
-  (* DELETE with no WHERE *)
-  assert_exec_rejected db "DELETE FROM sqlite_sequence" "sqlite_sequence";
   (* multi-row INSERT *)
   assert_exec_rejected
     db
@@ -12968,6 +12990,7 @@ let () =
         ; Alcotest.test_case "delete_resets" `Quick sqlite_sequence_delete_resets
         ; Alcotest.test_case "insert" `Quick sqlite_sequence_insert
         ; Alcotest.test_case "insert_positional" `Quick sqlite_sequence_insert_positional
+        ; Alcotest.test_case "delete_all_resets" `Quick sqlite_sequence_delete_all_resets
         ; Alcotest.test_case "rollback_reverts" `Quick sqlite_sequence_rollback_reverts
         ; Alcotest.test_case
             "rejects_unsupported"

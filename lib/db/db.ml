@@ -1990,6 +1990,35 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
            let* triggers = Cat.load_all_triggers t.store in
            Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
        in
+       (* #312: emit the AUTOINCREMENT high-water like SQLite's [.dump], so a
+          committed-DELETE high-water round-trips — replaying the data rows alone
+          only restores [max(rowid)+1].  This is data, so it is skipped in
+          [schema_only]; it is emitted before [COMMIT] so a [data_only] dump
+          carries it too.  Only tables with a seeded counter appear. *)
+       let* () =
+         if schema_only
+         then Lwt.return_unit
+         else (
+           let seeded =
+             List.filter
+               (fun (m : Cat.table_meta) ->
+                  m.Cat.autoincrement
+                  && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid))
+               tables
+           in
+           if seeded = []
+           then Lwt.return_unit
+           else
+             let* () = stmt "DELETE FROM sqlite_sequence" in
+             Lwt_list.iter_s
+               (fun (m : Cat.table_meta) ->
+                  stmt
+                    (Printf.sprintf
+                       "INSERT INTO sqlite_sequence VALUES(%s,%Ld)"
+                       (Sql.Exec.sql_literal_of_value (Row.V_text m.Cat.name))
+                       (Int64.sub m.Cat.next_rowid 1L)))
+               seeded)
+       in
        let* () = if data_only then stmt "COMMIT" else Lwt.return_unit in
        Lwt.return (Ok ()))
     (function

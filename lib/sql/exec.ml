@@ -5421,7 +5421,12 @@ let op_name = function
   | Plan.Op_sqlite_master -> "SqliteMaster"
   | Plan.Op_sqlite_sequence -> "SqliteSequence"
   | Plan.Op_seq_set { table; _ } -> "SeqSet(" ^ table ^ ")"
-  | Plan.Op_seq_reset { table } -> "SeqReset(" ^ table ^ ")"
+  | Plan.Op_seq_reset { table } ->
+    "SeqReset("
+    ^ (match table with
+       | Some t -> t
+       | None -> "*")
+    ^ ")"
 ;;
 
 let op_children = function
@@ -6345,9 +6350,15 @@ let execute_with_count
       let* () = Cat.set_next_rowid_in_txn cat ~name:table ~requested:seq tx in
       Lwt.return 0)
   | Plan.Op_seq_reset { table } ->
-    (* #312.1: writable sqlite_sequence DELETE. *)
+    (* #312.1: writable sqlite_sequence DELETE.  [None] (bare DELETE, no WHERE)
+       resets every AUTOINCREMENT counter — SQLite parity, and what a real
+       [sqlite3 .dump] emits before re-INSERTing. *)
     with_ddl_txn store cat mode (fun tx ->
-      let* () = Cat.reset_next_rowid_in_txn cat ~name:table tx in
+      let* () =
+        match table with
+        | Some name -> Cat.reset_next_rowid_in_txn cat ~name tx
+        | None -> Cat.reset_all_next_rowid_in_txn cat tx
+      in
       Lwt.return 0)
   | Plan.Op_drop_table { table_meta; indexes } ->
     execute_drop_table_op store cat ~mode ~table_meta ~indexes

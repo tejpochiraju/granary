@@ -337,8 +337,9 @@ type op =
       { table : string
       ; seq : int64
       } (** #312.1: writable sqlite_sequence SET/INSERT -> set [table]'s next_rowid. *)
-  | Op_seq_reset of { table : string }
-  (** #312.1: writable sqlite_sequence DELETE -> reset [table]'s next_rowid. *)
+  | Op_seq_reset of { table : string option }
+  (** #312.1: writable sqlite_sequence DELETE -> reset [table]'s next_rowid;
+      [None] (bare DELETE, no WHERE) resets every AUTOINCREMENT counter. *)
   | Op_no_op (** No-op plan node produced by IF EXISTS DROP when object not found. *)
   | Op_changes
   (** Returns rows affected by last DML. Intercepted in db.ml query — not exec.ml. *)
