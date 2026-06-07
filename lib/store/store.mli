@@ -259,7 +259,13 @@ val checkpoint : t -> unit Lwt.t
     fsyncs on commit.  Checkpoint and {!close} are always full-sync anchors,
     so [Batched]/[Off] data is made durable there.  The setting is
     DATABASE-WIDE (the commit queue is shared across connections), not
-    per-connection.  No-op on the in-memory backend. *)
+    per-connection.  No-op on the in-memory backend.
+
+    {b Crash safety:} an app-process crash is safe in every mode — unsynced
+    WAL frames live in the OS page cache, which survives process death, and
+    recovery replays them.  An OS or power crash with [Batched]/[Off] loses
+    acked commits in the un-synced window; recovery converges to a prefix of
+    acked commits (never torn state), but those commits may be gone. *)
 type durability =
   | Full
   | Batched of
