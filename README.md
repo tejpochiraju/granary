@@ -45,49 +45,41 @@ Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
 ## Benchmarks
 
 In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements
-both sides, WAL, fsync-per-commit, matched page cache), run on two hosts — an **HDD** box and an
-**NVMe** box — to separate the CPU term from the I/O term. Full method and tables:
-[docs/benchmarks/2026-06-02-bench-222-results.md](docs/benchmarks/2026-06-02-bench-222-results.md)
+both sides, WAL, fsync-per-commit, matched page cache), separating the CPU term from the I/O term
+via `cpu/wall` per run. Full method and tables:
+[docs/benchmarks/2026-06-07-bench-222-results.md](docs/benchmarks/2026-06-07-bench-222-results.md)
 (also on the [wiki](https://git.iotready.com/tej/sqlite_ocaml_port/wiki/Benchmarks)).
 
-> **Performance update (2026-06-02) — #228 / #229 fixed.** The two
-> *complexity* bugs called out below are resolved:
-> - **Point lookup `WHERE pk=?`** is now an **O(log n) B-tree seek** (was an
->   O(n) full table scan). Per-op time is flat across table size and ~**120–280×**
->   SQLite — down from ~**7,700×**.
-> - **Bulk insert** is now **O(n)** (was **O(n²)**): per-row time is flat
->   (~1.3 ms/row from 1k to 8k rows) instead of doubling with each table
->   doubling, so seeding no longer falls off a cliff.
->
-> The root cause was **not** the B-tree leaf-walk the profiling first suspected
-> (the tree fans out fine) but three layers above it: a Store cursor that
-> drained the *whole* tree into a list per probe, a query planner that didn't
-> lower `col = ?` (a bound parameter) to an index seek, and an O(n) freelist
-> scan on every page allocation. See [[Profiling]] / the
-> [results doc](docs/benchmarks/2026-06-02-profiling.md) for the corrected
-> analysis. The remaining **constant-factor** gap (~200–800× vs SQLite) is the
-> next target (#230 / #231). The tables below are the **pre-fix** #222 baseline.
+**Current NVMe baseline** (`1a73da0`, after #228 PK B-tree seek, #229 O(n) bulk insert, and the
+T4/T5 read-path work) — sqlocaml is now within single-digit multiples of C SQLite on most
+workloads:
 
-**These are honest, early numbers.** sqlocaml is a young pure-OCaml engine and is currently far
-slower than C SQLite, especially on reads:
+| workload (NVMe, plaintext) | sqlocaml vs SQLite | bound |
+|----------------------------|--------------------|-------|
+| point lookup `WHERE pk=?`  | ~3.7× slower | CPU |
+| range scan / aggregate     | ~8.3× slower | CPU |
+| insert (autocommit)        | ~2.0× slower | fsync |
+| commit throughput          | ~2.9× slower | fsync |
+| insert (batch, 1 txn)      | ~44× slower | mixed |
 
-| workload (NVMe, plaintext) | sqlocaml vs SQLite |
-|----------------------------|--------------------|
-| point lookup `WHERE pk=?`  | ~7,700× slower |
-| range scan / aggregate     | ~200× slower |
-| commit throughput          | ~8× slower |
-| insert (autocommit, on HDD)| ~2× slower (both fsync-bound) |
+That is a large improvement over the [2026-06-02 pre-fix baseline](docs/benchmarks/2026-06-02-bench-222-results.md)
+(`358b2b9`), where the same NVMe workloads were ~7,700× (point lookup, an O(n) full scan), ~200×
+(scan), and ~5,300× (batch insert, an O(n²) path) slower. The point-lookup and bulk-insert
+*complexity* bugs are gone; the only large remaining gap is **batch insert (~44×)**, a
+constant-factor copy-on-write write-amplification cost (#230 / #231).
 
-AES-256-GCM encryption-at-rest adds **~2× (≈ +100%)** to the read path; writes are barely
-affected.
+AES-256-GCM encryption-at-rest now adds only **~20% (or within noise)** to cache-resident reads —
+the frame-cache (T4) caches decrypted pages, down from the ~2× (≈ +100%) of the pre-fix run.
+Writes are barely affected.
 
-**Verdict (gating the read-side multicore epic #156):** the read path is **CPU-bound**
-(`cpu/wall ≈ 1.0` on both disks), writes are **fsync/I-O-bound**. In this baseline a point
-lookup cost as much as a full table scan — the `WHERE pk=?` predicate was not lowered to a B-tree
-seek. **That single-threaded O(n) read path (and the O(n²) insert path) is now fixed** — see the
-performance update above — which was the highest-leverage step *before* multicore. #156 stays
-deferred until the constant factor is brought down (#230). See the results doc for the full
-analysis.
+**Verdict:** reads are **CPU-bound** (`cpu/wall ≈ 1.0`), single-row writes are **fsync/I-O-bound**
+(`cpu/wall` 0.5–0.6). With the O(n) read path and O(n²) insert path fixed, **4 of 5 plaintext
+workloads are within the #231 "10× of SQLite" goal**; the read-side multicore epic (#156) remains
+gated on closing the batch-insert constant factor first.
+
+> **Honest, early numbers.** sqlocaml is a young pure-OCaml engine; these are a snapshot on a
+> production NVMe host under live load, at a small (cache-resident) dataset, and are expected to
+> keep moving as the write path is optimized.
 
 Reproduce: `scripts/bench222.sh` (builds the bench image and runs the suite; cross-host steps in
 the results doc).
