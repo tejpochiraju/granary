@@ -516,6 +516,11 @@ let test_mode_switch_resets_counter () =
    the sink callback must fire 0 times.  A checkpoint then makes them durable
    (via its own path), after which the sink ship cursor is reset for the new
    epoch. *)
+(* Follow-up (#298): a registered sink pins durability to [Full], so the
+   batched/off "withhold unsynced frames from the sink" scenario is now
+   architecturally disallowed.  With a sink registered, attempting [Batched]
+   is ignored, every commit fsyncs, and the sink ships every committed frame.
+   (Previously this test exercised the now-removed gated-ship path.) *)
 let test_sink_gated_to_synced () =
   run
   @@ with_fresh ~f:(fun path ->
@@ -528,12 +533,13 @@ let test_sink_gated_to_synced () =
          (fun ~epoch:_ ~base_idx:_ ~count:_ ->
            incr fired;
            Lwt.return_unit));
-    (* High N + no clock => neither trigger fires; commits stay unsynced. *)
+    (* Sink forces Full; the relax request is ignored. *)
     S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
+    Alcotest.(check bool) "sink pins Full" true (S.durability st = S.Full);
     let* () = do_commits st 5 in
-    (* Give any (erroneously) scheduled async callbacks a chance to run. *)
+    (* Let the async sink callbacks run. *)
     let* () = Lwt.pause () in
-    Alcotest.(check int) "sink does not fire for unsynced commits" 0 !fired;
+    Alcotest.(check bool) "sink ships every committed frame" true (!fired >= 1);
     let* () = S.close st in
     Lwt.return_unit)
 ;;
@@ -592,6 +598,61 @@ let test_switch_to_full_flushes_sql () =
     Lwt.return_unit)
 ;;
 
+(* --- replication-guard (follow-up): a sink pins durability to Full --- *)
+
+let noop_sink = Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit)
+
+(* 1. Registering a sink forces Full even from Off, and reports active. *)
+let test_sink_forces_full () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_durability st S.Off;
+    Alcotest.(check bool) "Off before sink" true (S.durability st = S.Off);
+    S.set_commit_callback st noop_sink;
+    Alcotest.(check bool) "sink forced Full" true (S.durability st = S.Full);
+    Alcotest.(check bool) "callback active" true (S.commit_callback_active st);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* 2. While a sink is active, relaxing via the Store API is ignored. *)
+let test_sink_rejects_relax_store () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_commit_callback st noop_sink;
+    Alcotest.(check bool) "Full after sink" true (S.durability st = S.Full);
+    S.set_durability st (S.Batched { commits = 10; interval_ms = 10 });
+    Alcotest.(check bool) "relax ignored while sink active" true (S.durability st = S.Full);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* 3. Removing the sink lets durability relax again (and Batched params that
+   were recorded while pinned take effect). *)
+let test_sink_removal_allows_relax () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_commit_callback st noop_sink;
+    (* recorded while pinned, not applied yet *)
+    S.set_durability st (S.Batched { commits = 7; interval_ms = 13 });
+    Alcotest.(check bool) "still Full" true (S.durability st = S.Full);
+    S.set_commit_callback st None;
+    Alcotest.(check bool) "no longer active" false (S.commit_callback_active st);
+    (* recorded params are available for later use *)
+    Alcotest.(check int) "batch N recorded" 7 (S.sync_batch_commits st);
+    Alcotest.(check int) "batch T recorded" 13 (S.sync_batch_interval_ms st);
+    S.set_durability st (S.Batched { commits = 7; interval_ms = 13 });
+    Alcotest.(check bool)
+      "relax allowed after removal"
+      true
+      (S.durability st = S.Batched { commits = 7; interval_ms = 13 });
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -639,7 +700,7 @@ let () =
             `Quick
             test_mode_switch_resets_counter
         ; Alcotest.test_case
-            "#1 sink gated to synced frames"
+            "#1 sink pins Full and ships every frame"
             `Quick
             test_sink_gated_to_synced
         ] )
@@ -652,6 +713,17 @@ let () =
             "#3 switch-to-full flushes (SQL)"
             `Quick
             test_switch_to_full_flushes_sql
+        ] )
+    ; ( "replication-guard"
+      , [ Alcotest.test_case "sink forces Full" `Quick test_sink_forces_full
+        ; Alcotest.test_case
+            "relax rejected while sink active (Store)"
+            `Quick
+            test_sink_rejects_relax_store
+        ; Alcotest.test_case
+            "removal allows relax again"
+            `Quick
+            test_sink_removal_allows_relax
         ] )
     ]
 ;;

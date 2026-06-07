@@ -76,6 +76,9 @@ recovery are unaffected — only *when* commits are fsynced changes.
 > - The time bound (T) is **opportunistic**: it is checked when a commit arrives or at checkpoint,
 >   and requires a clock supplied via the `?clock` open-option. A fully idle database is not
 >   flushed until the next commit / checkpoint / close.
+> - **Replication:** a registered replication commit-sink requires `synchronous=full`. `batched`/`off`
+>   are rejected while replication is active (the checkpoint replica gate assumes every committed frame
+>   is shipped, which only holds under `full`).
 
 > **Scope:** unlike SQLite, where `synchronous` is per-connection, this setting is
 > **database-wide** — the WAL commit queue is shared across all connections to a store, so a

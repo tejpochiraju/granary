@@ -1714,29 +1714,54 @@ let set_durability (t : t) (d : durability) : unit =
   match t.backend with
   | Mem _ -> ()
   | Btree st ->
-    let new_mode =
+    let requested_non_full =
       match d with
-      | Full -> `Full
-      | Off -> `Off
-      | Batched _ -> `Batched
+      | Full -> false
+      | _ -> true
     in
-    (* #298/#4: when the mode actually changes, reset the batched durability
-       counters so a long [Off] period doesn't carry a huge stale
-       [unsynced_commits] into [Batched] (which would immediately fsync), and
-       the T window restarts at mode entry.  Safe because [close]/[checkpoint]
-       (frame-state based) remain the durability anchors; the counter is only a
-       trigger heuristic. *)
-    if st.sync_mode <> new_mode
+    if requested_non_full && st.on_committed_frames <> None
     then (
-      st.unsynced_commits <- 0;
-      st.last_sync_time <- st.clock ());
-    (match d with
-     | Full -> st.sync_mode <- `Full
-     | Off -> st.sync_mode <- `Off
-     | Batched { commits; interval_ms } ->
-       st.sync_mode <- `Batched;
-       st.batch_commits <- max 0 commits;
-       st.batch_interval_ms <- max 0 interval_ms)
+      (* #298: a sink mandates Full — ignore the relax request but still record
+         any Batched params for when the sink is later removed.  The checkpoint
+         replica-floor gate requires every committed frame to be shipped, which
+         only holds under Full. *)
+      match d with
+      | Batched { commits; interval_ms } ->
+        st.batch_commits <- max 0 commits;
+        st.batch_interval_ms <- max 0 interval_ms
+      | _ -> ())
+    else (
+      let new_mode =
+        match d with
+        | Full -> `Full
+        | Off -> `Off
+        | Batched _ -> `Batched
+      in
+      (* #298/#4: when the mode actually changes, reset the batched durability
+         counters so a long [Off] period doesn't carry a huge stale
+         [unsynced_commits] into [Batched] (which would immediately fsync), and
+         the T window restarts at mode entry.  Safe because [close]/[checkpoint]
+         (frame-state based) remain the durability anchors; the counter is only a
+         trigger heuristic. *)
+      if st.sync_mode <> new_mode
+      then (
+        st.unsynced_commits <- 0;
+        st.last_sync_time <- st.clock ());
+      match d with
+      | Full -> st.sync_mode <- `Full
+      | Off -> st.sync_mode <- `Off
+      | Batched { commits; interval_ms } ->
+        st.sync_mode <- `Batched;
+        st.batch_commits <- max 0 commits;
+        st.batch_interval_ms <- max 0 interval_ms)
+;;
+
+(* #298: True iff a replication commit-sink is currently registered.  While
+   active, durability is pinned to [Full]. *)
+let commit_callback_active (t : t) : bool =
+  match t.backend with
+  | Mem _ -> false
+  | Btree st -> st.on_committed_frames <> None
 ;;
 
 (* #298/#3: force any committed-but-unsynced WAL frames to disk now.  No-op in
@@ -1757,28 +1782,23 @@ let flush_unsynced (t : t) : unit Lwt.t =
     if not pending
     then Lwt.return_unit
     else
-      let* r = Pager.wal_sync st.pager in
-      (match r with
-       | Ok () ->
-         st.unsynced_commits <- 0;
-         st.last_sync_time <- st.clock ();
-         (* #298/#1: frames are now durable — ship the newly-synced range to the
-            replication sink (if any), mirroring [commit_wal]'s gated ship. *)
-         (match st.on_committed_frames, st.wal with
-          | Some cb, Some wal ->
-            let synced = Wal.committed_frames wal in
-            if synced > st.sink_shipped_frames
-            then (
-              let base = st.sink_shipped_frames in
-              let count = synced - base in
-              st.sink_shipped_frames <- synced;
-              let epoch = Wal.epoch wal in
-              Lwt.async (fun () -> cb ~epoch ~base_idx:base ~count))
-          | _ -> ());
-         Lwt.return_unit
-       | Error e ->
-         Lwt.fail_with
-           (Format.asprintf "Store.flush_unsynced: wal_sync: %a" Pager.pp_error e))
+      (* #298/#5: route the fsync through the group-commit serializer rather
+         than calling [Pager.wal_sync] unlocked, which raced [commit_wal]'s
+         post-unlock fsync + cursor.  A sink now forces Full, so [flush_unsynced]
+         only runs when NO sink is active — the previous sink-ship block here is
+         dead and has been removed. *)
+      let* (_ : [ `Drainer | `Joiner ]) =
+        group_commit_sync st.commit_queue (fun () ->
+          let* r = Pager.wal_sync st.pager in
+          match r with
+          | Ok () -> Lwt.return_unit
+          | Error e ->
+            Lwt.fail_with
+              (Format.asprintf "Store.flush_unsynced: wal_sync: %a" Pager.pp_error e))
+      in
+      st.unsynced_commits <- 0;
+      st.last_sync_time <- st.clock ();
+      Lwt.return_unit
 ;;
 
 let sync_batch_commits (t : t) : int =
@@ -2589,6 +2609,15 @@ let set_commit_callback
     st.on_committed_frames <- cb;
     (match cb with
      | None -> st.replication_shipped_frames <- max_int
+     | Some _ ->
+       (* #298: a replication commit-sink requires Full durability — the
+          checkpoint replica-floor gate assumes every committed frame is
+          shipped, which only holds when every commit fsyncs. Force Full on
+          registration; relaxing durability is rejected while a sink is active
+          (see set_durability / the PRAGMA handler). *)
+       st.sync_mode <- `Full);
+    (match cb with
+     | None -> ()
      | Some _ ->
        (* Pin the current committed_frames so the async sink can safely
           read frames before advancing the position. *)

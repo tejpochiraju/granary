@@ -6474,20 +6474,26 @@ let execute_with_count
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
   | Plan.Op_pragma_set_synchronous { mode } ->
-    let d =
-      match mode with
-      | "full" -> S.Full
-      | "off" -> S.Off
-      | "batched" ->
-        S.Batched
-          { commits = S.sync_batch_commits store
-          ; interval_ms = S.sync_batch_interval_ms store
-          }
-      | _ -> failwith (Printf.sprintf "PRAGMA synchronous: unknown mode %s" mode)
-    in
-    let* () = if mode = "full" then S.flush_unsynced store else Lwt.return_unit in
-    S.set_durability store d;
-    Lwt.return 0
+    if mode <> "full" && S.commit_callback_active store
+    then
+      failwith
+        "PRAGMA synchronous: durability cannot be relaxed while a replication \
+         commit-sink is active (replication requires synchronous=full)"
+    else (
+      let d =
+        match mode with
+        | "full" -> S.Full
+        | "off" -> S.Off
+        | "batched" ->
+          S.Batched
+            { commits = S.sync_batch_commits store
+            ; interval_ms = S.sync_batch_interval_ms store
+            }
+        | _ -> failwith (Printf.sprintf "PRAGMA synchronous: unknown mode %s" mode)
+      in
+      let* () = if mode = "full" then S.flush_unsynced store else Lwt.return_unit in
+      S.set_durability store d;
+      Lwt.return 0)
   | Plan.Op_pragma_set_wal_batch_commits { n } ->
     S.set_sync_batch_commits store (Int64.to_int n);
     Lwt.return 0

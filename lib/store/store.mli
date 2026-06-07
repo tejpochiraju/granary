@@ -461,11 +461,20 @@ val set_replication_gate_max_yields : t -> int -> unit
     reads and ships its first batch.  The consumer must still call
     {!update_replication_position} to advance the floor as frames
     are shipped.  Pass [None] to unregister (resets the floor to
-    [max_int], disabling gating). *)
+    [max_int], disabling gating).
+
+    A registered replication commit-sink pins durability to [Full];
+    [Batched]/[Off] are rejected while a sink is active, because the checkpoint
+    replica-floor gate requires every committed frame to be shipped, which only
+    holds when every commit fsyncs. *)
 val set_commit_callback
   :  t
   -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
   -> unit
+
+(** True iff a replication commit-sink is currently registered (see
+    {!set_commit_callback}). While active, durability is pinned to [Full]. *)
+val commit_callback_active : t -> bool
 
 (** -------------------------------------------------------------------- *)
 
