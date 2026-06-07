@@ -43,13 +43,13 @@ let to_db ?clock ?durability ~path = function
     Lwt.return (Ok db)
 ;;
 
-let open_file ?page_size ?reserved_bytes_per_page ?clock ?durability ~path () =
+let open_file ?page_size ?reserved_bytes_per_page ?clock ~path () =
   install ();
   let explicit_geometry = page_size <> None || reserved_bytes_per_page <> None in
   let* r =
     Store.open_file ?page_size ?reserved_bytes_per_page ~explicit_geometry ~path ()
   in
-  to_db ?clock ?durability ~path r
+  to_db ?clock ~path r
 ;;
 
 let open_file_wal ?page_size ?reserved_bytes_per_page ?clock ?durability ~path () =

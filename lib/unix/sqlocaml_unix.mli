@@ -29,13 +29,13 @@ val install : unit -> unit
     existing file (whose stored geometry is used).  Reopening with an explicit
     geometry that disagrees with the file is rejected.
 
-    [clock] and [durability] are forwarded to {!Sqlocaml.Db.of_store}; a [clock]
-    is required for the [`Batched] T (time-interval) sync trigger (#298). *)
+    [clock] is forwarded to {!Sqlocaml.Db.of_store} (used by datetime).  Note:
+    durability applies to WAL mode only; the non-WAL commit path syncs inline
+    and ignores the sync mode, so {!open_file} takes no [durability] (#298). *)
 val open_file
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?clock:(unit -> float)
-  -> ?durability:Sqlocaml_store.Store.durability
   -> path:string
   -> unit
   -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t

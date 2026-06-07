@@ -1336,7 +1336,13 @@ let execute_control_op top t sql op =
            (match result with
             | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
             | Ok store ->
-              let* sub_db = of_store ~file_path:path store in
+              let* sub_db =
+                of_store
+                  ?clock:t.clock
+                  ~durability:(S.durability t.store)
+                  ~file_path:path
+                  store
+              in
               Hashtbl.add top.attached schema sub_db;
               Lwt.return (Ok ()))))
   | Sql.Plan.Op_detach { schema } ->

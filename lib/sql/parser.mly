@@ -344,9 +344,9 @@ pragma_stmt:
            failwith (Printf.sprintf "PRAGMA wal_autocheckpoint: expected integer, got %s" value))
       | "synchronous" ->
         let lv = String.lowercase_ascii value in
-        (match lv with
-         | "full" | "batched" | "off" -> Ast.S_pragma (Ast.Pragma_synchronous_set lv)
-         | _ ->
+        (match Sqlocaml_store.Store.durability_of_string lv with
+         | Some _ -> Ast.S_pragma (Ast.Pragma_synchronous_set lv)
+         | None ->
            failwith (Printf.sprintf
              "PRAGMA synchronous = %s: expected full|batched|off" value))
       | "wal_batch_commits" ->

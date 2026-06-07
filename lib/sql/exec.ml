@@ -6485,6 +6485,7 @@ let execute_with_count
           }
       | _ -> failwith (Printf.sprintf "PRAGMA synchronous: unknown mode %s" mode)
     in
+    let* () = if mode = "full" then S.flush_unsynced store else Lwt.return_unit in
     S.set_durability store d;
     Lwt.return 0
   | Plan.Op_pragma_set_wal_batch_commits { n } ->
@@ -9535,12 +9536,7 @@ and to_stream
     let n = S.wal_autocheckpoint store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
   | Plan.Op_pragma_get_synchronous ->
-    let s =
-      match S.durability store with
-      | S.Full -> "full"
-      | S.Batched _ -> "batched"
-      | S.Off -> "off"
-    in
+    let s = S.string_of_durability (S.durability store) in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_text s |] ])
   | Plan.Op_pragma_get_wal_batch_commits ->
     let n = S.sync_batch_commits store in

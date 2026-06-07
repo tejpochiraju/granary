@@ -538,6 +538,60 @@ let test_sink_gated_to_synced () =
     Lwt.return_unit)
 ;;
 
+(* --- review fixes (#298 Group B) --- *)
+
+(* B1 (#3): switching to [full] FIRST flushes pending unsynced frames, so
+   commits acked under a relaxed mode become durable immediately.  We open a
+   WAL store, set batched with a high N and no clock so commits stay unsynced
+   (wal_sync_count does not advance), do a few commits, then flip to full via
+   the store-level [flush_unsynced] (the exact mechanism [PRAGMA synchronous =
+   full] runs before [set_durability]).  The sync count must increase. *)
+let test_switch_to_full_flushes_store () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_wal_autocheckpoint st 0;
+    S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 5 in
+    Alcotest.(check int)
+      "commits stayed unsynced under high-N batched"
+      0
+      (S.wal_sync_count st - s0);
+    let* () = S.flush_unsynced st in
+    Alcotest.(check bool)
+      "flush_unsynced flushed pending frames"
+      true
+      (S.wal_sync_count st - s0 >= 1);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* B1 (#3) at the Db/SQL layer: PRAGMA synchronous = full flushes pending
+   unsynced commits made under batched mode before switching. *)
+let test_switch_to_full_flushes_sql () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* db = open_db path in
+    let* () = exec_ok db "PRAGMA wal_autocheckpoint = 0" in
+    let* () = exec_ok db "PRAGMA wal_batch_commits = 1000000" in
+    let* () = exec_ok db "PRAGMA wal_batch_interval_ms = 1000000" in
+    let* () = exec_ok db "CREATE TABLE t (k INTEGER PRIMARY KEY, v TEXT)" in
+    let* () = exec_ok db "PRAGMA synchronous = batched" in
+    let s0 = D.wal_sync_count db in
+    let* () = exec_ok db "INSERT INTO t (k, v) VALUES (1, 'a')" in
+    let* () = exec_ok db "INSERT INTO t (k, v) VALUES (2, 'b')" in
+    let* () = exec_ok db "INSERT INTO t (k, v) VALUES (3, 'c')" in
+    let pending = D.wal_sync_count db - s0 in
+    let* () = exec_ok db "PRAGMA synchronous = full" in
+    Alcotest.(check bool)
+      "PRAGMA synchronous = full flushed pending unsynced commits"
+      true
+      (D.wal_sync_count db - s0 > pending);
+    let* () = D.close db in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -588,6 +642,16 @@ let () =
             "#1 sink gated to synced frames"
             `Quick
             test_sink_gated_to_synced
+        ] )
+    ; ( "review-fixes-b"
+      , [ Alcotest.test_case
+            "#3 switch-to-full flushes (store)"
+            `Quick
+            test_switch_to_full_flushes_store
+        ; Alcotest.test_case
+            "#3 switch-to-full flushes (SQL)"
+            `Quick
+            test_switch_to_full_flushes_sql
         ] )
     ]
 ;;
