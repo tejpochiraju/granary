@@ -1,5 +1,12 @@
 # Benchmark Results — sqlocaml vs SQLite (#222)
 
+> **⚠️ Superseded (NVMe).** This is the **pre-fix** snapshot at `358b2b9`. The point-lookup
+> (#228), bulk-insert (#229), and read-path (T4/T5) work has since landed; the current NVMe
+> baseline is in [2026-06-07-bench-222-results.md](2026-06-07-bench-222-results.md)
+> (`1a73da0`: point lookup ~3.7×, scan ~8.3×, batch insert ~44×, down from
+> ~7,700× / ~200× / ~5,300× here). This doc is kept for historical reference and for the
+> HDD-host numbers, which were not re-run.
+
 **Date:** 2026-06-02 · **sqlocaml:** `358b2b9` · **SQLite:** 3.45.1 (in-process bindings)
 **Method/design:** [design doc](../superpowers/specs/2026-06-02-bench-222-sqlocaml-vs-sqlite-design.md) · **Harness:** `test/bench_compare.ml` · **Runner:** `scripts/bench222.sh` · **Raw CSVs:** [`bench/results/`](../../bench/results/)
 
