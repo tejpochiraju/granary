@@ -237,6 +237,88 @@ let test_off_durable_after_close () =
   cleanup path
 ;;
 
+(* --- PRAGMA surface --- *)
+
+let open_db path =
+  let* db = D.open_file_wal ~path () in
+  match db with
+  | Ok d -> Lwt.return d
+  | Error e -> Alcotest.failf "Db.open_file_wal: %a" D.pp_error e
+;;
+
+let query1_text db sql =
+  let* s = D.query db sql in
+  let* s =
+    match s with
+    | Ok s -> Lwt.return s
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+  in
+  let* rows = Lwt_stream.to_list s in
+  match rows with
+  | [ [| D.V_text t |] ] -> Lwt.return t
+  | _ -> Alcotest.failf "expected one text row for %s" sql
+;;
+
+let query1_int db sql =
+  let* s = D.query db sql in
+  let* s =
+    match s with
+    | Ok s -> Lwt.return s
+    | Error e -> Alcotest.failf "query: %a" D.pp_error e
+  in
+  let* rows = Lwt_stream.to_list s in
+  match rows with
+  | [ [| D.V_int n |] ] -> Lwt.return (Int64.to_int n)
+  | _ -> Alcotest.failf "expected one int row for %s" sql
+;;
+
+let exec_ok db sql =
+  let* r = D.execute db sql in
+  match r with
+  | Ok () -> Lwt.return_unit
+  | Error e -> Alcotest.failf "execute %s: %a" sql D.pp_error e
+;;
+
+let test_pragma_round_trip () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* db = open_db path in
+    let* v = query1_text db "PRAGMA synchronous" in
+    Alcotest.(check string) "default full" "full" v;
+    let* () = exec_ok db "PRAGMA synchronous = batched" in
+    let* v = query1_text db "PRAGMA synchronous" in
+    Alcotest.(check string) "set batched" "batched" v;
+    let* () = exec_ok db "PRAGMA wal_batch_commits = 42" in
+    let* n = query1_int db "PRAGMA wal_batch_commits" in
+    Alcotest.(check int) "N round-trip" 42 n;
+    let* () = exec_ok db "PRAGMA wal_batch_interval_ms = 250" in
+    let* n = query1_int db "PRAGMA wal_batch_interval_ms" in
+    Alcotest.(check int) "T round-trip" 250 n;
+    let* () = exec_ok db "PRAGMA synchronous = off" in
+    let* v = query1_text db "PRAGMA synchronous" in
+    Alcotest.(check string) "set off" "off" v;
+    let* () = exec_ok db "PRAGMA synchronous = full" in
+    let* v = query1_text db "PRAGMA synchronous" in
+    Alcotest.(check string) "back to full" "full" v;
+    let* () = D.close db in
+    Lwt.return_unit)
+;;
+
+let test_pragma_invalid_value () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* db = open_db path in
+    let* r = D.execute db "PRAGMA synchronous = wat" in
+    Alcotest.(check bool)
+      "invalid mode rejected"
+      true
+      (match r with
+       | Error _ -> true
+       | Ok () -> false);
+    let* () = D.close db in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -256,6 +338,10 @@ let () =
         ] )
     ; ( "durability-anchors"
       , [ Alcotest.test_case "off durable after close" `Quick test_off_durable_after_close
+        ] )
+    ; ( "pragma"
+      , [ Alcotest.test_case "synchronous/N/T round-trip" `Quick test_pragma_round_trip
+        ; Alcotest.test_case "invalid mode rejected" `Quick test_pragma_invalid_value
         ] )
     ]
 ;;

@@ -269,6 +269,12 @@ type op =
   | Op_pragma_get_wal_autocheckpoint (** Read per-connection auto-checkpoint threshold. *)
   | Op_pragma_set_wal_autocheckpoint of { n : int64 }
   (** Set per-connection auto-checkpoint threshold (0 disables). *)
+  | Op_pragma_get_synchronous (** #298 read durability mode *)
+  | Op_pragma_set_synchronous of { mode : string }
+  | Op_pragma_get_wal_batch_commits
+  | Op_pragma_set_wal_batch_commits of { n : int64 }
+  | Op_pragma_get_wal_batch_interval_ms
+  | Op_pragma_set_wal_batch_interval_ms of { n : int64 }
   | Op_vacuum (** Compact-rebuild the database file (phase 37 / #120). *)
   | Op_attach of
       { path : string

@@ -811,6 +811,12 @@ let plan_pragma_rows cat kind =
   | Ast.Pragma_wal_checkpoint
   | Ast.Pragma_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set _
+  | Ast.Pragma_synchronous
+  | Ast.Pragma_synchronous_set _
+  | Ast.Pragma_wal_batch_commits
+  | Ast.Pragma_wal_batch_commits_set _
+  | Ast.Pragma_wal_batch_interval_ms
+  | Ast.Pragma_wal_batch_interval_ms_set _
   | Ast.Pragma_database_list
   | Ast.Pragma_active_database
   | Ast.Pragma_active_database_set _ ->
@@ -831,6 +837,13 @@ let plan_pragma cat kind =
   | Ast.Pragma_wal_checkpoint -> Plan.Op_pragma_wal_checkpoint
   | Ast.Pragma_wal_autocheckpoint -> Plan.Op_pragma_get_wal_autocheckpoint
   | Ast.Pragma_wal_autocheckpoint_set n -> Plan.Op_pragma_set_wal_autocheckpoint { n }
+  | Ast.Pragma_synchronous -> Plan.Op_pragma_get_synchronous
+  | Ast.Pragma_synchronous_set mode -> Plan.Op_pragma_set_synchronous { mode }
+  | Ast.Pragma_wal_batch_commits -> Plan.Op_pragma_get_wal_batch_commits
+  | Ast.Pragma_wal_batch_commits_set n -> Plan.Op_pragma_set_wal_batch_commits { n }
+  | Ast.Pragma_wal_batch_interval_ms -> Plan.Op_pragma_get_wal_batch_interval_ms
+  | Ast.Pragma_wal_batch_interval_ms_set n ->
+    Plan.Op_pragma_set_wal_batch_interval_ms { n }
   | Ast.Pragma_database_list -> Plan.Op_database_list
   | Ast.Pragma_active_database -> Plan.Op_active_database_get
   | Ast.Pragma_active_database_set s -> Plan.Op_active_database_set { schema = s }
