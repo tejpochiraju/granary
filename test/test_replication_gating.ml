@@ -588,6 +588,99 @@ let test_close_drains_in_flight_checkpoint () =
      Lwt.return_unit)
 ;;
 
+(* #338 (review r2 #2): close must drain in-flight async sink ships before
+   tearing down the WAL fd — their callbacks read frames lazily, so a torn-down
+   fd loses the standby's tail.  Here the ship callback blocks on a resolver we
+   control; close must NOT complete until the ship finishes. *)
+let test_close_drains_in_flight_ship () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     Store.set_wal_autocheckpoint st 0;
+     (* no checkpoint interference *)
+     let ship_gate, release_ship = Lwt.wait () in
+     let* () =
+       Store.set_commit_callback
+         st
+         (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> ship_gate))
+     in
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let* () = Store.commit rw in
+     (* ship is dispatched and now blocked in the callback. *)
+     let close_p = Store.close st in
+     let* () = wait_for (fun () -> false) 15 in
+     Alcotest.(check bool)
+       "close blocks until the in-flight ship completes"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Sleep -> true
+        | _ -> false);
+     (* let the ship finish; close then drains and completes. *)
+     Lwt.wakeup_later release_ship ();
+     let* () =
+       wait_for
+         (fun () ->
+            match Lwt.state close_p with
+            | Lwt.Sleep -> false
+            | _ -> true)
+         50
+     in
+     Alcotest.(check bool)
+       "close completes after the ship drains"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Return () -> true
+        | _ -> false);
+     Lwt.return_unit)
+;;
+
+(* #338 (review r2 #1): an autocheckpoint dispatched by a committer can park on
+   [acquire_write] behind a write lock another (abandoned) txn grabbed during the
+   committer's fsync window.  close must not wait on such a not-yet-fd-active
+   checkpoint (it would hang forever).  We reproduce by starting a threshold-1
+   commit, then taking the lock with a second txn while the first is mid-commit,
+   then leaving that txn abandoned. *)
+let test_close_does_not_hang_on_lock_parked_checkpoint () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     Store.set_wal_autocheckpoint st 1;
+     let* rwA = Store.rw_begin st in
+     let* () = Store.put rwA 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let commitA = Store.commit rwA in
+     (* While A is committing (it releases the write lock for its fsync), B grabs
+        the lock and is then abandoned — A's post-fsync autockpt dispatch parks on
+        [acquire_write]. *)
+     let* (_ : Store.rw Store.txn) = Store.rw_begin st in
+     let* () = commitA in
+     let* () = wait_for (fun () -> false) 15 in
+     let close_p = Store.close st in
+     let* () =
+       wait_for
+         (fun () ->
+            match Lwt.state close_p with
+            | Lwt.Sleep -> false
+            | _ -> true)
+         50
+     in
+     Alcotest.(check bool)
+       "close completes despite an autockpt parked on the write lock"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Return () -> true
+        | _ -> false);
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "replication-gating"
@@ -629,6 +722,14 @@ let () =
             "#338 close drains in-flight checkpoint"
             `Quick
             test_close_drains_in_flight_checkpoint
+        ; Alcotest.test_case
+            "#338 close drains in-flight ship"
+            `Quick
+            test_close_drains_in_flight_ship
+        ; Alcotest.test_case
+            "#338 close does not hang on lock-parked checkpoint"
+            `Quick
+            test_close_does_not_hang_on_lock_parked_checkpoint
         ] )
     ]
 ;;

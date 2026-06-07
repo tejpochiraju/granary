@@ -122,7 +122,24 @@ val open_block_wal
   -> unit
   -> (t, error) result Lwt.t
 
-(** Close the store. After this, any use of the store or its txns is
+(** Close the store: drain in-flight background work, fsync any unsynced WAL
+    frames (batched/off modes), then release the WAL and backing fds.  Raises if
+    the final fsync fails (close is a durability anchor — an EIO/ENOSPC is
+    surfaced, not swallowed).
+
+    Quiesce contract (#338).  [close] does NOT acquire the write lock — an
+    abandoned write transaction holds it until commit/rollback, and close must
+    not hang on that.  Instead:
+    - Callers MUST stop issuing new transactions before calling [close]; a write
+      begun after close starts is rejected ({!rw_begin} fails once closing).
+    - An in-flight autocheckpoint or replication sink ship that is actively
+      touching the fds is drained first, so teardown never pulls the WAL/pager
+      out from under it.
+    - An autocheckpoint merely parked (on the replication floor, or on the write
+      lock behind an open txn) is abandoned cleanly without performing its I/O;
+      its frames remain in the WAL and replay on next open (no data loss).
+
+    After [close] returns, any further use of the store or its txns is
     undefined. *)
 val close : t -> unit Lwt.t
 

@@ -623,12 +623,14 @@ let () =
        common to every mode; only the sqlocaml variant list differs. *)
     print_string (csv_header ^ "\n");
     run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
-    (match Sys.getenv_opt "SQLOCAML_BENCH_DURABILITY" with
+    (match
+       Option.map String.lowercase_ascii (Sys.getenv_opt "SQLOCAML_BENCH_DURABILITY")
+     with
      | None ->
        (* Original #222 behaviour, unchanged: sqlocaml runs under Full. *)
        run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
        run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
-     | Some ("sweep" | "SWEEP") ->
+     | Some "sweep" ->
        (* #332: one CSV comparing commit throughput across all three durability
           modes (plaintext only — the durability knob is orthogonal to
           encryption). *)
