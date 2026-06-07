@@ -124,6 +124,91 @@ let test_mem_backend_noop () =
   run (S.close st)
 ;;
 
+(* --- fsync accounting --- *)
+
+let commit_kv st i =
+  let* tx = S.rw_begin st in
+  let* () = S.put tx 16 (bs (Printf.sprintf "k%04d" i)) (bs (Printf.sprintf "v%04d" i)) in
+  S.commit tx
+;;
+
+let do_commits st n =
+  let rec loop i =
+    if i = n
+    then Lwt.return_unit
+    else
+      let* () = commit_kv st i in
+      loop (i + 1)
+  in
+  loop 0
+;;
+
+let test_full_syncs_each_commit () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_durability st S.Full;
+    S.set_wal_autocheckpoint st 0;
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 20 in
+    let delta = S.wal_sync_count st - s0 in
+    Alcotest.(check bool)
+      (Printf.sprintf "full: ~1 fsync/commit (got %d for 20)" delta)
+      true
+      (delta >= 20);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+let test_off_never_syncs_on_commit () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_durability st S.Off;
+    S.set_wal_autocheckpoint st 0;
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 50 in
+    let delta = S.wal_sync_count st - s0 in
+    Alcotest.(check int) "off: zero commit fsyncs" 0 delta;
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+let test_batched_syncs_every_n () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_durability st (S.Batched { commits = 10; interval_ms = 1_000_000 });
+    S.set_wal_autocheckpoint st 0;
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 30 in
+    let delta = S.wal_sync_count st - s0 in
+    Alcotest.(check bool)
+      (Printf.sprintf "batched N=10: ~3 fsyncs (got %d), far below 30" delta)
+      true
+      (delta >= 1 && delta <= 5);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+let test_batched_syncs_on_time () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    let now = ref 0. in
+    S.set_clock st (fun () -> !now);
+    S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 100 });
+    S.set_wal_autocheckpoint st 0;
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 5 in
+    Alcotest.(check int) "no sync before T elapses" 0 (S.wal_sync_count st - s0);
+    now := 0.5;
+    let* () = commit_kv st 999 in
+    Alcotest.(check bool) "sync after T elapses" true (S.wal_sync_count st - s0 >= 1);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -131,6 +216,15 @@ let () =
       , [ Alcotest.test_case "default is full" `Quick test_default_is_full
         ; Alcotest.test_case "set/get round-trip" `Quick test_set_get_round_trip
         ; Alcotest.test_case "mem backend no-op" `Quick test_mem_backend_noop
+        ] )
+    ; ( "fsync-accounting"
+      , [ Alcotest.test_case "full syncs each commit" `Quick test_full_syncs_each_commit
+        ; Alcotest.test_case
+            "off never syncs on commit"
+            `Quick
+            test_off_never_syncs_on_commit
+        ; Alcotest.test_case "batched syncs every N" `Quick test_batched_syncs_every_n
+        ; Alcotest.test_case "batched syncs on time" `Quick test_batched_syncs_on_time
         ] )
     ]
 ;;

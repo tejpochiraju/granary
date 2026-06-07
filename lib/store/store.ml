@@ -179,13 +179,10 @@ type bt_state =
   ; mutable batch_commits : int (* #298: batched N threshold (default 256) *)
   ; mutable batch_interval_ms : int (* #298: batched T threshold ms (default 100) *)
   ; mutable unsynced_commits : int
-        [@warning "-69"]
-        (* #298: committed-but-unsynced batches since last fsync; consulted in later tasks. *)
+    (* #298: committed-but-unsynced batches since last fsync. *)
   ; mutable last_sync_time : float
-        [@warning "-69"]
-        (* #298: clock () at last commit fsync; for the T trigger; consulted in later tasks. *)
-  ; mutable clock : unit -> float [@warning "-69"]
-    (* #298: wall-clock source; default returns 0.; consulted in later tasks. *)
+    (* #298: clock () at last commit fsync; for the T trigger. *)
+  ; mutable clock : unit -> float (* #298: wall-clock source; default returns 0. *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
@@ -1469,14 +1466,43 @@ let commit_wal t st =
   Lwt.catch
     (fun () ->
        let* () = commit_prepare_btree ~header_commit:Header.commit_no_sync st in
+       (* #298: decide the sync policy under the write lock so the counter is
+          race-free across concurrent writers, then release the lock. *)
+       let do_sync =
+         match st.sync_mode with
+         | `Full -> true
+         | `Off ->
+           st.unsynced_commits <- st.unsynced_commits + 1;
+           false
+         | `Batched ->
+           st.unsynced_commits <- st.unsynced_commits + 1;
+           let elapsed_ms = (st.clock () -. st.last_sync_time) *. 1000. in
+           st.unsynced_commits >= st.batch_commits
+           || elapsed_ms >= float_of_int st.batch_interval_ms
+       in
        unlock_once ();
-       let* role =
-         group_commit_sync st.commit_queue (fun () ->
-           let* r = Pager.wal_sync st.pager in
-           match r with
-           | Ok () -> Lwt.return_unit
-           | Error e ->
-             Lwt.fail_with (Format.asprintf "Store.commit: wal_sync: %a" Pager.pp_error e))
+       let* () =
+         if do_sync
+         then (
+           let* role =
+             group_commit_sync st.commit_queue (fun () ->
+               let* r = Pager.wal_sync st.pager in
+               match r with
+               | Ok () -> Lwt.return_unit
+               | Error e ->
+                 Lwt.fail_with
+                   (Format.asprintf "Store.commit: wal_sync: %a" Pager.pp_error e))
+           in
+           (* fsync succeeded (failure raises above): reset the loss window. *)
+           st.unsynced_commits <- 0;
+           st.last_sync_time <- st.clock ();
+           match role with
+           | `Joiner -> Lwt.return_unit
+           | `Drainer -> maybe_autockpt_after_commit t st)
+         else
+           (* No fsync this commit: still bound the WAL via autocheckpoint
+              (checkpoint is a full-sync durability anchor). *)
+           maybe_autockpt_after_commit t st
        in
        (* Fire the frame-sink callback asynchronously so the commit path
           is never blocked by replication I/O. *)
@@ -1489,9 +1515,7 @@ let commit_wal t st =
             let epoch = Wal.epoch wal in
             let count = new_frames - prev_frames in
             Lwt.async (fun () -> cb ~epoch ~base_idx:prev_frames ~count)));
-       match role with
-       | `Joiner -> Lwt.return_unit
-       | `Drainer -> maybe_autockpt_after_commit t st)
+       Lwt.return_unit)
     (fun exn ->
        unlock_once ();
        Lwt.fail exn)
