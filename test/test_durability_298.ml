@@ -212,6 +212,31 @@ let test_batched_syncs_on_time () =
     Lwt.return_unit)
 ;;
 
+(* --- durability anchors --- *)
+
+let test_off_durable_after_close () =
+  let path = fresh_path () in
+  cleanup path;
+  (* Write in off mode, then close (which must flush), reopen, read. *)
+  run
+    (let* st = open_st path in
+     S.set_durability st S.Off;
+     S.set_wal_autocheckpoint st 0;
+     let* () = do_commits st 25 in
+     S.close st);
+  run
+    (let* st = open_st path in
+     let* tx = S.ro_begin st in
+     let* v = S.get tx 16 (bs "k0010") in
+     let* () = S.ro_end tx in
+     Alcotest.(check (option string))
+       "off-mode data durable after clean close"
+       (Some "v0010")
+       (Option.map Bytes.to_string v);
+     S.close st);
+  cleanup path
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -228,6 +253,9 @@ let () =
             test_off_never_syncs_on_commit
         ; Alcotest.test_case "batched syncs every N" `Quick test_batched_syncs_every_n
         ; Alcotest.test_case "batched syncs on time" `Quick test_batched_syncs_on_time
+        ] )
+    ; ( "durability-anchors"
+      , [ Alcotest.test_case "off durable after close" `Quick test_off_durable_after_close
         ] )
     ]
 ;;

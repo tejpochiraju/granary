@@ -596,6 +596,18 @@ let close (t : t) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
   | Btree st ->
+    (* #298: in batched/off mode the last acked commits may never have been
+       fsynced; a final WAL sync makes them durable across process exit. *)
+    let* () =
+      if st.unsynced_commits > 0
+      then (
+        let* r = Pager.wal_sync st.pager in
+        (match r with
+         | Ok () -> st.unsynced_commits <- 0
+         | Error _ -> ());
+        Lwt.return_unit)
+      else Lwt.return_unit
+    in
     let* () =
       match st.wal_close with
       | None -> Lwt.return_unit
