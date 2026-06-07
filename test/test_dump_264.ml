@@ -593,6 +593,76 @@ let test_fts_roundtrip () =
            (List.sort compare (rows restored match_q))))
 ;;
 
+(* Sorted dump lines that mention [needle] (used to compare an FTS table's
+   emitted INSERTs across two dumps). *)
+let dump_lines ~needle s =
+  String.split_on_char '\n' s
+  |> List.filter (fun l -> contains_substr ~needle l)
+  |> List.sort compare
+;;
+
+(* #330: an FTS5 table's rowids round-trip exactly.  An explicit rowid can be
+   inserted (INSERT INTO fts(rowid, ...)), the dump emits each row's rowid, and
+   the high-water counter advances past an explicit rowid so a later auto-insert
+   does not collide. *)
+let test_fts_explicit_rowid () =
+  with_db (fun db ->
+    exec db "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
+    exec db "INSERT INTO docs (rowid, title, body) VALUES (100, 'hello', 'world')";
+    (* the content row is readable and MATCH still works *)
+    Alcotest.(check (list string))
+      "row present"
+      [ "t:hello,t:world" ]
+      (table_data db "docs");
+    Alcotest.(check (list string))
+      "MATCH finds it"
+      [ "t:hello" ]
+      (rows db "SELECT title FROM docs WHERE docs MATCH 'world'");
+    (* a following auto-rowid insert advances past the explicit rowid (no reuse) *)
+    exec db "INSERT INTO docs (title, body) VALUES ('next', 'doc')";
+    let s = dump db in
+    Alcotest.(check bool)
+      "dump carries the explicit rowid 100"
+      true
+      (contains_substr ~needle:"VALUES(100," s);
+    Alcotest.(check bool)
+      "auto rowid advanced to 101 past the explicit one"
+      true
+      (contains_substr ~needle:"VALUES(101," s))
+;;
+
+(* #330: a delete leaves a rowid gap; the dump must carry the surviving rowids
+   so a restore preserves them rather than re-packing to 1..n.  Proven by
+   idempotence: dumping the restored db yields the same FTS INSERTs. *)
+let test_fts_rowid_gap_roundtrip () =
+  with_db (fun db ->
+    exec db "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
+    exec db "INSERT INTO docs (title, body) VALUES ('a', 'x')";
+    (* rowid 1 *)
+    exec db "INSERT INTO docs (title, body) VALUES ('b', 'y')";
+    (* rowid 2 *)
+    exec db "INSERT INTO docs (title, body) VALUES ('c', 'z')";
+    (* rowid 3 *)
+    exec db "DELETE FROM docs WHERE body = 'y'";
+    (* gap at rowid 2 *)
+    let s1 = dump db in
+    Alcotest.(check bool)
+      "surviving rowids carried explicitly"
+      true
+      (contains_substr ~needle:"INSERT INTO docs (rowid" s1);
+    let restored = restore s1 in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close restored) with
+        | _ -> ())
+      (fun () ->
+         let s2 = dump restored in
+         Alcotest.(check (list string))
+           "FTS INSERTs identical after round-trip (rowids preserved, gap kept)"
+           (dump_lines ~needle:"INSERT INTO docs" s1)
+           (dump_lines ~needle:"INSERT INTO docs" s2)))
+;;
+
 (* #321: a [Failure] in the pre-BEGIN window (here a sink that raises on its very
    first write, before [BEGIN] is emitted) must surface as [Error], not a raised
    exception, and the handler must NOT emit a dangling [ROLLBACK] — a [ROLLBACK]
@@ -667,6 +737,39 @@ let test_views_triggers_point_in_time () =
       "concurrent trigger trg2 not in dump (point-in-time schema)"
       false
       (contains_substr ~needle:"trg2" s))
+;;
+
+(* #329: when [Db.dump] runs inside an explicit transaction, view/trigger DDL
+   must be read through that txn (read-your-own-writes, #262) so the schema
+   section agrees with the row data — which is also read through the txn.  Here a
+   view and trigger are created (uncommitted) inside the txn alongside an
+   uncommitted row; the dump must include all three, not just the row. *)
+let test_views_triggers_in_explicit_txn () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (x INTEGER)";
+    exec db "CREATE TABLE audit (m TEXT)";
+    exec db "BEGIN";
+    exec db "INSERT INTO t VALUES (42)";
+    exec db "CREATE VIEW v_txn AS SELECT x FROM t";
+    exec
+      db
+      "CREATE TRIGGER trg_txn AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('z'); END";
+    let s = dump db in
+    exec db "ROLLBACK";
+    (* the txn's uncommitted row data is in the dump (read-your-own-writes) ... *)
+    Alcotest.(check bool)
+      "uncommitted row dumped"
+      true
+      (contains_substr ~needle:"INSERT INTO t VALUES(42)" s);
+    (* ... and so must its uncommitted view and trigger DDL be (#329) *)
+    Alcotest.(check bool)
+      "uncommitted view dumped"
+      true
+      (contains_substr ~needle:"v_txn" s);
+    Alcotest.(check bool)
+      "uncommitted trigger dumped"
+      true
+      (contains_substr ~needle:"trg_txn" s))
 ;;
 
 (* #281: now that #269 removed the DDL-in-txn deadlock, a schema-bearing dump is
@@ -807,6 +910,11 @@ let () =
             test_user_index_pk_prefix_survives
         ; Alcotest.test_case "view depending on view" `Quick test_view_on_view
         ; Alcotest.test_case "fts content round-trip (#319)" `Quick test_fts_roundtrip
+        ; Alcotest.test_case "fts explicit rowid (#330)" `Quick test_fts_explicit_rowid
+        ; Alcotest.test_case
+            "fts rowid gap round-trip (#330)"
+            `Quick
+            test_fts_rowid_gap_roundtrip
         ; Alcotest.test_case
             "sink failure before BEGIN (#321)"
             `Quick
@@ -815,6 +923,10 @@ let () =
             "views/triggers point-in-time (#322/#323)"
             `Quick
             test_views_triggers_point_in_time
+        ; Alcotest.test_case
+            "views/triggers in explicit txn (#329)"
+            `Quick
+            test_views_triggers_in_explicit_txn
         ; Alcotest.test_case
             "schema dump wrapped in txn (#281)"
             `Quick

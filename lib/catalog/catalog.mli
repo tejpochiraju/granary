@@ -419,6 +419,16 @@ val next_fts_rowid_in_txn
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> int64 Lwt.t
 
+(** #330: advance an FTS table's rowid high-water so the next auto-allocated
+    rowid is past [rowid] (used after an explicit-rowid insert).  No-op when the
+    counter is already beyond it.  Does NOT commit; the caller owns the commit. *)
+val ensure_fts_rowid_above_in_txn
+  :  t
+  -> name:string
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> int64
+  -> unit Lwt.t
+
 (** Persist FK constraints for a table to the sys_meta B-tree.
 
     [?txn] (#269): write through this already-held explicit writer transaction

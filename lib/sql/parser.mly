@@ -663,10 +663,18 @@ opt_conflict:
 value_row:
   | LPAREN vals = separated_nonempty_list(COMMA, expr) RPAREN { vals }
 
+(* A column name in an INSERT target list.  Same as [any_ident] but also accepts
+   the [ROWID] keyword, so [INSERT INTO fts(rowid, ...)] parses — needed for an
+   FTS5 table's explicit rowid (#330).  Sema rejects [rowid] for ordinary tables
+   that have no such column, so this only widens the INSERT column-list grammar. *)
+insert_col:
+  | id = any_ident { id }
+  | ROWID          { "rowid" }
+
 insert:
   (* INSERT INTO t (cols) SELECT ... *)
   | INSERT oc = opt_conflict INTO table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+      LPAREN cols = separated_nonempty_list(COMMA, insert_col) RPAREN
       sel = compound_select
     { Ast.S_insert_select { table; columns = cols; on_conflict = oc; select = sel } }
   (* INSERT INTO t SELECT ... / INSERT INTO t WITH ... SELECT ... *)
@@ -678,7 +686,7 @@ insert:
     { Ast.S_insert_select { table; columns = []; on_conflict = oc; select = sel } }
   (* existing VALUES alternatives *)
   | INSERT oc = opt_conflict INTO table = any_ident
-      LPAREN cols = separated_nonempty_list(COMMA, any_ident) RPAREN
+      LPAREN cols = separated_nonempty_list(COMMA, insert_col) RPAREN
       VALUES rows = separated_nonempty_list(COMMA, value_row)
       upsert = opt_upsert
       ret = opt_returning

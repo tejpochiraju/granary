@@ -231,6 +231,7 @@ type op =
       { fts_meta : Cat.fts_table_meta
       ; col_names : string list
       ; col_values : expr list
+      ; rowid_value : expr option (** #330: explicit [rowid] from the column list *)
       }
   | Op_fts_delete of
       { fts_meta : Cat.fts_table_meta

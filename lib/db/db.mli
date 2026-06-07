@@ -165,17 +165,20 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     emitted rows reflect a single consistent moment even if other writers commit
     concurrently while the dump runs — matching [sqlite3 .dump], which previously
     differed by reading each table in its own snapshot (a torn dump). View and
-    trigger DDL is read through that same shared snapshot too (#322/#323), so the
-    schema section stays point-in-time consistent with the row data even if a
-    concurrent [CREATE]/[DROP VIEW|TRIGGER] commits mid-dump. Table/index DDL and
-    the AUTOINCREMENT high-water still come from the in-memory catalog (a separate
-    consistency surface), so for a fully consistent result those should be
-    quiescent during the dump.
+    trigger DDL is read through that same view too (#322/#323/#329): the shared
+    snapshot in autocommit, or the explicit transaction when one is active — so
+    the schema section is always consistent with the row data (point-in-time
+    against a concurrent [CREATE]/[DROP VIEW|TRIGGER] commit, and read-your-own
+    -writes inside a transaction). Table/index DDL and the AUTOINCREMENT high-water
+    still come from the in-memory catalog (a separate consistency surface), so for
+    a fully consistent result those should be quiescent during the dump.
 
-    {b FTS5 content is dumped (#319).} An FTS5 table's [CREATE VIRTUAL TABLE] is
-    emitted followed by [INSERT]s for its stored content (in column order), so a
-    replay re-inserts the original rows and rebuilds the index — matching how
-    [sqlite3 .dump] round-trips an FTS table.
+    {b FTS5 content is dumped (#319/#330).} An FTS5 table's [CREATE VIRTUAL TABLE]
+    is emitted followed by [INSERT INTO t(rowid, ..)] statements for its stored
+    content, so a replay re-inserts the original rows (rebuilding the index) with
+    their {e original rowids} — a delete leaves a rowid gap that the restore
+    preserves rather than re-packing, matching how [sqlite3 .dump] round-trips an
+    FTS table.
 
     Composite / table-level PRIMARY KEYs round-trip as plain [UNIQUE] indexes
     (this engine's internal representation): the data is preserved, but the
