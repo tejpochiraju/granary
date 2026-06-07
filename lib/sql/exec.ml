@@ -5870,13 +5870,45 @@ let execute_fts_insert
       (fts_meta : Cat.fts_table_meta)
       ~col_names
       ~col_values
+      ~rowid_value
   : int Lwt.t
   =
   let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-       let* rowid = Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx in
+       (* #330: an explicit [rowid] is used verbatim (and the high-water advanced
+          past it so a later auto-insert never reuses it); otherwise allocate the
+          next rowid as before. *)
+       let* rowid =
+         match rowid_value with
+         | None -> Cat.next_fts_rowid_in_txn cat ~name:fts_meta.Cat.fts_name tx
+         | Some e ->
+           let rowid =
+             match eval_expr clock params [||] e with
+             | Row.V_int n -> n
+             | Row.V_real f -> Int64.of_float f
+             | _ -> raise (Failure "FTS rowid must be an integer")
+           in
+           let* () =
+             Cat.ensure_fts_rowid_above_in_txn cat ~name:fts_meta.Cat.fts_name tx rowid
+           in
+           Lwt.return rowid
+       in
        let key = Rowid.encode rowid in
+       (* #330: if a row already exists at this rowid (explicit-rowid collision),
+          de-index it first so its index entries are not left stale. *)
+       let* () =
+         match rowid_value with
+         | None -> Lwt.return_unit
+         | Some _ ->
+           let* existing = S.get tx fts_meta.Cat.fts_content_tree key in
+           (match existing with
+            | None -> Lwt.return_unit
+            | Some old_bytes ->
+              let old_texts = fts_decode_content old_bytes in
+              let old_col_texts = List.mapi (fun i t -> i, t) old_texts in
+              fts_deindex_document tx ~fts_meta ~rowid ~col_texts:old_col_texts)
+       in
        let vals = List.map (fun e -> eval_expr clock params [||] e) col_values in
        let n_cols = List.length fts_meta.Cat.fts_columns in
        let texts = Array.make n_cols "" in
@@ -6388,8 +6420,17 @@ let execute_with_count
     with_ddl_txn store cat mode (fun tx ->
       let* _ = Cat.create_fts_table ~txn:tx cat ~name ~columns in
       Lwt.return 0)
-  | Plan.Op_fts_insert { fts_meta; col_names; col_values } ->
-    execute_fts_insert store cat ~mode ~clock ~params fts_meta ~col_names ~col_values
+  | Plan.Op_fts_insert { fts_meta; col_names; col_values; rowid_value } ->
+    execute_fts_insert
+      store
+      cat
+      ~mode
+      ~clock
+      ~params
+      fts_meta
+      ~col_names
+      ~col_values
+      ~rowid_value
   | Plan.Op_fts_delete { fts_meta; where } ->
     execute_fts_delete store cat ~mode ~clock ~params fts_meta ~where
   | Plan.Op_alter_table { table_meta; action } ->
@@ -8658,6 +8699,30 @@ and stream_aggregate
         with_windows
     in
     Lwt.return (Lwt_stream.of_list final_rows)
+
+and read_fts_content_rows store mode (fts_meta : Cat.fts_table_meta)
+  : (int64 * string list) list Lwt.t
+  =
+  (* #330: read the FTS content tree as (rowid, column-texts) pairs through [mode]
+     (the same shared snapshot / explicit txn the dump uses for table rows), so
+     [Db.dump] can emit INSERTs that carry the original rowids and round-trip the
+     index exactly.  The content tree is keyed by rowid, so this is the only place
+     FTS rowids are surfaced — deliberately out-of-band, not via a SQL projection
+     (see #330). *)
+  with_read store mode (fun rh ->
+    let* cur = rh_cursor_open rh fts_meta.Cat.fts_content_tree in
+    let _sr = S.cursor_first cur in
+    let acc = ref [] in
+    let rec walk () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (k, v) ->
+        acc := (Rowid.decode k, fts_decode_content v) :: !acc;
+        walk ()
+    in
+    walk ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !acc))
 
 and stream_fts_seq_scan clock params store mode (fts_meta : Cat.fts_table_meta) where =
   (* #257: captured at construction (inside [query]'s [with_value] scope), same

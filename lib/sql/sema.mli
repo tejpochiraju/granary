@@ -235,6 +235,7 @@ type bound_stmt =
       { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta
       ; col_names : string list
       ; col_values : bound_expr list
+      ; rowid_value : bound_expr option (** #330: explicit [rowid], if given *)
       }
   | BS_fts_delete of
       { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta

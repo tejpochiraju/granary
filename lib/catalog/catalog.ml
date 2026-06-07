@@ -1103,10 +1103,8 @@ let load_all_fts store =
 (* View persistence                                                     *)
 (* ------------------------------------------------------------------ *)
 
-let load_all_views store =
-  S.with_ro store
-  @@ fun tx ->
-  let%lwt cur = S.cursor_open tx sys_views_tid in
+let load_all_pairs_in_tx tx tid =
+  let%lwt cur = S.cursor_open tx tid in
   let _sr = S.cursor_first cur in
   let pairs = ref [] in
   let rec walk () =
@@ -1120,6 +1118,13 @@ let load_all_views store =
   S.cursor_close cur;
   Lwt.return (List.rev !pairs)
 ;;
+
+(* #322/#323: read view DDL through a caller-supplied snapshot so [Db.dump] can
+   thread its single shared RO snapshot here, making view DDL point-in-time with
+   the row data; a concurrent CREATE/DROP VIEW commit then cannot tear the dump's
+   schema section relative to its rows. *)
+let load_all_views_in_tx (tx : _ S.txn) = load_all_pairs_in_tx tx sys_views_tid
+let load_all_views store = S.with_ro store load_all_views_in_tx
 
 (* #269: run [f tx] through the ambient explicit transaction ([?txn = Some tx],
    left uncommitted — the db layer owns its lifecycle) or, in autocommit, a fresh
@@ -1150,23 +1155,9 @@ let remove_view ?txn store ~name =
 (* Trigger persistence                                                  *)
 (* ------------------------------------------------------------------ *)
 
-let load_all_triggers store =
-  S.with_ro store
-  @@ fun tx ->
-  let%lwt cur = S.cursor_open tx sys_triggers_tid in
-  let _sr = S.cursor_first cur in
-  let pairs = ref [] in
-  let rec walk () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (k, v) ->
-      pairs := (Bytes.to_string k, Bytes.to_string v) :: !pairs;
-      walk ()
-  in
-  walk ();
-  S.cursor_close cur;
-  Lwt.return (List.rev !pairs)
-;;
+(* #322/#323: trigger DDL counterpart to [load_all_views_in_tx]. *)
+let load_all_triggers_in_tx (tx : _ S.txn) = load_all_pairs_in_tx tx sys_triggers_tid
+let load_all_triggers store = S.with_ro store load_all_triggers_in_tx
 
 (* [?txn] (#269): persist/remove through the ambient explicit transaction when
    one is active, else autocommit. *)
@@ -2603,21 +2594,42 @@ let create_fts_table ?txn (t : t) ~name ~columns : fts_table_meta Lwt.t =
 
 (** Rowid counter for FTS tables stored as a separate key in sys_fts_tid.
     Key format: name ++ "\x00rowid" (the \x00 prefix sorts before printable ASCII). *)
-let next_fts_rowid_in_txn (_t : t) ~name (tx : S.rw S.txn) : int64 Lwt.t =
-  let rowid_key = Bytes.cat (Bytes.of_string name) sys_fts_rowid_suffix in
+let fts_rowid_counter_key name = Bytes.cat (Bytes.of_string name) sys_fts_rowid_suffix
+
+let read_fts_rowid_counter tx rowid_key =
   let%lwt cur_opt = S.get tx sys_fts_tid rowid_key in
-  let cur =
-    match cur_opt with
-    | None -> 1L
-    | Some b ->
-      let n, _ = Varint.decode_int64 b 0 in
-      n
-  in
-  let next = Int64.add cur 1L in
+  match cur_opt with
+  | None -> Lwt.return 1L
+  | Some b ->
+    let n, _ = Varint.decode_int64 b 0 in
+    Lwt.return n
+;;
+
+let write_fts_rowid_counter tx rowid_key v =
   let nbuf = Buffer.create 8 in
-  Varint.encode_int64 nbuf next;
-  let%lwt () = S.put tx sys_fts_tid rowid_key (Buffer.to_bytes nbuf) in
+  Varint.encode_int64 nbuf v;
+  S.put tx sys_fts_tid rowid_key (Buffer.to_bytes nbuf)
+;;
+
+let next_fts_rowid_in_txn (_t : t) ~name (tx : S.rw S.txn) : int64 Lwt.t =
+  let rowid_key = fts_rowid_counter_key name in
+  let%lwt cur = read_fts_rowid_counter tx rowid_key in
+  let%lwt () = write_fts_rowid_counter tx rowid_key (Int64.add cur 1L) in
   Lwt.return cur
+;;
+
+(* #330: after an explicit-rowid insert, advance the high-water so the next
+   auto-allocated rowid is past [rowid] (the counter holds the next rowid to
+   assign).  No-op when the counter is already beyond [rowid]. *)
+let ensure_fts_rowid_above_in_txn (_t : t) ~name (tx : S.rw S.txn) (rowid : int64)
+  : unit Lwt.t
+  =
+  let rowid_key = fts_rowid_counter_key name in
+  let%lwt cur = read_fts_rowid_counter tx rowid_key in
+  let want = Int64.add rowid 1L in
+  if Int64.compare want cur > 0
+  then write_fts_rowid_counter tx rowid_key want
+  else Lwt.return_unit
 ;;
 
 let get_fk_enforcement t = t.fk_enforcement

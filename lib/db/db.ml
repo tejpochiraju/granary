@@ -1847,9 +1847,39 @@ let dump_index_is_implied (meta : Cat.table_meta) (idx : Cat.index_info) =
      | _ -> false)
 ;;
 
+(* Emit [INSERT] statements for every row of table/FTS-table [name] by selecting
+   [col_idents] (already quoted, in storage order) through the executor — so the
+   rowid-alias column resolves to its stored value and FTS content reads through
+   the content tree.  [explicit_cols] names the columns in the [INSERT] (needed
+   when the selected set omits generated columns); otherwise a bare
+   [INSERT INTO t VALUES] is emitted.  [?mode] threads the dump's shared RO
+   snapshot so reads are point-in-time. *)
+let emit_rows_as_inserts ?mode t ~name ~col_idents ~explicit_cols ~stmt =
+  let qname = Sql.Exec.quote_ident name in
+  let cols_csv = String.concat ", " col_idents in
+  let select_sql = Printf.sprintf "SELECT %s FROM %s" cols_csv qname in
+  let* r = query_impl ?mode t select_sql in
+  match r with
+  | Error e -> Lwt.fail (Failure (Format.asprintf "dump %s: %a" name pp_error e))
+  | Ok stream ->
+    let prefix =
+      if explicit_cols
+      then Printf.sprintf "INSERT INTO %s (%s) VALUES" qname cols_csv
+      else Printf.sprintf "INSERT INTO %s VALUES" qname
+    in
+    Lwt_stream.iter_s
+      (fun (row : Row.t) ->
+         let vals =
+           Array.to_list row
+           |> List.map Sql.Exec.sql_literal_of_value
+           |> String.concat ","
+         in
+         stmt (Printf.sprintf "%s(%s)" prefix vals))
+      stream
+;;
+
 (* Emit [INSERT] statements for every row of [meta] (skipping generated columns,
-   whose values are derived).  Reads through the executor so the rowid-alias
-   column resolves to its stored value. *)
+   whose values are derived). *)
 let dump_table_rows ?mode t (meta : Cat.table_meta) ~stmt =
   let dump_cols =
     List.filter (fun (c : Row.column) -> c.Row.generated_as = None) meta.Cat.columns
@@ -1858,36 +1888,45 @@ let dump_table_rows ?mode t (meta : Cat.table_meta) ~stmt =
   then Lwt.return_unit
   else (
     let has_generated = List.length dump_cols <> List.length meta.Cat.columns in
-    let qname = Sql.Exec.quote_ident meta.Cat.name in
     let col_idents =
       List.map (fun (c : Row.column) -> Sql.Exec.quote_ident c.Row.name) dump_cols
     in
-    let select_sql =
-      Printf.sprintf "SELECT %s FROM %s" (String.concat ", " col_idents) qname
+    emit_rows_as_inserts
+      ?mode
+      t
+      ~name:meta.Cat.name
+      ~col_idents
+      ~explicit_cols:has_generated
+      ~stmt)
+;;
+
+(* #319/#330: emit [INSERT]s for an FTS5 table's stored content so a replay
+   re-inserts the rows and rebuilds the index (matching sqlite3 [.dump] rather
+   than restoring the table empty).  Each row carries its [rowid] explicitly
+   ([INSERT INTO t(rowid, col..) VALUES(rowid, ..)]) so rowids round-trip exactly
+   — a delete leaves a gap that the restore preserves, instead of re-packing.
+   Rows are read directly from the content tree (the only place FTS rowids are
+   surfaced) through [mode], the dump's shared snapshot / explicit txn. *)
+let dump_fts_rows ~mode ~store (m : Cat.fts_table_meta) ~stmt =
+  match m.Cat.fts_columns with
+  | [] -> Lwt.return_unit
+  | cols ->
+    let qname = Sql.Exec.quote_ident m.Cat.fts_name in
+    let col_idents = List.map Sql.Exec.quote_ident cols in
+    let prefix =
+      Printf.sprintf
+        "INSERT INTO %s (rowid, %s) VALUES"
+        qname
+        (String.concat ", " col_idents)
     in
-    let* r = query_impl ?mode t select_sql in
-    match r with
-    | Error e ->
-      Lwt.fail (Failure (Format.asprintf "dump %s: %a" meta.Cat.name pp_error e))
-    | Ok stream ->
-      let prefix =
-        if has_generated
-        then
-          Printf.sprintf
-            "INSERT INTO %s (%s) VALUES"
-            qname
-            (String.concat ", " col_idents)
-        else Printf.sprintf "INSERT INTO %s VALUES" qname
-      in
-      Lwt_stream.iter_s
-        (fun (row : Row.t) ->
-           let vals =
-             Array.to_list row
-             |> List.map Sql.Exec.sql_literal_of_value
-             |> String.concat ","
-           in
-           stmt (Printf.sprintf "%s(%s)" prefix vals))
-        stream)
+    let* rows = Sql.Exec.read_fts_content_rows store mode m in
+    Lwt_list.iter_s
+      (fun (rowid, texts) ->
+         let vals =
+           List.map (fun s -> Sql.Exec.sql_literal_of_value (Row.V_text s)) texts
+         in
+         stmt (Printf.sprintf "%s(%Ld,%s)" prefix rowid (String.concat "," vals)))
+      rows
 ;;
 
 (* Whole-word, case-insensitive occurrence of [word] in [s] (identifier-bounded
@@ -1962,13 +2001,46 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
      of [t.store] would be the wrong store — that path keeps its prior
      per-statement behavior).  The snapshot is ended when finished, even on
      error (#164). *)
-  let* read_mode, finish_snapshot =
+  (* [load_views]/[load_triggers] read view & trigger DDL through the SAME txn the
+     row data is read through, so the schema section is consistent with the data:
+     - explicit txn active: through that txn (#329, read-your-own-writes, #262),
+       matching the row data which also reads through it;
+     - autocommit on [main]: through the shared #274 RO snapshot (#322/#323);
+     - autocommit on a non-main active schema: per-call committed snapshots (the
+       row reads route to an attached store with no single snapshot anyway). *)
+  (* [fts_mode] is the concrete [txn_mode] equivalent of [read_mode] (which is
+     [None] when [query_impl] would resolve it from [t.explicit_txn]); the FTS
+     content read (#330) needs an explicit mode rather than the [?mode] optional. *)
+  let* read_mode, fts_mode, finish_snapshot, load_views, load_triggers =
     match t.explicit_txn with
+    | Some tx ->
+      Lwt.return
+        ( None
+        , Sql.Exec.In_txn tx
+        , (fun () -> Lwt.return_unit)
+        , (fun () -> Cat.load_all_views_in_tx tx)
+        , fun () -> Cat.load_all_triggers_in_tx tx )
     | None when String.equal t.active_schema "main" ->
       let* snap = S.ro_begin t.store in
-      Lwt.return (Some (Sql.Exec.In_ro_txn snap), fun () -> S.ro_end snap)
-    | _ -> Lwt.return (None, fun () -> Lwt.return_unit)
+      Lwt.return
+        ( Some (Sql.Exec.In_ro_txn snap)
+        , Sql.Exec.In_ro_txn snap
+        , (fun () -> S.ro_end snap)
+        , (fun () -> Cat.load_all_views_in_tx snap)
+        , fun () -> Cat.load_all_triggers_in_tx snap )
+    | None ->
+      Lwt.return
+        ( None
+        , Sql.Exec.Auto
+        , (fun () -> Lwt.return_unit)
+        , (fun () -> Cat.load_all_views t.store)
+        , fun () -> Cat.load_all_triggers t.store )
   in
+  (* #321: track whether [BEGIN] was actually emitted, so a [Failure] in the
+     pre-BEGIN window (catalog enumeration, the [PRAGMA] write, or a streaming
+     [sink] that raises on its first write) does not close a transaction that was
+     never opened with a dangling [ROLLBACK]. *)
+  let began = ref false in
   Lwt.finalize
     (fun () ->
        Lwt.catch
@@ -1987,6 +2059,7 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
           keep.  The [PRAGMA foreign_keys=OFF] stays outside the transaction,
           matching sqlite. *)
             let* () = stmt "BEGIN" in
+            began := true;
             (* Base tables: DDL immediately followed by that table's data. *)
             let* () =
               Lwt_list.iter_s
@@ -2001,18 +2074,27 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                    else dump_table_rows ?mode:read_mode t meta ~stmt)
                 tables
             in
-            (* Schema objects emitted after all data: FTS virtual tables (DDL only —
-          content is rebuilt on insert; full content dump is a follow-up),
-          explicit indexes, then views and triggers. *)
+            (* #319: FTS virtual tables — [CREATE VIRTUAL TABLE] (unless
+          [data_only]) immediately followed by its content rows as [INSERT]s
+          (unless [schema_only]), so a replay re-inserts the rows and rebuilds the
+          index instead of restoring the table empty. *)
+            let* () =
+              Lwt_list.iter_s
+                (fun (m : Cat.fts_table_meta) ->
+                   let* () =
+                     if data_only then Lwt.return_unit else stmt (Sql.Exec.ddl_of_fts m)
+                   in
+                   if schema_only
+                   then Lwt.return_unit
+                   else dump_fts_rows ~mode:fts_mode ~store:t.store m ~stmt)
+                (Cat.list_fts_tables cat)
+            in
+            (* Schema objects emitted after all data: explicit indexes, then views
+          and triggers. *)
             let* () =
               if data_only
               then Lwt.return_unit
               else
-                let* () =
-                  Lwt_list.iter_s
-                    (fun (m : Cat.fts_table_meta) -> stmt (Sql.Exec.ddl_of_fts m))
-                    (Cat.list_fts_tables cat)
-                in
                 let* () =
                   Lwt_list.iter_s
                     (fun (meta : Cat.table_meta) ->
@@ -2024,13 +2106,17 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                          (Cat.indexes_for_table cat ~table:meta.Cat.name))
                     tables
                 in
-                let* views = Cat.load_all_views t.store in
+                (* #322/#323/#329: view & trigger DDL read through the same txn as
+              the row data (see [load_views]/[load_triggers] above), so the schema
+              section is consistent with the data and a concurrent
+              CREATE/DROP VIEW|TRIGGER commit cannot tear the dump. *)
+                let* views = load_views () in
                 let* () =
                   Lwt_list.iter_s
                     (fun (_n, sql) -> stmt sql)
                     (order_views_by_dependency views)
                 in
-                let* triggers = Cat.load_all_triggers t.store in
+                let* triggers = load_triggers () in
                 Lwt_list.iter_s (fun (_n, sql) -> stmt sql) triggers
             in
             (* #312: emit the AUTOINCREMENT high-water like SQLite's [.dump], so a
@@ -2066,9 +2152,17 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
             Lwt.return (Ok ()))
          (function
            | Failure msg ->
-             (* The dump has already sunk an unterminated [BEGIN]; close it with a
-                [ROLLBACK] so a streaming sink is not left mid-transaction. *)
-             let* () = stmt "ROLLBACK" in
+             (* #321: only close with [ROLLBACK] if [BEGIN] was actually emitted;
+                otherwise (a failure in the pre-BEGIN window) a [ROLLBACK] with no
+                matching [BEGIN] would be rejected on replay.  Guard the handler's
+                own [sink] call so that if the [sink] itself is the failure source,
+                its re-invocation cannot raise out of [Lwt.catch] and break the
+                [Ok]/[Error] contract. *)
+             let* () =
+               if !began
+               then Lwt.catch (fun () -> stmt "ROLLBACK") (fun _ -> Lwt.return_unit)
+               else Lwt.return_unit
+             in
              Lwt.return (Error (Runtime msg))
            | exn -> Lwt.fail exn))
     finish_snapshot

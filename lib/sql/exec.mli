@@ -149,6 +149,16 @@ val ddl_of_index : Sqlocaml_catalog.Catalog.index_info -> string
 (** #264: reconstruct a [CREATE VIRTUAL TABLE .. USING fts5(..)] statement. *)
 val ddl_of_fts : Sqlocaml_catalog.Catalog.fts_table_meta -> string
 
+(** #330: read an FTS5 table's stored content as [(rowid, column_texts)] pairs
+    through [mode] (the dump's shared snapshot / explicit txn), so [Db.dump] can
+    emit [INSERT INTO fts(rowid, ..)] statements that round-trip rowids exactly.
+    Rowids are surfaced only here (out-of-band), not via any SQL projection. *)
+val read_fts_content_rows
+  :  Sqlocaml_store.Store.t
+  -> txn_mode
+  -> Sqlocaml_catalog.Catalog.fts_table_meta
+  -> (int64 * string list) list Lwt.t
+
 (** #264: render a {!Sqlocaml_encoding.Row.value} as a standalone SQL literal
     that re-reads to the identical value (text quoted, blob as [X'..'], float as
     the shortest round-tripping REAL literal, non-finite floats as

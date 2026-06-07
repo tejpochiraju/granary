@@ -953,8 +953,13 @@ let rec plan ?cat = function
   | Sema.BS_rollback_to name -> Plan.Op_rollback_to name
   | Sema.BS_create_fts_table { name; columns } ->
     Plan.Op_create_fts_table { name; columns }
-  | Sema.BS_fts_insert { fts_meta; col_names; col_values } ->
-    Plan.Op_fts_insert { fts_meta; col_names; col_values = List.map plan_expr col_values }
+  | Sema.BS_fts_insert { fts_meta; col_names; col_values; rowid_value } ->
+    Plan.Op_fts_insert
+      { fts_meta
+      ; col_names
+      ; col_values = List.map plan_expr col_values
+      ; rowid_value = Option.map plan_expr rowid_value
+      }
   | Sema.BS_fts_delete { fts_meta; where } ->
     Plan.Op_fts_delete { fts_meta; where = Option.map plan_expr where }
   | Sema.BS_fts_seq_scan { fts_meta; where } ->

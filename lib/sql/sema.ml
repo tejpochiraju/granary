@@ -284,6 +284,7 @@ type bound_stmt =
       { fts_meta : Cat.fts_table_meta
       ; col_names : string list
       ; col_values : bound_expr list
+      ; rowid_value : bound_expr option (** #330: explicit [rowid], if given *)
       }
   | BS_fts_delete of
       { fts_meta : Cat.fts_table_meta
@@ -1481,43 +1482,53 @@ let bind_fts_insert cat ~param_counter ~named_params ~table ~columns ~values =
     let fts_cols = fts_meta.Cat.fts_columns in
     (* If no columns specified, default to all FTS columns in order *)
     let columns = if columns = [] then fts_cols else columns in
-    (* Validate that all specified columns exist in fts_meta.fts_columns *)
-    let bad = List.find_opt (fun c -> not (List.mem c fts_cols)) columns in
-    (match bad with
-     | Some col -> Lwt.return (Error (Unknown_column { table; column = col }))
-     | None ->
-       (* Bind the value expressions using a synthetic table meta *)
-       let synth_meta = fts_as_table_meta fts_meta in
-       let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
-         match e with
-         | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
-           bind_expr ~param_counter ~named_params synth_meta e
-         | _ -> Error (Unsupported "complex expression in INSERT VALUES")
-       in
-       let results = List.map bind_value_expr values in
-       let errors =
-         List.filter_map
-           (function
-             | Error e -> Some e
-             | Ok _ -> None)
-           results
-       in
-       (match errors with
-        | e :: _ -> Lwt.return (Error e)
-        | [] ->
-          let col_values =
-            List.filter_map
-              (function
-                | Ok e -> Some e
-                | Error _ -> None)
-              results
-          in
-          let n_cols = List.length columns in
-          let n_vals = List.length values in
-          if n_cols <> n_vals
-          then Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
-          else
-            Lwt.return (Ok (BS_fts_insert { fts_meta; col_names = columns; col_values }))))
+    let synth_meta = fts_as_table_meta fts_meta in
+    let bind_value_expr (e : Ast.expr) : (bound_expr, error) result =
+      match e with
+      | Ast.E_lit _ | Ast.E_neg _ | Ast.E_param _ ->
+        bind_expr ~param_counter ~named_params synth_meta e
+      | _ -> Error (Unsupported "complex expression in INSERT VALUES")
+    in
+    (* #330: an explicit [rowid] column is split out and bound separately; the
+       remaining columns must be content columns.  Arity is checked against the
+       full (rowid + content) column list. *)
+    let n_cols = List.length columns in
+    let n_vals = List.length values in
+    if n_cols <> n_vals
+    then Lwt.return (Error (Arity_mismatch { expected = n_cols; got = n_vals }))
+    else (
+      let pairs = List.combine columns values in
+      let is_rowid c = String.lowercase_ascii c = "rowid" in
+      let rowid_pairs, content_pairs = List.partition (fun (c, _) -> is_rowid c) pairs in
+      let content_cols = List.map fst content_pairs in
+      (* Validate the content columns against the FTS schema. *)
+      let bad = List.find_opt (fun c -> not (List.mem c fts_cols)) content_cols in
+      match bad with
+      | Some col -> Lwt.return (Error (Unknown_column { table; column = col }))
+      | None ->
+        let rowid_value_res =
+          match rowid_pairs with
+          | [] -> Ok None
+          | [ (_, e) ] -> Result.map Option.some (bind_value_expr e)
+          | _ -> Error (Unsupported "rowid specified more than once in INSERT")
+        in
+        let content_results = List.map (fun (_, e) -> bind_value_expr e) content_pairs in
+        let errors =
+          List.filter_map
+            (function
+              | Error e -> Some e
+              | Ok _ -> None)
+            content_results
+        in
+        (match rowid_value_res, errors with
+         | Error e, _ -> Lwt.return (Error e)
+         | _, e :: _ -> Lwt.return (Error e)
+         | Ok rowid_value, [] ->
+           let col_values = List.filter_map Result.to_option content_results in
+           Lwt.return
+             (Ok
+                (BS_fts_insert
+                   { fts_meta; col_names = content_cols; col_values; rowid_value }))))
 ;;
 
 let bind_returning_exprs
