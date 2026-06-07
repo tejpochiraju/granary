@@ -527,12 +527,14 @@ let test_sink_gated_to_synced () =
     let* st = open_st path in
     S.set_wal_autocheckpoint st 0;
     let fired = ref 0 in
-    S.set_commit_callback
-      st
-      (Some
-         (fun ~epoch:_ ~base_idx:_ ~count:_ ->
-           incr fired;
-           Lwt.return_unit));
+    let* () =
+      S.set_commit_callback
+        st
+        (Some
+           (fun ~epoch:_ ~base_idx:_ ~count:_ ->
+             incr fired;
+             Lwt.return_unit))
+    in
     (* Sink forces Full; the relax request is ignored. *)
     S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
     Alcotest.(check bool) "sink pins Full" true (S.durability st = S.Full);
@@ -609,7 +611,7 @@ let test_sink_forces_full () =
     let* st = open_st path in
     S.set_durability st S.Off;
     Alcotest.(check bool) "Off before sink" true (S.durability st = S.Off);
-    S.set_commit_callback st noop_sink;
+    let* () = S.set_commit_callback st noop_sink in
     Alcotest.(check bool) "sink forced Full" true (S.durability st = S.Full);
     Alcotest.(check bool) "callback active" true (S.commit_callback_active st);
     let* () = S.close st in
@@ -621,7 +623,7 @@ let test_sink_rejects_relax_store () =
   run
   @@ with_fresh ~f:(fun path ->
     let* st = open_st path in
-    S.set_commit_callback st noop_sink;
+    let* () = S.set_commit_callback st noop_sink in
     Alcotest.(check bool) "Full after sink" true (S.durability st = S.Full);
     S.set_durability st (S.Batched { commits = 10; interval_ms = 10 });
     Alcotest.(check bool) "relax ignored while sink active" true (S.durability st = S.Full);
@@ -635,11 +637,11 @@ let test_sink_removal_allows_relax () =
   run
   @@ with_fresh ~f:(fun path ->
     let* st = open_st path in
-    S.set_commit_callback st noop_sink;
+    let* () = S.set_commit_callback st noop_sink in
     (* recorded while pinned, not applied yet *)
     S.set_durability st (S.Batched { commits = 7; interval_ms = 13 });
     Alcotest.(check bool) "still Full" true (S.durability st = S.Full);
-    S.set_commit_callback st None;
+    let* () = S.set_commit_callback st None in
     Alcotest.(check bool) "no longer active" false (S.commit_callback_active st);
     (* recorded params are available for later use *)
     Alcotest.(check int) "batch N recorded" 7 (S.sync_batch_commits st);
@@ -650,6 +652,66 @@ let test_sink_removal_allows_relax () =
       true
       (S.durability st = S.Batched { commits = 7; interval_ms = 13 });
     let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* #336/1: open(off/batched) → commit (acked but unsynced) → register a sink.
+   Registration must flush the pending unsynced frames NOW (it pins Full going
+   forward but ships only NEW frames, so these historical frames would otherwise
+   linger OS-crash-exposed until the next commit/checkpoint/close). *)
+let test_sink_registration_flushes () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_wal_autocheckpoint st 0;
+    S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 5 in
+    Alcotest.(check int)
+      "commits stayed unsynced under high-N batched"
+      0
+      (S.wal_sync_count st - s0);
+    let* () = S.set_commit_callback st noop_sink in
+    Alcotest.(check bool)
+      "sink registration flushed pending unsynced frames"
+      true
+      (S.wal_sync_count st - s0 >= 1);
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* #336/3: the SQL layer rejects relaxing durability while a sink is active
+   (companion to the Store-level [test_sink_rejects_relax_store], which checks
+   the silently-ignored Store-API contract — see set_durability docs). *)
+let test_sink_rejects_relax_sql () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    let* () = S.set_commit_callback st noop_sink in
+    let* db = D.of_store st in
+    let* r_off = D.execute db "PRAGMA synchronous = off" in
+    Alcotest.(check bool)
+      "PRAGMA synchronous=off rejected while sink active"
+      true
+      (match r_off with
+       | Error _ -> true
+       | Ok () -> false);
+    let* r_batched = D.execute db "PRAGMA synchronous = batched" in
+    Alcotest.(check bool)
+      "PRAGMA synchronous=batched rejected while sink active"
+      true
+      (match r_batched with
+       | Error _ -> true
+       | Ok () -> false);
+    (* synchronous=full is still allowed (it's a no-op tighten). *)
+    let* r_full = D.execute db "PRAGMA synchronous = full" in
+    Alcotest.(check bool)
+      "PRAGMA synchronous=full allowed while sink active"
+      true
+      (match r_full with
+       | Ok () -> true
+       | Error _ -> false);
+    let* () = D.close db in
     Lwt.return_unit)
 ;;
 
@@ -724,6 +786,14 @@ let () =
             "removal allows relax again"
             `Quick
             test_sink_removal_allows_relax
+        ; Alcotest.test_case
+            "#336/1 sink registration flushes pending unsynced"
+            `Quick
+            test_sink_registration_flushes
+        ; Alcotest.test_case
+            "#336/3 relax rejected while sink active (SQL)"
+            `Quick
+            test_sink_rejects_relax_sql
         ] )
     ]
 ;;

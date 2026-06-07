@@ -47,6 +47,41 @@ let host_label =
      | _ -> "unknown")
 ;;
 
+(* #332: per-deployment durability mode for the sqlocaml engine's WAL commits.
+   Selected by [SQLOCAML_BENCH_DURABILITY] (full|batched|off|sweep); the
+   SQLite reference always runs synchronous=FULL.  Held in a ref so the sweep
+   mode can re-open the same engine under each mode in turn.  The default
+   ([None]) preserves the original #222 behaviour exactly (Full, untagged
+   variants). *)
+let sqlocaml_durability = ref Sqlocaml_store.Store.Full
+
+let durability_label (d : Sqlocaml_store.Store.durability) =
+  match d with
+  | Sqlocaml_store.Store.Full -> "full"
+  | Sqlocaml_store.Store.Off -> "off"
+  | Sqlocaml_store.Store.Batched { commits; interval_ms } ->
+    Printf.sprintf "batched-n%d-t%dms" commits interval_ms
+;;
+
+let batched_from_env () =
+  Sqlocaml_store.Store.Batched
+    { commits = env_int "SQLOCAML_BENCH_BATCH_N" 256
+    ; interval_ms = env_int "SQLOCAML_BENCH_BATCH_T_MS" 100
+    }
+;;
+
+let parse_durability s : Sqlocaml_store.Store.durability =
+  match String.lowercase_ascii s with
+  | "full" -> Sqlocaml_store.Store.Full
+  | "off" -> Sqlocaml_store.Store.Off
+  | "batched" -> batched_from_env ()
+  | other ->
+    failwith
+      (Printf.sprintf
+         "SQLOCAML_BENCH_DURABILITY: unknown mode %s (full|batched|off|sweep)"
+         other)
+;;
+
 (* Deterministic pk sequence for point lookups — no wall-clock/random seed so
    both engines hit the SAME keys in the SAME order. Simple LCG mod rows. *)
 let lookup_keys ~rows ~n =
@@ -99,13 +134,29 @@ module Sqlocaml : ENGINE = struct
      | _ -> ());
     (try Unix.unlink (path ^ "-wal") with
      | _ -> ());
+    (* #332: a real wall-clock so the batched T trigger fires (the default clock
+       returns 0, disabling the time-based fsync); forward the selected
+       durability mode to the WAL commit path. Harmless under Full. *)
     let db =
       match key with
-      | None -> unwrap (run (Sqlocaml_unix.open_file_wal ~path ()))
+      | None ->
+        unwrap
+          (run
+             (Sqlocaml_unix.open_file_wal
+                ~durability:!sqlocaml_durability
+                ~clock:Unix.gettimeofday
+                ~path
+                ()))
       | Some k ->
         (match run (Sqlocaml_unix.Store.open_file_wal ~key:k ~path ()) with
          | Error _ -> Alcotest.fail "sqlocaml: encrypted open failed"
-         | Ok store -> run (Db.of_store ~file_path:path store))
+         | Ok store ->
+           run
+             (Db.of_store
+                ~file_path:path
+                ~durability:!sqlocaml_durability
+                ~clock:Unix.gettimeofday
+                store))
     in
     { db }
   ;;
@@ -568,8 +619,36 @@ let () =
   match Sys.getenv_opt "SQLOCAML_BENCH_SMOKE" with
   | Some ("1" | "true") -> smoke ()
   | _ ->
+    (* Header + the SQLite reference baseline (always synchronous=FULL) are
+       common to every mode; only the sqlocaml variant list differs. *)
     print_string (csv_header ^ "\n");
     run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
-    run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
-    run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
+    (match
+       Option.map String.lowercase_ascii (Sys.getenv_opt "SQLOCAML_BENCH_DURABILITY")
+     with
+     | None ->
+       (* Original #222 behaviour, unchanged: sqlocaml runs under Full. *)
+       run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
+       run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
+     | Some "sweep" ->
+       (* #332: one CSV comparing commit throughput across all three durability
+          modes (plaintext only — the durability knob is orthogonal to
+          encryption). *)
+       List.iter
+         (fun d ->
+            sqlocaml_durability := d;
+            run_engine
+              (module Sqlocaml)
+              ~variant:("plaintext/" ^ durability_label d)
+              ~key:None)
+         [ Sqlocaml_store.Store.Full; batched_from_env (); Sqlocaml_store.Store.Off ]
+     | Some mode ->
+       (* A single explicit mode; variant tagged so the CSV is self-describing. *)
+       sqlocaml_durability := parse_durability mode;
+       let lbl = durability_label !sqlocaml_durability in
+       run_engine (module Sqlocaml) ~variant:("plaintext/" ^ lbl) ~key:None;
+       run_engine
+         (module Sqlocaml)
+         ~variant:("encrypted/" ^ lbl)
+         ~key:(Some (String.make 32 'K')))
 ;;

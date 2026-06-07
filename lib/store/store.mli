@@ -122,7 +122,24 @@ val open_block_wal
   -> unit
   -> (t, error) result Lwt.t
 
-(** Close the store. After this, any use of the store or its txns is
+(** Close the store: drain in-flight background work, fsync any unsynced WAL
+    frames (batched/off modes), then release the WAL and backing fds.  Raises if
+    the final fsync fails (close is a durability anchor — an EIO/ENOSPC is
+    surfaced, not swallowed).
+
+    Quiesce contract (#338).  [close] does NOT acquire the write lock — an
+    abandoned write transaction holds it until commit/rollback, and close must
+    not hang on that.  Instead:
+    - Callers MUST stop issuing new transactions before calling [close]; a write
+      begun after close starts is rejected ({!rw_begin} fails once closing).
+    - An in-flight autocheckpoint or replication sink ship that is actively
+      touching the fds is drained first, so teardown never pulls the WAL/pager
+      out from under it.
+    - An autocheckpoint merely parked (on the replication floor, or on the write
+      lock behind an open txn) is abandoned cleanly without performing its I/O;
+      its frames remain in the WAL and replay on next open (no data loss).
+
+    After [close] returns, any further use of the store or its txns is
     undefined. *)
 val close : t -> unit Lwt.t
 
@@ -283,7 +300,18 @@ val durability : t -> durability
     When the mode actually changes, the batched durability counters
     ([unsynced_commits] and the T window) are reset, so a long [Off] period
     does not carry a stale count into [Batched]; durability is unaffected
-    because checkpoint/close remain the anchors. *)
+    because checkpoint/close remain the anchors.
+
+    Contract while a replication commit-sink is active (#336): a request to
+    relax below [Full] ([Batched]/[Off]) is SILENTLY IGNORED at this Store-API
+    layer — the mode stays [Full], though any [Batched] N/T params supplied are
+    still recorded so they take effect once the sink is removed (see
+    {!set_commit_callback}, {!commit_callback_active}).  This deliberately
+    differs from the SQL layer, where [PRAGMA synchronous] raises on the same
+    request: an embedder driving the store directly opts into the "configure
+    now, apply on sink removal" ergonomics, whereas an interactive SQL user
+    expects an explicit error.  Use {!commit_callback_active} to check before
+    calling if you need a signal. *)
 val set_durability : t -> durability -> unit
 
 (** Batched commit-count threshold N (default 256). Independent of the active
@@ -466,11 +494,17 @@ val set_replication_gate_max_yields : t -> int -> unit
     A registered replication commit-sink pins durability to [Full];
     [Batched]/[Off] are rejected while a sink is active, because the checkpoint
     replica-floor gate requires every committed frame to be shipped, which only
-    holds when every commit fsyncs. *)
+    holds when every commit fsyncs.
+
+    Registering a sink first {!flush_unsynced}es any committed-but-unsynced
+    frames (#336): a store opened [off]/[batched] may have acked commits still
+    in the OS page cache, and registration pins [Full] going forward but ships
+    only NEW frames — so those historical frames are fsynced now rather than
+    left crash-exposed.  This is why registration returns an [Lwt.t]. *)
 val set_commit_callback
   :  t
   -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
-  -> unit
+  -> unit Lwt.t
 
 (** True iff a replication commit-sink is currently registered (see
     {!set_commit_callback}). While active, durability is pinned to [Full]. *)
