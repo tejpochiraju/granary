@@ -492,11 +492,16 @@ let test_checkpoint_waits_for_in_flight_ship () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* #338: close must wait for an in-flight autocheckpoint rather than    *)
-(* tearing down the WAL/pager fds underneath a parked checkpoint.       *)
+(* #338: close drains an in-flight autocheckpoint without tearing down  *)
+(* fds underneath it — and without acquiring t.lock (which an abandoned  *)
+(* write txn or a floor-stranded checkpoint would hang it on).          *)
 (* ------------------------------------------------------------------ *)
 
-let test_close_waits_for_in_flight_checkpoint () =
+(* #338 (review #3): close must NOT take the write lock — an abandoned write txn
+   holds it until commit/rollback (reachable from Db.close, which does not finish
+   active txns), so close would deadlock.  Here a txn is left open; close must
+   still complete. *)
+let test_close_does_not_hang_on_open_txn () =
   Lwt_main.run
     (let* sr = open_test_store () in
      let st =
@@ -504,14 +509,51 @@ let test_close_waits_for_in_flight_checkpoint () =
        | Ok s -> s
        | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
-     (* Build up some frames without tripping the (default high) threshold. *)
+     let* (_ : Store.rw Store.txn) = Store.rw_begin st in
+     (* txn deliberately neither committed nor rolled back: it holds the write
+        lock. *)
+     let close_p = Store.close st in
+     let* () =
+       wait_for
+         (fun () ->
+            match Lwt.state close_p with
+            | Lwt.Sleep -> false
+            | _ -> true)
+         50
+     in
+     Alcotest.(check bool)
+       "close completes despite an open write txn (no deadlock on t.lock)"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Return () -> true
+        | _ -> false);
+     Lwt.return_unit)
+;;
+
+(* #338 (review #2/#4): close drains an in-flight autocheckpoint that is parked
+   on a stranded replication floor.  It must complete WITHOUT advancing the floor
+   (it signals teardown so the checkpoint unwinds) and must not checkpoint under
+   teardown (epoch unchanged — no Wal.reset on the about-to-close fds). *)
+let test_close_drains_in_flight_checkpoint () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
      let* rw = Store.rw_begin st in
      let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
      let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
      let* () = Store.commit rw in
+     let epoch0, _ =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
      (* Pin the floor low and lower the threshold so the next commit dispatches
         an autocheckpoint that PARKS (holding the write lock) on the floor gate,
-        leaving [autockpt_in_flight = true]. *)
+        leaving [autockpt_in_flight = true].  The floor is never advanced. *)
      Store.update_replication_position st ~shipped:0;
      Store.set_wal_autocheckpoint st 3;
      let* rw2 = Store.rw_begin st in
@@ -519,24 +561,30 @@ let test_close_waits_for_in_flight_checkpoint () =
      let* () = Store.put rw2 16 (Bytes.of_string "k4") (Bytes.of_string "v4") in
      let* () = Store.commit rw2 in
      let* () = wait_for (fun () -> false) 20 in
-     (* close must not return while the autocheckpoint is parked in flight. *)
      let close_p = Store.close st in
-     let* () = wait_for (fun () -> false) 10 in
+     let* () =
+       wait_for
+         (fun () ->
+            match Lwt.state close_p with
+            | Lwt.Sleep -> false
+            | _ -> true)
+         50
+     in
      Alcotest.(check bool)
-       "close blocks while an autocheckpoint is in flight"
-       true
-       (match Lwt.state close_p with
-        | Lwt.Sleep -> true
-        | _ -> false);
-     (* Wake the parked checkpoint; close then drains it and completes. *)
-     Store.update_replication_position st ~shipped:max_int;
-     let* () = close_p in
-     Alcotest.(check bool)
-       "close completed after in-flight autocheckpoint drained"
+       "close completes despite a floor-stranded in-flight checkpoint"
        true
        (match Lwt.state close_p with
         | Lwt.Return () -> true
         | _ -> false);
+     let epoch1, _ =
+       match Store.replication_state st with
+       | Some s -> s
+       | None -> Alcotest.failf "expected WAL mode"
+     in
+     Alcotest.(check int64)
+       "in-flight checkpoint aborted at close (epoch unchanged)"
+       epoch0
+       epoch1;
      Lwt.return_unit)
 ;;
 
@@ -574,9 +622,13 @@ let () =
             `Quick
             test_checkpoint_waits_for_in_flight_ship
         ; Alcotest.test_case
-            "#338 close waits for in-flight checkpoint"
+            "#338 close does not hang on an open txn"
             `Quick
-            test_close_waits_for_in_flight_checkpoint
+            test_close_does_not_hang_on_open_txn
+        ; Alcotest.test_case
+            "#338 close drains in-flight checkpoint"
+            `Quick
+            test_close_drains_in_flight_checkpoint
         ] )
     ]
 ;;

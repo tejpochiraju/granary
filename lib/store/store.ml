@@ -188,6 +188,13 @@ type bt_state =
        replication sink ([on_committed_frames]).  The sink is fired ONLY for
        frames that have been fsynced, so a standby can never lead a
        crash-recovered master.  Reset to 0 on checkpoint (new epoch). *)
+  ; mutable closing : bool
+    (* #338: set by [close] to signal teardown.  [maybe_autockpt_after_commit]
+       then dispatches no fresh checkpoint, and an in-flight/parked one unwinds
+       without touching the pager/WAL fds ([checkpoint_unlocked] and
+       [wait_for_readers_past] bail on it).  Lets [close] drain checkpoints
+       without acquiring [t.lock] — which an abandoned write txn holds until
+       commit/rollback, so taking it would hang close. *)
   ; mutable sink_ships_in_flight : int
     (* #337: count of async sink ships dispatched but not yet completed.  The
        ship callback reads WAL frame payloads LAZILY ([Wal.read_frame]); a
@@ -598,6 +605,7 @@ let make_btree_store
     ; clock = (fun () -> 0.)
     ; sink_shipped_frames = 0
     ; sink_ships_in_flight = 0
+    ; closing = false
     }
   in
   { backend = Btree st
@@ -611,67 +619,71 @@ let close (t : t) : unit Lwt.t =
   match t.backend with
   | Mem _ -> Lwt.return_unit
   | Btree st ->
-    (* #338: serialize teardown against the async autocheckpoint, which holds
-       [t.lock] while touching the WAL/pager.  First drain any in-flight
-       checkpoint — it needs the lock, so we must NOT hold the lock while
-       waiting (a held lock would deadlock it) — then take the write lock for
-       the whole teardown so no fresh checkpoint I/O can race the fd close.
-       (A checkpoint parked indefinitely on a stranded replication floor will
-       block close just as it blocks [checkpoint]; that is the existing,
-       budget-mitigated contract — see [wait_for_readers_past].) *)
+    (* #338: an async autocheckpoint touches the pager/WAL while holding
+       [t.lock]; tearing the fds down underneath it corrupts the (swallowed)
+       checkpoint and relies on WAL-replay self-healing.  Rather than take
+       [t.lock] for teardown — which an abandoned write txn holds until
+       commit/rollback, so [close] would hang on it (and a stranded
+       replication floor would hang a checkpoint holding it) — signal teardown
+       via [st.closing]:
+
+       - [maybe_autockpt_after_commit] dispatches no fresh checkpoint once set;
+       - an in-flight/parked checkpoint unwinds without fd I/O
+         ([wait_for_readers_past] and [checkpoint_unlocked] bail on [closing]);
+       - the broadcast wakes a checkpoint parked on the replication floor so it
+         observes [closing] and exits.
+
+       We then wait — event-driven on [reader_done_cond], which the checkpoint
+       fiber broadcasts when it clears [autockpt_in_flight] — for any in-flight
+       checkpoint to finish before touching the fds.  Callers must still quiesce
+       their own writers before [close] (see store.mli). *)
+    st.closing <- true;
+    Lwt_condition.broadcast st.reader_done_cond ();
     let rec wait_autockpt () =
       if st.autockpt_in_flight
       then
-        let* () = Lwt.pause () in
+        let* () = Lwt_condition.wait st.reader_done_cond in
         wait_autockpt ()
       else Lwt.return_unit
     in
     let* () = wait_autockpt () in
-    let* () = Rwlock.acquire_write t.lock in
-    Lwt.finalize
-      (fun () ->
-         (* #298: in batched/off mode the last acked commits may never have been
-            fsynced. Decide on the WAL's actual committed-frame state rather than
-            the in-memory unsynced counter, which a concurrent no-sync committer
-            can race. A redundant fsync here (frames already durable) is cheap
-            and safe; skipping a needed one is not. Full mode syncs every
-            commit. *)
-         let needs_final_sync =
-           st.sync_mode <> `Full
-           &&
-           match st.wal with
-           | Some w -> Sqlocaml_storage.Wal.committed_frames w > 0
-           | None -> false
-         in
-         (* #298/#2: a failed final fsync still releases the fds
-            (wal_close/close_fn) but THEN raises — close is a durability anchor,
-            so silently reporting success on EIO/ENOSPC is wrong (matches the
-            commit/checkpoint convention of surfacing sync errors). *)
-         let* sync_err =
-           if needs_final_sync
-           then
-             let* r = Pager.wal_sync st.pager in
-             match r with
-             | Ok () ->
-               st.unsynced_commits <- 0;
-               Lwt.return_none
-             | Error e -> Lwt.return_some e
-           else Lwt.return_none
-         in
-         let* () =
-           match st.wal_close with
-           | None -> Lwt.return_unit
-           | Some f -> f ()
-         in
-         let* () = st.close_fn () in
-         match sync_err with
-         | None -> Lwt.return_unit
-         | Some e ->
-           Lwt.fail_with
-             (Format.asprintf "Store.close: final wal_sync: %a" Pager.pp_error e))
-      (fun () ->
-         Rwlock.release_write t.lock;
-         Lwt.return_unit)
+    (* #298: in batched/off mode the last acked commits may never have been
+       fsynced. Decide on the WAL's actual committed-frame state rather than the
+       in-memory unsynced counter. A redundant fsync here (frames already
+       durable) is cheap and safe; skipping a needed one is not. Full mode syncs
+       every commit. *)
+    let needs_final_sync =
+      st.sync_mode <> `Full
+      &&
+      match st.wal with
+      | Some w -> Sqlocaml_storage.Wal.committed_frames w > 0
+      | None -> false
+    in
+    (* #298/#2: a failed final fsync still releases the fds (wal_close/close_fn)
+       but THEN raises — close is a durability anchor, so silently reporting
+       success on EIO/ENOSPC is wrong (matches the commit/checkpoint convention
+       of surfacing sync errors). *)
+    let* sync_err =
+      if needs_final_sync
+      then
+        let* r = Pager.wal_sync st.pager in
+        match r with
+        | Ok () ->
+          st.unsynced_commits <- 0;
+          Lwt.return_none
+        | Error e -> Lwt.return_some e
+      else Lwt.return_none
+    in
+    let* () =
+      match st.wal_close with
+      | None -> Lwt.return_unit
+      | Some f -> f ()
+    in
+    let* () = st.close_fn () in
+    (match sync_err with
+     | None -> Lwt.return_unit
+     | Some e ->
+       Lwt.fail_with (Format.asprintf "Store.close: final wal_sync: %a" Pager.pp_error e))
 ;;
 
 (* #95: discover the file's geometry by reading page 0's leading bytes through
@@ -1245,7 +1257,12 @@ let write_freelist_pages pager : int64 Lwt.t =
     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
     can invoke it via [maybe_autocheckpoint] below. *)
 let rec wait_for_readers_past (st : bt_state) ~target ~max_floor_yields =
-  if ro_readers_below st ~target
+  if st.closing
+  then
+    (* #338: close is tearing down — stop gating so a parked checkpoint unwinds;
+       [checkpoint_unlocked] then aborts before any fd I/O. *)
+    Lwt.return_unit
+  else if ro_readers_below st ~target
   then
     (* A local reader blocks: wait unconditionally on the broadcast. *)
     let* () = Lwt_condition.wait st.reader_done_cond in
@@ -1272,57 +1289,64 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let* () =
     wait_for_readers_past st ~target ~max_floor_yields:st.replication_gate_max_yields
   in
-  let pairs = ref [] in
-  Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
-  let rec write_each = function
-    | [] -> Lwt.return_unit
-    | (pid, idx) :: rest ->
-      let* r = Wal.read_frame wal idx in
-      (match r with
-       | Error e -> Lwt.fail_with (Format.asprintf "checkpoint read: %a" Wal.pp_error e)
-       | Ok page ->
-         let* wr = Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page in
-         (match wr with
-          | Error e ->
-            Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
-          | Ok () -> write_each rest))
-  in
-  let* () = write_each !pairs in
-  let* sr = Pager.flush_sync_main st.pager in
-  match sr with
-  | Error e -> Lwt.fail_with (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
-  | Ok () ->
-    (* #337: an async sink ship dispatched from [commit_wal] reads its frame
+  if st.closing
+  then
+    (* #338: [close] signalled teardown while we were gated — abort before any
+       pager/WAL fd I/O.  [close] fsyncs the WAL itself; the un-migrated frames
+       replay on next open.  No data loss. *)
+    Lwt.return_unit
+  else (
+    let pairs = ref [] in
+    Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+    let rec write_each = function
+      | [] -> Lwt.return_unit
+      | (pid, idx) :: rest ->
+        let* r = Wal.read_frame wal idx in
+        (match r with
+         | Error e -> Lwt.fail_with (Format.asprintf "checkpoint read: %a" Wal.pp_error e)
+         | Ok page ->
+           let* wr = Pager.flush_one_to_main st.pager ~page_id:pid ~buf:page in
+           (match wr with
+            | Error e ->
+              Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
+            | Ok () -> write_each rest))
+    in
+    let* () = write_each !pairs in
+    let* sr = Pager.flush_sync_main st.pager in
+    match sr with
+    | Error e -> Lwt.fail_with (Format.asprintf "checkpoint sync: %a" Pager.pp_error e)
+    | Ok () ->
+      (* #337: an async sink ship dispatched from [commit_wal] reads its frame
        payloads LAZILY.  [Wal.reset] below recycles/zeroes those frames and
        bumps the epoch, so wait for any in-flight ship to finish reading first.
        The ship runs without [t.lock] (it only reads frames), so it makes
        progress while this fiber holds the lock and parks here; it broadcasts
        [reader_done_cond] on completion.  The check-then-reset is yield-free, so
        no ship dispatched after the count reaches 0 can slip in before reset. *)
-    let rec wait_ships () =
-      if st.sink_ships_in_flight > 0
-      then
-        let* () = Lwt_condition.wait st.reader_done_cond in
-        wait_ships ()
-      else Lwt.return_unit
-    in
-    let* () = wait_ships () in
-    Wal.reset wal;
-    (* #298/#1: checkpoint is a full-sync durability anchor — everything is now
+      let rec wait_ships () =
+        if st.sink_ships_in_flight > 0
+        then
+          let* () = Lwt_condition.wait st.reader_done_cond in
+          wait_ships ()
+        else Lwt.return_unit
+      in
+      let* () = wait_ships () in
+      Wal.reset wal;
+      (* #298/#1: checkpoint is a full-sync durability anchor — everything is now
        durable and the WAL starts a fresh epoch at frame 0.  Reset the sink
        ship counter (new epoch) and the batched durability counters so a long
        unsynced window doesn't carry stale state across the anchor. *)
-    st.sink_shipped_frames <- 0;
-    st.unsynced_commits <- 0;
-    st.last_sync_time <- st.clock ();
-    (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
+      st.sink_shipped_frames <- 0;
+      st.unsynced_commits <- 0;
+      st.last_sync_time <- st.clock ();
+      (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
        committed_frames, but [replication_shipped_frames] still refers to the
        old epoch's absolute count.  Without re-pinning, the next checkpoint
        would see a stale floor that appears to be past the new target,
        silently allowing frame recycling before the sink ships them. *)
-    if st.on_committed_frames <> None
-    then st.replication_shipped_frames <- Wal.committed_frames wal;
-    Lwt.return_unit
+      if st.on_committed_frames <> None
+      then st.replication_shipped_frames <- Wal.committed_frames wal;
+      Lwt.return_unit)
 ;;
 
 (** Called from [commit] while [lock] is still held (exclusive). If the WAL has
@@ -1507,7 +1531,9 @@ let commit_prepare_btree
    the WAL has grown past the threshold and none is already in flight. *)
 let maybe_autockpt_after_commit t st =
   if
-    st.wal_autocheckpoint_threshold <= 0
+    st.closing
+    (* #338: no fresh checkpoint once close has signalled teardown. *)
+    || st.wal_autocheckpoint_threshold <= 0
     || Wal.committed_frames
          (match st.wal with
           | Some w -> w
@@ -1534,6 +1560,8 @@ let maybe_autockpt_after_commit t st =
              (fun _ -> Lwt.return_unit))
         (fun () ->
            st.autockpt_in_flight <- false;
+           (* #338: wake a [close] awaiting the in-flight checkpoint to drain. *)
+           Lwt_condition.broadcast st.reader_done_cond ();
            Lwt.return_unit));
     Lwt.return_unit)
 ;;
@@ -2679,30 +2707,43 @@ let set_commit_callback
        st.replication_shipped_frames <- max_int;
        Lwt.return_unit
      | Some _ ->
-       (* #336/1: flush any committed-but-unsynced frames NOW, while still in
-          the old mode ([flush_unsynced] is a no-op once we pin [Full] below).
-          A store opened [off]/[batched] may have acked commits sitting in the
-          OS page cache; registration ships only NEW frames, so without this
-          those historical frames would linger crash-exposed until the next
-          commit/checkpoint/close despite the sink implying synchronous=full. *)
-       let* () = flush_unsynced t in
-       st.on_committed_frames <- cb;
-       (* #298: a replication commit-sink requires Full durability — the
-          checkpoint replica-floor gate assumes every committed frame is
-          shipped, which only holds when every commit fsyncs. Force Full on
-          registration; relaxing durability is rejected while a sink is active
-          (see set_durability / the PRAGMA handler). *)
-       st.sync_mode <- `Full;
-       (* Pin the current committed_frames so the async sink can safely
-          read frames before advancing the position. *)
-       (match st.wal with
-        | None -> ()
-        | Some wal ->
-          st.replication_shipped_frames <- Wal.committed_frames wal;
-          (* #298/#1: a sink registered mid-life ships only NEW synced frames,
-             not history — start the ship cursor at the current count. *)
-          st.sink_shipped_frames <- Wal.committed_frames wal);
-       Lwt.return_unit)
+       (* #336/1 + review #1: do the flush AND the pin atomically under the
+          write lock.  [flush_unsynced] yields (group-commit drain); without the
+          lock a concurrent commit could interleave in the OLD mode (no fsync,
+          no ship — cb not yet set), and the subsequent
+          [sink_shipped_frames <- committed_frames] pin would then bury those
+          frames below the ship cursor forever (silent standby divergence). The
+          lock blocks new commits ([rw_begin]) for the brief flush+pin so the
+          cursor pins exactly the pre-registration frontier. *)
+       let* () = Rwlock.acquire_write t.lock in
+       Lwt.finalize
+         (fun () ->
+            (* Flush while still in the old mode — [flush_unsynced] is a no-op
+               once we pin [Full] below.  A store opened [off]/[batched] may have
+               acked commits in the OS page cache; the sink ships only NEW
+               frames, so these historical frames would otherwise linger
+               crash-exposed until the next commit/checkpoint/close despite the
+               sink implying synchronous=full. *)
+            let* () = flush_unsynced t in
+            st.on_committed_frames <- cb;
+            (* #298: a replication commit-sink requires Full durability — the
+               checkpoint replica-floor gate assumes every committed frame is
+               shipped, which only holds when every commit fsyncs. Force Full on
+               registration; relaxing durability is rejected while a sink is
+               active (see set_durability / the PRAGMA handler). *)
+            st.sync_mode <- `Full;
+            (match st.wal with
+             | None -> ()
+             | Some wal ->
+               st.replication_shipped_frames <- Wal.committed_frames wal;
+               (* #298/#1: a sink registered mid-life ships only NEW synced
+                  frames, not history — start the ship cursor at the current
+                  count. *)
+               st.sink_shipped_frames <- Wal.committed_frames wal);
+            Lwt.return_unit)
+         (fun () ->
+            Rwlock.release_write t.lock;
+            Lwt.return_unit))
 ;;
 
 (* ------------------------------------------------------------------ *)

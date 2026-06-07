@@ -619,20 +619,19 @@ let () =
   match Sys.getenv_opt "SQLOCAML_BENCH_SMOKE" with
   | Some ("1" | "true") -> smoke ()
   | _ ->
+    (* Header + the SQLite reference baseline (always synchronous=FULL) are
+       common to every mode; only the sqlocaml variant list differs. *)
+    print_string (csv_header ^ "\n");
+    run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
     (match Sys.getenv_opt "SQLOCAML_BENCH_DURABILITY" with
      | None ->
        (* Original #222 behaviour, unchanged: sqlocaml runs under Full. *)
-       print_string (csv_header ^ "\n");
-       run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
        run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
        run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
      | Some ("sweep" | "SWEEP") ->
        (* #332: one CSV comparing commit throughput across all three durability
           modes (plaintext only — the durability knob is orthogonal to
-          encryption).  SQLite's reference (always FULL) is emitted once as the
-          cross-engine baseline. *)
-       print_string (csv_header ^ "\n");
-       run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
+          encryption). *)
        List.iter
          (fun d ->
             sqlocaml_durability := d;
@@ -645,8 +644,6 @@ let () =
        (* A single explicit mode; variant tagged so the CSV is self-describing. *)
        sqlocaml_durability := parse_durability mode;
        let lbl = durability_label !sqlocaml_durability in
-       print_string (csv_header ^ "\n");
-       run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
        run_engine (module Sqlocaml) ~variant:("plaintext/" ^ lbl) ~key:None;
        run_engine
          (module Sqlocaml)
