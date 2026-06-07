@@ -191,9 +191,11 @@ let test_replication_gating_survives_epoch_bump () =
        | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
      (* Register callback so checkpoint_unlocked re-pins the floor. *)
-     Store.set_commit_callback
-       st
-       (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit));
+     let* () =
+       Store.set_commit_callback
+         st
+         (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit))
+     in
      Store.set_wal_autocheckpoint st 3;
      (* Epoch 0: commit, ship, let checkpoint proceed. *)
      let* rw = Store.rw_begin st in
@@ -259,7 +261,7 @@ let test_replication_gating_survives_epoch_bump () =
      in
      Alcotest.(check bool) "epoch bumped after unblock" true (epoch3 > epoch2);
      Alcotest.(check bool) "WAL reset after unblock" true (frames3 < frames2);
-     Store.set_commit_callback st None;
+     let* () = Store.set_commit_callback st None in
      let* () = Store.close st in
      Lwt.return_unit)
 ;;
@@ -413,22 +415,128 @@ let test_commit_callback_fired () =
      let cb_fired = ref false in
      let cb_count = ref 0 in
      let cb_promise, cb_resolver = Lwt.wait () in
-     Store.set_commit_callback
-       st
-       (Some
-          (fun ~epoch:_ ~base_idx:_ ~count ->
-            cb_fired := true;
-            cb_count := count;
-            Lwt.wakeup cb_resolver ();
-            Lwt.return_unit));
+     let* () =
+       Store.set_commit_callback
+         st
+         (Some
+            (fun ~epoch:_ ~base_idx:_ ~count ->
+              cb_fired := true;
+              cb_count := count;
+              Lwt.wakeup cb_resolver ();
+              Lwt.return_unit))
+     in
      let* rw = Store.rw_begin st in
      let* () = Store.put rw 16 (Bytes.of_string "hello") (Bytes.of_string "world") in
      let* () = Store.commit rw in
      let* () = cb_promise in
      Alcotest.(check bool) "callback fired" true !cb_fired;
      Alcotest.(check bool) "non-zero count" true (!cb_count > 0);
-     Store.set_commit_callback st None;
+     let* () = Store.set_commit_callback st None in
      let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #337: an autocheckpoint must not Wal.reset out from under a sink     *)
+(* ship that is still in flight (the async cb reads frames lazily).     *)
+(* ------------------------------------------------------------------ *)
+
+let test_checkpoint_waits_for_in_flight_ship () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     let epoch_changed_under_cb = ref false in
+     let cb_completed = ref false in
+     (* A slow lazy reader: yield repeatedly, each time checking that the epoch
+        we were shipped is still the live epoch.  If a checkpoint resets the WAL
+        while we are in flight, [replication_state] reports a bumped epoch — the
+        exact corruption #337 describes (a real reader would get Corrupt_frame
+        with a stale epoch). *)
+     let cb ~epoch ~base_idx:_ ~count:_ =
+       let rec spin n =
+         if n = 0
+         then (
+           cb_completed := true;
+           Lwt.return_unit)
+         else (
+           (match Store.replication_state st with
+            | Some (e, _) when not (Int64.equal e epoch) -> epoch_changed_under_cb := true
+            | _ -> ());
+           let* () = Lwt.pause () in
+           spin (n - 1))
+       in
+       spin 12
+     in
+     let* () = Store.set_commit_callback st (Some cb) in
+     Store.set_wal_autocheckpoint st 1;
+     (* Lift the acked-position floor to max_int so the checkpoint is gated ONLY
+        by the in-flight-ship guard, not by the floor. *)
+     Store.update_replication_position st ~shipped:max_int;
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let* () = Store.put rw 16 (Bytes.of_string "b") (Bytes.of_string "2") in
+     let* () = Store.commit rw in
+     let* () = wait_for (fun () -> !cb_completed) 100 in
+     Alcotest.(check bool) "ship callback ran to completion" true !cb_completed;
+     Alcotest.(check bool)
+       "WAL not reset out from under in-flight sink ship"
+       false
+       !epoch_changed_under_cb;
+     let* () = Store.set_commit_callback st None in
+     let* () = Store.close st in
+     Lwt.return_unit)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #338: close must wait for an in-flight autocheckpoint rather than    *)
+(* tearing down the WAL/pager fds underneath a parked checkpoint.       *)
+(* ------------------------------------------------------------------ *)
+
+let test_close_waits_for_in_flight_checkpoint () =
+  Lwt_main.run
+    (let* sr = open_test_store () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     (* Build up some frames without tripping the (default high) threshold. *)
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
+     let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
+     let* () = Store.commit rw in
+     (* Pin the floor low and lower the threshold so the next commit dispatches
+        an autocheckpoint that PARKS (holding the write lock) on the floor gate,
+        leaving [autockpt_in_flight = true]. *)
+     Store.update_replication_position st ~shipped:0;
+     Store.set_wal_autocheckpoint st 3;
+     let* rw2 = Store.rw_begin st in
+     let* () = Store.put rw2 16 (Bytes.of_string "k3") (Bytes.of_string "v3") in
+     let* () = Store.put rw2 16 (Bytes.of_string "k4") (Bytes.of_string "v4") in
+     let* () = Store.commit rw2 in
+     let* () = wait_for (fun () -> false) 20 in
+     (* close must not return while the autocheckpoint is parked in flight. *)
+     let close_p = Store.close st in
+     let* () = wait_for (fun () -> false) 10 in
+     Alcotest.(check bool)
+       "close blocks while an autocheckpoint is in flight"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Sleep -> true
+        | _ -> false);
+     (* Wake the parked checkpoint; close then drains it and completes. *)
+     Store.update_replication_position st ~shipped:max_int;
+     let* () = close_p in
+     Alcotest.(check bool)
+       "close completed after in-flight autocheckpoint drained"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Return () -> true
+        | _ -> false);
      Lwt.return_unit)
 ;;
 
@@ -459,6 +567,16 @@ let () =
             "timeout never abandons RO reader"
             `Quick
             test_gate_timeout_never_abandons_ro_reader
+        ] )
+    ; ( "in_flight_safety"
+      , [ Alcotest.test_case
+            "#337 checkpoint waits for in-flight ship"
+            `Quick
+            test_checkpoint_waits_for_in_flight_ship
+        ; Alcotest.test_case
+            "#338 close waits for in-flight checkpoint"
+            `Quick
+            test_close_waits_for_in_flight_checkpoint
         ] )
     ]
 ;;

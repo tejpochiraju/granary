@@ -1,0 +1,14 @@
+host=otp-infra-1-hdd
+issue=332
+date=2026-06-07T11:03:41Z
+nproc=8
+disk=sda      1 HGST HUS724020AL;sdb      1 HGST HUS724020AL;
+fs_device=/dev/md3
+rotational=yes (HGST HUS724020AL 7200rpm, md RAID)
+sqlite_version=3.45.1
+sqlocaml_sha=84c2bf6
+branch=fix-338-336-337-durability-followups
+sweep=SQLOCAML_BENCH_DURABILITY=sweep
+rows=2000 ops=1000 scans=10 commits=500 repeats=3 page_cache=1024
+batched_params=N=256,T=100ms
+note=Data dir bind-mounted to host /dev/md3 (rotational) so commit fsync hits the platter, not the podman overlay.
