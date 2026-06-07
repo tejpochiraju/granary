@@ -91,6 +91,9 @@ let set_file_provider p = file_provider_ref := Some p
 
 let open_in_memory ?clock () =
   let store = S.create () in
+  (match clock with
+   | Some c -> S.set_clock store c
+   | None -> ());
   let* catalog = Cat.open_ store in
   Lwt.return
     { store
@@ -151,8 +154,16 @@ let load_triggers_into_hashtbl store trig_tbl =
 
 (* Wrap an already-open store as a [Db.t]: load the catalog, views, and
    triggers.  [file_path] is recorded so VACUUM can rebuild the file in place
-   (Some for file-backed handles, None for in-memory / arbitrary devices). *)
-let of_store ?clock ?file_path store =
+   (Some for file-backed handles, None for in-memory / arbitrary devices).
+   [durability] sets the database-wide durability knob on the store before
+   loading the catalog. *)
+let of_store ?clock ?durability ?file_path store =
+  (match clock with
+   | Some c -> S.set_clock store c
+   | None -> ());
+  (match durability with
+   | Some d -> S.set_durability store d
+   | None -> ());
   let* catalog = Cat.open_ store in
   let views = Hashtbl.create 4 in
   let* () = load_views_into_hashtbl store views in
@@ -177,7 +188,17 @@ let of_store ?clock ?file_path store =
     }
 ;;
 
-let open_block ?geom ~read_page ~write_page ~sync ~resize ~n_pages ~close ()
+let open_block
+      ?geom
+      ?clock
+      ?durability
+      ~read_page
+      ~write_page
+      ~sync
+      ~resize
+      ~n_pages
+      ~close
+      ()
   : (t, error) result Lwt.t
   =
   let* result =
@@ -195,7 +216,7 @@ let open_block ?geom ~read_page ~write_page ~sync ~resize ~n_pages ~close ()
   match result with
   | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
   | Ok store ->
-    let* db = of_store store in
+    let* db = of_store ?clock ?durability store in
     Lwt.return (Ok db)
 ;;
 
@@ -1315,7 +1336,13 @@ let execute_control_op top t sql op =
            (match result with
             | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
             | Ok store ->
-              let* sub_db = of_store ~file_path:path store in
+              let* sub_db =
+                of_store
+                  ?clock:t.clock
+                  ~durability:(S.durability t.store)
+                  ~file_path:path
+                  store
+              in
               Hashtbl.add top.attached schema sub_db;
               Lwt.return (Ok ()))))
   | Sql.Plan.Op_detach { schema } ->

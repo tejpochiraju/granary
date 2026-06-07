@@ -42,6 +42,48 @@ Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
   `Mirage_crypto_rng_unix.use_default ()`); the core library never seeds, to
   stay Mirage-clean.
 
+## Durability modes (`PRAGMA synchronous`)
+
+sqlocaml supports a per-deployment durability setting analogous to SQLite's `synchronous`, gating
+only the WAL group-commit fsync. CoW shadow-paging, snapshot isolation, rollback, and crash
+recovery are unaffected — only *when* commits are fsynced changes.
+
+| Mode | Commit-time fsync | App-process crash | OS / power crash |
+|------|-------------------|-------------------|------------------|
+| `full` (default) | fsync on every group-commit before the commit is acked | no loss | no loss |
+| `batched` | deferred: fsync once `wal_batch_commits` commits accumulate **or** `wal_batch_interval_ms` ms elapse since the last sync (whichever first) | no loss | up to the last synced commit frame (prefix only) |
+| `off` | never on commit | no loss | back to the last checkpoint |
+
+**Configuration** (database-wide):
+
+- `PRAGMA synchronous = full | batched | off`
+- `PRAGMA wal_batch_commits = N` (default 256) — the batched commit-count threshold
+- `PRAGMA wal_batch_interval_ms = T` (default 100) — the batched time threshold (milliseconds)
+- Open-option: `Db.open_block ?durability:(Sqlocaml_store.Store.Batched { commits; interval_ms })` (also `Full` / `Off`)
+- The getters (`PRAGMA synchronous`, `PRAGMA wal_batch_commits`, `PRAGMA wal_batch_interval_ms`) read the current values back.
+
+> **Caveat — `batched` and `off` trade safety for speed.**
+> - **App-process crash is always safe** in every mode: unsynced WAL frames live in the OS page
+>   cache, which survives process death, and recovery replays them.
+> - **`batched`/`off` give no write-ordering guarantee under an OS or power crash** (the same
+>   caveat LMDB documents for `NOSYNC`). Recovery still converges to a *prefix* of acked commits —
+>   never torn or interleaved state, because WAL recovery trusts only checksum-valid,
+>   commit-marked frames — but acked commits in the loss window can be gone.
+> - `batched` bounds the loss window by `wal_batch_commits` (N) or `wal_batch_interval_ms` (T).
+>   `off` is for ephemeral / rebuildable data (bulk load, caches).
+> - Checkpoint and database `close` are always full-sync anchors, so `batched`/`off` data is made
+>   durable there.
+> - The time bound (T) is **opportunistic**: it is checked when a commit arrives or at checkpoint,
+>   and requires a clock supplied via the `?clock` open-option. A fully idle database is not
+>   flushed until the next commit / checkpoint / close.
+> - **Replication:** a registered replication commit-sink requires `synchronous=full`. `batched`/`off`
+>   are rejected while replication is active (the checkpoint replica gate assumes every committed frame
+>   is shipped, which only holds under `full`).
+
+> **Scope:** unlike SQLite, where `synchronous` is per-connection, this setting is
+> **database-wide** — the WAL commit queue is shared across all connections to a store, so a
+> `PRAGMA synchronous` on any connection changes the mode for all of them (last writer wins).
+
 ## Benchmarks
 
 In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements

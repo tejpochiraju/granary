@@ -250,6 +250,82 @@ val wal_mode : t -> bool
     internally so it serialises with commits. *)
 val checkpoint : t -> unit Lwt.t
 
+(** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
+    [Full] fsyncs the WAL on every group-commit before acking (the default,
+    unchanged behaviour).  [Batched] acks immediately and defers the fsync
+    until [commits] un-synced commits accumulate OR [interval_ms] have elapsed
+    since the last sync (whichever first; the time bound needs a clock — see
+    {!set_clock} — otherwise only the commit count triggers).  [Off] never
+    fsyncs on commit.  Checkpoint and {!close} are always full-sync anchors,
+    so [Batched]/[Off] data is made durable there.  The setting is
+    DATABASE-WIDE (the commit queue is shared across connections), not
+    per-connection.  No-op on the in-memory backend.
+
+    {b Crash safety:} an app-process crash is safe in every mode — unsynced
+    WAL frames live in the OS page cache, which survives process death, and
+    recovery replays them.  An OS or power crash with [Batched]/[Off] loses
+    acked commits in the un-synced window; recovery converges to a prefix of
+    acked commits (never torn state), but those commits may be gone. *)
+type durability =
+  | Full
+  | Batched of
+      { commits : int
+      ; interval_ms : int
+      }
+  | Off
+
+(** Current durability mode. Returns [Full] on the in-memory backend. *)
+val durability : t -> durability
+
+(** Set the durability mode. [Batched] params are remembered across switches
+    to [Full]/[Off] (so a later [PRAGMA synchronous=batched] restores them).
+    No-op on the in-memory backend.  Negative [Batched] params are clamped to 0.
+    When the mode actually changes, the batched durability counters
+    ([unsynced_commits] and the T window) are reset, so a long [Off] period
+    does not carry a stale count into [Batched]; durability is unaffected
+    because checkpoint/close remain the anchors. *)
+val set_durability : t -> durability -> unit
+
+(** Batched commit-count threshold N (default 256). Independent of the active
+    mode; only takes effect while the mode is [Batched].
+    Returns the default (256) on the in-memory backend. *)
+val sync_batch_commits : t -> int
+
+(** Set the batched commit-count threshold N (clamped to >= 0). A value of 0
+    DISABLES the commit-count trigger (durability then relies on the time
+    trigger, if any, plus checkpoint/close). No-op on the in-memory backend. *)
+val set_sync_batch_commits : t -> int -> unit
+
+(** Batched time threshold T in milliseconds (default 100).
+    Returns the default (100) on the in-memory backend. *)
+val sync_batch_interval_ms : t -> int
+
+(** Set the batched time threshold T in milliseconds (clamped to >= 0). A value
+    of 0 DISABLES the time trigger (durability then relies on the commit-count
+    trigger, if any, plus checkpoint/close). No-op on the in-memory backend. *)
+val set_sync_batch_interval_ms : t -> int -> unit
+
+(** Force any committed-but-unsynced WAL frames to disk now (batched/off modes).
+    A no-op in [Full] mode, on the in-memory backend, or when nothing is pending.
+    Used when tightening durability (e.g. PRAGMA synchronous=full) so already-acked
+    commits become durable immediately rather than only on the next commit. *)
+val flush_unsynced : t -> unit Lwt.t
+
+(** Parse a durability mode name (case-insensitive "full"|"batched"|"off").
+    Returns [None] for anything else.  [Batched] uses the current default
+    params; callers that need to preserve N/T should construct [Batched] from
+    {!sync_batch_commits}/{!sync_batch_interval_ms} themselves. *)
+val durability_of_string : string -> durability option
+
+(** Canonical lowercase name of a durability mode ("full"|"batched"|"off"). *)
+val string_of_durability : durability -> string
+
+(** Install the wall-clock source ([unit -> float], Unix-epoch seconds) used by
+    [Batched] mode's time threshold. Without one, the default [fun () -> 0.]
+    disables the time trigger (only the commit count fires). No-op on the
+    in-memory backend. *)
+val set_clock : t -> (unit -> float) -> unit
+
 (** Get the per-connection auto-checkpoint threshold (in WAL frames).
     A value of 0 means auto-checkpoint is disabled. Returns 0 on the
     in-memory backend. *)
@@ -385,11 +461,20 @@ val set_replication_gate_max_yields : t -> int -> unit
     reads and ships its first batch.  The consumer must still call
     {!update_replication_position} to advance the floor as frames
     are shipped.  Pass [None] to unregister (resets the floor to
-    [max_int], disabling gating). *)
+    [max_int], disabling gating).
+
+    A registered replication commit-sink pins durability to [Full];
+    [Batched]/[Off] are rejected while a sink is active, because the checkpoint
+    replica-floor gate requires every committed frame to be shipped, which only
+    holds when every commit fsyncs. *)
 val set_commit_callback
   :  t
   -> (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
   -> unit
+
+(** True iff a replication commit-sink is currently registered (see
+    {!set_commit_callback}). While active, durability is pinned to [Full]. *)
+val commit_callback_active : t -> bool
 
 (** -------------------------------------------------------------------- *)
 

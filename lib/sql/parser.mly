@@ -342,6 +342,21 @@ pragma_stmt:
         (try Ast.S_pragma (Ast.Pragma_wal_autocheckpoint_set (Int64.of_string value))
          with Failure _ ->
            failwith (Printf.sprintf "PRAGMA wal_autocheckpoint: expected integer, got %s" value))
+      | "synchronous" ->
+        let lv = String.lowercase_ascii value in
+        (match Sqlocaml_store.Store.durability_of_string lv with
+         | Some _ -> Ast.S_pragma (Ast.Pragma_synchronous_set lv)
+         | None ->
+           failwith (Printf.sprintf
+             "PRAGMA synchronous = %s: expected full|batched|off" value))
+      | "wal_batch_commits" ->
+        (try Ast.S_pragma (Ast.Pragma_wal_batch_commits_set (Int64.of_string value))
+         with Failure _ ->
+           failwith (Printf.sprintf "PRAGMA wal_batch_commits: expected integer, got %s" value))
+      | "wal_batch_interval_ms" ->
+        (try Ast.S_pragma (Ast.Pragma_wal_batch_interval_ms_set (Int64.of_string value))
+         with Failure _ ->
+           failwith (Printf.sprintf "PRAGMA wal_batch_interval_ms: expected integer, got %s" value))
       | "foreign_keys" ->
         let on = match String.lowercase_ascii value with
           | "1" | "on" | "true" -> true
@@ -379,6 +394,9 @@ pragma_stmt:
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
       | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
       | "wal_autocheckpoint" -> Ast.S_pragma Ast.Pragma_wal_autocheckpoint
+      | "synchronous"           -> Ast.S_pragma Ast.Pragma_synchronous
+      | "wal_batch_commits"     -> Ast.S_pragma Ast.Pragma_wal_batch_commits
+      | "wal_batch_interval_ms" -> Ast.S_pragma Ast.Pragma_wal_batch_interval_ms
       | "database_list"   -> Ast.S_pragma Ast.Pragma_database_list
       | "active_database" -> Ast.S_pragma Ast.Pragma_active_database
       | _                 -> Ast.S_pragma (Ast.Pragma_set (name, "")) }

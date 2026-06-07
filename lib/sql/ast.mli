@@ -451,6 +451,12 @@ and pragma_kind =
   | Pragma_wal_autocheckpoint (* PRAGMA wal_autocheckpoint — read threshold *)
   | Pragma_wal_autocheckpoint_set of int64
     (* PRAGMA wal_autocheckpoint = N — set per-connection threshold (0 disables) *)
+  | Pragma_synchronous (* PRAGMA synchronous — read mode (#298) *)
+  | Pragma_synchronous_set of string (* PRAGMA synchronous = full|batched|off *)
+  | Pragma_wal_batch_commits (* PRAGMA wal_batch_commits — read N (#298) *)
+  | Pragma_wal_batch_commits_set of int64 (* PRAGMA wal_batch_commits = N *)
+  | Pragma_wal_batch_interval_ms (* PRAGMA wal_batch_interval_ms — read T (#298) *)
+  | Pragma_wal_batch_interval_ms_set of int64 (* PRAGMA wal_batch_interval_ms = T *)
   | Pragma_database_list (* PRAGMA database_list — list main + attached *)
   | Pragma_active_database (* PRAGMA active_database — read current schema name *)
   | Pragma_active_database_set of

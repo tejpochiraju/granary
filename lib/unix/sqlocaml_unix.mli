@@ -27,20 +27,28 @@ val install : unit -> unit
     [reserved_bytes_per_page] (default 0) set the page geometry when CREATING a
     new file (#95); they are immutable thereafter and ignored when reopening an
     existing file (whose stored geometry is used).  Reopening with an explicit
-    geometry that disagrees with the file is rejected. *)
+    geometry that disagrees with the file is rejected.
+
+    [clock] is forwarded to {!Sqlocaml.Db.of_store} (used by datetime).  Note:
+    durability applies to WAL mode only; the non-WAL commit path syncs inline
+    and ignores the sync mode, so {!open_file} takes no [durability] (#298). *)
 val open_file
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
+  -> ?clock:(unit -> float)
   -> path:string
   -> unit
   -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
 
 (** Open a persistent WAL-mode database ([path] for the main DB, [path ^ "-wal"]
     for the WAL), registering the file provider.  Crash recovery runs
-    automatically at open.  Geometry arguments behave as in {!open_file} (#95). *)
+    automatically at open.  Geometry arguments behave as in {!open_file} (#95).
+    [clock] and [durability] are forwarded to {!Sqlocaml.Db.of_store} (#298). *)
 val open_file_wal
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
+  -> ?clock:(unit -> float)
+  -> ?durability:Sqlocaml_store.Store.durability
   -> path:string
   -> unit
   -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t

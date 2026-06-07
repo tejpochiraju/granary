@@ -5414,6 +5414,15 @@ let op_name = function
   | Plan.Op_pragma_get_wal_autocheckpoint -> "Pragma(get_wal_autocheckpoint)"
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     Printf.sprintf "Pragma(set_wal_autocheckpoint=%Ld)" n
+  | Plan.Op_pragma_get_synchronous -> "Pragma(get_synchronous)"
+  | Plan.Op_pragma_set_synchronous { mode } ->
+    Printf.sprintf "Pragma(set_synchronous=%s)" mode
+  | Plan.Op_pragma_get_wal_batch_commits -> "Pragma(get_wal_batch_commits)"
+  | Plan.Op_pragma_set_wal_batch_commits { n } ->
+    Printf.sprintf "Pragma(set_wal_batch_commits=%Ld)" n
+  | Plan.Op_pragma_get_wal_batch_interval_ms -> "Pragma(get_wal_batch_interval_ms)"
+  | Plan.Op_pragma_set_wal_batch_interval_ms { n } ->
+    Printf.sprintf "Pragma(set_wal_batch_interval_ms=%Ld)" n
   | Plan.Op_vacuum -> "Vacuum"
   | Plan.Op_attach { schema; _ } -> Printf.sprintf "Attach(%s)" schema
   | Plan.Op_detach { schema } -> Printf.sprintf "Detach(%s)" schema
@@ -6464,6 +6473,33 @@ let execute_with_count
   | Plan.Op_pragma_set_wal_autocheckpoint { n } ->
     S.set_wal_autocheckpoint store (Int64.to_int n);
     Lwt.return 0
+  | Plan.Op_pragma_set_synchronous { mode } ->
+    if mode <> "full" && S.commit_callback_active store
+    then
+      failwith
+        "PRAGMA synchronous: durability cannot be relaxed while a replication \
+         commit-sink is active (replication requires synchronous=full)"
+    else (
+      let d =
+        match mode with
+        | "full" -> S.Full
+        | "off" -> S.Off
+        | "batched" ->
+          S.Batched
+            { commits = S.sync_batch_commits store
+            ; interval_ms = S.sync_batch_interval_ms store
+            }
+        | _ -> failwith (Printf.sprintf "PRAGMA synchronous: unknown mode %s" mode)
+      in
+      let* () = if mode = "full" then S.flush_unsynced store else Lwt.return_unit in
+      S.set_durability store d;
+      Lwt.return 0)
+  | Plan.Op_pragma_set_wal_batch_commits { n } ->
+    S.set_sync_batch_commits store (Int64.to_int n);
+    Lwt.return 0
+  | Plan.Op_pragma_set_wal_batch_interval_ms { n } ->
+    S.set_sync_batch_interval_ms store (Int64.to_int n);
+    Lwt.return 0
   | Plan.Op_vacuum ->
     Lwt.fail_with "VACUUM must be executed via Db.execute / Db.vacuum (no Db handle)"
   | Plan.Op_attach _
@@ -6510,7 +6546,11 @@ let execute_with_count
   | Plan.Op_fts_match_scan _
   | Plan.Op_distinct _
   | Plan.Op_sqlite_master
-  | Plan.Op_sqlite_sequence -> failwith "Exec.execute: use Exec.query for read operations"
+  | Plan.Op_sqlite_sequence
+  | Plan.Op_pragma_get_synchronous
+  | Plan.Op_pragma_get_wal_batch_commits
+  | Plan.Op_pragma_get_wal_batch_interval_ms ->
+    failwith "Exec.execute: use Exec.query for read operations"
 ;;
 
 (** Compatibility entry point: discards the rows-affected count. *)
@@ -9335,6 +9375,9 @@ and stream_explain clock params store mode cat analyze inner =
         | Plan.Op_pragma_set_recursive_triggers _
         | Plan.Op_pragma_set_defer_fk _
         | Plan.Op_pragma_set_wal_autocheckpoint _
+        | Plan.Op_pragma_set_synchronous _
+        | Plan.Op_pragma_set_wal_batch_commits _
+        | Plan.Op_pragma_set_wal_batch_interval_ms _
         | Plan.Op_fts_insert _
         | Plan.Op_fts_delete _
         | Plan.Op_create_fts_table _ -> true
@@ -9498,6 +9541,15 @@ and to_stream
   | Plan.Op_pragma_get_wal_autocheckpoint ->
     let n = S.wal_autocheckpoint store in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
+  | Plan.Op_pragma_get_synchronous ->
+    let s = S.string_of_durability (S.durability store) in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_text s |] ])
+  | Plan.Op_pragma_get_wal_batch_commits ->
+    let n = S.sync_batch_commits store in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
+  | Plan.Op_pragma_get_wal_batch_interval_ms ->
+    let n = S.sync_batch_interval_ms store in
+    Lwt.return (Lwt_stream.of_list [ [| Row.V_int (Int64.of_int n) |] ])
   | Plan.Op_pragma_get_defer_fk ->
     let v =
       match cat with
@@ -9617,6 +9669,10 @@ and to_stream
   | Plan.Op_insert _ | Plan.Op_insert_select _ | Plan.Op_update _ | Plan.Op_delete _ ->
     failwith "Exec.query: use Exec.execute for write operations"
   | Plan.Op_seq_set _ | Plan.Op_seq_reset _ ->
+    failwith "Exec.query: use Exec.execute for write operations"
+  | Plan.Op_pragma_set_synchronous _
+  | Plan.Op_pragma_set_wal_batch_commits _
+  | Plan.Op_pragma_set_wal_batch_interval_ms _ ->
     failwith "Exec.query: use Exec.execute for write operations"
 ;;
 
