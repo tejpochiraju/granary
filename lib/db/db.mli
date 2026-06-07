@@ -44,11 +44,17 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     for Mirage adapters; the adapter handles device-capacity bounds
     internally.  [~close] is called by [Db.close].
 
+    [clock] and [durability] are open-options forwarded to [of_store]:
+    [durability] sets the database-wide durability knob (full/batched/off)
+    before the catalog is loaded.
+
     This is the platform-agnostic entry point.  Unix file convenience
     constructors ([open_file] / [open_file_wal]) live in the [sqlocaml.unix]
     driver library so this core carries no [unix] dependency (#170). *)
 val open_block
   :  ?geom:Sqlocaml_storage.Geometry.t
+  -> ?clock:(unit -> float)
+  -> ?durability:Sqlocaml_store.Store.durability
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -61,10 +67,14 @@ val open_block
 (** Wrap an already-open {!Sqlocaml_store.Store.t} as a database handle,
     loading its catalog, views, and triggers.  [file_path] records the
     on-disk path for file-backed handles so VACUUM can rebuild in place;
-    omit it for in-memory / arbitrary block devices.  Used by the
+    omit it for in-memory / arbitrary block devices.  [durability] sets the
+    database-wide durability knob (full/batched/off) on the store before the
+    catalog is loaded — use this to configure the store's fsync policy at
+    open time without needing a raw store handle afterwards.  Used by the
     [sqlocaml.unix] driver and by ATTACH. *)
 val of_store
   :  ?clock:(unit -> float)
+  -> ?durability:Sqlocaml_store.Store.durability
   -> ?file_path:string
   -> Sqlocaml_store.Store.t
   -> t Lwt.t

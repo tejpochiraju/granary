@@ -319,6 +319,25 @@ let test_pragma_invalid_value () =
     Lwt.return_unit)
 ;;
 
+(* --- Db open-option --- *)
+
+let test_of_store_durability_option () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    let* db =
+      D.of_store
+        ~durability:(Sqlocaml_store.Store.Batched { commits = 8; interval_ms = 20 })
+        st
+    in
+    let* v = query1_text db "PRAGMA synchronous" in
+    Alcotest.(check string) "of_store option applied" "batched" v;
+    let* n = query1_int db "PRAGMA wal_batch_commits" in
+    Alcotest.(check int) "of_store N applied" 8 n;
+    let* () = D.close db in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -342,6 +361,9 @@ let () =
     ; ( "pragma"
       , [ Alcotest.test_case "synchronous/N/T round-trip" `Quick test_pragma_round_trip
         ; Alcotest.test_case "invalid mode rejected" `Quick test_pragma_invalid_value
+        ] )
+    ; ( "open-option"
+      , [ Alcotest.test_case "of_store ?durability" `Quick test_of_store_durability_option
         ] )
     ]
 ;;

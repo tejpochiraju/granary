@@ -343,9 +343,9 @@ pragma_stmt:
          with Failure _ ->
            failwith (Printf.sprintf "PRAGMA wal_autocheckpoint: expected integer, got %s" value))
       | "synchronous" ->
-        (match String.lowercase_ascii value with
-         | "full" | "batched" | "off" ->
-           Ast.S_pragma (Ast.Pragma_synchronous_set (String.lowercase_ascii value))
+        let lv = String.lowercase_ascii value in
+        (match lv with
+         | "full" | "batched" | "off" -> Ast.S_pragma (Ast.Pragma_synchronous_set lv)
          | _ ->
            failwith (Printf.sprintf
              "PRAGMA synchronous = %s: expected full|batched|off" value))
