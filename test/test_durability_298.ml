@@ -178,15 +178,17 @@ let test_batched_syncs_every_n () =
   run
   @@ with_fresh ~f:(fun path ->
     let* st = open_st path in
-    S.set_durability st (S.Batched { commits = 10; interval_ms = 1_000_000 });
+    S.set_durability
+      st
+      (S.Batched
+         { commits = 10
+         ; interval_ms = 1_000_000 (* effectively infinite: disables the T trigger *)
+         });
     S.set_wal_autocheckpoint st 0;
     let s0 = S.wal_sync_count st in
     let* () = do_commits st 30 in
     let delta = S.wal_sync_count st - s0 in
-    Alcotest.(check bool)
-      (Printf.sprintf "batched N=10: ~3 fsyncs (got %d), far below 30" delta)
-      true
-      (delta >= 1 && delta <= 5);
+    Alcotest.(check int) "batched N=10 over 30 commits => exactly 3 fsyncs" 3 delta;
     let* () = S.close st in
     Lwt.return_unit)
 ;;
@@ -203,6 +205,7 @@ let test_batched_syncs_on_time () =
     let* () = do_commits st 5 in
     Alcotest.(check int) "no sync before T elapses" 0 (S.wal_sync_count st - s0);
     now := 0.5;
+    (* 500ms > 100ms threshold *)
     let* () = commit_kv st 999 in
     Alcotest.(check bool) "sync after T elapses" true (S.wal_sync_count st - s0 >= 1);
     let* () = S.close st in

@@ -1470,7 +1470,7 @@ let commit_wal t st =
           race-free across concurrent writers, then release the lock. *)
        let do_sync =
          match st.sync_mode with
-         | `Full -> true
+         | `Full -> true (* always sync; unsynced_commits is not tracked in Full mode *)
          | `Off ->
            st.unsynced_commits <- st.unsynced_commits + 1;
            false
