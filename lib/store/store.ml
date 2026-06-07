@@ -172,9 +172,32 @@ type bt_state =
        consumer while following the master's WAL stream; cleared on
        promotion or when the follower loop exits.  The in-memory backend
        ignores this flag (Mem stores have no standby semantics). *)
+  ; mutable sync_mode : [ `Full | `Batched | `Off ]
+    (* #298: durability mode. [`Full] = fsync every group-commit (default).
+       [`Batched] = defer fsync until [batch_commits] or [batch_interval_ms].
+       [`Off] = never fsync on commit. Only consulted in WAL mode. *)
+  ; mutable batch_commits : int (* #298: batched N threshold (default 256) *)
+  ; mutable batch_interval_ms : int (* #298: batched T threshold ms (default 100) *)
+  ; mutable unsynced_commits : int
+        [@warning "-69"]
+        (* #298: committed-but-unsynced batches since last fsync; consulted in later tasks. *)
+  ; mutable last_sync_time : float
+        [@warning "-69"]
+        (* #298: clock () at last commit fsync; for the T trigger; consulted in later tasks. *)
+  ; mutable clock : unit -> float [@warning "-69"]
+    (* #298: wall-clock source; default returns 0.; consulted in later tasks. *)
   }
 
 let default_wal_autocheckpoint_threshold = 1000
+
+(** #298: per-deployment durability mode. *)
+type durability =
+  | Full
+  | Batched of
+      { commits : int
+      ; interval_ms : int
+      }
+  | Off
 
 type backend =
   | Mem of (tree_id, Bytes.t Bytes_map.t ref) Hashtbl.t
@@ -555,6 +578,12 @@ let make_btree_store
     ; replication_gate_max_yields = max_int
     ; on_committed_frames = None
     ; follower = false
+    ; sync_mode = `Full
+    ; batch_commits = 256
+    ; batch_interval_ms = 100
+    ; unsynced_commits = 0
+    ; last_sync_time = 0.
+    ; clock = (fun () -> 0.)
     }
   in
   { backend = Btree st
@@ -1567,6 +1596,60 @@ let set_wal_autocheckpoint (t : t) (n : int) : unit =
   match t.backend with
   | Mem _ -> ()
   | Btree st -> st.wal_autocheckpoint_threshold <- max 0 n
+;;
+
+let durability (t : t) : durability =
+  match t.backend with
+  | Mem _ -> Full
+  | Btree st ->
+    (match st.sync_mode with
+     | `Full -> Full
+     | `Off -> Off
+     | `Batched ->
+       Batched { commits = st.batch_commits; interval_ms = st.batch_interval_ms })
+;;
+
+let set_durability (t : t) (d : durability) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st ->
+    (match d with
+     | Full -> st.sync_mode <- `Full
+     | Off -> st.sync_mode <- `Off
+     | Batched { commits; interval_ms } ->
+       st.sync_mode <- `Batched;
+       st.batch_commits <- max 0 commits;
+       st.batch_interval_ms <- max 0 interval_ms)
+;;
+
+let sync_batch_commits (t : t) : int =
+  match t.backend with
+  | Mem _ -> 256
+  | Btree st -> st.batch_commits
+;;
+
+let set_sync_batch_commits (t : t) (n : int) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.batch_commits <- max 0 n
+;;
+
+let sync_batch_interval_ms (t : t) : int =
+  match t.backend with
+  | Mem _ -> 100
+  | Btree st -> st.batch_interval_ms
+;;
+
+let set_sync_batch_interval_ms (t : t) (n : int) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.batch_interval_ms <- max 0 n
+;;
+
+let set_clock (t : t) (c : unit -> float) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.clock <- c
 ;;
 
 (* Number of fsyncs the WAL has performed since open.  Exposed for #77

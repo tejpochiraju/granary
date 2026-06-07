@@ -250,6 +250,53 @@ val wal_mode : t -> bool
     internally so it serialises with commits. *)
 val checkpoint : t -> unit Lwt.t
 
+(** #298: per-deployment durability mode (analogue of SQLite [synchronous]).
+    [Full] fsyncs the WAL on every group-commit before acking (the default,
+    unchanged behaviour).  [Batched] acks immediately and defers the fsync
+    until [commits] un-synced commits accumulate OR [interval_ms] have elapsed
+    since the last sync (whichever first; the time bound needs a clock — see
+    {!set_clock} — otherwise only the commit count triggers).  [Off] never
+    fsyncs on commit.  Checkpoint and {!close} are always full-sync anchors,
+    so [Batched]/[Off] data is made durable there.  The setting is
+    DATABASE-WIDE (the commit queue is shared across connections), not
+    per-connection.  No-op on the in-memory backend. *)
+type durability =
+  | Full
+  | Batched of
+      { commits : int
+      ; interval_ms : int
+      }
+  | Off
+
+(** Current durability mode. Returns [Full] on the in-memory backend. *)
+val durability : t -> durability
+
+(** Set the durability mode. [Batched] params are remembered across switches
+    to [Full]/[Off] (so a later [PRAGMA synchronous=batched] restores them).
+    No-op on the in-memory backend. *)
+val set_durability : t -> durability -> unit
+
+(** Batched commit-count threshold N (default 256). Independent of the active
+    mode; only takes effect while the mode is [Batched]. *)
+val sync_batch_commits : t -> int
+
+(** Set the batched commit-count threshold N (clamped to >= 0). No-op on the
+    in-memory backend. *)
+val set_sync_batch_commits : t -> int -> unit
+
+(** Batched time threshold T in milliseconds (default 100). *)
+val sync_batch_interval_ms : t -> int
+
+(** Set the batched time threshold T in milliseconds (clamped to >= 0). No-op
+    on the in-memory backend. *)
+val set_sync_batch_interval_ms : t -> int -> unit
+
+(** Install the wall-clock source ([unit -> float], Unix-epoch seconds) used by
+    [Batched] mode's time threshold. Without one, the default [fun () -> 0.]
+    disables the time trigger (only the commit count fires). No-op on the
+    in-memory backend. *)
+val set_clock : t -> (unit -> float) -> unit
+
 (** Get the per-connection auto-checkpoint threshold (in WAL frames).
     A value of 0 means auto-checkpoint is disabled. Returns 0 on the
     in-memory backend. *)
