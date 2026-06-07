@@ -145,9 +145,10 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     The output is a self-contained SQL script that recreates the database when
     replayed statement-by-statement through {!execute}: [PRAGMA foreign_keys=OFF;],
     then for each table its [CREATE TABLE] followed by [INSERT] statements for
-    its rows, then FTS virtual tables, explicit indexes, views (in dependency
-    order) and triggers. Tables are emitted in creation order. Generated-column
-    values are omitted (recomputed on insert); implicit PRIMARY KEY indexes the
+    its rows, then each FTS5 virtual table's [CREATE VIRTUAL TABLE] followed by
+    [INSERT]s for its content, then explicit indexes, views (in dependency order)
+    and triggers. Tables are emitted in creation order. Generated-column values
+    are omitted (recomputed on insert); implicit PRIMARY KEY indexes the
     [CREATE TABLE] already implies are not re-emitted.
 
     The whole script is wrapped in [BEGIN]/[COMMIT] (after the leading [PRAGMA
@@ -163,16 +164,18 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     (when an explicit transaction is active, its view is used instead), so the
     emitted rows reflect a single consistent moment even if other writers commit
     concurrently while the dump runs — matching [sqlite3 .dump], which previously
-    differed by reading each table in its own snapshot (a torn dump). Schema is
-    not read through that shared snapshot: table/index DDL and the AUTOINCREMENT
-    high-water come from the in-memory catalog, while view and trigger DDL is
-    read from its own per-call store snapshot. So for a fully consistent result
-    the schema should be quiescent during the dump.
+    differed by reading each table in its own snapshot (a torn dump). View and
+    trigger DDL is read through that same shared snapshot too (#322/#323), so the
+    schema section stays point-in-time consistent with the row data even if a
+    concurrent [CREATE]/[DROP VIEW|TRIGGER] commits mid-dump. Table/index DDL and
+    the AUTOINCREMENT high-water still come from the in-memory catalog (a separate
+    consistency surface), so for a fully consistent result those should be
+    quiescent during the dump.
 
-    {b FTS5 content is not dumped.} An FTS5 table's [CREATE VIRTUAL TABLE] is
-    emitted but its rows are not (content-dumping is a planned follow-up), so a
-    database whose data lives in FTS5 tables restores with those tables {e empty}
-    — be aware before relying on this as a backup.
+    {b FTS5 content is dumped (#319).} An FTS5 table's [CREATE VIRTUAL TABLE] is
+    emitted followed by [INSERT]s for its stored content (in column order), so a
+    replay re-inserts the original rows and rebuilds the index — matching how
+    [sqlite3 .dump] round-trips an FTS table.
 
     Composite / table-level PRIMARY KEYs round-trip as plain [UNIQUE] indexes
     (this engine's internal representation): the data is preserved, but the

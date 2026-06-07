@@ -556,23 +556,117 @@ let test_view_on_view () =
 
 (* FTS5 virtual tables: the dump recreates them (empty) via DDL and emits no row
    INSERTs against them (content dump is a planned follow-up). *)
-let test_fts_ddl_only () =
+(* #319: an FTS5 table's content is dumped as [INSERT]s (not DDL only), so a
+   replay re-inserts the original rows and rebuilds the index — [.dump] round-trips
+   FTS-backed data instead of restoring it empty.  We assert both that the rows
+   round-trip and that the rebuilt index still answers [MATCH]. *)
+let test_fts_roundtrip () =
   with_db (fun db ->
     exec db "CREATE VIRTUAL TABLE docs USING fts5(title, body)";
     exec db "INSERT INTO docs (title, body) VALUES ('hi', 'hello world')";
+    exec db "INSERT INTO docs (title, body) VALUES ('bye', 'goodbye world')";
     let s = dump db in
     Alcotest.(check bool)
       "FTS CREATE VIRTUAL TABLE emitted"
       true
       (contains_substr ~needle:"CREATE VIRTUAL TABLE" s);
     Alcotest.(check bool)
-      "no INSERT against the FTS table"
-      false
+      "FTS content emitted as INSERTs"
+      true
       (contains_substr ~needle:"INSERT INTO docs" s);
-    (* and the script replays cleanly into an empty FTS table *)
     let restored = restore s in
-    try run (Db.close restored) with
-    | _ -> ())
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close restored) with
+        | _ -> ())
+      (fun () ->
+         Alcotest.(check (list string))
+           "FTS rows round-trip"
+           (table_data db "docs")
+           (table_data restored "docs");
+         (* the index rebuilt on replay still answers MATCH queries (sorted in
+            OCaml since MATCH does not support an ORDER BY clause here) *)
+         let match_q = "SELECT title FROM docs WHERE docs MATCH 'world'" in
+         Alcotest.(check (list string))
+           "restored FTS answers MATCH"
+           (List.sort compare (rows db match_q))
+           (List.sort compare (rows restored match_q))))
+;;
+
+(* #321: a [Failure] in the pre-BEGIN window (here a sink that raises on its very
+   first write, before [BEGIN] is emitted) must surface as [Error], not a raised
+   exception, and the handler must NOT emit a dangling [ROLLBACK] — a [ROLLBACK]
+   with no matching [BEGIN] would be rejected on replay, and re-invoking the
+   already-failing sink would escape the [Ok]/[Error] contract entirely. *)
+let test_dump_sink_fails_before_begin () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER)";
+    let calls = ref 0 in
+    let sink _ =
+      incr calls;
+      raise (Failure "boom")
+    in
+    let r = run (Db.dump db ~sink ()) in
+    (match r with
+     | Error _ -> ()
+     | Ok () -> Alcotest.fail "expected Error from a failing sink");
+    (* The first (and only) sink call is the pre-BEGIN PRAGMA write.  The handler
+       must not call the sink a second time with a dangling ROLLBACK. *)
+    Alcotest.(check int) "sink not re-invoked with a dangling ROLLBACK" 1 !calls)
+;;
+
+(* #322/#323: view and trigger DDL must read the same point-in-time snapshot as
+   the row data.  We commit a [CREATE VIEW]/[CREATE TRIGGER] *during* the dump
+   (right after the snapshot is taken, at the pre-BEGIN PRAGMA write) and assert
+   the dump reflects the pre-mutation schema — the concurrently-created view and
+   trigger must NOT appear.  Without threading the shared snapshot through
+   [load_all_views]/[load_all_triggers], each would open its own fresh snapshot
+   and leak the concurrent commit into the schema section. *)
+let test_views_triggers_point_in_time () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (x INTEGER)";
+    exec db "CREATE TABLE audit (m TEXT)";
+    exec db "CREATE VIEW v1 AS SELECT x FROM t";
+    exec
+      db
+      "CREATE TRIGGER trg1 AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('a'); END";
+    let buf = Buffer.create 256 in
+    let mutated = ref false in
+    let sink line =
+      Buffer.add_string buf line;
+      if (not !mutated) && contains_substr ~needle:"PRAGMA foreign_keys=OFF" line
+      then (
+        mutated := true;
+        let* r1 = Db.execute db "CREATE VIEW v2 AS SELECT x FROM t" in
+        let () = unwrap r1 in
+        let* r2 =
+          Db.execute
+            db
+            "CREATE TRIGGER trg2 AFTER INSERT ON t BEGIN INSERT INTO audit VALUES ('b'); \
+             END"
+        in
+        Lwt.return (unwrap r2))
+      else Lwt.return_unit
+    in
+    unwrap (run (Db.dump db ~sink ()));
+    let s = Buffer.contents buf in
+    Alcotest.(check bool) "mutation fired mid-dump" true !mutated;
+    Alcotest.(check bool)
+      "pre-existing view v1 dumped"
+      true
+      (contains_substr ~needle:"v1" s);
+    Alcotest.(check bool)
+      "pre-existing trigger trg1 dumped"
+      true
+      (contains_substr ~needle:"trg1" s);
+    Alcotest.(check bool)
+      "concurrent view v2 not in dump (point-in-time schema)"
+      false
+      (contains_substr ~needle:"v2" s);
+    Alcotest.(check bool)
+      "concurrent trigger trg2 not in dump (point-in-time schema)"
+      false
+      (contains_substr ~needle:"trg2" s))
 ;;
 
 (* #281: now that #269 removed the DDL-in-txn deadlock, a schema-bearing dump is
@@ -712,7 +806,15 @@ let () =
             `Quick
             test_user_index_pk_prefix_survives
         ; Alcotest.test_case "view depending on view" `Quick test_view_on_view
-        ; Alcotest.test_case "fts ddl only" `Quick test_fts_ddl_only
+        ; Alcotest.test_case "fts content round-trip (#319)" `Quick test_fts_roundtrip
+        ; Alcotest.test_case
+            "sink failure before BEGIN (#321)"
+            `Quick
+            test_dump_sink_fails_before_begin
+        ; Alcotest.test_case
+            "views/triggers point-in-time (#322/#323)"
+            `Quick
+            test_views_triggers_point_in_time
         ; Alcotest.test_case
             "schema dump wrapped in txn (#281)"
             `Quick

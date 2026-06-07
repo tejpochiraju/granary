@@ -499,6 +499,11 @@ val schema_txn_poisoned : t -> bool
 (** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
 val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
 
+(** #322/#323: load all view definitions through a caller-supplied snapshot,
+    so [Db.dump] can read view DDL under its single shared RO snapshot and keep
+    the schema section point-in-time consistent with the row data. *)
+val load_all_views_in_tx : _ Sqlocaml_store.Store.txn -> (string * string) list Lwt.t
+
 (** Persist a view's SQL text to the sys_views B-tree.
 
     [?txn] (#269): write through this already-held explicit writer transaction
@@ -519,6 +524,9 @@ val remove_view
 
 (** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
 val load_all_triggers : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+
+(** #322/#323: trigger-DDL counterpart to {!load_all_views_in_tx}. *)
+val load_all_triggers_in_tx : _ Sqlocaml_store.Store.txn -> (string * string) list Lwt.t
 
 (** Persist a trigger's CREATE TRIGGER SQL to the sys_triggers B-tree.
     Call this whenever CREATE TRIGGER is executed.

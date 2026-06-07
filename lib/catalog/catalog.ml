@@ -1103,10 +1103,8 @@ let load_all_fts store =
 (* View persistence                                                     *)
 (* ------------------------------------------------------------------ *)
 
-let load_all_views store =
-  S.with_ro store
-  @@ fun tx ->
-  let%lwt cur = S.cursor_open tx sys_views_tid in
+let load_all_pairs_in_tx tx tid =
+  let%lwt cur = S.cursor_open tx tid in
   let _sr = S.cursor_first cur in
   let pairs = ref [] in
   let rec walk () =
@@ -1120,6 +1118,13 @@ let load_all_views store =
   S.cursor_close cur;
   Lwt.return (List.rev !pairs)
 ;;
+
+(* #322/#323: read view DDL through a caller-supplied snapshot so [Db.dump] can
+   thread its single shared RO snapshot here, making view DDL point-in-time with
+   the row data; a concurrent CREATE/DROP VIEW commit then cannot tear the dump's
+   schema section relative to its rows. *)
+let load_all_views_in_tx (tx : _ S.txn) = load_all_pairs_in_tx tx sys_views_tid
+let load_all_views store = S.with_ro store load_all_views_in_tx
 
 (* #269: run [f tx] through the ambient explicit transaction ([?txn = Some tx],
    left uncommitted — the db layer owns its lifecycle) or, in autocommit, a fresh
@@ -1150,23 +1155,9 @@ let remove_view ?txn store ~name =
 (* Trigger persistence                                                  *)
 (* ------------------------------------------------------------------ *)
 
-let load_all_triggers store =
-  S.with_ro store
-  @@ fun tx ->
-  let%lwt cur = S.cursor_open tx sys_triggers_tid in
-  let _sr = S.cursor_first cur in
-  let pairs = ref [] in
-  let rec walk () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (k, v) ->
-      pairs := (Bytes.to_string k, Bytes.to_string v) :: !pairs;
-      walk ()
-  in
-  walk ();
-  S.cursor_close cur;
-  Lwt.return (List.rev !pairs)
-;;
+(* #322/#323: trigger DDL counterpart to [load_all_views_in_tx]. *)
+let load_all_triggers_in_tx (tx : _ S.txn) = load_all_pairs_in_tx tx sys_triggers_tid
+let load_all_triggers store = S.with_ro store load_all_triggers_in_tx
 
 (* [?txn] (#269): persist/remove through the ambient explicit transaction when
    one is active, else autocommit. *)
