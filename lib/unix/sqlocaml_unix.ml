@@ -34,31 +34,31 @@ let provider : Sqlocaml.Db.file_provider =
 
 let install () = Sqlocaml.Db.set_file_provider provider
 
-let to_db ~path = function
+let to_db ?clock ?durability ~path = function
   | Error e ->
     Lwt.return
       (Error (Sqlocaml.Db.Runtime (Format.asprintf "%a" Sqlocaml_store.Store.pp_error e)))
   | Ok store ->
-    let* db = Sqlocaml.Db.of_store ~file_path:path store in
+    let* db = Sqlocaml.Db.of_store ?clock ?durability ~file_path:path store in
     Lwt.return (Ok db)
 ;;
 
-let open_file ?page_size ?reserved_bytes_per_page ~path () =
+let open_file ?page_size ?reserved_bytes_per_page ?clock ?durability ~path () =
   install ();
   let explicit_geometry = page_size <> None || reserved_bytes_per_page <> None in
   let* r =
     Store.open_file ?page_size ?reserved_bytes_per_page ~explicit_geometry ~path ()
   in
-  to_db ~path r
+  to_db ?clock ?durability ~path r
 ;;
 
-let open_file_wal ?page_size ?reserved_bytes_per_page ~path () =
+let open_file_wal ?page_size ?reserved_bytes_per_page ?clock ?durability ~path () =
   install ();
   let explicit_geometry = page_size <> None || reserved_bytes_per_page <> None in
   let* r =
     Store.open_file_wal ?page_size ?reserved_bytes_per_page ~explicit_geometry ~path ()
   in
-  to_db ~path r
+  to_db ?clock ?durability ~path r
 ;;
 
 [@@@ai_disclosure "ai-generated"]

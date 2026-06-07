@@ -597,9 +597,19 @@ let close (t : t) : unit Lwt.t =
   | Mem _ -> Lwt.return_unit
   | Btree st ->
     (* #298: in batched/off mode the last acked commits may never have been
-       fsynced; a final WAL sync makes them durable across process exit. *)
+       fsynced. Decide on the WAL's actual committed-frame state rather than the
+       in-memory unsynced counter, which a concurrent no-sync committer can
+       race. A redundant fsync here (frames already durable) is cheap and safe;
+       skipping a needed one is not. Full mode already syncs every commit. *)
+    let needs_final_sync =
+      st.sync_mode <> `Full
+      &&
+      match st.wal with
+      | Some w -> Sqlocaml_storage.Wal.committed_frames w > 0
+      | None -> false
+    in
     let* () =
-      if st.unsynced_commits > 0
+      if needs_final_sync
       then (
         let* r = Pager.wal_sync st.pager in
         (match r with
@@ -1687,7 +1697,9 @@ let set_sync_batch_interval_ms (t : t) (n : int) : unit =
 let set_clock (t : t) (c : unit -> float) : unit =
   match t.backend with
   | Mem _ -> ()
-  | Btree st -> st.clock <- c
+  | Btree st ->
+    st.clock <- c;
+    st.last_sync_time <- c ()
 ;;
 
 (* Number of fsyncs the WAL has performed since open.  Exposed for #77

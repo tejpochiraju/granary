@@ -11,8 +11,7 @@ end
 module D = struct
   include Sqlocaml.Db
 
-  (* used by later-task tests (#298) *)
-  let open_file_wal = Sqlocaml_unix.open_file_wal [@@warning "-32"]
+  let open_file_wal = Sqlocaml_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -41,8 +40,7 @@ let with_fresh ~f =
        Lwt.return_unit)
 ;;
 
-(* used by later-task tests (#298) *)
-let bs = Bytes.of_string [@@warning "-32"]
+let bs = Bytes.of_string
 
 let open_st path =
   let* sr = S.open_file_wal ~path () in
@@ -232,6 +230,29 @@ let test_off_durable_after_close () =
      Alcotest.(check (option string))
        "off-mode data durable after clean close"
        (Some "v0010")
+       (Option.map Bytes.to_string v);
+     S.close st);
+  cleanup path
+;;
+
+let test_batched_durable_after_close () =
+  let path = fresh_path () in
+  cleanup path;
+  run
+    (let* st = open_st path in
+     (* High N + no clock => neither N nor T fires; commits stay unsynced. *)
+     S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
+     S.set_wal_autocheckpoint st 0;
+     let* () = do_commits st 15 in
+     S.close st);
+  run
+    (let* st = open_st path in
+     let* tx = S.ro_begin st in
+     let* v = S.get tx 16 (bs "k0007") in
+     let* () = S.ro_end tx in
+     Alcotest.(check (option string))
+       "batched data durable after clean close"
+       (Some "v0007")
        (Option.map Bytes.to_string v);
      S.close st);
   cleanup path
@@ -464,6 +485,10 @@ let () =
         ] )
     ; ( "durability-anchors"
       , [ Alcotest.test_case "off durable after close" `Quick test_off_durable_after_close
+        ; Alcotest.test_case
+            "batched durable after close"
+            `Quick
+            test_batched_durable_after_close
         ] )
     ; ( "pragma"
       , [ Alcotest.test_case "synchronous/N/T round-trip" `Quick test_pragma_round_trip
