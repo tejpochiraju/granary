@@ -1054,49 +1054,61 @@ let ro_begin t =
      checkpoint coordinator that wants to know "are any RO snapshots
      still in flight?" *)
   let* () = Rwlock.acquire_read t.lock in
-  match t.backend with
-  | Mem trees ->
-    (* #178: snapshot every tree so RO reads never observe uncommitted
+  let is_closing =
+    match t.backend with
+    | Btree st -> st.closing
+    | Mem _ -> false
+  in
+  if is_closing
+  then (
+    (* #338 (review r3): fail fast on a snapshot begun after [close] signalled
+       teardown — matches [rw_begin], avoiding an obscure pager EBADF later. *)
+    Rwlock.release_read t.lock;
+    Lwt.fail_with "Store.ro_begin: store is closing — read transactions are rejected")
+  else (
+    match t.backend with
+    | Mem trees ->
+      (* #178: snapshot every tree so RO reads never observe uncommitted
        writes from a concurrent writer that later rolls back.  The
        Btree backend gets snapshot isolation from the pager/WAL layer;
        the mem backend must provide it here. *)
-    let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
-    Lwt.return
-      (Ro
-         { rs_store = t
-         ; rs_snap_txn_id = 0L
-         ; rs_snap_meta_root = 0L
-         ; rs_snap_trees = Hashtbl.create 1
-         ; rs_snap_frames = 0
-         ; rs_pinned = Hashtbl.create 1
-         ; rs_mem_snap = Some snap
-         })
-  | Btree st ->
-    let snap_txn_id = st.current_header.txn_id in
-    let snap_meta_root = st.current_header.root_page in
-    let snap_frames =
-      match st.wal with
-      | None -> 0
-      | Some w -> Wal.committed_frames w
-    in
-    let count =
-      Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id)
-    in
-    Hashtbl.replace st.active_readers snap_txn_id (count + 1);
-    let frame_count =
-      Option.value ~default:0 (Hashtbl.find_opt st.active_reader_frames snap_frames)
-    in
-    Hashtbl.replace st.active_reader_frames snap_frames (frame_count + 1);
-    Lwt.return
-      (Ro
-         { rs_store = t
-         ; rs_snap_txn_id = snap_txn_id
-         ; rs_snap_meta_root = snap_meta_root
-         ; rs_snap_trees = Hashtbl.create 4
-         ; rs_snap_frames = snap_frames
-         ; rs_pinned = Hashtbl.create 64
-         ; rs_mem_snap = None
-         })
+      let snap = Hashtbl.fold (fun tid r acc -> (tid, !r) :: acc) trees [] in
+      Lwt.return
+        (Ro
+           { rs_store = t
+           ; rs_snap_txn_id = 0L
+           ; rs_snap_meta_root = 0L
+           ; rs_snap_trees = Hashtbl.create 1
+           ; rs_snap_frames = 0
+           ; rs_pinned = Hashtbl.create 1
+           ; rs_mem_snap = Some snap
+           })
+    | Btree st ->
+      let snap_txn_id = st.current_header.txn_id in
+      let snap_meta_root = st.current_header.root_page in
+      let snap_frames =
+        match st.wal with
+        | None -> 0
+        | Some w -> Wal.committed_frames w
+      in
+      let count =
+        Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id)
+      in
+      Hashtbl.replace st.active_readers snap_txn_id (count + 1);
+      let frame_count =
+        Option.value ~default:0 (Hashtbl.find_opt st.active_reader_frames snap_frames)
+      in
+      Hashtbl.replace st.active_reader_frames snap_frames (frame_count + 1);
+      Lwt.return
+        (Ro
+           { rs_store = t
+           ; rs_snap_txn_id = snap_txn_id
+           ; rs_snap_meta_root = snap_meta_root
+           ; rs_snap_trees = Hashtbl.create 4
+           ; rs_snap_frames = snap_frames
+           ; rs_pinned = Hashtbl.create 64
+           ; rs_mem_snap = None
+           }))
 ;;
 
 let rw_begin t =
@@ -1683,7 +1695,15 @@ let commit_wal t st =
             | None -> ()
             | Some cb ->
               let synced = Wal.committed_frames wal in
-              if synced > st.sink_shipped_frames
+              (* #338 (review r3): do NOT dispatch a fresh ship once [close] has
+                 signalled teardown — its lazy [Wal.read_frame] would race
+                 [wal_close] (a commit mid-fsync when close starts can reach here
+                 AFTER close's drain saw [sink_ships_in_flight = 0]).  The frames
+                 are already fsynced; the standby re-syncs from the WAL on
+                 reconnect, same recovery story as an aborted checkpoint.  The
+                 check is yield-free up to [Lwt.async], so close cannot set
+                 [closing] between this check and the dispatch. *)
+              if (not st.closing) && synced > st.sink_shipped_frames
               then (
                 let base = st.sink_shipped_frames in
                 let count = synced - base in

@@ -58,7 +58,7 @@ let sync_ok () = Lwt.return (Ok ())
 (* Open a WAL store in memory                                          *)
 (* ------------------------------------------------------------------ *)
 
-let open_test_store () =
+let open_test_store ?(wal_sync = sync_ok) () =
   let main_dev = mk_dev (1024 * 4096) in
   let wal_dev = mk_dev 65536 in
   let main_n_pages = Int64.of_int (Bytes.length main_dev.buf / 4096) in
@@ -90,7 +90,7 @@ let open_test_store () =
     ~n_pages:main_n_pages
     ~wal_read_at:(read_at wal_dev)
     ~wal_write_at:(write_at wal_dev)
-    ~wal_sync:sync_ok
+    ~wal_sync
     ~wal_size_bytes:(Int64.of_int (Bytes.length wal_dev.buf))
     ~close:(fun () -> Lwt.return_unit)
     ~wal_close:(fun () -> Lwt.return_unit)
@@ -654,14 +654,14 @@ let test_close_does_not_hang_on_lock_parked_checkpoint () =
        | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
      in
      Store.set_wal_autocheckpoint st 1;
-     let* rwA = Store.rw_begin st in
-     let* () = Store.put rwA 16 (Bytes.of_string "a") (Bytes.of_string "1") in
-     let commitA = Store.commit rwA in
+     let* rw_a = Store.rw_begin st in
+     let* () = Store.put rw_a 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let commit_a = Store.commit rw_a in
      (* While A is committing (it releases the write lock for its fsync), B grabs
         the lock and is then abandoned — A's post-fsync autockpt dispatch parks on
         [acquire_write]. *)
      let* (_ : Store.rw Store.txn) = Store.rw_begin st in
-     let* () = commitA in
+     let* () = commit_a in
      let* () = wait_for (fun () -> false) 15 in
      let close_p = Store.close st in
      let* () =
@@ -678,6 +678,71 @@ let test_close_does_not_hang_on_lock_parked_checkpoint () =
        (match Lwt.state close_p with
         | Lwt.Return () -> true
         | _ -> false);
+     Lwt.return_unit)
+;;
+
+(* #338 (review r3 #2): a commit mid-fsync when [close] starts must NOT dispatch
+   a fresh ship after close's drain has passed — its lazy reader would race
+   [wal_close].  Gate the commit's fsync so it is still in flight when close
+   drains (sees no ship), then resume it; the ship dispatch must observe
+   [closing] and be skipped (callback never fires). *)
+let test_close_suppresses_post_drain_ship () =
+  Lwt_main.run
+    (let sync_gate, release_sync = Lwt.wait () in
+     let gated = ref false in
+     let wal_sync () =
+       if !gated
+       then
+         let* () = sync_gate in
+         Lwt.return (Ok ())
+       else Lwt.return (Ok ())
+     in
+     let* sr = open_test_store ~wal_sync () in
+     let st =
+       match sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     Store.set_wal_autocheckpoint st 0;
+     let shipped = ref 0 in
+     let* () =
+       Store.set_commit_callback
+         st
+         (Some
+            (fun ~epoch:_ ~base_idx:_ ~count:_ ->
+              incr shipped;
+              Lwt.return_unit))
+     in
+     (* Arm the gate so the NEXT commit's fsync blocks mid-flight. *)
+     gated := true;
+     let* rw = Store.rw_begin st in
+     let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
+     let commit_p = Store.commit rw in
+     (* commit is now parked in [wal_sync]; lock released, ship not yet dispatched. *)
+     let* () = wait_for (fun () -> false) 10 in
+     let close_p = Store.close st in
+     let* () =
+       wait_for
+         (fun () ->
+            match Lwt.state close_p with
+            | Lwt.Sleep -> false
+            | _ -> true)
+         50
+     in
+     Alcotest.(check bool)
+       "close completes while the gated commit is still mid-fsync"
+       true
+       (match Lwt.state close_p with
+        | Lwt.Return () -> true
+        | _ -> false);
+     (* Release the fsync; the commit resumes and reaches its ship block. *)
+     Lwt.wakeup_later release_sync ();
+     let* () = commit_p in
+     let* () = wait_for (fun () -> false) 10 in
+     Alcotest.(check int)
+       "ship suppressed once closing (no read against closed fd)"
+       0
+       !shipped;
      Lwt.return_unit)
 ;;
 
@@ -730,6 +795,10 @@ let () =
             "#338 close does not hang on lock-parked checkpoint"
             `Quick
             test_close_does_not_hang_on_lock_parked_checkpoint
+        ; Alcotest.test_case
+            "#338 close suppresses post-drain ship"
+            `Quick
+            test_close_suppresses_post_drain_ship
         ] )
     ]
 ;;
