@@ -1,5 +1,7 @@
 #!/bin/sh
-# Faithful local equivalent of CI's `dune build @fmt` gate for OCaml sources.
+# Faithful local equivalent of CI's `dune build @fmt` gate: OCaml sources
+# (.ml/.mli via the pinned ocamlformat, worktree-safe) plus dune files (via
+# `dune build @fmt` itself, which is skipped gracefully inside a git worktree).
 #
 # Why this exists (we kept shipping fmt failures that only CI caught):
 #   * `dune build @fmt` is the real gate, but inside a git *worktree* mounted
@@ -64,11 +66,37 @@ for f in $files; do
   fi
 done
 
+# Dune files (dune / dune-project): CI's @fmt formats these too, but with dune's
+# OWN formatter — `dune format-dune-file` is NOT equivalent (it injects
+# blank-line-between-stanzas and dependency rewraps that @fmt leaves alone), so
+# it can't be used here. The only faithful tool is `dune build @fmt` itself.
+# That works in a normal checkout but aborts inside a git *worktree* (its gitdir
+# link points outside the build mount), so skip gracefully there — CI is the
+# backstop. Only run when the ocamlformat pass above is clean, to avoid
+# double-reporting any .ml/.mli issues @fmt would also flag.
+if [ "$status" -eq 0 ]; then
+  if [ "$mode" = "fix" ]; then
+    dune build @fmt --auto-promote >/tmp/_fmt_dune.out 2>&1 || true
+  elif fmt_out=$(dune build @fmt 2>&1); then
+    : # dune files (and .ml/.mli) are clean per the real gate
+  else
+    case "$fmt_out" in
+      *"not a git repository"* | *fatal:*)
+        echo "⚠ dune-file formatting NOT checked: 'dune build @fmt' is unusable"
+        echo "  inside a git worktree. Run this in the main checkout, or rely on CI." ;;
+      *)
+        echo "✗ dune-file formatting (dune build @fmt):"
+        echo "$fmt_out"
+        status=1 ;;
+    esac
+  fi
+fi
+
 echo
 if [ "$mode" = "fix" ]; then
-  echo "Reformatted in place across $count source files (ocamlformat $(ocamlformat --version))."
+  echo "Reformatted in place across $count OCaml sources + dune files (ocamlformat $(ocamlformat --version) + dune build @fmt)."
 elif [ "$status" -eq 0 ]; then
-  echo "✓ All $count OCaml sources match ocamlformat $(ocamlformat --version) — parity with CI's dune build @fmt gate."
+  echo "✓ All $count OCaml sources + dune files match the formatter (ocamlformat $(ocamlformat --version) + dune build @fmt) — parity with CI's @fmt gate."
 else
   echo "Formatting check FAILED. Run 'scripts/check-fmt.sh --fix' to fix; this matches CI's 'dune build @fmt' gate."
 fi
