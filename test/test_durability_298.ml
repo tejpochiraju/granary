@@ -368,7 +368,7 @@ let simulate_crash_truncate path ~keep_frames =
     Unix.ftruncate fd aligned;
     Unix.close fd
   with
-  | _ ->
+  | Unix.Unix_error (Unix.ENOENT, _, _) ->
     (* WAL does not exist yet — nothing to truncate.
         This can happen if the engine checkpointed everything back to the
         main file; in that case the data is already durable. *)
@@ -422,6 +422,12 @@ let test_off_recovers_prefix () =
   run
     (let* st = open_st path in
      let* tx = S.ro_begin st in
+     let* first = S.get tx 16 (bs "k0000") in
+     (match first with
+      | Some _ -> ()
+      | None ->
+        Alcotest.fail
+          "k0000 missing after half-truncation — total loss; prefix test would be vacuous");
      let rec scan i seen_gap =
        if i = 40
        then Lwt.return_unit
