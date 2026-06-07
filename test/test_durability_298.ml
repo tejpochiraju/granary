@@ -11,6 +11,7 @@ end
 module D = struct
   include Sqlocaml.Db
 
+  (* used by later-task tests (#298) *)
   let open_file_wal = Sqlocaml_unix.open_file_wal [@@warning "-32"]
 end
 
@@ -40,6 +41,7 @@ let with_fresh ~f =
        Lwt.return_unit)
 ;;
 
+(* used by later-task tests (#298) *)
 let bs = Bytes.of_string [@@warning "-32"]
 
 let open_st path =
@@ -91,8 +93,35 @@ let test_set_get_round_trip () =
       (match S.durability st with
        | S.Batched _ -> true
        | _ -> false);
+    S.set_durability st S.Full;
+    Alcotest.(check int)
+      "interval_ms survives switch to Full"
+      33
+      (S.sync_batch_interval_ms st);
+    S.set_durability st S.Off;
+    Alcotest.(check bool)
+      "Off round-trip"
+      true
+      (match S.durability st with
+       | S.Off -> true
+       | _ -> false);
     let* () = S.close st in
     Lwt.return_unit)
+;;
+
+let test_mem_backend_noop () =
+  let st = S.create () in
+  (* Mem backend: setters are no-ops, getters return defaults *)
+  S.set_durability st (S.Batched { commits = 5; interval_ms = 5 });
+  Alcotest.(check bool)
+    "mem stays Full"
+    true
+    (match S.durability st with
+     | S.Full -> true
+     | _ -> false);
+  Alcotest.(check int) "mem commits default" 256 (S.sync_batch_commits st);
+  Alcotest.(check int) "mem interval default" 100 (S.sync_batch_interval_ms st);
+  run (S.close st)
 ;;
 
 let () =
@@ -101,6 +130,7 @@ let () =
     [ ( "accessors"
       , [ Alcotest.test_case "default is full" `Quick test_default_is_full
         ; Alcotest.test_case "set/get round-trip" `Quick test_set_get_round_trip
+        ; Alcotest.test_case "mem backend no-op" `Quick test_mem_backend_noop
         ] )
     ]
 ;;

@@ -189,6 +189,8 @@ type bt_state =
   }
 
 let default_wal_autocheckpoint_threshold = 1000
+let default_batch_commits = 256
+let default_batch_interval_ms = 100
 
 (** #298: per-deployment durability mode. *)
 type durability =
@@ -579,8 +581,8 @@ let make_btree_store
     ; on_committed_frames = None
     ; follower = false
     ; sync_mode = `Full
-    ; batch_commits = 256
-    ; batch_interval_ms = 100
+    ; batch_commits = default_batch_commits
+    ; batch_interval_ms = default_batch_interval_ms
     ; unsynced_commits = 0
     ; last_sync_time = 0.
     ; clock = (fun () -> 0.)
@@ -1624,7 +1626,7 @@ let set_durability (t : t) (d : durability) : unit =
 
 let sync_batch_commits (t : t) : int =
   match t.backend with
-  | Mem _ -> 256
+  | Mem _ -> default_batch_commits
   | Btree st -> st.batch_commits
 ;;
 
@@ -1636,7 +1638,7 @@ let set_sync_batch_commits (t : t) (n : int) : unit =
 
 let sync_batch_interval_ms (t : t) : int =
   match t.backend with
-  | Mem _ -> 100
+  | Mem _ -> default_batch_interval_ms
   | Btree st -> st.batch_interval_ms
 ;;
 

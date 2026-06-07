@@ -273,18 +273,20 @@ val durability : t -> durability
 
 (** Set the durability mode. [Batched] params are remembered across switches
     to [Full]/[Off] (so a later [PRAGMA synchronous=batched] restores them).
-    No-op on the in-memory backend. *)
+    No-op on the in-memory backend.  Negative [Batched] params are clamped to 0. *)
 val set_durability : t -> durability -> unit
 
 (** Batched commit-count threshold N (default 256). Independent of the active
-    mode; only takes effect while the mode is [Batched]. *)
+    mode; only takes effect while the mode is [Batched].
+    Returns the default (256) on the in-memory backend. *)
 val sync_batch_commits : t -> int
 
 (** Set the batched commit-count threshold N (clamped to >= 0). No-op on the
     in-memory backend. *)
 val set_sync_batch_commits : t -> int -> unit
 
-(** Batched time threshold T in milliseconds (default 100). *)
+(** Batched time threshold T in milliseconds (default 100).
+    Returns the default (100) on the in-memory backend. *)
 val sync_batch_interval_ms : t -> int
 
 (** Set the batched time threshold T in milliseconds (clamped to >= 0). No-op
