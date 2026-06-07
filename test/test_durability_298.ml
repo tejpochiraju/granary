@@ -338,6 +338,107 @@ let test_of_store_durability_option () =
     Lwt.return_unit)
 ;;
 
+(* WAL frame size constant (header 32 bytes + page 4096 bytes = 4128? no:
+   the WAL uses 4096-byte pages and 24-byte frame headers = 4120 bytes/frame,
+   consistent with test_wal_autocheckpoint.ml's frame_size = 4120). *)
+let frame_size = 4120
+
+(* Simulate a crash by truncating the WAL to a frame-aligned length that
+   drops some trailing frames.  This mirrors the idiom in test_crash_property.ml
+   (truncate_wal / Unix.ftruncate) and represents kernel-buffer data that was
+   never flushed to disk because no fsync was issued in Off mode.
+
+   We keep the WAL header (32 bytes) plus [keep_frames] complete frames.
+   If the WAL file is smaller than expected we still truncate to whatever
+   frame-aligned size is possible (possibly 0 usable frames). *)
+let simulate_crash_truncate path ~keep_frames =
+  let wal_path = path ^ "-wal" in
+  (* WAL file layout: 32-byte WAL header + N * frame_size bytes of frames *)
+  let wal_header_size = 32 in
+  let target = wal_header_size + (keep_frames * frame_size) in
+  try
+    let actual = (Unix.stat wal_path).Unix.st_size in
+    let truncate_to = min target actual in
+    (* Round down to a frame boundary relative to the header *)
+    let usable = truncate_to - wal_header_size in
+    let aligned =
+      wal_header_size + if usable < 0 then 0 else usable - (usable mod frame_size)
+    in
+    let fd = Unix.openfile wal_path [ Unix.O_RDWR ] 0o644 in
+    Unix.ftruncate fd aligned;
+    Unix.close fd
+  with
+  | _ ->
+    (* WAL does not exist yet — nothing to truncate.
+        This can happen if the engine checkpointed everything back to the
+        main file; in that case the data is already durable. *)
+    ()
+;;
+
+(* Test: in Off mode, after a simulated crash (WAL tail truncation at a
+   frame boundary — representing unflushed kernel buffers lost on process
+   death), recovery must yield a COMMIT-PREFIX of the acknowledged commits.
+   That is: the recovered keys form a contiguous range k0000..k{j-1} for
+   some j in [0,40].  No holes are permitted (a missing key followed by a
+   present one would indicate structural inconsistency in the WAL replay).
+
+   Crash simulation methodology (mirrors test_crash_property.ml):
+   - Write commits in Off mode (no fsync on commit — data sits in OS page cache).
+   - Close the store normally (the fd is released but no fsync was ever issued
+     for the commit payloads, so the WAL tail may or may not be on stable storage).
+   - Truncate the WAL to a frame-aligned offset keeping roughly the first half of
+     frames.  This models the kernel discarding the trailing OS page-cache pages
+     that were never fsynced to disk.
+   - Reopen and assert the prefix property. *)
+let test_off_recovers_prefix () =
+  let path = fresh_path () in
+  cleanup path;
+  (* Phase 1: write 40 commits in Off mode (no fsyncs issued on commit).
+     Close the store normally — this releases the lock in locked_inodes so
+     we can reopen below.  The "crash" is modelled by the WAL truncation
+     that follows: we discard the trailing frames that were never fsynced. *)
+  run
+    (let* st = open_st path in
+     S.set_durability st S.Off;
+     S.set_wal_autocheckpoint st 0;
+     let* () = do_commits st 40 in
+     S.close st);
+  (* Phase 2: truncate the WAL to lose some trailing frames.
+     We keep roughly half the frames to exercise partial-recovery, while
+     still leaving enough for prefix-consistency to be testable.  The exact
+     cut point does not matter; what matters is that the remaining frames
+     decode to a valid prefix of commits. *)
+  (let wal_path = path ^ "-wal" in
+   let wal_total =
+     try (Unix.stat wal_path).Unix.st_size with
+     | _ -> 0
+   in
+   (* Compute total frame count and keep roughly the first half. *)
+   let wal_header_size = 32 in
+   let total_frames = (wal_total - wal_header_size) / frame_size in
+   let keep_frames = total_frames / 2 in
+   simulate_crash_truncate path ~keep_frames);
+  (* Phase 3: reopen the DB and verify the prefix property. *)
+  run
+    (let* st = open_st path in
+     let* tx = S.ro_begin st in
+     let rec scan i seen_gap =
+       if i = 40
+       then Lwt.return_unit
+       else
+         let* v = S.get tx 16 (bs (Printf.sprintf "k%04d" i)) in
+         match v, seen_gap with
+         | Some _, true ->
+           Alcotest.failf "hole then key at %d — not a prefix (gap before i=%d)" i i
+         | None, _ -> scan (i + 1) true
+         | Some _, false -> scan (i + 1) false
+     in
+     let* () = scan 0 false in
+     let* () = S.ro_end tx in
+     S.close st);
+  cleanup path
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -364,6 +465,12 @@ let () =
         ] )
     ; ( "open-option"
       , [ Alcotest.test_case "of_store ?durability" `Quick test_of_store_durability_option
+        ] )
+    ; ( "recovery"
+      , [ Alcotest.test_case
+            "off recovers a commit-prefix"
+            `Quick
+            test_off_recovers_prefix
         ] )
     ]
 ;;
