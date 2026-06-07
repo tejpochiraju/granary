@@ -279,7 +279,11 @@ val durability : t -> durability
 
 (** Set the durability mode. [Batched] params are remembered across switches
     to [Full]/[Off] (so a later [PRAGMA synchronous=batched] restores them).
-    No-op on the in-memory backend.  Negative [Batched] params are clamped to 0. *)
+    No-op on the in-memory backend.  Negative [Batched] params are clamped to 0.
+    When the mode actually changes, the batched durability counters
+    ([unsynced_commits] and the T window) are reset, so a long [Off] period
+    does not carry a stale count into [Batched]; durability is unaffected
+    because checkpoint/close remain the anchors. *)
 val set_durability : t -> durability -> unit
 
 (** Batched commit-count threshold N (default 256). Independent of the active
@@ -287,17 +291,34 @@ val set_durability : t -> durability -> unit
     Returns the default (256) on the in-memory backend. *)
 val sync_batch_commits : t -> int
 
-(** Set the batched commit-count threshold N (clamped to >= 0). No-op on the
-    in-memory backend. *)
+(** Set the batched commit-count threshold N (clamped to >= 0). A value of 0
+    DISABLES the commit-count trigger (durability then relies on the time
+    trigger, if any, plus checkpoint/close). No-op on the in-memory backend. *)
 val set_sync_batch_commits : t -> int -> unit
 
 (** Batched time threshold T in milliseconds (default 100).
     Returns the default (100) on the in-memory backend. *)
 val sync_batch_interval_ms : t -> int
 
-(** Set the batched time threshold T in milliseconds (clamped to >= 0). No-op
-    on the in-memory backend. *)
+(** Set the batched time threshold T in milliseconds (clamped to >= 0). A value
+    of 0 DISABLES the time trigger (durability then relies on the commit-count
+    trigger, if any, plus checkpoint/close). No-op on the in-memory backend. *)
 val set_sync_batch_interval_ms : t -> int -> unit
+
+(** Force any committed-but-unsynced WAL frames to disk now (batched/off modes).
+    A no-op in [Full] mode, on the in-memory backend, or when nothing is pending.
+    Used when tightening durability (e.g. PRAGMA synchronous=full) so already-acked
+    commits become durable immediately rather than only on the next commit. *)
+val flush_unsynced : t -> unit Lwt.t
+
+(** Parse a durability mode name (case-insensitive "full"|"batched"|"off").
+    Returns [None] for anything else.  [Batched] uses the current default
+    params; callers that need to preserve N/T should construct [Batched] from
+    {!sync_batch_commits}/{!sync_batch_interval_ms} themselves. *)
+val durability_of_string : string -> durability option
+
+(** Canonical lowercase name of a durability mode ("full"|"batched"|"off"). *)
+val string_of_durability : durability -> string
 
 (** Install the wall-clock source ([unit -> float], Unix-epoch seconds) used by
     [Batched] mode's time threshold. Without one, the default [fun () -> 0.]

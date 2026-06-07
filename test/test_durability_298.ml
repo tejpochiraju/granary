@@ -466,6 +466,78 @@ let test_off_recovers_prefix () =
   cleanup path
 ;;
 
+(* --- review fixes (#298 Group A) --- *)
+
+(* #8: a non-positive count threshold DISABLES the count trigger rather than
+   firing every commit.  With T effectively infinite and no clock advance, no
+   commit should ever sync. *)
+let test_n_zero_disables_count_trigger () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_durability st (S.Batched { commits = 0; interval_ms = 1_000_000 });
+    S.set_wal_autocheckpoint st 0;
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 30 in
+    let delta = S.wal_sync_count st - s0 in
+    Alcotest.(check int) "N=0 disables count trigger: zero commit fsyncs" 0 delta;
+    (* Control: a positive N still works (N=10 over 30 => 3 syncs). *)
+    S.set_durability st (S.Batched { commits = 10; interval_ms = 1_000_000 });
+    let s1 = S.wal_sync_count st in
+    let* () = do_commits st 30 in
+    let delta2 = S.wal_sync_count st - s1 in
+    Alcotest.(check int) "control N=10 over 30 commits => 3 fsyncs" 3 delta2;
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* #4: switching modes resets the unsynced-commit counter, so a long [Off]
+   run does not carry stale accrual into [Batched] and trip N immediately. *)
+let test_mode_switch_resets_counter () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_wal_autocheckpoint st 0;
+    S.set_durability st S.Off;
+    let* () = do_commits st 20 in
+    (* Now switch to Batched N=10.  If the 20 Off-commits had carried over,
+       the very first batched commit would immediately trip N=10. *)
+    S.set_durability st (S.Batched { commits = 10; interval_ms = 1_000_000 });
+    let s0 = S.wal_sync_count st in
+    let* () = do_commits st 5 in
+    let delta = S.wal_sync_count st - s0 in
+    Alcotest.(check int) "mode switch reset counter: 5 batched commits, no sync" 0 delta;
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
+(* #1 (headline): the replication sink must NEVER fire for unsynced frames.
+   In batched mode with N high and no clock, commits accumulate unsynced, so
+   the sink callback must fire 0 times.  A checkpoint then makes them durable
+   (via its own path), after which the sink ship cursor is reset for the new
+   epoch. *)
+let test_sink_gated_to_synced () =
+  run
+  @@ with_fresh ~f:(fun path ->
+    let* st = open_st path in
+    S.set_wal_autocheckpoint st 0;
+    let fired = ref 0 in
+    S.set_commit_callback
+      st
+      (Some
+         (fun ~epoch:_ ~base_idx:_ ~count:_ ->
+           incr fired;
+           Lwt.return_unit));
+    (* High N + no clock => neither trigger fires; commits stay unsynced. *)
+    S.set_durability st (S.Batched { commits = 1_000_000; interval_ms = 1_000_000 });
+    let* () = do_commits st 5 in
+    (* Give any (erroneously) scheduled async callbacks a chance to run. *)
+    let* () = Lwt.pause () in
+    Alcotest.(check int) "sink does not fire for unsynced commits" 0 !fired;
+    let* () = S.close st in
+    Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "durability_298"
@@ -502,6 +574,20 @@ let () =
             "off recovers a commit-prefix"
             `Quick
             test_off_recovers_prefix
+        ] )
+    ; ( "review-fixes"
+      , [ Alcotest.test_case
+            "#8 N=0 disables count trigger"
+            `Quick
+            test_n_zero_disables_count_trigger
+        ; Alcotest.test_case
+            "#4 mode switch resets counter"
+            `Quick
+            test_mode_switch_resets_counter
+        ; Alcotest.test_case
+            "#1 sink gated to synced frames"
+            `Quick
+            test_sink_gated_to_synced
         ] )
     ]
 ;;
