@@ -296,7 +296,14 @@
 
 (test
  (name test_durability_298)
- (libraries sqlocaml sqlocaml.store sqlocaml.storage sqlocaml.unix alcotest lwt.unix unix))
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.storage
+  sqlocaml.unix
+  alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_overflow)
