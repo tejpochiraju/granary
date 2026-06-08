@@ -68,6 +68,8 @@ type bt_savepoint =
   ; sp_freelist : Freelist.t
   ; sp_n_pages : int64
   ; sp_dirty : Pager.dirty_snapshot
+  ; sp_txn_pool : int64 list
+    (** #297: txn-owned page pool snapshot, restored on savepoint rollback. *)
   }
 
 (* Per-store commit queue for WAL-mode group commit (#77, #151).  After
@@ -1153,6 +1155,7 @@ let rw_begin t =
          | Some m -> Int64.min current_rw_txn_id m
        in
        Pager.set_alloc_min_safe st.pager min_safe;
+       Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
        st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
     Lwt.return (Rw t))
 ;;
@@ -2046,6 +2049,7 @@ let savepoint_begin (Rw t : rw txn) name =
       ; sp_freelist = Pager.freelist st.pager
       ; sp_n_pages = Pager.n_pages st.pager
       ; sp_dirty = Pager.dirty_clone st.pager
+      ; sp_txn_pool = Pager.txn_owned_pool_get st.pager
       }
     in
     st.bt_savepoints <- sp :: st.bt_savepoints;
@@ -2109,6 +2113,7 @@ let savepoint_rollback (Rw t : rw txn) name =
         Pager.set_freelist st.pager sp.sp_freelist;
         Pager.set_n_pages st.pager sp.sp_n_pages;
         Pager.dirty_restore st.pager sp.sp_dirty;
+        Pager.txn_owned_pool_set st.pager sp.sp_txn_pool;
         (* Keep the named savepoint at the top so it can be re-used. *)
         st.bt_savepoints <- sp :: rest
       | _ :: rest -> find rest

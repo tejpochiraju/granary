@@ -61,6 +61,16 @@ type t =
   ; mutable freelist : Freelist.t
   ; mutable current_txn_id : int64
   ; mutable alloc_min_safe : int64
+  ; mutable n_pages_at_rw_begin : int64
+    (** #297: page count captured at rw_begin; pages with id >= this
+        threshold were allocated by file extension in the current txn
+        and can be safely freed+reused within the same txn without
+        affecting snapshot readers or in-flight cursors. *)
+  ; mutable txn_owned_pool : int64 list
+    (** #297: pool of page-ids that were allocated above
+        [n_pages_at_rw_begin] during the current txn and have since
+        been freed.  [alloc] consults this pool before the main
+        freelist. *)
   ; mutable wal : wal_callbacks option
   ; mutable write_tag : int32
     (** #174: schema-fingerprint stamp to write into the reserved header bytes
@@ -81,11 +91,13 @@ let pp_error fmt = function
 let pp fmt t =
   Format.fprintf
     fmt
-    "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld }@]"
+    "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld;@ \
+     txn_pool = %d }@]"
     t.n_pages
     (Hashtbl.length t.cache)
     (Hashtbl.length t.dirty)
     t.current_txn_id
+    (List.length t.txn_owned_pool)
 ;;
 
 let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
@@ -103,6 +115,8 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; freelist
   ; current_txn_id = 0L
   ; alloc_min_safe = 0L
+  ; n_pages_at_rw_begin = 0L
+  ; txn_owned_pool = []
   ; wal = None
   ; write_tag = 0l
   }
@@ -377,25 +391,40 @@ let write_owned t page_id buf = Hashtbl.replace t.dirty page_id buf
      consults [dirty] first on the no-snapshot path. *)
 
 let alloc t =
-  match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
-  | Some (pid32, fl') ->
-    t.freelist <- fl';
-    Lwt.return_ok (Int64.of_int32 pid32)
-  | None ->
-    (* Extend the file by one page *)
-    let new_id = t.n_pages in
-    let new_pages = Int64.add t.n_pages 1L in
-    let open Lwt.Syntax in
-    let* result = t.resize ~n_pages:new_pages in
-    (match result with
-     | Error msg -> Lwt.return_error (Block_error msg)
-     | Ok () ->
-       t.n_pages <- new_pages;
-       Lwt.return_ok new_id)
+  (* #297: consult the txn-owned pool first — pages that were allocated
+     above n_pages_at_rw_begin and have since been freed within this txn. *)
+  match t.txn_owned_pool with
+  | pid :: rest ->
+    t.txn_owned_pool <- rest;
+    Lwt.return_ok pid
+  | [] ->
+    match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
+    | Some (pid32, fl') ->
+      t.freelist <- fl';
+      Lwt.return_ok (Int64.of_int32 pid32)
+    | None ->
+      (* Extend the file by one page *)
+      let new_id = t.n_pages in
+      let new_pages = Int64.add t.n_pages 1L in
+      let open Lwt.Syntax in
+      let* result = t.resize ~n_pages:new_pages in
+      (match result with
+       | Error msg -> Lwt.return_error (Block_error msg)
+       | Ok () ->
+         t.n_pages <- new_pages;
+         Lwt.return_ok new_id)
 ;;
 
 let free t ~page_id ~freed_at_txn_id =
-  t.freelist <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
+  (* #297: pages allocated above n_pages_at_rw_begin are txn-owned and
+     can be safely reused within the current txn.  Route them to the
+     txn_owned_pool instead of the main freelist so [alloc] returns them
+     immediately without risking cursor or snapshot corruption. *)
+  if Int64.compare page_id t.n_pages_at_rw_begin >= 0
+  then t.txn_owned_pool <- page_id :: t.txn_owned_pool
+  else
+    t.freelist <-
+      Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
 ;;
 
 (* Internal: drive the WAL append callback [append] with the dirty
@@ -500,6 +529,12 @@ let freelist t = t.freelist
 let set_txn_id t id = t.current_txn_id <- id
 let get_txn_id t = t.current_txn_id
 let set_alloc_min_safe t v = t.alloc_min_safe <- v
+let set_n_pages_at_rw_begin t v = t.n_pages_at_rw_begin <- v
+let txn_owned_pool_get t = t.txn_owned_pool
+let txn_owned_pool_set t v = t.txn_owned_pool <- v
+(* Referenced from store.ml; suppress unused-value warning within package. *)
+let _set_n_pages_at_rw_begin = set_n_pages_at_rw_begin
+let _txn_owned_pool_get = txn_owned_pool_get
 
 (* Number of distinct pages currently pinned by live RO snapshots (#159).
    Exposed for #164 testing: lets a test assert pins return to 0 after a
@@ -517,7 +552,10 @@ let clear_dirty t =
     dirty_pids;
   let old_fifo = Queue.copy t.fifo in
   Queue.clear t.fifo;
-  Queue.iter (fun key -> if Hashtbl.mem t.cache key then Queue.push key t.fifo) old_fifo
+  Queue.iter (fun key -> if Hashtbl.mem t.cache key then Queue.push key t.fifo) old_fifo;
+  (* #297: txn-owned pages are discarded on rollback (they were never
+     part of a committed tree). *)
+  txn_owned_pool_set t []
 ;;
 
 type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t

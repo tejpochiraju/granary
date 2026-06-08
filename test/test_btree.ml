@@ -295,10 +295,19 @@ let test_root_page_changes () =
   (* The pager starts with pages 0 and 1 pre-allocated, so the first alloc
      returns page 2 — i.e. root must not be 0L after a successful put. *)
   Alcotest.(check bool) "root_page non-zero after first put" true (r1 <> 0L);
-  (* Each put on a distinct key creates a new CoW page, so the root changes. *)
+  (* With #297, pages allocated in this txn (above n_pages_at_rw_begin)
+     are reused within the txn.  The root may stay the SAME because
+     the old page is freed and immediately reclaimed, overwritten with
+     the new content.  Verify the tree is functional either way. *)
   let t2 = ok_btree (run (Btree.put t1 (b "b") (b "2"))) in
   let r2 = Btree.root_page t2 in
-  Alcotest.(check bool) "root_page changed after second put (CoW)" true (r1 <> r2)
+  Alcotest.(check bool) "root_page non-zero" true (r2 <> 0L);
+  (match run (Btree.get t2 (b "b")) with
+     | Ok v -> Alcotest.(check (option string)) "second key reads back" (Some "2") (Option.map Bytes.to_string v)
+     | Error e -> Alcotest.failf "get b failed: %a" Btree.pp_error e);
+  (match run (Btree.get t2 (b "a")) with
+   | Ok v -> Alcotest.(check (option string)) "first key still reads back" (Some "1") (Option.map Bytes.to_string v)
+   | Error e -> Alcotest.failf "get a failed: %a" Btree.pp_error e)
 ;;
 
 let test_key_too_large () =
