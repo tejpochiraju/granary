@@ -810,8 +810,11 @@ let rec propagate_up pager (path : path_step list) (child_result : write_result)
           right_new
     in
     (* Free the old branch page.  Stamp it with the pager's current_txn_id.
-       Pager reuses a freed page only when alloc_min_safe > freed_at, so a page
-       freed within this transaction will not be immediately recycled — safe. *)
+       Committed-tree pages go to the main freelist where the guard
+       alloc_min_safe > freed_at prevents same-txn reuse — safe.
+       (#297) Pages allocated above n_pages_at_rw_begin are routed to a
+       separate txn_owned_pool and ARE reused within this txn, but this
+       branch was part of a committed tree so it follows the main path. *)
     Pager.free pager ~page_id:step.page_id ~freed_at_txn_id:(Pager.get_txn_id pager);
     let* w = write_branch_maybe_split pager new_entries ~right_page:new_right_page in
     (match w with

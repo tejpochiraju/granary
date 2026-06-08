@@ -1155,6 +1155,15 @@ let rw_begin t =
          | Some m -> Int64.min current_rw_txn_id m
        in
        Pager.set_alloc_min_safe st.pager min_safe;
+       (* #297: same-txn page reuse happens via the txn_owned_pool (pages
+          allocated above n_pages_at_rw_begin), NOT the main freelist, so
+          alloc_min_safe is unchanged from the pre-#297 baseline.  The
+          None branch (no readers) and Some m branch (reader exists) both
+          keep the original guard — committed-tree pages freed at
+          current_rw_txn_id are never eligible for same-txn reuse via the
+          main freelist regardless of reader state.  The txn_owned_pool,
+          checked before the main freelist by Pager.alloc, provides
+          same-txn reuse independently of the freelist guard. *)
        Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
        st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
     Lwt.return (Rw t))
