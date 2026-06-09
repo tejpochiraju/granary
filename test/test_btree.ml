@@ -303,11 +303,19 @@ let test_root_page_changes () =
   let r2 = Btree.root_page t2 in
   Alcotest.(check bool) "root_page non-zero" true (r2 <> 0L);
   (match run (Btree.get t2 (b "b")) with
-     | Ok v -> Alcotest.(check (option string)) "second key reads back" (Some "2") (Option.map Bytes.to_string v)
-     | Error e -> Alcotest.failf "get b failed: %a" Btree.pp_error e);
-  (match run (Btree.get t2 (b "a")) with
-   | Ok v -> Alcotest.(check (option string)) "first key still reads back" (Some "1") (Option.map Bytes.to_string v)
-   | Error e -> Alcotest.failf "get a failed: %a" Btree.pp_error e)
+   | Ok v ->
+     Alcotest.(check (option string))
+       "second key reads back"
+       (Some "2")
+       (Option.map Bytes.to_string v)
+   | Error e -> Alcotest.failf "get b failed: %a" Btree.pp_error e);
+  match run (Btree.get t2 (b "a")) with
+  | Ok v ->
+    Alcotest.(check (option string))
+      "first key still reads back"
+      (Some "1")
+      (Option.map Bytes.to_string v)
+  | Error e -> Alcotest.failf "get a failed: %a" Btree.pp_error e
 ;;
 
 let test_key_too_large () =

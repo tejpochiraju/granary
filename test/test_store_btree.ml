@@ -1677,43 +1677,43 @@ let test_same_txn_page_reuse_bounded () =
       try Sys.remove path with
       | _ -> ())
     (fun () ->
-      let store = Result.get_ok (run (S.open_file ~path ())) in
-      (* Insert some rows in separate txns to build tree structure *)
-      let n_setup = 10 in
-      for i = 1 to n_setup do
-        let tx = run (S.rw_begin store) in
-        let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-        run (S.put tx 16 key (Bytes.of_string "v"));
-        run (S.commit tx)
-      done;
-      let n_pages_before = S.n_pages store in
-      (* Insert many more rows in a SINGLE transaction *)
-      let n_insert = 200 in
-      let tx = run (S.rw_begin store) in
-      for i = n_setup + 1 to n_setup + n_insert do
-        let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-        run (S.put tx 16 key (Bytes.of_string "v"))
-      done;
-      run (S.commit tx);
-      let n_pages_after = S.n_pages store in
-      let growth = Int64.(sub n_pages_after n_pages_before) in
-      (* Growth should be bounded by tree depth * split pages, not by
+       let store = Result.get_ok (run (S.open_file ~path ())) in
+       (* Insert some rows in separate txns to build tree structure *)
+       let n_setup = 10 in
+       for i = 1 to n_setup do
+         let tx = run (S.rw_begin store) in
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"));
+         run (S.commit tx)
+       done;
+       let n_pages_before = S.n_pages store in
+       (* Insert many more rows in a SINGLE transaction *)
+       let n_insert = 200 in
+       let tx = run (S.rw_begin store) in
+       for i = n_setup + 1 to n_setup + n_insert do
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         run (S.put tx 16 key (Bytes.of_string "v"))
+       done;
+       run (S.commit tx);
+       let n_pages_after = S.n_pages store in
+       let growth = Int64.(sub n_pages_after n_pages_before) in
+       (* Growth should be bounded by tree depth * split pages, not by
          N_insert * depth. A 210-row single-tree insert should grow by
          well under 100 pages (each insert reuses freed pages). *)
-      Alcotest.(check bool)
-        (Printf.sprintf "n_pages growth %Ld < 100" growth)
-        true
-        (Int64.compare growth 100L < 0);
-      (* Verify all data is correct *)
-      let ro = run (S.ro_begin store) in
-      for i = 1 to n_setup + n_insert do
-        let key = Bytes.of_string (Printf.sprintf "%04d" i) in
-        match run (S.get ro 16 key) with
-        | Some v -> Alcotest.(check string) "correct value" "v" (Bytes.to_string v)
-        | None -> Alcotest.failf "key %d not found" i
-      done;
-      run (S.ro_end ro);
-      run (S.close store))
+       Alcotest.(check bool)
+         (Printf.sprintf "n_pages growth %Ld < 100" growth)
+         true
+         (Int64.compare growth 100L < 0);
+       (* Verify all data is correct *)
+       let ro = run (S.ro_begin store) in
+       for i = 1 to n_setup + n_insert do
+         let key = Bytes.of_string (Printf.sprintf "%04d" i) in
+         match run (S.get ro 16 key) with
+         | Some v -> Alcotest.(check string) "correct value" "v" (Bytes.to_string v)
+         | None -> Alcotest.failf "key %d not found" i
+       done;
+       run (S.ro_end ro);
+       run (S.close store))
 ;;
 
 (* ------------------------------------------------------------------ *)

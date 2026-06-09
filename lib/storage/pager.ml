@@ -91,8 +91,8 @@ let pp_error fmt = function
 let pp fmt t =
   Format.fprintf
     fmt
-    "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld;@ \
-     txn_pool = %d }@]"
+    "@[<hv>Pager.t { n_pages = %Ld;@ cached = %d;@ dirty = %d;@ txn_id = %Ld;@ txn_pool \
+     = %d }@]"
     t.n_pages
     (Hashtbl.length t.cache)
     (Hashtbl.length t.dirty)
@@ -398,21 +398,21 @@ let alloc t =
     t.txn_owned_pool <- rest;
     Lwt.return_ok pid
   | [] ->
-    match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
-    | Some (pid32, fl') ->
-      t.freelist <- fl';
-      Lwt.return_ok (Int64.of_int32 pid32)
-    | None ->
-      (* Extend the file by one page *)
-      let new_id = t.n_pages in
-      let new_pages = Int64.add t.n_pages 1L in
-      let open Lwt.Syntax in
-      let* result = t.resize ~n_pages:new_pages in
-      (match result with
-       | Error msg -> Lwt.return_error (Block_error msg)
-       | Ok () ->
-         t.n_pages <- new_pages;
-         Lwt.return_ok new_id)
+    (match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
+     | Some (pid32, fl') ->
+       t.freelist <- fl';
+       Lwt.return_ok (Int64.of_int32 pid32)
+     | None ->
+       (* Extend the file by one page *)
+       let new_id = t.n_pages in
+       let new_pages = Int64.add t.n_pages 1L in
+       let open Lwt.Syntax in
+       let* result = t.resize ~n_pages:new_pages in
+       (match result with
+        | Error msg -> Lwt.return_error (Block_error msg)
+        | Ok () ->
+          t.n_pages <- new_pages;
+          Lwt.return_ok new_id))
 ;;
 
 let free t ~page_id ~freed_at_txn_id =
@@ -423,8 +423,8 @@ let free t ~page_id ~freed_at_txn_id =
   if Int64.compare page_id t.n_pages_at_rw_begin >= 0
   then t.txn_owned_pool <- page_id :: t.txn_owned_pool
   else
-    t.freelist <-
-      Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
+    t.freelist
+    <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
 ;;
 
 (* Internal: drive the WAL append callback [append] with the dirty
