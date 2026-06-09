@@ -68,18 +68,27 @@ val set_wal : t -> wal_callbacks option -> unit
 (** True when a WAL overlay is attached. *)
 val wal_mode : t -> bool
 
-(** Read [page_id], consulting dirty (writer path) or the WAL snapshot. *)
+(** Read [page_id], consulting dirty (writer path) or the WAL snapshot.
+    When [~bypass_cache:true], the page is read from the block device but NOT
+    inserted into the shared FIFO cache.  Intended for single-use pages such as
+    BLOB overflow chains where caching would evict hot B-tree pages without
+    benefit.  On a cache hit the cached buffer is still returned even when
+    [bypass_cache] is set; only insertion-on-miss is suppressed. *)
 val read
   :  ?snapshot_frames:int
   -> ?pin_set:(int64, unit) Hashtbl.t
+  -> ?bypass_cache:bool
   -> t
   -> int64
   -> (Cstruct.t, error) result Lwt.t
 
-(** Zero-copy borrow-read: the callback receives the page buffer directly. *)
+(** Zero-copy borrow-read: the callback receives the page buffer directly.
+    When [~bypass_cache:true], the page is read from the block device but NOT
+    inserted into the shared FIFO cache.  See {!val:read} for details. *)
 val read_borrow
   :  ?snapshot_frames:int
   -> ?pin_set:(int64, unit) Hashtbl.t
+  -> ?bypass_cache:bool
   -> t
   -> int64
   -> (Cstruct.t -> 'a Lwt.t)

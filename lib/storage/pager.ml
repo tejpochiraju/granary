@@ -252,7 +252,7 @@ let resolve_wal_page t finder =
 
 (* Load [page_id] from the shared cache, or from the block device on a miss
    (caching the result).  The returned Cstruct is fresh. *)
-let load_main_page t pin_set page_id =
+let load_main_page ?(bypass_cache = false) t pin_set page_id =
   let open Lwt.Syntax in
   let key = cache_key_main page_id in
   match Hashtbl.find_opt t.cache key with
@@ -265,19 +265,21 @@ let load_main_page t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       cache_add t key (cstruct_dup buf);
-       pin_page t pin_set page_id;
+       if not bypass_cache
+       then (
+         cache_add t key (cstruct_dup buf);
+         pin_page t pin_set page_id);
        Lwt.return_ok buf)
 ;;
 
-let read ?snapshot_frames ?pin_set t page_id =
+let read ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
   let open Lwt.Syntax in
   let load_after_wal finder =
     let* wal_r = resolve_wal_page t finder in
     match wal_r with
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> Lwt.return_ok page
-    | Ok None -> load_main_page t pin_set page_id
+    | Ok None -> load_main_page ~bypass_cache t pin_set page_id
   in
   match snapshot_frames with
   | None ->
@@ -328,7 +330,7 @@ let resolve_wal_page_borrow t finder =
    concurrent writer dirtying the same page during a yielding callback installs
    a NEW buffer and leaves this borrowed one untouched; eviction merely drops
    the hashtbl entry, the buffer itself stays live while the callback holds it. *)
-let load_main_page_borrow t pin_set page_id =
+let load_main_page_borrow ?(bypass_cache = false) t pin_set page_id =
   let open Lwt.Syntax in
   let key = cache_key_main page_id in
   match Hashtbl.find_opt t.cache key with
@@ -341,12 +343,14 @@ let load_main_page_borrow t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       cache_add t key buf;
-       pin_page t pin_set page_id;
+       if not bypass_cache
+       then (
+         cache_add t key buf;
+         pin_page t pin_set page_id);
        Lwt.return_ok buf)
 ;;
 
-let read_borrow ?snapshot_frames ?pin_set t page_id f =
+let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
   let open Lwt.Syntax in
   let borrow buf =
     let* v = f buf in
@@ -358,7 +362,7 @@ let read_borrow ?snapshot_frames ?pin_set t page_id f =
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> borrow page
     | Ok None ->
-      let* r = load_main_page_borrow t pin_set page_id in
+      let* r = load_main_page_borrow ~bypass_cache t pin_set page_id in
       (match r with
        | Error e -> Lwt.return_error e
        | Ok buf -> borrow buf)
