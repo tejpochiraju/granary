@@ -1,0 +1,124 @@
+name: Benchmark (#345)
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_label:
+        description: Label for the result CSV/meta (default "bench-ci")
+        required: false
+        default: bench-ci
+      rows:
+        description: Dataset rows (default 100000)
+        required: false
+        default: "100000"
+      ops:
+        description: Point-lookup ops (default 20000)
+        required: false
+        default: "20000"
+      scans:
+        description: Scan/agg repeats (default 50)
+        required: false
+        default: "50"
+      commits:
+        description: Single-row txns (default 500)
+        required: false
+        default: "500"
+      repeats:
+        description: Timed repeats (default 5)
+        required: false
+        default: "5"
+      page_cache:
+        description: Page-cache pages (default 1024)
+        required: false
+        default: "1024"
+
+concurrency:
+  group: bench-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: self-hosted
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+
+    steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev sqlite3
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.4-bench-${{ hashFiles('sqlocaml.opam') }}
+          restore-keys: opam-5.4-bench-
+
+      - name: Install opam packages
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix uutf uucp \
+            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3
+
+      - name: Build bench binary
+        run: opam exec -- dune build test/bench_compare.exe
+
+      - name: Run benchmark
+        env:
+          SQLOCAML_BENCH_HOST: ${{ github.event.inputs.host_label }}
+          SQLOCAML_BENCH_ROWS: ${{ github.event.inputs.rows }}
+          SQLOCAML_BENCH_OPS: ${{ github.event.inputs.ops }}
+          SQLOCAML_BENCH_SCANS: ${{ github.event.inputs.scans }}
+          SQLOCAML_BENCH_COMMITS: ${{ github.event.inputs.commits }}
+          SQLOCAML_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
+          SQLOCAML_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
+        run: |
+          LABEL="${{ github.event.inputs.host_label }}"
+          mkdir -p bench/results
+          opam exec -- dune exec test/bench_compare.exe 2>&1 \
+            > "bench/results/${LABEL}.csv"
+          echo "bench/results/${LABEL}.csv:"
+          cat "bench/results/${LABEL}.csv"
+
+      - name: Generate metadata
+        run: |
+          LABEL="${{ github.event.inputs.host_label }}"
+          {
+            echo "host=$LABEL"
+            echo "date=$(date -u +%FT%TZ)"
+            echo "nproc=$(nproc)"
+            echo "sqlite_version=$(sqlite3 --version | awk '{print $1}')"
+            echo "sqlocaml_sha=$(git rev-parse --short HEAD)"
+            echo "rows=${{ github.event.inputs.rows }} ops=${{ github.event.inputs.ops }} scans=${{ github.event.inputs.scans }} commits=${{ github.event.inputs.commits }} repeats=${{ github.event.inputs.repeats }} page_cache=${{ github.event.inputs.page_cache }}"
+          } > "bench/results/${LABEL}.meta"
+          cat "bench/results/${LABEL}.meta"
+
+      - name: Upload results as artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results-${{ github.event.inputs.host_label }}
+          path: bench/results/
+          retention-days: 90
+
+      - name: Commit results
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LABEL="${{ github.event.inputs.host_label }}"
+          git config user.name "bench-bot"
+          git config user.email "bench-bot@iotready.com"
+          git add bench/results/
+          if git diff --cached --quiet; then
+            echo "No new results to commit"
+            exit 0
+          fi
+          git commit -m "bench(#345): results for ${LABEL}"
+          git remote set-url origin "https://x-access-token:${TOKEN}@$(echo '${{ github.server_url }}' | sed 's|https://||')/${{ github.repository }}.git"
+          git push origin HEAD:${{ github.ref_name }}
