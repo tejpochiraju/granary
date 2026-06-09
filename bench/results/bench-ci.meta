@@ -1,0 +1,15 @@
+host=bench-ci
+date=2026-06-09T18:25:01Z
+nproc=12
+sqlite_version=3.45.1
+sqlocaml_sha=28127d9
+rows=100000
+ops=20000
+scans=50
+commits=500
+repeats=5
+page_cache=1024
+storage=overlay-fs (ci-container /tmp)
+disk=sda 0 Virtual Floppy0 
+sr0 0 Virtual CDROM0 
+nvme1n1 0 WDC CL SN720 SDAQNTW-512G-2000 

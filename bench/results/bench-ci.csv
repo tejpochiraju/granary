@@ -1,0 +1,16 @@
+host,engine,workload,variant,rows,ops,wall_s,cpu_s,cpu_wall_ratio,ops_per_s
+bench-ci,sqlite,point_lookup,plaintext,100000,20000,0.055415,0.055257,0.997,360913.7
+bench-ci,sqlite,scan_agg,plaintext,100000,50,0.223192,0.222570,0.997,224.0
+bench-ci,sqlite,insert_one,plaintext,20000,20000,8.015658,0.704566,0.088,2495.1
+bench-ci,sqlite,insert_batch,plaintext,100000,100000,0.095669,0.086780,0.907,1045270.3
+bench-ci,sqlite,commit_n,plaintext,500,500,0.175602,0.018339,0.104,2847.3
+bench-ci,sqlocaml,point_lookup,plaintext,100000,20000,0.208826,0.208096,0.997,95773.5
+bench-ci,sqlocaml,scan_agg,plaintext,100000,50,2.235709,2.332148,1.043,22.4
+bench-ci,sqlocaml,insert_one,plaintext,20000,20000,23.065903,12.434290,0.539,867.1
+bench-ci,sqlocaml,insert_batch,plaintext,100000,100000,12.304386,12.226165,0.994,8127.2
+bench-ci,sqlocaml,commit_n,plaintext,500,500,0.622305,0.355193,0.571,803.5
+bench-ci,sqlocaml,point_lookup,encrypted,100000,20000,0.240091,0.239464,0.997,83301.7
+bench-ci,sqlocaml,scan_agg,encrypted,100000,50,2.817838,2.918724,1.036,17.7
+bench-ci,sqlocaml,insert_one,encrypted,20000,20000,27.404727,16.224918,0.592,729.8
+bench-ci,sqlocaml,insert_batch,encrypted,100000,100000,12.852020,12.780698,0.994,7780.9
+bench-ci,sqlocaml,commit_n,encrypted,500,500,0.722372,0.437964,0.606,692.2
