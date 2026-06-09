@@ -339,12 +339,14 @@ let test_bypass_cache_does_not_evict () =
     let bytes = Bytes.make Page.page_size (Char.chr (i land 0xFF)) in
     Hashtbl.replace mb.store (Int64.of_int i) bytes
   done;
-  (* Fill cache with pages 0..62 using normal reads (63 pages, cache cap is 64) *)
+  (* 63 = cache_cap - 1 (cache is pinned to 64 in this test suite's init).
+     Filling 63 slots with normal reads means the 64th normal read *would*
+     evict under non-bypass, making the bypass anti-eviction test meaningful. *)
   for i = 0 to 62 do
     let _ = run (Pager.read p (Int64.of_int i)) in
     ()
   done;
-  (* Now read pages 63..127 with bypass — should NOT evict *)
+  (* Now read pages 63..127 with bypass — should NOT evict hot pages *)
   let reads_before_bypass = mb.read_count in
   for i = 63 to 127 do
     let _ = run (Pager.read ~bypass_cache:true p (Int64.of_int i)) in
@@ -363,6 +365,15 @@ let test_bypass_cache_does_not_evict () =
   Alcotest.(check int)
     "cached pages not evicted by bypass"
     reads_before_reread
+    mb.read_count;
+  (* The bypass-read pages must NOT have been cached either *)
+  let reads_before_check = mb.read_count in
+  let _ = run (Pager.read p 63L) in
+  let _ = run (Pager.read p 100L) in
+  let _ = run (Pager.read p 127L) in
+  Alcotest.(check int)
+    "bypass-read pages are not cached"
+    (reads_before_check + 3)
     mb.read_count
 ;;
 
