@@ -265,7 +265,8 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       if not bypass_cache then (
+       if not bypass_cache
+       then (
          cache_add t key (cstruct_dup buf);
          pin_page t pin_set page_id);
        Lwt.return_ok buf)
@@ -342,7 +343,8 @@ let load_main_page_borrow ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       if not bypass_cache then (
+       if not bypass_cache
+       then (
          cache_add t key buf;
          pin_page t pin_set page_id);
        Lwt.return_ok buf)
