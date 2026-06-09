@@ -1,182 +1,7 @@
-(** Page cache + allocator over a BLOCK backend.
-    Holds dirty pages in memory until [flush] is called. *)
+(** Pager: page cache + allocator over a BLOCK backend. *)
 
-type t
+type cache_key = int64 * int
 
-type error =
-  | Block_error of string
-  | Corruption of string
-
-(** Pretty-print page count, cache/dirty sizes and current txn id. *)
-val pp : Format.formatter -> t -> unit
-
-(** Pretty-print an {!error}. *)
-val pp_error : Format.formatter -> error -> unit
-
-(** Create a pager over an open Unix_file or Mem block device.  The geometry
-    defaults to {!Geometry.default} (4096/0); the open path calls {!set_geom}
-    with the file's real geometry before any page op (#95).
-    [n_pages]: current total pages in the file (from header, or 0 for empty file).
-    [freelist]: the current freelist state (deserialized from the file, or [Freelist.empty]). *)
-val create
-  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
-  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
-  -> sync:(unit -> (unit, string) result Lwt.t)
-  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
-  -> n_pages:int64
-  -> freelist:Freelist.t
-  -> t
-
-(** Set this pager's page geometry (#95).  Called once by the open path before
-    any page read/write, after the geometry is peeked/decided. *)
-val set_geom : t -> Geometry.t -> unit
-
-(** The page geometry chosen for this pager (#95). *)
-val geom : t -> Geometry.t
-
-(** [geom.page_size] — bytes per page on disk. *)
-val page_size : t -> int
-
-(** [geom.reserved_bytes_per_page] — fixed bytes carved off each page's tail. *)
-val reserved_bytes : t -> int
-
-(** Usable data-area bytes per page for this geometry. *)
-val max_data_bytes : t -> int
-
-(** Maximum payload an overflow page can hold for this geometry. *)
-val max_overflow_payload_bytes : t -> int
-
-(** Freelist entries per freelist page for this geometry. *)
-val max_freelist_entries_per_page : t -> int
-
-(** Read a page.
-    [snapshot_frames] (default [None]): writer / non-WAL reader path —
-    consults the dirty set first, then the WAL's latest frame, then main
-    DB.  [Some n]: snapshot reader bounded to WAL frames strictly less
-    than [n]; never consults the dirty set.
-
-    [pin_set] (default [None]): when provided, every main-DB-cached page
-    returned through this call is pinned for the owning RO snapshot (#159)
-    — recorded in [pin_set] and refcounted internally so eviction skips it
-    until the snapshot releases it via {!unpin_all}.  Pages served from a
-    WAL frame are not cached and so are never pinned.  Subject to a budget
-    that always leaves a reserve of evictable slots.
-
-    The returned Cstruct.t is a fresh copy — caller may modify it freely. *)
-val read
-  :  ?snapshot_frames:int
-  -> ?pin_set:(int64, unit) Hashtbl.t
-  -> t
-  -> int64
-  -> (Cstruct.t, error) result Lwt.t
-
-(** Scoped zero-copy read (#244).  Resolves [page_id] exactly as {!read}
-    (dirty / WAL / cache / main, honouring [snapshot_frames] and [pin_set])
-    but hands the callback a {b borrowed} view of the underlying page buffer,
-    shedding the per-call defensive ~4 KB [cstruct_dup] that {!read} always
-    pays.  On the cache / dirty paths this is fully copy-free.  On the WAL path
-    (#246) {!Wal.read_frame} may now hand back a buffer the WAL retains in its
-    decrypted-frame cache (shared across readers, immutable for the life of the
-    WAL generation), so the borrow is copy-free there too on a cache hit; it
-    stays memory-safe under the same read-only borrow contract, not on any
-    per-call freshness.  Returns
-    [Ok] of the callback's result, or [Error] if the page read itself fails
-    (the callback is then not invoked).
-
-    {b Borrow contract — the callback MUST:}
-    - treat the buffer as read-only (never mutate it); and
-    - not retain it past the callback (don't store it in cursor/tree state, don't
-      return it or any [Cstruct.sub] of it).
-
-    Decode the bytes you need into owned values inside the callback and return
-    those.  The buffer aliases the shared cache / dirty / WAL-frame buffer;
-    those are only ever replaced wholesale, never written in place, so a
-    concurrent writer dirtying the same page during a yielding callback cannot
-    corrupt the borrowed view.  Use {!read} (which copies) for any caller that
-    needs to mutate or keep the page. *)
-val read_borrow
-  :  ?snapshot_frames:int
-  -> ?pin_set:(int64, unit) Hashtbl.t
-  -> t
-  -> int64
-  -> (Cstruct.t -> 'a Lwt.t)
-  -> ('a, error) result Lwt.t
-
-(** Release every page pinned into [pin_set] by a snapshot's reads.
-    Decrements the shared pin refcount per page; pages reaching zero
-    become evictable again.  Called from [Store.ro_end]. *)
-val unpin_all : t -> (int64, unit) Hashtbl.t -> unit
-
-(** Mark a page as dirty with new contents. Buffered until [flush].
-    Does not write to BLOCK immediately. The Cstruct.t is copied internally. *)
-val write : t -> int64 -> Cstruct.t -> unit
-
-(** Like {!write}, but takes ownership of the buffer instead of copying it.
-    The caller MUST NOT mutate the buffer afterwards.  Saves a full page-sized
-    alloc+memcpy per call; used on the B+-tree write path where each page buffer
-    is freshly built and never reused. *)
-val write_owned : t -> int64 -> Cstruct.t -> unit
-
-(** Allocate a new page ID. Tries freelist first (reusing pages where
-    freed_at_txn_id < alloc_min_safe); extends file if none available. *)
-val alloc : t -> (int64, error) result Lwt.t
-
-(** Free a page (add to in-memory freelist with [freed_at_txn_id]). *)
-val free : t -> page_id:int64 -> freed_at_txn_id:int64 -> unit
-
-(** Flush all dirty pages to BLOCK: write each dirty page, then sync.
-    Clears the dirty set after success. *)
-val flush : t -> (unit, error) result Lwt.t
-
-(** Like {!flush} but skips the trailing device sync when in WAL mode.
-    Used by the group-commit coordinator to write the batch's frames
-    without paying a per-writer fsync.  On non-WAL backends this is
-    identical to {!flush}. *)
-val flush_no_sync : t -> (unit, error) result Lwt.t
-
-(** Invoke the WAL device sync.  No-op when no WAL hook is installed.
-    Used by the group-commit coordinator after a sequence of
-    {!flush_no_sync} calls. *)
-val wal_sync : t -> (unit, error) result Lwt.t
-
-(** Current total page count (updated by [alloc]). *)
-val n_pages : t -> int64
-
-(** Current freelist state (for serialisation into header). *)
-val freelist : t -> Freelist.t
-
-(** Set the current RW transaction ID. B+-tree uses get_txn_id for freed_at stamps. *)
-val set_txn_id : t -> int64 -> unit
-
-(** Get the current RW transaction ID (used by btree.ml for freed_at stamps). *)
-val get_txn_id : t -> int64
-
-(** Set the minimum txn_id threshold for freelist reuse.
-    A freed page is reusable iff freed_at_txn_id < alloc_min_safe. *)
-val set_alloc_min_safe : t -> int64 -> unit
-
-(** Number of distinct pages currently pinned by live RO snapshots (#159).
-    Diagnostic/testing only. *)
-val pinned_count : t -> int
-
-(** Replace the in-memory freelist (used after deserializing from disk). *)
-val set_freelist : t -> Freelist.t -> unit
-
-(** Override the pager's current page count.  Used by [Store.open_block]
-    after probing headers to set the authoritative logical page count
-    without going through the resize callback. *)
-val set_n_pages : t -> int64 -> unit
-
-(** Discard all dirty pages (and remove them from the read cache) without
-    writing them to disk. Used on rollback to prevent aborted writes from
-    being visible. *)
-val clear_dirty : t -> unit
-
-(** Optional WAL hook. When set, [read] consults [wal_find_page] before
-    falling back to the read cache + main DB; [flush] appends the dirty
-    set to the WAL as a single commit batch instead of writing to the
-    main DB. The Pager does not depend on [Sqlocaml_storage.Wal] — the
-    caller wires the callbacks in. *)
 type wal_callbacks =
   { wal_find_page : int64 -> int option
   ; wal_find_page_at : int64 -> max_frame:int -> int option
@@ -186,39 +11,150 @@ type wal_callbacks =
   ; wal_sync : unit -> (unit, string) result Lwt.t
   }
 
-(** Install (or clear) the WAL hook. Pass [None] to revert to direct
-    main-DB writes. *)
-val set_wal : t -> wal_callbacks option -> unit
+type t
 
-(** True iff a WAL hook is currently installed. *)
-val wal_mode : t -> bool
+type error =
+  | Block_error of string
+  | Corruption of string
 
-(** #174: set the schema-fingerprint stamp written into the reserved header
-    bytes of subsequently-built Branch/Leaf pages.  The store sets this per
-    tree-operation (0 for system/untagged trees). *)
+type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
+
+(** Pretty-print a pager error. *)
+val pp_error : Format.formatter -> error -> unit
+
+(** Pretty-print the pager state (n_pages, cache/dirty sizes, txn_id). *)
+val pp : Format.formatter -> t -> unit
+
+(** Create a pager over BLOCK callbacks with the given initial page count and freelist. *)
+val create
+  :  read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> resize:(n_pages:int64 -> (unit, string) result Lwt.t)
+  -> n_pages:int64
+  -> freelist:Freelist.t
+  -> t
+
+(** Set the schema-fingerprint stamp for subsequently-built Btree pages (#174). *)
 val set_write_tag : t -> int32 -> unit
 
-(** Current schema-fingerprint stamp (#174); read by the page builders. *)
+(** Current schema-fingerprint stamp (#174). *)
 val write_tag : t -> int32
 
-(** Write a single page directly to the main-DB callback, bypassing the
-    WAL hook. Used by checkpointing. Does not sync. *)
-val flush_one_to_main : t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t
+(** Set the file's page geometry (called once on open, before any page op). *)
+val set_geom : t -> Geometry.t -> unit
 
-(** Sync the main-DB callback. Used at the end of checkpoint. *)
+(** Current page geometry. *)
+val geom : t -> Geometry.t
+
+(** Page size in bytes. *)
+val page_size : t -> int
+
+(** Reserved bytes per page (#174 schema fingerprint). *)
+val reserved_bytes : t -> int
+
+(** Maximum bytes of user data per page. *)
+val max_data_bytes : t -> int
+
+(** Maximum payload bytes for an overflow page. *)
+val max_overflow_payload_bytes : t -> int
+
+(** Maximum freelist entries that fit on one page. *)
+val max_freelist_entries_per_page : t -> int
+
+(** Attach or detach the WAL overlay.  Clears cache on transition into WAL mode. *)
+val set_wal : t -> wal_callbacks option -> unit
+
+(** True when a WAL overlay is attached. *)
+val wal_mode : t -> bool
+
+(** Read [page_id], consulting dirty (writer path) or the WAL snapshot. *)
+val read
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> t
+  -> int64
+  -> (Cstruct.t, error) result Lwt.t
+
+(** Zero-copy borrow-read: the callback receives the page buffer directly. *)
+val read_borrow
+  :  ?snapshot_frames:int
+  -> ?pin_set:(int64, unit) Hashtbl.t
+  -> t
+  -> int64
+  -> (Cstruct.t -> 'a Lwt.t)
+  -> ('a, error) result Lwt.t
+
+(** Write [buf] to [page_id] (defensive copy). *)
+val write : t -> int64 -> Cstruct.t -> unit
+
+(** Write [buf] to [page_id] (takes ownership, no defensive copy). *)
+val write_owned : t -> int64 -> Cstruct.t -> unit
+
+(** Allocate a page: txn-owned pool, then main freelist, then file extension. *)
+val alloc : t -> (int64, error) result Lwt.t
+
+(** Free [page_id] stamped with [freed_at_txn_id]; txn-owned pages route to the pool. *)
+val free : t -> page_id:int64 -> freed_at_txn_id:int64 -> unit
+
+(** Flush all dirty pages to the WAL with an fsync. *)
+val flush : t -> (unit, error) result Lwt.t
+
+(** Flush all dirty pages to the WAL without an fsync. *)
+val flush_no_sync : t -> (unit, error) result Lwt.t
+
+(** Flush dirty pages directly to the main BLOCK device with an fsync. *)
 val flush_sync_main : t -> (unit, error) result Lwt.t
 
-(** Opaque snapshot of the dirty page set, captured at a given moment.
-    Used by Store.savepoint to roll back to an intermediate state without
-    aborting the entire transaction. *)
-type dirty_snapshot
+(** Flush a single page to the main BLOCK device. *)
+val flush_one_to_main : t -> page_id:int64 -> buf:Cstruct.t -> (unit, error) result Lwt.t
 
-(** Clone the current dirty set. The Cstruct buffers themselves are not
-    deep-copied — they are only ever replaced (not mutated in-place) by
-    [write], so sharing references is safe. *)
+(** Current page count (may grow via [alloc], shrink via [set_n_pages]). *)
+val n_pages : t -> int64
+
+(** Current freelist state. *)
+val freelist : t -> Freelist.t
+
+(** Set the current RW transaction ID. *)
+val set_txn_id : t -> int64 -> unit
+
+(** Current RW transaction ID (0 when no RW txn is active). *)
+val get_txn_id : t -> int64
+
+(** Set the minimum safe txn ID for freelist reuse (gated by active readers). *)
+val set_alloc_min_safe : t -> int64 -> unit
+
+(** Number of distinct pages pinned by live RO snapshots (#159). *)
+val pinned_count : t -> int
+
+(** Replace the entire freelist (used by rollback and checkpoint). *)
+val set_freelist : t -> Freelist.t -> unit
+
+(** Override n_pages (used by savepoint rollback to truncate the file). *)
+val set_n_pages : t -> int64 -> unit
+
+(** Discard all dirty pages and rollback state (#297 pool included). *)
+val clear_dirty : t -> unit
+
+(** Snapshot the dirty set (for savepoints). *)
 val dirty_clone : t -> dirty_snapshot
 
-(** Restore the dirty set to a snapshot. Any pages now-dirty but not in
-    the snapshot are removed; pages in the snapshot are reinstated with
-    their snapshotted content. The read cache is left as-is. *)
+(** Restore a dirty set snapshot (for savepoints). *)
 val dirty_restore : t -> dirty_snapshot -> unit
+
+(** Release every pin held by an RO snapshot (#159). *)
+val unpin_all : t -> (int64, unit) Hashtbl.t -> unit
+
+(** Forward-sync the WAL (fsync the WAL file). *)
+val wal_sync : t -> (unit, error) result Lwt.t
+
+(* #297: txn-owned page pool API *)
+
+(** Set the page count threshold at rw_begin; pages >= this are txn-owned. *)
+val set_n_pages_at_rw_begin : t -> int64 -> unit
+
+(** Current txn-owned page pool (freed pages available for reuse). *)
+val txn_owned_pool_get : t -> int64 list
+
+(** Replace the txn-owned page pool (used by commit and rollback). *)
+val txn_owned_pool_set : t -> int64 list -> unit
