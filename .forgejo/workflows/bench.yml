@@ -33,7 +33,7 @@ on:
         default: "1024"
 
 concurrency:
-  group: bench-${{ github.sha }}
+  group: bench
   cancel-in-progress: true
 
 jobs:
@@ -63,15 +63,13 @@ jobs:
 
       - name: Install opam packages
         run: |
-          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+          opam install -y lwt cstruct menhir lwt_ppx \
             mirage-block mirage-block-unix uutf uucp \
-            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3
-
-      - name: Build bench binary
-        run: opam exec -- dune build test/bench_compare.exe
+            mirage-crypto mirage-crypto-rng sqlite3
 
       - name: Run benchmark
         env:
+          LABEL: ${{ github.event.inputs.host_label }}
           SQLOCAML_BENCH_HOST: ${{ github.event.inputs.host_label }}
           SQLOCAML_BENCH_ROWS: ${{ github.event.inputs.rows }}
           SQLOCAML_BENCH_OPS: ${{ github.event.inputs.ops }}
@@ -80,7 +78,8 @@ jobs:
           SQLOCAML_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
           SQLOCAML_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
         run: |
-          LABEL="${{ github.event.inputs.host_label }}"
+          LABEL="${LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="bench-ci"
           mkdir -p bench/results
           opam exec -- dune exec test/bench_compare.exe 2>&1 \
             > "bench/results/${LABEL}.csv"
@@ -88,15 +87,29 @@ jobs:
           cat "bench/results/${LABEL}.csv"
 
       - name: Generate metadata
+        env:
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
+          ROWS: ${{ github.event.inputs.rows }}
+          OPS: ${{ github.event.inputs.ops }}
+          SCANS: ${{ github.event.inputs.scans }}
+          COMMITS: ${{ github.event.inputs.commits }}
+          REPEATS: ${{ github.event.inputs.repeats }}
+          PAGE_CACHE: ${{ github.event.inputs.page_cache }}
         run: |
-          LABEL="${{ github.event.inputs.host_label }}"
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="bench-ci"
           {
             echo "host=$LABEL"
             echo "date=$(date -u +%FT%TZ)"
             echo "nproc=$(nproc)"
             echo "sqlite_version=$(sqlite3 --version | awk '{print $1}')"
             echo "sqlocaml_sha=$(git rev-parse --short HEAD)"
-            echo "rows=${{ github.event.inputs.rows }} ops=${{ github.event.inputs.ops }} scans=${{ github.event.inputs.scans }} commits=${{ github.event.inputs.commits }} repeats=${{ github.event.inputs.repeats }} page_cache=${{ github.event.inputs.page_cache }}"
+            echo "rows=$ROWS"
+            echo "ops=$OPS"
+            echo "scans=$SCANS"
+            echo "commits=$COMMITS"
+            echo "repeats=$REPEATS"
+            echo "page_cache=$PAGE_CACHE"
           } > "bench/results/${LABEL}.meta"
           cat "bench/results/${LABEL}.meta"
 
@@ -109,9 +122,14 @@ jobs:
 
       - name: Commit results
         env:
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.ref_name }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          LABEL="${{ github.event.inputs.host_label }}"
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="bench-ci"
           git config user.name "bench-bot"
           git config user.email "bench-bot@iotready.com"
           git add bench/results/
@@ -120,5 +138,6 @@ jobs:
             exit 0
           fi
           git commit -m "bench(#345): results for ${LABEL}"
-          git remote set-url origin "https://x-access-token:${TOKEN}@$(echo '${{ github.server_url }}' | sed 's|https://||')/${{ github.repository }}.git"
-          git push origin HEAD:${{ github.ref_name }}
+          git remote set-url origin "https://x-access-token:${TOKEN}@$(echo "${SERVER_URL}" | sed 's|https://||')/${REPOSITORY}.git"
+          git pull --rebase origin "${BRANCH}"
+          git push origin HEAD:"${BRANCH}"
