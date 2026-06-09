@@ -1165,6 +1165,8 @@ let rw_begin t =
           checked before the main freelist by Pager.alloc, provides
           same-txn reuse independently of the freelist guard. *)
        Pager.set_n_pages_at_rw_begin st.pager (Pager.n_pages st.pager);
+       (* #297: defensive reset — any leftover from the previous txn is stale. *)
+       Pager.txn_owned_pool_set st.pager [];
        st.txn_freelist_snapshot <- Some (Pager.freelist st.pager));
     Lwt.return (Rw t))
 ;;
@@ -1575,6 +1577,10 @@ let commit_prepare_btree
     st.current_header <- { new_state with txn_id = Int64.add st.current_header.txn_id 1L };
     st.txn_freelist_snapshot <- None;
     st.bt_savepoints <- [];
+    (* #297: discard the txn-owned pool — these pages are now part
+       of the committed tree (freed file-extension pages reuse
+       within the txn; any not reused by commit are orphans). *)
+    Pager.txn_owned_pool_set st.pager [];
     Lwt.return_unit
 ;;
 

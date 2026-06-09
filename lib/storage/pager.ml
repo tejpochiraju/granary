@@ -532,9 +532,6 @@ let set_alloc_min_safe t v = t.alloc_min_safe <- v
 let set_n_pages_at_rw_begin t v = t.n_pages_at_rw_begin <- v
 let txn_owned_pool_get t = t.txn_owned_pool
 let txn_owned_pool_set t v = t.txn_owned_pool <- v
-(* Referenced from store.ml; suppress unused-value warning within package. *)
-let _set_n_pages_at_rw_begin = set_n_pages_at_rw_begin
-let _txn_owned_pool_get = txn_owned_pool_get
 
 (* Number of distinct pages currently pinned by live RO snapshots (#159).
    Exposed for #164 testing: lets a test assert pins return to 0 after a

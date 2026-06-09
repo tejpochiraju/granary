@@ -182,6 +182,9 @@ let test_free_then_alloc_reusable () =
 (* free then alloc (with alloc_min_safe = freed_at_txn_id) → returns NEW page (freed not yet reusable) *)
 let test_free_then_alloc_same_txn () =
   let p, _ = make_pager ~n_pages:5L () in
+  (* #297: set n_pages_at_rw_begin so page 3 (< 5) routes to the main
+     freelist, not the txn_owned_pool, to test the guard directly. *)
+  Pager.set_n_pages_at_rw_begin p 5L;
   Pager.free p ~page_id:3L ~freed_at_txn_id:2L;
   (* alloc_min_safe=2: freed_at(2) < 2 is false — page 3 not yet reusable *)
   Pager.set_alloc_min_safe p 2L;
