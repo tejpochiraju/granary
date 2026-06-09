@@ -68,9 +68,9 @@ jobs:
             mirage-crypto mirage-crypto-rng sqlite3
 
       - name: Run benchmark
+        id: run
         env:
-          LABEL: ${{ github.event.inputs.host_label }}
-          SQLOCAML_BENCH_HOST: ${{ github.event.inputs.host_label }}
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
           SQLOCAML_BENCH_ROWS: ${{ github.event.inputs.rows }}
           SQLOCAML_BENCH_OPS: ${{ github.event.inputs.ops }}
           SQLOCAML_BENCH_SCANS: ${{ github.event.inputs.scans }}
@@ -78,8 +78,10 @@ jobs:
           SQLOCAML_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
           SQLOCAML_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
         run: |
-          LABEL="${LABEL//[^a-zA-Z0-9_-]/}"
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
           [[ -z "$LABEL" ]] && LABEL="bench-ci"
+          export SQLOCAML_BENCH_HOST="$LABEL"
+          echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
           mkdir -p bench/results
           opam exec -- dune exec test/bench_compare.exe 2>&1 \
             > "bench/results/${LABEL}.csv"
@@ -110,13 +112,15 @@ jobs:
             echo "commits=$COMMITS"
             echo "repeats=$REPEATS"
             echo "page_cache=$PAGE_CACHE"
+            echo "storage=overlay-fs (ci-container /tmp)"
+            echo "disk=$(lsblk -d -o NAME,ROTA,MODEL --noheadings 2>/dev/null | tr -s ' ' | head -3 || echo 'unavailable')"
           } > "bench/results/${LABEL}.meta"
           cat "bench/results/${LABEL}.meta"
 
       - name: Upload results as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: bench-results-${{ github.event.inputs.host_label }}
+          name: bench-results-${{ steps.run.outputs.label }}
           path: bench/results/
           retention-days: 90
 
