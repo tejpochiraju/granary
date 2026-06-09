@@ -113,7 +113,8 @@ jobs:
             echo "repeats=$REPEATS"
             echo "page_cache=$PAGE_CACHE"
             echo "storage=overlay-fs (ci-container /tmp)"
-            echo "disk=$(lsblk -d -o NAME,ROTA,MODEL --noheadings 2>/dev/null | tr -s ' ' | head -3 || echo 'unavailable')"
+            DISK=$(lsblk -d -o NAME,ROTA,MODEL --noheadings 2>/dev/null | tr -s ' ' | head -3)
+            echo "disk=${DISK:-unavailable}"
           } > "bench/results/${LABEL}.meta"
           cat "bench/results/${LABEL}.meta"
 
