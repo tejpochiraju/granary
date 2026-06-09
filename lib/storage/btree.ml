@@ -189,28 +189,35 @@ let read_overflow_chain ?snapshot_frames ?pin_set pager ~head_pid ~total_size
              (Printf.sprintf "overflow chain short: got %d of %d bytes" offset total_size))
     else
       let* r =
-        Pager.read_borrow ?snapshot_frames ?pin_set pager pid (fun buf ->
-          let common = Page.read_common buf in
-          if common.kind <> Page.Overflow
-          then
-            Lwt.return (Error (Tree_corrupt "overflow chain points to non-overflow page"))
-          else (
-            let payload_len = Page.overflow_payload_len buf in
-            let remaining = total_size - offset in
-            if payload_len > remaining
-            then
-              Lwt.return
-                (Error
-                   (Tree_corrupt
-                      (Printf.sprintf
-                         "overflow chain page payload %d exceeds remaining %d"
-                         payload_len
-                         remaining)))
-            else (
-              (* Copies OUT into the owned [out] buffer — buf is not retained. *)
-              Cstruct.blit_to_bytes buf (Page.data_offset + 2) out offset payload_len;
-              let next_pid = page_id_of_int32 common.right_page in
-              Lwt.return (Ok (next_pid, offset + payload_len)))))
+        Pager.read_borrow
+          ?snapshot_frames
+          ?pin_set
+          ~bypass_cache:true
+          pager
+          pid
+          (fun buf ->
+             let common = Page.read_common buf in
+             if common.kind <> Page.Overflow
+             then
+               Lwt.return
+                 (Error (Tree_corrupt "overflow chain points to non-overflow page"))
+             else (
+               let payload_len = Page.overflow_payload_len buf in
+               let remaining = total_size - offset in
+               if payload_len > remaining
+               then
+                 Lwt.return
+                   (Error
+                      (Tree_corrupt
+                         (Printf.sprintf
+                            "overflow chain page payload %d exceeds remaining %d"
+                            payload_len
+                            remaining)))
+               else (
+                 (* Copies OUT into the owned [out] buffer — buf is not retained. *)
+                 Cstruct.blit_to_bytes buf (Page.data_offset + 2) out offset payload_len;
+                 let next_pid = page_id_of_int32 common.right_page in
+                 Lwt.return (Ok (next_pid, offset + payload_len)))))
       in
       bind_pager r (function
         | Error e -> return_error e
@@ -227,7 +234,7 @@ let free_overflow_chain pager ~head_pid : (unit, error) result Lwt.t =
     then return_ok ()
     else
       let* r =
-        Pager.read_borrow pager pid (fun buf ->
+        Pager.read_borrow ~bypass_cache:true pager pid (fun buf ->
           let common = Page.read_common buf in
           if common.kind <> Page.Overflow
           then (* Defensive: don't free non-overflow pages. *)

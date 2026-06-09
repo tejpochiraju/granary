@@ -287,6 +287,86 @@ let test_cache_eviction () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* Cache-bypass tests (#268)                                           *)
+(* ------------------------------------------------------------------ *)
+
+(** [~bypass_cache:true] reads from BLOCK every time (never cached). *)
+let test_bypass_cache_does_not_cache () =
+  let p, mb = make_pager ~n_pages:2L () in
+  let bytes0 = Bytes.make Page.page_size '\x77' in
+  let bytes1 = Bytes.make Page.page_size '\x88' in
+  Hashtbl.replace mb.store 0L bytes0;
+  Hashtbl.replace mb.store 1L bytes1;
+  (* Read page 0 normally — gets cached *)
+  let _ = run (Pager.read p 0L) in
+  Alcotest.(check int) "first read hits BLOCK" 1 mb.read_count;
+  let _ = run (Pager.read p 0L) in
+  Alcotest.(check int) "second read from cache" 1 mb.read_count;
+  (* Read page 1 with bypass — hits BLOCK every time *)
+  let _ = run (Pager.read ~bypass_cache:true p 1L) in
+  Alcotest.(check int) "bypass read hits BLOCK" 2 mb.read_count;
+  let _ = run (Pager.read ~bypass_cache:true p 1L) in
+  Alcotest.(check int) "second bypass read still hits BLOCK" 3 mb.read_count
+;;
+
+(** [~bypass_cache:true] with [read_borrow] — same property. *)
+let test_bypass_cache_read_borrow () =
+  let p, mb = make_pager ~n_pages:2L () in
+  let bytes0 = Bytes.make Page.page_size '\x77' in
+  let bytes1 = Bytes.make Page.page_size '\x88' in
+  Hashtbl.replace mb.store 0L bytes0;
+  Hashtbl.replace mb.store 1L bytes1;
+  (* First: cached path — second read_borrow shouldn't hit BLOCK *)
+  let _ = run (Pager.read_borrow p 0L (fun b -> Lwt.return b)) in
+  Alcotest.(check int) "first borrow hits BLOCK" 1 mb.read_count;
+  let _ = run (Pager.read_borrow p 0L (fun b -> Lwt.return b)) in
+  Alcotest.(check int) "second borrow from cache" 1 mb.read_count;
+  (* Bypass on an already-cached page still serves from cache *)
+  let _ = run (Pager.read_borrow ~bypass_cache:true p 0L (fun b -> Lwt.return b)) in
+  Alcotest.(check int) "bypass borrow serves cached page" 1 mb.read_count;
+  (* Bypass on a different page — hits BLOCK every time *)
+  let _ = run (Pager.read_borrow ~bypass_cache:true p 1L (fun b -> Lwt.return b)) in
+  Alcotest.(check int) "bypass borrow page 1 first time" 2 mb.read_count;
+  let _ = run (Pager.read_borrow ~bypass_cache:true p 1L (fun b -> Lwt.return b)) in
+  Alcotest.(check int) "bypass borrow page 1 second time" 3 mb.read_count
+;;
+
+(** Bypass reads don't evict hot pages from the cache. *)
+let test_bypass_cache_does_not_evict () =
+  let p, mb = make_pager ~n_pages:128L () in
+  (* Pre-populate mock store for all pages *)
+  for i = 0 to 127 do
+    let bytes = Bytes.make Page.page_size (Char.chr (i land 0xFF)) in
+    Hashtbl.replace mb.store (Int64.of_int i) bytes
+  done;
+  (* Fill cache with pages 0..62 using normal reads (63 pages, cache cap is 64) *)
+  for i = 0 to 62 do
+    let _ = run (Pager.read p (Int64.of_int i)) in
+    ()
+  done;
+  (* Now read pages 63..127 with bypass — should NOT evict *)
+  let reads_before_bypass = mb.read_count in
+  for i = 63 to 127 do
+    let _ = run (Pager.read ~bypass_cache:true p (Int64.of_int i)) in
+    ()
+  done;
+  Alcotest.(check int)
+    "bypass reads all hit BLOCK (not cached)"
+    65
+    (mb.read_count - reads_before_bypass);
+  (* Re-read pages 0..62 — they should still be in cache *)
+  let reads_before_reread = mb.read_count in
+  for i = 0 to 62 do
+    let _ = run (Pager.read p (Int64.of_int i)) in
+    ()
+  done;
+  Alcotest.(check int)
+    "cached pages not evicted by bypass"
+    reads_before_reread
+    mb.read_count
+;;
+
+(* ------------------------------------------------------------------ *)
 (* QCheck property tests                                               *)
 (* ------------------------------------------------------------------ *)
 
@@ -554,6 +634,18 @@ let () =
             `Quick
             test_n_pages_after_two_allocs
         ; Alcotest.test_case "cache eviction" `Quick test_cache_eviction
+        ; Alcotest.test_case
+            "bypass cache does not cache"
+            `Quick
+            test_bypass_cache_does_not_cache
+        ; Alcotest.test_case
+            "bypass cache read_borrow"
+            `Quick
+            test_bypass_cache_read_borrow
+        ; Alcotest.test_case
+            "bypass cache does not evict hot pages"
+            `Quick
+            test_bypass_cache_does_not_evict
         ] )
     ; ( "errors"
       , [ Alcotest.test_case "pp_error Block_error" `Quick test_pp_error_block
