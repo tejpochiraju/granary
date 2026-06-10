@@ -402,6 +402,37 @@ let test_incremental_restore_round_trip () =
     Lwt.return_unit
 ;;
 
+let test_incremental_restore_empty_sets () =
+  let* store, main_d, _wal_d = store_with_wal () in
+  let* () = Store.close store in
+  let pager =
+    Pager.create
+      ~read_page:(read_page main_d)
+      ~write_page:(write_page main_d)
+      ~sync:sync_ok
+      ~resize:resize_ok
+      ~n_pages:16L
+      ~freelist:Freelist.empty
+  in
+  let restore_wal_d = mk_dev 65536 in
+  let* r =
+    Replication.incremental_restore
+      ~read_at:(read_at restore_wal_d)
+      ~write_at:(write_at restore_wal_d)
+      ~sync:sync_ok
+      ~wal_size_bytes:(dev_size restore_wal_d)
+      ~pager
+      ~incremental_sets:[ [] ]
+      ()
+  in
+  match r with
+  | Error (`Restore_error msg) -> Alcotest.failf "empty-set restore failed: %s" msg
+  | Ok (epoch, idx) ->
+    Alcotest.(check int64) "epoch is 0L for empty sets" 0L epoch;
+    Alcotest.(check int) "idx is -1 for empty sets" (-1) idx;
+    Lwt.return_unit
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Test suite                                                           *)
 (* ------------------------------------------------------------------ *)
@@ -426,6 +457,8 @@ let () =
             run (test_frame_conversion_round_trip ()))
         ; Alcotest.test_case "incremental_restore round-trip" `Quick (fun () ->
             run (test_incremental_restore_round_trip ()))
+        ; Alcotest.test_case "empty incremental_sets" `Quick (fun () ->
+            run (test_incremental_restore_empty_sets ()))
         ] )
     ]
 ;;

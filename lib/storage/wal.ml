@@ -436,7 +436,7 @@ let open_
    (review #210). *)
 let cache_frame t ~expected_epoch idx page =
   if
-    t.epoch = expected_epoch
+    Int64.equal t.epoch expected_epoch
     && t.frame_cache_capacity > 0
     && not (Hashtbl.mem t.frame_cache idx)
   then (

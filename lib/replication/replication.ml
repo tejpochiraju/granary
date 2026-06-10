@@ -289,15 +289,13 @@ let incremental_restore
     Lwt.return_error (`Restore_error (Format.asprintf "Wal.open_: %a" Wal.pp_error e))
   | Ok wal ->
     let initial_epoch =
-      match
-        List.find_opt
-          (function
-            | [] -> false
-            | _ -> true)
-          incremental_sets
-      with
-      | Some (f :: _) -> f.epoch
-      | _ -> 0L
+      let rec first_nonempty (sets : Sqlocaml_store.Store.backup_frame list list) =
+        match sets with
+        | [] -> 0L
+        | [] :: rest -> first_nonempty rest
+        | (f :: _) :: _ -> f.epoch
+      in
+      first_nonempty incremental_sets
     in
     let rec apply_sets (last_epoch, last_idx) = function
       | [] -> Lwt.return_ok (last_epoch, last_idx)
