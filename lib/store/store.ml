@@ -2913,7 +2913,11 @@ let capture_frames_since (t : t) ~since_epoch ~since_idx :
          Lwt.return None
        else
          let committed = Wal.committed_frames wal in
-         let start = since_idx + 1 in
+          let start =
+            if since_idx = max_int
+            then max_int
+            else since_idx + 1
+          in
          if start >= committed
          then Lwt.return (Some (Ok []))
          else
@@ -2960,11 +2964,10 @@ let capture_frames_since (t : t) ~since_epoch ~since_idx :
                     in
                     loop (idx + 1) (bf :: acc)
           in
-          let* result = loop start [] in
-          match result with
-          | None -> Lwt.return None
-          | Some (Ok frames) -> Lwt.return (Some (Ok frames))
-          | Some (Error _ as e) -> Lwt.return (Some e))
+          (* loop already returns the exact type of this branch —
+             None for epoch-changed, Some (Ok frames) for success,
+             Some (Error _) for I/O failure.  Direct return. *)
+          loop start [])
 ;;
 
 (** Install an asynchronous callback invoked after each WAL commit batch.

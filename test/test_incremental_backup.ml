@@ -228,7 +228,7 @@ let test_backup_floor_gates_checkpoint () =
   Store.update_backup_position store ~shipped:committed1;
   let rec wait_advanced n =
     if n <= 0
-    then Lwt.return_unit
+    then Alcotest.fail "timeout: checkpoint did not complete after floor advance"
     else
       match Store.replication_state store with
       | Some (epoch, frames) when Int64.compare epoch epoch0 > 0 && frames < committed1 ->
@@ -361,15 +361,18 @@ let test_incremental_restore_round_trip () =
   match r2 with
   | Error e -> Alcotest.failf "re-open store failed: %a" Store.pp_error e
   | Ok restored_store ->
-    let* ro_tx = Store.ro_begin restored_store in
-    let* v1 = Store.get ro_tx 16 (bs "k1") in
-    (match v1 with
-     | None -> Alcotest.fail "k1 not found after restore"
-     | Some v -> Alcotest.(check string) "k1 value after restore" "v1" (Bytes.to_string v));
-    let* v2 = Store.get ro_tx 16 (bs "k2") in
-    (match v2 with
-     | None -> Alcotest.fail "k2 not found after restore"
-     | Some v -> Alcotest.(check string) "k2 value after restore" "v2" (Bytes.to_string v));
+    let* () =
+      Store.with_ro restored_store (fun ro_tx ->
+        let* v1 = Store.get ro_tx 16 (bs "k1") in
+        (match v1 with
+         | None -> Alcotest.fail "k1 not found after restore"
+         | Some v -> Alcotest.(check string) "k1 value after restore" "v1" (Bytes.to_string v));
+        let* v2 = Store.get ro_tx 16 (bs "k2") in
+        (match v2 with
+         | None -> Alcotest.fail "k2 not found after restore"
+         | Some v -> Alcotest.(check string) "k2 value after restore" "v2" (Bytes.to_string v));
+        Lwt.return_unit)
+    in
     let* () = Store.close restored_store in
     Lwt.return_unit
 ;;

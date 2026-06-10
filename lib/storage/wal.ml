@@ -471,7 +471,11 @@ let read_committed_frame t idx =
     | Error e -> Lwt.return_error e
     | Ok None -> Lwt.return_error (Corrupt_frame idx)
     | Ok (Some f) ->
-      cache_frame t idx f.page;
+      (* Do NOT call [cache_frame] here: a concurrent checkpoint could
+         have reset the cache during the I/O yield, and inserting a
+         stale-epoch page would poison the cache for the new epoch
+         (review #209).  The normal [read_frame] path populates the
+         cache; backup reads don't need to prime it. *)
       Lwt.return_ok f
 ;;
 
