@@ -255,6 +255,55 @@ let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
     Lwt.return_ok last_committed
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* Incremental restore (#265)                                           *)
+(* ------------------------------------------------------------------ *)
+
+(** Convert a {!Sqlocaml_store.Store.backup_frame} to a
+    {!replicated_frame} for use with {!apply_frames_epoch_aware}. *)
+let backup_frame_to_replicated (bf : Sqlocaml_store.Store.backup_frame) : replicated_frame =
+  { epoch = bf.epoch
+  ; frame_idx = bf.frame_idx
+  ; page_id = bf.page_id
+  ; is_commit = bf.is_commit
+  ; page = bf.page
+  ; checksum = bf.checksum
+  ; source_salt = bf.source_salt
+  ; source_seed = bf.source_seed
+  }
+;;
+
+let incremental_restore
+      ~read_at
+      ~write_at
+      ~sync
+      ~wal_size_bytes
+      ~pager
+      ~(incremental_sets : Sqlocaml_store.Store.backup_frame list list)
+      ()
+  =
+  let* wal_r = Wal.open_ ~read_at ~write_at ~sync ~size_bytes:wal_size_bytes () in
+  match wal_r with
+  | Error e ->
+    Lwt.return_error (`Restore_error (Format.asprintf "Wal.open_: %a" Wal.pp_error e))
+  | Ok wal ->
+    let initial_epoch =
+      match List.find_opt (function [] -> false | _ -> true) incremental_sets with
+      | Some (f :: _) -> f.epoch
+      | _ -> 0L
+    in
+    let rec apply_sets (last_epoch, last_idx) = function
+      | [] -> Lwt.return_ok (last_epoch, last_idx)
+      | frames :: rest ->
+        let replicated = List.map backup_frame_to_replicated frames in
+        let* r = apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx replicated in
+        match r with
+        | Error (`Apply_error msg) -> Lwt.return_error (`Restore_error msg)
+        | Ok (epoch, idx) -> apply_sets (epoch, idx) rest
+    in
+    apply_sets (initial_epoch, -1) incremental_sets
+;;
+
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]

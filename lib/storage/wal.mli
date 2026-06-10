@@ -115,6 +115,14 @@ val find_page_at : t -> int64 -> max_frame:int -> int option
     generation; the cache is dropped wholesale on {!reset}.) *)
 val read_frame : t -> int -> (Cstruct.t, error) result Lwt.t
 
+(** Read the full frame metadata AND decrypted page bytes at a given
+    committed frame index.  Like {!read_frame} but also returns the
+    [page_id] and [is_commit] flag so the caller can reconstruct the
+    full frame record (e.g. for incremental backup / frame capture).
+
+    Raises [Corrupt_frame] for indices outside [0, committed_frames). *)
+val read_committed_frame : t -> int -> (frame, error) result Lwt.t
+
 (** Append a batch of pages; the LAST entry in the list is automatically
     marked as the commit frame. Performs a single [sync] at the end and
     only then updates the in-memory index. If [sync] fails the index is

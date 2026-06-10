@@ -459,7 +459,20 @@ let read_frame t idx =
        | Ok None -> Lwt.return_error (Corrupt_frame idx)
        | Ok (Some f) ->
          cache_frame t idx f.page;
-         Lwt.return_ok f.page))
+          Lwt.return_ok f.page))
+;;
+
+let read_committed_frame t idx =
+  if idx < 0 || idx >= t.committed_frames
+  then Lwt.return_error (Corrupt_frame idx)
+  else
+    let* r = read_frame_raw ~verify:false t idx in
+    match r with
+    | Error e -> Lwt.return_error e
+    | Ok None -> Lwt.return_error (Corrupt_frame idx)
+    | Ok (Some f) ->
+      cache_frame t idx f.page;
+      Lwt.return_ok f
 ;;
 
 (* ----------------------------------------------------------------- *)

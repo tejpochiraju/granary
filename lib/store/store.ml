@@ -160,7 +160,23 @@ type bt_state =
        broadcast condition, exactly as before this knob existed.  Local
        RO readers are NEVER abandoned by this budget — only the
        replication floor.  On timeout the standby falls outside the live
-       un-checkpointed window and must re-base (see #208). *)
+        un-checkpointed window and must re-base (see #208). *)
+  ; mutable backup_shipped_frames : int
+    (* WAL frame index up to which the backup consumer (if any) has
+       captured frames.  Analogous to [replication_shipped_frames] but for
+       incremental backup (#265).  Initialized to [max_int] so that when no
+       backup consumer is active it does not gate checkpoint truncation.
+       The backup consumer calls {!update_backup_position} to advance this
+       as frames are captured and stored. *)
+  ; mutable backup_gate_max_yields : int
+    (* Bounded-yield "timeout" for the checkpoint gate's wait on the
+       backup floor (#265).  Same semantics as
+       [replication_gate_max_yields]: when the backup consumer has not yet
+       captured frames up to the checkpoint target, the gate yields up to
+       this many times before proceeding anyway.  [max_int] (the default)
+       means unbounded — wait indefinitely.  A finite budget bounds the
+       wait: once spent, the checkpoint proceeds and un-captured frames are
+       recycled (the backup must re-base).  Negative inputs clamp to [0]. *)
   ; mutable on_committed_frames :
       (epoch:int64 -> base_idx:int -> count:int -> unit Lwt.t) option
     (* Optional callback invoked asynchronously after each WAL commit batch.
@@ -469,9 +485,17 @@ let ro_readers_below (st : bt_state) ~target =
 ;;
 
 (* True iff a replication consumer is active and its acked floor is below
-   [target].  This gate is subject to the #207 bounded-yield timeout. *)
+    [target].  This gate is subject to the #207 bounded-yield timeout. *)
 let replication_floor_below (st : bt_state) ~target =
   st.replication_shipped_frames <> max_int && st.replication_shipped_frames < target
+;;
+
+(* True iff a backup consumer is active and its captured floor is below
+   [target].  Analogous to [replication_floor_below] but for the
+   incremental backup watermark (#265).  Subject to a bounded-yield
+   timeout like the replication floor. *)
+let backup_floor_below (st : bt_state) ~target =
+  st.backup_shipped_frames <> max_int && st.backup_shipped_frames < target
 ;;
 
 (* Lookup-or-build the Btree handle for a tree_id using a snapshot's
@@ -607,6 +631,8 @@ let make_btree_store
     ; autockpt_in_flight = false
     ; replication_shipped_frames = max_int
     ; replication_gate_max_yields = max_int
+    ; backup_shipped_frames = max_int
+    ; backup_gate_max_yields = max_int
     ; on_committed_frames = None
     ; follower = false
     ; sync_mode = `Full
@@ -1311,13 +1337,18 @@ let write_freelist_pages pager : int64 Lwt.t =
    produces no broadcast to wake on.
 
    No [~mutex] is passed to [Lwt_condition.wait]: under cooperative Lwt the
-   gate check + wait register atomically (no yield between them), so the
-   standard POSIX condvar mutex pairing isn't needed.  Would need revisiting
-   under a preemptive or effect-based multicore runtime. *)
+    gate check + wait register atomically (no yield between them), so the
+    standard POSIX condvar mutex pairing isn't needed.  Would need revisiting
+    under a preemptive or effect-based multicore runtime. *)
 (** Body of [checkpoint] without mutex management. Caller MUST already
-    hold [t.lock] (e.g. during [commit]). Defined here so [commit]
-    can invoke it via [maybe_autocheckpoint] below. *)
-let rec wait_for_readers_past (st : bt_state) ~target ~max_floor_yields =
+     hold [t.lock] (e.g. during [commit]). Defined here so [commit]
+     can invoke it via [maybe_autocheckpoint] below. *)
+let rec wait_for_readers_past
+      (st : bt_state)
+      ~target
+      ~replication_max_yields
+      ~backup_max_yields
+  =
   if st.closing
   then
     (* #338: close is tearing down — stop gating so a parked checkpoint unwinds;
@@ -1327,28 +1358,43 @@ let rec wait_for_readers_past (st : bt_state) ~target ~max_floor_yields =
   then
     (* A local reader blocks: wait unconditionally on the broadcast. *)
     let* () = Lwt_condition.wait st.reader_done_cond in
-    wait_for_readers_past st ~target ~max_floor_yields
-  else if replication_floor_below st ~target
+    wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields
+  else if replication_floor_below st ~target && replication_max_yields > 0
   then
-    if max_floor_yields = max_int
+    (* Replication floor is behind and budget remains.  Guard with > 0 so
+       an exhausted budget falls through to the backup floor check below
+       (review #2); the <= 0 sub-branch is therefore never entered. *)
+    if replication_max_yields = max_int
     then
       (* Unbounded: efficient event-driven wait, no busy-poll. *)
       let* () = Lwt_condition.wait st.reader_done_cond in
-      wait_for_readers_past st ~target ~max_floor_yields
-    else if max_floor_yields <= 0
+      wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields
+    else
+      let* () = Lwt.pause () in
+      wait_for_readers_past st ~target ~replication_max_yields:(replication_max_yields - 1) ~backup_max_yields
+  else if backup_floor_below st ~target
+  then
+    if backup_max_yields = max_int
     then
-      (* Budget spent: proceed past the stranded replication floor. *)
+      let* () = Lwt_condition.wait st.reader_done_cond in
+      wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields
+    else if backup_max_yields <= 0
+    then
       Lwt.return_unit
     else
       let* () = Lwt.pause () in
-      wait_for_readers_past st ~target ~max_floor_yields:(max_floor_yields - 1)
+      wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields:(backup_max_yields - 1)
   else Lwt.return_unit
 ;;
 
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let target = Wal.committed_frames wal in
   let* () =
-    wait_for_readers_past st ~target ~max_floor_yields:st.replication_gate_max_yields
+    wait_for_readers_past
+      st
+      ~target
+      ~replication_max_yields:st.replication_gate_max_yields
+      ~backup_max_yields:st.backup_gate_max_yields
   in
   if st.closing
   then
@@ -1404,15 +1450,21 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
            st.sink_shipped_frames <- 0;
            st.unsynced_commits <- 0;
            st.last_sync_time <- st.clock ();
-           (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
-            committed_frames, but [replication_shipped_frames] still refers to
-            the old epoch's absolute count.  Without re-pinning, the next
-            checkpoint would see a stale floor that appears to be past the new
-            target, silently allowing frame recycling before the sink ships
-            them. *)
-           if st.on_committed_frames <> None
-           then st.replication_shipped_frames <- Wal.committed_frames wal;
-           Lwt.return_unit)
+            (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
+             committed_frames, but [replication_shipped_frames] still refers to
+             the old epoch's absolute count.  Without re-pinning, the next
+             checkpoint would see a stale floor that appears to be past the new
+             target, silently allowing frame recycling before the sink ships
+             them. *)
+            if st.on_committed_frames <> None
+            then st.replication_shipped_frames <- Wal.committed_frames wal;
+            (* Re-pin the backup floor for the new epoch (#265).  Same
+             reasoning: without re-pinning, the next checkpoint would see a
+             stale backup floor from the old epoch and recycle frames before
+             the backup consumer has captured them. *)
+            if st.backup_shipped_frames <> max_int
+            then st.backup_shipped_frames <- Wal.committed_frames wal;
+            Lwt.return_unit)
       (fun () ->
          st.ckpt_io_in_flight <- st.ckpt_io_in_flight - 1;
          Lwt_condition.broadcast st.reader_done_cond ();
@@ -2763,6 +2815,156 @@ let replication_state (t : t) =
     (match st.wal with
      | None -> None
      | Some wal -> Some (Wal.epoch wal, Wal.committed_frames wal))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Incremental backup (#265)                                            *)
+(* ------------------------------------------------------------------ *)
+
+(** Register the backup consumer's captured position so checkpoint
+    truncation waits for frames to be backed up before recycling them.
+    Analogous to {!update_replication_position} but for the incremental
+    backup watermark. *)
+let update_backup_position (t : t) ~shipped =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st ->
+    st.backup_shipped_frames <- shipped;
+    Lwt_condition.broadcast st.reader_done_cond ()
+;;
+
+(** Get (epoch, committed_frames) for the active WAL; [None] if no WAL.
+    Review #8: delegates to {!replication_state} — the two functions share
+    the same body because both track the same WAL position. *)
+let backup_state (t : t) = replication_state t
+;;
+
+(** Return the backup floor's bounded-yield budget for the checkpoint
+    gate.  Defaults to [max_int] (unbounded) on the B+-tree backend,
+    [0] on the in-memory backend (no checkpoint gating). *)
+let backup_gate_max_yields (t : t) : int =
+  match t.backend with
+  | Mem _ -> 0
+  | Btree st -> st.backup_gate_max_yields
+;;
+
+(** Set the bounded-yield budget the checkpoint gate will spend waiting
+    for the backup floor to reach the checkpoint target before proceeding
+    anyway (#265).  Same semantics as {!set_replication_gate_max_yields}.
+    Negative inputs clamp to [0].  No-op on the in-memory backend. *)
+let set_backup_gate_max_yields (t : t) (n : int) : unit =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.backup_gate_max_yields <- max 0 n
+;;
+
+(** A captured WAL frame for incremental backup (#265).  Contains the
+    full frame metadata and page payload needed to reconstruct the
+    database at a later point.
+
+    The {!checksum} field covers the decrypted page payload (transport
+    integrity for the backup frame), matching the same scheme used by
+    {!Sqlocaml_replication.replicated_frame}.  For unencrypted WALs the
+    plaintext equals the on-disk page; for encrypted WALs the checksum
+    guards against corruption of the decrypted content during transport
+    or storage, not the on-disk ciphertext. *)
+type backup_frame =
+  { epoch : int64
+  ; frame_idx : int
+  ; page_id : int64
+  ; is_commit : bool
+  ; page : Cstruct.t
+  ; checksum : int64
+  ; source_salt : int64
+  ; source_seed : int64
+  }
+
+(* NOTE (review #8): backup_frame and Sqlocaml_replication.replicated_frame
+   are structurally identical.  A future consolidation could merge them
+   into a shared frame type, but the two modules have no common dependency
+   today and the duplication is small enough to live with. *)
+
+(** Capture the committed WAL frames since a given watermark position,
+    returning them as a list of {!backup_frame}.
+
+    [~since_epoch] and [~since_idx] identify the watermark: frames with
+    indices strictly greater than [since_idx] in the current epoch are
+    returned.  If the WAL's epoch has advanced past [since_epoch], no
+    frames can be captured (the caller must take a fresh base snapshot).
+
+    Returns [None] when the WAL's epoch has changed (meaning the caller's
+    watermark is stale and a re-base is needed).  Returns [Some []] when
+    the watermark is current but no new frames have been committed. *)
+let capture_frames_since (t : t) ~since_epoch ~since_idx :
+    (backup_frame list, [> `Capture_error of string ]) result option Lwt.t
+  =
+  match t.backend with
+  | Mem _ -> Some (Ok []) |> Lwt.return
+  | Btree st ->
+    (match st.wal with
+     | None ->
+       Lwt.return (Some (Error (`Capture_error "no WAL active")))
+     | Some wal ->
+       let current_epoch = Wal.epoch wal in
+       if not (Int64.equal current_epoch since_epoch)
+       then
+         (* Epoch changed: the watermark is stale and the caller must
+            re-base (take a fresh full snapshot). *)
+         Lwt.return None
+       else
+         let committed = Wal.committed_frames wal in
+         let start = since_idx + 1 in
+         if start >= committed
+         then Lwt.return (Some (Ok []))
+         else
+          let salt = Wal.salt wal in
+          let seed = Wal.seed wal in
+          let rec loop idx acc =
+            if idx >= committed
+            then Lwt.return (Some (Ok (List.rev acc)))
+            else
+              (* A concurrent checkpoint can bump the epoch while we yield
+                 on I/O.  If the epoch changed, the watermark is stale —
+                 signal through [None] so the caller re-bases cleanly
+                 instead of getting an I/O error. *)
+              let current_epoch = Wal.epoch wal in
+              if not (Int64.equal current_epoch since_epoch)
+              then Lwt.return None
+              else
+                let* r = Wal.read_committed_frame wal idx in
+                match r with
+                | Error _ when not (Int64.equal (Wal.epoch wal) since_epoch) ->
+                  Lwt.return None
+                | Error e ->
+                  Lwt.return (Some
+                    (Error (`Capture_error
+                       (Format.asprintf "read frame %d: %a" idx Wal.pp_error e))))
+                | Ok f ->
+                  if not (Int64.equal (Wal.epoch wal) since_epoch)
+                  then Lwt.return None
+                  else
+                    let flags = if f.is_commit then 1L else 0L in
+                    let checksum =
+                      Wal.frame_checksum ~salt ~seed ~page_id:f.page_id ~flags ~page:f.page
+                    in
+                    let bf : backup_frame =
+                      { epoch = current_epoch
+                      ; frame_idx = idx
+                      ; page_id = f.page_id
+                      ; is_commit = f.is_commit
+                      ; page = f.page
+                      ; checksum
+                      ; source_salt = salt
+                      ; source_seed = seed
+                      }
+                    in
+                    loop (idx + 1) (bf :: acc)
+          in
+          let* result = loop start [] in
+          match result with
+          | None -> Lwt.return None
+          | Some (Ok frames) -> Lwt.return (Some (Ok frames))
+          | Some (Error _ as e) -> Lwt.return (Some e))
 ;;
 
 (** Install an asynchronous callback invoked after each WAL commit batch.

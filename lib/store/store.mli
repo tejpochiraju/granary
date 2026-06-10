@@ -477,6 +477,96 @@ val replication_gate_max_yields : t -> int
     backend. *)
 val set_replication_gate_max_yields : t -> int -> unit
 
+(** -------------------------------------------------------------------- *)
+
+(** Incremental backup (#265)                                                *)
+
+(** -------------------------------------------------------------------- *)
+
+(** A captured WAL frame for incremental backup.  Contains the full frame
+    metadata and page payload needed to reconstruct the database.
+
+    The {!checksum} field covers the decrypted page payload (transport
+    integrity for the backup frame), matching the same scheme used by
+    {!Sqlocaml_replication.replicated_frame}.  For unencrypted WALs the
+    plaintext equals the on-disk page; for encrypted WALs the checksum
+    guards against corruption of the decrypted content during transport
+    or storage, not the on-disk ciphertext. *)
+type backup_frame =
+  { epoch : int64
+  ; frame_idx : int
+  ; page_id : int64
+  ; is_commit : bool
+  ; page : Cstruct.t
+  ; checksum : int64
+  ; source_salt : int64
+  ; source_seed : int64
+  }
+
+(** Register the backup consumer's captured position so checkpoint
+    truncation waits for frames to be backed up before recycling them.
+    Analogous to {!update_replication_position} but for the incremental
+    backup watermark (#265).  When set to [max_int] (the default), the
+    backup consumer is effectively disabled and does not gate checkpoint.
+
+    Broadcasts [reader_done_cond] so that any checkpoint currently
+    parked in [wait_for_readers_past] is immediately woken. *)
+val update_backup_position : t -> shipped:int -> unit
+
+(** Get (epoch, committed_frames) for the active WAL; [None] if no WAL
+    is in effect or on the in-memory backend. *)
+val backup_state : t -> (int64 * int) option
+
+(** Bounded-yield "timeout" the checkpoint gate spends waiting for the
+    backup floor to reach the checkpoint target before proceeding anyway
+    (#265).  Returns [max_int] (unbounded, the default) on the B+-tree
+    backend; [0] on the in-memory backend. *)
+val backup_gate_max_yields : t -> int
+
+(** Set the checkpoint gate's bounded-yield budget for the backup floor.
+    A slow or unreachable backup consumer must not wedge the master's WAL
+    forever: once the budget is spent the checkpoint proceeds and
+    un-captured frames are recycled (the backup must re-base).  Same
+    semantics as {!set_replication_gate_max_yields}.
+
+    Pure-Mirage has no ambient clock, so this "timeout" is a count of
+    cooperative [Lwt.pause] yields, not wall-clock time.  [max_int] (the
+    default) means unbounded — wait indefinitely.  A finite value bounds
+    the stall: once the budget plus the replication budget is spent, the
+    checkpoint proceeds even if the backup floor is behind.
+
+    {b Caution (review #4):} [max_int] (the default) combined with a
+    [capture_frames_since] returning [None] triggers a re-base cycle.  The
+    backup consumer must copy the entire database before it can advance
+    the floor via {!update_backup_position}, and during that re-base every
+    write txn that triggers autocheckpoint is blocked on the backup floor.
+    If re-base time exceeds your acceptable write-stall window, set a
+    finite budget here so the checkpoint eventually proceeds and the
+    re-base is allowed to complete as a fresh incremental chain.
+
+    Negative inputs clamp to [0].  Local RO readers are never abandoned by
+    this budget — only the backup floor.  No-op on the in-memory backend. *)
+val set_backup_gate_max_yields : t -> int -> unit
+
+(** Capture the committed WAL frames since a given watermark position,
+    returning them as a list of {!backup_frame}.
+
+    [~since_epoch] and [~since_idx] identify the watermark: frames with
+    indices strictly greater than [since_idx] in the current epoch are
+    returned.  If the WAL's epoch has advanced past [since_epoch], no
+    frames can be captured (the caller must take a fresh base snapshot
+    via {!copy_to}).
+
+    Returns [None] when the WAL's epoch has changed (the watermark is
+    stale — re-base needed).  Returns [Some []] when the watermark is
+    current but no new frames have been committed.  Returns [Some (Error _)]
+    on I/O or corruption errors. *)
+val capture_frames_since
+  :  t
+  -> since_epoch:int64
+  -> since_idx:int
+  -> (backup_frame list, [> `Capture_error of string ]) result option Lwt.t
+
 (** Install an asynchronous callback invoked after each WAL commit batch.
     The callback receives [~epoch], [~base_idx] (starting WAL frame index
     of this batch), and [~count] (number of frames committed).  Fired

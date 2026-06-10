@@ -80,6 +80,39 @@ val cold_restore
   -> unit
   -> (unit, [> `Restore_error of string ]) result Lwt.t
 
+(** Incremental restore: chain a full base snapshot + ordered incremental
+    frame sets captured via {!Sqlocaml_store.Store.capture_frames_since}.
+
+    The caller must have already loaded the base snapshot into [~pager]
+    before calling this function — this module does not load snapshots;
+    it only replays WAL frames on top of the already-prepared pager state.
+
+    Opens a WAL over the provided callbacks, then applies each incremental
+    frame set in order via {!apply_frames_epoch_aware}, handling epoch
+    transitions transparently.
+
+    Returns the final [(epoch, frame_idx)] — the position of the last
+    committed frame applied — or [Ok (0L, -1)] (the initial position)
+    if no frames were provided.  Returns [Error `Restore_error] on
+    WAL-open failure or frame-apply failure. *)
+val incremental_restore
+  :  read_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
+  -> sync:(unit -> (unit, string) result Lwt.t)
+  -> wal_size_bytes:int64
+  -> pager:Sqlocaml_storage.Pager.t
+  -> incremental_sets:Sqlocaml_store.Store.backup_frame list list
+  -> unit
+  -> ((int64 * int), [> `Restore_error of string ]) result Lwt.t
+
+(** Convert a {!Sqlocaml_store.Store.backup_frame} (as returned by
+    {!Sqlocaml_store.Store.capture_frames_since}) to a {!replicated_frame}
+    for use with {!apply_frames}, {!apply_frames_epoch_aware}, or
+    {!verify_checksum}. *)
+val backup_frame_to_replicated
+  :  Sqlocaml_store.Store.backup_frame
+  -> replicated_frame
+
 (** -------------------------------------------------------------------- *)
 
 (** Standby apply driver (#172)                                            *)
