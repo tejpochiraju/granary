@@ -1648,17 +1648,26 @@ let compute_stored_generated_cols
       (row : Row.t)
   : unit
   =
-  List.iteri
-    (fun i (col : Row.column) ->
-       match col.Row.generated_as with
-       | None -> ()
-       | Some (sql, true) ->
-         let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
-         row.(i) <- eval_expr clock params row plan_e
-       | Some (_, false) ->
-         (* VIRTUAL: write NULL placeholder; recomputed on read. *)
-         row.(i) <- Row.V_null)
-    meta.Cat.columns
+  (* #347: skip when no column is a STORED generated column — the common case.
+     VIRTUAL columns stay at V_null (set by [build_insert_row]'s Array.make). *)
+  if List.exists
+       (fun (c : Row.column) ->
+          match c.Row.generated_as with
+          | Some (_, true) -> true
+          | _ -> false)
+       meta.Cat.columns
+  then
+    List.iteri
+      (fun i (col : Row.column) ->
+         match col.Row.generated_as with
+         | None -> ()
+         | Some (sql, true) ->
+           let plan_e = compile_generated_expr meta.Cat.name i meta.Cat.columns sql in
+           row.(i) <- eval_expr clock params row plan_e
+         | Some (_, false) ->
+           (* VIRTUAL: write NULL placeholder; recomputed on read. *)
+           row.(i) <- Row.V_null)
+      meta.Cat.columns
 ;;
 
 (** Recompute VIRTUAL generated columns from the underlying row values.
@@ -1879,25 +1888,28 @@ let eval_check_constraints
       (row : Row.t)
   : unit
   =
-  (* Phase 35 Task 2: populate VIRTUAL generated columns into a scratch row
-     before evaluating CHECKs, so checks that reference a VIRTUAL column see
-     the up-to-date value instead of [V_null]. *)
-  let row_for_check = with_computed_virtuals clock params table_meta row in
-  List.iteri
-    (fun i (col : Row.column) ->
-       match col.check_sql with
-       | None -> ()
-       | Some check_sql ->
-         let check_plan =
-           compile_check_expr table_meta.name i table_meta.columns check_sql
-         in
-         let result = eval_expr clock params row_for_check check_plan in
-         (* SQLite: NULL result -> passes (not a violation) *)
-         if result <> Row.V_null && not (value_truthy result)
-         then
-           failwith
-             (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name))
-    table_meta.columns
+  (* #347: skip entirely when no column carries a CHECK — the common case. *)
+  if List.exists (fun (c : Row.column) -> Option.is_some c.check_sql) table_meta.Cat.columns
+  then (
+    (* Phase 35 Task 2: populate VIRTUAL generated columns into a scratch row
+       before evaluating CHECKs, so checks that reference a VIRTUAL column see
+       the up-to-date value instead of [V_null]. *)
+    let row_for_check = with_computed_virtuals clock params table_meta row in
+    List.iteri
+      (fun i (col : Row.column) ->
+         match col.check_sql with
+         | None -> ()
+         | Some check_sql ->
+           let check_plan =
+             compile_check_expr table_meta.name i table_meta.columns check_sql
+           in
+           let result = eval_expr clock params row_for_check check_plan in
+           (* SQLite: NULL result -> passes (not a violation) *)
+           if result <> Row.V_null && not (value_truthy result)
+           then
+             failwith
+               (Printf.sprintf "CHECK constraint failed: %s.%s" table_meta.name col.name))
+      table_meta.columns)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -2792,7 +2804,7 @@ let enforce_insert_fks store (cat : Cat.t) (table_meta : Cat.table_meta) (row : 
 
 (* Resolve the rowid for an INSERT: the INTEGER PRIMARY KEY for WITHOUT ROWID
    tables (must be present, non-NULL, integer), else a freshly allocated one. *)
-let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
+let insert_rowid ?(defer_counter = false) tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
   : int64 Lwt.t
   =
   if table_meta.Cat.without_rowid
@@ -2832,6 +2844,7 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
            if Int64.compare n Int64.max_int < 0
            then
              Cat.bump_next_rowid_in_txn
+               ~defer_counter
                cat
                ~name:table_meta.name
                ~at_least:(Int64.add n 1L)
@@ -2841,6 +2854,7 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
              (* #312: pin the AUTOINCREMENT counter at max_int so the next
                 auto-allocation detects exhaustion and raises SQLITE_FULL. *)
              Cat.bump_next_rowid_in_txn
+               ~defer_counter
                cat
                ~name:table_meta.name
                ~at_least:Int64.max_int
@@ -2849,7 +2863,7 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
          in
          Lwt.return n
        | Row.V_null ->
-         let* id = Cat.next_rowid_in_txn cat ~name:table_meta.name tx in
+         let* id = Cat.next_rowid_in_txn ~defer_counter cat ~name:table_meta.name tx in
          row.(pk_idx) <- Row.V_int id;
          Lwt.return id
        | _ ->
@@ -2857,7 +2871,7 @@ let insert_rowid tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
            (Printf.sprintf
               "datatype mismatch: INTEGER PRIMARY KEY column '%s' requires an integer"
               (List.nth table_meta.columns pk_idx).Row.name))
-    | None -> Cat.next_rowid_in_txn cat ~name:table_meta.name tx)
+    | None -> Cat.next_rowid_in_txn ~defer_counter cat ~name:table_meta.name tx)
 ;;
 
 (* SQLite-faithful UNIQUE violation message: "UNIQUE constraint failed: t.a"
@@ -3332,7 +3346,9 @@ let execute_insert
             | _ -> false)
          | None -> false
        in
-       let* rowid = insert_rowid tx cat table_meta row in
+       (* #347: defer the per-row counter B-tree write when inside an explicit txn;
+          [flush_dirty_counters_tx] writes it once at COMMIT instead. *)
+       let* rowid = insert_rowid ~defer_counter:(not owned) tx cat table_meta row in
        let idxs = Cat.indexes_for_table cat ~table:table_meta.name in
        (* Phase 35 Task 2: compute VIRTUAL generated columns into a scratch row
          before extracting index keys so VIRTUAL cells contribute their value. *)

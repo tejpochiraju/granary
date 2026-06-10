@@ -1902,7 +1902,7 @@ let next_rowid t ~name =
     The txn is NOT committed; the caller is responsible for the commit.
     Use this when an explicit transaction is already held to avoid
     deadlocking on the store's RW mutex. *)
-let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
+let next_rowid_in_txn ?(defer_counter = false) t ~name (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
@@ -1923,10 +1923,15 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
       let id, next = alloc_rowid m in
       let m' = { m with next_rowid = next } in
       (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
-         ROLLBACK recomputes only it. *)
+         ROLLBACK recomputes only it.
+         #347: when [defer_counter] (explicit txn), skip the per-row B-tree write
+         to sys_tables — [flush_dirty_counters_tx] writes it once at COMMIT. *)
       Schema_cache.bump_rowid t.sc ~name m';
-      let%lwt () = put_table_counter_tx tx m' in
-      Lwt.return id)
+      if defer_counter
+      then Lwt.return id
+      else
+        let%lwt () = put_table_counter_tx tx m' in
+        Lwt.return id)
 ;;
 
 (** #243 (T1): after an INSERT supplies an explicit INTEGER PRIMARY KEY value,
@@ -1940,7 +1945,7 @@ let next_rowid_in_txn t ~name (tx : S.rw S.txn) =
     counter only ever rises and never lowers.  [at_least] is always [id+1] with
     [id < max_int] (the caller guards the ceiling), so it can never be the empty
     sentinel. *)
-let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
+let bump_next_rowid_in_txn ?(defer_counter = false) t ~name ~at_least (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
@@ -1955,8 +1960,9 @@ let bump_next_rowid_in_txn t ~name ~at_least (tx : S.rw S.txn) =
       Schema_cache.bump_rowid t.sc ~name m';
       (* #314: [put_table_counter_tx] mirrors the high-water for AUTOINCREMENT
          tables.  The no-op early-return path above never reaches here, so a
-         non-moving bump leaves both primary and mirror untouched. *)
-      put_table_counter_tx tx m')
+         non-moving bump leaves both primary and mirror untouched.
+         #347: when [defer_counter] (explicit txn), skip per-row write — flushed once at COMMIT. *)
+      if defer_counter then Lwt.return_unit else put_table_counter_tx tx m')
 ;;
 
 (* #312.1: largest stored rowid in a table's data tree, computed within an
@@ -2073,6 +2079,21 @@ let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
          put_table_counter_tx tx m')
        else Lwt.return_unit)
     tables
+;;
+
+(* #347: flush all dirty rowid counters into the B-tree under [tx], called once
+   at COMMIT to replace the per-row [put_table_counter_tx] writes that
+   [next_rowid_in_txn]/[bump_next_rowid_in_txn] skip when [~defer_counter:true].
+   Uses [take_rowid_bumped] which clears the dirty set; [commit_schema_changes]'s
+   subsequent reset is a no-op on the already-empty table. *)
+let flush_dirty_counters_tx t (tx : S.rw S.txn) =
+  let names = Schema_cache.take_rowid_bumped t.sc in
+  Lwt_list.iter_s
+    (fun name ->
+       match Schema_cache.find_table t.sc name with
+       | None -> Lwt.return_unit
+       | Some m -> put_table_counter_tx tx m)
+    names
 ;;
 
 (* [?txn]: as for [create_table] (#269), an active explicit transaction is

@@ -223,7 +223,8 @@ val next_rowid : t -> name:string -> int64 Lwt.t
     Does NOT commit; the caller owns the commit.  Use within explicit
     transactions to avoid deadlocking on the store's writer mutex. *)
 val next_rowid_in_txn
-  :  t
+  :  ?defer_counter:bool
+  -> t
   -> name:string
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> int64 Lwt.t
@@ -232,7 +233,8 @@ val next_rowid_in_txn
     at least [at_least] (= an explicitly-inserted INTEGER PRIMARY KEY value + 1),
     matching SQLite. Never lowers the counter; does NOT commit. *)
 val bump_next_rowid_in_txn
-  :  t
+  :  ?defer_counter:bool
+  -> t
   -> name:string
   -> at_least:int64
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
@@ -265,6 +267,15 @@ val reset_next_rowid_in_txn
     seeded AUTOINCREMENT counter (SQLite parity; what [sqlite3 .dump] emits).
     Mutates through the held RW transaction (does NOT commit). *)
 val reset_all_next_rowid_in_txn
+  :  t
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** #347: flush all dirty rowid counters into the B-tree under [tx].  Call once
+    before [S.commit] when inserts used [~defer_counter:true] to skip per-row
+    [put_table_counter_tx] writes.  Clears the dirty set; the subsequent
+    [commit_schema_changes] reset is a no-op. *)
+val flush_dirty_counters_tx
   :  t
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> unit Lwt.t

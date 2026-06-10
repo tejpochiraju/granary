@@ -526,6 +526,8 @@ let commit_txn t =
     Lwt.catch
       (fun () ->
          let* () = drain_pending_fks_or_fail t tx in
+         (* #347: write deferred rowid counters once before committing the txn. *)
+         let* () = Cat.flush_dirty_counters_tx t.catalog tx in
          let* () = S.commit tx in
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
@@ -600,6 +602,8 @@ let release_savepoint t name =
                 "cannot commit transaction - a DDL statement failed partway through; the \
                  transaction was uncommittable and has been rolled back"))
       else
+        (* #347: write deferred rowid counters once before committing the txn. *)
+        let* () = Cat.flush_dirty_counters_tx t.catalog tx in
         let* () = S.commit tx in
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
