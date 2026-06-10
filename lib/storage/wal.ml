@@ -459,7 +459,7 @@ let read_frame t idx =
        | Ok None -> Lwt.return_error (Corrupt_frame idx)
        | Ok (Some f) ->
          cache_frame t idx f.page;
-          Lwt.return_ok f.page))
+         Lwt.return_ok f.page))
 ;;
 
 let read_committed_frame t idx =

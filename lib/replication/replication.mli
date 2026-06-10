@@ -103,15 +103,13 @@ val incremental_restore
   -> pager:Sqlocaml_storage.Pager.t
   -> incremental_sets:Sqlocaml_store.Store.backup_frame list list
   -> unit
-  -> ((int64 * int), [> `Restore_error of string ]) result Lwt.t
+  -> (int64 * int, [> `Restore_error of string ]) result Lwt.t
 
 (** Convert a {!Sqlocaml_store.Store.backup_frame} (as returned by
     {!Sqlocaml_store.Store.capture_frames_since}) to a {!replicated_frame}
     for use with {!apply_frames}, {!apply_frames_epoch_aware}, or
     {!verify_checksum}. *)
-val backup_frame_to_replicated
-  :  Sqlocaml_store.Store.backup_frame
-  -> replicated_frame
+val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated_frame
 
 (** -------------------------------------------------------------------- *)
 

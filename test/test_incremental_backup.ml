@@ -95,7 +95,6 @@ let store_with_wal () =
 ;;
 
 let bs s = Bytes.of_string s
-
 let run = Lwt_main.run
 
 (* ------------------------------------------------------------------ *)
@@ -119,7 +118,11 @@ let test_capture_basic () =
   let* r = Store.capture_frames_since store ~since_epoch:epoch0 ~since_idx:(-1) in
   match r with
   | None -> Alcotest.fail "capture returned None (epoch changed unexpectedly)"
-  | Some (Error e) -> Alcotest.failf "capture error: %s" (match e with `Capture_error s -> s)
+  | Some (Error e) ->
+    Alcotest.failf
+      "capture error: %s"
+      (match e with
+       | `Capture_error s -> s)
   | Some (Ok frames) ->
     Alcotest.(check int) "captured all frames since idx -1" frames0 (List.length frames);
     (* Only the last frame of each commit batch has is_commit=true *)
@@ -135,8 +138,10 @@ let test_capture_basic () =
     List.iteri
       (fun i f ->
          let rf = Replication.backup_frame_to_replicated f in
-         Alcotest.(check bool) (Printf.sprintf "frame %d checksum valid" i)
-           true (Replication.verify_checksum rf))
+         Alcotest.(check bool)
+           (Printf.sprintf "frame %d checksum valid" i)
+           true
+           (Replication.verify_checksum rf))
       frames;
     let* () = Store.close store in
     Lwt.return_unit
@@ -153,10 +158,16 @@ let test_capture_empty () =
     | Some s -> s
     | None -> Alcotest.fail "expected WAL mode"
   in
-  let* r = Store.capture_frames_since store ~since_epoch:epoch0 ~since_idx:(frames0 - 1) in
+  let* r =
+    Store.capture_frames_since store ~since_epoch:epoch0 ~since_idx:(frames0 - 1)
+  in
   match r with
   | None -> Alcotest.fail "capture returned None"
-  | Some (Error e) -> Alcotest.failf "capture error: %s" (match e with `Capture_error s -> s)
+  | Some (Error e) ->
+    Alcotest.failf
+      "capture error: %s"
+      (match e with
+       | `Capture_error s -> s)
   | Some (Ok frames) ->
     Alcotest.(check int) "no new frames to capture" 0 (List.length frames);
     let* () = Store.close store in
@@ -175,8 +186,7 @@ let test_capture_stale_epoch () =
     (* Expected: epoch changed (watermark is stale) *)
     let* () = Store.close store in
     Lwt.return_unit
-  | Some _ ->
-    Alcotest.fail "expected None for stale epoch"
+  | Some _ -> Alcotest.fail "expected None for stale epoch"
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -206,8 +216,11 @@ let test_backup_floor_gates_checkpoint () =
      floor gate if the gate were broken.  Then assert the epoch
      is unchanged — proving the gate actually held. *)
   let rec pause_n n =
-    if n <= 0 then Lwt.return_unit
-    else let* () = Lwt.pause () in pause_n (n - 1)
+    if n <= 0
+    then Lwt.return_unit
+    else
+      let* () = Lwt.pause () in
+      pause_n (n - 1)
   in
   let* () = pause_n 50 in
   let epoch1, _frames1 =
@@ -229,13 +242,13 @@ let test_backup_floor_gates_checkpoint () =
   let rec wait_advanced n =
     if n <= 0
     then Alcotest.fail "timeout: checkpoint did not complete after floor advance"
-    else
+    else (
       match Store.replication_state store with
       | Some (epoch, frames) when Int64.compare epoch epoch0 > 0 && frames < committed1 ->
         Lwt.return_unit
       | _ ->
         let* () = Lwt.pause () in
-        wait_advanced (n - 1)
+        wait_advanced (n - 1))
   in
   let* () = wait_advanced 100 in
   let epoch2, frames2 =
@@ -243,7 +256,10 @@ let test_backup_floor_gates_checkpoint () =
     | Some s -> s
     | None -> Alcotest.fail "expected WAL mode"
   in
-  Alcotest.(check bool) "epoch bumped after floor advance" true (Int64.compare epoch2 epoch0 > 0);
+  Alcotest.(check bool)
+    "epoch bumped after floor advance"
+    true
+    (Int64.compare epoch2 epoch0 > 0);
   Alcotest.(check bool) "frames reset after checkpoint" true (frames2 < committed1);
   let* () = Store.close store in
   Lwt.return_unit
@@ -277,11 +293,19 @@ let test_frame_conversion_round_trip () =
     (fun i bf ->
        let rf = Replication.backup_frame_to_replicated bf in
        Alcotest.(check int64) (Printf.sprintf "rf %d: epoch" i) bf.epoch rf.epoch;
-       Alcotest.(check int) (Printf.sprintf "rf %d: frame_idx" i) bf.frame_idx rf.frame_idx;
+       Alcotest.(check int)
+         (Printf.sprintf "rf %d: frame_idx" i)
+         bf.frame_idx
+         rf.frame_idx;
        Alcotest.(check int64) (Printf.sprintf "rf %d: page_id" i) bf.page_id rf.page_id;
-       Alcotest.(check bool) (Printf.sprintf "rf %d: is_commit" i) bf.is_commit rf.is_commit;
-       Alcotest.(check bool) (Printf.sprintf "rf %d: checksum valid" i)
-         true (Replication.verify_checksum rf))
+       Alcotest.(check bool)
+         (Printf.sprintf "rf %d: is_commit" i)
+         bf.is_commit
+         rf.is_commit;
+       Alcotest.(check bool)
+         (Printf.sprintf "rf %d: checksum valid" i)
+         true
+         (Replication.verify_checksum rf))
     frames;
   let* () = Store.close store in
   Lwt.return_unit
@@ -332,12 +356,11 @@ let test_incremental_restore_round_trip () =
       ~sync:sync_ok
       ~wal_size_bytes:(dev_size restore_wal_d)
       ~pager
-      ~incremental_sets:[frames]
+      ~incremental_sets:[ frames ]
       ()
   in
   (match r with
-   | Error (`Restore_error msg) ->
-     Alcotest.failf "incremental_restore failed: %s" msg
+   | Error (`Restore_error msg) -> Alcotest.failf "incremental_restore failed: %s" msg
    | Ok (epoch, idx) ->
      Alcotest.(check int64) "restore epoch" epoch0 epoch;
      Alcotest.(check int) "restore final idx" (List.length frames - 1) idx);
@@ -366,11 +389,13 @@ let test_incremental_restore_round_trip () =
         let* v1 = Store.get ro_tx 16 (bs "k1") in
         (match v1 with
          | None -> Alcotest.fail "k1 not found after restore"
-         | Some v -> Alcotest.(check string) "k1 value after restore" "v1" (Bytes.to_string v));
+         | Some v ->
+           Alcotest.(check string) "k1 value after restore" "v1" (Bytes.to_string v));
         let* v2 = Store.get ro_tx 16 (bs "k2") in
         (match v2 with
          | None -> Alcotest.fail "k2 not found after restore"
-         | Some v -> Alcotest.(check string) "k2 value after restore" "v2" (Bytes.to_string v));
+         | Some v ->
+           Alcotest.(check string) "k2 value after restore" "v2" (Bytes.to_string v));
         Lwt.return_unit)
     in
     let* () = Store.close restored_store in
@@ -385,19 +410,22 @@ let () =
   Alcotest.run
     "incremental_backup"
     [ ( "capture"
-      , [ Alcotest.test_case "basic frame capture" `Quick (fun () -> run (test_capture_basic ()))
-        ; Alcotest.test_case "empty capture" `Quick (fun () -> run (test_capture_empty ()))
-        ; Alcotest.test_case "stale epoch" `Quick (fun () -> run (test_capture_stale_epoch ()))
+      , [ Alcotest.test_case "basic frame capture" `Quick (fun () ->
+            run (test_capture_basic ()))
+        ; Alcotest.test_case "empty capture" `Quick (fun () ->
+            run (test_capture_empty ()))
+        ; Alcotest.test_case "stale epoch" `Quick (fun () ->
+            run (test_capture_stale_epoch ()))
         ] )
     ; ( "floor"
-      , [ Alcotest.test_case "backup floor gates checkpoint" `Quick
-            (fun () -> run (test_backup_floor_gates_checkpoint ()))
+      , [ Alcotest.test_case "backup floor gates checkpoint" `Quick (fun () ->
+            run (test_backup_floor_gates_checkpoint ()))
         ] )
     ; ( "frame_conversion"
-      , [ Alcotest.test_case "backup_frame to replicated_frame" `Quick
-            (fun () -> run (test_frame_conversion_round_trip ()))
-        ; Alcotest.test_case "incremental_restore round-trip" `Quick
-            (fun () -> run (test_incremental_restore_round_trip ()))
+      , [ Alcotest.test_case "backup_frame to replicated_frame" `Quick (fun () ->
+            run (test_frame_conversion_round_trip ()))
+        ; Alcotest.test_case "incremental_restore round-trip" `Quick (fun () ->
+            run (test_incremental_restore_round_trip ()))
         ] )
     ]
 ;;
