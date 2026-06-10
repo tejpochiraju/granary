@@ -427,9 +427,18 @@ let open_
    freshly-decrypted page from [read_frame_raw]; it is never mutated in place
    afterwards (callers either [cstruct_dup] it or borrow it read-only under the
    pager's borrow contract), so sharing it across repeated reads is sound — the
-   same immutability invariant the main page cache relies on. *)
-let cache_frame t idx page =
-  if t.frame_cache_capacity > 0 && not (Hashtbl.mem t.frame_cache idx)
+   same immutability invariant the main page cache relies on.
+
+   [expected_epoch] guards against cache-poisoning: a concurrent checkpoint
+   can call [Wal.reset] (clearing [frame_cache] and bumping epoch) during
+   the I/O yield in [read_frame_raw]; the caller captures the epoch before
+   the yield and passes it here so we no-op if the epoch has changed
+   (review #210). *)
+let cache_frame t ~expected_epoch idx page =
+  if
+    Int64.equal t.epoch expected_epoch
+    && t.frame_cache_capacity > 0
+    && not (Hashtbl.mem t.frame_cache idx)
   then (
     while
       Hashtbl.length t.frame_cache >= t.frame_cache_capacity
@@ -453,13 +462,14 @@ let read_frame t idx =
     | None ->
       (* Skip checksum: frames < committed_frames were validated at recovery
          and the WAL is append-only thereafter. *)
+      let epoch_before = t.epoch in
       let* r = read_frame_raw ~verify:false t idx in
       (match r with
        | Error e -> Lwt.return_error e
        | Ok None -> Lwt.return_error (Corrupt_frame idx)
        | Ok (Some f) ->
-         cache_frame t idx f.page;
-          Lwt.return_ok f.page))
+         cache_frame t ~expected_epoch:epoch_before idx f.page;
+         Lwt.return_ok f.page))
 ;;
 
 let read_committed_frame t idx =
@@ -471,7 +481,11 @@ let read_committed_frame t idx =
     | Error e -> Lwt.return_error e
     | Ok None -> Lwt.return_error (Corrupt_frame idx)
     | Ok (Some f) ->
-      cache_frame t idx f.page;
+      (* Do NOT call [cache_frame] here: a concurrent checkpoint could
+         have reset the cache during the I/O yield, and inserting a
+         stale-epoch page would poison the cache for the new epoch
+         (review #209).  The normal [read_frame] path populates the
+         cache; backup reads don't need to prime it. *)
       Lwt.return_ok f
 ;;
 

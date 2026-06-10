@@ -1344,10 +1344,10 @@ let write_freelist_pages pager : int64 Lwt.t =
      hold [t.lock] (e.g. during [commit]). Defined here so [commit]
      can invoke it via [maybe_autocheckpoint] below. *)
 let rec wait_for_readers_past
-      (st : bt_state)
-      ~target
-      ~replication_max_yields
-      ~backup_max_yields
+          (st : bt_state)
+          ~target
+          ~replication_max_yields
+          ~backup_max_yields
   =
   if st.closing
   then
@@ -1371,7 +1371,11 @@ let rec wait_for_readers_past
       wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields
     else
       let* () = Lwt.pause () in
-      wait_for_readers_past st ~target ~replication_max_yields:(replication_max_yields - 1) ~backup_max_yields
+      wait_for_readers_past
+        st
+        ~target
+        ~replication_max_yields:(replication_max_yields - 1)
+        ~backup_max_yields
   else if backup_floor_below st ~target
   then
     if backup_max_yields = max_int
@@ -1379,11 +1383,14 @@ let rec wait_for_readers_past
       let* () = Lwt_condition.wait st.reader_done_cond in
       wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields
     else if backup_max_yields <= 0
-    then
-      Lwt.return_unit
+    then Lwt.return_unit
     else
       let* () = Lwt.pause () in
-      wait_for_readers_past st ~target ~replication_max_yields ~backup_max_yields:(backup_max_yields - 1)
+      wait_for_readers_past
+        st
+        ~target
+        ~replication_max_yields
+        ~backup_max_yields:(backup_max_yields - 1)
   else Lwt.return_unit
 ;;
 
@@ -1450,21 +1457,21 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
            st.sink_shipped_frames <- 0;
            st.unsynced_commits <- 0;
            st.last_sync_time <- st.clock ();
-            (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
+           (* Re-pin the replication floor for the new epoch.  [Wal.reset] zeroes
              committed_frames, but [replication_shipped_frames] still refers to
              the old epoch's absolute count.  Without re-pinning, the next
              checkpoint would see a stale floor that appears to be past the new
              target, silently allowing frame recycling before the sink ships
              them. *)
-            if st.on_committed_frames <> None
-            then st.replication_shipped_frames <- Wal.committed_frames wal;
-            (* Re-pin the backup floor for the new epoch (#265).  Same
+           if st.on_committed_frames <> None
+           then st.replication_shipped_frames <- Wal.committed_frames wal;
+           (* Re-pin the backup floor for the new epoch (#265).  Same
              reasoning: without re-pinning, the next checkpoint would see a
              stale backup floor from the old epoch and recycle frames before
              the backup consumer has captured them. *)
-            if st.backup_shipped_frames <> max_int
-            then st.backup_shipped_frames <- Wal.committed_frames wal;
-            Lwt.return_unit)
+           if st.backup_shipped_frames <> max_int
+           then st.backup_shipped_frames <- Wal.committed_frames wal;
+           Lwt.return_unit)
       (fun () ->
          st.ckpt_io_in_flight <- st.ckpt_io_in_flight - 1;
          Lwt_condition.broadcast st.reader_done_cond ();
@@ -2837,7 +2844,6 @@ let update_backup_position (t : t) ~shipped =
     Review #8: delegates to {!replication_state} — the two functions share
     the same body because both track the same WAL position. *)
 let backup_state (t : t) = replication_state t
-;;
 
 (** Return the backup floor's bounded-yield budget for the checkpoint
     gate.  Defaults to [max_int] (unbounded) on the B+-tree backend,
@@ -2895,15 +2901,14 @@ type backup_frame =
     Returns [None] when the WAL's epoch has changed (meaning the caller's
     watermark is stale and a re-base is needed).  Returns [Some []] when
     the watermark is current but no new frames have been committed. *)
-let capture_frames_since (t : t) ~since_epoch ~since_idx :
-    (backup_frame list, [> `Capture_error of string ]) result option Lwt.t
+let capture_frames_since (t : t) ~since_epoch ~since_idx
+  : (backup_frame list, [> `Capture_error of string ]) result option Lwt.t
   =
   match t.backend with
   | Mem _ -> Some (Ok []) |> Lwt.return
   | Btree st ->
     (match st.wal with
-     | None ->
-       Lwt.return (Some (Error (`Capture_error "no WAL active")))
+     | None -> Lwt.return (Some (Error (`Capture_error "no WAL active")))
      | Some wal ->
        let current_epoch = Wal.epoch wal in
        if not (Int64.equal current_epoch since_epoch)
@@ -2911,60 +2916,66 @@ let capture_frames_since (t : t) ~since_epoch ~since_idx :
          (* Epoch changed: the watermark is stale and the caller must
             re-base (take a fresh full snapshot). *)
          Lwt.return None
-       else
+       else (
          let committed = Wal.committed_frames wal in
-         let start = since_idx + 1 in
+         let start = if since_idx = max_int then max_int else since_idx + 1 in
          if start >= committed
          then Lwt.return (Some (Ok []))
-         else
-          let salt = Wal.salt wal in
-          let seed = Wal.seed wal in
-          let rec loop idx acc =
-            if idx >= committed
-            then Lwt.return (Some (Ok (List.rev acc)))
-            else
-              (* A concurrent checkpoint can bump the epoch while we yield
+         else (
+           let salt = Wal.salt wal in
+           let seed = Wal.seed wal in
+           let rec loop idx acc =
+             if idx >= committed
+             then Lwt.return (Some (Ok (List.rev acc)))
+             else (
+               (* A concurrent checkpoint can bump the epoch while we yield
                  on I/O.  If the epoch changed, the watermark is stale —
                  signal through [None] so the caller re-bases cleanly
                  instead of getting an I/O error. *)
-              let current_epoch = Wal.epoch wal in
-              if not (Int64.equal current_epoch since_epoch)
-              then Lwt.return None
-              else
-                let* r = Wal.read_committed_frame wal idx in
-                match r with
-                | Error _ when not (Int64.equal (Wal.epoch wal) since_epoch) ->
-                  Lwt.return None
-                | Error e ->
-                  Lwt.return (Some
-                    (Error (`Capture_error
-                       (Format.asprintf "read frame %d: %a" idx Wal.pp_error e))))
-                | Ok f ->
-                  if not (Int64.equal (Wal.epoch wal) since_epoch)
-                  then Lwt.return None
-                  else
-                    let flags = if f.is_commit then 1L else 0L in
-                    let checksum =
-                      Wal.frame_checksum ~salt ~seed ~page_id:f.page_id ~flags ~page:f.page
-                    in
-                    let bf : backup_frame =
-                      { epoch = current_epoch
-                      ; frame_idx = idx
-                      ; page_id = f.page_id
-                      ; is_commit = f.is_commit
-                      ; page = f.page
-                      ; checksum
-                      ; source_salt = salt
-                      ; source_seed = seed
-                      }
-                    in
-                    loop (idx + 1) (bf :: acc)
-          in
-          let* result = loop start [] in
-          match result with
-          | None -> Lwt.return None
-          | Some (Ok frames) -> Lwt.return (Some (Ok frames))
-          | Some (Error _ as e) -> Lwt.return (Some e))
+               let current_epoch = Wal.epoch wal in
+               if not (Int64.equal current_epoch since_epoch)
+               then Lwt.return None
+               else
+                 let* r = Wal.read_committed_frame wal idx in
+                 match r with
+                 | Error _ when not (Int64.equal (Wal.epoch wal) since_epoch) ->
+                   Lwt.return None
+                 | Error e ->
+                   Lwt.return
+                     (Some
+                        (Error
+                           (`Capture_error
+                               (Format.asprintf "read frame %d: %a" idx Wal.pp_error e))))
+                 | Ok f ->
+                   if not (Int64.equal (Wal.epoch wal) since_epoch)
+                   then Lwt.return None
+                   else (
+                     let flags = if f.is_commit then 1L else 0L in
+                     let checksum =
+                       Wal.frame_checksum
+                         ~salt
+                         ~seed
+                         ~page_id:f.page_id
+                         ~flags
+                         ~page:f.page
+                     in
+                     let bf : backup_frame =
+                       { epoch = current_epoch
+                       ; frame_idx = idx
+                       ; page_id = f.page_id
+                       ; is_commit = f.is_commit
+                       ; page = f.page
+                       ; checksum
+                       ; source_salt = salt
+                       ; source_seed = seed
+                       }
+                     in
+                     loop (idx + 1) (bf :: acc)))
+           in
+           (* loop already returns the exact type of this branch —
+             None for epoch-changed, Some (Ok frames) for success,
+             Some (Error _) for I/O failure.  Direct return. *)
+           loop start [])))
 ;;
 
 (** Install an asynchronous callback invoked after each WAL commit batch.
