@@ -2918,6 +2918,7 @@ let capture_frames_since (t : t) ~since_epoch ~since_idx
          Lwt.return None
        else (
          let committed = Wal.committed_frames wal in
+         (* max_int = "no floor" sentinel; increment would overflow to min_int *)
          let start = if since_idx = max_int then max_int else since_idx + 1 in
          if start >= committed
          then Lwt.return (Some (Ok []))
