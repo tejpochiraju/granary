@@ -979,13 +979,11 @@ let put_x_into_leaf t key value =
       let leaf_common = Page.read_common leaf_buf in
       let entries, _ = decode_leaf_entries leaf_buf leaf_common in
       let leaf_right = page_id_of_int32 leaf_common.right_page in
-      let plain_entries =
-        List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
-      in
       let existing_stored =
         List.find_map
-          (fun (k, v) -> if Bytes.equal k key then Some v else None)
-          plain_entries
+          (fun (e : Page.leaf_entry) ->
+             if Bytes.equal e.key key then Some e.value else None)
+          entries
       in
       match existing_stored with
       | Some _ ->
@@ -994,6 +992,10 @@ let put_x_into_leaf t key value =
            never need the old bytes.  Only CA_replace fetches them via S.get. *)
         return_ok (t, Some Bytes.empty)
       | None ->
+        (* Defer plain_entries allocation to the write path only. *)
+        let plain_entries =
+          List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
+        in
         let* prep_r = prepare_stored_value t.pager value in
         (match prep_r with
          | Error e -> return_error e

@@ -2284,7 +2284,7 @@ let put_x (Rw t : rw txn) tid key value : bytes option Lwt.t =
       | Some shadow -> shadow_get shadow trees tid
     in
     (match Bytes_map.find_opt key map with
-     | Some old -> Lwt.return (Some old)
+     | Some _ -> Lwt.return (Some Bytes.empty)
      | None ->
        (match t.mem_rw_shadow with
         | None ->

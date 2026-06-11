@@ -3223,7 +3223,6 @@ let execute_upsert_update
     Lwt.return true
 ;;
 
-(* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
 (* Plain INSERT path (no UPSERT match from secondary indexes): honor IGNORE
    (skip), delete REPLACE conflicts, write the new row + index entries using
    [S.put_x] (combined check+write) when [alias_explicit=true] to avoid a

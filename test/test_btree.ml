@@ -903,7 +903,6 @@ let test_put_x_absent () =
   Alcotest.(check bool) "key written" true (r = Ok (Some (b "v")))
 ;;
 
-(* put_x on a key that already exists must NOT overwrite and must return the old value. *)
 (* put_x on a key that already exists must NOT overwrite and must signal
    conflict with Some (sentinel); only the conflict flag matters to callers. *)
 let test_put_x_present () =
