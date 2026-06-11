@@ -2275,6 +2275,38 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
        Lwt.fail_with (Format.asprintf "Store.put: %a" pp_error (map_btree_err e)))
 ;;
 
+let put_x (Rw t : rw txn) tid key value : bytes option Lwt.t =
+  match t.backend with
+  | Mem trees ->
+    let map =
+      match t.mem_rw_shadow with
+      | None -> !(mem_tree trees tid)
+      | Some shadow -> shadow_get shadow trees tid
+    in
+    (match Bytes_map.find_opt key map with
+     | Some old -> Lwt.return (Some old)
+     | None ->
+       (match t.mem_rw_shadow with
+        | None ->
+          let r = mem_tree trees tid in
+          r := Bytes_map.add key value !r
+        | Some shadow ->
+          t.mem_rw_shadow
+          <- Some (shadow_update shadow trees tid (Bytes_map.add key value)));
+       Lwt.return None)
+  | Btree st ->
+    let* r = bt_get_tree st tid in
+    let* bt = unwrap_error r in
+    Pager.set_write_tag st.pager (tree_tag st tid);
+    let* p = Btree.put_x bt key value in
+    (match p with
+     | Ok (bt', old_opt) ->
+       Hashtbl.replace st.trees tid bt';
+       Lwt.return old_opt
+     | Error e ->
+       Lwt.fail_with (Format.asprintf "Store.put_x: %a" pp_error (map_btree_err e)))
+;;
+
 let del (Rw t : rw txn) tid key : unit Lwt.t =
   match t.backend with
   | Mem trees ->

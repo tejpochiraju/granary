@@ -894,6 +894,25 @@ let prop_root_nonzero_after_put =
          Int64.compare (Btree.root_page t) 0L > 0)
 ;;
 
+(* put_x: insert if key absent, return existing value if key present. *)
+let test_put_x_absent () =
+  let t, _ = empty_tree () in
+  let t, old = run (Btree.put_x t (b "k") (b "v")) |> ok_btree in
+  Alcotest.(check bool) "put_x absent returns None" true (old = None);
+  let r = run (Btree.get t (b "k")) in
+  Alcotest.(check bool) "key written" true (r = Ok (Some (b "v")))
+;;
+
+(* put_x on a key that already exists must NOT overwrite and must return the old value. *)
+let test_put_x_present () =
+  let t, _ = empty_tree () in
+  let t = ok_btree (run (Btree.put t (b "k") (b "old"))) in
+  let t, old = run (Btree.put_x t (b "k") (b "new")) |> ok_btree in
+  Alcotest.(check bool) "put_x present returns Some old" true (old = Some (b "old"));
+  let r = run (Btree.get t (b "k")) in
+  Alcotest.(check bool) "original value preserved" true (r = Ok (Some (b "old")))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Runner                                                              *)
 (* ------------------------------------------------------------------ *)
@@ -941,6 +960,8 @@ let () =
             "cursor advance leaf error"
             `Quick
             test_cursor_advance_next_leaf_error
+        ; Alcotest.test_case "put_x absent inserts" `Quick test_put_x_absent
+        ; Alcotest.test_case "put_x present no-overwrite" `Quick test_put_x_present
         ] )
     ; "qcheck", qcheck_tests
     ]

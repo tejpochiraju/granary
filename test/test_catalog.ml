@@ -1228,6 +1228,83 @@ let test_indexes_for_table () =
      Lwt.return_unit)
 ;;
 
+(* After a schema rollback, the index must disappear from indexes_for_table.
+   This guards the correctness of indexes_by_table secondary-map undo. *)
+let test_indexes_for_table_rollback () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"t"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* tx = S.rw_begin store in
+     let* r =
+       C.create_index
+         cat
+         ~txn:tx
+         ~name:"idx_id"
+         ~table:"t"
+         ~columns:[ "id" ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     (match r with
+      | Error e -> Alcotest.failf "create_index: %s" e
+      | Ok _ -> ());
+     let during = C.indexes_for_table cat ~table:"t" in
+     Alcotest.(check int) "1 index during txn" 1 (List.length during);
+     C.rollback_schema_changes cat;
+     let* () = S.rollback tx in
+     let after = C.indexes_for_table cat ~table:"t" in
+     Alcotest.(check int) "0 indexes after rollback" 0 (List.length after);
+     Lwt.return_unit)
+;;
+
+(* After rename_table, indexes_for_table must return indexes under the new name. *)
+let test_indexes_for_table_after_rename () =
+  run
+    (let store = S.create () in
+     let* cat = C.open_ store in
+     let* _ =
+       C.create_table
+         cat
+         ~name:"old"
+         ~columns:[ int_col "id" ]
+         ~without_rowid:false
+         ~autoincrement:false
+     in
+     let* _ =
+       C.create_index
+         cat
+         ~name:"idx_id"
+         ~table:"old"
+         ~columns:[ "id" ]
+         ~unique:false
+         ~expr_flags:[ false ]
+         ~where_sql:None
+         ~origin:`User
+     in
+     let before_old = C.indexes_for_table cat ~table:"old" in
+     Alcotest.(check int) "1 index on old before rename" 1 (List.length before_old);
+     let* r = C.rename_table cat ~old_name:"old" ~new_name:"new" in
+     (match r with
+      | Error e -> Alcotest.failf "rename_table: %s" e
+      | Ok () -> ());
+     let after_old = C.indexes_for_table cat ~table:"old" in
+     Alcotest.(check int) "0 indexes on old after rename" 0 (List.length after_old);
+     let after_new = C.indexes_for_table cat ~table:"new" in
+     Alcotest.(check int) "1 index on new after rename" 1 (List.length after_new);
+     Alcotest.(check string) "idx_table updated" "new" (List.hd after_new).C.idx_table;
+     Lwt.return_unit)
+;;
+
 let test_create_index_unknown_table () =
   run
     (let store = S.create () in
@@ -2319,6 +2396,14 @@ let () =
             `Quick
             test_index_origin_persists_across_reopen
         ; Alcotest.test_case "find_index" `Quick test_find_index
+        ; Alcotest.test_case
+            "indexes_for_table_rollback"
+            `Quick
+            test_indexes_for_table_rollback
+        ; Alcotest.test_case
+            "indexes_for_table_after_rename"
+            `Quick
+            test_indexes_for_table_after_rename
         ] )
     ; ( "drop"
       , [ Alcotest.test_case "drop_table_basic" `Quick test_drop_table_basic

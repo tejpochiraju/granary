@@ -963,6 +963,80 @@ let put t key value : (t, error) result Lwt.t =
     put_into_leaf t key value
 ;;
 
+(* Insert [value] at [key] only if [key] is absent.
+   Single tree descent: if the key is found in the target leaf, decode and
+   return the existing value (no write); if absent, write the new value and
+   return None.  Saves the pre-read descent vs. a separate [get] + [put]. *)
+let put_x_into_leaf t key value =
+  let* path_r = find_leaf t key in
+  match path_r with
+  | Error e -> return_error e
+  | Ok (path, leaf_pid) ->
+    let* leaf_r =
+      Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid
+    in
+    bind_pager leaf_r (fun leaf_buf ->
+      let leaf_common = Page.read_common leaf_buf in
+      let entries, _ = decode_leaf_entries leaf_buf leaf_common in
+      let leaf_right = page_id_of_int32 leaf_common.right_page in
+      let plain_entries =
+        List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
+      in
+      let existing_stored =
+        List.find_map
+          (fun (k, v) -> if Bytes.equal k key then Some v else None)
+          plain_entries
+      in
+      match existing_stored with
+      | Some stored ->
+        let* dv =
+          decode_leaf_value
+            ?snapshot_frames:t.snapshot_frames
+            ?pin_set:t.pin_set
+            t.pager
+            stored
+        in
+        (match dv with
+         | Error e -> return_error e
+         | Ok old_bytes -> return_ok (t, Some old_bytes))
+      | None ->
+        let* prep_r = prepare_stored_value t.pager value in
+        (match prep_r with
+         | Error e -> return_error e
+         | Ok stored_value ->
+           let new_entries = leaf_insert_or_replace plain_entries key stored_value in
+           Pager.free
+             t.pager
+             ~page_id:leaf_pid
+             ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+           let* w =
+             write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right
+           in
+           (match w with
+            | Error e -> return_error e
+            | Ok t' -> return_ok (t', None))))
+;;
+
+let put_x t key value : (t * bytes option, error) result Lwt.t =
+  let key_len = Bytes.length key in
+  let val_len = Bytes.length value in
+  if key_len > max_key_size
+  then return_error (Key_too_large key_len)
+  else if val_len > max_value_size
+  then return_error (Value_too_large val_len)
+  else if Int64.compare t.root_page 0L = 0
+  then
+    let* prep_r = prepare_stored_value t.pager value in
+    match prep_r with
+    | Error e -> return_error e
+    | Ok stored_value ->
+      let* t' = put_into_empty_tree t key stored_value in
+      (match t' with
+       | Error e -> return_error e
+       | Ok t'' -> return_ok (t'', None))
+  else put_x_into_leaf t key value
+;;
+
 (* ------------------------------------------------------------------ *)
 (* DEL                                                                  *)
 (* ------------------------------------------------------------------ *)
