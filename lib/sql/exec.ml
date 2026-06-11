@@ -2296,7 +2296,20 @@ let acquire_txn store mode =
     Lwt.fail (Failure "write attempted under a read-only transaction (In_ro_txn)")
 ;;
 
-let release_txn tx owned = if owned then S.commit tx else Lwt.return_unit
+(* Commit [tx] if [owned], otherwise no-op.  When [cat] is provided and
+   [owned], flush deferred rowid counters first (#347) so that counters
+   dirtied by nested In_txn DML (e.g. trigger inserts) are persisted. *)
+let release_txn ?cat tx owned =
+  if owned
+  then
+    let* () =
+      match cat with
+      | None -> Lwt.return_unit
+      | Some c -> Cat.flush_dirty_counters_tx c tx
+    in
+    S.commit tx
+  else Lwt.return_unit
+;;
 
 (* #269: run a DDL body [f tx] under a transaction chosen by [mode], threading
    the writer txn into the catalog so DDL participates in any ambient explicit
@@ -3217,7 +3230,7 @@ let execute_upsert_update
       | None -> Lwt.return_unit
       | Some f -> f ~tx ~old_row ~new_row
     in
-    let* () = release_txn tx owned in
+    let* () = release_txn ~cat tx owned in
     Lwt.return true
 ;;
 
@@ -3225,6 +3238,7 @@ let execute_upsert_update
    conflicts, write the new row + index entries, fire AFTER hooks, commit if owned. *)
 let execute_insert_write
       tx
+      (cat : Cat.t)
       (table_meta : Cat.table_meta)
       ~clock
       ~params
@@ -3270,7 +3284,7 @@ let execute_insert_write
       | None -> Lwt.return_unit
       | Some f -> f ~tx ~new_row:row
     in
-    let* () = release_txn tx owned in
+    let* () = release_txn ~cat tx owned in
     Lwt.return true
 ;;
 
@@ -3406,6 +3420,7 @@ let execute_insert
          let* inserted =
            execute_insert_write
              tx
+             cat
              table_meta
              ~clock
              ~params
@@ -5002,7 +5017,7 @@ let execute_update
              matches
          in
          let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
-         let* () = release_txn tx owned in
+         let* () = release_txn ~cat tx owned in
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -5317,7 +5332,7 @@ let execute_delete
            | None -> Lwt.return_unit
            | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
          in
-         let* () = release_txn tx owned in
+         let* () = release_txn ~cat tx owned in
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -5963,7 +5978,7 @@ let execute_fts_insert
        in
        let col_texts = List.mapi (fun i t -> i, t) text_list in
        let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
-       let* () = release_txn tx owned in
+       let* () = release_txn ~cat tx owned in
        Lwt.return 1)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6022,7 +6037,7 @@ let execute_fts_delete
                 fts_deindex_document tx ~fts_meta ~rowid ~col_texts)
              matches
          in
-         let* () = release_txn tx owned in
+         let* () = release_txn ~cat tx owned in
          Lwt.return n)
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
