@@ -904,11 +904,13 @@ let test_put_x_absent () =
 ;;
 
 (* put_x on a key that already exists must NOT overwrite and must return the old value. *)
+(* put_x on a key that already exists must NOT overwrite and must signal
+   conflict with Some (sentinel); only the conflict flag matters to callers. *)
 let test_put_x_present () =
   let t, _ = empty_tree () in
   let t = ok_btree (run (Btree.put t (b "k") (b "old"))) in
   let t, old = run (Btree.put_x t (b "k") (b "new")) |> ok_btree in
-  Alcotest.(check bool) "put_x present returns Some old" true (old = Some (b "old"));
+  Alcotest.(check bool) "put_x present returns Some (conflict sentinel)" true (old <> None);
   let r = run (Btree.get t (b "k")) in
   Alcotest.(check bool) "original value preserved" true (r = Ok (Some (b "old")))
 ;;

@@ -988,17 +988,11 @@ let put_x_into_leaf t key value =
           plain_entries
       in
       match existing_stored with
-      | Some stored ->
-        let* dv =
-          decode_leaf_value
-            ?snapshot_frames:t.snapshot_frames
-            ?pin_set:t.pin_set
-            t.pager
-            stored
-        in
-        (match dv with
-         | Error e -> return_error e
-         | Ok old_bytes -> return_ok (t, Some old_bytes))
+      | Some _ ->
+        (* Key exists: signal conflict with a sentinel.  Do NOT decode/traverse
+           the overflow chain — most callers (CA_ignore, upsert, default-fail)
+           never need the old bytes.  Only CA_replace fetches them via S.get. *)
+        return_ok (t, Some Bytes.empty)
       | None ->
         let* prep_r = prepare_stored_value t.pager value in
         (match prep_r with

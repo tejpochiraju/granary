@@ -3003,6 +3003,36 @@ let insert_row_indexes
     idxs
 ;;
 
+(* [row_for_idx] must already have VIRTUAL generated columns applied (e.g.
+   via [decode_with_virtual] or [with_computed_virtuals]).  Callers that
+   obtain the row from [decode_with_virtual] can pass it directly — virtual
+   cols are computed in-place there, so no extra [Array.copy] is needed. *)
+let delete_row_indexes
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row_for_idx : Row.t)
+      ~rowid
+      indexes
+  : unit Lwt.t
+  =
+  let schema = table_meta.Cat.columns in
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       if not (row_matches_index_where clock params idx schema row_for_idx)
+       then Lwt.return_unit
+       else (
+         let iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx schema row_for_idx)
+         in
+         let old_ikey = Index_key.encode iks ~rowid in
+         S.del tx idx.idx_tree_id old_ikey))
+    indexes
+;;
+
 (* REPLACE conflict resolution: delete each [to_delete] row and its index
    entries (firing BEFORE DELETE); returns the displaced rows in original order. *)
 let delete_replace_conflicts
@@ -3032,20 +3062,14 @@ let delete_replace_conflicts
              | Some f -> f ~tx ~old_row
            in
            let* () = S.del tx table_meta.tree_id old_key in
-           Lwt_list.iter_s
-             (fun (idx2 : Cat.index_info) ->
-                if
-                  not
-                    (row_matches_index_where clock params idx2 table_meta.columns old_row)
-                then Lwt.return_unit
-                else (
-                  let iks2 =
-                    List.map
-                      row_value_to_index_value
-                      (get_index_key_values clock params idx2 table_meta.columns old_row)
-                  in
-                  let old_ikey = Index_key.encode iks2 ~rowid:old_rowid in
-                  S.del tx idx2.idx_tree_id old_ikey))
+           (* old_row from decode_with_virtual already has VIRTUAL cols applied *)
+           delete_row_indexes
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~row_for_idx:old_row
+             ~rowid:old_rowid
              idxs)
       (List.sort_uniq compare to_delete)
   in
@@ -3200,33 +3224,6 @@ let execute_upsert_update
 ;;
 
 (* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
-let delete_row_indexes
-      tx
-      (table_meta : Cat.table_meta)
-      ~clock
-      ~params
-      ~(row : Row.t)
-      ~rowid
-      indexes
-  : unit Lwt.t
-  =
-  let schema = table_meta.Cat.columns in
-  let row_for_idx = with_computed_virtuals clock params table_meta row in
-  Lwt_list.iter_s
-    (fun (idx : Cat.index_info) ->
-       if not (row_matches_index_where clock params idx schema row_for_idx)
-       then Lwt.return_unit
-       else (
-         let iks =
-           List.map
-             row_value_to_index_value
-             (get_index_key_values clock params idx schema row_for_idx)
-         in
-         let old_ikey = Index_key.encode iks ~rowid in
-         S.del tx idx.idx_tree_id old_ikey))
-    indexes
-;;
-
 (* Plain INSERT path (no UPSERT match from secondary indexes): honor IGNORE
    (skip), delete REPLACE conflicts, write the new row + index entries using
    [S.put_x] (combined check+write) when [alias_explicit=true] to avoid a
@@ -3258,9 +3255,10 @@ let execute_insert_write
   if skip
   then
     (* IGNORE from secondary-index pre-check: rollback if owned.
-       Invariant: [on_conflict = CA_ignore] implies [check_insert_unique] set
-       [skip=true], so [to_delete=[]] and [delete_replace_conflicts] below is a
-       no-op — making [S.rollback] safe (no hooks fired, no tree deletes made). *)
+       [on_conflict = CA_ignore] means [check_insert_unique] set [skip=true]
+       and never populated [to_delete], so the else-branch (including
+       [delete_replace_conflicts]) is unreachable — no hooks have fired and no
+       B-tree deletes have been made, so [S.rollback] is safe. *)
     let* () = if owned then S.rollback tx else Lwt.return_unit in
     Lwt.return false
   else
@@ -3307,36 +3305,53 @@ let execute_insert_write
       in
       let* () = release_txn ~cat tx owned in
       Lwt.return true
-    | Some old_bytes ->
-      (* Alias PK conflict detected by put_x (key present, NOT overwritten). *)
+    | Some _ ->
+      (* Alias PK conflict detected by put_x (key present, NOT overwritten).
+         put_x returns a sentinel [Some Bytes.empty] — callers that need the
+         old row bytes (CA_replace) fetch them via S.get below. *)
       let col_name = Option.value alias_col_name ~default:"rowid" in
       (match on_conflict, upsert_update with
        | Some Ast.CA_ignore, _ ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.return false
        | Some Ast.CA_replace, _ ->
-         let old_row = decode_with_virtual clock params table_meta old_bytes in
+         let* old_bytes_opt = S.get tx table_meta.tree_id key in
+         let old_row =
+           match old_bytes_opt with
+           | Some b -> decode_with_virtual clock params table_meta b
+           | None -> failwith "put_x conflict but row gone before CA_replace fetch"
+         in
          (* Fire BEFORE DELETE for the alias-PK displaced row.  Note: when
-             there are simultaneous secondary-index REPLACE conflicts, those
-             hooks fire first (inside delete_replace_conflicts above) — so the
-             hook order is the reverse of the old check_alias_pk_conflict path
-             which prepended the alias rowid to [to_delete], putting it first. *)
+            there are simultaneous secondary-index REPLACE conflicts, those
+            hooks fired first (inside delete_replace_conflicts above), so the
+            alias-PK BEFORE DELETE fires last. *)
          let* () =
            match on_replace_delete_before with
            | None -> Lwt.return_unit
            | Some f -> f ~tx ~old_row
          in
          (* Delete the alias-PK row's index entries.
-             old_rowid = rowid by alias-PK invariant: the conflict is on this
-             same key, so the displaced row's rowid equals the inserted rowid. *)
+            old_rowid = rowid by alias-PK invariant: the conflict is on this
+            same key, so the displaced row's rowid equals the inserted rowid.
+            old_row from decode_with_virtual already has VIRTUAL cols applied. *)
          let* () =
-           delete_row_indexes tx table_meta ~clock ~params ~row:old_row ~rowid idxs
+           delete_row_indexes
+             tx
+             table_meta
+             ~clock
+             ~params
+             ~row_for_idx:old_row
+             ~rowid
+             idxs
          in
          let* () = S.put tx table_meta.tree_id key bytes in
          let* () =
            insert_row_indexes tx table_meta ~clock ~params ~row_for_idx ~rowid idxs
          in
-         let all_displaced = old_row :: displaced_rows in
+         (* Fire AFTER DELETE for all displaced rows.  Use [displaced_rows @
+            [old_row]] so alias-PK row fires last — matching the BEFORE DELETE
+            order (secondary conflicts first, alias-PK last). *)
+         let all_displaced = displaced_rows @ [ old_row ] in
          let* () =
            match on_replace_delete with
            | None -> Lwt.return_unit
@@ -3351,7 +3366,13 @@ let execute_insert_write
          Lwt.return true
        | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
          (* Alias PK is always a single column, so single-element equality
-             suffices — no sort needed. *)
+            suffices — no sort needed.  Fire AFTER DELETE for any secondary
+            REPLACE displaced rows before handing off to the upsert path. *)
+         let* () =
+           match on_replace_delete with
+           | None -> Lwt.return_unit
+           | Some f -> Lwt_list.iter_s (fun r -> f ~tx ~old_row:r) displaced_rows
+         in
          execute_upsert_update
            tx
            cat
@@ -5308,7 +5329,11 @@ let apply_delete_row
     apply_delete_cascades tx cat table_meta ~clock ~params ~visited ~child_refs ~row
   in
   let rowid_key = Rowid.encode rowid in
-  let* () = delete_row_indexes tx table_meta ~clock ~params ~row ~rowid indexes in
+  (* row from drain_matching_rows_in_tx → decode_with_virtual: VIRTUAL cols
+     already applied in-place, so pass directly as row_for_idx. *)
+  let* () =
+    delete_row_indexes tx table_meta ~clock ~params ~row_for_idx:row ~rowid indexes
+  in
   S.del tx table_meta.tree_id rowid_key
 ;;
 

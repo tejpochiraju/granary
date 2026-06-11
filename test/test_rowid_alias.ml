@@ -254,6 +254,44 @@ let test_upsert_on_pk_last_rowid () =
       (scalar_int db "SELECT last_insert_rowid()"))
 ;;
 
+(* INSERT OR REPLACE that displaces BOTH a secondary-index row (via
+   delete_replace_conflicts) AND the alias-PK row (via put_x CA_replace arm)
+   must fire AFTER DELETE hooks in the same order as BEFORE DELETE hooks.
+   Secondary-conflict row fires BEFORE DELETE first; the fix ensures it also
+   fires AFTER DELETE first (#350 review finding). *)
+let test_replace_both_conflicts_after_delete_order () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "CREATE UNIQUE INDEX idx ON t (v)";
+    (* Log tables: one row per event, rowid order = insertion order *)
+    exec db "CREATE TABLE before_log (deleted_id INTEGER)";
+    exec db "CREATE TABLE after_log (deleted_id INTEGER)";
+    exec
+      db
+      "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN INSERT INTO before_log VALUES \
+       (OLD.id); END";
+    exec
+      db
+      "CREATE TRIGGER ad AFTER DELETE ON t BEGIN INSERT INTO after_log VALUES (OLD.id); \
+       END";
+    exec db "INSERT INTO t VALUES (1, 'x')";
+    exec db "INSERT INTO t VALUES (2, 'y')";
+    (* Row (1,'y') conflicts both on secondary (v='y' → displaces id=2) and
+       alias PK (id=1 → displaces id=1). BEFORE DELETE fires 2 then 1;
+       AFTER DELETE must fire in the same order. *)
+    exec db "INSERT OR REPLACE INTO t VALUES (1, 'y')";
+    let before_ids = ints db "SELECT deleted_id FROM before_log" in
+    let after_ids = ints db "SELECT deleted_id FROM after_log" in
+    Alcotest.(check (list int64))
+      "BEFORE DELETE fires secondary-conflict row (2) then alias-PK row (1)"
+      [ 2L; 1L ]
+      before_ids;
+    Alcotest.(check (list int64))
+      "AFTER DELETE fires in same order as BEFORE DELETE (2 then 1)"
+      [ 2L; 1L ]
+      after_ids)
+;;
+
 (* FK referencing an alias parent: valid child inserts, invalid rejected. *)
 let test_fk_to_alias_parent () =
   with_db (fun db ->
@@ -445,6 +483,10 @@ let () =
             "UPSERT on PK updates last_insert_rowid (#350)"
             `Quick
             test_upsert_on_pk_last_rowid
+        ; Alcotest.test_case
+            "REPLACE both conflicts consistent AFTER DELETE order (#350)"
+            `Quick
+            test_replace_both_conflicts_after_delete_order
         ; Alcotest.test_case "FK to alias parent" `Quick test_fk_to_alias_parent
         ; Alcotest.test_case "negative and large ids" `Quick test_negative_and_large_ids
         ; Alcotest.test_case "table-level PK alias" `Quick test_table_level_pk_alias
