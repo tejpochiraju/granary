@@ -162,7 +162,6 @@ module Schema_cache : sig
   val mem_index : t -> string -> bool
   val find_fts : t -> string -> fts_table_meta option
   val fold_tables : (string -> table_meta -> 'a -> 'a) -> t -> 'a -> 'a
-  val fold_indexes : (string -> index_info -> 'a -> 'a) -> t -> 'a -> 'a
   val fold_fts : (string -> fts_table_meta -> 'a -> 'a) -> t -> 'a -> 'a
   val indexes_for_table : t -> table:string -> index_info list
   val count_tables : t -> int
@@ -258,7 +257,6 @@ end = struct
   let mem_index t name = Hashtbl.mem t.indexes name
   let find_fts t name = Hashtbl.find_opt t.fts name
   let fold_tables f t acc = Hashtbl.fold f t.tables acc
-  let fold_indexes f t acc = Hashtbl.fold f t.indexes acc
   let fold_fts f t acc = Hashtbl.fold f t.fts acc
 
   let indexes_for_table t ~table =
@@ -2434,10 +2432,9 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
      exactly).  The fingerprint is unchanged by a rename, so [put_table]'s re-stamp
      is a no-op. *)
   let to_update =
-    Schema_cache.fold_indexes
-      (fun k v acc -> if String.equal v.idx_table old_name then (k, v) :: acc else acc)
-      t.sc
-      []
+    List.map
+      (fun (v : index_info) -> v.idx_name, v)
+      (Schema_cache.indexes_for_table t.sc ~table:old_name)
   in
   (match txn with
    | Some _ ->

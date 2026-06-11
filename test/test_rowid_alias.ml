@@ -240,6 +240,20 @@ let test_upsert_on_pk () =
        | _ -> "??"))
 ;;
 
+(* last_insert_rowid() must reflect the upserted row's id — the alias-PK
+   conflict is detected by put_x rather than a pre-read, and the result flows
+   back through set_last_inserted_rowid.  SQLite-correct behavior. *)
+let test_upsert_on_pk_last_rowid () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (5, 'a')";
+    exec db "INSERT INTO t VALUES (5, 'b') ON CONFLICT(id) DO UPDATE SET v = 'updated'";
+    Alcotest.(check int64)
+      "last_insert_rowid is 5 after alias-PK upsert"
+      5L
+      (scalar_int db "SELECT last_insert_rowid()"))
+;;
+
 (* FK referencing an alias parent: valid child inserts, invalid rejected. *)
 let test_fk_to_alias_parent () =
   with_db (fun db ->
@@ -427,6 +441,10 @@ let () =
         ; Alcotest.test_case "INSERT OR REPLACE on PK" `Quick test_replace_on_pk
         ; Alcotest.test_case "INSERT OR IGNORE on PK" `Quick test_ignore_on_pk
         ; Alcotest.test_case "UPSERT on PK" `Quick test_upsert_on_pk
+        ; Alcotest.test_case
+            "UPSERT on PK updates last_insert_rowid (#350)"
+            `Quick
+            test_upsert_on_pk_last_rowid
         ; Alcotest.test_case "FK to alias parent" `Quick test_fk_to_alias_parent
         ; Alcotest.test_case "negative and large ids" `Quick test_negative_and_large_ids
         ; Alcotest.test_case "table-level PK alias" `Quick test_table_level_pk_alias

@@ -3199,6 +3199,34 @@ let execute_upsert_update
     Lwt.return true
 ;;
 
+(* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
+let delete_row_indexes
+      tx
+      (table_meta : Cat.table_meta)
+      ~clock
+      ~params
+      ~(row : Row.t)
+      ~rowid
+      indexes
+  : unit Lwt.t
+  =
+  let schema = table_meta.Cat.columns in
+  let row_for_idx = with_computed_virtuals clock params table_meta row in
+  Lwt_list.iter_s
+    (fun (idx : Cat.index_info) ->
+       if not (row_matches_index_where clock params idx schema row_for_idx)
+       then Lwt.return_unit
+       else (
+         let iks =
+           List.map
+             row_value_to_index_value
+             (get_index_key_values clock params idx schema row_for_idx)
+         in
+         let old_ikey = Index_key.encode iks ~rowid in
+         S.del tx idx.idx_tree_id old_ikey))
+    indexes
+;;
+
 (* Plain INSERT path (no UPSERT match from secondary indexes): honor IGNORE
    (skip), delete REPLACE conflicts, write the new row + index entries using
    [S.put_x] (combined check+write) when [alias_explicit=true] to avoid a
@@ -3229,7 +3257,10 @@ let execute_insert_write
   =
   if skip
   then
-    (* IGNORE from secondary-index pre-check: rollback if owned. *)
+    (* IGNORE from secondary-index pre-check: rollback if owned.
+       Invariant: [on_conflict = CA_ignore] implies [check_insert_unique] set
+       [skip=true], so [to_delete=[]] and [delete_replace_conflicts] below is a
+       no-op — making [S.rollback] safe (no hooks fired, no tree deletes made). *)
     let* () = if owned then S.rollback tx else Lwt.return_unit in
     Lwt.return false
   else
@@ -3246,8 +3277,11 @@ let execute_insert_write
     let key = Rowid.encode rowid in
     let bytes = Row.encode table_meta.columns row in
     (* #350: use put_x for explicit alias PK rows to combine the uniqueness
-       check with the write in a single B-tree descent.  For all other cases
-       (no alias, auto rowid) just put — no alias PK conflict is possible. *)
+       check with the write in a single B-tree descent (1 descent on the
+       no-conflict path; 2 for CA_replace since put_x does not write on
+       conflict and a follow-up S.put is needed).  For all other cases (no
+       alias col, auto-allocated rowid) just S.put — no alias PK conflict
+       is possible. *)
     let* conflict_opt =
       if alias_explicit
       then S.put_x tx table_meta.tree_id key bytes
@@ -3282,37 +3316,21 @@ let execute_insert_write
          Lwt.return false
        | Some Ast.CA_replace, _ ->
          let old_row = decode_with_virtual clock params table_meta old_bytes in
-         let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
+         (* Fire BEFORE DELETE for the alias-PK displaced row.  Note: when
+             there are simultaneous secondary-index REPLACE conflicts, those
+             hooks fire first (inside delete_replace_conflicts above) — so the
+             hook order is the reverse of the old check_alias_pk_conflict path
+             which prepended the alias rowid to [to_delete], putting it first. *)
          let* () =
            match on_replace_delete_before with
            | None -> Lwt.return_unit
            | Some f -> f ~tx ~old_row
          in
+         (* Delete the alias-PK row's index entries.
+             old_rowid = rowid by alias-PK invariant: the conflict is on this
+             same key, so the displaced row's rowid equals the inserted rowid. *)
          let* () =
-           Lwt_list.iter_s
-             (fun (idx : Cat.index_info) ->
-                if
-                  not
-                    (row_matches_index_where
-                       clock
-                       params
-                       idx
-                       table_meta.columns
-                       old_row_for_idx)
-                then Lwt.return_unit
-                else (
-                  let old_iks =
-                    List.map
-                      row_value_to_index_value
-                      (get_index_key_values
-                         clock
-                         params
-                         idx
-                         table_meta.columns
-                         old_row_for_idx)
-                  in
-                  S.del tx idx.idx_tree_id (Index_key.encode old_iks ~rowid)))
-             idxs
+           delete_row_indexes tx table_meta ~clock ~params ~row:old_row ~rowid idxs
          in
          let* () = S.put tx table_meta.tree_id key bytes in
          let* () =
@@ -3331,9 +3349,9 @@ let execute_insert_write
          in
          let* () = release_txn ~cat tx owned in
          Lwt.return true
-       | _, Some (conflict_cols, assigns)
-         when List.sort String.compare [ col_name ]
-              = List.sort String.compare conflict_cols ->
+       | _, Some (conflict_cols, assigns) when conflict_cols = [ col_name ] ->
+         (* Alias PK is always a single column, so single-element equality
+             suffices — no sort needed. *)
          execute_upsert_update
            tx
            cat
@@ -5269,34 +5287,6 @@ let apply_delete_cascades
               child_meta)
            fks)
       child_refs
-;;
-
-(* Remove [row]'s index entries (honoring each index's WHERE predicate). *)
-let delete_row_indexes
-      tx
-      (table_meta : Cat.table_meta)
-      ~clock
-      ~params
-      ~(row : Row.t)
-      ~rowid
-      indexes
-  : unit Lwt.t
-  =
-  let schema = table_meta.Cat.columns in
-  let row_for_idx = with_computed_virtuals clock params table_meta row in
-  Lwt_list.iter_s
-    (fun (idx : Cat.index_info) ->
-       if not (row_matches_index_where clock params idx schema row_for_idx)
-       then Lwt.return_unit
-       else (
-         let iks =
-           List.map
-             row_value_to_index_value
-             (get_index_key_values clock params idx schema row_for_idx)
-         in
-         let old_ikey = Index_key.encode iks ~rowid in
-         S.del tx idx.idx_tree_id old_ikey))
-    indexes
 ;;
 
 (* Delete one matched row: run ON DELETE cascades, remove index entries, then
