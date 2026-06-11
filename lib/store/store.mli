@@ -194,6 +194,12 @@ val get : _ txn -> tree_id -> bytes -> bytes option Lwt.t
 (** Insert or update a key in a tree. Only available in RW transactions. *)
 val put : rw txn -> tree_id -> bytes -> bytes -> unit Lwt.t
 
+(** [put_x tx tid key value] inserts [value] at [key] if absent.
+    Returns [None] on success (key was new, value written).
+    Returns [Some Bytes.empty] (conflict sentinel) when key already existed
+    (NOT overwritten).  Callers that need the old bytes must fetch via {!get}. *)
+val put_x : rw txn -> tree_id -> bytes -> bytes -> bytes option Lwt.t
+
 (** Delete a key from a tree. No-op if the key does not exist. Only
     available in RW transactions. *)
 val del : rw txn -> tree_id -> bytes -> unit Lwt.t

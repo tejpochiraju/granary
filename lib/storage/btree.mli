@@ -52,6 +52,13 @@ val get : t -> bytes -> (bytes option, error) result Lwt.t
     @return [Error (Value_too_large n)] if the value is more than 1024 bytes. *)
 val put : t -> bytes -> bytes -> (t, error) result Lwt.t
 
+(** [put_x t key value] inserts [value] at [key] in a single tree descent.
+    Returns [(t', None)] when [key] was absent (value written).
+    Returns [(t, Some Bytes.empty)] when [key] already existed (NOT overwritten).
+    The returned bytes on conflict are a sentinel — callers that need the old
+    value must fetch it separately via {!get}. *)
+val put_x : t -> bytes -> bytes -> (t * bytes option, error) result Lwt.t
+
 (** Delete a key.  No-op if absent.  Returns an updated [t].
 
     Phase 1 deletion is lazy: an emptied leaf is left in the tree (callers

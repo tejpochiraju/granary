@@ -162,8 +162,8 @@ module Schema_cache : sig
   val mem_index : t -> string -> bool
   val find_fts : t -> string -> fts_table_meta option
   val fold_tables : (string -> table_meta -> 'a -> 'a) -> t -> 'a -> 'a
-  val fold_indexes : (string -> index_info -> 'a -> 'a) -> t -> 'a -> 'a
   val fold_fts : (string -> fts_table_meta -> 'a -> 'a) -> t -> 'a -> 'a
+  val indexes_for_table : t -> table:string -> index_info list
   val count_tables : t -> int
   val count_indexes : t -> int
   val count_fts : t -> int
@@ -225,6 +225,7 @@ end = struct
   type t =
     { tables : (string, table_meta) Hashtbl.t
     ; indexes : (string, index_info) Hashtbl.t
+    ; indexes_by_table : (string, index_info list) Hashtbl.t
     ; fts : (string, fts_table_meta) Hashtbl.t
     ; stamp : table_meta -> unit
     ; mutable undo : (unit -> unit) list
@@ -236,6 +237,7 @@ end = struct
   let create ~stamp =
     { tables = Hashtbl.create 16
     ; indexes = Hashtbl.create 16
+    ; indexes_by_table = Hashtbl.create 16
     ; fts = Hashtbl.create 8
     ; stamp
     ; undo = []
@@ -255,8 +257,12 @@ end = struct
   let mem_index t name = Hashtbl.mem t.indexes name
   let find_fts t name = Hashtbl.find_opt t.fts name
   let fold_tables f t acc = Hashtbl.fold f t.tables acc
-  let fold_indexes f t acc = Hashtbl.fold f t.indexes acc
   let fold_fts f t acc = Hashtbl.fold f t.fts acc
+
+  let indexes_for_table t ~table =
+    Option.value (Hashtbl.find_opt t.indexes_by_table table) ~default:[]
+  ;;
+
   let count_tables t = Hashtbl.length t.tables
   let count_indexes t = Hashtbl.length t.indexes
   let count_fts t = Hashtbl.length t.fts
@@ -284,21 +290,47 @@ end = struct
       | None -> ())
   ;;
 
+  let by_table_add t idx_table info =
+    let lst = Option.value (Hashtbl.find_opt t.indexes_by_table idx_table) ~default:[] in
+    Hashtbl.replace t.indexes_by_table idx_table (info :: lst)
+  ;;
+
+  let by_table_remove t idx_table idx_name =
+    match Hashtbl.find_opt t.indexes_by_table idx_table with
+    | None -> ()
+    | Some lst ->
+      (match List.filter (fun i -> not (String.equal i.idx_name idx_name)) lst with
+       | [] -> Hashtbl.remove t.indexes_by_table idx_table
+       | lst' -> Hashtbl.replace t.indexes_by_table idx_table lst')
+  ;;
+
   let put_index t ~name info =
     let prior = Hashtbl.find_opt t.indexes name in
+    (match prior with
+     | Some p -> by_table_remove t p.idx_table name
+     | None -> ());
     Hashtbl.replace t.indexes name info;
+    by_table_add t info.idx_table info;
     push_undo t (fun () ->
+      by_table_remove t info.idx_table name;
       match prior with
-      | Some i -> Hashtbl.replace t.indexes name i
+      | Some i ->
+        Hashtbl.replace t.indexes name i;
+        by_table_add t i.idx_table i
       | None -> Hashtbl.remove t.indexes name)
   ;;
 
   let remove_index t ~name =
     let prior = Hashtbl.find_opt t.indexes name in
     Hashtbl.remove t.indexes name;
+    (match prior with
+     | Some p -> by_table_remove t p.idx_table name
+     | None -> ());
     push_undo t (fun () ->
       match prior with
-      | Some i -> Hashtbl.replace t.indexes name i
+      | Some i ->
+        Hashtbl.replace t.indexes name i;
+        by_table_add t i.idx_table i
       | None -> ())
   ;;
 
@@ -317,7 +349,15 @@ end = struct
   ;;
 
   let remove_table_durable t ~name = Hashtbl.remove t.tables name
-  let put_index_durable t ~name info = Hashtbl.replace t.indexes name info
+
+  let put_index_durable t ~name info =
+    (match Hashtbl.find_opt t.indexes name with
+     | Some p -> by_table_remove t p.idx_table name
+     | None -> ());
+    Hashtbl.replace t.indexes name info;
+    by_table_add t info.idx_table info
+  ;;
+
   let put_fts_durable t ~name meta = Hashtbl.replace t.fts name meta
 
   let bump_rowid t ~name meta =
@@ -2187,13 +2227,7 @@ let add_column ?txn t ~table_name ~(column : Row.column) =
       Lwt.return (Ok ()))
 ;;
 
-let indexes_for_table t ~table =
-  Schema_cache.fold_indexes
-    (fun _ info acc -> if info.idx_table = table then info :: acc else acc)
-    t.sc
-    []
-;;
-
+let indexes_for_table t ~table = Schema_cache.indexes_for_table t.sc ~table
 let find_index t ~name = Schema_cache.find_index t.sc name
 
 let find_index_covering_cols t ~table_name ~col_idxs =
@@ -2398,10 +2432,9 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
      exactly).  The fingerprint is unchanged by a rename, so [put_table]'s re-stamp
      is a no-op. *)
   let to_update =
-    Schema_cache.fold_indexes
-      (fun k v acc -> if String.equal v.idx_table old_name then (k, v) :: acc else acc)
-      t.sc
-      []
+    List.map
+      (fun (v : index_info) -> v.idx_name, v)
+      (Schema_cache.indexes_for_table t.sc ~table:old_name)
   in
   (match txn with
    | Some _ ->
