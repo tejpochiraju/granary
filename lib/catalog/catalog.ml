@@ -1929,9 +1929,9 @@ let next_rowid_in_txn ?(defer_counter = false) t ~name (tx : S.rw S.txn) =
       Schema_cache.bump_rowid t.sc ~name m';
       if defer_counter
       then Lwt.return id
-      else
+      else (
         let%lwt () = put_table_counter_tx tx m' in
-        Lwt.return id)
+        Lwt.return id))
 ;;
 
 (** #243 (T1): after an INSERT supplies an explicit INTEGER PRIMARY KEY value,

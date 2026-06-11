@@ -1650,12 +1650,13 @@ let compute_stored_generated_cols
   =
   (* #347: skip when no column is a STORED generated column — the common case.
      VIRTUAL columns stay at V_null (set by [build_insert_row]'s Array.make). *)
-  if List.exists
-       (fun (c : Row.column) ->
-          match c.Row.generated_as with
-          | Some (_, true) -> true
-          | _ -> false)
-       meta.Cat.columns
+  if
+    List.exists
+      (fun (c : Row.column) ->
+         match c.Row.generated_as with
+         | Some (_, true) -> true
+         | _ -> false)
+      meta.Cat.columns
   then
     List.iteri
       (fun i (col : Row.column) ->
@@ -1889,7 +1890,10 @@ let eval_check_constraints
   : unit
   =
   (* #347: skip entirely when no column carries a CHECK — the common case. *)
-  if List.exists (fun (c : Row.column) -> Option.is_some c.check_sql) table_meta.Cat.columns
+  if
+    List.exists
+      (fun (c : Row.column) -> Option.is_some c.check_sql)
+      table_meta.Cat.columns
   then (
     (* Phase 35 Task 2: populate VIRTUAL generated columns into a scratch row
        before evaluating CHECKs, so checks that reference a VIRTUAL column see
@@ -2804,7 +2808,12 @@ let enforce_insert_fks store (cat : Cat.t) (table_meta : Cat.table_meta) (row : 
 
 (* Resolve the rowid for an INSERT: the INTEGER PRIMARY KEY for WITHOUT ROWID
    tables (must be present, non-NULL, integer), else a freshly allocated one. *)
-let insert_rowid ?(defer_counter = false) tx (cat : Cat.t) (table_meta : Cat.table_meta) (row : Row.t)
+let insert_rowid
+      ?(defer_counter = false)
+      tx
+      (cat : Cat.t)
+      (table_meta : Cat.table_meta)
+      (row : Row.t)
   : int64 Lwt.t
   =
   if table_meta.Cat.without_rowid
