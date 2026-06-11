@@ -161,6 +161,50 @@ val leaf_lookup : Cstruct.t -> n_keys:int -> key:bytes -> bytes option
     list-based pick (#245). *)
 val branch_pick : Cstruct.t -> n_keys:int -> right_page:int32 -> key:bytes -> int32
 
+(** Result of {!leaf_find_position}: where a key belongs in a sorted leaf page. *)
+type leaf_position =
+  { insert_off : int
+  ; data_end : int
+  ; key_found : bool
+  }
+
+(** Zero-alloc scan to find where [key] belongs in a sorted leaf page.
+    [insert_off] is the offset of the first entry >= [key] (or [data_end]).
+    [key_found] is true iff an exact match exists at [insert_off]. *)
+val leaf_find_position : Cstruct.t -> n_keys:int -> key:bytes -> leaf_position
+
+(** Build a new leaf page with ([key], [stored_value]) inserted at
+    [pos.insert_off] via byte-surgery (no entry decode/re-encode).
+    Caller guarantees [pos.key_found = false] and the entry fits without split. *)
+val leaf_blit_insert
+  :  Cstruct.t
+  -> pos:leaf_position
+  -> key:bytes
+  -> stored_value:bytes
+  -> right_page:int32
+  -> write_tag:int32
+  -> n_keys:int
+  -> Cstruct.t
+
+(** Like {!branch_pick} but also returns the chosen child's ordinal index and
+    byte offset of its [left_child] int32 field (-1 for [right_page]). *)
+val branch_pick_with_info
+  :  Cstruct.t
+  -> n_keys:int
+  -> right_page:int32
+  -> key:bytes
+  -> int32 * int * int
+
+(** Build a new branch page identical to [buf] except the child pointer at
+    [child_ptr_offset] is replaced with [new_child] ([child_ptr_offset < 0]
+    updates [right_page] instead).  Returns a fresh, freshly-sealed Cstruct. *)
+val branch_blit_update_child
+  :  Cstruct.t
+  -> child_ptr_offset:int
+  -> new_child:int32
+  -> write_tag:int32
+  -> Cstruct.t
+
 (** [4080 / 12 = 340] freelist entries per page for the DEFAULT 4096 geometry.
     For a runtime geometry use {!Geometry.max_freelist_entries_per_page}. *)
 val max_freelist_entries_per_page : int

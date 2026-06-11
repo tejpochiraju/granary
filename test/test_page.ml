@@ -905,6 +905,313 @@ let prop_branch_pick_matches =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* leaf_find_position tests                                            *)
+(* ------------------------------------------------------------------ *)
+
+let build_leaf_page entries =
+  let buf = fresh_page () in
+  let _ =
+    List.fold_left
+      (fun off (k, v) -> P.leaf_append_entry buf ~offset:off ~key:k ~value:v)
+      P.data_offset
+      entries
+  in
+  buf, List.length entries
+;;
+
+let test_leaf_find_position_empty () =
+  let buf, n = build_leaf_page [] in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key:(Bytes.of_string "a") in
+  Alcotest.(check int) "insert_off=data_offset" P.data_offset pos.P.insert_off;
+  Alcotest.(check int) "data_end=data_offset" P.data_offset pos.P.data_end;
+  Alcotest.(check bool) "key_found=false" false pos.P.key_found
+;;
+
+let test_leaf_find_position_before_first () =
+  let buf, n = build_leaf_page [ Bytes.of_string "b", Bytes.of_string "v" ] in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key:(Bytes.of_string "a") in
+  Alcotest.(check int) "insert_off=data_offset" P.data_offset pos.P.insert_off;
+  Alcotest.(check bool) "key_found=false" false pos.P.key_found;
+  Alcotest.(check bool) "data_end>data_offset" true (pos.P.data_end > P.data_offset)
+;;
+
+let test_leaf_find_position_after_last () =
+  let buf, n = build_leaf_page [ Bytes.of_string "a", Bytes.of_string "v" ] in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key:(Bytes.of_string "z") in
+  Alcotest.(check bool) "key_found=false" false pos.P.key_found;
+  Alcotest.(check int) "insert_off=data_end" pos.P.data_end pos.P.insert_off
+;;
+
+let test_leaf_find_position_exact () =
+  let k = Bytes.of_string "hello" in
+  let buf, n = build_leaf_page [ k, Bytes.of_string "v" ] in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key:k in
+  Alcotest.(check bool) "key_found=true" true pos.P.key_found;
+  Alcotest.(check int) "insert_off=data_offset" P.data_offset pos.P.insert_off
+;;
+
+(* ------------------------------------------------------------------ *)
+(* leaf_blit_insert tests                                              *)
+(* ------------------------------------------------------------------ *)
+
+let test_leaf_blit_insert_empty () =
+  let buf, n = build_leaf_page [] in
+  let key = Bytes.of_string "k"
+  and sv = Bytes.of_string "\x00val" in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key in
+  let nb =
+    P.leaf_blit_insert
+      buf
+      ~pos
+      ~key
+      ~stored_value:sv
+      ~right_page:0l
+      ~write_tag:0l
+      ~n_keys:n
+  in
+  let c = P.read_common nb in
+  Alcotest.(check int) "n_keys=1" 1 c.n_keys;
+  match P.leaf_entry_at nb ~offset:P.data_offset with
+  | `Entry e -> Alcotest.(check bytes) "key round-trips" key e.key
+  | `End -> Alcotest.fail "expected entry"
+;;
+
+let test_leaf_blit_insert_before () =
+  let buf, n = build_leaf_page [ Bytes.of_string "z", Bytes.of_string "v2" ] in
+  let k1 = Bytes.of_string "a"
+  and sv = Bytes.of_string "\x00v1" in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key:k1 in
+  let nb =
+    P.leaf_blit_insert
+      buf
+      ~pos
+      ~key:k1
+      ~stored_value:sv
+      ~right_page:0l
+      ~write_tag:0l
+      ~n_keys:n
+  in
+  Alcotest.(check int) "n_keys=2" 2 (P.read_common nb).n_keys;
+  match P.leaf_entry_at nb ~offset:P.data_offset with
+  | `Entry e -> Alcotest.(check bytes) "first key=a" k1 e.key
+  | `End -> Alcotest.fail "expected first entry"
+;;
+
+(* QCheck: leaf_blit_insert ≡ decode+insert+encode *)
+let ref_leaf_insert buf n key sv right_page tag =
+  let acc = ref [] in
+  let rec scan off i =
+    if i >= n
+    then ()
+    else (
+      match P.leaf_entry_at buf ~offset:off with
+      | `End -> ()
+      | `Entry e ->
+        acc := (e.key, e.value) :: !acc;
+        scan e.next_offset (i + 1))
+  in
+  scan P.data_offset 0;
+  let plain = List.rev !acc in
+  let new_plain =
+    let rec ins a = function
+      | [] -> List.rev_append a [ key, sv ]
+      | ((k, _) as h) :: t ->
+        let c = Bytes.compare key k in
+        if c <= 0
+        then List.rev_append a ((key, sv) :: (if c = 0 then t else h :: t))
+        else ins (h :: a) t
+    in
+    ins [] plain
+  in
+  let nb = Cstruct.create P.page_size in
+  Cstruct.memset nb 0;
+  let cnt =
+    List.fold_left
+      (fun (off, i) (k, v) -> P.leaf_append_entry nb ~offset:off ~key:k ~value:v, i + 1)
+      (P.data_offset, 0)
+      new_plain
+    |> snd
+  in
+  P.write_common nb P.{ kind = Leaf; flags = 0; n_keys = cnt; right_page; crc32 = 0l };
+  P.write_tag nb tag;
+  P.seal nb;
+  nb
+;;
+
+let prop_leaf_blit_insert_equiv =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 40 in
+      let* raw =
+        list_size
+          (return n)
+          (pair (bytes_size (int_range 1 10)) (bytes_size (int_range 1 20)))
+      in
+      let* nk = bytes_size (int_range 1 10) in
+      let* nv = bytes_size (int_range 1 10) in
+      let* rp = int32 in
+      let* tag = int32 in
+      return (raw, nk, nv, rp, tag))
+  in
+  QCheck.Test.make
+    ~name:"prop_leaf_blit_insert_matches_reference"
+    ~count:5_000
+    (QCheck.make gen)
+    (fun (raw, nk, nv, rp, tag) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, v) -> P.leaf_append_entry buf ~offset:off ~key:k ~value:v)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       let sv = Bytes.cat (Bytes.make 1 '\x00') nv in
+       let esz = 2 + Bytes.length nk + 2 + Bytes.length sv in
+       let dsz =
+         List.fold_left (fun a (k, v) -> a + 2 + Bytes.length k + 2 + Bytes.length v) 0 su
+       in
+       if dsz + esz > P.max_data_bytes
+       then true
+       else if List.exists (fun (k, _) -> Bytes.equal k nk) su
+       then true
+       else (
+         let pos = P.leaf_find_position buf ~n_keys:n ~key:nk in
+         let fast =
+           P.leaf_blit_insert
+             buf
+             ~pos
+             ~key:nk
+             ~stored_value:sv
+             ~right_page:rp
+             ~write_tag:tag
+             ~n_keys:n
+         in
+         let ref_ = ref_leaf_insert buf n nk sv rp tag in
+         Cstruct.equal fast ref_))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* branch_pick_with_info tests                                         *)
+(* ------------------------------------------------------------------ *)
+
+let test_branch_pick_with_info_empty () =
+  let buf = fresh_page () in
+  let rp = 42l in
+  let c, idx, ptr =
+    P.branch_pick_with_info buf ~n_keys:0 ~right_page:rp ~key:(Bytes.of_string "x")
+  in
+  Alcotest.(check int32) "child=right_page" rp c;
+  Alcotest.(check int) "idx=0" 0 idx;
+  Alcotest.(check int) "ptr=-1" (-1) ptr
+;;
+
+let test_branch_pick_with_info_left () =
+  let buf = fresh_page () in
+  let lc = 77l
+  and rp = 88l
+  and k = Bytes.of_string "m" in
+  let _ = P.branch_append_entry buf ~offset:P.data_offset ~key:k ~left_child:lc in
+  let c, _idx, ptr =
+    P.branch_pick_with_info buf ~n_keys:1 ~right_page:rp ~key:(Bytes.of_string "a")
+  in
+  Alcotest.(check int32) "child=left_child" lc c;
+  Alcotest.(check bool) "ptr>=0" true (ptr >= 0);
+  Alcotest.(check int32) "ptr reads lc" lc (Cstruct.BE.get_uint32 buf ptr)
+;;
+
+let test_branch_pick_with_info_right () =
+  let buf = fresh_page () in
+  let lc = 77l
+  and rp = 88l
+  and k = Bytes.of_string "m" in
+  let _ = P.branch_append_entry buf ~offset:P.data_offset ~key:k ~left_child:lc in
+  let c, idx, ptr =
+    P.branch_pick_with_info buf ~n_keys:1 ~right_page:rp ~key:(Bytes.of_string "z")
+  in
+  Alcotest.(check int32) "child=right_page" rp c;
+  Alcotest.(check int) "idx=n_keys" 1 idx;
+  Alcotest.(check int) "ptr=-1" (-1) ptr
+;;
+
+let prop_branch_pick_with_info_agrees =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 80 in
+      let* raw = list_size (return n) (pair (bytes_size (int_range 0 20)) int32) in
+      let* rp = int32 in
+      let* probe = bytes_size (int_range 0 20) in
+      return (raw, rp, probe))
+  in
+  QCheck.Test.make
+    ~name:"prop_branch_pick_with_info_agrees"
+    ~count:10_000
+    (QCheck.make gen)
+    (fun (raw, rp, probe) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, lc) ->
+              P.branch_append_entry buf ~offset:off ~key:k ~left_child:lc)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       let ref_ = ref_branch_pick buf n rp probe in
+       let fast, _, ptr =
+         P.branch_pick_with_info buf ~n_keys:n ~right_page:rp ~key:probe
+       in
+       fast = ref_ && (ptr < 0 || Cstruct.BE.get_uint32 buf ptr = fast))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* branch_blit_update_child tests                                      *)
+(* ------------------------------------------------------------------ *)
+
+let test_branch_blit_update_child_left () =
+  let buf = fresh_page () in
+  let lc = 77l
+  and rp = 88l
+  and k = Bytes.of_string "m" in
+  let _ = P.branch_append_entry buf ~offset:P.data_offset ~key:k ~left_child:lc in
+  P.write_common
+    buf
+    P.{ kind = Branch; flags = 0; n_keys = 1; right_page = rp; crc32 = 0l };
+  P.seal buf;
+  let _, _, ptr =
+    P.branch_pick_with_info buf ~n_keys:1 ~right_page:rp ~key:(Bytes.of_string "a")
+  in
+  let nb =
+    P.branch_blit_update_child buf ~child_ptr_offset:ptr ~new_child:99l ~write_tag:0l
+  in
+  Alcotest.(check int32)
+    "left_child updated"
+    99l
+    (P.branch_pick nb ~n_keys:1 ~right_page:rp ~key:(Bytes.of_string "a"))
+;;
+
+let test_branch_blit_update_child_right () =
+  let buf = fresh_page () in
+  let lc = 77l
+  and rp = 88l
+  and k = Bytes.of_string "m" in
+  let _ = P.branch_append_entry buf ~offset:P.data_offset ~key:k ~left_child:lc in
+  P.write_common
+    buf
+    P.{ kind = Branch; flags = 0; n_keys = 1; right_page = rp; crc32 = 0l };
+  P.seal buf;
+  let nb =
+    P.branch_blit_update_child buf ~child_ptr_offset:(-1) ~new_child:123l ~write_tag:0l
+  in
+  Alcotest.(check int32)
+    "right_page updated"
+    123l
+    (P.branch_pick nb ~n_keys:1 ~right_page:123l ~key:(Bytes.of_string "z"))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* RUNNER                                                              *)
 (* ------------------------------------------------------------------ *)
 
@@ -919,6 +1226,8 @@ let () =
       ; prop_common_roundtrip
       ; prop_leaf_lookup_matches
       ; prop_branch_pick_matches
+      ; prop_leaf_blit_insert_equiv
+      ; prop_branch_pick_with_info_agrees
       ]
   in
   Alcotest.run
@@ -1047,6 +1356,28 @@ let () =
             "leaf append respects reserved tail"
             `Quick
             test_leaf_append_respects_reserved
+        ] )
+    ; ( "leaf_find_position"
+      , [ Alcotest.test_case "empty page" `Quick test_leaf_find_position_empty
+        ; Alcotest.test_case "before first" `Quick test_leaf_find_position_before_first
+        ; Alcotest.test_case "after last" `Quick test_leaf_find_position_after_last
+        ; Alcotest.test_case "exact match" `Quick test_leaf_find_position_exact
+        ] )
+    ; ( "leaf_blit_insert"
+      , [ Alcotest.test_case "into empty" `Quick test_leaf_blit_insert_empty
+        ; Alcotest.test_case "before existing" `Quick test_leaf_blit_insert_before
+        ] )
+    ; ( "branch_pick_with_info"
+      , [ Alcotest.test_case "empty branch" `Quick test_branch_pick_with_info_empty
+        ; Alcotest.test_case "follows left_child" `Quick test_branch_pick_with_info_left
+        ; Alcotest.test_case "follows right_page" `Quick test_branch_pick_with_info_right
+        ] )
+    ; ( "branch_blit_update_child"
+      , [ Alcotest.test_case "update left_child" `Quick test_branch_blit_update_child_left
+        ; Alcotest.test_case
+            "update right_page"
+            `Quick
+            test_branch_blit_update_child_right
         ] )
     ; "qcheck", qcheck_tests
     ]

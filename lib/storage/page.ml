@@ -83,15 +83,16 @@ let write_common buf c =
 (* CRC32 (IEEE polynomial)                                             *)
 (* ------------------------------------------------------------------ *)
 
-(* Build the IEEE CRC32 lookup table at module load time. *)
-let crc32_table : int32 array =
-  let table = Array.make 256 0l in
+(* CRC32 table using native OCaml int (63-bit on 64-bit platforms) to avoid
+   the per-operation heap allocation that OCaml's Int32 boxing incurs.  Every
+   value fits in a 32-bit unsigned range so 63-bit int is a safe superset.
+   Requires 64-bit platform — correct for all sqlocaml/MirageOS targets. *)
+let crc32_table : int array =
+  let table = Array.make 256 0 in
   for i = 0 to 255 do
-    let crc = ref (Int32.of_int i) in
+    let crc = ref i in
     for _ = 0 to 7 do
-      if Int32.logand !crc 1l = 1l
-      then crc := Int32.logxor (Int32.shift_right_logical !crc 1) 0xEDB88320l
-      else crc := Int32.shift_right_logical !crc 1
+      if !crc land 1 = 1 then crc := (!crc lsr 1) lxor 0xEDB88320 else crc := !crc lsr 1
     done;
     table.(i) <- !crc
   done;
@@ -99,30 +100,27 @@ let crc32_table : int32 array =
 ;;
 
 (*
-  Compute CRC32 over all 4096 bytes of [buf], treating bytes 8..11 (the
-  crc32 field) as zeros without modifying the buffer.
+  Compute CRC32 over all bytes of [buf], treating bytes 8..11 (the
+  crc32 field) as zeros without modifying the buffer.  Returns a native
+  int holding the unsigned 32-bit CRC value (high 31 bits are zero).
 *)
-let compute_crc buf =
-  let crc = ref 0xFFFFFFFFl in
+let compute_crc_int buf =
+  let crc = ref 0xFFFFFFFF in
   for i = 0 to Cstruct.length buf - 1 do
-    (* Treat bytes 8..11 (the stored CRC32 field) as zero during computation *)
     let byte = if i >= 8 && i <= 11 then 0 else Char.code (Cstruct.get_char buf i) in
-    let idx = Int32.to_int (Int32.logand (Int32.logxor !crc (Int32.of_int byte)) 0xFFl) in
-    crc := Int32.logxor (Int32.shift_right_logical !crc 8) crc32_table.(idx)
+    crc := crc32_table.(!crc lxor byte land 0xFF) lxor (!crc lsr 8)
   done;
-  Int32.logxor !crc 0xFFFFFFFFl
+  !crc lxor 0xFFFFFFFF
 ;;
+
+let compute_crc buf = Int32.of_int (compute_crc_int buf)
 
 let verify_crc buf =
   let stored = Cstruct.BE.get_uint32 buf 8 in
-  let computed = compute_crc buf in
-  computed = stored
+  Int32.of_int (compute_crc_int buf) = stored
 ;;
 
-let seal buf =
-  let crc = compute_crc buf in
-  Cstruct.BE.set_uint32 buf 8 crc
-;;
+let seal buf = Cstruct.BE.set_uint32 buf 8 (Int32.of_int (compute_crc_int buf))
 
 (* #174: per-tree schema-fingerprint stamp.  It lives in the 4 reserved bytes
    at offset 12 of the common header (zeroed by [write_common]).  Write it
@@ -432,6 +430,118 @@ let rec branch_pick_loop buf page_size n_keys right_page key offset i =
    list-based pick (#245). *)
 let branch_pick buf ~n_keys ~right_page ~key : int32 =
   branch_pick_loop buf (Cstruct.length buf) n_keys right_page key data_offset 0
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Zero-alloc write-path helpers (#356)                                *)
+(* ------------------------------------------------------------------ *)
+
+(* Result of {!leaf_find_position}: where a key belongs in a sorted leaf page. *)
+type leaf_position =
+  { insert_off : int (* byte offset of first entry >= key, or data_end *)
+  ; data_end : int (* byte offset right after last entry *)
+  ; key_found : bool (* true iff an exact match exists at insert_off *)
+  }
+
+(* Scan a sorted leaf page to find where [key] belongs.  Single forward pass,
+   allocates nothing.  Returns [insert_off = data_end] when the new key is
+   larger than all existing keys. *)
+let leaf_find_position buf ~n_keys ~key : leaf_position =
+  let page_size = Cstruct.length buf in
+  let rec scan offset i insert_off insert_set key_found =
+    if i >= n_keys || offset + 4 > page_size
+    then
+      { insert_off = (if insert_set then insert_off else offset)
+      ; data_end = offset
+      ; key_found
+      }
+    else (
+      let key_len = Cstruct.BE.get_uint16 buf offset in
+      let val_off = offset + 2 + key_len in
+      let val_len = Cstruct.BE.get_uint16 buf val_off in
+      let next_off = val_off + 2 + val_len in
+      if insert_set
+      then scan next_off (i + 1) insert_off true key_found
+      else (
+        let c = compare_key_at buf ~kstart:(offset + 2) ~klen:key_len ~key in
+        if c < 0
+        then scan next_off (i + 1) offset true false
+        else if c = 0
+        then scan next_off (i + 1) offset true true
+        else scan next_off (i + 1) (-1) false false))
+  in
+  scan data_offset 0 (-1) false false
+;;
+
+(* Build a new leaf page with [key, stored_value] inserted at [pos.insert_off].
+   Entries before the insertion point are blitted from [buf]; entries after are
+   blitted after the new entry.  Updates n_keys, tag, and CRC.  Caller ensures
+   [pos.key_found = false] and that the new entry fits without a split. *)
+let leaf_blit_insert buf ~pos ~key ~stored_value ~right_page ~write_tag:tag ~n_keys =
+  let page_size = Cstruct.length buf in
+  let new_buf = Cstruct.create page_size in
+  Cstruct.memset new_buf 0;
+  let before_len = pos.insert_off - data_offset in
+  if before_len > 0 then Cstruct.blit buf data_offset new_buf data_offset before_len;
+  let after_off =
+    leaf_append_entry new_buf ~offset:pos.insert_off ~key ~value:stored_value
+  in
+  let after_len = pos.data_end - pos.insert_off in
+  if after_len > 0 then Cstruct.blit buf pos.insert_off new_buf after_off after_len;
+  let common = { kind = Leaf; flags = 0; n_keys = n_keys + 1; right_page; crc32 = 0l } in
+  write_common new_buf common;
+  write_tag new_buf tag;
+  seal new_buf;
+  new_buf
+;;
+
+(* Like [branch_pick_loop] but also returns the child's ordinal index and the
+   byte offset of its [left_child] int32 field within [buf] (-1 for right_page).
+   Allocates nothing. *)
+let rec branch_pick_with_info_loop buf page_size n_keys right_page key offset i =
+  if i >= n_keys || offset + 6 > page_size
+  then right_page, i, -1
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    if offset + 2 + key_len + 4 > page_size
+    then right_page, i, -1
+    else (
+      let c = compare_key_at buf ~kstart:(offset + 2) ~klen:key_len ~key in
+      if c < 0
+      then (
+        let ptr_off = offset + 2 + key_len in
+        Cstruct.BE.get_uint32 buf ptr_off, i, ptr_off)
+      else
+        branch_pick_with_info_loop
+          buf
+          page_size
+          n_keys
+          right_page
+          key
+          (offset + 2 + key_len + 4)
+          (i + 1)))
+;;
+
+(* In-place branch child selection that also returns the chosen child's ordinal
+   index and the byte offset of its [left_child] field (-1 for [right_page]).
+   Used in the fast CoW branch-update path (#356). *)
+let branch_pick_with_info buf ~n_keys ~right_page ~key : int32 * int * int =
+  branch_pick_with_info_loop buf (Cstruct.length buf) n_keys right_page key data_offset 0
+;;
+
+(* Build a new branch page identical to [buf] except the child pointer at
+   [child_ptr_offset] is replaced with [new_child].  If [child_ptr_offset < 0]
+   the [right_page] header field is updated instead.  Returns a fresh,
+   freshly-sealed Cstruct. *)
+let branch_blit_update_child buf ~child_ptr_offset ~new_child ~write_tag:tag =
+  let page_size = Cstruct.length buf in
+  let new_buf = Cstruct.create page_size in
+  Cstruct.blit buf 0 new_buf 0 page_size;
+  if child_ptr_offset >= 0
+  then Cstruct.BE.set_uint32 new_buf child_ptr_offset new_child
+  else Cstruct.BE.set_uint32 new_buf 4 new_child;
+  write_tag new_buf tag;
+  new_buf
 ;;
 
 (* ------------------------------------------------------------------ *)

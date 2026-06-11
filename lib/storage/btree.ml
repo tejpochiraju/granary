@@ -874,6 +874,32 @@ let write_leaf_and_propagate t ~path ~new_entries ~right_page =
          | Ok () -> return_ok { t with root_page = new_root_pid }))
 ;;
 
+(* Free [old_pid], allocate a new page, write [new_leaf] to it, and propagate
+   the change up the path.  Shared by the fast insert paths (#356). *)
+let commit_leaf_and_propagate t ~path ~old_pid ~new_leaf =
+  Pager.free t.pager ~page_id:old_pid ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+  let* alloc_r = Pager.alloc t.pager in
+  bind_pager alloc_r (fun new_pid ->
+    Pager.write_owned t.pager new_pid new_leaf;
+    let* up = propagate_up t.pager (List.rev path) (One_page new_pid) in
+    match up with
+    | Error e -> return_error e
+    | Ok (One_page new_root) -> return_ok { t with root_page = new_root }
+    | Ok (Split (left_pid, split_key, right_pid)) ->
+      let* alloc_r = Pager.alloc t.pager in
+      bind_pager alloc_r (fun new_root_pid ->
+        let* w =
+          build_and_write_branch
+            t.pager
+            ~page_id:new_root_pid
+            ~entries:[ split_key, left_pid ]
+            ~right_page:right_pid
+        in
+        match w with
+        | Error e -> return_error e
+        | Ok () -> return_ok { t with root_page = new_root_pid }))
+;;
+
 (* Empty tree → create a single leaf page holding [(key, stored_value)]. *)
 let put_into_empty_tree t key stored_value =
   let* alloc_r = Pager.alloc t.pager in
@@ -891,52 +917,86 @@ let put_into_empty_tree t key stored_value =
 ;;
 
 (* Non-empty tree → find the target leaf, insert-or-replace, write back.
-   Takes the RAW [value]: the target leaf is read here anyway, so the stale
-   overflow chain under [key] (if any) is freed and the new value prepared
-   inside this single descent — see [put]'s #231 note. *)
+   Fast path (#356): for an absent key that fits without a split, borrow the
+   leaf (no copy), scan in-place for the insert position (zero-alloc), and
+   build the new leaf via byte-surgery.  Falls back to the decode+encode path
+   for replace (needs overflow-chain handling) or when a split is required. *)
 let put_into_leaf t key value =
   let* path_r = find_leaf t key in
   match path_r with
   | Error e -> return_error e
   | Ok (path, leaf_pid) ->
-    let* leaf_r =
-      Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid
-    in
-    bind_pager leaf_r (fun leaf_buf ->
-      let leaf_common = Page.read_common leaf_buf in
-      let entries, _ = decode_leaf_entries leaf_buf leaf_common in
-      let leaf_right = page_id_of_int32 leaf_common.right_page in
-      let plain_entries =
-        List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
-      in
-      (* #231: free any existing overflow chain under [key] using the value we
-         already decoded from this leaf — the B+-tree is sorted, so if [key]
-         exists it is in THIS leaf.  Done BEFORE [prepare_stored_value] so the
-         freed pages can back the new chain (preserves the original
-         free-before-alloc ordering that [put] used to get from [get_raw]). *)
-      let old_value =
-        List.find_map
-          (fun (k, v) -> if Bytes.equal k key then Some v else None)
-          plain_entries
-      in
-      let* free_r =
-        match old_value with
-        | None -> return_ok ()
-        | Some v -> maybe_free_overflow_of t.pager v
-      in
-      match free_r with
-      | Error e -> return_error e
-      | Ok () ->
-        let* prep_r = prepare_stored_value t.pager value in
-        (match prep_r with
-         | Error e -> return_error e
-         | Ok stored_value ->
-           let new_entries = leaf_insert_or_replace plain_entries key stored_value in
-           Pager.free
-             t.pager
-             ~page_id:leaf_pid
-             ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-           write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right))
+    let* prep_r = prepare_stored_value t.pager value in
+    (match prep_r with
+     | Error e -> return_error e
+     | Ok stored_value ->
+       let reserved = Pager.reserved_bytes t.pager in
+       let entry_size = 2 + Bytes.length key + 2 + Bytes.length stored_value in
+       let* scan_r =
+         Pager.read_borrow t.pager leaf_pid (fun leaf_buf ->
+           let common = Page.read_common leaf_buf in
+           let pos = Page.leaf_find_position leaf_buf ~n_keys:common.n_keys ~key in
+           if pos.Page.key_found
+           then Lwt.return `Needs_full
+           else if
+             pos.Page.data_end - Page.data_offset + entry_size
+             > Page.max_data_bytes - reserved
+           then Lwt.return `Needs_full
+           else
+             Lwt.return
+               (`Fast
+                   (Page.leaf_blit_insert
+                      leaf_buf
+                      ~pos
+                      ~key
+                      ~stored_value
+                      ~right_page:common.right_page
+                      ~write_tag:(Pager.write_tag t.pager)
+                      ~n_keys:common.n_keys)))
+       in
+       bind_pager scan_r (function
+         | `Fast new_buf ->
+           let* t' =
+             commit_leaf_and_propagate t ~path ~old_pid:leaf_pid ~new_leaf:new_buf
+           in
+           (match t' with
+            | Error e -> return_error e
+            | Ok t' -> return_ok t')
+         | `Needs_full ->
+           let* leaf_r =
+             Pager.read
+               ?snapshot_frames:t.snapshot_frames
+               ?pin_set:t.pin_set
+               t.pager
+               leaf_pid
+           in
+           bind_pager leaf_r (fun leaf_buf ->
+             let leaf_common = Page.read_common leaf_buf in
+             let entries, _ = decode_leaf_entries leaf_buf leaf_common in
+             let leaf_right = page_id_of_int32 leaf_common.right_page in
+             let plain_entries =
+               List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
+             in
+             (* #231: free any existing overflow chain before writing new one. *)
+             let old_value =
+               List.find_map
+                 (fun (k, v) -> if Bytes.equal k key then Some v else None)
+                 plain_entries
+             in
+             let* free_r =
+               match old_value with
+               | None -> return_ok ()
+               | Some v -> maybe_free_overflow_of t.pager v
+             in
+             match free_r with
+             | Error e -> return_error e
+             | Ok () ->
+               let new_entries = leaf_insert_or_replace plain_entries key stored_value in
+               Pager.free
+                 t.pager
+                 ~page_id:leaf_pid
+                 ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+               write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right)))
 ;;
 
 let put t key value : (t, error) result Lwt.t =
@@ -964,53 +1024,78 @@ let put t key value : (t, error) result Lwt.t =
 ;;
 
 (* Insert [value] at [key] only if [key] is absent.
-   Single tree descent: if the key is found in the target leaf, decode and
-   return the existing value (no write); if absent, write the new value and
-   return None.  Saves the pre-read descent vs. a separate [get] + [put]. *)
+   Fast path (#356): borrow the leaf (no 4096-byte copy for dirty pages), scan
+   in-place for [key] (zero-alloc), and build the new leaf page via byte-surgery
+   when the key is absent and the entry fits without a split.  Falls back to the
+   full decode path only when a split is required (~1 in 127 sequential inserts). *)
 let put_x_into_leaf t key value =
   let* path_r = find_leaf t key in
   match path_r with
   | Error e -> return_error e
   | Ok (path, leaf_pid) ->
-    let* leaf_r =
-      Pager.read ?snapshot_frames:t.snapshot_frames ?pin_set:t.pin_set t.pager leaf_pid
-    in
-    bind_pager leaf_r (fun leaf_buf ->
-      let leaf_common = Page.read_common leaf_buf in
-      let entries, _ = decode_leaf_entries leaf_buf leaf_common in
-      let leaf_right = page_id_of_int32 leaf_common.right_page in
-      let existing_stored =
-        List.find_map
-          (fun (e : Page.leaf_entry) ->
-             if Bytes.equal e.key key then Some e.value else None)
-          entries
-      in
-      match existing_stored with
-      | Some _ ->
-        (* Key exists: signal conflict with a sentinel.  Do NOT decode/traverse
-           the overflow chain — most callers (CA_ignore, upsert, default-fail)
-           never need the old bytes.  Only CA_replace fetches them via S.get. *)
-        return_ok (t, Some Bytes.empty)
-      | None ->
-        (* Defer plain_entries allocation to the write path only. *)
-        let plain_entries =
-          List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
-        in
-        let* prep_r = prepare_stored_value t.pager value in
-        (match prep_r with
-         | Error e -> return_error e
-         | Ok stored_value ->
-           let new_entries = leaf_insert_or_replace plain_entries key stored_value in
-           Pager.free
-             t.pager
-             ~page_id:leaf_pid
-             ~freed_at_txn_id:(Pager.get_txn_id t.pager);
-           let* w =
-             write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right
+    let* prep_r = prepare_stored_value t.pager value in
+    (match prep_r with
+     | Error e -> return_error e
+     | Ok stored_value ->
+       let reserved = Pager.reserved_bytes t.pager in
+       let entry_size = 2 + Bytes.length key + 2 + Bytes.length stored_value in
+       let* scan_r =
+         Pager.read_borrow t.pager leaf_pid (fun leaf_buf ->
+           let common = Page.read_common leaf_buf in
+           let pos = Page.leaf_find_position leaf_buf ~n_keys:common.n_keys ~key in
+           if pos.Page.key_found
+           then Lwt.return `Conflict
+           else if
+             pos.Page.data_end - Page.data_offset + entry_size
+             > Page.max_data_bytes - reserved
+           then Lwt.return `Needs_split
+           else
+             Lwt.return
+               (`Fast
+                   (Page.leaf_blit_insert
+                      leaf_buf
+                      ~pos
+                      ~key
+                      ~stored_value
+                      ~right_page:common.right_page
+                      ~write_tag:(Pager.write_tag t.pager)
+                      ~n_keys:common.n_keys)))
+       in
+       bind_pager scan_r (function
+         | `Conflict -> return_ok (t, Some Bytes.empty)
+         | `Fast new_buf ->
+           let* t' =
+             commit_leaf_and_propagate t ~path ~old_pid:leaf_pid ~new_leaf:new_buf
            in
-           (match w with
+           (match t' with
             | Error e -> return_error e
-            | Ok t' -> return_ok (t', None))))
+            | Ok t' -> return_ok (t', None))
+         | `Needs_split ->
+           let* leaf_r =
+             Pager.read
+               ?snapshot_frames:t.snapshot_frames
+               ?pin_set:t.pin_set
+               t.pager
+               leaf_pid
+           in
+           bind_pager leaf_r (fun leaf_buf ->
+             let leaf_common = Page.read_common leaf_buf in
+             let entries, _ = decode_leaf_entries leaf_buf leaf_common in
+             let leaf_right = page_id_of_int32 leaf_common.right_page in
+             let plain_entries =
+               List.map (fun (e : Page.leaf_entry) -> e.key, e.value) entries
+             in
+             let new_entries = leaf_insert_or_replace plain_entries key stored_value in
+             Pager.free
+               t.pager
+               ~page_id:leaf_pid
+               ~freed_at_txn_id:(Pager.get_txn_id t.pager);
+             let* w =
+               write_leaf_and_propagate t ~path ~new_entries ~right_page:leaf_right
+             in
+             match w with
+             | Error e -> return_error e
+             | Ok t' -> return_ok (t', None))))
 ;;
 
 let put_x t key value : (t * bytes option, error) result Lwt.t =
