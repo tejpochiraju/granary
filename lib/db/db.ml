@@ -839,72 +839,76 @@ let rec fire_trigger_stmt ?(tx : S.rw S.txn option = None) t stmt =
     body raises and removes the nested-trigger deadlock that previously
     forced AFTER firing outside the parent txn. *)
 and make_trigger_hook t table_meta ~timing ~event =
-  let matching =
-    Hashtbl.fold
-      (fun _name ast acc ->
-         match trigger_meta_of_ast ast with
-         | Some m
-           when String.equal m.trig_table table_meta.Cat.name
-                && m.trig_timing = timing
-                && m.trig_event = event -> m :: acc
-         | _ -> acc)
-      t.triggers
-      []
-  in
-  if matching = []
+  if Hashtbl.length t.triggers = 0
   then None
-  else
-    Some
-      (fun ~tx ~new_row ~old_row ->
-        let schema = table_meta.Cat.columns in
-        Lwt_list.iter_s
-          (fun m ->
-             let* should_fire =
-               match m.trig_when with
-               | None -> Lwt.return true
-               | Some when_expr ->
-                 let subst =
-                   map_expr (make_subst_fn ~schema ~new_row ~old_row) when_expr
-                 in
-                 let* bound =
-                   Sql.Sema.bind
-                     ~views:t.views
-                     t.catalog
-                     (Sql.Ast.S_const_select { exprs = [ subst, None ] })
-                 in
-                 (match bound with
-                  | Error e ->
-                    Lwt.fail_with
-                      (Format.asprintf
-                         "trigger WHEN clause binding error: %a"
-                         Sql.Sema.pp_error
-                         e)
-                  | Ok bw ->
-                    let op = Sql.Planner.plan ~cat:t.catalog bw in
-                    (* WHEN clause query runs inside the parent txn so it sees the
-                in-flight writes (matches SQLite semantics for AFTER WHEN). *)
-                    let mode = Sql.Exec.In_txn tx in
-                    let* stream =
-                      Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op
-                    in
-                    let* rows = Lwt_stream.to_list stream in
-                    Lwt.return
-                      (match rows with
-                       | row :: _ when Array.length row > 0 ->
-                         (match row.(0) with
-                          | Row.V_int 0L | Row.V_null -> false
-                          | _ -> true)
-                       | _ -> true))
-             in
-             if not should_fire
-             then Lwt.return_unit
-             else
-               Lwt_list.iter_s
-                 (fun stmt ->
-                    let substituted = subst_new_old ~schema ~new_row ~old_row stmt in
-                    fire_trigger_stmt ~tx:(Some tx) t substituted)
-                 m.trig_body)
-          matching)
+  else (
+    let matching =
+      Hashtbl.fold
+        (fun _name ast acc ->
+           match trigger_meta_of_ast ast with
+           | Some m
+             when String.equal m.trig_table table_meta.Cat.name
+                  && m.trig_timing = timing
+                  && m.trig_event = event -> m :: acc
+           | _ -> acc)
+        t.triggers
+        []
+    in
+    if matching = []
+    then None
+    else
+      Some
+        (fun ~tx ~new_row ~old_row ->
+          let schema = table_meta.Cat.columns in
+          Lwt_list.iter_s
+            (fun m ->
+               let* should_fire =
+                 match m.trig_when with
+                 | None -> Lwt.return true
+                 | Some when_expr ->
+                   let subst =
+                     map_expr (make_subst_fn ~schema ~new_row ~old_row) when_expr
+                   in
+                   let* bound =
+                     Sql.Sema.bind
+                       ~views:t.views
+                       t.catalog
+                       (Sql.Ast.S_const_select { exprs = [ subst, None ] })
+                   in
+                   (match bound with
+                    | Error e ->
+                      Lwt.fail_with
+                        (Format.asprintf
+                           "trigger WHEN clause binding error: %a"
+                           Sql.Sema.pp_error
+                           e)
+                    | Ok bw ->
+                      let op = Sql.Planner.plan ~cat:t.catalog bw in
+                      (* WHEN clause query runs inside the parent txn so it sees
+                         the in-flight writes (matches SQLite semantics for AFTER
+                         WHEN). *)
+                      let mode = Sql.Exec.In_txn tx in
+                      let* stream =
+                        Sql.Exec.query ~mode ~clock:t.clock t.store t.catalog op
+                      in
+                      let* rows = Lwt_stream.to_list stream in
+                      Lwt.return
+                        (match rows with
+                         | row :: _ when Array.length row > 0 ->
+                           (match row.(0) with
+                            | Row.V_int 0L | Row.V_null -> false
+                            | _ -> true)
+                         | _ -> true))
+               in
+               if not should_fire
+               then Lwt.return_unit
+               else
+                 Lwt_list.iter_s
+                   (fun stmt ->
+                      let substituted = subst_new_old ~schema ~new_row ~old_row stmt in
+                      fire_trigger_stmt ~tx:(Some tx) t substituted)
+                   m.trig_body)
+            matching))
 
 (** Build the REPLACE-conflict-delete and UPSERT-conflict-update hooks for
     an INSERT-ish op.  These fire when [INSERT OR REPLACE] conflicts on a

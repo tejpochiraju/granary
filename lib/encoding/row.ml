@@ -106,6 +106,18 @@ let encode schema row =
   then
     invalid_arg
       (Printf.sprintf "Row.encode: expected %d columns, got %d" n (Array.length row));
+  (* Precompute a VIRTUAL-generated-column mask once. Previously this was a
+     [List.nth schema i] per element across two row walks below — O(n^2) in the
+     column count; one [List.map] pass makes the lookups O(1). *)
+  let is_virtual =
+    Array.of_list
+      (List.map
+         (fun col ->
+            match col.generated_as with
+            | Some (_, false) -> true
+            | _ -> false)
+         schema)
+  in
   let buf = Buffer.create 32 in
   (* 1. column count *)
   Varint.encode_uint64 buf (Int64.of_int n);
@@ -115,16 +127,10 @@ let encode schema row =
         STORED generated columns are persisted normally. *)
   let bitmap_bytes = (n + 7) / 8 in
   let bitmap = Bytes.make bitmap_bytes '\x00' in
-  let is_virtual_col i =
-    let col = List.nth schema i in
-    match col.generated_as with
-    | Some (_, false) -> true
-    | _ -> false
-  in
   Array.iteri
     (fun i v ->
        let null_in_bitmap =
-         is_virtual_col i
+         is_virtual.(i)
          ||
          match v with
          | V_null -> true
@@ -140,7 +146,7 @@ let encode schema row =
   Buffer.add_bytes buf bitmap;
   (* 3. non-null values in column order — skip VIRTUAL generated cols *)
   List.iteri
-    (fun i col -> if is_virtual_col i then () else encode_col_value buf col row.(i))
+    (fun i col -> if is_virtual.(i) then () else encode_col_value buf col row.(i))
     schema;
   Buffer.to_bytes buf
 ;;
