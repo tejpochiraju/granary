@@ -621,3 +621,13 @@ val set_follower : t -> bool -> unit
 
 (** True iff follower mode is active (write transactions are rejected). *)
 val is_follower : t -> bool
+
+(** Record the last-applied commit position on a following standby.
+    [ro_begin] will cap RO snapshot frames to this position so readers
+    never observe WAL frames past what has been applied on this node (#263).
+    No-op on the in-memory backend. *)
+val set_follower_ack_position : t -> epoch:int64 -> frame_idx:int -> unit
+
+(** Get the recorded follower ack position, or [None] if not following or
+    no position has been recorded yet. *)
+val follower_ack_position : t -> (int64 * int) option

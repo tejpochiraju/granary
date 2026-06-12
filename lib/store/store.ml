@@ -196,6 +196,11 @@ type bt_state =
        consumer while following the master's WAL stream; cleared on
        promotion or when the follower loop exits.  The in-memory backend
        ignores this flag (Mem stores have no standby semantics). *)
+  ; mutable follower_ack_position : (int64 * int) option
+    (* (epoch, frame_idx) of the last commit applied on this follower, or
+       [None] when no position has been recorded yet.  When set, [ro_begin]
+       caps the RO snapshot's visible WAL frames to [frame_idx] so readers
+       never observe frames past the follower's last-applied commit (#263). *)
   ; mutable sync_mode : [ `Full | `Batched | `Off ]
     (* #298: durability mode. [`Full] = fsync every group-commit (default).
        [`Batched] = defer fsync until [batch_commits] or [batch_interval_ms].
@@ -642,6 +647,7 @@ let make_btree_store
     ; backup_gate_max_yields = max_int
     ; on_committed_frames = None
     ; follower = false
+    ; follower_ack_position = None
     ; sync_mode = `Full
     ; batch_commits = default_batch_commits
     ; batch_interval_ms = default_batch_interval_ms
@@ -1121,10 +1127,22 @@ let ro_begin t =
     | Btree st ->
       let snap_txn_id = st.current_header.txn_id in
       let snap_meta_root = st.current_header.root_page in
-      let snap_frames =
+      let committed_frames =
         match st.wal with
         | None -> 0
         | Some w -> Wal.committed_frames w
+      in
+      let snap_frames =
+        if st.follower
+        then (
+          match st.follower_ack_position with
+          | Some (_follower_epoch, follower_idx) ->
+            (* On a following replica, cap the RO snapshot to the follower's
+               last-applied commit boundary so the reader never observes WAL
+               frames that haven't been applied on this node yet (#263). *)
+            min committed_frames follower_idx
+          | None -> committed_frames)
+        else committed_frames
       in
       let count =
         Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id)
@@ -3164,6 +3182,23 @@ let is_follower (t : t) =
   match t.backend with
   | Mem _ -> false
   | Btree st -> st.follower
+;;
+
+(** Record the last-applied commit position on a following standby so
+    [ro_begin] can bound RO snapshots to this position (#263).  No-op
+    on the in-memory backend. *)
+let set_follower_ack_position (t : t) ~(epoch : int64) ~(frame_idx : int) =
+  match t.backend with
+  | Mem _ -> ()
+  | Btree st -> st.follower_ack_position <- Some (epoch, frame_idx)
+;;
+
+(** Get the recorded follower ack position, or [None] if not following or
+    no position has been recorded yet. *)
+let follower_ack_position (t : t) =
+  match t.backend with
+  | Mem _ -> None
+  | Btree st -> st.follower_ack_position
 ;;
 
 [@@@ai_disclosure "ai-generated"]
