@@ -196,11 +196,14 @@ type bt_state =
        consumer while following the master's WAL stream; cleared on
        promotion or when the follower loop exits.  The in-memory backend
        ignores this flag (Mem stores have no standby semantics). *)
-  ; mutable follower_ack_position : (int64 * int) option
-    (* (epoch, frame_idx) of the last commit applied on this follower, or
-       [None] when no position has been recorded yet.  When set, [ro_begin]
-       caps the RO snapshot's visible WAL frames to [frame_idx] so readers
-       never observe frames past the follower's last-applied commit (#263). *)
+  ; mutable follower_ack_position : int option
+    (* [Wal.committed_frames] at the time the last apply batch completed on
+       this follower, or [None] when no position has been recorded yet.
+       When [Some n], [ro_begin] caps the RO snapshot's visible WAL frames
+       to [min committed_frames n] so readers never observe frames past the
+       follower's last-applied commit (#263).  Stored in local committed-frame
+       count space so it compares correctly against [Wal.committed_frames]
+       and survives local epoch resets. *)
   ; mutable sync_mode : [ `Full | `Batched | `Off ]
     (* #298: durability mode. [`Full] = fsync every group-commit (default).
        [`Batched] = defer fsync until [batch_commits] or [batch_interval_ms].
@@ -1136,11 +1139,15 @@ let ro_begin t =
         if st.follower
         then (
           match st.follower_ack_position with
-          | Some (_follower_epoch, follower_idx) ->
+          | Some n ->
             (* On a following replica, cap the RO snapshot to the follower's
                last-applied commit boundary so the reader never observes WAL
-               frames that haven't been applied on this node yet (#263). *)
-            min committed_frames follower_idx
+               frames that haven't been applied on this node yet (#263).
+               Both [committed_frames] and [n] are local committed-frame
+               counts (not master-epoch indices), so [min] is safe and
+               naturally handles a post-reset WAL where committed_frames
+               has dropped below the recorded ack position. *)
+            min committed_frames n
           | None -> committed_frames)
         else committed_frames
       in
@@ -3174,7 +3181,9 @@ let set_commit_callback
 let set_follower (t : t) (on : bool) =
   match t.backend with
   | Mem _ -> ()
-  | Btree st -> st.follower <- on
+  | Btree st ->
+    st.follower <- on;
+    if not on then st.follower_ack_position <- None
 ;;
 
 (** True iff follower mode is active (writes are rejected). *)
@@ -3184,17 +3193,26 @@ let is_follower (t : t) =
   | Btree st -> st.follower
 ;;
 
-(** Record the last-applied commit position on a following standby so
-    [ro_begin] can bound RO snapshots to this position (#263).  No-op
-    on the in-memory backend. *)
-let set_follower_ack_position (t : t) ~(epoch : int64) ~(frame_idx : int) =
+(** Record the current [Wal.committed_frames] as the follower's last-applied
+    commit boundary.  [ro_begin] will cap RO snapshots to this position so
+    readers never observe WAL frames past what has been applied on this node
+    (#263).  The value is captured from the store's own WAL so it lives in
+    local committed-frame count space — no coordinate mismatch vs. master
+    epoch indices.  No-op on the in-memory backend. *)
+let set_follower_ack_position (t : t) =
   match t.backend with
   | Mem _ -> ()
-  | Btree st -> st.follower_ack_position <- Some (epoch, frame_idx)
+  | Btree st ->
+    let n =
+      match st.wal with
+      | None -> 0
+      | Some w -> Wal.committed_frames w
+    in
+    st.follower_ack_position <- Some n
 ;;
 
-(** Get the recorded follower ack position, or [None] if not following or
-    no position has been recorded yet. *)
+(** Get the recorded follower ack position (a local [Wal.committed_frames]
+    count), or [None] if not following or no position has been recorded yet. *)
 let follower_ack_position (t : t) =
   match t.backend with
   | Mem _ -> None
