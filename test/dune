@@ -438,15 +438,15 @@
 
 (test
  (name test_standby)
-  (libraries
-   sqlocaml.replication
-   sqlocaml.store
-   sqlocaml.storage
-   alcotest
-   lwt.unix
-   qcheck-core
-   qcheck-alcotest
-   unix))
+ (libraries
+  sqlocaml.replication
+  sqlocaml.store
+  sqlocaml.storage
+  alcotest
+  lwt.unix
+  qcheck-core
+  qcheck-alcotest
+  unix))
 
 ; Cross-engine benchmark vs C SQLite — needs the `sqlite3` opam library.
 ; `(optional)` lets builds where `sqlite3` is absent (e.g. `dune build @install`)
