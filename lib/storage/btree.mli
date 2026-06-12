@@ -59,6 +59,38 @@ val put : t -> bytes -> bytes -> (t, error) result Lwt.t
     value must fetch it separately via {!get}. *)
 val put_x : t -> bytes -> bytes -> (t * bytes option, error) result Lwt.t
 
+(** Opaque cached position at a tree's rightmost leaf, enabling O(1) appends
+    for a run of strictly-increasing inserts (#356).  Held by the Store per
+    tree-id; re-validated against the live page on every use. *)
+type append_cursor
+
+(** The cursor's current maximum key (the tree's rightmost key). *)
+val append_cursor_max_key : append_cursor -> bytes
+
+(** Result of {!try_inplace_append}. *)
+type append_outcome =
+  | Appended of append_cursor (** inserted in place; carries the updated cursor *)
+  | Not_applicable (** cursor stale or leaf full — caller must use {!put_x} *)
+  | Append_failed of error
+
+(** [try_inplace_append t ac ~key ~value] appends ([key], [value]) to the
+    rightmost leaf cached in [ac] in O(1), if [ac] still matches the live page
+    and the entry fits.  [key] must exceed every key in the tree (the caller
+    guarantees this; it is re-validated).  Returns [Not_applicable] — never an
+    error — when the cursor is stale or the leaf is full, so the caller falls
+    back to {!put_x}. *)
+val try_inplace_append
+  :  t
+  -> append_cursor
+  -> key:bytes
+  -> value:bytes
+  -> append_outcome Lwt.t
+
+(** Descend the rightmost spine and build a fresh {!append_cursor} for the
+    tree's current rightmost leaf, or [None] for an empty tree.  Used to
+    (re)prime the cursor after a general-path append or a split. *)
+val rightmost_append_cursor : t -> (append_cursor option, error) result Lwt.t
+
 (** Delete a key.  No-op if absent.  Returns an updated [t].
 
     Phase 1 deletion is lazy: an emptied leaf is left in the tree (callers

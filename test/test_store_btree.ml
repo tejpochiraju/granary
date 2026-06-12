@@ -443,6 +443,195 @@ let test_many_puts_persist () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* 7b. Append cursor (#356): O(1) bulk sequential put_x                 *)
+(* ------------------------------------------------------------------ *)
+
+let key i = bs (Printf.sprintf "k%08d" i)
+let value i = bs (Printf.sprintf "v%08d" i)
+
+(* Read every (key, value) of tree 0 back, in sorted order. *)
+let read_all_sorted s =
+  let* tx = S.ro_begin s in
+  let* cur = S.cursor_open tx 0 in
+  let _ = S.cursor_first cur in
+  let entries = collect_all cur in
+  S.cursor_close cur;
+  let* () = S.ro_end tx in
+  Lwt.return entries
+;;
+
+(* A long run of strictly-increasing put_x inserts exercises the append-cursor
+   fast path across many leaf splits.  Every key must read back, in order. *)
+let test_append_cursor_bulk_sorted () =
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path () in
+       let s = ok_store r in
+       let n = 3000 in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* old = S.put_x tx 0 (key i) (value i) in
+              Alcotest.(check bool) "no conflict on fresh key" true (old = None);
+              Lwt.return_unit)
+           (List.init n Fun.id)
+       in
+       let* () = S.commit tx in
+       let* entries = read_all_sorted s in
+       Alcotest.(check int) "count" n (List.length entries);
+       List.iteri
+         (fun i (k, v) ->
+            Alcotest.check bytes_eq (Printf.sprintf "key %d" i) (key i) k;
+            Alcotest.check bytes_eq (Printf.sprintf "val %d" i) (value i) v)
+         entries;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
+
+(* Appends, then a middle insert (invalidates the cursor), then more appends
+   (re-primes).  All keys, including the out-of-order one, must be present. *)
+let test_append_cursor_interleaved_middle () =
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path () in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* _ = S.put_x tx 0 (key i) (value i) in
+              Lwt.return_unit)
+           (List.init 500 (fun i -> i + 1000))
+       in
+       (* Out-of-order insert in the middle of the existing range. *)
+       let* _ = S.put_x tx 0 (key 1234_5) (value 1234_5) in
+       (* Resume appending past the previous max. *)
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* _ = S.put_x tx 0 (key i) (value i) in
+              Lwt.return_unit)
+           (List.init 500 (fun i -> i + 1500))
+       in
+       let* () = S.commit tx in
+       let* entries = read_all_sorted s in
+       Alcotest.(check int) "count incl middle" 1001 (List.length entries);
+       (* Verify strictly ascending. *)
+       let sorted =
+         let ks = List.map fst entries in
+         ks = List.sort Bytes.compare ks
+       in
+       Alcotest.(check bool) "ascending" true sorted;
+       (* The middle key is present. *)
+       let* tx = S.ro_begin s in
+       let* got = S.get tx 0 (key 1234_5) in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "middle key present" (Some (value 1234_5)) got;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
+
+(* Appends, deletes the current max, then appends a new max.  The delete must
+   invalidate the cursor so the following append re-primes correctly. *)
+let test_append_cursor_delete_then_append () =
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path () in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* _ = S.put_x tx 0 (key i) (value i) in
+              Lwt.return_unit)
+           (List.init 300 Fun.id)
+       in
+       let* () = S.del tx 0 (key 299) in
+       let* _ = S.put_x tx 0 (key 300) (value 300) in
+       let* () = S.commit tx in
+       let* tx = S.ro_begin s in
+       let* g299 = S.get tx 0 (key 299) in
+       let* g300 = S.get tx 0 (key 300) in
+       let* g298 = S.get tx 0 (key 298) in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "deleted max gone" None g299;
+       Alcotest.check bytes_opt_eq "new max present" (Some (value 300)) g300;
+       Alcotest.check bytes_opt_eq "old value intact" (Some (value 298)) g298;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
+
+(* put_x must signal a conflict (and NOT overwrite) on a duplicate key, even on
+   the append fast path. *)
+let test_append_cursor_conflict () =
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path () in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* o1 = S.put_x tx 0 (key 10) (value 10) in
+       let* o2 = S.put_x tx 0 (key 11) (value 11) in
+       (* Re-insert an existing key: must conflict, value unchanged. *)
+       let* o3 = S.put_x tx 0 (key 11) (bs "OVERWRITE") in
+       let* () = S.commit tx in
+       Alcotest.(check bool) "first insert ok" true (o1 = None);
+       Alcotest.(check bool) "second insert ok" true (o2 = None);
+       Alcotest.(check bool) "duplicate conflicts" true (o3 <> None);
+       let* tx = S.ro_begin s in
+       let* g = S.get tx 0 (key 11) in
+       let* () = S.ro_end tx in
+       Alcotest.check bytes_opt_eq "not overwritten" (Some (value 11)) g;
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
+
+(* The append cursor must not survive a rollback-to-savepoint that discards the
+   appends it cached. *)
+let test_append_cursor_savepoint_rollback () =
+  run
+    (with_fresh_db ~f:(fun path ->
+       let* r = S.open_file ~path () in
+       let s = ok_store r in
+       let* tx = S.rw_begin s in
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* _ = S.put_x tx 0 (key i) (value i) in
+              Lwt.return_unit)
+           (List.init 200 Fun.id)
+       in
+       let* () = S.savepoint_begin tx "sp" in
+       (* Append more inside the savepoint, then roll back. *)
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* _ = S.put_x tx 0 (key i) (value i) in
+              Lwt.return_unit)
+           (List.init 200 (fun i -> i + 200))
+       in
+       let* () = S.savepoint_rollback tx "sp" in
+       (* Continue appending after the rollback — keys 200.. should now insert
+          cleanly (they were undone) and the cursor must have re-primed. *)
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let* old = S.put_x tx 0 (key i) (value i) in
+              Alcotest.(check bool)
+                (Printf.sprintf "post-rollback key %d fresh" i)
+                true
+                (old = None);
+              Lwt.return_unit)
+           (List.init 200 (fun i -> i + 200))
+       in
+       let* () = S.commit tx in
+       let* entries = read_all_sorted s in
+       Alcotest.(check int) "count after rollback+reinsert" 400 (List.length entries);
+       let* () = S.close s in
+       Lwt.return_unit))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* 8. Empty / missing                                                   *)
 (* ------------------------------------------------------------------ *)
 
@@ -1750,6 +1939,22 @@ let () =
         ] )
     ; "txn", [ Alcotest.test_case "rw_serialises" `Quick test_rw_serialises ]
     ; "scale", [ Alcotest.test_case "many_puts" `Quick test_many_puts ]
+    ; ( "append_cursor"
+      , [ Alcotest.test_case "bulk sorted" `Slow test_append_cursor_bulk_sorted
+        ; Alcotest.test_case
+            "interleaved middle"
+            `Quick
+            test_append_cursor_interleaved_middle
+        ; Alcotest.test_case
+            "delete then append"
+            `Quick
+            test_append_cursor_delete_then_append
+        ; Alcotest.test_case "conflict" `Quick test_append_cursor_conflict
+        ; Alcotest.test_case
+            "savepoint rollback"
+            `Quick
+            test_append_cursor_savepoint_rollback
+        ] )
     ; "missing", [ Alcotest.test_case "missing_key" `Quick test_missing_key ]
     ; ( "extra"
       , [ Alcotest.test_case "btree_block_error" `Quick test_btree_block_error_propagation

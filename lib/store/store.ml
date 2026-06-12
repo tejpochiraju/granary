@@ -116,6 +116,12 @@ type bt_state =
   ; (* Maps snap_txn_id -> reference count of active RO txns at that snapshot *)
     mutable bt_savepoints : bt_savepoint list
   ; (* Stack of named savepoints; newest at front. Cleared on commit/rollback. *)
+    bt_append : (tree_id, Btree.append_cursor) Hashtbl.t
+  ; (* #356: per-tree append cursor for O(1) bulk sequential inserts.  Set by
+     [put_x] after an append, consumed by the next append.  Invalidated on
+     commit/rollback/savepoint-rollback and on any non-append mutation of the
+     tree.  Re-validated against the live page on every use, so a stale entry
+     can only force the slow path, never corrupt the tree. *)
     wal : Sqlocaml_storage.Wal.t option
   ; (* When set, commits append to this WAL instead of writing to the main
      DB; reads route through it via the Pager hook. *)
@@ -622,6 +628,7 @@ let make_btree_store
     ; txn_freelist_snapshot = None
     ; active_readers = Hashtbl.create 4
     ; bt_savepoints = []
+    ; bt_append = Hashtbl.create 8
     ; wal
     ; wal_close
     ; wal_autocheckpoint_threshold = default_wal_autocheckpoint_threshold
@@ -1833,6 +1840,9 @@ let commit (Rw t : rw txn) : unit Lwt.t =
     Rwlock.release_write t.lock;
     Lwt.return_unit
   | Btree st ->
+    (* #356: the append cursor is only valid within a txn (its leaf is dirty);
+       commit flushes dirty pages, so drop it. *)
+    Hashtbl.clear st.bt_append;
     (match st.wal with
      | None ->
        Lwt.finalize
@@ -1869,6 +1879,7 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         to it); we revert it to the last-committed root from the
         header. *)
      Hashtbl.clear st.trees;
+     Hashtbl.clear st.bt_append (* #356: dirty pages discarded below. *);
      st.meta <- Btree.create st.pager ~root_page:st.current_header.root_page;
      (match st.txn_freelist_snapshot with
       | Some fl ->
@@ -2188,6 +2199,9 @@ let savepoint_rollback (Rw t : rw txn) name =
         Pager.set_n_pages st.pager sp.sp_n_pages;
         Pager.dirty_restore st.pager sp.sp_dirty;
         Pager.txn_owned_pool_set st.pager sp.sp_txn_pool;
+        (* #356: the restored dirty pages may be an earlier version of the
+           cached rightmost leaf; drop the append cursor so it re-primes. *)
+        Hashtbl.clear st.bt_append;
         (* Keep the named savepoint at the top so it can be re-used. *)
         st.bt_savepoints <- sp :: rest
       | _ :: rest -> find rest
@@ -2266,6 +2280,9 @@ let put (Rw t : rw txn) tid key value : unit Lwt.t =
     let* r = bt_get_tree st tid in
     let* bt = unwrap_error r in
     Pager.set_write_tag st.pager (tree_tag st tid);
+    (* #356: [put] may replace or split anywhere; invalidate the append cursor
+       for this tree so a subsequent append re-primes from the live rightmost. *)
+    Hashtbl.remove st.bt_append tid;
     let* p = Btree.put bt key value in
     (match p with
      | Ok bt' ->
@@ -2298,13 +2315,64 @@ let put_x (Rw t : rw txn) tid key value : bytes option Lwt.t =
     let* r = bt_get_tree st tid in
     let* bt = unwrap_error r in
     Pager.set_write_tag st.pager (tree_tag st tid);
-    let* p = Btree.put_x bt key value in
-    (match p with
-     | Ok (bt', old_opt) ->
-       Hashtbl.replace st.trees tid bt';
-       Lwt.return old_opt
-     | Error e ->
-       Lwt.fail_with (Format.asprintf "Store.put_x: %a" pp_error (map_btree_err e)))
+    (* #356 append fast path: O(1) in-place append to the cached rightmost leaf
+       when [key] is strictly greater than the cursor's max. *)
+    let* fast =
+      match Hashtbl.find_opt st.bt_append tid with
+      | Some ac when Bytes.compare key (Btree.append_cursor_max_key ac) > 0 ->
+        let* outcome = Btree.try_inplace_append bt ac ~key ~value in
+        (match outcome with
+         | Btree.Appended ac' ->
+           Hashtbl.replace st.bt_append tid ac';
+           Lwt.return (Some None)
+         | Btree.Not_applicable -> Lwt.return None
+         | Btree.Append_failed e ->
+           Lwt.fail_with (Format.asprintf "Store.put_x: %a" pp_error (map_btree_err e)))
+      | _ -> Lwt.return None
+    in
+    (match fast with
+     | Some old_opt -> Lwt.return old_opt
+     | None ->
+       (* General path.  Remember the prior cursor max to decide whether this
+          insert was an append worth re-priming the cursor for. *)
+       let prev_max =
+         Option.map Btree.append_cursor_max_key (Hashtbl.find_opt st.bt_append tid)
+       in
+       let* p = Btree.put_x bt key value in
+       (match p with
+        | Error e ->
+          Lwt.fail_with (Format.asprintf "Store.put_x: %a" pp_error (map_btree_err e))
+        | Ok (bt', old_opt) ->
+          Hashtbl.replace st.trees tid bt';
+          (match old_opt with
+           | Some _ ->
+             (* Conflict: nothing inserted; leave the cursor as-is. *)
+             Lwt.return old_opt
+           | None ->
+             (* Inserted.  If [key] extends the tree to the right (an append),
+                re-prime the cursor from the new rightmost leaf; otherwise it was
+                a middle insert and the cursor is invalidated. *)
+             let append_like =
+               match prev_max with
+               | None -> true (* cold start: probe whether it was an append *)
+               | Some m -> Bytes.compare key m > 0
+             in
+             if not append_like
+             then (
+               Hashtbl.remove st.bt_append tid;
+               Lwt.return None)
+             else
+               let* rc = Btree.rightmost_append_cursor bt' in
+               (match rc with
+                | Ok (Some ac) when Bytes.equal (Btree.append_cursor_max_key ac) key ->
+                  Hashtbl.replace st.bt_append tid ac;
+                  Lwt.return None
+                | Ok _ ->
+                  Hashtbl.remove st.bt_append tid;
+                  Lwt.return None
+                | Error e ->
+                  Lwt.fail_with
+                    (Format.asprintf "Store.put_x: %a" pp_error (map_btree_err e))))))
 ;;
 
 let del (Rw t : rw txn) tid key : unit Lwt.t =
@@ -2322,6 +2390,8 @@ let del (Rw t : rw txn) tid key : unit Lwt.t =
     let* r = bt_get_tree st tid in
     let* bt = unwrap_error r in
     Pager.set_write_tag st.pager (tree_tag st tid);
+    (* #356: a delete may free or restructure the rightmost leaf; invalidate. *)
+    Hashtbl.remove st.bt_append tid;
     let* d = Btree.del bt key in
     (match d with
      | Ok bt' ->

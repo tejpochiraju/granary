@@ -388,6 +388,16 @@ let write t page_id buf =
    copies of dirty pages, so stored buffers are never aliased to readers. *)
 let write_owned t page_id buf = Hashtbl.replace t.dirty page_id buf
 
+(* #356: return the LIVE dirty buffer for [page_id] (NOT a copy), or [None] if
+   the page is not dirty in the current write txn.  The caller MAY mutate the
+   returned buffer in place: a page in [dirty] was allocated or CoW-copied by
+   THIS txn, so no committed snapshot and no concurrent reader references it
+   (snapshot readers resolve through WAL frames, never [dirty]; the writer's own
+   read-your-own-writes via [read] returns a fresh [cstruct_dup]).  The single
+   RW lock guarantees no other writer.  Mutations must keep the page well-formed;
+   the CRC is resealed for every dirty page at flush time (see [seal_dirty]). *)
+let dirty_buffer t page_id : Cstruct.t option = Hashtbl.find_opt t.dirty page_id
+
 (* Previously also injected into the shared cache here for
      read-after-write inside the same txn.  Removed (#149): a concurrent
      reader at an older snapshot would see uncommitted bytes.  The
@@ -571,11 +581,23 @@ let clear_dirty t =
 
 type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
 
-let dirty_clone t = Hashtbl.copy t.dirty
+(* #356: DEEP-copy each page buffer when snapshotting/restoring the dirty set
+   for savepoints.  In-place insert mutation (see [dirty_buffer]) mutates dirty
+   buffers in place, so a shallow [Hashtbl.copy] (which aliases the Cstructs)
+   would let a post-savepoint mutation corrupt the snapshot — ROLLBACK TO could
+   then not undo it.  Deep copies make the snapshot immune; [dirty_restore]
+   likewise installs fresh copies so the snapshot stays pristine for a repeated
+   ROLLBACK TO the same savepoint.  Savepoints are only taken on explicit
+   SAVEPOINT statements (never per-insert), so this copy is off the hot path. *)
+let dirty_clone t =
+  let snap = Hashtbl.create (Hashtbl.length t.dirty) in
+  Hashtbl.iter (fun k v -> Hashtbl.replace snap k (cstruct_dup v)) t.dirty;
+  snap
+;;
 
 let dirty_restore t snap =
   Hashtbl.reset t.dirty;
-  Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k v) snap
+  Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k (cstruct_dup v)) snap
 ;;
 
 let flush_one_to_main t ~page_id ~buf =
