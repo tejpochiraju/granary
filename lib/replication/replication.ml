@@ -154,12 +154,15 @@ let cold_restore
 
 (** Migrate the latest version of every page in the WAL index to the main
     DB, sync, then reset the WAL (bumping its epoch).  Mirrors the engine's
-    [Store.checkpoint_unlocked] sequence; no reader-gating is needed because
-    a following standby serves no readers.  Unlike [checkpoint_unlocked] it
+    [Store.checkpoint_unlocked] sequence; unlike [checkpoint_unlocked] it
     does not re-pin a downstream replication floor (no [replication_shipped_frames]
     equivalent) — correct for a leaf standby; revisit for cascading
-    replication (see #208). *)
-let checkpoint_wal_to_main ~wal ~pager =
+    replication (see #208).
+
+    [~reader_gate] is called before [Wal.reset] with the current
+    [Wal.committed_frames] as target, ensuring no in-flight RO snapshot
+    references WAL frame indices about to be recycled (#263). *)
+let checkpoint_wal_to_main ~wal ~pager ~reader_gate =
   let pairs = ref [] in
   Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
   let rec write_each = function
@@ -188,6 +191,7 @@ let checkpoint_wal_to_main ~wal ~pager =
        Lwt.return_error
          (`Apply_error (Format.asprintf "checkpoint sync: %a" Pager.pp_error e))
      | Ok () ->
+       let* () = reader_gate ~target:(Wal.committed_frames wal) in
        Wal.reset wal;
        Lwt.return_ok ())
 ;;
@@ -207,7 +211,7 @@ let split_by_epoch frames =
   | f :: rest -> go [] [ f ] f.epoch rest
 ;;
 
-let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
+let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx ~reader_gate frames =
   (* A single batch may bundle frames from more than one master epoch if the
      master checkpointed mid-stream (#209).  Split into maximal single-epoch
      runs and feed each through the epoch-transition logic in order: whenever
@@ -225,7 +229,7 @@ let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx frames =
         if Int64.equal run_epoch current_epoch
         then apply_frames ~wal ~pager run
         else
-          let* cr = checkpoint_wal_to_main ~wal ~pager in
+          let* cr = checkpoint_wal_to_main ~wal ~pager ~reader_gate in
           match cr with
           | Error (`Apply_error _) as e -> Lwt.return e
           | Ok () -> apply_frames ~wal ~pager run
@@ -300,7 +304,15 @@ let incremental_restore
       | [] -> Lwt.return_ok (last_epoch, last_idx)
       | frames :: rest ->
         let replicated = List.map backup_frame_to_replicated frames in
-        let* r = apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx replicated in
+        let* r =
+          apply_frames_epoch_aware
+            ~wal
+            ~pager
+            ~last_epoch
+            ~last_idx
+            ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+            replicated
+        in
         (match r with
          | Error (`Apply_error msg) -> Lwt.return_error (`Restore_error msg)
          | Ok (epoch, idx) -> apply_sets (epoch, idx) rest)

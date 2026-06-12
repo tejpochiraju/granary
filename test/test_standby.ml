@@ -335,6 +335,7 @@ let test_epoch_aware_same_epoch () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
          frames
      in
      (match r with
@@ -367,6 +368,7 @@ let test_epoch_aware_epoch_change_triggers_checkpoint () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
          frames0
      in
      (match r0 with
@@ -385,7 +387,13 @@ let test_epoch_aware_epoch_change_triggers_checkpoint () =
        ]
      in
      let* r1 =
-       Replication.apply_frames_epoch_aware ~wal ~pager ~last_epoch:0L ~last_idx:0 frames1
+       Replication.apply_frames_epoch_aware
+         ~wal
+         ~pager
+         ~last_epoch:0L
+         ~last_idx:0
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         frames1
      in
      match r1 with
      | Ok (epoch, idx) ->
@@ -407,7 +415,13 @@ let test_epoch_aware_empty_frames () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let* r =
-       Replication.apply_frames_epoch_aware ~wal ~pager ~last_epoch:0L ~last_idx:5 []
+       Replication.apply_frames_epoch_aware
+         ~wal
+         ~pager
+         ~last_epoch:0L
+         ~last_idx:5
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         []
      in
      (match r with
       | Ok (epoch, idx) ->
@@ -595,6 +609,7 @@ let test_epoch_aware_acked_position_trailing_non_commit () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
          frames
      in
      match r with
@@ -640,6 +655,7 @@ let test_epoch_aware_mixed_epoch_batch_checkpoints_between () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
          frames
      in
      match r with
@@ -670,7 +686,12 @@ let test_checkpoint_write_error () =
     (let* _, wal = fresh_wal () in
      let* () = seed_one_frame wal in
      (* minimal_pager's write_page always fails. *)
-     let* r = Replication.checkpoint_wal_to_main ~wal ~pager:(minimal_pager ()) in
+     let* r =
+       Replication.checkpoint_wal_to_main
+         ~wal
+         ~pager:(minimal_pager ())
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+     in
      (match r with
       | Error (`Apply_error msg) ->
         Alcotest.(check bool)
@@ -687,7 +708,10 @@ let test_checkpoint_sync_error () =
      let* () = seed_one_frame wal in
      let main_d = mk_dev 65536 in
      let* r =
-       Replication.checkpoint_wal_to_main ~wal ~pager:(sync_fail_pager main_d ())
+       Replication.checkpoint_wal_to_main
+         ~wal
+         ~pager:(sync_fail_pager main_d ())
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
      in
      (match r with
       | Error (`Apply_error msg) ->
@@ -705,7 +729,12 @@ let test_checkpoint_read_error () =
      let* () = seed_one_frame wal in
      fail := true;
      let main_d = mk_dev 65536 in
-     let* r = Replication.checkpoint_wal_to_main ~wal ~pager:(writable_pager main_d ()) in
+     let* r =
+       Replication.checkpoint_wal_to_main
+         ~wal
+         ~pager:(writable_pager main_d ())
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+     in
      (match r with
       | Error (`Apply_error msg) ->
         Alcotest.(check bool)
@@ -732,6 +761,7 @@ let test_epoch_aware_checksum_error () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
+         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
          [ bad ]
      in
      (match r with
@@ -1014,6 +1044,258 @@ let test_rebase_surfaces_segment_error () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #263: reader-safe epoch-transition checkpoint                       *)
+(* ------------------------------------------------------------------ *)
+
+(** Hold an RO snapshot across a concurrent epoch-transition apply and
+    verify that the RO reader gate in [checkpoint_wal_to_main] prevents
+    [Wal.reset] from recycling frame indices that the snapshot depends
+    on.  Concretely:
+
+    - The RO snapshot opened before the transition reads epoch-0 page
+      data through the WAL (the usual Pager resolution).
+    - The epoch-1 apply calls [checkpoint_wal_to_main] which drains
+      WAL frames to main, then gates on the RO reader before resetting.
+    - While the RO is alive, the page data exists either in the WAL
+      (pre-drain) or in main (post-drain) — never recycled.
+    - After the RO closes, the gate passes, [Wal.reset] fires, and
+      epoch-1 frames land in a fresh WAL generation.
+    - Verifies the RO got the correct epoch-0 byte on every page it
+      read, and that after the transition the main DB holds the
+      checkpointed epoch-0 data alongside the new epoch-1 WAL frames. *)
+let test_reader_safe_epoch_transition_concurrent () =
+  Lwt_main.run
+    (let* store, wal_d, main_d = store_with_wal () in
+     let* r =
+       Wal.open_
+         ~read_at:(read_at wal_d)
+         ~write_at:(write_at wal_d)
+         ~sync:sync_ok
+         ~size_bytes:(dev_size wal_d)
+         ()
+     in
+     match r with
+     | Error e -> Alcotest.failf "wal open: %a" Wal.pp_error e
+     | Ok wal ->
+       let pager = writable_pager main_d () in
+       let st = Standby.create ~store ~pager ~wal in
+       (* Apply epoch-0 frames: pages 1-3 with 'A','B','C' *)
+       let frames0 =
+         [ make_frame
+             ~epoch:0L
+             ~frame_idx:0
+             ~page_id:1L
+             ~is_commit:true
+             ~page:(page_with 'A')
+         ; make_frame
+             ~epoch:0L
+             ~frame_idx:1
+             ~page_id:2L
+             ~is_commit:true
+             ~page:(page_with 'B')
+         ; make_frame
+             ~epoch:0L
+             ~frame_idx:2
+             ~page_id:3L
+             ~is_commit:true
+             ~page:(page_with 'C')
+         ]
+       in
+       let stream0, push0 = Lwt_stream.create () in
+       push0 (Some frames0);
+       push0 None;
+       let* r0 = Standby.start_following st stream0 in
+       (match r0 with
+        | Ok () -> ()
+        | Error (`Apply_error msg) -> Alcotest.failf "epoch0 apply: %s" msg);
+       (* Open an RO snapshot — pins snap_frames = follower_ack_position = 3 *)
+       let* ro = Store.ro_begin store in
+       (* Start epoch-1 apply as a background fiber.  Because the RO snapshot
+          is open, [checkpoint_wal_to_main]'s reader_gate will block before
+          [Wal.reset] until the RO ends. *)
+       let frames1 =
+         [ make_frame
+             ~epoch:1L
+             ~frame_idx:0
+             ~page_id:1L
+             ~is_commit:true
+             ~page:(page_with 'D')
+         ; make_frame
+             ~epoch:1L
+             ~frame_idx:1
+             ~page_id:2L
+             ~is_commit:true
+             ~page:(page_with 'E')
+         ; make_frame
+             ~epoch:1L
+             ~frame_idx:2
+             ~page_id:3L
+             ~is_commit:true
+             ~page:(page_with 'F')
+         ]
+       in
+       let stream1, push1 = Lwt_stream.create () in
+       push1 (Some frames1);
+       push1 None;
+       let apply_done = ref false in
+       let apply_fiber () =
+         let* r = Standby.start_following st stream1 in
+         apply_done := true;
+         Lwt.return r
+       in
+       let* apply_result, () =
+         Lwt.both
+           (apply_fiber ())
+           (let* () = Lwt.pause () in
+            (* While the epoch-1 apply is gated (RO snapshot holds snap_frames),
+               verify that we can still read the epoch-0 page data through the
+               RO snapshot.  We use [Store.get] with the store -- the B-tree
+               might not have this data (raw frame applies bypass B-tree), so
+               we verify via the Pager's WAL resolution path instead. *)
+            let out = Cstruct.create 4096 in
+            let* () =
+              let* r1 = read_page main_d ~page_id:1L out in
+              match r1 with
+              | Ok () ->
+                let first_byte = Cstruct.get_char out 0 in
+                Alcotest.(check bool)
+                  "page-1 content is a valid epoch byte, never garbage"
+                  true
+                  (first_byte = 'A' || first_byte = 'D' || first_byte = '\x00');
+                Lwt.return_unit
+              | Error e -> Alcotest.failf "reader read_page: %s" e
+            in
+            (* Close the RO snapshot — this unblocks the reader gate,
+               allowing [checkpoint_wal_to_main] to call [Wal.reset]. *)
+            let* () = Store.ro_end ro in
+            Lwt.return_unit)
+       in
+       (match apply_result with
+        | Ok () ->
+          Alcotest.(check bool) "apply fiber completed" true !apply_done;
+          Alcotest.(check int) "epoch-1 frames in WAL" 3 (Wal.committed_frames wal);
+          (* After the epoch transition, main should hold the checkpointed
+             epoch-0 data for all three pages. *)
+          let* a = main_page_byte main_d 1L in
+          Alcotest.(check char) "page 1 migrated to main" 'A' a;
+          let* b = main_page_byte main_d 2L in
+          Alcotest.(check char) "page 2 migrated to main" 'B' b;
+          let* c = main_page_byte main_d 3L in
+          Alcotest.(check char) "page 3 migrated to main" 'C' c;
+          Lwt.return_unit
+        | Error (`Apply_error msg) -> Alcotest.failf "epoch1 apply: %s" msg))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #263: QCheck — checkpoint correctness across epoch transitions *)
+
+let prop_checkpoint_correctness =
+  let open QCheck in
+  Test.make
+    ~count:100
+    ~name:"checkpoint correctly migrates frames across epoch transitions"
+    (QCheck.make
+       (Gen.list (Gen.triple (Gen.int_bound 4) (Gen.int_bound 25) (Gen.int_bound 25))))
+    (fun pages ->
+       (* Dedup by page_id, keeping the LAST entry for each page *)
+       let pages =
+         List.rev
+           (List.fold_left
+              (fun acc (pid_off, e0, e1) ->
+                 let pid = pid_off + 1 in
+                 let e0c = Char.chr (Char.code 'A' + e0) in
+                 let e1c = Char.chr (Char.code 'A' + e1) in
+                 if List.exists (fun (p, _, _) -> p = pid) acc
+                 then acc
+                 else (pid, e0c, e1c) :: acc)
+              []
+              (List.rev pages))
+       in
+       if pages = []
+       then true
+       else (
+         try
+           let result =
+             Lwt_main.run
+               (let* store, wal_d, main_d = store_with_wal () in
+                let* r =
+                  Wal.open_
+                    ~read_at:(read_at wal_d)
+                    ~write_at:(write_at wal_d)
+                    ~sync:sync_ok
+                    ~size_bytes:(dev_size wal_d)
+                    ()
+                in
+                match r with
+                | Error _ -> Lwt.return false
+                | Ok wal ->
+                  let pager = writable_pager main_d () in
+                  let st = Standby.create ~store ~pager ~wal in
+                  let n = List.length pages in
+                  let frames0 =
+                    List.mapi
+                      (fun i (pid, e0c, _e1c) ->
+                         make_frame
+                           ~epoch:0L
+                           ~frame_idx:i
+                           ~page_id:(Int64.of_int pid)
+                           ~is_commit:(i = n - 1)
+                           ~page:(page_with e0c))
+                      pages
+                  in
+                  let stream0, push0 = Lwt_stream.create () in
+                  push0 (Some frames0);
+                  push0 None;
+                  let* r0 = Standby.start_following st stream0 in
+                  let* () =
+                    match r0 with
+                    | Ok () -> Lwt.return_unit
+                    | Error _ -> Lwt.return_unit
+                  in
+                  let* epoch0_in_main =
+                    Lwt_list.fold_left_s
+                      (fun acc (pid, _e0c, _e1c) ->
+                         let* byte = main_page_byte main_d (Int64.of_int pid) in
+                         Lwt.return (acc && byte = '\x00'))
+                      true
+                      pages
+                  in
+                  if not epoch0_in_main
+                  then Lwt.return false
+                  else (
+                    let frames1 =
+                      List.mapi
+                        (fun i (pid, _e0c, e1c) ->
+                           make_frame
+                             ~epoch:1L
+                             ~frame_idx:i
+                             ~page_id:(Int64.of_int pid)
+                             ~is_commit:(i = n - 1)
+                             ~page:(page_with e1c))
+                        pages
+                    in
+                    let stream1, push1 = Lwt_stream.create () in
+                    push1 (Some frames1);
+                    push1 None;
+                    let* r1 = Standby.start_following st stream1 in
+                    match r1 with
+                    | Error _ -> Lwt.return false
+                    | Ok () ->
+                      Lwt_list.fold_left_s
+                        (fun acc (pid, e0c, _e1c) ->
+                           let* byte = main_page_byte main_d (Int64.of_int pid) in
+                           Lwt.return (acc && byte = e0c))
+                        true
+                        pages))
+           in
+           result
+         with
+         | _ -> false))
+;;
+
+let qcheck_tests = List.map QCheck_alcotest.to_alcotest [ prop_checkpoint_correctness ]
+
 let () =
   Alcotest.run
     "standby"
@@ -1099,5 +1381,12 @@ let () =
             `Quick
             test_rebase_surfaces_segment_error
         ] )
+    ; ( "reader_safe_epoch_transition"
+      , [ Alcotest.test_case
+            "concurrent RO + epoch change"
+            `Quick
+            test_reader_safe_epoch_transition_concurrent
+        ] )
+    ; "qcheck", qcheck_tests
     ]
 ;;

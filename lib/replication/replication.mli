@@ -129,6 +129,7 @@ val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated
 val checkpoint_wal_to_main
   :  wal:Sqlocaml_storage.Wal.t
   -> pager:Sqlocaml_storage.Pager.t
+  -> reader_gate:(target:int -> unit Lwt.t)
   -> (unit, [> `Apply_error of string ]) result Lwt.t
 
 (** Apply a batch of replicated frames into the standby's WAL and pager,
@@ -156,5 +157,6 @@ val apply_frames_epoch_aware
   -> pager:Sqlocaml_storage.Pager.t
   -> last_epoch:int64
   -> last_idx:int
+  -> reader_gate:(target:int -> unit Lwt.t)
   -> replicated_frame list
   -> (int64 * int, [> `Apply_error of string ]) result Lwt.t
