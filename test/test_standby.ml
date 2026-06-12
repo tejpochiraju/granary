@@ -335,7 +335,7 @@ let test_epoch_aware_same_epoch () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          frames
      in
      (match r with
@@ -368,7 +368,7 @@ let test_epoch_aware_epoch_change_triggers_checkpoint () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          frames0
      in
      (match r0 with
@@ -392,7 +392,7 @@ let test_epoch_aware_epoch_change_triggers_checkpoint () =
          ~pager
          ~last_epoch:0L
          ~last_idx:0
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          frames1
      in
      match r1 with
@@ -420,7 +420,7 @@ let test_epoch_aware_empty_frames () =
          ~pager
          ~last_epoch:0L
          ~last_idx:5
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          []
      in
      (match r with
@@ -609,7 +609,7 @@ let test_epoch_aware_acked_position_trailing_non_commit () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          frames
      in
      match r with
@@ -655,7 +655,7 @@ let test_epoch_aware_mixed_epoch_batch_checkpoints_between () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          frames
      in
      match r with
@@ -690,7 +690,7 @@ let test_checkpoint_write_error () =
        Replication.checkpoint_wal_to_main
          ~wal
          ~pager:(minimal_pager ())
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
      in
      (match r with
       | Error (`Apply_error msg) ->
@@ -711,7 +711,7 @@ let test_checkpoint_sync_error () =
        Replication.checkpoint_wal_to_main
          ~wal
          ~pager:(sync_fail_pager main_d ())
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
      in
      (match r with
       | Error (`Apply_error msg) ->
@@ -733,7 +733,7 @@ let test_checkpoint_read_error () =
        Replication.checkpoint_wal_to_main
          ~wal
          ~pager:(writable_pager main_d ())
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
      in
      (match r with
       | Error (`Apply_error msg) ->
@@ -761,7 +761,7 @@ let test_epoch_aware_checksum_error () =
          ~pager
          ~last_epoch:0L
          ~last_idx:(-1)
-         ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+         ~reader_gate:Replication.no_reader_gate
          [ bad ]
      in
      (match r with
@@ -1049,21 +1049,20 @@ let test_rebase_surfaces_segment_error () =
 (* ------------------------------------------------------------------ *)
 
 (** Hold an RO snapshot across a concurrent epoch-transition apply and
-    verify that the RO reader gate in [checkpoint_wal_to_main] prevents
-    [Wal.reset] from recycling frame indices that the snapshot depends
-    on.  Concretely:
+    verify that the reader gate in [checkpoint_wal_to_main] blocks until
+    the RO snapshot ends, preventing [Wal.reset] from recycling frame
+    indices that the in-flight RO snapshot depends on.
 
-    - The RO snapshot opened before the transition reads epoch-0 page
-      data through the WAL (the usual Pager resolution).
-    - The epoch-1 apply calls [checkpoint_wal_to_main] which drains
-      WAL frames to main, then gates on the RO reader before resetting.
-    - While the RO is alive, the page data exists either in the WAL
-      (pre-drain) or in main (post-drain) — never recycled.
-    - After the RO closes, the gate passes, [Wal.reset] fires, and
-      epoch-1 frames land in a fresh WAL generation.
-    - Verifies the RO got the correct epoch-0 byte on every page it
-      read, and that after the transition the main DB holds the
-      checkpointed epoch-0 data alongside the new epoch-1 WAL frames. *)
+    Caveat: the test store (created by {!store_with_wal}) and the Standby
+    use separate {!Wal.t} handles over the same wal device.  The reader
+    gate's target is the Standby's [Wal.committed_frames], while the RO
+    snapshot's [snap_frames] comes from the store's internal WAL (which
+    the Standby never appends to) — so the counter comparison is between
+    different WAL instances.  The gate still {e mechanically} blocks
+    because the Standby's committed-frames (N > 0) always exceeds the
+    store's (0 on a fresh WAL), but a full end-to-end test of the
+    snapshot→frame dependency would require the store and Standby to
+    share a WAL handle (see #263 discussion on PR #359). *)
 let test_reader_safe_epoch_transition_concurrent () =
   Lwt_main.run
     (let* store, wal_d, main_d = store_with_wal () in
@@ -1109,11 +1108,14 @@ let test_reader_safe_epoch_transition_concurrent () =
        (match r0 with
         | Ok () -> ()
         | Error (`Apply_error msg) -> Alcotest.failf "epoch0 apply: %s" msg);
-       (* Open an RO snapshot — pins snap_frames = follower_ack_position = 3 *)
+       (* Open an RO snapshot on the store.  The store's Wal.committed_frames
+          is 0 (Standby appends to a separate WAL handle), so the RO snapshot
+          gets snap_frames = 0. *)
        let* ro = Store.ro_begin store in
-       (* Start epoch-1 apply as a background fiber.  Because the RO snapshot
-          is open, [checkpoint_wal_to_main]'s reader_gate will block before
-          [Wal.reset] until the RO ends. *)
+       (* Start epoch-1 apply as a background fiber.  When it reaches
+          [checkpoint_wal_to_main], the reader_gate will call
+          [Store.wait_for_readers_past ~target:3].  Since the RO snapshot's
+          snap_frames = 0 < 3, the gate will block until the RO snapshot ends. *)
        let frames1 =
          [ make_frame
              ~epoch:1L
@@ -1148,24 +1150,13 @@ let test_reader_safe_epoch_transition_concurrent () =
          Lwt.both
            (apply_fiber ())
            (let* () = Lwt.pause () in
-            (* While the epoch-1 apply is gated (RO snapshot holds snap_frames),
-               verify that we can still read the epoch-0 page data through the
-               RO snapshot.  We use [Store.get] with the store -- the B-tree
-               might not have this data (raw frame applies bypass B-tree), so
-               we verify via the Pager's WAL resolution path instead. *)
-            let out = Cstruct.create 4096 in
-            let* () =
-              let* r1 = read_page main_d ~page_id:1L out in
-              match r1 with
-              | Ok () ->
-                let first_byte = Cstruct.get_char out 0 in
-                Alcotest.(check bool)
-                  "page-1 content is a valid epoch byte, never garbage"
-                  true
-                  (first_byte = 'A' || first_byte = 'D' || first_byte = '\x00');
-                Lwt.return_unit
-              | Error e -> Alcotest.failf "reader read_page: %s" e
-            in
+            (* The apply fiber should be blocked on the reader gate at this
+               point (snap_frames=0 < target=3).  If the gate were a no-op,
+               the apply would have completed before this line runs. *)
+            Alcotest.(check bool)
+              "apply blocked on reader gate while RO is open"
+              false
+              !apply_done;
             (* Close the RO snapshot — this unblocks the reader gate,
                allowing [checkpoint_wal_to_main] to call [Wal.reset]. *)
             let* () = Store.ro_end ro in
@@ -1173,7 +1164,7 @@ let test_reader_safe_epoch_transition_concurrent () =
        in
        (match apply_result with
         | Ok () ->
-          Alcotest.(check bool) "apply fiber completed" true !apply_done;
+          Alcotest.(check bool) "apply completed after RO end" true !apply_done;
           Alcotest.(check int) "epoch-1 frames in WAL" 3 (Wal.committed_frames wal);
           (* After the epoch transition, main should hold the checkpointed
              epoch-0 data for all three pages. *)

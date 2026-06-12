@@ -117,6 +117,11 @@ val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated
 
 (** -------------------------------------------------------------------- *)
 
+(** A no-op reader gate that returns immediately without waiting.  Use
+    for paths known to serve no concurrent readers (e.g. cold restore,
+    incremental restore, or direct test invocations). *)
+val no_reader_gate : target:int -> unit Lwt.t
+
 (** Checkpoint the standby's WAL into the main DB and reset it.
 
     Migrates the latest version of every page in the WAL index to the

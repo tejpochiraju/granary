@@ -152,12 +152,37 @@ let cold_restore
 (* Epoch-aware apply for standby (#172)                                *)
 (* ------------------------------------------------------------------ *)
 
+(** A no-op reader gate: returns immediately without waiting.  Use for
+    paths that serve no concurrent readers (e.g. cold restore, direct
+    test invocations). *)
+let no_reader_gate ~target:_ = Lwt.return_unit
+
 (** Migrate the latest version of every page in the WAL index to the main
     DB, sync, then reset the WAL (bumping its epoch).  Mirrors the engine's
-    [Store.checkpoint_unlocked] sequence; unlike [checkpoint_unlocked] it
-    does not re-pin a downstream replication floor (no [replication_shipped_frames]
-    equivalent) — correct for a leaf standby; revisit for cascading
-    replication (see #208).
+    [Store.checkpoint_unlocked] spine: [iter -> flush -> sync -> gate -> reset].
+
+    Unlike [checkpoint_unlocked] the reader gate is called {e after} the main
+    flush and sync rather than before it.  This is safe because during the
+    flush window the WAL index stays intact --- a concurrent RO snapshot
+    resolves pages from the WAL, not from the freshly-flushed main page.  Only
+    [Wal.reset] (which {e is} gated) switches resolution to main.  The ordering
+    divergence from [checkpoint_unlocked] is benign provided the gate always
+    fires before [Wal.reset].
+
+    The following engine concerns from [checkpoint_unlocked] are intentionally
+    omitted for a leaf standby (revisit for cascading replication #208):
+
+    - No {!Store.close} abort (#338): [~reader_gate]'s implementation
+      ([Store.wait_for_readers_past]) already short-circuits on [st.closing],
+      so the gate yields immediately during teardown and reset proceeds.
+      If the gate is a no-op (e.g. [no_reader_gate]) the caller must ensure
+      no concurrent reader holds stale references before calling this function.
+    - No [ckpt_io_in_flight] tracking: a leaf standby has no concurrent close
+      that needs to drain in-flight checkpoint I/O.
+    - No sink-ship drain (#337): a leaf standby has no replication sink
+      shipping frames lazily.
+    - No floor re-pinning (#207/#265): a leaf standby is not a replication
+      source, so no downstream floor to re-pin after reset.
 
     [~reader_gate] is called before [Wal.reset] with the current
     [Wal.committed_frames] as target, ensuring no in-flight RO snapshot
@@ -310,7 +335,7 @@ let incremental_restore
             ~pager
             ~last_epoch
             ~last_idx
-            ~reader_gate:(fun ~target:_ -> Lwt.return_unit)
+            ~reader_gate:no_reader_gate
             replicated
         in
         (match r with
