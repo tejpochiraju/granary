@@ -388,6 +388,16 @@ let write t page_id buf =
    copies of dirty pages, so stored buffers are never aliased to readers. *)
 let write_owned t page_id buf = Hashtbl.replace t.dirty page_id buf
 
+(* #356: return the LIVE dirty buffer for [page_id] (NOT a copy), or [None] if
+   the page is not dirty in the current write txn.  The caller MAY mutate the
+   returned buffer in place: a page in [dirty] was allocated or CoW-copied by
+   THIS txn, so no committed snapshot and no concurrent reader references it
+   (snapshot readers resolve through WAL frames, never [dirty]; the writer's own
+   read-your-own-writes via [read] returns a fresh [cstruct_dup]).  The single
+   RW lock guarantees no other writer.  Mutations must keep the page well-formed;
+   the CRC is resealed for every dirty page at flush time (see [seal_dirty]). *)
+let dirty_buffer t page_id : Cstruct.t option = Hashtbl.find_opt t.dirty page_id
+
 (* Previously also injected into the shared cache here for
      read-after-write inside the same txn.  Removed (#149): a concurrent
      reader at an older snapshot would see uncommitted bytes.  The
@@ -431,6 +441,14 @@ let free t ~page_id ~freed_at_txn_id =
     <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
 ;;
 
+(* Seal all dirty pages' CRCs just before flushing to disk (#356).
+   B+-tree build helpers skip Page.seal per-page to avoid sealing pages
+   that will be immediately overwritten by the next insert (the
+   txn_owned_pool recycles page ids, so at commit only ~O(tree_size) pages
+   survive, not O(n_inserts) × pages_per_insert).  Sealing at flush time
+   amortises the cost across the entire batch. *)
+let seal_dirty t = Hashtbl.iter (fun _ buf -> Page.seal buf) t.dirty
+
 (* Internal: drive the WAL append callback [append] with the dirty
    entries; on success clear the dirty set.  Used by both [flush] (sync)
    and [flush_no_sync] (group commit) so the dirty-set management is
@@ -440,13 +458,14 @@ let flush_via_wal t ~append =
   let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
   if entries = []
   then Lwt.return_ok ()
-  else
+  else (
+    seal_dirty t;
     let* r = append entries in
     match r with
     | Error msg -> Lwt.return_error (Block_error msg)
     | Ok () ->
       Hashtbl.clear t.dirty;
-      Lwt.return_ok ()
+      Lwt.return_ok ())
 ;;
 
 let flush_no_sync t =
@@ -456,6 +475,7 @@ let flush_no_sync t =
     (* Non-WAL backends have no notion of deferred sync — fall through to
        the regular [flush] which writes pages + syncs. *)
     let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
+    seal_dirty t;
     let open Lwt.Syntax in
     let rec write_all = function
       | [] ->
@@ -561,11 +581,23 @@ let clear_dirty t =
 
 type dirty_snapshot = (int64, Cstruct.t) Hashtbl.t
 
-let dirty_clone t = Hashtbl.copy t.dirty
+(* #356: DEEP-copy each page buffer when snapshotting/restoring the dirty set
+   for savepoints.  In-place insert mutation (see [dirty_buffer]) mutates dirty
+   buffers in place, so a shallow [Hashtbl.copy] (which aliases the Cstructs)
+   would let a post-savepoint mutation corrupt the snapshot — ROLLBACK TO could
+   then not undo it.  Deep copies make the snapshot immune; [dirty_restore]
+   likewise installs fresh copies so the snapshot stays pristine for a repeated
+   ROLLBACK TO the same savepoint.  Savepoints are only taken on explicit
+   SAVEPOINT statements (never per-insert), so this copy is off the hot path. *)
+let dirty_clone t =
+  let snap = Hashtbl.create (Hashtbl.length t.dirty) in
+  Hashtbl.iter (fun k v -> Hashtbl.replace snap k (cstruct_dup v)) t.dirty;
+  snap
+;;
 
 let dirty_restore t snap =
   Hashtbl.reset t.dirty;
-  Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k v) snap
+  Hashtbl.iter (fun k v -> Hashtbl.replace t.dirty k (cstruct_dup v)) snap
 ;;
 
 let flush_one_to_main t ~page_id ~buf =

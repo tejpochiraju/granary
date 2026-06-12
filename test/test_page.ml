@@ -1034,7 +1034,7 @@ let ref_leaf_insert buf n key sv right_page tag =
   in
   P.write_common nb P.{ kind = Leaf; flags = 0; n_keys = cnt; right_page; crc32 = 0l };
   P.write_tag nb tag;
-  P.seal nb;
+  (* No seal: leaf_blit_insert defers CRC to WAL-flush (#356). *)
   nb
 ;;
 
@@ -1090,6 +1090,136 @@ let prop_leaf_blit_insert_equiv =
          in
          let ref_ = ref_leaf_insert buf n nk sv rp tag in
          Cstruct.equal fast ref_))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* leaf_insert_inplace tests                                           *)
+(* ------------------------------------------------------------------ *)
+
+(* Decode all [n] entries of a leaf page into a (key, value) list. *)
+let decode_all_leaf buf n =
+  let acc = ref [] in
+  let rec scan off i =
+    if i >= n
+    then ()
+    else (
+      match P.leaf_entry_at buf ~offset:off with
+      | `End -> ()
+      | `Entry e ->
+        acc := (e.key, e.value) :: !acc;
+        scan e.next_offset (i + 1))
+  in
+  scan P.data_offset 0;
+  List.rev !acc
+;;
+
+let test_leaf_insert_inplace_append () =
+  let buf, n = build_leaf_page [ Bytes.of_string "a", Bytes.of_string "1" ] in
+  let key = Bytes.of_string "z"
+  and sv = Bytes.of_string "\x009" in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key in
+  P.leaf_insert_inplace buf ~pos ~key ~stored_value:sv ~n_keys:n;
+  Alcotest.(check int) "n_keys=2" 2 (P.read_common buf).n_keys;
+  let entries = decode_all_leaf buf 2 in
+  Alcotest.(check (list (pair bytes bytes)))
+    "appended in order"
+    [ Bytes.of_string "a", Bytes.of_string "1"; key, sv ]
+    entries
+;;
+
+let test_leaf_insert_inplace_middle () =
+  let buf, n =
+    build_leaf_page
+      [ Bytes.of_string "a", Bytes.of_string "1"
+      ; Bytes.of_string "c", Bytes.of_string "3"
+      ]
+  in
+  let key = Bytes.of_string "b"
+  and sv = Bytes.of_string "\x002" in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key in
+  P.leaf_insert_inplace buf ~pos ~key ~stored_value:sv ~n_keys:n;
+  Alcotest.(check int) "n_keys=3" 3 (P.read_common buf).n_keys;
+  let entries = decode_all_leaf buf 3 in
+  Alcotest.(check (list (pair bytes bytes)))
+    "inserted in sorted middle"
+    [ Bytes.of_string "a", Bytes.of_string "1"
+    ; key, sv
+    ; Bytes.of_string "c", Bytes.of_string "3"
+    ]
+    entries
+;;
+
+let test_leaf_insert_inplace_front () =
+  let buf, n = build_leaf_page [ Bytes.of_string "m", Bytes.of_string "5" ] in
+  let key = Bytes.of_string "a"
+  and sv = Bytes.of_string "\x000" in
+  let pos = P.leaf_find_position buf ~n_keys:n ~key in
+  P.leaf_insert_inplace buf ~pos ~key ~stored_value:sv ~n_keys:n;
+  let entries = decode_all_leaf buf 2 in
+  Alcotest.(check (list (pair bytes bytes)))
+    "inserted at front"
+    [ key, sv; Bytes.of_string "m", Bytes.of_string "5" ]
+    entries
+;;
+
+(* QCheck: in-place insert yields the same decoded entries as blit insert. *)
+let prop_leaf_insert_inplace_equiv =
+  let gen =
+    QCheck.Gen.(
+      let* n = int_range 0 40 in
+      let* raw =
+        list_size
+          (return n)
+          (pair (bytes_size (int_range 1 10)) (bytes_size (int_range 1 20)))
+      in
+      let* nk = bytes_size (int_range 1 10) in
+      let* nv = bytes_size (int_range 1 10) in
+      return (raw, nk, nv))
+  in
+  QCheck.Test.make
+    ~name:"prop_leaf_insert_inplace_matches_blit"
+    ~count:5_000
+    (QCheck.make gen)
+    (fun (raw, nk, nv) ->
+       let su = sort_unique_by_key raw in
+       let buf = fresh_page () in
+       let _ =
+         List.fold_left
+           (fun off (k, v) -> P.leaf_append_entry buf ~offset:off ~key:k ~value:v)
+           P.data_offset
+           su
+       in
+       let n = List.length su in
+       let sv = Bytes.cat (Bytes.make 1 '\x00') nv in
+       let esz = 2 + Bytes.length nk + 2 + Bytes.length sv in
+       let dsz =
+         List.fold_left (fun a (k, v) -> a + 2 + Bytes.length k + 2 + Bytes.length v) 0 su
+       in
+       if dsz + esz > P.max_data_bytes
+       then true
+       else if List.exists (fun (k, _) -> Bytes.equal k nk) su
+       then true
+       else (
+         (* Build the expected page via the (already-verified) blit path. *)
+         let pos0 = P.leaf_find_position buf ~n_keys:n ~key:nk in
+         let blit =
+           P.leaf_blit_insert
+             buf
+             ~pos:pos0
+             ~key:nk
+             ~stored_value:sv
+             ~right_page:0l
+             ~write_tag:0l
+             ~n_keys:n
+         in
+         (* Mutate a private copy in place. *)
+         let inplace = Cstruct.create P.page_size in
+         Cstruct.blit buf 0 inplace 0 P.page_size;
+         let pos = P.leaf_find_position inplace ~n_keys:n ~key:nk in
+         P.leaf_insert_inplace inplace ~pos ~key:nk ~stored_value:sv ~n_keys:n;
+         let want = decode_all_leaf blit (n + 1) in
+         let got = decode_all_leaf inplace (n + 1) in
+         want = got && (P.read_common inplace).n_keys = n + 1))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1227,6 +1357,7 @@ let () =
       ; prop_leaf_lookup_matches
       ; prop_branch_pick_matches
       ; prop_leaf_blit_insert_equiv
+      ; prop_leaf_insert_inplace_equiv
       ; prop_branch_pick_with_info_agrees
       ]
   in
@@ -1366,6 +1497,11 @@ let () =
     ; ( "leaf_blit_insert"
       , [ Alcotest.test_case "into empty" `Quick test_leaf_blit_insert_empty
         ; Alcotest.test_case "before existing" `Quick test_leaf_blit_insert_before
+        ] )
+    ; ( "leaf_insert_inplace"
+      , [ Alcotest.test_case "append at end" `Quick test_leaf_insert_inplace_append
+        ; Alcotest.test_case "insert in middle" `Quick test_leaf_insert_inplace_middle
+        ; Alcotest.test_case "insert at front" `Quick test_leaf_insert_inplace_front
         ] )
     ; ( "branch_pick_with_info"
       , [ Alcotest.test_case "empty branch" `Quick test_branch_pick_with_info_empty

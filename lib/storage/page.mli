@@ -186,6 +186,25 @@ val leaf_blit_insert
   -> n_keys:int
   -> Cstruct.t
 
+(** Insert ([key], [stored_value]) into a sorted leaf page IN PLACE at
+    [pos.insert_off], shifting tail entries up and bumping n_keys.  Mutates
+    [buf] directly — used by the in-place insert fast path (#356) when the leaf
+    is already owned by the current write txn.  Caller guarantees
+    [pos.key_found = false] and the entry fits.  Preserves right_page and tag;
+    CRC reseals at flush. *)
+val leaf_insert_inplace
+  :  Cstruct.t
+  -> pos:leaf_position
+  -> key:bytes
+  -> stored_value:bytes
+  -> n_keys:int
+  -> unit
+
+(** Zero-alloc test whether the leaf entry starting at byte [offset] has key
+    equal to [key].  Bounds-checked (false on a malformed offset).  Used to
+    validate an append cursor against the live page (#356). *)
+val leaf_key_matches_at : Cstruct.t -> offset:int -> key:bytes -> bool
+
 (** Like {!branch_pick} but also returns the chosen child's ordinal index and
     byte offset of its [left_child] int32 field (-1 for [right_page]). *)
 val branch_pick_with_info

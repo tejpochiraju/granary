@@ -473,10 +473,27 @@ let leaf_find_position buf ~n_keys ~key : leaf_position =
   scan data_offset 0 (-1) false false
 ;;
 
+(* Zero-alloc test: does the leaf entry starting at byte [offset] have a key
+   equal to [key]?  Used to validate an append-cursor against the live page
+   (#356) without decoding the entry.  Bounds-checked: returns false if
+   [offset] does not address a well-formed entry. *)
+let leaf_key_matches_at buf ~offset ~key =
+  let page_size = Cstruct.length buf in
+  if offset + 2 > page_size
+  then false
+  else (
+    let key_len = Cstruct.BE.get_uint16 buf offset in
+    if offset + 2 + key_len > page_size
+    then false
+    else
+      Bytes.length key = key_len
+      && compare_key_at buf ~kstart:(offset + 2) ~klen:key_len ~key = 0)
+;;
+
 (* Build a new leaf page with [key, stored_value] inserted at [pos.insert_off].
    Entries before the insertion point are blitted from [buf]; entries after are
-   blitted after the new entry.  Updates n_keys, tag, and CRC.  Caller ensures
-   [pos.key_found = false] and that the new entry fits without a split. *)
+   blitted after the new entry.  Updates n_keys and tag.  CRC seal is deferred
+   to flush-time (#356) — the pager seals all dirty pages at WAL-commit. *)
 let leaf_blit_insert buf ~pos ~key ~stored_value ~right_page ~write_tag:tag ~n_keys =
   let page_size = Cstruct.length buf in
   let new_buf = Cstruct.create page_size in
@@ -491,8 +508,38 @@ let leaf_blit_insert buf ~pos ~key ~stored_value ~right_page ~write_tag:tag ~n_k
   let common = { kind = Leaf; flags = 0; n_keys = n_keys + 1; right_page; crc32 = 0l } in
   write_common new_buf common;
   write_tag new_buf tag;
-  seal new_buf;
   new_buf
+;;
+
+(* Insert ([key], [stored_value]) into a sorted leaf page IN PLACE at
+   [pos.insert_off], shifting the tail entries up to make room, then bumping
+   the header's n_keys.  Mutates [buf] directly — used by the in-place insert
+   fast path (#356) when the leaf is already owned by the current write txn
+   (dirty), avoiding a full page copy + parent-pointer rewrite.
+
+   The tail shift copies bytes backward (high → low destination first) so the
+   source and destination ranges may overlap safely; for an append at the end
+   ([pos.insert_off = pos.data_end]) the tail is empty and no shift happens.
+
+   Caller guarantees [pos.key_found = false] and that the new entry fits within
+   the page's usable region.  Preserves the existing right_page and tag.  CRC
+   is resealed at flush-time (#356). *)
+let leaf_insert_inplace buf ~pos ~key ~stored_value ~n_keys =
+  let entry_size = 2 + Bytes.length key + 2 + Bytes.length stored_value in
+  let tail_len = pos.data_end - pos.insert_off in
+  (* Shift the tail [insert_off, data_end) up by [entry_size], backward so the
+     overlapping ranges don't clobber unread source bytes. *)
+  if tail_len > 0
+  then
+    for i = tail_len - 1 downto 0 do
+      Cstruct.set_uint8
+        buf
+        (pos.insert_off + entry_size + i)
+        (Cstruct.get_uint8 buf (pos.insert_off + i))
+    done;
+  let _ = leaf_append_entry buf ~offset:pos.insert_off ~key ~value:stored_value in
+  (* Bump n_keys in the common header (bytes 2..3, uint16 BE). *)
+  Cstruct.BE.set_uint16 buf 2 (n_keys + 1)
 ;;
 
 (* Like [branch_pick_loop] but also returns the child's ordinal index and the

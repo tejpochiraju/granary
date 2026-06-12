@@ -100,6 +100,13 @@ val write : t -> int64 -> Cstruct.t -> unit
 (** Write [buf] to [page_id] (takes ownership, no defensive copy). *)
 val write_owned : t -> int64 -> Cstruct.t -> unit
 
+(** #356: the LIVE dirty buffer for [page_id] (NOT a copy), or [None] if the
+    page is not dirty in the current write txn.  A dirty page was allocated or
+    CoW-copied by this txn, so no committed snapshot or concurrent reader
+    references it — the caller may mutate it in place.  Mutations must keep the
+    page well-formed; the CRC reseals at flush time. *)
+val dirty_buffer : t -> int64 -> Cstruct.t option
+
 (** Allocate a page: txn-owned pool, then main freelist, then file extension. *)
 val alloc : t -> (int64, error) result Lwt.t
 
