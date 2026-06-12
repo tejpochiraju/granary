@@ -117,6 +117,11 @@ val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated
 
 (** -------------------------------------------------------------------- *)
 
+(** A no-op reader gate that returns immediately without waiting.  Use
+    for paths known to serve no concurrent readers (e.g. cold restore,
+    incremental restore, or direct test invocations). *)
+val no_reader_gate : target:int -> unit Lwt.t
+
 (** Checkpoint the standby's WAL into the main DB and reset it.
 
     Migrates the latest version of every page in the WAL index to the
@@ -129,6 +134,7 @@ val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated
 val checkpoint_wal_to_main
   :  wal:Sqlocaml_storage.Wal.t
   -> pager:Sqlocaml_storage.Pager.t
+  -> reader_gate:(target:int -> unit Lwt.t)
   -> (unit, [> `Apply_error of string ]) result Lwt.t
 
 (** Apply a batch of replicated frames into the standby's WAL and pager,
@@ -156,5 +162,6 @@ val apply_frames_epoch_aware
   -> pager:Sqlocaml_storage.Pager.t
   -> last_epoch:int64
   -> last_idx:int
+  -> reader_gate:(target:int -> unit Lwt.t)
   -> replicated_frame list
   -> (int64 * int, [> `Apply_error of string ]) result Lwt.t

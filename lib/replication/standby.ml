@@ -22,6 +22,7 @@ type t =
   ; mutable last_epoch : int64
   ; mutable last_frame_idx : int
   ; apply_mutex : Lwt_mutex.t
+  ; reader_gate : target:int -> unit Lwt.t
   }
 
 let create ~store ~pager ~wal =
@@ -32,6 +33,7 @@ let create ~store ~pager ~wal =
   ; last_epoch = 0L
   ; last_frame_idx = -1
   ; apply_mutex = Lwt_mutex.create ()
+  ; reader_gate = Store.wait_for_readers_past store
   }
 ;;
 
@@ -66,7 +68,12 @@ let promote t =
            the last epoch-change checkpoint.  [checkpoint_wal_to_main] also
            bumps the local WAL epoch via [Wal.reset], so locally-generated
            writes start with a fresh epoch distinct from the master's. *)
-        let* r = Replication.checkpoint_wal_to_main ~wal:t.wal ~pager:t.pager in
+        let* r =
+          Replication.checkpoint_wal_to_main
+            ~wal:t.wal
+            ~pager:t.pager
+            ~reader_gate:t.reader_gate
+        in
         (match r with
          | Error (`Apply_error msg) ->
            Lwt.fail_with ("Standby.promote: drain failed: " ^ msg)
@@ -114,6 +121,7 @@ let start_following t stream =
                          ~pager:t.pager
                          ~last_epoch:t.last_epoch
                          ~last_idx:t.last_frame_idx
+                         ~reader_gate:t.reader_gate
                          frames
                      in
                      (match r with
@@ -178,6 +186,7 @@ let rebase t segments =
                 ~pager:t.pager
                 ~last_epoch:t.last_epoch
                 ~last_idx:t.last_frame_idx
+                ~reader_gate:t.reader_gate
                 frames
             in
             (match r with

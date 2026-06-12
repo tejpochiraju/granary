@@ -3214,6 +3214,17 @@ let follower_ack_position (t : t) =
   | Btree st -> st.follower_ack_position
 ;;
 
+let wait_for_readers_past (t : t) ~target =
+  match t.backend with
+  | Mem _ -> Lwt.return_unit
+  | Btree st ->
+    wait_for_readers_past
+      st
+      ~target
+      ~replication_max_yields:st.replication_gate_max_yields
+      ~backup_max_yields:st.backup_gate_max_yields
+;;
+
 [@@@ai_disclosure "ai-generated"]
 [@@@ai_model "claude-opus-4-7"]
 [@@@ai_provider "Anthropic"]

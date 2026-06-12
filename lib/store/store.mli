@@ -634,3 +634,14 @@ val set_follower_ack_position : t -> frames:int -> unit
 (** Get the recorded follower ack position (a local [Wal.committed_frames]
     count), or [None] if not following or no position has been recorded yet. *)
 val follower_ack_position : t -> int option
+
+(** Wait for in-flight RO snapshots whose [snap_frames] is below [target] to
+    complete.  Reuses the same reader-pin gating as the inline checkpoint
+    ([checkpoint_unlocked]): local RO readers are waited on unconditionally;
+    the replication and backup floors are subject to the store's configured
+    bounded-yield budgets (#207, #265).  No-op on the in-memory backend.
+
+    Used by the standby's epoch-transition checkpoint to ensure no live RO
+    snapshot references WAL frame indices about to be recycled by
+    [Wal.reset] (#263). *)
+val wait_for_readers_past : t -> target:int -> unit Lwt.t

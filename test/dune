@@ -444,6 +444,8 @@
   sqlocaml.storage
   alcotest
   lwt.unix
+  qcheck-core
+  qcheck-alcotest
   unix))
 
 ; Cross-engine benchmark vs C SQLite — needs the `sqlite3` opam library.
