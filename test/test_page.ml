@@ -1034,7 +1034,7 @@ let ref_leaf_insert buf n key sv right_page tag =
   in
   P.write_common nb P.{ kind = Leaf; flags = 0; n_keys = cnt; right_page; crc32 = 0l };
   P.write_tag nb tag;
-  P.seal nb;
+  (* No seal: leaf_blit_insert defers CRC to WAL-flush (#356). *)
   nb
 ;;
 

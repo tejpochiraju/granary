@@ -160,8 +160,7 @@ let write_overflow_chain pager (value : bytes) : (int64 * int, error) result Lwt
           ~payload:value
           ~payload_off:offset
           ~payload_len;
-        Page.seal buf;
-        (* #231: per-overflow-page buffer is freshly built, never reused. *)
+        (* CRC seal deferred to flush-time (#356). *)
         Pager.write_owned pager pid buf;
         write_chain (idx + 1) rest (offset + payload_len)
     in
@@ -361,9 +360,9 @@ let build_and_write_leaf pager ~page_id ~entries ~right_page : (unit, error) res
   Page.write_common buf common;
   (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
   Page.write_tag buf (Pager.write_tag pager);
-  Page.seal buf;
-  (* #231: [buf] is freshly built here and never touched again — hand it to the
-     pager without the defensive copy that [Pager.write] would make. *)
+  (* CRC seal is deferred to WAL/flush-time (#356).  The pager's dirty table
+     replaces this buffer on the next insert of the same page (txn_owned_pool
+     recycles page ids), so sealing here is almost always wasted work. *)
   Pager.write_owned pager page_id buf;
   return_ok ()
 ;;
@@ -399,8 +398,7 @@ let build_and_write_branch pager ~page_id ~entries ~right_page
   Page.write_common buf common;
   (* #174: stamp this tree's schema fingerprint into the reserved header bytes. *)
   Page.write_tag buf (Pager.write_tag pager);
-  Page.seal buf;
-  (* #231: freshly-built buffer, never reused — transfer ownership, no copy. *)
+  (* CRC seal deferred to flush-time (#356). *)
   Pager.write_owned pager page_id buf;
   return_ok ()
 ;;

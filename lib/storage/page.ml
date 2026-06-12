@@ -475,8 +475,8 @@ let leaf_find_position buf ~n_keys ~key : leaf_position =
 
 (* Build a new leaf page with [key, stored_value] inserted at [pos.insert_off].
    Entries before the insertion point are blitted from [buf]; entries after are
-   blitted after the new entry.  Updates n_keys, tag, and CRC.  Caller ensures
-   [pos.key_found = false] and that the new entry fits without a split. *)
+   blitted after the new entry.  Updates n_keys and tag.  CRC seal is deferred
+   to flush-time (#356) — the pager seals all dirty pages at WAL-commit. *)
 let leaf_blit_insert buf ~pos ~key ~stored_value ~right_page ~write_tag:tag ~n_keys =
   let page_size = Cstruct.length buf in
   let new_buf = Cstruct.create page_size in
@@ -491,7 +491,6 @@ let leaf_blit_insert buf ~pos ~key ~stored_value ~right_page ~write_tag:tag ~n_k
   let common = { kind = Leaf; flags = 0; n_keys = n_keys + 1; right_page; crc32 = 0l } in
   write_common new_buf common;
   write_tag new_buf tag;
-  seal new_buf;
   new_buf
 ;;
 

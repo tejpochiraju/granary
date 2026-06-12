@@ -431,6 +431,14 @@ let free t ~page_id ~freed_at_txn_id =
     <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
 ;;
 
+(* Seal all dirty pages' CRCs just before flushing to disk (#356).
+   B+-tree build helpers skip Page.seal per-page to avoid sealing pages
+   that will be immediately overwritten by the next insert (the
+   txn_owned_pool recycles page ids, so at commit only ~O(tree_size) pages
+   survive, not O(n_inserts) × pages_per_insert).  Sealing at flush time
+   amortises the cost across the entire batch. *)
+let seal_dirty t = Hashtbl.iter (fun _ buf -> Page.seal buf) t.dirty
+
 (* Internal: drive the WAL append callback [append] with the dirty
    entries; on success clear the dirty set.  Used by both [flush] (sync)
    and [flush_no_sync] (group commit) so the dirty-set management is
@@ -440,13 +448,14 @@ let flush_via_wal t ~append =
   let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
   if entries = []
   then Lwt.return_ok ()
-  else
+  else (
+    seal_dirty t;
     let* r = append entries in
     match r with
     | Error msg -> Lwt.return_error (Block_error msg)
     | Ok () ->
       Hashtbl.clear t.dirty;
-      Lwt.return_ok ()
+      Lwt.return_ok ())
 ;;
 
 let flush_no_sync t =
@@ -456,6 +465,7 @@ let flush_no_sync t =
     (* Non-WAL backends have no notion of deferred sync — fall through to
        the regular [flush] which writes pages + syncs. *)
     let entries = Hashtbl.fold (fun pid buf acc -> (pid, buf) :: acc) t.dirty [] in
+    seal_dirty t;
     let open Lwt.Syntax in
     let rec write_all = function
       | [] ->
