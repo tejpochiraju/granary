@@ -121,7 +121,9 @@ let start_following t stream =
                       | Ok (epoch, idx) ->
                         t.last_epoch <- epoch;
                         t.last_frame_idx <- idx;
-                        Store.set_follower_ack_position t.store;
+                        Store.set_follower_ack_position
+                          t.store
+                          ~frames:(Wal.committed_frames t.wal);
                         Lwt.return `Continue))
                in
                (match outcome with
@@ -183,7 +185,9 @@ let rebase t segments =
              | Ok (epoch, idx) ->
                t.last_epoch <- epoch;
                t.last_frame_idx <- idx;
-               Store.set_follower_ack_position t.store;
+               Store.set_follower_ack_position
+                 t.store
+                 ~frames:(Wal.committed_frames t.wal);
                loop ())
         in
         loop ())

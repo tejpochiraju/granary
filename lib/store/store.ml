@@ -3193,22 +3193,17 @@ let is_follower (t : t) =
   | Btree st -> st.follower
 ;;
 
-(** Record the current [Wal.committed_frames] as the follower's last-applied
+(** Record a local [Wal.committed_frames] count as the follower's last-applied
     commit boundary.  [ro_begin] will cap RO snapshots to this position so
     readers never observe WAL frames past what has been applied on this node
-    (#263).  The value is captured from the store's own WAL so it lives in
-    local committed-frame count space — no coordinate mismatch vs. master
-    epoch indices.  No-op on the in-memory backend. *)
-let set_follower_ack_position (t : t) =
+    (#263).  The caller should supply the count from the WAL handle it applied
+    into, so the value lives in local committed-frame count space (no coordinate
+    mismatch vs. master epoch indices) without depending on WAL instance identity
+    between the caller and the store.  No-op on the in-memory backend. *)
+let set_follower_ack_position (t : t) ~(frames : int) =
   match t.backend with
   | Mem _ -> ()
-  | Btree st ->
-    let n =
-      match st.wal with
-      | None -> 0
-      | Some w -> Wal.committed_frames w
-    in
-    st.follower_ack_position <- Some n
+  | Btree st -> st.follower_ack_position <- Some frames
 ;;
 
 (** Get the recorded follower ack position (a local [Wal.committed_frames]

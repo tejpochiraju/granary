@@ -270,6 +270,48 @@ let test_follower_allows_rw_begin_after_clear () =
      Lwt.return_unit)
 ;;
 
+let test_follower_ro_ack_position () =
+  Lwt_main.run
+    (let* store, _, _ = store_with_wal () in
+     (* Initial state: no ack recorded *)
+     Alcotest.(check bool)
+       "no ack initially"
+       true
+       (Store.follower_ack_position store = None);
+     (* Write data to create WAL frames *)
+     let* rw = Store.rw_begin store in
+     let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
+     let* () = Store.commit rw in
+     let frames =
+       match Store.replication_state store with
+       | Some (_, n) -> n
+       | None -> Alcotest.fail "store should be in WAL mode"
+     in
+     Alcotest.(check bool) "committed_frames > 0" true (frames > 0);
+     (* Set follower mode and record ack at current frame count *)
+     Store.set_follower store true;
+     Store.set_follower_ack_position store ~frames;
+     Alcotest.(check bool)
+       "ack stored"
+       true
+       (Store.follower_ack_position store = Some frames);
+     (* RO read with follower + ack: succeeds and returns committed data *)
+     let* ro = Store.ro_begin store in
+     let* v1 = Store.get ro 16 (Bytes.of_string "k1") in
+     let* () = Store.ro_end ro in
+     Alcotest.(check bool)
+       "k1 readable on follower"
+       true
+       (v1 = Some (Bytes.of_string "v1"));
+     (* set_follower false must clear the ack position *)
+     Store.set_follower store false;
+     Alcotest.(check bool)
+       "ack cleared on set_follower false"
+       true
+       (Store.follower_ack_position store = None);
+     Lwt.return_unit)
+;;
+
 (* ------------------------------------------------------------------ *)
 (* epoch-aware apply tests                                             *)
 (* ------------------------------------------------------------------ *)
@@ -981,6 +1023,10 @@ let () =
             "allows rw_begin after clear"
             `Quick
             test_follower_allows_rw_begin_after_clear
+        ; Alcotest.test_case
+            "ro_begin with ack position"
+            `Quick
+            test_follower_ro_ack_position
         ] )
     ; ( "epoch_aware_apply"
       , [ Alcotest.test_case "same epoch" `Quick test_epoch_aware_same_epoch
