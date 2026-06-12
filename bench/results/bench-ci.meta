@@ -1,8 +1,8 @@
 host=bench-ci
-date=2026-06-12T03:41:02Z
+date=2026-06-12T07:43:05Z
 nproc=12
 sqlite_version=3.45.1
-sqlocaml_sha=6d5179c
+sqlocaml_sha=e883737
 rows=100000
 ops=20000
 scans=50
