@@ -176,6 +176,42 @@ let quote_ident s =
   else s
 ;;
 
+let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
+  Buffer.add_string buf " PRIMARY KEY";
+  (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
+     the non-alias shape (hidden rowid + __pk index). *)
+  if col.Row.pk_desc then Buffer.add_string buf " DESC";
+  if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT"
+;;
+
+let format_column ~autoinc_idx i (col : Row.column) =
+  let buf = Buffer.create 64 in
+  Buffer.add_string buf (quote_ident col.Row.name);
+  Buffer.add_char buf ' ';
+  Buffer.add_string buf (sql_of_row_type col.Row.ty);
+  if col.Row.not_null then Buffer.add_string buf " NOT NULL";
+  if col.Row.primary_key then format_pk_suffix ~autoinc_idx i col buf;
+  (match col.Row.default with
+   | None -> ()
+   | Some dv ->
+     Buffer.add_string buf " DEFAULT ";
+     Buffer.add_string buf (sql_of_default_value dv));
+  (match col.Row.check_sql with
+   | None -> ()
+   | Some sql ->
+     Buffer.add_string buf " CHECK(";
+     Buffer.add_string buf sql;
+     Buffer.add_char buf ')');
+  (match col.Row.generated_as with
+   | None -> ()
+   | Some (expr_sql, is_stored) ->
+     Buffer.add_string buf " GENERATED ALWAYS AS (";
+     Buffer.add_string buf expr_sql;
+     Buffer.add_string buf ") ";
+     Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
+  Buffer.contents buf
+;;
+
 let ddl_of_table (meta : Cat.table_meta) =
   let without_rowid, autoincrement =
     match meta.Cat.storage with
@@ -187,42 +223,7 @@ let ddl_of_table (meta : Cat.table_meta) =
     then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
     else None
   in
-  let col_parts =
-    List.mapi
-      (fun i (col : Row.column) ->
-         let buf = Buffer.create 64 in
-         Buffer.add_string buf (quote_ident col.Row.name);
-         Buffer.add_char buf ' ';
-         Buffer.add_string buf (sql_of_row_type col.Row.ty);
-         if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-         if col.Row.primary_key
-         then (
-           Buffer.add_string buf " PRIMARY KEY";
-           (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
-              the non-alias shape (hidden rowid + __pk index). *)
-           if col.Row.pk_desc then Buffer.add_string buf " DESC";
-           if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT");
-         (match col.Row.default with
-          | None -> ()
-          | Some dv ->
-            Buffer.add_string buf " DEFAULT ";
-            Buffer.add_string buf (sql_of_default_value dv));
-         (match col.Row.check_sql with
-          | None -> ()
-          | Some sql ->
-            Buffer.add_string buf " CHECK(";
-            Buffer.add_string buf sql;
-            Buffer.add_char buf ')');
-         (match col.Row.generated_as with
-          | None -> ()
-          | Some (expr_sql, is_stored) ->
-            Buffer.add_string buf " GENERATED ALWAYS AS (";
-            Buffer.add_string buf expr_sql;
-            Buffer.add_string buf ") ";
-            Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
-         Buffer.contents buf)
-      meta.Cat.columns
-  in
+  let col_parts = List.mapi (format_column ~autoinc_idx) meta.Cat.columns in
   let fk_parts =
     List.map
       (fun (fk : Cat.fk_constraint) ->
