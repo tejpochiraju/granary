@@ -24,6 +24,30 @@ let query db sql =
   Lwt_stream.to_list stream
 ;;
 
+let expect_error db sql =
+  let* result = Db.execute db sql in
+  (match result with
+   | Error _ -> ()
+   | Ok () -> failwith ("expected error from: " ^ sql));
+  Lwt.return_unit
+;;
+
+exception Not_an_error
+
+let expect_query_error db sql =
+  Lwt.catch
+    (fun () ->
+       let* result = Db.query db sql in
+       match result with
+       | Error _ -> Lwt.return_unit
+       | Ok stream ->
+         let* _ = Lwt_stream.to_list stream in
+         Lwt.fail Not_an_error)
+    (function
+      | Not_an_error -> failwith ("expected error from: " ^ sql)
+      | _ -> Lwt.return_unit)
+;;
+
 let test_create_columnstore () =
   let db = make_db () in
   let* () = exec db "CREATE TABLE t (region TEXT, amount REAL) USING COLUMNSTORE" in
@@ -131,6 +155,46 @@ let test_group_by () =
   Lwt.return_unit
 ;;
 
+let test_insert_returning_rejected () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE t (x REAL) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO t VALUES (1.0)" in
+  let* () = expect_query_error db "INSERT INTO t VALUES (2.0) RETURNING x" in
+  Lwt.return_unit
+;;
+
+let test_update_returning_rejected () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE t (x REAL) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO t VALUES (1.0)" in
+  let* () = expect_query_error db "UPDATE t SET x = 2.0 RETURNING x" in
+  Lwt.return_unit
+;;
+
+let test_delete_returning_rejected () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE t (x REAL) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO t VALUES (1.0)" in
+  let* () = expect_query_error db "DELETE FROM t RETURNING x" in
+  Lwt.return_unit
+;;
+
+let test_alter_table_rejected () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE t (x REAL) USING COLUMNSTORE" in
+  let* () = expect_error db "ALTER TABLE t ADD COLUMN y TEXT" in
+  Lwt.return_unit
+;;
+
+let test_fk_on_columnar_parent_rejected () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE col_t (id INTEGER PRIMARY KEY) USING COLUMNSTORE" in
+  let* () =
+    expect_error db "CREATE TABLE child (id INT, col_id INT REFERENCES col_t(id))"
+  in
+  Lwt.return_unit
+;;
+
 let () =
   let tests =
     [ "create_columnstore", test_create_columnstore
@@ -141,6 +205,11 @@ let () =
     ; "count", test_count
     ; "min_max", test_min_max
     ; "group_by", test_group_by
+    ; "insert_returning_rejected", test_insert_returning_rejected
+    ; "update_returning_rejected", test_update_returning_rejected
+    ; "delete_returning_rejected", test_delete_returning_rejected
+    ; "alter_table_rejected", test_alter_table_rejected
+    ; "fk_on_columnar_parent_rejected", test_fk_on_columnar_parent_rejected
     ]
   in
   List.iter
