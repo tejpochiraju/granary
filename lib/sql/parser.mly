@@ -70,7 +70,7 @@
 %token LENGTH LOWER UPPER ABS COALESCE IFNULL
 %token SUBSTR TRIM LTRIM RTRIM REPLACE INSTR ROUND TYPEOF
 %token DATE DATETIME JULIANDAY STRFTIME TIME UNIXEPOCH
-%token VIRTUAL USING FTS5
+%token VIRTUAL USING COLUMNSTORE FTS5
 %token MATCH
 %token ALTER ADD RENAME TO COLUMN
 %token PRAGMA
@@ -199,6 +199,7 @@ any_ident:
   | UNIQUE        { "unique" }
   | UPDATE        { "update" }
   | USING         { "using" }
+  | COLUMNSTORE   { "columnstore" }
   | VALUES        { "values" }
   | VIEW          { "view" }
   | VIRTUAL       { "virtual" }
@@ -550,15 +551,19 @@ without_rowid_opt:
   | WITHOUT ROWID { true }
   |               { false }
 
+using_columnstore_opt:
+  | USING COLUMNSTORE { true }
+  |                   { false }
+
 create_table:
-  | CREATE TABLE name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt
+  | CREATE TABLE name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt cs = using_columnstore_opt
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
-      S_create_table { name; columns = cols; constraints = cons; if_not_exists = false; without_rowid = wr } }
-  | CREATE TABLE IF NOT EXISTS name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = false; without_rowid = wr; using_columnstore = cs } }
+  | CREATE TABLE IF NOT EXISTS name = any_ident LPAREN items = separated_nonempty_list(COMMA, table_item) RPAREN wr = without_rowid_opt cs = using_columnstore_opt
     { let cols = List.filter_map (function TI_col c -> Some c | _ -> None) items in
       let cons = List.filter_map (function TI_constraint c -> Some c | _ -> None) items in
-      S_create_table { name; columns = cols; constraints = cons; if_not_exists = true; without_rowid = wr } }
+      S_create_table { name; columns = cols; constraints = cons; if_not_exists = true; without_rowid = wr; using_columnstore = cs } }
 
 create_fts_table:
   | CREATE VIRTUAL TABLE name = any_ident USING FTS5

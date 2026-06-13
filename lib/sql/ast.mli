@@ -293,6 +293,7 @@ and stmt =
         (** [WITHOUT ROWID] table option (phase 37 / #122).  Requires a
             single-column INTEGER PRIMARY KEY; the PK column's value is
             used directly as the row's storage key — no auto-rowid. *)
+      ; using_columnstore : bool
       }
   | S_insert of
       { table : string

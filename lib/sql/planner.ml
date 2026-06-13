@@ -852,6 +852,8 @@ let plan_pragma cat kind =
 ;;
 
 let rec plan ?cat = function
+  | Sema.BS_col_create_table { name; columns; if_not_exists } ->
+    Plan.Op_col_create_table { name; columns; if_not_exists }
   | Sema.BS_create_table
       { name
       ; columns
