@@ -1279,7 +1279,16 @@ let extract_fk_constraints cat ~columns ~constraints =
                         @ [ [ cd.Ast.name ], parent_table, [ pk_col.name ], od, ou, def ]
                        )))
             | Some (parent_table, parent_col, od, ou, def) ->
-              Ok (fks @ [ [ cd.Ast.name ], parent_table, [ parent_col ], od, ou, def ])))
+              (match Cat.find_table_cached cat ~name:parent_table with
+               | Some parent_meta when Cat.is_columnar parent_meta ->
+                 Error
+                   (Unsupported
+                      (Printf.sprintf
+                         "FOREIGN KEY on '%s': cannot reference columnar table '%s'"
+                         cd.Ast.name
+                         parent_table))
+               | _ ->
+                 Ok (fks @ [ [ cd.Ast.name ], parent_table, [ parent_col ], od, ou, def ]))))
       (Ok [])
       columns
   in
@@ -1301,15 +1310,23 @@ let extract_fk_constraints cat ~columns ~constraints =
                   ; on_update
                   ; deferrable
                   } ->
-                Ok
-                  (fks
-                   @ [ ( local_cols
-                       , parent_table
-                       , parent_cols
-                       , on_delete
-                       , on_update
-                       , deferrable )
-                     ])
+                (match Cat.find_table_cached cat ~name:parent_table with
+                 | Some parent_meta when Cat.is_columnar parent_meta ->
+                   Error
+                     (Unsupported
+                        (Printf.sprintf
+                           "FOREIGN KEY constraint: cannot reference columnar table '%s'"
+                           parent_table))
+                 | _ ->
+                   Ok
+                     (fks
+                      @ [ ( local_cols
+                          , parent_table
+                          , parent_cols
+                          , on_delete
+                          , on_update
+                          , deferrable )
+                        ]))
               | _ -> Ok fks))
         (Ok [])
         constraints
@@ -3419,28 +3436,32 @@ let bind_alter_table cat ~table ~action =
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some table_meta ->
-    (match action with
-     | Ast.AA_add_column col_def -> bind_add_column cat ~table_meta ~action col_def
-     | Ast.AA_rename_table new_name ->
-       (match reject_reserved_name new_name with
-        | Error e -> Lwt.return (Error e)
-        | Ok () -> Lwt.return (Ok (BS_alter_table { table_meta; action })))
-     | Ast.AA_rename_column (old_col, _new_col) ->
-       let exists =
-         List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns
-       in
-       if not exists
-       then Lwt.return (Error (Unknown_column { table; column = old_col }))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action }))
-     | Ast.AA_drop_column col_name ->
-       let exists =
-         List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns
-       in
-       if not exists
-       then Lwt.return (Error (Unknown_column { table; column = col_name }))
-       else if List.length table_meta.Cat.columns <= 1
-       then Lwt.return (Error (Unsupported "cannot drop the only column of a table"))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action })))
+    if Cat.is_columnar table_meta
+    then
+      Lwt.return (Error (Unsupported "ALTER TABLE is not supported on columnar tables"))
+    else (
+      match action with
+      | Ast.AA_add_column col_def -> bind_add_column cat ~table_meta ~action col_def
+      | Ast.AA_rename_table new_name ->
+        (match reject_reserved_name new_name with
+         | Error e -> Lwt.return (Error e)
+         | Ok () -> Lwt.return (Ok (BS_alter_table { table_meta; action })))
+      | Ast.AA_rename_column (old_col, _new_col) ->
+        let exists =
+          List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns
+        in
+        if not exists
+        then Lwt.return (Error (Unknown_column { table; column = old_col }))
+        else Lwt.return (Ok (BS_alter_table { table_meta; action }))
+      | Ast.AA_drop_column col_name ->
+        let exists =
+          List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns
+        in
+        if not exists
+        then Lwt.return (Error (Unknown_column { table; column = col_name }))
+        else if List.length table_meta.Cat.columns <= 1
+        then Lwt.return (Error (Unsupported "cannot drop the only column of a table"))
+        else Lwt.return (Ok (BS_alter_table { table_meta; action })))
 ;;
 
 (* ------------------------------------------------------------------ *)

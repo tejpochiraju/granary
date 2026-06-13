@@ -9869,6 +9869,9 @@ and to_stream
       on_conflict
       returning
       upsert_update
+  | Plan.Op_update { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_update
       { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
@@ -9886,6 +9889,9 @@ and to_stream
       offset
       indexes
       returning
+  | Plan.Op_delete { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     stream_delete_returning
