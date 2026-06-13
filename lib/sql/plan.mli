@@ -91,6 +91,13 @@ type op =
       ; without_rowid : bool
       ; autoincrement : bool (** #299: INTEGER PRIMARY KEY AUTOINCREMENT. *)
       }
+  | Op_col_create_table of
+      { name : string
+      ; columns : Sqlocaml_encoding.Row.column list
+      ; if_not_exists : bool
+      }
+  (** DDL: [CREATE TABLE name (...) USING COLUMNSTORE].
+          Registers the table in the catalog with [Columnar] storage. *)
   | Op_insert of
       { table_meta : Cat.table_meta
       ; ordinals : int list
@@ -156,6 +163,8 @@ type op =
         (** #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — a
             single table-tree seek by the integer key, no index. *)
       }
+  | Op_col_seq_scan of { table_meta : Cat.table_meta }
+  (** Scan a columnar table; emits one [Row.t] per stored row. *)
   | Op_update of
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)

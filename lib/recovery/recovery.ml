@@ -240,7 +240,7 @@ let recover ~read_page ~n_pages ~open_source ~write_to =
       match remaining_tables with
       | [] -> Lwt.return (acc_rev, tables_recovered)
       | table_meta :: rest ->
-        let tree_id = table_meta.Catalog.tree_id in
+        let tree_id, _, _, _ = Catalog.row_storage table_meta in
         let* table_rows = extract_one_table store tree_id in
         let n_rows = List.length table_rows in
         let recovered = if n_rows > 0 then tables_recovered + 1 else tables_recovered in

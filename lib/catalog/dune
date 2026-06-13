@@ -1,7 +1,7 @@
 (library
  (name sqlocaml_catalog)
  (public_name sqlocaml.catalog)
- (libraries lwt sqlocaml.encoding sqlocaml.store)
+ (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.columnar)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

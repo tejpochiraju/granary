@@ -458,7 +458,8 @@ let plan_seqscan_tree_id () =
   match Planner.plan bound with
   | Plan.Op_project { child = Plan.Op_seq_scan { table_meta }; _ } ->
     (* First user table gets tree_id = 16 per catalog comment *)
-    Alcotest.(check int) "tree_id" 16 (table_meta.tree_id :> int)
+    let tid, _, _, _ = Cat.row_storage table_meta in
+    Alcotest.(check int) "tree_id" 16 tid
   | _ -> Alcotest.fail "expected Op_project { child=Op_seq_scan _ }"
 ;;
 

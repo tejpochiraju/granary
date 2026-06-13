@@ -125,14 +125,13 @@ let recognise_eq_col_col = function
    -1 = CTE, -2 = sqlite_master, -3 = sqlite_sequence.  Each is materialized by a
    dedicated plan op rather than a [Op_seq_scan] over a stored tree. *)
 let make_scan (meta : Cat.table_meta) : Plan.op =
-  if meta.Cat.tree_id = -1
-  then
+  match meta.Cat.storage with
+  | Cat.Columnar _ -> Plan.Op_col_seq_scan { table_meta = meta }
+  | Cat.Row { tree_id = -1; _ } ->
     Plan.Op_cte_scan { cte_name = meta.Cat.name; n_cols = List.length meta.Cat.columns }
-  else if meta.Cat.tree_id = -2
-  then Plan.Op_sqlite_master
-  else if meta.Cat.tree_id = -3
-  then Plan.Op_sqlite_sequence
-  else Plan.Op_seq_scan { table_meta = meta }
+  | Cat.Row { tree_id = -2; _ } -> Plan.Op_sqlite_master
+  | Cat.Row { tree_id = -3; _ } -> Plan.Op_sqlite_sequence
+  | Cat.Row _ -> Plan.Op_seq_scan { table_meta = meta }
 ;;
 
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
@@ -274,8 +273,9 @@ let plan_base cat ~table_meta ~where ~has_joins =
          (match find_index_on_col cat table_meta col_idx with
           | Some idx ->
             let col_type = (List.nth table_meta.columns col_idx).Row.ty in
+            let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
             Plan.Op_index_lookup
-              { table_tree = table_meta.tree_id
+              { table_tree = tree_id_pl
               ; idx_tree = idx.idx_tree_id
               ; col_idx
               ; col_type
@@ -616,10 +616,11 @@ let plan_create_index
       ~unique
       ~if_not_exists
   =
+  let tree_id_ci, _, _, _ = Cat.row_storage table_meta in
   Plan.Op_create_index
     { name
     ; table = table_meta.Cat.name
-    ; tree_id = table_meta.Cat.tree_id
+    ; tree_id = tree_id_ci
     ; col_sqls
     ; col_expr_flags
     ; where_expr = Option.map plan_expr where_expr

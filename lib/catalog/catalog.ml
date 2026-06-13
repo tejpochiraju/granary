@@ -78,21 +78,20 @@ type pending_fk_check =
   ; pfk_recheck : pending_fk_recheck
   }
 
+type storage =
+  | Row of
+      { tree_id : S.tree_id
+      ; next_rowid : int64
+      ; without_rowid : bool
+      ; autoincrement : bool
+      }
+  | Columnar of Sqlocaml_columnar.Col_store.t
+
 type table_meta =
   { name : string
-  ; tree_id : S.tree_id
+  ; storage : storage
   ; columns : Row.column list
-  ; next_rowid : int64
-    (** Next rowid to auto-allocate, maintained as [max existing rowid + 1].
-        The sentinel [empty_next_rowid] marks a table that has never had a
-        rowid seeded (conceptually [max = -inf]) so the FIRST row seeds the
-        counter from its actual value — see #250. *)
   ; fk_constraints : fk_constraint list
-  ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
-  ; autoincrement : bool
-    (** #299: [INTEGER PRIMARY KEY AUTOINCREMENT].  Sticky rowid high-water —
-        ROLLBACK reverts to the committed counter rather than recomputing
-        [max(rowid)+1] from data, so committed DELETEs never get reused. *)
   }
 
 (** #250: sentinel [next_rowid] for an alias table with no rowid seeded yet.  A
@@ -103,6 +102,19 @@ type table_meta =
     [max(rowid)+1 >= Int64.min_int + 1], so it can never collide with this
     sentinel (allocation guards the [max_int] overflow that would wrap to it). *)
 let empty_next_rowid = Int64.min_int
+
+let row_storage (m : table_meta) =
+  match m.storage with
+  | Row { tree_id; next_rowid; without_rowid; autoincrement } ->
+    tree_id, next_rowid, without_rowid, autoincrement
+  | Columnar _ -> failwith (Printf.sprintf "table '%s' is a columnar table" m.name)
+;;
+
+let is_columnar m =
+  match m.storage with
+  | Columnar _ -> true
+  | Row _ -> false
+;;
 
 type idx_origin =
   [ `Implicit_pk
@@ -399,7 +411,10 @@ end = struct
      is corrected to this snapshot value. *)
   let snapshot_rowids t =
     Hashtbl.fold
-      (fun name (m : table_meta) acc -> (name, m.next_rowid) :: acc)
+      (fun name (m : table_meta) acc ->
+         match m.storage with
+         | Row { next_rowid; _ } -> (name, next_rowid) :: acc
+         | Columnar _ -> acc)
       t.tables
       []
   ;;
@@ -420,8 +435,9 @@ end = struct
     List.iter
       (fun (name, next_rowid) ->
          match Hashtbl.find_opt t.tables name with
-         | Some m -> Hashtbl.replace t.tables name { m with next_rowid }
-         | None -> ())
+         | Some ({ storage = Row r; _ } as m) ->
+           Hashtbl.replace t.tables name { m with storage = Row { r with next_rowid } }
+         | _ -> ())
       rowids
   ;;
 
@@ -525,7 +541,9 @@ let compute_rowid_alias_col (columns : Row.column list) ~without_rowid : int opt
 
 (* Convenience: the rowid-alias column of a loaded table, if any. *)
 let rowid_alias_col (m : table_meta) : int option =
-  compute_rowid_alias_col m.columns ~without_rowid:m.without_rowid
+  match m.storage with
+  | Columnar _ -> None
+  | Row { without_rowid; _ } -> compute_rowid_alias_col m.columns ~without_rowid
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -534,18 +552,26 @@ let rowid_alias_col (m : table_meta) : int option =
 
 let encode_table_value m =
   let buf = Buffer.create 16 in
-  Varint.encode_uint64 buf (Int64.of_int m.tree_id);
-  Varint.encode_int64 buf m.next_rowid;
-  (* Trailing without_rowid flag (phase 37).  Old encodings have no trailing
-     bytes; the decoder treats their absence as [false]. *)
-  Varint.encode_uint64 buf (if m.without_rowid then 1L else 0L);
-  (* #299: trailing autoincrement flag.  Older encodings lack it; the decoder
-     treats its absence as [false]. *)
-  Varint.encode_uint64 buf (if m.autoincrement then 1L else 0L);
+  (match m.storage with
+   | Row { tree_id; next_rowid; without_rowid; autoincrement } ->
+     Varint.encode_uint64 buf (Int64.of_int tree_id);
+     Varint.encode_int64 buf next_rowid;
+     Varint.encode_uint64 buf (if without_rowid then 1L else 0L);
+     Varint.encode_uint64 buf (if autoincrement then 1L else 0L);
+     Varint.encode_uint64 buf 0L (* storage_kind = Row *)
+   | Columnar _ ->
+     Varint.encode_uint64 buf 0L;
+     (* dummy tree_id *)
+     Varint.encode_int64 buf empty_next_rowid;
+     Varint.encode_uint64 buf 0L;
+     (* without_rowid = false *)
+     Varint.encode_uint64 buf 0L;
+     (* autoincrement = false *)
+     Varint.encode_uint64 buf 1L (* storage_kind = Columnar *));
   Buffer.to_bytes buf
 ;;
 
-let decode_table_value bytes =
+let decode_table_storage bytes columns =
   let tid, off = Varint.decode_uint64 bytes 0 in
   let next, off' = Varint.decode_int64 bytes off in
   let without_rowid, off'' =
@@ -555,14 +581,24 @@ let decode_table_value bytes =
       let v, o = Varint.decode_uint64 bytes off' in
       Int64.to_int v <> 0, o)
   in
-  let autoincrement =
+  let autoincrement, off''' =
     if off'' >= Bytes.length bytes
-    then false
+    then false, off''
     else (
-      let v, _ = Varint.decode_uint64 bytes off'' in
-      Int64.to_int v <> 0)
+      let v, o = Varint.decode_uint64 bytes off'' in
+      Int64.to_int v <> 0, o)
   in
-  Int64.to_int tid, next, without_rowid, autoincrement
+  let storage_kind =
+    if off''' >= Bytes.length bytes
+    then 0
+    else (
+      let v, _ = Varint.decode_uint64 bytes off''' in
+      Int64.to_int v)
+  in
+  match storage_kind with
+  | 1 -> Columnar (Sqlocaml_columnar.Col_store.create columns)
+  | _ ->
+    Row { tree_id = Int64.to_int tid; next_rowid = next; without_rowid; autoincrement }
 ;;
 
 (* Column key: table_name ++ NUL ++ ordinal_be8 *)
@@ -1057,19 +1093,12 @@ let load_all_tables store =
         Lwt.catch
           (fun () ->
              let name = Bytes.to_string k in
-             let tid, next_rowid, without_rowid, autoincrement = decode_table_value v in
              let%lwt cols = load_columns tx name in
+             let storage = decode_table_storage v cols in
              Hashtbl.replace
                tbl
                name
-               { name
-               ; tree_id = tid
-               ; columns = cols
-               ; next_rowid
-               ; fk_constraints = []
-               ; without_rowid
-               ; autoincrement
-               };
+               { name; storage; columns = cols; fk_constraints = [] };
              Lwt.return_unit)
           (fun _exn ->
              (* Corrupt primary catalog row/columns (#174): skip it here; the
@@ -1303,15 +1332,23 @@ let decode_fks bytes =
    without_rowid).  Computed from the in-memory cache, so it always reflects
    the current schema after any DDL. *)
 let fingerprint_of_meta (m : table_meta) =
-  Schema_fingerprint.compute ~columns:m.columns ~without_rowid:m.without_rowid
+  let without_rowid =
+    match m.storage with
+    | Row r -> r.without_rowid
+    | Columnar _ -> false
+  in
+  Schema_fingerprint.compute ~columns:m.columns ~without_rowid
 ;;
 
 (* #174: register the table's page-header stamp (low 32 bits of its
    fingerprint) with the store, so its B+-tree pages self-identify their
    schema.  Skips the ephemeral CTE sentinel (tree_id = -1). *)
 let register_tag store (m : table_meta) =
-  if m.tree_id >= 0
-  then S.set_tree_tag store m.tree_id (Schema_fingerprint.low32 (fingerprint_of_meta m))
+  match m.storage with
+  | Columnar _ -> ()
+  | Row { tree_id; _ } when tree_id >= 0 ->
+    S.set_tree_tag store tree_id (Schema_fingerprint.low32 (fingerprint_of_meta m))
+  | Row _ -> ()
 ;;
 
 (* The mirror is keyed by tree_id (fixed 8-byte BE) and stores a fully
@@ -1335,12 +1372,18 @@ let mirror_key (tid : S.tree_id) =
 ;;
 
 let encode_mirror_entry (m : table_meta) =
+  let tree_id, without_rowid, autoincrement, next_rowid =
+    match m.storage with
+    | Row { tree_id; without_rowid; autoincrement; next_rowid } ->
+      tree_id, without_rowid, autoincrement, next_rowid
+    | Columnar _ -> -1, false, false, empty_next_rowid
+  in
   let buf = Buffer.create 128 in
   Varint.encode_uint64 buf (Int64.of_int mirror_version);
   Varint.encode_uint64 buf (Int64.of_int (String.length m.name));
   Buffer.add_string buf m.name;
-  Varint.encode_uint64 buf (Int64.of_int m.tree_id);
-  Buffer.add_uint8 buf (if m.without_rowid then 1 else 0);
+  Varint.encode_uint64 buf (Int64.of_int tree_id);
+  Buffer.add_uint8 buf (if without_rowid then 1 else 0);
   let fpb = Bytes.create 8 in
   Bytes.set_int64_be fpb 0 (fingerprint_of_meta m);
   Buffer.add_bytes buf fpb;
@@ -1355,15 +1398,15 @@ let encode_mirror_entry (m : table_meta) =
   Varint.encode_uint64 buf (Int64.of_int (Bytes.length fkb));
   Buffer.add_bytes buf fkb;
   (* #299 (mirror v2): trailing autoincrement byte. *)
-  Buffer.add_uint8 buf (if m.autoincrement then 1 else 0);
+  Buffer.add_uint8 buf (if autoincrement then 1 else 0);
   (* #314 (mirror v3): for an AUTOINCREMENT table, persist the volatile rowid
      high-water so mirror reconstruction restores it instead of recomputing
      max(rowid)+1.  Non-AUTOINCREMENT tables omit it (no per-insert mirror
      write).  Encoded as a presence byte + int64. *)
-  if m.autoincrement
+  if autoincrement
   then (
     Buffer.add_uint8 buf 1;
-    Varint.encode_int64 buf m.next_rowid)
+    Varint.encode_int64 buf next_rowid)
   else Buffer.add_uint8 buf 0;
   Buffer.to_bytes buf
 ;;
@@ -1417,19 +1460,20 @@ let decode_mirror_entry bytes : table_meta * int64 =
     else empty_next_rowid
   in
   ( { name
-    ; tree_id = Int64.to_int tid
+    ; storage =
+        Row { tree_id = Int64.to_int tid; next_rowid; without_rowid; autoincrement }
     ; columns
-    ; next_rowid
     ; fk_constraints
-    ; without_rowid
-    ; autoincrement
     }
   , fp )
 ;;
 
 (* Write/replace a table's mirror entry inside an already-open RW txn. *)
 let put_mirror_tx tx (m : table_meta) =
-  S.put tx sys_mirror_tid (mirror_key m.tree_id) (encode_mirror_entry m)
+  match m.storage with
+  | Columnar _ -> Lwt.return_unit
+  | Row { tree_id; _ } ->
+    S.put tx sys_mirror_tid (mirror_key tree_id) (encode_mirror_entry m)
 ;;
 
 (* Persist [m]'s rowid counter to the primary [_sys_tables] row, and — for
@@ -1440,11 +1484,17 @@ let put_mirror_tx tx (m : table_meta) =
    counter-mutation path. *)
 let put_table_counter_tx tx (m : table_meta) =
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string m.name) (encode_table_value m) in
-  if m.autoincrement then put_mirror_tx tx m else Lwt.return_unit
+  match m.storage with
+  | Row { autoincrement = true; _ } -> put_mirror_tx tx m
+  | _ -> Lwt.return_unit
 ;;
 
 (* Remove a table's mirror entry inside an already-open RW txn. *)
-let del_mirror_tx tx (tid : S.tree_id) = S.del tx sys_mirror_tid (mirror_key tid)
+let del_mirror_tx tx (m : table_meta) =
+  match m.storage with
+  | Columnar _ -> Lwt.return_unit
+  | Row { tree_id; _ } -> S.del tx sys_mirror_tid (mirror_key tree_id)
+;;
 
 (* Decode every mirror entry into a [table_meta]; skip corrupt entries. *)
 let load_mirror_entries store =
@@ -1478,9 +1528,15 @@ let load_mirror_entries store =
    below-counter id seeds from its own value, exactly as in-session).  WITHOUT
    ROWID tables are skipped — they don't use rowid keys. *)
 let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
-  if m.without_rowid
+  let without_rowid, autoincrement, next_rowid, tree_id =
+    match m.storage with
+    | Row { without_rowid; autoincrement; next_rowid; tree_id } ->
+      without_rowid, autoincrement, next_rowid, tree_id
+    | Columnar _ -> false, false, empty_next_rowid, -1
+  in
+  if without_rowid
   then Lwt.return m
-  else if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+  else if autoincrement && not (Int64.equal next_rowid empty_next_rowid)
   then
     (* #314: the mirror (v3) carries the sticky high-water for AUTOINCREMENT
        tables; trust it instead of recomputing max(rowid)+1, which would make a
@@ -1492,7 +1548,7 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
   else
     S.with_ro store
     @@ fun tx ->
-    let%lwt cur = S.cursor_open tx m.tree_id in
+    let%lwt cur = S.cursor_open tx tree_id in
     let _sr = S.cursor_first cur in
     let max_key = ref None in
     let rec walk () =
@@ -1509,7 +1565,10 @@ let recover_next_rowid store (m : table_meta) : table_meta Lwt.t =
       | None -> empty_next_rowid
       | Some k -> Int64.add (Rowid.decode k) 1L
     in
-    Lwt.return { m with next_rowid = recovered }
+    Lwt.return
+      { m with
+        storage = Row { tree_id; next_rowid = recovered; without_rowid; autoincrement }
+      }
 ;;
 
 (* #299: read a table's LAST-COMMITTED [next_rowid] straight from its
@@ -1528,7 +1587,12 @@ let read_committed_next_rowid store ~name : int64 Lwt.t =
   match v with
   | None -> Lwt.return empty_next_rowid
   | Some bytes ->
-    let _tid, next, _wr, _ai = decode_table_value bytes in
+    let storage = decode_table_storage bytes [] in
+    let next =
+      match storage with
+      | Row { next_rowid; _ } -> next_rowid
+      | Columnar _ -> empty_next_rowid
+    in
     Lwt.return next
 ;;
 
@@ -1603,10 +1667,24 @@ let open_ store =
      only over primary tables). *)
   let%lwt mirror = load_mirror_entries store in
   let present_tids =
-    Hashtbl.fold (fun _ (m : table_meta) acc -> m.tree_id :: acc) cache []
+    Hashtbl.fold
+      (fun _ (m : table_meta) acc ->
+         match m.storage with
+         | Row { tree_id; _ } -> tree_id :: acc
+         | Columnar _ -> acc)
+      cache
+      []
   in
   let reconstructed =
-    List.filter (fun (m : table_meta) -> not (List.mem m.tree_id present_tids)) mirror
+    List.filter
+      (fun (m : table_meta) ->
+         let tid =
+           match m.storage with
+           | Row { tree_id; _ } -> tree_id
+           | Columnar _ -> -1
+         in
+         not (List.mem tid present_tids))
+      mirror
   in
   List.iter (fun (m : table_meta) -> Hashtbl.replace cache m.name m) reconstructed;
   (* #175: for tables reconstructed from the mirror, recover next_rowid by
@@ -1628,7 +1706,17 @@ let open_ store =
     (fun (m : table_meta) ->
        match Hashtbl.find_opt cache m.name with
        | Some primary
-         when primary.tree_id = m.tree_id
+         when (let tid_p =
+                 match primary.storage with
+                 | Row { tree_id; _ } -> tree_id
+                 | Columnar _ -> -1
+               in
+               let tid_m =
+                 match m.storage with
+                 | Row { tree_id; _ } -> tree_id
+                 | Columnar _ -> -1
+               in
+               tid_p = tid_m)
               && not (Int64.equal (fingerprint_of_meta primary) (fingerprint_of_meta m))
          ->
          Printf.eprintf
@@ -1732,15 +1820,26 @@ let recompute_rowid_counters_after_rollback t =
     (fun name ->
        match Schema_cache.find_table t.sc name with
        | None -> Lwt.return_unit
-       | Some m when m.without_rowid -> Lwt.return_unit
-       | Some m when m.autoincrement ->
-         let%lwt committed = read_committed_next_rowid t.store ~name in
-         Schema_cache.set_rowid_durable t.sc ~name { m with next_rowid = committed };
-         Lwt.return_unit
+       | Some m when is_columnar m -> Lwt.return_unit
        | Some m ->
-         let%lwt recovered = recover_next_rowid t.store m in
-         Schema_cache.set_rowid_durable t.sc ~name recovered;
-         Lwt.return_unit)
+         let tree_id, _next_rowid, without_rowid, autoincrement = row_storage m in
+         if without_rowid
+         then Lwt.return_unit
+         else if autoincrement
+         then (
+           let%lwt committed = read_committed_next_rowid t.store ~name in
+           Schema_cache.set_rowid_durable
+             t.sc
+             ~name
+             { m with
+               storage =
+                 Row { tree_id; next_rowid = committed; without_rowid; autoincrement }
+             };
+           Lwt.return_unit)
+         else (
+           let%lwt recovered = recover_next_rowid t.store m in
+           Schema_cache.set_rowid_durable t.sc ~name recovered;
+           Lwt.return_unit))
     names
 ;;
 
@@ -1779,12 +1878,10 @@ let savepoint_release_schema t name = Schema_cache.savepoint_release t.sc name
 let put_table_rows tx ~name ~columns ~without_rowid ~autoincrement ~tid =
   let m =
     { name
-    ; tree_id = tid
+    ; storage =
+        Row { tree_id = tid; next_rowid = empty_next_rowid; without_rowid; autoincrement }
     ; columns
-    ; next_rowid = empty_next_rowid
     ; fk_constraints = []
-    ; without_rowid
-    ; autoincrement
     }
   in
   let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
@@ -1839,7 +1936,10 @@ let fingerprints_by_tree_id t =
   Schema_cache.fold_tables
     (fun _ (m : table_meta) acc ->
        (* Skip the ephemeral CTE sentinel (tree_id = -1): no real on-disk tree. *)
-       if m.tree_id >= 0 then (m.tree_id, fingerprint_of_meta m) :: acc else acc)
+       match m.storage with
+       | Columnar _ -> acc
+       | Row { tree_id; _ } when tree_id >= 0 -> (tree_id, fingerprint_of_meta m) :: acc
+       | Row _ -> acc)
     t.sc
     []
 ;;
@@ -1857,7 +1957,12 @@ let mirror_fingerprints t =
     | Some (_k, v) ->
       (try
          let m, fp = decode_mirror_entry v in
-         acc := (m.tree_id, fp) :: !acc
+         let tid =
+           match m.storage with
+           | Row { tree_id; _ } -> tree_id
+           | Columnar _ -> -1
+         in
+         acc := (tid, fp) :: !acc
        with
        | Invalid_argument _ | Failure _ -> ());
       walk ()
@@ -1916,8 +2021,8 @@ let list_tables t =
    rather than wrap to [Int64.min_int] (which is the empty sentinel) — a further
    NULL insert then re-tries [max_int] and collides, instead of silently
    resetting the table to "empty". *)
-let alloc_rowid (m : table_meta) : int64 * int64 =
-  let id = if Int64.equal m.next_rowid empty_next_rowid then 1L else m.next_rowid in
+let alloc_rowid (next_rowid : int64) : int64 * int64 =
+  let id = if Int64.equal next_rowid empty_next_rowid then 1L else next_rowid in
   let next = if Int64.equal id Int64.max_int then Int64.max_int else Int64.add id 1L in
   id, next
 ;;
@@ -1926,8 +2031,13 @@ let next_rowid t ~name =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let id, next = alloc_rowid m in
-    let m' = { m with next_rowid = next } in
+    let tree_id, nrid, without_rowid, autoincrement = row_storage m in
+    let id, next = alloc_rowid nrid in
+    let m' =
+      { m with
+        storage = Row { tree_id; next_rowid = next; without_rowid; autoincrement }
+      }
+    in
     (* Update the cache BEFORE [rw_begin] (which yields), matching the original
        order: find -> alloc -> cache-write stays atomic under Lwt so two
        concurrent autocommit callers cannot read the same stale counter. *)
@@ -1946,22 +2056,16 @@ let next_rowid_in_txn ?(defer_counter = false) t ~name (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    (* #312: an AUTOINCREMENT table whose counter is already pinned at max_int
-       (a max_int rowid exists) cannot allocate another id.  SQLite raises
-       SQLITE_FULL here instead of probing for a free rowid; match its wording.
-       Use [Lwt.fail_with] so it surfaces as a catchable SQL [Error] like the
-       other user-facing insert failures.  Plain rowid tables keep the existing
-       hold-at-max behavior.
-       Known conflation (PR#315 review): [next_rowid = max_int] means both
-       "max_int already handed out" and "max_int is next to hand out", so we
-       raise one id early in the pure auto-increment path (an explicit insert of
-       max_int-1 bumps next to max_int, then the next NULL insert raises instead
-       of allocating max_int).  Unreachable in practice — it needs 2^63 rows. *)
-    if m.autoincrement && Int64.equal m.next_rowid Int64.max_int
+    let tree_id, next_rowid, without_rowid, autoincrement = row_storage m in
+    if autoincrement && Int64.equal next_rowid Int64.max_int
     then Lwt.fail_with "database or disk is full"
     else (
-      let id, next = alloc_rowid m in
-      let m' = { m with next_rowid = next } in
+      let id, next = alloc_rowid next_rowid in
+      let m' =
+        { m with
+          storage = Row { tree_id; next_rowid = next; without_rowid; autoincrement }
+        }
+      in
       (* #293: [bump_rowid] caches [m'] and marks this table's counter dirty so a
          ROLLBACK recomputes only it.
          #347: when [defer_counter] (explicit txn), skip the per-row B-tree write
@@ -1989,11 +2093,16 @@ let bump_next_rowid_in_txn ?(defer_counter = false) t ~name ~at_least (tx : S.rw
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let unseeded = Int64.equal m.next_rowid empty_next_rowid in
-    if (not unseeded) && Int64.compare at_least m.next_rowid <= 0
+    let tree_id, next_rowid, without_rowid, autoincrement = row_storage m in
+    let unseeded = Int64.equal next_rowid empty_next_rowid in
+    if (not unseeded) && Int64.compare at_least next_rowid <= 0
     then Lwt.return_unit
     else (
-      let m' = { m with next_rowid = at_least } in
+      let m' =
+        { m with
+          storage = Row { tree_id; next_rowid = at_least; without_rowid; autoincrement }
+        }
+      in
       (* #293: [bump_rowid] caches [m'] and marks dirty only when the counter
          actually moved (the early-return no-op above leaves the cached counter
          untouched, so nothing to recompute). *)
@@ -2018,7 +2127,12 @@ let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
      confirmed the table is present, so this arm is unreachable in practice. *)
   | None -> failwith (Printf.sprintf "no table '%s'" name)
   | Some m ->
-    let%lwt cur = S.cursor_open tx m.tree_id in
+    let tree_id =
+      match m.storage with
+      | Row { tree_id; _ } -> tree_id
+      | Columnar _ -> failwith "max_rowid_in_txn on columnar table"
+    in
+    let%lwt cur = S.cursor_open tx tree_id in
     let _sr = S.cursor_first cur in
     let max_key = ref None in
     let rec walk () =
@@ -2054,14 +2168,11 @@ let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
   | Some m ->
-    if not m.autoincrement
+    let tree_id, next_rowid, without_rowid, autoincrement = row_storage m in
+    if not autoincrement
     then
       failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
     else (
-      (* Saturating add: [requested = max_int] means "max_int was handed out", so
-         the counter must pin at [max_int] (the next insert then raises
-         SQLITE_FULL).  A plain [requested + 1] would overflow to [min_int] and
-         fall into the lower-clamp path, silently resetting to [max(rowid)+1]. *)
       let want_next =
         if Int64.equal requested Int64.max_int
         then Int64.max_int
@@ -2069,8 +2180,8 @@ let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
       in
       let%lwt clamped =
         if
-          (not (Int64.equal m.next_rowid empty_next_rowid))
-          && Int64.compare want_next m.next_rowid >= 0
+          (not (Int64.equal next_rowid empty_next_rowid))
+          && Int64.compare want_next next_rowid >= 0
         then Lwt.return want_next
         else (
           let%lwt mx = max_rowid_in_txn t ~name tx in
@@ -2081,7 +2192,11 @@ let set_next_rowid_in_txn t ~name ~requested (tx : S.rw S.txn) =
           in
           Lwt.return (if Int64.compare want_next floor > 0 then want_next else floor))
       in
-      let m' = { m with next_rowid = clamped } in
+      let m' =
+        { m with
+          storage = Row { tree_id; next_rowid = clamped; without_rowid; autoincrement }
+        }
+      in
       Schema_cache.bump_rowid t.sc ~name m';
       put_table_counter_tx tx m')
 ;;
@@ -2095,11 +2210,17 @@ let reset_next_rowid_in_txn t ~name (tx : S.rw S.txn) =
   match Schema_cache.find_table t.sc name with
   | None -> failwith (Printf.sprintf "sqlite_sequence: no such table '%s'" name)
   | Some m ->
-    if not m.autoincrement
+    let tree_id, _nrid, without_rowid, autoincrement = row_storage m in
+    if not autoincrement
     then
       failwith (Printf.sprintf "sqlite_sequence: '%s' is not an AUTOINCREMENT table" name)
     else (
-      let m' = { m with next_rowid = empty_next_rowid } in
+      let m' =
+        { m with
+          storage =
+            Row { tree_id; next_rowid = empty_next_rowid; without_rowid; autoincrement }
+        }
+      in
       Schema_cache.bump_rowid t.sc ~name m';
       put_table_counter_tx tx m')
 ;;
@@ -2112,9 +2233,16 @@ let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
   let%lwt tables = list_tables t in
   Lwt_list.iter_s
     (fun (m : table_meta) ->
-       if m.autoincrement && not (Int64.equal m.next_rowid empty_next_rowid)
+       let tree_id, nrid, without_rowid, autoincrement = row_storage m in
+       if autoincrement && not (Int64.equal nrid empty_next_rowid)
        then (
-         let m' = { m with next_rowid = empty_next_rowid } in
+         let m' =
+           { m with
+             storage =
+               Row
+                 { tree_id; next_rowid = empty_next_rowid; without_rowid; autoincrement }
+           }
+         in
          Schema_cache.bump_rowid t.sc ~name:m.name m';
          put_table_counter_tx tx m')
        else Lwt.return_unit)
@@ -2333,7 +2461,7 @@ let drop_table t tx ~name =
   (* 0. Remove the mirror entry (keyed by tree_id), if we know the tree_id. *)
   let%lwt () =
     match Schema_cache.find_table t.sc name with
-    | Some m -> del_mirror_tx tx m.tree_id
+    | Some m -> del_mirror_tx tx m
     | None -> Lwt.return_unit
   in
   (* 1. Remove table entry from _sys_tables. *)

@@ -87,6 +87,11 @@ type op =
       ; without_rowid : bool
       ; autoincrement : bool (** #299: INTEGER PRIMARY KEY AUTOINCREMENT. *)
       }
+  | Op_col_create_table of
+      { name : string
+      ; columns : Sqlocaml_encoding.Row.column list
+      ; if_not_exists : bool
+      }
   | Op_insert of
       { table_meta : Cat.table_meta
       ; ordinals : int list
@@ -149,10 +154,8 @@ type op =
   | Op_rowid_lookup of
       { table_meta : Cat.table_meta
       ; lookup_val : expr
-        (** #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias.  The
-            alias column IS the table key, so this is a single table-tree seek by
-            [Rowid.encode <int value>] — no separate index, no double fetch. *)
       }
+  | Op_col_seq_scan of { table_meta : Cat.table_meta }
   | Op_update of
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)

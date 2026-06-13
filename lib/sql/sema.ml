@@ -4,7 +4,9 @@ module Cat = Sqlocaml_catalog.Catalog
 
 let sqlite_master_meta : Cat.table_meta =
   { Cat.name = "sqlite_master"
-  ; Cat.tree_id = -2
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -2; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns =
       [ { Row.name = "type"
         ; Row.ty = Row.Text
@@ -52,17 +54,16 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.generated_as = None
         }
       ]
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
 (* #312: synthesized read-only view over the AUTOINCREMENT counters. *)
 let sqlite_sequence_meta : Cat.table_meta =
   { Cat.name = "sqlite_sequence"
-  ; Cat.tree_id = -3
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -3; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns =
       [ { Row.name = "name"
         ; Row.ty = Row.Text
@@ -83,10 +84,7 @@ let sqlite_sequence_meta : Cat.table_meta =
         ; Row.generated_as = None
         }
       ]
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
@@ -402,12 +400,15 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
       m.Cat.fts_columns
   in
   { Cat.name = m.Cat.fts_name
-  ; Cat.tree_id = m.Cat.fts_content_tree
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = m.Cat.fts_content_tree
+        ; next_rowid = 0L
+        ; without_rowid = false
+        ; autoincrement = false
+        }
   ; Cat.columns
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
@@ -3544,12 +3545,11 @@ let rec col_names_of_ast_stmt = function
 let bind_const_select ~param_counter ~named_params exprs =
   let dummy_meta : Cat.table_meta =
     { Cat.name = "__const__"
-    ; Cat.tree_id = 0
+    ; Cat.storage =
+        Cat.Row
+          { tree_id = 0; next_rowid = 0L; without_rowid = false; autoincrement = false }
     ; Cat.columns = []
-    ; Cat.next_rowid = 0L
     ; Cat.fk_constraints = []
-    ; Cat.without_rowid = false
-    ; Cat.autoincrement = false
     }
   in
   let bound =
@@ -3605,12 +3605,11 @@ let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
       col_names
   in
   { Cat.name
-  ; Cat.tree_id = -1
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -1; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns = cte_cols
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
