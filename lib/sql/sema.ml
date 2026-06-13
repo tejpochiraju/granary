@@ -1251,23 +1251,33 @@ let extract_fk_constraints cat ~columns ~constraints =
                          cd.Ast.name
                          parent_table))
                | Some parent_meta ->
-                 (match
-                    List.find_opt
-                      (fun (c : Row.column) -> c.primary_key)
-                      parent_meta.Cat.columns
-                  with
-                  | None ->
-                    Error
-                      (Unsupported
-                         (Printf.sprintf
-                            "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer \
-                             column"
-                            cd.Ast.name
-                            parent_table))
-                  | Some pk_col ->
-                    Ok
-                      (fks
-                       @ [ [ cd.Ast.name ], parent_table, [ pk_col.name ], od, ou, def ])))
+                 if Cat.is_columnar parent_meta
+                 then
+                   Error
+                     (Unsupported
+                        (Printf.sprintf
+                           "FOREIGN KEY on '%s': cannot reference columnar table '%s'"
+                           cd.Ast.name
+                           parent_table))
+                 else (
+                   match
+                     List.find_opt
+                       (fun (c : Row.column) -> c.primary_key)
+                       parent_meta.Cat.columns
+                   with
+                   | None ->
+                     Error
+                       (Unsupported
+                          (Printf.sprintf
+                             "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to \
+                              infer column"
+                             cd.Ast.name
+                             parent_table))
+                   | Some pk_col ->
+                     Ok
+                       (fks
+                        @ [ [ cd.Ast.name ], parent_table, [ pk_col.name ], od, ou, def ]
+                       )))
             | Some (parent_table, parent_col, od, ou, def) ->
               Ok (fks @ [ [ cd.Ast.name ], parent_table, [ parent_col ], od, ou, def ])))
       (Ok [])
@@ -2963,71 +2973,78 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
     (match meta_opt with
      | None -> Lwt.return (Error (Unknown_table table))
      | Some meta ->
-       let pc = ref 0 in
-       let np = Hashtbl.create 0 in
-       (* Bind each column expression to validate it; discard the bound forms —
+       if Cat.is_columnar meta
+       then
+         Lwt.return
+           (Error
+              (Unsupported
+                 (Printf.sprintf "cannot create index on columnar table '%s'" table)))
+       else (
+         let pc = ref 0 in
+         let np = Hashtbl.create 0 in
+         (* Bind each column expression to validate it; discard the bound forms —
        the SQL strings in col_sqls are sufficient for runtime eval. *)
-       let col_results =
-         List.map
-           (fun col_ast ->
-              match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
-              | Error e -> Error e
-              | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
-           columns
-       in
-       let errors =
-         List.filter_map
-           (function
-             | Error e -> Some e
-             | Ok _ -> None)
-           col_results
-       in
-       (match errors with
-        | e :: _ -> Lwt.return (Error e)
-        | [] ->
-          (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
+         let col_results =
+           List.map
+             (fun col_ast ->
+                match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
+                | Error e -> Error e
+                | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
+             columns
+         in
+         let errors =
+           List.filter_map
+             (function
+               | Error e -> Some e
+               | Ok _ -> None)
+             col_results
+         in
+         match errors with
+         | e :: _ -> Lwt.return (Error e)
+         | [] ->
+           (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
           supported.  The exec.ml index-write paths recompute virtuals into
           a scratch row before extracting index keys, so VIRTUAL cells
           contribute their up-to-date value instead of NULL. *)
-          (* Compute col_sqls and col_expr_flags from the original AST *)
-          let col_sqls, col_expr_flags =
-            List.split
-              (List.map
-                 (fun col_ast ->
-                    match col_ast with
-                    | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
-                    | _ -> Ast.expr_to_sql col_ast, true)
-                 columns)
-          in
-          (* Bind WHERE clause *)
-          let where_result =
-            match where_clause with
-            | None -> Ok (None, None)
-            | Some w_ast ->
-              (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
-               | Error e -> Error e
-               | Ok bw -> Ok (Some bw, Some w_ast))
-          in
-          (match where_result with
-           | Error e -> Lwt.return (Error e)
-           | Ok (where_expr, where_ast) ->
-             (match Cat.find_index cat ~name with
-              | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-              | _ ->
-                (* Some _ reaches here only with if_not_exists=true (silent
+           (* Compute col_sqls and col_expr_flags from the original AST *)
+           let col_sqls, col_expr_flags =
+             List.split
+               (List.map
+                  (fun col_ast ->
+                     match col_ast with
+                     | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
+                     | _ -> Ast.expr_to_sql col_ast, true)
+                  columns)
+           in
+           (* Bind WHERE clause *)
+           let where_result =
+             match where_clause with
+             | None -> Ok (None, None)
+             | Some w_ast ->
+               (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
+                | Error e -> Error e
+                | Ok bw -> Ok (Some bw, Some w_ast))
+           in
+           (match where_result with
+            | Error e -> Lwt.return (Error e)
+            | Ok (where_expr, where_ast) ->
+              (match Cat.find_index cat ~name with
+               | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+               | _ ->
+                 (* Some _ reaches here only with if_not_exists=true (silent
                 success); None creates.  Both carry the param's if_not_exists. *)
-                Lwt.return
-                  (Ok
-                     (BS_create_index
-                        { name
-                        ; table_meta = meta
-                        ; col_sqls
-                        ; col_expr_flags
-                        ; where_expr
-                        ; where_ast
-                        ; unique
-                        ; if_not_exists
-                        }))))))
+                 Lwt.return
+                   (Ok
+                      (BS_create_index
+                         { name
+                         ; table_meta = meta
+                         ; col_sqls
+                         ; col_expr_flags
+                         ; where_expr
+                         ; where_ast
+                         ; unique
+                         ; if_not_exists
+                         }))))))
 ;;
 
 (* ------------------------------------------------------------------ *)

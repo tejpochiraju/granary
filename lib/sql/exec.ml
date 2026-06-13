@@ -2654,29 +2654,33 @@ let fk_parent_has_row_in_tx
       ~(parent_vals : Row.value list)
   : bool Lwt.t
   =
-  let parent_tree_id, _, _, _ = Cat.row_storage parent_meta in
-  let* cur = S.cursor_open tx parent_tree_id in
-  let _sr = S.cursor_first cur in
-  let found = ref false in
-  let rec scan () =
-    if !found
-    then ()
-    else (
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (_k, vbytes) ->
-        let row = decode_with_virtual None [||] parent_meta vbytes in
-        let ok =
-          List.for_all2
-            (fun pi pv -> compare_values row.(pi) pv = 0)
-            parent_idxs
-            parent_vals
-        in
-        if ok then found := true else scan ())
-  in
-  scan ();
-  S.cursor_close cur;
-  Lwt.return !found
+  (* Columnar tables cannot be FK parents — no unique constraints, no indexes. *)
+  if Cat.is_columnar parent_meta
+  then Lwt.return false
+  else (
+    let parent_tree_id, _, _, _ = Cat.row_storage parent_meta in
+    let* cur = S.cursor_open tx parent_tree_id in
+    let _sr = S.cursor_first cur in
+    let found = ref false in
+    let rec scan () =
+      if !found
+      then ()
+      else (
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (_k, vbytes) ->
+          let row = decode_with_virtual None [||] parent_meta vbytes in
+          let ok =
+            List.for_all2
+              (fun pi pv -> compare_values row.(pi) pv = 0)
+              parent_idxs
+              parent_vals
+          in
+          if ok then found := true else scan ())
+    in
+    scan ();
+    S.cursor_close cur;
+    Lwt.return !found)
 ;;
 
 (** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
@@ -6548,12 +6552,16 @@ let execute_with_count
       | Cat.Columnar cs -> cs
       | Cat.Row _ -> assert false
     in
+    let n_cols = List.length table_meta.Cat.columns in
     let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
     let* src_rows = Lwt_stream.to_list stream in
     let batch =
       Array.of_list
         (List.map
-           (fun row -> Array.of_list (List.map (fun i -> row.(i)) ordinals))
+           (fun src_row ->
+              let dest = Array.make n_cols Row.V_null in
+              List.iteri (fun i ord -> dest.(ord) <- src_row.(i)) ordinals;
+              dest)
            src_rows)
     in
     Sqlocaml_columnar.Col_store.insert_rows col_store batch;
@@ -9844,6 +9852,9 @@ and to_stream
   | Plan.Op_intersect { left; right } ->
     stream_intersect clock params store mode cat left right
   | Plan.Op_except { left; right } -> stream_except clock params store mode cat left right
+  | Plan.Op_insert { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     when returning <> [] ->
     stream_insert_returning

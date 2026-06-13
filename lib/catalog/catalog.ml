@@ -2257,9 +2257,10 @@ let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
   let%lwt tables = list_tables t in
   Lwt_list.iter_s
     (fun (m : table_meta) ->
-       let tree_id, nrid, without_rowid, autoincrement = row_storage m in
-       if autoincrement && not (Int64.equal nrid empty_next_rowid)
-       then (
+       match m.storage with
+       | Columnar _ -> Lwt.return_unit
+       | Row { tree_id; next_rowid = nrid; without_rowid; autoincrement }
+         when autoincrement && not (Int64.equal nrid empty_next_rowid) ->
          let m' =
            { m with
              storage =
@@ -2268,8 +2269,8 @@ let reset_all_next_rowid_in_txn t (tx : S.rw S.txn) =
            }
          in
          Schema_cache.bump_rowid t.sc ~name:m.name m';
-         put_table_counter_tx tx m')
-       else Lwt.return_unit)
+         put_table_counter_tx tx m'
+       | _ -> Lwt.return_unit)
     tables
 ;;
 
