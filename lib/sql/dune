@@ -1,7 +1,14 @@
 (library
  (name sqlocaml_sql)
  (public_name sqlocaml.sql)
- (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.catalog sqlocaml.columnar uutf uucp)
+ (libraries
+  lwt
+  sqlocaml.encoding
+  sqlocaml.store
+  sqlocaml.catalog
+  sqlocaml.columnar
+  uutf
+  uucp)
  (preprocess
   (pps lwt_ppx))
  (instrumentation
