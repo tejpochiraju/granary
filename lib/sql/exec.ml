@@ -6501,6 +6501,28 @@ let execute_with_count
       in
       Lwt.return 0
   | Plan.Op_insert
+      { table_meta; ordinals; values; on_conflict = _; returning = _; upsert_update = _ }
+    when Cat.is_columnar table_meta ->
+    let col_store =
+      match table_meta.Cat.storage with
+      | Cat.Columnar cs -> cs
+      | Cat.Row _ -> assert false
+    in
+    let n_cols = List.length table_meta.Cat.columns in
+    let rows =
+      List.map
+        (fun vals ->
+           let row = Array.make n_cols Row.V_null in
+           List.iter2
+             (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr)
+             ordinals
+             vals;
+           row)
+        values
+    in
+    Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
+    Lwt.return (List.length values)
+  | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     execute_insert_values
       store
@@ -6519,6 +6541,23 @@ let execute_with_count
       ~values
       ~on_conflict
       ~upsert_update
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict = _ }
+    when Cat.is_columnar table_meta ->
+    let col_store =
+      match table_meta.Cat.storage with
+      | Cat.Columnar cs -> cs
+      | Cat.Row _ -> assert false
+    in
+    let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
+    let* src_rows = Lwt_stream.to_list stream in
+    let batch =
+      Array.of_list
+        (List.map
+           (fun row -> Array.of_list (List.map (fun i -> row.(i)) ordinals))
+           src_rows)
+    in
+    Sqlocaml_columnar.Col_store.insert_rows col_store batch;
+    Lwt.return (Array.length batch)
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
     execute_insert_select_op
       store
@@ -8102,6 +8141,15 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
   in
   Lwt.return stream
 
+and stream_col_seq_scan _clock _params _store _mode (table_meta : Cat.table_meta) =
+  let col_store =
+    match table_meta.Cat.storage with
+    | Cat.Columnar cs -> cs
+    | Cat.Row _ -> assert false
+  in
+  let seq = Sqlocaml_columnar.Col_store.to_row_seq col_store in
+  Lwt.return (Lwt_stream.of_list (List.of_seq seq))
+
 and stream_filter clock params store mode cat pred child =
   (* #257: a correlated subquery in the predicate is re-evaluated per row at
      pull time — outside [query]'s [with_value] scope — so capture the active
@@ -9646,7 +9694,7 @@ and to_stream
   match op with
   | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store mode table_meta
   | Plan.Op_col_seq_scan { table_meta } ->
-    stream_seq_scan clock params store mode table_meta
+    stream_col_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
