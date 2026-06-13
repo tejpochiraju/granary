@@ -1852,7 +1852,15 @@ let pp_error fmt = function
 (* Deterministic emission order: tables in creation order (tree_id ascending),
    which also lets FK parents precede children for the common case. *)
 let dump_table_order (tables : Cat.table_meta list) =
-  List.sort (fun (a : Cat.table_meta) b -> compare a.Cat.tree_id b.Cat.tree_id) tables
+  List.sort
+    (fun (a : Cat.table_meta) b ->
+       let tid_of m =
+         match m.Cat.storage with
+         | Cat.Row { tree_id; _ } -> tree_id
+         | Cat.Columnar _ -> max_int
+       in
+       compare (tid_of a) (tid_of b))
+    tables
 ;;
 
 (* True for an implicit index that replaying the [CREATE TABLE] already
@@ -2166,8 +2174,10 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                 let seeded =
                   List.filter
                     (fun (m : Cat.table_meta) ->
-                       m.Cat.autoincrement
-                       && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid))
+                       match m.Cat.storage with
+                       | Cat.Row { autoincrement = true; next_rowid; _ }
+                         when not (Int64.equal next_rowid Cat.empty_next_rowid) -> true
+                       | _ -> false)
                     tables
                 in
                 if seeded = []
@@ -2176,11 +2186,12 @@ let dump t ?(schema_only = false) ?(data_only = false) ~sink () =
                   let* () = stmt "DELETE FROM sqlite_sequence" in
                   Lwt_list.iter_s
                     (fun (m : Cat.table_meta) ->
+                       let _, nrid, _, _ = Cat.row_storage m in
                        stmt
                          (Printf.sprintf
                             "INSERT INTO sqlite_sequence VALUES(%s,%Ld)"
                             (Sql.Exec.sql_literal_of_value (Row.V_text m.Cat.name))
-                            (Int64.sub m.Cat.next_rowid 1L)))
+                            (Int64.sub nrid 1L)))
                     seeded)
             in
             let* () = stmt "COMMIT" in

@@ -4,7 +4,9 @@ module Cat = Sqlocaml_catalog.Catalog
 
 let sqlite_master_meta : Cat.table_meta =
   { Cat.name = "sqlite_master"
-  ; Cat.tree_id = -2
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -2; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns =
       [ { Row.name = "type"
         ; Row.ty = Row.Text
@@ -52,17 +54,16 @@ let sqlite_master_meta : Cat.table_meta =
         ; Row.generated_as = None
         }
       ]
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
 (* #312: synthesized read-only view over the AUTOINCREMENT counters. *)
 let sqlite_sequence_meta : Cat.table_meta =
   { Cat.name = "sqlite_sequence"
-  ; Cat.tree_id = -3
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -3; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns =
       [ { Row.name = "name"
         ; Row.ty = Row.Text
@@ -83,10 +84,7 @@ let sqlite_sequence_meta : Cat.table_meta =
         ; Row.generated_as = None
         }
       ]
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
@@ -184,7 +182,12 @@ type seq_write =
   | Seq_reset of { table : string option (** [None] = DELETE with no WHERE: reset all *) }
 
 type bound_stmt =
-  | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)
+  | BS_no_op
+  | BS_col_create_table of
+      { name : string
+      ; columns : Row.column list
+      ; if_not_exists : bool
+      }
   | BS_create_table of
       { name : string
       ; columns : Row.column list
@@ -402,12 +405,15 @@ let fts_as_table_meta (m : Cat.fts_table_meta) : Cat.table_meta =
       m.Cat.fts_columns
   in
   { Cat.name = m.Cat.fts_name
-  ; Cat.tree_id = m.Cat.fts_content_tree
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = m.Cat.fts_content_tree
+        ; next_rowid = 0L
+        ; without_rowid = false
+        ; autoincrement = false
+        }
   ; Cat.columns
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
@@ -1245,25 +1251,44 @@ let extract_fk_constraints cat ~columns ~constraints =
                          cd.Ast.name
                          parent_table))
                | Some parent_meta ->
-                 (match
-                    List.find_opt
-                      (fun (c : Row.column) -> c.primary_key)
-                      parent_meta.Cat.columns
-                  with
-                  | None ->
-                    Error
-                      (Unsupported
-                         (Printf.sprintf
-                            "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to infer \
-                             column"
-                            cd.Ast.name
-                            parent_table))
-                  | Some pk_col ->
-                    Ok
-                      (fks
-                       @ [ [ cd.Ast.name ], parent_table, [ pk_col.name ], od, ou, def ])))
+                 if Cat.is_columnar parent_meta
+                 then
+                   Error
+                     (Unsupported
+                        (Printf.sprintf
+                           "FOREIGN KEY on '%s': cannot reference columnar table '%s'"
+                           cd.Ast.name
+                           parent_table))
+                 else (
+                   match
+                     List.find_opt
+                       (fun (c : Row.column) -> c.primary_key)
+                       parent_meta.Cat.columns
+                   with
+                   | None ->
+                     Error
+                       (Unsupported
+                          (Printf.sprintf
+                             "FOREIGN KEY on '%s': table '%s' has no PRIMARY KEY to \
+                              infer column"
+                             cd.Ast.name
+                             parent_table))
+                   | Some pk_col ->
+                     Ok
+                       (fks
+                        @ [ [ cd.Ast.name ], parent_table, [ pk_col.name ], od, ou, def ]
+                       )))
             | Some (parent_table, parent_col, od, ou, def) ->
-              Ok (fks @ [ [ cd.Ast.name ], parent_table, [ parent_col ], od, ou, def ])))
+              (match Cat.find_table_cached cat ~name:parent_table with
+               | Some parent_meta when Cat.is_columnar parent_meta ->
+                 Error
+                   (Unsupported
+                      (Printf.sprintf
+                         "FOREIGN KEY on '%s': cannot reference columnar table '%s'"
+                         cd.Ast.name
+                         parent_table))
+               | _ ->
+                 Ok (fks @ [ [ cd.Ast.name ], parent_table, [ parent_col ], od, ou, def ]))))
       (Ok [])
       columns
   in
@@ -1285,15 +1310,23 @@ let extract_fk_constraints cat ~columns ~constraints =
                   ; on_update
                   ; deferrable
                   } ->
-                Ok
-                  (fks
-                   @ [ ( local_cols
-                       , parent_table
-                       , parent_cols
-                       , on_delete
-                       , on_update
-                       , deferrable )
-                     ])
+                (match Cat.find_table_cached cat ~name:parent_table with
+                 | Some parent_meta when Cat.is_columnar parent_meta ->
+                   Error
+                     (Unsupported
+                        (Printf.sprintf
+                           "FOREIGN KEY constraint: cannot reference columnar table '%s'"
+                           parent_table))
+                 | _ ->
+                   Ok
+                     (fks
+                      @ [ ( local_cols
+                          , parent_table
+                          , parent_cols
+                          , on_delete
+                          , on_update
+                          , deferrable )
+                        ]))
               | _ -> Ok fks))
         (Ok [])
         constraints
@@ -1366,97 +1399,118 @@ let reject_reserved_name name =
   else Ok ()
 ;;
 
-let bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid =
+let bind_create
+      cat
+      ~name
+      ~columns
+      ~constraints
+      ~if_not_exists
+      ~without_rowid
+      ~using_columnstore
+  =
   match reject_reserved_name name with
   | Error e -> Lwt.return (Error e)
   | Ok () ->
-    let* existing = Cat.find_table cat ~name in
-    (match existing with
-     | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-     | Some _ (* if_not_exists = true: silently succeed *) ->
-       Lwt.return
-         (Ok
-            (BS_create_table
-               { name
-               ; columns = []
-               ; uniq_idxs = []
-               ; if_not_exists = true
-               ; fk_constraints = []
-               ; without_rowid
-               ; autoincrement = false
-               }))
-     | None ->
-       let unsupported_check =
-         List.find_opt
-           (fun (c : Ast.column_def) ->
-              match c.check with
-              | None -> false
-              | Some e -> check_expr_unsupported e)
-           columns
-       in
-       (match unsupported_check with
-        | Some col ->
-          Lwt.return
-            (Error
-               (Unsupported
-                  (Printf.sprintf
-                     "CHECK constraint on column '%s' contains unsupported expression \
-                      form (aggregates, subqueries, and parameters are not allowed)"
-                     col.name)))
-        | None ->
-          (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
+    if using_columnstore
+    then
+      let* existing = Cat.find_table cat ~name in
+      match existing with
+      | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+      | Some _ ->
+        Lwt.return (Ok (BS_col_create_table { name; columns = []; if_not_exists = true }))
+      | None ->
+        Lwt.return
+          (Ok
+             (BS_col_create_table
+                { name; columns = List.map column_of_def columns; if_not_exists }))
+    else
+      let* existing = Cat.find_table cat ~name in
+      (match existing with
+       | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+       | Some _ (* if_not_exists = true: silently succeed *) ->
+         Lwt.return
+           (Ok
+              (BS_create_table
+                 { name
+                 ; columns = []
+                 ; uniq_idxs = []
+                 ; if_not_exists = true
+                 ; fk_constraints = []
+                 ; without_rowid
+                 ; autoincrement = false
+                 }))
+       | None ->
+         let unsupported_check =
+           List.find_opt
+             (fun (c : Ast.column_def) ->
+                match c.check with
+                | None -> false
+                | Some e -> check_expr_unsupported e)
+             columns
+         in
+         (match unsupported_check with
+          | Some col ->
+            Lwt.return
+              (Error
+                 (Unsupported
+                    (Printf.sprintf
+                       "CHECK constraint on column '%s' contains unsupported expression \
+                        form (aggregates, subqueries, and parameters are not allowed)"
+                       col.name)))
+          | None ->
+            (* #312: a table-level PRIMARY KEY(col AUTOINCREMENT) marks its column's
           column_def, so validation/derivation reuse the column-form path.  A
           composite or non-INTEGER PK is still rejected downstream because the
           marked column will not be the rowid alias. *)
-          let tc_ai_cols =
-            List.concat_map
-              (function
-                | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
-                | _ -> [])
-              constraints
-          in
-          let columns =
-            if tc_ai_cols = []
-            then columns
-            else
-              List.map
-                (fun (c : Ast.column_def) ->
-                   if List.mem c.name tc_ai_cols
-                   then { c with autoincrement = true }
-                   else c)
-                columns
-          in
-          let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
-          (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
+            let tc_ai_cols =
+              List.concat_map
+                (function
+                  | Ast.TC_primary_key { pk_cols; autoincrement = true } -> pk_cols
+                  | _ -> [])
+                constraints
+            in
+            let columns =
+              if tc_ai_cols = []
+              then columns
+              else
+                List.map
+                  (fun (c : Ast.column_def) ->
+                     if List.mem c.name tc_ai_cols
+                     then { c with autoincrement = true }
+                     else c)
+                  columns
+            in
+            let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
+            (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)
-          let rowid_alias_col_name =
-            Option.map
-              (fun i -> (List.nth row_cols i).Row.name)
-              (Cat.compute_rowid_alias_col row_cols ~without_rowid)
-          in
-          let uniq_idxs =
-            auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
-          in
-          (match extract_fk_constraints cat ~columns ~constraints with
-           | Error e -> Lwt.return (Error e)
-           | Ok fk_constraints ->
-             (match validate_without_rowid ~name ~without_rowid row_cols with
-              | Error e -> Lwt.return (Error e)
-              | Ok () ->
-                (match validate_autoincrement ~without_rowid columns row_cols with
-                 | Error e -> Lwt.return (Error e)
-                 | Ok autoincrement ->
-                   Lwt.return
-                     (Ok
-                        (BS_create_table
-                           { name
-                           ; columns = row_cols
-                           ; uniq_idxs
-                           ; if_not_exists
-                           ; fk_constraints
-                           ; without_rowid
-                           ; autoincrement
-                           })))))))
+            let rowid_alias_col_name =
+              Option.map
+                (fun i -> (List.nth row_cols i).Row.name)
+                (Cat.compute_rowid_alias_col row_cols ~without_rowid)
+            in
+            let uniq_idxs =
+              auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name
+            in
+            (match extract_fk_constraints cat ~columns ~constraints with
+             | Error e -> Lwt.return (Error e)
+             | Ok fk_constraints ->
+               (match validate_without_rowid ~name ~without_rowid row_cols with
+                | Error e -> Lwt.return (Error e)
+                | Ok () ->
+                  (match validate_autoincrement ~without_rowid columns row_cols with
+                   | Error e -> Lwt.return (Error e)
+                   | Ok autoincrement ->
+                     Lwt.return
+                       (Ok
+                          (BS_create_table
+                             { name
+                             ; columns = row_cols
+                             ; uniq_idxs
+                             ; if_not_exists
+                             ; fk_constraints
+                             ; without_rowid
+                             ; autoincrement
+                             })))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -2936,71 +2990,78 @@ let bind_create_index cat ~name ~table ~columns ~where_clause ~unique ~if_not_ex
     (match meta_opt with
      | None -> Lwt.return (Error (Unknown_table table))
      | Some meta ->
-       let pc = ref 0 in
-       let np = Hashtbl.create 0 in
-       (* Bind each column expression to validate it; discard the bound forms —
+       if Cat.is_columnar meta
+       then
+         Lwt.return
+           (Error
+              (Unsupported
+                 (Printf.sprintf "cannot create index on columnar table '%s'" table)))
+       else (
+         let pc = ref 0 in
+         let np = Hashtbl.create 0 in
+         (* Bind each column expression to validate it; discard the bound forms —
        the SQL strings in col_sqls are sufficient for runtime eval. *)
-       let col_results =
-         List.map
-           (fun col_ast ->
-              match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
-              | Error e -> Error e
-              | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
-           columns
-       in
-       let errors =
-         List.filter_map
-           (function
-             | Error e -> Some e
-             | Ok _ -> None)
-           col_results
-       in
-       (match errors with
-        | e :: _ -> Lwt.return (Error e)
-        | [] ->
-          (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
+         let col_results =
+           List.map
+             (fun col_ast ->
+                match bind_expr ~param_counter:pc ~named_params:np meta col_ast with
+                | Error e -> Error e
+                | Ok _ -> Ok col_ast (* keep AST for SQL serialization only *))
+             columns
+         in
+         let errors =
+           List.filter_map
+             (function
+               | Error e -> Some e
+               | Ok _ -> None)
+             col_results
+         in
+         match errors with
+         | e :: _ -> Lwt.return (Error e)
+         | [] ->
+           (* Phase 35 Task 2: CREATE INDEX on VIRTUAL generated columns is now
           supported.  The exec.ml index-write paths recompute virtuals into
           a scratch row before extracting index keys, so VIRTUAL cells
           contribute their up-to-date value instead of NULL. *)
-          (* Compute col_sqls and col_expr_flags from the original AST *)
-          let col_sqls, col_expr_flags =
-            List.split
-              (List.map
-                 (fun col_ast ->
-                    match col_ast with
-                    | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
-                    | _ -> Ast.expr_to_sql col_ast, true)
-                 columns)
-          in
-          (* Bind WHERE clause *)
-          let where_result =
-            match where_clause with
-            | None -> Ok (None, None)
-            | Some w_ast ->
-              (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
-               | Error e -> Error e
-               | Ok bw -> Ok (Some bw, Some w_ast))
-          in
-          (match where_result with
-           | Error e -> Lwt.return (Error e)
-           | Ok (where_expr, where_ast) ->
-             (match Cat.find_index cat ~name with
-              | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
-              | _ ->
-                (* Some _ reaches here only with if_not_exists=true (silent
+           (* Compute col_sqls and col_expr_flags from the original AST *)
+           let col_sqls, col_expr_flags =
+             List.split
+               (List.map
+                  (fun col_ast ->
+                     match col_ast with
+                     | Ast.E_col cname | Ast.E_tbl_col (_, cname) -> cname, false
+                     | _ -> Ast.expr_to_sql col_ast, true)
+                  columns)
+           in
+           (* Bind WHERE clause *)
+           let where_result =
+             match where_clause with
+             | None -> Ok (None, None)
+             | Some w_ast ->
+               (match bind_expr ~param_counter:pc ~named_params:np meta w_ast with
+                | Error e -> Error e
+                | Ok bw -> Ok (Some bw, Some w_ast))
+           in
+           (match where_result with
+            | Error e -> Lwt.return (Error e)
+            | Ok (where_expr, where_ast) ->
+              (match Cat.find_index cat ~name with
+               | Some _ when not if_not_exists -> Lwt.return (Error (Already_exists name))
+               | _ ->
+                 (* Some _ reaches here only with if_not_exists=true (silent
                 success); None creates.  Both carry the param's if_not_exists. *)
-                Lwt.return
-                  (Ok
-                     (BS_create_index
-                        { name
-                        ; table_meta = meta
-                        ; col_sqls
-                        ; col_expr_flags
-                        ; where_expr
-                        ; where_ast
-                        ; unique
-                        ; if_not_exists
-                        }))))))
+                 Lwt.return
+                   (Ok
+                      (BS_create_index
+                         { name
+                         ; table_meta = meta
+                         ; col_sqls
+                         ; col_expr_flags
+                         ; where_expr
+                         ; where_ast
+                         ; unique
+                         ; if_not_exists
+                         }))))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3375,28 +3436,32 @@ let bind_alter_table cat ~table ~action =
   match meta_opt with
   | None -> Lwt.return (Error (Unknown_table table))
   | Some table_meta ->
-    (match action with
-     | Ast.AA_add_column col_def -> bind_add_column cat ~table_meta ~action col_def
-     | Ast.AA_rename_table new_name ->
-       (match reject_reserved_name new_name with
-        | Error e -> Lwt.return (Error e)
-        | Ok () -> Lwt.return (Ok (BS_alter_table { table_meta; action })))
-     | Ast.AA_rename_column (old_col, _new_col) ->
-       let exists =
-         List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns
-       in
-       if not exists
-       then Lwt.return (Error (Unknown_column { table; column = old_col }))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action }))
-     | Ast.AA_drop_column col_name ->
-       let exists =
-         List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns
-       in
-       if not exists
-       then Lwt.return (Error (Unknown_column { table; column = col_name }))
-       else if List.length table_meta.Cat.columns <= 1
-       then Lwt.return (Error (Unsupported "cannot drop the only column of a table"))
-       else Lwt.return (Ok (BS_alter_table { table_meta; action })))
+    if Cat.is_columnar table_meta
+    then
+      Lwt.return (Error (Unsupported "ALTER TABLE is not supported on columnar tables"))
+    else (
+      match action with
+      | Ast.AA_add_column col_def -> bind_add_column cat ~table_meta ~action col_def
+      | Ast.AA_rename_table new_name ->
+        (match reject_reserved_name new_name with
+         | Error e -> Lwt.return (Error e)
+         | Ok () -> Lwt.return (Ok (BS_alter_table { table_meta; action })))
+      | Ast.AA_rename_column (old_col, _new_col) ->
+        let exists =
+          List.exists (fun c -> String.equal c.Row.name old_col) table_meta.Cat.columns
+        in
+        if not exists
+        then Lwt.return (Error (Unknown_column { table; column = old_col }))
+        else Lwt.return (Ok (BS_alter_table { table_meta; action }))
+      | Ast.AA_drop_column col_name ->
+        let exists =
+          List.exists (fun c -> String.equal c.Row.name col_name) table_meta.Cat.columns
+        in
+        if not exists
+        then Lwt.return (Error (Unknown_column { table; column = col_name }))
+        else if List.length table_meta.Cat.columns <= 1
+        then Lwt.return (Error (Unsupported "cannot drop the only column of a table"))
+        else Lwt.return (Ok (BS_alter_table { table_meta; action })))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3544,12 +3609,11 @@ let rec col_names_of_ast_stmt = function
 let bind_const_select ~param_counter ~named_params exprs =
   let dummy_meta : Cat.table_meta =
     { Cat.name = "__const__"
-    ; Cat.tree_id = 0
+    ; Cat.storage =
+        Cat.Row
+          { tree_id = 0; next_rowid = 0L; without_rowid = false; autoincrement = false }
     ; Cat.columns = []
-    ; Cat.next_rowid = 0L
     ; Cat.fk_constraints = []
-    ; Cat.without_rowid = false
-    ; Cat.autoincrement = false
     }
   in
   let bound =
@@ -3605,19 +3669,26 @@ let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
       col_names
   in
   { Cat.name
-  ; Cat.tree_id = -1
+  ; Cat.storage =
+      Cat.Row
+        { tree_id = -1; next_rowid = 0L; without_rowid = false; autoincrement = false }
   ; Cat.columns = cte_cols
-  ; Cat.next_rowid = 0L
   ; Cat.fk_constraints = []
-  ; Cat.without_rowid = false
-  ; Cat.autoincrement = false
   }
 ;;
 
 let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter cat stmt =
   match stmt with
-  | Ast.S_create_table { name; columns; constraints; if_not_exists; without_rowid } ->
-    bind_create cat ~name ~columns ~constraints ~if_not_exists ~without_rowid
+  | Ast.S_create_table
+      { name; columns; constraints; if_not_exists; without_rowid; using_columnstore } ->
+    bind_create
+      cat
+      ~name
+      ~columns
+      ~constraints
+      ~if_not_exists
+      ~without_rowid
+      ~using_columnstore
   | Ast.S_insert { table; columns; values; on_conflict; returning; upsert_update }
     when is_sqlite_sequence table ->
     bind_seq_insert ~columns ~values ~on_conflict ~returning ~upsert_update

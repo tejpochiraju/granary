@@ -414,6 +414,10 @@ let () =
         ; Alcotest.test_case "real-col" `Quick create_real_col
         ; Alcotest.test_case "blob-col" `Quick create_blob_col
         ; Alcotest.test_case "all-types" `Quick create_all_types
+        ; Alcotest.test_case "columnstore" `Quick (fun () ->
+            match parse "CREATE TABLE t (x REAL) USING COLUMNSTORE" with
+            | Ast.S_create_table { name = "t"; using_columnstore = true; _ } -> ()
+            | _ -> Alcotest.fail "expected S_create_table with USING COLUMNSTORE")
         ] )
     ; ( "insert"
       , [ Alcotest.test_case "named-cols" `Quick insert_named_cols

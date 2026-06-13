@@ -176,50 +176,54 @@ let quote_ident s =
   else s
 ;;
 
+let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
+  Buffer.add_string buf " PRIMARY KEY";
+  (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
+     the non-alias shape (hidden rowid + __pk index). *)
+  if col.Row.pk_desc then Buffer.add_string buf " DESC";
+  if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT"
+;;
+
+let format_column ~autoinc_idx i (col : Row.column) =
+  let buf = Buffer.create 64 in
+  Buffer.add_string buf (quote_ident col.Row.name);
+  Buffer.add_char buf ' ';
+  Buffer.add_string buf (sql_of_row_type col.Row.ty);
+  if col.Row.not_null then Buffer.add_string buf " NOT NULL";
+  if col.Row.primary_key then format_pk_suffix ~autoinc_idx i col buf;
+  (match col.Row.default with
+   | None -> ()
+   | Some dv ->
+     Buffer.add_string buf " DEFAULT ";
+     Buffer.add_string buf (sql_of_default_value dv));
+  (match col.Row.check_sql with
+   | None -> ()
+   | Some sql ->
+     Buffer.add_string buf " CHECK(";
+     Buffer.add_string buf sql;
+     Buffer.add_char buf ')');
+  (match col.Row.generated_as with
+   | None -> ()
+   | Some (expr_sql, is_stored) ->
+     Buffer.add_string buf " GENERATED ALWAYS AS (";
+     Buffer.add_string buf expr_sql;
+     Buffer.add_string buf ") ";
+     Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
+  Buffer.contents buf
+;;
+
 let ddl_of_table (meta : Cat.table_meta) =
-  (* #299: the rowid-alias column carries the AUTOINCREMENT keyword in the dump. *)
+  let without_rowid, autoincrement =
+    match meta.Cat.storage with
+    | Cat.Row { without_rowid; autoincrement; _ } -> without_rowid, autoincrement
+    | Cat.Columnar _ -> false, false
+  in
   let autoinc_idx =
-    if meta.Cat.autoincrement
-    then
-      Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid:meta.Cat.without_rowid
+    if autoincrement
+    then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
     else None
   in
-  let col_parts =
-    List.mapi
-      (fun i (col : Row.column) ->
-         let buf = Buffer.create 64 in
-         Buffer.add_string buf (quote_ident col.Row.name);
-         Buffer.add_char buf ' ';
-         Buffer.add_string buf (sql_of_row_type col.Row.ty);
-         if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-         if col.Row.primary_key
-         then (
-           Buffer.add_string buf " PRIMARY KEY";
-           (* #312: a DESC PK is a non-alias; re-emit DESC so reopen reproduces
-              the non-alias shape (hidden rowid + __pk index). *)
-           if col.Row.pk_desc then Buffer.add_string buf " DESC";
-           if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT");
-         (match col.Row.default with
-          | None -> ()
-          | Some dv ->
-            Buffer.add_string buf " DEFAULT ";
-            Buffer.add_string buf (sql_of_default_value dv));
-         (match col.Row.check_sql with
-          | None -> ()
-          | Some sql ->
-            Buffer.add_string buf " CHECK(";
-            Buffer.add_string buf sql;
-            Buffer.add_char buf ')');
-         (match col.Row.generated_as with
-          | None -> ()
-          | Some (expr_sql, is_stored) ->
-            Buffer.add_string buf " GENERATED ALWAYS AS (";
-            Buffer.add_string buf expr_sql;
-            Buffer.add_string buf ") ";
-            Buffer.add_string buf (if is_stored then "STORED" else "VIRTUAL"));
-         Buffer.contents buf)
-      meta.Cat.columns
-  in
+  let col_parts = List.mapi (format_column ~autoinc_idx) meta.Cat.columns in
   let fk_parts =
     List.map
       (fun (fk : Cat.fk_constraint) ->
@@ -233,10 +237,11 @@ let ddl_of_table (meta : Cat.table_meta) =
       meta.Cat.fk_constraints
   in
   Printf.sprintf
-    "CREATE TABLE %s (%s)%s"
+    "CREATE TABLE %s (%s)%s%s"
     (quote_ident meta.Cat.name)
     (String.concat ", " (col_parts @ fk_parts))
-    (if meta.Cat.without_rowid then " WITHOUT ROWID" else "")
+    (if without_rowid then " WITHOUT ROWID" else "")
+    (if Cat.is_columnar meta then " USING COLUMNSTORE" else "")
 ;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -2512,7 +2517,8 @@ let decode_index_key_rowid (ikey : bytes) : int64 =
    (used when no index covers the child columns). [full_scan_exists] stops at
    the first matching row; [full_scan_collect] gathers all (rowid,row) matches. *)
 let full_scan_exists tx (meta : Cat.table_meta) (pred : Row.t -> bool) : bool Lwt.t =
-  let* cur = S.cursor_open tx meta.Cat.tree_id in
+  let tree_id, _, _, _ = Cat.row_storage meta in
+  let* cur = S.cursor_open tx tree_id in
   let _sr = S.cursor_first cur in
   let found = ref false in
   let rec scan () =
@@ -2533,7 +2539,8 @@ let full_scan_exists tx (meta : Cat.table_meta) (pred : Row.t -> bool) : bool Lw
 let full_scan_collect tx (meta : Cat.table_meta) (pred : Row.t -> bool)
   : (int64 * Row.t) list Lwt.t
   =
-  let* cur = S.cursor_open tx meta.Cat.tree_id in
+  let tree_id, _, _, _ = Cat.row_storage meta in
+  let* cur = S.cursor_open tx tree_id in
   let _sr = S.cursor_first cur in
   let buf = ref [] in
   let rec scan () =
@@ -2589,7 +2596,8 @@ let fk_child_has_ref_multi_in_tx
           if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
           then (
             let rowid = decode_index_key_rowid ikey in
-            let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+            let child_tree_id, _, _, _ = Cat.row_storage child_meta in
+            let* row_opt = S.get tx child_tree_id (Rowid.encode rowid) in
             match row_opt with
             | None -> walk ()
             | Some vbytes ->
@@ -2647,28 +2655,33 @@ let fk_parent_has_row_in_tx
       ~(parent_vals : Row.value list)
   : bool Lwt.t
   =
-  let* cur = S.cursor_open tx parent_meta.Cat.tree_id in
-  let _sr = S.cursor_first cur in
-  let found = ref false in
-  let rec scan () =
-    if !found
-    then ()
-    else (
-      match S.cursor_next cur with
-      | None -> ()
-      | Some (_k, vbytes) ->
-        let row = decode_with_virtual None [||] parent_meta vbytes in
-        let ok =
-          List.for_all2
-            (fun pi pv -> compare_values row.(pi) pv = 0)
-            parent_idxs
-            parent_vals
-        in
-        if ok then found := true else scan ())
-  in
-  scan ();
-  S.cursor_close cur;
-  Lwt.return !found
+  (* Columnar tables cannot be FK parents — no unique constraints, no indexes. *)
+  if Cat.is_columnar parent_meta
+  then Lwt.return false
+  else (
+    let parent_tree_id, _, _, _ = Cat.row_storage parent_meta in
+    let* cur = S.cursor_open tx parent_tree_id in
+    let _sr = S.cursor_first cur in
+    let found = ref false in
+    let rec scan () =
+      if !found
+      then ()
+      else (
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (_k, vbytes) ->
+          let row = decode_with_virtual None [||] parent_meta vbytes in
+          let ok =
+            List.for_all2
+              (fun pi pv -> compare_values row.(pi) pv = 0)
+              parent_idxs
+              parent_vals
+          in
+          if ok then found := true else scan ())
+    in
+    scan ();
+    S.cursor_close cur;
+    Lwt.return !found)
 ;;
 
 (** Scan [parent_meta] for a row matching [parent_vals] on [parent_idxs].
@@ -2829,7 +2842,8 @@ let insert_rowid
       (row : Row.t)
   : int64 Lwt.t
   =
-  if table_meta.Cat.without_rowid
+  let _, _, without_rowid, autoincrement = Cat.row_storage table_meta in
+  if without_rowid
   then (
     match
       List.find_index (fun (c : Row.column) -> c.primary_key) table_meta.Cat.columns
@@ -2871,7 +2885,7 @@ let insert_rowid
                ~name:table_meta.name
                ~at_least:(Int64.add n 1L)
                tx
-           else if table_meta.Cat.autoincrement
+           else if autoincrement
            then
              (* #312: pin the AUTOINCREMENT counter at max_int so the next
                 auto-allocation detects exhaustion and raises SQLITE_FULL. *)
@@ -3050,7 +3064,13 @@ let delete_replace_conflicts
     Lwt_list.iter_s
       (fun old_rowid ->
          let old_key = Rowid.encode old_rowid in
-         let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+         let* old_bytes_opt =
+           S.get
+             tx
+             (let x, _, _, _ = Cat.row_storage table_meta in
+              x)
+             old_key
+         in
          match old_bytes_opt with
          | None -> Lwt.return_unit
          | Some old_bytes ->
@@ -3061,7 +3081,13 @@ let delete_replace_conflicts
              | None -> Lwt.return_unit
              | Some f -> f ~tx ~old_row
            in
-           let* () = S.del tx table_meta.tree_id old_key in
+           let* () =
+             S.del
+               tx
+               (let x, _, _, _ = Cat.row_storage table_meta in
+                x)
+               old_key
+           in
            (* old_row from decode_with_virtual already has VIRTUAL cols applied *)
            delete_row_indexes
              tx
@@ -3113,8 +3139,9 @@ let write_row_rekeyed
   let* () =
     if Int64.equal new_rowid old_rowid
     then Lwt.return_unit
-    else
-      let* existing = S.get tx table_meta.Cat.tree_id (Rowid.encode new_rowid) in
+    else (
+      let upd_tree_id, _, _, _ = Cat.row_storage table_meta in
+      let* existing = S.get tx upd_tree_id (Rowid.encode new_rowid) in
       match existing with
       | None -> Lwt.return_unit
       | Some _ ->
@@ -3124,7 +3151,7 @@ let write_row_rekeyed
           | None -> "rowid"
         in
         Lwt.fail_with
-          (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name)
+          (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
   in
   let schema = table_meta.Cat.columns in
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
@@ -3158,9 +3185,10 @@ let write_row_rekeyed
          else Lwt.return_unit)
       indexes
   in
+  let upd_tree_id2, _, _, _ = Cat.row_storage table_meta in
   let new_bytes = Row.encode schema new_row in
-  let* () = S.del tx table_meta.Cat.tree_id (Rowid.encode old_rowid) in
-  let* () = S.put tx table_meta.Cat.tree_id (Rowid.encode new_rowid) new_bytes in
+  let* () = S.del tx upd_tree_id2 (Rowid.encode old_rowid) in
+  let* () = S.put tx upd_tree_id2 (Rowid.encode new_rowid) new_bytes in
   Lwt.return new_rowid
 ;;
 
@@ -3181,7 +3209,13 @@ let execute_upsert_update
   : bool Lwt.t
   =
   let old_key = Rowid.encode old_rowid in
-  let* old_bytes_opt = S.get tx table_meta.tree_id old_key in
+  let* old_bytes_opt =
+    S.get
+      tx
+      (let x, _, _, _ = Cat.row_storage table_meta in
+       x)
+      old_key
+  in
   match old_bytes_opt with
   | None ->
     let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -3281,9 +3315,22 @@ let execute_insert_write
        is possible. *)
     let* conflict_opt =
       if alias_explicit
-      then S.put_x tx table_meta.tree_id key bytes
+      then
+        S.put_x
+          tx
+          (let x, _, _, _ = Cat.row_storage table_meta in
+           x)
+          key
+          bytes
       else
-        let* () = S.put tx table_meta.tree_id key bytes in
+        let* () =
+          S.put
+            tx
+            (let x, _, _, _ = Cat.row_storage table_meta in
+             x)
+            key
+            bytes
+        in
         Lwt.return None
     in
     match conflict_opt with
@@ -3314,7 +3361,13 @@ let execute_insert_write
          let* () = if owned then S.rollback tx else Lwt.return_unit in
          Lwt.return false
        | Some Ast.CA_replace, _ ->
-         let* old_bytes_opt = S.get tx table_meta.tree_id key in
+         let* old_bytes_opt =
+           S.get
+             tx
+             (let x, _, _, _ = Cat.row_storage table_meta in
+              x)
+             key
+         in
          let old_row =
            match old_bytes_opt with
            | Some b -> decode_with_virtual clock params table_meta b
@@ -3343,7 +3396,14 @@ let execute_insert_write
              ~rowid
              idxs
          in
-         let* () = S.put tx table_meta.tree_id key bytes in
+         let* () =
+           S.put
+             tx
+             (let x, _, _, _ = Cat.row_storage table_meta in
+              x)
+             key
+             bytes
+         in
          let* () =
            insert_row_indexes tx table_meta ~clock ~params ~row_for_idx ~rowid idxs
          in
@@ -3765,7 +3825,8 @@ let scan_child_rows_multi_tx
           if Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
           then (
             let rowid = decode_index_key_rowid ikey in
-            let* row_opt = S.get tx child_meta.Cat.tree_id (Rowid.encode rowid) in
+            let child_tree_id_fk, _, _, _ = Cat.row_storage child_meta in
+            let* row_opt = S.get tx child_tree_id_fk (Rowid.encode rowid) in
             match row_opt with
             | None -> walk ()
             | Some vbytes ->
@@ -3814,7 +3875,8 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
            S.del tx idx.idx_tree_id old_ikey))
       child_idxs
   in
-  S.del tx meta.Cat.tree_id rowid_key
+  let del_tree_id, _, _, _ = Cat.row_storage meta in
+  S.del tx del_tree_id rowid_key
 ;;
 
 (** Update one column to [new_val] in a row within an existing RW transaction.
@@ -4586,7 +4648,12 @@ let drain_matching_rows_in_tx
       ~(where : Plan.expr option)
   : (int64 * Row.t) list Lwt.t
   =
-  let* cur = S.cursor_open tx table_meta.tree_id in
+  let* cur =
+    S.cursor_open
+      tx
+      (let x, _, _, _ = Cat.row_storage table_meta in
+       x)
+  in
   let _sr = S.cursor_first cur in
   let buf = ref [] in
   let rec drain () =
@@ -5333,7 +5400,11 @@ let apply_delete_row
   let* () =
     delete_row_indexes tx table_meta ~clock ~params ~row_for_idx:row ~rowid indexes
   in
-  S.del tx table_meta.tree_id rowid_key
+  S.del
+    tx
+    (let x, _, _, _ = Cat.row_storage table_meta in
+     x)
+    rowid_key
 ;;
 
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
@@ -5468,6 +5539,7 @@ let execute_drop_index
 
 let op_name = function
   | Plan.Op_seq_scan { table_meta } -> "SeqScan(" ^ table_meta.Cat.name ^ ")"
+  | Plan.Op_col_seq_scan { table_meta } -> "ColSeqScan(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_filter _ -> "Filter"
   | Plan.Op_project _ -> "Project"
   | Plan.Op_expr_project _ -> "ExprProject"
@@ -5498,6 +5570,7 @@ let op_name = function
   | Plan.Op_update { table_meta; _ } -> "Update(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_delete { table_meta; _ } -> "Delete(" ^ table_meta.Cat.name ^ ")"
   | Plan.Op_create_table { name; _ } -> "CreateTable(" ^ name ^ ")"
+  | Plan.Op_col_create_table { name; _ } -> "ColCreateTable(" ^ name ^ ")"
   | Plan.Op_create_index { name; table; _ } ->
     "CreateIndex(" ^ name ^ " on " ^ table ^ ")"
   | Plan.Op_drop_table { table_meta; _ } -> "DropTable(" ^ table_meta.Cat.name ^ ")"
@@ -6244,7 +6317,8 @@ let alter_drop_column tx (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name :
      dropped dependent indexes are restored on ROLLBACK without an external block. *)
   (* Drain every row through [tx] (read-your-own-writes) before rewriting, so the
      cursor is closed before we put back the reshaped rows into the same tree. *)
-  let* cur = S.cursor_open tx table_meta.Cat.tree_id in
+  let alt_tree_id, _, _, _ = Cat.row_storage table_meta in
+  let* cur = S.cursor_open tx alt_tree_id in
   let _sr = S.cursor_first cur in
   let rows = ref [] in
   let rec drain () =
@@ -6264,7 +6338,7 @@ let alter_drop_column tx (cat : Cat.t) ~(table_meta : Cat.table_meta) col_name :
     Lwt_list.iter_s
       (fun (k, new_row) ->
          let new_bytes = Row.encode new_columns new_row in
-         S.put tx table_meta.Cat.tree_id k new_bytes)
+         S.put tx alt_tree_id k new_bytes)
       !rows
   in
   let* result = Cat.drop_column ~txn:tx cat ~table_name ~col_name in
@@ -6419,6 +6493,40 @@ let execute_with_count
       ~fk_constraints
       ~without_rowid
       ~autoincrement
+  | Plan.Op_col_create_table { name; columns; if_not_exists } ->
+    if Cat.table_exists cat ~name
+    then
+      if if_not_exists
+      then Lwt.return 0
+      else failwith (Printf.sprintf "table '%s' already exists" name)
+    else
+      let* () =
+        with_ddl_txn store cat mode (fun tx ->
+          Cat.create_columnstore_table ~txn:tx cat ~name ~columns)
+      in
+      Lwt.return 0
+  | Plan.Op_insert
+      { table_meta; ordinals; values; on_conflict = _; returning = _; upsert_update = _ }
+    when Cat.is_columnar table_meta ->
+    let col_store =
+      match table_meta.Cat.storage with
+      | Cat.Columnar cs -> cs
+      | Cat.Row _ -> assert false
+    in
+    let n_cols = List.length table_meta.Cat.columns in
+    let rows =
+      List.map
+        (fun vals ->
+           let row = Array.make n_cols Row.V_null in
+           List.iter2
+             (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr)
+             ordinals
+             vals;
+           row)
+        values
+    in
+    Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
+    Lwt.return (List.length values)
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     execute_insert_values
@@ -6438,6 +6546,27 @@ let execute_with_count
       ~values
       ~on_conflict
       ~upsert_update
+  | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict = _ }
+    when Cat.is_columnar table_meta ->
+    let col_store =
+      match table_meta.Cat.storage with
+      | Cat.Columnar cs -> cs
+      | Cat.Row _ -> assert false
+    in
+    let n_cols = List.length table_meta.Cat.columns in
+    let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
+    let* src_rows = Lwt_stream.to_list stream in
+    let batch =
+      Array.of_list
+        (List.map
+           (fun src_row ->
+              let dest = Array.make n_cols Row.V_null in
+              List.iteri (fun i ord -> dest.(ord) <- src_row.(i)) ordinals;
+              dest)
+           src_rows)
+    in
+    Sqlocaml_columnar.Col_store.insert_rows col_store batch;
+    Lwt.return (Array.length batch)
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
     execute_insert_select_op
       store
@@ -6483,36 +6612,50 @@ let execute_with_count
       ~if_not_exists
   | Plan.Op_update
       { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
-    execute_update_op
-      store
-      cat
-      ~mode
-      ~params
-      ~clock
-      ~before_hook
-      ~after_hook
-      ~table_meta
-      ~assignments
-      ~where
-      ~order
-      ~limit
-      ~offset
-      ~indexes
+    if Cat.is_columnar table_meta
+    then
+      Lwt.fail_with
+        (Printf.sprintf
+           "UPDATE is not supported on columnar table '%s'"
+           table_meta.Cat.name)
+    else
+      execute_update_op
+        store
+        cat
+        ~mode
+        ~params
+        ~clock
+        ~before_hook
+        ~after_hook
+        ~table_meta
+        ~assignments
+        ~where
+        ~order
+        ~limit
+        ~offset
+        ~indexes
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
-    execute_delete_op
-      store
-      cat
-      ~mode
-      ~params
-      ~clock
-      ~before_hook
-      ~after_hook
-      ~table_meta
-      ~where
-      ~order
-      ~limit
-      ~offset
-      ~indexes
+    if Cat.is_columnar table_meta
+    then
+      Lwt.fail_with
+        (Printf.sprintf
+           "DELETE is not supported on columnar table '%s'"
+           table_meta.Cat.name)
+    else
+      execute_delete_op
+        store
+        cat
+        ~mode
+        ~params
+        ~clock
+        ~before_hook
+        ~after_hook
+        ~table_meta
+        ~where
+        ~order
+        ~limit
+        ~offset
+        ~indexes
   | Plan.Op_seq_set { table; seq } ->
     (* #312.1: writable sqlite_sequence SET/INSERT.  Runs through [with_ddl_txn]
        so it participates in any ambient explicit transaction (borrowed [In_txn]
@@ -6648,6 +6791,7 @@ let execute_with_count
   | Plan.Op_last_insert_rowid
   | Plan.Op_total_changes -> failwith "Exec.execute: use Exec.query for read operations"
   | Plan.Op_seq_scan _
+  | Plan.Op_col_seq_scan _
   | Plan.Op_filter _
   | Plan.Op_project _
   | Plan.Op_expr_project _
@@ -7152,6 +7296,7 @@ let rec plan_expr_has_subquery : Plan.expr -> bool = function
 (** Extract table_meta from the leftmost seq scan in a plan op. *)
 let rec get_outer_scan_meta : Plan.op -> Cat.table_meta option = function
   | Plan.Op_seq_scan { table_meta } -> Some table_meta
+  | Plan.Op_col_seq_scan { table_meta } -> Some table_meta
   | Plan.Op_filter { child; _ } -> get_outer_scan_meta child
   | Plan.Op_sort { child; _ } -> get_outer_scan_meta child
   | Plan.Op_limit { child; _ } -> get_outer_scan_meta child
@@ -7973,7 +8118,8 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
      and materialises only the entries actually pulled.  [Bytes.empty] is the
      minimum key, so the first [seek_next] returns the first row — matching the
      old [cursor_first]+[cursor_next] semantics. *)
-  let* cur = rh_seek_ge rh table_meta.tree_id Bytes.empty in
+  let seq_tree_id, _, _, _ = Cat.row_storage table_meta in
+  let* cur = rh_seek_ge rh seq_tree_id Bytes.empty in
   (* Snapshot lifetime tied to the stream: end on exhaustion OR a mid-scan read
      error so a corrupt page can't leak locks/refcounts/pins (#164). Idempotent. *)
   let ended = ref false in
@@ -8003,6 +8149,15 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
            Lwt.fail exn))
   in
   Lwt.return stream
+
+and stream_col_seq_scan _clock _params _store _mode (table_meta : Cat.table_meta) =
+  let col_store =
+    match table_meta.Cat.storage with
+    | Cat.Columnar cs -> cs
+    | Cat.Row _ -> assert false
+  in
+  let seq = Sqlocaml_columnar.Col_store.to_row_seq col_store in
+  Lwt.return (Lwt_stream.of_list (List.of_seq seq))
 
 and stream_filter clock params store mode cat pred child =
   (* #257: a correlated subquery in the predicate is re-evaluated per row at
@@ -8196,7 +8351,8 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
     (* #262: read through the active txn so a primary-key point lookup sees the
        row when it was written earlier in the same open transaction. *)
     let* rh = rh_begin store mode in
-    let* vrow = rh_get rh table_meta.Cat.tree_id (Rowid.encode n) in
+    let rl_tree_id, _, _, _ = Cat.row_storage table_meta in
+    let* vrow = rh_get rh rl_tree_id (Rowid.encode n) in
     let* () = rh_finish rh in
     (match vrow with
      | None -> Lwt.return (Lwt_stream.of_list [])
@@ -8246,7 +8402,8 @@ and nlj_probe_left
           let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
           let rowid = Rowid.decode rowid_bytes in
           let table_key = Rowid.encode rowid in
-          let* vrow = rh_get rh right_meta.Cat.tree_id table_key in
+          let nlj_tree_id, _, _, _ = Cat.row_storage right_meta in
+          let* vrow = rh_get rh nlj_tree_id table_key in
           match vrow with
           | None -> scan ()
           | Some vbytes ->
@@ -8742,7 +8899,8 @@ and run_aggregate_fast_path clock params store mode cat table_meta pred_opt aggs
     (* #262: fold over the active txn when one is open, so a COUNT/SUM reflects
        rows written earlier in the same uncommitted transaction. *)
     let* rh = rh_begin store mode in
-    let* cur = rh_seek_ge rh table_meta.Cat.tree_id Bytes.empty in
+    let agg_tree_id, _, _, _ = Cat.row_storage table_meta in
+    let* cur = rh_seek_ge rh agg_tree_id Bytes.empty in
     let ended = ref false in
     let finish () =
       if !ended
@@ -9032,23 +9190,26 @@ and stream_pragma_integrity_check store cat =
   let* () =
     Lwt_list.iter_s
       (fun (meta : Cat.table_meta) ->
-         let* row_count = count_entries tx meta.tree_id in
-         let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
-         Lwt_list.iter_s
-           (fun (idx : Cat.index_info) ->
-              let is_partial = idx.idx_where_sql <> None in
-              let* idx_count = count_entries tx idx.idx_tree_id in
-              if (not is_partial) && idx_count <> row_count
-              then
-                add_err
-                  (Printf.sprintf
-                     "index %s on %s: %d entries != %d rows"
-                     idx.idx_name
-                     meta.name
-                     idx_count
-                     row_count);
-              Lwt.return_unit)
-           idxs)
+         match meta.Cat.storage with
+         | Cat.Columnar _ -> Lwt.return_unit
+         | Cat.Row { tree_id; _ } ->
+           let* row_count = count_entries tx tree_id in
+           let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
+           Lwt_list.iter_s
+             (fun (idx : Cat.index_info) ->
+                let is_partial = idx.idx_where_sql <> None in
+                let* idx_count = count_entries tx idx.idx_tree_id in
+                if (not is_partial) && idx_count <> row_count
+                then
+                  add_err
+                    (Printf.sprintf
+                       "index %s on %s: %d entries != %d rows"
+                       idx.idx_name
+                       meta.name
+                       idx_count
+                       row_count);
+                Lwt.return_unit)
+             idxs)
       tables
   in
   let result = List.rev !errors in
@@ -9069,10 +9230,15 @@ and stream_sqlite_master store cat =
   let table_rows =
     List.map
       (fun (meta : Cat.table_meta) ->
+         let sm_tree_id =
+           match meta.Cat.storage with
+           | Cat.Row { tree_id; _ } -> tree_id
+           | Cat.Columnar _ -> 0
+         in
          [| Row.V_text "table"
           ; Row.V_text meta.Cat.name
           ; Row.V_text meta.Cat.name
-          ; Row.V_int (Int64.of_int meta.Cat.tree_id)
+          ; Row.V_int (Int64.of_int sm_tree_id)
           ; Row.V_text (ddl_of_table meta)
          |])
       tables
@@ -9131,7 +9297,13 @@ and stream_sqlite_master store cat =
      table exists (matching SQLite — independent of whether a row has been
      inserted yet). *)
   let seq_rows =
-    if List.exists (fun (m : Cat.table_meta) -> m.Cat.autoincrement) tables
+    if
+      List.exists
+        (fun (m : Cat.table_meta) ->
+           match m.Cat.storage with
+           | Cat.Row { autoincrement = true; _ } -> true
+           | _ -> false)
+        tables
     then
       [ [| Row.V_text "table"
          ; Row.V_text "sqlite_sequence"
@@ -9156,13 +9328,11 @@ and stream_sqlite_sequence cat =
   let rows =
     List.filter_map
       (fun (m : Cat.table_meta) ->
-         if m.Cat.autoincrement && not (Int64.equal m.Cat.next_rowid Cat.empty_next_rowid)
-         then
-           (* [next_rowid] is the next id to allocate, so the high-water mark
-              (last id handed out — SQLite's [sqlite_sequence.seq]) is
-              [next_rowid - 1]. *)
-           Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub m.Cat.next_rowid 1L) |]
-         else None)
+         match m.Cat.storage with
+         | Cat.Row { autoincrement = true; next_rowid; _ }
+           when not (Int64.equal next_rowid Cat.empty_next_rowid) ->
+           Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub next_rowid 1L) |]
+         | _ -> None)
       tables
   in
   Lwt.return (Lwt_stream.of_list rows)
@@ -9532,6 +9702,8 @@ and to_stream
   =
   match op with
   | Plan.Op_seq_scan { table_meta } -> stream_seq_scan clock params store mode table_meta
+  | Plan.Op_col_seq_scan { table_meta } ->
+    stream_col_seq_scan clock params store mode table_meta
   | Plan.Op_filter { pred; child } -> stream_filter clock params store mode cat pred child
   | Plan.Op_project { ordinals; child } ->
     let* inner = to_stream clock params store ~mode ~cat child in
@@ -9681,6 +9853,9 @@ and to_stream
   | Plan.Op_intersect { left; right } ->
     stream_intersect clock params store mode cat left right
   | Plan.Op_except { left; right } -> stream_except clock params store mode cat left right
+  | Plan.Op_insert { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_insert { table_meta; ordinals; values; on_conflict; returning; upsert_update }
     when returning <> [] ->
     stream_insert_returning
@@ -9695,6 +9870,9 @@ and to_stream
       on_conflict
       returning
       upsert_update
+  | Plan.Op_update { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_update
       { table_meta; assignments; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
@@ -9712,6 +9890,9 @@ and to_stream
       offset
       indexes
       returning
+  | Plan.Op_delete { table_meta; returning; _ }
+    when returning <> [] && Cat.is_columnar table_meta ->
+    Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
     when returning <> [] ->
     stream_delete_returning
@@ -9752,6 +9933,7 @@ and to_stream
   | Plan.Op_explain { analyze; inner } ->
     stream_explain clock params store mode cat analyze inner
   | Plan.Op_create_table _
+  | Plan.Op_col_create_table _
   | Plan.Op_create_index _
   | Plan.Op_drop_table _
   | Plan.Op_drop_index _
@@ -9808,7 +9990,7 @@ let () = to_stream_ref := to_stream
 let rec op_uses_index (op : Plan.op) : bool =
   match op with
   | Plan.Op_index_lookup _ | Plan.Op_rowid_lookup _ | Plan.Op_fts_match_scan _ -> true
-  | Plan.Op_seq_scan _ | Plan.Op_fts_seq_scan _ -> false
+  | Plan.Op_seq_scan _ | Plan.Op_col_seq_scan _ | Plan.Op_fts_seq_scan _ -> false
   | Plan.Op_filter { child; _ }
   | Plan.Op_project { child; _ }
   | Plan.Op_expr_project { child; _ }

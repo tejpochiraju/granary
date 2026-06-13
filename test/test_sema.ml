@@ -89,6 +89,7 @@ let bind_create_new () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with
@@ -128,6 +129,7 @@ let bind_create_duplicate () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with
@@ -172,6 +174,7 @@ let bind_create_preserves_cols () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with
@@ -3075,6 +3078,7 @@ let bind_create_default_null () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with
@@ -3110,6 +3114,7 @@ let bind_create_default_real () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with
@@ -3145,6 +3150,7 @@ let bind_create_default_blob () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   match bind cat stmt with

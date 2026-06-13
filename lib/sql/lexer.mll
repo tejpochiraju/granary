@@ -154,6 +154,7 @@ rule token = parse
       | "UNIXEPOCH"  -> UNIXEPOCH
       | "VIRTUAL"    -> VIRTUAL
       | "USING"      -> USING
+      | "COLUMNSTORE" -> COLUMNSTORE
       | "FTS5"       -> FTS5
       | "MATCH"      -> MATCH
       | "RETURNING"  -> RETURNING

@@ -240,11 +240,15 @@ let recover ~read_page ~n_pages ~open_source ~write_to =
       match remaining_tables with
       | [] -> Lwt.return (acc_rev, tables_recovered)
       | table_meta :: rest ->
-        let tree_id = table_meta.Catalog.tree_id in
-        let* table_rows = extract_one_table store tree_id in
-        let n_rows = List.length table_rows in
-        let recovered = if n_rows > 0 then tables_recovered + 1 else tables_recovered in
-        extract_all (List.rev_append table_rows acc_rev) recovered rest
+        (match table_meta.Catalog.storage with
+         | Catalog.Columnar _ -> extract_all acc_rev tables_recovered rest
+         | Catalog.Row { tree_id; _ } ->
+           let* table_rows = extract_one_table store tree_id in
+           let n_rows = List.length table_rows in
+           let recovered =
+             if n_rows > 0 then tables_recovered + 1 else tables_recovered
+           in
+           extract_all (List.rev_append table_rows acc_rev) recovered rest)
     in
     let* all_rows_rev, tables_recovered = extract_all [] 0 tables in
     let all_rows = List.rev all_rows_rev in

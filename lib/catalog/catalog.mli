@@ -56,22 +56,29 @@ type pending_fk_check =
         resolved (e.g. parent row now exists, child row now deleted). *)
   }
 
+type storage =
+  | Row of
+      { tree_id : Sqlocaml_store.Store.tree_id
+      ; next_rowid : int64
+        (** Next rowid to auto-allocate.  [empty_next_rowid] = never seeded. *)
+      ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
+      ; autoincrement : bool (** #299: sticky rowid high-water. *)
+      }
+  | Columnar of Sqlocaml_columnar.Col_store.t
+  (** M1: in-memory only; Col_store is empty on re-open after restart. *)
+
 type table_meta =
   { name : string
-  ; tree_id : Sqlocaml_store.Store.tree_id
+  ; storage : storage
   ; columns : Sqlocaml_encoding.Row.column list
-  ; next_rowid : int64
   ; fk_constraints : fk_constraint list
-  ; without_rowid : bool
-    (** WITHOUT ROWID — the INTEGER PRIMARY KEY column's value is used
-        as the row's storage key (no auto-allocated rowid).  Phase 37. *)
-  ; autoincrement : bool
-    (** #299: [INTEGER PRIMARY KEY AUTOINCREMENT].  When [true] the rowid
-        counter is a sticky high-water mark: on ROLLBACK it reverts to the
-        last-committed value (read back from [_sys_tables]) instead of being
-        recomputed as [max(rowid)+1] from the data tree, so a committed DELETE
-        of the top row is never reused. *)
   }
+
+(** Extract the Row payload.  Raises if [storage = Columnar]. *)
+val row_storage : table_meta -> Sqlocaml_store.Store.tree_id * int64 * bool * bool
+(** Returns [(tree_id, next_rowid, without_rowid, autoincrement)]. *)
+
+val is_columnar : table_meta -> bool
 
 (** Sentinel [next_rowid] for a rowid/alias table that has never seeded its
     counter — conceptually [max = -inf].  Used to tell "never inserted" apart
@@ -90,6 +97,7 @@ val compute_rowid_alias_col
 
 (** [rowid_alias_col m] = [compute_rowid_alias_col m.columns ~without_rowid]. *)
 val rowid_alias_col : table_meta -> int option
+(** [None] for columnar tables (no rowid). *)
 
 (** #243 (T1): record the rowid of the most recently INSERTed row (for
     [last_insert_rowid()]).  Set by the executor after each successful insert. *)
@@ -396,6 +404,16 @@ val drop_column
   -> table_name:string
   -> col_name:string
   -> (unit, string) result Lwt.t
+
+(** [create_columnstore_table ?txn t ~name ~columns] registers a columnar table
+    in the catalog (sys_tables + sys_columns), allocates no B-tree.
+    Returns unit (no tree_id — columnar tables have no B-tree). *)
+val create_columnstore_table
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> name:string
+  -> columns:Sqlocaml_encoding.Row.column list
+  -> unit Lwt.t
 
 (** True if a table with [name] exists in the catalog. *)
 val table_exists : t -> name:string -> bool

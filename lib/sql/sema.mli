@@ -108,7 +108,12 @@ type seq_write =
   | Seq_reset of { table : string option (** [None] = DELETE with no WHERE: reset all *) }
 
 type bound_stmt =
-  | BS_no_op (** Emitted by IF EXISTS DROP when the named object does not exist. *)
+  | BS_no_op
+  | BS_col_create_table of
+      { name : string
+      ; columns : Sqlocaml_encoding.Row.column list
+      ; if_not_exists : bool
+      }
   | BS_create_table of
       { name : string
       ; columns : Sqlocaml_encoding.Row.column list

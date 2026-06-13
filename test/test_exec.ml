@@ -136,7 +136,9 @@ let exec_create_table_tree_id () =
      let* result = Cat.find_table cat ~name:"first" in
      (match result with
       | None -> Alcotest.fail "expected Some, got None"
-      | Some m -> Alcotest.(check int) "tree_id is 16" 16 m.Cat.tree_id);
+      | Some m ->
+        let tid, _, _, _ = Cat.row_storage m in
+        Alcotest.(check int) "tree_id is 16" 16 tid);
      Lwt.return_unit)
 ;;
 
@@ -228,7 +230,12 @@ let exec_insert_one_row () =
      let* meta = Cat.find_table cat ~name:"t" in
      let m = Option.get meta in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "alice" ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      Alcotest.(check int) "one entry" 1 (List.length pairs);
      Lwt.return_unit)
 ;;
@@ -254,7 +261,12 @@ let exec_insert_two_rows () =
      let m = Option.get meta in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "alice" ]);
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 2L; Ast.L_text "bob" ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      Alcotest.(check int) "two entries" 2 (List.length pairs);
      Lwt.return_unit)
 ;;
@@ -279,7 +291,12 @@ let exec_insert_row_content () =
      let* meta = Cat.find_table cat ~name:"t" in
      let m = Option.get meta in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 7L; Ast.L_text "hat" ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      (match pairs with
       | [ (_, vbytes) ] ->
         let row = Row.decode id_name_cols vbytes in
@@ -316,7 +333,12 @@ let exec_insert_null () =
      (* Insert with NULL in the name column (ordinal 0 = id, ordinal 1 = name) *)
      (* We insert only id=5; name stays NULL (Array.make initialises to V_null) *)
      insert store cat "t" ([ 0 ], [ Ast.L_int 5L ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      (match pairs with
       | [ (_, vbytes) ] ->
         let row = Row.decode id_name_cols vbytes in
@@ -348,7 +370,12 @@ let exec_insert_increments_rowid () =
      let m = Option.get meta in
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 1L; Ast.L_text "a" ]);
      insert store cat "t" ([ 0; 1 ], [ Ast.L_int 2L; Ast.L_text "b" ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      (* Two inserts → two distinct keys in the tree *)
      Alcotest.(check int) "two distinct rowid keys" 2 (List.length pairs);
      let k0, _ = List.nth pairs 0 in
@@ -378,7 +405,12 @@ let exec_insert_text_only () =
      let* meta = Cat.find_table cat ~name:"words" in
      let m = Option.get meta in
      insert store cat "words" ([ 0 ], [ Ast.L_text "hello" ]);
-     let pairs = cursor_collect store m.Cat.tree_id in
+     let pairs =
+       cursor_collect
+         store
+         (let x, _, _, _ = Cat.row_storage m in
+          x)
+     in
      (match pairs with
       | [ (_, vbytes) ] ->
         let row = Row.decode schema vbytes in
@@ -1557,7 +1589,9 @@ let exec_create_index_basic () =
          (Plan.Op_create_index
             { name = "idx_id"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1600,7 +1634,9 @@ let query_create_index_raises () =
              (Plan.Op_create_index
                 { name = "idx"
                 ; table = "tci"
-                ; tree_id = m.Cat.tree_id
+                ; tree_id =
+                    (let x, _, _, _ = Cat.row_storage m in
+                     x)
                 ; col_sqls = [ "x" ]
                 ; col_expr_flags = [ false ]
                 ; where_expr = None
@@ -1648,7 +1684,9 @@ let query_index_lookup_basic () =
          (Plan.Op_create_index
             { name = "idx_id"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1662,7 +1700,9 @@ let query_index_lookup_basic () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Integer
@@ -1708,7 +1748,9 @@ let query_index_lookup_type_mismatch () =
          (Plan.Op_create_index
             { name = "idx_id2"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1723,7 +1765,9 @@ let query_index_lookup_type_mismatch () =
      (* col_type=Integer but lookup_val is TEXT — type mismatch → IK_null → no results *)
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Integer
@@ -1770,7 +1814,9 @@ let query_index_lookup_multiple_matches () =
          (Plan.Op_create_index
             { name = "idx_id_multi"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1784,7 +1830,9 @@ let query_index_lookup_multiple_matches () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Integer
@@ -1827,7 +1875,9 @@ let query_index_lookup_text () =
          (Plan.Op_create_index
             { name = "idx_name"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "name" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1841,7 +1891,9 @@ let query_index_lookup_text () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 1
          ; col_type = Row.Text
@@ -1894,7 +1946,9 @@ let query_index_lookup_real () =
          (Plan.Op_create_index
             { name = "idx_r"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "r" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1908,7 +1962,9 @@ let query_index_lookup_real () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Real
@@ -1961,7 +2017,9 @@ let query_index_lookup_blob () =
          (Plan.Op_create_index
             { name = "idx_b"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "b" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -1975,7 +2033,9 @@ let query_index_lookup_blob () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Blob
@@ -2017,7 +2077,9 @@ let query_index_lookup_null () =
          (Plan.Op_create_index
             { name = "idx_n"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None
@@ -2031,7 +2093,9 @@ let query_index_lookup_null () =
      let (idx : Cat.index_info) = Option.get idx_opt in
      let op =
        Plan.Op_index_lookup
-         { table_tree = m.Cat.tree_id
+         { table_tree =
+             (let x_id, _, _, _ = Cat.row_storage m in
+              x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; col_idx = 0
          ; col_type = Row.Integer
@@ -2325,7 +2389,9 @@ let unique_index_first_insert_succeeds () =
          (Plan.Op_create_index
             { name = "idx_u"
             ; table = "t"
-            ; tree_id = m.Cat.tree_id
+            ; tree_id =
+                (let x, _, _, _ = Cat.row_storage m in
+                 x)
             ; col_sqls = [ "id" ]
             ; col_expr_flags = [ false ]
             ; where_expr = None

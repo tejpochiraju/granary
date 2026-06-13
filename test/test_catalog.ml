@@ -54,7 +54,8 @@ let test_create_then_find () =
      (match result with
       | None -> Alcotest.fail "expected Some, got None"
       | Some m ->
-        Alcotest.(check int) "tree_id" tid m.tree_id;
+        let stored_tid, _, _, _ = C.row_storage m in
+        Alcotest.(check int) "tree_id" tid stored_tid;
         Alcotest.(check int) "column count" 2 (List.length m.columns));
      Lwt.return_unit)
 ;;
@@ -544,7 +545,8 @@ let test_metadata_survives_reopen () =
       | None -> Alcotest.fail "table not found after reopen"
       | Some m ->
         Alcotest.(check string) "name preserved" "users" m.C.name;
-        Alcotest.(check int) "tree_id preserved" 16 m.C.tree_id);
+        let tid_test, _, _, _ = C.row_storage m in
+        Alcotest.(check int) "tree_id preserved" 16 tid_test);
      Lwt.return_unit)
 ;;
 
@@ -617,7 +619,9 @@ let test_tree_id_survives_reopen () =
      let* result = C.find_table cat2 ~name:"t" in
      (match result with
       | None -> Alcotest.fail "table not found after reopen"
-      | Some m -> Alcotest.(check int) "tree_id survives reopen" tid1 m.C.tree_id);
+      | Some m ->
+        let tid_survive, _, _, _ = C.row_storage m in
+        Alcotest.(check int) "tree_id survives reopen" tid1 tid_survive);
      Lwt.return_unit)
 ;;
 
@@ -897,10 +901,11 @@ let mirror_preserves_autoincrement () =
   match Lwt_main.run (C.find_table cat2 ~name:"t") with
   | None -> Alcotest.fail "t should be reconstructed from the mirror"
   | Some m ->
+    let _, _, _, ai_mirror = C.row_storage m in
     Alcotest.(check bool)
       "mirror-reconstructed table keeps autoincrement=true"
       true
-      m.C.autoincrement
+      ai_mirror
 ;;
 
 (* #314: the AUTOINCREMENT high-water (incl. a committed-DELETE high-water) must
@@ -955,14 +960,15 @@ let mirror_preserves_autoincrement_counter () =
      (match C.find_table_cached cat2 ~name:"t" with
       | None -> Alcotest.fail "table t should be reconstructed from mirror"
       | Some m ->
+        let _, nr_mirror, _, ai_mirror2 = C.row_storage m in
         Alcotest.(check bool)
           "reconstructed table keeps autoincrement=true"
           true
-          m.C.autoincrement;
+          ai_mirror2;
         Alcotest.(check int64)
           "reconstructed next_rowid is the sticky high-water 3, not max+1=2"
           3L
-          m.C.next_rowid);
+          nr_mirror);
      (* The next auto-allocated rowid must be 3, not the deleted/reused 2. *)
      let* r = C.next_rowid cat2 ~name:"t" in
      Alcotest.(check int64) "next allocated rowid is 3, not reused 2" 3L r;
@@ -2036,9 +2042,10 @@ let test_mirror_recovers_lost_primary_row () =
      (match found with
       | None -> Alcotest.fail "table not recovered from mirror after primary row loss"
       | Some m ->
-        Alcotest.(check int) "recovered tree_id" tid m.tree_id;
+        let tid_rec, _, wo_rec, _ = C.row_storage m in
+        Alcotest.(check int) "recovered tree_id" tid tid_rec;
         Alcotest.(check int) "recovered column count" 2 (List.length m.columns);
-        Alcotest.(check bool) "recovered without_rowid" false m.without_rowid;
+        Alcotest.(check bool) "recovered without_rowid" false wo_rec;
         Alcotest.(check (option int64))
           "recovered fingerprint matches original"
           (Some (SF.compute ~columns:cols ~without_rowid:false))
@@ -2157,7 +2164,8 @@ let test_mirror_recovers_next_rowid () =
      (match C.find_table_cached cat2 ~name:"t" with
       | None -> Alcotest.fail "table t should be recovered from mirror"
       | Some m ->
-        Alcotest.(check int64) "recovered next_rowid is max+1" 43L m.C.next_rowid);
+        let _, nrid_rec, _, _ = C.row_storage m in
+        Alcotest.(check int64) "recovered next_rowid is max+1" 43L nrid_rec);
      (* Allocate one more rowid — should yield 43, not 1. *)
      let* r = C.next_rowid cat2 ~name:"t" in
      Alcotest.(check int64) "next allocated rowid is 43" 43L r;
@@ -2191,10 +2199,8 @@ let test_mirror_recovers_negative_next_rowid () =
      (match C.find_table_cached cat2 ~name:"t" with
       | None -> Alcotest.fail "table t should be recovered from mirror"
       | Some m ->
-        Alcotest.(check int64)
-          "recovered next_rowid is max(-5,-3)+1 = -2"
-          (-2L)
-          m.C.next_rowid);
+        let _, nrid_rec2, _, _ = C.row_storage m in
+        Alcotest.(check int64) "recovered next_rowid is max(-5,-3)+1 = -2" (-2L) nrid_rec2);
      let* r = C.next_rowid cat2 ~name:"t" in
      Alcotest.(check int64) "next allocated rowid is -2, not 1" (-2L) r;
      Lwt.return_unit)
