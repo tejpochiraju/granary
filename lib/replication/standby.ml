@@ -131,11 +131,10 @@ let start_following t stream =
                       | Ok (epoch, idx) ->
                         t.last_epoch <- epoch;
                         t.last_frame_idx <- idx;
-                        Store.set_follower_ack_position
-                          t.store
-                          ~frames:(Wal.committed_frames t.wal);
+                        let acked = Wal.committed_frames t.wal in
+                        Store.set_follower_ack_position t.store ~frames:acked;
                         (match t.on_standby_ack with
-                         | Some cb -> cb (Wal.committed_frames t.wal)
+                         | Some cb -> cb acked
                          | None -> ());
                         Lwt.return `Continue))
                in
@@ -199,11 +198,10 @@ let rebase t segments =
              | Ok (epoch, idx) ->
                t.last_epoch <- epoch;
                t.last_frame_idx <- idx;
-               Store.set_follower_ack_position
-                 t.store
-                 ~frames:(Wal.committed_frames t.wal);
+               let acked = Wal.committed_frames t.wal in
+               Store.set_follower_ack_position t.store ~frames:acked;
                (match t.on_standby_ack with
-                | Some cb -> cb (Wal.committed_frames t.wal)
+                | Some cb -> cb acked
                 | None -> ());
                loop ())
         in

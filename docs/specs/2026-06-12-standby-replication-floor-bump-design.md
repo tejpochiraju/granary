@@ -34,7 +34,7 @@ even though the standby has already consumed those frames.
 
 ## Design: option A (recommended) — position-advance callback
 
-Add an optional `~on_standby_ack:(frames:int -> unit)` parameter to
+Add an optional `?on_standby_ack:(int -> unit)` parameter to
 `Standby.create`.  The application passes a callback that advances the
 master's replication floor.  The standby calls it after every successful
 apply batch, with the local `Wal.committed_frames` value.
@@ -139,8 +139,9 @@ call is a no-op on the master — the application simply doesn't wire
 `on_standby_ack` or passes a no-op.
 
 The floor may already be at or past the standby's position (the ship
-path set it).  The standby's call is then a no-op (`shipped` ≤ current
-floor), which is harmless.
+path set it).  The standby's call then sets `replication_shipped_frames`
+to a value at or below the current floor — harmless: a lower value only
+makes the gate wait longer; it never recycles un-shipped frames.
 
 ## What about the sink-ship drain (#337)?
 

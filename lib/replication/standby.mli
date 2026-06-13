@@ -29,8 +29,10 @@ type t
     [Wal.committed_frames] count.  The application typically uses it to
     advance the master's replication floor via
     {!Sqlocaml_store.Store.update_replication_position}, so the master's
-    checkpoint gate reflects the standby's true applied position.  No-op
-    when omitted. *)
+    checkpoint gate reflects the standby's true applied position.  The
+    callback must not raise: in [start_following] it is caught by the
+    loop's exception handler and degrades to an
+    [`Apply_error]; in [rebase] it is not caught.  No-op when omitted. *)
 val create
   :  store:Sqlocaml_store.Store.t
   -> pager:Sqlocaml_storage.Pager.t

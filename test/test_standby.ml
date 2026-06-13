@@ -1305,14 +1305,17 @@ let test_on_standby_ack_fires_after_each_batch () =
          ~on_standby_ack:(fun frames -> calls := frames :: !calls)
          ()
      in
-     let frames =
+     let batch1 =
        [ make_frame
            ~epoch:0L
            ~frame_idx:0
            ~page_id:1L
            ~is_commit:true
            ~page:(page_with 'A')
-       ; make_frame
+       ]
+     in
+     let batch2 =
+       [ make_frame
            ~epoch:0L
            ~frame_idx:1
            ~page_id:2L
@@ -1321,13 +1324,18 @@ let test_on_standby_ack_fires_after_each_batch () =
        ]
      in
      let stream, push = Lwt_stream.create () in
-     push (Some frames);
+     push (Some batch1);
+     push (Some batch2);
      push None;
      let* r = Standby.start_following st stream in
      (match r with
       | Ok () ->
-        Alcotest.(check int) "callback called once" 1 (List.length !calls);
-        Alcotest.(check int) "callback gets committed_frames" 2 (List.hd !calls)
+        Alcotest.(check int) "callback called twice" 2 (List.length !calls);
+        Alcotest.(check int)
+          "first call gets committed_frames=1"
+          1
+          (List.hd (List.rev !calls));
+        Alcotest.(check int) "second call gets committed_frames=2" 2 (List.hd !calls)
       | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
      Lwt.return_unit)
 ;;
@@ -1354,6 +1362,45 @@ let test_on_standby_ack_noop_when_omitted () =
      (match r with
       | Ok () -> Alcotest.(check int) "frames applied" 1 (Wal.committed_frames wal)
       | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     Lwt.return_unit)
+;;
+
+let test_rebase_calls_on_standby_ack () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let calls = ref [] in
+     let st =
+       Standby.create
+         ~store
+         ~pager
+         ~wal
+         ~on_standby_ack:(fun frames -> calls := frames :: !calls)
+         ()
+     in
+     let seg =
+       [ make_frame
+           ~epoch:5L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'X')
+       ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some seg);
+     push None;
+     let* r = Standby.rebase st stream in
+     (match r with
+      | Ok _ ->
+        Alcotest.(check int) "callback called once during rebase" 1 (List.length !calls);
+        Alcotest.(check int)
+          "callback gets committed_frames after rebase"
+          1
+          (List.hd !calls)
+      | Error (`Apply_error msg) -> Alcotest.failf "rebase: %s" msg);
      Lwt.return_unit)
 ;;
 
@@ -1457,6 +1504,7 @@ let () =
             "no-op when omitted"
             `Quick
             test_on_standby_ack_noop_when_omitted
+        ; Alcotest.test_case "fires during rebase" `Quick test_rebase_calls_on_standby_ack
         ] )
     ; "qcheck", qcheck_tests
     ]
