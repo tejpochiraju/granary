@@ -87,6 +87,7 @@ let plan_create_table () =
       ; constraints = []
       ; if_not_exists = false
       ; without_rowid = false
+      ; using_columnstore = false
       }
   in
   let bound = bind cat stmt in
