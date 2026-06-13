@@ -1,10 +1,10 @@
-(** End-to-end test for the shared-WAL-handle scenario (#360).
+(** End-to-end test for the shared-WAL-device scenario (#360).
 
     Exercises the full master–standby lifecycle where the master Store and
-    the Standby share the same WAL device.  The master commits data, frames
-    are captured and fed to the Standby via the apply loop, and the
-    {!Standby.on_standby_ack} callback advances the master's replication
-    floor through {!Store.update_replication_position}. *)
+    the Standby open separate {!Wal.t} handles over the same WAL device.
+    The master commits data, frames are captured and fed to the Standby via
+    the apply loop, and the {!Standby.on_standby_ack} callback advances the
+    master's replication floor through {!Store.update_replication_position}. *)
 
 open Lwt.Syntax
 module Wal = Sqlocaml_storage.Wal
@@ -173,19 +173,18 @@ let open_topology () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* #360: shared-WAL-handle end-to-end test                             *)
+(* #360: shared-WAL-device end-to-end test                             *)
 (* ------------------------------------------------------------------ *)
 
 (** 1. The master commits Store transactions.
     2. Frames are captured from the master store.
-    3. The Standby applies them via the shared WAL handle.
+    3. The Standby applies them via its WAL handle over the same device.
     4. The {!on_standby_ack} callback fires and advances the master's
        replication floor.
-    5. Data is visible through the shared WAL. *)
-let test_shared_wal_end_to_end () =
+    5. Data is visible through the standby WAL handle. *)
+let test_master_commit_standby_applies () =
   Lwt_main.run
     (let* topo = open_topology () in
-     (* Commit data on the master store. *)
      let* rw = Store.rw_begin topo.master in
      let* () = Store.put rw 16 (Bytes.of_string "k1") (Bytes.of_string "v1") in
      let* () = Store.put rw 16 (Bytes.of_string "k2") (Bytes.of_string "v2") in
@@ -204,7 +203,6 @@ let test_shared_wal_end_to_end () =
        | None -> Alcotest.fail "master has no WAL"
      in
      Alcotest.(check bool) "master has committed frames" true (commit_frames > 0);
-     (* Capture frames from the master store. *)
      let* r = Store.capture_frames_since topo.master ~since_epoch:0L ~since_idx:(-1) in
      let frames =
        match r with
@@ -213,7 +211,6 @@ let test_shared_wal_end_to_end () =
        | None -> Alcotest.fail "capture_frames_since returned None (epoch changed)"
      in
      Alcotest.(check bool) "captured at least one frame" true (frames <> []);
-     (* Feed captured frames to the Standby via its apply loop. *)
      let stream, push = Lwt_stream.create () in
      push (Some frames);
      push None;
@@ -221,7 +218,7 @@ let test_shared_wal_end_to_end () =
      (match r with
       | Ok () ->
         Alcotest.(check bool)
-          "standby committed frames via shared WAL"
+          "standby committed frames via standalone WAL handle"
           true
           (Wal.committed_frames topo.shared_wal > 0);
         Alcotest.(check int)
@@ -238,21 +235,22 @@ let test_shared_wal_end_to_end () =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* #360: shared-WAL-handle with master write + live standby            *)
+(* #360: shared-WAL-device with commit callback + live standby         *)
 (* ------------------------------------------------------------------ *)
 
-(** Verify the Standby can consume frames from a commit callback:
-    register a commit callback that captures frames on the fly and
-    feeds them to the Standby via a stream, simulating the real
-    application topology. *)
-let test_shared_wal_with_commit_callback () =
+(** Verify the Standby can consume frames captured via the commit
+    callback.  The callback stores captured frames in a ref; after
+    the commit the main fiber reads the ref and feeds them to the
+    Standby.  This explicitly avoids the ordering dependency of the
+    callback pushing directly into a live stream (the callback fires
+    via {!Lwt.async} and may not have completed when the main fiber
+    reaches the next line). *)
+let test_commit_callback_feeds_standby () =
   Lwt_main.run
     (let* topo = open_topology () in
-     (* Set up a commit callback that captures frames and pushes them
-        into a stream for the Standby to consume. *)
      let shipped_epoch = ref 0L in
      let shipped_idx = ref (-1) in
-     let shipper_stream, shipper_push = Lwt_stream.create () in
+     let captured_ref = ref [] in
      let* () =
        Store.set_commit_callback
          topo.master
@@ -268,42 +266,22 @@ let test_shared_wal_with_commit_callback () =
                | Some (Ok fs) when fs <> [] ->
                  shipped_epoch := epoch;
                  shipped_idx := base_idx + count - 1;
-                 let replicated = List.map Replication.backup_frame_to_replicated fs in
-                 shipper_push (Some replicated)
+                 captured_ref := List.map Replication.backup_frame_to_replicated fs
                | _ -> ());
               Lwt.return_unit))
      in
-     (* Start the Standby consuming from the shipper stream in a
-        background fiber.  Use a ref to observe the result. *)
-     let apply_result = ref None in
-     let _apply_fiber =
-       Lwt.async (fun () ->
-         let* r = Standby.start_following topo.standby shipper_stream in
-         apply_result := Some r;
-         Lwt.return_unit)
-     in
-     (* Give the standby loop time to enter the stream consumer. *)
-     let* () = Lwt.pause () in
-     (* Commit on the master.  The commit callback fires asynchronously
-        and pushes frames into the stream. *)
      let* rw = Store.rw_begin topo.master in
      let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
      let* () = Store.put rw 16 (Bytes.of_string "b") (Bytes.of_string "2") in
      let* () = Store.put rw 16 (Bytes.of_string "c") (Bytes.of_string "3") in
      let* () = Store.commit rw in
-     (* Close the shipper stream so the Standby's apply loop terminates. *)
-     shipper_push None;
-     (* Wait for the Standby to finish applying. *)
-     let* () =
-       wait_for
-         (fun () ->
-            match !apply_result with
-            | Some _ -> true
-            | None -> false)
-         100
-     in
-     (match !apply_result with
-      | Some (Ok ()) ->
+     let* () = wait_for (fun () -> !captured_ref <> []) 50 in
+     let stream, push = Lwt_stream.create () in
+     push (Some !captured_ref);
+     push None;
+     let* r = Standby.start_following topo.standby stream in
+     (match r with
+      | Ok () ->
         Alcotest.(check bool)
           "standby committed frames via live callback"
           true
@@ -313,65 +291,81 @@ let test_shared_wal_with_commit_callback () =
           "ack position matches committed frames"
           (Wal.committed_frames topo.shared_wal)
           !(topo.acked_frames)
-      | Some (Error (`Apply_error msg)) -> Alcotest.failf "standby apply error: %s" msg
-      | None -> Alcotest.fail "standby did not complete");
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
      let* () = Store.set_commit_callback topo.master None in
      Lwt.return_unit)
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* #360: shared-WAL-handle with checkpoint gating                      *)
+(* #360: shared-WAL-device checkpoint gating                           *)
 (* ------------------------------------------------------------------ *)
 
 (** Verify that the master's autocheckpoint is gated on the standby's
-    floor advance when using the shared-WAL-handle topology. *)
-let test_shared_wal_checkpoint_gating () =
+    floor advance:
+    1. Register a commit callback to activate the gate infrastructure.
+    2. Set autocheckpoint to 2 frames and commit 2+ keys.
+       The autocheckpoint dispatches but parks waiting for the floor.
+    3. Ship frames to the Standby.
+    4. The {!on_standby_ack} fires {!Store.update_replication_position},
+       advancing the floor.
+    5. The checkpoint completes: master epoch advances. *)
+let test_checkpoint_gating_via_standby_ack () =
   Lwt_main.run
     (let* topo = open_topology () in
-     (* Register a commit callback so the gate infrastructure is active. *)
      let* () =
        Store.set_commit_callback
          topo.master
          (Some (fun ~epoch:_ ~base_idx:_ ~count:_ -> Lwt.return_unit))
      in
+     Store.set_wal_autocheckpoint topo.master 2;
      let* rw = Store.rw_begin topo.master in
      let* () = Store.put rw 16 (Bytes.of_string "a") (Bytes.of_string "1") in
      let* () = Store.put rw 16 (Bytes.of_string "b") (Bytes.of_string "2") in
      let* () = Store.commit rw in
-     (* Record state before shipping. *)
-     let _epoch_pre, frames_pre =
+     (* Yield so the autocheckpoint async fiber can start parking. *)
+     let* () = Lwt.pause () in
+     let* () = Lwt.pause () in
+     let epoch_pre, frames_pre =
        match Store.replication_state topo.master with
        | Some s -> s
        | None -> Alcotest.fail "master has no WAL"
      in
+     Alcotest.(check bool)
+       "checkpoint has not reset the WAL (epoch unchanged)"
+       true
+       (epoch_pre = 0L);
      Alcotest.(check bool) "frames committed before ship" true (frames_pre > 0);
-     (* Capture frames and ship to the Standby. *)
      let* r = Store.capture_frames_since topo.master ~since_epoch:0L ~since_idx:(-1) in
      let frames =
        match r with
        | Some (Ok fs) -> List.map Replication.backup_frame_to_replicated fs
        | Some (Error (`Capture_error msg)) -> Alcotest.failf "capture error: %s" msg
-       | None -> Alcotest.fail "capture returned None"
+       | None -> Alcotest.fail "capture returned None (checkpoint advanced before ship)"
      in
      let stream, push = Lwt_stream.create () in
      push (Some frames);
      push None;
      let* r = Standby.start_following topo.standby stream in
      (match r with
-      | Ok () -> Alcotest.(check int) "standby applied" 1 !(topo.ack_calls)
+      | Ok () -> Alcotest.(check int) "standby ack callback fired" 1 !(topo.ack_calls)
       | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
-     (* Verify the master's replication floor was advanced by the
-        on_standby_ack → update_replication_position call. *)
      let* () =
        wait_for
          (fun () ->
             match Store.replication_state topo.master with
-            | Some (_epoch, frames) ->
-              (* After the ack, the frame count should match the standby *)
-              frames <= Wal.committed_frames topo.shared_wal || frames_pre <= frames
+            | Some (epoch, _frames) -> epoch > epoch_pre
             | None -> false)
-         10
+         50
      in
+     let epoch_post, _frames_post =
+       match Store.replication_state topo.master with
+       | Some s -> s
+       | None -> Alcotest.fail "master has no WAL"
+     in
+     Alcotest.(check bool)
+       "checkpoint completed after floor advance (epoch bumped)"
+       true
+       (epoch_post > epoch_pre);
      let* () = Store.set_commit_callback topo.master None in
      Lwt.return_unit)
 ;;
@@ -379,19 +373,19 @@ let test_shared_wal_checkpoint_gating () =
 let () =
   Alcotest.run
     "shared_wal"
-    [ ( "shared_wal_end_to_end"
+    [ ( "shared_wal"
       , [ Alcotest.test_case
-            "commit master, capture frames, standby applies, ack fires"
+            "master commit → standby apply → ack fires"
             `Quick
-            test_shared_wal_end_to_end
+            test_master_commit_standby_applies
         ; Alcotest.test_case
-            "commit callback feeds live standby stream"
+            "commit callback captures frames for standby"
             `Quick
-            test_shared_wal_with_commit_callback
+            test_commit_callback_feeds_standby
         ; Alcotest.test_case
-            "checkpoint gating with shared WAL"
+            "checkpoint gating via standby ack"
             `Quick
-            test_shared_wal_checkpoint_gating
+            test_checkpoint_gating_via_standby_ack
         ] )
     ]
 ;;
