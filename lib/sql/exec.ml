@@ -177,7 +177,11 @@ let quote_ident s =
 ;;
 
 let ddl_of_table (meta : Cat.table_meta) =
-  let _, _, without_rowid, autoincrement = Cat.row_storage meta in
+  let without_rowid, autoincrement =
+    match meta.Cat.storage with
+    | Cat.Row { without_rowid; autoincrement; _ } -> without_rowid, autoincrement
+    | Cat.Columnar _ -> false, false
+  in
   let autoinc_idx =
     if autoincrement
     then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
@@ -232,10 +236,11 @@ let ddl_of_table (meta : Cat.table_meta) =
       meta.Cat.fk_constraints
   in
   Printf.sprintf
-    "CREATE TABLE %s (%s)%s"
+    "CREATE TABLE %s (%s)%s%s"
     (quote_ident meta.Cat.name)
     (String.concat ", " (col_parts @ fk_parts))
     (if without_rowid then " WITHOUT ROWID" else "")
+    (if Cat.is_columnar meta then " USING COLUMNSTORE" else "")
 ;;
 
 (** Extract the ON <table> target from a CREATE TRIGGER statement.
@@ -6484,17 +6489,17 @@ let execute_with_count
       ~without_rowid
       ~autoincrement
   | Plan.Op_col_create_table { name; columns; if_not_exists } ->
-    execute_create_table_op
-      store
-      cat
-      ~mode
-      ~name
-      ~columns
-      ~uniq_idxs:[]
-      ~if_not_exists
-      ~fk_constraints:[]
-      ~without_rowid:false
-      ~autoincrement:false
+    if Cat.table_exists cat ~name
+    then
+      if if_not_exists
+      then Lwt.return 0
+      else failwith (Printf.sprintf "table '%s' already exists" name)
+    else
+      let* () =
+        with_ddl_txn store cat mode (fun tx ->
+          Cat.create_columnstore_table ~txn:tx cat ~name ~columns)
+      in
+      Lwt.return 0
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     execute_insert_values
@@ -6559,36 +6564,50 @@ let execute_with_count
       ~if_not_exists
   | Plan.Op_update
       { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
-    execute_update_op
-      store
-      cat
-      ~mode
-      ~params
-      ~clock
-      ~before_hook
-      ~after_hook
-      ~table_meta
-      ~assignments
-      ~where
-      ~order
-      ~limit
-      ~offset
-      ~indexes
+    if Cat.is_columnar table_meta
+    then
+      Lwt.fail_with
+        (Printf.sprintf
+           "UPDATE is not supported on columnar table '%s'"
+           table_meta.Cat.name)
+    else
+      execute_update_op
+        store
+        cat
+        ~mode
+        ~params
+        ~clock
+        ~before_hook
+        ~after_hook
+        ~table_meta
+        ~assignments
+        ~where
+        ~order
+        ~limit
+        ~offset
+        ~indexes
   | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
-    execute_delete_op
-      store
-      cat
-      ~mode
-      ~params
-      ~clock
-      ~before_hook
-      ~after_hook
-      ~table_meta
-      ~where
-      ~order
-      ~limit
-      ~offset
-      ~indexes
+    if Cat.is_columnar table_meta
+    then
+      Lwt.fail_with
+        (Printf.sprintf
+           "DELETE is not supported on columnar table '%s'"
+           table_meta.Cat.name)
+    else
+      execute_delete_op
+        store
+        cat
+        ~mode
+        ~params
+        ~clock
+        ~before_hook
+        ~after_hook
+        ~table_meta
+        ~where
+        ~order
+        ~limit
+        ~offset
+        ~indexes
   | Plan.Op_seq_set { table; seq } ->
     (* #312.1: writable sqlite_sequence SET/INSERT.  Runs through [with_ddl_txn]
        so it participates in any ambient explicit transaction (borrowed [In_txn]
@@ -9114,24 +9133,26 @@ and stream_pragma_integrity_check store cat =
   let* () =
     Lwt_list.iter_s
       (fun (meta : Cat.table_meta) ->
-         let cnt_tree_id, _, _, _ = Cat.row_storage meta in
-         let* row_count = count_entries tx cnt_tree_id in
-         let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
-         Lwt_list.iter_s
-           (fun (idx : Cat.index_info) ->
-              let is_partial = idx.idx_where_sql <> None in
-              let* idx_count = count_entries tx idx.idx_tree_id in
-              if (not is_partial) && idx_count <> row_count
-              then
-                add_err
-                  (Printf.sprintf
-                     "index %s on %s: %d entries != %d rows"
-                     idx.idx_name
-                     meta.name
-                     idx_count
-                     row_count);
-              Lwt.return_unit)
-           idxs)
+         match meta.Cat.storage with
+         | Cat.Columnar _ -> Lwt.return_unit
+         | Cat.Row { tree_id; _ } ->
+           let* row_count = count_entries tx tree_id in
+           let idxs = Cat.indexes_for_table cat_val ~table:meta.name in
+           Lwt_list.iter_s
+             (fun (idx : Cat.index_info) ->
+                let is_partial = idx.idx_where_sql <> None in
+                let* idx_count = count_entries tx idx.idx_tree_id in
+                if (not is_partial) && idx_count <> row_count
+                then
+                  add_err
+                    (Printf.sprintf
+                       "index %s on %s: %d entries != %d rows"
+                       idx.idx_name
+                       meta.name
+                       idx_count
+                       row_count);
+                Lwt.return_unit)
+             idxs)
       tables
   in
   let result = List.rev !errors in
@@ -9152,7 +9173,11 @@ and stream_sqlite_master store cat =
   let table_rows =
     List.map
       (fun (meta : Cat.table_meta) ->
-         let sm_tree_id, _, _, _ = Cat.row_storage meta in
+         let sm_tree_id =
+           match meta.Cat.storage with
+           | Cat.Row { tree_id; _ } -> tree_id
+           | Cat.Columnar _ -> 0
+         in
          [| Row.V_text "table"
           ; Row.V_text meta.Cat.name
           ; Row.V_text meta.Cat.name
@@ -9218,8 +9243,9 @@ and stream_sqlite_master store cat =
     if
       List.exists
         (fun (m : Cat.table_meta) ->
-           let _, _, _, ai = Cat.row_storage m in
-           ai)
+           match m.Cat.storage with
+           | Cat.Row { autoincrement = true; _ } -> true
+           | _ -> false)
         tables
     then
       [ [| Row.V_text "table"
@@ -9245,10 +9271,11 @@ and stream_sqlite_sequence cat =
   let rows =
     List.filter_map
       (fun (m : Cat.table_meta) ->
-         let _, seq_next_rowid, _, seq_autoincrement = Cat.row_storage m in
-         if seq_autoincrement && not (Int64.equal seq_next_rowid Cat.empty_next_rowid)
-         then Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub seq_next_rowid 1L) |]
-         else None)
+         match m.Cat.storage with
+         | Cat.Row { autoincrement = true; next_rowid; _ }
+           when not (Int64.equal next_rowid Cat.empty_next_rowid) ->
+           Some [| Row.V_text m.Cat.name; Row.V_int (Int64.sub next_rowid 1L) |]
+         | _ -> None)
       tables
   in
   Lwt.return (Lwt_stream.of_list rows)

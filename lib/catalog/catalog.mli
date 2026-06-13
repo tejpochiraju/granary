@@ -405,6 +405,16 @@ val drop_column
   -> col_name:string
   -> (unit, string) result Lwt.t
 
+(** [create_columnstore_table ?txn t ~name ~columns] registers a columnar table
+    in the catalog (sys_tables + sys_columns), allocates no B-tree.
+    Returns unit (no tree_id — columnar tables have no B-tree). *)
+val create_columnstore_table
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> t
+  -> name:string
+  -> columns:Sqlocaml_encoding.Row.column list
+  -> unit Lwt.t
+
 (** True if a table with [name] exists in the catalog. *)
 val table_exists : t -> name:string -> bool
 

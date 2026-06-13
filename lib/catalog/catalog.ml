@@ -1925,6 +1925,30 @@ let create_table ?txn t ~name ~columns ~without_rowid ~autoincrement =
     Lwt.return tid
 ;;
 
+let create_columnstore_table ?txn t ~name ~columns =
+  if Schema_cache.mem_table t.sc name
+  then failwith (Printf.sprintf "table '%s' already exists" name);
+  let col_store = Sqlocaml_columnar.Col_store.create columns in
+  let m = { name; storage = Columnar col_store; columns; fk_constraints = [] } in
+  let write_rows tx =
+    let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
+    Lwt_list.iteri_s
+      (fun i col -> S.put tx sys_columns_tid (column_key name i) (encode_column col))
+      columns
+  in
+  match txn with
+  | Some tx ->
+    let%lwt () = write_rows tx in
+    Schema_cache.put_table t.sc ~name m;
+    Lwt.return ()
+  | None ->
+    let%lwt tx = S.rw_begin t.store in
+    let%lwt () = write_rows tx in
+    let%lwt () = S.commit tx in
+    Schema_cache.put_table_durable t.sc ~name m;
+    Lwt.return ()
+;;
+
 let find_table t ~name = Lwt.return (Schema_cache.find_table t.sc name)
 let find_table_cached t ~name = Schema_cache.find_table t.sc name
 
