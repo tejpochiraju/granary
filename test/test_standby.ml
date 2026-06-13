@@ -441,7 +441,7 @@ let test_standby_create_mode () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      Alcotest.(check bool) "initial mode Following" true (Standby.mode st = Following);
      let pos = Standby.acked_position st in
      Alcotest.(check int64) "initial epoch 0" 0L pos.epoch;
@@ -465,7 +465,7 @@ let test_standby_promote () =
      match wr with
      | Error e -> Alcotest.failf "wal open: %a" Wal.pp_error e
      | Ok wal ->
-       let st = Standby.create ~store ~pager ~wal in
+       let st = Standby.create ~store ~pager ~wal () in
        Alcotest.(check bool) "mode Following" true (Standby.mode st = Following);
        let* () = Standby.promote st in
        Alcotest.(check bool) "mode Promoted" true (Standby.mode st = Promoted);
@@ -483,7 +483,7 @@ let test_standby_start_following_applies_frames () =
     (let* _, wal = fresh_wal () in
      let pager = minimal_pager () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let frames =
        [ make_frame
            ~epoch:0L
@@ -513,7 +513,7 @@ let test_standby_promote_drains_wal_to_main () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let frames =
        [ make_frame
            ~epoch:0L
@@ -560,7 +560,7 @@ let test_standby_follower_mode_enforced_during_loop () =
      match wr with
      | Error e -> Alcotest.failf "wal open: %a" Wal.pp_error e
      | Ok wal ->
-       let st = Standby.create ~store ~pager ~wal in
+       let st = Standby.create ~store ~pager ~wal () in
        let stream, push = Lwt_stream.create () in
        (* Start the follower loop and immediately end it *)
        push None;
@@ -784,7 +784,7 @@ let test_promoted_follower_does_not_apply () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let* () = Standby.promote st in
      Alcotest.(check int) "wal empty after promote" 0 (Wal.committed_frames wal);
      (* A batch arriving after promotion must NOT be applied into the
@@ -819,7 +819,7 @@ let test_apply_exception_does_not_wedge_promote () =
     (let* raise_now, wal = raising_write_wal () in
      let pager = minimal_pager () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      (* The next WAL write (during apply) will raise. *)
      raise_now := true;
      let frames =
@@ -854,7 +854,7 @@ let test_start_following_on_promoted_keeps_store_writable () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let* _, wal = fresh_wal () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let* () = Standby.promote st in
      Alcotest.(check bool) "follower cleared by promote" false (Store.is_follower store);
      (* Re-invoking start_following on an already-promoted standby must NOT
@@ -892,7 +892,7 @@ let test_rebase_replays_segments_and_discards_stale_wal () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      (* Simulate the fallen-behind state: a stale frame sits in the WAL. *)
      let stale =
        make_frame ~epoch:0L ~frame_idx:0 ~page_id:9L ~is_commit:true ~page:(page_with 'Z')
@@ -951,7 +951,7 @@ let test_rebase_then_following_resumes_without_double_apply () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      (* Re-base to (epoch 6, idx 0). *)
      let seg =
        [ make_frame
@@ -1002,7 +1002,7 @@ let test_rebase_rejected_when_promoted () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let* () = Standby.promote st in
      let stream, push = Lwt_stream.create () in
      push None;
@@ -1023,7 +1023,7 @@ let test_rebase_surfaces_segment_error () =
      let main_d = mk_dev 65536 in
      let pager = writable_pager main_d () in
      let store = Store.create () in
-     let st = Standby.create ~store ~pager ~wal in
+     let st = Standby.create ~store ~pager ~wal () in
      let good =
        make_frame ~epoch:5L ~frame_idx:0 ~page_id:1L ~is_commit:true ~page:(page_with 'X')
      in
@@ -1078,7 +1078,7 @@ let test_reader_safe_epoch_transition_concurrent () =
      | Error e -> Alcotest.failf "wal open: %a" Wal.pp_error e
      | Ok wal ->
        let pager = writable_pager main_d () in
-       let st = Standby.create ~store ~pager ~wal in
+       let st = Standby.create ~store ~pager ~wal () in
        (* Apply epoch-0 frames: pages 1-3 with 'A','B','C' *)
        let frames0 =
          [ make_frame
@@ -1222,7 +1222,7 @@ let prop_checkpoint_correctness =
                 | Error _ -> Lwt.return false
                 | Ok wal ->
                   let pager = writable_pager main_d () in
-                  let st = Standby.create ~store ~pager ~wal in
+                  let st = Standby.create ~store ~pager ~wal () in
                   let n = List.length pages in
                   let frames0 =
                     List.mapi
@@ -1286,6 +1286,123 @@ let prop_checkpoint_correctness =
 ;;
 
 let qcheck_tests = List.map QCheck_alcotest.to_alcotest [ prop_checkpoint_correctness ]
+
+(* ------------------------------------------------------------------ *)
+(* #263 item 3: on_standby_ack callback                                *)
+(* ------------------------------------------------------------------ *)
+
+let test_on_standby_ack_fires_after_each_batch () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let pager = minimal_pager () in
+     let store = Store.create () in
+     let calls = ref [] in
+     let st =
+       Standby.create
+         ~store
+         ~pager
+         ~wal
+         ~on_standby_ack:(fun frames -> calls := frames :: !calls)
+         ()
+     in
+     let batch1 =
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'A')
+       ]
+     in
+     let batch2 =
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:1
+           ~page_id:2L
+           ~is_commit:true
+           ~page:(page_with 'B')
+       ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some batch1);
+     push (Some batch2);
+     push None;
+     let* r = Standby.start_following st stream in
+     (match r with
+      | Ok () ->
+        Alcotest.(check int) "callback called twice" 2 (List.length !calls);
+        Alcotest.(check int)
+          "first call gets committed_frames=1"
+          1
+          (List.hd (List.rev !calls));
+        Alcotest.(check int) "second call gets committed_frames=2" 2 (List.hd !calls)
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     Lwt.return_unit)
+;;
+
+let test_on_standby_ack_noop_when_omitted () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let pager = minimal_pager () in
+     let store = Store.create () in
+     let st = Standby.create ~store ~pager ~wal () in
+     let frames =
+       [ make_frame
+           ~epoch:0L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'A')
+       ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some frames);
+     push None;
+     let* r = Standby.start_following st stream in
+     (match r with
+      | Ok () -> Alcotest.(check int) "frames applied" 1 (Wal.committed_frames wal)
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     Lwt.return_unit)
+;;
+
+let test_rebase_calls_on_standby_ack () =
+  Lwt_main.run
+    (let* _, wal = fresh_wal () in
+     let main_d = mk_dev 65536 in
+     let pager = writable_pager main_d () in
+     let store = Store.create () in
+     let calls = ref [] in
+     let st =
+       Standby.create
+         ~store
+         ~pager
+         ~wal
+         ~on_standby_ack:(fun frames -> calls := frames :: !calls)
+         ()
+     in
+     let seg =
+       [ make_frame
+           ~epoch:5L
+           ~frame_idx:0
+           ~page_id:1L
+           ~is_commit:true
+           ~page:(page_with 'X')
+       ]
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some seg);
+     push None;
+     let* r = Standby.rebase st stream in
+     (match r with
+      | Ok _ ->
+        Alcotest.(check int) "callback called once during rebase" 1 (List.length !calls);
+        Alcotest.(check int)
+          "callback gets committed_frames after rebase"
+          1
+          (List.hd !calls)
+      | Error (`Apply_error msg) -> Alcotest.failf "rebase: %s" msg);
+     Lwt.return_unit)
+;;
 
 let () =
   Alcotest.run
@@ -1377,6 +1494,17 @@ let () =
             "concurrent RO + epoch change"
             `Quick
             test_reader_safe_epoch_transition_concurrent
+        ] )
+    ; ( "on_standby_ack"
+      , [ Alcotest.test_case
+            "fires after each batch"
+            `Quick
+            test_on_standby_ack_fires_after_each_batch
+        ; Alcotest.test_case
+            "no-op when omitted"
+            `Quick
+            test_on_standby_ack_noop_when_omitted
+        ; Alcotest.test_case "fires during rebase" `Quick test_rebase_calls_on_standby_ack
         ] )
     ; "qcheck", qcheck_tests
     ]

@@ -23,9 +23,10 @@ type t =
   ; mutable last_frame_idx : int
   ; apply_mutex : Lwt_mutex.t
   ; reader_gate : target:int -> unit Lwt.t
+  ; on_standby_ack : (int -> unit) option
   }
 
-let create ~store ~pager ~wal =
+let create ~store ~pager ~wal ?on_standby_ack () =
   { store
   ; pager
   ; wal
@@ -34,6 +35,7 @@ let create ~store ~pager ~wal =
   ; last_frame_idx = -1
   ; apply_mutex = Lwt_mutex.create ()
   ; reader_gate = Store.wait_for_readers_past store
+  ; on_standby_ack
   }
 ;;
 
@@ -129,9 +131,11 @@ let start_following t stream =
                       | Ok (epoch, idx) ->
                         t.last_epoch <- epoch;
                         t.last_frame_idx <- idx;
-                        Store.set_follower_ack_position
-                          t.store
-                          ~frames:(Wal.committed_frames t.wal);
+                        let acked = Wal.committed_frames t.wal in
+                        Store.set_follower_ack_position t.store ~frames:acked;
+                        (match t.on_standby_ack with
+                         | Some cb -> cb acked
+                         | None -> ());
                         Lwt.return `Continue))
                in
                (match outcome with
@@ -194,9 +198,11 @@ let rebase t segments =
              | Ok (epoch, idx) ->
                t.last_epoch <- epoch;
                t.last_frame_idx <- idx;
-               Store.set_follower_ack_position
-                 t.store
-                 ~frames:(Wal.committed_frames t.wal);
+               let acked = Wal.committed_frames t.wal in
+               Store.set_follower_ack_position t.store ~frames:acked;
+               (match t.on_standby_ack with
+                | Some cb -> cb acked
+                | None -> ());
                loop ())
         in
         loop ())
