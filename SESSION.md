@@ -34,6 +34,45 @@ What was done:
 
 Refs: #263, #207 (reader-aware replication floor — prerequisite, closed).
 
-## Next
+## 2026-06-12 — Session handover: item 3 of #263
 
-- item 3 of #263 — Reader-floor bump after standby profile load
+### State of #263
+
+| Item | Description | Status |
+|------|-------------|--------|
+| 1 | Bounded snapshot reads on following replica | Merged (PR #358) |
+| 2 | Reader-safe epoch-transition checkpoint | Merged (PR #359) |
+| 3 | Reader-floor bump after standby profile load | **Design drafted** |
+
+### What item 3 is
+
+Item 1 capped `snap_frames` to `follower_ack_position` on a following replica, preventing RO readers from seeing un-applied frames. Item 2 made `checkpoint_wal_to_main` gate on RO readers before `Wal.reset`.
+
+Item 3 ("Reader-floor bump after standby profile load") would advance the *replication floor* (a checkpoint gate — see `replication_floor_below` in `store.ml:503`, `update_replication_position` in `store.mli:460`) when a standby finishes applying a batch. This prevents the standby from blocking the *master's* checkpoint: without a floor bump, the master's `wait_for_readers_past` will not advance past the standby's acked position, so the master may stall on checkpoint waiting for the standby to ship frames.
+
+The prerequisite infrastructure already exists:
+- `update_replication_position` (`store.mli:460`) — register the shipped frame position
+- `replication_shipped_frames` (`store.ml:149`) — the floor `checkpoint_unlocked` waits on
+- `replication_gate_max_yields` (`store.ml:156`) — bounded-yield timeout for the floor wait
+
+Item 3 likely involves calling `Store.update_replication_position` from the standby driver after each successful apply, so the master's floor advances correctly. This interacts with the `on_committed_frames` callback (#337) and the sink-ship path.
+
+### Design
+
+See [docs/specs/2026-06-12-standby-replication-floor-bump-design.md](./docs/specs/2026-06-12-standby-replication-floor-bump-design.md).
+
+Recommended approach: add an `?on_standby_ack:(int -> unit)` callback to
+`Standby.create`. The application wires it to the master's
+`update_replication_position`. The standby calls it after each successful
+apply batch, with the local `Wal.committed_frames` value. This keeps the
+standby driver agnostic of master-store topology while allowing the
+master's replication floor to track the standby's true applied position.
+
+### Related issues
+
+- #207 (reader-aware replication floor — prerequisite, closed)
+- #337 (sink-ship drain before Wal.reset)
+- #360 (shared-WAL-handle end-to-end test) — deferred from PR #359 review
+
+### Refs
+- #263, #207, #337, #360
