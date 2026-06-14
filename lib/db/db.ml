@@ -537,13 +537,13 @@ let commit_txn t =
          (* #347: write deferred rowid counters once before committing the txn. *)
          let* () = Cat.flush_dirty_counters_tx t.catalog tx in
          (* Persist any dirty columnar stores before committing. *)
-         let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
+         let* saved = Cat.persist_dirty_columnar_stores t.catalog tx in
          let* () = S.commit tx in
          (* Dirty flags are cleared only after commit succeeds — if commit
              fails (disk-full, fsync error), the B-tree changes are discarded
              but the in-memory Col_store retains the rows, and dirty stays
              true so the next cycle retries. *)
-         Cat.mark_columnar_stores_clean t.catalog;
+         List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
@@ -620,9 +620,9 @@ let release_savepoint t name =
         (* #347: write deferred rowid counters once before committing the txn. *)
         let* () = Cat.flush_dirty_counters_tx t.catalog tx in
         (* Persist any dirty columnar stores before committing. *)
-        let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
+        let* saved = Cat.persist_dirty_columnar_stores t.catalog tx in
         let* () = S.commit tx in
-        Cat.mark_columnar_stores_clean t.catalog;
+        List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;
@@ -639,10 +639,6 @@ let rollback_to_savepoint t name =
     (* #280: revert the in-memory cache mutations of DDL registered since this
        savepoint so the catalog agrees with the store rolled back to [name]. *)
     Cat.savepoint_rollback_schema t.catalog name;
-    (* Reload all columnar stores through the RW txn so they reflect the
-       savepoint-reverted B-tree state (which includes this txn's own
-       uncommitted writes — a fresh RO snapshot would see committed state). *)
-    let* () = Cat.reload_columnar_stores_in_txn t.catalog tx in
     if List.mem name t.savepoint_names
     then (
       let rec trim = function

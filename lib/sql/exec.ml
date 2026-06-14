@@ -2305,24 +2305,21 @@ let acquire_txn store mode =
    [owned], flush deferred rowid counters first (#347) so that counters
    dirtied by nested In_txn DML (e.g. trigger inserts) are persisted, then
    persist any dirty columnar stores before committing.  After commit
-   succeeds, clear the dirty flag on columnar stores so the next cycle
-   only flushes new mutations. *)
+   succeeds, clear the dirty flag on the stores that were persisted so the
+   next cycle only flushes new mutations. *)
 let release_txn ?cat tx owned =
   if owned
-  then
-    let* () =
+  then (
+    let* saved =
       match cat with
-      | None -> Lwt.return_unit
+      | None -> Lwt.return []
       | Some c ->
         let* () = Cat.flush_dirty_counters_tx c tx in
         Cat.persist_dirty_columnar_stores c tx
     in
     let* () = S.commit tx in
-    match cat with
-    | Some c ->
-      Cat.mark_columnar_stores_clean c;
-      Lwt.return_unit
-    | None -> Lwt.return_unit
+    List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
+    Lwt.return_unit)
   else Lwt.return_unit
 ;;
 

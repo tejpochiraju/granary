@@ -38,3 +38,6 @@ val dirty : t -> bool
 
 (** [mark_clean store] resets the dirty flag. *)
 val mark_clean : t -> unit
+
+(** [mark_dirty store] sets the dirty flag. *)
+val mark_dirty : t -> unit

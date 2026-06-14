@@ -231,33 +231,18 @@ val list_tables : t -> table_meta list Lwt.t
 
 (** [persist_dirty_columnar_stores t tx] iterates all columnar tables in the
     catalog and persists any whose {!Sqlocaml_columnar.Col_store.dirty} flag
-    is set, using the given write transaction. *)
+    is set, using the given write transaction.  Returns the list of stores
+    that were persisted so callers can clear their dirty flags after commit. *)
 val persist_dirty_columnar_stores
   :  t
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> unit Lwt.t
-
-(** [mark_columnar_stores_clean t] clears the dirty flag on every columnar
-    store that has one set.  Call after a successful commit to confirm the
-    data has been durably persisted. *)
-val mark_columnar_stores_clean : t -> unit
+  -> Sqlocaml_columnar.Col_store.t list Lwt.t
 
 (** [load_columnar_stores t store] iterates all columnar tables in the catalog
     and loads their data from [store] via a fresh RO transaction.  Used on DB
     open to restore persisted columnar data.  Tables with no persisted data
-    remain empty. *)
+    are reset to empty. *)
 val load_columnar_stores : t -> Sqlocaml_store.Store.t -> unit Lwt.t
-
-(** [reload_columnar_stores_in_txn t tx] iterates all columnar tables and
-    reloads each from the B-tree using the given read-write transaction.
-    Used after {!Sqlocaml_store.Store.savepoint_rollback} to revert the
-    in-memory {!Sqlocaml_columnar.Col_store.t} to the savepoint state
-    (the RW txn sees its own uncommitted writes, so the reload reflects
-    the savepoint-reverted data). *)
-val reload_columnar_stores_in_txn
-  :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> unit Lwt.t
 
 (** Allocate and return the next rowid for a table, incrementing the counter.
     Raises [Failure] if the table does not exist. *)

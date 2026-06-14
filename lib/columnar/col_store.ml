@@ -14,6 +14,7 @@ let nrows t = t.total
 let columns t = t.schema
 let dirty t = t.dirty
 let mark_clean t = t.dirty <- false
+let mark_dirty t = t.dirty <- true
 
 let insert_rows t batch =
   let n = Array.length batch in
