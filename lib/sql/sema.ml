@@ -2051,7 +2051,7 @@ let bind_select_group_cols
               in
               (match select_qual_lookup ~tables table column with
                | Ok i -> Ok (i :: indices)
-               | Error _ -> Error (Unknown_column { table; column }))
+               | Error e -> Error e)
             | None ->
               (match (select_proj_lookup ~tables ~meta) col_name with
                | Ok i -> Ok (i :: indices)

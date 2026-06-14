@@ -426,7 +426,12 @@ let test_join_row_col_inner () =
       "SELECT row_t.val, col_t.amount FROM row_t JOIN col_t ON row_t.id = col_t.id ORDER \
        BY row_t.id, col_t.amount"
   in
-  assert (List.length rows = 3);
+  (match rows with
+   | [ [| Row.V_text "a"; Row.V_real 5.0 |]
+     ; [| Row.V_text "a"; Row.V_real 10.0 |]
+     ; [| Row.V_text "b"; Row.V_real 20.0 |]
+     ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -442,7 +447,10 @@ let test_join_col_row_inner () =
       "SELECT col_t.amount, row_t.val FROM col_t JOIN row_t ON col_t.id = row_t.id ORDER \
        BY col_t.id"
   in
-  assert (List.length rows = 2);
+  (match rows with
+   | [ [| Row.V_real 10.0; Row.V_text "a" |]; [| Row.V_real 20.0; Row.V_text "b" |] ] ->
+     ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -458,7 +466,12 @@ let test_join_col_col_inner () =
       "SELECT col_a.val, col_b.score FROM col_a JOIN col_b ON col_a.id = col_b.id ORDER \
        BY col_a.id, col_b.score"
   in
-  assert (List.length rows = 3);
+  (match rows with
+   | [ [| Row.V_text "a"; Row.V_real 5.0 |]
+     ; [| Row.V_text "a"; Row.V_real 10.0 |]
+     ; [| Row.V_text "b"; Row.V_real 20.0 |]
+     ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -474,7 +487,51 @@ let test_join_row_col_left () =
       "SELECT row_t.val, col_t.amount FROM row_t LEFT JOIN col_t ON row_t.id = col_t.id \
        ORDER BY row_t.id"
   in
-  assert (List.length rows = 3);
+  (match rows with
+   | [ [| Row.V_text "a"; Row.V_real 10.0 |]
+     ; [| Row.V_text "b"; Row.V_real 20.0 |]
+     ; [| Row.V_text "c"; Row.V_null |]
+     ] -> ()
+   | _ -> assert false);
+  Lwt.return_unit
+;;
+
+let test_join_col_row_left () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE col_t (id INTEGER, amount REAL) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO col_t VALUES (1, 10.0), (2, 20.0), (4, 30.0)" in
+  let* () = exec db "CREATE TABLE row_t (id INTEGER PRIMARY KEY, val TEXT)" in
+  let* () = exec db "INSERT INTO row_t VALUES (1, 'a'), (2, 'b'), (3, 'c')" in
+  let* rows =
+    query
+      db
+      "SELECT col_t.amount, row_t.val FROM col_t LEFT JOIN row_t ON col_t.id = row_t.id \
+       ORDER BY col_t.id"
+  in
+  (match rows with
+   | [ [| Row.V_real 10.0; Row.V_text "a" |]
+     ; [| Row.V_real 20.0; Row.V_text "b" |]
+     ; [| Row.V_real 30.0; Row.V_null |]
+     ] -> ()
+   | _ -> assert false);
+  Lwt.return_unit
+;;
+
+let test_join_col_col_left () =
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE col_a (id INTEGER, val TEXT) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO col_a VALUES (1, 'a'), (3, 'c')" in
+  let* () = exec db "CREATE TABLE col_b (id INTEGER, score REAL) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO col_b VALUES (1, 10.0), (2, 20.0)" in
+  let* rows =
+    query
+      db
+      "SELECT col_a.val, col_b.score FROM col_a LEFT JOIN col_b ON col_a.id = col_b.id \
+       ORDER BY col_a.id"
+  in
+  (match rows with
+   | [ [| Row.V_text "a"; Row.V_real 10.0 |]; [| Row.V_text "c"; Row.V_null |] ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -485,7 +542,9 @@ let test_join_agg_count () =
   let* () = exec db "CREATE TABLE col_t (id INTEGER, amount REAL) USING COLUMNSTORE" in
   let* () = exec db "INSERT INTO col_t VALUES (1, 10.0), (2, 20.0), (1, 5.0)" in
   let* rows = query db "SELECT COUNT(*) FROM row_t JOIN col_t ON row_t.id = col_t.id" in
-  assert (List.length rows = 1);
+  (match rows with
+   | [ [| Row.V_int 3L |] ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -501,7 +560,11 @@ let test_join_agg_group_by () =
       "SELECT row_t.region, SUM(col_t.amount) FROM row_t JOIN col_t ON row_t.id = \
        col_t.id GROUP BY row_t.region ORDER BY row_t.region"
   in
-  assert (List.length rows = 2);
+  (match rows with
+   | [ [| Row.V_text "north"; Row.V_real 15.0 |]
+     ; [| Row.V_text "south"; Row.V_real 20.0 |]
+     ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -514,7 +577,9 @@ let test_join_non_eq_on () =
   let* rows =
     query db "SELECT row_t.val, col_t.amount FROM row_t JOIN col_t ON row_t.id < col_t.id"
   in
-  assert (List.length rows > 0);
+  (match rows with
+   | [ [| Row.V_text "a"; Row.V_real 20.0 |] ] -> ()
+   | _ -> assert false);
   Lwt.return_unit
 ;;
 
@@ -546,6 +611,8 @@ let () =
     ; "join_col_row_inner", test_join_col_row_inner
     ; "join_col_col_inner", test_join_col_col_inner
     ; "join_row_col_left", test_join_row_col_left
+    ; "join_col_row_left", test_join_col_row_left
+    ; "join_col_col_left", test_join_col_col_left
     ; "join_agg_count", test_join_agg_count
     ; "join_agg_group_by", test_join_agg_group_by
     ; "join_non_eq_on", test_join_non_eq_on
