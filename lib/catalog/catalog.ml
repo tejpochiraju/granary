@@ -2086,24 +2086,21 @@ let persist_dirty_columnar_stores t (tx : S.rw S.txn) =
 
 let load_columnar_stores_with_txn t (tx : _ S.txn) =
   let tables = all_tables t in
-  let%lwt () =
-    Lwt_list.iter_s
-      (fun (m : table_meta) ->
-         match m.storage with
-         | Columnar (_, tid) ->
-           let%lwt loaded = Sqlocaml_columnar.Persist.load tx tid m.columns in
-           let cs =
-             match loaded with
-             | Some cs -> cs
-             | None -> Sqlocaml_columnar.Col_store.create m.columns
-           in
-           let m' = { m with storage = Columnar (cs, tid) } in
-           Schema_cache.put_table_durable t.sc ~name:m.name m';
-           Lwt.return_unit
-         | _ -> Lwt.return_unit)
-      tables
-  in
-  Lwt.return_unit
+  Lwt_list.iter_s
+    (fun (m : table_meta) ->
+       match m.storage with
+       | Columnar (_, tid) ->
+         let%lwt loaded = Sqlocaml_columnar.Persist.load tx tid m.columns in
+         let cs =
+           match loaded with
+           | Some cs -> cs
+           | None -> Sqlocaml_columnar.Col_store.create m.columns
+         in
+         let m' = { m with storage = Columnar (cs, tid) } in
+         Schema_cache.put_table_durable t.sc ~name:m.name m';
+         Lwt.return_unit
+       | _ -> Lwt.return_unit)
+    tables
 ;;
 
 let load_columnar_stores t store = S.with_ro store (load_columnar_stores_with_txn t)

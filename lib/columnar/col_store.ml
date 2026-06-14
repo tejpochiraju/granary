@@ -64,9 +64,15 @@ let to_row_seq t =
 let encode t =
   let buf = Buffer.create 64 in
   Buffer.add_char buf (Char.chr store_format_version);
-  Varint.encode_uint64 buf (Int64.of_int (Array.length t.columns));
+  let ncols = List.length t.schema in
+  Varint.encode_uint64 buf (Int64.of_int ncols);
   Varint.encode_uint64 buf (Int64.of_int t.total);
-  Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) t.columns;
+  let cols =
+    if Array.length t.columns = 0
+    then Array.init ncols (fun i -> Col.create (List.nth t.schema i).Row.ty 0)
+    else t.columns
+  in
+  Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) cols;
   Buffer.to_bytes buf
 ;;
 
