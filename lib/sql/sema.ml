@@ -2043,21 +2043,30 @@ let bind_select_group_cols
          match acc with
          | Error _ as e -> e
          | Ok indices ->
-           (match (select_proj_lookup ~tables ~meta) col_name with
-            | Ok i -> Ok (i :: indices) (* prepend, reverse later *)
-            | Error _ ->
-              (* try qualified lookup across all tables *)
-              let found =
-                List.find_map
-                  (fun (tm, _, _) ->
-                     match (select_qual_lookup ~tables) tm.Cat.name col_name with
-                     | Ok i -> Some i
-                     | Error _ -> None)
-                  tables
+           (match String.index_opt col_name '.' with
+            | Some dot_pos ->
+              let table = String.sub col_name 0 dot_pos
+              and column =
+                String.sub col_name (dot_pos + 1) (String.length col_name - dot_pos - 1)
               in
-              (match found with
-               | Some i -> Ok (i :: indices)
-               | None -> Error (Unknown_column { table = ""; column = col_name }))))
+              (match select_qual_lookup ~tables table column with
+               | Ok i -> Ok (i :: indices)
+               | Error e -> Error e)
+            | None ->
+              (match (select_proj_lookup ~tables ~meta) col_name with
+               | Ok i -> Ok (i :: indices)
+               | Error _ ->
+                 let found =
+                   List.find_map
+                     (fun (tm, _, _) ->
+                        match (select_qual_lookup ~tables) tm.Cat.name col_name with
+                        | Ok i -> Some i
+                        | Error _ -> None)
+                     tables
+                 in
+                 (match found with
+                  | Some i -> Ok (i :: indices)
+                  | None -> Error (Unknown_column { table = ""; column = col_name })))))
       (Ok [])
       group_by
   in

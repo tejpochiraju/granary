@@ -988,9 +988,13 @@ where_opt:
   |                { None }
   | WHERE e = expr { Some e }
 
+group_by_item:
+  | id = any_ident                           { id }
+  | t = any_ident DOT c = any_ident          { t ^ "." ^ c }
+
 group_by_clause:
-  |                                                                 { [] }
-  | GROUP BY cs = separated_nonempty_list(COMMA, any_ident)        { cs }
+  |                                                { [] }
+  | GROUP BY cs = separated_nonempty_list(COMMA, group_by_item)  { cs }
 
 having_clause:
   |                                                                 { None }
