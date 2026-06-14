@@ -989,8 +989,8 @@ where_opt:
   | WHERE e = expr { Some e }
 
 group_by_item:
-  | id = any_ident                           { id }
-  | t = any_ident DOT c = any_ident          { t ^ "." ^ c }
+  | id = any_ident                           { (id, None) }
+  | t = any_ident DOT c = any_ident          { (c, Some t) }
 
 group_by_clause:
   |                                                { [] }
