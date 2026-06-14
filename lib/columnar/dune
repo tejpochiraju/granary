@@ -1,6 +1,6 @@
 (library
  (name sqlocaml_columnar)
  (public_name sqlocaml.columnar)
- (libraries sqlocaml.encoding)
+ (libraries sqlocaml.encoding bigarray)
  (instrumentation
   (backend bisect_ppx)))
