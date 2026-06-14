@@ -69,7 +69,7 @@ let encode t =
   Varint.encode_uint64 buf (Int64.of_int t.total);
   let cols =
     if Array.length t.columns = 0
-    then Array.init ncols (fun i -> Col.create (List.nth t.schema i).Row.ty 0)
+    then Array.of_list (List.map (fun (col : Row.column) -> Col.create col.ty 0) t.schema)
     else t.columns
   in
   Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) cols;
