@@ -2031,6 +2031,47 @@ let list_tables t =
   Lwt.return (Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [])
 ;;
 
+let persist_dirty_columnar_stores t (tx : S.rw S.txn) =
+  let tables = Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [] in
+  let%lwt () =
+    Lwt_list.iter_s
+      (fun (m : table_meta) ->
+         match m.storage with
+         | Columnar (cs, tid) when Sqlocaml_columnar.Col_store.dirty cs ->
+           let%lwt () = Sqlocaml_columnar.Persist.save tx tid cs in
+           Sqlocaml_columnar.Col_store.mark_clean cs;
+           Lwt.return_unit
+         | _ -> Lwt.return_unit)
+      tables
+  in
+  Lwt.return_unit
+;;
+
+let load_columnar_stores t store =
+  let tables = Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [] in
+  let%lwt () =
+    S.with_ro store
+    @@ fun tx ->
+    let%lwt () =
+      Lwt_list.iter_s
+        (fun (m : table_meta) ->
+           match m.storage with
+           | Columnar (_, tid) ->
+             let%lwt loaded = Sqlocaml_columnar.Persist.load tx tid m.columns in
+             (match loaded with
+              | Some cs ->
+                let m' = { m with storage = Columnar (cs, tid) } in
+                Schema_cache.put_table_durable t.sc ~name:m.name m';
+                Lwt.return_unit
+              | None -> Lwt.return_unit)
+           | _ -> Lwt.return_unit)
+        tables
+    in
+    Lwt.return_unit
+  in
+  Lwt.return_unit
+;;
+
 (* #250: pick the rowid to auto-allocate for a NULL/omitted id, and the new
    counter.  An unseeded table ([empty_next_rowid]) allocates 1 (SQLite: empty
    table -> rowid 1); a seeded one allocates the running [max+1] counter.  The

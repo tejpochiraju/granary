@@ -229,6 +229,21 @@ val unregister_ephemeral : t -> name:string -> unit
 (** List all known tables. Order is unspecified. *)
 val list_tables : t -> table_meta list Lwt.t
 
+(** [persist_dirty_columnar_stores t tx] iterates all columnar tables in the
+    catalog and persists any whose {!Sqlocaml_columnar.Col_store.dirty} flag
+    is set, using the given write transaction.  The store's dirty flag is
+    cleared on success. *)
+val persist_dirty_columnar_stores
+  :  t
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
+(** [load_columnar_stores t store] iterates all columnar tables in the catalog
+    and loads their data from [store] via a fresh RO transaction.  Used on DB
+    open to restore persisted columnar data.  Tables with no persisted data
+    remain empty. *)
+val load_columnar_stores : t -> Sqlocaml_store.Store.t -> unit Lwt.t
+
 (** Allocate and return the next rowid for a table, incrementing the counter.
     Raises [Failure] if the table does not exist. *)
 val next_rowid : t -> name:string -> int64 Lwt.t

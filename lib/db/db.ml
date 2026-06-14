@@ -165,6 +165,8 @@ let of_store ?clock ?durability ?file_path store =
    | Some d -> S.set_durability store d
    | None -> ());
   let* catalog = Cat.open_ store in
+  (* Load persisted columnar data for columnar tables. *)
+  let* () = Cat.load_columnar_stores catalog store in
   let views = Hashtbl.create 4 in
   let* () = load_views_into_hashtbl store views in
   let triggers = Hashtbl.create 4 in
@@ -528,6 +530,8 @@ let commit_txn t =
          let* () = drain_pending_fks_or_fail t tx in
          (* #347: write deferred rowid counters once before committing the txn. *)
          let* () = Cat.flush_dirty_counters_tx t.catalog tx in
+         (* Persist any dirty columnar stores before committing. *)
+         let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
          let* () = S.commit tx in
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
@@ -604,6 +608,8 @@ let release_savepoint t name =
       else
         (* #347: write deferred rowid counters once before committing the txn. *)
         let* () = Cat.flush_dirty_counters_tx t.catalog tx in
+        (* Persist any dirty columnar stores before committing. *)
+        let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
         let* () = S.commit tx in
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;

@@ -1,3 +1,10 @@
 (test
  (name main)
- (libraries sqlocaml sqlocaml.encoding sqlocaml.columnar lwt lwt.unix unix))
+ (libraries
+  sqlocaml
+  sqlocaml.encoding
+  sqlocaml.columnar
+  sqlocaml.store
+  lwt
+  lwt.unix
+  unix))

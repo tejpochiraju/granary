@@ -2303,14 +2303,17 @@ let acquire_txn store mode =
 
 (* Commit [tx] if [owned], otherwise no-op.  When [cat] is provided and
    [owned], flush deferred rowid counters first (#347) so that counters
-   dirtied by nested In_txn DML (e.g. trigger inserts) are persisted. *)
+   dirtied by nested In_txn DML (e.g. trigger inserts) are persisted, then
+   persist any dirty columnar stores before committing. *)
 let release_txn ?cat tx owned =
   if owned
   then
     let* () =
       match cat with
       | None -> Lwt.return_unit
-      | Some c -> Cat.flush_dirty_counters_tx c tx
+      | Some c ->
+        let* () = Cat.flush_dirty_counters_tx c tx in
+        Cat.persist_dirty_columnar_stores c tx
     in
     S.commit tx
   else Lwt.return_unit

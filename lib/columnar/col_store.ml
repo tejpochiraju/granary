@@ -5,12 +5,15 @@ type t =
   { schema : Row.column list
   ; mutable columns : Col.t array
   ; mutable total : int
+  ; mutable dirty : bool
   }
 
 let store_format_version = 0x01
-let create schema = { schema; columns = [||]; total = 0 }
+let create schema = { schema; columns = [||]; total = 0; dirty = false }
 let nrows t = t.total
 let columns t = t.schema
+let dirty t = t.dirty
+let mark_clean t = t.dirty <- false
 
 let insert_rows t batch =
   let n = Array.length batch in
@@ -35,7 +38,8 @@ let insert_rows t batch =
       else Array.init ncols (fun i -> append_col i t.columns.(i))
     in
     t.columns <- new_cols;
-    t.total <- new_total)
+    t.total <- new_total;
+    t.dirty <- true)
 ;;
 
 let to_row_seq t =
@@ -106,5 +110,5 @@ let decode ?(off = 0) schema buf =
               clen
               total))
     columns;
-  { schema; columns; total }
+  { schema; columns; total; dirty = false }
 ;;
