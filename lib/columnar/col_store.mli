@@ -23,3 +23,11 @@ val insert_rows : t -> Row.t array -> unit
 (** [to_row_seq store] streams all rows in insertion order by reading from the
     typed column arrays. *)
 val to_row_seq : t -> Row.t Seq.t
+
+(** [encode store] serializes the entire store (schema + data) to a byte string. *)
+val encode : t -> bytes
+
+(** [decode ?off schema buf] deserializes a store from [buf] starting at
+    offset [off] (default 0) using the given schema.
+    Raises [Failure] on corrupt or malformed data. *)
+val decode : ?off:int -> Row.column list -> bytes -> t

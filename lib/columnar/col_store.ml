@@ -1,4 +1,5 @@
 module Row = Sqlocaml_encoding.Row
+module Varint = Sqlocaml_encoding.Varint
 
 type t =
   { schema : Row.column list
@@ -6,6 +7,7 @@ type t =
   ; mutable total : int
   }
 
+let store_format_version = 0x01
 let create schema = { schema; columns = [||]; total = 0 }
 let nrows t = t.total
 let columns t = t.schema
@@ -52,4 +54,57 @@ let to_row_seq t =
         Seq.Cons (row, next))
     in
     next)
+;;
+
+let encode t =
+  let buf = Buffer.create 64 in
+  Buffer.add_char buf (Char.chr store_format_version);
+  Varint.encode_uint64 buf (Int64.of_int (Array.length t.columns));
+  Varint.encode_uint64 buf (Int64.of_int t.total);
+  Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) t.columns;
+  Buffer.to_bytes buf
+;;
+
+let decode ?(off = 0) schema buf =
+  let version = Char.code (Bytes.get buf off) in
+  if version < store_format_version
+  then
+    failwith
+      (Printf.sprintf
+         "Col_store.decode: unsupported format version %d (expected >= %d)"
+         version
+         store_format_version);
+  let ncols, off = Varint.decode_uint64 buf (off + 1) in
+  let ncols = Int64.to_int ncols in
+  let schema_len = List.length schema in
+  if ncols <> schema_len
+  then
+    failwith
+      (Printf.sprintf
+         "Col_store.decode: encoded column count %d does not match schema length %d"
+         ncols
+         schema_len);
+  let total, off = Varint.decode_uint64 buf off in
+  let total = Int64.to_int total in
+  let columns = Array.make ncols (Col.create Row.Integer 0) in
+  let off = ref off in
+  for i = 0 to ncols - 1 do
+    let col, o2 = Col.decode buf !off in
+    columns.(i) <- col;
+    off := o2
+  done;
+  Array.iteri
+    (fun i col ->
+       let clen = Col.length col in
+       if clen <> total
+       then
+         failwith
+           (Printf.sprintf
+              "Col_store.decode: column %d has length %d but store header reports total \
+               %d"
+              i
+              clen
+              total))
+    columns;
+  { schema; columns; total }
 ;;

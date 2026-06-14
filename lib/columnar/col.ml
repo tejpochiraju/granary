@@ -1,4 +1,6 @@
 module Row = Sqlocaml_encoding.Row
+module Null_bitmap = Sqlocaml_encoding.Null_bitmap
+module Varint = Sqlocaml_encoding.Varint
 
 type t =
   | Int_col of
@@ -60,6 +62,12 @@ let length col =
     -> len
 ;;
 
+let dict_size col =
+  match col with
+  | Text_col { dict; _ } -> Array.length dict
+  | _ -> 0
+;;
+
 let pp fmt col =
   match col with
   | Int_col { len; _ } -> Format.fprintf fmt "Col.Int(%d)" len
@@ -114,6 +122,7 @@ let append_value_null col =
   | Blob_col c ->
     let nulls = resize_nulls c.nulls new_len in
     let values = grow_bytes_array c.values new_len in
+    values.(idx) <- Bytes.empty;
     Bigarray.Array1.set nulls idx 1;
     Blob_col { values; nulls; len = new_len }
 ;;
@@ -271,4 +280,148 @@ let of_values schema rows =
     let col = create col_ty nrows in
     let col_rows = Array.init nrows (fun r -> rows.(r).(i)) in
     append_batch col col_rows)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Serialization                                                      *)
+(* ------------------------------------------------------------------ *)
+
+let col_format_version = 0x01
+
+let emit_header buf tag len nulls =
+  Buffer.add_char buf (Char.chr tag);
+  Varint.encode_uint64 buf (Int64.of_int len);
+  let n_bytes = (len + 7) / 8 in
+  Varint.encode_uint64 buf (Int64.of_int n_bytes);
+  Null_bitmap.pack_bits_into buf nulls len
+;;
+
+let decode_col_header buf off =
+  let len, off = Varint.decode_uint64 buf off in
+  let len = Int64.to_int len in
+  let nulls_len, off = Varint.decode_uint64 buf off in
+  let nulls_len = Int64.to_int nulls_len in
+  let expected_bytes = (len + 7) / 8 in
+  if nulls_len <> expected_bytes
+  then
+    failwith
+      (Printf.sprintf
+         "Col.decode: corrupt null bitmap length %d, expected %d"
+         nulls_len
+         expected_bytes);
+  let nulls = Null_bitmap.unpack_bits buf off len in
+  len, nulls, off + nulls_len
+;;
+
+let encode col =
+  let buf = Buffer.create 64 in
+  Buffer.add_char buf (Char.chr col_format_version);
+  (match col with
+   | Int_col { values; nulls; len } ->
+     emit_header buf 0x01 len nulls;
+     for i = 0 to len - 1 do
+       if Bigarray.Array1.get nulls i = 0
+       then Buffer.add_int64_le buf (Bigarray.Array1.get values i)
+       else Buffer.add_int64_le buf 0L
+     done
+   | Real_col { values; nulls; len } ->
+     emit_header buf 0x02 len nulls;
+     for i = 0 to len - 1 do
+       if Bigarray.Array1.get nulls i = 0
+       then Buffer.add_int64_le buf (Int64.bits_of_float (Bigarray.Array1.get values i))
+       else Buffer.add_int64_le buf (Int64.bits_of_float 0.0)
+     done
+   | Text_col { dict; indices; nulls; len; _ } ->
+     emit_header buf 0x03 len nulls;
+     let dict_len = Array.length dict in
+     Varint.encode_uint64 buf (Int64.of_int dict_len);
+     for i = 0 to dict_len - 1 do
+       let s = dict.(i) in
+       Varint.encode_uint64 buf (Int64.of_int (String.length s));
+       Buffer.add_string buf s
+     done;
+     for i = 0 to len - 1 do
+       if Bigarray.Array1.get nulls i = 0
+       then Buffer.add_int32_le buf (Int32.of_int (Bigarray.Array1.get indices i))
+       else Buffer.add_int32_le buf 0l
+     done
+   | Blob_col { values; nulls; len } ->
+     emit_header buf 0x04 len nulls;
+     for i = 0 to len - 1 do
+       if Bigarray.Array1.get nulls i = 0
+       then (
+         let b = values.(i) in
+         Varint.encode_uint64 buf (Int64.of_int (Bytes.length b));
+         Buffer.add_bytes buf b)
+       else Varint.encode_uint64 buf 0L
+     done);
+  Buffer.to_bytes buf
+;;
+
+let decode buf off =
+  let version = Char.code (Bytes.get buf off) in
+  if version <> col_format_version
+  then
+    failwith
+      (Printf.sprintf
+         "Col.decode: unsupported format version %d (expected %d)"
+         version
+         col_format_version);
+  let off = off + 1 in
+  let tag = Char.code (Bytes.get buf off) in
+  let off = off + 1 in
+  match tag with
+  | 1 ->
+    let len, nulls, off = decode_col_header buf off in
+    let values = Bigarray.Array1.create Bigarray.int64 Bigarray.c_layout len in
+    let off = ref off in
+    for i = 0 to len - 1 do
+      let v = Bytes.get_int64_le buf !off in
+      Bigarray.Array1.set values i v;
+      off := !off + 8
+    done;
+    Int_col { values; nulls; len }, !off
+  | 2 ->
+    let len, nulls, off = decode_col_header buf off in
+    let values = Bigarray.Array1.create Bigarray.float64 Bigarray.c_layout len in
+    let off = ref off in
+    for i = 0 to len - 1 do
+      let v = Int64.float_of_bits (Bytes.get_int64_le buf !off) in
+      Bigarray.Array1.set values i v;
+      off := !off + 8
+    done;
+    Real_col { values; nulls; len }, !off
+  | 3 ->
+    let len, nulls, off = decode_col_header buf off in
+    let dict_len, off = Varint.decode_uint64 buf off in
+    let dict_len = Int64.to_int dict_len in
+    let dict = Array.make dict_len "" in
+    let off = ref off in
+    for i = 0 to dict_len - 1 do
+      let slen, o2 = Varint.decode_uint64 buf !off in
+      let slen = Int64.to_int slen in
+      off := o2 + slen;
+      dict.(i) <- Bytes.sub_string buf o2 slen
+    done;
+    let dict_tbl = Hashtbl.create dict_len in
+    Array.iteri (fun i s -> Hashtbl.add dict_tbl s i) dict;
+    let indices = Bigarray.Array1.create Bigarray.int Bigarray.c_layout len in
+    for i = 0 to len - 1 do
+      let v = Bytes.get_int32_le buf !off in
+      Bigarray.Array1.set indices i (Int32.to_int v);
+      off := !off + 4
+    done;
+    Text_col { dict; dict_tbl; indices; nulls; len }, !off
+  | 4 ->
+    let len, nulls, off = decode_col_header buf off in
+    let values = Array.make len Bytes.empty in
+    let off = ref off in
+    for i = 0 to len - 1 do
+      let blen, o2 = Varint.decode_uint64 buf !off in
+      let blen = Int64.to_int blen in
+      values.(i) <- Bytes.sub buf o2 blen;
+      off := o2 + blen
+    done;
+    Blob_col { values; nulls; len }, !off
+  | _ -> failwith (Printf.sprintf "Col.decode: unknown tag %d" tag)
 ;;

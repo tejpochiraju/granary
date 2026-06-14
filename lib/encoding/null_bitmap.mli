@@ -1,0 +1,31 @@
+(** Bitmap helpers for null-mask encoding.
+
+    Used by {!Sqlocaml_columnar.Col} for columnar null bitmaps.  Intended to
+    also replace the inline bitmap logic in {!Sqlocaml_encoding.Row} once the
+    API is adapted (see issue #372). *)
+
+module Bigarray = Bigarray
+
+(** [pack_bits bits n] packs the first [n] elements of [bits] into a
+    big-endian bitmask byte string.  Each byte encodes 8 entries: bit 0 of
+    byte 0 = bits[0], bit 1 = bits[1], etc. *)
+val pack_bits
+  :  (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+  -> int
+  -> bytes
+
+(** [pack_bits_into buf bits n] writes a packed bitmask directly into [buf],
+    one byte per 8 entries, without materialising an intermediate [Bytes.t]. *)
+val pack_bits_into
+  :  Buffer.t
+  -> (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+  -> int
+  -> unit
+
+(** [unpack_bits buf off n] reads [ceil(n/8)] bytes from [buf] starting at
+    [off] and unpacks them into a fresh bigarray of length [n]. *)
+val unpack_bits
+  :  bytes
+  -> int
+  -> int
+  -> (int, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t

@@ -195,6 +195,113 @@ let test_fk_on_columnar_parent_rejected () =
   Lwt.return_unit
 ;;
 
+let test_serialize_col_int () =
+  let module Col = Sqlocaml_columnar.Col in
+  let col = Col.create Row.Integer 4 in
+  let col = Col.append_value col (Row.V_int 42L) in
+  let col = Col.append_value col (Row.V_int (-1L)) in
+  let col = Col.append_value col Row.V_null in
+  let col = Col.append_value col (Row.V_int 7L) in
+  let encoded = Col.encode col in
+  let decoded, _ = Col.decode encoded 0 in
+  assert (Col.length decoded = 4);
+  assert (Col.get_value decoded 0 = Row.V_int 42L);
+  assert (Col.get_value decoded 1 = Row.V_int (-1L));
+  assert (Col.get_value decoded 2 = Row.V_null);
+  assert (Col.get_value decoded 3 = Row.V_int 7L)
+;;
+
+let test_serialize_col_real () =
+  let module Col = Sqlocaml_columnar.Col in
+  let col = Col.create Row.Real 4 in
+  let col = Col.append_value col (Row.V_real 3.14) in
+  let col = Col.append_value col Row.V_null in
+  let col = Col.append_value col (Row.V_real (-2.5)) in
+  let col = Col.append_value col (Row.V_real 0.0) in
+  let encoded = Col.encode col in
+  let decoded, _ = Col.decode encoded 0 in
+  assert (Col.length decoded = 4);
+  assert (Col.get_value decoded 0 = Row.V_real 3.14);
+  assert (Col.get_value decoded 1 = Row.V_null);
+  assert (Col.get_value decoded 2 = Row.V_real (-2.5));
+  assert (Col.get_value decoded 3 = Row.V_real 0.0)
+;;
+
+let test_serialize_col_text () =
+  let module Col = Sqlocaml_columnar.Col in
+  let col = Col.create Row.Text 4 in
+  let col = Col.append_value col (Row.V_text "hello") in
+  let col = Col.append_value col Row.V_null in
+  let col = Col.append_value col (Row.V_text "world") in
+  let col = Col.append_value col (Row.V_text "hello") in
+  let encoded = Col.encode col in
+  let decoded, _ = Col.decode encoded 0 in
+  assert (Col.length decoded = 4);
+  assert (Col.get_value decoded 0 = Row.V_text "hello");
+  assert (Col.get_value decoded 1 = Row.V_null);
+  assert (Col.get_value decoded 2 = Row.V_text "world");
+  assert (Col.get_value decoded 3 = Row.V_text "hello");
+  assert (Col.dict_size decoded = 2);
+  assert (Col.dict_size (Col.create Row.Integer 0) = 0)
+;;
+
+let test_serialize_col_blob () =
+  let module Col = Sqlocaml_columnar.Col in
+  let col = Col.create Row.Blob 4 in
+  let col = Col.append_value col (Row.V_blob (Bytes.of_string "\x00\x01\x02")) in
+  let col = Col.append_value col Row.V_null in
+  let col = Col.append_value col (Row.V_blob Bytes.empty) in
+  let col = Col.append_value col (Row.V_blob (Bytes.of_string "abc")) in
+  let encoded = Col.encode col in
+  let decoded, _ = Col.decode encoded 0 in
+  assert (Col.length decoded = 4);
+  assert (Col.get_value decoded 0 = Row.V_blob (Bytes.of_string "\x00\x01\x02"));
+  assert (Col.get_value decoded 1 = Row.V_null);
+  assert (Col.get_value decoded 2 = Row.V_blob Bytes.empty);
+  assert (Col.get_value decoded 3 = Row.V_blob (Bytes.of_string "abc"))
+;;
+
+let test_serialize_store_roundtrip () =
+  let default = None in
+  let check_sql = None in
+  let generated_as = None in
+  let cols =
+    [ Row.
+        { name = "id"
+        ; ty = Integer
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ; Row.
+        { name = "val"
+        ; ty = Real
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ]
+  in
+  let module Col_store = Sqlocaml_columnar.Col_store in
+  let store = Col_store.create cols in
+  Col_store.insert_rows
+    store
+    [| [| Row.V_int 1L; Row.V_real 10.0 |]; [| Row.V_int 2L; Row.V_real 20.0 |] |];
+  let encoded = Col_store.encode store in
+  let decoded = Col_store.decode cols encoded in
+  assert (Col_store.nrows decoded = 2);
+  let rows = List.of_seq (Col_store.to_row_seq decoded) in
+  match rows with
+  | [ [| Row.V_int 1L; Row.V_real 10.0 |]; [| Row.V_int 2L; Row.V_real 20.0 |] ] -> ()
+  | _ -> assert false
+;;
+
 let () =
   let tests =
     [ "create_columnstore", test_create_columnstore
@@ -210,6 +317,12 @@ let () =
     ; "delete_returning_rejected", test_delete_returning_rejected
     ; "alter_table_rejected", test_alter_table_rejected
     ; "fk_on_columnar_parent_rejected", test_fk_on_columnar_parent_rejected
+    ; ("serialize_col_int", fun () -> Lwt.return (test_serialize_col_int ()))
+    ; ("serialize_col_real", fun () -> Lwt.return (test_serialize_col_real ()))
+    ; ("serialize_col_text", fun () -> Lwt.return (test_serialize_col_text ()))
+    ; ("serialize_col_blob", fun () -> Lwt.return (test_serialize_col_blob ()))
+    ; ( "serialize_store_roundtrip"
+      , fun () -> Lwt.return (test_serialize_store_roundtrip ()) )
     ]
   in
   List.iter
