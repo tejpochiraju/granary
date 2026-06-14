@@ -64,8 +64,10 @@ type storage =
       ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
       ; autoincrement : bool (** #299: sticky rowid high-water. *)
       }
-  | Columnar of Sqlocaml_columnar.Col_store.t
-  (** M1: in-memory only; Col_store is empty on re-open after restart. *)
+  | Columnar of Sqlocaml_columnar.Col_store.t * Sqlocaml_store.Store.tree_id
+  (** Columnar table: in-memory store plus the tree_id allocated for
+      persistence.  The Col_store is empty on re-open after restart (M1
+      behaviour); the tree_id is reserved for T2 block-region persistence. *)
 
 type table_meta =
   { name : string
@@ -79,6 +81,10 @@ val row_storage : table_meta -> Sqlocaml_store.Store.tree_id * int64 * bool * bo
 (** Returns [(tree_id, next_rowid, without_rowid, autoincrement)]. *)
 
 val is_columnar : table_meta -> bool
+
+(** [tid_of_storage s] returns the tree_id for [Row] or [Columnar] storage.
+    Columnar tables with a legacy dummy tree_id return -1. *)
+val tid_of_storage : storage -> Sqlocaml_store.Store.tree_id
 
 (** Sentinel [next_rowid] for a rowid/alias table that has never seeded its
     counter — conceptually [max = -inf].  Used to tell "never inserted" apart

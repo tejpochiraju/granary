@@ -6510,7 +6510,7 @@ let execute_with_count
     when Cat.is_columnar table_meta ->
     let col_store =
       match table_meta.Cat.storage with
-      | Cat.Columnar cs -> cs
+      | Cat.Columnar (cs, _) -> cs
       | Cat.Row _ -> assert false
     in
     let n_cols = List.length table_meta.Cat.columns in
@@ -6550,7 +6550,7 @@ let execute_with_count
     when Cat.is_columnar table_meta ->
     let col_store =
       match table_meta.Cat.storage with
-      | Cat.Columnar cs -> cs
+      | Cat.Columnar (cs, _) -> cs
       | Cat.Row _ -> assert false
     in
     let n_cols = List.length table_meta.Cat.columns in
@@ -8153,7 +8153,7 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
 and stream_col_seq_scan _clock _params _store _mode (table_meta : Cat.table_meta) =
   let col_store =
     match table_meta.Cat.storage with
-    | Cat.Columnar cs -> cs
+    | Cat.Columnar (cs, _) -> cs
     | Cat.Row _ -> assert false
   in
   let seq = Sqlocaml_columnar.Col_store.to_row_seq col_store in

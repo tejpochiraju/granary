@@ -85,7 +85,7 @@ type storage =
       ; without_rowid : bool
       ; autoincrement : bool
       }
-  | Columnar of Sqlocaml_columnar.Col_store.t
+  | Columnar of Sqlocaml_columnar.Col_store.t * S.tree_id
 
 type table_meta =
   { name : string
@@ -114,6 +114,11 @@ let is_columnar m =
   match m.storage with
   | Columnar _ -> true
   | Row _ -> false
+;;
+
+let tid_of_storage = function
+  | Row { tree_id; _ } -> tree_id
+  | Columnar (_, tid) -> tid
 ;;
 
 type idx_origin =
@@ -559,9 +564,9 @@ let encode_table_value m =
      Varint.encode_uint64 buf (if without_rowid then 1L else 0L);
      Varint.encode_uint64 buf (if autoincrement then 1L else 0L);
      Varint.encode_uint64 buf 0L (* storage_kind = Row *)
-   | Columnar _ ->
-     Varint.encode_uint64 buf 0L;
-     (* dummy tree_id *)
+   | Columnar (_, tree_id) ->
+     Varint.encode_uint64 buf (Int64.of_int tree_id);
+     (* tree_id *)
      Varint.encode_int64 buf empty_next_rowid;
      Varint.encode_uint64 buf 0L;
      (* without_rowid = false *)
@@ -596,7 +601,10 @@ let decode_table_storage bytes columns =
       Int64.to_int v)
   in
   match storage_kind with
-  | 1 -> Columnar (Sqlocaml_columnar.Col_store.create columns)
+  | 1 ->
+    let tid = Int64.to_int tid in
+    let tid = if tid = 0 then -1 else tid in
+    Columnar (Sqlocaml_columnar.Col_store.create columns, tid)
   | _ ->
     Row { tree_id = Int64.to_int tid; next_rowid = next; without_rowid; autoincrement }
 ;;
@@ -1345,10 +1353,11 @@ let fingerprint_of_meta (m : table_meta) =
    schema.  Skips the ephemeral CTE sentinel (tree_id = -1). *)
 let register_tag store (m : table_meta) =
   match m.storage with
-  | Columnar _ -> ()
+  | Columnar (_, tid) when tid >= 0 ->
+    S.set_tree_tag store tid (Schema_fingerprint.low32 (fingerprint_of_meta m))
   | Row { tree_id; _ } when tree_id >= 0 ->
     S.set_tree_tag store tree_id (Schema_fingerprint.low32 (fingerprint_of_meta m))
-  | Row _ -> ()
+  | _ -> ()
 ;;
 
 (* The mirror is keyed by tree_id (fixed 8-byte BE) and stores a fully
@@ -1667,22 +1676,12 @@ let open_ store =
      only over primary tables). *)
   let%lwt mirror = load_mirror_entries store in
   let present_tids =
-    Hashtbl.fold
-      (fun _ (m : table_meta) acc ->
-         match m.storage with
-         | Row { tree_id; _ } -> tree_id :: acc
-         | Columnar _ -> acc)
-      cache
-      []
+    Hashtbl.fold (fun _ (m : table_meta) acc -> tid_of_storage m.storage :: acc) cache []
   in
   let reconstructed =
     List.filter
       (fun (m : table_meta) ->
-         let tid =
-           match m.storage with
-           | Row { tree_id; _ } -> tree_id
-           | Columnar _ -> -1
-         in
+         let tid = tid_of_storage m.storage in
          not (List.mem tid present_tids))
       mirror
   in
@@ -1706,16 +1705,8 @@ let open_ store =
     (fun (m : table_meta) ->
        match Hashtbl.find_opt cache m.name with
        | Some primary
-         when (let tid_p =
-                 match primary.storage with
-                 | Row { tree_id; _ } -> tree_id
-                 | Columnar _ -> -1
-               in
-               let tid_m =
-                 match m.storage with
-                 | Row { tree_id; _ } -> tree_id
-                 | Columnar _ -> -1
-               in
+         when (let tid_p = tid_of_storage primary.storage in
+               let tid_m = tid_of_storage m.storage in
                tid_p = tid_m)
               && not (Int64.equal (fingerprint_of_meta primary) (fingerprint_of_meta m))
          ->
@@ -1928,22 +1919,28 @@ let create_table ?txn t ~name ~columns ~without_rowid ~autoincrement =
 let create_columnstore_table ?txn t ~name ~columns =
   if Schema_cache.mem_table t.sc name
   then failwith (Printf.sprintf "table '%s' already exists" name);
-  let col_store = Sqlocaml_columnar.Col_store.create columns in
-  let m = { name; storage = Columnar col_store; columns; fk_constraints = [] } in
-  let write_rows tx =
+  let write_rows col_store tid tx =
+    let m = { name; storage = Columnar (col_store, tid); columns; fk_constraints = [] } in
     let%lwt () = S.put tx sys_tables_tid (Bytes.of_string name) (encode_table_value m) in
-    Lwt_list.iteri_s
-      (fun i col -> S.put tx sys_columns_tid (column_key name i) (encode_column col))
-      columns
+    let%lwt () =
+      Lwt_list.iteri_s
+        (fun i col -> S.put tx sys_columns_tid (column_key name i) (encode_column col))
+        columns
+    in
+    Lwt.return m
   in
   match txn with
   | Some tx ->
-    let%lwt () = write_rows tx in
+    let%lwt tid = next_user_tid_tx tx in
+    let col_store = Sqlocaml_columnar.Col_store.create columns in
+    let%lwt m = write_rows col_store tid tx in
     Schema_cache.put_table t.sc ~name m;
     Lwt.return ()
   | None ->
     let%lwt tx = S.rw_begin t.store in
-    let%lwt () = write_rows tx in
+    let%lwt tid = next_user_tid_tx tx in
+    let col_store = Sqlocaml_columnar.Col_store.create columns in
+    let%lwt m = write_rows col_store tid tx in
     let%lwt () = S.commit tx in
     Schema_cache.put_table_durable t.sc ~name m;
     Lwt.return ()
@@ -1981,11 +1978,7 @@ let mirror_fingerprints t =
     | Some (_k, v) ->
       (try
          let m, fp = decode_mirror_entry v in
-         let tid =
-           match m.storage with
-           | Row { tree_id; _ } -> tree_id
-           | Columnar _ -> -1
-         in
+         let tid = tid_of_storage m.storage in
          acc := (tid, fp) :: !acc
        with
        | Invalid_argument _ | Failure _ -> ());
