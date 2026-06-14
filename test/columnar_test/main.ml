@@ -302,6 +302,116 @@ let test_serialize_store_roundtrip () =
   | _ -> assert false
 ;;
 
+let test_persist_roundtrip () =
+  let module Col_store = Sqlocaml_columnar.Col_store in
+  let module Persist = Sqlocaml_columnar.Persist in
+  let module S = Sqlocaml_store.Store in
+  let default = None in
+  let check_sql = None in
+  let generated_as = None in
+  let cols =
+    [ Row.
+        { name = "id"
+        ; ty = Integer
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ; Row.
+        { name = "label"
+        ; ty = Text
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ; Row.
+        { name = "score"
+        ; ty = Real
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ]
+  in
+  let store = S.create () in
+  let tid = 16 in
+  let col_store = Col_store.create cols in
+  Col_store.insert_rows
+    col_store
+    [| [| Row.V_int 1L; Row.V_text "alpha"; Row.V_real 10.5 |]
+     ; [| Row.V_int 2L; Row.V_null; Row.V_real 20.0 |]
+     ; [| Row.V_int 3L; Row.V_text "beta"; Row.V_real 30.0 |]
+    |];
+  assert (Col_store.dirty col_store);
+  let* () =
+    let* tx = S.rw_begin store in
+    let* () = Persist.save tx tid col_store in
+    S.commit tx
+  in
+  Col_store.mark_clean col_store;
+  assert (not (Col_store.dirty col_store));
+  let* loaded = S.with_ro store (fun tx -> Persist.load tx tid cols) in
+  match loaded with
+  | Some loaded ->
+    assert (Col_store.nrows loaded = 3);
+    assert (not (Col_store.dirty loaded));
+    let rows = List.of_seq (Col_store.to_row_seq loaded) in
+    (match rows with
+     | [ [| Row.V_int 1L; Row.V_text "alpha"; Row.V_real 10.5 |]
+       ; [| Row.V_int 2L; Row.V_null; Row.V_real 20.0 |]
+       ; [| Row.V_int 3L; Row.V_text "beta"; Row.V_real 30.0 |]
+       ] -> Lwt.return_unit
+     | _ -> assert false)
+  | None -> assert false
+;;
+
+let test_persist_fresh_table_returns_none () =
+  (* A tree_id with no persisted data should return None from Persist.load. *)
+  let module Persist = Sqlocaml_columnar.Persist in
+  let module S = Sqlocaml_store.Store in
+  let default = None in
+  let check_sql = None in
+  let generated_as = None in
+  let cols =
+    [ Row.
+        { name = "x"
+        ; ty = Integer
+        ; not_null = false
+        ; primary_key = false
+        ; pk_desc = false
+        ; default
+        ; check_sql
+        ; generated_as
+        }
+    ]
+  in
+  let store = S.create () in
+  let tid = 17 in
+  let* loaded = S.with_ro store (fun tx -> Persist.load tx tid cols) in
+  assert (loaded = None);
+  Lwt.return_unit
+;;
+
+let test_persist_via_db_commit () =
+  (* Verify the commit path does not error when persisting columnar stores. *)
+  let db = make_db () in
+  let* () = exec db "CREATE TABLE t (a INTEGER, b TEXT) USING COLUMNSTORE" in
+  let* () = exec db "INSERT INTO t VALUES (10, 'hello'), (20, 'world')" in
+  let* rows = query db "SELECT COUNT(*) FROM t" in
+  match rows with
+  | [ [| Row.V_int 2L |] ] -> Lwt.return_unit
+  | _ -> assert false
+;;
+
 let () =
   let tests =
     [ "create_columnstore", test_create_columnstore
@@ -323,6 +433,9 @@ let () =
     ; ("serialize_col_blob", fun () -> Lwt.return (test_serialize_col_blob ()))
     ; ( "serialize_store_roundtrip"
       , fun () -> Lwt.return (test_serialize_store_roundtrip ()) )
+    ; "persist_roundtrip", test_persist_roundtrip
+    ; "persist_fresh_table_returns_none", test_persist_fresh_table_returns_none
+    ; "persist_via_db_commit", test_persist_via_db_commit
     ]
   in
   List.iter

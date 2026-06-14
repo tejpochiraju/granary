@@ -5,12 +5,16 @@ type t =
   { schema : Row.column list
   ; mutable columns : Col.t array
   ; mutable total : int
+  ; mutable dirty : bool
   }
 
 let store_format_version = 0x01
-let create schema = { schema; columns = [||]; total = 0 }
+let create schema = { schema; columns = [||]; total = 0; dirty = false }
 let nrows t = t.total
 let columns t = t.schema
+let dirty t = t.dirty
+let mark_clean t = t.dirty <- false
+let mark_dirty t = t.dirty <- true
 
 let insert_rows t batch =
   let n = Array.length batch in
@@ -35,7 +39,8 @@ let insert_rows t batch =
       else Array.init ncols (fun i -> append_col i t.columns.(i))
     in
     t.columns <- new_cols;
-    t.total <- new_total)
+    t.total <- new_total;
+    t.dirty <- true)
 ;;
 
 let to_row_seq t =
@@ -59,9 +64,15 @@ let to_row_seq t =
 let encode t =
   let buf = Buffer.create 64 in
   Buffer.add_char buf (Char.chr store_format_version);
-  Varint.encode_uint64 buf (Int64.of_int (Array.length t.columns));
+  let ncols = List.length t.schema in
+  Varint.encode_uint64 buf (Int64.of_int ncols);
   Varint.encode_uint64 buf (Int64.of_int t.total);
-  Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) t.columns;
+  let cols =
+    if Array.length t.columns = 0
+    then Array.of_list (List.map (fun (col : Row.column) -> Col.create col.ty 0) t.schema)
+    else t.columns
+  in
+  Array.iter (fun col -> Buffer.add_bytes buf (Col.encode col)) cols;
   Buffer.to_bytes buf
 ;;
 
@@ -106,5 +117,5 @@ let decode ?(off = 0) schema buf =
               clen
               total))
     columns;
-  { schema; columns; total }
+  { schema; columns; total; dirty = false }
 ;;

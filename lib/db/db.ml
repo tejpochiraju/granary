@@ -165,6 +165,8 @@ let of_store ?clock ?durability ?file_path store =
    | Some d -> S.set_durability store d
    | None -> ());
   let* catalog = Cat.open_ store in
+  (* Load persisted columnar data for columnar tables. *)
+  let* () = Cat.load_columnar_stores catalog store in
   let views = Hashtbl.create 4 in
   let* () = load_views_into_hashtbl store views in
   let triggers = Hashtbl.create 4 in
@@ -323,6 +325,8 @@ let vacuum t : unit Lwt.t =
               Lwt.fail_with msg
             | Ok new_store ->
               let* new_catalog = Cat.open_ new_store in
+              (* Load persisted columnar data into the fresh catalog. *)
+              let* () = Cat.load_columnar_stores new_catalog new_store in
               t.store <- new_store;
               t.catalog <- new_catalog;
               Hashtbl.clear t.views;
@@ -435,6 +439,10 @@ let force_rollback_txn t tx =
      reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
      after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
   let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
+  (* Reload all columnar stores from the rolled-back B-tree.  The RO snapshot
+     opened by [load_columnar_stores] sees the last committed state, which is
+     correct after a full rollback. *)
+  let* () = Cat.load_columnar_stores t.catalog t.store in
   t.explicit_txn <- None;
   t.savepoint_names <- [];
   t.auto_began <- false;
@@ -528,7 +536,14 @@ let commit_txn t =
          let* () = drain_pending_fks_or_fail t tx in
          (* #347: write deferred rowid counters once before committing the txn. *)
          let* () = Cat.flush_dirty_counters_tx t.catalog tx in
+         (* Persist any dirty columnar stores before committing. *)
+         let* saved = Cat.persist_dirty_columnar_stores t.catalog tx in
          let* () = S.commit tx in
+         (* Dirty flags are cleared only after commit succeeds — if commit
+             fails (disk-full, fsync error), the B-tree changes are discarded
+             but the in-memory Col_store retains the rows, and dirty stays
+             true so the next cycle retries. *)
+         List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
@@ -604,7 +619,10 @@ let release_savepoint t name =
       else
         (* #347: write deferred rowid counters once before committing the txn. *)
         let* () = Cat.flush_dirty_counters_tx t.catalog tx in
+        (* Persist any dirty columnar stores before committing. *)
+        let* saved = Cat.persist_dirty_columnar_stores t.catalog tx in
         let* () = S.commit tx in
+        List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;

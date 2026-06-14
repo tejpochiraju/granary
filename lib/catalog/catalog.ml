@@ -231,12 +231,16 @@ end = struct
      in-memory counter (#303): the full-ROLLBACK recompute-from-tree path
      ([recompute_rowid_counters_after_rollback]) is unusable mid-transaction —
      the RW txn is still open, so a fresh RO snapshot reads the last-committed
-     tree, not the savepoint state — so we snapshot/restore in memory instead. *)
+     tree, not the savepoint state — so we snapshot/restore in memory instead.
+     [sp_columnar] snapshots the encoded state (plus dirty flag) of every dirty
+     columnar store at SAVEPOINT, for the same reason: Persist.save only runs at
+     commit time, so the B-tree never holds in-txn columnar data. *)
   type savepoint =
     { sp_name : string
     ; sp_undo : (unit -> unit) list
     ; sp_poison : bool
     ; sp_rowids : (string * int64) list
+    ; sp_columnar : (string * bytes * bool) list
     }
 
   type t =
@@ -424,12 +428,31 @@ end = struct
       []
   ;;
 
+  (* Snapshot every columnar store's encoded state so ROLLBACK TO can restore
+     it.  Persist.save only runs at commit time, so the B-tree never holds
+     in-txn columnar data and cannot be used as a rollback source.  We snapshot
+     ALL columnar stores (not just dirty), because a clean store may be mutated
+     after the savepoint and then need restoration. *)
+  let snapshot_columnar t =
+    Hashtbl.fold
+      (fun name (m : table_meta) acc ->
+         match m.storage with
+         | Columnar (cs, _) ->
+           let encoded = Sqlocaml_columnar.Col_store.encode cs in
+           let was_dirty = Sqlocaml_columnar.Col_store.dirty cs in
+           (name, encoded, was_dirty) :: acc
+         | _ -> acc)
+      t.tables
+      []
+  ;;
+
   let savepoint_begin t name =
     t.savepoints
     <- { sp_name = name
        ; sp_undo = t.undo
        ; sp_poison = t.poisoned
        ; sp_rowids = snapshot_rowids t
+       ; sp_columnar = snapshot_columnar t
        }
        :: t.savepoints
   ;;
@@ -444,6 +467,21 @@ end = struct
            Hashtbl.replace t.tables name { m with storage = Row { r with next_rowid } }
          | _ -> ())
       rowids
+  ;;
+
+  (* Restore each columnar store to its savepoint snapshot.  The store is
+     marked dirty if it was dirty at snapshot time so unpersisted pre-savepoint
+     rows are still persisted on the next COMMIT. *)
+  let restore_columnar t snapshots =
+    List.iter
+      (fun (name, encoded, was_dirty) ->
+         match Hashtbl.find_opt t.tables name with
+         | Some ({ storage = Columnar (_, tid); columns; _ } as m) ->
+           let cs = Sqlocaml_columnar.Col_store.decode columns encoded in
+           if was_dirty then Sqlocaml_columnar.Col_store.mark_dirty cs;
+           Hashtbl.replace t.tables name { m with storage = Columnar (cs, tid) }
+         | _ -> ())
+      snapshots
   ;;
 
   let savepoint_rollback t name =
@@ -469,8 +507,10 @@ end = struct
       t.undo <- sp.sp_undo;
       t.poisoned <- sp.sp_poison;
       (* After the DDL undos above, correct the cached rowid counters to their
-         savepoint values (#303). *)
+          savepoint values (#303). *)
       restore_rowids t sp.sp_rowids;
+      (* Restore columnar stores to their savepoint snapshots. *)
+      restore_columnar t sp.sp_columnar;
       t.savepoints <- sp :: older
   ;;
 
@@ -2026,10 +2066,44 @@ let register_ephemeral t (meta : table_meta) =
 ;;
 
 let unregister_ephemeral t ~name = Schema_cache.remove_table_durable t.sc ~name
+let all_tables t = Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc []
+let list_tables t = Lwt.return (all_tables t)
 
-let list_tables t =
-  Lwt.return (Schema_cache.fold_tables (fun _ v acc -> v :: acc) t.sc [])
+let persist_dirty_columnar_stores t (tx : S.rw S.txn) =
+  let tables = all_tables t in
+  let%lwt saved =
+    Lwt_list.filter_map_s
+      (fun (m : table_meta) ->
+         match m.storage with
+         | Columnar (cs, tid) when Sqlocaml_columnar.Col_store.dirty cs ->
+           let%lwt () = Sqlocaml_columnar.Persist.save tx tid cs in
+           Lwt.return_some cs
+         | _ -> Lwt.return_none)
+      tables
+  in
+  Lwt.return saved
 ;;
+
+let load_columnar_stores_with_txn t (tx : _ S.txn) =
+  let tables = all_tables t in
+  Lwt_list.iter_s
+    (fun (m : table_meta) ->
+       match m.storage with
+       | Columnar (_, tid) ->
+         let%lwt loaded = Sqlocaml_columnar.Persist.load tx tid m.columns in
+         let cs =
+           match loaded with
+           | Some cs -> cs
+           | None -> Sqlocaml_columnar.Col_store.create m.columns
+         in
+         let m' = { m with storage = Columnar (cs, tid) } in
+         Schema_cache.put_table_durable t.sc ~name:m.name m';
+         Lwt.return_unit
+       | _ -> Lwt.return_unit)
+    tables
+;;
+
+let load_columnar_stores t store = S.with_ro store (load_columnar_stores_with_txn t)
 
 (* #250: pick the rowid to auto-allocate for a NULL/omitted id, and the new
    counter.  An unseeded table ([empty_next_rowid]) allocates 1 (SQLite: empty

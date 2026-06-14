@@ -31,3 +31,13 @@ val encode : t -> bytes
     offset [off] (default 0) using the given schema.
     Raises [Failure] on corrupt or malformed data. *)
 val decode : ?off:int -> Row.column list -> bytes -> t
+
+(** [dirty store] returns [true] if the store has been mutated since the
+    last call to {!mark_clean} (i.e. has unpersisted changes). *)
+val dirty : t -> bool
+
+(** [mark_clean store] resets the dirty flag. *)
+val mark_clean : t -> unit
+
+(** [mark_dirty store] sets the dirty flag. *)
+val mark_dirty : t -> unit
