@@ -325,6 +325,8 @@ let vacuum t : unit Lwt.t =
               Lwt.fail_with msg
             | Ok new_store ->
               let* new_catalog = Cat.open_ new_store in
+              (* Load persisted columnar data into the fresh catalog. *)
+              let* () = Cat.load_columnar_stores new_catalog new_store in
               t.store <- new_store;
               t.catalog <- new_catalog;
               Hashtbl.clear t.views;
@@ -437,6 +439,10 @@ let force_rollback_txn t tx =
      reuses a rolled-back rowid (SQLite parity for plain rowid tables).  Done
      after [S.rollback] released the RW lock so the recompute's RO txn is safe. *)
   let* () = Cat.recompute_rowid_counters_after_rollback t.catalog in
+  (* Reload all columnar stores from the rolled-back B-tree.  The RO snapshot
+     opened by [load_columnar_stores] sees the last committed state, which is
+     correct after a full rollback. *)
+  let* () = Cat.load_columnar_stores t.catalog t.store in
   t.explicit_txn <- None;
   t.savepoint_names <- [];
   t.auto_began <- false;
@@ -533,6 +539,11 @@ let commit_txn t =
          (* Persist any dirty columnar stores before committing. *)
          let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
          let* () = S.commit tx in
+         (* Dirty flags are cleared only after commit succeeds — if commit
+             fails (disk-full, fsync error), the B-tree changes are discarded
+             but the in-memory Col_store retains the rows, and dirty stays
+             true so the next cycle retries. *)
+         Cat.mark_columnar_stores_clean t.catalog;
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
@@ -611,6 +622,7 @@ let release_savepoint t name =
         (* Persist any dirty columnar stores before committing. *)
         let* () = Cat.persist_dirty_columnar_stores t.catalog tx in
         let* () = S.commit tx in
+        Cat.mark_columnar_stores_clean t.catalog;
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;
@@ -627,6 +639,10 @@ let rollback_to_savepoint t name =
     (* #280: revert the in-memory cache mutations of DDL registered since this
        savepoint so the catalog agrees with the store rolled back to [name]. *)
     Cat.savepoint_rollback_schema t.catalog name;
+    (* Reload all columnar stores through the RW txn so they reflect the
+       savepoint-reverted B-tree state (which includes this txn's own
+       uncommitted writes — a fresh RO snapshot would see committed state). *)
+    let* () = Cat.reload_columnar_stores_in_txn t.catalog tx in
     if List.mem name t.savepoint_names
     then (
       let rec trim = function

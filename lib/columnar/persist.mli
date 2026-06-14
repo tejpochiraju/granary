@@ -16,5 +16,6 @@ val save : S.rw S.txn -> S.tree_id -> Col_store.t -> unit Lwt.t
 
 (** [load tx tree_id schema] reads a previously persisted columnar store from
     the B-tree at [tree_id].  Returns [None] if no data has been persisted yet
-    (fresh table).  Raises [Failure] on corrupt data. *)
-val load : S.ro S.txn -> S.tree_id -> Row.column list -> Col_store.t option Lwt.t
+    (fresh table).  Raises [Failure] on corrupt data.  Works with both RO and
+    RW transactions. *)
+val load : _ S.txn -> S.tree_id -> Row.column list -> Col_store.t option Lwt.t
