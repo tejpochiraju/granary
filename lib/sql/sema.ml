@@ -2030,7 +2030,9 @@ let select_qual_lookup ~(tables : (Cat.table_meta * int * string option) list) t
      | None -> Error (Unknown_column { table = t; column = c }))
 ;;
 
-(* Bind GROUP BY column names to combined-row ordinals. *)
+(* Bind GROUP BY column names to combined-row ordinals.  Each item is
+   [(column, qualifier)] where qualifier is [Some table] for qualified
+   names like [table.col] and [None] for bare column names. *)
 let bind_select_group_cols
       ~(tables : (Cat.table_meta * int * string option) list)
       ~(meta : Cat.table_meta)
@@ -2039,17 +2041,13 @@ let bind_select_group_cols
   =
   let result =
     List.fold_left
-      (fun acc col_name ->
+      (fun acc (col_name, qualifier) ->
          match acc with
          | Error _ as e -> e
          | Ok indices ->
-           (match String.index_opt col_name '.' with
-            | Some dot_pos ->
-              let table = String.sub col_name 0 dot_pos
-              and column =
-                String.sub col_name (dot_pos + 1) (String.length col_name - dot_pos - 1)
-              in
-              (match select_qual_lookup ~tables table column with
+           (match qualifier with
+            | Some table ->
+              (match select_qual_lookup ~tables table col_name with
                | Ok i -> Ok (i :: indices)
                | Error e -> Error e)
             | None ->

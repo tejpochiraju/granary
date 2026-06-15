@@ -1962,7 +1962,7 @@ let bind_select_group_by_basic () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -1984,7 +1984,7 @@ let bind_select_group_by_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "bogus" ]
+      ; group_by = [ "bogus", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -2011,7 +2011,7 @@ let bind_select_group_by_multi_accepted () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id"; "name" ]
+      ; group_by = [ "id", None; "name", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -2021,6 +2021,98 @@ let bind_select_group_by_multi_accepted () =
   match bind cat stmt with
   | Ok (Sema.BS_select { group_by = [ 0; 1 ]; _ }) -> ()
   | _ -> Alcotest.fail "expected BS_select with two-column GROUP BY [0;1]"
+;;
+
+(** Qualified GROUP BY: table.column resolves to correct ordinal. *)
+let bind_select_group_by_qual_col () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "users" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { group_by = [ 0 ]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select GROUP BY users.id -> [0]"
+;;
+
+(** Qualified GROUP BY with unknown table emits Unknown_table. *)
+let bind_select_group_by_qual_unknown_table () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "ghost" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost in qualified GROUP BY"
+;;
+
+(** Qualified GROUP BY with unknown column on known table emits Unknown_column. *)
+let bind_select_group_by_qual_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "bogus", Some "users" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in qualified GROUP BY"
+;;
+
+(** Qualified GROUP BY via table alias: [GROUP BY u.id] where table_alias = Some "u". *)
+let bind_select_group_by_qual_alias () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = Some "u"
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "u" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { group_by = [ 0 ]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select GROUP BY u.id (alias) -> [0]"
 ;;
 
 let bind_select_having_basic () =
@@ -2033,7 +2125,7 @@ let bind_select_having_basic () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop
@@ -2135,7 +2227,7 @@ let bind_select_col_not_in_group_by_rejected () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -2822,7 +2914,7 @@ let bind_select_having_with_plain_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_lit (Ast.L_int 1L)))
       ; order = []
       ; limit = None
@@ -2845,7 +2937,7 @@ let bind_select_having_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_binop (Ast.Eq, Ast.E_col "bogus", Ast.E_lit (Ast.L_int 1L)))
       ; order = []
       ; limit = None
@@ -2868,7 +2960,7 @@ let bind_select_having_qual_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("users", "id"), Ast.E_lit (Ast.L_int 1L)))
@@ -2893,7 +2985,7 @@ let bind_select_having_qual_col_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop (Ast.Eq, Ast.E_tbl_col ("ghost", "id"), Ast.E_lit (Ast.L_int 1L)))
@@ -2920,7 +3012,7 @@ let bind_select_having_with_not_agg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_not (Ast.E_agg (Ast.Agg_count, None)))
       ; order = []
       ; limit = None
@@ -2943,7 +3035,7 @@ let bind_select_having_with_neg_agg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop
@@ -2971,7 +3063,7 @@ let bind_select_having_with_is_null_agg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_is_null (Ast.E_agg (Ast.Agg_count, None)))
       ; order = []
       ; limit = None
@@ -2993,7 +3085,7 @@ let bind_select_having_with_is_not_null_agg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_is_not_null (Ast.E_agg (Ast.Agg_count, None)))
       ; order = []
       ; limit = None
@@ -3422,7 +3514,7 @@ let bind_select_qual_no_join () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -3449,7 +3541,7 @@ let bind_select_qual_no_join_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -3474,7 +3566,7 @@ let bind_select_qual_no_join_unknown_table () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -3652,7 +3744,7 @@ let bind_select_having_binop_right_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; (* Left side OK (group col), right side unknown col *)
         having = Some (Ast.E_binop (Ast.Eq, Ast.E_col "id", Ast.E_col "bogus"))
       ; order = []
@@ -3677,7 +3769,7 @@ let bind_select_having_agg_unknown_arg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_agg (Ast.Agg_sum, Some (Ast.E_col "bogus")))
       ; order = []
       ; limit = None
@@ -3700,7 +3792,7 @@ let bind_select_having_agg_with_col_arg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop
@@ -3728,7 +3820,7 @@ let bind_select_having_agg_with_qual_arg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop
@@ -3757,7 +3849,7 @@ let bind_select_having_agg_with_qual_arg_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_agg (Ast.Agg_sum, Some (Ast.E_tbl_col ("ghost", "id"))))
       ; order = []
       ; limit = None
@@ -3781,7 +3873,7 @@ let bind_select_having_agg_complex_arg () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_agg
@@ -3808,7 +3900,7 @@ let bind_select_having_sum_star_rejected () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; (* SUM with no arg - only COUNT permits no argument *)
         having = Some (Ast.E_agg (Ast.Agg_sum, None))
       ; order = []
@@ -3844,7 +3936,7 @@ let bind_select_join_qual_left_unknown_col_proj () =
             }
           ]
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = None
       ; order = []
       ; limit = None
@@ -3872,7 +3964,7 @@ let bind_select_having_not_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_not (Ast.E_col "bogus"))
       ; order = []
       ; limit = None
@@ -3895,7 +3987,7 @@ let bind_select_having_is_null_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_is_null (Ast.E_col "bogus"))
       ; order = []
       ; limit = None
@@ -3918,7 +4010,7 @@ let bind_select_having_is_not_null_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_is_not_null (Ast.E_col "bogus"))
       ; order = []
       ; limit = None
@@ -3941,7 +4033,7 @@ let bind_select_having_neg_unknown_col () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_neg (Ast.E_col "bogus"))
       ; order = []
       ; limit = None
@@ -4910,7 +5002,7 @@ let bind_select_having_bitnot () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_bitnot (Ast.E_agg (Ast.Agg_count, None)))
       ; order = []
       ; limit = None
@@ -4933,7 +5025,7 @@ let bind_select_having_bitnot_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_bitnot (Ast.E_col "bogus"))
       ; order = []
       ; limit = None
@@ -4956,7 +5048,7 @@ let bind_select_having_between () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_between
@@ -4984,7 +5076,7 @@ let bind_select_having_between_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_between
@@ -5012,7 +5104,7 @@ let bind_select_having_in_ok () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_in
@@ -5039,7 +5131,7 @@ let bind_select_having_in_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_in (Ast.E_col "bogus", [ Ast.E_lit (Ast.L_int 1L) ]))
       ; order = []
       ; limit = None
@@ -5062,7 +5154,7 @@ let bind_select_having_param () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having =
           Some
             (Ast.E_binop
@@ -5088,7 +5180,7 @@ let bind_select_having_func_arity_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_func (Ast.Fn_length, []))
       ; order = []
       ; limit = None
@@ -5111,7 +5203,7 @@ let bind_select_having_func_arg_error () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_func (Ast.Fn_length, [ Ast.E_col "bogus" ]))
       ; order = []
       ; limit = None
@@ -5134,7 +5226,7 @@ let bind_select_having_match_rejected () =
       ; table_alias = None
       ; joins = []
       ; where = None
-      ; group_by = [ "id" ]
+      ; group_by = [ "id", None ]
       ; having = Some (Ast.E_match ("users", "hello"))
       ; order = []
       ; limit = None
@@ -5802,6 +5894,22 @@ let () =
             "bind_select_group_by_multi_accepted"
             `Quick
             bind_select_group_by_multi_accepted
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_col"
+            `Quick
+            bind_select_group_by_qual_col
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_unknown_table"
+            `Quick
+            bind_select_group_by_qual_unknown_table
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_unknown_col"
+            `Quick
+            bind_select_group_by_qual_unknown_col
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_alias"
+            `Quick
+            bind_select_group_by_qual_alias
         ; Alcotest.test_case "bind_select_having_basic" `Quick bind_select_having_basic
         ; Alcotest.test_case
             "bind_select_having_no_group_by_rejected"

@@ -280,6 +280,8 @@ and upsert_update =
   ; assignments : (string * expr) list
   }
 
+and group_by_item = string * string option
+
 and stmt =
   | S_create_table of
       { name : string
@@ -313,7 +315,7 @@ and stmt =
       ; table_alias : string option (** optional AS alias for the FROM table *)
       ; joins : join_clause list (** empty list = no joins *)
       ; where : expr option
-      ; group_by : string list (** column names; empty = no GROUP BY *)
+      ; group_by : group_by_item list (** column names; empty = no GROUP BY *)
       ; having : expr option (** HAVING predicate (may reference aggregates) *)
       ; order : order_key list (** empty = no ORDER BY *)
       ; limit : int option
