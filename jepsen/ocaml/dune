@@ -14,7 +14,6 @@
 
 (executable
  (name harness)
- (public_name sqlocaml_jepsen)
  (modules harness)
  (libraries
   jepsen_lib
@@ -31,6 +30,5 @@
 
 (executable
  (name negative_control)
- (public_name sqlocaml_jepsen_negative)
  (modules negative_control)
  (libraries jepsen_lib unix))

@@ -1,0 +1,7 @@
+(executable
+ (name sqlocaml_repl)
+ (public_name sqlocaml_repl)
+ (package sqlocaml_repl)
+ (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd nottui nottui-lwt)
+ (preprocess
+  (pps lwt_ppx)))

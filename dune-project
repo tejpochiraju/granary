@@ -20,3 +20,16 @@
   (mirage-crypto (>= "1.2.0"))
   (mirage-crypto-rng (>= "1.2.0"))
   (alcotest-lwt :with-test)))
+
+(package
+ (name sqlocaml_repl)
+ (synopsis "TUI REPL for sqlocaml")
+ (depends
+  (ocaml (>= 5.4))
+  sqlocaml
+  (lwt (>= 5.7))
+  (menhir (>= "20240715"))
+  (lwd (>= 0.5))
+  (nottui (>= 0.5))
+  (nottui-lwt (>= 0.5))
+  (lwt_ppx :build)))

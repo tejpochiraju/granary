@@ -394,8 +394,9 @@
 
 (test
  (name test_repl)
+ (modules test_repl)
  (libraries alcotest unix)
- (deps ../bin/sqlocaml_repl.exe))
+ (deps ../bin/repl/sqlocaml_repl.exe))
 
 (test
  (name test_rwlock)
