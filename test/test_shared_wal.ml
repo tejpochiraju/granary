@@ -439,15 +439,8 @@ let test_columnar_replication_via_wal () =
      (match rows with
       | [ [| Row.V_int 2L |] ] -> ()
       | _ -> Alcotest.fail "master insert failed");
-     (* Capture WAL frames. *)
-     let* () =
-       wait_for
-         (fun () ->
-            match Store.replication_state master_store with
-            | Some (_epoch, frames) -> frames > 0
-            | None -> false)
-         50
-     in
+     (* Capture WAL frames.  exec already awaits release_txn -> S.commit, so
+        committed_frames is > 0 when we reach here. *)
      let* capt_r =
        Store.capture_frames_since master_store ~since_epoch:0L ~since_idx:(-1)
      in
