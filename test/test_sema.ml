@@ -2023,6 +2023,75 @@ let bind_select_group_by_multi_accepted () =
   | _ -> Alcotest.fail "expected BS_select with two-column GROUP BY [0;1]"
 ;;
 
+(** Qualified GROUP BY: table.column resolves to correct ordinal. *)
+let bind_select_group_by_qual_col () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "users" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { group_by = [ 0 ]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select GROUP BY users.id -> [0]"
+;;
+
+(** Qualified GROUP BY with unknown table emits Unknown_table. *)
+let bind_select_group_by_qual_unknown_table () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "ghost" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Error (Sema.Unknown_table "ghost") -> ()
+  | _ -> Alcotest.fail "expected Unknown_table ghost in qualified GROUP BY"
+;;
+
+(** Qualified GROUP BY with unknown column on known table emits Unknown_column. *)
+let bind_select_group_by_qual_unknown_col () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = None
+      ; joins = []
+      ; where = None
+      ; group_by = [ "bogus", Some "users" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Error (Sema.Unknown_column { column = "bogus"; _ }) -> ()
+  | _ -> Alcotest.fail "expected Unknown_column bogus in qualified GROUP BY"
+;;
+
 let bind_select_having_basic () =
   let cat = two_col_cat () in
   let stmt =
@@ -5802,6 +5871,18 @@ let () =
             "bind_select_group_by_multi_accepted"
             `Quick
             bind_select_group_by_multi_accepted
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_col"
+            `Quick
+            bind_select_group_by_qual_col
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_unknown_table"
+            `Quick
+            bind_select_group_by_qual_unknown_table
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_unknown_col"
+            `Quick
+            bind_select_group_by_qual_unknown_col
         ; Alcotest.test_case "bind_select_having_basic" `Quick bind_select_having_basic
         ; Alcotest.test_case
             "bind_select_having_no_group_by_rejected"
