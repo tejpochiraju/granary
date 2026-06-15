@@ -1,10 +1,10 @@
 module Bigarray = Bigarray
 
-let pack_bits bits n =
+let pack_bits_of_bools is_null n =
   let n_bytes = (n + 7) / 8 in
-  let b = Bytes.create n_bytes in
+  let b = Bytes.make n_bytes '\x00' in
   for i = 0 to n - 1 do
-    if Bigarray.Array1.get bits i <> 0
+    if is_null i
     then (
       let byte_idx = i / 8 in
       let bit_idx = i mod 8 in
@@ -12,6 +12,8 @@ let pack_bits bits n =
   done;
   b
 ;;
+
+let pack_bits bits n = pack_bits_of_bools (fun i -> Bigarray.Array1.get bits i <> 0) n
 
 let pack_bits_into buf bits n =
   let n_bytes = (n + 7) / 8 in
@@ -35,4 +37,14 @@ let unpack_bits buf off n =
     Bigarray.Array1.set bits i is_set
   done;
   bits
+;;
+
+let unpack_bits_to_bools buf off n =
+  let result = Array.make n false in
+  for i = 0 to n - 1 do
+    let byte_idx = i / 8 in
+    let bit_idx = i mod 8 in
+    result.(i) <- (Bytes.get_uint8 buf (off + byte_idx) lsr bit_idx) land 1 = 1
+  done;
+  result
 ;;

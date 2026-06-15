@@ -125,24 +125,14 @@ let encode schema row =
         VIRTUAL generated columns are always encoded as NULL — their value
         is recomputed on read (see decode_with_virtual in lib/sql/exec.ml).
         STORED generated columns are persisted normally. *)
-  let bitmap_bytes = (n + 7) / 8 in
-  let bitmap = Bytes.make bitmap_bytes '\x00' in
-  Array.iteri
-    (fun i v ->
-       let null_in_bitmap =
-         is_virtual.(i)
-         ||
-         match v with
-         | V_null -> true
-         | _ -> false
-       in
-       if null_in_bitmap
-       then (
-         let byte_idx = i / 8
-         and bit_idx = i mod 8 in
-         let cur = Bytes.get_uint8 bitmap byte_idx in
-         Bytes.set_uint8 bitmap byte_idx (cur lor (1 lsl bit_idx))))
-    row;
+  let is_null i =
+    is_virtual.(i)
+    ||
+    match row.(i) with
+    | V_null -> true
+    | _ -> false
+  in
+  let bitmap = Null_bitmap.pack_bits_of_bools is_null n in
   Buffer.add_bytes buf bitmap;
   (* 3. non-null values in column order — skip VIRTUAL generated cols *)
   List.iteri
@@ -196,8 +186,8 @@ let decode schema encoded =
     invalid_arg
       (Printf.sprintf "Row.decode: expected at most %d columns, got %d" n n_encoded);
   (* 2. read null bitmap (sized for the encoded columns only) *)
+  let is_null = Null_bitmap.unpack_bits_to_bools encoded off n_encoded in
   let bitmap_bytes = (n_encoded + 7) / 8 in
-  let bitmap = Bytes.sub encoded off bitmap_bytes in
   let off = ref (off + bitmap_bytes) in
   (* 3. decode each column *)
   let result = Array.make n V_null in
@@ -205,10 +195,7 @@ let decode schema encoded =
     (fun i col ->
        if i < n_encoded
        then (
-         let byte_idx = i / 8
-         and bit_idx = i mod 8 in
-         let is_null = (Bytes.get_uint8 bitmap byte_idx lsr bit_idx) land 1 = 1 in
-         if not is_null
+         if not is_null.(i)
          then (
            let v, off' = decode_col_value encoded !off col in
            result.(i) <- v;
@@ -239,8 +226,8 @@ let decode_prefix schema encoded ~upto =
          "Row.decode_prefix: expected at most %d columns, got %d"
          n
          n_encoded);
+  let is_null = Null_bitmap.unpack_bits_to_bools encoded off n_encoded in
   let bitmap_bytes = (n_encoded + 7) / 8 in
-  let bitmap = Bytes.sub encoded off bitmap_bytes in
   let off = ref (off + bitmap_bytes) in
   let result = Array.make n V_null in
   let limit = if upto >= n then n - 1 else upto in
@@ -251,10 +238,7 @@ let decode_prefix schema encoded ~upto =
           then raise Exit (* nothing past [limit] is needed; stop walking *)
           else if i < n_encoded
           then (
-            let byte_idx = i / 8
-            and bit_idx = i mod 8 in
-            let is_null = (Bytes.get_uint8 bitmap byte_idx lsr bit_idx) land 1 = 1 in
-            if not is_null
+            if not is_null.(i)
             then (
               let v, off' = decode_col_value encoded !off col in
               result.(i) <- v;
