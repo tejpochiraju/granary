@@ -12,6 +12,8 @@ module Replication = Sqlocaml_replication.Replication
 module Standby = Sqlocaml_replication.Standby
 module Store = Sqlocaml_store.Store
 module Pager = Sqlocaml_storage.Pager
+module Db = Sqlocaml.Db
+module Row = Sqlocaml_encoding.Row
 
 (* ------------------------------------------------------------------ *)
 (* In-memory device helpers (same pattern as test_standby.ml)          *)
@@ -370,6 +372,146 @@ let test_checkpoint_gating_via_standby_ack () =
      Lwt.return_unit)
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #368 / T3: verify columnar data survives WAL replay on standby      *)
+(* ------------------------------------------------------------------ *)
+
+(** End-to-end test: create columnar data on the master via SQL, ship
+    WAL frames to the standby via the apply loop, then open a fresh
+    Store+Db on the shared devices and verify the columnar data is
+    visible. *)
+let test_columnar_replication_via_wal () =
+  Lwt_main.run
+    (let main_dev = mk_dev (1024 * 4096) in
+     let wal_dev = mk_dev 65536 in
+     (* Shared WAL + main device, same pattern as open_topology. *)
+     let* wal_r =
+       Wal.open_
+         ~read_at:(read_at wal_dev)
+         ~write_at:(write_at wal_dev)
+         ~sync:sync_ok
+         ~size_bytes:(dev_size wal_dev)
+         ()
+     in
+     let wal =
+       match wal_r with
+       | Ok w -> w
+       | Error e -> Alcotest.failf "wal open: %a" Wal.pp_error e
+     in
+     let main_n_pages = Int64.of_int (Bytes.length main_dev.buf / 4096) in
+     let* master_sr =
+       Store.open_block_wal
+         ~read_page:(read_page main_dev)
+         ~write_page:(write_page main_dev)
+         ~sync:sync_ok
+         ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
+         ~n_pages:main_n_pages
+         ~wal_read_at:(read_at wal_dev)
+         ~wal_write_at:(write_at wal_dev)
+         ~wal_sync:sync_ok
+         ~wal_size_bytes:(dev_size wal_dev)
+         ~close:(fun () -> Lwt.return_unit)
+         ~wal_close:(fun () -> Lwt.return_unit)
+         ()
+     in
+     let master_store =
+       match master_sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
+     in
+     let exec db sql =
+       let* r = Db.execute db sql in
+       match r with
+       | Ok () -> Lwt.return_unit
+       | Error e -> Alcotest.failf "exec: %a" Db.pp_error e
+     in
+     let query db sql =
+       let* r = Db.query db sql in
+       match r with
+       | Ok stream -> Lwt_stream.to_list stream
+       | Error e -> Alcotest.failf "query: %a" Db.pp_error e
+     in
+     (* Master: create columnar table + insert data. *)
+     let* master_db = Db.of_store master_store in
+     let* () = exec master_db "CREATE TABLE t (a INTEGER, b TEXT) USING COLUMNSTORE" in
+     let* () = exec master_db "INSERT INTO t VALUES (10, 'hello'), (20, 'world')" in
+     let* rows = query master_db "SELECT COUNT(*) FROM t" in
+     (match rows with
+      | [ [| Row.V_int 2L |] ] -> ()
+      | _ -> Alcotest.fail "master insert failed");
+     (* Capture WAL frames. *)
+     let* () =
+       wait_for
+         (fun () ->
+            match Store.replication_state master_store with
+            | Some (_epoch, frames) -> frames > 0
+            | None -> false)
+         50
+     in
+     let* capt_r =
+       Store.capture_frames_since master_store ~since_epoch:0L ~since_idx:(-1)
+     in
+     let frames =
+       match capt_r with
+       | Some (Ok fs) -> List.map Replication.backup_frame_to_replicated fs
+       | _ -> Alcotest.fail "capture frames failed"
+     in
+     Alcotest.(check bool) "captured frames" true (frames <> []);
+     (* Feed frames to a standby (uses the shared wal device). *)
+     let standby_store = Store.create () in
+     let pager = writable_pager main_dev () in
+     let ack_called = ref false in
+     let standby =
+       Standby.create
+         ~store:standby_store
+         ~pager
+         ~wal
+         ~on_standby_ack:(fun _ -> ack_called := true)
+         ()
+     in
+     let stream, push = Lwt_stream.create () in
+     push (Some frames);
+     push None;
+     let* apply_r = Standby.start_following standby stream in
+     (match apply_r with
+      | Ok () -> Alcotest.(check bool) "standby ack fired" true !ack_called
+      | Error (`Apply_error msg) -> Alcotest.failf "start_following: %s" msg);
+     (* Open a FRESH Store+Db on the shared devices — simulates a new
+        connection or a standby promotion that recovers the WAL. *)
+     let* fresh_sr =
+       Store.open_block_wal
+         ~read_page:(read_page main_dev)
+         ~write_page:(write_page main_dev)
+         ~sync:sync_ok
+         ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
+         ~n_pages:main_n_pages
+         ~wal_read_at:(read_at wal_dev)
+         ~wal_write_at:(write_at wal_dev)
+         ~wal_sync:sync_ok
+         ~wal_size_bytes:(dev_size wal_dev)
+         ~close:(fun () -> Lwt.return_unit)
+         ~wal_close:(fun () -> Lwt.return_unit)
+         ()
+     in
+     let fresh_store =
+       match fresh_sr with
+       | Ok s -> s
+       | Error e -> Alcotest.failf "fresh open_block_wal: %a" Store.pp_error e
+     in
+     let* fresh_db = Db.of_store fresh_store in
+     let* fresh_rows = query fresh_db "SELECT a, b FROM t ORDER BY a" in
+     Alcotest.(check int)
+       "standby sees 2 columnar rows via fresh store"
+       2
+       (List.length fresh_rows);
+     (match fresh_rows with
+      | [ [| Row.V_int 10L; Row.V_text "hello" |]
+        ; [| Row.V_int 20L; Row.V_text "world" |]
+        ] -> ()
+      | _ -> Alcotest.fail "unexpected columnar data on fresh-store standby");
+     Lwt.return_unit)
+;;
+
 let () =
   Alcotest.run
     "shared_wal"
@@ -386,6 +528,10 @@ let () =
             "checkpoint gating via standby ack"
             `Quick
             test_checkpoint_gating_via_standby_ack
+        ; Alcotest.test_case
+            "columnar data survives WAL replay on fresh store"
+            `Quick
+            test_columnar_replication_via_wal
         ] )
     ]
 ;;

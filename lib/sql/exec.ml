@@ -6515,6 +6515,7 @@ let execute_with_count
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict = _; returning = _; upsert_update = _ }
     when Cat.is_columnar table_meta ->
+    let* tx, owned = acquire_txn store mode in
     let col_store =
       match table_meta.Cat.storage with
       | Cat.Columnar (cs, _) -> cs
@@ -6533,6 +6534,7 @@ let execute_with_count
         values
     in
     Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
+    let* () = release_txn ~cat tx owned in
     Lwt.return (List.length values)
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
@@ -6555,6 +6557,7 @@ let execute_with_count
       ~upsert_update
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict = _ }
     when Cat.is_columnar table_meta ->
+    let* tx, owned = acquire_txn store mode in
     let col_store =
       match table_meta.Cat.storage with
       | Cat.Columnar (cs, _) -> cs
@@ -6573,6 +6576,7 @@ let execute_with_count
            src_rows)
     in
     Sqlocaml_columnar.Col_store.insert_rows col_store batch;
+    let* () = release_txn ~cat tx owned in
     Lwt.return (Array.length batch)
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
     execute_insert_select_op

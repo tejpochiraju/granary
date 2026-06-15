@@ -451,6 +451,9 @@
 (test
  (name test_shared_wal)
  (libraries
+  sqlocaml
+  sqlocaml.columnar
+  sqlocaml.encoding
   sqlocaml.replication
   sqlocaml.store
   sqlocaml.storage
