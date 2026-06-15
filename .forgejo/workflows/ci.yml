@@ -112,3 +112,26 @@ jobs:
 
       - name: Run merlint
         run: opam exec -- merlint --color=never
+
+      - name: Policy — no real-SQLite outside gated comparison files (#370)
+        run: |
+          violations=$(grep -rn '"sqlite3"' lib/ bin/ containers/ test/ \
+            --include='*.ml' 2>/dev/null \
+            | grep -v 'test/test_sqlite_compare.ml' \
+            | grep -v 'test/bench_perf_compare_sqlite3.ml' \
+            || true)
+          if [ -n "$violations" ]; then
+            echo "FAIL: sqlite3 binary invocation outside designated files:"
+            echo "$violations"
+            exit 1
+          fi
+          violations=$(grep -rn 'Sqlite3\.' lib/ bin/ containers/ test/ \
+            --include='*.ml' 2>/dev/null \
+            | grep -v 'test/bench_compare.ml' \
+            || true)
+          if [ -n "$violations" ]; then
+            echo "FAIL: Sqlite3 module used outside test/bench_compare.ml:"
+            echo "$violations"
+            exit 1
+          fi
+          echo "Policy OK: all sqlite3 references confined to gated comparison files"

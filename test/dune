@@ -160,8 +160,12 @@
  (name test_fts)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
-(test
+(executable
+ ; Real-SQLite correctness comparison: shells out to the sqlite3 CLI binary.
+ ; (optional) so default @runtest skips it; builds cleanly only when the
+ ; sqlite3 CLI is present at build time.
  (name test_sqlite_compare)
+ (optional)
  (libraries sqlocaml alcotest lwt.unix unix))
 
 (test
@@ -355,6 +359,15 @@
 
 (test
  (name test_perf_bench)
+ (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
+
+; Real-SQLite CLI performance baseline, extracted from test_perf_bench.ml to
+; keep default @runtest free of real-SQLite invocation.  Gated at build time
+; via (optional) — same pattern as bench_compare and test_sqlite_compare.
+
+(executable
+ (name bench_perf_compare_sqlite3)
+ (optional)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
