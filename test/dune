@@ -160,8 +160,13 @@
  (name test_fts)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
-(test
+(executable
+ ; Real-SQLite correctness comparison: shells out to the sqlite3 CLI binary.
+ ; Converted from (test) to (executable) so default @runtest skips it.
+ ; (optional) is a defensive no-op here (no sqlite3 library dep) but kept
+ ; for consistency with bench_compare.
  (name test_sqlite_compare)
+ (optional)
  (libraries sqlocaml alcotest lwt.unix unix))
 
 (test
@@ -356,6 +361,16 @@
 (test
  (name test_perf_bench)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
+
+; Real-SQLite CLI performance baseline, extracted from test_perf_bench.ml.
+; Converted from (test) to (executable) so default @runtest skips it.
+; (optional) is a defensive no-op here (no sqlite3 library dep) but kept
+; for consistency with bench_compare.
+
+(executable
+ (name bench_perf_compare_sqlite3)
+ (optional)
+ (libraries unix))
 
 (test
  (name test_insert_scaling)

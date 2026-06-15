@@ -201,52 +201,6 @@ let test_bench_wal () =
   | _ -> ()
 ;;
 
-(** Compare against sqlite3 CLI subprocess if available.  The
-    measurement only reports — never fails — because sqlite3 may not be
-    installed in the build environment. *)
-let test_bench_sqlite3_optional () =
-  let path = "/tmp/sqlocaml_phase39_sqlite3_bench.db" in
-  (try Unix.unlink path with
-   | _ -> ());
-  let sqlite3 =
-    match Sys.command "command -v sqlite3 > /dev/null 2>&1" with
-    | 0 -> Some "sqlite3"
-    | _ -> None
-  in
-  (match sqlite3 with
-   | None -> Printf.eprintf "\n=== sqlite3 CLI not available — skipping baseline ===\n%!"
-   | Some bin ->
-     Printf.eprintf "\n=== sqlite3 baseline (subprocess), N=%d ===\n%!" n;
-     let script_path = "/tmp/sqlocaml_phase39_sqlite3_bench.sql" in
-     let oc = open_out script_path in
-     output_string oc "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);\n";
-     output_string oc "BEGIN;\n";
-     for i = 0 to n - 1 do
-       Printf.fprintf
-         oc
-         "INSERT INTO t (id, name, val) VALUES (%d, 'row-%d', %d);\n"
-         i
-         i
-         (i * 3)
-     done;
-     output_string oc "COMMIT;\n";
-     close_out oc;
-     let t0 = Unix.gettimeofday () in
-     let exit_code =
-       Sys.command (Printf.sprintf "%s %s < %s > /dev/null" bin path script_path)
-     in
-     let dt = Unix.gettimeofday () -. t0 in
-     if exit_code = 0
-     then (
-       Printf.eprintf "BENCH: %-50s %8.4f s\n%!" "sqlite3 CLI: bulk INSERT in 1 txn" dt;
-       throughput "sqlite3 CLI: INSERT" n dt)
-     else Printf.eprintf "BENCH: sqlite3 subprocess exited %d (skipping)\n%!" exit_code;
-     (try Unix.unlink script_path with
-      | _ -> ()));
-  try Unix.unlink path with
-  | _ -> ()
-;;
-
 let () =
   Alcotest.run
     "perf_bench"
@@ -254,10 +208,6 @@ let () =
       , [ Alcotest.test_case "in-memory" `Slow test_bench_mem
         ; Alcotest.test_case "file backend" `Slow test_bench_file
         ; Alcotest.test_case "WAL backend" `Slow test_bench_wal
-        ; Alcotest.test_case
-            "sqlite3 CLI baseline (optional)"
-            `Slow
-            test_bench_sqlite3_optional
         ] )
     ]
 ;;
