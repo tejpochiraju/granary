@@ -835,6 +835,59 @@ let bitmap_tests =
   ]
 ;;
 
+(* ── Category 14: Null_bitmap shared module functions ────────────────── *)
+
+let null_bitmap_shared_tests =
+  [ ( "pack_bits_of_bools: all false"
+    , fun () ->
+        let b = Null_bitmap.pack_bits_of_bools (fun _ -> false) 4 in
+        Alcotest.(check int) "0 bytes for 4 bits" 1 (Bytes.length b);
+        Alcotest.(check bool) "all zeros" true (b = Bytes.make 1 '\x00') )
+  ; ( "pack_bits_of_bools: all true"
+    , fun () ->
+        let b = Null_bitmap.pack_bits_of_bools (fun _ -> true) 4 in
+        Alcotest.(check int) "1 byte for 4 bits" 1 (Bytes.length b);
+        Alcotest.(check bool) "all ones lower nibble" true (b = Bytes.make 1 '\x0f') )
+  ; ( "pack_bits_of_bools: alternating"
+    , fun () ->
+        let b = Null_bitmap.pack_bits_of_bools (fun i -> i mod 2 = 0) 4 in
+        (* bit0=1, bit1=0, bit2=1, bit3=0 => 0b0101 => 5 *)
+        Alcotest.(check bool) "0101" true (b = Bytes.make 1 '\x05') )
+  ; ( "pack_bits_of_bools: 9 columns spans 2 bytes"
+    , fun () ->
+        let b = Null_bitmap.pack_bits_of_bools (fun i -> i = 0 || i = 8) 9 in
+        Alcotest.(check int) "2 bytes for 9 bits" 2 (Bytes.length b);
+        (* byte0: bit0=1, rest=0 => 1; byte1: bit0=1 (col8's bit), rest=0 => 1 *)
+        Alcotest.(check bool) "byte0=1" true (Bytes.get_uint8 b 0 = 1);
+        Alcotest.(check bool) "byte1=1" true (Bytes.get_uint8 b 1 = 1) )
+  ; ( "unpack_bits_to_bools: 4 col, first null"
+    , fun () ->
+        let bm = Bytes.make 1 '\x01' in
+        let arr = Null_bitmap.unpack_bits_to_bools bm 0 4 in
+        Alcotest.(check int) "length 4" 4 (Array.length arr);
+        Alcotest.(check bool) "col0 null" true arr.(0);
+        Alcotest.(check bool) "col1 not null" false arr.(1);
+        Alcotest.(check bool) "col2 not null" false arr.(2);
+        Alcotest.(check bool) "col3 not null" false arr.(3) )
+  ; ( "unpack_bits_to_bools: 4 col, all null"
+    , fun () ->
+        let bm = Bytes.make 1 '\x0f' in
+        let arr = Null_bitmap.unpack_bits_to_bools bm 0 4 in
+        Alcotest.(check bool) "col0 null" true arr.(0);
+        Alcotest.(check bool) "col1 null" true arr.(1);
+        Alcotest.(check bool) "col2 null" true arr.(2);
+        Alcotest.(check bool) "col3 null" true arr.(3) )
+  ; ( "unpack_bits_to_bools: roundtrip"
+    , fun () ->
+        let is_null i = i = 0 || i = 3 || i = 7 in
+        let packed = Null_bitmap.pack_bits_of_bools is_null 9 in
+        let unpacked = Null_bitmap.unpack_bits_to_bools packed 0 9 in
+        for i = 0 to 8 do
+          Alcotest.(check bool) (Printf.sprintf "col%d" i) (is_null i) unpacked.(i)
+        done )
+  ]
+;;
+
 (* ── Assemble and run ────────────────────────────────────────────────── *)
 
 let make_tests label pairs =
@@ -870,6 +923,7 @@ let () =
     ; make_tests "value equal new types" value_equal_new_tests
     ; make_tests "type mismatch new" type_mismatch_new_tests
     ; make_tests "bitmap correctness" bitmap_tests
+    ; make_tests "null_bitmap shared" null_bitmap_shared_tests
     ; "qcheck", qcheck_tests
     ]
 ;;

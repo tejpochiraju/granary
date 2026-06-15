@@ -36,3 +36,26 @@ let unpack_bits buf off n =
   done;
   bits
 ;;
+
+let pack_bits_of_bools is_null n =
+  let n_bytes = (n + 7) / 8 in
+  let b = Bytes.create n_bytes in
+  for i = 0 to n - 1 do
+    if is_null i
+    then (
+      let byte_idx = i / 8 in
+      let bit_idx = i mod 8 in
+      Bytes.set_uint8 b byte_idx (Bytes.get_uint8 b byte_idx lor (1 lsl bit_idx)))
+  done;
+  b
+;;
+
+let unpack_bits_to_bools buf off n =
+  let result = Array.make n false in
+  for i = 0 to n - 1 do
+    let byte_idx = i / 8 in
+    let bit_idx = i mod 8 in
+    result.(i) <- (Bytes.get_uint8 buf (off + byte_idx) lsr bit_idx) land 1 = 1
+  done;
+  result
+;;
