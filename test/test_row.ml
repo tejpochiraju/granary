@@ -841,7 +841,7 @@ let null_bitmap_shared_tests =
   [ ( "pack_bits_of_bools: all false"
     , fun () ->
         let b = Null_bitmap.pack_bits_of_bools (fun _ -> false) 4 in
-        Alcotest.(check int) "0 bytes for 4 bits" 1 (Bytes.length b);
+        Alcotest.(check int) "1 byte for 4 bits" 1 (Bytes.length b);
         Alcotest.(check bool) "all zeros" true (b = Bytes.make 1 '\x00') )
   ; ( "pack_bits_of_bools: all true"
     , fun () ->
