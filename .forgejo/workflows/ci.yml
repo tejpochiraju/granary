@@ -115,13 +115,11 @@ jobs:
 
       - name: Policy — no real-SQLite outside gated comparison files (#370)
         run: |
-          violations=$(grep -rn '\bsqlite3\b' lib/ bin/ containers/ test/ \
+          violations=$(grep -rnE '"sqlite3[ "]' lib/ bin/ containers/ test/ \
             --include='*.ml' 2>/dev/null \
+            | grep -v 'test/bench_compare.ml' \
             | grep -v 'test/test_sqlite_compare.ml' \
             | grep -v 'test/bench_perf_compare_sqlite3.ml' \
-            | grep -v 'test/bench_compare.ml' \
-            | grep -v 'test/test_e2e.ml' \
-            | grep -v 'test/test_dump_264.ml' \
             || true)
           if [ -n "$violations" ]; then
             echo "FAIL: sqlite3 reference outside designated comparison files:"
