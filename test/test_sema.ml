@@ -2092,6 +2092,29 @@ let bind_select_group_by_qual_unknown_col () =
   | _ -> Alcotest.fail "expected Unknown_column bogus in qualified GROUP BY"
 ;;
 
+(** Qualified GROUP BY via table alias: [GROUP BY u.id] where table_alias = Some "u". *)
+let bind_select_group_by_qual_alias () =
+  let cat = two_col_cat () in
+  let stmt =
+    Ast.S_select
+      { distinct = false
+      ; proj = `Exprs [ Ast.E_col "id", None; Ast.E_agg (Ast.Agg_count, None), None ]
+      ; table = "users"
+      ; table_alias = Some "u"
+      ; joins = []
+      ; where = None
+      ; group_by = [ "id", Some "u" ]
+      ; having = None
+      ; order = []
+      ; limit = None
+      ; offset = None
+      }
+  in
+  match bind cat stmt with
+  | Ok (Sema.BS_select { group_by = [ 0 ]; _ }) -> ()
+  | _ -> Alcotest.fail "expected BS_select GROUP BY u.id (alias) -> [0]"
+;;
+
 let bind_select_having_basic () =
   let cat = two_col_cat () in
   let stmt =
@@ -5883,6 +5906,10 @@ let () =
             "bind_select_group_by_qual_unknown_col"
             `Quick
             bind_select_group_by_qual_unknown_col
+        ; Alcotest.test_case
+            "bind_select_group_by_qual_alias"
+            `Quick
+            bind_select_group_by_qual_alias
         ; Alcotest.test_case "bind_select_having_basic" `Quick bind_select_having_basic
         ; Alcotest.test_case
             "bind_select_having_no_group_by_rejected"

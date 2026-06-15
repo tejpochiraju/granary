@@ -320,6 +320,23 @@ let group_by_qualified_col () =
     sorted
 ;;
 
+(** Qualified GROUP BY via table alias: GROUP BY alias.col. *)
+let group_by_qualified_alias () =
+  let db = fresh_db () in
+  exec db "CREATE TABLE t (s TEXT, n INTEGER)";
+  exec db "INSERT INTO t (s, n) VALUES ('a', 1), ('b', 2), ('a', 3)";
+  let rows = query_ok db "SELECT u.s, SUM(u.n) FROM t AS u GROUP BY u.s ORDER BY u.s" in
+  Alcotest.(check int) "two groups" 2 (List.length rows);
+  let sorted =
+    List.map (fun r -> text_of_value r.(0), int64_of_value r.(1)) rows
+    |> List.sort compare
+  in
+  Alcotest.(check (list (pair string int64)))
+    "alias GROUP BY results"
+    [ "a", 4L; "b", 2L ]
+    sorted
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Group 3: HAVING                                                       *)
 (* ------------------------------------------------------------------ *)
@@ -491,6 +508,7 @@ let () =
         ; Alcotest.test_case "group_by_empty_table" `Quick group_by_empty_table
         ; Alcotest.test_case "group_by_null_groups" `Quick group_by_null_groups
         ; Alcotest.test_case "group_by_qualified_col" `Quick group_by_qualified_col
+        ; Alcotest.test_case "group_by_qualified_alias" `Quick group_by_qualified_alias
         ] )
     ; ( "having"
       , [ Alcotest.test_case "having_basic" `Quick having_basic
