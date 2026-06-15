@@ -2323,6 +2323,14 @@ let release_txn ?cat tx owned =
   else Lwt.return_unit
 ;;
 
+(** Extract the in-memory columnar store from a table_meta.  Asserts [Row]
+    cannot happen at call sites guarded by [Cat.is_columnar]. *)
+let col_store_of_meta (m : Cat.table_meta) : Sqlocaml_columnar.Col_store.t =
+  match m.Cat.storage with
+  | Cat.Columnar (cs, _) -> cs
+  | Cat.Row _ -> assert false
+;;
+
 (* #269: run a DDL body [f tx] under a transaction chosen by [mode], threading
    the writer txn into the catalog so DDL participates in any ambient explicit
    transaction instead of opening its own (which would self-deadlock against the
@@ -6515,25 +6523,28 @@ let execute_with_count
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict = _; returning = _; upsert_update = _ }
     when Cat.is_columnar table_meta ->
-    let col_store =
-      match table_meta.Cat.storage with
-      | Cat.Columnar (cs, _) -> cs
-      | Cat.Row _ -> assert false
-    in
-    let n_cols = List.length table_meta.Cat.columns in
-    let rows =
-      List.map
-        (fun vals ->
-           let row = Array.make n_cols Row.V_null in
-           List.iter2
-             (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr)
-             ordinals
-             vals;
-           row)
-        values
-    in
-    Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
-    Lwt.return (List.length values)
+    let* tx, owned = acquire_txn store mode in
+    Lwt.catch
+      (fun () ->
+         let col_store = col_store_of_meta table_meta in
+         let n_cols = List.length table_meta.Cat.columns in
+         let rows =
+           List.map
+             (fun vals ->
+                let row = Array.make n_cols Row.V_null in
+                List.iter2
+                  (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr)
+                  ordinals
+                  vals;
+                row)
+             values
+         in
+         Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
+         let* () = release_txn ~cat tx owned in
+         Lwt.return (List.length values))
+      (fun exn ->
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
   | Plan.Op_insert
       { table_meta; ordinals; values; on_conflict; returning = _; upsert_update } ->
     execute_insert_values
@@ -6555,11 +6566,7 @@ let execute_with_count
       ~upsert_update
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict = _ }
     when Cat.is_columnar table_meta ->
-    let col_store =
-      match table_meta.Cat.storage with
-      | Cat.Columnar (cs, _) -> cs
-      | Cat.Row _ -> assert false
-    in
+    let col_store = col_store_of_meta table_meta in
     let n_cols = List.length table_meta.Cat.columns in
     let* stream = !to_stream_ref clock params store ~mode ~cat:(Some cat) source in
     let* src_rows = Lwt_stream.to_list stream in
@@ -6572,8 +6579,15 @@ let execute_with_count
               dest)
            src_rows)
     in
-    Sqlocaml_columnar.Col_store.insert_rows col_store batch;
-    Lwt.return (Array.length batch)
+    let* tx, owned = acquire_txn store mode in
+    Lwt.catch
+      (fun () ->
+         Sqlocaml_columnar.Col_store.insert_rows col_store batch;
+         let* () = release_txn ~cat tx owned in
+         Lwt.return (Array.length batch))
+      (fun exn ->
+         let* () = if owned then S.rollback tx else Lwt.return_unit in
+         Lwt.fail exn)
   | Plan.Op_insert_select { table_meta; ordinals; source; on_conflict } ->
     execute_insert_select_op
       store
@@ -8158,11 +8172,7 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
   Lwt.return stream
 
 and stream_col_seq_scan _clock _params _store _mode (table_meta : Cat.table_meta) =
-  let col_store =
-    match table_meta.Cat.storage with
-    | Cat.Columnar (cs, _) -> cs
-    | Cat.Row _ -> assert false
-  in
+  let col_store = col_store_of_meta table_meta in
   let seq = Sqlocaml_columnar.Col_store.to_row_seq col_store in
   Lwt.return (Lwt_stream.of_list (List.of_seq seq))
 
