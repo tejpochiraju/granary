@@ -13,8 +13,8 @@
 
     Dot commands are preserved from the original blocking REPL: [.help],
     [.quit] / [.exit], [.tables], [.schema [name]], [.open <path>],
-    [.databases], [.dump [path]].  They now write their output to the shell views instead of
-    printing to stdout. *)
+    [.databases], [.dump [path]].  They now write their output to the shell
+    views instead of printing to stdout. *)
 
 open Lwt.Syntax
 module Db = Sqlocaml.Db

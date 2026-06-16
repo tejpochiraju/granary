@@ -122,7 +122,9 @@ module Event = Sqlocaml_store.Store.Event
 val set_event_callback : t -> (Event.t -> unit) option -> unit
 
 (** [tree_of_table t name] is the storage tree id backing table [name] in the
-    active schema, or [None] if no such table exists. Used by the internals
+    active schema, or [None] if no such table exists or the table has no real
+    on-disk tree (e.g. an ephemeral/CTE table, or a legacy zero-tid columnar
+    table, which carry a negative sentinel tree id). Used by the internals
     monitor to filter page events by table (#385). *)
 val tree_of_table : t -> string -> int option
 

@@ -68,6 +68,12 @@ let test_tree_of_table () =
     |> run
   in
   Alcotest.(check bool) "known table resolves" true (found <> None);
+  (* The guard in [tree_of_table] must never surface a negative sentinel tree id
+     (e.g. -1 for ephemeral/CTE or legacy zero-tid columnar tables) — such ids
+     would otherwise match all system-page events in a By_table filter. *)
+  (match found with
+   | Some t -> Alcotest.(check bool) "real tree id is non-negative" true (t >= 0)
+   | None -> Alcotest.fail "table t should resolve");
   Alcotest.(check (option int)) "unknown table is None" None missing
 ;;
 

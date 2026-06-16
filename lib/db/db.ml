@@ -242,8 +242,9 @@ let set_event_callback t cb = S.set_event_callback t.store cb
 
 let tree_of_table t name =
   match Cat.find_table_cached t.catalog ~name with
-  | None -> None
-  | Some meta -> Some (Cat.tid_of_storage meta.Cat.storage)
+  | Some meta when Cat.tid_of_storage meta.Cat.storage >= 0 ->
+    Some (Cat.tid_of_storage meta.Cat.storage)
+  | _ -> None
 ;;
 
 (* ------------------------------------------------------------------ *)
