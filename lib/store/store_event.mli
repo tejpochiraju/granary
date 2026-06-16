@@ -41,19 +41,39 @@ type t =
      [Txn_begin]/[Txn_commit]. *)
   | Page_read of
       { txn_id : int64
+      ; tree : int
+        (** [tree] is the store tree id whose operation triggered the
+                       I/O; [-1] when no op context was active (best-effort for
+                       [Page_write], which is stamped at WAL-flush time with the
+                       most recently active tree). *)
       ; page : int64
       }
   | Page_write of
       { txn_id : int64
+      ; tree : int
+        (** [tree] is the store tree id whose operation triggered the
+                       I/O; [-1] when no op context was active (best-effort for
+                       [Page_write], which is stamped at WAL-flush time with the
+                       most recently active tree). *)
       ; page : int64
       }
   | Page_alloc of
       { txn_id : int64
+      ; tree : int
+        (** [tree] is the store tree id whose operation triggered the
+                       I/O; [-1] when no op context was active (best-effort for
+                       [Page_write], which is stamped at WAL-flush time with the
+                       most recently active tree). *)
       ; page : int64
       ; reused : bool
       }
   | Page_free of
       { txn_id : int64
+      ; tree : int
+        (** [tree] is the store tree id whose operation triggered the
+                       I/O; [-1] when no op context was active (best-effort for
+                       [Page_write], which is stamped at WAL-flush time with the
+                       most recently active tree). *)
       ; page : int64
       }
 
@@ -64,6 +84,10 @@ val label : t -> string
     single owning txn ([Wal_reset], [Checkpoint_*]).  Used by the monitor's
     txn-id filter. *)
 val txn_id : t -> int64 option
+
+(** [tree_id_of ev] is the store tree id for the four page events, or [None]
+    for every non-page event. [-1] means "no active tree context". *)
+val tree_id_of : t -> int option
 
 (** Human-readable one-line rendering of an event. *)
 val pp : Format.formatter -> t -> unit

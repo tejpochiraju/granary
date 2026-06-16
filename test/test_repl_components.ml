@@ -12,16 +12,58 @@ let test_ring_capacity () =
   Alcotest.(check (list int64)) "oldest dropped" [ 3L; 4L; 5L ] ids
 ;;
 
+let mk_page ~txn ~tree = Ev.Page_read { txn_id = Int64.of_int txn; tree; page = 1L }
+
 let test_filter () =
   let l = L.create ~capacity:10 in
   List.iter (fun i -> L.push l (mk_commit (Int64.of_int i))) [ 1; 2; 3 ];
-  L.set_filter l (Some 2L);
+  L.set_filter l (L.By_txn 2L);
   Alcotest.(check (list int64))
     "only txn 2"
     [ 2L ]
     (List.filter_map Ev.txn_id (L.visible l));
-  L.set_filter l None;
+  L.set_filter l L.No_filter;
   Alcotest.(check int) "filter cleared" 3 (List.length (L.visible l))
+;;
+
+let test_table_filter () =
+  let l = L.create ~capacity:10 in
+  L.push l (mk_page ~txn:1 ~tree:16);
+  L.push l (mk_page ~txn:1 ~tree:32);
+  L.push l (mk_commit 1L);
+  L.set_filter l (L.By_table { name = "t"; tree = 16 });
+  let trees = List.filter_map Ev.tree_id_of (L.visible l) in
+  Alcotest.(check (list int)) "only tree 16 page events" [ 16 ] trees;
+  Alcotest.(check int)
+    "global commit hidden under table filter"
+    1
+    (List.length (L.visible l))
+;;
+
+let test_dump () =
+  let l = L.create ~capacity:10 in
+  L.push l (mk_commit 1L);
+  L.push l (mk_page ~txn:1 ~tree:16);
+  let path = Filename.temp_file "sqlocaml_dump" ".log" in
+  (match L.dump l path with
+   | Ok n -> Alcotest.(check int) "dumped 2 events" 2 n
+   | Error e -> Alcotest.failf "dump failed: %s" e);
+  let ic = open_in path in
+  let lines = ref [] in
+  (try
+     while true do
+       lines := input_line ic :: !lines
+     done
+   with
+   | End_of_file -> ());
+  close_in ic;
+  Sys.remove path;
+  Alcotest.(check int) "file has 2 lines" 2 (List.length !lines);
+  L.set_filter l (L.By_table { name = "t"; tree = 16 });
+  (match L.dump l path with
+   | Ok n -> Alcotest.(check int) "filtered dump = 1" 1 n
+   | Error e -> Alcotest.failf "dump failed: %s" e);
+  Sys.remove path
 ;;
 
 let test_pause_toggle () =
@@ -94,6 +136,22 @@ let test_monitor_renders () =
   Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 0)
 ;;
 
+let test_monitor_table_key () =
+  let l = Event_log.create ~capacity:10 in
+  let txn_called = ref false in
+  let table_called = ref false in
+  let r =
+    Monitor_view.handle_key
+      l
+      ~set_filter_prompt:(fun () -> txn_called := true)
+      ~set_table_filter_prompt:(fun () -> table_called := true)
+      (`ASCII 't', [])
+  in
+  Alcotest.(check bool) "t handled" true (r = `Handled);
+  Alcotest.(check bool) "table prompt opened" true !table_called;
+  Alcotest.(check bool) "txn prompt not opened" false !txn_called
+;;
+
 let test_shell_renders () =
   let v = Shell_view.create () in
   Shell_view.set_status v "Open: :memory:";
@@ -123,6 +181,11 @@ let test_parse_dot () =
   Alcotest.(check bool) "schema name" true (C.parse_dot ".schema t" = C.Schema (Some "t"));
   Alcotest.(check bool) "databases" true (C.parse_dot ".databases" = C.Databases);
   Alcotest.(check bool) "open" true (C.parse_dot ".open /a/b" = C.Open "/a/b");
+  Alcotest.(check bool) "dump none" true (C.parse_dot ".dump" = C.Dump None);
+  Alcotest.(check bool)
+    "dump path"
+    true
+    (C.parse_dot ".dump /t/x.log" = C.Dump (Some "/t/x.log"));
   Alcotest.(check bool)
     "unknown"
     true
@@ -132,23 +195,27 @@ let test_parse_dot () =
 ;;
 
 let test_classify () =
-  Alcotest.(check bool) "empty" true (C.classify ~filter_mode:false "  " = C.Empty);
+  Alcotest.(check bool) "empty" true (C.classify ~prompt:C.No_prompt "  " = C.Empty);
   Alcotest.(check bool)
     "sql"
     true
-    (C.classify ~filter_mode:false "SELECT 1;" = C.Sql [ "SELECT 1" ]);
+    (C.classify ~prompt:C.No_prompt "SELECT 1;" = C.Sql [ "SELECT 1" ]);
   Alcotest.(check bool)
     "dot"
     true
-    (C.classify ~filter_mode:false ".tables" = C.Dot C.Tables);
+    (C.classify ~prompt:C.No_prompt ".tables" = C.Dot C.Tables);
   Alcotest.(check bool)
-    "filter ok"
+    "txn filter ok"
     true
-    (C.classify ~filter_mode:true "42" = C.Filter (Some 42L));
+    (C.classify ~prompt:C.Txn_prompt "42" = C.Filter (C.Filter_txn (Some 42L)));
   Alcotest.(check bool)
-    "filter bad"
+    "txn filter bad"
     true
-    (C.classify ~filter_mode:true "xx" = C.Filter None)
+    (C.classify ~prompt:C.Txn_prompt "xx" = C.Filter (C.Filter_txn None));
+  Alcotest.(check bool)
+    "table filter"
+    true
+    (C.classify ~prompt:C.Table_prompt " users " = C.Filter (C.Filter_table "users"))
 ;;
 
 let test_schema_sql_escapes () =
@@ -173,9 +240,14 @@ let () =
     ; ( "event_log"
       , [ Alcotest.test_case "ring capacity" `Quick test_ring_capacity
         ; Alcotest.test_case "filter" `Quick test_filter
+        ; Alcotest.test_case "table filter" `Quick test_table_filter
+        ; Alcotest.test_case "dump" `Quick test_dump
         ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
         ] )
-    ; "monitor_view", [ Alcotest.test_case "renders" `Quick test_monitor_renders ]
+    ; ( "monitor_view"
+      , [ Alcotest.test_case "renders" `Quick test_monitor_renders
+        ; Alcotest.test_case "table key" `Quick test_monitor_table_key
+        ] )
     ; ( "shell_view"
       , [ Alcotest.test_case "renders" `Quick test_shell_renders
         ; Alcotest.test_case "header width" `Quick test_shell_header_width

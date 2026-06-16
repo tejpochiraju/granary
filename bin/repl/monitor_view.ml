@@ -22,14 +22,16 @@ let attr_for ev =
 let header log =
   let filt =
     match Event_log.filter log with
-    | None -> "all txns"
-    | Some id -> Printf.sprintf "txn=%Ld" id
+    | Event_log.No_filter -> "all"
+    | Event_log.By_txn id -> Printf.sprintf "txn=%Ld" id
+    | Event_log.By_table { name; _ } -> Printf.sprintf "tbl=%s" name
   in
   let pause = if Event_log.paused log then "PAUSED" else "live" in
   W.string
     ~attr:Notty.A.(st bold)
     (Printf.sprintf
-       "-- internals monitor [%s] [%s]  (space=pause / =filter c=clear x=clear-log) --"
+       "-- internals monitor [%s] [%s]  (space=pause /=txn t=table c=clear x=clear-log) \
+        --"
        pause
        filt)
 ;;
@@ -54,21 +56,27 @@ let render log =
       W.vbox (Lwd.return (header log) :: rows))
 ;;
 
-(* Translate a key into a monitor action.  [set_filter_prompt] is supplied by
-   the app so '/' can open an input line elsewhere (the shell pane). *)
-let handle_key log ~set_filter_prompt (key : Ui.key) : Ui.may_handle =
+(* Translate a key into a monitor action.  [set_filter_prompt] /
+   [set_table_filter_prompt] are supplied by the app so '/' and 't' can open an
+   input line elsewhere (the shell pane). *)
+let handle_key log ~set_filter_prompt ~set_table_filter_prompt (key : Ui.key)
+  : Ui.may_handle
+  =
   match key with
   | `ASCII ' ', _ ->
     Event_log.toggle_pause log;
     `Handled
   | `ASCII 'c', _ ->
-    Event_log.set_filter log None;
+    Event_log.set_filter log Event_log.No_filter;
     `Handled
   | `ASCII 'x', _ ->
     Event_log.clear log;
     `Handled
   | `ASCII '/', _ ->
     set_filter_prompt ();
+    `Handled
+  | `ASCII 't', _ ->
+    set_table_filter_prompt ();
     `Handled
   | _ -> `Unhandled
 ;;

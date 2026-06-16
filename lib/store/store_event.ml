@@ -27,19 +27,23 @@ type t =
   | Checkpoint_end of { pages_migrated : int }
   | Page_read of
       { txn_id : int64
+      ; tree : int
       ; page : int64
       }
   | Page_write of
       { txn_id : int64
+      ; tree : int
       ; page : int64
       }
   | Page_alloc of
       { txn_id : int64
+      ; tree : int
       ; page : int64
       ; reused : bool
       }
   | Page_free of
       { txn_id : int64
+      ; tree : int
       ; page : int64
       }
 
@@ -75,6 +79,14 @@ let txn_id = function
   | Wal_reset _ | Checkpoint_begin _ | Checkpoint_end _ -> None
 ;;
 
+let tree_id_of = function
+  | Page_read { tree; _ }
+  | Page_write { tree; _ }
+  | Page_alloc { tree; _ }
+  | Page_free { tree; _ } -> Some tree
+  | _ -> None
+;;
+
 let pp fmt ev =
   let tag = label ev in
   match ev with
@@ -93,10 +105,12 @@ let pp fmt ev =
     Format.fprintf fmt "%s target=%d" tag target_frames
   | Checkpoint_end { pages_migrated } ->
     Format.fprintf fmt "%s migrated=%d" tag pages_migrated
-  | Page_read { txn_id; page } -> Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
-  | Page_write { txn_id; page } ->
-    Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
-  | Page_alloc { txn_id; page; reused } ->
-    Format.fprintf fmt "%s txn=%Ld page=%Ld reused=%b" tag txn_id page reused
-  | Page_free { txn_id; page } -> Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
+  | Page_read { txn_id; tree; page } ->
+    Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page
+  | Page_write { txn_id; tree; page } ->
+    Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page
+  | Page_alloc { txn_id; tree; page; reused } ->
+    Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld reused=%b" tag txn_id tree page reused
+  | Page_free { txn_id; tree; page } ->
+    Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page
 ;;

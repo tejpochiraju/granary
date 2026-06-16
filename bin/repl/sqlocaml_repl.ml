@@ -13,8 +13,8 @@
 
     Dot commands are preserved from the original blocking REPL: [.help],
     [.quit] / [.exit], [.tables], [.schema [name]], [.open <path>],
-    [.databases].  They now write their output to the shell views instead of
-    printing to stdout. *)
+    [.databases], [.dump [path]].  They now write their output to the shell
+    views instead of printing to stdout. *)
 
 open Lwt.Syntax
 module Db = Sqlocaml.Db
@@ -26,7 +26,7 @@ let log = Event_log.create ~capacity:5000
 let shell = Shell_view.create ()
 let db_ref = ref None
 let quit_t, quit_u = Lwt.wait ()
-let filter_mode = ref false
+let prompt = ref Repl_command.No_prompt
 let busy = ref false
 let input_var = Shell_view.input_var shell
 
@@ -92,6 +92,8 @@ let dot_help () =
     ; ".tables                     list tables in the active schema"
     ; ".schema [name]              show CREATE statements (optionally for one table)"
     ; ".open <path>                close current db and open the given path"
+    ; ".dump [path]                write the visible event log to a file (default \
+       sqlocaml-events.log)"
     ; ".databases                  list attached databases"
     ; "Tab switches panes; Esc quits."
     ]
@@ -133,6 +135,13 @@ let dispatch_dot (d : Repl_command.dot) =
   | Schema o -> run_sql (Repl_command.schema_sql o)
   | Databases -> run_sql Repl_command.databases_sql
   | Open path -> dot_open path
+  | Dump path_opt ->
+    let path = Option.value path_opt ~default:"sqlocaml-events.log" in
+    (match Event_log.dump log path with
+     | Ok n ->
+       Shell_view.set_status shell (Printf.sprintf "dumped %d event(s) to %s" n path)
+     | Error e -> Shell_view.set_status shell (Printf.sprintf "dump failed: %s" e));
+    Lwt.return_unit
   | Unknown s ->
     Shell_view.set_status shell (Printf.sprintf "Unknown dot command: %s (try .help)" s);
     Lwt.return_unit
@@ -143,17 +152,29 @@ let dispatch_dot (d : Repl_command.dot) =
 (* ------------------------------------------------------------------ *)
 
 let submit input =
-  match Repl_command.classify ~filter_mode:!filter_mode input with
+  match Repl_command.classify ~prompt:!prompt input with
   | Empty -> Lwt.return_unit
-  | Filter idopt ->
-    filter_mode := false;
+  | Filter (Repl_command.Filter_txn idopt) ->
+    prompt := Repl_command.No_prompt;
     (match idopt with
      | Some id ->
-       Event_log.set_filter log (Some id);
+       Event_log.set_filter log (Event_log.By_txn id);
        Shell_view.set_status shell (Printf.sprintf "filter: txn=%Ld" id)
      | None ->
-       Event_log.set_filter log None;
+       Event_log.set_filter log Event_log.No_filter;
        Shell_view.set_status shell "filter: not a txn id");
+    Lwt.return_unit
+  | Filter (Repl_command.Filter_table name) ->
+    prompt := Repl_command.No_prompt;
+    (match !db_ref with
+     | None -> Shell_view.set_status shell "filter: no database open"
+     | Some db ->
+       (match Db.tree_of_table db name with
+        | Some tree ->
+          Event_log.set_filter log (Event_log.By_table { name; tree });
+          Shell_view.set_status shell (Printf.sprintf "filter: tbl=%s" name)
+        | None ->
+          Shell_view.set_status shell (Printf.sprintf "filter: no such table '%s'" name)));
     Lwt.return_unit
   | Dot d -> dispatch_dot d
   | Sql stmts -> Lwt_list.iter_s run_sql stmts
@@ -167,10 +188,17 @@ let shell_focus = Focus.make ()
 let monitor_focus = Focus.make ()
 
 let set_filter_prompt () =
-  filter_mode := true;
+  prompt := Repl_command.Txn_prompt;
   Lwd.set input_var "";
   Focus.request shell_focus;
   Shell_view.set_status shell "filter: enter a txn id, then Enter (empty=clear)"
+;;
+
+let set_table_filter_prompt () =
+  prompt := Repl_command.Table_prompt;
+  Lwd.set input_var "";
+  Focus.request shell_focus;
+  Shell_view.set_status shell "filter: enter a table name, then Enter"
 ;;
 
 (* Handle a key directed at the shell input.  Returns [`Handled] for keys it
@@ -178,14 +206,14 @@ let set_filter_prompt () =
 let shell_handle (key : Ui.key) : Ui.may_handle =
   match key with
   | `Escape, _ ->
-    if !filter_mode
+    if !prompt <> Repl_command.No_prompt
     then (
-      filter_mode := false;
+      prompt := Repl_command.No_prompt;
       Shell_view.set_status shell "filter: cancelled")
     else do_quit ();
     `Handled
   | `Tab, _ ->
-    filter_mode := false;
+    prompt := Repl_command.No_prompt;
     Focus.request monitor_focus;
     `Handled
   | `Enter, _ ->
@@ -233,7 +261,7 @@ let monitor_handle (key : Ui.key) : Ui.may_handle =
   | `Tab, _ ->
     Focus.request shell_focus;
     `Handled
-  | _ -> Monitor_view.handle_key log ~set_filter_prompt key
+  | _ -> Monitor_view.handle_key log ~set_filter_prompt ~set_table_filter_prompt key
 ;;
 
 (* ------------------------------------------------------------------ *)

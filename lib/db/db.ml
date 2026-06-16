@@ -240,6 +240,13 @@ module Event = S.Event
 
 let set_event_callback t cb = S.set_event_callback t.store cb
 
+let tree_of_table t name =
+  match Cat.find_table_cached t.catalog ~name with
+  | Some meta when Cat.tid_of_storage meta.Cat.storage >= 0 ->
+    Some (Cat.tid_of_storage meta.Cat.storage)
+  | _ -> None
+;;
+
 (* ------------------------------------------------------------------ *)
 (* VACUUM (#120)                                                       *)
 (* ------------------------------------------------------------------ *)

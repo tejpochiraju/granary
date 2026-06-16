@@ -15,17 +15,32 @@ val create : capacity:int -> t
     flag only freezes the rendered view, not ingestion. *)
 val push : t -> Event.t -> unit
 
-(** Current events, oldest-first, after applying the active txn-id filter. *)
+(** Current events, oldest-first, after applying the active filter. *)
 val visible : t -> Event.t list
 
 (** Total events currently retained (ignoring the filter). *)
 val length : t -> int
 
-(** [set_filter t f] sets the active txn-id filter ([None] = show all). *)
-val set_filter : t -> int64 option -> unit
+(** Active filter over the event stream (#385). *)
+type filter =
+  | No_filter
+  | By_txn of int64
+  | By_table of
+      { name : string (** display name; for the header only *)
+      ; tree : int (** the table's storage tree id; matched against events *)
+      }
 
-(** The active txn-id filter, if any. *)
-val filter : t -> int64 option
+(** [set_filter t f] sets the active filter ([No_filter] = show all). *)
+val set_filter : t -> filter -> unit
+
+(** The active filter. *)
+val filter : t -> filter
+
+(** [dump t path] writes the currently {!visible} events (respecting the active
+    filter), oldest-first, one per line via the event pretty-printer, to [path]
+    (truncating). Returns the number of events written, or an error message on
+    an I/O failure. *)
+val dump : t -> string -> (int, string) result
 
 (** Toggle the paused flag (freezes the view, not ingestion). *)
 val toggle_pause : t -> unit
