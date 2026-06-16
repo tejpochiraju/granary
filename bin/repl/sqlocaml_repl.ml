@@ -207,12 +207,18 @@ let shell_handle (key : Ui.key) : Ui.may_handle =
     do_quit ();
     `Handled
   | `Tab, _ ->
+    filter_mode := false;
     Focus.request monitor_focus;
     `Handled
   | `Enter, _ ->
     let input = Lwd.peek input_var in
     Lwd.set input_var "";
-    Lwt.async (fun () -> submit input);
+    Lwt.async (fun () ->
+      Lwt.catch
+        (fun () -> submit input)
+        (fun exn ->
+           Shell_view.set_status shell ("Error: " ^ Printexc.to_string exn);
+           Lwt.return_unit));
     `Handled
   | `Backspace, _ ->
     let s = Lwd.peek input_var in
@@ -279,7 +285,10 @@ let main () =
     set_db db;
     Focus.request shell_focus;
     Shell_view.set_status shell (Printf.sprintf "Open: %s" path);
-    Nottui_lwt.run ~quit:quit_t root
+    let* () = Nottui_lwt.run ~quit:quit_t root in
+    (match !db_ref with
+     | Some db -> Db.close db
+     | None -> Lwt.return_unit)
 ;;
 
 let () = Lwt_main.run (main ())
