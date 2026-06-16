@@ -17,3 +17,11 @@ type t =
       ; reused : bool (** [true] = freelist/txn-pool reuse; [false] = file extend *)
       }
   | Page_free of { page_id : int64 } (** page pushed to the freelist / txn pool *)
+
+let pp fmt = function
+  | Page_read { page_id } -> Format.fprintf fmt "PAGE_READ page=%Ld" page_id
+  | Page_write { page_id } -> Format.fprintf fmt "PAGE_WRITE page=%Ld" page_id
+  | Page_alloc { page_id; reused } ->
+    Format.fprintf fmt "PAGE_ALLOC page=%Ld reused=%b" page_id reused
+  | Page_free { page_id } -> Format.fprintf fmt "PAGE_FREE page=%Ld" page_id
+;;

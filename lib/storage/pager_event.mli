@@ -17,3 +17,6 @@ type t =
       ; reused : bool (** [true] = freelist/txn-pool reuse; [false] = file extend *)
       }
   | Page_free of { page_id : int64 } (** page pushed to the freelist / txn pool *)
+
+(** Pretty-print a page event (e.g. [PAGE_ALLOC page=9 reused=true]). *)
+val pp : Format.formatter -> t -> unit

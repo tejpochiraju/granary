@@ -264,10 +264,26 @@ let test_alloc_free_none_no_events () =
   Alcotest.(check int) "no events when callback is None" 0 (List.length !seen)
 ;;
 
+let test_pp_all_variants () =
+  let check expected ev =
+    Alcotest.(check string) expected expected (Format.asprintf "%a" Pager_event.pp ev)
+  in
+  check "PAGE_READ page=7" (Pager_event.Page_read { page_id = 7L });
+  check "PAGE_WRITE page=8" (Pager_event.Page_write { page_id = 8L });
+  check
+    "PAGE_ALLOC page=9 reused=true"
+    (Pager_event.Page_alloc { page_id = 9L; reused = true });
+  check
+    "PAGE_ALLOC page=9 reused=false"
+    (Pager_event.Page_alloc { page_id = 9L; reused = false });
+  check "PAGE_FREE page=10" (Pager_event.Page_free { page_id = 10L })
+;;
+
 let () =
   Alcotest.run
     "pager_event"
-    [ ( "plumbing"
+    [ "pp", [ Alcotest.test_case "pp all variants" `Quick test_pp_all_variants ]
+    ; ( "plumbing"
       , [ Alcotest.test_case "no ops no events" `Quick test_no_ops_no_events
         ; Alcotest.test_case "set None clears" `Quick test_set_none_clears
         ; Alcotest.test_case
