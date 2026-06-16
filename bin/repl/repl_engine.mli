@@ -11,10 +11,14 @@ val value_to_string : Db.value -> string
     VALUES/PRAGMA). *)
 val is_query_stmt : string -> bool
 
-(** True iff [buf] contains a [;] terminator outside any quoted string. *)
+(** True iff [buf] contains a [;] terminator outside any string literal, quoted
+    identifier, [--] line comment or [/* … */] block comment (#389). *)
 val has_terminator : Buffer.t -> bool
 
-(** Split a multi-statement string into trimmed statements, respecting quotes. *)
+(** Split a multi-statement string into trimmed statements.  A [;] only ends a
+    statement when it sits in plain SQL: occurrences inside string literals,
+    quoted identifiers, [--] line comments and [/* … */] block comments are kept
+    verbatim and never split (#389). *)
 val split_stmts : string -> string list
 
 (** Open a db at [path] ([":memory:"] for in-memory). *)

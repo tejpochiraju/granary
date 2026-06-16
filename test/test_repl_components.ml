@@ -99,6 +99,68 @@ let test_has_terminator () =
   Alcotest.(check bool) "term" true (E.has_terminator b)
 ;;
 
+(* #389: the splitter must ignore [;] inside SQL comments. *)
+let test_split_block_comment () =
+  Alcotest.(check (list string))
+    "semicolon inside a block comment is not a split"
+    [ "SELECT 1 /* ; */" ]
+    (E.split_stmts "SELECT 1 /* ; */ ;")
+;;
+
+let test_split_line_comment () =
+  Alcotest.(check (list string))
+    "semicolon inside a line comment is not a split"
+    [ "SELECT 1 -- ; comment" ]
+    (E.split_stmts "SELECT 1 -- ; comment\n;")
+;;
+
+(* #389: a quote inside a comment must not corrupt the in-string state, so the
+   real terminators after it still split. *)
+let test_split_quote_in_comment () =
+  Alcotest.(check (list string))
+    "apostrophe in a comment does not swallow later statements"
+    [ "-- it's fine\nSELECT 1"; "SELECT 2" ]
+    (E.split_stmts "-- it's fine\nSELECT 1; SELECT 2;")
+;;
+
+(* #389 (guard): comment markers inside a string literal are literal text. *)
+let test_split_comment_marker_in_string () =
+  Alcotest.(check (list string))
+    "comment markers inside a string literal are not comments"
+    [ "SELECT '-- ; /* not a comment */'" ]
+    (E.split_stmts "SELECT '-- ; /* not a comment */';")
+;;
+
+let test_has_terminator_block_comment () =
+  let b = Buffer.create 32 in
+  Buffer.add_string b "SELECT 1 /* ; */";
+  Alcotest.(check bool)
+    "no real terminator (; lives in a block comment)"
+    false
+    (E.has_terminator b)
+;;
+
+let test_has_terminator_line_comment () =
+  let b = Buffer.create 32 in
+  Buffer.add_string b "SELECT 1 -- ;\n";
+  Alcotest.(check bool)
+    "no real terminator (; lives in a line comment)"
+    false
+    (E.has_terminator b)
+;;
+
+(* Property: any number of semicolons inside a block comment never split. *)
+let prop_block_comment_semis_ignored =
+  QCheck.Test.make
+    ~count:100
+    ~name:"semicolons inside a block comment never split"
+    QCheck.(int_range 0 20)
+    (fun k ->
+       let comment = "/* " ^ String.make k ';' ^ " */" in
+       let input = Printf.sprintf "A; %s B;" comment in
+       E.split_stmts input = [ "A"; comment ^ " B" ])
+;;
+
 (* Property: splitting N simple statements joined by ';' recovers them all. *)
 let prop_split_roundtrip =
   QCheck.Test.make
@@ -232,10 +294,26 @@ let () =
       , [ Alcotest.test_case "is_query_stmt" `Quick test_is_query_stmt
         ; Alcotest.test_case "split_stmts" `Quick test_split_stmts_respects_quotes
         ; Alcotest.test_case "has_terminator" `Quick test_has_terminator
+        ; Alcotest.test_case "split block comment" `Quick test_split_block_comment
+        ; Alcotest.test_case "split line comment" `Quick test_split_line_comment
+        ; Alcotest.test_case "split quote in comment" `Quick test_split_quote_in_comment
+        ; Alcotest.test_case
+            "split comment marker in string"
+            `Quick
+            test_split_comment_marker_in_string
+        ; Alcotest.test_case
+            "has_terminator block comment"
+            `Quick
+            test_has_terminator_block_comment
+        ; Alcotest.test_case
+            "has_terminator line comment"
+            `Quick
+            test_has_terminator_line_comment
         ] )
     ; ( "props"
       , [ QCheck_alcotest.to_alcotest prop_split_roundtrip
         ; QCheck_alcotest.to_alcotest prop_is_query_whitespace_insensitive
+        ; QCheck_alcotest.to_alcotest prop_block_comment_semis_ignored
         ] )
     ; ( "event_log"
       , [ Alcotest.test_case "ring capacity" `Quick test_ring_capacity
