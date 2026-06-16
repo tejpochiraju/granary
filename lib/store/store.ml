@@ -197,6 +197,11 @@ type bt_state =
        events (the internals monitor).  [None] = zero overhead.  Invoked via
        [emit_event], which swallows any exception so a faulty observer can
        never break a transaction.  Btree backend only — Mem has no bt_state. *)
+  ; mutable current_tree : tree_id option
+    (* #385: the tree id of the in-flight read/write/cursor op, set at the
+       bt_get_tree(_ro) chokepoint and stamped onto page events by
+       translate_pager_event. Best-effort (single mutable shared across fibers),
+       same spirit as the pager's txn_id. [None] => stamp tree = -1. *)
   ; mutable follower : bool
     (* When true, [rw_begin] rejects with an error.  Set by the standby
        consumer while following the master's WAL stream; cleared on
@@ -439,6 +444,7 @@ let map_btree_err : Btree.error -> error = function
    tree_id's root page in the meta-tree; if absent (new tree), creates a
    fresh empty Btree (root_page = 0L). *)
 let bt_get_tree st (tid : tree_id) : (Btree.t, error) result Lwt.t =
+  st.current_tree <- Some tid;
   match Hashtbl.find_opt st.trees tid with
   | Some bt -> Lwt.return_ok bt
   | None ->
@@ -523,6 +529,7 @@ let backup_floor_below (st : bt_state) ~target =
 let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
   : (Btree.t, error) result Lwt.t
   =
+  st.current_tree <- Some tid;
   match Hashtbl.find_opt snap.rs_snap_trees tid with
   | Some bt -> Lwt.return_ok bt
   | None ->
@@ -636,6 +643,7 @@ let make_btree_store
     ; cipher
     ; meta
     ; trees = Hashtbl.create 16
+    ; current_tree = None
     ; tree_tags = Hashtbl.create 16
     ; current_header = h
     ; schema_version = h.schema_version
@@ -3258,16 +3266,24 @@ let set_commit_callback
    txn id from the pager.  Write-path events (alloc/write/free) always fire
    inside an active RW txn, so they carry the exact id; [Page_read] may fire
    outside a write txn, where [get_txn_id] returns 0 before the first txn and the
-   most-recent txn id between txns (best-effort). *)
+   most-recent txn id between txns (best-effort).
+   #385: also stamps the [tree] id from [st.current_tree], set at the
+   [bt_get_tree]/[bt_get_tree_ro] chokepoint by the op that triggered the I/O.
+   [-1] when no tree context is active.  Exact for read/alloc/free fired while a
+   tree op is in flight; best-effort for [Page_write], which is emitted at
+   WAL-flush time and carries whichever tree was most recently active. *)
 let translate_pager_event (st : bt_state) (pev : Pager_event.t) : Store_event.t =
   let txn_id = Pager.get_txn_id st.pager in
+  let tree = Option.value st.current_tree ~default:(-1) in
   match pev with
-  | Pager_event.Page_read { page_id } -> Store_event.Page_read { txn_id; page = page_id }
+  | Pager_event.Page_read { page_id } ->
+    Store_event.Page_read { txn_id; tree; page = page_id }
   | Pager_event.Page_write { page_id } ->
-    Store_event.Page_write { txn_id; page = page_id }
+    Store_event.Page_write { txn_id; tree; page = page_id }
   | Pager_event.Page_alloc { page_id; reused } ->
-    Store_event.Page_alloc { txn_id; page = page_id; reused }
-  | Pager_event.Page_free { page_id } -> Store_event.Page_free { txn_id; page = page_id }
+    Store_event.Page_alloc { txn_id; tree; page = page_id; reused }
+  | Pager_event.Page_free { page_id } ->
+    Store_event.Page_free { txn_id; tree; page = page_id }
 ;;
 
 let set_event_callback (t : t) (cb : (Store_event.t -> unit) option) =

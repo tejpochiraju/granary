@@ -13,11 +13,11 @@ let test_label_and_txn_id () =
   Alcotest.(check string)
     "page_read label"
     "PAGE_READ"
-    (Ev.label (Ev.Page_read { txn_id = 5L; page = 1L }));
+    (Ev.label (Ev.Page_read { txn_id = 5L; tree = 16; page = 1L }));
   Alcotest.(check (option int64))
     "page_read txn"
     (Some 5L)
-    (Ev.txn_id (Ev.Page_read { txn_id = 5L; page = 1L }))
+    (Ev.txn_id (Ev.Page_read { txn_id = 5L; tree = 16; page = 1L }))
 ;;
 
 let test_pp_roundtrip_nonempty () =
@@ -41,15 +41,44 @@ let test_pp_all_constructors () =
   check "WAL_RESET epoch=11" (Ev.Wal_reset { epoch = 11L });
   check "CKPT_BEGIN target=12" (Ev.Checkpoint_begin { target_frames = 12 });
   check "CKPT_END migrated=13" (Ev.Checkpoint_end { pages_migrated = 13 });
-  check "PAGE_READ txn=1 page=7" (Ev.Page_read { txn_id = 1L; page = 7L });
-  check "PAGE_WRITE txn=2 page=8" (Ev.Page_write { txn_id = 2L; page = 8L });
   check
-    "PAGE_ALLOC txn=3 page=9 reused=true"
-    (Ev.Page_alloc { txn_id = 3L; page = 9L; reused = true });
+    "PAGE_READ txn=1 tree=16 page=7"
+    (Ev.Page_read { txn_id = 1L; tree = 16; page = 7L });
   check
-    "PAGE_ALLOC txn=3 page=9 reused=false"
-    (Ev.Page_alloc { txn_id = 3L; page = 9L; reused = false });
-  check "PAGE_FREE txn=4 page=10" (Ev.Page_free { txn_id = 4L; page = 10L })
+    "PAGE_WRITE txn=2 tree=16 page=8"
+    (Ev.Page_write { txn_id = 2L; tree = 16; page = 8L });
+  check
+    "PAGE_ALLOC txn=3 tree=16 page=9 reused=true"
+    (Ev.Page_alloc { txn_id = 3L; tree = 16; page = 9L; reused = true });
+  check
+    "PAGE_ALLOC txn=3 tree=16 page=9 reused=false"
+    (Ev.Page_alloc { txn_id = 3L; tree = 16; page = 9L; reused = false });
+  check
+    "PAGE_FREE txn=4 tree=16 page=10"
+    (Ev.Page_free { txn_id = 4L; tree = 16; page = 10L })
+;;
+
+let test_tree_id_of () =
+  Alcotest.(check (option int))
+    "page_read tree"
+    (Some 16)
+    (Ev.tree_id_of (Ev.Page_read { txn_id = 1L; tree = 16; page = 7L }));
+  Alcotest.(check (option int))
+    "page_alloc tree"
+    (Some 32)
+    (Ev.tree_id_of (Ev.Page_alloc { txn_id = 1L; tree = 32; page = 7L; reused = false }));
+  Alcotest.(check (option int))
+    "page_free tree"
+    (Some 9)
+    (Ev.tree_id_of (Ev.Page_free { txn_id = 1L; tree = 9; page = 7L }));
+  Alcotest.(check (option int))
+    "page_write tree"
+    (Some 9)
+    (Ev.tree_id_of (Ev.Page_write { txn_id = 1L; tree = 9; page = 7L }));
+  Alcotest.(check (option int))
+    "txn has no tree"
+    None
+    (Ev.tree_id_of (Ev.Txn_commit { txn_id = 1L; frames = 0 }))
 ;;
 
 module S = struct
@@ -246,6 +275,53 @@ let test_checkpoint_then_read_emits_page_read () =
        evs)
 ;;
 
+(* #385: page reads are stamped with the tree id of the op that triggered them.
+   Cold-reopen (non-WAL) so reads come from the main file, then read ONLY tree
+   16 — every captured Page_read must carry tree=16. *)
+let test_page_read_carries_tree () =
+  let path = fresh_path () in
+  cleanup path;
+  let trees =
+    Lwt.finalize
+      (fun () ->
+         let open Lwt.Syntax in
+         let* st = S.open_file_wal ~path () in
+         let st = Result.get_ok st in
+         let* txn = S.rw_begin st in
+         let* () = S.put txn 16 (bs "k") (bs "v") in
+         let* () = S.commit txn in
+         let* () = S.checkpoint st in
+         let* () = S.close st in
+         let seen = ref [] in
+         let* st2 = Sqlocaml_unix.Store.open_file ~path () in
+         let st2 = Result.get_ok st2 in
+         S.set_event_callback
+           st2
+           (Some
+              (fun ev ->
+                match ev with
+                | Ev.Page_read _ ->
+                  (match Ev.tree_id_of ev with
+                   | Some t -> seen := t :: !seen
+                   | None -> ())
+                | _ -> ()));
+         let* txn2 = S.rw_begin st2 in
+         let* _ = S.get txn2 16 (bs "k") in
+         let* () = S.commit txn2 in
+         let* () = S.close st2 in
+         Lwt.return (List.rev !seen))
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check bool) "at least one page read" true (trees <> []);
+  Alcotest.(check bool)
+    "every page read tagged tree 16"
+    true
+    (List.for_all (fun t -> t = 16) trees)
+;;
+
 (* Defensive: a raising callback must not break the commit. *)
 let test_raising_callback_is_swallowed () =
   let path = fresh_path () in
@@ -410,6 +486,7 @@ let () =
       , [ Alcotest.test_case "label + txn_id" `Quick test_label_and_txn_id
         ; Alcotest.test_case "pp non-empty" `Quick test_pp_roundtrip_nonempty
         ; Alcotest.test_case "pp all constructors" `Quick test_pp_all_constructors
+        ; Alcotest.test_case "tree_id_of" `Quick test_tree_id_of
         ] )
     ; ( "seam"
       , [ Alcotest.test_case
@@ -443,6 +520,7 @@ let () =
             `Quick
             test_txn_commit_frames_matches_wal_append
         ; Alcotest.test_case "writes emit page free" `Quick test_writes_emit_page_free
+        ; Alcotest.test_case "page read carries tree" `Quick test_page_read_carries_tree
         ] )
     ; "props", [ QCheck_alcotest.to_alcotest prop_commit_count ]
     ]
