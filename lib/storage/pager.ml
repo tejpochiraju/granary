@@ -77,6 +77,11 @@ type t =
         of the next Branch/Leaf page built.  Set per tree-operation by the
         store; 0 for system/untagged trees.  Safe as shared state because
         writes are serialised under the single RW transaction. *)
+  ; mutable on_page_event : (Pager_event.t -> unit) option
+    (** #384: optional, synchronous, fire-and-forget observer for physical page
+        I/O (internals monitor).  [None] = zero overhead: every emit site guards
+        on this before constructing a [Pager_event.t], so nothing allocates when
+        unset.  [Store.set_event_callback] installs a translator here. *)
   }
 
 type error =
@@ -119,6 +124,7 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; txn_owned_pool = []
   ; wal = None
   ; write_tag = 0l
+  ; on_page_event = None
   }
 ;;
 
@@ -126,6 +132,16 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
    pages.  Reset to 0 before writing system-tree (e.g. meta) pages. *)
 let set_write_tag t (tag : int32) = t.write_tag <- tag
 let write_tag t = t.write_tag
+let set_page_event_callback t cb = t.on_page_event <- cb
+
+(* #384: fire a page event iff an observer is attached.  Guard-before-construct
+   at every call site keeps the [None] path allocation-free on hot paths. *)
+let emit_page_event t ev =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f ev
+[@@warning "-32"]
+;;
 
 (* #95: set the file's page geometry.  Called once by the open path before any
    page read/write, after peeking/deciding the geometry. *)
