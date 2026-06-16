@@ -102,6 +102,75 @@ let test_borrow_miss_emits_read () =
   | _ -> Alcotest.fail "expected exactly one Page_read"
 ;;
 
+let allocs seen =
+  List.filter_map
+    (function
+      | Pager_event.Page_alloc { page_id; reused } -> Some (page_id, reused)
+      | _ -> None)
+    (events seen)
+;;
+
+let frees seen =
+  List.filter_map
+    (function
+      | Pager_event.Page_free { page_id } -> Some page_id
+      | _ -> None)
+    (events seen)
+;;
+
+let test_alloc_extend_not_reused () =
+  let p, _ = make_pager ~n_pages:0L () in
+  let seen = recorder p in
+  let pid = run (Pager.alloc p) |> Result.get_ok in
+  Alcotest.(check (list (pair int64 bool)))
+    "alloc by file-extend, reused=false"
+    [ pid, false ]
+    (allocs seen)
+;;
+
+let test_alloc_from_freelist_reused () =
+  let fl = Freelist.add Freelist.empty ~page_id:1l ~freed_at_txn_id:1L in
+  let p, _ = make_pager ~n_pages:8L ~freelist:fl () in
+  Pager.set_alloc_min_safe p 5L;
+  let seen = recorder p in
+  let pid = run (Pager.alloc p) |> Result.get_ok in
+  Alcotest.(check (list (pair int64 bool)))
+    "alloc from freelist, reused=true"
+    [ pid, true ]
+    (allocs seen);
+  Alcotest.(check int64) "reused page id is 1" 1L pid
+;;
+
+let test_alloc_from_txn_pool_reused () =
+  let p, _ = make_pager ~n_pages:8L () in
+  Pager.set_n_pages_at_rw_begin p 4L;
+  Pager.free p ~page_id:6L ~freed_at_txn_id:1L;
+  (* attach recorder AFTER the free, so only the alloc is recorded *)
+  let seen = recorder p in
+  let pid = run (Pager.alloc p) |> Result.get_ok in
+  Alcotest.(check (list (pair int64 bool)))
+    "alloc from txn pool, reused=true"
+    [ pid, true ]
+    (allocs seen);
+  Alcotest.(check int64) "txn-pool page id is 6" 6L pid
+;;
+
+let test_free_below_threshold_emits_free () =
+  let p, _ = make_pager ~n_pages:8L () in
+  Pager.set_n_pages_at_rw_begin p 8L;
+  let seen = recorder p in
+  Pager.free p ~page_id:2L ~freed_at_txn_id:3L;
+  Alcotest.(check (list int64)) "Page_free for freelist push" [ 2L ] (frees seen)
+;;
+
+let test_free_txn_owned_emits_free () =
+  let p, _ = make_pager ~n_pages:8L () in
+  Pager.set_n_pages_at_rw_begin p 4L;
+  let seen = recorder p in
+  Pager.free p ~page_id:6L ~freed_at_txn_id:3L;
+  Alcotest.(check (list int64)) "Page_free for txn-owned push" [ 6L ] (frees seen)
+;;
+
 let () =
   Alcotest.run
     "pager_event"
@@ -113,6 +182,22 @@ let () =
       , [ Alcotest.test_case "cache miss emits read" `Quick test_cache_miss_emits_read
         ; Alcotest.test_case "cache hit emits nothing" `Quick test_cache_hit_emits_nothing
         ; Alcotest.test_case "borrow miss emits read" `Quick test_borrow_miss_emits_read
+        ] )
+    ; ( "alloc/free"
+      , [ Alcotest.test_case "alloc extend not reused" `Quick test_alloc_extend_not_reused
+        ; Alcotest.test_case
+            "alloc from freelist reused"
+            `Quick
+            test_alloc_from_freelist_reused
+        ; Alcotest.test_case
+            "alloc from txn pool reused"
+            `Quick
+            test_alloc_from_txn_pool_reused
+        ; Alcotest.test_case
+            "free below threshold"
+            `Quick
+            test_free_below_threshold_emits_free
+        ; Alcotest.test_case "free txn-owned" `Quick test_free_txn_owned_emits_free
         ] )
     ]
 ;;

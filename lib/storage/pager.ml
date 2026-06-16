@@ -145,6 +145,20 @@ let emit_read t page_id =
   | Some f -> f (Pager_event.Page_read { page_id })
 ;;
 
+(* #384: emit a [Page_alloc]/[Page_free] iff an observer is attached; the record
+   is built only inside the [Some] branch (zero-alloc when the monitor is off). *)
+let emit_alloc t page_id reused =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_alloc { page_id; reused })
+;;
+
+let emit_free t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_free { page_id })
+;;
+
 (* #95: set the file's page geometry.  Called once by the open path before any
    page read/write, after peeking/deciding the geometry. *)
 let set_geom t geom = t.geom <- geom
@@ -430,12 +444,15 @@ let alloc t =
   match t.txn_owned_pool with
   | pid :: rest ->
     t.txn_owned_pool <- rest;
+    emit_alloc t pid true;
     Lwt.return_ok pid
   | [] ->
     (match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
      | Some (pid32, fl') ->
        t.freelist <- fl';
-       Lwt.return_ok (Int64.of_int32 pid32)
+       let pid = Int64.of_int32 pid32 in
+       emit_alloc t pid true;
+       Lwt.return_ok pid
      | None ->
        (* Extend the file by one page *)
        let new_id = t.n_pages in
@@ -446,6 +463,7 @@ let alloc t =
         | Error msg -> Lwt.return_error (Block_error msg)
         | Ok () ->
           t.n_pages <- new_pages;
+          emit_alloc t new_id false;
           Lwt.return_ok new_id))
 ;;
 
@@ -458,7 +476,8 @@ let free t ~page_id ~freed_at_txn_id =
   then t.txn_owned_pool <- page_id :: t.txn_owned_pool
   else
     t.freelist
-    <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
+    <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id;
+  emit_free t page_id
 ;;
 
 (* Seal all dirty pages' CRCs just before flushing to disk (#356).
