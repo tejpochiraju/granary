@@ -4,11 +4,15 @@ module Ev = Sqlocaml.Db.Event
 
 let attr_for ev =
   let open Notty.A in
-  match Ev.label ev with
-  | "COMMIT" -> fg green
-  | "ROLLBACK" -> fg red
-  | "CKPT_BEGIN" | "CKPT_END" | "WAL_RESET" -> fg yellow
-  | _ -> empty
+  match (ev : Ev.t) with
+  | Ev.Txn_commit _ -> fg green
+  | Ev.Txn_rollback _ -> fg red
+  | Ev.Checkpoint_begin _ | Ev.Checkpoint_end _ | Ev.Wal_reset _ -> fg yellow
+  | Ev.Txn_begin _
+  | Ev.Savepoint_begin _
+  | Ev.Savepoint_release _
+  | Ev.Savepoint_rollback _
+  | Ev.Wal_append _ -> empty
 ;;
 
 let header log =

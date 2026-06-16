@@ -112,6 +112,52 @@ let test_shell_header_width () =
   Alcotest.(check int) "width covers header" (String.length "total_revenue") w.(0)
 ;;
 
+module C = Repl_command
+
+let test_parse_dot () =
+  Alcotest.(check bool) "help" true (C.parse_dot ".help" = C.Help);
+  Alcotest.(check bool) "quit" true (C.parse_dot ".quit" = C.Quit);
+  Alcotest.(check bool) "exit=quit" true (C.parse_dot ".exit" = C.Quit);
+  Alcotest.(check bool) "tables" true (C.parse_dot ".tables" = C.Tables);
+  Alcotest.(check bool) "schema none" true (C.parse_dot ".schema" = C.Schema None);
+  Alcotest.(check bool) "schema name" true (C.parse_dot ".schema t" = C.Schema (Some "t"));
+  Alcotest.(check bool) "databases" true (C.parse_dot ".databases" = C.Databases);
+  Alcotest.(check bool) "open" true (C.parse_dot ".open /a/b" = C.Open "/a/b");
+  Alcotest.(check bool)
+    "unknown"
+    true
+    (match C.parse_dot ".bogus" with
+     | C.Unknown _ -> true
+     | _ -> false)
+;;
+
+let test_classify () =
+  Alcotest.(check bool) "empty" true (C.classify ~filter_mode:false "  " = C.Empty);
+  Alcotest.(check bool)
+    "sql"
+    true
+    (C.classify ~filter_mode:false "SELECT 1;" = C.Sql [ "SELECT 1" ]);
+  Alcotest.(check bool)
+    "dot"
+    true
+    (C.classify ~filter_mode:false ".tables" = C.Dot C.Tables);
+  Alcotest.(check bool)
+    "filter ok"
+    true
+    (C.classify ~filter_mode:true "42" = C.Filter (Some 42L));
+  Alcotest.(check bool)
+    "filter bad"
+    true
+    (C.classify ~filter_mode:true "xx" = C.Filter None)
+;;
+
+let test_schema_sql_escapes () =
+  Alcotest.(check string)
+    "escapes quote"
+    "SELECT sql FROM sqlite_master WHERE name = 'a''b' AND sql IS NOT NULL"
+    (C.schema_sql (Some "a'b"))
+;;
+
 let () =
   Alcotest.run
     "repl_components"
@@ -133,6 +179,11 @@ let () =
     ; ( "shell_view"
       , [ Alcotest.test_case "renders" `Quick test_shell_renders
         ; Alcotest.test_case "header width" `Quick test_shell_header_width
+        ] )
+    ; ( "repl_command"
+      , [ Alcotest.test_case "parse_dot" `Quick test_parse_dot
+        ; Alcotest.test_case "classify" `Quick test_classify
+        ; Alcotest.test_case "schema_sql escapes" `Quick test_schema_sql_escapes
         ] )
     ]
 ;;

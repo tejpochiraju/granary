@@ -27,6 +27,7 @@ let shell = Shell_view.create ()
 let db_ref = ref None
 let quit_t, quit_u = Lwt.wait ()
 let filter_mode = ref false
+let busy = ref false
 let input_var = Shell_view.input_var shell
 
 (* ------------------------------------------------------------------ *)
@@ -100,24 +101,6 @@ let dot_help () =
   Shell_view.set_status shell "see commands above"
 ;;
 
-let dot_tables () =
-  run_sql "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-;;
-
-let dot_schema arg_opt =
-  let sql =
-    match arg_opt with
-    | None -> "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
-    | Some name ->
-      Printf.sprintf
-        "SELECT sql FROM sqlite_master WHERE name = '%s' AND sql IS NOT NULL"
-        (String.concat "''" (String.split_on_char '\'' name))
-  in
-  run_sql sql
-;;
-
-let dot_databases () = run_sql "PRAGMA database_list"
-
 let dot_open path =
   let* r = Repl_engine.open_db ~path in
   match r with
@@ -138,25 +121,20 @@ let dot_open path =
     Lwt.return_unit
 ;;
 
-let dispatch_dot line =
-  let trimmed = String.trim line in
-  let parts = String.split_on_char ' ' trimmed |> List.filter (fun s -> s <> "") in
-  match parts with
-  | [ ".help" ] ->
+let dispatch_dot (d : Repl_command.dot) =
+  match d with
+  | Help ->
     dot_help ();
     Lwt.return_unit
-  | [ ".quit" ] | [ ".exit" ] ->
+  | Quit ->
     do_quit ();
     Lwt.return_unit
-  | [ ".tables" ] -> dot_tables ()
-  | [ ".schema" ] -> dot_schema None
-  | [ ".schema"; name ] -> dot_schema (Some name)
-  | [ ".databases" ] -> dot_databases ()
-  | [ ".open"; path ] -> dot_open path
-  | _ ->
-    Shell_view.set_status
-      shell
-      (Printf.sprintf "Unknown dot command: %s (try .help)" trimmed);
+  | Tables -> run_sql Repl_command.tables_sql
+  | Schema o -> run_sql (Repl_command.schema_sql o)
+  | Databases -> run_sql Repl_command.databases_sql
+  | Open path -> dot_open path
+  | Unknown s ->
+    Shell_view.set_status shell (Printf.sprintf "Unknown dot command: %s (try .help)" s);
     Lwt.return_unit
 ;;
 
@@ -165,24 +143,20 @@ let dispatch_dot line =
 (* ------------------------------------------------------------------ *)
 
 let submit input =
-  if !filter_mode
-  then (
+  match Repl_command.classify ~filter_mode:!filter_mode input with
+  | Empty -> Lwt.return_unit
+  | Filter idopt ->
     filter_mode := false;
-    (match Int64.of_string_opt (String.trim input) with
+    (match idopt with
      | Some id ->
        Event_log.set_filter log (Some id);
        Shell_view.set_status shell (Printf.sprintf "filter: txn=%Ld" id)
      | None ->
        Event_log.set_filter log None;
        Shell_view.set_status shell "filter: not a txn id");
-    Lwt.return_unit)
-  else (
-    let t = String.trim input in
-    if t = ""
-    then Lwt.return_unit
-    else if t.[0] = '.'
-    then dispatch_dot t
-    else Lwt_list.iter_s run_sql (Repl_engine.split_stmts input))
+    Lwt.return_unit
+  | Dot d -> dispatch_dot d
+  | Sql stmts -> Lwt_list.iter_s run_sql stmts
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -204,7 +178,11 @@ let set_filter_prompt () =
 let shell_handle (key : Ui.key) : Ui.may_handle =
   match key with
   | `Escape, _ ->
-    do_quit ();
+    if !filter_mode
+    then (
+      filter_mode := false;
+      Shell_view.set_status shell "filter: cancelled")
+    else do_quit ();
     `Handled
   | `Tab, _ ->
     filter_mode := false;
@@ -213,12 +191,21 @@ let shell_handle (key : Ui.key) : Ui.may_handle =
   | `Enter, _ ->
     let input = Lwd.peek input_var in
     Lwd.set input_var "";
-    Lwt.async (fun () ->
-      Lwt.catch
-        (fun () -> submit input)
-        (fun exn ->
-           Shell_view.set_status shell ("Error: " ^ Printexc.to_string exn);
-           Lwt.return_unit));
+    if !busy
+    then Shell_view.set_status shell "busy — a query is still running"
+    else (
+      busy := true;
+      Lwt.async (fun () ->
+        Lwt.finalize
+          (fun () ->
+             Lwt.catch
+               (fun () -> submit input)
+               (fun exn ->
+                  Shell_view.set_status shell ("Error: " ^ Printexc.to_string exn);
+                  Lwt.return_unit))
+          (fun () ->
+             busy := false;
+             Lwt.return_unit)));
     `Handled
   | `Backspace, _ ->
     let s = Lwd.peek input_var in
@@ -284,7 +271,12 @@ let main () =
   | Ok db ->
     set_db db;
     Focus.request shell_focus;
-    Shell_view.set_status shell (Printf.sprintf "Open: %s" path);
+    if path = ":memory:"
+    then
+      Shell_view.set_status
+        shell
+        "Open: :memory: — in-memory; .open a file db to see monitor events"
+    else Shell_view.set_status shell (Printf.sprintf "Open: %s" path);
     let* () = Nottui_lwt.run ~quit:quit_t root in
     (match !db_ref with
      | Some db -> Db.close db
