@@ -77,6 +77,12 @@ type t =
         of the next Branch/Leaf page built.  Set per tree-operation by the
         store; 0 for system/untagged trees.  Safe as shared state because
         writes are serialised under the single RW transaction. *)
+  ; mutable on_page_event : (Pager_event.t -> unit) option
+    (** #384: optional, synchronous, fire-and-forget observer for physical page
+        I/O (internals monitor).  [None] = zero overhead: the per-kind [emit_*]
+        helpers construct the [Pager_event.t] only inside the [Some] branch, so
+        the [None] path neither allocates nor invokes anything.
+        [Store.set_event_callback] installs a translator here. *)
   }
 
 type error =
@@ -119,6 +125,7 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
   ; txn_owned_pool = []
   ; wal = None
   ; write_tag = 0l
+  ; on_page_event = None
   }
 ;;
 
@@ -126,6 +133,50 @@ let create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist =
    pages.  Reset to 0 before writing system-tree (e.g. meta) pages. *)
 let set_write_tag t (tag : int32) = t.write_tag <- tag
 let write_tag t = t.write_tag
+let set_page_event_callback t cb = t.on_page_event <- cb
+
+(* #384: emit a [Page_read] iff an observer is attached.  The event record is
+   constructed only inside the [Some] branch, so the [None] path allocates
+   nothing — keeping physical-read instrumentation truly zero-overhead when the
+   internals monitor is off. *)
+let emit_read t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_read { page_id })
+;;
+
+(* #384: emit a [Page_alloc]/[Page_free] iff an observer is attached; the record
+   is built only inside the [Some] branch (zero-alloc when the monitor is off). *)
+let emit_alloc t page_id reused =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_alloc { page_id; reused })
+;;
+
+(* #384: same zero-alloc guard as emit_alloc. *)
+let emit_free t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_free { page_id })
+;;
+
+(* #384: emit one [Page_write] per dirty entry being flushed.  Guard once, then
+   iterate — no allocation when no observer is attached (same zero-alloc
+   discipline as the per-kind emit helpers). *)
+let emit_writes t entries =
+  match t.on_page_event with
+  | None -> ()
+  | Some f ->
+    List.iter (fun (pid, _) -> f (Pager_event.Page_write { page_id = pid })) entries
+;;
+
+(* #384: emit a single [Page_write] iff an observer is attached (zero-alloc on
+   the [None] path, like the other per-kind emit helpers). *)
+let emit_write t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_write { page_id })
+;;
 
 (* #95: set the file's page geometry.  Called once by the open path before any
    page read/write, after peeking/deciding the geometry. *)
@@ -265,6 +316,7 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
+       emit_read t page_id;
        if not bypass_cache
        then (
          cache_add t key (cstruct_dup buf);
@@ -343,6 +395,7 @@ let load_main_page_borrow ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
+       emit_read t page_id;
        if not bypass_cache
        then (
          cache_add t key buf;
@@ -410,12 +463,15 @@ let alloc t =
   match t.txn_owned_pool with
   | pid :: rest ->
     t.txn_owned_pool <- rest;
+    emit_alloc t pid true;
     Lwt.return_ok pid
   | [] ->
     (match Freelist.pop t.freelist ~min_safe_txn_id:t.alloc_min_safe with
      | Some (pid32, fl') ->
        t.freelist <- fl';
-       Lwt.return_ok (Int64.of_int32 pid32)
+       let pid = Int64.of_int32 pid32 in
+       emit_alloc t pid true;
+       Lwt.return_ok pid
      | None ->
        (* Extend the file by one page *)
        let new_id = t.n_pages in
@@ -426,6 +482,7 @@ let alloc t =
         | Error msg -> Lwt.return_error (Block_error msg)
         | Ok () ->
           t.n_pages <- new_pages;
+          emit_alloc t new_id false;
           Lwt.return_ok new_id))
 ;;
 
@@ -438,7 +495,8 @@ let free t ~page_id ~freed_at_txn_id =
   then t.txn_owned_pool <- page_id :: t.txn_owned_pool
   else
     t.freelist
-    <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id
+    <- Freelist.add t.freelist ~page_id:(Int64.to_int32 page_id) ~freed_at_txn_id;
+  emit_free t page_id
 ;;
 
 (* Seal all dirty pages' CRCs just before flushing to disk (#356).
@@ -464,6 +522,7 @@ let flush_via_wal t ~append =
     match r with
     | Error msg -> Lwt.return_error (Block_error msg)
     | Ok () ->
+      emit_writes t entries;
       Hashtbl.clear t.dirty;
       Lwt.return_ok ())
 ;;
@@ -494,6 +553,7 @@ let flush_no_sync t =
               [write] no longer injects into the shared cache (#149), so we must
               update here after the block write is committed. *)
            cache_add t (cache_key_main pid) (cstruct_dup buf);
+           emit_write t pid;
            write_all rest)
     in
     write_all entries
@@ -522,6 +582,7 @@ let flush t =
       (match r with
        | Error msg -> Lwt.return_error (Block_error msg)
        | Ok () ->
+         emit_writes t entries;
          Hashtbl.clear t.dirty;
          Lwt.return_ok ())
   | None ->
@@ -543,6 +604,7 @@ let flush t =
               [write] no longer injects into the shared cache (#149), so we must
               update here after the block write is committed. *)
            cache_add t (cache_key_main pid) (cstruct_dup buf);
+           emit_write t pid;
            write_all rest)
     in
     write_all entries
@@ -605,6 +667,7 @@ let flush_one_to_main t ~page_id ~buf =
   let* r = t.write_page ~page_id buf in
   match r with
   | Ok () ->
+    emit_write t page_id;
     cache_add t (cache_key_main page_id) (cstruct_dup buf);
     Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)

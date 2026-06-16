@@ -25,6 +25,23 @@ type t =
   | Wal_reset of { epoch : int64 }
   | Checkpoint_begin of { target_frames : int }
   | Checkpoint_end of { pages_migrated : int }
+  | Page_read of
+      { txn_id : int64
+      ; page : int64
+      }
+  | Page_write of
+      { txn_id : int64
+      ; page : int64
+      }
+  | Page_alloc of
+      { txn_id : int64
+      ; page : int64
+      ; reused : bool
+      }
+  | Page_free of
+      { txn_id : int64
+      ; page : int64
+      }
 
 let label = function
   | Txn_begin _ -> "BEGIN"
@@ -37,6 +54,10 @@ let label = function
   | Wal_reset _ -> "WAL_RESET"
   | Checkpoint_begin _ -> "CKPT_BEGIN"
   | Checkpoint_end _ -> "CKPT_END"
+  | Page_read _ -> "PAGE_READ"
+  | Page_write _ -> "PAGE_WRITE"
+  | Page_alloc _ -> "PAGE_ALLOC"
+  | Page_free _ -> "PAGE_FREE"
 ;;
 
 let txn_id = function
@@ -46,7 +67,11 @@ let txn_id = function
   | Savepoint_begin { txn_id; _ }
   | Savepoint_release { txn_id; _ }
   | Savepoint_rollback { txn_id; _ }
-  | Wal_append { txn_id; _ } -> Some txn_id
+  | Wal_append { txn_id; _ }
+  | Page_read { txn_id; _ }
+  | Page_write { txn_id; _ }
+  | Page_alloc { txn_id; _ }
+  | Page_free { txn_id; _ } -> Some txn_id
   | Wal_reset _ | Checkpoint_begin _ | Checkpoint_end _ -> None
 ;;
 
@@ -68,4 +93,10 @@ let pp fmt ev =
     Format.fprintf fmt "%s target=%d" tag target_frames
   | Checkpoint_end { pages_migrated } ->
     Format.fprintf fmt "%s migrated=%d" tag pages_migrated
+  | Page_read { txn_id; page } -> Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
+  | Page_write { txn_id; page } ->
+    Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
+  | Page_alloc { txn_id; page; reused } ->
+    Format.fprintf fmt "%s txn=%Ld page=%Ld reused=%b" tag txn_id page reused
+  | Page_free { txn_id; page } -> Format.fprintf fmt "%s txn=%Ld page=%Ld" tag txn_id page
 ;;

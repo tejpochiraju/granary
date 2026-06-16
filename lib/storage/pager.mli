@@ -41,6 +41,12 @@ val set_write_tag : t -> int32 -> unit
 (** Current schema-fingerprint stamp (#174). *)
 val write_tag : t -> int32
 
+(** #384: attach/detach a synchronous observer for physical page I/O events
+    (internals monitor).  [None] (the default) is zero-overhead.  The observer
+    must be cheap and non-blocking; exceptions it raises are NOT caught here —
+    [Store.set_event_callback] wraps the store-level observer to swallow them. *)
+val set_page_event_callback : t -> (Pager_event.t -> unit) option -> unit
+
 (** Set the file's page geometry (called once on open, before any page op). *)
 val set_geom : t -> Geometry.t -> unit
 

@@ -21,6 +21,7 @@
   test_page_tag
   test_freelist
   test_pager
+  test_pager_event
   test_header
   test_btree
   test_index_key
@@ -65,6 +66,7 @@
   test_page_tag
   test_freelist
   test_pager
+  test_pager_event
   test_header
   test_btree
   test_index_key

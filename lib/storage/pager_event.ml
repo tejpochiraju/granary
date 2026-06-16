@@ -1,0 +1,27 @@
+(** Page-level signal emitted by {!Sqlocaml_storage.Pager} for the internals
+    monitor (#384).  Storage-local on purpose: [Store_event] lives a layer up in
+    [sqlocaml.store], which depends on this library, so the pager cannot
+    reference it without creating a dependency cycle.  [Store.set_event_callback]
+    translates these into [Store_event.t] variants.
+
+    Emitted only on PHYSICAL I/O: [Page_read] fires on a MAIN-FILE backend read
+    (cache miss), never on a cache hit — WAL-frame-served reads (resolved via the
+    WAL overlay, not the main file) emit nothing; [Page_write] fires once per
+    dirty page handed to the WAL/main on flush. *)
+type t =
+  | Page_read of { page_id : int64 }
+  (** main-file backend read — cache MISS only; WAL-served reads emit nothing *)
+  | Page_write of { page_id : int64 } (** page written to WAL/main on flush *)
+  | Page_alloc of
+      { page_id : int64
+      ; reused : bool (** [true] = freelist/txn-pool reuse; [false] = file extend *)
+      }
+  | Page_free of { page_id : int64 } (** page pushed to the freelist / txn pool *)
+
+let pp fmt = function
+  | Page_read { page_id } -> Format.fprintf fmt "PAGE_READ page=%Ld" page_id
+  | Page_write { page_id } -> Format.fprintf fmt "PAGE_WRITE page=%Ld" page_id
+  | Page_alloc { page_id; reused } ->
+    Format.fprintf fmt "PAGE_ALLOC page=%Ld reused=%b" page_id reused
+  | Page_free { page_id } -> Format.fprintf fmt "PAGE_FREE page=%Ld" page_id
+;;

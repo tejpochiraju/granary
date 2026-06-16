@@ -17,6 +17,7 @@ module Btree = Sqlocaml_storage.Btree
 module Pager = Sqlocaml_storage.Pager
 module Header = Sqlocaml_storage.Header
 module Freelist = Sqlocaml_storage.Freelist
+module Pager_event = Sqlocaml_storage.Pager_event
 module Page = Sqlocaml_storage.Page
 module Geometry = Sqlocaml_storage.Geometry
 module Crypto = Sqlocaml_storage.Crypto
@@ -1895,7 +1896,7 @@ let commit_wal t st =
          st
          (Store_event.Wal_append
             { txn_id = append_txn_id; base_idx = frames_before; count = appended });
-       Lwt.return_unit)
+       Lwt.return appended)
     (fun exn ->
        unlock_once ();
        Lwt.fail exn)
@@ -1924,24 +1925,27 @@ let commit (Rw t : rw txn) : unit Lwt.t =
     (* #356: the append cursor is only valid within a txn (its leaf is dirty);
        commit flushes dirty pages, so drop it. *)
     Hashtbl.clear st.bt_append;
-    (* #382: capture the id this txn commits as BEFORE the header is bumped
-       (commit_prepare_btree advances [st.current_header.txn_id]).  Emit
-       [Txn_commit] only after the commit work has succeeded.  [frames = 0] is a
-       placeholder: Task 4 wires the authoritative frame count via [Wal_append]. *)
+    (* #382/#386: capture the id this txn commits as BEFORE the header is bumped
+       (commit_prepare_btree advances [st.current_header.txn_id]).  [frames] is
+       the authoritative WAL-appended count returned by [commit_wal] (0 for the
+       non-WAL path, which appends no WAL frames). *)
     let committed_id = active_txn_id st in
-    let* () =
+    let* frames =
       match st.wal with
       | None ->
-        Lwt.finalize
-          (fun () ->
-             let* () = commit_prepare_btree ~header_commit:Header.commit st in
-             maybe_autocheckpoint st)
-          (fun () ->
-             Rwlock.release_write t.lock;
-             Lwt.return_unit)
+        let* () =
+          Lwt.finalize
+            (fun () ->
+               let* () = commit_prepare_btree ~header_commit:Header.commit st in
+               maybe_autocheckpoint st)
+            (fun () ->
+               Rwlock.release_write t.lock;
+               Lwt.return_unit)
+        in
+        Lwt.return 0 (* non-WAL: no WAL frames appended *)
       | Some _ -> commit_wal t st
     in
-    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames = 0 });
+    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames });
     Lwt.return_unit
 ;;
 
@@ -3250,10 +3254,38 @@ let set_commit_callback
             Lwt.return_unit))
 ;;
 
+(* #384: map a storage-level [Pager_event.t] to a [Store_event.t], stamping the
+   txn id from the pager.  Write-path events (alloc/write/free) always fire
+   inside an active RW txn, so they carry the exact id; [Page_read] may fire
+   outside a write txn, where [get_txn_id] returns 0 before the first txn and the
+   most-recent txn id between txns (best-effort). *)
+let translate_pager_event (st : bt_state) (pev : Pager_event.t) : Store_event.t =
+  let txn_id = Pager.get_txn_id st.pager in
+  match pev with
+  | Pager_event.Page_read { page_id } -> Store_event.Page_read { txn_id; page = page_id }
+  | Pager_event.Page_write { page_id } ->
+    Store_event.Page_write { txn_id; page = page_id }
+  | Pager_event.Page_alloc { page_id; reused } ->
+    Store_event.Page_alloc { txn_id; page = page_id; reused }
+  | Pager_event.Page_free { page_id } -> Store_event.Page_free { txn_id; page = page_id }
+;;
+
 let set_event_callback (t : t) (cb : (Store_event.t -> unit) option) =
   match t.backend with
   | Mem _ -> () (* Mem backend has no bt_state; emits no events (#382). *)
-  | Btree st -> st.on_event <- cb
+  | Btree st ->
+    st.on_event <- cb;
+    (match cb with
+     | None -> Pager.set_page_event_callback st.pager None
+     | Some f ->
+       Pager.set_page_event_callback
+         st.pager
+         (Some
+            (fun pev ->
+              (* Same guarantee as [emit_event]: a faulty observer must never
+                 break a transaction. *)
+              try f (translate_pager_event st pev) with
+              | _ -> ())))
 ;;
 
 module Event = Store_event
