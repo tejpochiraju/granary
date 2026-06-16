@@ -3615,7 +3615,14 @@ let rec col_names_of_ast_stmt = function
 (* Combine AST-derived names (which preserve SELECT aliases and bare column
    names) with the bound names (authoritative count + [*]-expansion + fallback):
    the bound list fixes the number of output columns, and AST names are used
-   wherever available, falling back to the bound name otherwise. *)
+   wherever available, falling back to the bound name otherwise.
+
+   This zips [ast_names] and [bound_names] positionally, which is sound only
+   because no representable projection mixes a star with named columns: [`All]
+   yields no AST names (so every column falls back to its bound name), while
+   [`Cols]/[`Exprs] yield exactly one AST name per output column.  An interior
+   [SELECT a, *, b] would misalign, but the AST has no constructor for an
+   interior star, so it is unreachable. *)
 let output_column_names ast bound =
   let ast_names = col_names_of_ast_stmt ast in
   let bound_names = col_names_of_bound_stmt bound in

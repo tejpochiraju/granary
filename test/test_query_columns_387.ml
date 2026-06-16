@@ -89,6 +89,17 @@ let test_const_select () =
       (cols_of db "SELECT 1 AS a, 2 AS b"))
 ;;
 
+(* A compound query takes its names from the left arm (PR #395 review:
+   exercises the BS_compound / S_compound left-branch path). *)
+let test_compound_union () =
+  with_db (fun db ->
+    seed db;
+    Alcotest.(check (list string))
+      "SELECT id AS x FROM t UNION SELECT v FROM t"
+      [ "x" ]
+      (cols_of db "SELECT id AS x FROM t UNION SELECT v FROM t"))
+;;
+
 let () =
   Alcotest.run
     "query_columns_387"
@@ -99,6 +110,7 @@ let () =
         ; Alcotest.test_case "single column" `Quick test_single_column
         ; Alcotest.test_case "aggregate alias" `Quick test_aggregate_alias
         ; Alcotest.test_case "const select" `Quick test_const_select
+        ; Alcotest.test_case "compound union" `Quick test_compound_union
         ] )
     ]
 ;;
