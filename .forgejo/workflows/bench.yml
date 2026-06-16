@@ -126,7 +126,9 @@ jobs:
       - name: Publish results to wiki
         env:
           RAW_LABEL: ${{ github.event.inputs.host_label }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Dedicated PAT (write:repository scope) stored as the BENCH_PAT secret:
+          # the auto GITHUB_TOKEN lacks the scope to push to the wiki repo.
+          TOKEN: ${{ secrets.BENCH_PAT }}
           RUN: ${{ github.run_number }}
           SERVER_URL: ${{ github.server_url }}
           REPOSITORY: ${{ github.repository }}
