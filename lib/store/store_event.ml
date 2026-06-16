@@ -30,6 +30,11 @@ type t =
       ; tree : int
       ; page : int64
       }
+  | Wal_read of
+      { txn_id : int64
+      ; tree : int
+      ; page : int64
+      }
   | Page_write of
       { txn_id : int64
       ; tree : int
@@ -59,6 +64,7 @@ let label = function
   | Checkpoint_begin _ -> "CKPT_BEGIN"
   | Checkpoint_end _ -> "CKPT_END"
   | Page_read _ -> "PAGE_READ"
+  | Wal_read _ -> "WAL_READ"
   | Page_write _ -> "PAGE_WRITE"
   | Page_alloc _ -> "PAGE_ALLOC"
   | Page_free _ -> "PAGE_FREE"
@@ -73,6 +79,7 @@ let txn_id = function
   | Savepoint_rollback { txn_id; _ }
   | Wal_append { txn_id; _ }
   | Page_read { txn_id; _ }
+  | Wal_read { txn_id; _ }
   | Page_write { txn_id; _ }
   | Page_alloc { txn_id; _ }
   | Page_free { txn_id; _ } -> Some txn_id
@@ -81,6 +88,7 @@ let txn_id = function
 
 let tree_id_of = function
   | Page_read { tree; _ }
+  | Wal_read { tree; _ }
   | Page_write { tree; _ }
   | Page_alloc { tree; _ }
   | Page_free { tree; _ } -> Some tree
@@ -105,7 +113,7 @@ let pp fmt ev =
     Format.fprintf fmt "%s target=%d" tag target_frames
   | Checkpoint_end { pages_migrated } ->
     Format.fprintf fmt "%s migrated=%d" tag pages_migrated
-  | Page_read { txn_id; tree; page } ->
+  | Page_read { txn_id; tree; page } | Wal_read { txn_id; tree; page } ->
     Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page
   | Page_write { txn_id; tree; page } ->
     Format.fprintf fmt "%s txn=%Ld tree=%d page=%Ld" tag txn_id tree page

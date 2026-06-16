@@ -48,6 +48,14 @@ type t =
                        most recently active tree). *)
       ; page : int64
       }
+  | Wal_read of
+      { txn_id : int64
+      ; tree : int
+        (** [tree] is the store tree id whose operation triggered the WAL-served
+                       read (#392); [-1] when no op context was active.  Same
+                       best-effort [txn_id]/[tree] stamping as [Page_read]. *)
+      ; page : int64
+      }
   | Page_write of
       { txn_id : int64
       ; tree : int
@@ -85,8 +93,9 @@ val label : t -> string
     txn-id filter. *)
 val txn_id : t -> int64 option
 
-(** [tree_id_of ev] is the store tree id for the four page events, or [None]
-    for every non-page event. [-1] means "no active tree context". *)
+(** [tree_id_of ev] is the store tree id for the page/WAL-read events
+    ([Page_read]/[Wal_read]/[Page_write]/[Page_alloc]/[Page_free]), or [None]
+    for every other event. [-1] means "no active tree context". *)
 val tree_id_of : t -> int option
 
 (** Human-readable one-line rendering of an event. *)

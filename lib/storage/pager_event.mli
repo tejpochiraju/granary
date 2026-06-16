@@ -4,13 +4,21 @@
     reference it without creating a dependency cycle.  [Store.set_event_callback]
     translates these into [Store_event.t] variants.
 
-    Emitted only on PHYSICAL I/O: [Page_read] fires on a MAIN-FILE backend read
-    (cache miss), never on a cache hit — WAL-frame-served reads (resolved via the
-    WAL overlay, not the main file) emit nothing; [Page_write] fires once per
-    dirty page handed to the WAL/main on flush. *)
+    Emitted on a pager-level backend resolution (the pager's own page cache
+    missed): [Page_read] fires when the page is served from the MAIN FILE,
+    [Wal_read] (#392) when it is served from the WAL overlay.  Neither fires on a
+    pager cache hit.  Like [Page_read], [Wal_read] fires per pager-level
+    resolution regardless of any cache internal to the WAL layer (its frame
+    cache), mirroring how [Page_read] fires regardless of the OS/block-device
+    cache under [read_page].  [Page_write] fires once per dirty page handed to
+    the WAL/main on flush. *)
 type t =
   | Page_read of { page_id : int64 }
-  (** main-file backend read — cache MISS only; WAL-served reads emit nothing *)
+  (** main-file backend read — pager cache MISS only; WAL-served reads emit
+      [Wal_read] instead *)
+  | Wal_read of { page_id : int64 }
+  (** WAL-overlay backend read (#392) — pager cache MISS resolved from a WAL
+      frame rather than the main file *)
   | Page_write of { page_id : int64 } (** page written to WAL/main on flush *)
   | Page_alloc of
       { page_id : int64

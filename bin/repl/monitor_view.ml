@@ -14,6 +14,7 @@ let attr_for ev =
   | Ev.Savepoint_rollback _
   | Ev.Wal_append _
   | Ev.Page_read _
+  | Ev.Wal_read _
   | Ev.Page_write _
   | Ev.Page_alloc _
   | Ev.Page_free _ -> empty

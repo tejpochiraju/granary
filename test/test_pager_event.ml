@@ -108,6 +108,84 @@ let fill_page byte =
   buf
 ;;
 
+let is_wal_read = function
+  | Pager_event.Wal_read _ -> true
+  | _ -> false
+;;
+
+(* Attach a mock WAL that resolves [page_id] to a frame and serves a page from
+   [wal_read_frame] (a physical frame read, from the pager's perspective). *)
+let attach_mock_wal p ~page_id ~frame_idx =
+  let wal_read_frame idx =
+    if idx = frame_idx
+    then Lwt.return_ok (fill_page 7)
+    else Lwt.return_error "no such frame"
+  in
+  let unused_commit _ = Lwt.return_ok () in
+  Pager.set_wal
+    p
+    (Some
+       { Pager.wal_find_page = (fun pid -> if pid = page_id then Some frame_idx else None)
+       ; wal_find_page_at =
+           (fun pid ~max_frame:_ -> if pid = page_id then Some frame_idx else None)
+       ; wal_read_frame
+       ; wal_append_commit = unused_commit
+       ; wal_append_commit_no_sync = unused_commit
+       ; wal_sync = (fun () -> Lwt.return_ok ())
+       })
+;;
+
+(* #392: a WAL-resident page read produces a [Wal_read] event with the page id —
+   not a [Page_read] (that variant stays main-file-only). *)
+let test_wal_served_read_emits_wal_read () =
+  let p, _ = make_pager ~n_pages:4L () in
+  attach_mock_wal p ~page_id:2L ~frame_idx:5;
+  let seen = recorder p in
+  let _ = run (Pager.read p 2L) |> Result.get_ok in
+  Alcotest.(check int)
+    "no main-file Page_read on WAL-served read"
+    0
+    (List.length (List.filter is_read (events seen)));
+  let wreads = List.filter is_wal_read (events seen) in
+  Alcotest.(check int) "one Wal_read on WAL-served read" 1 (List.length wreads);
+  match wreads with
+  | [ Pager_event.Wal_read { page_id } ] -> Alcotest.(check int64) "page id" 2L page_id
+  | _ -> Alcotest.fail "expected exactly one Wal_read"
+;;
+
+let test_wal_served_borrow_read_emits_wal_read () =
+  let p, _ = make_pager ~n_pages:4L () in
+  attach_mock_wal p ~page_id:3L ~frame_idx:1;
+  let seen = recorder p in
+  let _ = run (Pager.read_borrow p 3L (fun _ -> Lwt.return_unit)) |> Result.get_ok in
+  Alcotest.(check int)
+    "no main-file Page_read on WAL-served borrow read"
+    0
+    (List.length (List.filter is_read (events seen)));
+  let wreads = List.filter is_wal_read (events seen) in
+  Alcotest.(check int) "one Wal_read on WAL-served borrow read" 1 (List.length wreads);
+  match wreads with
+  | [ Pager_event.Wal_read { page_id } ] -> Alcotest.(check int64) "page id" 3L page_id
+  | _ -> Alcotest.fail "expected exactly one Wal_read"
+;;
+
+(* A page absent from the WAL falls through to the main file: main-file
+   [Page_read] only, no [Wal_read]. *)
+let test_wal_miss_falls_through_to_main_read () =
+  let p, _ = make_pager ~n_pages:4L () in
+  attach_mock_wal p ~page_id:2L ~frame_idx:5;
+  let seen = recorder p in
+  let _ = run (Pager.read p 3L) |> Result.get_ok in
+  Alcotest.(check int)
+    "no Wal_read when page absent from WAL"
+    0
+    (List.length (List.filter is_wal_read (events seen)));
+  Alcotest.(check int)
+    "one main-file Page_read on WAL miss"
+    1
+    (List.length (List.filter is_read (events seen)))
+;;
+
 let allocs seen =
   List.filter_map
     (function
@@ -269,6 +347,7 @@ let test_pp_all_variants () =
     Alcotest.(check string) expected expected (Format.asprintf "%a" Pager_event.pp ev)
   in
   check "PAGE_READ page=7" (Pager_event.Page_read { page_id = 7L });
+  check "WAL_READ page=11" (Pager_event.Wal_read { page_id = 11L });
   check "PAGE_WRITE page=8" (Pager_event.Page_write { page_id = 8L });
   check
     "PAGE_ALLOC page=9 reused=true"
@@ -295,6 +374,18 @@ let () =
       , [ Alcotest.test_case "cache miss emits read" `Quick test_cache_miss_emits_read
         ; Alcotest.test_case "cache hit emits nothing" `Quick test_cache_hit_emits_nothing
         ; Alcotest.test_case "borrow miss emits read" `Quick test_borrow_miss_emits_read
+        ; Alcotest.test_case
+            "WAL-served read emits Wal_read"
+            `Quick
+            test_wal_served_read_emits_wal_read
+        ; Alcotest.test_case
+            "WAL-served borrow read emits Wal_read"
+            `Quick
+            test_wal_served_borrow_read_emits_wal_read
+        ; Alcotest.test_case
+            "WAL miss falls through to main read"
+            `Quick
+            test_wal_miss_falls_through_to_main_read
         ] )
     ; ( "alloc/free"
       , [ Alcotest.test_case "alloc extend not reused" `Quick test_alloc_extend_not_reused

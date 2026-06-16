@@ -3293,6 +3293,8 @@ let translate_pager_event (st : bt_state) (pev : Pager_event.t) : Store_event.t 
   match pev with
   | Pager_event.Page_read { page_id } ->
     Store_event.Page_read { txn_id; tree; page = page_id }
+  | Pager_event.Wal_read { page_id } ->
+    Store_event.Wal_read { txn_id; tree; page = page_id }
   | Pager_event.Page_write { page_id } ->
     Store_event.Page_write { txn_id; tree; page = page_id }
   | Pager_event.Page_alloc { page_id; reused } ->
