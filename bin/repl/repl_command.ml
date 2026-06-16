@@ -5,11 +5,21 @@ type dot =
   | Schema of string option
   | Databases
   | Open of string
+  | Dump of string option
   | Unknown of string
+
+type prompt =
+  | No_prompt
+  | Txn_prompt
+  | Table_prompt
+
+type filter_input =
+  | Filter_txn of int64 option
+  | Filter_table of string
 
 type action =
   | Empty
-  | Filter of int64 option
+  | Filter of filter_input
   | Dot of dot
   | Sql of string list
 
@@ -24,19 +34,22 @@ let parse_dot line =
   | [ ".schema"; name ] -> Schema (Some name)
   | [ ".databases" ] -> Databases
   | [ ".open"; path ] -> Open path
+  | [ ".dump" ] -> Dump None
+  | [ ".dump"; path ] -> Dump (Some path)
   | _ -> Unknown trimmed
 ;;
 
-let classify ~filter_mode input =
-  if filter_mode
-  then Filter (Int64.of_string_opt (String.trim input))
-  else (
+let classify ~prompt input =
+  match prompt with
+  | Txn_prompt -> Filter (Filter_txn (Int64.of_string_opt (String.trim input)))
+  | Table_prompt -> Filter (Filter_table (String.trim input))
+  | No_prompt ->
     let t = String.trim input in
     if t = ""
     then Empty
     else if t.[0] = '.'
     then Dot (parse_dot t)
-    else Sql (Repl_engine.split_stmts input))
+    else Sql (Repl_engine.split_stmts input)
 ;;
 
 let tables_sql = "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
