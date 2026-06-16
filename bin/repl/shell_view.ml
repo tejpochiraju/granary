@@ -20,26 +20,40 @@ let set_result t ~headers ~rows =
   Lwd.set t.rows rows
 ;;
 
+let pad s w =
+  let p = w - String.length s in
+  s ^ if p > 0 then String.make p ' ' else ""
+;;
+
+(* Per-column widths that account for BOTH the widest data value and the header
+   label, so header and data cells in the same column share one width. Exposed
+   (no .mli) for testing. *)
+let column_widths_with_headers ~headers ~rows =
+  let data_widths = Repl_engine.column_widths rows in
+  let header_arr = Array.of_list headers in
+  let n_cols = max (Array.length data_widths) (Array.length header_arr) in
+  Array.init n_cols (fun i ->
+    let dw = if i < Array.length data_widths then data_widths.(i) else 0 in
+    let hw = if i < Array.length header_arr then String.length header_arr.(i) else 0 in
+    max dw hw)
+;;
+
 let render_rows headers rows =
-  let widths = Repl_engine.column_widths rows in
+  let widths = column_widths_with_headers ~headers ~rows in
+  let width_at i = if i < Array.length widths then widths.(i) else 0 in
   let render_row vals =
     let cells =
       Array.to_list
-        (Array.mapi
-           (fun i v ->
-              let s = Repl_engine.value_to_string v in
-              let pad =
-                (if i < Array.length widths then widths.(i) else 0) - String.length s
-              in
-              s ^ if pad > 0 then String.make pad ' ' else "")
-           vals)
+        (Array.mapi (fun i v -> pad (Repl_engine.value_to_string v) (width_at i)) vals)
     in
     W.string (String.concat " | " cells)
   in
   let header_row =
     if headers = []
     then []
-    else [ Lwd.return (W.string ~attr:Notty.A.(st bold) (String.concat " | " headers)) ]
+    else (
+      let cells = List.mapi (fun i h -> pad h (width_at i)) headers in
+      [ Lwd.return (W.string ~attr:Notty.A.(st bold) (String.concat " | " cells)) ])
   in
   header_row @ List.map (fun r -> Lwd.return (render_row r)) rows
 ;;

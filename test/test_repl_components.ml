@@ -103,6 +103,15 @@ let test_shell_renders () =
   Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 1)
 ;;
 
+let test_shell_header_width () =
+  let w =
+    Shell_view.column_widths_with_headers
+      ~headers:[ "total_revenue" ]
+      ~rows:[ [| Sqlocaml.Db.V_int 42L |] ]
+  in
+  Alcotest.(check int) "width covers header" (String.length "total_revenue") w.(0)
+;;
+
 let () =
   Alcotest.run
     "repl_components"
@@ -121,6 +130,9 @@ let () =
         ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
         ] )
     ; "monitor_view", [ Alcotest.test_case "renders" `Quick test_monitor_renders ]
-    ; "shell_view", [ Alcotest.test_case "renders" `Quick test_shell_renders ]
+    ; ( "shell_view"
+      , [ Alcotest.test_case "renders" `Quick test_shell_renders
+        ; Alcotest.test_case "header width" `Quick test_shell_header_width
+        ] )
     ]
 ;;
