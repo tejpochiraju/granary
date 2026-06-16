@@ -444,23 +444,30 @@ let map_btree_err : Btree.error -> error = function
    tree_id's root page in the meta-tree; if absent (new tree), creates a
    fresh empty Btree (root_page = 0L). *)
 let bt_get_tree st (tid : tree_id) : (Btree.t, error) result Lwt.t =
+  (* #385/#174: meta-tree pages read while resolving the root are system pages —
+     keep [current_tree] clear (stamps tree = -1) during the lookup, then stamp
+     [tid] so the caller's subsequent data-page reads are attributed to it. *)
+  st.current_tree <- None;
+  let* r =
+    match Hashtbl.find_opt st.trees tid with
+    | Some bt -> Lwt.return_ok bt
+    | None ->
+      let key = encode_tree_id tid in
+      let* r = Btree.get st.meta key in
+      (match r with
+       | Error e -> Lwt.return_error (map_btree_err e)
+       | Ok None ->
+         let bt = Btree.create st.pager ~root_page:0L in
+         Hashtbl.replace st.trees tid bt;
+         Lwt.return_ok bt
+       | Ok (Some v) ->
+         let root_page = decode_root_page v in
+         let bt = Btree.create st.pager ~root_page in
+         Hashtbl.replace st.trees tid bt;
+         Lwt.return_ok bt)
+  in
   st.current_tree <- Some tid;
-  match Hashtbl.find_opt st.trees tid with
-  | Some bt -> Lwt.return_ok bt
-  | None ->
-    let key = encode_tree_id tid in
-    let* r = Btree.get st.meta key in
-    (match r with
-     | Error e -> Lwt.return_error (map_btree_err e)
-     | Ok None ->
-       let bt = Btree.create st.pager ~root_page:0L in
-       Hashtbl.replace st.trees tid bt;
-       Lwt.return_ok bt
-     | Ok (Some v) ->
-       let root_page = decode_root_page v in
-       let bt = Btree.create st.pager ~root_page in
-       Hashtbl.replace st.trees tid bt;
-       Lwt.return_ok bt)
+  Lwt.return r
 ;;
 
 (* #174: the page-header stamp for [tid] (0 when untagged). *)
@@ -529,45 +536,51 @@ let backup_floor_below (st : bt_state) ~target =
 let bt_get_tree_ro (snap : ro_snapshot) (st : bt_state) (tid : tree_id)
   : (Btree.t, error) result Lwt.t
   =
+  (* #385/#174: see bt_get_tree — meta reads stay unattributed (tree = -1);
+     [tid] is stamped only after the handle is resolved. *)
+  st.current_tree <- None;
+  let* r =
+    match Hashtbl.find_opt snap.rs_snap_trees tid with
+    | Some bt -> Lwt.return_ok bt
+    | None ->
+      let snap_frames =
+        if snap.rs_snap_frames = 0 then None else Some snap.rs_snap_frames
+      in
+      let snap_meta =
+        Btree.create
+          ?snapshot_frames:snap_frames
+          ~pin_set:snap.rs_pinned
+          st.pager
+          ~root_page:snap.rs_snap_meta_root
+      in
+      let key = encode_tree_id tid in
+      let* r = Btree.get snap_meta key in
+      (match r with
+       | Error e -> Lwt.return_error (map_btree_err e)
+       | Ok None ->
+         let bt =
+           Btree.create
+             ?snapshot_frames:snap_frames
+             ~pin_set:snap.rs_pinned
+             st.pager
+             ~root_page:0L
+         in
+         Hashtbl.replace snap.rs_snap_trees tid bt;
+         Lwt.return_ok bt
+       | Ok (Some v) ->
+         let root_page = decode_root_page v in
+         let bt =
+           Btree.create
+             ?snapshot_frames:snap_frames
+             ~pin_set:snap.rs_pinned
+             st.pager
+             ~root_page
+         in
+         Hashtbl.replace snap.rs_snap_trees tid bt;
+         Lwt.return_ok bt)
+  in
   st.current_tree <- Some tid;
-  match Hashtbl.find_opt snap.rs_snap_trees tid with
-  | Some bt -> Lwt.return_ok bt
-  | None ->
-    let snap_frames =
-      if snap.rs_snap_frames = 0 then None else Some snap.rs_snap_frames
-    in
-    let snap_meta =
-      Btree.create
-        ?snapshot_frames:snap_frames
-        ~pin_set:snap.rs_pinned
-        st.pager
-        ~root_page:snap.rs_snap_meta_root
-    in
-    let key = encode_tree_id tid in
-    let* r = Btree.get snap_meta key in
-    (match r with
-     | Error e -> Lwt.return_error (map_btree_err e)
-     | Ok None ->
-       let bt =
-         Btree.create
-           ?snapshot_frames:snap_frames
-           ~pin_set:snap.rs_pinned
-           st.pager
-           ~root_page:0L
-       in
-       Hashtbl.replace snap.rs_snap_trees tid bt;
-       Lwt.return_ok bt
-     | Ok (Some v) ->
-       let root_page = decode_root_page v in
-       let bt =
-         Btree.create
-           ?snapshot_frames:snap_frames
-           ~pin_set:snap.rs_pinned
-           st.pager
-           ~root_page
-       in
-       Hashtbl.replace snap.rs_snap_trees tid bt;
-       Lwt.return_ok bt)
+  Lwt.return r
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3269,9 +3282,11 @@ let set_commit_callback
    most-recent txn id between txns (best-effort).
    #385: also stamps the [tree] id from [st.current_tree], set at the
    [bt_get_tree]/[bt_get_tree_ro] chokepoint by the op that triggered the I/O.
-   [-1] when no tree context is active.  Exact for read/alloc/free fired while a
-   tree op is in flight; best-effort for [Page_write], which is emitted at
-   WAL-flush time and carries whichever tree was most recently active. *)
+   Meta/system pages read while resolving a tree handle are stamped [tree = -1]
+   (per #174, system pages are never tagged with a user tree); a tree's own
+   data-page [Page_read]/[Page_alloc]/[Page_free] carry the exact tree id.
+   [Page_write] is best-effort: emitted at WAL-flush time, it carries whichever
+   tree was most recently active. *)
 let translate_pager_event (st : bt_state) (pev : Pager_event.t) : Store_event.t =
   let txn_id = Pager.get_txn_id st.pager in
   let tree = Option.value st.current_tree ~default:(-1) in

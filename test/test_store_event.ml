@@ -275,51 +275,75 @@ let test_checkpoint_then_read_emits_page_read () =
        evs)
 ;;
 
-(* #385: page reads are stamped with the tree id of the op that triggered them.
-   Cold-reopen (non-WAL) so reads come from the main file, then read ONLY tree
-   16 — every captured Page_read must carry tree=16. *)
+(* #385: page reads are stamped with the tree id of the op that triggered them;
+   meta/system pages read while resolving a handle are stamped -1, NOT the user
+   tree. Two-tree partition: reading tree 16 must never surface a page read
+   stamped 32 (and vice versa); every captured read is either the data tree or
+   the -1 system sentinel. Cold-reopen (non-WAL) forces main-file reads. *)
 let test_page_read_carries_tree () =
   let path = fresh_path () in
   cleanup path;
-  let trees =
+  let collect st =
+    let seen = ref [] in
+    S.set_event_callback
+      st
+      (Some
+         (fun ev ->
+           match ev with
+           | Ev.Page_read _ ->
+             (match Ev.tree_id_of ev with
+              | Some t -> seen := t :: !seen
+              | None -> ())
+           | _ -> ()));
+    seen
+  in
+  let t16, t32 =
     Lwt.finalize
       (fun () ->
          let open Lwt.Syntax in
          let* st = S.open_file_wal ~path () in
          let st = Result.get_ok st in
          let* txn = S.rw_begin st in
-         let* () = S.put txn 16 (bs "k") (bs "v") in
+         let* () = S.put txn 16 (bs "k16") (bs "v") in
+         let* () = S.put txn 32 (bs "k32") (bs "v") in
          let* () = S.commit txn in
          let* () = S.checkpoint st in
          let* () = S.close st in
-         let seen = ref [] in
+         (* reopen cold, non-WAL: every read is a main-file lookup *)
          let* st2 = Sqlocaml_unix.Store.open_file ~path () in
          let st2 = Result.get_ok st2 in
-         S.set_event_callback
-           st2
-           (Some
-              (fun ev ->
-                match ev with
-                | Ev.Page_read _ ->
-                  (match Ev.tree_id_of ev with
-                   | Some t -> seen := t :: !seen
-                   | None -> ())
-                | _ -> ()));
+         let seen = collect st2 in
          let* txn2 = S.rw_begin st2 in
-         let* _ = S.get txn2 16 (bs "k") in
+         let* _ = S.get txn2 16 (bs "k16") in
+         let reads16 = List.rev !seen in
+         seen := [];
+         let* _ = S.get txn2 32 (bs "k32") in
+         let reads32 = List.rev !seen in
          let* () = S.commit txn2 in
          let* () = S.close st2 in
-         Lwt.return (List.rev !seen))
+         Lwt.return (reads16, reads32))
       (fun () ->
          cleanup path;
          Lwt.return_unit)
     |> run
   in
-  Alcotest.(check bool) "at least one page read" true (trees <> []);
+  (* each read is either the data tree or the -1 system sentinel *)
   Alcotest.(check bool)
-    "every page read tagged tree 16"
+    "reads of tree 16 are 16 or -1 (no 32)"
     true
-    (List.for_all (fun t -> t = 16) trees)
+    (List.for_all (fun t -> t = 16 || t = -1) t16);
+  Alcotest.(check bool)
+    "reads of tree 32 are 32 or -1 (no 16)"
+    true
+    (List.for_all (fun t -> t = 32 || t = -1) t32);
+  (* and the data tree really was attributed at least once *)
+  Alcotest.(check bool) "tree 16 data read seen" true (List.mem 16 t16);
+  Alcotest.(check bool) "tree 32 data read seen" true (List.mem 32 t32);
+  (* the cold tree-16 lookup must read the meta-tree to resolve the root page;
+     those system pages must be stamped -1, NOT the user tree.  Under the bug
+     (meta read happens while current_tree = Some 16) this read is mis-stamped
+     16, so no -1 appears and this assertion fails. *)
+  Alcotest.(check bool) "tree 16 meta read stamped -1 (system)" true (List.mem (-1) t16)
 ;;
 
 (* Defensive: a raising callback must not break the commit. *)
