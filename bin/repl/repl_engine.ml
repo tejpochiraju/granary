@@ -27,103 +27,92 @@ let is_query_stmt sql =
 ;;
 
 (* Lexical state of the statement splitter.  A [;] only terminates a statement
-   in [Code]; inside string literals or comments it is ordinary text.  Doubled
-   string quotes (['']/[""]) are handled naturally: the closing quote returns us
-   to [Code] and the immediately following quote re-enters the string, so the
-   in-string parity at any [;] is correct without a dedicated escape state
-   (#389). *)
+   in [Code]; inside string literals, quoted identifiers or comments it is
+   ordinary text (#389).  [In_sq]/[In_dq]/[In_backtick] all open and close with
+   the same character, so a doubled quote (['']/[""]/[``]) is handled by parity
+   alone: the closing quote returns us to [Code] and the immediately following
+   quote re-enters, and no [;] can sit between two adjacent quote characters, so
+   the in-string state at any [;] is correct without a dedicated escape state.
+   [In_bracket] is asymmetric ([ opens, ] closes), so its []]] escape can NOT be
+   recovered by re-entry and is handled explicitly. *)
 type scan_state =
   | Code
   | In_sq (* inside a '...' string literal *)
   | In_dq (* inside a "..." quoted identifier *)
+  | In_backtick (* inside a `...` quoted identifier *)
+  | In_bracket (* inside a [...] quoted identifier *)
   | Line_comment (* after -- , until end of line *)
   | Block_comment (* inside /* ... */ *)
 
-let has_terminator buf =
-  let s = Buffer.contents buf in
+(* The single lexer both splitters share, so their state machines can never
+   drift (PR #394 review).  Walks [s] left to right threading [acc]: [on_char]
+   sees every character that belongs to the current statement (comment and
+   quote text included; the two-character [--]/[/*]/[*/] delimiters arrive as
+   two calls); [on_terminator] sees each [;] that ends a statement and is the
+   only place a [;] is consumed rather than emitted. *)
+let lex s ~init ~on_char ~on_terminator =
   let n = String.length s in
   let peek i = if i + 1 < n then s.[i + 1] else '\000' in
-  let rec scan i state =
+  let add2 acc a b = on_char (on_char acc a) b in
+  let rec code i acc c =
+    match c, peek i with
+    | '\'', _ -> go (i + 1) (on_char acc c) In_sq
+    | '"', _ -> go (i + 1) (on_char acc c) In_dq
+    | '`', _ -> go (i + 1) (on_char acc c) In_backtick
+    | '[', _ -> go (i + 1) (on_char acc c) In_bracket
+    | '-', '-' -> go (i + 2) (add2 acc '-' '-') Line_comment
+    | '/', '*' -> go (i + 2) (add2 acc '/' '*') Block_comment
+    | ';', _ -> go (i + 1) (on_terminator acc) Code
+    | _ -> go (i + 1) (on_char acc c) Code
+  and go i acc state =
     if i >= n
-    then false
+    then acc
     else (
       let c = s.[i] in
       match state with
-      | Code ->
-        (match c, peek i with
-         | '\'', _ -> scan (i + 1) In_sq
-         | '"', _ -> scan (i + 1) In_dq
-         | '-', '-' -> scan (i + 2) Line_comment
-         | '/', '*' -> scan (i + 2) Block_comment
-         | ';', _ -> true
-         | _ -> scan (i + 1) Code)
-      | In_sq -> scan (i + 1) (if c = '\'' then Code else In_sq)
-      | In_dq -> scan (i + 1) (if c = '"' then Code else In_dq)
-      | Line_comment -> scan (i + 1) (if c = '\n' then Code else Line_comment)
+      | Code -> code i acc c
+      | In_sq -> go (i + 1) (on_char acc c) (if c = '\'' then Code else In_sq)
+      | In_dq -> go (i + 1) (on_char acc c) (if c = '"' then Code else In_dq)
+      | In_backtick -> go (i + 1) (on_char acc c) (if c = '`' then Code else In_backtick)
+      | In_bracket ->
+        if c = ']' && peek i = ']'
+        then go (i + 2) (add2 acc ']' ']') In_bracket
+        else go (i + 1) (on_char acc c) (if c = ']' then Code else In_bracket)
+      | Line_comment ->
+        go (i + 1) (on_char acc c) (if c = '\n' then Code else Line_comment)
       | Block_comment ->
-        if c = '*' && peek i = '/' then scan (i + 2) Code else scan (i + 1) Block_comment)
+        if c = '*' && peek i = '/'
+        then go (i + 2) (add2 acc '*' '/') Code
+        else go (i + 1) (on_char acc c) Block_comment)
   in
-  scan 0 Code
+  go 0 init Code
+;;
+
+let has_terminator buf =
+  lex
+    (Buffer.contents buf)
+    ~init:false
+    ~on_char:(fun acc _ -> acc)
+    ~on_terminator:(fun _ -> true)
 ;;
 
 let split_stmts text =
-  let n = String.length text in
   let cur = Buffer.create 64 in
-  let add c = Buffer.add_char cur c in
-  let peek i = if i + 1 < n then text.[i + 1] else '\000' in
   let flush acc =
     let s = String.trim (Buffer.contents cur) in
     Buffer.clear cur;
     if s = "" then acc else s :: acc
   in
-  let code i acc c scan =
-    match c, peek i with
-    | '\'', _ ->
-      add c;
-      scan (i + 1) acc In_sq
-    | '"', _ ->
-      add c;
-      scan (i + 1) acc In_dq
-    | '-', '-' ->
-      add '-';
-      add '-';
-      scan (i + 2) acc Line_comment
-    | '/', '*' ->
-      add '/';
-      add '*';
-      scan (i + 2) acc Block_comment
-    | ';', _ -> scan (i + 1) (flush acc) Code
-    | _ ->
-      add c;
-      scan (i + 1) acc Code
+  let acc =
+    lex
+      text
+      ~init:[]
+      ~on_char:(fun acc c ->
+        Buffer.add_char cur c;
+        acc)
+      ~on_terminator:flush
   in
-  let rec scan i acc state =
-    if i >= n
-    then List.rev (flush acc)
-    else (
-      let c = text.[i] in
-      match state with
-      | Code -> code i acc c scan
-      | In_sq ->
-        add c;
-        scan (i + 1) acc (if c = '\'' then Code else In_sq)
-      | In_dq ->
-        add c;
-        scan (i + 1) acc (if c = '"' then Code else In_dq)
-      | Line_comment ->
-        add c;
-        scan (i + 1) acc (if c = '\n' then Code else Line_comment)
-      | Block_comment ->
-        if c = '*' && peek i = '/'
-        then (
-          add '*';
-          add '/';
-          scan (i + 2) acc Code)
-        else (
-          add c;
-          scan (i + 1) acc Block_comment))
-  in
-  scan 0 [] Code
+  List.rev (flush acc)
 ;;
 
 let open_db ~path =
