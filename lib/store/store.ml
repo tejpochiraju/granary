@@ -1921,6 +1921,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
      data from disk. The freelist snapshot ensures no aborted CoW frees
      corrupt future allocations. *)
 let rollback (Rw t : rw txn) : unit Lwt.t =
+  let to_emit = ref None in
   (match t.backend with
    | Mem _ ->
      (* #178: just discard the shadow — the live tree was never touched. *)
@@ -1943,9 +1944,16 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
       | None -> ());
      st.bt_savepoints <- [];
      (* #382: rollback does not change [st.current_header.txn_id], so
-        [active_txn_id] still reads the id this aborted txn would have used. *)
-     emit_event st (Store_event.Txn_rollback { txn_id = active_txn_id st }));
+        [active_txn_id] still reads the id this aborted txn would have used.
+        We capture the event here (where [st] is in scope) but emit it after
+        the write lock is released, for parity with [commit] — a future
+        observer doing real work must not stall writers while we hold the
+        global write lock. *)
+     to_emit := Some (st, Store_event.Txn_rollback { txn_id = active_txn_id st }));
   Rwlock.release_write t.lock;
+  (match !to_emit with
+   | Some (st, ev) -> emit_event st ev
+   | None -> ());
   Lwt.return_unit
 ;;
 
