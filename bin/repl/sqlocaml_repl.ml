@@ -13,7 +13,7 @@
 
     Dot commands are preserved from the original blocking REPL: [.help],
     [.quit] / [.exit], [.tables], [.schema [name]], [.open <path>],
-    [.databases].  They now write their output to the shell views instead of
+    [.databases], [.dump [path]].  They now write their output to the shell views instead of
     printing to stdout. *)
 
 open Lwt.Syntax
@@ -92,6 +92,8 @@ let dot_help () =
     ; ".tables                     list tables in the active schema"
     ; ".schema [name]              show CREATE statements (optionally for one table)"
     ; ".open <path>                close current db and open the given path"
+    ; ".dump [path]                write the visible event log to a file (default \
+       sqlocaml-events.log)"
     ; ".databases                  list attached databases"
     ; "Tab switches panes; Esc quits."
     ]
