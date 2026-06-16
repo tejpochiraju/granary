@@ -31,8 +31,12 @@ event-log export (#385); explicit per-COW events threaded into the btree.
    `Wal_append` as the authoritative batch event. The two now agree.
 4. **`Page_write` emits once per dirty page** even in the WAL-batch flush path
    (not one event per batch).
-5. **`txn_id` = best-effort, `0L` sentinel** when no transaction is active
-   (e.g. RO cache-miss reads, autocheckpoint writes). Documented in the `.mli`.
+5. **`txn_id` = best-effort, from `Pager.get_txn_id`.** Write-path events
+   (alloc / write / free) always fire inside an active RW txn, so they carry the
+   exact txn id. `Page_read` can fire outside a write txn; there `get_txn_id`
+   returns `0L` before the first txn and the most-recent txn id between txns.
+   This best-effort semantics is documented where the translator lives; the
+   monitor already tolerates reads without a meaningful txn.
 
 ## Architecture & layering
 
@@ -133,7 +137,8 @@ pager hook:
 ```
 
 `translate_pager_event st : Pager_event.t -> Store_event.t` maps each variant
-and stamps `txn_id` best-effort from the active txn (`0L` when none).
+and stamps `txn_id` from `Pager.get_txn_id st.pager` (see decision 5 for its
+best-effort semantics on reads outside a txn).
 
 ## #386 — real frame count
 
