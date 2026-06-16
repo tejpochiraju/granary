@@ -164,6 +164,15 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
+(** #387: the projected output column names for a row-returning [sql], without
+    executing it.  Parses and binds [sql] against the current schema and returns
+    a best-effort name per result column: a SELECT alias or bare column name
+    where known, [*] expanded to the source table's columns, and a positional
+    [col_N] placeholder for anonymous expressions.  Intended for header display
+    (e.g. the REPL); the list length matches the row width [query] produces for
+    the same statement. *)
+val query_columns : t -> string -> (string list, error) result Lwt.t
+
 (** #264: stream a logical SQL dump (a {{:https://sqlite.org/cli.html#dump}.dump}-style
     export) of the database to [sink], one chunk at a time.
 

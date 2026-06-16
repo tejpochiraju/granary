@@ -65,8 +65,12 @@ let run_sql sql =
           Shell_view.set_status shell (Format.asprintf "Error: %a" Db.pp_error e);
           Lwt.return_unit
         | Ok stream ->
+          (* #387: column headers come from a separate, side-effect-free
+             resolve; if it fails for any reason we still show the rows. *)
+          let* c = Db.query_columns db s in
+          let headers = Result.value c ~default:[] in
           let* rows = Lwt_stream.to_list stream in
-          Shell_view.set_result shell ~headers:[] ~rows;
+          Shell_view.set_result shell ~headers ~rows;
           Shell_view.set_status shell (Printf.sprintf "%d row(s)" (List.length rows));
           Lwt.return_unit)
       else
