@@ -9,7 +9,15 @@ let test_label_and_txn_id () =
   Alcotest.(check (option int64))
     "wal_reset has no txn"
     None
-    (Ev.txn_id (Ev.Wal_reset { epoch = 2L }))
+    (Ev.txn_id (Ev.Wal_reset { epoch = 2L }));
+  Alcotest.(check string)
+    "page_read label"
+    "PAGE_READ"
+    (Ev.label (Ev.Page_read { txn_id = 5L; page = 1L }));
+  Alcotest.(check (option int64))
+    "page_read txn"
+    (Some 5L)
+    (Ev.txn_id (Ev.Page_read { txn_id = 5L; page = 1L }))
 ;;
 
 let test_pp_roundtrip_nonempty () =
@@ -32,7 +40,16 @@ let test_pp_all_constructors () =
     (Ev.Wal_append { txn_id = 8L; base_idx = 9; count = 10 });
   check "WAL_RESET epoch=11" (Ev.Wal_reset { epoch = 11L });
   check "CKPT_BEGIN target=12" (Ev.Checkpoint_begin { target_frames = 12 });
-  check "CKPT_END migrated=13" (Ev.Checkpoint_end { pages_migrated = 13 })
+  check "CKPT_END migrated=13" (Ev.Checkpoint_end { pages_migrated = 13 });
+  check "PAGE_READ txn=1 page=7" (Ev.Page_read { txn_id = 1L; page = 7L });
+  check "PAGE_WRITE txn=2 page=8" (Ev.Page_write { txn_id = 2L; page = 8L });
+  check
+    "PAGE_ALLOC txn=3 page=9 reused=true"
+    (Ev.Page_alloc { txn_id = 3L; page = 9L; reused = true });
+  check
+    "PAGE_ALLOC txn=3 page=9 reused=false"
+    (Ev.Page_alloc { txn_id = 3L; page = 9L; reused = false });
+  check "PAGE_FREE txn=4 page=10" (Ev.Page_free { txn_id = 4L; page = 10L })
 ;;
 
 module S = struct

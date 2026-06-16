@@ -30,6 +30,23 @@ type t =
   | Wal_reset of { epoch : int64 }
   | Checkpoint_begin of { target_frames : int }
   | Checkpoint_end of { pages_migrated : int }
+  | Page_read of
+      { txn_id : int64
+      ; page : int64
+      }
+  | Page_write of
+      { txn_id : int64
+      ; page : int64
+      }
+  | Page_alloc of
+      { txn_id : int64
+      ; page : int64
+      ; reused : bool
+      }
+  | Page_free of
+      { txn_id : int64
+      ; page : int64
+      }
 
 (** Short uppercase tag for display, e.g. ["COMMIT"], ["WAL_APPEND"]. *)
 val label : t -> string
