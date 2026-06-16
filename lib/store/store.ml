@@ -17,6 +17,7 @@ module Btree = Sqlocaml_storage.Btree
 module Pager = Sqlocaml_storage.Pager
 module Header = Sqlocaml_storage.Header
 module Freelist = Sqlocaml_storage.Freelist
+module Pager_event = Sqlocaml_storage.Pager_event
 module Page = Sqlocaml_storage.Page
 module Geometry = Sqlocaml_storage.Geometry
 module Crypto = Sqlocaml_storage.Crypto
@@ -3250,10 +3251,38 @@ let set_commit_callback
             Lwt.return_unit))
 ;;
 
+(* #384: map a storage-level [Pager_event.t] to a [Store_event.t], stamping the
+   txn id from the pager.  Write-path events (alloc/write/free) always fire
+   inside an active RW txn, so they carry the exact id; [Page_read] may fire
+   outside a write txn, where [get_txn_id] returns 0 before the first txn and the
+   most-recent txn id between txns (best-effort). *)
+let translate_pager_event (st : bt_state) (pev : Pager_event.t) : Store_event.t =
+  let txn_id = Pager.get_txn_id st.pager in
+  match pev with
+  | Pager_event.Page_read { page_id } -> Store_event.Page_read { txn_id; page = page_id }
+  | Pager_event.Page_write { page_id } ->
+    Store_event.Page_write { txn_id; page = page_id }
+  | Pager_event.Page_alloc { page_id; reused } ->
+    Store_event.Page_alloc { txn_id; page = page_id; reused }
+  | Pager_event.Page_free { page_id } -> Store_event.Page_free { txn_id; page = page_id }
+;;
+
 let set_event_callback (t : t) (cb : (Store_event.t -> unit) option) =
   match t.backend with
   | Mem _ -> () (* Mem backend has no bt_state; emits no events (#382). *)
-  | Btree st -> st.on_event <- cb
+  | Btree st ->
+    st.on_event <- cb;
+    (match cb with
+     | None -> Pager.set_page_event_callback st.pager None
+     | Some f ->
+       Pager.set_page_event_callback
+         st.pager
+         (Some
+            (fun pev ->
+              (* Same guarantee as [emit_event]: a faulty observer must never
+                 break a transaction. *)
+              try f (translate_pager_event st pev) with
+              | _ -> ())))
 ;;
 
 module Event = Store_event

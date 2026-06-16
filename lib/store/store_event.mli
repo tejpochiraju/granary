@@ -30,6 +30,10 @@ type t =
   | Wal_reset of { epoch : int64 }
   | Checkpoint_begin of { target_frames : int }
   | Checkpoint_end of { pages_migrated : int }
+  (* #384: page-level physical-I/O events.  [txn_id] is stamped by
+     [Store.set_event_callback] from [Pager.get_txn_id] (the underlying
+     [Pager_event.t] carries only the page id); best-effort for reads outside a
+     write txn. *)
   | Page_read of
       { txn_id : int64
       ; page : int64

@@ -151,6 +151,101 @@ let test_wal_append_and_checkpoint () =
   Alcotest.(check bool) "WAL_RESET" true (List.mem "WAL_RESET" labels)
 ;;
 
+(* Collect full events (not just labels) while [f] runs. *)
+let with_event_recorder ~f =
+  let path = fresh_path () in
+  cleanup path;
+  let seen = ref [] in
+  Lwt.finalize
+    (fun () ->
+       let open Lwt.Syntax in
+       let* st = S.open_file_wal ~path () in
+       let st = Result.get_ok st in
+       S.set_event_callback st (Some (fun ev -> seen := ev :: !seen));
+       let* () = f st in
+       let* () = S.close st in
+       Lwt.return (List.rev !seen))
+    (fun () ->
+       cleanup path;
+       Lwt.return_unit)
+  |> run
+;;
+
+let test_insert_emits_page_events () =
+  let evs =
+    with_event_recorder ~f:(fun st ->
+      let open Lwt.Syntax in
+      let* txn = S.rw_begin st in
+      let* () = S.put txn 16 (bs "k") (bs "v") in
+      S.commit txn)
+  in
+  let has p = List.exists p evs in
+  Alcotest.(check bool)
+    "has PAGE_ALLOC"
+    true
+    (has (function
+       | Ev.Page_alloc _ -> true
+       | _ -> false));
+  Alcotest.(check bool)
+    "has PAGE_WRITE"
+    true
+    (has (function
+       | Ev.Page_write _ -> true
+       | _ -> false));
+  Alcotest.(check bool)
+    "page write txn > 0"
+    true
+    (has (function
+       | Ev.Page_write { txn_id; _ } -> txn_id > 0L
+       | _ -> false))
+;;
+
+(* #384: [Page_read] fires only when a page is loaded from the main file (cache
+   miss, not served from the WAL index).  In WAL mode, a reopen re-populates the
+   WAL index via recover_index so reads go through the WAL path.  Reopening with
+   the non-WAL [open_file] forces every read through the main-file path so
+   [load_main_page] / [emit_read] reliably fires on a cache miss. *)
+let test_checkpoint_then_read_emits_page_read () =
+  let path = fresh_path () in
+  cleanup path;
+  let evs =
+    Lwt.finalize
+      (fun () ->
+         let open Lwt.Syntax in
+         (* Step 1: write + commit + checkpoint so data lands in the main file. *)
+         let* st = S.open_file_wal ~path () in
+         let st = Result.get_ok st in
+         let* txn = S.rw_begin st in
+         let* () = S.put txn 16 (bs "k") (bs "v") in
+         let* () = S.commit txn in
+         let* () = S.checkpoint st in
+         let* () = S.close st in
+         (* Step 2: reopen with the non-WAL open_file so the pager has no WAL
+            index.  Every read is a main-file lookup; cache is cold on open. *)
+         let seen = ref [] in
+         let* st2 = Sqlocaml_unix.Store.open_file ~path () in
+         let st2 = Result.get_ok st2 in
+         S.set_event_callback st2 (Some (fun ev -> seen := ev :: !seen));
+         let* txn2 = S.rw_begin st2 in
+         let* _ = S.get txn2 16 (bs "k") in
+         let* () = S.commit txn2 in
+         let* () = S.close st2 in
+         Lwt.return (List.rev !seen))
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check bool)
+    "has PAGE_READ"
+    true
+    (List.exists
+       (function
+         | Ev.Page_read _ -> true
+         | _ -> false)
+       evs)
+;;
+
 (* Defensive: a raising callback must not break the commit. *)
 let test_raising_callback_is_swallowed () =
   let path = fresh_path () in
@@ -282,6 +377,14 @@ let () =
             "wal_append count nonneg under autockpt"
             `Quick
             test_wal_append_count_nonneg_under_autockpt
+        ; Alcotest.test_case
+            "insert emits page events"
+            `Quick
+            test_insert_emits_page_events
+        ; Alcotest.test_case
+            "checkpoint then read emits page read"
+            `Quick
+            test_checkpoint_then_read_emits_page_read
         ] )
     ; "props", [ QCheck_alcotest.to_alcotest prop_commit_count ]
     ]
