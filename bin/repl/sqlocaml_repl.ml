@@ -189,11 +189,11 @@ let shell_handle (key : Ui.key) : Ui.may_handle =
     Focus.request monitor_focus;
     `Handled
   | `Enter, _ ->
-    let input = Lwd.peek input_var in
-    Lwd.set input_var "";
     if !busy
     then Shell_view.set_status shell "busy — a query is still running"
     else (
+      let input = Lwd.peek input_var in
+      Lwd.set input_var "";
       busy := true;
       Lwt.async (fun () ->
         Lwt.finalize
