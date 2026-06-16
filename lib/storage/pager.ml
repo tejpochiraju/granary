@@ -160,6 +160,16 @@ let emit_free t page_id =
   | Some f -> f (Pager_event.Page_free { page_id })
 ;;
 
+(* #384: emit one [Page_write] per dirty entry being flushed.  Guard once, then
+   iterate — no allocation when no observer is attached (same zero-alloc
+   discipline as the per-kind emit helpers). *)
+let emit_writes t entries =
+  match t.on_page_event with
+  | None -> ()
+  | Some f ->
+    List.iter (fun (pid, _) -> f (Pager_event.Page_write { page_id = pid })) entries
+;;
+
 (* #95: set the file's page geometry.  Called once by the open path before any
    page read/write, after peeking/deciding the geometry. *)
 let set_geom t geom = t.geom <- geom
@@ -504,6 +514,7 @@ let flush_via_wal t ~append =
     match r with
     | Error msg -> Lwt.return_error (Block_error msg)
     | Ok () ->
+      emit_writes t entries;
       Hashtbl.clear t.dirty;
       Lwt.return_ok ())
 ;;
@@ -536,6 +547,7 @@ let flush_no_sync t =
            cache_add t (cache_key_main pid) (cstruct_dup buf);
            write_all rest)
     in
+    emit_writes t entries;
     write_all entries
 ;;
 
@@ -562,6 +574,7 @@ let flush t =
       (match r with
        | Error msg -> Lwt.return_error (Block_error msg)
        | Ok () ->
+         emit_writes t entries;
          Hashtbl.clear t.dirty;
          Lwt.return_ok ())
   | None ->
@@ -585,6 +598,7 @@ let flush t =
            cache_add t (cache_key_main pid) (cstruct_dup buf);
            write_all rest)
     in
+    emit_writes t entries;
     write_all entries
 ;;
 
@@ -645,6 +659,7 @@ let flush_one_to_main t ~page_id ~buf =
   let* r = t.write_page ~page_id buf in
   match r with
   | Ok () ->
+    emit_writes t [ page_id, buf ];
     cache_add t (cache_key_main page_id) (cstruct_dup buf);
     Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)

@@ -102,6 +102,12 @@ let test_borrow_miss_emits_read () =
   | _ -> Alcotest.fail "expected exactly one Page_read"
 ;;
 
+let fill_page byte =
+  let buf = Cstruct.create Page.page_size in
+  Cstruct.memset buf byte;
+  buf
+;;
+
 let allocs seen =
   List.filter_map
     (function
@@ -116,6 +122,72 @@ let frees seen =
       | Pager_event.Page_free { page_id } -> Some page_id
       | _ -> None)
     (events seen)
+;;
+
+let writes seen =
+  List.filter_map
+    (function
+      | Pager_event.Page_write { page_id } -> Some page_id
+      | _ -> None)
+    (events seen)
+;;
+
+(* Non-WAL pager: [flush] writes each dirty page to main. *)
+let test_flush_emits_one_write_per_dirty () =
+  let p, _ = make_pager ~n_pages:4L () in
+  Pager.write p 0L (fill_page 1);
+  Pager.write p 1L (fill_page 2);
+  Pager.write p 2L (fill_page 3);
+  let seen = recorder p in
+  let _ = run (Pager.flush p) |> Result.get_ok in
+  let ws = List.sort compare (writes seen) in
+  Alcotest.(check (list int64)) "one Page_write per dirty page" [ 0L; 1L; 2L ] ws
+;;
+
+let test_flush_one_to_main_emits_write () =
+  let p, _ = make_pager ~n_pages:4L () in
+  let seen = recorder p in
+  let _ =
+    run (Pager.flush_one_to_main p ~page_id:1L ~buf:(fill_page 9)) |> Result.get_ok
+  in
+  Alcotest.(check (list int64)) "single write" [ 1L ] (writes seen)
+;;
+
+let test_flush_empty_no_writes () =
+  let p, _ = make_pager ~n_pages:4L () in
+  let seen = recorder p in
+  let _ = run (Pager.flush p) |> Result.get_ok in
+  Alcotest.(check (list int64)) "no dirty pages -> no writes" [] (writes seen)
+;;
+
+(* QCheck: every reused page-id was previously freed in the same session. *)
+let prop_reuse_was_freed =
+  QCheck.Test.make
+    ~count:100
+    ~name:"alloc reused=true page was previously freed"
+    QCheck.(int_range 1 30)
+    (fun n ->
+       let p, _ = make_pager ~n_pages:0L () in
+       (* force the main freelist, not the txn-owned pool *)
+       Pager.set_n_pages_at_rw_begin p 1_000_000L;
+       let freed = Hashtbl.create 16 in
+       let alloc1 () = run (Pager.alloc p) |> Result.get_ok in
+       let pids = List.init n (fun _ -> alloc1 ()) in
+       List.iter
+         (fun pid ->
+            Hashtbl.replace freed pid ();
+            Pager.free p ~page_id:pid ~freed_at_txn_id:1L)
+         pids;
+       Pager.set_alloc_min_safe p 1_000_000L;
+       let seen = ref [] in
+       Pager.set_page_event_callback p (Some (fun ev -> seen := ev :: !seen));
+       let _ = List.init n (fun _ -> alloc1 ()) in
+       List.for_all
+         (function
+           | Pager_event.Page_alloc { page_id; reused = true } ->
+             Hashtbl.mem freed page_id
+           | _ -> true)
+         !seen)
 ;;
 
 let test_alloc_extend_not_reused () =
@@ -214,5 +286,17 @@ let () =
             test_free_below_threshold_emits_free
         ; Alcotest.test_case "free txn-owned" `Quick test_free_txn_owned_emits_free
         ] )
+    ; ( "write"
+      , [ Alcotest.test_case
+            "flush one write per dirty"
+            `Quick
+            test_flush_emits_one_write_per_dirty
+        ; Alcotest.test_case
+            "flush_one_to_main emits write"
+            `Quick
+            test_flush_one_to_main_emits_write
+        ; Alcotest.test_case "flush empty no writes" `Quick test_flush_empty_no_writes
+        ] )
+    ; "props", [ QCheck_alcotest.to_alcotest prop_reuse_was_freed ]
     ]
 ;;
