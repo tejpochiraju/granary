@@ -170,6 +170,14 @@ let emit_writes t entries =
     List.iter (fun (pid, _) -> f (Pager_event.Page_write { page_id = pid })) entries
 ;;
 
+(* #384: emit a single [Page_write] iff an observer is attached (zero-alloc on
+   the [None] path, like the other per-kind emit helpers). *)
+let emit_write t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Page_write { page_id })
+;;
+
 (* #95: set the file's page geometry.  Called once by the open path before any
    page read/write, after peeking/deciding the geometry. *)
 let set_geom t geom = t.geom <- geom
@@ -545,9 +553,9 @@ let flush_no_sync t =
               [write] no longer injects into the shared cache (#149), so we must
               update here after the block write is committed. *)
            cache_add t (cache_key_main pid) (cstruct_dup buf);
+           emit_write t pid;
            write_all rest)
     in
-    emit_writes t entries;
     write_all entries
 ;;
 
@@ -596,9 +604,9 @@ let flush t =
               [write] no longer injects into the shared cache (#149), so we must
               update here after the block write is committed. *)
            cache_add t (cache_key_main pid) (cstruct_dup buf);
+           emit_write t pid;
            write_all rest)
     in
-    emit_writes t entries;
     write_all entries
 ;;
 
@@ -659,7 +667,7 @@ let flush_one_to_main t ~page_id ~buf =
   let* r = t.write_page ~page_id buf in
   match r with
   | Ok () ->
-    emit_writes t [ page_id, buf ];
+    emit_write t page_id;
     cache_add t (cache_key_main page_id) (cstruct_dup buf);
     Lwt.return_ok ()
   | Error s -> Lwt.return_error (Block_error s)

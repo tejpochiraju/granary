@@ -160,6 +160,16 @@ let test_flush_empty_no_writes () =
   Alcotest.(check (list int64)) "no dirty pages -> no writes" [] (writes seen)
 ;;
 
+let test_flush_no_sync_emits_writes () =
+  let p, _ = make_pager ~n_pages:4L () in
+  Pager.write p 0L (fill_page 1);
+  Pager.write p 1L (fill_page 2);
+  let seen = recorder p in
+  let _ = run (Pager.flush_no_sync p) |> Result.get_ok in
+  let ws = List.sort compare (writes seen) in
+  Alcotest.(check (list int64)) "flush_no_sync emits per dirty page" [ 0L; 1L ] ws
+;;
+
 (* QCheck: every reused page-id was previously freed in the same session. *)
 let prop_reuse_was_freed =
   QCheck.Test.make
@@ -296,6 +306,10 @@ let () =
             `Quick
             test_flush_one_to_main_emits_write
         ; Alcotest.test_case "flush empty no writes" `Quick test_flush_empty_no_writes
+        ; Alcotest.test_case
+            "flush_no_sync emits writes"
+            `Quick
+            test_flush_no_sync_emits_writes
         ] )
     ; "props", [ QCheck_alcotest.to_alcotest prop_reuse_was_freed ]
     ]
