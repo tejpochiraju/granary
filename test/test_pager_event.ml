@@ -131,6 +131,7 @@ let test_alloc_extend_not_reused () =
 let test_alloc_from_freelist_reused () =
   let fl = Freelist.add Freelist.empty ~page_id:1l ~freed_at_txn_id:1L in
   let p, _ = make_pager ~n_pages:8L ~freelist:fl () in
+  (* min_safe must exceed freed_at_txn_id (1L) so the page is poppable *)
   Pager.set_alloc_min_safe p 5L;
   let seen = recorder p in
   let pid = run (Pager.alloc p) |> Result.get_ok in
@@ -171,12 +172,26 @@ let test_free_txn_owned_emits_free () =
   Alcotest.(check (list int64)) "Page_free for txn-owned push" [ 6L ] (frees seen)
 ;;
 
+let test_alloc_free_none_no_events () =
+  let p, _ = make_pager ~n_pages:8L () in
+  let seen = ref [] in
+  Pager.set_page_event_callback p (Some (fun ev -> seen := ev :: !seen));
+  Pager.set_page_event_callback p None;
+  let _ = run (Pager.alloc p) |> Result.get_ok in
+  Pager.free p ~page_id:2L ~freed_at_txn_id:1L;
+  Alcotest.(check int) "no events when callback is None" 0 (List.length !seen)
+;;
+
 let () =
   Alcotest.run
     "pager_event"
     [ ( "plumbing"
       , [ Alcotest.test_case "no ops no events" `Quick test_no_ops_no_events
         ; Alcotest.test_case "set None clears" `Quick test_set_none_clears
+        ; Alcotest.test_case
+            "alloc/free None no events"
+            `Quick
+            test_alloc_free_none_no_events
         ] )
     ; ( "read"
       , [ Alcotest.test_case "cache miss emits read" `Quick test_cache_miss_emits_read

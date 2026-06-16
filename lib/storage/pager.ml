@@ -153,6 +153,7 @@ let emit_alloc t page_id reused =
   | Some f -> f (Pager_event.Page_alloc { page_id; reused })
 ;;
 
+(* #384: same zero-alloc guard as emit_alloc. *)
 let emit_free t page_id =
   match t.on_page_event with
   | None -> ()
