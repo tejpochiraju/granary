@@ -96,6 +96,8 @@ let dot_help () =
     ; ".tables                     list tables in the active schema"
     ; ".schema [name]              show CREATE statements (optionally for one table)"
     ; ".open <path>                close current db and open the given path"
+    ; ".import <path>              import a SQLite file (needs sqlite3 in PATH; \
+       read-only on the source)"
     ; ".dump [path]                write the visible event log to a file (default \
        sqlocaml-events.log)"
     ; ".databases                  list attached databases"
@@ -127,6 +129,61 @@ let dot_open path =
     Lwt.return_unit
 ;;
 
+(* #91: read a SQLite file's contents as a SQL script via [sqlite3 <path>
+   .dump].  Read-only on the source — [.dump] never writes the file.  Returns
+   the dump text, or a message if sqlite3 is missing or the file is unreadable. *)
+let sqlite3_dump path =
+  Lwt.catch
+    (fun () ->
+       let pr = Lwt_process.open_process_in ("", [| "sqlite3"; path; ".dump" |]) in
+       let* out = Lwt_io.read pr#stdout in
+       let* status = pr#close in
+       match status with
+       | Unix.WEXITED 0 -> Lwt.return (Ok out)
+       | Unix.WEXITED 127 -> Lwt.return (Error "sqlite3 not found in PATH")
+       | Unix.WEXITED n ->
+         Lwt.return
+           (Error (Printf.sprintf "sqlite3 exited %d (not a valid SQLite file?)" n))
+       | Unix.WSIGNALED n | Unix.WSTOPPED n ->
+         Lwt.return (Error (Printf.sprintf "sqlite3 killed by signal %d" n)))
+    (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+;;
+
+let dot_import path =
+  match !db_ref with
+  | None ->
+    Shell_view.set_status shell "Error: no database open";
+    Lwt.return_unit
+  | Some db ->
+    let* dump = sqlite3_dump path in
+    (match dump with
+     | Error msg ->
+       Shell_view.set_status shell (Printf.sprintf "import failed: %s" msg);
+       Lwt.return_unit
+     | Ok dump ->
+       let* applied, failures = Repl_engine.import_sqlite_dump db dump in
+       let msg =
+         match failures with
+         | [] -> Printf.sprintf "imported %d statement(s) from %s" applied path
+         | (stmt, err) :: _ ->
+           let preview =
+             let one_line = String.map (fun c -> if c = '\n' then ' ' else c) stmt in
+             if String.length one_line > 40
+             then String.sub one_line 0 40 ^ "…"
+             else one_line
+           in
+           Printf.sprintf
+             "imported %d statement(s); %d failed (first: %s — %s)"
+             applied
+             (List.length failures)
+             preview
+             err
+       in
+       Shell_view.set_result shell ~headers:[] ~rows:[];
+       Shell_view.set_status shell msg;
+       Lwt.return_unit)
+;;
+
 let dispatch_dot (d : Repl_command.dot) =
   match d with
   | Help ->
@@ -139,6 +196,7 @@ let dispatch_dot (d : Repl_command.dot) =
   | Schema o -> run_sql (Repl_command.schema_sql o)
   | Databases -> run_sql Repl_command.databases_sql
   | Open path -> dot_open path
+  | Import path -> dot_import path
   | Dump path_opt ->
     let path = Option.value path_opt ~default:"sqlocaml-events.log" in
     (match Event_log.dump log path with

@@ -22,6 +22,19 @@ val has_terminator : Buffer.t -> bool
     [/* … */] block comments are kept verbatim and never split (#389). *)
 val split_stmts : string -> string list
 
+(** [sqlite_dump_stmts dump] is the list of statements to replay from a SQLite
+    [.dump] script: transaction control ([BEGIN]/[COMMIT]/[END]), [PRAGMA]s and
+    internal [sqlite_sequence] maintenance are dropped, the rest kept verbatim
+    (#91). *)
+val sqlite_dump_stmts : string -> string list
+
+(** [import_sqlite_dump db dump] replays the statements of a SQLite [.dump]
+    script into [db], best-effort and in autocommit so a single failing
+    statement does not abort the rest.  Returns the number of statements
+    applied and the list of [(statement, error message)] pairs that failed
+    (#91). *)
+val import_sqlite_dump : Db.t -> string -> (int * (string * string) list) Lwt.t
+
 (** Open a db at [path] ([":memory:"] for in-memory). *)
 val open_db : path:string -> (Db.t, Db.error) result Lwt.t
 

@@ -17,6 +17,7 @@
   sqlocaml.unix
   lwt
   lwt.unix
+  unix
   lwd
   nottui
   nottui-lwt)

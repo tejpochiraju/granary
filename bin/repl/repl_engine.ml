@@ -115,6 +115,69 @@ let split_stmts text =
   List.rev (flush acc)
 ;;
 
+(* #91: import a SQLite [.dump] script. *)
+
+(* Uppercased leading keyword of [s] (up to the first whitespace). *)
+let first_word_upper s =
+  let s = String.trim s in
+  let len = String.length s in
+  let stop c = c = ' ' || c = '\n' || c = '\t' in
+  let rec end_of_word i = if i >= len || stop s.[i] then i else end_of_word (i + 1) in
+  String.uppercase_ascii (String.sub s 0 (end_of_word 0))
+;;
+
+(* True iff [sub] occurs in [s] (naive search; statements are short). *)
+let contains_sub s sub =
+  let n = String.length s
+  and m = String.length sub in
+  let rec at i = (i + m <= n && String.sub s i m = sub) || (i + m < n && at (i + 1)) in
+  m = 0 || at 0
+;;
+
+(* A SQLite [.dump] wraps its DDL/INSERTs in [PRAGMA foreign_keys=OFF;],
+   [BEGIN TRANSACTION;] / [COMMIT;] and — for AUTOINCREMENT tables —
+   maintenance of the internal [sqlite_sequence] table.  Our engine owns
+   transaction control, pragmas and the [sqlite_sequence] view (#312/#314), so
+   those statements are dropped; everything else is replayed verbatim. *)
+let skip_dump_stmt s =
+  match first_word_upper s with
+  | "PRAGMA" | "BEGIN" | "COMMIT" | "END" -> true
+  | ("DELETE" | "INSERT") as _kw ->
+    contains_sub (String.uppercase_ascii s) "SQLITE_SEQUENCE"
+  | _ -> false
+;;
+
+let sqlite_dump_stmts text =
+  split_stmts text |> List.filter (fun s -> not (skip_dump_stmt s))
+;;
+
+(* Run one statement, converting both [Db] errors and any raised exception into
+   a human-readable message so a single bad statement cannot abort the import. *)
+let run_stmt db stmt =
+  Lwt.catch
+    (fun () ->
+       let+ r = Db.execute db stmt in
+       match r with
+       | Ok () -> Ok ()
+       | Error e -> Error (Format.asprintf "%a" Db.pp_error e))
+    (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+;;
+
+let import_sqlite_dump db dump =
+  let stmts = sqlite_dump_stmts dump in
+  let+ applied, failures =
+    Lwt_list.fold_left_s
+      (fun (applied, failures) stmt ->
+         let+ r = run_stmt db stmt in
+         match r with
+         | Ok () -> applied + 1, failures
+         | Error msg -> applied, (stmt, msg) :: failures)
+      (0, [])
+      stmts
+  in
+  applied, List.rev failures
+;;
+
 let open_db ~path =
   if path = ":memory:"
   then

@@ -1,6 +1,7 @@
 module E = Repl_engine
 module L = Event_log
 module Ev = Sqlocaml.Db.Event
+module Db = Sqlocaml.Db
 
 let mk_commit id = Ev.Txn_commit { txn_id = id; frames = 0 }
 
@@ -310,6 +311,10 @@ let test_parse_dot () =
     true
     (C.parse_dot ".dump /t/x.log" = C.Dump (Some "/t/x.log"));
   Alcotest.(check bool)
+    "import"
+    true
+    (C.parse_dot ".import /a/b.sqlite" = C.Import "/a/b.sqlite");
+  Alcotest.(check bool)
     "unknown"
     true
     (match C.parse_dot ".bogus" with
@@ -346,6 +351,76 @@ let test_schema_sql_escapes () =
     "escapes quote"
     "SELECT sql FROM sqlite_master WHERE name = 'a''b' AND sql IS NOT NULL"
     (C.schema_sql (Some "a'b"))
+;;
+
+(* ── #91: SQLite .dump import ─────────────────────────────────────── *)
+
+let test_sqlite_dump_stmts () =
+  let dump =
+    "PRAGMA foreign_keys=OFF;\n\
+     BEGIN TRANSACTION;\n\
+     CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);\n\
+     INSERT INTO t VALUES(1,'a');\n\
+     DELETE FROM sqlite_sequence;\n\
+     INSERT INTO sqlite_sequence VALUES('t',1);\n\
+     COMMIT;\n"
+  in
+  Alcotest.(check (list string))
+    "wrapper + sqlite_sequence stripped, data kept"
+    [ "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"; "INSERT INTO t VALUES(1,'a')" ]
+    (E.sqlite_dump_stmts dump)
+;;
+
+let ( let* ) = Lwt.bind
+
+let test_import_sqlite_dump_ok () =
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let dump =
+       "PRAGMA foreign_keys=OFF;\n\
+        BEGIN TRANSACTION;\n\
+        CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);\n\
+        INSERT INTO users VALUES(1,'alice');\n\
+        INSERT INTO users VALUES(2,'bob');\n\
+        COMMIT;\n"
+     in
+     let* applied, failures = E.import_sqlite_dump db dump in
+     Alcotest.(check int) "3 statements applied" 3 applied;
+     Alcotest.(check int) "no failures" 0 (List.length failures);
+     let* r = Db.query db "SELECT name FROM users ORDER BY id" in
+     match r with
+     | Error e -> Alcotest.failf "query failed: %a" Db.pp_error e
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       let names = List.map (fun row -> E.value_to_string row.(0)) rows in
+       Alcotest.(check (list string)) "rows imported" [ "alice"; "bob" ] names;
+       Db.close db)
+;;
+
+let test_import_sqlite_dump_best_effort () =
+  (* A typeless-column table (unsupported by strict typing) fails its own
+     statements but does not abort import of the rest. *)
+  Lwt_main.run
+    (let* db = Db.open_in_memory () in
+     let dump =
+       "CREATE TABLE p(a,b);\n\
+        INSERT INTO p VALUES(1,2);\n\
+        CREATE TABLE q(x INT);\n\
+        INSERT INTO q VALUES(9);\n"
+     in
+     let* applied, failures = E.import_sqlite_dump db dump in
+     Alcotest.(check int) "q create+insert applied" 2 applied;
+     Alcotest.(check int) "p create+insert failed" 2 (List.length failures);
+     let* r = Db.query db "SELECT x FROM q" in
+     match r with
+     | Error e -> Alcotest.failf "query failed: %a" Db.pp_error e
+     | Ok stream ->
+       let* rows = Lwt_stream.to_list stream in
+       Alcotest.(check (list string))
+         "q imported"
+         [ "9" ]
+         (List.map (fun row -> E.value_to_string row.(0)) rows);
+       Db.close db)
 ;;
 
 let () =
@@ -417,6 +492,14 @@ let () =
       , [ Alcotest.test_case "parse_dot" `Quick test_parse_dot
         ; Alcotest.test_case "classify" `Quick test_classify
         ; Alcotest.test_case "schema_sql escapes" `Quick test_schema_sql_escapes
+        ] )
+    ; ( "sqlite_import"
+      , [ Alcotest.test_case "dump_stmts filter" `Quick test_sqlite_dump_stmts
+        ; Alcotest.test_case "import ok" `Quick test_import_sqlite_dump_ok
+        ; Alcotest.test_case
+            "import best-effort"
+            `Quick
+            test_import_sqlite_dump_best_effort
         ] )
     ]
 ;;

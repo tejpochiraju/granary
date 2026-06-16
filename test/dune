@@ -238,6 +238,14 @@
  (modules test_sqlite_compare)
  (libraries sqlocaml alcotest lwt.unix unix))
 
+(executable
+ ; #91 SQLite .dump import integration: shells out to the sqlite3 CLI, so it is
+ ; an (executable) (default @runtest skips it) and gated on sqlite3 in PATH.
+ (name test_sqlite_import_91)
+ (optional)
+ (modules test_sqlite_import_91)
+ (libraries sqlocaml repl_lib alcotest lwt.unix unix))
+
 (test
  (name test_store_btree)
  (modules test_store_btree)
