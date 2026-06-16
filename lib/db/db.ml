@@ -236,6 +236,10 @@ let create_worker_handle t =
 
 let wal_sync_count t = S.wal_sync_count t.store
 
+module Event = S.Event
+
+let set_event_callback t cb = S.set_event_callback t.store cb
+
 (* ------------------------------------------------------------------ *)
 (* VACUUM (#120)                                                       *)
 (* ------------------------------------------------------------------ *)

@@ -40,7 +40,8 @@
   test_ddl_txn_269
   test_unique_build_288
   test_schema_cache_283
-  test_store_event)
+  test_store_event
+  test_db_event_385)
  (modules
   test_dummy
   test_mem
@@ -82,7 +83,8 @@
   test_ddl_txn_269
   test_unique_build_288
   test_schema_cache_283
-  test_store_event)
+  test_store_event
+  test_db_event_385)
  (libraries
   alcotest
   qcheck-core
