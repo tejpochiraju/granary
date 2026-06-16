@@ -47,25 +47,32 @@ let has_terminator buf =
 
 let split_stmts text =
   let n = String.length text in
-  let rec scan i acc cur in_sq in_dq =
+  let cur = Buffer.create 64 in
+  let flush acc =
+    let s = String.trim (Buffer.contents cur) in
+    Buffer.clear cur;
+    if s = "" then acc else s :: acc
+  in
+  let rec scan i acc in_sq in_dq =
     if i >= n
-    then (
-      let last = String.trim cur in
-      if last = "" then List.rev acc else List.rev (last :: acc))
+    then List.rev (flush acc)
     else (
       let c = text.[i] in
       if c = '\'' && not in_dq
-      then scan (i + 1) acc (cur ^ String.make 1 c) (not in_sq) in_dq
-      else if c = '"' && not in_sq
-      then scan (i + 1) acc (cur ^ String.make 1 c) in_sq (not in_dq)
-      else if c = ';' && (not in_sq) && not in_dq
       then (
-        let s = String.trim cur in
-        let acc' = if s = "" then acc else s :: acc in
-        scan (i + 1) acc' "" in_sq in_dq)
-      else scan (i + 1) acc (cur ^ String.make 1 c) in_sq in_dq)
+        Buffer.add_char cur c;
+        scan (i + 1) acc (not in_sq) in_dq)
+      else if c = '"' && not in_sq
+      then (
+        Buffer.add_char cur c;
+        scan (i + 1) acc in_sq (not in_dq))
+      else if c = ';' && (not in_sq) && not in_dq
+      then scan (i + 1) (flush acc) in_sq in_dq
+      else (
+        Buffer.add_char cur c;
+        scan (i + 1) acc in_sq in_dq))
   in
-  scan 0 [] "" false false
+  scan 0 [] false false
 ;;
 
 let open_db ~path =
