@@ -117,7 +117,8 @@ val wal_sync_count : t -> int
 module Event = Sqlocaml_store.Store.Event
 
 (** Register/clear the internals-monitor observer on this database's store.
-    No-op for in-memory databases.  See {!Sqlocaml_store.Store.set_event_callback}. *)
+    No-op for in-memory databases.  The callback should be cheap and
+    non-blocking (see {!Sqlocaml_store.Store.set_event_callback}). *)
 val set_event_callback : t -> (Event.t -> unit) option -> unit
 
 (** Rebuild the database file in place: copies every tree from the
