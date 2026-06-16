@@ -372,16 +372,12 @@ let test_txn_commit_frames_matches_wal_append () =
         | _ -> None)
       evs
   in
+  let append_count = Option.value ~default:(-1) append_count in
   Alcotest.(check (option int))
-    "commit frames present"
-    (Some (Option.get append_count))
+    "commit frames == wal append count"
+    (Some append_count)
     commit_frames;
-  Alcotest.(check bool)
-    "commit frames > 0 for a real write"
-    true
-    (match commit_frames with
-     | Some n -> n > 0
-     | None -> false)
+  Alcotest.(check bool) "commit frames > 0 for a real write" true (append_count > 0)
 ;;
 
 let test_writes_emit_page_free () =
@@ -390,6 +386,7 @@ let test_writes_emit_page_free () =
       let open Lwt.Syntax in
       let* txn = S.rw_begin st in
       let* () =
+        (* enough inserts to force B-tree splits + page frees (freelist/pool pushes) *)
         Lwt_list.iter_s
           (fun i -> S.put txn 16 (bs (Printf.sprintf "k%04d" i)) (bs "v"))
           (List.init 1000 Fun.id)
