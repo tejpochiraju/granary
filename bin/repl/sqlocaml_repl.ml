@@ -1,161 +1,110 @@
-(** sqlocaml interactive shell (phase 40 / #70).
+(** sqlocaml interactive TUI shell (#382).
 
-    A modest sqlite3-style REPL.  Goals:
-    - Multi-line input accumulated until a terminating semicolon (outside
-      string literals).
-    - Dot commands: [.help], [.quit] / [.exit], [.tables], [.schema [name]],
-      [.open <path>], [.databases].
-    - Per-statement error recovery: parse / sema / runtime errors print a
-      message but do not exit the loop.
-    - Column-header output for query results, separator-aligned for narrow
-      tables.
+    A single-root nottui application composing two panes:
+    - SHELL (top): an editable input line, query results, and a status line
+      (all rendered by {!Shell_view}).
+    - MONITOR (bottom): a live, bounded view of engine internals events
+      (rendered by {!Monitor_view}), with pause / filter / clear actions.
 
-    Non-goals: history, completion, syntax highlighting, line editing
-    beyond what the host terminal provides.  Users wanting readline can
-    pipe through [rlwrap]. *)
+    The two panes each own a focus handle; Tab toggles focus between them.
+    The shell handles character entry, Backspace, Enter (submit) and Escape
+    (quit).  The monitor handles space (pause), '/' (filter prompt), 'c'
+    (clear filter) and 'x' (clear log).
+
+    Dot commands are preserved from the original blocking REPL: [.help],
+    [.quit] / [.exit], [.tables], [.schema [name]], [.open <path>],
+    [.databases].  They now write their output to the shell views instead of
+    printing to stdout. *)
 
 open Lwt.Syntax
 module Db = Sqlocaml.Db
+module W = Nottui_widgets
+module Ui = Nottui.Ui
+module Focus = Nottui.Focus
+
+let log = Event_log.create ~capacity:5000
+let shell = Shell_view.create ()
+let db_ref = ref None
+let quit_t, quit_u = Lwt.wait ()
+let filter_mode = ref false
+let input_var = Shell_view.input_var shell
 
 (* ------------------------------------------------------------------ *)
-(* Output formatting                                                    *)
+(* Engine event wiring                                                  *)
 (* ------------------------------------------------------------------ *)
 
-let value_to_string = function
-  | Db.V_null -> "NULL"
-  | Db.V_int n -> Int64.to_string n
-  | Db.V_real f -> Printf.sprintf "%.17g" f
-  | Db.V_text s -> s
-  | Db.V_blob b -> Printf.sprintf "<blob:%d>" (Bytes.length b)
+let wire_callback db = Db.set_event_callback db (Some (fun ev -> Event_log.push log ev))
+
+let set_db db =
+  db_ref := Some db;
+  wire_callback db
 ;;
 
-(* Pretty-print a list of result rows in a pipe-separated table.  Each
-   column is padded to its widest entry.  Without headers (we have no
-   way to read column names back from the engine for a generic SELECT)
-   the output prints just the data rows aligned by their own widths. *)
-let print_rows rows =
-  match rows with
-  | [] -> ()
-  | first :: _ ->
-    let n_cols = Array.length first in
-    let widths = Array.make n_cols 0 in
-    List.iter
-      (fun row ->
-         Array.iteri
-           (fun i v ->
-              let len = String.length (value_to_string v) in
-              if len > widths.(i) then widths.(i) <- len)
-           row)
-      rows;
-    List.iter
-      (fun row ->
-         Array.iteri
-           (fun i v ->
-              if i > 0 then print_string " | ";
-              let s = value_to_string v in
-              let pad = widths.(i) - String.length s in
-              print_string s;
-              if pad > 0 then print_string (String.make pad ' '))
-           row;
-         print_newline ())
-      rows
-;;
+let do_quit () = if Lwt.is_sleeping quit_t then Lwt.wakeup_later quit_u ()
 
 (* ------------------------------------------------------------------ *)
-(* Statement classification                                             *)
+(* SQL execution                                                        *)
 (* ------------------------------------------------------------------ *)
 
-let is_query_stmt sql =
+let run_sql sql =
   let s = String.trim sql in
   if s = ""
-  then false
+  then Lwt.return_unit
   else (
-    let upper = String.uppercase_ascii s in
-    let stop c = c = ' ' || c = '\n' || c = '\t' in
-    let len = String.length upper in
-    let rec end_of_word i =
-      if i >= len || stop upper.[i] then i else end_of_word (i + 1)
-    in
-    let i = end_of_word 0 in
-    let first = String.sub upper 0 i in
-    match first with
-    | "SELECT" | "WITH" | "EXPLAIN" | "VALUES" | "PRAGMA" -> true
-    | _ -> false)
+    match !db_ref with
+    | None ->
+      Shell_view.set_status shell "Error: no database open";
+      Lwt.return_unit
+    | Some db ->
+      if Repl_engine.is_query_stmt s
+      then (
+        let* r = Db.query db s in
+        match r with
+        | Error e ->
+          Shell_view.set_status shell (Format.asprintf "Error: %a" Db.pp_error e);
+          Lwt.return_unit
+        | Ok stream ->
+          let* rows = Lwt_stream.to_list stream in
+          Shell_view.set_result shell ~headers:[] ~rows;
+          Shell_view.set_status shell (Printf.sprintf "%d row(s)" (List.length rows));
+          Lwt.return_unit)
+      else
+        let* r = Db.execute_change_count db s in
+        (match r with
+         | Error e ->
+           Shell_view.set_status shell (Format.asprintf "Error: %a" Db.pp_error e);
+           Lwt.return_unit
+         | Ok n ->
+           Shell_view.set_status shell (Printf.sprintf "%d row(s) affected" n);
+           Lwt.return_unit))
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Multi-line input — accumulate until terminating ';' outside strings. *)
-(* ------------------------------------------------------------------ *)
-
-(* Returns true if [buf] contains a terminating semicolon outside any
-   single-quoted string.  We scan character-by-character; double-quoted
-   identifiers behave the same as single-quoted strings for this
-   purpose. *)
-let has_terminator buf =
-  let s = Buffer.contents buf in
-  let n = String.length s in
-  let rec loop i in_squote in_dquote =
-    if i >= n
-    then false
-    else (
-      let c = s.[i] in
-      if c = '\'' && not in_dquote
-      then loop (i + 1) (not in_squote) in_dquote
-      else if c = '"' && not in_squote
-      then loop (i + 1) in_squote (not in_dquote)
-      else if c = ';' && (not in_squote) && not in_dquote
-      then true
-      else loop (i + 1) in_squote in_dquote)
-  in
-  loop 0 false false
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Database open helpers                                                *)
-(* ------------------------------------------------------------------ *)
-
-let open_db ~path =
-  if path = ":memory:"
-  then
-    let* d = Db.open_in_memory () in
-    Lwt.return (Ok d)
-  else Sqlocaml_unix.open_file ~path ()
-;;
-
-(* ------------------------------------------------------------------ *)
-(* Dot commands                                                         *)
+(* Dot commands (preserved from the original REPL, writing to views)    *)
 (* ------------------------------------------------------------------ *)
 
 let dot_help () =
-  print_endline ".help                       this list";
-  print_endline ".quit | .exit               leave the shell";
-  print_endline ".tables                     list tables in the active schema";
-  print_endline
-    ".schema [name]              show CREATE statements (optionally for one table)";
-  print_endline ".open <path>                close current db and open the given path";
-  print_endline ".databases                  list attached databases";
-  print_endline "";
-  print_endline
-    "Multi-line SQL: type until a terminating ';' on its own or trailing a line."
+  Shell_view.set_result shell ~headers:[] ~rows:[];
+  let lines =
+    [ ".help                       this list"
+    ; ".quit | .exit               leave the shell"
+    ; ".tables                     list tables in the active schema"
+    ; ".schema [name]              show CREATE statements (optionally for one table)"
+    ; ".open <path>                close current db and open the given path"
+    ; ".databases                  list attached databases"
+    ; "Tab switches panes; Esc quits."
+    ]
+  in
+  let rows = List.map (fun l -> [| Db.V_text l |]) lines in
+  Shell_view.set_result shell ~headers:[ "help" ] ~rows;
+  Shell_view.set_status shell "see commands above"
 ;;
 
-let dot_tables db =
-  match
-    Lwt_main.run
-      (Db.query db "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-  with
-  | Error e -> Format.printf "Error: %a\n%!" Db.pp_error e
-  | Ok stream ->
-    let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-    List.iter
-      (fun row ->
-         match row.(0) with
-         | Db.V_text s -> print_endline s
-         | _ -> ())
-      rows
+let dot_tables () =
+  run_sql "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
 ;;
 
-let dot_schema db arg_opt =
+let dot_schema arg_opt =
   let sql =
     match arg_opt with
     | None -> "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
@@ -164,186 +113,173 @@ let dot_schema db arg_opt =
         "SELECT sql FROM sqlite_master WHERE name = '%s' AND sql IS NOT NULL"
         (String.concat "''" (String.split_on_char '\'' name))
   in
-  match Lwt_main.run (Db.query db sql) with
-  | Error e -> Format.printf "Error: %a\n%!" Db.pp_error e
-  | Ok stream ->
-    let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-    List.iter
-      (fun row ->
-         match row.(0) with
-         | Db.V_text s ->
-           print_string s;
-           print_endline ";"
-         | _ -> ())
-      rows
+  run_sql sql
 ;;
 
-let dot_databases db =
-  match Lwt_main.run (Db.query db "PRAGMA database_list") with
-  | Error e -> Format.printf "Error: %a\n%!" Db.pp_error e
-  | Ok stream ->
-    let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-    print_rows rows
+let dot_databases () = run_sql "PRAGMA database_list"
+
+let dot_open path =
+  let* r = Repl_engine.open_db ~path in
+  match r with
+  | Error e ->
+    Shell_view.set_status
+      shell
+      (Format.asprintf "Error opening '%s': %a" path Db.pp_error e);
+    Lwt.return_unit
+  | Ok new_db ->
+    let* () =
+      match !db_ref with
+      | Some old -> Db.close old
+      | None -> Lwt.return_unit
+    in
+    set_db new_db;
+    Shell_view.set_result shell ~headers:[] ~rows:[];
+    Shell_view.set_status shell (Printf.sprintf "Opened %s" path);
+    Lwt.return_unit
 ;;
 
-(* Returns [Some new_db] when the command opened a new db (caller swaps);
-   [None] otherwise.  Always prints any feedback. *)
-let dispatch_dot ~db line =
+let dispatch_dot line =
   let trimmed = String.trim line in
   let parts = String.split_on_char ' ' trimmed |> List.filter (fun s -> s <> "") in
   match parts with
   | [ ".help" ] ->
     dot_help ();
-    None
-  | [ ".quit" ] | [ ".exit" ] -> exit 0
-  | [ ".tables" ] ->
-    dot_tables db;
-    None
-  | [ ".schema" ] ->
-    dot_schema db None;
-    None
-  | [ ".schema"; name ] ->
-    dot_schema db (Some name);
-    None
-  | [ ".databases" ] ->
-    dot_databases db;
-    None
-  | [ ".open"; path ] ->
-    (match Lwt_main.run (open_db ~path) with
-     | Ok new_db ->
-       Lwt_main.run (Db.close db);
-       Printf.printf "Opened %s\n%!" path;
-       Some new_db
-     | Error e ->
-       Format.printf "Error opening '%s': %a\n%!" path Db.pp_error e;
-       None)
+    Lwt.return_unit
+  | [ ".quit" ] | [ ".exit" ] ->
+    do_quit ();
+    Lwt.return_unit
+  | [ ".tables" ] -> dot_tables ()
+  | [ ".schema" ] -> dot_schema None
+  | [ ".schema"; name ] -> dot_schema (Some name)
+  | [ ".databases" ] -> dot_databases ()
+  | [ ".open"; path ] -> dot_open path
   | _ ->
-    Printf.printf "Unknown dot command: %s (try .help)\n%!" trimmed;
-    None
+    Shell_view.set_status
+      shell
+      (Printf.sprintf "Unknown dot command: %s (try .help)" trimmed);
+    Lwt.return_unit
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* Statement execution                                                  *)
+(* Submit                                                               *)
 (* ------------------------------------------------------------------ *)
 
-let run_one_stmt db stmt =
-  let s = String.trim stmt in
-  if s = ""
-  then ()
-  else if is_query_stmt s
+let submit input =
+  if !filter_mode
   then (
-    match Lwt_main.run (Db.query db s) with
-    | Error e -> Format.printf "Error: %a\n%!" Db.pp_error e
-    | Ok stream ->
-      let rows = Lwt_main.run (Lwt_stream.to_list stream) in
-      print_rows rows)
+    filter_mode := false;
+    (match Int64.of_string_opt (String.trim input) with
+     | Some id ->
+       Event_log.set_filter log (Some id);
+       Shell_view.set_status shell (Printf.sprintf "filter: txn=%Ld" id)
+     | None ->
+       Event_log.set_filter log None;
+       Shell_view.set_status shell "filter: not a txn id");
+    Lwt.return_unit)
   else (
-    match Lwt_main.run (Db.execute_change_count db s) with
-    | Error e -> Format.printf "Error: %a\n%!" Db.pp_error e
-    | Ok n -> if n > 0 then Printf.printf "%d row(s) affected\n%!" n)
-;;
-
-(** Split a complete buffer (containing one or more semicolons) into
-    individual statements.  This is a coarse split: it respects quoting
-    so SQL with semicolons inside strings is not torn. *)
-let split_stmts text =
-  let n = String.length text in
-  let rec scan i acc cur in_squote in_dquote =
-    if i >= n
-    then (
-      let last = String.trim cur in
-      if last = "" then List.rev acc else List.rev (last :: acc))
-    else (
-      let c = text.[i] in
-      if c = '\'' && not in_dquote
-      then scan (i + 1) acc (cur ^ String.make 1 c) (not in_squote) in_dquote
-      else if c = '"' && not in_squote
-      then scan (i + 1) acc (cur ^ String.make 1 c) in_squote (not in_dquote)
-      else if c = ';' && (not in_squote) && not in_dquote
-      then (
-        let s = String.trim cur in
-        let acc' = if s = "" then acc else s :: acc in
-        scan (i + 1) acc' "" in_squote in_dquote)
-      else scan (i + 1) acc (cur ^ String.make 1 c) in_squote in_dquote)
-  in
-  scan 0 [] "" false false
+    let t = String.trim input in
+    if t = ""
+    then Lwt.return_unit
+    else if t.[0] = '.'
+    then dispatch_dot t
+    else Lwt_list.iter_s run_sql (Repl_engine.split_stmts input))
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* REPL loop                                                            *)
+(* Key handling                                                         *)
 (* ------------------------------------------------------------------ *)
 
-let primary_prompt = "sqlocaml> "
-let continue_prompt = "      ...> "
+let shell_focus = Focus.make ()
+let monitor_focus = Focus.make ()
 
-let banner () =
-  print_endline "sqlocaml interactive shell.";
-  print_endline "Enter SQL terminated with ';'.  Type .help for shell commands."
+let set_filter_prompt () =
+  filter_mode := true;
+  Lwd.set input_var "";
+  Focus.request shell_focus;
+  Shell_view.set_status shell "filter: enter a txn id, then Enter (empty=clear)"
 ;;
 
-(* Read one logical command (either a dot command or a complete
-   SQL statement up to ';').  Returns [None] on EOF. *)
-let read_one () =
-  let buf = Buffer.create 256 in
-  let rec loop primary =
-    print_string (if primary then primary_prompt else continue_prompt);
-    let () =
-      try flush stdout with
-      | Sys_error _ -> ()
-    in
-    match input_line stdin with
-    | exception End_of_file ->
-      if Buffer.length buf = 0 then None else Some (Buffer.contents buf)
-    | line ->
-      let stripped = String.trim line in
-      if primary && String.length stripped > 0 && stripped.[0] = '.'
-      then Some stripped
-      else (
-        if Buffer.length buf > 0 then Buffer.add_char buf '\n';
-        Buffer.add_string buf line;
-        if has_terminator buf then Some (Buffer.contents buf) else loop false)
+(* Handle a key directed at the shell input.  Returns [`Handled] for keys it
+   consumes so they do not bubble to other areas. *)
+let shell_handle (key : Ui.key) : Ui.may_handle =
+  match key with
+  | `Escape, _ ->
+    do_quit ();
+    `Handled
+  | `Tab, _ ->
+    Focus.request monitor_focus;
+    `Handled
+  | `Enter, _ ->
+    let input = Lwd.peek input_var in
+    Lwd.set input_var "";
+    Lwt.async (fun () -> submit input);
+    `Handled
+  | `Backspace, _ ->
+    let s = Lwd.peek input_var in
+    let n = String.length s in
+    if n > 0 then Lwd.set input_var (String.sub s 0 (n - 1));
+    `Handled
+  | `ASCII c, _ ->
+    Lwd.set input_var (Lwd.peek input_var ^ String.make 1 c);
+    `Handled
+  | `Uchar u, _ ->
+    let b = Buffer.create 4 in
+    Buffer.add_utf_8_uchar b u;
+    Lwd.set input_var (Lwd.peek input_var ^ Buffer.contents b);
+    `Handled
+  | _ -> `Unhandled
+;;
+
+(* Monitor keys; Tab returns focus to the shell, Escape quits, everything else
+   is delegated to [Monitor_view.handle_key]. *)
+let monitor_handle (key : Ui.key) : Ui.may_handle =
+  match key with
+  | `Escape, _ ->
+    do_quit ();
+    `Handled
+  | `Tab, _ ->
+    Focus.request shell_focus;
+    `Handled
+  | _ -> Monitor_view.handle_key log ~set_filter_prompt key
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Root UI                                                              *)
+(* ------------------------------------------------------------------ *)
+
+let root =
+  let shell_ui =
+    Lwd.map2 (Focus.status shell_focus) (Shell_view.render shell) ~f:(fun focus ui ->
+      Ui.keyboard_area ~focus shell_handle ui)
   in
-  loop true
+  let monitor_ui =
+    Lwd.map2 (Focus.status monitor_focus) (Monitor_view.render log) ~f:(fun focus ui ->
+      Ui.keyboard_area ~focus monitor_handle ui)
+  in
+  W.v_pane shell_ui monitor_ui
 ;;
+
+(* ------------------------------------------------------------------ *)
+(* Entry point                                                          *)
+(* ------------------------------------------------------------------ *)
 
 let main () =
-  (* Enable Unix file operations (ATTACH / VACUUM / .open) for this process. *)
   Sqlocaml_unix.install ();
   let path =
     match Array.to_list Sys.argv |> List.tl with
     | [] -> ":memory:"
     | path :: _ -> path
   in
-  let db_ref =
-    ref
-      (match Lwt_main.run (open_db ~path) with
-       | Ok d -> d
-       | Error e ->
-         Format.eprintf "Cannot open '%s': %a\n%!" path Db.pp_error e;
-         exit 1)
-  in
-  banner ();
-  Printf.printf "Open: %s\n%!" path;
-  let rec loop () =
-    match read_one () with
-    | None ->
-      print_newline ();
-      exit 0
-    | Some s ->
-      let trimmed = String.trim s in
-      if trimmed = ""
-      then loop ()
-      else if String.length trimmed > 0 && trimmed.[0] = '.'
-      then (
-        (match dispatch_dot ~db:!db_ref trimmed with
-         | Some new_db -> db_ref := new_db
-         | None -> ());
-        loop ())
-      else (
-        List.iter (run_one_stmt !db_ref) (split_stmts s);
-        loop ())
-  in
-  loop ()
+  let* r = Repl_engine.open_db ~path in
+  match r with
+  | Error e ->
+    Format.eprintf "Cannot open '%s': %a\n%!" path Db.pp_error e;
+    exit 1
+  | Ok db ->
+    set_db db;
+    Focus.request shell_focus;
+    Shell_view.set_status shell (Printf.sprintf "Open: %s" path);
+    Nottui_lwt.run ~quit:quit_t root
 ;;
 
-let () = main ()
+let () = Lwt_main.run (main ())
