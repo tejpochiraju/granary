@@ -4,11 +4,13 @@
     reference it without creating a dependency cycle.  [Store.set_event_callback]
     translates these into [Store_event.t] variants.
 
-    Emitted only on PHYSICAL I/O: [Page_read] fires on a backend read (cache
-    miss), never on a cache hit; [Page_write] fires once per dirty page handed to
-    the WAL/main on flush. *)
+    Emitted only on PHYSICAL I/O: [Page_read] fires on a MAIN-FILE backend read
+    (cache miss), never on a cache hit — WAL-frame-served reads (resolved via the
+    WAL overlay, not the main file) emit nothing; [Page_write] fires once per
+    dirty page handed to the WAL/main on flush. *)
 type t =
-  | Page_read of { page_id : int64 } (** backend read — cache MISS only *)
+  | Page_read of { page_id : int64 }
+  (** main-file backend read — cache MISS only; WAL-served reads emit nothing *)
   | Page_write of { page_id : int64 } (** page written to WAL/main on flush *)
   | Page_alloc of
       { page_id : int64
