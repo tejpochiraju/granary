@@ -1,8 +1,8 @@
 (library
  (name repl_lib)
  (wrapped false)
- (modules repl_engine)
- (libraries sqlocaml sqlocaml.unix lwt lwt.unix)
+ (modules repl_engine event_log)
+ (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd)
  (preprocess
   (pps lwt_ppx)))
 

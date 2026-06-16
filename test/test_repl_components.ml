@@ -1,4 +1,35 @@
 module E = Repl_engine
+module L = Event_log
+module Ev = Sqlocaml.Db.Event
+
+let mk_commit id = Ev.Txn_commit { txn_id = id; frames = 0 }
+
+let test_ring_capacity () =
+  let l = L.create ~capacity:3 in
+  List.iter (fun i -> L.push l (mk_commit (Int64.of_int i))) [ 1; 2; 3; 4; 5 ];
+  Alcotest.(check int) "capped at 3" 3 (L.length l);
+  let ids = List.filter_map Ev.txn_id (L.visible l) in
+  Alcotest.(check (list int64)) "oldest dropped" [ 3L; 4L; 5L ] ids
+;;
+
+let test_filter () =
+  let l = L.create ~capacity:10 in
+  List.iter (fun i -> L.push l (mk_commit (Int64.of_int i))) [ 1; 2; 3 ];
+  L.set_filter l (Some 2L);
+  Alcotest.(check (list int64))
+    "only txn 2"
+    [ 2L ]
+    (List.filter_map Ev.txn_id (L.visible l));
+  L.set_filter l None;
+  Alcotest.(check int) "filter cleared" 3 (List.length (L.visible l))
+;;
+
+let test_pause_toggle () =
+  let l = L.create ~capacity:10 in
+  Alcotest.(check bool) "starts unpaused" false (L.paused l);
+  L.toggle_pause l;
+  Alcotest.(check bool) "paused" true (L.paused l)
+;;
 
 let test_is_query_stmt () =
   Alcotest.(check bool) "select" true (E.is_query_stmt "SELECT 1");
@@ -65,6 +96,11 @@ let () =
     ; ( "props"
       , [ QCheck_alcotest.to_alcotest prop_split_roundtrip
         ; QCheck_alcotest.to_alcotest prop_is_query_whitespace_insensitive
+        ] )
+    ; ( "event_log"
+      , [ Alcotest.test_case "ring capacity" `Quick test_ring_capacity
+        ; Alcotest.test_case "filter" `Quick test_filter
+        ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
         ] )
     ]
 ;;
