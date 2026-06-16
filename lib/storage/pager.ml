@@ -79,9 +79,11 @@ type t =
         writes are serialised under the single RW transaction. *)
   ; mutable on_page_event : (Pager_event.t -> unit) option
     (** #384: optional, synchronous, fire-and-forget observer for physical page
-        I/O (internals monitor).  [None] = zero overhead: every emit site guards
-        on this before constructing a [Pager_event.t], so nothing allocates when
-        unset.  [Store.set_event_callback] installs a translator here. *)
+        I/O (internals monitor).  [None] = zero overhead: [emit_page_event]
+        guards on this before the observer is invoked, and the emit sites pass a
+        freshly-constructed [Pager_event.t] only inside the [Some] branch, so
+        nothing allocates when unset.  [Store.set_event_callback] installs a
+        translator here. *)
   }
 
 type error =
@@ -134,13 +136,12 @@ let set_write_tag t (tag : int32) = t.write_tag <- tag
 let write_tag t = t.write_tag
 let set_page_event_callback t cb = t.on_page_event <- cb
 
-(* #384: fire a page event iff an observer is attached.  Guard-before-construct
-   at every call site keeps the [None] path allocation-free on hot paths. *)
+(* #384: fire a page event iff an observer is attached.  The guard lives here:
+   [None] path is allocation-free on hot paths. *)
 let emit_page_event t ev =
   match t.on_page_event with
   | None -> ()
   | Some f -> f ev
-[@@warning "-32"]
 ;;
 
 (* #95: set the file's page geometry.  Called once by the open path before any
@@ -281,6 +282,7 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
+       emit_page_event t (Pager_event.Page_read { page_id });
        if not bypass_cache
        then (
          cache_add t key (cstruct_dup buf);
@@ -359,6 +361,7 @@ let load_main_page_borrow ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
+       emit_page_event t (Pager_event.Page_read { page_id });
        if not bypass_cache
        then (
          cache_add t key buf;

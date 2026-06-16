@@ -66,12 +66,53 @@ let test_set_none_clears () =
   Alcotest.(check int) "no events after clearing callback" 0 (List.length (events seen))
 ;;
 
+let is_read = function
+  | Pager_event.Page_read _ -> true
+  | _ -> false
+;;
+
+let test_cache_miss_emits_read () =
+  let p, _ = make_pager ~n_pages:4L () in
+  let seen = recorder p in
+  let _ = run (Pager.read p 2L) in
+  let reads = List.filter is_read (events seen) in
+  Alcotest.(check int) "one Page_read on cache miss" 1 (List.length reads);
+  match reads with
+  | [ Pager_event.Page_read { page_id } ] -> Alcotest.(check int64) "page id" 2L page_id
+  | _ -> Alcotest.fail "expected exactly one Page_read"
+;;
+
+let test_cache_hit_emits_nothing () =
+  let p, _ = make_pager ~n_pages:4L () in
+  let _ = run (Pager.read p 2L) in
+  (* prime cache *)
+  let seen = recorder p in
+  let _ = run (Pager.read p 2L) in
+  (* now a hit *)
+  Alcotest.(check int) "no Page_read on cache hit" 0 (List.length (events seen))
+;;
+
+let test_borrow_miss_emits_read () =
+  let p, _ = make_pager ~n_pages:4L () in
+  let seen = recorder p in
+  let _ = run (Pager.read_borrow p 3L (fun _ -> Lwt.return_unit)) in
+  Alcotest.(check int)
+    "one Page_read on borrow cache miss"
+    1
+    (List.length (List.filter is_read (events seen)))
+;;
+
 let () =
   Alcotest.run
     "pager_event"
     [ ( "plumbing"
       , [ Alcotest.test_case "no ops no events" `Quick test_no_ops_no_events
         ; Alcotest.test_case "set None clears" `Quick test_set_none_clears
+        ] )
+    ; ( "read"
+      , [ Alcotest.test_case "cache miss emits read" `Quick test_cache_miss_emits_read
+        ; Alcotest.test_case "cache hit emits nothing" `Quick test_cache_hit_emits_nothing
+        ; Alcotest.test_case "borrow miss emits read" `Quick test_borrow_miss_emits_read
         ] )
     ]
 ;;
