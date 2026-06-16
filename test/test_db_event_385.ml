@@ -45,9 +45,34 @@ let test_passthrough_fires () =
   Alcotest.(check bool) "events fired through Db" true (n > 0)
 ;;
 
+let test_tree_of_table () =
+  let path = fresh_path () in
+  cleanup path;
+  let open Lwt.Syntax in
+  let found, missing =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file_wal ~path () in
+         let db = Result.get_ok db in
+         let* _ = D.execute db "CREATE TABLE t(x INTEGER)" in
+         let found = D.tree_of_table db "t" in
+         let missing = D.tree_of_table db "nope" in
+         let* () = D.close db in
+         Lwt.return (found, missing))
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check bool) "known table resolves" true (found <> None);
+  Alcotest.(check (option int)) "unknown table is None" None missing
+;;
+
 let () =
   Sqlocaml_unix.install ();
   Alcotest.run
     "db_event"
-    [ "passthrough", [ Alcotest.test_case "fires" `Quick test_passthrough_fires ] ]
+    [ "passthrough", [ Alcotest.test_case "fires" `Quick test_passthrough_fires ]
+    ; "tree_of_table", [ Alcotest.test_case "resolves" `Quick test_tree_of_table ]
+    ]
 ;;
