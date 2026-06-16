@@ -79,11 +79,10 @@ type t =
         writes are serialised under the single RW transaction. *)
   ; mutable on_page_event : (Pager_event.t -> unit) option
     (** #384: optional, synchronous, fire-and-forget observer for physical page
-        I/O (internals monitor).  [None] = zero overhead: [emit_page_event]
-        guards on this before the observer is invoked, and the emit sites pass a
-        freshly-constructed [Pager_event.t] only inside the [Some] branch, so
-        nothing allocates when unset.  [Store.set_event_callback] installs a
-        translator here. *)
+        I/O (internals monitor).  [None] = zero overhead: the per-kind [emit_*]
+        helpers construct the [Pager_event.t] only inside the [Some] branch, so
+        the [None] path neither allocates nor invokes anything.
+        [Store.set_event_callback] installs a translator here. *)
   }
 
 type error =
@@ -136,12 +135,14 @@ let set_write_tag t (tag : int32) = t.write_tag <- tag
 let write_tag t = t.write_tag
 let set_page_event_callback t cb = t.on_page_event <- cb
 
-(* #384: fire a page event iff an observer is attached.  The guard lives here:
-   [None] path is allocation-free on hot paths. *)
-let emit_page_event t ev =
+(* #384: emit a [Page_read] iff an observer is attached.  The event record is
+   constructed only inside the [Some] branch, so the [None] path allocates
+   nothing — keeping physical-read instrumentation truly zero-overhead when the
+   internals monitor is off. *)
+let emit_read t page_id =
   match t.on_page_event with
   | None -> ()
-  | Some f -> f ev
+  | Some f -> f (Pager_event.Page_read { page_id })
 ;;
 
 (* #95: set the file's page geometry.  Called once by the open path before any
@@ -282,7 +283,7 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       emit_page_event t (Pager_event.Page_read { page_id });
+       emit_read t page_id;
        if not bypass_cache
        then (
          cache_add t key (cstruct_dup buf);
@@ -361,7 +362,7 @@ let load_main_page_borrow ?(bypass_cache = false) t pin_set page_id =
     (match result with
      | Error msg -> Lwt.return_error (Block_error msg)
      | Ok () ->
-       emit_page_event t (Pager_event.Page_read { page_id });
+       emit_read t page_id;
        if not bypass_cache
        then (
          cache_add t key buf;

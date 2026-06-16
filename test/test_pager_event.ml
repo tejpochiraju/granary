@@ -84,11 +84,10 @@ let test_cache_miss_emits_read () =
 
 let test_cache_hit_emits_nothing () =
   let p, _ = make_pager ~n_pages:4L () in
+  (* prime cache — recorder not yet attached *)
   let _ = run (Pager.read p 2L) in
-  (* prime cache *)
   let seen = recorder p in
   let _ = run (Pager.read p 2L) in
-  (* now a hit *)
   Alcotest.(check int) "no Page_read on cache hit" 0 (List.length (events seen))
 ;;
 
@@ -96,10 +95,11 @@ let test_borrow_miss_emits_read () =
   let p, _ = make_pager ~n_pages:4L () in
   let seen = recorder p in
   let _ = run (Pager.read_borrow p 3L (fun _ -> Lwt.return_unit)) in
-  Alcotest.(check int)
-    "one Page_read on borrow cache miss"
-    1
-    (List.length (List.filter is_read (events seen)))
+  let reads = List.filter is_read (events seen) in
+  Alcotest.(check int) "one Page_read on borrow cache miss" 1 (List.length reads);
+  match reads with
+  | [ Pager_event.Page_read { page_id } ] -> Alcotest.(check int64) "page id" 3L page_id
+  | _ -> Alcotest.fail "expected exactly one Page_read"
 ;;
 
 let () =
