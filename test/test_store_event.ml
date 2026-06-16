@@ -17,7 +17,15 @@ let test_label_and_txn_id () =
   Alcotest.(check (option int64))
     "page_read txn"
     (Some 5L)
-    (Ev.txn_id (Ev.Page_read { txn_id = 5L; tree = 16; page = 1L }))
+    (Ev.txn_id (Ev.Page_read { txn_id = 5L; tree = 16; page = 1L }));
+  Alcotest.(check string)
+    "wal_read label"
+    "WAL_READ"
+    (Ev.label (Ev.Wal_read { txn_id = 9L; tree = 16; page = 1L }));
+  Alcotest.(check (option int64))
+    "wal_read txn"
+    (Some 9L)
+    (Ev.txn_id (Ev.Wal_read { txn_id = 9L; tree = 16; page = 1L }))
 ;;
 
 let test_pp_roundtrip_nonempty () =
@@ -45,6 +53,9 @@ let test_pp_all_constructors () =
     "PAGE_READ txn=1 tree=16 page=7"
     (Ev.Page_read { txn_id = 1L; tree = 16; page = 7L });
   check
+    "WAL_READ txn=1 tree=16 page=7"
+    (Ev.Wal_read { txn_id = 1L; tree = 16; page = 7L });
+  check
     "PAGE_WRITE txn=2 tree=16 page=8"
     (Ev.Page_write { txn_id = 2L; tree = 16; page = 8L });
   check
@@ -63,6 +74,10 @@ let test_tree_id_of () =
     "page_read tree"
     (Some 16)
     (Ev.tree_id_of (Ev.Page_read { txn_id = 1L; tree = 16; page = 7L }));
+  Alcotest.(check (option int))
+    "wal_read tree"
+    (Some 24)
+    (Ev.tree_id_of (Ev.Wal_read { txn_id = 1L; tree = 24; page = 7L }));
   Alcotest.(check (option int))
     "page_alloc tree"
     (Some 32)
@@ -271,6 +286,49 @@ let test_checkpoint_then_read_emits_page_read () =
     (List.exists
        (function
          | Ev.Page_read _ -> true
+         | _ -> false)
+       evs)
+;;
+
+(* #392: a read served from the WAL overlay (not the main file) emits WAL_READ,
+   not PAGE_READ.  After a write+commit WITHOUT a checkpoint the data lives in
+   the WAL; reopening with [open_file_wal] recovers the WAL index so the cold
+   read resolves through the WAL frame path. *)
+let test_wal_resident_read_emits_wal_read () =
+  let path = fresh_path () in
+  cleanup path;
+  let evs =
+    Lwt.finalize
+      (fun () ->
+         let open Lwt.Syntax in
+         (* write + commit; NO checkpoint, so the row stays in the WAL *)
+         let* st = S.open_file_wal ~path () in
+         let st = Result.get_ok st in
+         let* txn = S.rw_begin st in
+         let* () = S.put txn 16 (bs "k") (bs "v") in
+         let* () = S.commit txn in
+         let* () = S.close st in
+         (* reopen WAL: recover_index re-populates the WAL frame index, cache cold *)
+         let seen = ref [] in
+         let* st2 = S.open_file_wal ~path () in
+         let st2 = Result.get_ok st2 in
+         S.set_event_callback st2 (Some (fun ev -> seen := ev :: !seen));
+         let* txn2 = S.rw_begin st2 in
+         let* _ = S.get txn2 16 (bs "k") in
+         let* () = S.commit txn2 in
+         let* () = S.close st2 in
+         Lwt.return (List.rev !seen))
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check bool)
+    "has WAL_READ"
+    true
+    (List.exists
+       (function
+         | Ev.Wal_read _ -> true
          | _ -> false)
        evs)
 ;;
@@ -539,6 +597,10 @@ let () =
             "checkpoint then read emits page read"
             `Quick
             test_checkpoint_then_read_emits_page_read
+        ; Alcotest.test_case
+            "wal-resident read emits wal read"
+            `Quick
+            test_wal_resident_read_emits_wal_read
         ; Alcotest.test_case
             "txn commit frames matches wal append"
             `Quick

@@ -145,6 +145,16 @@ let emit_read t page_id =
   | Some f -> f (Pager_event.Page_read { page_id })
 ;;
 
+(* #392: emit a [Wal_read] iff an observer is attached — the WAL-overlay
+   counterpart of [emit_read].  Fires on a pager cache miss resolved from a WAL
+   frame (a backend resolution from the pager's viewpoint), with the same
+   zero-alloc guard as the other per-kind emit helpers. *)
+let emit_wal_read t page_id =
+  match t.on_page_event with
+  | None -> ()
+  | Some f -> f (Pager_event.Wal_read { page_id })
+;;
+
 (* #384: emit a [Page_alloc]/[Page_free] iff an observer is attached; the record
    is built only inside the [Some] branch (zero-alloc when the monitor is off). *)
 let emit_alloc t page_id reused =
@@ -286,8 +296,10 @@ let cstruct_dup src =
 (* Resolve [page_id] from the WAL, if any.  [finder] picks the relevant frame
    (latest, or latest <= a snapshot bound).  WAL frames are NOT cached: frame
    indices are recycled after a WAL reset (checkpoint), so a cached
-   (page_id, frame_idx) entry could be served stale.  Returns a fresh Cstruct. *)
-let resolve_wal_page t finder =
+   (page_id, frame_idx) entry could be served stale.  Returns a fresh Cstruct.
+   #392: emits [Wal_read page_id] on the frame-served path (the WAL-overlay
+   counterpart of [emit_read] in [load_main_page]). *)
+let resolve_wal_page t ~page_id finder =
   let open Lwt.Syntax in
   match t.wal with
   | None -> Lwt.return_ok None
@@ -298,7 +310,9 @@ let resolve_wal_page t finder =
        let* r = cb.wal_read_frame frame_idx in
        (match r with
         | Error s -> Lwt.return_error (Block_error s)
-        | Ok page -> Lwt.return_ok (Some (cstruct_dup page))))
+        | Ok page ->
+          emit_wal_read t page_id;
+          Lwt.return_ok (Some (cstruct_dup page))))
 ;;
 
 (* Load [page_id] from the shared cache, or from the block device on a miss
@@ -327,7 +341,7 @@ let load_main_page ?(bypass_cache = false) t pin_set page_id =
 let read ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
   let open Lwt.Syntax in
   let load_after_wal finder =
-    let* wal_r = resolve_wal_page t finder in
+    let* wal_r = resolve_wal_page t ~page_id finder in
     match wal_r with
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> Lwt.return_ok page
@@ -359,7 +373,7 @@ let read ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id =
    place), exactly like the main page cache's borrow invariant above.  A future
    in-place mutation of a [Wal.read_frame] result would corrupt the cache and
    every concurrent borrower — see [Wal.read_frame]'s contract. *)
-let resolve_wal_page_borrow t finder =
+let resolve_wal_page_borrow t ~page_id finder =
   let open Lwt.Syntax in
   match t.wal with
   | None -> Lwt.return_ok None
@@ -370,7 +384,9 @@ let resolve_wal_page_borrow t finder =
        let* r = cb.wal_read_frame frame_idx in
        (match r with
         | Error s -> Lwt.return_error (Block_error s)
-        | Ok page -> Lwt.return_ok (Some page)))
+        | Ok page ->
+          emit_wal_read t page_id;
+          Lwt.return_ok (Some page)))
 ;;
 
 (* Like [load_main_page] but returns the cache's own buffer WITHOUT a defensive
@@ -410,7 +426,7 @@ let read_borrow ?snapshot_frames ?pin_set ?(bypass_cache = false) t page_id f =
     Lwt.return_ok v
   in
   let load_after_wal finder =
-    let* wal_r = resolve_wal_page_borrow t finder in
+    let* wal_r = resolve_wal_page_borrow t ~page_id finder in
     match wal_r with
     | Error e -> Lwt.return_error e
     | Ok (Some page) -> borrow page
