@@ -101,6 +101,84 @@ let test_savepoint_events () =
   Alcotest.(check bool) "SP_RELEASE" true (List.mem "SP_RELEASE" labels)
 ;;
 
+let test_wal_append_and_checkpoint () =
+  let labels =
+    with_recorder ~f:(fun st ->
+      let open Lwt.Syntax in
+      let* txn = S.rw_begin st in
+      let* () = S.put txn 16 (bs "k") (bs "v") in
+      let* () = S.commit txn in
+      S.checkpoint st)
+  in
+  Alcotest.(check bool) "WAL_APPEND" true (List.mem "WAL_APPEND" labels);
+  Alcotest.(check bool) "CKPT_BEGIN" true (List.mem "CKPT_BEGIN" labels);
+  Alcotest.(check bool) "CKPT_END" true (List.mem "CKPT_END" labels);
+  Alcotest.(check bool) "WAL_RESET" true (List.mem "WAL_RESET" labels)
+;;
+
+(* Defensive: a raising callback must not break the commit. *)
+let test_raising_callback_is_swallowed () =
+  let path = fresh_path () in
+  cleanup path;
+  let ok =
+    Lwt.finalize
+      (fun () ->
+         let open Lwt.Syntax in
+         let* st = S.open_file_wal ~path () in
+         let st = Result.get_ok st in
+         S.set_event_callback st (Some (fun _ -> failwith "boom"));
+         let* txn = S.rw_begin st in
+         let* () = S.put txn 16 (bs "k") (bs "v") in
+         let* () = S.commit txn in
+         let* () = S.close st in
+         Lwt.return true)
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check bool) "commit survived a raising observer" true ok
+;;
+
+let prop_commit_count =
+  QCheck.Test.make
+    ~count:50
+    ~name:"commit count matches"
+    QCheck.(list bool)
+    (fun outcomes ->
+       let path = fresh_path () in
+       cleanup path;
+       let commits = ref 0 in
+       Lwt.finalize
+         (fun () ->
+            let open Lwt.Syntax in
+            let* st = S.open_file_wal ~path () in
+            let st = Result.get_ok st in
+            S.set_event_callback
+              st
+              (Some
+                 (fun ev ->
+                   match ev with
+                   | Ev.Txn_commit _ -> incr commits
+                   | _ -> ()));
+            let* () =
+              Lwt_list.iter_s
+                (fun commit ->
+                   let open Lwt.Syntax in
+                   let* txn = S.rw_begin st in
+                   let* () = S.put txn 16 (bs "k") (bs "v") in
+                   if commit then S.commit txn else S.rollback txn)
+                outcomes
+            in
+            let* () = S.close st in
+            Lwt.return_unit)
+         (fun () ->
+            cleanup path;
+            Lwt.return_unit)
+       |> run;
+       !commits = List.length (List.filter Fun.id outcomes))
+;;
+
 let () =
   Alcotest.run
     "store_event"
@@ -115,6 +193,15 @@ let () =
             test_commit_emits_begin_and_commit
         ; Alcotest.test_case "rollback emits rollback" `Quick test_rollback_emits_rollback
         ; Alcotest.test_case "savepoint events" `Quick test_savepoint_events
+        ; Alcotest.test_case
+            "wal append + checkpoint"
+            `Quick
+            test_wal_append_and_checkpoint
+        ; Alcotest.test_case
+            "raising callback swallowed"
+            `Quick
+            test_raising_callback_is_swallowed
         ] )
+    ; "props", [ QCheck_alcotest.to_alcotest prop_commit_count ]
     ]
 ;;

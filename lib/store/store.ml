@@ -1448,6 +1448,7 @@ let rec wait_for_readers_past
 
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let target = Wal.committed_frames wal in
+  emit_event st (Store_event.Checkpoint_begin { target_frames = target });
   let* () =
     wait_for_readers_past
       st
@@ -1472,6 +1473,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
       (fun () ->
          let pairs = ref [] in
          Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+         (* #382: count the pages actually migrated to the main file so the
+            [Checkpoint_end] event reports the real work done. *)
+         let migrated = ref 0 in
          let rec write_each = function
            | [] -> Lwt.return_unit
            | (pid, idx) :: rest ->
@@ -1484,7 +1488,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
                 (match wr with
                  | Error e ->
                    Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
-                 | Ok () -> write_each rest))
+                 | Ok () ->
+                   incr migrated;
+                   write_each rest))
          in
          let* () = write_each !pairs in
          let* sr = Pager.flush_sync_main st.pager in
@@ -1501,6 +1507,10 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
             dispatched after the count reaches 0 can slip in before reset. *)
            let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
            Wal.reset wal;
+           (* #382: WAL is reset to a fresh epoch and the migration is done.
+              Read [Wal.epoch] AFTER reset for the new epoch. *)
+           emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
+           emit_event st (Store_event.Checkpoint_end { pages_migrated = !migrated });
            (* #298/#1: checkpoint is a full-sync durability anchor — everything
             is now durable and the WAL starts a fresh epoch at frame 0.  Reset
             the sink ship counter (new epoch) and the batched durability counters
@@ -1766,6 +1776,12 @@ let commit_wal t st =
     | Some w -> w
     | None -> assert false
   in
+  (* #382: capture the cumulative committed frame count and this txn's id BEFORE
+     the append/commit work, so the [Wal_append] emitted at the end reports the
+     authoritative batch this commit produced (relative to nothing — an absolute
+     base/count pair), independent of the replication cursor. *)
+  let frames_before = Wal.committed_frames wal in
+  let append_txn_id = active_txn_id st in
   Lwt.catch
     (fun () ->
        let* () = commit_prepare_btree ~header_commit:Header.commit_no_sync st in
@@ -1859,6 +1875,15 @@ let commit_wal t st =
               (checkpoint is a full-sync durability anchor). *)
            maybe_autockpt_after_commit t st
        in
+       (* #382: emit the authoritative frame batch for this commit.  Done after
+          the append + any group-commit sync; [Wal.committed_frames] already
+          reflects the appended frames.  Synchronous and lock-free, consistent
+          with the [Txn_commit] emit that runs after lock release. *)
+       let appended = Wal.committed_frames wal - frames_before in
+       emit_event
+         st
+         (Store_event.Wal_append
+            { txn_id = append_txn_id; base_idx = frames_before; count = appended });
        Lwt.return_unit)
     (fun exn ->
        unlock_once ();

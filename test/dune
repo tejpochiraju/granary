@@ -85,6 +85,7 @@
   test_store_event)
  (libraries
   alcotest
+  qcheck-core
   qcheck-alcotest
   sqlocaml
   sqlocaml.block
