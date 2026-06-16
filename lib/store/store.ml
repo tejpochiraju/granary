@@ -1896,7 +1896,7 @@ let commit_wal t st =
          st
          (Store_event.Wal_append
             { txn_id = append_txn_id; base_idx = frames_before; count = appended });
-       Lwt.return_unit)
+       Lwt.return appended)
     (fun exn ->
        unlock_once ();
        Lwt.fail exn)
@@ -1925,24 +1925,27 @@ let commit (Rw t : rw txn) : unit Lwt.t =
     (* #356: the append cursor is only valid within a txn (its leaf is dirty);
        commit flushes dirty pages, so drop it. *)
     Hashtbl.clear st.bt_append;
-    (* #382: capture the id this txn commits as BEFORE the header is bumped
-       (commit_prepare_btree advances [st.current_header.txn_id]).  Emit
-       [Txn_commit] only after the commit work has succeeded.  [frames = 0] is a
-       placeholder: Task 4 wires the authoritative frame count via [Wal_append]. *)
+    (* #382/#386: capture the id this txn commits as BEFORE the header is bumped
+       (commit_prepare_btree advances [st.current_header.txn_id]).  [frames] is
+       the authoritative WAL-appended count returned by [commit_wal] (0 for the
+       non-WAL path, which appends no WAL frames). *)
     let committed_id = active_txn_id st in
-    let* () =
+    let* frames =
       match st.wal with
       | None ->
-        Lwt.finalize
-          (fun () ->
-             let* () = commit_prepare_btree ~header_commit:Header.commit st in
-             maybe_autocheckpoint st)
-          (fun () ->
-             Rwlock.release_write t.lock;
-             Lwt.return_unit)
+        let* () =
+          Lwt.finalize
+            (fun () ->
+               let* () = commit_prepare_btree ~header_commit:Header.commit st in
+               maybe_autocheckpoint st)
+            (fun () ->
+               Rwlock.release_write t.lock;
+               Lwt.return_unit)
+        in
+        Lwt.return 0 (* non-WAL: no WAL frames appended *)
       | Some _ -> commit_wal t st
     in
-    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames = 0 });
+    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames });
     Lwt.return_unit
 ;;
 

@@ -350,6 +350,62 @@ let test_wal_append_count_nonneg_under_autockpt () =
   Alcotest.(check (list (pair int int))) "no negative Wal_append counts/base" [] !bad
 ;;
 
+let test_txn_commit_frames_matches_wal_append () =
+  let evs =
+    with_event_recorder ~f:(fun st ->
+      let open Lwt.Syntax in
+      let* txn = S.rw_begin st in
+      let* () = S.put txn 16 (bs "k") (bs "v") in
+      S.commit txn)
+  in
+  let commit_frames =
+    List.find_map
+      (function
+        | Ev.Txn_commit { frames; _ } -> Some frames
+        | _ -> None)
+      evs
+  in
+  let append_count =
+    List.find_map
+      (function
+        | Ev.Wal_append { count; _ } -> Some count
+        | _ -> None)
+      evs
+  in
+  Alcotest.(check (option int))
+    "commit frames present"
+    (Some (Option.get append_count))
+    commit_frames;
+  Alcotest.(check bool)
+    "commit frames > 0 for a real write"
+    true
+    (match commit_frames with
+     | Some n -> n > 0
+     | None -> false)
+;;
+
+let test_writes_emit_page_free () =
+  let evs =
+    with_event_recorder ~f:(fun st ->
+      let open Lwt.Syntax in
+      let* txn = S.rw_begin st in
+      let* () =
+        Lwt_list.iter_s
+          (fun i -> S.put txn 16 (bs (Printf.sprintf "k%04d" i)) (bs "v"))
+          (List.init 1000 Fun.id)
+      in
+      S.commit txn)
+  in
+  Alcotest.(check bool)
+    "has PAGE_FREE"
+    true
+    (List.exists
+       (function
+         | Ev.Page_free _ -> true
+         | _ -> false)
+       evs)
+;;
+
 let () =
   Alcotest.run
     "store_event"
@@ -385,6 +441,11 @@ let () =
             "checkpoint then read emits page read"
             `Quick
             test_checkpoint_then_read_emits_page_read
+        ; Alcotest.test_case
+            "txn commit frames matches wal append"
+            `Quick
+            test_txn_commit_frames_matches_wal_append
+        ; Alcotest.test_case "writes emit page free" `Quick test_writes_emit_page_free
         ] )
     ; "props", [ QCheck_alcotest.to_alcotest prop_commit_count ]
     ]
