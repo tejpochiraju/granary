@@ -41,7 +41,8 @@
   test_unique_build_288
   test_schema_cache_283
   test_store_event
-  test_db_event_385)
+  test_db_event_385
+  test_repl_components)
  (modules
   test_dummy
   test_mem
@@ -84,7 +85,8 @@
   test_unique_build_288
   test_schema_cache_283
   test_store_event
-  test_db_event_385)
+  test_db_event_385
+  test_repl_components)
  (libraries
   alcotest
   qcheck-core
@@ -97,6 +99,7 @@
   sqlocaml.sql
   sqlocaml.storage
   sqlocaml.unix
+  repl_lib
   lwt.unix
   unix))
 
