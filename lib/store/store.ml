@@ -1448,6 +1448,10 @@ let rec wait_for_readers_past
 
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let target = Wal.committed_frames wal in
+  (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
+     aborts early (store closing, or an I/O error before [Wal.reset]), no
+     matching [Checkpoint_end] is emitted.  Monitor consumers must tolerate an
+     unbalanced begin. *)
   emit_event st (Store_event.Checkpoint_begin { target_frames = target });
   let* () =
     wait_for_readers_past
@@ -1785,6 +1789,11 @@ let commit_wal t st =
   Lwt.catch
     (fun () ->
        let* () = commit_prepare_btree ~header_commit:Header.commit_no_sync st in
+       (* #382: capture the appended frame count under the write lock, before
+          [unlock_once] and the group-commit yields — a concurrent
+          auto-checkpoint can [Wal.reset] (zeroing committed_frames) during
+          those yields, which would make the count negative if read later. *)
+       let frames_after = Wal.committed_frames wal in
        (* #298: decide the sync policy under the write lock so the counter is
           race-free across concurrent writers, then release the lock. *)
        let do_sync =
@@ -1875,11 +1884,13 @@ let commit_wal t st =
               (checkpoint is a full-sync durability anchor). *)
            maybe_autockpt_after_commit t st
        in
-       (* #382: emit the authoritative frame batch for this commit.  Done after
-          the append + any group-commit sync; [Wal.committed_frames] already
-          reflects the appended frames.  Synchronous and lock-free, consistent
+       (* #382: emit the authoritative frame batch for this commit.  Uses
+          [frames_after] captured under the write lock (above) rather than
+          re-reading [Wal.committed_frames] here — a concurrent auto-checkpoint
+          could have [Wal.reset] during the group-commit yields, which would
+          make a re-read count negative.  Synchronous and lock-free, consistent
           with the [Txn_commit] emit that runs after lock release. *)
-       let appended = Wal.committed_frames wal - frames_before in
+       let appended = frames_after - frames_before in
        emit_event
          st
          (Store_event.Wal_append

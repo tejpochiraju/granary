@@ -179,6 +179,47 @@ let prop_commit_count =
        !commits = List.length (List.filter Fun.id outcomes))
 ;;
 
+(* #382 (Fix 1 regression): forcing an auto-checkpoint to fire during commits
+   must never produce a negative [Wal_append] count or base_idx.  A concurrent
+   [Wal.reset] (zeroing committed_frames) during the group-commit yields would,
+   if the count were re-read after lock release, go negative. *)
+let test_wal_append_count_nonneg_under_autockpt () =
+  let path = fresh_path () in
+  cleanup path;
+  let bad = ref [] in
+  Lwt.finalize
+    (fun () ->
+       let open Lwt.Syntax in
+       let* st = S.open_file_wal ~path () in
+       let st = Result.get_ok st in
+       S.set_wal_autocheckpoint st 1;
+       (* force auto-checkpoint to fire between/within commits *)
+       S.set_event_callback
+         st
+         (Some
+            (fun ev ->
+              match ev with
+              | Ev.Wal_append { base_idx; count; _ } ->
+                if count < 0 || base_idx < 0 then bad := (base_idx, count) :: !bad
+              | _ -> ()));
+       let* () =
+         Lwt_list.iter_s
+           (fun i ->
+              let open Lwt.Syntax in
+              let* txn = S.rw_begin st in
+              let* () = S.put txn 16 (bs (Printf.sprintf "k%d" i)) (bs "v") in
+              S.commit txn)
+           (List.init 20 Fun.id)
+       in
+       let* () = S.close st in
+       Lwt.return_unit)
+    (fun () ->
+       cleanup path;
+       Lwt.return_unit)
+  |> run;
+  Alcotest.(check (list (pair int int))) "no negative Wal_append counts/base" [] !bad
+;;
+
 let () =
   Alcotest.run
     "store_event"
@@ -201,6 +242,10 @@ let () =
             "raising callback swallowed"
             `Quick
             test_raising_callback_is_swallowed
+        ; Alcotest.test_case
+            "wal_append count nonneg under autockpt"
+            `Quick
+            test_wal_append_count_nonneg_under_autockpt
         ] )
     ; "props", [ QCheck_alcotest.to_alcotest prop_commit_count ]
     ]
