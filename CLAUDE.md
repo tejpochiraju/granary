@@ -58,6 +58,24 @@ tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml
 
 The pre-commit hook runs format checks automatically on staged `.ml`/`.mli` files.
 
+### Before pushing: dune-file formatting + merlint
+
+The CI **lint** job runs `dune build @fmt` (which checks dune-file formatting *and* ocamlformat) and `merlint`. Formatting only your `.ml`/`.mli` with ocamlformat is **not** enough — CI will still fail on unformatted `dune` files or merlint findings. Run both locally before pushing:
+
+```sh
+# dune-file formatting — @fmt can't run in a worktree (the worktree .git is a
+# file → "fatal: not a git repository"), so use the standalone formatter:
+tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev \
+  dune format-dune-file path/to/dune > "$tmp" && mv "$tmp" path/to/dune && chmod 644 path/to/dune
+# verify a dune file is already formatted (expect no diff):
+diff <(podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev dune format-dune-file path/to/dune) path/to/dune
+
+# merlint — run from the workspace root; expect 0 issues for your files
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev merlint
+```
+
+merlint enforces (among others): max nesting depth 4, every library module has a `.mli`, an abstract `type t` has a `pp`, and every public `val` in an `.mli` has a `(** … *)` doc comment (not `(* … *)`). It ignores the pre-existing `sqlite3 not found` build warning and still reports.
+
 ### Coverage
 
 Use the manual binary loop, not `dune runtest --instrument-with=bisect_ppx` (requires RPC daemon):
