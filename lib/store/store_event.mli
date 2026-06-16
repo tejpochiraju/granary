@@ -32,8 +32,13 @@ type t =
   | Checkpoint_end of { pages_migrated : int }
   (* #384: page-level physical-I/O events.  [txn_id] is stamped by
      [Store.set_event_callback] from [Pager.get_txn_id] (the underlying
-     [Pager_event.t] carries only the page id); best-effort for reads outside a
-     write txn. *)
+     [Pager_event.t] carries only the page id).  It is exact for write-path
+     events fired inside an active RW txn ([Page_alloc]/[Page_free], and
+     [Page_write] on commit-flush).  It is best-effort otherwise: [Page_read]
+     outside a write txn, and [Page_write] emitted during checkpoint /
+     replication / recovery (no owning txn), carry the most-recent committed
+     txn id rather than an owning one — and are NOT bracketed by
+     [Txn_begin]/[Txn_commit]. *)
   | Page_read of
       { txn_id : int64
       ; page : int64
