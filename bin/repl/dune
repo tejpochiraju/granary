@@ -1,8 +1,8 @@
 (library
  (name repl_lib)
  (wrapped false)
- (modules repl_engine event_log)
- (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd)
+ (modules repl_engine event_log monitor_view)
+ (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd nottui notty-community)
  (preprocess
   (pps lwt_ppx)))
 

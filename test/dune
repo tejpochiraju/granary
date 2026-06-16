@@ -100,6 +100,8 @@
   sqlocaml.storage
   sqlocaml.unix
   repl_lib
+  lwd
+  nottui
   lwt.unix
   unix))
 

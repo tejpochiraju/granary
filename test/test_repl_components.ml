@@ -85,6 +85,15 @@ let prop_is_query_whitespace_insensitive =
     (fun (kw, ws) -> E.is_query_stmt (ws ^ kw ^ " 1") = true)
 ;;
 
+let test_monitor_renders () =
+  let l = Event_log.create ~capacity:10 in
+  Event_log.push l (mk_commit 1L);
+  let ui_lwd = Monitor_view.render l in
+  let root = Lwd.observe ui_lwd in
+  let ui = Lwd.quick_sample root in
+  Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 0)
+;;
+
 let () =
   Alcotest.run
     "repl_components"
@@ -102,5 +111,6 @@ let () =
         ; Alcotest.test_case "filter" `Quick test_filter
         ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
         ] )
+    ; "monitor_view", [ Alcotest.test_case "renders" `Quick test_monitor_renders ]
     ]
 ;;
