@@ -39,4 +39,5 @@ val label : t -> string
     txn-id filter. *)
 val txn_id : t -> int64 option
 
+(** Human-readable one-line rendering of an event. *)
 val pp : Format.formatter -> t -> unit

@@ -21,12 +21,24 @@ val visible : t -> Event.t list
 (** Total events currently retained (ignoring the filter). *)
 val length : t -> int
 
+(** [set_filter t f] sets the active txn-id filter ([None] = show all). *)
 val set_filter : t -> int64 option -> unit
+
+(** The active txn-id filter, if any. *)
 val filter : t -> int64 option
+
+(** Toggle the paused flag (freezes the view, not ingestion). *)
 val toggle_pause : t -> unit
+
+(** Whether the view is paused. *)
 val paused : t -> bool
+
+(** Drop all retained events. *)
 val clear : t -> unit
 
 (** The [Lwd] root that a view observes; bumped whenever the buffer, filter, or
     pause flag changes. *)
 val state_var : t -> unit Lwd.var
+
+(** Minimal pretty-printer: retained-event count, pause state, active filter. *)
+val pp : Format.formatter -> t -> unit

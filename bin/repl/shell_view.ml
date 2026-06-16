@@ -27,7 +27,7 @@ let pad s w =
 
 (* Per-column widths that account for BOTH the widest data value and the header
    label, so header and data cells in the same column share one width. Exposed
-   (no .mli) for testing. *)
+   (see .mli) for testing. *)
 let column_widths_with_headers ~headers ~rows =
   let data_widths = Repl_engine.column_widths rows in
   let header_arr = Array.of_list headers in
@@ -58,13 +58,24 @@ let render_rows headers rows =
   header_row @ List.map (fun r -> Lwd.return (render_row r)) rows
 ;;
 
+let pp fmt t =
+  Format.fprintf
+    fmt
+    "Shell_view{input=%S status=%S}"
+    (Lwd.peek t.input)
+    (Lwd.peek t.status)
+;;
+
 let render t =
-  Lwd.bind (Lwd.get t.input) ~f:(fun input ->
-    Lwd.bind (Lwd.get t.status) ~f:(fun status ->
-      Lwd.bind (Lwd.get t.headers) ~f:(fun headers ->
-        Lwd.bind (Lwd.get t.rows) ~f:(fun rows ->
+  let pair a b = Lwd.map2 a b ~f:(fun x y -> x, y) in
+  Lwd.bind
+    (pair (Lwd.get t.input) (Lwd.get t.status))
+    ~f:(fun (input, status) ->
+      Lwd.bind
+        (pair (Lwd.get t.headers) (Lwd.get t.rows))
+        ~f:(fun (headers, rows) ->
           W.vbox
             ([ Lwd.return (W.string ~attr:Notty.A.(fg cyan) ("sqlocaml> " ^ input)) ]
              @ render_rows headers rows
-             @ [ Lwd.return (W.string ~attr:Notty.A.(fg lightblack) status) ])))))
+             @ [ Lwd.return (W.string ~attr:Notty.A.(fg lightblack) status) ])))
 ;;

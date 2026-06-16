@@ -11,6 +11,14 @@
  (public_name sqlocaml_repl)
  (package sqlocaml_repl)
  (modules sqlocaml_repl)
- (libraries repl_lib sqlocaml sqlocaml.unix lwt lwt.unix lwd nottui nottui-lwt)
+ (libraries
+  repl_lib
+  sqlocaml
+  sqlocaml.unix
+  lwt
+  lwt.unix
+  lwd
+  nottui
+  nottui-lwt)
  (preprocess
   (pps lwt_ppx)))

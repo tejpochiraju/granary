@@ -51,3 +51,14 @@ let clear t =
 ;;
 
 let state_var t = t.state
+
+let pp fmt t =
+  Format.fprintf
+    fmt
+    "Event_log{len=%d paused=%b filter=%s}"
+    (Queue.length t.q)
+    t.paused
+    (match t.filter with
+     | None -> "-"
+     | Some id -> Int64.to_string id)
+;;

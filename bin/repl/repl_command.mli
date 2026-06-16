@@ -26,6 +26,13 @@ val classify : filter_mode:bool -> string -> action
 
 (* Pure SQL builders for the dot-commands (so their text — incl. the .schema
    single-quote escaping — is testable). *)
+
+(** SQL for [.tables]: list user tables. *)
 val tables_sql : string
+
+(** SQL for [.databases]. *)
 val databases_sql : string
+
+(** [schema_sql name] is the [.schema] query (all tables, or one; single-quotes
+    in [name] are escaped). *)
 val schema_sql : string option -> string
