@@ -2174,7 +2174,7 @@ let pinned_page_count (t : t) : int =
 let live_read_locks (t : t) : int = Rwlock.readers t.lock
 
 (* ------------------------------------------------------------------ *)
-(* Savepoints (Mem backend only; B-tree deferred)                      *)
+(* Savepoints (both Mem and B-tree backends)                           *)
 (* ------------------------------------------------------------------ *)
 
 (** Push a named savepoint: snapshot the current shadow state (#178). *)
