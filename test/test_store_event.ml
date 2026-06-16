@@ -17,6 +17,24 @@ let test_pp_roundtrip_nonempty () =
   Alcotest.(check bool) "pp non-empty" true (String.length s > 0)
 ;;
 
+let test_pp_all_constructors () =
+  let check expected ev =
+    Alcotest.(check string) expected expected (Format.asprintf "%a" Ev.pp ev)
+  in
+  check "BEGIN txn=1" (Ev.Txn_begin { txn_id = 1L });
+  check "ROLLBACK txn=4" (Ev.Txn_rollback { txn_id = 4L });
+  check "COMMIT txn=2 frames=3" (Ev.Txn_commit { txn_id = 2L; frames = 3 });
+  check "SP_BEGIN txn=5 name=a" (Ev.Savepoint_begin { txn_id = 5L; name = "a" });
+  check "SP_RELEASE txn=6 name=b" (Ev.Savepoint_release { txn_id = 6L; name = "b" });
+  check "SP_ROLLBACK txn=7 name=c" (Ev.Savepoint_rollback { txn_id = 7L; name = "c" });
+  check
+    "WAL_APPEND txn=8 base=9 count=10"
+    (Ev.Wal_append { txn_id = 8L; base_idx = 9; count = 10 });
+  check "WAL_RESET epoch=11" (Ev.Wal_reset { epoch = 11L });
+  check "CKPT_BEGIN target=12" (Ev.Checkpoint_begin { target_frames = 12 });
+  check "CKPT_END migrated=13" (Ev.Checkpoint_end { pages_migrated = 13 })
+;;
+
 module S = struct
   include Sqlocaml_store.Store
 
@@ -226,6 +244,7 @@ let () =
     [ ( "type"
       , [ Alcotest.test_case "label + txn_id" `Quick test_label_and_txn_id
         ; Alcotest.test_case "pp non-empty" `Quick test_pp_roundtrip_nonempty
+        ; Alcotest.test_case "pp all constructors" `Quick test_pp_all_constructors
         ] )
     ; ( "seam"
       , [ Alcotest.test_case
