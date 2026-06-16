@@ -113,6 +113,14 @@ val create_worker_handle : t -> t Lwt.t
     databases.  Exposed for #77 group-commit testing. *)
 val wal_sync_count : t -> int
 
+(** Re-export of the internal-events type (#382). *)
+module Event = Sqlocaml_store.Store.Event
+
+(** Register/clear the internals-monitor observer on this database's store.
+    No-op for in-memory databases.  The callback should be cheap and
+    non-blocking (see {!Sqlocaml_store.Store.set_event_callback}). *)
+val set_event_callback : t -> (Event.t -> unit) option -> unit
+
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then
     atomically renames it over the original.  This drops free-list

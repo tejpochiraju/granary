@@ -39,9 +39,57 @@
   test_dump_264
   test_ddl_txn_269
   test_unique_build_288
-  test_schema_cache_283)
+  test_schema_cache_283
+  test_store_event
+  test_db_event_385
+  test_repl_components)
+ (modules
+  test_dummy
+  test_mem
+  test_varint
+  test_rowid
+  test_row
+  test_schema_fingerprint
+  test_store
+  test_geometry
+  test_geometry_e2e
+  test_catalog
+  test_lexer
+  test_parser
+  test_sema
+  test_planner
+  test_exec
+  test_e2e
+  test_unix_file
+  test_page
+  test_page_tag
+  test_freelist
+  test_pager
+  test_header
+  test_btree
+  test_index_key
+  test_expr
+  test_update
+  test_delete
+  test_join
+  test_aggregate
+  test_write_alloc
+  test_read_alloc
+  test_get_alloc
+  test_rowid_alias
+  test_query_stats_239
+  test_query_stats_257
+  test_txn_ryw_262
+  test_dump_264
+  test_ddl_txn_269
+  test_unique_build_288
+  test_schema_cache_283
+  test_store_event
+  test_db_event_385
+  test_repl_components)
  (libraries
   alcotest
+  qcheck-core
   qcheck-alcotest
   sqlocaml
   sqlocaml.block
@@ -51,11 +99,15 @@
   sqlocaml.sql
   sqlocaml.storage
   sqlocaml.unix
+  repl_lib
+  lwd
+  nottui
   lwt.unix
   unix))
 
 (test
  (name test_crypto)
+ (modules test_crypto)
  (libraries
   alcotest
   qcheck-alcotest
@@ -67,6 +119,7 @@
 
 (test
  (name test_encryption_e2e)
+ (modules test_encryption_e2e)
  (libraries
   alcotest
   lwt
@@ -80,6 +133,7 @@
 
 (test
  (name test_store_crypto)
+ (modules test_store_crypto)
  (libraries
   alcotest
   lwt
@@ -94,10 +148,12 @@
 
 (test
  (name test_store_crypto_unseeded)
+ (modules test_store_crypto_unseeded)
  (libraries alcotest lwt lwt.unix cstruct sqlocaml.store sqlocaml.storage))
 
 (test
  (name test_wal_crypto)
+ (modules test_wal_crypto)
  (libraries
   alcotest
   alcotest-lwt
@@ -110,6 +166,7 @@
 
 (test
  (name test_conformance)
+ (modules test_conformance)
  (libraries
   sqlocaml
   sqlocaml.block
@@ -128,18 +185,22 @@
 
 (test
  (name test_datetime)
+ (modules test_datetime)
  (libraries sqlocaml.sql alcotest))
 
 (test
  (name test_parallel)
+ (modules test_parallel)
  (libraries sqlocaml.parallel alcotest))
 
 (test
  (name test_scalar_fns)
+ (modules test_scalar_fns)
  (libraries sqlocaml sqlocaml.sql alcotest lwt.unix))
 
 (test
  (name test_txn)
+ (modules test_txn)
  (libraries
   sqlocaml
   sqlocaml.sql
@@ -150,14 +211,17 @@
 
 (test
  (name test_mirage_backend)
+ (modules test_mirage_backend)
  (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))
 
 (test
  (name test_prepared)
+ (modules test_prepared)
  (libraries sqlocaml alcotest lwt.unix))
 
 (test
  (name test_fts)
+ (modules test_fts)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (executable
@@ -167,10 +231,12 @@
  ; for consistency with bench_compare.
  (name test_sqlite_compare)
  (optional)
+ (modules test_sqlite_compare)
  (libraries sqlocaml alcotest lwt.unix unix))
 
 (test
  (name test_store_btree)
+ (modules test_store_btree)
  (libraries
   alcotest
   qcheck-alcotest
@@ -189,6 +255,7 @@
 
 (test
  (name test_all_backends)
+ (modules test_all_backends)
  (libraries
   sqlocaml
   sqlocaml.block
@@ -207,24 +274,29 @@
 
 (test
  (name test_sqlite_corpus)
+ (modules test_sqlite_corpus)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix)
  (deps
   (source_tree sqlite_corpus)))
 
 (test
  (name test_parser_fuzz)
+ (modules test_parser_fuzz)
  (libraries sqlocaml alcotest qcheck-core qcheck-alcotest lwt.unix unix))
 
 (test
  (name test_crash_recovery)
+ (modules test_crash_recovery)
  (libraries sqlocaml sqlocaml.block sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_wal)
+ (modules test_wal)
  (libraries sqlocaml.storage alcotest lwt.unix))
 
 (test
  (name test_store_wal)
+ (modules test_store_wal)
  (libraries
   sqlocaml
   sqlocaml.store
@@ -237,6 +309,7 @@
 
 (test
  (name test_online_backup)
+ (modules test_online_backup)
  (libraries
   sqlocaml
   sqlocaml.store
@@ -251,6 +324,7 @@
 
 (test
  (name test_store_rekey)
+ (modules test_store_rekey)
  (libraries
   sqlocaml.store
   sqlocaml.storage
@@ -264,6 +338,7 @@
 
 (test
  (name test_crash_property)
+ (modules test_crash_property)
  (libraries
   sqlocaml.store
   sqlocaml.storage
@@ -276,6 +351,7 @@
 
 (test
  (name test_wal_fault_injection)
+ (modules test_wal_fault_injection)
  (libraries
   sqlocaml.store
   sqlocaml.storage
@@ -286,6 +362,7 @@
 
 (test
  (name test_wal_autocheckpoint)
+ (modules test_wal_autocheckpoint)
  (libraries
   sqlocaml
   sqlocaml.store
@@ -297,10 +374,12 @@
 
 (test
  (name test_group_commit)
+ (modules test_group_commit)
  (libraries sqlocaml sqlocaml.store sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_durability_298)
+ (modules test_durability_298)
  (libraries
   sqlocaml
   sqlocaml.store
@@ -312,6 +391,7 @@
 
 (test
  (name test_overflow)
+ (modules test_overflow)
  (libraries
   sqlocaml.store
   sqlocaml.storage
@@ -322,6 +402,7 @@
 
 (test
  (name test_without_rowid)
+ (modules test_without_rowid)
  (libraries
   sqlocaml
   sqlocaml.store
@@ -333,6 +414,7 @@
 
 (test
  (name test_vacuum)
+ (modules test_vacuum)
  (libraries
   sqlocaml
   sqlocaml.encoding
@@ -344,22 +426,27 @@
 
 (test
  (name test_trigger_atomicity)
+ (modules test_trigger_atomicity)
  (libraries sqlocaml sqlocaml.encoding alcotest lwt.unix))
 
 (test
  (name test_multifiber_stress)
+ (modules test_multifiber_stress)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_concurrent_rmw_223)
+ (modules test_concurrent_rmw_223)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_soak)
+ (modules test_soak)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_perf_bench)
+ (modules test_perf_bench)
  (libraries sqlocaml sqlocaml.encoding sqlocaml.unix alcotest lwt.unix unix))
 
 ; Real-SQLite CLI performance baseline, extracted from test_perf_bench.ml.
@@ -370,26 +457,32 @@
 (executable
  (name bench_perf_compare_sqlite3)
  (optional)
+ (modules bench_perf_compare_sqlite3)
  (libraries unix))
 
 (test
  (name test_insert_scaling)
+ (modules test_insert_scaling)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_fts_scaling)
+ (modules test_fts_scaling)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_seek_stack)
+ (modules test_seek_stack)
  (libraries sqlocaml.store alcotest lwt.unix))
 
 (test
  (name test_scan_alloc)
+ (modules test_scan_alloc)
  (libraries sqlocaml.store sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name test_attach)
+ (modules test_attach)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
@@ -400,26 +493,32 @@
 
 (test
  (name test_rwlock)
+ (modules test_rwlock)
  (libraries sqlocaml.store alcotest lwt.unix))
 
 (test
  (name test_pager_versioned_cache)
+ (modules test_pager_versioned_cache)
  (libraries sqlocaml.storage alcotest lwt.unix))
 
 (test
  (name test_pager_snapshot_pin)
+ (modules test_pager_snapshot_pin)
  (libraries sqlocaml.store alcotest lwt.unix unix))
 
 (test
  (name test_wal_reader_snapshot)
+ (modules test_wal_reader_snapshot)
  (libraries sqlocaml sqlocaml.store sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name bench_wal_reader_scaling)
+ (modules bench_wal_reader_scaling)
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
  (name bench_wal_fsync_overlap)
+ (modules bench_wal_fsync_overlap)
  (libraries
   sqlocaml.store
   sqlocaml.block
@@ -430,6 +529,7 @@
 
 (test
  (name bench_slow_read_yield)
+ (modules bench_slow_read_yield)
  (libraries
   sqlocaml.store
   sqlocaml.block
@@ -440,6 +540,7 @@
 
 (test
  (name test_replication)
+ (modules test_replication)
  (libraries
   sqlocaml.replication
   sqlocaml.storage
@@ -450,10 +551,12 @@
 
 (test
  (name test_replication_gating)
+ (modules test_replication_gating)
  (libraries sqlocaml sqlocaml.store sqlocaml.storage alcotest lwt.unix unix))
 
 (test
  (name test_standby)
+ (modules test_standby)
  (libraries
   sqlocaml.replication
   sqlocaml.store
@@ -466,6 +569,7 @@
 
 (test
  (name test_shared_wal)
+ (modules test_shared_wal)
  (libraries
   sqlocaml
   sqlocaml.columnar
@@ -499,6 +603,7 @@
 
 (test
  (name test_incremental_backup)
+ (modules test_incremental_backup)
  (libraries
   sqlocaml.replication
   sqlocaml.store

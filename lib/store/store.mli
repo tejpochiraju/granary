@@ -606,6 +606,19 @@ val set_commit_callback
     {!set_commit_callback}). While active, durability is pinned to [Full]. *)
 val commit_callback_active : t -> bool
 
+(** Re-export of the internal-events type (#382). *)
+module Event = Store_event
+
+(** Register (or clear with [None]) a synchronous, fire-and-forget observer for
+    internal engine events — the internals monitor.  No-op on the in-memory
+    backend (it has no storage seams).  The callback must not raise; any
+    exception it throws is swallowed so it cannot break a transaction.  The
+    callback should also be cheap and non-blocking: some events are emitted
+    while the engine holds the write lock (transaction begin, savepoints,
+    checkpoint start), so a slow observer can stall writers.  The intended use
+    is an O(1) buffer push. *)
+val set_event_callback : t -> (Event.t -> unit) option -> unit
+
 (** -------------------------------------------------------------------- *)
 
 (** Standby-follower integration (#172)                                      *)

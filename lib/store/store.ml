@@ -191,6 +191,11 @@ type bt_state =
        individual frames via [Wal.read_frame] and ships them to the object
        store.  Fired via [Lwt.async] so it never blocks the commit path.
        [None] when no sink is registered. *)
+  ; mutable on_event : (Store_event.t -> unit) option
+    (* #382: optional, synchronous, fire-and-forget observer for internal
+       events (the internals monitor).  [None] = zero overhead.  Invoked via
+       [emit_event], which swallows any exception so a faulty observer can
+       never break a transaction.  Btree backend only — Mem has no bt_state. *)
   ; mutable follower : bool
     (* When true, [rw_begin] rejects with an error.  Set by the standby
        consumer while following the master's WAL stream; cleared on
@@ -649,6 +654,7 @@ let make_btree_store
     ; backup_shipped_frames = max_int
     ; backup_gate_max_yields = max_int
     ; on_committed_frames = None
+    ; on_event = None
     ; follower = false
     ; follower_ack_position = None
     ; sync_mode = `Full
@@ -1171,6 +1177,19 @@ let ro_begin t =
            }))
 ;;
 
+let emit_event (st : bt_state) (ev : Store_event.t) =
+  match st.on_event with
+  | None -> ()
+  | Some f ->
+    (try f ev with
+     | _ -> ())
+;;
+
+(* The id the currently-active rw txn will commit as.  The header is not bumped
+   until commit, so every event of one txn shares this id (one writer at a time
+   under the write lock). *)
+let active_txn_id (st : bt_state) = Int64.add st.current_header.txn_id 1L
+
 let rw_begin t =
   let* () = Rwlock.acquire_write t.lock in
   let is_follower =
@@ -1206,6 +1225,7 @@ let rw_begin t =
        t.mem_savepoints <- []
      | Btree st ->
        let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+       emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
        Pager.set_txn_id st.pager current_rw_txn_id;
        let min_safe =
          match min_active_reader_txn st with
@@ -1428,6 +1448,11 @@ let rec wait_for_readers_past
 
 let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
   let target = Wal.committed_frames wal in
+  (* #382: [Checkpoint_begin] is a best-effort signal — if the checkpoint
+     aborts early (store closing, or an I/O error before [Wal.reset]), no
+     matching [Checkpoint_end] is emitted.  Monitor consumers must tolerate an
+     unbalanced begin. *)
+  emit_event st (Store_event.Checkpoint_begin { target_frames = target });
   let* () =
     wait_for_readers_past
       st
@@ -1452,6 +1477,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
       (fun () ->
          let pairs = ref [] in
          Wal.iter_index wal (fun pid idx -> pairs := (pid, idx) :: !pairs);
+         (* #382: count the pages actually migrated to the main file so the
+            [Checkpoint_end] event reports the real work done. *)
+         let migrated = ref 0 in
          let rec write_each = function
            | [] -> Lwt.return_unit
            | (pid, idx) :: rest ->
@@ -1464,7 +1492,9 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
                 (match wr with
                  | Error e ->
                    Lwt.fail_with (Format.asprintf "checkpoint write: %a" Pager.pp_error e)
-                 | Ok () -> write_each rest))
+                 | Ok () ->
+                   incr migrated;
+                   write_each rest))
          in
          let* () = write_each !pairs in
          let* sr = Pager.flush_sync_main st.pager in
@@ -1481,6 +1511,10 @@ let checkpoint_unlocked (st : bt_state) (wal : Wal.t) : unit Lwt.t =
             dispatched after the count reaches 0 can slip in before reset. *)
            let* () = wait_until st (fun () -> st.sink_ships_in_flight = 0) in
            Wal.reset wal;
+           (* #382: WAL is reset to a fresh epoch and the migration is done.
+              Read [Wal.epoch] AFTER reset for the new epoch. *)
+           emit_event st (Store_event.Wal_reset { epoch = Wal.epoch wal });
+           emit_event st (Store_event.Checkpoint_end { pages_migrated = !migrated });
            (* #298/#1: checkpoint is a full-sync durability anchor — everything
             is now durable and the WAL starts a fresh epoch at frame 0.  Reset
             the sink ship counter (new epoch) and the batched durability counters
@@ -1746,9 +1780,20 @@ let commit_wal t st =
     | Some w -> w
     | None -> assert false
   in
+  (* #382: capture the cumulative committed frame count and this txn's id BEFORE
+     the append/commit work, so the [Wal_append] emitted at the end reports the
+     authoritative batch this commit produced (relative to nothing — an absolute
+     base/count pair), independent of the replication cursor. *)
+  let frames_before = Wal.committed_frames wal in
+  let append_txn_id = active_txn_id st in
   Lwt.catch
     (fun () ->
        let* () = commit_prepare_btree ~header_commit:Header.commit_no_sync st in
+       (* #382: capture the appended frame count under the write lock, before
+          [unlock_once] and the group-commit yields — a concurrent
+          auto-checkpoint can [Wal.reset] (zeroing committed_frames) during
+          those yields, which would make the count negative if read later. *)
+       let frames_after = Wal.committed_frames wal in
        (* #298: decide the sync policy under the write lock so the counter is
           race-free across concurrent writers, then release the lock. *)
        let do_sync =
@@ -1839,6 +1884,17 @@ let commit_wal t st =
               (checkpoint is a full-sync durability anchor). *)
            maybe_autockpt_after_commit t st
        in
+       (* #382: emit the authoritative frame batch for this commit.  Uses
+          [frames_after] captured under the write lock (above) rather than
+          re-reading [Wal.committed_frames] here — a concurrent auto-checkpoint
+          could have [Wal.reset] during the group-commit yields, which would
+          make a re-read count negative.  Synchronous and lock-free, consistent
+          with the [Txn_commit] emit that runs after lock release. *)
+       let appended = frames_after - frames_before in
+       emit_event
+         st
+         (Store_event.Wal_append
+            { txn_id = append_txn_id; base_idx = frames_before; count = appended });
        Lwt.return_unit)
     (fun exn ->
        unlock_once ();
@@ -1868,16 +1924,25 @@ let commit (Rw t : rw txn) : unit Lwt.t =
     (* #356: the append cursor is only valid within a txn (its leaf is dirty);
        commit flushes dirty pages, so drop it. *)
     Hashtbl.clear st.bt_append;
-    (match st.wal with
-     | None ->
-       Lwt.finalize
-         (fun () ->
-            let* () = commit_prepare_btree ~header_commit:Header.commit st in
-            maybe_autocheckpoint st)
-         (fun () ->
-            Rwlock.release_write t.lock;
-            Lwt.return_unit)
-     | Some _ -> commit_wal t st)
+    (* #382: capture the id this txn commits as BEFORE the header is bumped
+       (commit_prepare_btree advances [st.current_header.txn_id]).  Emit
+       [Txn_commit] only after the commit work has succeeded.  [frames = 0] is a
+       placeholder: Task 4 wires the authoritative frame count via [Wal_append]. *)
+    let committed_id = active_txn_id st in
+    let* () =
+      match st.wal with
+      | None ->
+        Lwt.finalize
+          (fun () ->
+             let* () = commit_prepare_btree ~header_commit:Header.commit st in
+             maybe_autocheckpoint st)
+          (fun () ->
+             Rwlock.release_write t.lock;
+             Lwt.return_unit)
+      | Some _ -> commit_wal t st
+    in
+    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames = 0 });
+    Lwt.return_unit
 ;;
 
 (* rollback:
@@ -1892,6 +1957,7 @@ let commit (Rw t : rw txn) : unit Lwt.t =
      data from disk. The freelist snapshot ensures no aborted CoW frees
      corrupt future allocations. *)
 let rollback (Rw t : rw txn) : unit Lwt.t =
+  let to_emit = ref None in
   (match t.backend with
    | Mem _ ->
      (* #178: just discard the shadow — the live tree was never touched. *)
@@ -1912,8 +1978,18 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         Pager.clear_dirty st.pager;
         st.txn_freelist_snapshot <- None
       | None -> ());
-     st.bt_savepoints <- []);
+     st.bt_savepoints <- [];
+     (* #382: rollback does not change [st.current_header.txn_id], so
+        [active_txn_id] still reads the id this aborted txn would have used.
+        We capture the event here (where [st] is in scope) but emit it after
+        the write lock is released, for parity with [commit] — a future
+        observer doing real work must not stall writers while we hold the
+        global write lock. *)
+     to_emit := Some (st, Store_event.Txn_rollback { txn_id = active_txn_id st }));
   Rwlock.release_write t.lock;
+  (match !to_emit with
+   | Some (st, ev) -> emit_event st ev
+   | None -> ());
   Lwt.return_unit
 ;;
 
@@ -2134,7 +2210,7 @@ let pinned_page_count (t : t) : int =
 let live_read_locks (t : t) : int = Rwlock.readers t.lock
 
 (* ------------------------------------------------------------------ *)
-(* Savepoints (Mem backend only; B-tree deferred)                      *)
+(* Savepoints (both Mem and B-tree backends)                           *)
 (* ------------------------------------------------------------------ *)
 
 (** Push a named savepoint: snapshot the current shadow state (#178). *)
@@ -2163,6 +2239,7 @@ let savepoint_begin (Rw t : rw txn) name =
       }
     in
     st.bt_savepoints <- sp :: st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_begin { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 
@@ -2184,6 +2261,7 @@ let savepoint_release (Rw t : rw txn) name =
       | _ :: rest -> drop rest
     in
     st.bt_savepoints <- drop st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_release { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 
@@ -2232,6 +2310,7 @@ let savepoint_rollback (Rw t : rw txn) name =
       | _ :: rest -> find rest
     in
     find st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_rollback { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 
@@ -3170,6 +3249,14 @@ let set_commit_callback
             Rwlock.release_write t.lock;
             Lwt.return_unit))
 ;;
+
+let set_event_callback (t : t) (cb : (Store_event.t -> unit) option) =
+  match t.backend with
+  | Mem _ -> () (* Mem backend has no bt_state; emits no events (#382). *)
+  | Btree st -> st.on_event <- cb
+;;
+
+module Event = Store_event
 
 (* ------------------------------------------------------------------ *)
 (* Follower mode (#172)                                                 *)

@@ -1,0 +1,189 @@
+module E = Repl_engine
+module L = Event_log
+module Ev = Sqlocaml.Db.Event
+
+let mk_commit id = Ev.Txn_commit { txn_id = id; frames = 0 }
+
+let test_ring_capacity () =
+  let l = L.create ~capacity:3 in
+  List.iter (fun i -> L.push l (mk_commit (Int64.of_int i))) [ 1; 2; 3; 4; 5 ];
+  Alcotest.(check int) "capped at 3" 3 (L.length l);
+  let ids = List.filter_map Ev.txn_id (L.visible l) in
+  Alcotest.(check (list int64)) "oldest dropped" [ 3L; 4L; 5L ] ids
+;;
+
+let test_filter () =
+  let l = L.create ~capacity:10 in
+  List.iter (fun i -> L.push l (mk_commit (Int64.of_int i))) [ 1; 2; 3 ];
+  L.set_filter l (Some 2L);
+  Alcotest.(check (list int64))
+    "only txn 2"
+    [ 2L ]
+    (List.filter_map Ev.txn_id (L.visible l));
+  L.set_filter l None;
+  Alcotest.(check int) "filter cleared" 3 (List.length (L.visible l))
+;;
+
+let test_pause_toggle () =
+  let l = L.create ~capacity:10 in
+  Alcotest.(check bool) "starts unpaused" false (L.paused l);
+  L.toggle_pause l;
+  Alcotest.(check bool) "paused" true (L.paused l)
+;;
+
+let test_is_query_stmt () =
+  Alcotest.(check bool) "select" true (E.is_query_stmt "SELECT 1");
+  Alcotest.(check bool) "with" true (E.is_query_stmt "  with x as (..) select ..");
+  Alcotest.(check bool) "insert" false (E.is_query_stmt "INSERT INTO t VALUES (1)");
+  Alcotest.(check bool) "empty" false (E.is_query_stmt "   ")
+;;
+
+let test_split_stmts_respects_quotes () =
+  Alcotest.(check (list string))
+    "two stmts"
+    [ "SELECT 1"; "SELECT 2" ]
+    (E.split_stmts "SELECT 1; SELECT 2;");
+  Alcotest.(check (list string))
+    "semicolon in string is not a split"
+    [ "INSERT INTO t VALUES ('a;b')" ]
+    (E.split_stmts "INSERT INTO t VALUES ('a;b');")
+;;
+
+let test_has_terminator () =
+  let b = Buffer.create 16 in
+  Buffer.add_string b "SELECT 1";
+  Alcotest.(check bool) "no term" false (E.has_terminator b);
+  Buffer.add_char b ';';
+  Alcotest.(check bool) "term" true (E.has_terminator b)
+;;
+
+(* Property: splitting N simple statements joined by ';' recovers them all. *)
+let prop_split_roundtrip =
+  QCheck.Test.make
+    ~count:200
+    ~name:"split_stmts round-trips simple statements"
+    QCheck.(
+      list_small (make QCheck.Gen.(string_size (int_range 1 8) ~gen:(char_range 'a' 'z'))))
+    (fun parts ->
+       (* keep only non-empty, non-whitespace tokens (the function drops empties) *)
+       let parts = List.filter (fun s -> String.trim s <> "") parts in
+       let joined = String.concat ";" parts ^ if parts = [] then "" else ";" in
+       E.split_stmts joined = List.map String.trim parts)
+;;
+
+(* Property: a leading-keyword query is classified as a query regardless of
+   leading whitespace / case. *)
+let prop_is_query_whitespace_insensitive =
+  QCheck.Test.make
+    ~count:200
+    ~name:"is_query_stmt ignores leading whitespace and case"
+    QCheck.(
+      pair
+        (oneof_list [ "select"; "WITH"; "Explain"; "values"; "pragma" ])
+        (make
+           QCheck.Gen.(string_size (int_range 0 5) ~gen:(oneof_list [ ' '; '\t'; '\n' ]))))
+    (fun (kw, ws) -> E.is_query_stmt (ws ^ kw ^ " 1") = true)
+;;
+
+let test_monitor_renders () =
+  let l = Event_log.create ~capacity:10 in
+  Event_log.push l (mk_commit 1L);
+  let ui_lwd = Monitor_view.render l in
+  let root = Lwd.observe ui_lwd in
+  let ui = Lwd.quick_sample root in
+  Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 0)
+;;
+
+let test_shell_renders () =
+  let v = Shell_view.create () in
+  Shell_view.set_status v "Open: :memory:";
+  Shell_view.set_result v ~headers:[ "x" ] ~rows:[ [| Sqlocaml.Db.V_int 1L |] ];
+  let root = Lwd.observe (Shell_view.render v) in
+  let ui = Lwd.quick_sample root in
+  Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 1)
+;;
+
+let test_shell_header_width () =
+  let w =
+    Shell_view.column_widths_with_headers
+      ~headers:[ "total_revenue" ]
+      ~rows:[ [| Sqlocaml.Db.V_int 42L |] ]
+  in
+  Alcotest.(check int) "width covers header" (String.length "total_revenue") w.(0)
+;;
+
+module C = Repl_command
+
+let test_parse_dot () =
+  Alcotest.(check bool) "help" true (C.parse_dot ".help" = C.Help);
+  Alcotest.(check bool) "quit" true (C.parse_dot ".quit" = C.Quit);
+  Alcotest.(check bool) "exit=quit" true (C.parse_dot ".exit" = C.Quit);
+  Alcotest.(check bool) "tables" true (C.parse_dot ".tables" = C.Tables);
+  Alcotest.(check bool) "schema none" true (C.parse_dot ".schema" = C.Schema None);
+  Alcotest.(check bool) "schema name" true (C.parse_dot ".schema t" = C.Schema (Some "t"));
+  Alcotest.(check bool) "databases" true (C.parse_dot ".databases" = C.Databases);
+  Alcotest.(check bool) "open" true (C.parse_dot ".open /a/b" = C.Open "/a/b");
+  Alcotest.(check bool)
+    "unknown"
+    true
+    (match C.parse_dot ".bogus" with
+     | C.Unknown _ -> true
+     | _ -> false)
+;;
+
+let test_classify () =
+  Alcotest.(check bool) "empty" true (C.classify ~filter_mode:false "  " = C.Empty);
+  Alcotest.(check bool)
+    "sql"
+    true
+    (C.classify ~filter_mode:false "SELECT 1;" = C.Sql [ "SELECT 1" ]);
+  Alcotest.(check bool)
+    "dot"
+    true
+    (C.classify ~filter_mode:false ".tables" = C.Dot C.Tables);
+  Alcotest.(check bool)
+    "filter ok"
+    true
+    (C.classify ~filter_mode:true "42" = C.Filter (Some 42L));
+  Alcotest.(check bool)
+    "filter bad"
+    true
+    (C.classify ~filter_mode:true "xx" = C.Filter None)
+;;
+
+let test_schema_sql_escapes () =
+  Alcotest.(check string)
+    "escapes quote"
+    "SELECT sql FROM sqlite_master WHERE name = 'a''b' AND sql IS NOT NULL"
+    (C.schema_sql (Some "a'b"))
+;;
+
+let () =
+  Alcotest.run
+    "repl_components"
+    [ ( "repl_engine"
+      , [ Alcotest.test_case "is_query_stmt" `Quick test_is_query_stmt
+        ; Alcotest.test_case "split_stmts" `Quick test_split_stmts_respects_quotes
+        ; Alcotest.test_case "has_terminator" `Quick test_has_terminator
+        ] )
+    ; ( "props"
+      , [ QCheck_alcotest.to_alcotest prop_split_roundtrip
+        ; QCheck_alcotest.to_alcotest prop_is_query_whitespace_insensitive
+        ] )
+    ; ( "event_log"
+      , [ Alcotest.test_case "ring capacity" `Quick test_ring_capacity
+        ; Alcotest.test_case "filter" `Quick test_filter
+        ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
+        ] )
+    ; "monitor_view", [ Alcotest.test_case "renders" `Quick test_monitor_renders ]
+    ; ( "shell_view"
+      , [ Alcotest.test_case "renders" `Quick test_shell_renders
+        ; Alcotest.test_case "header width" `Quick test_shell_header_width
+        ] )
+    ; ( "repl_command"
+      , [ Alcotest.test_case "parse_dot" `Quick test_parse_dot
+        ; Alcotest.test_case "classify" `Quick test_classify
+        ; Alcotest.test_case "schema_sql escapes" `Quick test_schema_sql_escapes
+        ] )
+    ]
+;;

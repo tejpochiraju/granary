@@ -1,7 +1,24 @@
+(library
+ (name repl_lib)
+ (wrapped false)
+ (modules repl_engine event_log monitor_view shell_view repl_command)
+ (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd nottui notty-community)
+ (preprocess
+  (pps lwt_ppx)))
+
 (executable
  (name sqlocaml_repl)
  (public_name sqlocaml_repl)
  (package sqlocaml_repl)
- (libraries sqlocaml sqlocaml.unix lwt lwt.unix lwd nottui nottui-lwt)
+ (modules sqlocaml_repl)
+ (libraries
+  repl_lib
+  sqlocaml
+  sqlocaml.unix
+  lwt
+  lwt.unix
+  lwd
+  nottui
+  nottui-lwt)
  (preprocess
   (pps lwt_ppx)))
