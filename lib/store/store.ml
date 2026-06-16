@@ -2203,6 +2203,7 @@ let savepoint_begin (Rw t : rw txn) name =
       }
     in
     st.bt_savepoints <- sp :: st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_begin { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 
@@ -2224,6 +2225,7 @@ let savepoint_release (Rw t : rw txn) name =
       | _ :: rest -> drop rest
     in
     st.bt_savepoints <- drop st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_release { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 
@@ -2272,6 +2274,7 @@ let savepoint_rollback (Rw t : rw txn) name =
       | _ :: rest -> find rest
     in
     find st.bt_savepoints;
+    emit_event st (Store_event.Savepoint_rollback { txn_id = active_txn_id st; name });
     Lwt.return_unit
 ;;
 

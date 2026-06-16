@@ -85,6 +85,22 @@ let test_rollback_emits_rollback () =
   Alcotest.(check bool) "no COMMIT" false (List.mem "COMMIT" labels)
 ;;
 
+let test_savepoint_events () =
+  let labels =
+    with_recorder ~f:(fun st ->
+      let open Lwt.Syntax in
+      let* txn = S.rw_begin st in
+      let* () = S.savepoint_begin txn "sp1" in
+      let* () = S.put txn 16 (bs "k") (bs "v") in
+      let* () = S.savepoint_rollback txn "sp1" in
+      let* () = S.savepoint_release txn "sp1" in
+      S.commit txn)
+  in
+  Alcotest.(check bool) "SP_BEGIN" true (List.mem "SP_BEGIN" labels);
+  Alcotest.(check bool) "SP_ROLLBACK" true (List.mem "SP_ROLLBACK" labels);
+  Alcotest.(check bool) "SP_RELEASE" true (List.mem "SP_RELEASE" labels)
+;;
+
 let () =
   Alcotest.run
     "store_event"
@@ -98,6 +114,7 @@ let () =
             `Quick
             test_commit_emits_begin_and_commit
         ; Alcotest.test_case "rollback emits rollback" `Quick test_rollback_emits_rollback
+        ; Alcotest.test_case "savepoint events" `Quick test_savepoint_events
         ] )
     ]
 ;;
