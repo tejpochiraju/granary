@@ -94,6 +94,15 @@ let test_monitor_renders () =
   Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 0)
 ;;
 
+let test_shell_renders () =
+  let v = Shell_view.create () in
+  Shell_view.set_status v "Open: :memory:";
+  Shell_view.set_result v ~headers:[ "x" ] ~rows:[ [| Sqlocaml.Db.V_int 1L |] ];
+  let root = Lwd.observe (Shell_view.render v) in
+  let ui = Lwd.quick_sample root in
+  Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 1)
+;;
+
 let () =
   Alcotest.run
     "repl_components"
@@ -112,5 +121,6 @@ let () =
         ; Alcotest.test_case "pause toggle" `Quick test_pause_toggle
         ] )
     ; "monitor_view", [ Alcotest.test_case "renders" `Quick test_monitor_renders ]
+    ; "shell_view", [ Alcotest.test_case "renders" `Quick test_shell_renders ]
     ]
 ;;
