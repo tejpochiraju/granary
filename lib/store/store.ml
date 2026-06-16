@@ -191,6 +191,11 @@ type bt_state =
        individual frames via [Wal.read_frame] and ships them to the object
        store.  Fired via [Lwt.async] so it never blocks the commit path.
        [None] when no sink is registered. *)
+  ; mutable on_event : (Store_event.t -> unit) option
+    (* #382: optional, synchronous, fire-and-forget observer for internal
+       events (the internals monitor).  [None] = zero overhead.  Invoked via
+       [emit_event], which swallows any exception so a faulty observer can
+       never break a transaction.  Btree backend only — Mem has no bt_state. *)
   ; mutable follower : bool
     (* When true, [rw_begin] rejects with an error.  Set by the standby
        consumer while following the master's WAL stream; cleared on
@@ -649,6 +654,7 @@ let make_btree_store
     ; backup_shipped_frames = max_int
     ; backup_gate_max_yields = max_int
     ; on_committed_frames = None
+    ; on_event = None
     ; follower = false
     ; follower_ack_position = None
     ; sync_mode = `Full
@@ -1171,6 +1177,19 @@ let ro_begin t =
            }))
 ;;
 
+let emit_event (st : bt_state) (ev : Store_event.t) =
+  match st.on_event with
+  | None -> ()
+  | Some f ->
+    (try f ev with
+     | _ -> ())
+;;
+
+(* The id the currently-active rw txn will commit as.  The header is not bumped
+   until commit, so every event of one txn shares this id (one writer at a time
+   under the write lock). *)
+let active_txn_id (st : bt_state) = Int64.add st.current_header.txn_id 1L
+
 let rw_begin t =
   let* () = Rwlock.acquire_write t.lock in
   let is_follower =
@@ -1206,6 +1225,7 @@ let rw_begin t =
        t.mem_savepoints <- []
      | Btree st ->
        let current_rw_txn_id = Int64.add st.current_header.txn_id 1L in
+       emit_event st (Store_event.Txn_begin { txn_id = current_rw_txn_id });
        Pager.set_txn_id st.pager current_rw_txn_id;
        let min_safe =
          match min_active_reader_txn st with
@@ -1868,16 +1888,25 @@ let commit (Rw t : rw txn) : unit Lwt.t =
     (* #356: the append cursor is only valid within a txn (its leaf is dirty);
        commit flushes dirty pages, so drop it. *)
     Hashtbl.clear st.bt_append;
-    (match st.wal with
-     | None ->
-       Lwt.finalize
-         (fun () ->
-            let* () = commit_prepare_btree ~header_commit:Header.commit st in
-            maybe_autocheckpoint st)
-         (fun () ->
-            Rwlock.release_write t.lock;
-            Lwt.return_unit)
-     | Some _ -> commit_wal t st)
+    (* #382: capture the id this txn commits as BEFORE the header is bumped
+       (commit_prepare_btree advances [st.current_header.txn_id]).  Emit
+       [Txn_commit] only after the commit work has succeeded.  [frames = 0] is a
+       placeholder: Task 4 wires the authoritative frame count via [Wal_append]. *)
+    let committed_id = active_txn_id st in
+    let* () =
+      match st.wal with
+      | None ->
+        Lwt.finalize
+          (fun () ->
+             let* () = commit_prepare_btree ~header_commit:Header.commit st in
+             maybe_autocheckpoint st)
+          (fun () ->
+             Rwlock.release_write t.lock;
+             Lwt.return_unit)
+      | Some _ -> commit_wal t st
+    in
+    emit_event st (Store_event.Txn_commit { txn_id = committed_id; frames = 0 });
+    Lwt.return_unit
 ;;
 
 (* rollback:
@@ -1912,7 +1941,10 @@ let rollback (Rw t : rw txn) : unit Lwt.t =
         Pager.clear_dirty st.pager;
         st.txn_freelist_snapshot <- None
       | None -> ());
-     st.bt_savepoints <- []);
+     st.bt_savepoints <- [];
+     (* #382: rollback does not change [st.current_header.txn_id], so
+        [active_txn_id] still reads the id this aborted txn would have used. *)
+     emit_event st (Store_event.Txn_rollback { txn_id = active_txn_id st }));
   Rwlock.release_write t.lock;
   Lwt.return_unit
 ;;
@@ -3170,6 +3202,14 @@ let set_commit_callback
             Rwlock.release_write t.lock;
             Lwt.return_unit))
 ;;
+
+let set_event_callback (t : t) (cb : (Store_event.t -> unit) option) =
+  match t.backend with
+  | Mem _ -> () (* Mem backend has no bt_state; emits no events (#382). *)
+  | Btree st -> st.on_event <- cb
+;;
+
+module Event = Store_event
 
 (* ------------------------------------------------------------------ *)
 (* Follower mode (#172)                                                 *)
