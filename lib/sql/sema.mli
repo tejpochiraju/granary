@@ -341,3 +341,10 @@ val bind_returning_params
   -> Sqlocaml_catalog.Catalog.t
   -> Ast.stmt
   -> (bound_stmt * (string * int) list, error) result Lwt.t
+
+(** Best-effort output column names for a row-returning statement (#387), given
+    its [Ast.stmt] and the matching {!bound_stmt}.  The bound form fixes the
+    number of output columns ([*] expanded to the source table's columns); AST
+    names supply SELECT aliases and bare column names where present, and a
+    positional [col_N] placeholder is used for anonymous expressions. *)
+val output_column_names : Ast.stmt -> bound_stmt -> string list

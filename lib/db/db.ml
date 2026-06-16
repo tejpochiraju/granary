@@ -1705,6 +1705,23 @@ let query_with_stats top sql =
   | Ok stream -> Lwt.return (Ok (stream, stats))
 ;;
 
+(* #387: resolve the projected column names without executing.  Routing,
+   parsing and binding mirror [compile_routed] up to the [bind] step; the names
+   are derived from the bound statement (with its AST for aliases / bare column
+   names) by {!Sql.Sema.output_column_names}.  Side-effect-free: binding only
+   reads the in-memory catalog, so this never opens a transaction or touches the
+   store. *)
+let query_columns top sql =
+  match parse sql with
+  | Error e -> Lwt.return (Error e)
+  | Ok ast ->
+    let t = resolve_target_ast top ast in
+    let* bound = Sql.Sema.bind ~views:t.views t.catalog ast in
+    (match bound with
+     | Error e -> Lwt.return (Error (Sema e))
+     | Ok b -> Lwt.return (Ok (Sql.Sema.output_column_names ast b)))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Prepared statement API                                               *)
 (* ------------------------------------------------------------------ *)

@@ -3612,6 +3612,25 @@ let rec col_names_of_ast_stmt = function
   | _ -> []
 ;;
 
+(* Combine AST-derived names (which preserve SELECT aliases and bare column
+   names) with the bound names (authoritative count + [*]-expansion + fallback):
+   the bound list fixes the number of output columns, and AST names are used
+   wherever available, falling back to the bound name otherwise.
+
+   This zips [ast_names] and [bound_names] positionally, which is sound only
+   because no representable projection mixes a star with named columns: [`All]
+   yields no AST names (so every column falls back to its bound name), while
+   [`Cols]/[`Exprs] yield exactly one AST name per output column.  An interior
+   [SELECT a, *, b] would misalign, but the AST has no constructor for an
+   interior star, so it is unreachable. *)
+let output_column_names ast bound =
+  let ast_names = col_names_of_ast_stmt ast in
+  let bound_names = col_names_of_bound_stmt bound in
+  let n = List.length bound_names in
+  List.init n (fun i ->
+    if i < List.length ast_names then List.nth ast_names i else List.nth bound_names i)
+;;
+
 (* FROM-less SELECT: bind each projection expr with no table context. *)
 let bind_const_select ~param_counter ~named_params exprs =
   let dummy_meta : Cat.table_meta =
@@ -3654,13 +3673,7 @@ let bind_const_select ~param_counter ~named_params exprs =
 (* Build the ephemeral table_meta for a CTE from its base query's columns
    (AST names preferred to preserve aliases, falling back to bound names). *)
 let derive_cte_meta ~name col_source_ast col_source : Cat.table_meta =
-  let ast_names = col_names_of_ast_stmt col_source_ast in
-  let bound_names = col_names_of_bound_stmt col_source in
-  let n_cols = List.length bound_names in
-  let col_names =
-    List.init n_cols (fun i ->
-      if i < List.length ast_names then List.nth ast_names i else List.nth bound_names i)
-  in
+  let col_names = output_column_names col_source_ast col_source in
   let cte_cols =
     List.map
       (fun col_name ->

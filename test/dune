@@ -43,6 +43,7 @@
   test_schema_cache_283
   test_store_event
   test_db_event_385
+  test_query_columns_387
   test_repl_components)
  (modules
   test_dummy
@@ -88,6 +89,7 @@
   test_schema_cache_283
   test_store_event
   test_db_event_385
+  test_query_columns_387
   test_repl_components)
  (libraries
   alcotest
