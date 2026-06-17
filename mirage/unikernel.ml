@@ -8,11 +8,16 @@
    This is the amd64 baseline #402 then cross-builds on aarch64.  The engine is
    100% OCaml with an explicitly byte-ordered on-disk format, so the only
    arch-relevant code is the WAL fsync / commit path, which the explicit
-   transaction here exercises end-to-end. *)
+   transaction here exercises end-to-end.
+
+   The main DB lives on the block device; the WAL uses the shared in-memory
+   {!Sqlocaml_sample.Mem_wal} buffer (also driven by the host smoke test, so the
+   two cannot drift). See mirage/README.md. *)
 
 open Lwt.Syntax
 module Store = Sqlocaml_store.Store
 module Db = Sqlocaml.Db
+module Mem_wal = Sqlocaml_sample.Mem_wal
 
 let src = Logs.Src.create "sqlocaml-demo" ~doc:"sqlocaml sample unikernel"
 
@@ -21,43 +26,9 @@ module Log = (val Logs.src_log src : Logs.LOG)
 module Make (B : Mirage_block.S) = struct
   module MB = Sqlocaml_mirage_block.Mirage_backend.Make (B)
 
-  (* The WAL needs positioned byte I/O at non-sector-aligned offsets, so it does
-     not ride the page-addressed block device directly; this sample keeps it in
-     an in-memory, lazily-grown buffer.  See mirage/README.md. *)
-  type wal_dev = { mutable buf : Bytes.t }
-
-  let wal_grow d need =
-    let cur = Bytes.length d.buf in
-    if need > cur
-    then (
-      let nb = Bytes.make (max need (cur * 2)) '\x00' in
-      Bytes.blit d.buf 0 nb 0 cur;
-      d.buf <- nb)
-  ;;
-
-  let wal_read_at d ~offset out =
-    let off = Int64.to_int offset in
-    let len = Cstruct.length out in
-    wal_grow d (off + len);
-    Cstruct.blit_from_bytes d.buf off out 0 len;
-    Lwt.return (Ok ())
-  ;;
-
-  let wal_write_at d ~offset src =
-    let off = Int64.to_int offset in
-    let len = Cstruct.length src in
-    wal_grow d (off + len);
-    let tmp = Bytes.create len in
-    Cstruct.blit_to_bytes src 0 tmp 0 len;
-    Bytes.blit tmp 0 d.buf off len;
-    Lwt.return (Ok ())
-  ;;
-
-  let wal_sync () = Lwt.return (Ok ())
-
   let start block =
     let* adapter = MB.connect block in
-    let wal = { buf = Bytes.make 65536 '\x00' } in
+    let wal = Mem_wal.create () in
     let* sr =
       Store.open_block_wal
         ~read_page:(MB.read_page adapter)
@@ -65,10 +36,10 @@ module Make (B : Mirage_block.S) = struct
         ~sync:(MB.sync adapter)
         ~resize:(MB.resize adapter)
         ~n_pages:0L
-        ~wal_read_at:(wal_read_at wal)
-        ~wal_write_at:(wal_write_at wal)
-        ~wal_sync
-        ~wal_size_bytes:(Int64.of_int (Bytes.length wal.buf))
+        ~wal_read_at:(Mem_wal.read_at wal)
+        ~wal_write_at:(Mem_wal.write_at wal)
+        ~wal_sync:Mem_wal.sync
+        ~wal_size_bytes:(Mem_wal.size_bytes wal)
         ~close:(fun () -> MB.close adapter)
         ~wal_close:(fun () -> Lwt.return_unit)
         ()

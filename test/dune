@@ -229,7 +229,6 @@
   sqlocaml.sample
   sqlocaml.mirage_block
   mirage-block-unix
-  cstruct
   alcotest
   lwt.unix
   unix))

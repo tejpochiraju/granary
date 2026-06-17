@@ -6,7 +6,7 @@
 #
 #   podman build -t sqlocaml-mirage -f Containerfile.mirage .
 #   podman run --rm -v "$(pwd):/workspace:z" -w /workspace/mirage sqlocaml-mirage \
-#     sh -c 'mirage configure -t unix && make depends && dune build'
+#     sh -c 'mirage configure -t unix && make depends && make build'
 #
 # The mirage CLI is NOT in sqlocaml-dev (it pulls the mirage runtime + opam
 # monorepo), which is why it lives in this dedicated image rather than bloating

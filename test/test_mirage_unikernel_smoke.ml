@@ -2,56 +2,18 @@
 
     Opens a {!Sqlocaml_store.Store} in WAL mode with the main DB on a real
     [mirage-block-unix] device (wrapped by {!Sqlocaml_mirage_block.Mirage_backend})
-    and an in-memory, byte-addressed WAL buffer — the exact shape the sample
-    unikernel uses — then runs the shared {!Sqlocaml_sample.Sample.run_demo}
-    workload and asserts the WAL fsync / commit path fired.  Runs in the plain
-    [sqlocaml-dev] image (no mirage CLI / solo5 needed), so CI guards the
-    Mirage_backend <-> Store wiring against bit-rot. *)
+    and the shared in-memory {!Sqlocaml_sample.Mem_wal} WAL buffer — the exact
+    shape the sample unikernel uses — then runs the shared
+    {!Sqlocaml_sample.Sample.run_demo} workload and asserts the WAL fsync /
+    commit path fired. Runs in the plain [sqlocaml-dev] image (no mirage CLI /
+    solo5 needed), so CI guards the Mirage_backend <-> Store wiring against
+    bit-rot. *)
 
 open Lwt.Syntax
 module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
 module Store = Sqlocaml_store.Store
 module Db = Sqlocaml.Db
-
-(* ------------------------------------------------------------------ *)
-(* In-memory, byte-addressed WAL device                                *)
-(*                                                                     *)
-(* The WAL needs positioned byte I/O (offset = header + idx*frame_size,*)
-(* not sector-aligned), so it cannot ride a page-addressed Mirage_block*)
-(* device directly.  The sample keeps it in memory; see mirage/README. *)
-(* ------------------------------------------------------------------ *)
-
-type wal_dev = { mutable buf : Bytes.t }
-
-let wal_grow d need =
-  let cur = Bytes.length d.buf in
-  if need > cur
-  then (
-    let nb = Bytes.make (max need (cur * 2)) '\x00' in
-    Bytes.blit d.buf 0 nb 0 cur;
-    d.buf <- nb)
-;;
-
-let wal_read_at d ~offset out =
-  let off = Int64.to_int offset in
-  let len = Cstruct.length out in
-  (* Reading past the written region yields zeros (the WAL grows lazily). *)
-  wal_grow d (off + len);
-  Cstruct.blit_from_bytes d.buf off out 0 len;
-  Lwt.return (Ok ())
-;;
-
-let wal_write_at d ~offset src =
-  let off = Int64.to_int offset in
-  let len = Cstruct.length src in
-  wal_grow d (off + len);
-  let tmp = Bytes.create len in
-  Cstruct.blit_to_bytes src 0 tmp 0 len;
-  Bytes.blit tmp 0 d.buf off len;
-  Lwt.return (Ok ())
-;;
-
-let wal_sync () = Lwt.return (Ok ())
+module Mem_wal = Sqlocaml_sample.Mem_wal
 
 (* A 4 MiB zero-filled file = 1024 pages of 4096 bytes; ample for the demo. *)
 let tmp_file () =
@@ -70,7 +32,7 @@ let test_smoke () =
        Lwt_main.run
          (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
           let* adapter = MB.connect dev in
-          let wal = { buf = Bytes.make 65536 '\x00' } in
+          let wal = Mem_wal.create () in
           let* sr =
             Store.open_block_wal
               ~read_page:(MB.read_page adapter)
@@ -78,10 +40,10 @@ let test_smoke () =
               ~sync:(MB.sync adapter)
               ~resize:(MB.resize adapter)
               ~n_pages:0L
-              ~wal_read_at:(wal_read_at wal)
-              ~wal_write_at:(wal_write_at wal)
-              ~wal_sync
-              ~wal_size_bytes:(Int64.of_int (Bytes.length wal.buf))
+              ~wal_read_at:(Mem_wal.read_at wal)
+              ~wal_write_at:(Mem_wal.write_at wal)
+              ~wal_sync:Mem_wal.sync
+              ~wal_size_bytes:(Mem_wal.size_bytes wal)
               ~close:(fun () -> MB.close adapter)
               ~wal_close:(fun () -> Lwt.return_unit)
               ()
@@ -95,10 +57,14 @@ let test_smoke () =
              | Error e -> Alcotest.failf "run_demo: %a" Db.pp_error e
              | Ok n ->
                Alcotest.(check int) "rows read back through WAL store" 3 n;
-               Alcotest.(check bool)
-                 "WAL fsync/commit path fired"
-                 true
-                 (Db.wal_sync_count db > 0);
+               (* The demo commits exactly twice — the implicit auto-commit of
+                  the CREATE TABLE DDL, then the explicit BEGIN/COMMIT — and
+                  synchronous=full fsyncs each. An exact count guards against a
+                  regression that double-syncs or skips the commit fsync. *)
+               Alcotest.(check int)
+                 "WAL fsync/commit path fired exactly twice"
+                 2
+                 (Db.wal_sync_count db);
                Db.close db)))
 ;;
 
