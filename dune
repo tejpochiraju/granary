@@ -1,0 +1,6 @@
+; The sample MirageOS unikernel under mirage/ is assembled by the `mirage` CLI
+; (not in the sqlocaml-dev image) and pulls the mirage runtime, so it must not
+; be part of the normal `dune build`. Exclude it from this project's dir scan;
+; `mirage configure` then drives its own build inside mirage/ (#403).
+
+(dirs :standard \ mirage)

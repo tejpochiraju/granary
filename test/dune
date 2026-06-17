@@ -221,6 +221,20 @@
  (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))
 
 (test
+ (name test_mirage_unikernel_smoke)
+ (modules test_mirage_unikernel_smoke)
+ (libraries
+  sqlocaml
+  sqlocaml.store
+  sqlocaml.sample
+  sqlocaml.mirage_block
+  mirage-block-unix
+  cstruct
+  alcotest
+  lwt.unix
+  unix))
+
+(test
  (name test_prepared)
  (modules test_prepared)
  (libraries sqlocaml alcotest lwt.unix))
