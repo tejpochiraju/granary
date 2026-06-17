@@ -130,6 +130,27 @@ type query_stats =
 (** A zeroed {!query_stats} ([used_index = false]). *)
 val make_query_stats : unit -> query_stats
 
+(** #240: opaque accumulator for the set of user tables a write statement
+    mutated.  Install it around a statement with {!with_dirty} and read the
+    result with {!dirty_elements}. *)
+type dirty_tables_acc
+
+(** A fresh, empty {!dirty_tables_acc}. *)
+val make_dirty_acc : unit -> dirty_tables_acc
+
+(** [with_dirty acc f] runs [f] with [acc] installed as the active write-path
+    mutation sink, so every table whose {e rows} [f] mutates — directly, or
+    indirectly via FK cascades and triggers — is recorded in [acc].  Nestable
+    and independent of the {!query} stats context.  Schema-changing DDL
+    ([ALTER]/[DROP]) is intentionally {b not} recorded, even when it rewrites
+    rows (e.g. [ALTER TABLE … DROP COLUMN]): DDL invalidation is handled out of
+    band (see {!Sqlocaml_db.Db.dirty_tables}). *)
+val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+
+(** The user tables recorded in [acc]: sorted, deduplicated, with SQLite-reserved
+    [sqlite_…] objects (sqlite_master / sqlite_sequence) excluded. *)
+val dirty_elements : dirty_tables_acc -> string list
+
 (** #264: quote a SQL identifier with double-quotes when it is not a plain
     [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
     otherwise. *)

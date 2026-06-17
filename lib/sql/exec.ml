@@ -6,6 +6,49 @@ module Rowid = Sqlocaml_encoding.Rowid
 module Index_key = Sqlocaml_encoding.Index_key
 module Varint = Sqlocaml_encoding.Varint
 
+(* #240: the set of user tables a write statement actually mutated, accumulated
+   for an external read cache.  Like [query_stats] it rides Lwt
+   sequence-associated storage so it need not be threaded through the DML and
+   recursive cascade/trigger paths: [with_dirty] installs a fresh accumulator
+   for the statement; every physical-mutation site calls [mark_dirty], a no-op
+   when no accumulator is installed (plain [execute]/[run] callers pay nothing —
+   a single predicted branch off the hot path, never per-row in the common case).
+   Defined here, ahead of the DML functions, so every [mark_dirty] call site can
+   reach it (the mutation sites span [execute_insert] onward). *)
+type dirty_tables_acc = (string, unit) Hashtbl.t
+
+let make_dirty_acc () : dirty_tables_acc = Hashtbl.create 8
+let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
+
+(* Reserved-prefix internal tables — the synthesized [sqlite_…] objects
+   (sqlite_master / sqlite_sequence) — are never reported: an external cache only
+   invalidates user tables.  [sqlite_] is the SOLE prefix [sema] forbids to user
+   objects ([reject_reserved_name], sema.ml), so filtering exactly it is
+   false-positive-free.  The engine's own [_sys_…] catalog trees are NOT matched:
+   they are reached by fixed tree-id, never by name through a mark site, so they
+   cannot appear here — whereas [_sys_]/[sys_] ARE legal user-table names (sema
+   permits them), and a user table named e.g. [sys_audit] must still be reported. *)
+let is_internal_table_name (name : string) = String.starts_with ~prefix:"sqlite_" name
+
+(* Record that [name]'s rows changed in the current statement. *)
+let mark_dirty (name : string) =
+  match Lwt.get dirty_tables_key with
+  | None -> ()
+  | Some h -> Hashtbl.replace h name ()
+;;
+
+(* Install [acc] as the active write-path mutation sink for [f]'s dynamic extent
+   (propagated across binds, so nested cascade/trigger writes record into it). *)
+let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.with_value dirty_tables_key (Some acc) f
+;;
+
+(* Drain to the public shape: user tables only, deduplicated, sorted. *)
+let dirty_elements (h : dirty_tables_acc) : string list =
+  Hashtbl.fold (fun k () acc -> if is_internal_table_name k then acc else k :: acc) h []
+  |> List.sort_uniq String.compare
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
@@ -3572,19 +3615,26 @@ let execute_insert
        in
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
-         (* Secondary-index upsert conflict: update the conflicting row. *)
-         execute_upsert_update
-           tx
-           cat
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~assigns
-           ~old_rowid
-           ~on_upsert_update_before
-           ~on_upsert_update
+         (* Secondary-index upsert conflict: update the conflicting row.
+            [execute_upsert_update] writes via [write_row_rekeyed] (raw put/del),
+            bypassing the marked normal-insert path, so mark here when it actually
+            updated the row. *)
+         let* updated =
+           execute_upsert_update
+             tx
+             cat
+             table_meta
+             ~clock
+             ~params
+             ~owned
+             ~row
+             ~assigns
+             ~old_rowid
+             ~on_upsert_update_before
+             ~on_upsert_update
+         in
+         if updated then mark_dirty table_meta.Cat.name;
+         Lwt.return updated
        | _ ->
          let* inserted =
            execute_insert_write
@@ -3614,6 +3664,7 @@ let execute_insert
             is correct even when an explicit id differs from [next_rowid - 1].
             Skipped inserts (ON CONFLICT IGNORE ⇒ [inserted=false]) leave it. *)
          if inserted then Cat.set_last_inserted_rowid cat rowid;
+         if inserted then mark_dirty table_meta.Cat.name;
          Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -3871,6 +3922,7 @@ let scan_child_rows_multi_tx
 
 (** Delete a single row and its index entries within an existing RW transaction. *)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+  mark_dirty meta.Cat.name;
   let rowid_key = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* Phase 35 Task 2: ensure VIRTUAL gen cols are populated before key extraction. *)
@@ -3905,6 +3957,7 @@ let update_col_in_tx
       ~col_idx
       ~new_val
   =
+  mark_dirty meta.Cat.name;
   let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
@@ -5200,6 +5253,7 @@ let execute_update
          in
          let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
          let* () = release_txn ~cat tx owned in
+         if n > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -5495,6 +5549,7 @@ let execute_delete
            | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
          in
          let* () = release_txn ~cat tx owned in
+         if n > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6143,6 +6198,7 @@ let execute_fts_insert
        let col_texts = List.mapi (fun i t -> i, t) text_list in
        let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
        let* () = release_txn ~cat tx owned in
+       mark_dirty fts_meta.Cat.fts_name;
        Lwt.return 1)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6202,6 +6258,8 @@ let execute_fts_delete
              matches
          in
          let* () = release_txn ~cat tx owned in
+         (* [n > 0] here (the [n = 0] case returned early above). *)
+         mark_dirty fts_meta.Cat.fts_name;
          Lwt.return n)
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6541,6 +6599,7 @@ let execute_with_count
          in
          Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
          let* () = release_txn ~cat tx owned in
+         if values <> [] then mark_dirty table_meta.Cat.name;
          Lwt.return (List.length values))
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6584,6 +6643,7 @@ let execute_with_count
       (fun () ->
          Sqlocaml_columnar.Col_store.insert_rows col_store batch;
          let* () = release_txn ~cat tx owned in
+         if Array.length batch > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return (Array.length batch))
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in

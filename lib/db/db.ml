@@ -71,6 +71,11 @@ type query_stats = Sql.Exec.query_stats =
   ; mutable used_index : bool
   }
 
+(* #240: user tables whose rows a write statement actually mutated, including
+   tables touched indirectly by triggers and FK cascades.  Sorted, deduplicated;
+   internal/system tables excluded. *)
+type dirty_tables = string list
+
 type error =
   | Parse of string
   | Sema of Sql.Sema.error
@@ -1626,6 +1631,22 @@ let execute_change_count top sql =
      | None -> execute_dml_op_count t op)
 ;;
 
+let execute_with_dirty top sql =
+  let acc = Sql.Exec.make_dirty_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> execute top sql) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok () -> Lwt.return (Ok (Sql.Exec.dirty_elements acc))
+;;
+
+let execute_change_count_with_dirty top sql =
+  let acc = Sql.Exec.make_dirty_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> execute_change_count top sql) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok n -> Lwt.return (Ok (n, Sql.Exec.dirty_elements acc))
+;;
+
 (* #259: single source of truth for the control-op dispatch shared by [query]
    and [query_with_stats].  The canned control ops (changes / last_insert_rowid
    / database_list / ...) do no scan; only the real-op branch touches [stats],
@@ -1832,6 +1853,14 @@ let run st ~params =
           Cat.clear_pending_fk_checks t.catalog;
           Lwt.return (Error (Runtime msg))
         | exn -> Lwt.fail exn))
+;;
+
+let run_with_dirty st ~params =
+  let acc = Sql.Exec.make_dirty_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> run st ~params) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok n -> Lwt.return (Ok (n, Sql.Exec.dirty_elements acc))
 ;;
 
 (* #259: shared body for [iter] / [iter_with_stats].  As with [query_impl],

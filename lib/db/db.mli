@@ -164,6 +164,38 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
+(** #240: the set of user tables whose {e rows} a write statement actually
+    mutated, including tables touched indirectly by triggers and FK cascades.
+    Sorted and deduplicated; internal/system tables are excluded.  Enables an
+    external read cache to invalidate the tables whose row data changed.
+
+    {b Scope: row-level DML only.}  This signal reports {!Db.execute}-style row
+    mutations (INSERT / UPDATE / DELETE, upserts, cascades, trigger bodies,
+    columnar and FTS writes).  It does {b not} report schema-changing or
+    destructive DDL — [DROP TABLE], and [ALTER TABLE] in all its forms
+    ([ADD]/[DROP]/[RENAME COLUMN], [RENAME TABLE]) — {e even when the DDL
+    physically rewrites every row} (e.g. [ALTER TABLE … DROP COLUMN], which
+    reshapes the stored rows).  Such a statement yields an {b empty} list here.
+    A consumer that caches query results MUST invalidate on schema changes
+    through a separate schema-version / fingerprint signal (cf. #174); an empty
+    result from a DDL statement therefore does {b not} imply the table's
+    observable contents are unchanged. *)
+type dirty_tables = string list
+
+(** Like {!execute}, but also returns the {!dirty_tables} the statement mutated.
+    The list is empty for a no-op write (e.g. [INSERT OR IGNORE] that inserts
+    nothing) and for {e all} DDL (including row-rewriting DDL such as [ALTER
+    TABLE … DROP COLUMN] and [DROP TABLE]) — see the {!dirty_tables} scope note;
+    DDL invalidation is out of band. *)
+val execute_with_dirty : t -> string -> (dirty_tables, error) result Lwt.t
+
+(** Like {!execute_change_count}, but also returns the {!dirty_tables} the
+    statement mutated alongside the rows-affected count. *)
+val execute_change_count_with_dirty
+  :  t
+  -> string
+  -> (int * dirty_tables, error) result Lwt.t
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name
@@ -253,6 +285,10 @@ val prepare : t -> string -> (stmt, error) result Lwt.t
 (** Execute a write statement (INSERT, UPDATE, DELETE) with the given
     positional parameter values.  Returns the rows-affected count. *)
 val run : stmt -> params:value list -> (int, error) result Lwt.t
+
+(** Like {!run}, but also returns the {!dirty_tables} the prepared write
+    mutated alongside the rows-affected count. *)
+val run_with_dirty : stmt -> params:value list -> (int * dirty_tables, error) result Lwt.t
 
 (** Execute a read statement (SELECT) with the given positional
     parameter values.  Returns a stream of result rows.
