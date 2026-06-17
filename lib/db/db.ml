@@ -1855,6 +1855,14 @@ let run st ~params =
         | exn -> Lwt.fail exn))
 ;;
 
+let run_with_dirty st ~params =
+  let acc = Sql.Exec.make_dirty_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> run st ~params) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok n -> Lwt.return (Ok (n, Sql.Exec.dirty_elements acc))
+;;
+
 (* #259: shared body for [iter] / [iter_with_stats].  As with [query_impl],
    omitting [stats] yields the unchanged zero-overhead read path. *)
 let iter_impl ?stats st ~params =

@@ -272,6 +272,10 @@ val prepare : t -> string -> (stmt, error) result Lwt.t
     positional parameter values.  Returns the rows-affected count. *)
 val run : stmt -> params:value list -> (int, error) result Lwt.t
 
+(** Like {!run}, but also returns the {!dirty_tables} the prepared write
+    mutated alongside the rows-affected count. *)
+val run_with_dirty : stmt -> params:value list -> (int * dirty_tables, error) result Lwt.t
+
 (** Execute a read statement (SELECT) with the given positional
     parameter values.  Returns a stream of result rows.
 

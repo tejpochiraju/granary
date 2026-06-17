@@ -88,6 +88,21 @@ let test_change_count_with_dirty () =
     Alcotest.(check (list string)) "dirtied once (deduped)" [ "users" ] tables)
 ;;
 
+let test_run_with_dirty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, n TEXT)";
+    let st = unwrap (run (Db.prepare db "INSERT INTO users VALUES (?, ?)")) in
+    let n, tables =
+      unwrap
+        (run
+           (Db.run_with_dirty
+              st
+              ~params:[ Sqlocaml_encoding.Row.V_int 1L; Sqlocaml_encoding.Row.V_text "a" ]))
+    in
+    Alcotest.(check int) "one row" 1 n;
+    Alcotest.(check (list string)) "run dirtied users" [ "users" ] tables)
+;;
+
 let () =
   Alcotest.run
     "dirty_tables_240"
@@ -101,6 +116,7 @@ let () =
         ; Alcotest.test_case "update hit/miss" `Quick test_update_hit_and_miss
         ; Alcotest.test_case "delete hit/miss" `Quick test_delete_hit_and_miss
         ; Alcotest.test_case "change_count_with_dirty" `Quick test_change_count_with_dirty
+        ; Alcotest.test_case "run_with_dirty" `Quick test_run_with_dirty
         ] )
     ]
 ;;
