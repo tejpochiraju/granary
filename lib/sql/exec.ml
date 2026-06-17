@@ -3615,19 +3615,26 @@ let execute_insert
        in
        match upsert_update, upsert_rowid with
        | Some (_, assigns), Some old_rowid ->
-         (* Secondary-index upsert conflict: update the conflicting row. *)
-         execute_upsert_update
-           tx
-           cat
-           table_meta
-           ~clock
-           ~params
-           ~owned
-           ~row
-           ~assigns
-           ~old_rowid
-           ~on_upsert_update_before
-           ~on_upsert_update
+         (* Secondary-index upsert conflict: update the conflicting row.
+            [execute_upsert_update] writes via [write_row_rekeyed] (raw put/del),
+            bypassing the marked normal-insert path, so mark here when it actually
+            updated the row. *)
+         let* updated =
+           execute_upsert_update
+             tx
+             cat
+             table_meta
+             ~clock
+             ~params
+             ~owned
+             ~row
+             ~assigns
+             ~old_rowid
+             ~on_upsert_update_before
+             ~on_upsert_update
+         in
+         if updated then mark_dirty table_meta.Cat.name;
+         Lwt.return updated
        | _ ->
          let* inserted =
            execute_insert_write
@@ -6191,6 +6198,7 @@ let execute_fts_insert
        let col_texts = List.mapi (fun i t -> i, t) text_list in
        let* () = fts_index_document tx ~fts_meta ~rowid ~col_texts in
        let* () = release_txn ~cat tx owned in
+       mark_dirty fts_meta.Cat.fts_name;
        Lwt.return 1)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6250,6 +6258,8 @@ let execute_fts_delete
              matches
          in
          let* () = release_txn ~cat tx owned in
+         (* [n > 0] here (the [n = 0] case returned early above). *)
+         mark_dirty fts_meta.Cat.fts_name;
          Lwt.return n)
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6589,6 +6599,7 @@ let execute_with_count
          in
          Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
          let* () = release_txn ~cat tx owned in
+         if values <> [] then mark_dirty table_meta.Cat.name;
          Lwt.return (List.length values))
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -6632,6 +6643,7 @@ let execute_with_count
       (fun () ->
          Sqlocaml_columnar.Col_store.insert_rows col_store batch;
          let* () = release_txn ~cat tx owned in
+         if Array.length batch > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return (Array.length batch))
       (fun exn ->
          let* () = if owned then S.rollback tx else Lwt.return_unit in

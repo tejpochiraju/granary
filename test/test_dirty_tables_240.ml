@@ -171,6 +171,89 @@ let test_error_propagates () =
       Alcotest.failf "expected Error, got dirty set [%s]" (String.concat "; " tables))
 ;;
 
+(* Gap 1 — secondary-index UPSERT (ON CONFLICT(<unique index>) DO UPDATE).
+   The conflict→update arm writes via [write_row_rekeyed] (raw put/del), not the
+   marked normal-insert path, so the mutated table must still be reported. *)
+let test_secondary_index_upsert_marks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE u (id INTEGER PRIMARY KEY, k TEXT, v TEXT)";
+    exec db "CREATE UNIQUE INDEX u_k ON u (k)";
+    exec db "INSERT INTO u VALUES (1, 'key', 'a')";
+    (* conflict on the UNIQUE index over k (NOT the PK alias) → DO UPDATE path *)
+    check_dirty
+      "secondary-index upsert update marks table"
+      [ "u" ]
+      (dirty
+         db
+         "INSERT INTO u (id, k, v) VALUES (2, 'key', 'b') ON CONFLICT(k) DO UPDATE SET v \
+          = excluded.v"))
+;;
+
+(* Gap 2 — columnar (COLUMNSTORE) INSERT writes via Col_store.insert_rows with
+   no marked primitive; a successful insert must report the table. *)
+let test_columnar_insert_marks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (a INTEGER, b TEXT) USING COLUMNSTORE";
+    check_dirty
+      "columnar insert marks table"
+      [ "c" ]
+      (dirty db "INSERT INTO c VALUES (1, 'x')"))
+;;
+
+(* Gap 2 — columnar INSERT…SELECT with no source rows writes nothing → no mark. *)
+let test_columnar_insert_select_noop_is_empty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE src (a INTEGER, b TEXT)";
+    exec db "CREATE TABLE c (a INTEGER, b TEXT) USING COLUMNSTORE";
+    check_dirty
+      "columnar insert-select no source rows: empty"
+      []
+      (dirty db "INSERT INTO c SELECT a, b FROM src"))
+;;
+
+(* Gap 3 — FTS5 virtual-table INSERT mutates the user table via raw put. *)
+let test_fts_insert_marks () =
+  with_db (fun db ->
+    exec db "CREATE VIRTUAL TABLE docs USING FTS5(title, body)";
+    check_dirty
+      "fts insert marks table"
+      [ "docs" ]
+      (dirty db "INSERT INTO docs (title, body) VALUES ('t', 'hello world')"))
+;;
+
+(* Gap 3 — FTS5 DELETE that removes a row must report; a no-op delete must not. *)
+let test_fts_delete_marks () =
+  with_db (fun db ->
+    exec db "CREATE VIRTUAL TABLE docs USING FTS5(title, body)";
+    exec db "INSERT INTO docs (title, body) VALUES ('t', 'hello world')";
+    check_dirty
+      "fts delete no-op: empty"
+      []
+      (dirty db "DELETE FROM docs WHERE title = 'absent'");
+    check_dirty
+      "fts delete marks table"
+      [ "docs" ]
+      (dirty db "DELETE FROM docs WHERE title = 't'"))
+;;
+
+(* ON UPDATE CASCADE: updating the parent key cascades to the child via the
+   [update_col_in_tx] mark — should already PASS with the existing cascade code. *)
+let test_on_update_cascade () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec db "CREATE TABLE dept (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE emp (id INTEGER PRIMARY KEY, d INTEGER REFERENCES dept(id) ON UPDATE \
+       CASCADE)";
+    exec db "INSERT INTO dept VALUES (1)";
+    exec db "INSERT INTO emp VALUES (10, 1)";
+    check_dirty
+      "update cascade marks parent+child"
+      [ "dept"; "emp" ]
+      (dirty db "UPDATE dept SET id = 2 WHERE id = 1"))
+;;
+
 (* QCheck: a chain t0 → t1 → … → t(n-1) of AFTER INSERT triggers means one
    insert into t0 mutates every table in the chain. The reported set must be
    exactly those tables, sorted and duplicate-free, for any chain length. *)
@@ -229,6 +312,20 @@ let () =
             "autoincrement excludes internal"
             `Quick
             test_autoincrement_excludes_internal
+        ] )
+    ; ( "write-path coverage"
+      , [ Alcotest.test_case
+            "secondary-index upsert"
+            `Quick
+            test_secondary_index_upsert_marks
+        ; Alcotest.test_case "columnar insert" `Quick test_columnar_insert_marks
+        ; Alcotest.test_case
+            "columnar insert-select no-op"
+            `Quick
+            test_columnar_insert_select_noop_is_empty
+        ; Alcotest.test_case "fts insert" `Quick test_fts_insert_marks
+        ; Alcotest.test_case "fts delete hit/miss" `Quick test_fts_delete_marks
+        ; Alcotest.test_case "on update cascade" `Quick test_on_update_cascade
         ] )
     ; "property", [ QCheck_alcotest.to_alcotest trigger_chain_property ]
     ]
