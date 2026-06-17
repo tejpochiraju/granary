@@ -3,6 +3,8 @@
 (using menhir 2.1)
 (generate_opam_files true)
 (version 0.0.1)
+(source
+ (uri "git+ssh://git@git.iotready.com:2222/tej/sqlite_ocaml_port.git"))
 
 (package
  (name sqlocaml)

@@ -16,3 +16,11 @@ bench/profiling/*.svg
 # stray compiler/format stderr captures (never commit)
 *.err
 *.log
+
+# MirageOS sample unikernel (#403): `mirage configure` generates a Makefile,
+# dune files, main.ml, dist/, duniverse/, a lockfile and a `disk` image — none
+# of which belong in git. Track only the hand-written sources + README.
+mirage/*
+!mirage/config.ml
+!mirage/unikernel.ml
+!mirage/README.md

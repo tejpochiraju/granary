@@ -121,6 +121,15 @@ podman run --rm --platform=linux/arm64 -v "$(pwd):/workspace:z" -w /workspace \
 > portable across architectures. When reusing one checkout across amd64 and
 > arm64 build hosts, run a clean rebuild (`rm -rf _build`) after switching.
 
+### Sample MirageOS unikernel
+
+A minimal, in-tree sample unikernel under [`mirage/`](mirage/) runs the engine
+over a `Mirage_block` device in WAL mode (the amd64 baseline for the aarch64
+audit, #403). It builds and runs on the `unix` target and builds for the `hvt`
+(Solo5) target. The `mirage` CLI is not in `sqlocaml-dev`; see
+[`mirage/README.md`](mirage/README.md) for the dedicated build image
+([`Containerfile.mirage`](Containerfile.mirage)) and the build/run commands.
+
 ## Benchmarks
 
 In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements

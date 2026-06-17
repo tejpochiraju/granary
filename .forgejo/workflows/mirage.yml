@@ -1,0 +1,68 @@
+name: Mirage unikernel
+
+# Builds the sample MirageOS unikernel (#403) so the `mirage` target does not
+# silently bit-rot. The everyday CI/test gate already runs the host smoke test
+# (test_mirage_unikernel_smoke) which exercises the Mirage_backend <-> Store WAL
+# wiring; this job goes further and assembles a real unikernel with the `mirage`
+# CLI + Solo5 toolchain — too heavy (opam-monorepo pull + a from-source duniverse
+# build) to gate every PR, so it runs weekly and on demand.
+#
+# `sqlocaml` is an unpublished local package; opam-monorepo vendors it from the
+# local pin, which requires a real git checkout (actions/checkout provides one).
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Tuesdays 05:00 UTC — clear of the nightly Jepsen and Monday cross-arch slots.
+    - cron: "0 5 * * 2"
+
+jobs:
+  build-unikernel:
+    runs-on: self-hosted
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+
+    steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (engine + Solo5 build tooling)
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev gcc make m4 libseccomp-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.4-mirage-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          restore-keys: opam-5.4-mirage-
+
+      - name: Install engine deps + mirage CLI
+        run: |
+          opam install -y lwt cstruct menhir mirage-block mirage-block-unix \
+            uutf uucp mirage-crypto mirage-crypto-rng mirage.4.11.0
+
+      - name: Pin the local engine (vendored by opam-monorepo, not installed)
+        run: opam pin add -yn sqlocaml .
+
+      - name: mirage configure -t unix + build + run
+        run: |
+          cd mirage
+          opam exec -- mirage configure -t unix
+          opam exec -- make depends
+          opam exec -- make build
+          rm -f disk && truncate -s 8M disk   # in-memory WAL: fresh disk per run
+          opam exec -- ./dist/sqlocaml-demo --logs='*:info'
+
+      - name: mirage configure -t hvt + build
+        run: |
+          cd mirage
+          opam exec -- mirage clean
+          opam exec -- mirage configure -t hvt
+          opam exec -- make depends
+          opam exec -- make build
+          test -f dist/sqlocaml-demo.hvt && echo "hvt unikernel built OK"

@@ -1,0 +1,7 @@
+(library
+ (name sqlocaml_sample)
+ (public_name sqlocaml.sample)
+ (modules sample mem_wal)
+ (libraries sqlocaml lwt cstruct)
+ (instrumentation
+  (backend bisect_ppx)))
