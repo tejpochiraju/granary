@@ -36,6 +36,7 @@
   test_rowid_alias
   test_query_stats_239
   test_query_stats_257
+  test_dirty_tables_240
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
@@ -82,6 +83,7 @@
   test_rowid_alias
   test_query_stats_239
   test_query_stats_257
+  test_dirty_tables_240
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269

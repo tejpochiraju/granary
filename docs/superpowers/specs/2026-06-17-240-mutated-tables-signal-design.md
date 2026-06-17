@@ -27,7 +27,7 @@ invalidation path). It is **not** a blocker for the constrained first cut.
 |---|---|
 | API shape | **Parallel `_with_dirty` variants** — mirror #239's `query_with_stats`/`iter_with_stats`. Existing signatures untouched; opt-in; pull-based. |
 | Collection type | **`type dirty_tables = string list`** — deduplicated, sorted. Light to consume; no abstract-module / `pp` / merlint burden. |
-| Internal tables | **User tables only** — filter names with reserved `sqlite_`/`sys_` prefixes. camel caches user-table queries; internal churn is noise. |
+| Internal tables | **User tables only** — filter names with the SQLite-reserved `sqlite_` prefix (the only prefix sema forbids to user tables). camel caches user-table queries; internal churn is noise. |
 
 Rejected: a registered global callback (push-based, decorrelated from the call,
 charges every write incl. internal ones, ordering subtleties under nested
@@ -85,7 +85,7 @@ implementation plan via failing tests first.
 ```ocaml
 (** #240: the set of user tables whose rows a write statement actually mutated,
     including tables touched indirectly by triggers and FK cascades.  Sorted,
-    deduplicated; internal/system tables (reserved [sqlite_]/[sys_] prefixes)
+    deduplicated; internal/system tables (the SQLite-reserved [sqlite_] prefix)
     are excluded.  Enables an external read cache to invalidate exactly the
     tables that changed.  See {!execute_with_dirty}. *)
 type dirty_tables = string list

@@ -6,6 +6,49 @@ module Rowid = Sqlocaml_encoding.Rowid
 module Index_key = Sqlocaml_encoding.Index_key
 module Varint = Sqlocaml_encoding.Varint
 
+(* #240: the set of user tables a write statement actually mutated, accumulated
+   for an external read cache.  Like [query_stats] it rides Lwt
+   sequence-associated storage so it need not be threaded through the DML and
+   recursive cascade/trigger paths: [with_dirty] installs a fresh accumulator
+   for the statement; every physical-mutation site calls [mark_dirty], a no-op
+   when no accumulator is installed (plain [execute]/[run] callers pay nothing —
+   a single predicted branch off the hot path, never per-row in the common case).
+   Defined here, ahead of the DML functions, so every [mark_dirty] call site can
+   reach it (the mutation sites span [execute_insert] onward). *)
+type dirty_tables_acc = (string, unit) Hashtbl.t
+
+let make_dirty_acc () : dirty_tables_acc = Hashtbl.create 8
+let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
+
+(* Reserved-prefix internal tables — the synthesized [sqlite_…] objects
+   (sqlite_master / sqlite_sequence) — are never reported: an external cache only
+   invalidates user tables.  [sqlite_] is the SOLE prefix [sema] forbids to user
+   objects ([reject_reserved_name], sema.ml), so filtering exactly it is
+   false-positive-free.  The engine's own [_sys_…] catalog trees are NOT matched:
+   they are reached by fixed tree-id, never by name through a mark site, so they
+   cannot appear here — whereas [_sys_]/[sys_] ARE legal user-table names (sema
+   permits them), and a user table named e.g. [sys_audit] must still be reported. *)
+let is_internal_table_name (name : string) = String.starts_with ~prefix:"sqlite_" name
+
+(* Record that [name]'s rows changed in the current statement. *)
+let mark_dirty (name : string) =
+  match Lwt.get dirty_tables_key with
+  | None -> ()
+  | Some h -> Hashtbl.replace h name ()
+;;
+
+(* Install [acc] as the active write-path mutation sink for [f]'s dynamic extent
+   (propagated across binds, so nested cascade/trigger writes record into it). *)
+let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
+  Lwt.with_value dirty_tables_key (Some acc) f
+;;
+
+(* Drain to the public shape: user tables only, deduplicated, sorted. *)
+let dirty_elements (h : dirty_tables_acc) : string list =
+  Hashtbl.fold (fun k () acc -> if is_internal_table_name k then acc else k :: acc) h []
+  |> List.sort_uniq String.compare
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
@@ -3614,6 +3657,7 @@ let execute_insert
             is correct even when an explicit id differs from [next_rowid - 1].
             Skipped inserts (ON CONFLICT IGNORE ⇒ [inserted=false]) leave it. *)
          if inserted then Cat.set_last_inserted_rowid cat rowid;
+         if inserted then mark_dirty table_meta.Cat.name;
          Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise. *)

@@ -164,6 +164,17 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
+(** #240: the set of user tables whose rows a write statement actually mutated,
+    including tables touched indirectly by triggers and FK cascades.  Sorted and
+    deduplicated; internal/system tables are excluded.  Enables an external read
+    cache to invalidate exactly the tables that changed. *)
+type dirty_tables = string list
+
+(** Like {!execute}, but also returns the {!dirty_tables} the statement mutated.
+    For a pure-DDL or no-op write (e.g. [INSERT OR IGNORE] that inserts nothing)
+    the list is empty. *)
+val execute_with_dirty : t -> string -> (dirty_tables, error) result Lwt.t
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name

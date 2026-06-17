@@ -202,11 +202,13 @@ type dirty_tables_acc = (string, unit) Hashtbl.t
 let make_dirty_acc () : dirty_tables_acc = Hashtbl.create 8
 let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
 
-(* Reserved-prefix internal tables ([sqlite_…] master/sequence, [sys_…] catalog
-   trees) are never reported: an external cache only invalidates user tables. *)
-let is_internal_table_name (name : string) =
-  String.starts_with ~prefix:"sqlite_" name || String.starts_with ~prefix:"sys_" name
-;;
+(* Reserved-prefix internal tables ([sqlite_…] = sqlite_master / sqlite_sequence)
+   are never reported: an external cache only invalidates user tables.  [sqlite_]
+   is the sole prefix sema forbids to user objects, so filtering exactly it is
+   false-positive-free; the engine's own [_sys_…] catalog trees are reached by
+   tree-id (never by name through a mark site), and [_sys_]/[sys_] are legal
+   user-table names that MUST still be reported. *)
+let is_internal_table_name (name : string) = String.starts_with ~prefix:"sqlite_" name
 
 (* Record that [name]'s rows changed in the current statement. *)
 let mark_dirty (name : string) =
@@ -262,7 +264,7 @@ val make_dirty_acc : unit -> dirty_tables_acc
 val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** The user tables recorded in [acc]: sorted, deduplicated, with
-    internal/system tables ([sqlite_…]/[sys_…]) excluded. *)
+    internal/system tables ([sqlite_…]) excluded. *)
 val dirty_elements : dirty_tables_acc -> string list
 ```
 
@@ -843,7 +845,7 @@ git push origin feat/240-mutated-tables
   installed by `Exec.with_dirty`; ~5 one-line `mark_dirty` sites (3 main DML
   functions, which also cover trigger-body DML via re-entry; 2 FK-cascade
   primitives). Plain `execute`/`run` install no accumulator and pay nothing.
-- Internal/system tables (`sqlite_…`/`sys_…`) are excluded; result is sorted and
+- Internal/system tables (`sqlite_…`) are excluded; result is sorted and
   deduplicated.
 
 ## Test plan
