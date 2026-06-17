@@ -103,6 +103,42 @@ let test_run_with_dirty () =
     Alcotest.(check (list string)) "run dirtied users" [ "users" ] tables)
 ;;
 
+(* ON DELETE CASCADE: deleting the parent silently deletes child rows inside the
+   engine — the set must include BOTH tables. *)
+let test_on_delete_cascade () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec db "CREATE TABLE dept (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE emp (id INTEGER PRIMARY KEY, d INTEGER REFERENCES dept(id) ON DELETE \
+       CASCADE)";
+    exec db "INSERT INTO dept VALUES (1)";
+    exec db "INSERT INTO emp VALUES (10, 1)";
+    (* sorted, deduplicated: dept before emp *)
+    check_dirty
+      "delete cascade marks parent+child"
+      [ "dept"; "emp" ]
+      (dirty db "DELETE FROM dept WHERE id = 1"))
+;;
+
+(* ON DELETE SET NULL: the child row is UPDATEd (FK col set NULL), not deleted. *)
+let test_on_delete_set_null () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec db "CREATE TABLE dept (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TABLE emp (id INTEGER PRIMARY KEY, d INTEGER REFERENCES dept(id) ON DELETE \
+       SET NULL)";
+    exec db "INSERT INTO dept VALUES (1)";
+    exec db "INSERT INTO emp VALUES (10, 1)";
+    check_dirty
+      "set-null marks parent+child"
+      [ "dept"; "emp" ]
+      (dirty db "DELETE FROM dept WHERE id = 1"))
+;;
+
 let () =
   Alcotest.run
     "dirty_tables_240"
@@ -117,6 +153,10 @@ let () =
         ; Alcotest.test_case "delete hit/miss" `Quick test_delete_hit_and_miss
         ; Alcotest.test_case "change_count_with_dirty" `Quick test_change_count_with_dirty
         ; Alcotest.test_case "run_with_dirty" `Quick test_run_with_dirty
+        ] )
+    ; ( "cascades"
+      , [ Alcotest.test_case "on delete cascade" `Quick test_on_delete_cascade
+        ; Alcotest.test_case "on delete set null" `Quick test_on_delete_set_null
         ] )
     ]
 ;;

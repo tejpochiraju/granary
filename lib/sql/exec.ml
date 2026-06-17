@@ -3915,6 +3915,7 @@ let scan_child_rows_multi_tx
 
 (** Delete a single row and its index entries within an existing RW transaction. *)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
+  mark_dirty meta.Cat.name;
   let rowid_key = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* Phase 35 Task 2: ensure VIRTUAL gen cols are populated before key extraction. *)
@@ -3949,6 +3950,7 @@ let update_col_in_tx
       ~col_idx
       ~new_val
   =
+  mark_dirty meta.Cat.name;
   let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
