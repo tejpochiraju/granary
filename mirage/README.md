@@ -92,6 +92,39 @@ make build                            # -> dist/sqlocaml-demo.hvt
 `mirage clean` removes the generated build files. They are all gitignored — only
 `config.ml`, `unikernel.ml`, and this README are tracked.
 
+## aarch64 (#402)
+
+The unikernel was audited on **aarch64** — the engine is 100 % OCaml with a
+byte-ordered on-disk format and no C stubs, so this is toolchain/packaging
+verification, not engine work. There is no native arm64 host here, so the audit
+ran under qemu-user emulation (the binfmt handlers from #157).
+
+Build the mirage image from the arm64 dev base, then build as above inside it:
+
+```sh
+podman build --platform=linux/arm64 \
+  --build-arg BASE=localhost/sqlocaml-dev:arm64 \
+  -t sqlocaml-mirage:arm64 -f Containerfile.mirage .
+podman run --rm --platform=linux/arm64 -v "$PWD:/workspace:z" -w /workspace \
+  sqlocaml-mirage:arm64 sh -c '...'   # same opam pin + mirage configure/build steps
+```
+
+**Result (both targets pass, no quirks):**
+
+- `mirage v4.11.0` installs and runs on the aarch64 switch.
+- `-t unix`: builds (native aarch64 ELF) and **runs** —
+  `read back 3 rows; WAL fsyncs=2`. This clears the #157 risk note: the
+  `mirage-block-unix` WAL fsync syscalls are arch-neutral on arm64.
+- `-t hvt`: the `ocaml-solo5` aarch64 cross toolchain installs and cross-compiles
+  cleanly; `dist/sqlocaml-demo.hvt` is a valid Solo5 image
+  (ELF `e_machine = 0xB7` = `EM_AARCH64`). Running it needs an arm64
+  hypervisor (`solo5-hvt` + arm64 KVM), out of scope for the x86 host here.
+
+> Emulated arm64 mirage-CLI builds are slow (~45–60 min for the full
+> duniverse/Solo5 compile), so there is no scheduled arm64 *unikernel* CI leg.
+> The arm64 WAL-fsync wiring is still guarded weekly: `cross-arch.yml` runs the
+> full `dune runtest` (including `test_mirage_unikernel_smoke`) on arm64.
+
 ## CI
 
 - The host smoke test runs in the normal `dune test` gate (`ci.yml`).
