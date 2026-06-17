@@ -139,6 +139,28 @@ let test_on_delete_set_null () =
       (dirty db "DELETE FROM dept WHERE id = 1"))
 ;;
 
+(* AFTER INSERT trigger whose body writes a DIFFERENT table: both must appear. *)
+let test_trigger_marks_both_tables () =
+  with_db (fun db ->
+    exec db "CREATE TABLE a (id INTEGER PRIMARY KEY)";
+    exec db "CREATE TABLE b (id INTEGER PRIMARY KEY)";
+    exec
+      db
+      "CREATE TRIGGER a_ai AFTER INSERT ON a BEGIN INSERT INTO b VALUES (NEW.id); END";
+    check_dirty "trigger fans out to b" [ "a"; "b" ] (dirty db "INSERT INTO a VALUES (1)"))
+;;
+
+(* AUTOINCREMENT bumps the internal rowid counter (sqlite_sequence is a view);
+   the internal name must NOT leak into the set. *)
+let test_autoincrement_excludes_internal () =
+  with_db (fun db ->
+    exec db "CREATE TABLE s (id INTEGER PRIMARY KEY AUTOINCREMENT, n TEXT)";
+    check_dirty
+      "autoincrement insert: user table only"
+      [ "s" ]
+      (dirty db "INSERT INTO s (n) VALUES ('x')"))
+;;
+
 let () =
   Alcotest.run
     "dirty_tables_240"
@@ -157,6 +179,13 @@ let () =
     ; ( "cascades"
       , [ Alcotest.test_case "on delete cascade" `Quick test_on_delete_cascade
         ; Alcotest.test_case "on delete set null" `Quick test_on_delete_set_null
+        ] )
+    ; ( "semantics"
+      , [ Alcotest.test_case "trigger marks both" `Quick test_trigger_marks_both_tables
+        ; Alcotest.test_case
+            "autoincrement excludes internal"
+            `Quick
+            test_autoincrement_excludes_internal
         ] )
     ]
 ;;
