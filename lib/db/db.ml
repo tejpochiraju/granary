@@ -1639,6 +1639,14 @@ let execute_with_dirty top sql =
   | Ok () -> Lwt.return (Ok (Sql.Exec.dirty_elements acc))
 ;;
 
+let execute_change_count_with_dirty top sql =
+  let acc = Sql.Exec.make_dirty_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> execute_change_count top sql) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok n -> Lwt.return (Ok (n, Sql.Exec.dirty_elements acc))
+;;
+
 (* #259: single source of truth for the control-op dispatch shared by [query]
    and [query_with_stats].  The canned control ops (changes / last_insert_rowid
    / database_list / ...) do no scan; only the real-op branch touches [stats],

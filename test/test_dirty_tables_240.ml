@@ -56,6 +56,38 @@ let test_ddl_is_empty () =
     check_dirty "create table dirties nothing" [] (dirty db "CREATE TABLE t (x INTEGER)"))
 ;;
 
+let test_update_hit_and_miss () =
+  with_db (fun db ->
+    exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, n TEXT)";
+    exec db "INSERT INTO users VALUES (1, 'a')";
+    check_dirty
+      "update hit"
+      [ "users" ]
+      (dirty db "UPDATE users SET n = 'b' WHERE id = 1");
+    check_dirty "update miss" [] (dirty db "UPDATE users SET n = 'c' WHERE id = 999"))
+;;
+
+let test_delete_hit_and_miss () =
+  with_db (fun db ->
+    exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, n TEXT)";
+    exec db "INSERT INTO users VALUES (1, 'a')";
+    check_dirty "delete miss" [] (dirty db "DELETE FROM users WHERE id = 999");
+    check_dirty "delete hit" [ "users" ] (dirty db "DELETE FROM users WHERE id = 1"))
+;;
+
+(* execute_change_count_with_dirty returns BOTH the rows-affected count and the set. *)
+let test_change_count_with_dirty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, n TEXT)";
+    exec db "INSERT INTO users VALUES (1, 'a')";
+    exec db "INSERT INTO users VALUES (2, 'a')";
+    let n, tables =
+      unwrap (run (Db.execute_change_count_with_dirty db "UPDATE users SET n = 'z'"))
+    in
+    Alcotest.(check int) "rows changed" 2 n;
+    Alcotest.(check (list string)) "dirtied once (deduped)" [ "users" ] tables)
+;;
+
 let () =
   Alcotest.run
     "dirty_tables_240"
@@ -66,6 +98,9 @@ let () =
             `Quick
             test_insert_or_ignore_noop_is_empty
         ; Alcotest.test_case "ddl empty" `Quick test_ddl_is_empty
+        ; Alcotest.test_case "update hit/miss" `Quick test_update_hit_and_miss
+        ; Alcotest.test_case "delete hit/miss" `Quick test_delete_hit_and_miss
+        ; Alcotest.test_case "change_count_with_dirty" `Quick test_change_count_with_dirty
         ] )
     ]
 ;;

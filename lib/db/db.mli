@@ -175,6 +175,13 @@ type dirty_tables = string list
     the list is empty. *)
 val execute_with_dirty : t -> string -> (dirty_tables, error) result Lwt.t
 
+(** Like {!execute_change_count}, but also returns the {!dirty_tables} the
+    statement mutated alongside the rows-affected count. *)
+val execute_change_count_with_dirty
+  :  t
+  -> string
+  -> (int * dirty_tables, error) result Lwt.t
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name

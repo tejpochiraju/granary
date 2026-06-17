@@ -5244,6 +5244,7 @@ let execute_update
          in
          let* () = run_update_hook ~clock ~params ~assignments ~tx after_hook matches in
          let* () = release_txn ~cat tx owned in
+         if n > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
@@ -5539,6 +5540,7 @@ let execute_delete
            | Some f -> Lwt_list.iter_s (fun (_rowid, old_row) -> f ~tx ~old_row) matches
          in
          let* () = release_txn ~cat tx owned in
+         if n > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return n)
     (fun exn ->
        let* () = if owned then S.rollback tx else Lwt.return_unit in
