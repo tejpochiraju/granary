@@ -23,9 +23,11 @@ val has_terminator : Buffer.t -> bool
 val split_stmts : string -> string list
 
 (** [sqlite_dump_stmts dump] is the list of statements to replay from a SQLite
-    [.dump] script: transaction control ([BEGIN]/[COMMIT]/[END]), [PRAGMA]s and
-    internal [sqlite_sequence] maintenance are dropped, the rest kept verbatim
-    (#91). *)
+    [.dump] script: transaction control ([BEGIN]/[COMMIT]/[END]), [PRAGMA]s,
+    [ANALYZE] and INSERT/DELETE maintenance of internal [sqlite_] tables
+    ([sqlite_sequence], [sqlite_stat1/4]) are dropped; the rest is kept verbatim.
+    The internal-table test anchors on the target table, so a user INSERT whose
+    value merely mentions ["sqlite_…"] is preserved (#91). *)
 val sqlite_dump_stmts : string -> string list
 
 (** [import_sqlite_dump db dump] replays the statements of a SQLite [.dump]

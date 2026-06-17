@@ -371,6 +371,25 @@ let test_sqlite_dump_stmts () =
     (E.sqlite_dump_stmts dump)
 ;;
 
+(* Regression (PR #400 review): internal-table maintenance is identified by the
+   *target table*, never a substring — so a user row whose value mentions
+   "sqlite_…" survives, while ANALYZE / sqlite_stat1 metadata is dropped. *)
+let test_sqlite_dump_stmts_internal_tables () =
+  let dump =
+    "ANALYZE sqlite_schema;\n\
+     INSERT INTO sqlite_stat1 VALUES('t','ix','1 1');\n\
+     INSERT INTO t VALUES(1,'sqlite_sequence rocks');\n\
+     DELETE FROM sqlite_sequence;\n\
+     INSERT INTO log VALUES('reset sqlite_sequence now');\n"
+  in
+  Alcotest.(check (list string))
+    "internal-table maintenance dropped; user rows with the substring kept"
+    [ "INSERT INTO t VALUES(1,'sqlite_sequence rocks')"
+    ; "INSERT INTO log VALUES('reset sqlite_sequence now')"
+    ]
+    (E.sqlite_dump_stmts dump)
+;;
+
 let ( let* ) = Lwt.bind
 
 let test_import_sqlite_dump_ok () =
@@ -495,6 +514,10 @@ let () =
         ] )
     ; ( "sqlite_import"
       , [ Alcotest.test_case "dump_stmts filter" `Quick test_sqlite_dump_stmts
+        ; Alcotest.test_case
+            "dump_stmts internal tables"
+            `Quick
+            test_sqlite_dump_stmts_internal_tables
         ; Alcotest.test_case "import ok" `Quick test_import_sqlite_dump_ok
         ; Alcotest.test_case
             "import best-effort"

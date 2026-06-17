@@ -117,33 +117,61 @@ let split_stmts text =
 
 (* #91: import a SQLite [.dump] script. *)
 
-(* Uppercased leading keyword of [s] (up to the first whitespace). *)
-let first_word_upper s =
-  let s = String.trim s in
+(* The leading [n] tokens of [s], uppercased.  Tokens are runs of non-separator
+   characters; [(] and [,] are separators too, so a table name is split from a
+   following column list or [VALUES(]. *)
+let lead_tokens n s =
   let len = String.length s in
-  let stop c = c = ' ' || c = '\n' || c = '\t' in
-  let rec end_of_word i = if i >= len || stop s.[i] then i else end_of_word (i + 1) in
-  String.uppercase_ascii (String.sub s 0 (end_of_word 0))
+  let is_sep c = c = ' ' || c = '\t' || c = '\n' || c = '\r' || c = '(' || c = ',' in
+  let rec skip i = if i < len && is_sep s.[i] then skip (i + 1) else i in
+  let rec take i = if i < len && not (is_sep s.[i]) then take (i + 1) else i in
+  let rec loop i acc k =
+    if k = 0
+    then List.rev acc
+    else (
+      let st = skip i in
+      if st >= len
+      then List.rev acc
+      else (
+        let en = take st in
+        loop en (String.uppercase_ascii (String.sub s st (en - st)) :: acc) (k - 1)))
+  in
+  loop 0 [] n
 ;;
 
-(* True iff [sub] occurs in [s] (naive search; statements are short). *)
-let contains_sub s sub =
-  let n = String.length s
-  and m = String.length sub in
-  let rec at i = (i + m <= n && String.sub s i m = sub) || (i + m < n && at (i + 1)) in
-  m = 0 || at 0
+(* Strip one layer of identifier quoting (["…"], [`…`], [\[…\]]) from [name]. *)
+let unquote_ident name =
+  let n = String.length name in
+  if n >= 2
+  then (
+    match name.[0], name.[n - 1] with
+    | '"', '"' | '`', '`' | '[', ']' -> String.sub name 1 (n - 2)
+    | _ -> name)
+  else name
+;;
+
+(* True iff [name] targets an internal SQLite table — the reserved [sqlite_]
+   prefix, which no user table may use.  A dump's INSERT/DELETE against such a
+   table is therefore always engine-internal maintenance (sqlite_sequence,
+   sqlite_stat1/sqlite_stat4, …) and never user data. *)
+let is_internal_table name =
+  let n = String.uppercase_ascii (unquote_ident name) in
+  String.length n >= 7 && String.sub n 0 7 = "SQLITE_"
 ;;
 
 (* A SQLite [.dump] wraps its DDL/INSERTs in [PRAGMA foreign_keys=OFF;],
-   [BEGIN TRANSACTION;] / [COMMIT;] and — for AUTOINCREMENT tables —
-   maintenance of the internal [sqlite_sequence] table.  Our engine owns
-   transaction control, pragmas and the [sqlite_sequence] view (#312/#314), so
-   those statements are dropped; everything else is replayed verbatim. *)
+   [BEGIN TRANSACTION;] / [COMMIT;], and emits maintenance of internal tables:
+   [sqlite_sequence] (AUTOINCREMENT) and, on an ANALYZEd database, [ANALYZE …]
+   plus [INSERT INTO sqlite_stat1/4 …].  Our engine owns transaction control,
+   pragmas and those internal tables, so such statements are dropped; everything
+   else — including a user INSERT whose *value* merely mentions "sqlite_…" — is
+   replayed verbatim.  The internal-table test anchors on the target table
+   token, never a substring, so user rows are never silently dropped. *)
 let skip_dump_stmt s =
-  match first_word_upper s with
-  | "PRAGMA" | "BEGIN" | "COMMIT" | "END" -> true
-  | ("DELETE" | "INSERT") as _kw ->
-    contains_sub (String.uppercase_ascii s) "SQLITE_SEQUENCE"
+  match lead_tokens 3 s with
+  | ("PRAGMA" | "BEGIN" | "COMMIT" | "END" | "ANALYZE") :: _ -> true
+  | "INSERT" :: "INTO" :: tbl :: _ -> is_internal_table tbl
+  | "DELETE" :: "FROM" :: tbl :: _ -> is_internal_table tbl
   | _ -> false
 ;;
 

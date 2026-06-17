@@ -129,6 +129,19 @@ let dot_open path =
     Lwt.return_unit
 ;;
 
+(* Truncate [s] to at most [max_bytes] bytes without splitting a UTF-8 sequence
+   (back off over 0x80..0xBF continuation bytes at the cut point). *)
+let utf8_truncate s max_bytes =
+  if String.length s <= max_bytes
+  then s
+  else (
+    let i = ref max_bytes in
+    while !i > 0 && Char.code s.[!i] land 0xC0 = 0x80 do
+      decr i
+    done;
+    String.sub s 0 !i)
+;;
+
 (* #91: read a SQLite file's contents as a SQL script via [sqlite3 <path>
    .dump].  Read-only on the source — [.dump] never writes the file.  Returns
    the dump text, or a message if sqlite3 is missing or the file is unreadable. *)
@@ -169,7 +182,7 @@ let dot_import path =
            let preview =
              let one_line = String.map (fun c -> if c = '\n' then ' ' else c) stmt in
              if String.length one_line > 40
-             then String.sub one_line 0 40 ^ "…"
+             then utf8_truncate one_line 40 ^ "…"
              else one_line
            in
            Printf.sprintf

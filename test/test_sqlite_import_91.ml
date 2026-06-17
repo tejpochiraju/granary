@@ -52,12 +52,15 @@ let test_real_dump_roundtrip () =
         | _ -> ())
       (fun () ->
          (* A schema that exercises AUTOINCREMENT (→ sqlite_sequence lines),
-            NULLs, an escaped quote, and a secondary index. *)
+            NULLs, an escaped quote, a secondary index, a TEXT value that
+            mentions "sqlite_sequence" (PR #400 review #1 — must survive), and
+            ANALYZE (→ ANALYZE + sqlite_stat1 lines, PR #400 review #2 — must be
+            filtered, not fail). *)
          let setup =
            "CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, age \
             INT);INSERT INTO users(name,age) VALUES('alice',30),('bob',NULL);CREATE \
-            TABLE t2(x TEXT);INSERT INTO t2 VALUES('he''llo');CREATE INDEX ix ON \
-            users(name);"
+            TABLE t2(x TEXT);INSERT INTO t2 VALUES('he''llo');INSERT INTO t2 \
+            VALUES('sqlite_sequence rocks');CREATE INDEX ix ON users(name);ANALYZE;"
          in
          ignore
            (Sys.command
@@ -70,14 +73,17 @@ let test_real_dump_roundtrip () =
            (let* db = Db.open_in_memory () in
             let* applied, failures = Repl_engine.import_sqlite_dump db dump in
             Alcotest.(check int)
-              "all typed statements imported without failure"
+              "no spurious failures (ANALYZE / sqlite_stat1 filtered)"
               0
               (List.length failures);
             Alcotest.(check bool) "applied something" true (applied > 0);
             let* names = strings_of_query db "SELECT name FROM users ORDER BY id" in
             Alcotest.(check (list string)) "users round-tripped" [ "alice"; "bob" ] names;
-            let* xs = strings_of_query db "SELECT x FROM t2" in
-            Alcotest.(check (list string)) "escaped quote preserved" [ "he'llo" ] xs;
+            let* xs = strings_of_query db "SELECT x FROM t2 ORDER BY x" in
+            Alcotest.(check (list string))
+              "escaped quote preserved + sqlite_sequence-in-value row survives"
+              [ "he'llo"; "sqlite_sequence rocks" ]
+              xs;
             Db.close db)))
 ;;
 
