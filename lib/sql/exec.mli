@@ -139,9 +139,12 @@ type dirty_tables_acc
 val make_dirty_acc : unit -> dirty_tables_acc
 
 (** [with_dirty acc f] runs [f] with [acc] installed as the active write-path
-    mutation sink, so every table mutated by [f] — directly, or indirectly via
-    FK cascades and triggers — is recorded in [acc].  Nestable and independent
-    of the {!query} stats context. *)
+    mutation sink, so every table whose {e rows} [f] mutates — directly, or
+    indirectly via FK cascades and triggers — is recorded in [acc].  Nestable
+    and independent of the {!query} stats context.  Schema-changing DDL
+    ([ALTER]/[DROP]) is intentionally {b not} recorded, even when it rewrites
+    rows (e.g. [ALTER TABLE … DROP COLUMN]): DDL invalidation is handled out of
+    band (see {!Sqlocaml_db.Db.dirty_tables}). *)
 val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** The user tables recorded in [acc]: sorted, deduplicated, with SQLite-reserved

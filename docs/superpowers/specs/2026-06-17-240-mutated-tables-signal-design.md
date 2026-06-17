@@ -111,6 +111,14 @@ the list type and installs/drains the accumulator in the three wrappers.
   matched nothing, or touched only internal tables).
 - The set is correlated with exactly that call's result (no global side channel).
 - Pure read statements never produce a dirty set (these variants are write-only).
+- **Row-level DML only.** Schema-changing/destructive DDL (`DROP TABLE`, all
+  `ALTER TABLE` forms) yields an **empty** set — *including* row-rewriting DDL
+  like `ALTER TABLE … DROP COLUMN`, which physically reshapes every stored row.
+  An empty result from a DDL statement therefore does **not** imply the table's
+  observable contents are unchanged; camel must invalidate on schema changes via
+  a separate schema-version / fingerprint signal (cf. #174). This keeps the
+  signal a clean single-axis (row-data) notification and avoids overloading it
+  with schema-shape changes that need plan/result-shape invalidation anyway.
 
 ## Testing
 
@@ -126,6 +134,9 @@ the list type and installs/drains the accumulator in the three wrappers.
 - Nested/recursive triggers → all distinct tables present, deduped.
 - AUTOINCREMENT insert → set is `["t"]`, **not** `["sqlite_sequence"; "t"]`
   (internal-table filter; `sqlite_sequence` is a view anyway).
+- DDL boundary: `CREATE TABLE`, `DROP TABLE`, and `ALTER TABLE … DROP COLUMN`
+  (row-rewriting) each → **empty** set — pins the out-of-scope decision so the
+  `[]`-for-DDL contract can't silently regress into "row-neutral".
 - `run_with_dirty` on a prepared multi-step write → correct set.
 - Determinism: the list is sorted and duplicate-free (QCheck over random
   multi-table trigger fan-out).
@@ -135,4 +146,9 @@ the list type and installs/drains the accumulator in the three wrappers.
 
 - A push/callback API (deferred unless camel needs it).
 - Per-statement cost stats (that is #239, already shipped).
+- **Schema-change (DDL) invalidation.** `ALTER`/`DROP` are not reported here, even
+  when they rewrite rows (`DROP COLUMN`). camel handles schema invalidation via a
+  separate schema-version / fingerprint signal (cf. #174). Decided in PR #404
+  review: keep this signal single-axis (row data); schema-shape changes need
+  query-plan/result-shape invalidation that a per-table row signal can't express.
 - Surfacing row-level deltas (only the table *set* is exposed).

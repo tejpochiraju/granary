@@ -56,6 +56,26 @@ let test_ddl_is_empty () =
     check_dirty "create table dirties nothing" [] (dirty db "CREATE TABLE t (x INTEGER)"))
 ;;
 
+(* #240 / PR #404 review: the signal is row-level DML only.  Schema-changing and
+   destructive DDL reports an EMPTY set — even [ALTER TABLE … DROP COLUMN], which
+   physically rewrites every stored row.  camel invalidates schema changes out of
+   band (a schema-version / fingerprint signal, cf. #174).  These tests pin that
+   boundary so the [] contract can't silently regress into "row-neutral". *)
+let test_alter_drop_column_is_empty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'x', 'y')";
+    (* DROP COLUMN drains + re-puts every row (reshaped), yet is out of scope. *)
+    check_dirty "drop column reports nothing" [] (dirty db "ALTER TABLE t DROP COLUMN c"))
+;;
+
+let test_drop_table_is_empty () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (a INTEGER PRIMARY KEY)";
+    exec db "INSERT INTO t VALUES (1)";
+    check_dirty "drop table reports nothing" [] (dirty db "DROP TABLE t"))
+;;
+
 let test_update_hit_and_miss () =
   with_db (fun db ->
     exec db "CREATE TABLE users (id INTEGER PRIMARY KEY, n TEXT)";
@@ -301,6 +321,13 @@ let () =
         ; Alcotest.test_case "change_count_with_dirty" `Quick test_change_count_with_dirty
         ; Alcotest.test_case "run_with_dirty" `Quick test_run_with_dirty
         ; Alcotest.test_case "error propagates" `Quick test_error_propagates
+        ] )
+    ; ( "ddl boundary (out of scope)"
+      , [ Alcotest.test_case
+            "alter drop column empty"
+            `Quick
+            test_alter_drop_column_is_empty
+        ; Alcotest.test_case "drop table empty" `Quick test_drop_table_is_empty
         ] )
     ; ( "cascades"
       , [ Alcotest.test_case "on delete cascade" `Quick test_on_delete_cascade
