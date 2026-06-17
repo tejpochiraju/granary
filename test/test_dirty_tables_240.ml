@@ -161,6 +161,48 @@ let test_autoincrement_excludes_internal () =
       (dirty db "INSERT INTO s (n) VALUES ('x')"))
 ;;
 
+(* A statement that fails to parse propagates [Error] through the wrapper
+   (covers the [Error] arm; no accumulator is drained). *)
+let test_error_propagates () =
+  with_db (fun db ->
+    match run (Db.execute_with_dirty db "INSERT INTphony") with
+    | Error _ -> ()
+    | Ok tables ->
+      Alcotest.failf "expected Error, got dirty set [%s]" (String.concat "; " tables))
+;;
+
+(* QCheck: a chain t0 → t1 → … → t(n-1) of AFTER INSERT triggers means one
+   insert into t0 mutates every table in the chain. The reported set must be
+   exactly those tables, sorted and duplicate-free, for any chain length. *)
+let trigger_chain_property =
+  QCheck.Test.make
+    ~count:50
+    ~name:"trigger chain: dirty set is the sorted unique chain"
+    QCheck.(int_range 1 6)
+    (fun n ->
+       with_db (fun db ->
+         let names = List.init n (fun i -> Printf.sprintf "t%d" i) in
+         List.iter
+           (fun nm ->
+              exec db (Printf.sprintf "CREATE TABLE %s (id INTEGER PRIMARY KEY)" nm))
+           names;
+         (* chain: inserting into t(i) inserts into t(i+1) *)
+         for i = 0 to n - 2 do
+           exec
+             db
+             (Printf.sprintf
+                "CREATE TRIGGER tr%d AFTER INSERT ON t%d BEGIN INSERT INTO t%d VALUES \
+                 (NEW.id); END"
+                i
+                i
+                (i + 1))
+         done;
+         let got = dirty db "INSERT INTO t0 VALUES (1)" in
+         let expected = List.sort_uniq String.compare names in
+         (* sorted + unique + complete *)
+         got = expected))
+;;
+
 let () =
   Alcotest.run
     "dirty_tables_240"
@@ -175,6 +217,7 @@ let () =
         ; Alcotest.test_case "delete hit/miss" `Quick test_delete_hit_and_miss
         ; Alcotest.test_case "change_count_with_dirty" `Quick test_change_count_with_dirty
         ; Alcotest.test_case "run_with_dirty" `Quick test_run_with_dirty
+        ; Alcotest.test_case "error propagates" `Quick test_error_propagates
         ] )
     ; ( "cascades"
       , [ Alcotest.test_case "on delete cascade" `Quick test_on_delete_cascade
@@ -187,5 +230,6 @@ let () =
             `Quick
             test_autoincrement_excludes_internal
         ] )
+    ; "property", [ QCheck_alcotest.to_alcotest trigger_chain_property ]
     ]
 ;;
