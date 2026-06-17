@@ -10,6 +10,9 @@ type dot =
   | Databases
   | Open of string
   | Dump of string option (** [.dump [path]]: export the event log (#385) *)
+  | Import of string
+  (** [.import <path>]: import a SQLite [.sqlite] file into the active db,
+          read-only on the source, via [sqlite3 <path> .dump] (#91). *)
   | Unknown of string
 
 (** Which filter prompt (if any) is currently active, so a submitted line is

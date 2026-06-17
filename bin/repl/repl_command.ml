@@ -6,6 +6,7 @@ type dot =
   | Databases
   | Open of string
   | Dump of string option
+  | Import of string
   | Unknown of string
 
 type prompt =
@@ -36,6 +37,7 @@ let parse_dot line =
   | [ ".open"; path ] -> Open path
   | [ ".dump" ] -> Dump None
   | [ ".dump"; path ] -> Dump (Some path)
+  | [ ".import"; path ] -> Import path
   | _ -> Unknown trimmed
 ;;
 

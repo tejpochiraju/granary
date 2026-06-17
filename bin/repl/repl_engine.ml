@@ -115,6 +115,97 @@ let split_stmts text =
   List.rev (flush acc)
 ;;
 
+(* #91: import a SQLite [.dump] script. *)
+
+(* The leading [n] tokens of [s], uppercased.  Tokens are runs of non-separator
+   characters; [(] and [,] are separators too, so a table name is split from a
+   following column list or [VALUES(]. *)
+let lead_tokens n s =
+  let len = String.length s in
+  let is_sep c = c = ' ' || c = '\t' || c = '\n' || c = '\r' || c = '(' || c = ',' in
+  let rec skip i = if i < len && is_sep s.[i] then skip (i + 1) else i in
+  let rec take i = if i < len && not (is_sep s.[i]) then take (i + 1) else i in
+  let rec loop i acc k =
+    if k = 0
+    then List.rev acc
+    else (
+      let st = skip i in
+      if st >= len
+      then List.rev acc
+      else (
+        let en = take st in
+        loop en (String.uppercase_ascii (String.sub s st (en - st)) :: acc) (k - 1)))
+  in
+  loop 0 [] n
+;;
+
+(* Strip one layer of identifier quoting (["…"], [`…`], [\[…\]]) from [name]. *)
+let unquote_ident name =
+  let n = String.length name in
+  if n >= 2
+  then (
+    match name.[0], name.[n - 1] with
+    | '"', '"' | '`', '`' | '[', ']' -> String.sub name 1 (n - 2)
+    | _ -> name)
+  else name
+;;
+
+(* True iff [name] targets an internal SQLite table — the reserved [sqlite_]
+   prefix, which no user table may use.  A dump's INSERT/DELETE against such a
+   table is therefore always engine-internal maintenance (sqlite_sequence,
+   sqlite_stat1/sqlite_stat4, …) and never user data. *)
+let is_internal_table name =
+  let n = String.uppercase_ascii (unquote_ident name) in
+  String.length n >= 7 && String.sub n 0 7 = "SQLITE_"
+;;
+
+(* A SQLite [.dump] wraps its DDL/INSERTs in [PRAGMA foreign_keys=OFF;],
+   [BEGIN TRANSACTION;] / [COMMIT;], and emits maintenance of internal tables:
+   [sqlite_sequence] (AUTOINCREMENT) and, on an ANALYZEd database, [ANALYZE …]
+   plus [INSERT INTO sqlite_stat1/4 …].  Our engine owns transaction control,
+   pragmas and those internal tables, so such statements are dropped; everything
+   else — including a user INSERT whose *value* merely mentions "sqlite_…" — is
+   replayed verbatim.  The internal-table test anchors on the target table
+   token, never a substring, so user rows are never silently dropped. *)
+let skip_dump_stmt s =
+  match lead_tokens 3 s with
+  | ("PRAGMA" | "BEGIN" | "COMMIT" | "END" | "ANALYZE") :: _ -> true
+  | "INSERT" :: "INTO" :: tbl :: _ -> is_internal_table tbl
+  | "DELETE" :: "FROM" :: tbl :: _ -> is_internal_table tbl
+  | _ -> false
+;;
+
+let sqlite_dump_stmts text =
+  split_stmts text |> List.filter (fun s -> not (skip_dump_stmt s))
+;;
+
+(* Run one statement, converting both [Db] errors and any raised exception into
+   a human-readable message so a single bad statement cannot abort the import. *)
+let run_stmt db stmt =
+  Lwt.catch
+    (fun () ->
+       let+ r = Db.execute db stmt in
+       match r with
+       | Ok () -> Ok ()
+       | Error e -> Error (Format.asprintf "%a" Db.pp_error e))
+    (fun exn -> Lwt.return (Error (Printexc.to_string exn)))
+;;
+
+let import_sqlite_dump db dump =
+  let stmts = sqlite_dump_stmts dump in
+  let+ applied, failures =
+    Lwt_list.fold_left_s
+      (fun (applied, failures) stmt ->
+         let+ r = run_stmt db stmt in
+         match r with
+         | Ok () -> applied + 1, failures
+         | Error msg -> applied, (stmt, msg) :: failures)
+      (0, [])
+      stmts
+  in
+  applied, List.rev failures
+;;
+
 let open_db ~path =
   if path = ":memory:"
   then
