@@ -28,3 +28,4 @@ build: [
     "@doc" {with-doc}
   ]
 ]
+dev-repo: "git+ssh://git@git.iotready.com:2222/tej/sqlite_ocaml_port.git"

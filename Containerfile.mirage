@@ -1,0 +1,27 @@
+# sqlocaml MirageOS build image (#403).
+#
+# Extends the sqlocaml-dev image with the `mirage` CLI (4.11.x) and the
+# Solo5/ocaml-solo5 build tooling, so the sample unikernel under mirage/ can be
+# assembled and built for the `unix` and `hvt` targets:
+#
+#   podman build -t sqlocaml-mirage -f Containerfile.mirage .
+#   podman run --rm -v "$(pwd):/workspace:z" -w /workspace/mirage sqlocaml-mirage \
+#     sh -c 'mirage configure -t unix && make depends && dune build'
+#
+# The mirage CLI is NOT in sqlocaml-dev (it pulls the mirage runtime + opam
+# monorepo), which is why it lives in this dedicated image rather than bloating
+# the everyday dev/test/CI image. See mirage/README.md.
+FROM localhost/sqlocaml-dev:latest
+USER root
+# Solo5 / ocaml-solo5 build a tiny C runtime, so the host toolchain is needed
+# (pkg-config + libgmp-dev already come from the base image).
+RUN apt-get update \
+ && apt-get install -y gcc make m4 libseccomp-dev \
+ && rm -rf /var/lib/apt/lists/*
+USER opam
+# The mirage CLI itself. The per-target backend packages (mirage-unix for unix,
+# ocaml-solo5/solo5 for hvt) are pulled on demand by `make depends` at configure
+# time, since they depend on the chosen target.
+RUN opam install -y mirage.4.11.0
+WORKDIR /workspace
+ENTRYPOINT ["opam", "exec", "--"]
