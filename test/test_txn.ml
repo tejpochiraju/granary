@@ -198,24 +198,22 @@ let test_rollback_to_savepoint_autoincrement () =
     rows
 ;;
 
-(* #293 (perf-fix scoping): the rollback recompute must be restricted to tables
-   bumped IN the rolled-back txn, NOT every cached rowid table.  This is both the
-   perf fix and a correctness guard: recompute lowers a counter to max(rowid)+1,
-   which is WRONG for a table that has a trailing gap (its top rows were deleted)
-   and was not actually bumped in the rolled-back txn.
+(* #293 (perf-fix scoping) / #409: the rollback recompute must be restricted to
+   tables bumped IN the rolled-back txn, NOT every cached rowid table.
 
-   Table A is committed with rowids 1,2,3 then has 3 DELETEd, so its counter sits
-   at 4 while max(rowid) is 2.  A second, unrelated txn touches only table B and
-   ROLLBACKs.  If the rollback recomputed A (the pre-fix all-tables behaviour) it
-   would drop A's counter from 4 to 3, and the next INSERT would REUSE rowid 3.
-   With per-txn scoping A is untouched, so the next INSERT correctly gets rowid 4.
-   This proves the dirty set is scoped per-txn and cleared on commit (the second
-   rollback's set names only B). *)
+   A is AUTOINCREMENT so its high-water counter is *sticky*: deleting rowid 3
+   does NOT lower it (SQLite parity — unlike a plain rowid table, which reuses a
+   deleted max; see #409 and test_savepoint_stm), so A sits at counter 4 with
+   max(rowid) 2.  A second, unrelated txn touches only table B and ROLLBACKs.
+   With per-txn dirty-set scoping the rollback recomputes only B, leaving A's
+   committed counter undisturbed, so A's next INSERT correctly gets rowid 4.
+   (This used a plain table before #409 — which incorrectly retained the deleted
+   high-water; AUTOINCREMENT now carries the legitimately-ahead counter.) *)
 let test_rollback_does_not_disturb_committed_other_table () =
   let db = fresh_db () in
-  exec db "CREATE TABLE a (id INTEGER PRIMARY KEY, v TEXT)";
+  exec db "CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)";
   exec db "CREATE TABLE b (id INTEGER PRIMARY KEY, v TEXT)";
-  (* A gets rowids 1,2,3 then drops 3, leaving counter=4 but max(rowid)=2. *)
+  (* A gets rowids 1,2,3 then drops 3; AUTOINCREMENT keeps counter=4, max=2. *)
   exec db "INSERT INTO a (v) VALUES ('a1')";
   exec db "INSERT INTO a (v) VALUES ('a2')";
   exec db "INSERT INTO a (v) VALUES ('a3')";
@@ -224,12 +222,12 @@ let test_rollback_does_not_disturb_committed_other_table () =
   exec db "BEGIN";
   exec db "INSERT INTO b (v) VALUES ('b1')";
   exec db "ROLLBACK";
-  (* A's next allocation must be rowid 4 (committed counter undisturbed).  A
+  (* A's next allocation must be rowid 4 (sticky counter undisturbed).  A
      recompute-all rollback would have lowered it to 3 and wrongly reused it. *)
   exec db "INSERT INTO a (v) VALUES ('a4')";
   let rows = query_int_text db "SELECT id, v FROM a ORDER BY id ASC" in
   Alcotest.(check (list (pair int string)))
-    "committed table A keeps its high-water counter across an unrelated rollback"
+    "AUTOINCREMENT table A keeps its sticky counter across an unrelated rollback"
     [ 1, "a1"; 2, "a2"; 4, "a4" ]
     rows
 ;;

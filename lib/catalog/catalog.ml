@@ -2241,6 +2241,58 @@ let max_rowid_in_txn t ~name (tx : 'a S.txn) : int64 option Lwt.t =
        | Some k -> Some (Rowid.decode k))
 ;;
 
+(* #409: SQLite keeps no persisted counter for a plain (non-AUTOINCREMENT)
+   rowid table — it derives the next rowid as [max(rowid) + 1] over the LIVE
+   rows, so a committed DELETE of the current maximum makes that rowid reusable.
+   Our engine caches a high-water [next_rowid] that [bump_rowid] only ever
+   raises, so without this hook the deleted high-water survives and the rowid is
+   never reused (diverging from SQLite in both the autocommit and explicit-txn
+   paths).
+
+   When a plain rowid table's CURRENT high-water row ([next_rowid - 1]) is
+   deleted, recompute the counter from the live tree — within the caller's [tx],
+   so [max_rowid_in_txn] sees the just-applied delete (read-your-own-writes)
+   whether the surrounding statement autocommits or runs inside an explicit
+   transaction — and persist it (primary row via [put_table_counter_tx]; marked
+   dirty via [bump_rowid] so a ROLLBACK reverts it like any other counter move).
+
+   AUTOINCREMENT is intentionally skipped: its high-water is sticky across
+   committed deletes (#299/#314).  The cheap [rowid = next_rowid - 1] guard means
+   this only fires on the rare delete-of-max, so ordinary deletes and the O(1)
+   cached INSERT fast path are untouched. *)
+let note_rowid_deleted t ~name ~rowid (tx : S.rw S.txn) =
+  match Schema_cache.find_table t.sc name with
+  | None -> Lwt.return_unit
+  | Some m ->
+    (match m.storage with
+     | Row { tree_id; next_rowid; without_rowid = false; autoincrement = false }
+       when (not (Int64.equal next_rowid empty_next_rowid))
+            && Int64.equal rowid (Int64.sub next_rowid 1L) ->
+       let%lwt mx = max_rowid_in_txn t ~name tx in
+       let recovered =
+         match mx with
+         | None -> empty_next_rowid
+         | Some k -> Int64.add k 1L
+       in
+       if Int64.equal recovered next_rowid
+       then Lwt.return_unit
+       else (
+         let m' =
+           { m with
+             storage =
+               Row
+                 { tree_id
+                 ; next_rowid = recovered
+                 ; without_rowid = false
+                 ; autoincrement = false
+                 }
+           }
+         in
+         Schema_cache.bump_rowid t.sc ~name m';
+         put_table_counter_tx tx m')
+     | _ -> Lwt.return_unit)
+;;
+
 (* #312.1: writable [sqlite_sequence] SET/INSERT for table [name] with the
    requested seq value [requested].  Faithful to SQLite's effective rule
    [next = max(requested, max(rowid)) + 1]: the new counter is

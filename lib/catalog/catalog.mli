@@ -300,6 +300,21 @@ val reset_all_next_rowid_in_txn
   -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
   -> unit Lwt.t
 
+(** #409: note that [rowid] was deleted from plain rowid table [name].  When the
+    deleted row was the current high-water ([next_rowid - 1]), recompute the
+    cached counter to [max(rowid) + 1] over the live rows (scanned within the
+    held transaction, so it reflects the just-applied delete) so the rowid is
+    reused on the next insert, matching SQLite.  Mutates through the held RW
+    transaction (does NOT commit) and marks the counter dirty so a ROLLBACK
+    reverts it.  A no-op for AUTOINCREMENT tables (sticky high-water), WITHOUT
+    ROWID tables, unseeded counters, and deletes of any non-high-water row. *)
+val note_rowid_deleted
+  :  t
+  -> name:string
+  -> rowid:int64
+  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> unit Lwt.t
+
 (** #347: flush all dirty rowid counters into the B-tree under [tx].  Call once
     before [S.commit] when inserts used [~defer_counter:true] to skip per-row
     [put_table_counter_tx] writes.  Clears the dirty set; the subsequent
