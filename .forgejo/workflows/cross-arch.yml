@@ -1,0 +1,92 @@
+name: Cross-arch
+
+# Cross-platform build+test matrix (#157): proves the engine builds and the full
+# suite passes on both linux/amd64 and linux/arm64. The on-disk format is
+# explicitly byte-ordered and there are no C stubs, so the encoding/B-tree/WAL
+# and QCheck fuzz suites are the canaries for any latent endianness / word-size
+# regression.
+#
+# This is NOT wired into the per-PR pipeline: the arm64 leg runs under qemu-user
+# emulation on the amd64 self-hosted runner and is far too slow to gate every PR.
+# It runs weekly and on demand instead; the runtime is recorded in the job log so
+# we can later decide whether a native arm64 runner is worth it. amd64 here is
+# native and fast — it doubles as an independent cross-check of the main CI leg.
+#
+# Prereq for the arm64 leg: the runner host must have the qemu binfmt handlers
+# registered (Debian/Ubuntu: `qemu-user-static` + `binfmt-support`). If they are
+# absent the arm64 container simply fails to start; fail-fast is off so the amd64
+# leg still reports.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Mondays 04:30 UTC — off the nightly Jepsen slot.
+    - cron: "30 4 * * 1"
+
+jobs:
+  build-and-test:
+    runs-on: self-hosted
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --platform=linux/${{ matrix.arch }}
+
+    steps:
+      - name: Record start time
+        run: echo "START_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Show architecture
+        run: |
+          echo "matrix.arch=${{ matrix.arch }}"
+          uname -m
+          opam exec -- ocamlfind ocamlc -config | grep -E '^(architecture|word_size):' || true
+
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.4-${{ matrix.arch }}-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          restore-keys: opam-5.4-${{ matrix.arch }}-
+
+      - name: Install opam packages
+        run: |
+          opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
+            mirage-block mirage-block-unix uutf uucp ocamlformat.0.29.0 \
+            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3 \
+            nottui nottui-lwt lwd
+
+      - name: Build
+        run: opam exec -- dune build
+
+      - name: Test
+        # Same timing-gate neutralization as the main CI leg: the bench_* suites
+        # run for smoke coverage but their wall-time thresholds are meaningless
+        # under emulation, so disable them here (esp. on the arm64/qemu leg).
+        env:
+          SQLOCAML_BENCH_MIN_SPEEDUP: "0"
+          SQLOCAML_BENCH_PARALLEL_MAX: "1000000"
+          SQLOCAML_BENCH_MAX_WRITER_S: "1000000"
+          SQLOCAML_BENCH_MAX_RATIO: "1000000"
+        run: opam exec -- dune runtest
+
+      - name: Record runtime
+        if: always()
+        run: |
+          END_EPOCH=$(date +%s)
+          ELAPSED=$(( END_EPOCH - START_EPOCH ))
+          echo "::notice title=cross-arch runtime::${{ matrix.arch }} build+test took ${ELAPSED}s ($(uname -m))"
+          echo "Cross-arch (${{ matrix.arch }}, $(uname -m)) build+test wall time: ${ELAPSED}s"

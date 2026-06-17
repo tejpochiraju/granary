@@ -84,6 +84,43 @@ recovery are unaffected — only *when* commits are fsynced changes.
 > **database-wide** — the WAL commit queue is shared across all connections to a store, so a
 > `PRAGMA synchronous` on any connection changes the mode for all of them (last writer wins).
 
+## Building & cross-platform support
+
+The engine is 100% OCaml with no C stubs, and the on-disk format is explicitly
+byte-ordered (big-endian page headers and index keys, little-endian float64 in
+rows), so builds are architecture-neutral. Both **`linux/amd64`** and
+**`linux/arm64`** are supported and verified (#157); `darwin/arm64` works for
+local dev. The `ocaml/opam` base image in `Containerfile` is published
+multi-arch, so the same `Containerfile` builds on either host.
+
+```sh
+# native build (host architecture)
+podman build -t sqlocaml-dev -f Containerfile .
+
+# explicit per-arch builds — these build natively on a matching host and under
+# qemu-user-static emulation on a foreign host (e.g. arm64 on an x86 box):
+podman build --platform=linux/amd64 -t sqlocaml-dev:amd64 -f Containerfile .
+podman build --platform=linux/arm64 -t sqlocaml-dev:arm64 -f Containerfile .
+```
+
+To build or run a foreign-architecture image on an x86 host, register the qemu
+binfmt handlers once (Debian/Ubuntu):
+
+```sh
+sudo apt-get install -y qemu-user-static binfmt-support
+```
+
+Then build and test exactly as on the host architecture:
+
+```sh
+podman run --rm --platform=linux/arm64 -v "$(pwd):/workspace:z" -w /workspace \
+  sqlocaml-dev:arm64 dune runtest
+```
+
+> **`_build/` is architecture-specific.** dune artefacts under `_build/` are not
+> portable across architectures. When reusing one checkout across amd64 and
+> arm64 build hosts, run a clean rebuild (`rm -rf _build`) after switching.
+
 ## Benchmarks
 
 In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepared statements
