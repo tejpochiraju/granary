@@ -190,6 +190,12 @@ val history_release : t -> unit
 (** All retained commit-log records in ascending txn order ([] when as-of is off). *)
 val history_log : t -> History.record list Lwt.t
 
+(** [history_enabled t] (#266/#412) reports whether the store was opened with an
+    as-of commit-log sink ([~as_of_history:true] with a sink supplied).  [false]
+    on the in-memory backend or when as-of history is disabled.  Used by ATTACH
+    to inherit the top handle's as-of setting. *)
+val history_enabled : t -> bool
+
 (** [ro_begin_as_of t target] opens a read-only snapshot against the retained
     root with the largest txn/timestamp [<=] [target].  Raises {!History_error}
     [History_unavailable] when as-of is off and [History_pruned] when the target
