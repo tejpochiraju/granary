@@ -123,16 +123,26 @@ let file_history_sink ~path : History.sink =
         (fun () ->
            let* st = Lwt_unix.fstat fd in
            let len = st.Unix.st_size in
-           let bytes = Bytes.create len in
-           let rec read_all off =
-             if off >= len
-             then Lwt.return_unit
-             else
-               let* n = Lwt_unix.read fd bytes off (len - off) in
-               if n = 0 then Lwt.return_unit else read_all (off + n)
-           in
-           let* () = read_all 0 in
-           Lwt.return (History.decode_all (Cstruct.of_bytes bytes)))
+           (* #266 (review): guard an absurd/hostile reported size — an unclamped
+              [Bytes.create len] would raise [Invalid_argument] and escape as an
+              opaque Lwt rejection at DB open. Treat such a log as unreadable. *)
+           if len < 0 || len > Sys.max_string_length
+           then Lwt.return []
+           else (
+             let bytes = Bytes.create len in
+             (* Track bytes ACTUALLY read: an EOF before [len] (truncation/short
+                read) must not feed an uninitialised tail to [decode_all]; decode
+                only the prefix [0, got). decode_all already tolerates a torn
+                tail, so the readable prefix is the right answer. *)
+             let rec read_all off =
+               if off >= len
+               then Lwt.return off
+               else
+                 let* n = Lwt_unix.read fd bytes off (len - off) in
+                 if n = 0 then Lwt.return off else read_all (off + n)
+             in
+             let* got = read_all 0 in
+             Lwt.return (History.decode_all (Cstruct.of_bytes (Bytes.sub bytes 0 got)))))
         (fun () -> Lwt_unix.close fd)
   in
   { History.append; load }

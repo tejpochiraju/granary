@@ -156,6 +156,10 @@ txn id (for `` `Txn ``) or timestamp (for `` `Ts ``) that is ≤ the target**.
 
 ### Limitations
 
+- **Requires an active retention floor.** As-of reads serve only what
+  `history_pin` protects: with no floor set, every as-of target returns
+  `History_pruned`. Pinning is **not retroactive** — pin *before* the writes you
+  want to retain across.
 - **Unencrypted databases only** (the sidecar log is always plaintext; encrypted
   DB support is future work).
 - **Schema is read at HEAD.** DDL executed after the target snapshot may

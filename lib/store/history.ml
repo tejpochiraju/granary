@@ -84,8 +84,19 @@ let resolve (records : record list) (target : target) : record option =
     match target with
     | `Txn t | `Ts t -> t
   in
+  (* #266 (review): return the record with the genuine MAXIMUM key ≤ bound, not
+     the last one in list order. For [`Txn] (unique, sorted) this is identical to
+     a left fold; for [`Ts] under a non-monotonic clock it is the fix — the
+     largest-timestamp record need not be the last in txn order. Equal-max ties
+     resolve to the later record in list order (the later txn). *)
   List.fold_left
-    (fun acc r -> if Int64.compare (key r) bound <= 0 then Some r else acc)
+    (fun acc r ->
+       if Int64.compare (key r) bound <= 0
+       then (
+         match acc with
+         | Some a when Int64.compare (key a) (key r) >= 0 -> acc
+         | _ -> Some r)
+       else acc)
     None
     records
 ;;

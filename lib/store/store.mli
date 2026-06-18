@@ -174,7 +174,11 @@ val ro_begin : t -> ro txn Lwt.t
 
 (** [history_pin t ~txn_id] (#266) sets the retention floor: pages reachable from
     commits [>= txn_id] are never reused, so they stay queryable via
-    {!ro_begin_as_of}.  No-op on the in-memory backend or when as-of is off. *)
+    {!ro_begin_as_of}.  No-op on the in-memory backend or when as-of is off.
+
+    The floor is {b not retroactive}: pin {b before} the writes you want to retain
+    across.  Pinning after superseded pages have already been recycled cannot
+    recover them — an as-of read of such a target returns [History_pruned]. *)
 val history_pin : t -> txn_id:int64 -> unit
 
 (** The current retention floor, or [None] when unset. *)
@@ -189,7 +193,12 @@ val history_log : t -> History.record list Lwt.t
 (** [ro_begin_as_of t target] opens a read-only snapshot against the retained
     root with the largest txn/timestamp [<=] [target].  Raises {!History_error}
     [History_unavailable] when as-of is off and [History_pruned] when the target
-    predates the retained floor.  End it with {!ro_end} like any RO txn. *)
+    predates the retained floor.  End it with {!ro_end} like any RO txn.
+
+    As-of reads serve {b only} what an active retention floor protects: with no
+    floor set (via {!history_pin}) every target resolves to [History_pruned],
+    because uncapped commits recycle superseded pages and a snapshot would read
+    garbage.  The floor is not retroactive — see {!history_pin}. *)
 val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
 
 (** Raised by {!ro_begin_as_of} to carry an as-of {!error}. *)

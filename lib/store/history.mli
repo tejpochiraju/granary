@@ -39,8 +39,10 @@ val decode : Cstruct.t -> record option
     CRC-failing record (a torn tail), returning every valid record before it. *)
 val decode_all : Cstruct.t -> record list
 
-(** [resolve records target] returns the record with the largest [txn_id]
-    (for [`Txn]) or [timestamp] (for [`Ts]) that is [<=] the target, or
-    [None] if every record is newer (or the list is empty).  [records] must
-    be in ascending order. *)
+(** [resolve records target] returns the record with the largest key [<=] the
+    target — [txn_id] for [`Txn], [timestamp] for [`Ts] — or [None] if every
+    record is newer (or the list is empty).  The maximum is computed over the
+    matching keys, so a non-monotonic [`Ts] log resolves correctly; equal-key
+    ties resolve to the later record in list order (the later txn).  [`Ts] is
+    only meaningful under a monotonic commit clock. *)
 val resolve : record list -> target -> record option

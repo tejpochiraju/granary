@@ -1348,7 +1348,12 @@ let ro_begin_as_of t (target : History.target) =
        let pruned =
          match st.history_floor with
          | Some f -> Int64.compare r.History.txn_id f < 0
-         | None -> false
+         | None ->
+           (* #266 (review): no floor ⇒ nothing is retained; refuse rather than
+              serve recycled pages. Without a pin, [rw_begin] leaves [min_safe]
+              uncapped, so the freelist recycles the resolved root's pages and
+              the snapshot would read garbage. *)
+           true
        in
        if pruned
        then Lwt.fail (History_error History_pruned)

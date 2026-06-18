@@ -43,6 +43,17 @@ let test_resolve_ts_le () =
   assert (H.resolve recs (`Ts 30L) = Some (r 3L 30L 300L))
 ;;
 
+(* resolve: under a non-monotonic `Ts log, must return the record with the
+   genuine MAXIMUM timestamp <= bound, not merely the last-in-list one. Here t3
+   (ts=150) is later in txn order than t2 (ts=200) but has a smaller ts; a
+   `Ts 250 query must resolve to t2, not t3. (#266 review) *)
+let test_resolve_ts_non_monotonic () =
+  let recs = [ r 1L 100L 100L; r 2L 200L 200L; r 3L 150L 150L; r 4L 300L 300L ] in
+  assert (H.resolve recs (`Ts 250L) = Some (r 2L 200L 200L));
+  (* `Txn behaviour is unchanged: unique, sorted, exact. *)
+  assert (H.resolve recs (`Txn 3L) = Some (r 3L 150L 150L))
+;;
+
 (* decode: short buffer (< record_size) must return None *)
 let test_decode_short_buffer () =
   let short = Cstruct.create (H.record_size - 1) in
@@ -86,6 +97,7 @@ let () =
   test_decode_all_drops_torn_tail ();
   test_resolve_txn_le ();
   test_resolve_ts_le ();
+  test_resolve_ts_non_monotonic ();
   test_decode_short_buffer ();
   test_decode_all_empty ();
   test_resolve_empty ();

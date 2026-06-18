@@ -309,8 +309,46 @@ let test_load_error_no_lock_leak () =
           Lwt.return_unit))
 ;;
 
+(* #266 (review, BLOCKER): with NO retention floor, an as-of read must refuse
+   (History_pruned) rather than open a snapshot against a root whose pages the
+   uncapped freelist has already recycled — which would return garbage. Commit
+   A (capture t1), then commit B plus several churn txns WITHOUT pinning, and
+   assert the read at t1 raises History_pruned. *)
+let test_unpinned_as_of_pruned () =
+  with_store ~as_of:true (fun store ->
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 0 (bs "A") (bs "rowA") in
+    let* () = S.commit tx in
+    let* log = S.history_log store in
+    let t1 =
+      match log with
+      | r :: _ -> r.H.txn_id
+      | [] -> failwith "history log empty after first commit"
+    in
+    (* churn: several more commits, NO history_pin *)
+    let rec churn = function
+      | 0 -> Lwt.return_unit
+      | n ->
+        let* tx = S.rw_begin store in
+        let key = bs (Printf.sprintf "B%d" n) in
+        let* () = S.put tx 0 key (bs "rowB") in
+        let* () = S.commit tx in
+        churn (n - 1)
+    in
+    let* () = churn 5 in
+    assert (S.history_floor store = None);
+    Lwt.catch
+      (fun () ->
+         let* _ = S.ro_begin_as_of store (`Txn t1) in
+         failwith "expected History_pruned for unpinned as-of read")
+      (function
+        | S.History_error S.History_pruned -> Lwt.return_unit
+        | exn -> Lwt.fail exn))
+;;
+
 let () =
   test_pin_floor ();
+  test_unpinned_as_of_pruned ();
   test_unavailable_without_flag ();
   test_time_travel ();
   run (test_mem_retention_api_noop ());

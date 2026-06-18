@@ -173,7 +173,10 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
 (** [query_as_of t target sql] (#266) runs a read-only [sql] query against the
     database as it existed at [target] (a past txn id or timestamp).  Requires
     the db to have been opened with [~as_of_history:true]; otherwise the result
-    carries [History_unavailable].  [History_pruned] when [target] predates the
+    carries [History_unavailable].  As-of reads require an active retention floor
+    set via {!history_pin}: with no floor every target resolves to
+    [History_pruned], and the floor is not retroactive — pin before the writes you
+    want to retain across.  [History_pruned] also when [target] predates the
     retained floor.  Schema is read at HEAD: a query whose table had DDL after
     [target] may misinterpret older rows (schema-as-of is out of scope, #266).
     As-of applies to the MAIN database only; a query routed (via the active
