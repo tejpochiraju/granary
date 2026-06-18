@@ -1719,10 +1719,26 @@ let query top sql = query_impl top sql
 
 (* #266: thin Db wrappers over the store-level as-of retention API, so callers
    manage the history floor without reaching through to the raw store. *)
-let history_pin t ~txn_id = S.history_pin t.store ~txn_id
-let history_floor t = S.history_floor t.store
-let history_release t = S.history_release t.store
-let history_log t = S.history_log t.store
+
+(* #412: resolve a schema name to the store whose as-of history it owns.
+   "main" is the top handle's own store; any other name must currently be an
+   ATTACHed schema.  Raises [Invalid_argument] on an unknown schema. *)
+let store_for_schema (top : t) schema =
+  if String.equal schema "main"
+  then top.store
+  else (
+    match Hashtbl.find_opt top.attached schema with
+    | Some sub -> sub.store
+    | None -> invalid_arg (Printf.sprintf "history: unknown schema '%s'" schema))
+;;
+
+let history_pin ?(schema = "main") t ~txn_id =
+  S.history_pin (store_for_schema t schema) ~txn_id
+;;
+
+let history_floor ?(schema = "main") t = S.history_floor (store_for_schema t schema)
+let history_release ?(schema = "main") t = S.history_release (store_for_schema t schema)
+let history_log ?(schema = "main") t = S.history_log (store_for_schema t schema)
 
 (* #266: SQL-level time travel.  Opens a read-only snapshot of the committed
    state as it existed at [target] (a past txn id / timestamp) and runs [sql]

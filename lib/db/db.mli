@@ -187,22 +187,28 @@ val query_as_of
   -> string
   -> (row Lwt_stream.t, error) result Lwt.t
 
-(** [history_pin t ~txn_id] (#266) sets the retention floor at [txn_id]: the
-    committed root at or before [txn_id] is retained so {!query_as_of} can reach
-    it.  No-op when as-of history is not enabled. *)
-val history_pin : t -> txn_id:int64 -> unit
+(** [history_pin ?schema t ~txn_id] (#266/#412) sets the retention floor at
+    [txn_id] for [schema] (default ["main"]; otherwise a currently ATTACHed
+    schema): the committed root at or before [txn_id] is retained so
+    {!query_as_of} can reach it.  No-op when as-of history is not enabled.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_pin : ?schema:string -> t -> txn_id:int64 -> unit
 
-(** [history_floor t] (#266) is the current retention floor txn id, or [None]
-    when no floor is pinned (or as-of history is not enabled). *)
-val history_floor : t -> int64 option
+(** [history_floor ?schema t] (#266/#412) is [schema]'s current retention floor
+    txn id, or [None] when no floor is pinned (or as-of history is not enabled).
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_floor : ?schema:string -> t -> int64 option
 
-(** [history_release t] (#266) clears the retention floor, allowing pruning of
-    previously pinned historical roots. *)
-val history_release : t -> unit
+(** [history_release ?schema t] (#266/#412) clears [schema]'s retention floor,
+    allowing pruning of previously pinned historical roots.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_release : ?schema:string -> t -> unit
 
-(** [history_log t] (#266) is the recorded commit history (the [<path>.aslog]
-    sidecar), oldest first.  Empty when as-of history is not enabled. *)
-val history_log : t -> Sqlocaml_store.History.record list Lwt.t
+(** [history_log ?schema t] (#266/#412) is [schema]'s recorded commit history
+    (the [<path>.aslog] sidecar), oldest first.  Empty when as-of history is not
+    enabled.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_log : ?schema:string -> t -> Sqlocaml_store.History.record list Lwt.t
 
 (** #240: the set of user tables whose {e rows} a write statement actually
     mutated, including tables touched indirectly by triggers and FK cascades.

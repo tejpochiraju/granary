@@ -543,6 +543,11 @@
  (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
 
 (test
+ (name test_attach_as_of)
+ (modules test_attach_as_of)
+ (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
+
+(test
  (name test_repl)
  (modules test_repl)
  (libraries alcotest unix)

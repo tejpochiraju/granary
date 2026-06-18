@@ -229,6 +229,8 @@ let err_str = function
   | Db.Parse e -> "parse: " ^ e
   | Db.Sema _ -> "sema"
   | Db.Runtime e -> "runtime: " ^ e
+  | Db.History_unavailable -> "history_unavailable"
+  | Db.History_pruned -> "history_pruned"
 ;;
 
 let query_pairs db =
