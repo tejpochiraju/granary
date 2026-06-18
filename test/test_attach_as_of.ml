@@ -285,6 +285,38 @@ let test_detach_then_pin_raises () =
   |> run
 ;;
 
+(* #412 (review): VACUUM must preserve the as-of CAPABILITY.  Compaction
+   legitimately drops the pre-VACUUM roots, but the commit-log sink must stay
+   enabled so as-of keeps recording going forward — otherwise [query_as_of]
+   silently returns [History_unavailable] after a VACUUM. *)
+let test_vacuum_preserves_history () =
+  let path = fresh_path () in
+  cleanup path;
+  let rows =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~as_of_history:true ~path () in
+         let db = ok db in
+         let* () = exec db "CREATE TABLE t(id INTEGER)" in
+         let* () = exec db "INSERT INTO t VALUES (1)" in
+         let* () = exec db "VACUUM" in
+         (* History must still record after VACUUM. *)
+         let* () = exec db "INSERT INTO t VALUES (2)" in
+         let* t_after = head_txn db ~schema:"main" in
+         let* () = exec db "INSERT INTO t VALUES (3)" in
+         D.history_pin db ~txn_id:t_after;
+         let* hist = D.query_as_of db (`Txn t_after) "SELECT id FROM t" in
+         let* hist_rows = Lwt_stream.to_list (ok hist) in
+         let* () = D.close db in
+         Lwt.return (List.sort compare (texts hist_rows)))
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check (list int)) "as-of after vacuum sees 1,2 not 3" [ 1; 2 ] rows
+;;
+
 let () =
   Alcotest.run
     "attach_as_of"
@@ -303,6 +335,12 @@ let () =
     ; ( "properties"
       , [ QCheck_alcotest.to_alcotest test_floor_independence
         ; Alcotest.test_case "detach then pin raises" `Quick test_detach_then_pin_raises
+        ] )
+    ; ( "vacuum"
+      , [ Alcotest.test_case
+            "vacuum preserves history"
+            `Quick
+            test_vacuum_preserves_history
         ] )
     ]
 ;;

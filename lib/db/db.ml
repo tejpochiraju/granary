@@ -337,11 +337,22 @@ let vacuum t : unit Lwt.t =
            let* tids = S.list_tree_ids t.store in
            let* () = copy_all_trees ~src:t.store ~dst ~tids in
            let* () = S.close dst in
+           (* #412: preserve the as-of CAPABILITY across VACUUM.  Compaction
+              drops the pre-VACUUM roots, so the existing [<path>.aslog] (which
+              records now-invalid root pages) must be discarded — appending to it
+              would yield a non-monotonic log whose old targets resolve to garbage
+              roots in the rebuilt file.  We capture whether history was on, drop
+              the stale log below, and reopen with the sink enabled so recording
+              continues fresh.  The rebuild target [dst] deliberately ran WITHOUT
+              history (no orphaned [tmp_path.aslog]). *)
+           let had_history = S.history_enabled t.store in
            let* () = S.close t.store in
            (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
            prov.remove_file (path ^ "-wal");
+           (* Stale as-of log: its roots predate compaction (see above). *)
+           prov.remove_file (path ^ ".aslog");
            prov.rename_file tmp_path path;
-           let* new_store_r = prov.open_store ~path () in
+           let* new_store_r = prov.open_store ~as_of_history:had_history ~path () in
            (match new_store_r with
             | Error e ->
               let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
@@ -1745,7 +1756,14 @@ let history_pin ?(schema = "main") t ~txn_id =
 
 let history_floor ?(schema = "main") t = S.history_floor (store_for_schema t schema)
 let history_release ?(schema = "main") t = S.history_release (store_for_schema t schema)
-let history_log ?(schema = "main") t = S.history_log (store_for_schema t schema)
+
+(* [history_log] returns an [Lwt.t], so resolve the schema INSIDE a thunk: an
+   unknown-schema [Invalid_argument] must surface as a rejected promise (the
+   in-thunk [store_for_schema] is caught by [Lwt.catch]), matching the return
+   type rather than escaping synchronously. *)
+let history_log ?(schema = "main") t =
+  Lwt.catch (fun () -> S.history_log (store_for_schema t schema)) Lwt.fail
+;;
 
 (* #266: SQL-level time travel.  Opens a read-only snapshot of the committed
    state as it existed at [target] (a past txn id / timestamp) and runs [sql]
