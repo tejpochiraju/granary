@@ -75,6 +75,7 @@ let error_msg = function
   | Db.Parse s -> "Parse: " ^ s
   | Db.Runtime s -> "Runtime: " ^ s
   | Db.Sema _ -> "Sema error"
+  | e -> Format.asprintf "%a" Db.pp_error e
 ;;
 
 let exec_ok db sql =

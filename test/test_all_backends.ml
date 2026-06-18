@@ -28,6 +28,7 @@ let error_msg = function
   | DB.Parse s -> s
   | DB.Runtime s -> s
   | DB.Sema _ -> "sema error"
+  | e -> Format.asprintf "%a" DB.pp_error e
 ;;
 
 let execute_ok db sql =

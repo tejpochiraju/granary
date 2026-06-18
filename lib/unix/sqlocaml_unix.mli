@@ -31,11 +31,16 @@ val install : unit -> unit
 
     [clock] is forwarded to {!Sqlocaml.Db.of_store} (used by datetime).  Note:
     durability applies to WAL mode only; the non-WAL commit path syncs inline
-    and ignores the sync mode, so {!open_file} takes no [durability] (#298). *)
+    and ignores the sync mode, so {!open_file} takes no [durability] (#298).
+
+    [as_of_history] (#266) defaults to [false]; set it to [true] to enable the
+    [<path>.aslog] as-of commit log, which lets {!Sqlocaml.Db.query_as_of} read
+    the database as it existed at a past txn id / timestamp. *)
 val open_file
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?clock:(unit -> float)
+  -> ?as_of_history:bool
   -> path:string
   -> unit
   -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
@@ -43,12 +48,14 @@ val open_file
 (** Open a persistent WAL-mode database ([path] for the main DB, [path ^ "-wal"]
     for the WAL), registering the file provider.  Crash recovery runs
     automatically at open.  Geometry arguments behave as in {!open_file} (#95).
-    [clock] and [durability] are forwarded to {!Sqlocaml.Db.of_store} (#298). *)
+    [clock] and [durability] are forwarded to {!Sqlocaml.Db.of_store} (#298).
+    [as_of_history] (#266) defaults to [false] — see {!open_file}. *)
 val open_file_wal
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?clock:(unit -> float)
   -> ?durability:Sqlocaml_store.Store.durability
+  -> ?as_of_history:bool
   -> path:string
   -> unit
   -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
