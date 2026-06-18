@@ -1743,50 +1743,62 @@ let query_as_of top (target : Sqlocaml_store.History.target) sql =
   Lwt.catch
     (fun () ->
        let* ro = S.ro_begin_as_of top.store target in
-       let end_ro () = S.ro_end ro in
-       let op_promise, t = compile_routed top sql in
-       let* op = op_promise in
-       match op with
-       | Error e ->
-         let* () = end_ro () in
-         Lwt.return (Error e)
-       | Ok op ->
-         (match
-            Sql.Exec.query
-              ~mode:(Sql.Exec.In_ro_txn ro)
-              ~clock:t.clock
-              t.store
-              t.catalog
-              op
-          with
-          | exception Failure msg ->
+       (* Idempotent ender, hoisted so the pre-stream guard below and the
+          stream-drain path share the same [ended] ref — [ro] can never be
+          double-ended. *)
+       let ended = ref false in
+       let end_ro () =
+         if !ended
+         then Lwt.return_unit
+         else (
+           ended := true;
+           S.ro_end ro)
+       in
+       (* Once [ro] is open, ANY exception raised before the lazy stream is
+          handed to the caller (e.g. the planner's [failwith]/[assert false],
+          which propagate as Lwt rejections rather than [Error _]) must end
+          [ro] exactly once and re-raise — otherwise the historical reader
+          leaks and pins page reclamation. *)
+       Lwt.catch
+         (fun () ->
+            let op_promise, t = compile_routed top sql in
+            let* op = op_promise in
+            match op with
+            | Error e ->
+              let* () = end_ro () in
+              Lwt.return (Error e)
+            | Ok op ->
+              (match
+                 Sql.Exec.query
+                   ~mode:(Sql.Exec.In_ro_txn ro)
+                   ~clock:t.clock
+                   t.store
+                   t.catalog
+                   op
+               with
+               | exception Failure msg ->
+                 let* () = end_ro () in
+                 Lwt.return (Error (Runtime msg))
+               | lwt_stream ->
+                 let* stream = lwt_stream in
+                 let wrapped =
+                   Lwt_stream.from (fun () ->
+                     Lwt.catch
+                       (fun () ->
+                          let* next = Lwt_stream.get stream in
+                          match next with
+                          | None ->
+                            let* () = end_ro () in
+                            Lwt.return_none
+                          | Some row -> Lwt.return_some row)
+                       (fun exn ->
+                          let* () = end_ro () in
+                          Lwt.fail exn))
+                 in
+                 Lwt.return (Ok wrapped)))
+         (fun exn ->
             let* () = end_ro () in
-            Lwt.return (Error (Runtime msg))
-          | lwt_stream ->
-            let* stream = lwt_stream in
-            let ended = ref false in
-            let finish () =
-              if !ended
-              then Lwt.return_unit
-              else (
-                ended := true;
-                end_ro ())
-            in
-            let wrapped =
-              Lwt_stream.from (fun () ->
-                Lwt.catch
-                  (fun () ->
-                     let* next = Lwt_stream.get stream in
-                     match next with
-                     | None ->
-                       let* () = finish () in
-                       Lwt.return_none
-                     | Some row -> Lwt.return_some row)
-                  (fun exn ->
-                     let* () = finish () in
-                     Lwt.fail exn))
-            in
-            Lwt.return (Ok wrapped)))
+            Lwt.fail exn))
     (function
       | S.History_error S.History_unavailable -> Lwt.return (Error History_unavailable)
       | S.History_error S.History_pruned -> Lwt.return (Error History_pruned)

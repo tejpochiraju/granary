@@ -79,8 +79,66 @@ let test_query_as_of () =
   Alcotest.(check (list string)) "live yields both 'a' and 'b'" [ "a"; "b" ] both
 ;;
 
+(* Negative path: a Db opened WITHOUT [~as_of_history] cannot serve a historical
+   read, so [query_as_of] resolves to [Error History_unavailable]. *)
+let test_history_unavailable () =
+  let path = fresh_path () in
+  cleanup path;
+  let result =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~path () in
+         let db = ok db in
+         let* _ = D.execute db "CREATE TABLE t(id INTEGER)" in
+         let* r = D.query_as_of db (`Txn 1L) "SELECT 1" in
+         let* () = D.close db in
+         Lwt.return r)
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  match result with
+  | Error D.History_unavailable -> ()
+  | Error e -> Alcotest.failf "expected History_unavailable, got %a" D.pp_error e
+  | Ok _ -> Alcotest.fail "expected History_unavailable, got Ok"
+;;
+
+(* Negative path: with history enabled and a non-empty log whose earliest txn is
+   > 0, resolving [`Txn 0L] finds no record <= 0 → [Error History_pruned]. *)
+let test_history_pruned () =
+  let path = fresh_path () in
+  cleanup path;
+  let result =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~as_of_history:true ~path () in
+         let db = ok db in
+         let* _ = D.execute db "CREATE TABLE t(id INTEGER)" in
+         let* _ = D.execute db "INSERT INTO t VALUES (1)" in
+         (* Log is now non-empty; its earliest txn id is > 0, so a [`Txn 0L]
+            target resolves to no record → pruned. *)
+         let* r = D.query_as_of db (`Txn 0L) "SELECT id FROM t" in
+         let* () = D.close db in
+         Lwt.return r)
+      (fun () ->
+         cleanup path;
+         Lwt.return_unit)
+    |> run
+  in
+  match result with
+  | Error D.History_pruned -> ()
+  | Error e -> Alcotest.failf "expected History_pruned, got %a" D.pp_error e
+  | Ok _ -> Alcotest.fail "expected History_pruned, got Ok"
+;;
+
 let () =
   Alcotest.run
     "db_as_of"
-    [ "query_as_of", [ Alcotest.test_case "historical vs live" `Quick test_query_as_of ] ]
+    [ ( "query_as_of"
+      , [ Alcotest.test_case "historical vs live" `Quick test_query_as_of
+        ; Alcotest.test_case "history_unavailable" `Quick test_history_unavailable
+        ; Alcotest.test_case "history_pruned" `Quick test_history_pruned
+        ] )
+    ]
 ;;
