@@ -34,6 +34,14 @@ let ok = function
   | Error e -> Alcotest.failf "unexpected error: %a" D.pp_error e
 ;;
 
+let exec db sql =
+  let* r = D.execute db sql in
+  (match r with
+   | Ok () -> ()
+   | Error e -> Alcotest.failf "exec failed (%s): %a" sql D.pp_error e);
+  Lwt.return_unit
+;;
+
 (* head txn id of [schema]'s commit log after the latest commit. *)
 let head_txn db ~schema =
   let* records = D.history_log ~schema db in
@@ -93,12 +101,40 @@ let test_unknown_schema_raises () =
   |> run
 ;;
 
+(* Attaching under a history-enabled top inherits as-of: writes to the attached
+   db land in its own commit log. *)
+let test_attach_inherits_history () =
+  let main_path = fresh_path () in
+  let aux_path = main_path ^ ".aux" in
+  cleanup main_path;
+  cleanup aux_path;
+  Lwt.finalize
+    (fun () ->
+       let* db = D.open_file ~as_of_history:true ~path:main_path () in
+       let db = ok db in
+       let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+       let* () = exec db "PRAGMA active_database = 'aux'" in
+       let* () = exec db "CREATE TABLE t(id INTEGER)" in
+       let* () = exec db "INSERT INTO t VALUES (1)" in
+       let* log = D.history_log ~schema:"aux" db in
+       Alcotest.(check bool) "aux log non-empty" true (log <> []);
+       D.close db)
+    (fun () ->
+       cleanup main_path;
+       cleanup aux_path;
+       Lwt.return_unit)
+  |> run
+;;
+
 let () =
   Alcotest.run
     "attach_as_of"
     [ ( "retention"
       , [ Alcotest.test_case "pin default schema" `Quick test_pin_default_schema
         ; Alcotest.test_case "unknown schema raises" `Quick test_unknown_schema_raises
+        ] )
+    ; ( "attach"
+      , [ Alcotest.test_case "attach inherits history" `Quick test_attach_inherits_history
         ] )
     ]
 ;;

@@ -92,13 +92,15 @@ val of_store
 type file_provider =
   { open_store :
       ?geom:Sqlocaml_store.Store.Geometry.t
+      -> ?as_of_history:bool
       -> path:string
       -> unit
       -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
     (** [geom] (#176) is the geometry to CREATE a fresh file with — VACUUM
         passes the source's geometry so the rebuilt file keeps its page_size and
         reserved bytes.  Ignored when opening an existing file (its geometry is
-        peeked from the header). *)
+        peeked from the header).  [as_of_history] (default [false]) enables the
+        opened store's as-of commit log. *)
   ; remove_file : string -> unit (** best-effort unlink; ignore if absent *)
   ; rename_file : string -> string -> unit (** atomic rename over the target *)
   }

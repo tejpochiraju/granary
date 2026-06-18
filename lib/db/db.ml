@@ -88,7 +88,12 @@ type error =
    core itself carries no OS/filesystem dependency (#170); when no provider is
    installed, ATTACH and VACUUM fail with a clear error. *)
 type file_provider =
-  { open_store : ?geom:S.Geometry.t -> path:string -> unit -> (S.t, S.error) result Lwt.t
+  { open_store :
+      ?geom:S.Geometry.t
+      -> ?as_of_history:bool
+      -> path:string
+      -> unit
+      -> (S.t, S.error) result Lwt.t
   ; remove_file : string -> unit
   ; rename_file : string -> string -> unit
   }
@@ -1376,7 +1381,9 @@ let execute_control_op top t sql op =
                    "ATTACH requires a file provider; link sqlocaml.unix and call \
                     Db.set_file_provider"))
          | Some prov ->
-           let* result = prov.open_store ~path () in
+           let* result =
+             prov.open_store ~as_of_history:(S.history_enabled top.store) ~path ()
+           in
            (match result with
             | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
             | Ok store ->
