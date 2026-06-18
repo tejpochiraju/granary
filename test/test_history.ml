@@ -15,6 +15,13 @@ let test_crc_rejects_corruption () =
   assert (H.decode buf = None)
 ;;
 
+let test_decode_all_two_full () =
+  let a = H.encode (r 1L 10L 100L) in
+  let b = H.encode (r 2L 20L 200L) in
+  let buf = Cstruct.concat [ a; b ] in
+  assert (H.decode_all buf = [ r 1L 10L 100L; r 2L 20L 200L ])
+;;
+
 let test_decode_all_drops_torn_tail () =
   let a = H.encode (r 1L 10L 100L) in
   let b = H.encode (r 2L 20L 200L) in
@@ -53,6 +60,7 @@ let test_qcheck_roundtrip () =
 let () =
   test_roundtrip ();
   test_crc_rejects_corruption ();
+  test_decode_all_two_full ();
   test_decode_all_drops_torn_tail ();
   test_resolve_txn_le ();
   test_resolve_ts_le ();
