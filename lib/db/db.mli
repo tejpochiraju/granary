@@ -181,8 +181,10 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     want to retain across.  [History_pruned] also when [target] predates the
     retained floor.  Schema is read at HEAD: a query whose table had DDL after
     [target] may misinterpret older rows (schema-as-of is out of scope, #266).
-    As-of applies to the MAIN database only; a query routed (via the active
-    schema) to an ATTACHed database is rejected with a [Runtime] error. *)
+    As-of resolves against whichever database the statement routes to — MAIN, or
+    the active ATTACHed schema (#412).  A single query cannot span MAIN and an
+    attached db at one [target]: their commit orders are independent, so routing
+    consults exactly one store's history. *)
 val query_as_of
   :  t
   -> Sqlocaml_store.History.target

@@ -1765,75 +1765,60 @@ let history_log ?(schema = "main") t = S.history_log (store_for_schema t schema)
 let query_as_of top (target : Sqlocaml_store.History.target) sql =
   Lwt.catch
     (fun () ->
-       let* ro = S.ro_begin_as_of top.store target in
-       (* Idempotent ender, hoisted so the pre-stream guard below and the
-          stream-drain path share the same [ended] ref — [ro] can never be
-          double-ended. *)
-       let ended = ref false in
-       let end_ro () =
-         if !ended
-         then Lwt.return_unit
-         else (
-           ended := true;
-           S.ro_end ro)
-       in
-       (* Once [ro] is open, ANY exception raised before the lazy stream is
-          handed to the caller (e.g. the planner's [failwith]/[assert false],
-          which propagate as Lwt rejections rather than [Error _]) must end
-          [ro] exactly once and re-raise — otherwise the historical reader
-          leaks and pins page reclamation. *)
-       Lwt.catch
-         (fun () ->
-            let op_promise, t = compile_routed top sql in
-            let* op = op_promise in
-            match op with
-            | Error e ->
+       (* #412: route FIRST, then open the historical snapshot on whichever store
+          the statement resolves to (MAIN, or the active ATTACHed schema).  The
+          executor already runs against the routed handle's store/catalog/clock;
+          only the snapshot needs to follow routing.  As-of resolves per store —
+          a single query cannot span two databases at one target (their commit
+          orders are independent). *)
+       let op_promise, t = compile_routed top sql in
+       let* op = op_promise in
+       match op with
+       | Error e -> Lwt.return (Error e)
+       | Ok op ->
+         let* ro = S.ro_begin_as_of t.store target in
+         (* Idempotent ender shared by the pre-stream guard and the drain path. *)
+         let ended = ref false in
+         let end_ro () =
+           if !ended
+           then Lwt.return_unit
+           else (
+             ended := true;
+             S.ro_end ro)
+         in
+         Lwt.catch
+           (fun () ->
+              match
+                Sql.Exec.query
+                  ~mode:(Sql.Exec.In_ro_txn ro)
+                  ~clock:t.clock
+                  t.store
+                  t.catalog
+                  op
+              with
+              | exception Failure msg ->
+                let* () = end_ro () in
+                Lwt.return (Error (Runtime msg))
+              | lwt_stream ->
+                let* stream = lwt_stream in
+                let wrapped =
+                  Lwt_stream.from (fun () ->
+                    Lwt.catch
+                      (fun () ->
+                         let* next = Lwt_stream.get stream in
+                         match next with
+                         | None ->
+                           let* () = end_ro () in
+                           Lwt.return_none
+                         | Some row -> Lwt.return_some row)
+                      (fun exn ->
+                         let* () = end_ro () in
+                         Lwt.fail exn))
+                in
+                Lwt.return (Ok wrapped))
+           (fun exn ->
               let* () = end_ro () in
-              Lwt.return (Error e)
-            | _ when not (t.store == top.store) ->
-              (* #266: as-of is whole-DB on the MAIN store only.  [ro] is a
-                 historical snapshot of [top.store]; if routing sent this plan to
-                 an ATTACHed sub-handle ([t.store != top.store]) it would read
-                 that store's CURRENT bytes through a foreign snapshot — wrong and
-                 unsupported.  Reject before executing. *)
-              let* () = end_ro () in
-              Lwt.return
-                (Error
-                   (Runtime
-                      "as-of queries are not supported against attached databases (as-of \
-                       applies to the main database only)"))
-            | Ok op ->
-              (match
-                 Sql.Exec.query
-                   ~mode:(Sql.Exec.In_ro_txn ro)
-                   ~clock:t.clock
-                   t.store
-                   t.catalog
-                   op
-               with
-               | exception Failure msg ->
-                 let* () = end_ro () in
-                 Lwt.return (Error (Runtime msg))
-               | lwt_stream ->
-                 let* stream = lwt_stream in
-                 let wrapped =
-                   Lwt_stream.from (fun () ->
-                     Lwt.catch
-                       (fun () ->
-                          let* next = Lwt_stream.get stream in
-                          match next with
-                          | None ->
-                            let* () = end_ro () in
-                            Lwt.return_none
-                          | Some row -> Lwt.return_some row)
-                       (fun exn ->
-                          let* () = end_ro () in
-                          Lwt.fail exn))
-                 in
-                 Lwt.return (Ok wrapped)))
-         (fun exn ->
-            let* () = end_ro () in
-            Lwt.fail exn))
+              Lwt.fail exn))
     (function
       | S.History_error S.History_unavailable -> Lwt.return (Error History_unavailable)
       | S.History_error S.History_pruned -> Lwt.return (Error History_pruned)

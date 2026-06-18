@@ -50,6 +50,15 @@ let head_txn db ~schema =
   | [] -> Alcotest.failf "history log for %s is empty" schema
 ;;
 
+let texts rows =
+  List.map
+    (fun (row : D.row) ->
+       match row.(0) with
+       | D.V_int n -> Int64.to_int n
+       | _ -> Alcotest.fail "expected INT in column 0")
+    rows
+;;
+
 let test_pin_default_schema () =
   let main_path = fresh_path () in
   cleanup main_path;
@@ -126,6 +135,98 @@ let test_attach_inherits_history () =
   |> run
 ;;
 
+let test_as_of_on_attached () =
+  let main_path = fresh_path () in
+  let aux_path = main_path ^ ".aux" in
+  cleanup main_path;
+  cleanup aux_path;
+  let only_1, both =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~as_of_history:true ~path:main_path () in
+         let db = ok db in
+         let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+         let* () = exec db "PRAGMA active_database = 'aux'" in
+         let* () = exec db "CREATE TABLE t(id INTEGER)" in
+         let* () = exec db "INSERT INTO t VALUES (1)" in
+         let* t1 = head_txn db ~schema:"aux" in
+         let* () = exec db "INSERT INTO t VALUES (2)" in
+         D.history_pin ~schema:"aux" db ~txn_id:t1;
+         let* hist = D.query_as_of db (`Txn t1) "SELECT id FROM t" in
+         let* hist_rows = Lwt_stream.to_list (ok hist) in
+         let* live = D.query db "SELECT id FROM t" in
+         let* live_rows = Lwt_stream.to_list (ok live) in
+         let* () = D.close db in
+         Lwt.return (texts hist_rows, List.sort compare (texts live_rows)))
+      (fun () ->
+         cleanup main_path;
+         cleanup aux_path;
+         Lwt.return_unit)
+    |> run
+  in
+  Alcotest.(check (list int)) "as-of t1 yields only 1" [ 1 ] only_1;
+  Alcotest.(check (list int)) "live yields 1 and 2" [ 1; 2 ] both
+;;
+
+let test_as_of_attached_pruned () =
+  let main_path = fresh_path () in
+  let aux_path = main_path ^ ".aux" in
+  cleanup main_path;
+  cleanup aux_path;
+  let result =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~as_of_history:true ~path:main_path () in
+         let db = ok db in
+         let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+         let* () = exec db "PRAGMA active_database = 'aux'" in
+         let* () = exec db "CREATE TABLE t(id INTEGER)" in
+         let* () = exec db "INSERT INTO t VALUES (1)" in
+         let* t1 = head_txn db ~schema:"aux" in
+         (* No floor pinned on aux ⇒ History_pruned. *)
+         let* r = D.query_as_of db (`Txn t1) "SELECT id FROM t" in
+         let* () = D.close db in
+         Lwt.return r)
+      (fun () ->
+         cleanup main_path;
+         cleanup aux_path;
+         Lwt.return_unit)
+    |> run
+  in
+  match result with
+  | Error D.History_pruned -> ()
+  | Ok _ -> Alcotest.fail "expected History_pruned, got Ok"
+  | Error e -> Alcotest.failf "expected History_pruned, got %a" D.pp_error e
+;;
+
+let test_attach_history_off () =
+  let main_path = fresh_path () in
+  let aux_path = main_path ^ ".aux" in
+  cleanup main_path;
+  cleanup aux_path;
+  let result =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~path:main_path () in
+         let db = ok db in
+         let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+         let* () = exec db "PRAGMA active_database = 'aux'" in
+         let* () = exec db "CREATE TABLE t(id INTEGER)" in
+         let* r = D.query_as_of db (`Txn 1L) "SELECT id FROM t" in
+         let* () = D.close db in
+         Lwt.return r)
+      (fun () ->
+         cleanup main_path;
+         cleanup aux_path;
+         Lwt.return_unit)
+    |> run
+  in
+  match result with
+  | Error D.History_unavailable -> ()
+  | Ok _ -> Alcotest.fail "expected History_unavailable, got Ok"
+  | Error e -> Alcotest.failf "expected History_unavailable, got %a" D.pp_error e
+;;
+
 let () =
   Alcotest.run
     "attach_as_of"
@@ -135,6 +236,11 @@ let () =
         ] )
     ; ( "attach"
       , [ Alcotest.test_case "attach inherits history" `Quick test_attach_inherits_history
+        ] )
+    ; ( "as_of"
+      , [ Alcotest.test_case "as-of on attached" `Quick test_as_of_on_attached
+        ; Alcotest.test_case "as-of attached pruned" `Quick test_as_of_attached_pruned
+        ; Alcotest.test_case "attach history off" `Quick test_attach_history_off
         ] )
     ]
 ;;

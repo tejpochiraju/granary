@@ -19,14 +19,6 @@ let fresh_path () =
   Printf.sprintf "/tmp/sqlocaml_test_db_as_of_%04d.db" n
 ;;
 
-(* substring containment without pulling in [str]. *)
-let contains ~needle haystack =
-  let nl = String.length needle
-  and hl = String.length haystack in
-  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
-  nl = 0 || go 0
-;;
-
 let cleanup path =
   (try Unix.unlink path with
    | _ -> ());
@@ -140,10 +132,9 @@ let test_history_pruned () =
   | Ok _ -> Alcotest.fail "expected History_pruned, got Ok"
 ;;
 
-(* #266 (review, Fix 4): as-of applies to the MAIN database only.  When the
-   active schema routes a query to an ATTACHed sub-handle whose store differs
-   from the main store, [query_as_of] must reject (it cannot read the attached
-   store's history through the main store's historical snapshot). *)
+(* #412: as-of now routes to whichever store the query targets.  When the active
+   schema routes a query to an ATTACHed sub-handle with no retention floor pinned,
+   [query_as_of] resolves to [History_pruned] (not a [Runtime] rejection). *)
 let test_attached_rejected () =
   let path = fresh_path () in
   let aux = fresh_path () in
@@ -167,7 +158,7 @@ let test_attached_rejected () =
          let* _ = D.execute db "PRAGMA active_database = 'aux'" in
          let* _ = D.execute db "CREATE TABLE u(id INTEGER, v TEXT)" in
          (* Now active schema is 'aux'; an unqualified SELECT routes to the
-            attached store — as-of must reject. *)
+            attached store.  No floor is pinned on aux → History_pruned. *)
          let* r = D.query_as_of db (`Txn t1) "SELECT v FROM u" in
          let* () = D.close db in
          Lwt.return r)
@@ -178,11 +169,10 @@ let test_attached_rejected () =
     |> run
   in
   match result with
-  | Error (D.Runtime msg) ->
-    if not (contains ~needle:"attached" msg)
-    then Alcotest.failf "expected an 'attached' Runtime message, got: %s" msg
-  | Error e -> Alcotest.failf "expected Runtime (attached), got %a" D.pp_error e
-  | Ok _ -> Alcotest.fail "expected Runtime (attached), got Ok"
+  | Error D.History_pruned -> ()
+  | Error e ->
+    Alcotest.failf "expected History_pruned (aux has no floor), got %a" D.pp_error e
+  | Ok _ -> Alcotest.fail "expected History_pruned (aux has no floor), got Ok"
 ;;
 
 (* #266 (review, BLOCKER): with as-of enabled but NO retention floor pinned,
