@@ -88,7 +88,12 @@ type error =
    core itself carries no OS/filesystem dependency (#170); when no provider is
    installed, ATTACH and VACUUM fail with a clear error. *)
 type file_provider =
-  { open_store : ?geom:S.Geometry.t -> path:string -> unit -> (S.t, S.error) result Lwt.t
+  { open_store :
+      ?geom:S.Geometry.t
+      -> ?as_of_history:bool
+      -> path:string
+      -> unit
+      -> (S.t, S.error) result Lwt.t
   ; remove_file : string -> unit
   ; rename_file : string -> string -> unit
   }
@@ -332,11 +337,22 @@ let vacuum t : unit Lwt.t =
            let* tids = S.list_tree_ids t.store in
            let* () = copy_all_trees ~src:t.store ~dst ~tids in
            let* () = S.close dst in
+           (* #412: preserve the as-of CAPABILITY across VACUUM.  Compaction
+              drops the pre-VACUUM roots, so the existing [<path>.aslog] (which
+              records now-invalid root pages) must be discarded — appending to it
+              would yield a non-monotonic log whose old targets resolve to garbage
+              roots in the rebuilt file.  We capture whether history was on, drop
+              the stale log below, and reopen with the sink enabled so recording
+              continues fresh.  The rebuild target [dst] deliberately ran WITHOUT
+              history (no orphaned [tmp_path.aslog]). *)
+           let had_history = S.history_enabled t.store in
            let* () = S.close t.store in
            (* Best-effort cleanup of WAL sidecar — its contents are now stale. *)
            prov.remove_file (path ^ "-wal");
+           (* Stale as-of log: its roots predate compaction (see above). *)
+           prov.remove_file (path ^ ".aslog");
            prov.rename_file tmp_path path;
-           let* new_store_r = prov.open_store ~path () in
+           let* new_store_r = prov.open_store ~as_of_history:had_history ~path () in
            (match new_store_r with
             | Error e ->
               let msg = Format.asprintf "VACUUM reopen: %a" S.pp_error e in
@@ -1376,7 +1392,9 @@ let execute_control_op top t sql op =
                    "ATTACH requires a file provider; link sqlocaml.unix and call \
                     Db.set_file_provider"))
          | Some prov ->
-           let* result = prov.open_store ~path () in
+           let* result =
+             prov.open_store ~as_of_history:(S.history_enabled top.store) ~path ()
+           in
            (match result with
             | Error e -> Lwt.return (Error (Runtime (Format.asprintf "%a" S.pp_error e)))
             | Ok store ->
@@ -1719,10 +1737,33 @@ let query top sql = query_impl top sql
 
 (* #266: thin Db wrappers over the store-level as-of retention API, so callers
    manage the history floor without reaching through to the raw store. *)
-let history_pin t ~txn_id = S.history_pin t.store ~txn_id
-let history_floor t = S.history_floor t.store
-let history_release t = S.history_release t.store
-let history_log t = S.history_log t.store
+
+(* #412: resolve a schema name to the store whose as-of history it owns.
+   "main" is the top handle's own store; any other name must currently be an
+   ATTACHed schema.  Raises [Invalid_argument] on an unknown schema. *)
+let store_for_schema (top : t) schema =
+  if String.equal schema "main"
+  then top.store
+  else (
+    match Hashtbl.find_opt top.attached schema with
+    | Some sub -> sub.store
+    | None -> invalid_arg (Printf.sprintf "history: unknown schema '%s'" schema))
+;;
+
+let history_pin ?(schema = "main") t ~txn_id =
+  S.history_pin (store_for_schema t schema) ~txn_id
+;;
+
+let history_floor ?(schema = "main") t = S.history_floor (store_for_schema t schema)
+let history_release ?(schema = "main") t = S.history_release (store_for_schema t schema)
+
+(* [history_log] returns an [Lwt.t], so resolve the schema INSIDE a thunk: an
+   unknown-schema [Invalid_argument] must surface as a rejected promise (the
+   in-thunk [store_for_schema] is caught by [Lwt.catch]), matching the return
+   type rather than escaping synchronously. *)
+let history_log ?(schema = "main") t =
+  Lwt.catch (fun () -> S.history_log (store_for_schema t schema)) Lwt.fail
+;;
 
 (* #266: SQL-level time travel.  Opens a read-only snapshot of the committed
    state as it existed at [target] (a past txn id / timestamp) and runs [sql]
@@ -1742,75 +1783,60 @@ let history_log t = S.history_log t.store
 let query_as_of top (target : Sqlocaml_store.History.target) sql =
   Lwt.catch
     (fun () ->
-       let* ro = S.ro_begin_as_of top.store target in
-       (* Idempotent ender, hoisted so the pre-stream guard below and the
-          stream-drain path share the same [ended] ref — [ro] can never be
-          double-ended. *)
-       let ended = ref false in
-       let end_ro () =
-         if !ended
-         then Lwt.return_unit
-         else (
-           ended := true;
-           S.ro_end ro)
-       in
-       (* Once [ro] is open, ANY exception raised before the lazy stream is
-          handed to the caller (e.g. the planner's [failwith]/[assert false],
-          which propagate as Lwt rejections rather than [Error _]) must end
-          [ro] exactly once and re-raise — otherwise the historical reader
-          leaks and pins page reclamation. *)
-       Lwt.catch
-         (fun () ->
-            let op_promise, t = compile_routed top sql in
-            let* op = op_promise in
-            match op with
-            | Error e ->
+       (* #412: route FIRST, then open the historical snapshot on whichever store
+          the statement resolves to (MAIN, or the active ATTACHed schema).  The
+          executor already runs against the routed handle's store/catalog/clock;
+          only the snapshot needs to follow routing.  As-of resolves per store —
+          a single query cannot span two databases at one target (their commit
+          orders are independent). *)
+       let op_promise, t = compile_routed top sql in
+       let* op = op_promise in
+       match op with
+       | Error e -> Lwt.return (Error e)
+       | Ok op ->
+         let* ro = S.ro_begin_as_of t.store target in
+         (* Idempotent ender shared by the pre-stream guard and the drain path. *)
+         let ended = ref false in
+         let end_ro () =
+           if !ended
+           then Lwt.return_unit
+           else (
+             ended := true;
+             S.ro_end ro)
+         in
+         Lwt.catch
+           (fun () ->
+              match
+                Sql.Exec.query
+                  ~mode:(Sql.Exec.In_ro_txn ro)
+                  ~clock:t.clock
+                  t.store
+                  t.catalog
+                  op
+              with
+              | exception Failure msg ->
+                let* () = end_ro () in
+                Lwt.return (Error (Runtime msg))
+              | lwt_stream ->
+                let* stream = lwt_stream in
+                let wrapped =
+                  Lwt_stream.from (fun () ->
+                    Lwt.catch
+                      (fun () ->
+                         let* next = Lwt_stream.get stream in
+                         match next with
+                         | None ->
+                           let* () = end_ro () in
+                           Lwt.return_none
+                         | Some row -> Lwt.return_some row)
+                      (fun exn ->
+                         let* () = end_ro () in
+                         Lwt.fail exn))
+                in
+                Lwt.return (Ok wrapped))
+           (fun exn ->
               let* () = end_ro () in
-              Lwt.return (Error e)
-            | _ when not (t.store == top.store) ->
-              (* #266: as-of is whole-DB on the MAIN store only.  [ro] is a
-                 historical snapshot of [top.store]; if routing sent this plan to
-                 an ATTACHed sub-handle ([t.store != top.store]) it would read
-                 that store's CURRENT bytes through a foreign snapshot — wrong and
-                 unsupported.  Reject before executing. *)
-              let* () = end_ro () in
-              Lwt.return
-                (Error
-                   (Runtime
-                      "as-of queries are not supported against attached databases (as-of \
-                       applies to the main database only)"))
-            | Ok op ->
-              (match
-                 Sql.Exec.query
-                   ~mode:(Sql.Exec.In_ro_txn ro)
-                   ~clock:t.clock
-                   t.store
-                   t.catalog
-                   op
-               with
-               | exception Failure msg ->
-                 let* () = end_ro () in
-                 Lwt.return (Error (Runtime msg))
-               | lwt_stream ->
-                 let* stream = lwt_stream in
-                 let wrapped =
-                   Lwt_stream.from (fun () ->
-                     Lwt.catch
-                       (fun () ->
-                          let* next = Lwt_stream.get stream in
-                          match next with
-                          | None ->
-                            let* () = end_ro () in
-                            Lwt.return_none
-                          | Some row -> Lwt.return_some row)
-                       (fun exn ->
-                          let* () = end_ro () in
-                          Lwt.fail exn))
-                 in
-                 Lwt.return (Ok wrapped)))
-         (fun exn ->
-            let* () = end_ro () in
-            Lwt.fail exn))
+              Lwt.fail exn))
     (function
       | S.History_error S.History_unavailable -> Lwt.return (Error History_unavailable)
       | S.History_error S.History_pruned -> Lwt.return (Error History_pruned)

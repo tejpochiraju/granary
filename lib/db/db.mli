@@ -92,13 +92,15 @@ val of_store
 type file_provider =
   { open_store :
       ?geom:Sqlocaml_store.Store.Geometry.t
+      -> ?as_of_history:bool
       -> path:string
       -> unit
       -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
     (** [geom] (#176) is the geometry to CREATE a fresh file with — VACUUM
         passes the source's geometry so the rebuilt file keeps its page_size and
         reserved bytes.  Ignored when opening an existing file (its geometry is
-        peeked from the header). *)
+        peeked from the header).  [as_of_history] (default [false]) enables the
+        opened store's as-of commit log. *)
   ; remove_file : string -> unit (** best-effort unlink; ignore if absent *)
   ; rename_file : string -> string -> unit (** atomic rename over the target *)
   }
@@ -179,30 +181,38 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     want to retain across.  [History_pruned] also when [target] predates the
     retained floor.  Schema is read at HEAD: a query whose table had DDL after
     [target] may misinterpret older rows (schema-as-of is out of scope, #266).
-    As-of applies to the MAIN database only; a query routed (via the active
-    schema) to an ATTACHed database is rejected with a [Runtime] error. *)
+    As-of resolves against whichever database the statement routes to — MAIN, or
+    the active ATTACHed schema (#412).  A single query cannot span MAIN and an
+    attached db at one [target]: their commit orders are independent, so routing
+    consults exactly one store's history. *)
 val query_as_of
   :  t
   -> Sqlocaml_store.History.target
   -> string
   -> (row Lwt_stream.t, error) result Lwt.t
 
-(** [history_pin t ~txn_id] (#266) sets the retention floor at [txn_id]: the
-    committed root at or before [txn_id] is retained so {!query_as_of} can reach
-    it.  No-op when as-of history is not enabled. *)
-val history_pin : t -> txn_id:int64 -> unit
+(** [history_pin ?schema t ~txn_id] (#266/#412) sets the retention floor at
+    [txn_id] for [schema] (default ["main"]; otherwise a currently ATTACHed
+    schema): the committed root at or before [txn_id] is retained so
+    {!query_as_of} can reach it.  No-op when as-of history is not enabled.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_pin : ?schema:string -> t -> txn_id:int64 -> unit
 
-(** [history_floor t] (#266) is the current retention floor txn id, or [None]
-    when no floor is pinned (or as-of history is not enabled). *)
-val history_floor : t -> int64 option
+(** [history_floor ?schema t] (#266/#412) is [schema]'s current retention floor
+    txn id, or [None] when no floor is pinned (or as-of history is not enabled).
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_floor : ?schema:string -> t -> int64 option
 
-(** [history_release t] (#266) clears the retention floor, allowing pruning of
-    previously pinned historical roots. *)
-val history_release : t -> unit
+(** [history_release ?schema t] (#266/#412) clears [schema]'s retention floor,
+    allowing pruning of previously pinned historical roots.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_release : ?schema:string -> t -> unit
 
-(** [history_log t] (#266) is the recorded commit history (the [<path>.aslog]
-    sidecar), oldest first.  Empty when as-of history is not enabled. *)
-val history_log : t -> Sqlocaml_store.History.record list Lwt.t
+(** [history_log ?schema t] (#266/#412) is [schema]'s recorded commit history
+    (the [<path>.aslog] sidecar), oldest first.  Empty when as-of history is not
+    enabled.
+    @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
+val history_log : ?schema:string -> t -> Sqlocaml_store.History.record list Lwt.t
 
 (** #240: the set of user tables whose {e rows} a write statement actually
     mutated, including tables touched indirectly by triggers and FK cascades.

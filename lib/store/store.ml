@@ -1329,6 +1329,12 @@ let history_log t =
   | _ -> Lwt.return []
 ;;
 
+let history_enabled t =
+  match bt_of t with
+  | Some { history = Some _; _ } -> true
+  | _ -> false
+;;
+
 let ro_begin_as_of t (target : History.target) =
   (* #266 (review): resolve the historical target — which requires loading the
      history log from the sink (real I/O for the Unix file sink: openfile/fstat/

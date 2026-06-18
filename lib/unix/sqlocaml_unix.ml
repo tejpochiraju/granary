@@ -14,11 +14,12 @@ module Store = Store
    it and peeks the header instead. *)
 let provider : Sqlocaml.Db.file_provider =
   { Sqlocaml.Db.open_store =
-      (fun ?geom ~path () ->
+      (fun ?geom ?as_of_history ~path () ->
         match geom with
-        | None -> Store.open_file ~path ()
+        | None -> Store.open_file ?as_of_history ~path ()
         | Some g ->
           Store.open_file
+            ?as_of_history
             ~page_size:g.Sqlocaml_storage.Geometry.page_size
             ~reserved_bytes_per_page:g.Sqlocaml_storage.Geometry.reserved_bytes_per_page
             ~explicit_geometry:true

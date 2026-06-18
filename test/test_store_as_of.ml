@@ -346,6 +346,19 @@ let test_unpinned_as_of_pruned () =
         | exn -> Lwt.fail exn))
 ;;
 
+(* history_enabled: true when opened with as_of_history:true + sink; false
+   otherwise (both the "flag off" btree case and the mem backend). *)
+let test_history_enabled () =
+  with_store ~as_of:true (fun store_on ->
+    assert (S.history_enabled store_on = true);
+    Lwt.return_unit);
+  with_store ~as_of:false (fun store_off ->
+    assert (S.history_enabled store_off = false);
+    Lwt.return_unit);
+  let store_mem = S.create () in
+  assert (S.history_enabled store_mem = false)
+;;
+
 let () =
   test_pin_floor ();
   test_unpinned_as_of_pruned ();
@@ -358,5 +371,6 @@ let () =
   test_misconfigured ();
   test_floor_pruned ();
   test_load_error_no_lock_leak ();
+  test_history_enabled ();
   print_endline "test_store_as_of: OK"
 ;;
