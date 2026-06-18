@@ -216,6 +216,11 @@
   lwt.unix))
 
 (test
+ (name test_savepoint_stm)
+ (modules test_savepoint_stm)
+ (libraries sqlocaml alcotest qcheck-core qcheck-alcotest lwt.unix))
+
+(test
  (name test_mirage_backend)
  (modules test_mirage_backend)
  (libraries sqlocaml.mirage_block mirage-block-unix alcotest lwt.unix unix))

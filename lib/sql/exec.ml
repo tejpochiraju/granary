@@ -3943,7 +3943,9 @@ let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row
       child_idxs
   in
   let del_tree_id, _, _, _ = Cat.row_storage meta in
-  S.del tx del_tree_id rowid_key
+  let* () = S.del tx del_tree_id rowid_key in
+  (* #409: reuse a plain rowid table's high-water after a committed delete. *)
+  Cat.note_rowid_deleted cat ~name:meta.Cat.name ~rowid tx
 ;;
 
 (** Update one column to [new_val] in a row within an existing RW transaction.
@@ -5469,11 +5471,15 @@ let apply_delete_row
   let* () =
     delete_row_indexes tx table_meta ~clock ~params ~row_for_idx:row ~rowid indexes
   in
-  S.del
-    tx
-    (let x, _, _, _ = Cat.row_storage table_meta in
-     x)
-    rowid_key
+  let* () =
+    S.del
+      tx
+      (let x, _, _, _ = Cat.row_storage table_meta in
+       x)
+      rowid_key
+  in
+  (* #409: reuse a plain rowid table's high-water after a committed delete. *)
+  Cat.note_rowid_deleted cat ~name:table_meta.Cat.name ~rowid tx
 ;;
 
 (** Run [Op_delete]: drain matching rows into a list (snapshot read),
