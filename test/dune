@@ -545,7 +545,14 @@
 (test
  (name test_attach_as_of)
  (modules test_attach_as_of)
- (libraries sqlocaml sqlocaml.unix alcotest lwt.unix unix))
+ (libraries
+  sqlocaml
+  sqlocaml.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_repl)

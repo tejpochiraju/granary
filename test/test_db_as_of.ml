@@ -135,7 +135,7 @@ let test_history_pruned () =
 (* #412: as-of now routes to whichever store the query targets.  When the active
    schema routes a query to an ATTACHed sub-handle with no retention floor pinned,
    [query_as_of] resolves to [History_pruned] (not a [Runtime] rejection). *)
-let test_attached_rejected () =
+let test_attached_as_of_pruned () =
   let path = fresh_path () in
   let aux = fresh_path () in
   cleanup path;
@@ -219,7 +219,7 @@ let () =
       , [ Alcotest.test_case "historical vs live" `Quick test_query_as_of
         ; Alcotest.test_case "history_unavailable" `Quick test_history_unavailable
         ; Alcotest.test_case "history_pruned" `Quick test_history_pruned
-        ; Alcotest.test_case "attached_rejected" `Quick test_attached_rejected
+        ; Alcotest.test_case "attached as-of pruned" `Quick test_attached_as_of_pruned
         ; Alcotest.test_case "unpinned_pruned" `Quick test_unpinned_query_as_of_pruned
         ] )
     ]

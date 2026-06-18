@@ -227,6 +227,64 @@ let test_attach_history_off () =
   | Error e -> Alcotest.failf "expected History_unavailable, got %a" D.pp_error e
 ;;
 
+let test_floor_independence =
+  QCheck.Test.make
+    ~name:"main and aux floors are independent"
+    ~count:50
+    QCheck.(pair (int_range 1 1_000_000) (int_range 1 1_000_000))
+    (fun (a, b) ->
+       let main_path = fresh_path () in
+       let aux_path = main_path ^ ".aux" in
+       cleanup main_path;
+       cleanup aux_path;
+       let result =
+         Lwt.finalize
+           (fun () ->
+              let* db = D.open_file ~as_of_history:true ~path:main_path () in
+              let db = ok db in
+              let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+              let fa = Int64.of_int a
+              and fb = Int64.of_int b in
+              D.history_pin db ~txn_id:fa;
+              D.history_pin ~schema:"aux" db ~txn_id:fb;
+              let mf = D.history_floor db in
+              let af = D.history_floor ~schema:"aux" db in
+              let* () = D.close db in
+              Lwt.return (mf, af))
+           (fun () ->
+              cleanup main_path;
+              cleanup aux_path;
+              Lwt.return_unit)
+         |> run
+       in
+       result = (Some (Int64.of_int a), Some (Int64.of_int b)))
+;;
+
+let test_detach_then_pin_raises () =
+  let main_path = fresh_path () in
+  let aux_path = main_path ^ ".aux" in
+  cleanup main_path;
+  cleanup aux_path;
+  Lwt.finalize
+    (fun () ->
+       let* db = D.open_file ~as_of_history:true ~path:main_path () in
+       let db = ok db in
+       let* () = exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux_path) in
+       let* () = exec db "DETACH DATABASE aux" in
+       let raised =
+         match D.history_pin ~schema:"aux" db ~txn_id:1L with
+         | exception Invalid_argument _ -> true
+         | _ -> false
+       in
+       Alcotest.(check bool) "pin after detach raises" true raised;
+       D.close db)
+    (fun () ->
+       cleanup main_path;
+       cleanup aux_path;
+       Lwt.return_unit)
+  |> run
+;;
+
 let () =
   Alcotest.run
     "attach_as_of"
@@ -241,6 +299,10 @@ let () =
       , [ Alcotest.test_case "as-of on attached" `Quick test_as_of_on_attached
         ; Alcotest.test_case "as-of attached pruned" `Quick test_as_of_attached_pruned
         ; Alcotest.test_case "attach history off" `Quick test_attach_history_off
+        ] )
+    ; ( "properties"
+      , [ QCheck_alcotest.to_alcotest test_floor_independence
+        ; Alcotest.test_case "detach then pin raises" `Quick test_detach_then_pin_raises
         ] )
     ]
 ;;
