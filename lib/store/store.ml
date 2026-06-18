@@ -40,6 +40,9 @@ type error =
   | Encryption_rng_unseeded
   (** a key was supplied but {!Mirage_crypto_rng} is not seeded, so no per-page
       nonce can be generated — the application must seed the RNG at boot *)
+  | History_unavailable (** as-of API used on a store opened without the feature *)
+  | History_pruned (** as-of target is older than the retained floor *)
+  | History_misconfigured (** [as_of_history:true] but no history sink supplied *)
 
 let pp_error fmt = function
   | Block_error s -> Format.fprintf fmt "Block_error(%s)" s
@@ -51,6 +54,12 @@ let pp_error fmt = function
   | Encryption_key_mismatch -> Format.pp_print_string fmt "Encryption_key_mismatch"
   | Not_encrypted -> Format.pp_print_string fmt "Not_encrypted"
   | Encryption_rng_unseeded -> Format.pp_print_string fmt "Encryption_rng_unseeded"
+  | History_unavailable ->
+    Format.fprintf fmt "as-of time travel is not enabled on this database"
+  | History_pruned ->
+    Format.fprintf fmt "as-of target is older than the retained history horizon"
+  | History_misconfigured ->
+    Format.fprintf fmt "as_of_history was requested but no history log was supplied"
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -197,6 +206,16 @@ type bt_state =
        events (the internals monitor).  [None] = zero overhead.  Invoked via
        [emit_event], which swallows any exception so a faulty observer can
        never break a transaction.  Btree backend only — Mem has no bt_state. *)
+  ; mutable history : History.sink option
+    (* #266: append-only as-of commit log.  [Some] iff the store was opened
+       with [~as_of_history:true] AND a sink was supplied; [None] disables
+       the whole feature (zero commit-path overhead). *)
+  ; mutable history_now : unit -> int64
+    (* #266: wall-clock (ms since epoch) stamped onto each commit-log record.
+       Injected at open; defaults to a constant 0 when history is disabled. *)
+  ; mutable history_floor : int64 option
+    (* #266: retention floor.  When [Some t], [min_safe] is capped at [t+1]
+       so pages reachable from roots >= t are never reused. *)
   ; mutable current_tree : tree_id option
     (* #385: the tree id of the in-flight read/write/cursor op, set at the
        bt_get_tree(_ro) chokepoint and stamped onto page events by
@@ -644,6 +663,8 @@ let make_btree_store
       ?(wal = None)
       ?(wal_close = None)
       ?(cipher = None)
+      ?(history = None)
+      ?(history_now = fun () -> 0L)
       ~close_fn
       ~pager
       ~meta
@@ -677,6 +698,9 @@ let make_btree_store
     ; backup_gate_max_yields = max_int
     ; on_committed_frames = None
     ; on_event = None
+    ; history
+    ; history_now
+    ; history_floor = None
     ; follower = false
     ; follower_ack_position = None
     ; sync_mode = `Full
@@ -696,6 +720,25 @@ let make_btree_store
   ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
+;;
+
+(* #266: internal seam for the as-of feature.  The commit log ([history]) and
+   the wall-clock source ([history_now]) are consumed by the commit path, and
+   [history_floor] is set by the retention/pruning logic.  Both land in a later
+   task; these accessors keep the fields live (and document the seam) so the
+   inert state introduced here compiles cleanly. *)
+let history_sink (st : bt_state) : History.sink option = st.history
+let history_now (st : bt_state) : int64 = st.history_now ()
+let set_history (st : bt_state) (sink : History.sink option) : unit = st.history <- sink
+let set_history_now (st : bt_state) (now : unit -> int64) : unit = st.history_now <- now
+
+let set_history_floor (st : bt_state) (floor : int64 option) : unit =
+  st.history_floor <- floor
+;;
+
+(* Keep the seam referenced until the read/commit paths consume it (#266). *)
+let () =
+  ignore (history_sink, history_now, set_history, set_history_now, set_history_floor)
 ;;
 
 (* #338 (review r2): event-driven wait until [pred] holds, parking on
@@ -909,6 +952,9 @@ let check_key (h : Header.t) cipher =
 ;;
 
 let open_block
+      ?(as_of_history = false)
+      ?(history : History.sink option)
+      ?(now : (unit -> int64) option)
       ?(key : string option)
       ?(geom = Geometry.default)
       ~(init_if_corrupt : bool)
@@ -921,50 +967,85 @@ let open_block
       ()
   : (t, error) result Lwt.t
   =
-  match
-    let ( let* ) = Result.bind in
-    let* cipher = build_cipher key in
-    let* () = ensure_rng_seeded cipher in
-    let* geom = geom_for_cipher cipher geom in
-    Ok (cipher, geom)
-  with
-  | Error e -> Lwt.return_error e
-  | Ok (cipher, geom) ->
-    let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-    let pager =
-      Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
+  (* #266: guard the misconfig FIRST, before opening any device/fds, so a bad
+     request can never leak resources. *)
+  if as_of_history && Option.is_none history
+  then Lwt.return_error History_misconfigured
+  else (
+    let history = if as_of_history then history else None in
+    let history_now =
+      match now with
+      | Some f -> f
+      | None -> fun () -> 0L
     in
-    (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
+    match
+      let ( let* ) = Result.bind in
+      let* cipher = build_cipher key in
+      let* () = ensure_rng_seeded cipher in
+      let* geom = geom_for_cipher cipher geom in
+      Ok (cipher, geom)
+    with
+    | Error e -> Lwt.return_error e
+    | Ok (cipher, geom) ->
+      let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+      let pager =
+        Pager.create
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages
+          ~freelist:Freelist.empty
+      in
+      (* Adopt the file's real geometry (peeked for an existing file, [geom] for a
        fresh one) before any header read so buffers are sized correctly (#95). *)
-    let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-    Pager.set_geom pager eff_geom;
-    let%lwt hr = Header.read_live pager in
-    (match hr with
-     | Error Header.Both_headers_corrupt when init_if_corrupt ->
-       (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
+      let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+      Pager.set_geom pager eff_geom;
+      let%lwt hr = Header.read_live pager in
+      (match hr with
+       | Error Header.Both_headers_corrupt when init_if_corrupt ->
+         (* Fresh device — initialise headers.  Disabled via [~init_if_corrupt:false]
           so an existing-but-corrupt device surfaces [Header_error] instead of
           being silently re-initialised (a Unix-file open must not clobber). *)
-       let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-       (match ir with
-        | Error e -> Lwt.return_error (map_header_err e)
-        | Ok () ->
-          Pager.set_n_pages pager 2L;
-          let%lwt hr2 = Header.read_live pager in
-          (match hr2 with
-           | Error e -> Lwt.return_error (map_header_err e)
-           | Ok h ->
-             let meta = Btree.create pager ~root_page:0L in
-             Lwt.return_ok (make_btree_store ~cipher ~close_fn:close ~pager ~meta ~h ())))
-     | Error e -> Lwt.return_error (map_header_err e)
-     | Ok h ->
-       (match check_key h cipher with
-        | Error e -> Lwt.return_error e
-        | Ok () ->
-          Pager.set_n_pages pager h.n_pages_total;
-          let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
-          Pager.set_freelist pager fl;
-          let meta = Btree.create pager ~root_page:h.root_page in
-          Lwt.return_ok (make_btree_store ~cipher ~close_fn:close ~pager ~meta ~h ())))
+         let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+         (match ir with
+          | Error e -> Lwt.return_error (map_header_err e)
+          | Ok () ->
+            Pager.set_n_pages pager 2L;
+            let%lwt hr2 = Header.read_live pager in
+            (match hr2 with
+             | Error e -> Lwt.return_error (map_header_err e)
+             | Ok h ->
+               let meta = Btree.create pager ~root_page:0L in
+               Lwt.return_ok
+                 (make_btree_store
+                    ~cipher
+                    ~history
+                    ~history_now
+                    ~close_fn:close
+                    ~pager
+                    ~meta
+                    ~h
+                    ())))
+       | Error e -> Lwt.return_error (map_header_err e)
+       | Ok h ->
+         (match check_key h cipher with
+          | Error e -> Lwt.return_error e
+          | Ok () ->
+            Pager.set_n_pages pager h.n_pages_total;
+            let%lwt fl = read_freelist_pages pager ~first_page:h.freelist_page in
+            Pager.set_freelist pager fl;
+            let meta = Btree.create pager ~root_page:h.root_page in
+            Lwt.return_ok
+              (make_btree_store
+                 ~cipher
+                 ~history
+                 ~history_now
+                 ~close_fn:close
+                 ~pager
+                 ~meta
+                 ~h
+                 ()))))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1009,7 +1090,8 @@ let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
 (* After the WAL hook is installed, re-read the (now WAL-aware) header,
    reconcile [n_pages] for a freshly-initialised DB, load the freelist, and
    build the WAL-backed store. *)
-let finish_wal_open ~cipher ~close ~wal_close ~pager ~wal ~was_fresh =
+let finish_wal_open ~cipher ~history ~history_now ~close ~wal_close ~pager ~wal ~was_fresh
+  =
   let%lwt hr2 = Header.read_live pager in
   match hr2 with
   | Error e -> Lwt.return_error (map_header_err e)
@@ -1032,6 +1114,8 @@ let finish_wal_open ~cipher ~close ~wal_close ~pager ~wal ~was_fresh =
        Lwt.return_ok
          (make_btree_store
             ~cipher
+            ~history
+            ~history_now
             ~wal:(Some wal)
             ~wal_close:(Some wal_close)
             ~close_fn:close
@@ -1042,6 +1126,9 @@ let finish_wal_open ~cipher ~close ~wal_close ~pager ~wal ~was_fresh =
 ;;
 
 let open_block_wal
+      ?(as_of_history = false)
+      ?(history : History.sink option)
+      ?(now : (unit -> int64) option)
       ?(key : string option)
       ?(geom = Geometry.default)
       ~(read_page : page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -1058,61 +1145,86 @@ let open_block_wal
       ()
   : (t, error) result Lwt.t
   =
-  match
-    let ( let* ) = Result.bind in
-    let* cipher = build_cipher key in
-    let* () = ensure_rng_seeded cipher in
-    let* geom = geom_for_cipher cipher geom in
-    Ok (cipher, geom)
-  with
-  | Error e -> Lwt.return_error e
-  | Ok (cipher, geom) ->
-    let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
-    let pager =
-      Pager.create ~read_page ~write_page ~sync ~resize ~n_pages ~freelist:Freelist.empty
+  (* #266: guard the misconfig FIRST, before opening any device/fds, so a bad
+     request can never leak resources. *)
+  if as_of_history && Option.is_none history
+  then Lwt.return_error History_misconfigured
+  else (
+    let history = if as_of_history then history else None in
+    let history_now =
+      match now with
+      | Some f -> f
+      | None -> fun () -> 0L
     in
-    (* Adopt the file's real geometry before any header read or WAL open so the
+    match
+      let ( let* ) = Result.bind in
+      let* cipher = build_cipher key in
+      let* () = ensure_rng_seeded cipher in
+      let* geom = geom_for_cipher cipher geom in
+      Ok (cipher, geom)
+    with
+    | Error e -> Lwt.return_error e
+    | Ok (cipher, geom) ->
+      let read_page, write_page = wrap_callbacks cipher ~read_page ~write_page in
+      let pager =
+        Pager.create
+          ~read_page
+          ~write_page
+          ~sync
+          ~resize
+          ~n_pages
+          ~freelist:Freelist.empty
+      in
+      (* Adopt the file's real geometry before any header read or WAL open so the
        main-DB buffers and the WAL frame size both match it (#95). *)
-    let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
-    Pager.set_geom pager eff_geom;
-    (* Step 1: read the main-DB header (or initialise if fresh). The WAL
+      let%lwt eff_geom = peek_geometry ~read_page ~fallback:geom in
+      Pager.set_geom pager eff_geom;
+      (* Step 1: read the main-DB header (or initialise if fresh). The WAL
        hook is NOT installed yet, so writes go directly to the main DB.
        [was_fresh] flag preserves the post-init n_pages override below. *)
-    let%lwt hr = Header.read_live pager in
-    let%lwt init_result =
-      match hr with
-      | Error Header.Both_headers_corrupt ->
-        let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
-        (match ir with
-         | Error e -> Lwt.return_error (map_header_err e)
-         | Ok () ->
-           Pager.set_n_pages pager 2L;
-           Lwt.return_ok true)
-      | Error e -> Lwt.return_error (map_header_err e)
-      | Ok _ -> Lwt.return_ok false
-    in
-    (match init_result with
-     | Error e -> Lwt.return_error e
-     | Ok was_fresh ->
-       (* Step 2: open the WAL and recover its index. *)
-       let%lwt wr =
-         Wal.open_
-           ~cipher
-           ~page_size:(Pager.page_size pager)
-           ~read_at:wal_read_at
-           ~write_at:wal_write_at
-           ~sync:wal_sync
-           ~size_bytes:wal_size_bytes
-           ()
-       in
-       (match wr with
-        | Error e ->
-          Lwt.return_error (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
-        | Ok wal ->
-          (* Step 3: install the hook so subsequent reads consult the WAL. *)
-          install_wal_hook pager wal;
-          (* Step 4: re-read the header (now WAL-aware) and build the store. *)
-          finish_wal_open ~cipher ~close ~wal_close ~pager ~wal ~was_fresh))
+      let%lwt hr = Header.read_live pager in
+      let%lwt init_result =
+        match hr with
+        | Error Header.Both_headers_corrupt ->
+          let%lwt ir = Header.init ~enc:(make_enc_info cipher) pager in
+          (match ir with
+           | Error e -> Lwt.return_error (map_header_err e)
+           | Ok () ->
+             Pager.set_n_pages pager 2L;
+             Lwt.return_ok true)
+        | Error e -> Lwt.return_error (map_header_err e)
+        | Ok _ -> Lwt.return_ok false
+      in
+      (match init_result with
+       | Error e -> Lwt.return_error e
+       | Ok was_fresh ->
+         (* Step 2: open the WAL and recover its index. *)
+         let%lwt wr =
+           Wal.open_
+             ~cipher
+             ~page_size:(Pager.page_size pager)
+             ~read_at:wal_read_at
+             ~write_at:wal_write_at
+             ~sync:wal_sync
+             ~size_bytes:wal_size_bytes
+             ()
+         in
+         (match wr with
+          | Error e ->
+            Lwt.return_error (Block_error (Format.asprintf "wal open: %a" Wal.pp_error e))
+          | Ok wal ->
+            (* Step 3: install the hook so subsequent reads consult the WAL. *)
+            install_wal_hook pager wal;
+            (* Step 4: re-read the header (now WAL-aware) and build the store. *)
+            finish_wal_open
+              ~cipher
+              ~history
+              ~history_now
+              ~close
+              ~wal_close
+              ~pager
+              ~wal
+              ~was_fresh)))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -1253,6 +1365,13 @@ let rw_begin t =
          match min_active_reader_txn st with
          | None -> current_rw_txn_id
          | Some m -> Int64.min current_rw_txn_id m
+       in
+       (* #266: cap [min_safe] at the retention floor so pages reachable from
+          roots >= the floor are never reused by the allocator. *)
+       let min_safe =
+         match st.history_floor with
+         | None -> min_safe
+         | Some f -> Int64.min min_safe (Int64.add f 1L)
        in
        Pager.set_alloc_min_safe st.pager min_safe;
        (* #297: same-txn page reuse happens via the txn_owned_pool (pages

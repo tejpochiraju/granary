@@ -52,6 +52,9 @@ type error =
   (** a key was supplied but {!Mirage_crypto_rng} is not seeded, so no per-page
       nonce can be generated — the application must seed the RNG at boot
       (e.g. [Mirage_crypto_rng_unix.use_default ()] or a Mirage entropy source) *)
+  | History_unavailable (** as-of API used on a store opened without the feature *)
+  | History_pruned (** as-of target is older than the retained floor *)
+  | History_misconfigured (** [as_of_history:true] but no history sink supplied *)
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
@@ -81,9 +84,17 @@ val create : unit -> t
     plaintext, the default.  May return [Encryption_key_required] (encrypted DB,
     no key), [Encryption_key_mismatch] (wrong key), [Not_encrypted] (key
     supplied for a plaintext DB) or [Encryption_rng_unseeded] (a key was given
-    but the RNG was never seeded). *)
+    but the RNG was never seeded).
+
+    (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
+    (else [History_misconfigured]); each commit is recorded for as-of reads.
+    [now] supplies the wall-clock (ms since epoch) stamped onto each record.
+    Default [false] — feature off, zero overhead. *)
 val open_block
-  :  ?key:string
+  :  ?as_of_history:bool
+  -> ?history:History.sink
+  -> ?now:(unit -> int64)
+  -> ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
   -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -104,9 +115,17 @@ val open_block
     opens (or creates) the database encrypted — both the main-DB pages >= 2 and
     the WAL frame payloads — while the pager and B+-tree see only plaintext.
     Absent ⇒ plaintext, the default.  May return [Encryption_key_required],
-    [Encryption_key_mismatch], [Not_encrypted] or [Encryption_rng_unseeded]. *)
+    [Encryption_key_mismatch], [Not_encrypted] or [Encryption_rng_unseeded].
+
+    (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
+    (else [History_misconfigured]); each commit is recorded for as-of reads.
+    [now] supplies the wall-clock (ms since epoch) stamped onto each record.
+    Default [false] — feature off, zero overhead. *)
 val open_block_wal
-  :  ?key:string
+  :  ?as_of_history:bool
+  -> ?history:History.sink
+  -> ?now:(unit -> int64)
+  -> ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
