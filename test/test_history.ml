@@ -43,6 +43,28 @@ let test_resolve_ts_le () =
   assert (H.resolve recs (`Ts 30L) = Some (r 3L 30L 300L))
 ;;
 
+(* decode: short buffer (< record_size) must return None *)
+let test_decode_short_buffer () =
+  let short = Cstruct.create (H.record_size - 1) in
+  assert (H.decode short = None)
+;;
+
+(* decode_all: empty buffer yields empty list *)
+let test_decode_all_empty () = assert (H.decode_all (Cstruct.create 0) = [])
+
+(* resolve: empty list yields None *)
+let test_resolve_empty () =
+  assert (H.resolve [] (`Txn 100L) = None);
+  assert (H.resolve [] (`Ts 100L) = None)
+;;
+
+(* resolve: all records newer than target yields None *)
+let test_resolve_all_newer () =
+  let recs = [ r 5L 50L 500L; r 10L 100L 1000L ] in
+  assert (H.resolve recs (`Txn 3L) = None);
+  assert (H.resolve recs (`Ts 30L) = None)
+;;
+
 let test_qcheck_roundtrip () =
   let gen = QCheck.(triple int64 int64 int64) in
   let prop =
@@ -64,6 +86,10 @@ let () =
   test_decode_all_drops_torn_tail ();
   test_resolve_txn_le ();
   test_resolve_ts_le ();
+  test_decode_short_buffer ();
+  test_decode_all_empty ();
+  test_resolve_empty ();
+  test_resolve_all_newer ();
   print_endline "test_history: OK";
   test_qcheck_roundtrip ()
 ;;

@@ -145,9 +145,117 @@ let test_time_travel () =
     Lwt.return_unit)
 ;;
 
+(* Mem backend: history_pin/floor/release are all no-ops; they must not raise. *)
+let test_mem_retention_api_noop () =
+  let store = S.create () in
+  S.history_pin store ~txn_id:42L;
+  assert (S.history_floor store = None);
+  S.history_release store;
+  assert (S.history_floor store = None);
+  Lwt.return_unit
+;;
+
+(* Mem backend: ro_begin_as_of raises History_unavailable. *)
+let test_mem_as_of_unavailable () =
+  let store = S.create () in
+  run
+    (Lwt.catch
+       (fun () ->
+          let* _ = S.ro_begin_as_of store (`Txn 1L) in
+          failwith "expected History_unavailable")
+       (function
+         | S.History_error S.History_unavailable -> Lwt.return_unit
+         | exn -> Lwt.fail exn))
+;;
+
+(* Mem backend: history_log returns []. *)
+let test_mem_history_log_empty () =
+  let store = S.create () in
+  run
+    (let* log = S.history_log store in
+     assert (log = []);
+     Lwt.return_unit)
+;;
+
+(* Btree backend opened WITHOUT as_of: history_log returns []. *)
+let test_btree_history_log_empty_when_disabled () =
+  with_store ~as_of:false (fun store ->
+    let* log = S.history_log store in
+    assert (log = []);
+    Lwt.return_unit)
+;;
+
+(* open_block with as_of_history=true but no history sink →
+   History_misconfigured. *)
+let test_misconfigured () =
+  let path = tmp_block_file () in
+  run
+    (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+     let* adapter = MB.connect dev in
+     let* result =
+       S.open_block
+         ~as_of_history:true (* no ~history *)
+         ~init_if_corrupt:true
+         ~read_page:(MB.read_page adapter)
+         ~write_page:(MB.write_page adapter)
+         ~sync:(MB.sync adapter)
+         ~resize:(MB.resize adapter)
+         ~n_pages:(MB.n_pages adapter)
+         ~close:(fun () -> MB.close adapter)
+         ()
+     in
+     (try Unix.unlink path with
+      | _ -> ());
+     match result with
+     | Error S.History_misconfigured -> Lwt.return_unit
+     | Ok _ -> failwith "expected History_misconfigured, got Ok"
+     | Error e ->
+       failwith (Format.asprintf "expected History_misconfigured, got %a" S.pp_error e))
+;;
+
+(* ro_begin_as_of: target exists in log but is below the floor →
+   History_pruned.  Commit two txns (T1 < T2), set floor to T2, then
+   try to read at T1. *)
+let test_floor_pruned () =
+  with_store ~as_of:true (fun store ->
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 0 (bs "k1") (bs "v1") in
+    let* () = S.commit tx in
+    let* log1 = S.history_log store in
+    let t1 =
+      match log1 with
+      | r :: _ -> r.H.txn_id
+      | [] -> failwith "log empty after first commit"
+    in
+    let* tx = S.rw_begin store in
+    let* () = S.put tx 0 (bs "k2") (bs "v2") in
+    let* () = S.commit tx in
+    let* log2 = S.history_log store in
+    let t2 =
+      match List.rev log2 with
+      | r :: _ -> r.H.txn_id
+      | [] -> failwith "log empty after second commit"
+    in
+    (* Pin floor AT T2; T1 < T2, so a read at T1 should raise History_pruned. *)
+    S.history_pin store ~txn_id:t2;
+    Lwt.catch
+      (fun () ->
+         let* _ = S.ro_begin_as_of store (`Txn t1) in
+         failwith "expected History_pruned")
+      (function
+        | S.History_error S.History_pruned -> Lwt.return_unit
+        | exn -> Lwt.fail exn))
+;;
+
 let () =
   test_pin_floor ();
   test_unavailable_without_flag ();
   test_time_travel ();
+  run (test_mem_retention_api_noop ());
+  test_mem_as_of_unavailable ();
+  test_mem_history_log_empty ();
+  test_btree_history_log_empty_when_disabled ();
+  test_misconfigured ();
+  test_floor_pruned ();
   print_endline "test_store_as_of: OK"
 ;;
