@@ -3,6 +3,11 @@
     and hand them to the platform-agnostic [Store.open_block]/[open_block_wal],
     so the store core stays free of any [unix] dependency (#170). *)
 
+(** [file_history_sink ~path] (#266) is an append-only, fsync-on-append
+    {!Sqlocaml_store.History.sink} backed by the file at [path] (the
+    [<db>.aslog] sidecar).  A torn tail record is dropped on load. *)
+val file_history_sink : path:string -> Sqlocaml_store.History.sink
+
 (** Open a B+-tree store over a Unix file at [path].  Creates and pre-sizes the
     file if absent; otherwise reopens an existing sqlocaml database.
 
@@ -14,11 +19,16 @@
 
     When supplied ([key], a 32-byte AES-256 key), the database is created/opened
     encrypted at rest (AES-256-GCM); absent ⇒ plaintext (opt-in default). Fixed
-    at creation. *)
+    at creation.
+
+    (#266) When [as_of_history] is [true], commits are recorded to a
+    [<path>.aslog] sidecar (via {!file_history_sink}) with a wall-clock
+    timestamp, enabling as-of reads. Default [false]. *)
 val open_file
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?explicit_geometry:bool
+  -> ?as_of_history:bool
   -> ?key:string
   -> path:string
   -> unit
@@ -30,11 +40,16 @@ val open_file
 
     When supplied ([key], a 32-byte AES-256 key), the database is created/opened
     encrypted at rest (AES-256-GCM); absent ⇒ plaintext (opt-in default). Fixed
-    at creation. *)
+    at creation.
+
+    (#266) When [as_of_history] is [true], commits are recorded to a
+    [<path>.aslog] sidecar (via {!file_history_sink}) with a wall-clock
+    timestamp, enabling as-of reads. Default [false]. *)
 val open_file_wal
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?explicit_geometry:bool
+  -> ?as_of_history:bool
   -> ?key:string
   -> path:string
   -> unit

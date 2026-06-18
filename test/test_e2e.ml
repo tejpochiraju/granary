@@ -1338,7 +1338,8 @@ let not_null_insert_null () =
     (match e with
      | Db.Parse msg -> Alcotest.failf "expected Not_null_violation, got Parse: %s" msg
      | Db.Sema _ -> Alcotest.fail "expected Not_null_violation, got other Sema error"
-     | Db.Runtime msg -> Alcotest.failf "expected Not_null_violation, got Runtime: %s" msg)
+     | Db.Runtime msg -> Alcotest.failf "expected Not_null_violation, got Runtime: %s" msg
+     | e -> Alcotest.failf "expected Not_null_violation, got %a" Db.pp_error e)
   | Ok () -> Alcotest.fail "expected Not_null_violation error, got Ok"
 ;;
 
@@ -1378,7 +1379,8 @@ let not_null_update_to_null () =
     (match e with
      | Db.Parse msg -> Alcotest.failf "got Parse: %s" msg
      | Db.Sema _ -> Alcotest.fail "got other Sema error"
-     | Db.Runtime msg -> Alcotest.failf "got Runtime: %s" msg)
+     | Db.Runtime msg -> Alcotest.failf "got Runtime: %s" msg
+     | e -> Alcotest.failf "got %a" Db.pp_error e)
 ;;
 
 (** Explicit DEFAULT value is returned after SELECT. *)

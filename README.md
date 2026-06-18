@@ -84,6 +84,100 @@ recovery are unaffected — only *when* commits are fsynced changes.
 > **database-wide** — the WAL commit queue is shared across all connections to a store, so a
 > `PRAGMA synchronous` on any connection changes the mode for all of them (last writer wins).
 
+## As-of time travel (#266)
+
+Read the database **as it existed at any past commit**, identified by transaction
+id or wall-clock timestamp. Feature is **off by default** — zero overhead unless
+enabled.
+
+### Enabling
+
+Pass `~as_of_history:true` when opening the database. On the Unix layer this
+writes a `<path>.aslog` sidecar file containing a CRC32-verified, fixed-width
+record per commit (txn id, wall-clock ms, root page):
+
+```ocaml
+(* plain-file open *)
+let* db = Sqlocaml_unix.open_file ~as_of_history:true ~path:"app.db" () in
+
+(* WAL open *)
+let* db = Sqlocaml_unix.open_file_wal ~as_of_history:true ~path:"app.db" () in
+```
+
+For the lower-level `Store.open_block` / `Store.open_block_wal`, supply a
+`~history:History.sink` (the injected log backend) and a `~now` clock in
+addition to `~as_of_history:true`.
+
+### Retention
+
+Pages reachable from historical roots are only retained while a floor is set.
+Without a floor an open historical reader still pins its own snapshot, but pages
+from released snapshots can be reclaimed.
+
+```ocaml
+(* Retain every root from txn_id onwards — pages stay queryable. *)
+Store.history_pin t ~txn_id;
+
+(* Read the current retention floor (None = unset). *)
+Store.history_floor t;
+
+(* Release the floor; reclamation of superseded pages resumes. *)
+Store.history_release t;
+
+(* Inspect the full commit log (ascending txn order). *)
+let* records = Store.history_log t in
+```
+
+The same wrappers are available at the `Db` layer (`Db.history_pin`,
+`Db.history_floor`, `Db.history_release`, `Db.history_log`).
+
+### Reading
+
+```ocaml
+(* Store level — raw snapshot *)
+let* ro = Store.ro_begin_as_of t (`Txn txn_id) in  (* or `Ts ms *)
+(* ... get/cursor_open/etc. ... *)
+let* () = Store.ro_end ro in
+
+(* SQL level — lazy result stream *)
+let* stream = Db.query_as_of db (`Txn txn_id) "SELECT …" in
+```
+
+`ro_begin_as_of` / `query_as_of` return the committed root with the **largest
+txn id (for `` `Txn ``) or timestamp (for `` `Ts ``) that is ≤ the target**.
+
+### Errors
+
+| Error | Meaning |
+|---|---|
+| `History_unavailable` | Store opened without `~as_of_history:true` |
+| `History_pruned` | Target predates the retained floor (or log is empty) |
+| `History_misconfigured` | `as_of_history:true` but no `history` sink supplied |
+
+### Limitations
+
+- **Requires an active retention floor.** As-of reads serve only what
+  `history_pin` protects: with no floor set, every as-of target returns
+  `History_pruned`. Pinning is **not retroactive** — pin *before* the writes you
+  want to retain across.
+- **Unencrypted databases only** (the sidecar log is always plaintext; encrypted
+  DB support is future work).
+- **Schema is read at HEAD.** DDL executed after the target snapshot may
+  misinterpret older rows (column types, table layout). Keep schema stable across
+  the query horizon, or re-open with a matching schema version.
+- **Dense whole-DB retention grows the file** under write-heavy workloads: every
+  historical root's page tree is pinned while the floor is set. Per-table /
+  sparse retention and a GC sweep are future work; #266 remains open for those.
+- **In-memory and Mirage backends:** history is non-durable (in-memory sink only,
+  lost on restart). Durable history requires the Unix file sink.
+- **`` `Ts `` (timestamp) resolution assumes a monotonic, non-decreasing wall
+  clock** (guaranteed under the single-writer model); a backwards clock
+  adjustment could make a `` `Ts `` target resolve to a slightly different
+  commit. `` `Txn `` resolution is always exact.
+- **Main database only.** As-of applies to the main store; a query routed to an
+  ATTACHed database is rejected (`as-of queries are not supported against
+  attached databases`).
+
 ## Building & cross-platform support
 
 The engine is 100% OCaml with no C stubs, and the on-disk format is explicitly

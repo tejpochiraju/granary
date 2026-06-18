@@ -19,6 +19,12 @@ type error =
   | Parse of string (** SQL syntax error *)
   | Sema of Sqlocaml_sql.Sema.error (** name/type error *)
   | Runtime of string (** unexpected internal error *)
+  | History_unavailable
+  (** #266: an as-of read was requested on a database opened without
+          [~as_of_history:true]. *)
+  | History_pruned
+  (** #266: the as-of target predates the retained history floor (see
+          {!history_pin}), so the snapshot is no longer available. *)
 
 (** #239: per-query cost/stats signal for an external cost-based cache,
     re-exported from {!Sqlocaml_sql.Exec.query_stats}.  [rows_examined] is the
@@ -163,6 +169,40 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     consumed — read them once it is fully drained.  See
     {!Sqlocaml_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
+
+(** [query_as_of t target sql] (#266) runs a read-only [sql] query against the
+    database as it existed at [target] (a past txn id or timestamp).  Requires
+    the db to have been opened with [~as_of_history:true]; otherwise the result
+    carries [History_unavailable].  As-of reads require an active retention floor
+    set via {!history_pin}: with no floor every target resolves to
+    [History_pruned], and the floor is not retroactive — pin before the writes you
+    want to retain across.  [History_pruned] also when [target] predates the
+    retained floor.  Schema is read at HEAD: a query whose table had DDL after
+    [target] may misinterpret older rows (schema-as-of is out of scope, #266).
+    As-of applies to the MAIN database only; a query routed (via the active
+    schema) to an ATTACHed database is rejected with a [Runtime] error. *)
+val query_as_of
+  :  t
+  -> Sqlocaml_store.History.target
+  -> string
+  -> (row Lwt_stream.t, error) result Lwt.t
+
+(** [history_pin t ~txn_id] (#266) sets the retention floor at [txn_id]: the
+    committed root at or before [txn_id] is retained so {!query_as_of} can reach
+    it.  No-op when as-of history is not enabled. *)
+val history_pin : t -> txn_id:int64 -> unit
+
+(** [history_floor t] (#266) is the current retention floor txn id, or [None]
+    when no floor is pinned (or as-of history is not enabled). *)
+val history_floor : t -> int64 option
+
+(** [history_release t] (#266) clears the retention floor, allowing pruning of
+    previously pinned historical roots. *)
+val history_release : t -> unit
+
+(** [history_log t] (#266) is the recorded commit history (the [<path>.aslog]
+    sidecar), oldest first.  Empty when as-of history is not enabled. *)
+val history_log : t -> Sqlocaml_store.History.record list Lwt.t
 
 (** #240: the set of user tables whose {e rows} a write statement actually
     mutated, including tables touched indirectly by triggers and FK cascades.

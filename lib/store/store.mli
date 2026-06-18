@@ -52,6 +52,9 @@ type error =
   (** a key was supplied but {!Mirage_crypto_rng} is not seeded, so no per-page
       nonce can be generated — the application must seed the RNG at boot
       (e.g. [Mirage_crypto_rng_unix.use_default ()] or a Mirage entropy source) *)
+  | History_unavailable (** as-of API used on a store opened without the feature *)
+  | History_pruned (** as-of target is older than the retained floor *)
+  | History_misconfigured (** [as_of_history:true] but no history sink supplied *)
 
 (** Pretty-print an {!error}. *)
 val pp_error : Format.formatter -> error -> unit
@@ -81,9 +84,17 @@ val create : unit -> t
     plaintext, the default.  May return [Encryption_key_required] (encrypted DB,
     no key), [Encryption_key_mismatch] (wrong key), [Not_encrypted] (key
     supplied for a plaintext DB) or [Encryption_rng_unseeded] (a key was given
-    but the RNG was never seeded). *)
+    but the RNG was never seeded).
+
+    (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
+    (else [History_misconfigured]); each commit is recorded for as-of reads.
+    [now] supplies the wall-clock (ms since epoch) stamped onto each record.
+    Default [false] — feature off, zero overhead. *)
 val open_block
-  :  ?key:string
+  :  ?as_of_history:bool
+  -> ?history:History.sink
+  -> ?now:(unit -> int64)
+  -> ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
   -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -104,9 +115,17 @@ val open_block
     opens (or creates) the database encrypted — both the main-DB pages >= 2 and
     the WAL frame payloads — while the pager and B+-tree see only plaintext.
     Absent ⇒ plaintext, the default.  May return [Encryption_key_required],
-    [Encryption_key_mismatch], [Not_encrypted] or [Encryption_rng_unseeded]. *)
+    [Encryption_key_mismatch], [Not_encrypted] or [Encryption_rng_unseeded].
+
+    (#266) When [as_of_history] is [true], a [history] sink MUST be supplied
+    (else [History_misconfigured]); each commit is recorded for as-of reads.
+    [now] supplies the wall-clock (ms since epoch) stamped onto each record.
+    Default [false] — feature off, zero overhead. *)
 val open_block_wal
-  :  ?key:string
+  :  ?as_of_history:bool
+  -> ?history:History.sink
+  -> ?now:(unit -> int64)
+  -> ?key:string
   -> ?geom:Sqlocaml_storage.Geometry.t
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -152,6 +171,38 @@ val set_tree_tag : t -> tree_id -> int32 -> unit
 
 (** Begin a read-only transaction. Multiple RO txns may run concurrently. *)
 val ro_begin : t -> ro txn Lwt.t
+
+(** [history_pin t ~txn_id] (#266) sets the retention floor: pages reachable from
+    commits [>= txn_id] are never reused, so they stay queryable via
+    {!ro_begin_as_of}.  No-op on the in-memory backend or when as-of is off.
+
+    The floor is {b not retroactive}: pin {b before} the writes you want to retain
+    across.  Pinning after superseded pages have already been recycled cannot
+    recover them — an as-of read of such a target returns [History_pruned]. *)
+val history_pin : t -> txn_id:int64 -> unit
+
+(** The current retention floor, or [None] when unset. *)
+val history_floor : t -> int64 option
+
+(** Clear the retention floor; superseded pages become reclaimable again. *)
+val history_release : t -> unit
+
+(** All retained commit-log records in ascending txn order ([] when as-of is off). *)
+val history_log : t -> History.record list Lwt.t
+
+(** [ro_begin_as_of t target] opens a read-only snapshot against the retained
+    root with the largest txn/timestamp [<=] [target].  Raises {!History_error}
+    [History_unavailable] when as-of is off and [History_pruned] when the target
+    predates the retained floor.  End it with {!ro_end} like any RO txn.
+
+    As-of reads serve {b only} what an active retention floor protects: with no
+    floor set (via {!history_pin}) every target resolves to [History_pruned],
+    because uncapped commits recycle superseded pages and a snapshot would read
+    garbage.  The floor is not retroactive — see {!history_pin}. *)
+val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
+
+(** Raised by {!ro_begin_as_of} to carry an as-of {!error}. *)
+exception History_error of error
 
 (** Begin a read-write transaction. Only one RW txn may be active at a
     time; this call blocks until the previous one commits or rolls back. *)

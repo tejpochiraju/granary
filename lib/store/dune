@@ -2,6 +2,7 @@
  (name sqlocaml_store)
  (public_name sqlocaml.store)
  (libraries
+  cstruct
   lwt
   sqlocaml.block
   sqlocaml.encoding

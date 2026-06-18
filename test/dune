@@ -112,6 +112,16 @@
   unix))
 
 (test
+ (name test_unix_as_of)
+ (modules test_unix_as_of)
+ (libraries sqlocaml.unix sqlocaml.store lwt lwt.unix unix))
+
+(test
+ (name test_db_as_of)
+ (modules test_db_as_of)
+ (libraries alcotest sqlocaml sqlocaml.unix sqlocaml.store lwt lwt.unix unix))
+
+(test
  (name test_crypto)
  (modules test_crypto)
  (libraries
@@ -284,6 +294,21 @@
   mirage-block-unix
   lwt.unix
   unix))
+
+(test
+ (name test_store_as_of)
+ (modules test_store_as_of)
+ (libraries
+  sqlocaml.store
+  sqlocaml.mirage_block
+  mirage-block-unix
+  lwt.unix
+  unix))
+
+(test
+ (name test_wal_as_of)
+ (modules test_wal_as_of)
+ (libraries sqlocaml.store sqlocaml.storage lwt.unix unix))
 
 (test
  (name test_all_backends)
@@ -649,3 +674,8 @@
  (name test_agg_fastpath_247)
  (modules test_agg_fastpath_247)
  (libraries alcotest qcheck-core sqlocaml sqlocaml.unix lwt lwt.unix unix))
+
+(test
+ (name test_history)
+ (modules test_history)
+ (libraries sqlocaml_store cstruct qcheck-core qcheck-core.runner))

@@ -179,6 +179,7 @@ let open_file path () =
       | Db.Parse s -> "Parse: " ^ s
       | Db.Runtime s -> "Runtime: " ^ s
       | Db.Sema _ -> "Sema error"
+      | e -> Format.asprintf "%a" Db.pp_error e
     in
     Alcotest.failf "open_file failed: %s" msg
 ;;

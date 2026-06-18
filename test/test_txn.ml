@@ -35,6 +35,7 @@ let exec db sql =
   | Error (Db.Parse e) -> Alcotest.failf "parse error in %S: %s" sql e
   | Error (Db.Sema _) -> Alcotest.failf "sema error in %S" sql
   | Error (Db.Runtime e) -> Alcotest.failf "runtime error in %S: %s" sql e
+  | Error e -> Alcotest.failf "error in %S: %a" sql Db.pp_error e
 ;;
 
 let query_ints db sql =
