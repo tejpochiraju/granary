@@ -644,3 +644,8 @@
  (name test_agg_fastpath_247)
  (modules test_agg_fastpath_247)
  (libraries alcotest qcheck-core sqlocaml sqlocaml.unix lwt lwt.unix unix))
+
+(test
+ (name test_history)
+ (modules test_history)
+ (libraries sqlocaml_store cstruct qcheck-core qcheck-core.runner))
