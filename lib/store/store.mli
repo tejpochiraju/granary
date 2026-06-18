@@ -172,6 +172,29 @@ val set_tree_tag : t -> tree_id -> int32 -> unit
 (** Begin a read-only transaction. Multiple RO txns may run concurrently. *)
 val ro_begin : t -> ro txn Lwt.t
 
+(** [history_pin t ~txn_id] (#266) sets the retention floor: pages reachable from
+    commits [>= txn_id] are never reused, so they stay queryable via
+    {!ro_begin_as_of}.  No-op on the in-memory backend or when as-of is off. *)
+val history_pin : t -> txn_id:int64 -> unit
+
+(** The current retention floor, or [None] when unset. *)
+val history_floor : t -> int64 option
+
+(** Clear the retention floor; superseded pages become reclaimable again. *)
+val history_release : t -> unit
+
+(** All retained commit-log records in ascending txn order ([] when as-of is off). *)
+val history_log : t -> History.record list Lwt.t
+
+(** [ro_begin_as_of t target] opens a read-only snapshot against the retained
+    root with the largest txn/timestamp [<=] [target].  Raises {!History_error}
+    [History_unavailable] when as-of is off and [History_pruned] when the target
+    predates the retained floor.  End it with {!ro_end} like any RO txn. *)
+val ro_begin_as_of : t -> History.target -> ro txn Lwt.t
+
+(** Raised by {!ro_begin_as_of} to carry an as-of {!error}. *)
+exception History_error of error
+
 (** Begin a read-write transaction. Only one RW txn may be active at a
     time; this call blocks until the previous one commits or rolls back. *)
 val rw_begin : t -> rw txn Lwt.t

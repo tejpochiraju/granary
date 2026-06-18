@@ -281,6 +281,16 @@
   unix))
 
 (test
+ (name test_store_as_of)
+ (modules test_store_as_of)
+ (libraries
+  sqlocaml.store
+  sqlocaml.mirage_block
+  mirage-block-unix
+  lwt.unix
+  unix))
+
+(test
  (name test_all_backends)
  (modules test_all_backends)
  (libraries

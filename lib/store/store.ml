@@ -206,11 +206,11 @@ type bt_state =
        events (the internals monitor).  [None] = zero overhead.  Invoked via
        [emit_event], which swallows any exception so a faulty observer can
        never break a transaction.  Btree backend only — Mem has no bt_state. *)
-  ; mutable history : History.sink option
+  ; history : History.sink option
     (* #266: append-only as-of commit log.  [Some] iff the store was opened
        with [~as_of_history:true] AND a sink was supplied; [None] disables
        the whole feature (zero commit-path overhead). *)
-  ; mutable history_now : unit -> int64
+  ; history_now : unit -> int64
     (* #266: wall-clock (ms since epoch) stamped onto each commit-log record.
        Injected at open; defaults to a constant 0 when history is disabled. *)
   ; mutable history_floor : int64 option
@@ -720,25 +720,6 @@ let make_btree_store
   ; mem_rw_shadow = None
   ; mem_savepoints = []
   }
-;;
-
-(* #266: internal seam for the as-of feature.  The commit log ([history]) and
-   the wall-clock source ([history_now]) are consumed by the commit path, and
-   [history_floor] is set by the retention/pruning logic.  Both land in a later
-   task; these accessors keep the fields live (and document the seam) so the
-   inert state introduced here compiles cleanly. *)
-let history_sink (st : bt_state) : History.sink option = st.history
-let history_now (st : bt_state) : int64 = st.history_now ()
-let set_history (st : bt_state) (sink : History.sink option) : unit = st.history <- sink
-let set_history_now (st : bt_state) (now : unit -> int64) : unit = st.history_now <- now
-
-let set_history_floor (st : bt_state) (floor : int64 option) : unit =
-  st.history_floor <- floor
-;;
-
-(* Keep the seam referenced until the read/commit paths consume it (#266). *)
-let () =
-  ignore (history_sink, history_now, set_history, set_history_now, set_history_floor)
 ;;
 
 (* #338 (review r2): event-driven wait until [pred] holds, parking on
@@ -1314,6 +1295,79 @@ let ro_begin t =
            ~snap_meta_root:st.current_header.root_page))
 ;;
 
+(* #266: as-of retention API + time-travel read path.  [History_error] carries
+   an {!error} out to the caller (the SQL layer maps it to a friendly message). *)
+exception History_error of error
+
+let bt_of t =
+  match t.backend with
+  | Btree s -> Some s
+  | Mem _ -> None
+;;
+
+let history_pin t ~txn_id =
+  match bt_of t with
+  | Some st -> st.history_floor <- Some txn_id
+  | None -> ()
+;;
+
+let history_floor t =
+  match bt_of t with
+  | Some st -> st.history_floor
+  | None -> None
+;;
+
+let history_release t =
+  match bt_of t with
+  | Some st -> st.history_floor <- None
+  | None -> ()
+;;
+
+let history_log t =
+  match bt_of t with
+  | Some { history = Some sink; _ } -> sink.History.load ()
+  | _ -> Lwt.return []
+;;
+
+let ro_begin_as_of t (target : History.target) =
+  let* () = Rwlock.acquire_read t.lock in
+  match bt_of t with
+  | None ->
+    Rwlock.release_read t.lock;
+    Lwt.fail (History_error History_unavailable)
+  | Some { history = None; _ } ->
+    Rwlock.release_read t.lock;
+    Lwt.fail (History_error History_unavailable)
+  | Some ({ history = Some sink; _ } as st) ->
+    if st.closing
+    then (
+      Rwlock.release_read t.lock;
+      Lwt.fail_with "Store.ro_begin_as_of: store is closing")
+    else
+      let* records = sink.History.load () in
+      (match History.resolve records target with
+       | None ->
+         Rwlock.release_read t.lock;
+         Lwt.fail (History_error History_pruned)
+       | Some r ->
+         let pruned =
+           match st.history_floor with
+           | Some f -> Int64.compare r.History.txn_id f < 0
+           | None -> false
+         in
+         if pruned
+         then (
+           Rwlock.release_read t.lock;
+           Lwt.fail (History_error History_pruned))
+         else
+           Lwt.return
+             (ro_begin_at
+                t
+                st
+                ~snap_txn_id:r.History.txn_id
+                ~snap_meta_root:r.History.root_page))
+;;
+
 let emit_event (st : bt_state) (ev : Store_event.t) =
   match st.on_event with
   | None -> ()
@@ -1850,7 +1904,19 @@ let commit_prepare_btree
        of the committed tree (freed file-extension pages reuse
        within the txn; any not reused by commit are orphans). *)
     Pager.txn_owned_pool_set st.pager [];
-    Lwt.return_unit
+    (* #266: record this committed root in the as-of commit log.  Shared by both
+       the inline-sync and WAL group-commit paths (both call this function). *)
+    (match st.history with
+     | None -> Lwt.return_unit
+     | Some sink ->
+       let r =
+         { History.txn_id = st.current_header.txn_id
+         ; timestamp = st.history_now ()
+         ; root_page = st.current_header.root_page
+         }
+       in
+       (* Best-effort: a failed append must never fail a durable commit. *)
+       Lwt.catch (fun () -> sink.History.append r) (fun _ -> Lwt.return_unit))
 ;;
 
 (* commit:
