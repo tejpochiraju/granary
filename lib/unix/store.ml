@@ -5,6 +5,7 @@
 
 open Lwt.Syntax
 module Core = Sqlocaml_store.Store
+module History = Sqlocaml_store.History
 module Geometry = Sqlocaml_storage.Geometry
 module Header = Sqlocaml_storage.Header
 
@@ -85,10 +86,63 @@ let ensure_sized file =
   else Lwt.return_unit
 ;;
 
+(* #266: an append-only, fsync-on-append history sink backed by the file at
+   [path] (the [<db>.aslog] sidecar).  [append] opens O_APPEND, writes one
+   fixed-width record and fsyncs; [load] slurps the whole file and lets
+   [History.decode_all] stop at the first torn/CRC-failing tail record. *)
+let file_history_sink ~path : History.sink =
+  let append (r : History.record) =
+    let* fd =
+      Lwt_unix.openfile path [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND ] 0o644
+    in
+    Lwt.finalize
+      (fun () ->
+         let bytes = Cstruct.to_bytes (History.encode r) in
+         let total = Bytes.length bytes in
+         (* [Lwt_unix.write] may report a short write; loop to completion so a
+            partial write never leaves a CRC-valid prefix + corrupt tail. *)
+         let rec write_all off =
+           if off >= total
+           then Lwt.return_unit
+           else
+             let* n = Lwt_unix.write fd bytes off (total - off) in
+             if n = 0
+             then Lwt.fail_with "file_history_sink: write returned 0"
+             else write_all (off + n)
+         in
+         let* () = write_all 0 in
+         Lwt_unix.fsync fd)
+      (fun () -> Lwt_unix.close fd)
+  in
+  let load () =
+    if not (Sys.file_exists path)
+    then Lwt.return []
+    else
+      let* fd = Lwt_unix.openfile path [ Unix.O_RDONLY ] 0 in
+      Lwt.finalize
+        (fun () ->
+           let* st = Lwt_unix.fstat fd in
+           let len = st.Unix.st_size in
+           let bytes = Bytes.create len in
+           let rec read_all off =
+             if off >= len
+             then Lwt.return_unit
+             else
+               let* n = Lwt_unix.read fd bytes off (len - off) in
+               if n = 0 then Lwt.return_unit else read_all (off + n)
+           in
+           let* () = read_all 0 in
+           Lwt.return (History.decode_all (Cstruct.of_bytes bytes)))
+        (fun () -> Lwt_unix.close fd)
+  in
+  { History.append; load }
+;;
+
 let open_file
       ?(page_size = 4096)
       ?(reserved_bytes_per_page = 0)
       ?(explicit_geometry = false)
+      ?(as_of_history = false)
       ?key
       ~path
       ()
@@ -119,8 +173,19 @@ let open_file
             let* _ = Unix_file.close file in
             Lwt.return_unit
           in
+          (* #266: when as-of history is enabled, record commits to the
+             [<path>.aslog] sidecar with a wall-clock (ms) timestamp. *)
+          let history =
+            if as_of_history
+            then Some (file_history_sink ~path:(path ^ ".aslog"))
+            else None
+          in
+          let now () = Int64.of_float (Unix.gettimeofday () *. 1000.) in
           let* r =
             Core.open_block
+              ~as_of_history
+              ?history
+              ~now
               ?key
               ~geom
               ~init_if_corrupt:was_fresh
@@ -186,6 +251,7 @@ let open_file_wal
       ?(page_size = 4096)
       ?(reserved_bytes_per_page = 0)
       ?(explicit_geometry = false)
+      ?(as_of_history = false)
       ?key
       ~path
       ()
@@ -230,8 +296,18 @@ let open_file_wal
              | Unix.Unix_error _ -> ());
             Lwt.return_unit
           in
+          (* #266: see [open_file]. *)
+          let history =
+            if as_of_history
+            then Some (file_history_sink ~path:(path ^ ".aslog"))
+            else None
+          in
+          let now () = Int64.of_float (Unix.gettimeofday () *. 1000.) in
           let* r =
             Core.open_block_wal
+              ~as_of_history
+              ?history
+              ~now
               ?key
               ~geom
               ~read_page

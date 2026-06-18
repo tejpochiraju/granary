@@ -112,6 +112,11 @@
   unix))
 
 (test
+ (name test_unix_as_of)
+ (modules test_unix_as_of)
+ (libraries sqlocaml.unix sqlocaml.store lwt lwt.unix unix))
+
+(test
  (name test_crypto)
  (modules test_crypto)
  (libraries
