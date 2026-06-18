@@ -1330,35 +1330,34 @@ let history_log t =
 ;;
 
 let ro_begin_as_of t (target : History.target) =
-  let* () = Rwlock.acquire_read t.lock in
+  (* #266 (review): resolve the historical target — which requires loading the
+     history log from the sink (real I/O for the Unix file sink: openfile/fstat/
+     read, any of which may reject with EIO/EMFILE/…) — BEFORE acquiring the read
+     lock.  Holding the read lock across a rejecting [load] would leak it (the
+     coordinator would then never see the reader drain, stalling checkpoint and
+     [close]).  Only the snapshot registration in [ro_begin_at] and the [closing]
+     recheck need the lock, exactly as [ro_begin] holds it during registration. *)
   match bt_of t with
-  | None ->
-    Rwlock.release_read t.lock;
-    Lwt.fail (History_error History_unavailable)
-  | Some { history = None; _ } ->
-    Rwlock.release_read t.lock;
-    Lwt.fail (History_error History_unavailable)
+  | None -> Lwt.fail (History_error History_unavailable)
+  | Some { history = None; _ } -> Lwt.fail (History_error History_unavailable)
   | Some ({ history = Some sink; _ } as st) ->
-    if st.closing
-    then (
-      Rwlock.release_read t.lock;
-      Lwt.fail_with "Store.ro_begin_as_of: store is closing")
-    else
-      let* records = sink.History.load () in
-      (match History.resolve records target with
-       | None ->
-         Rwlock.release_read t.lock;
-         Lwt.fail (History_error History_pruned)
-       | Some r ->
-         let pruned =
-           match st.history_floor with
-           | Some f -> Int64.compare r.History.txn_id f < 0
-           | None -> false
-         in
-         if pruned
+    let* records = sink.History.load () in
+    (match History.resolve records target with
+     | None -> Lwt.fail (History_error History_pruned)
+     | Some r ->
+       let pruned =
+         match st.history_floor with
+         | Some f -> Int64.compare r.History.txn_id f < 0
+         | None -> false
+       in
+       if pruned
+       then Lwt.fail (History_error History_pruned)
+       else
+         let* () = Rwlock.acquire_read t.lock in
+         if st.closing
          then (
            Rwlock.release_read t.lock;
-           Lwt.fail (History_error History_pruned))
+           Lwt.fail_with "Store.ro_begin_as_of: store is closing")
          else
            Lwt.return
              (ro_begin_at

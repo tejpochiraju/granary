@@ -247,6 +247,68 @@ let test_floor_pruned () =
         | exn -> Lwt.fail exn))
 ;;
 
+(* #266 (review): if the history sink's [load] REJECTS (reachable for the real
+   Unix file sink: openfile/fstat/read can fail with EIO/EMFILE/…), the read
+   lock that [ro_begin_as_of] used to acquire up front would leak.  This test
+   wires a sink whose [load] always fails, asserts [ro_begin_as_of] raises, and
+   then proves the read lock was NOT leaked by showing a subsequent live
+   [ro_begin]/[ro_end] AND a [rw_begin]/[commit] both still complete (a leaked
+   read lock would stall the writer/checkpoint/close coordination). *)
+let test_load_error_no_lock_leak () =
+  let failing_sink : H.sink =
+    { H.append = (fun _ -> Lwt.return_unit); load = (fun () -> Lwt.fail (Failure "io")) }
+  in
+  let path = tmp_block_file () in
+  run
+    (let* dev = Block.connect ~prefered_sector_size:(Some 4096) path in
+     let* adapter = MB.connect dev in
+     let* result =
+       S.open_block
+         ~as_of_history:true
+         ~history:failing_sink
+         ~now:(monotonic ())
+         ~init_if_corrupt:true
+         ~read_page:(MB.read_page adapter)
+         ~write_page:(MB.write_page adapter)
+         ~sync:(MB.sync adapter)
+         ~resize:(MB.resize adapter)
+         ~n_pages:(MB.n_pages adapter)
+         ~close:(fun () -> MB.close adapter)
+         ()
+     in
+     let store =
+       match result with
+       | Ok s -> s
+       | Error e -> failwith (Format.asprintf "open_block failed: %a" S.pp_error e)
+     in
+     Lwt.finalize
+       (fun () ->
+          (* ro_begin_as_of must raise because [load] rejects *)
+          let* () =
+            Lwt.catch
+              (fun () ->
+                 let* _ = S.ro_begin_as_of store (`Txn 1L) in
+                 failwith "expected load to reject")
+              (function
+                | Failure msg when msg = "io" -> Lwt.return_unit
+                | exn -> Lwt.fail exn)
+          in
+          (* liveness proof: a normal RO snapshot opens and ends immediately *)
+          let* ro = S.ro_begin store in
+          let* () = S.ro_end ro in
+          (* liveness proof: a write txn begins (would block if a read lock had
+             leaked under a shared/exclusive coordinator) and commits *)
+          let* tx = S.rw_begin store in
+          let* () = S.put tx 0 (bs "k") (bs "v") in
+          let* () = S.commit tx in
+          Lwt.return_unit)
+       (fun () ->
+          let* () = S.close store in
+          (try Unix.unlink path with
+           | _ -> ());
+          Lwt.return_unit))
+;;
+
 let () =
   test_pin_floor ();
   test_unavailable_without_flag ();
@@ -257,5 +319,6 @@ let () =
   test_btree_history_log_empty_when_disabled ();
   test_misconfigured ();
   test_floor_pruned ();
+  test_load_error_no_lock_leak ();
   print_endline "test_store_as_of: OK"
 ;;

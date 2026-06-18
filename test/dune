@@ -301,6 +301,11 @@
   unix))
 
 (test
+ (name test_wal_as_of)
+ (modules test_wal_as_of)
+ (libraries sqlocaml.store sqlocaml.storage lwt.unix unix))
+
+(test
  (name test_all_backends)
  (modules test_all_backends)
  (libraries

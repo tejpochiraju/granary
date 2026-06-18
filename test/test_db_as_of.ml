@@ -19,6 +19,14 @@ let fresh_path () =
   Printf.sprintf "/tmp/sqlocaml_test_db_as_of_%04d.db" n
 ;;
 
+(* substring containment without pulling in [str]. *)
+let contains ~needle haystack =
+  let nl = String.length needle
+  and hl = String.length haystack in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  nl = 0 || go 0
+;;
+
 let cleanup path =
   (try Unix.unlink path with
    | _ -> ());
@@ -132,6 +140,51 @@ let test_history_pruned () =
   | Ok _ -> Alcotest.fail "expected History_pruned, got Ok"
 ;;
 
+(* #266 (review, Fix 4): as-of applies to the MAIN database only.  When the
+   active schema routes a query to an ATTACHed sub-handle whose store differs
+   from the main store, [query_as_of] must reject (it cannot read the attached
+   store's history through the main store's historical snapshot). *)
+let test_attached_rejected () =
+  let path = fresh_path () in
+  let aux = fresh_path () in
+  cleanup path;
+  cleanup aux;
+  let result =
+    Lwt.finalize
+      (fun () ->
+         let* db = D.open_file ~as_of_history:true ~path () in
+         let db = ok db in
+         let* _ = D.execute db "CREATE TABLE t(id INTEGER, v TEXT)" in
+         let* _ = D.execute db "INSERT INTO t VALUES (1,'a')" in
+         let* log = D.history_log db in
+         let t1 =
+           match List.rev log with
+           | last :: _ -> last.H.txn_id
+           | [] -> Alcotest.fail "history log is empty after a commit"
+         in
+         D.history_pin db ~txn_id:t1;
+         let* _ = D.execute db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux) in
+         let* _ = D.execute db "PRAGMA active_database = 'aux'" in
+         let* _ = D.execute db "CREATE TABLE u(id INTEGER, v TEXT)" in
+         (* Now active schema is 'aux'; an unqualified SELECT routes to the
+            attached store — as-of must reject. *)
+         let* r = D.query_as_of db (`Txn t1) "SELECT v FROM u" in
+         let* () = D.close db in
+         Lwt.return r)
+      (fun () ->
+         cleanup path;
+         cleanup aux;
+         Lwt.return_unit)
+    |> run
+  in
+  match result with
+  | Error (D.Runtime msg) ->
+    if not (contains ~needle:"attached" msg)
+    then Alcotest.failf "expected an 'attached' Runtime message, got: %s" msg
+  | Error e -> Alcotest.failf "expected Runtime (attached), got %a" D.pp_error e
+  | Ok _ -> Alcotest.fail "expected Runtime (attached), got Ok"
+;;
+
 let () =
   Alcotest.run
     "db_as_of"
@@ -139,6 +192,7 @@ let () =
       , [ Alcotest.test_case "historical vs live" `Quick test_query_as_of
         ; Alcotest.test_case "history_unavailable" `Quick test_history_unavailable
         ; Alcotest.test_case "history_pruned" `Quick test_history_pruned
+        ; Alcotest.test_case "attached_rejected" `Quick test_attached_rejected
         ] )
     ]
 ;;

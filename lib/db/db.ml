@@ -1767,6 +1767,18 @@ let query_as_of top (target : Sqlocaml_store.History.target) sql =
             | Error e ->
               let* () = end_ro () in
               Lwt.return (Error e)
+            | _ when not (t.store == top.store) ->
+              (* #266: as-of is whole-DB on the MAIN store only.  [ro] is a
+                 historical snapshot of [top.store]; if routing sent this plan to
+                 an ATTACHed sub-handle ([t.store != top.store]) it would read
+                 that store's CURRENT bytes through a foreign snapshot — wrong and
+                 unsupported.  Reject before executing. *)
+              let* () = end_ro () in
+              Lwt.return
+                (Error
+                   (Runtime
+                      "as-of queries are not supported against attached databases (as-of \
+                       applies to the main database only)"))
             | Ok op ->
               (match
                  Sql.Exec.query

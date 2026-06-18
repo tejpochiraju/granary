@@ -166,6 +166,13 @@ txn id (for `` `Txn ``) or timestamp (for `` `Ts ``) that is ≤ the target**.
   sparse retention and a GC sweep are future work; #266 remains open for those.
 - **In-memory and Mirage backends:** history is non-durable (in-memory sink only,
   lost on restart). Durable history requires the Unix file sink.
+- **`` `Ts `` (timestamp) resolution assumes a monotonic, non-decreasing wall
+  clock** (guaranteed under the single-writer model); a backwards clock
+  adjustment could make a `` `Ts `` target resolve to a slightly different
+  commit. `` `Txn `` resolution is always exact.
+- **Main database only.** As-of applies to the main store; a query routed to an
+  ATTACHed database is rejected (`as-of queries are not supported against
+  attached databases`).
 
 ## Building & cross-platform support
 

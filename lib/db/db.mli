@@ -175,7 +175,9 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     the db to have been opened with [~as_of_history:true]; otherwise the result
     carries [History_unavailable].  [History_pruned] when [target] predates the
     retained floor.  Schema is read at HEAD: a query whose table had DDL after
-    [target] may misinterpret older rows (schema-as-of is out of scope, #266). *)
+    [target] may misinterpret older rows (schema-as-of is out of scope, #266).
+    As-of applies to the MAIN database only; a query routed (via the active
+    schema) to an ATTACHed database is rejected with a [Runtime] error. *)
 val query_as_of
   :  t
   -> Sqlocaml_store.History.target
