@@ -1231,6 +1231,44 @@ let open_block_wal
 (* Transactions                                                         *)
 (* ------------------------------------------------------------------ *)
 
+(* Build an RO snapshot against an explicit (txn_id, meta_root).  [ro_begin]
+   passes the live header; [ro_begin_as_of] passes a retained historical root.
+   Registers the snapshot in [active_readers]/[active_reader_frames] so
+   reclamation respects it, exactly as the live path does.  Uses the CURRENT
+   committed-frames horizon: CoW never rewrites a retained page-id, so each
+   retained page has exactly one WAL frame and "latest up to head" == the
+   historical content (the floor/reader pin prevents reuse). *)
+let ro_begin_at t st ~snap_txn_id ~snap_meta_root =
+  let committed_frames =
+    match st.wal with
+    | None -> 0
+    | Some w -> Wal.committed_frames w
+  in
+  let snap_frames =
+    if st.follower
+    then (
+      match st.follower_ack_position with
+      | Some n -> min committed_frames n
+      | None -> committed_frames)
+    else committed_frames
+  in
+  let count = Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id) in
+  Hashtbl.replace st.active_readers snap_txn_id (count + 1);
+  let frame_count =
+    Option.value ~default:0 (Hashtbl.find_opt st.active_reader_frames snap_frames)
+  in
+  Hashtbl.replace st.active_reader_frames snap_frames (frame_count + 1);
+  Ro
+    { rs_store = t
+    ; rs_snap_txn_id = snap_txn_id
+    ; rs_snap_meta_root = snap_meta_root
+    ; rs_snap_trees = Hashtbl.create 4
+    ; rs_snap_frames = snap_frames
+    ; rs_pinned = Hashtbl.create 64
+    ; rs_mem_snap = None
+    }
+;;
+
 let ro_begin t =
   (* [Rwlock.acquire_read] is a counter bump, not an exclusion: under
      snapshot isolation readers and writers don't conflict, so the call
@@ -1268,47 +1306,12 @@ let ro_begin t =
            ; rs_mem_snap = Some snap
            })
     | Btree st ->
-      let snap_txn_id = st.current_header.txn_id in
-      let snap_meta_root = st.current_header.root_page in
-      let committed_frames =
-        match st.wal with
-        | None -> 0
-        | Some w -> Wal.committed_frames w
-      in
-      let snap_frames =
-        if st.follower
-        then (
-          match st.follower_ack_position with
-          | Some n ->
-            (* On a following replica, cap the RO snapshot to the follower's
-               last-applied commit boundary so the reader never observes WAL
-               frames that haven't been applied on this node yet (#263).
-               Both [committed_frames] and [n] are local committed-frame
-               counts (not master-epoch indices), so [min] is safe and
-               naturally handles a post-reset WAL where committed_frames
-               has dropped below the recorded ack position. *)
-            min committed_frames n
-          | None -> committed_frames)
-        else committed_frames
-      in
-      let count =
-        Option.value ~default:0 (Hashtbl.find_opt st.active_readers snap_txn_id)
-      in
-      Hashtbl.replace st.active_readers snap_txn_id (count + 1);
-      let frame_count =
-        Option.value ~default:0 (Hashtbl.find_opt st.active_reader_frames snap_frames)
-      in
-      Hashtbl.replace st.active_reader_frames snap_frames (frame_count + 1);
       Lwt.return
-        (Ro
-           { rs_store = t
-           ; rs_snap_txn_id = snap_txn_id
-           ; rs_snap_meta_root = snap_meta_root
-           ; rs_snap_trees = Hashtbl.create 4
-           ; rs_snap_frames = snap_frames
-           ; rs_pinned = Hashtbl.create 64
-           ; rs_mem_snap = None
-           }))
+        (ro_begin_at
+           t
+           st
+           ~snap_txn_id:st.current_header.txn_id
+           ~snap_meta_root:st.current_header.root_page))
 ;;
 
 let emit_event (st : bt_state) (ev : Store_event.t) =
