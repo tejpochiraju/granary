@@ -275,18 +275,26 @@ val execute_change_count_with_dirty
     an incremental view-maintenance layer consumes.  Empty for no-op writes and
     DDL, same as {!execute_with_dirty}.
 
-    {b Phase 0 coverage.}  The feed covers ordinary rowid-table DML completely:
-    INSERT, UPDATE, DELETE, REPLACE (delete-old + insert-new), UPSERT [DO UPDATE],
-    and rows mutated indirectly by FK cascades and triggers.  It does {b not} yet
+    {b Phase 0 coverage.}  The feed covers ordinary rowid-table DML: INSERT,
+    UPDATE, DELETE, REPLACE (delete-old + insert-new), UPSERT [DO UPDATE], and
+    rows mutated indirectly by FK cascades and triggers.  It does {b not} yet
     carry row-level deltas for FTS5 or columnar tables — those still report only
     their {e name} via {!execute_with_dirty} and are absent here.  A consumer that
     must invalidate on FTS/columnar writes uses {!execute_with_dirty} alongside
-    this; full FTS/columnar row capture is a follow-up.
+    this; full FTS/columnar row capture is a follow-up (#418).
 
-    A REPLACE that overwrites the {e same} INTEGER-PK-alias rowid is a physical
-    in-place write and surfaces as a single {!Inserted} of that rowid (no paired
-    {!Deleted}); a consumer treats "inserted a rowid it already holds" as a
-    replace. *)
+    {b Rowid identity.}  Deltas are keyed by rowid.  An UPDATE that changes a
+    row's INTEGER-PK alias {e moves} it to a new rowid — a change of identity —
+    so it surfaces as a {!Deleted} of the old rowid paired with an {!Inserted} at
+    the new one, not an {!Updated}.  Conversely, a REPLACE that overwrites the
+    {e same} alias rowid is a physical in-place write and surfaces as a single
+    {!Inserted} of that rowid (no paired {!Deleted}); a consumer treats "inserted
+    a rowid it already holds" as a replace.
+
+    {b Multiple deltas per rowid.}  Within one statement a rowid may appear in
+    more than one change — e.g. a self-referential FK [ON UPDATE CASCADE] whose
+    cascade updates a row that the statement {e also} matches directly.  Consumers
+    must fold deltas in order rather than assume one per rowid (#418). *)
 val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
 (** #387: the projected output column names for a row-returning [sql], without

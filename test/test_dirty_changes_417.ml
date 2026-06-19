@@ -199,6 +199,52 @@ let test_secondary_index_upsert_update () =
           = excluded.v"))
 ;;
 
+(* #419 review #1: an UPDATE that MOVES the row to a new rowid (changing the
+   INTEGER-PK alias) is a change of identity, so the feed models it as a
+   [Deleted] of the old rowid + an [Inserted] at the new one — not an [Updated]
+   keyed under a now-stale rowid.  Matches the REPLACE-displacement shape. *)
+let test_rowid_changing_update_is_del_ins () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    check_kinds
+      "rowid move = delete old + insert new"
+      [ "t", [ "DEL:1"; "INS:5" ] ]
+      (kinds db "UPDATE t SET id = 5 WHERE id = 1"))
+;;
+
+(* A normal (rowid-preserving) UPDATE is still a single [Updated]. *)
+let test_inplace_update_stays_updated () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, 'a')";
+    check_kinds
+      "in-place update stays a single UPD"
+      [ "t", [ "UPD:1" ] ]
+      (kinds db "UPDATE t SET v = 'b' WHERE id = 1"))
+;;
+
+(* #419 review #2 (documented limitation, see #418): a self-referential FK
+   ON UPDATE CASCADE where a row is BOTH cascaded and directly matched touches
+   that row more than once — the cascade updates its FK column, then the main
+   loop re-keys it.  Pinned here so the (non-deduplicated) behavior is an
+   explicit, tested contract rather than an accident.  An IVM consumer must
+   tolerate multiple deltas per rowid within one statement. *)
+let test_self_ref_cascade_double_touch () =
+  with_db (fun db ->
+    exec db "PRAGMA foreign_keys = ON";
+    exec
+      db
+      "CREATE TABLE t (id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON UPDATE \
+       CASCADE, v TEXT)";
+    exec db "INSERT INTO t VALUES (1, NULL, 'root')";
+    exec db "INSERT INTO t VALUES (2, 1, 'child')";
+    check_kinds
+      "self-ref cascade: rowid 2 touched by cascade then re-key"
+      [ "t", [ "UPD:2"; "DEL:1"; "INS:11"; "DEL:2"; "INS:12" ] ]
+      (kinds db "UPDATE t SET id = id + 10"))
+;;
+
 (* ON UPDATE CASCADE: the parent update AND the cascaded child update both reach
    the feed. *)
 let test_on_update_cascade_child () =
@@ -278,9 +324,23 @@ let () =
             `Quick
             test_secondary_index_upsert_update
         ] )
+    ; ( "rowid move"
+      , [ Alcotest.test_case
+            "rowid-changing update = del+ins"
+            `Quick
+            test_rowid_changing_update_is_del_ins
+        ; Alcotest.test_case
+            "in-place update stays upd"
+            `Quick
+            test_inplace_update_stays_updated
+        ] )
     ; ( "cascades"
       , [ Alcotest.test_case "cascade delete changes" `Quick test_cascade_delete_changes
         ; Alcotest.test_case "on update cascade child" `Quick test_on_update_cascade_child
+        ; Alcotest.test_case
+            "self-ref cascade double touch"
+            `Quick
+            test_self_ref_cascade_double_touch
         ] )
     ; ( "phase0 boundary"
       , [ Alcotest.test_case "fts no row feed" `Quick test_fts_has_no_row_feed_yet ] )

@@ -85,6 +85,20 @@ let record_change (table : string) (change : row_change) =
      | None -> Hashtbl.add log table (ref [ change ]))
 ;;
 
+(* #417: record an UPDATE whose row may have been re-keyed.  When the rowid is
+   unchanged it is one [Updated]; when an UPDATE of the INTEGER-PK alias MOVED the
+   row to a new rowid (#243/#249), the identity changed, so it is modelled as a
+   [Deleted] of the old rowid followed by an [Inserted] at the new one — the same
+   shape REPLACE-displacement emits, and what a Z-set/IVM consumer needs to track
+   the move (it keys deltas by rowid). *)
+let record_update (table : string) ~old_rowid ~new_rowid ~old_row ~new_row =
+  if Int64.equal old_rowid new_rowid
+  then record_change table (Updated { rowid = old_rowid; old_row; new_row })
+  else (
+    record_change table (Deleted { rowid = old_rowid; row = old_row });
+    record_change table (Inserted { rowid = new_rowid; row = new_row }))
+;;
+
 (* Install [acc] as the active write-path mutation sink for [f]'s dynamic extent
    (propagated across binds, so nested cascade/trigger writes record into it). *)
 let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
@@ -4045,15 +4059,10 @@ let update_col_in_tx
   let new_row = Array.copy row in
   new_row.(col_idx) <- new_val;
   compute_stored_generated_cols None [||] meta new_row;
-  (* #417: FK-cascade child column update (ON UPDATE CASCADE / SET NULL / SET
-     DEFAULT) — record the pre/post images for the delta feed.  [rowid] is the
-     pre-image rowid; a cascade that re-keys the child's own INTEGER PK is the
-     rare exception where the post-image rowid differs. *)
-  record_change meta.Cat.name (Updated { rowid; old_row = row; new_row });
   (* #249: a cascade that lands on the child's own INTEGER PRIMARY KEY column
      must MOVE the child row (re-key + reindex), like any other alias-column
      UPDATE — funnel through the shared helper. *)
-  let* (_ : int64) =
+  let* new_rowid =
     write_row_rekeyed
       tx
       meta
@@ -4064,6 +4073,10 @@ let update_col_in_tx
       ~old_rowid:rowid
       ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
   in
+  (* #417: record the FK-cascade child column update (ON UPDATE CASCADE / SET
+     NULL / SET DEFAULT); a cascade that re-keyed the child's own INTEGER PK is
+     recorded as Deleted+Inserted, like any rowid-changing UPDATE. *)
+  record_update meta.Cat.name ~old_rowid:rowid ~new_rowid ~old_row:row ~new_row;
   Lwt.return_unit
 ;;
 
@@ -5186,7 +5199,7 @@ let apply_update_row
       ~indexes
       ~assignments
       (rowid, old_row)
-  : Row.t Lwt.t
+  : (int64 * Row.t) Lwt.t
   =
   let new_row = apply_assignments ~clock ~params assignments old_row in
   compute_stored_generated_cols clock params table_meta new_row;
@@ -5209,7 +5222,7 @@ let apply_update_row
   (* #243/#249: re-keys the row when the UPDATE changed the INTEGER PRIMARY KEY
      alias column (uniqueness probe + del-old/put-new + reindex), else rewrites
      in place.  Shared with the UPSERT and ON UPDATE CASCADE paths. *)
-  let* (_ : int64) =
+  let* new_rowid =
     write_row_rekeyed
       tx
       table_meta
@@ -5222,8 +5235,9 @@ let apply_update_row
   in
   (* Return the row as actually stored (generated columns included) so callers
      such as UPDATE ... RETURNING can project committed values, not a pre-lock
-     snapshot (#226). *)
-  Lwt.return new_row
+     snapshot (#226); [new_rowid] (#417) differs from [rowid] only when the UPDATE
+     moved the INTEGER-PK alias. *)
+  Lwt.return (new_rowid, new_row)
 ;;
 
 (* Fire an UPDATE row-hook (BEFORE/AFTER) for each matched row, recomputing
@@ -5321,7 +5335,7 @@ let execute_update
          let* () =
            Lwt_list.iter_s
              (fun ((rowid, old_row) as m) ->
-                let* new_row =
+                let* new_rowid, new_row =
                   apply_update_row
                     tx
                     cat
@@ -5334,8 +5348,14 @@ let execute_update
                     m
                 in
                 (* #417: capture the per-row pre/post images for the delta feed
-                   (no-op unless a change-capturing accumulator is installed). *)
-                record_change table_meta.Cat.name (Updated { rowid; old_row; new_row });
+                   (no-op unless a change-capturing accumulator is installed); a
+                   rowid-changing UPDATE is recorded as Deleted+Inserted. *)
+                record_update
+                  table_meta.Cat.name
+                  ~old_rowid:rowid
+                  ~new_rowid
+                  ~old_row
+                  ~new_row;
                 (* RETURNING / row collection sees the committed row (#226). *)
                 (match collect with
                  | Some f -> f new_row
