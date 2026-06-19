@@ -39,6 +39,7 @@
   test_dirty_tables_240
   test_dirty_changes_417
   test_zset_417
+  test_ivm_operators_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
@@ -88,6 +89,7 @@
   test_dirty_tables_240
   test_dirty_changes_417
   test_zset_417
+  test_ivm_operators_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
