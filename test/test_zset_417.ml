@@ -141,12 +141,31 @@ let prop_distinct_nonneg =
     List.for_all (fun (_, w) -> w = 1) (Z.to_list (Z.distinct a)))
 ;;
 
+let no_zero z = List.for_all (fun (_, w) -> w <> 0) (Z.to_list z)
+
 let prop_no_zero_entries =
   QCheck.Test.make
     ~count:200
     ~name:"canonical: no zero-weight entries stored"
     arb_zset
-    (fun a -> List.for_all (fun (_, w) -> w <> 0) (Z.to_list a))
+    (fun a -> no_zero a)
+;;
+
+(* The ops that build maps directly (bypassing [add_weight]) must each preserve
+   the no-zero-weight invariant by construction; check their outputs, not just
+   [of_list]'s. *)
+let prop_ops_preserve_canonical =
+  QCheck.Test.make
+    ~count:200
+    ~name:"direct-build operators preserve canonical form"
+    QCheck.(pair (int_range (-3) 3) arb_zset)
+    (fun (n, a) ->
+       no_zero (Z.negate a)
+       && no_zero (Z.scale n a)
+       && no_zero (Z.map (fun x -> x mod 3) a)
+       && no_zero (Z.filter (fun x -> x > 0) a)
+       && no_zero (Z.distinct a)
+       && no_zero (Z.sub a a))
 ;;
 
 let prop_scale_distributes =
@@ -184,6 +203,7 @@ let () =
           ; prop_distinct_idempotent
           ; prop_distinct_nonneg
           ; prop_no_zero_entries
+          ; prop_ops_preserve_canonical
           ; prop_scale_distributes
           ] )
     ]

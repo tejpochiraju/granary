@@ -43,8 +43,11 @@ module Make (E : ELEMENT) = struct
   let zero = M.empty
   let is_zero = M.is_empty
 
-  (* Add [w] to [e]'s weight, removing the entry if it cancels to 0.  The single
-     chokepoint that preserves the no-zero-entry invariant. *)
+  (* Add [w] to [e]'s weight, removing the entry if it cancels to 0.  This is the
+     chokepoint for the {e summing} paths ([singleton]/[of_list]/[add]/[map]),
+     where two contributions can cancel.  The direct-build ops below
+     ([negate]/[scale]/[filter]/[distinct]) each preserve the no-zero-weight
+     invariant by construction on a canonical input, so they may bypass it. *)
   let add_weight m e w =
     if w = 0
     then m
@@ -70,11 +73,20 @@ module Make (E : ELEMENT) = struct
   ;;
 
   let add a b = M.fold (fun e w acc -> add_weight acc e w) b a
+
+  (* invariant-safe: negating a nonzero weight stays nonzero *)
   let negate m = M.map (fun w -> -w) m
   let sub a b = add a (negate b)
+
+  (* invariant-safe: [n = 0] must short-circuit to empty, else [n * w] (n, w both
+     nonzero) stays nonzero *)
   let scale n m = if n = 0 then M.empty else M.map (fun w -> n * w) m
   let map f m = M.fold (fun e w acc -> add_weight acc (f e) w) m M.empty
+
+  (* invariant-safe: keeps a subset of already-nonzero entries *)
   let filter p m = M.filter (fun e _ -> p e) m
+
+  (* invariant-safe: only emits weight 1 *)
   let distinct m = M.fold (fun e w acc -> if w > 0 then M.add e 1 acc else acc) m M.empty
   let support m = List.map fst (M.bindings m)
   let cardinality m = M.cardinal m
