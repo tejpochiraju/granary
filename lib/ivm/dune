@@ -1,0 +1,5 @@
+(library
+ (name sqlocaml_ivm)
+ (public_name sqlocaml.ivm)
+ (instrumentation
+  (backend bisect_ppx)))

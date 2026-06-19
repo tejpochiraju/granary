@@ -38,6 +38,7 @@
   test_query_stats_257
   test_dirty_tables_240
   test_dirty_changes_417
+  test_zset_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
@@ -86,6 +87,7 @@
   test_query_stats_257
   test_dirty_tables_240
   test_dirty_changes_417
+  test_zset_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
@@ -105,6 +107,7 @@
   sqlocaml.store
   sqlocaml.catalog
   sqlocaml.sql
+  sqlocaml.ivm
   sqlocaml.storage
   sqlocaml.unix
   repl_lib
