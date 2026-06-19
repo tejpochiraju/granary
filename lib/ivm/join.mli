@@ -5,7 +5,11 @@
     integrated inputs [L] and [R] (indexed by join key) and, given a delta on
     either side, returns the matching output delta and folds it into a
     materialized output — so the join is kept current in time proportional to the
-    change, not the size of [L] and [R]. *)
+    change, not the size of [L] and [R].
+
+    Output carries {e bag} multiplicity: a matched pair contributes the product
+    of its input weights.  Set / [SELECT DISTINCT] semantics, if wanted, are a
+    {!Zset.S.distinct} applied to the output, not built in here. *)
 
 (** What to join: the two input and one output Z-set domains, the join key, and
     how to extract keys / combine a matched pair into an output element. *)

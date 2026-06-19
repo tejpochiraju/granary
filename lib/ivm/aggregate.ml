@@ -70,6 +70,11 @@ module Make (S : SPEC) = struct
          let old_acc = get t.groups g in
          let new_acc = { mult = old_acc.mult + d.mult; aggv = old_acc.aggv + d.aggv } in
          out_delta := S.Out.add !out_delta (row_delta g old_acc new_acc);
+         (* Prune ONLY when both totals are zero.  A SUM group whose weights
+            cancel to [mult = 0] but [aggv <> 0] is deliberately kept: dropping it
+            would lose [aggv] and corrupt the value if the group later revives.
+            (For COUNT this never arises — [aggv = mult].)  On a high-churn SUM
+            view such net-zero groups accumulate; bound it in Phase 3 if needed. *)
          t.groups
          <- (if new_acc.mult = 0 && new_acc.aggv = 0
              then GMap.remove g t.groups

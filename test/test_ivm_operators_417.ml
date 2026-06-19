@@ -99,23 +99,33 @@ let arb_steps =
   |> QCheck.map (List.map (fun (l, r) -> ZL.of_list l, ZR.of_list r))
 ;;
 
+(* Stronger than comparing only the final total: after EVERY step, both the
+   accumulated returned deltas and the materialized output must equal the batch
+   join of the inputs seen so far.  This pins every intermediate snapshot, so a
+   bug that telescopes to the right final total but diverges mid-stream fails. *)
 let prop_join_incremental_eq_batch =
   QCheck.Test.make
     ~count:400
-    ~name:"incremental join == batch recomputation"
+    ~name:"incremental join == batch at every prefix"
     arb_steps
     (fun steps ->
        let j = J.create () in
-       let total_out =
+       let ok, _, _, _ =
          List.fold_left
-           (fun acc (dl, dr) -> ZO.add acc (J.step j ~left:dl ~right:dr))
-           ZO.zero
+           (fun (ok, accl, accr, accout) (dl, dr) ->
+              let out = J.step j ~left:dl ~right:dr in
+              let accl = ZL.add accl dl
+              and accr = ZR.add accr dr in
+              let accout = ZO.add accout out in
+              let expected = batch_join accl accr in
+              ( ok && ZO.equal accout expected && ZO.equal (J.output j) expected
+              , accl
+              , accr
+              , accout ))
+           (true, ZL.zero, ZR.zero, ZO.zero)
            steps
        in
-       let total_l = List.fold_left (fun a (dl, _) -> ZL.add a dl) ZL.zero steps in
-       let total_r = List.fold_left (fun a (_, dr) -> ZR.add a dr) ZR.zero steps in
-       let expected = batch_join total_l total_r in
-       ZO.equal total_out expected && ZO.equal (J.output j) expected)
+       ok)
 ;;
 
 (* ---- Incremental grouped aggregates (COUNT, SUM) ---- *)
@@ -237,16 +247,24 @@ let arb_count_steps =
 let prop_count_incremental_eq_batch =
   QCheck.Test.make
     ~count:400
-    ~name:"incremental COUNT == batch"
+    ~name:"incremental COUNT == batch at every prefix"
     arb_count_steps
     (fun steps ->
        let c = Cnt.create () in
-       let total =
-         List.fold_left (fun acc d -> ZG.add acc (Cnt.step c d)) ZG.zero steps
+       let ok, _, _ =
+         List.fold_left
+           (fun (ok, seen, accout) d ->
+              let out = Cnt.step c d in
+              let seen = ZIc.add seen d in
+              let accout = ZG.add accout out in
+              let expected = batch_count seen in
+              ( ok && ZG.equal accout expected && ZG.equal (Cnt.output c) expected
+              , seen
+              , accout ))
+           (true, ZIc.zero, ZG.zero)
+           steps
        in
-       let all = List.fold_left ZIc.add ZIc.zero steps in
-       let expected = batch_count all in
-       ZG.equal total expected && ZG.equal (Cnt.output c) expected)
+       ok)
 ;;
 
 let arb_sum_steps =
@@ -258,12 +276,26 @@ let arb_sum_steps =
 ;;
 
 let prop_sum_incremental_eq_batch =
-  QCheck.Test.make ~count:400 ~name:"incremental SUM == batch" arb_sum_steps (fun steps ->
-    let s = Sm.create () in
-    let total = List.fold_left (fun acc d -> ZG.add acc (Sm.step s d)) ZG.zero steps in
-    let all = List.fold_left ZIs.add ZIs.zero steps in
-    let expected = batch_sum all in
-    ZG.equal total expected && ZG.equal (Sm.output s) expected)
+  QCheck.Test.make
+    ~count:400
+    ~name:"incremental SUM == batch at every prefix"
+    arb_sum_steps
+    (fun steps ->
+       let s = Sm.create () in
+       let ok, _, _ =
+         List.fold_left
+           (fun (ok, seen, accout) d ->
+              let out = Sm.step s d in
+              let seen = ZIs.add seen d in
+              let accout = ZG.add accout out in
+              let expected = batch_sum seen in
+              ( ok && ZG.equal accout expected && ZG.equal (Sm.output s) expected
+              , seen
+              , accout ))
+           (true, ZIs.zero, ZG.zero)
+           steps
+       in
+       ok)
 ;;
 
 (* ---- Linear operators (select/project) are delta-transparent: applying them

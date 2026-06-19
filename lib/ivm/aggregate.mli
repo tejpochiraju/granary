@@ -6,7 +6,14 @@
     [measure = fun _ -> 1]).  Given an input delta, {!step} returns the output
     delta that retracts each changed group's old [(group, value)] row and inserts
     its new one — keeping the result relation current without rescanning the
-    input.  A group's row is present iff its total weight is [> 0]. *)
+    input.  A group's row is present iff its total weight is [> 0], and each
+    present group yields exactly one output row.
+
+    The measure is {e additive}, which is what makes the running total
+    maintainable from a delta (this covers [COUNT], [SUM], and [AVG] as
+    sum-with-count).  Order-sensitive aggregates ([MIN]/[MAX]) cannot be
+    expressed this way — a retraction can lower the current extremum, which needs
+    the full group, not a running scalar — and are out of scope here. *)
 
 (** What to aggregate: the input/output Z-set domains, the grouping key, the
     per-element measure, and how to render a [(group, value)] result row. *)
