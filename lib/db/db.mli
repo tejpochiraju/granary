@@ -232,6 +232,30 @@ val history_log : ?schema:string -> t -> Sqlocaml_store.History.record list Lwt.
     observable contents are unchanged. *)
 type dirty_tables = string list
 
+(** #417 Phase 0: one row-level mutation in the delta feed.  [rowid] is the row's
+    int64 rowid; [row]/[old_row]/[new_row] are the full {!row}s involved.
+    Re-exported from {!Sqlocaml_sql.Exec.row_change}. *)
+type row_change = Sqlocaml_sql.Exec.row_change =
+  | Inserted of
+      { rowid : int64
+      ; row : row
+      }
+  | Deleted of
+      { rowid : int64
+      ; row : row
+      }
+  | Updated of
+      { rowid : int64
+      ; old_row : row
+      ; new_row : row
+      }
+
+(** #417: the per-table row-level deltas a write statement produced — [(table,
+    changes)] pairs sorted by table name, each table's changes in application
+    order.  Same name/scope rules as {!dirty_tables}: user tables only, internal
+    [sqlite_…] objects excluded, DDL out of band. *)
+type table_changes = (string * row_change list) list
+
 (** Like {!execute}, but also returns the {!dirty_tables} the statement mutated.
     The list is empty for a no-op write (e.g. [INSERT OR IGNORE] that inserts
     nothing) and for {e all} DDL (including row-rewriting DDL such as [ALTER
@@ -245,6 +269,33 @@ val execute_change_count_with_dirty
   :  t
   -> string
   -> (int * dirty_tables, error) result Lwt.t
+
+(** #417: like {!execute_with_dirty}, but returns the row-level {!table_changes}
+    delta feed (rowid + old/new rows) instead of just the table names — the input
+    an incremental view-maintenance layer consumes.  Empty for no-op writes and
+    DDL, same as {!execute_with_dirty}.
+
+    {b Phase 0 coverage.}  The feed covers ordinary rowid-table DML: INSERT,
+    UPDATE, DELETE, REPLACE (delete-old + insert-new), UPSERT [DO UPDATE], and
+    rows mutated indirectly by FK cascades and triggers.  It does {b not} yet
+    carry row-level deltas for FTS5 or columnar tables — those still report only
+    their {e name} via {!execute_with_dirty} and are absent here.  A consumer that
+    must invalidate on FTS/columnar writes uses {!execute_with_dirty} alongside
+    this; full FTS/columnar row capture is a follow-up (#418).
+
+    {b Rowid identity.}  Deltas are keyed by rowid.  An UPDATE that changes a
+    row's INTEGER-PK alias {e moves} it to a new rowid — a change of identity —
+    so it surfaces as a {!Deleted} of the old rowid paired with an {!Inserted} at
+    the new one, not an {!Updated}.  Conversely, a REPLACE that overwrites the
+    {e same} alias rowid is a physical in-place write and surfaces as a single
+    {!Inserted} of that rowid (no paired {!Deleted}); a consumer treats "inserted
+    a rowid it already holds" as a replace.
+
+    {b Multiple deltas per rowid.}  Within one statement a rowid may appear in
+    more than one change — e.g. a self-referential FK [ON UPDATE CASCADE] whose
+    cascade updates a row that the statement {e also} matches directly.  Consumers
+    must fold deltas in order rather than assume one per rowid (#418). *)
+val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns

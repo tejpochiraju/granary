@@ -14,10 +14,43 @@ module Varint = Sqlocaml_encoding.Varint
    when no accumulator is installed (plain [execute]/[run] callers pay nothing —
    a single predicted branch off the hot path, never per-row in the common case).
    Defined here, ahead of the DML functions, so every [mark_dirty] call site can
-   reach it (the mutation sites span [execute_insert] onward). *)
-type dirty_tables_acc = (string, unit) Hashtbl.t
+   reach it (the mutation sites span [execute_insert] onward).
 
-let make_dirty_acc () : dirty_tables_acc = Hashtbl.create 8
+   #417 Phase 0: an accumulator may ALSO capture the row-level delta — the rowid
+   and old/new {!Row.t} of every mutated row — for an incremental view-maintenance
+   consumer (DBSP-style).  This is opt-in: [make_change_acc] enables capture,
+   [make_dirty_acc] does not.  The name-set path ([mark_dirty]) is byte-for-byte
+   unchanged whether or not capture is on, so plain #240 callers pay nothing; the
+   row-level [record_change] is a single predicted branch (returns immediately
+   when [changes = None] or no accumulator is installed). *)
+type row_change =
+  | Inserted of
+      { rowid : int64
+      ; row : Row.t
+      }
+  | Deleted of
+      { rowid : int64
+      ; row : Row.t
+      }
+  | Updated of
+      { rowid : int64
+      ; old_row : Row.t
+      ; new_row : Row.t
+      }
+
+type dirty_tables_acc =
+  { names : (string, unit) Hashtbl.t
+  ; changes : (string, row_change list ref) Hashtbl.t option
+    (* [Some] => row-level capture is on; per-table lists held in reverse
+       (newest-first) and reversed on drain by [dirty_changes]. *)
+  }
+
+let make_dirty_acc () : dirty_tables_acc = { names = Hashtbl.create 8; changes = None }
+
+let make_change_acc () : dirty_tables_acc =
+  { names = Hashtbl.create 8; changes = Some (Hashtbl.create 8) }
+;;
+
 let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
 
 (* Reserved-prefix internal tables — the synthesized [sqlite_…] objects
@@ -34,7 +67,36 @@ let is_internal_table_name (name : string) = String.starts_with ~prefix:"sqlite_
 let mark_dirty (name : string) =
   match Lwt.get dirty_tables_key with
   | None -> ()
-  | Some h -> Hashtbl.replace h name ()
+  | Some { names; _ } -> Hashtbl.replace names name ()
+;;
+
+(* #417: record one row-level [change] against [table].  A no-op (one branch)
+   unless an accumulator with capture enabled is installed.  Also marks [table]
+   in the name set so a captured change can never reference a table missing from
+   {!dirty_elements} (callers at the per-row loop sites need not also call
+   [mark_dirty]). *)
+let record_change (table : string) (change : row_change) =
+  match Lwt.get dirty_tables_key with
+  | None | Some { changes = None; _ } -> ()
+  | Some { names; changes = Some log } ->
+    Hashtbl.replace names table ();
+    (match Hashtbl.find_opt log table with
+     | Some r -> r := change :: !r
+     | None -> Hashtbl.add log table (ref [ change ]))
+;;
+
+(* #417: record an UPDATE whose row may have been re-keyed.  When the rowid is
+   unchanged it is one [Updated]; when an UPDATE of the INTEGER-PK alias MOVED the
+   row to a new rowid (#243/#249), the identity changed, so it is modelled as a
+   [Deleted] of the old rowid followed by an [Inserted] at the new one — the same
+   shape REPLACE-displacement emits, and what a Z-set/IVM consumer needs to track
+   the move (it keys deltas by rowid). *)
+let record_update (table : string) ~old_rowid ~new_rowid ~old_row ~new_row =
+  if Int64.equal old_rowid new_rowid
+  then record_change table (Updated { rowid = old_rowid; old_row; new_row })
+  else (
+    record_change table (Deleted { rowid = old_rowid; row = old_row });
+    record_change table (Inserted { rowid = new_rowid; row = new_row }))
 ;;
 
 (* Install [acc] as the active write-path mutation sink for [f]'s dynamic extent
@@ -44,9 +106,26 @@ let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
 ;;
 
 (* Drain to the public shape: user tables only, deduplicated, sorted. *)
-let dirty_elements (h : dirty_tables_acc) : string list =
-  Hashtbl.fold (fun k () acc -> if is_internal_table_name k then acc else k :: acc) h []
+let dirty_elements ({ names; _ } : dirty_tables_acc) : string list =
+  Hashtbl.fold
+    (fun k () acc -> if is_internal_table_name k then acc else k :: acc)
+    names
+    []
   |> List.sort_uniq String.compare
+;;
+
+(* #417: drain the per-table row-level deltas: user tables only, sorted by name,
+   each table's changes in the order they were applied.  Empty for a
+   non-capturing accumulator. *)
+let dirty_changes ({ changes; _ } : dirty_tables_acc) : (string * row_change list) list =
+  match changes with
+  | None -> []
+  | Some log ->
+    Hashtbl.fold
+      (fun k r acc -> if is_internal_table_name k then acc else (k, List.rev !r) :: acc)
+      log
+      []
+    |> List.sort (fun (a, _) (b, _) -> String.compare a b)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -3134,6 +3213,12 @@ let delete_replace_conflicts
          | Some old_bytes ->
            let old_row = decode_with_virtual clock params table_meta old_bytes in
            displaced_rows := old_row :: !displaced_rows;
+           (* #417: REPLACE/INSERT OR REPLACE displaces a conflicting row before
+              re-inserting; record the removed row so the delta feed pairs this
+              [Deleted] with the [Inserted] the insert path emits. *)
+           record_change
+             table_meta.Cat.name
+             (Deleted { rowid = old_rowid; row = old_row });
            let* () =
              match on_replace_delete_before with
              | None -> Lwt.return_unit
@@ -3311,6 +3396,10 @@ let execute_upsert_update
       | None -> Lwt.return_unit
       | Some f -> f ~tx ~old_row ~new_row
     in
+    (* #417: secondary-index UPSERT DO UPDATE writes via [write_row_rekeyed],
+       bypassing the marked plain-insert/update loops; record the pre/post images
+       here so the delta feed covers it. *)
+    record_change table_meta.Cat.name (Updated { rowid = old_rowid; old_row; new_row });
     let* () = release_txn ~cat tx owned in
     Lwt.return true
 ;;
@@ -3664,7 +3753,10 @@ let execute_insert
             is correct even when an explicit id differs from [next_rowid - 1].
             Skipped inserts (ON CONFLICT IGNORE ⇒ [inserted=false]) leave it. *)
          if inserted then Cat.set_last_inserted_rowid cat rowid;
-         if inserted then mark_dirty table_meta.Cat.name;
+         if inserted
+         then (
+           mark_dirty table_meta.Cat.name;
+           record_change table_meta.Cat.name (Inserted { rowid; row }));
          Lwt.return inserted)
     (fun exn ->
        (* On any exception: rollback if we own the txn, then re-raise. *)
@@ -3923,6 +4015,10 @@ let scan_child_rows_multi_tx
 (** Delete a single row and its index entries within an existing RW transaction. *)
 let delete_row_in_tx tx (cat : Cat.t) (meta : Cat.table_meta) ~rowid ~(row : Row.t) =
   mark_dirty meta.Cat.name;
+  (* #417: this primitive fires for FK-cascade child deletes (the top-level
+     delete records via [apply_delete_row]'s loop), so the removed child row
+     reaches the delta feed. *)
+  record_change meta.Cat.name (Deleted { rowid; row });
   let rowid_key = Rowid.encode rowid in
   let child_idxs = Cat.indexes_for_table cat ~table:meta.Cat.name in
   (* Phase 35 Task 2: ensure VIRTUAL gen cols are populated before key extraction. *)
@@ -3966,7 +4062,7 @@ let update_col_in_tx
   (* #249: a cascade that lands on the child's own INTEGER PRIMARY KEY column
      must MOVE the child row (re-key + reindex), like any other alias-column
      UPDATE — funnel through the shared helper. *)
-  let* (_ : int64) =
+  let* new_rowid =
     write_row_rekeyed
       tx
       meta
@@ -3977,6 +4073,10 @@ let update_col_in_tx
       ~old_rowid:rowid
       ~indexes:(Cat.indexes_for_table cat ~table:meta.Cat.name)
   in
+  (* #417: record the FK-cascade child column update (ON UPDATE CASCADE / SET
+     NULL / SET DEFAULT); a cascade that re-keyed the child's own INTEGER PK is
+     recorded as Deleted+Inserted, like any rowid-changing UPDATE. *)
+  record_update meta.Cat.name ~old_rowid:rowid ~new_rowid ~old_row:row ~new_row;
   Lwt.return_unit
 ;;
 
@@ -5099,7 +5199,7 @@ let apply_update_row
       ~indexes
       ~assignments
       (rowid, old_row)
-  : Row.t Lwt.t
+  : (int64 * Row.t) Lwt.t
   =
   let new_row = apply_assignments ~clock ~params assignments old_row in
   compute_stored_generated_cols clock params table_meta new_row;
@@ -5122,7 +5222,7 @@ let apply_update_row
   (* #243/#249: re-keys the row when the UPDATE changed the INTEGER PRIMARY KEY
      alias column (uniqueness probe + del-old/put-new + reindex), else rewrites
      in place.  Shared with the UPSERT and ON UPDATE CASCADE paths. *)
-  let* (_ : int64) =
+  let* new_rowid =
     write_row_rekeyed
       tx
       table_meta
@@ -5135,8 +5235,9 @@ let apply_update_row
   in
   (* Return the row as actually stored (generated columns included) so callers
      such as UPDATE ... RETURNING can project committed values, not a pre-lock
-     snapshot (#226). *)
-  Lwt.return new_row
+     snapshot (#226); [new_rowid] (#417) differs from [rowid] only when the UPDATE
+     moved the INTEGER-PK alias. *)
+  Lwt.return (new_rowid, new_row)
 ;;
 
 (* Fire an UPDATE row-hook (BEFORE/AFTER) for each matched row, recomputing
@@ -5233,8 +5334,8 @@ let execute_update
          in
          let* () =
            Lwt_list.iter_s
-             (fun m ->
-                let* new_row =
+             (fun ((rowid, old_row) as m) ->
+                let* new_rowid, new_row =
                   apply_update_row
                     tx
                     cat
@@ -5246,6 +5347,15 @@ let execute_update
                     ~assignments
                     m
                 in
+                (* #417: capture the per-row pre/post images for the delta feed
+                   (no-op unless a change-capturing accumulator is installed); a
+                   rowid-changing UPDATE is recorded as Deleted+Inserted. *)
+                record_update
+                  table_meta.Cat.name
+                  ~old_rowid:rowid
+                  ~new_rowid
+                  ~old_row
+                  ~new_row;
                 (* RETURNING / row collection sees the committed row (#226). *)
                 (match collect with
                  | Some f -> f new_row
@@ -5537,10 +5647,13 @@ let execute_delete
          in
          let* () =
            Lwt_list.iter_s
-             (fun ((_rowid, old_row) as m) ->
+             (fun ((rowid, old_row) as m) ->
                 let* () =
                   apply_delete_row tx cat table_meta ~clock ~params ~child_refs ~indexes m
                 in
+                (* #417: capture the removed row for the delta feed (no-op unless
+                   a change-capturing accumulator is installed). *)
+                record_change table_meta.Cat.name (Deleted { rowid; row = old_row });
                 (* RETURNING / row collection sees the row as deleted under the
                    write lock, not a pre-lock snapshot (#226). *)
                 (match collect with

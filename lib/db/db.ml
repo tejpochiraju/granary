@@ -76,6 +76,25 @@ type query_stats = Sql.Exec.query_stats =
    internal/system tables excluded. *)
 type dirty_tables = string list
 
+(* #417 Phase 0: the row-level delta feed.  Same constructors as
+   {!Sql.Exec.row_change}, re-exported so consumers stay in [Db]. *)
+type row_change = Sql.Exec.row_change =
+  | Inserted of
+      { rowid : int64
+      ; row : Row.t
+      }
+  | Deleted of
+      { rowid : int64
+      ; row : Row.t
+      }
+  | Updated of
+      { rowid : int64
+      ; old_row : Row.t
+      ; new_row : Row.t
+      }
+
+type table_changes = (string * row_change list) list
+
 type error =
   | Parse of string
   | Sema of Sql.Sema.error
@@ -1665,6 +1684,14 @@ let execute_change_count_with_dirty top sql =
   match r with
   | Error e -> Lwt.return (Error e)
   | Ok n -> Lwt.return (Ok (n, Sql.Exec.dirty_elements acc))
+;;
+
+let execute_with_changes top sql =
+  let acc = Sql.Exec.make_change_acc () in
+  let* r = Sql.Exec.with_dirty acc (fun () -> execute top sql) in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok () -> Lwt.return (Ok (Sql.Exec.dirty_changes acc))
 ;;
 
 (* #259: single source of truth for the control-op dispatch shared by [query]
