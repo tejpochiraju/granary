@@ -37,6 +37,7 @@
   test_query_stats_239
   test_query_stats_257
   test_dirty_tables_240
+  test_dirty_changes_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269
@@ -84,6 +85,7 @@
   test_query_stats_239
   test_query_stats_257
   test_dirty_tables_240
+  test_dirty_changes_417
   test_txn_ryw_262
   test_dump_264
   test_ddl_txn_269

@@ -130,13 +130,39 @@ type query_stats =
 (** A zeroed {!query_stats} ([used_index = false]). *)
 val make_query_stats : unit -> query_stats
 
+(** #417 Phase 0: one row-level mutation captured by a change-capturing
+    {!dirty_tables_acc}.  [rowid] is the row's int64 rowid; rows are the full
+    {!Sqlocaml_encoding.Row.t} as written/removed.  [Updated] carries both the
+    pre-image ([old_row]) and post-image ([new_row]). *)
+type row_change =
+  | Inserted of
+      { rowid : int64
+      ; row : Sqlocaml_encoding.Row.t
+      }
+  | Deleted of
+      { rowid : int64
+      ; row : Sqlocaml_encoding.Row.t
+      }
+  | Updated of
+      { rowid : int64
+      ; old_row : Sqlocaml_encoding.Row.t
+      ; new_row : Sqlocaml_encoding.Row.t
+      }
+
 (** #240: opaque accumulator for the set of user tables a write statement
     mutated.  Install it around a statement with {!with_dirty} and read the
-    result with {!dirty_elements}. *)
+    result with {!dirty_elements}.  A capturing accumulator ({!make_change_acc})
+    additionally records the per-row {!row_change} deltas, read with
+    {!dirty_changes} (#417). *)
 type dirty_tables_acc
 
-(** A fresh, empty {!dirty_tables_acc}. *)
+(** A fresh, empty {!dirty_tables_acc} that records mutated table {e names} only. *)
 val make_dirty_acc : unit -> dirty_tables_acc
+
+(** #417: a fresh accumulator that additionally captures the per-row
+    {!row_change} deltas (read with {!dirty_changes}).  Row capture is opt-in:
+    {!make_dirty_acc} callers pay nothing for it. *)
+val make_change_acc : unit -> dirty_tables_acc
 
 (** [with_dirty acc f] runs [f] with [acc] installed as the active write-path
     mutation sink, so every table whose {e rows} [f] mutates — directly, or
@@ -150,6 +176,13 @@ val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 (** The user tables recorded in [acc]: sorted, deduplicated, with SQLite-reserved
     [sqlite_…] objects (sqlite_master / sqlite_sequence) excluded. *)
 val dirty_elements : dirty_tables_acc -> string list
+
+(** #417: the per-row {!row_change} deltas recorded in [acc], as [(table,
+    changes)] pairs sorted by table name, each table's changes in application
+    order.  SQLite-reserved [sqlite_…] objects are excluded, matching
+    {!dirty_elements}.  Always [[]] for a non-capturing accumulator
+    ({!make_dirty_acc}). *)
+val dirty_changes : dirty_tables_acc -> (string * row_change list) list
 
 (** #264: quote a SQL identifier with double-quotes when it is not a plain
     [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
