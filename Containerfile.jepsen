@@ -12,6 +12,14 @@
 # Build:
 #   podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
 #
+# The `--platform=linux/amd64` pin on the FROM below is load-bearing (#424): the
+# self-hosted runner host shares its rootless podman image store across all
+# workflows, and the weekly Cross-arch job (cross-arch.yml) pulls this same base
+# tag as linux/arm64. Without the pin, the next nightly `podman build` reuses the
+# cached arm64 base and dies at the first `RUN` with "Exec format error" on the
+# amd64 host. Pinning here (and on the build command) makes the base resolution
+# deterministic regardless of what the shared store was last left holding.
+#
 # Run the OCaml harness:
 #   podman run --rm -it sqlocaml-jepsen sqlocaml_jepsen --help
 #
@@ -22,7 +30,7 @@
 #   sqlocaml_jepsen --backend mem --workers 4 --ops 100 --history /tmp/history.edn
 #   cd /workspace/jepsen/clojure && clojure -M -m jepsen.check /tmp/history.edn
 
-FROM docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
+FROM --platform=linux/amd64 docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
 
 # ------------------------------------------------------------------
 # Install system deps: Java (JRE/JDK), curl, fuse, faketime, etc.
