@@ -56,8 +56,14 @@ jobs:
             "${GITHUB_SHA}"
           git checkout -q FETCH_HEAD
 
+      # --platform=linux/amd64 is required (#424): the runner host's rootless
+      # podman image store is shared across workflows, and the weekly Cross-arch
+      # job pulls the ocaml/opam base tag as arm64. Without pinning, this build's
+      # `FROM` reuses that cached arm64 base and fails at the first `RUN` with
+      # "Exec format error" on the amd64 host. The Containerfile FROM is pinned
+      # too; this is belt-and-suspenders so the target platform is unambiguous.
       - name: Build Jepsen image (cached by podman layers across runs)
-        run: podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
+        run: podman build --platform=linux/amd64 -t sqlocaml-jepsen -f Containerfile.jepsen .
 
       # No -v bind mount: paths would resolve on the host (remote podman), and
       # the image already contains this checkout at /workspace via COPY.
