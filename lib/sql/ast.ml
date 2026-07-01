@@ -198,6 +198,11 @@ type table_constraint =
       }
   (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) ON DELETE/UPDATE action *)
 
+type refresh_mode =
+  | Refresh_auto
+  | Refresh_full
+  | Refresh_delta
+
 (** Expressions, statements, and column_def are mutually recursive because
     column_def.check embeds an [expr], and subquery expressions embed a [stmt]. *)
 type expr =
@@ -394,6 +399,11 @@ and stmt =
   | S_create_view of
       { name : string
       ; query : stmt
+      }
+  | S_create_reactive_view of
+      { name : string
+      ; query : stmt
+      ; refresh : refresh_mode
       }
   | S_drop_view of
       { name : string

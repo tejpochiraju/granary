@@ -332,6 +332,11 @@ type bound_stmt =
       { name : string
       ; query : Ast.stmt
       }
+  | BS_create_reactive_view of
+      { name : string
+      ; query : Ast.stmt
+      ; refresh : Ast.refresh_mode
+      }
   | BS_drop_view of { name : string }
   | BS_create_trigger of
       { name : string
@@ -3854,6 +3859,14 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
        (match bound_r with
         | Error e -> Lwt.return (Error e)
         | Ok _ -> Lwt.return (Ok (BS_create_view { name; query }))))
+  | Ast.S_create_reactive_view { name; query; refresh } ->
+    (match reject_reserved_name name with
+     | Error e -> Lwt.return (Error e)
+     | Ok () ->
+       let* bound_r = bind_internal ~views ~named_params ~param_counter cat query in
+       (match bound_r with
+        | Error e -> Lwt.return (Error e)
+        | Ok _ -> Lwt.return (Ok (BS_create_reactive_view { name; query; refresh }))))
   | Ast.S_drop_view { name; if_exists = _ } -> Lwt.return (Ok (BS_drop_view { name }))
   | Ast.S_create_trigger { name; timing; event; table; when_; body } ->
     (match reject_reserved_name name with

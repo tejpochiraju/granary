@@ -297,6 +297,18 @@ val execute_change_count_with_dirty
     must fold deltas in order rather than assume one per rowid (#418). *)
 val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
 
+(** #427: register [cb] to fire after every commit that changes reactive view
+    [view_name]'s materialisation.  [cb] receives the native {!row_change} diffs
+    applied to [_rv_<view_name>] (Deleted/Inserted pairs; a changed aggregate row
+    is a delete of the old plus an insert of the new).  Commits that leave the
+    view unchanged — and DDL — fire nothing.  A no-op if [view_name] is not a
+    reactive view. *)
+val register_view_callback
+  :  t
+  -> view_name:string
+  -> (row_change list -> unit Lwt.t)
+  -> unit
+
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
     a best-effort name per result column: a SELECT alias or bare column name

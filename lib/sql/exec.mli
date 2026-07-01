@@ -173,6 +173,11 @@ val make_change_acc : unit -> dirty_tables_acc
     band (see {!Sqlocaml_db.Db.dirty_tables}). *)
 val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
+(** The accumulator installed by the nearest enclosing {!with_dirty}, if any.
+    Lets a caller (the #427 reactive-view driver) reuse an ambient
+    change-capturing accumulator instead of shadowing it with a fresh one. *)
+val current_dirty_acc : unit -> dirty_tables_acc option
+
 (** The user tables recorded in [acc]: sorted, deduplicated, with SQLite-reserved
     [sqlite_…] objects (sqlite_master / sqlite_sequence) excluded. *)
 val dirty_elements : dirty_tables_acc -> string list

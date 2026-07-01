@@ -6,7 +6,8 @@
   sqlocaml.store
   sqlocaml.catalog
   sqlocaml.sql
-  sqlocaml.encoding)
+  sqlocaml.encoding
+  sqlocaml.ivm)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

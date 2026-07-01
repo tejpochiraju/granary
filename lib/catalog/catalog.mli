@@ -597,6 +597,25 @@ val remove_view
   -> name:string
   -> unit Lwt.t
 
+(** #427: load all reactive-view definitions as [(name, create_sql)] pairs. *)
+val load_all_reactive_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+
+(** #427: persist a reactive view's [CREATE REACTIVE VIEW] SQL text.  [?txn] as
+    for {!persist_view}. *)
+val persist_reactive_view
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> sql:string
+  -> unit Lwt.t
+
+(** #427: remove a reactive view's SQL text.  [?txn] as above. *)
+val remove_reactive_view
+  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Sqlocaml_store.Store.t
+  -> name:string
+  -> unit Lwt.t
+
 (** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
 val load_all_triggers : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
 

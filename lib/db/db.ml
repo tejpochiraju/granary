@@ -4,6 +4,36 @@ module Cat = Sqlocaml_catalog.Catalog
 module Sql = Sqlocaml_sql
 module Row = Sqlocaml_encoding.Row
 
+(* #427: reactive-view runtime state.  A view is either full-refresh (re-run the
+   SELECT on each relevant commit) or delta-maintained through the IVM aggregate
+   engine.  [rv_query] is the parsed SELECT; [rv_out_cols] the resolved
+   materialization column names; [rv_base_tables] the tables whose row changes
+   drive the view. *)
+type rv_measure =
+  | RV_count
+  | RV_sum of int (* ordinal of the SUM column in the base row *)
+
+type rv_mode =
+  | RV_full
+  | RV_delta of
+      { group_ord : int (* ordinal of the GROUP BY column in the base row *)
+      ; measure : rv_measure
+      ; engine : Reactive_view.Agg_engine.state
+      }
+
+type rv_entry =
+  { rv_name : string
+  ; rv_query : Sql.Ast.stmt
+  ; rv_base_tables : string list
+  ; rv_out_cols : string list
+  ; mutable rv_mode : rv_mode
+  ; mutable rv_provisional : bool
+    (** #427: a full-refresh view materialised while empty gets an all-TEXT
+        placeholder schema; on the first non-empty refresh the [_rv_…] table is
+        re-created with column types inferred from the data. *)
+  ; mutable rv_callbacks : (Sql.Exec.row_change list -> unit Lwt.t) list
+  }
+
 type t =
   { mutable store : S.t
   ; mutable catalog : Cat.t
@@ -30,6 +60,19 @@ type t =
         #64).  Defaults to ["main"].  Switched via [PRAGMA
         active_database = name]; the named schema must exist in
         [attached] or equal ["main"]. *)
+  ; reactive_views : (string, rv_entry) Hashtbl.t
+    (** #427: [CREATE REACTIVE VIEW] definitions, keyed by view name.  Held on
+        the top-level handle only. *)
+  ; rv_pending : (string, Sql.Exec.row_change list) Hashtbl.t
+    (** #427: base-table row changes accumulated since the last reactive-view
+        flush, keyed by base-table name (newest-appended, application order).
+        Flushed on autocommit / COMMIT, dropped on ROLLBACK. *)
+  ; mutable rv_refreshing : bool
+    (** #427: re-entrancy guard — true while the driver writes [_rv_…] tables,
+        so those writes do not themselves drive reactive views. *)
+  ; mutable rv_resync : bool
+    (** #427: set when a savepoint rollback made the accumulated deltas
+        untrustworthy; the next flush full-resyncs every affected view. *)
   }
 
 let pp fmt t =
@@ -102,6 +145,58 @@ type error =
   | History_unavailable (* #266: as-of query on a db opened without history *)
   | History_pruned (* #266: as-of target predates the retained floor *)
 
+(* #427: forward hooks for the reactive-view driver.  The heavy lifting (reading
+   base tables, materialising [_rv_…] tables) re-enters [query]/[execute]/[run],
+   which are defined far below; these refs are populated at module-load time by
+   the implementations at the bottom of the file. *)
+let rv_load_hook : (t -> unit Lwt.t) ref = ref (fun _ -> Lwt.return_unit)
+
+let rv_create_hook
+  : (t
+     -> sql:string
+     -> name:string
+     -> Sql.Ast.stmt
+     -> Sql.Ast.refresh_mode
+     -> (unit, error) result Lwt.t)
+      ref
+  =
+  ref (fun _ ~sql:_ ~name:_ _ _ -> Lwt.return (Ok ()))
+;;
+
+let rv_flush_hook : (t -> (unit, error) result Lwt.t) ref =
+  ref (fun _ -> Lwt.return (Ok ()))
+;;
+
+(* Is [tbl] a base table of some registered reactive view? *)
+let rv_is_base_table t tbl =
+  Hashtbl.fold
+    (fun _ e found -> found || List.mem tbl e.rv_base_tables)
+    t.reactive_views
+    false
+;;
+
+let rv_absorb_one t tbl changes =
+  let prev =
+    match Hashtbl.find_opt t.rv_pending tbl with
+    | Some l -> l
+    | None -> []
+  in
+  Hashtbl.replace t.rv_pending tbl (prev @ changes)
+;;
+
+(* Accumulate one statement's captured row changes into [t.rv_pending], keeping
+   only tables that some reactive view depends on. *)
+let rv_absorb_changes t acc =
+  if Hashtbl.length t.reactive_views > 0
+  then
+    List.iter
+      (fun (tbl, changes) -> if rv_is_base_table t tbl then rv_absorb_one t tbl changes)
+      (Sql.Exec.dirty_changes acc)
+;;
+
+(* Drop all accumulated pending changes (on ROLLBACK). *)
+let rv_clear_pending t = Hashtbl.reset t.rv_pending
+
 (* File operations the SQL engine needs for ATTACH and VACUUM, injected by a
    platform driver (e.g. [sqlocaml.unix]) through [set_file_provider].  The
    core itself carries no OS/filesystem dependency (#170); when no provider is
@@ -142,6 +237,10 @@ let open_in_memory ?clock () =
     ; file_path = None
     ; attached = Hashtbl.create 1
     ; active_schema = "main"
+    ; reactive_views = Hashtbl.create 4
+    ; rv_pending = Hashtbl.create 4
+    ; rv_refreshing = false
+    ; rv_resync = false
     }
 ;;
 
@@ -202,7 +301,7 @@ let of_store ?clock ?durability ?file_path store =
   let* () = load_views_into_hashtbl store views in
   let triggers = Hashtbl.create 4 in
   let* () = load_triggers_into_hashtbl store triggers in
-  Lwt.return
+  let db =
     { store
     ; catalog
     ; clock
@@ -218,7 +317,16 @@ let of_store ?clock ?durability ?file_path store =
     ; file_path
     ; attached = Hashtbl.create 1
     ; active_schema = "main"
+    ; reactive_views = Hashtbl.create 4
+    ; rv_pending = Hashtbl.create 4
+    ; rv_refreshing = false
+    ; rv_resync = false
     }
+  in
+  (* #427: reconstruct reactive-view registry (parse defs, rebuild delta engine
+     state from the current base-table contents). *)
+  let* () = !rv_load_hook db in
+  Lwt.return db
 ;;
 
 let open_block
@@ -616,6 +724,8 @@ let rollback_txn t =
     (* #269: [force_rollback_txn] reverts any in-txn DDL's in-memory cache
        changes (schema-undo log) along with the store. *)
     let* () = force_rollback_txn t tx in
+    (* #427: the aborted txn's row changes never happened — drop them. *)
+    rv_clear_pending t;
     Lwt.return (Ok ())
 ;;
 
@@ -700,6 +810,9 @@ let rollback_to_savepoint t name =
         | _ :: rest -> trim rest
       in
       t.savepoint_names <- trim t.savepoint_names);
+    (* #427: a partial rollback makes the accumulated deltas untrustworthy;
+       resync every affected view from base tables at the enclosing COMMIT. *)
+    t.rv_resync <- true;
     Lwt.return (Ok ())
 ;;
 
@@ -1471,6 +1584,10 @@ let execute_control_op top t sql op =
            ~persist:(fun txn -> Cat.persist_view ?txn t.store ~name ~sql)
        in
        Lwt.return (Ok ()))
+  | Sql.Plan.Op_create_reactive_view { name; query; refresh } ->
+    (* #427: classify, materialise [_rv_<name>], build any delta engine, and
+       persist the definition.  Reactive views live on the top-level handle. *)
+    Some (!rv_create_hook top ~sql ~name query refresh)
   | Sql.Plan.Op_drop_view { name } ->
     Some
       (let prev = Hashtbl.find_opt t.views name in
@@ -1632,7 +1749,7 @@ let execute_dml_op_count t op =
     else Lwt.return (Ok n))
 ;;
 
-let execute top sql =
+let execute_core top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   match op with
@@ -1647,7 +1764,7 @@ let execute top sql =
      | None -> execute_dml_op t op)
 ;;
 
-let execute_change_count top sql =
+let execute_change_count_core top sql =
   let op_promise, t = compile_routed top sql in
   let* op = op_promise in
   let count_of_unit = function
@@ -1670,8 +1787,48 @@ let execute_change_count top sql =
      | None -> execute_dml_op_count t op)
 ;;
 
+(* #427: run [core ()], and when reactive views exist, capture the statement's
+   row changes and drive maintenance.  On autocommit (and after a COMMIT that
+   left [explicit_txn = None]) the accumulated deltas are flushed to the [_rv_…]
+   materialisations; inside an explicit transaction they accumulate until COMMIT.
+   The fast path (no reactive views, or re-entrant [_rv_…] writes) is unchanged. *)
+let drive_reactive top ~core =
+  if Hashtbl.length top.reactive_views = 0 || top.rv_refreshing
+  then core ()
+  else
+    let* result, acc =
+      match Sql.Exec.current_dirty_acc () with
+      | Some acc ->
+        let* r = core () in
+        Lwt.return (r, acc)
+      | None ->
+        let acc = Sql.Exec.make_change_acc () in
+        let* r = Sql.Exec.with_dirty acc core in
+        Lwt.return (r, acc)
+    in
+    (match result with
+     | Ok _ -> rv_absorb_changes top acc
+     | Error _ -> ());
+    match result with
+    | Error _ -> Lwt.return result
+    | Ok _ ->
+      if top.explicit_txn = None && (Hashtbl.length top.rv_pending > 0 || top.rv_resync)
+      then
+        let* fr = !rv_flush_hook top in
+        match fr with
+        | Ok () -> Lwt.return result
+        | Error e -> Lwt.return (Error e)
+      else Lwt.return result
+;;
+
+let execute top sql = drive_reactive top ~core:(fun () -> execute_core top sql)
+
+let execute_change_count top sql =
+  drive_reactive top ~core:(fun () -> execute_change_count_core top sql)
+;;
+
 let execute_with_dirty top sql =
-  let acc = Sql.Exec.make_dirty_acc () in
+  let acc = Sql.Exec.make_change_acc () in
   let* r = Sql.Exec.with_dirty acc (fun () -> execute top sql) in
   match r with
   | Error e -> Lwt.return (Error e)
@@ -1679,7 +1836,7 @@ let execute_with_dirty top sql =
 ;;
 
 let execute_change_count_with_dirty top sql =
-  let acc = Sql.Exec.make_dirty_acc () in
+  let acc = Sql.Exec.make_change_acc () in
   let* r = Sql.Exec.with_dirty acc (fun () -> execute_change_count top sql) in
   match r with
   | Error e -> Lwt.return (Error e)
@@ -1929,7 +2086,7 @@ let params_of_named st named =
   arr
 ;;
 
-let run st ~params =
+let run_core st ~params =
   if st.finalized
   then Lwt.return (Error (Runtime "statement already finalized"))
   else (
@@ -2010,8 +2167,10 @@ let run st ~params =
         | exn -> Lwt.fail exn))
 ;;
 
+let run st ~params = drive_reactive st.db_ref ~core:(fun () -> run_core st ~params)
+
 let run_with_dirty st ~params =
-  let acc = Sql.Exec.make_dirty_acc () in
+  let acc = Sql.Exec.make_change_acc () in
   let* r = Sql.Exec.with_dirty acc (fun () -> run st ~params) in
   match r with
   | Error e -> Lwt.return (Error e)
@@ -2463,6 +2622,593 @@ let dump_to_string t ?(schema_only = false) ?(data_only = false) () =
   match r with
   | Error _ as e -> Lwt.return e
   | Ok () -> Lwt.return (Ok (Buffer.contents buf))
+;;
+
+(* ================================================================== *)
+(* #427: reactive-view driver implementation                           *)
+(* ================================================================== *)
+
+module Rv = Reactive_view
+
+let rv_table_name name = "_rv_" ^ name
+
+(* Double-quote an identifier, escaping embedded quotes. *)
+let rv_quote id = "\"" ^ String.concat "\"\"" (String.split_on_char '"' id) ^ "\""
+
+let rv_ty_sql = function
+  | Row.Integer -> "INTEGER"
+  | Row.Text -> "TEXT"
+  | Row.Real -> "REAL"
+  | Row.Blob -> "BLOB"
+;;
+
+let rv_ty_of_value = function
+  | Row.V_int _ -> Row.Integer
+  | Row.V_real _ -> Row.Real
+  | Row.V_text _ -> Row.Text
+  | Row.V_blob _ -> Row.Blob
+  | Row.V_null -> Row.Text
+;;
+
+let rec rv_iter_ok f = function
+  | [] -> Lwt.return (Ok ())
+  | x :: xs ->
+    let* r = f x in
+    (match r with
+     | Ok () -> rv_iter_ok f xs
+     | Error _ as e -> Lwt.return e)
+;;
+
+(* Read all rows of a SQL query into a list. *)
+let rv_query_sql top sql =
+  let* r = query top sql in
+  match r with
+  | Error e -> Lwt.return (Error e)
+  | Ok stream ->
+    let* rows = Lwt_stream.to_list stream in
+    Lwt.return (Ok rows)
+;;
+
+(* Run the view's own SELECT (as a parsed AST) and collect its rows. *)
+let rv_query_ast top ast =
+  let* bound = Sql.Sema.bind ~views:top.views top.catalog ast in
+  match bound with
+  | Error e -> Lwt.return (Error (Sema e))
+  | Ok b ->
+    let op = Sql.Planner.plan ~cat:top.catalog b in
+    let mode =
+      match top.explicit_txn with
+      | None -> Sql.Exec.Auto
+      | Some tx -> Sql.Exec.In_txn tx
+    in
+    let* stream = Sql.Exec.query ~mode ~clock:top.clock top.store top.catalog op in
+    let* rows = Lwt_stream.to_list stream in
+    Lwt.return (Ok rows)
+;;
+
+let rv_current_rows top entry =
+  rv_query_sql
+    top
+    (Printf.sprintf "SELECT * FROM %s" (rv_quote (rv_table_name entry.rv_name)))
+;;
+
+(* Insert a batch of rows into [tbl] (a quoted table name) via one prepared
+   statement. *)
+let rv_insert_rows top tbl ncols rows =
+  let phs = String.concat ", " (List.init ncols (fun _ -> "?")) in
+  let sql = Printf.sprintf "INSERT INTO %s VALUES (%s)" tbl phs in
+  let* pr = prepare top sql in
+  match pr with
+  | Error e -> Lwt.return (Error e)
+  | Ok st ->
+    rv_iter_ok
+      (fun r ->
+         let* rr = run st ~params:(Array.to_list r) in
+         match rr with
+         | Ok _ -> Lwt.return (Ok ())
+         | Error e -> Lwt.return (Error e))
+      rows
+;;
+
+(* Apply an output delta [(row, weight)] to [_rv_<name>] and fire callbacks with
+   native {!row_change} diffs.  [weight < 0] rows are removed, [weight > 0] rows
+   inserted; view-output changes surface as Deleted/Inserted pairs (a changed
+   group is a delete of its old aggregate row plus an insert of the new one),
+   matching how the row-level feed models identity changes. *)
+let rv_apply_and_notify top entry out_delta =
+  if out_delta = []
+  then Lwt.return (Ok ())
+  else (
+    let tbl = rv_quote (rv_table_name entry.rv_name) in
+    let cols = entry.rv_out_cols in
+    let ncols = List.length cols in
+    let want_cb = entry.rv_callbacks <> [] in
+    let changes = ref [] in
+    let dels = List.filter_map (fun (r, w) -> if w < 0 then Some r else None) out_delta in
+    let inss = List.filter_map (fun (r, w) -> if w > 0 then Some r else None) out_delta in
+    (* Delete a materialised row by exact match.  [IS <expr>] is not supported by
+       the parser, so match NULL cells with [IS NULL] and the rest with [= ?]. *)
+    let delete_one r =
+      let conds =
+        List.mapi
+          (fun i c ->
+             match r.(i) with
+             | Row.V_null -> rv_quote c ^ " IS NULL"
+             | _ -> rv_quote c ^ " = ?")
+          cols
+      in
+      let params = Array.to_list r |> List.filter (fun v -> v <> Row.V_null) in
+      let del_sql =
+        Printf.sprintf "DELETE FROM %s WHERE %s" tbl (String.concat " AND " conds)
+      in
+      let* pr = prepare top del_sql in
+      match pr with
+      | Error e -> Lwt.return (Error e)
+      | Ok st ->
+        let* rr = run st ~params in
+        (match rr with
+         | Ok _ ->
+           if want_cb then changes := Deleted { rowid = 0L; row = r } :: !changes;
+           Lwt.return (Ok ())
+         | Error e -> Lwt.return (Error e))
+    in
+    let* rdel = rv_iter_ok delete_one dels in
+    match rdel with
+    | Error _ as e -> Lwt.return e
+    | Ok () ->
+      let phs = String.concat ", " (List.init ncols (fun _ -> "?")) in
+      let ins_sql = Printf.sprintf "INSERT INTO %s VALUES (%s)" tbl phs in
+      let* pins = prepare top ins_sql in
+      (match pins with
+       | Error e -> Lwt.return (Error e)
+       | Ok st ->
+         let* rins =
+           rv_iter_ok
+             (fun r ->
+                let* rr = run st ~params:(Array.to_list r) in
+                match rr with
+                | Ok _ ->
+                  if want_cb
+                  then
+                    changes
+                    := Inserted { rowid = top.last_insert_rowid; row = r } :: !changes;
+                  Lwt.return (Ok ())
+                | Error e -> Lwt.return (Error e))
+             inss
+         in
+         (match rins with
+          | Error _ as e -> Lwt.return e
+          | Ok () ->
+            if want_cb && !changes <> []
+            then (
+              let batch = List.rev !changes in
+              let* () = Lwt_list.iter_s (fun cb -> cb batch) entry.rv_callbacks in
+              Lwt.return (Ok ()))
+            else Lwt.return (Ok ()))))
+;;
+
+let rv_meas measure row =
+  match measure with
+  | RV_count -> 1
+  | RV_sum ord ->
+    (match row.(ord) with
+     | Row.V_int i -> Int64.to_int i
+     | Row.V_real f -> int_of_float f
+     | _ -> 0)
+;;
+
+let rv_proj group_ord measure row : Rv.Agg_engine.input =
+  { key = [| row.(group_ord) |]; meas = rv_meas measure row }
+;;
+
+let rv_change_of group_ord measure : row_change -> Rv.Agg_engine.change = function
+  | Inserted { row; _ } -> Rv.Agg_engine.Ins (rv_proj group_ord measure row)
+  | Deleted { row; _ } -> Rv.Agg_engine.Del (rv_proj group_ord measure row)
+  | Updated { old_row; new_row; _ } ->
+    Rv.Agg_engine.Upd
+      (rv_proj group_ord measure old_row, rv_proj group_ord measure new_row)
+;;
+
+(* Multiset difference of two row lists → (removed, added). *)
+let rv_multiset_diff old_rows new_rows =
+  let os = List.sort Rv.row_compare old_rows in
+  let ns = List.sort Rv.row_compare new_rows in
+  let rec go removed added os ns =
+    match os, ns with
+    | [], ns -> List.rev removed, List.rev_append added ns
+    | os, [] -> List.rev_append removed os, List.rev added
+    | o :: ot, n :: nt ->
+      let c = Rv.row_compare o n in
+      if c = 0
+      then go removed added ot nt
+      else if c < 0
+      then go (o :: removed) added ot ns
+      else go removed (n :: added) os nt
+  in
+  go [] [] os ns
+;;
+
+let rv_delta_of_diff (removed, added) =
+  List.map (fun r -> r, -1) removed @ List.map (fun r -> r, 1) added
+;;
+
+(* Full-refresh: recompute the SELECT, diff against the current materialisation,
+   apply the minimal change set. *)
+(* Per-column SQL type inferred from data: the first non-null value's type,
+   defaulting to TEXT for an all-null (or empty) column. *)
+let rv_infer_full_types rows arity =
+  List.init arity (fun i ->
+    let rec find = function
+      | [] -> "TEXT"
+      | (r : Row.value array) :: rest ->
+        (match r.(i) with
+         | Row.V_null -> find rest
+         | v -> rv_ty_sql (rv_ty_of_value v))
+    in
+    find rows)
+;;
+
+let rv_create_table top name out_cols coltypes =
+  let coldefs =
+    List.mapi (fun i c -> rv_quote c ^ " " ^ List.nth coltypes i) out_cols
+    |> String.concat ", "
+  in
+  let sql =
+    Printf.sprintf "CREATE TABLE %s (%s)" (rv_quote (rv_table_name name)) coldefs
+  in
+  execute top sql
+;;
+
+let rv_refresh_full top entry =
+  let* nr = rv_query_ast top entry.rv_query in
+  match nr with
+  | Error _ as e -> Lwt.return e
+  | Ok new_rows ->
+    (* A view materialised while empty has an all-TEXT placeholder schema; once
+       real rows exist, re-create [_rv_…] with types inferred from them so strict
+       column typing accepts the values. *)
+    if entry.rv_provisional && new_rows <> []
+    then (
+      let arity = List.length entry.rv_out_cols in
+      let coltypes = rv_infer_full_types new_rows arity in
+      let* dr =
+        execute
+          top
+          (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name)))
+      in
+      match dr with
+      | Error _ as e -> Lwt.return e
+      | Ok () ->
+        let* cr = rv_create_table top entry.rv_name entry.rv_out_cols coltypes in
+        (match cr with
+         | Error _ as e -> Lwt.return e
+         | Ok () ->
+           entry.rv_provisional <- false;
+           rv_apply_and_notify top entry (rv_delta_of_diff ([], new_rows))))
+    else
+      let* cr = rv_current_rows top entry in
+      (match cr with
+       | Error _ as e -> Lwt.return e
+       | Ok old_rows ->
+         rv_apply_and_notify
+           top
+           entry
+           (rv_delta_of_diff (rv_multiset_diff old_rows new_rows)))
+;;
+
+(* Rebuild a delta engine from the current base-table contents (used on open and
+   after a savepoint rollback made accumulated deltas untrustworthy). *)
+let rv_rebuild_engine top ~base ~group_ord ~measure =
+  let* br = rv_query_sql top (Printf.sprintf "SELECT * FROM %s" (rv_quote base)) in
+  match br with
+  | Error _ as e -> Lwt.return e
+  | Ok rows ->
+    let engine = Rv.Agg_engine.create () in
+    let evs =
+      List.map (fun row -> Rv.Agg_engine.Ins (rv_proj group_ord measure row)) rows
+    in
+    let _ = Rv.Agg_engine.step engine evs in
+    Lwt.return (Ok engine)
+;;
+
+let rv_refresh_one top entry ~resync =
+  match entry.rv_mode with
+  | RV_full -> rv_refresh_full top entry
+  | RV_delta { group_ord; measure; engine } ->
+    if resync
+    then (
+      let base = List.hd entry.rv_base_tables in
+      let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+      match er with
+      | Error _ as e -> Lwt.return e
+      | Ok fresh ->
+        entry.rv_mode <- RV_delta { group_ord; measure; engine = fresh };
+        let target = Rv.Agg_engine.snapshot fresh in
+        let* cr = rv_current_rows top entry in
+        (match cr with
+         | Error _ as e -> Lwt.return e
+         | Ok cur ->
+           rv_apply_and_notify top entry (rv_delta_of_diff (rv_multiset_diff cur target))))
+    else (
+      let base = List.hd entry.rv_base_tables in
+      let changes =
+        match Hashtbl.find_opt top.rv_pending base with
+        | Some l -> l
+        | None -> []
+      in
+      let evs = List.map (rv_change_of group_ord measure) changes in
+      let out_delta = Rv.Agg_engine.step engine evs in
+      rv_apply_and_notify top entry out_delta)
+;;
+
+let rv_flush top =
+  top.rv_refreshing <- true;
+  Lwt.finalize
+    (fun () ->
+       let dirty = Hashtbl.fold (fun k _ acc -> k :: acc) top.rv_pending [] in
+       let resync = top.rv_resync in
+       let views =
+         Hashtbl.fold
+           (fun _ e acc ->
+              if resync || List.exists (fun bt -> List.mem bt dirty) e.rv_base_tables
+              then e :: acc
+              else acc)
+           top.reactive_views
+           []
+       in
+       rv_iter_ok (fun e -> rv_refresh_one top e ~resync) views)
+    (fun () ->
+       Hashtbl.reset top.rv_pending;
+       top.rv_resync <- false;
+       top.rv_refreshing <- false;
+       Lwt.return_unit)
+;;
+
+let rv_ordinal cols name =
+  let rec go i = function
+    | [] -> None
+    | (c : Row.column) :: _ when String.equal c.name name -> Some i
+    | _ :: r -> go (i + 1) r
+  in
+  go 0 cols
+;;
+
+(* Resolve a Delta classification into base-row ordinals + a measure.  Fails
+   (Error) when the shape cannot actually be maintained (missing column, or a
+   SUM over a non-integer column). *)
+let rv_build_delta top base_tables group_col agg =
+  match base_tables with
+  | [ base ] ->
+    (match Cat.find_table_cached top.catalog ~name:base with
+     | None -> Error (Printf.sprintf "reactive view: base table '%s' not found" base)
+     | Some meta ->
+       let cols = meta.Cat.columns in
+       (match rv_ordinal cols group_col with
+        | None ->
+          Error (Printf.sprintf "reactive view: GROUP BY column '%s' not found" group_col)
+        | Some gord ->
+          (match agg with
+           | Rv.Count -> Ok (gord, RV_count)
+           | Rv.Sum_col c ->
+             (match rv_ordinal cols c with
+              | None ->
+                Error (Printf.sprintf "reactive view: SUM column '%s' not found" c)
+              | Some mord ->
+                (match (List.nth cols mord).Row.ty with
+                 | Row.Integer -> Ok (gord, RV_sum mord)
+                 | _ ->
+                   Error
+                     (Printf.sprintf
+                        "reactive view: SUM(%s) over a non-integer column is not \
+                         delta-maintainable"
+                        c))))))
+  | _ -> Error "reactive view: delta maintenance requires a single base table"
+;;
+
+let rv_group_col_ty top base group_ord =
+  match Cat.find_table_cached top.catalog ~name:base with
+  | Some meta -> rv_ty_sql (List.nth meta.Cat.columns group_ord).Row.ty
+  | None -> "TEXT"
+;;
+
+let rv_create top ~sql ~name query refresh =
+  if Hashtbl.mem top.reactive_views name
+  then
+    Lwt.return (Error (Runtime (Printf.sprintf "reactive view '%s' already exists" name)))
+  else (
+    let cls = Rv.classify query in
+    let base_tables = cls.base_tables in
+    let decided =
+      match refresh, cls.kind with
+      | Sql.Ast.Refresh_full, _ -> Ok `Full
+      | Sql.Ast.Refresh_delta, Rv.Delta { group_col; agg } ->
+        (match rv_build_delta top base_tables group_col agg with
+         | Ok x -> Ok (`Delta x)
+         | Error e -> Error e)
+      | Sql.Ast.Refresh_delta, Rv.Full ->
+        Error
+          (Printf.sprintf
+             "REFRESH DELTA: view '%s' is not delta-maintainable (only single-column \
+              COUNT/SUM GROUP BY is supported incrementally)"
+             name)
+      | Sql.Ast.Refresh_auto, Rv.Delta { group_col; agg } ->
+        (match rv_build_delta top base_tables group_col agg with
+         | Ok x -> Ok (`Delta x)
+         | Error _ -> Ok `Full)
+      | Sql.Ast.Refresh_auto, Rv.Full -> Ok `Full
+    in
+    match decided with
+    | Error e -> Lwt.return (Error (Runtime e))
+    | Ok choice ->
+      top.rv_refreshing <- true;
+      Lwt.finalize
+        (fun () ->
+           let register ~provisional mode out_cols =
+             let entry =
+               { rv_name = name
+               ; rv_query = query
+               ; rv_base_tables = base_tables
+               ; rv_out_cols = out_cols
+               ; rv_mode = mode
+               ; rv_provisional = provisional
+               ; rv_callbacks = []
+               }
+             in
+             Hashtbl.replace top.reactive_views name entry;
+             Cat.persist_reactive_view top.store ~name ~sql
+           in
+           match choice with
+           | `Delta (group_ord, measure) ->
+             let base = List.hd base_tables in
+             let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+             (match er with
+              | Error _ as e -> Lwt.return e
+              | Ok engine ->
+                let out_cols =
+                  match cls.out_cols with
+                  | Some c -> c
+                  | None -> [ "grp"; "agg" ]
+                in
+                let coltypes = [ rv_group_col_ty top base group_ord; "INTEGER" ] in
+                let* cr = rv_create_table top name out_cols coltypes in
+                (match cr with
+                 | Error _ as e -> Lwt.return e
+                 | Ok () ->
+                   let init_rows = Rv.Agg_engine.snapshot engine in
+                   let* ir =
+                     rv_insert_rows
+                       top
+                       (rv_quote (rv_table_name name))
+                       (List.length out_cols)
+                       init_rows
+                   in
+                   (match ir with
+                    | Error _ as e -> Lwt.return e
+                    | Ok () ->
+                      let* () =
+                        register
+                          ~provisional:false
+                          (RV_delta { group_ord; measure; engine })
+                          out_cols
+                      in
+                      Lwt.return (Ok ()))))
+           | `Full ->
+             let* nr = rv_query_ast top query in
+             (match nr with
+              | Error _ as e -> Lwt.return e
+              | Ok new_rows ->
+                let arity =
+                  match new_rows with
+                  | r :: _ -> Array.length r
+                  | [] ->
+                    (match cls.out_cols with
+                     | Some c -> List.length c
+                     | None -> 0)
+                in
+                if arity = 0
+                then
+                  Lwt.return
+                    (Error
+                       (Runtime
+                          (Printf.sprintf
+                             "reactive view '%s': cannot determine columns (empty result \
+                              and SELECT *); use an explicit projection"
+                             name)))
+                else (
+                  let out_cols =
+                    match cls.out_cols with
+                    | Some c when List.length c = arity -> c
+                    | _ -> List.init arity (fun i -> Printf.sprintf "c%d" i)
+                  in
+                  (* No rows yet → placeholder all-TEXT schema, re-typed on the
+                     first non-empty refresh. *)
+                  let provisional = new_rows = [] in
+                  let coltypes =
+                    if provisional
+                    then List.init arity (fun _ -> "TEXT")
+                    else rv_infer_full_types new_rows arity
+                  in
+                  let* cr = rv_create_table top name out_cols coltypes in
+                  match cr with
+                  | Error _ as e -> Lwt.return e
+                  | Ok () ->
+                    let* ir =
+                      rv_insert_rows top (rv_quote (rv_table_name name)) arity new_rows
+                    in
+                    (match ir with
+                     | Error _ as e -> Lwt.return e
+                     | Ok () ->
+                       let* () = register ~provisional RV_full out_cols in
+                       Lwt.return (Ok ())))))
+        (fun () ->
+           top.rv_refreshing <- false;
+           Lwt.return_unit))
+;;
+
+(* Rebuild the in-memory registry on open: re-parse each stored definition,
+   restore delta-engine state from the current base contents.  The persisted
+   [_rv_<name>] table already reflects the last committed state, so nothing is
+   re-materialised here. *)
+let rv_load top =
+  let* pairs = Cat.load_all_reactive_views top.store in
+  top.rv_refreshing <- true;
+  Lwt.finalize
+    (fun () ->
+       Lwt_list.iter_s
+         (fun (name, sql) ->
+            match parse sql with
+            | Ok (Sql.Ast.S_create_reactive_view { query; _ }) ->
+              let cls = Rv.classify query in
+              let out_cols =
+                match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
+                | Some meta -> List.map (fun (c : Row.column) -> c.name) meta.Cat.columns
+                | None ->
+                  (match cls.out_cols with
+                   | Some c -> c
+                   | None -> [])
+              in
+              let register mode =
+                Hashtbl.replace
+                  top.reactive_views
+                  name
+                  { rv_name = name
+                  ; rv_query = query
+                  ; rv_base_tables = cls.base_tables
+                  ; rv_out_cols = out_cols
+                  ; rv_mode = mode
+                  ; rv_provisional = false
+                  ; rv_callbacks = []
+                  };
+                Lwt.return_unit
+              in
+              (match cls.kind with
+               | Rv.Delta { group_col; agg } ->
+                 (match rv_build_delta top cls.base_tables group_col agg with
+                  | Error _ -> register RV_full
+                  | Ok (group_ord, measure) ->
+                    let base = List.hd cls.base_tables in
+                    let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+                    (match er with
+                     | Ok engine -> register (RV_delta { group_ord; measure; engine })
+                     | Error _ -> register RV_full))
+               | Rv.Full -> register RV_full)
+            | _ -> Lwt.return_unit)
+         pairs)
+    (fun () ->
+       top.rv_refreshing <- false;
+       Lwt.return_unit)
+;;
+
+let register_view_callback top ~view_name cb =
+  match Hashtbl.find_opt top.reactive_views view_name with
+  | Some e -> e.rv_callbacks <- e.rv_callbacks @ [ cb ]
+  | None -> ()
+;;
+
+let () =
+  rv_create_hook := rv_create;
+  (rv_flush_hook := fun top -> rv_flush top);
+  rv_load_hook := rv_load
 ;;
 
 [@@@ai_disclosure "ai-generated"]

@@ -185,6 +185,10 @@ rule token = parse
       | "CONFLICT"   -> CONFLICT
       | "DO"         -> DO
       | "VIEW"       -> VIEW
+      | "REACTIVE"   -> REACTIVE
+      | "REFRESH"    -> REFRESH
+      | "DELTA"      -> DELTA_KW
+      | "FULL"       -> FULL
       | "OVER"       -> OVER
       | "PARTITION"  -> PARTITION
       | "RECURSIVE"  -> RECURSIVE
