@@ -413,6 +413,12 @@ pragma_value:
   | ON                     { "on" }
   | n = INT_LIT            { Int64.to_string n }
   | s = STRING_LIT         { s }
+  (* #427: keep these keywords usable as bare pragma values, e.g.
+     [PRAGMA synchronous = full] (the #298/#334 durability API). *)
+  | FULL                   { "full" }
+  | REACTIVE               { "reactive" }
+  | REFRESH                { "refresh" }
+  | DELTA_KW               { "delta" }
 
 drop_table:
   | DROP TABLE name = any_ident

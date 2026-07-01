@@ -55,6 +55,17 @@ let rows2 db sql : (string * int) list =
 
 let mv db name = rows2 db (Printf.sprintf "SELECT * FROM _rv_%s" name)
 
+(* single-column text rows, sorted, duplicates preserved (multiset). *)
+let rows1 db sql : string list =
+  let stream = unwrap (run (Db.query db sql)) in
+  run (Lwt_stream.to_list stream)
+  |> List.map (fun r ->
+    match r.(0) with
+    | Db.V_text s -> s
+    | _ -> Alcotest.failf "expected text col for %S" sql)
+  |> List.sort compare
+;;
+
 (* ---- fixed-sequence correctness (delta COUNT + SUM) ---- *)
 
 let test_delta_count_sum () =
@@ -187,6 +198,66 @@ let test_callbacks () =
     Alcotest.(check int) "count change fires one batch" 1 (List.length !fired))
 ;;
 
+(* ---- regression (review #428): full-refresh must not collapse duplicate
+   output rows.  A non-distinct projection can hold several identical rows;
+   changing one must delete exactly one copy, not all of them. ---- *)
+
+let test_full_refresh_duplicate_rows () =
+  with_db (fun db ->
+    exec db "CREATE TABLE orders (id INTEGER PRIMARY KEY, status TEXT)";
+    exec db "CREATE REACTIVE VIEW v AS SELECT status FROM orders REFRESH FULL";
+    exec db "INSERT INTO orders VALUES (1, 'open')";
+    exec db "INSERT INTO orders VALUES (2, 'open')";
+    Alcotest.(check (list string))
+      "two identical 'open' rows are both materialised"
+      [ "open"; "open" ]
+      (rows1 db "SELECT * FROM _rv_v");
+    exec db "UPDATE orders SET status = 'closed' WHERE id = 1";
+    Alcotest.(check (list string))
+      "changing one of two duplicates deletes exactly one copy"
+      [ "closed"; "open" ]
+      (rows1 db "SELECT * FROM _rv_v");
+    (* and it must equal the authoritative query at all times *)
+    Alcotest.(check (list string))
+      "view = authoritative"
+      (rows1 db "SELECT status FROM orders")
+      (rows1 db "SELECT * FROM _rv_v"))
+;;
+
+(* ---- regression (review #428): [FULL] as a keyword must not break
+   [PRAGMA synchronous = full] (the #298/#334 durability API). ---- *)
+
+let test_pragma_full_still_parses () =
+  with_db (fun db ->
+    (match run (Db.execute db "PRAGMA synchronous = full") with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "PRAGMA synchronous = full: %a" Db.pp_error e);
+    match run (Db.execute db "PRAGMA synchronous = off") with
+    | Ok () -> ()
+    | Error e -> Alcotest.failf "PRAGMA synchronous = off: %a" Db.pp_error e)
+;;
+
+(* ---- regression (review #428): the reactive-view flush must not leak
+   synthetic [_rv_…] changes into an ambient change accumulator. ---- *)
+
+let test_no_rv_leak_into_changes () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    let changes =
+      unwrap (run (Db.execute_with_changes db "INSERT INTO t VALUES (1, 'a', 10)"))
+    in
+    let tables = List.map fst changes in
+    Alcotest.(check (list string))
+      "only the base table appears in the feed"
+      [ "t" ]
+      tables;
+    Alcotest.(check bool)
+      "no _rv_ table leaked into the change feed"
+      false
+      (List.exists (fun n -> String.length n >= 4 && String.sub n 0 4 = "_rv_") tables))
+;;
+
 (* ---- property: delta views track the DB across random op sequences ---- *)
 
 type op =
@@ -248,7 +319,22 @@ let () =
             test_refresh_full_forces_full
         ] )
     ; ( "full-refresh"
-      , [ Alcotest.test_case "min via full refresh" `Quick test_full_refresh_min ] )
+      , [ Alcotest.test_case "min via full refresh" `Quick test_full_refresh_min
+        ; Alcotest.test_case
+            "duplicate rows preserved"
+            `Quick
+            test_full_refresh_duplicate_rows
+        ] )
+    ; ( "regression"
+      , [ Alcotest.test_case
+            "pragma synchronous=full parses"
+            `Quick
+            test_pragma_full_still_parses
+        ; Alcotest.test_case
+            "no _rv_ leak into change feed"
+            `Quick
+            test_no_rv_leak_into_changes
+        ] )
     ; ( "errors"
       , [ Alcotest.test_case
             "refresh delta rejected on min"

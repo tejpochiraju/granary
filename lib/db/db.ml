@@ -2738,8 +2738,12 @@ let rv_apply_and_notify top entry out_delta =
           cols
       in
       let params = Array.to_list r |> List.filter (fun v -> v <> Row.V_null) in
+      (* [LIMIT 1]: [rv_multiset_diff] yields one [removed] entry per excess copy,
+         so each delete must remove exactly one matching row — a full-refresh view
+         whose projection is non-distinct can hold several identical rows, and an
+         unbounded DELETE would wipe all copies (silent data loss). *)
       let del_sql =
-        Printf.sprintf "DELETE FROM %s WHERE %s" tbl (String.concat " AND " conds)
+        Printf.sprintf "DELETE FROM %s WHERE %s LIMIT 1" tbl (String.concat " AND " conds)
       in
       let* pr = prepare top del_sql in
       match pr with
@@ -2859,32 +2863,61 @@ let rv_create_table top name out_cols coltypes =
   execute top sql
 ;;
 
+(* Current SQL column types of [_rv_<name>], from the catalog. *)
+let rv_table_col_types top name =
+  match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
+  | Some meta ->
+    Some (List.map (fun (c : Row.column) -> rv_ty_sql c.Row.ty) meta.Cat.columns)
+  | None -> None
+;;
+
 let rv_refresh_full top entry =
   let* nr = rv_query_ast top entry.rv_query in
   match nr with
   | Error _ as e -> Lwt.return e
   | Ok new_rows ->
-    (* A view materialised while empty has an all-TEXT placeholder schema; once
-       real rows exist, re-create [_rv_…] with types inferred from them so strict
-       column typing accepts the values. *)
-    if entry.rv_provisional && new_rows <> []
+    let arity = List.length entry.rv_out_cols in
+    let want_types =
+      if new_rows = [] then None else Some (rv_infer_full_types new_rows arity)
+    in
+    (* Re-type [_rv_…] when (a) it was a placeholder all-TEXT schema created while
+       empty, or (b) a column's runtime type has drifted (nullable/union-typed
+       projections) so the inferred type no longer matches — otherwise strict
+       column typing would reject the INSERT and fail the (already-committed)
+       triggering statement. *)
+    let needs_recreate =
+      match want_types with
+      | None -> false
+      | Some want ->
+        entry.rv_provisional
+        ||
+          (match rv_table_col_types top entry.rv_name with
+          | Some cur -> cur <> want
+          | None -> false)
+    in
+    if needs_recreate
     then (
-      let arity = List.length entry.rv_out_cols in
-      let coltypes = rv_infer_full_types new_rows arity in
-      let* dr =
-        execute
-          top
-          (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name)))
-      in
-      match dr with
+      let coltypes = Option.get want_types in
+      let* cr0 = rv_current_rows top entry in
+      match cr0 with
       | Error _ as e -> Lwt.return e
-      | Ok () ->
-        let* cr = rv_create_table top entry.rv_name entry.rv_out_cols coltypes in
-        (match cr with
+      | Ok old_rows ->
+        let* dr =
+          execute
+            top
+            (Printf.sprintf "DROP TABLE %s" (rv_quote (rv_table_name entry.rv_name)))
+        in
+        (match dr with
          | Error _ as e -> Lwt.return e
          | Ok () ->
-           entry.rv_provisional <- false;
-           rv_apply_and_notify top entry (rv_delta_of_diff ([], new_rows))))
+           let* cr = rv_create_table top entry.rv_name entry.rv_out_cols coltypes in
+           (match cr with
+            | Error _ as e -> Lwt.return e
+            | Ok () ->
+              entry.rv_provisional <- false;
+              (* Table is freshly empty: the [removed] deletes are harmless no-ops
+                 that still drive Deleted callbacks; the [added] inserts refill it. *)
+              rv_apply_and_notify top entry (rv_delta_of_diff (old_rows, new_rows)))))
     else
       let* cr = rv_current_rows top entry in
       (match cr with
@@ -2941,8 +2974,7 @@ let rv_refresh_one top entry ~resync =
       rv_apply_and_notify top entry out_delta)
 ;;
 
-let rv_flush top =
-  top.rv_refreshing <- true;
+let rv_flush_inner top =
   Lwt.finalize
     (fun () ->
        let dirty = Hashtbl.fold (fun k _ acc -> k :: acc) top.rv_pending [] in
@@ -2962,6 +2994,15 @@ let rv_flush top =
        top.rv_resync <- false;
        top.rv_refreshing <- false;
        Lwt.return_unit)
+;;
+
+let rv_flush top =
+  top.rv_refreshing <- true;
+  (* #427 review: the flush writes [_rv_<name>] via internal DML.  If a caller's
+     change-capturing accumulator is still bound (e.g. [execute_with_changes]),
+     those derived writes would surface as user changes.  Shadow it with a
+     throwaway non-capturing accumulator for the flush's extent. *)
+  Sql.Exec.with_dirty (Sql.Exec.make_dirty_acc ()) (fun () -> rv_flush_inner top)
 ;;
 
 let rv_ordinal cols name =
@@ -3145,55 +3186,68 @@ let rv_create top ~sql ~name query refresh =
            Lwt.return_unit))
 ;;
 
-(* Rebuild the in-memory registry on open: re-parse each stored definition,
-   restore delta-engine state from the current base contents.  The persisted
-   [_rv_<name>] table already reflects the last committed state, so nothing is
-   re-materialised here. *)
+(* Rebuild the in-memory registry on open: re-parse each stored definition and
+   restore delta-engine state from the current base contents.  Then reconcile
+   each [_rv_<name>] table against the freshly-computed materialisation: a crash
+   between a base commit and its view flush would otherwise leave the persisted
+   table stale forever (and future deltas would stack on a wrong base). *)
 let rv_load top =
   let* pairs = Cat.load_all_reactive_views top.store in
   top.rv_refreshing <- true;
   Lwt.finalize
     (fun () ->
+       let* () =
+         Lwt_list.iter_s
+           (fun (name, sql) ->
+              match parse sql with
+              | Ok (Sql.Ast.S_create_reactive_view { query; _ }) ->
+                let cls = Rv.classify query in
+                let out_cols =
+                  match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
+                  | Some meta ->
+                    List.map (fun (c : Row.column) -> c.name) meta.Cat.columns
+                  | None ->
+                    (match cls.out_cols with
+                     | Some c -> c
+                     | None -> [])
+                in
+                let register mode =
+                  Hashtbl.replace
+                    top.reactive_views
+                    name
+                    { rv_name = name
+                    ; rv_query = query
+                    ; rv_base_tables = cls.base_tables
+                    ; rv_out_cols = out_cols
+                    ; rv_mode = mode
+                    ; rv_provisional = false
+                    ; rv_callbacks = []
+                    };
+                  Lwt.return_unit
+                in
+                (match cls.kind with
+                 | Rv.Delta { group_col; agg } ->
+                   (match rv_build_delta top cls.base_tables group_col agg with
+                    | Error _ -> register RV_full
+                    | Ok (group_ord, measure) ->
+                      let base = List.hd cls.base_tables in
+                      let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
+                      (match er with
+                       | Ok engine -> register (RV_delta { group_ord; measure; engine })
+                       | Error _ -> register RV_full))
+                 | Rv.Full -> register RV_full)
+              | _ -> Lwt.return_unit)
+           pairs
+       in
+       (* Reconcile each persisted materialisation against recomputed state.  For
+          a cleanly-closed db this diff is empty (no writes); after a crash it
+          self-heals the stale [_rv_…] rows.  Best-effort: a failure here must not
+          block opening the database. *)
        Lwt_list.iter_s
-         (fun (name, sql) ->
-            match parse sql with
-            | Ok (Sql.Ast.S_create_reactive_view { query; _ }) ->
-              let cls = Rv.classify query in
-              let out_cols =
-                match Cat.find_table_cached top.catalog ~name:(rv_table_name name) with
-                | Some meta -> List.map (fun (c : Row.column) -> c.name) meta.Cat.columns
-                | None ->
-                  (match cls.out_cols with
-                   | Some c -> c
-                   | None -> [])
-              in
-              let register mode =
-                Hashtbl.replace
-                  top.reactive_views
-                  name
-                  { rv_name = name
-                  ; rv_query = query
-                  ; rv_base_tables = cls.base_tables
-                  ; rv_out_cols = out_cols
-                  ; rv_mode = mode
-                  ; rv_provisional = false
-                  ; rv_callbacks = []
-                  };
-                Lwt.return_unit
-              in
-              (match cls.kind with
-               | Rv.Delta { group_col; agg } ->
-                 (match rv_build_delta top cls.base_tables group_col agg with
-                  | Error _ -> register RV_full
-                  | Ok (group_ord, measure) ->
-                    let base = List.hd cls.base_tables in
-                    let* er = rv_rebuild_engine top ~base ~group_ord ~measure in
-                    (match er with
-                     | Ok engine -> register (RV_delta { group_ord; measure; engine })
-                     | Error _ -> register RV_full))
-               | Rv.Full -> register RV_full)
-            | _ -> Lwt.return_unit)
-         pairs)
+         (fun (_, e) ->
+            let* _ = rv_refresh_one top e ~resync:true in
+            Lwt.return_unit)
+         (Hashtbl.fold (fun k e acc -> (k, e) :: acc) top.reactive_views []))
     (fun () ->
        top.rv_refreshing <- false;
        Lwt.return_unit)
