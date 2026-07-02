@@ -81,6 +81,7 @@
 %token CASE WHEN THEN ELSE END
 %token AS CAST NULLIF IIF WITH
 %token CONFLICT DO VIEW
+%token REACTIVE REFRESH DELTA_KW FULL
 %token TRIGGER BEFORE AFTER
 %token INSTEAD
 %token CASCADE RESTRICT
@@ -202,6 +203,10 @@ any_ident:
   | COLUMNSTORE   { "columnstore" }
   | VALUES        { "values" }
   | VIEW          { "view" }
+  | REACTIVE      { "reactive" }
+  | REFRESH       { "refresh" }
+  | DELTA_KW      { "delta" }
+  | FULL          { "full" }
   | VIRTUAL       { "virtual" }
   | ABORT         { "abort" }
   | GROUP_CONCAT  { "group_concat" }
@@ -269,6 +274,7 @@ any_ident:
 
 stmt:
   | s = with_cte          { s }
+  | s = create_reactive_view { s }
   | s = create_view       { s }
   | s = drop_view         { s }
   | s = create_trigger    { s }
@@ -407,6 +413,12 @@ pragma_value:
   | ON                     { "on" }
   | n = INT_LIT            { Int64.to_string n }
   | s = STRING_LIT         { s }
+  (* #427: keep these keywords usable as bare pragma values, e.g.
+     [PRAGMA synchronous = full] (the #298/#334 durability API). *)
+  | FULL                   { "full" }
+  | REACTIVE               { "reactive" }
+  | REFRESH                { "refresh" }
+  | DELTA_KW               { "delta" }
 
 drop_table:
   | DROP TABLE name = any_ident
@@ -423,6 +435,15 @@ drop_index:
 create_view:
   | CREATE VIEW name = any_ident AS query = compound_select
     { Ast.S_create_view { name; query } }
+
+create_reactive_view:
+  | CREATE REACTIVE VIEW name = any_ident AS query = compound_select refresh = refresh_clause
+    { Ast.S_create_reactive_view { name; query; refresh } }
+
+refresh_clause:
+  |                 { Ast.Refresh_auto }
+  | REFRESH FULL    { Ast.Refresh_full }
+  | REFRESH DELTA_KW { Ast.Refresh_delta }
 
 drop_view:
   | DROP VIEW name = any_ident

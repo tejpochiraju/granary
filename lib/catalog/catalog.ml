@@ -20,6 +20,10 @@ let sys_fts_tid : S.tree_id = 4
 let sys_views_tid : S.tree_id = 5
 let sys_triggers_tid : S.tree_id = 6
 
+(* #427: reactive-view definitions.  Keyed by view name; value is the full
+   [CREATE REACTIVE VIEW …] SQL text, re-parsed on open (as views/triggers). *)
+let sys_reactive_views_tid : S.tree_id = 8
+
 (* #174: redundant catalog mirror.  A second, self-describing copy of every
    table's schema keyed by tree_id, so a single damaged primary-catalog page
    does not lose the schema for every table.  Also the canonical
@@ -1266,6 +1270,23 @@ let persist_view ?txn store ~name ~sql =
 let remove_view ?txn store ~name =
   borrow_or_autocommit ?txn store (fun tx ->
     S.del tx sys_views_tid (Bytes.of_string name))
+;;
+
+(* #427: reactive-view persistence — same shape as views (name -> SQL text). *)
+let load_all_reactive_views_in_tx (tx : _ S.txn) =
+  load_all_pairs_in_tx tx sys_reactive_views_tid
+;;
+
+let load_all_reactive_views store = S.with_ro store load_all_reactive_views_in_tx
+
+let persist_reactive_view ?txn store ~name ~sql =
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.put tx sys_reactive_views_tid (Bytes.of_string name) (Bytes.of_string sql))
+;;
+
+let remove_reactive_view ?txn store ~name =
+  borrow_or_autocommit ?txn store (fun tx ->
+    S.del tx sys_reactive_views_tid (Bytes.of_string name))
 ;;
 
 (* ------------------------------------------------------------------ *)

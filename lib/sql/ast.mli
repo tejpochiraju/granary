@@ -201,6 +201,15 @@ type table_constraint =
       }
   (** FOREIGN KEY(local_cols) REFERENCES parent_table(parent_cols) ON DELETE/UPDATE action *)
 
+(** Maintenance mode for a [CREATE REACTIVE VIEW] (#427).  [Refresh_auto] is the
+    absence of a [REFRESH] clause — the classifier picks delta or full at CREATE
+    time.  [Refresh_full]/[Refresh_delta] force the mode; forcing delta on an
+    unmaintainable SELECT shape is a compile error. *)
+type refresh_mode =
+  | Refresh_auto
+  | Refresh_full
+  | Refresh_delta
+
 (** Expressions, statements, and column_def are mutually recursive because
     column_def.check embeds an [expr], and subquery expressions embed a [stmt]. *)
 type expr =
@@ -403,6 +412,15 @@ and stmt =
       { name : string
       ; query : stmt
       }
+  | S_create_reactive_view of
+      { name : string
+      ; query : stmt
+      ; refresh : refresh_mode
+      }
+  (** [CREATE REACTIVE VIEW name AS query [REFRESH FULL|DELTA]] (#427).  A
+        declaratively maintained view over the IVM engine.  [refresh] records
+        the user's explicit clause; [Refresh_auto] leaves the maintenance mode
+        to the classifier at CREATE time. *)
   | S_drop_view of
       { name : string
       ; if_exists : bool

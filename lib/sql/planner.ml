@@ -997,6 +997,8 @@ let rec plan ?cat = function
     Plan.Op_with_cte
       { cte_name = name; def = plan ?cat def; query = plan ?cat query; recursive }
   | Sema.BS_create_view { name; query } -> Plan.Op_create_view { name; query }
+  | Sema.BS_create_reactive_view { name; query; refresh } ->
+    Plan.Op_create_reactive_view { name; query; refresh }
   | Sema.BS_drop_view { name } -> Plan.Op_drop_view { name }
   | Sema.BS_create_trigger { name; timing; event; table; when_; body } ->
     Plan.Op_create_trigger { name; timing; event; table; when_; body }

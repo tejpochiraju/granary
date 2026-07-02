@@ -105,6 +105,8 @@ let with_dirty (acc : dirty_tables_acc) (f : unit -> 'a Lwt.t) : 'a Lwt.t =
   Lwt.with_value dirty_tables_key (Some acc) f
 ;;
 
+let current_dirty_acc () : dirty_tables_acc option = Lwt.get dirty_tables_key
+
 (* Drain to the public shape: user tables only, deduplicated, sorted. *)
 let dirty_elements ({ names; _ } : dirty_tables_acc) : string list =
   Hashtbl.fold
@@ -5772,6 +5774,7 @@ let op_name = function
   | Plan.Op_release name -> "Release(" ^ name ^ ")"
   | Plan.Op_rollback_to name -> "RollbackTo(" ^ name ^ ")"
   | Plan.Op_create_view { name; _ } -> "CreateView(" ^ name ^ ")"
+  | Plan.Op_create_reactive_view { name; _ } -> "CreateReactiveView(" ^ name ^ ")"
   | Plan.Op_drop_view { name } -> "DropView(" ^ name ^ ")"
   | Plan.Op_create_trigger { name; _ } -> "CreateTrigger(" ^ name ^ ")"
   | Plan.Op_drop_trigger { name } -> "DropTrigger(" ^ name ^ ")"
@@ -6969,6 +6972,7 @@ let execute_with_count
     Lwt.fail_with
       "ATTACH/DETACH/database_list/active_database must be executed via Db.execute"
   | Plan.Op_create_view _
+  | Plan.Op_create_reactive_view _
   | Plan.Op_drop_view _
   | Plan.Op_create_trigger _
   | Plan.Op_drop_trigger _
@@ -9849,6 +9853,7 @@ and stream_explain clock params store mode cat analyze inner =
         | Plan.Op_release _
         | Plan.Op_rollback_to _
         | Plan.Op_create_view _
+        | Plan.Op_create_reactive_view _
         | Plan.Op_drop_view _
         | Plan.Op_create_trigger _
         | Plan.Op_drop_trigger _
@@ -10138,6 +10143,7 @@ and to_stream
   | Plan.Op_fts_delete _
   | Plan.Op_alter_table _
   | Plan.Op_create_view _
+  | Plan.Op_create_reactive_view _
   | Plan.Op_drop_view _
   | Plan.Op_create_trigger _
   | Plan.Op_drop_trigger _

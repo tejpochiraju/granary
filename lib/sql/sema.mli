@@ -282,6 +282,11 @@ type bound_stmt =
       { name : string
       ; query : Ast.stmt
       }
+  | BS_create_reactive_view of
+      { name : string
+      ; query : Ast.stmt
+      ; refresh : Ast.refresh_mode
+      }
   | BS_drop_view of { name : string }
   | BS_create_trigger of
       { name : string

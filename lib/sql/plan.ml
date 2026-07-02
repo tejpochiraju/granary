@@ -327,6 +327,11 @@ type op =
       { name : string
       ; query : Ast.stmt
       }
+  | Op_create_reactive_view of
+      { name : string
+      ; query : Ast.stmt
+      ; refresh : Ast.refresh_mode
+      }
   | Op_drop_view of { name : string }
   | Op_create_trigger of
       { name : string
