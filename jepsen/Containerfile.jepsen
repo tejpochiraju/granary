@@ -10,7 +10,13 @@
 # Run:     podman run --rm -v $(pwd):/workspace:z -w /workspace/jepsen/clojure \
 #            sqlocaml-jepsen clojure -M -m jepsen.check <history.edn> -w list-append
 
-FROM docker.io/library/clojure:temurin-21-noble
+# `--platform` pin: multi-arch base on a shared rootless podman store (#426). An
+# unpinned `FROM` can resolve to a foreign-arch image left in the store by the
+# cross-arch job and fail at build/run. The `${TARGETPLATFORM:-linux/amd64}`
+# default is safe when no `--platform` flag is passed and honours one when it is.
+# `ARG TARGETPLATFORM` is required for buildah to expand it at `FROM` time.
+ARG TARGETPLATFORM
+FROM --platform=${TARGETPLATFORM:-linux/amd64} docker.io/library/clojure:temurin-21-noble
 
 # Pre-download Clojure deps so they're cached in an image layer
 WORKDIR /deps
