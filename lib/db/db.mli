@@ -141,7 +141,10 @@ val tree_of_table : t -> string -> int option
     {!Sqlocaml_catalog.Catalog.list_tables} / {!Sqlocaml_catalog.Catalog.find_table}.
     The result reflects the schema at call time; the engine may swap its catalog
     on recovery, so treat the returned handle as a snapshot rather than caching
-    it across a reopen. Do not mutate it — schema changes go through SQL DDL. *)
+    it across a reopen. This is the {e live} handle: [Catalog.t] also exposes
+    mutators ([drop_table], [add_column], …), so "do not mutate it — schema
+    changes go through SQL DDL" is a caller contract, not enforced. See #433 for
+    a possible opaque read-only projection should this grow more consumers. *)
 val catalog : t -> Sqlocaml_catalog.Catalog.t
 
 (** Rebuild the database file in place: copies every tree from the
