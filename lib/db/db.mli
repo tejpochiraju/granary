@@ -136,6 +136,14 @@ val set_event_callback : t -> (Event.t -> unit) option -> unit
     monitor to filter page events by table (#385). *)
 val tree_of_table : t -> string -> int option
 
+(** [catalog t] is the active in-memory catalog backing [t], for read-only
+    schema/type projection — column names, types, and NOT NULL constraints via
+    {!Sqlocaml_catalog.Catalog.list_tables} / {!Sqlocaml_catalog.Catalog.find_table}.
+    The result reflects the schema at call time; the engine may swap its catalog
+    on recovery, so treat the returned handle as a snapshot rather than caching
+    it across a reopen. Do not mutate it — schema changes go through SQL DDL. *)
+val catalog : t -> Sqlocaml_catalog.Catalog.t
+
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then
     atomically renames it over the original.  This drops free-list
