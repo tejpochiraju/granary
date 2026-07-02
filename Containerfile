@@ -8,7 +8,20 @@
 # (Debian/Ubuntu: `sudo apt-get install -y qemu-user-static binfmt-support`).
 # Note: `_build/` artefacts are arch-specific — `rm -rf _build` when switching
 # the build host between architectures on the same checkout. See README.
-FROM docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
+#
+# The `--platform` pin below is load-bearing (#426): the runner host shares a
+# single rootless podman store, and the weekly cross-arch.yml job pulls this same
+# base tag as linux/arm64. An *unpinned* `FROM` would then resolve to that cached
+# arm64 image on an amd64 host and die at the first `RUN` with "Exec format
+# error". `${TARGETPLATFORM:-linux/amd64}` defaults to amd64 when no `--platform`
+# flag is passed, and buildah/podman override it when you *do* pass one — so the
+# documented arm64 build above still works, while an unpinned build is safe.
+# Repo-wide convention: every multi-arch base `FROM` pins its platform this way.
+# The `ARG TARGETPLATFORM` line is required — without it buildah/podman does not
+# expand TARGETPLATFORM at `FROM` time, so an explicit `--platform` flag would be
+# silently ignored and the arm64 build above would produce an amd64 image.
+ARG TARGETPLATFORM
+FROM --platform=${TARGETPLATFORM:-linux/amd64} docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
 USER root
 RUN apt-get update && apt-get install -y pkg-config libgmp-dev
 USER opam
