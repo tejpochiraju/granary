@@ -230,7 +230,7 @@ In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepa
 both sides, WAL, fsync-per-commit, matched page cache), separating the CPU term from the I/O term
 via `cpu/wall` per run. Full method and tables:
 [docs/benchmarks/2026-06-07-bench-222-results.md](docs/benchmarks/2026-06-07-bench-222-results.md)
-(also on the [wiki](https://git.iotready.com/tej/sqlite_ocaml_port/wiki/Benchmarks)).
+(also on the [wiki](https://git.iotready.com/experiments/kosha/wiki/Benchmarks)).
 
 **Current NVMe baseline** (`1a73da0`, after #228 PK B-tree seek, #229 O(n) bulk insert, and the
 T4/T5 read-path work) — sqlocaml is now within single-digit multiples of C SQLite on most

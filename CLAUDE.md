@@ -91,7 +91,7 @@ When your work is ready:
 
 ```sh
 git push origin <branch-name>
-~/.local/bin/forgejo pr create tej/sqlite_ocaml_port \
+~/.local/bin/forgejo pr create experiments/kosha \
   --title="feat(#NNN): short description" \
   --head=<branch-name> \
   --base=main \
@@ -110,10 +110,10 @@ EOF
 
 ### Filing issues
 
-"File an issue" means Forgejo (`tej/sqlite_ocaml_port`), not GitHub or any third-party URL.
+"File an issue" means Forgejo (`experiments/kosha`), not GitHub or any third-party URL.
 
 ```sh
-~/.local/bin/forgejo issue create tej/sqlite_ocaml_port --title="..." --body="..."
+~/.local/bin/forgejo issue create experiments/kosha --title="..." --body="..."
 ```
 
 ### Testing standards
@@ -135,16 +135,16 @@ bin/          — CLI entry point
 
 ## Forgejo CLI reference
 
-Binary: `~/.local/bin/forgejo`. Repo slug: `tej/sqlite_ocaml_port`.
+Binary: `~/.local/bin/forgejo`. Repo slug: `experiments/kosha`.
 
 Common commands:
 
 ```sh
-forgejo issue list tej/sqlite_ocaml_port
-forgejo issue view tej/sqlite_ocaml_port <N>
-forgejo issue close tej/sqlite_ocaml_port <N>
-forgejo pr list tej/sqlite_ocaml_port
-forgejo pr view tej/sqlite_ocaml_port <N>
-forgejo pr review tej/sqlite_ocaml_port <N> --approve
-forgejo pr merge tej/sqlite_ocaml_port <N> --method=squash
+forgejo issue list experiments/kosha
+forgejo issue view experiments/kosha <N>
+forgejo issue close experiments/kosha <N>
+forgejo pr list experiments/kosha
+forgejo pr view experiments/kosha <N>
+forgejo pr review experiments/kosha <N> --approve
+forgejo pr merge experiments/kosha <N> --method=squash
 ```

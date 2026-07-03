@@ -4,7 +4,7 @@
 (generate_opam_files true)
 (version 0.0.1)
 (source
- (uri "git+ssh://git@git.iotready.com:2222/tej/sqlite_ocaml_port.git"))
+ (uri "git+ssh://git@git.iotready.com:2222/experiments/kosha.git"))
 
 (package
  (name sqlocaml)
