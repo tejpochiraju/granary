@@ -7,21 +7,21 @@
      I/O callbacks via [open_block]/[open_block_wal].  Persists across
      reopen.  Inherits the B+-tree leaf-cell size limits (512-byte keys,
      1024-byte values).  Unix-file convenience constructors live in the
-     [sqlocaml.unix] driver library, not here, so the core stays
+     [granary.unix] driver library, not here, so the core stays
      platform-agnostic (#170).
 
    The two are wrapped in a sum type so callers see one [Store.t]. *)
 
 open Lwt.Syntax
-module Btree = Sqlocaml_storage.Btree
-module Pager = Sqlocaml_storage.Pager
-module Header = Sqlocaml_storage.Header
-module Freelist = Sqlocaml_storage.Freelist
-module Pager_event = Sqlocaml_storage.Pager_event
-module Page = Sqlocaml_storage.Page
-module Geometry = Sqlocaml_storage.Geometry
-module Crypto = Sqlocaml_storage.Crypto
-module Varint = Sqlocaml_encoding.Varint
+module Btree = Granary_storage.Btree
+module Pager = Granary_storage.Pager
+module Header = Granary_storage.Header
+module Freelist = Granary_storage.Freelist
+module Pager_event = Granary_storage.Pager_event
+module Page = Granary_storage.Page
+module Geometry = Granary_storage.Geometry
+module Crypto = Granary_storage.Crypto
+module Varint = Granary_encoding.Varint
 module Bytes_map = Map.Make (Bytes)
 
 type ro
@@ -132,7 +132,7 @@ type bt_state =
      commit/rollback/savepoint-rollback and on any non-append mutation of the
      tree.  Re-validated against the live page on every use, so a stale entry
      can only force the slow path, never corrupt the tree. *)
-    wal : Sqlocaml_storage.Wal.t option
+    wal : Granary_storage.Wal.t option
   ; (* When set, commits append to this WAL instead of writing to the main
      DB; reads route through it via the Pager hook. *)
     wal_close : (unit -> unit Lwt.t) option
@@ -773,7 +773,7 @@ let close (t : t) : unit Lwt.t =
       st.sync_mode <> `Full
       &&
       match st.wal with
-      | Some w -> Sqlocaml_storage.Wal.committed_frames w > 0
+      | Some w -> Granary_storage.Wal.committed_frames w > 0
       | None -> false
     in
     (* #298/#2: a failed final fsync still releases the fds (wal_close/close_fn)
@@ -1033,7 +1033,7 @@ let open_block
 (* WAL-mode opens                                                       *)
 (* ------------------------------------------------------------------ *)
 
-module Wal = Sqlocaml_storage.Wal
+module Wal = Granary_storage.Wal
 
 let install_wal_hook (pager : Pager.t) (wal : Wal.t) =
   let cb : Pager.wal_callbacks =
@@ -2413,7 +2413,7 @@ let wal_sync_count (t : t) : int =
   | Btree st ->
     (match st.wal with
      | None -> 0
-     | Some w -> Sqlocaml_storage.Wal.sync_count w)
+     | Some w -> Granary_storage.Wal.sync_count w)
 ;;
 
 (* Diagnostic/testing accessors for #164: observe that ending a snapshot
@@ -3299,7 +3299,7 @@ let set_backup_gate_max_yields (t : t) (n : int) : unit =
 
     The {!checksum} field covers the decrypted page payload (transport
     integrity for the backup frame), matching the same scheme used by
-    {!Sqlocaml_replication.replicated_frame}.  For unencrypted WALs the
+    {!Granary_replication.replicated_frame}.  For unencrypted WALs the
     plaintext equals the on-disk page; for encrypted WALs the checksum
     guards against corruption of the decrypted content during transport
     or storage, not the on-disk ciphertext. *)
@@ -3314,7 +3314,7 @@ type backup_frame =
   ; source_seed : int64
   }
 
-(* NOTE (review #8): backup_frame and Sqlocaml_replication.replicated_frame
+(* NOTE (review #8): backup_frame and Granary_replication.replicated_frame
    are structurally identical.  A future consolidation could merge them
    into a shared frame type, but the two modules have no common dependency
    today and the duplication is small enough to live with. *)

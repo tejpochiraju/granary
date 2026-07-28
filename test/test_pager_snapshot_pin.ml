@@ -14,7 +14,7 @@
     read count grows without bound. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+module S = Granary_store.Store
 
 let bs = Bytes.of_string
 let run = Lwt_main.run
@@ -119,7 +119,7 @@ let writer_commit st i =
 
 let test_pinned_snapshot_no_growing_tail () =
   (* Small cache so writer churn comfortably exceeds it. *)
-  Unix.putenv "SQLOCAML_PAGE_CACHE" "64";
+  Unix.putenv "GRANARY_PAGE_CACHE" "64";
   run
     (let* st, reads = open_store () in
      (* Seed enough rows to span a genuine multi-page working set (root +
@@ -130,7 +130,7 @@ let test_pinned_snapshot_no_growing_tail () =
      let* ro = S.ro_begin st in
      (* Warm walk: materialises (and, post-fix, pins) the working set. *)
      let* _ = walk ro in
-     (* Each cycle commits well over [SQLOCAML_PAGE_CACHE] fresh CoW pages,
+     (* Each cycle commits well over [GRANARY_PAGE_CACHE] fresh CoW pages,
        so without pinning the reader's whole working set is evicted every
        cycle; the re-fetch count then grows linearly with [cycles]. *)
      let cycles = 8 in

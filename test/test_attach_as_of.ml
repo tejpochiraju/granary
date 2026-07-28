@@ -3,22 +3,22 @@
     and get their own [<path>.aslog].  Retention is per-schema. *)
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module H = Sqlocaml_store.History
+module H = Granary_store.History
 open Lwt.Syntax
 
-let () = Sqlocaml_unix.install ()
+let () = Granary_unix.install ()
 let run = Lwt_main.run
 let counter = ref 0
 
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_attach_as_of_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_attach_as_of_%04d.db" n
 ;;
 
 let cleanup path =

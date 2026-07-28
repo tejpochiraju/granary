@@ -4,9 +4,9 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 (* ------------------------------------------------------------------ *)
@@ -214,7 +214,7 @@ let () =
     List.map
       (fun f ->
          Alcotest.test_case (Filename.basename f) `Quick (fun () ->
-           let path = Filename.temp_file "sqlocaml_corpus_" ".db" in
+           let path = Filename.temp_file "granary_corpus_" ".db" in
            Fun.protect
              ~finally:(fun () ->
                try Unix.unlink path with

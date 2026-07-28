@@ -9,8 +9,8 @@
     state; read-only — using it on a write path raises. *)
 type txn_mode =
   | Auto
-  | In_txn of Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  | In_ro_txn of Sqlocaml_store.Store.ro Sqlocaml_store.Store.txn
+  | In_txn of Granary_store.Store.rw Granary_store.Store.txn
+  | In_ro_txn of Granary_store.Store.ro Granary_store.Store.txn
 
 (** Execute a write operation ([Plan.op]) against the store and catalog.
     Runs in its own autocommit RW transaction unless [?mode] supplies an
@@ -19,43 +19,43 @@ type txn_mode =
 val execute
   :  ?mode:txn_mode
   -> ?clock:(unit -> float) option
-  -> ?params:Sqlocaml_encoding.Row.value array
+  -> ?params:Granary_encoding.Row.value array
   -> ?before_hook:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> new_row:Sqlocaml_encoding.Row.t option
-        -> old_row:Sqlocaml_encoding.Row.t option
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> new_row:Granary_encoding.Row.t option
+        -> old_row:Granary_encoding.Row.t option
         -> unit Lwt.t)
          option
   -> ?after_hook:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> new_row:Sqlocaml_encoding.Row.t option
-        -> old_row:Sqlocaml_encoding.Row.t option
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> new_row:Granary_encoding.Row.t option
+        -> old_row:Granary_encoding.Row.t option
         -> unit Lwt.t)
          option
   -> ?on_replace_delete_before:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_replace_delete:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_upsert_update_before:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
-        -> new_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
+        -> new_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_upsert_update:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
-        -> new_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
+        -> new_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
-  -> Sqlocaml_store.Store.t
-  -> Sqlocaml_catalog.Catalog.t
+  -> Granary_store.Store.t
+  -> Granary_catalog.Catalog.t
   -> Plan.op
   -> unit Lwt.t
 
@@ -67,43 +67,43 @@ val execute
 val execute_with_count
   :  ?mode:txn_mode
   -> ?clock:(unit -> float) option
-  -> ?params:Sqlocaml_encoding.Row.value array
+  -> ?params:Granary_encoding.Row.value array
   -> ?before_hook:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> new_row:Sqlocaml_encoding.Row.t option
-        -> old_row:Sqlocaml_encoding.Row.t option
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> new_row:Granary_encoding.Row.t option
+        -> old_row:Granary_encoding.Row.t option
         -> unit Lwt.t)
          option
   -> ?after_hook:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> new_row:Sqlocaml_encoding.Row.t option
-        -> old_row:Sqlocaml_encoding.Row.t option
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> new_row:Granary_encoding.Row.t option
+        -> old_row:Granary_encoding.Row.t option
         -> unit Lwt.t)
          option
   -> ?on_replace_delete_before:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_replace_delete:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_upsert_update_before:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
-        -> new_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
+        -> new_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
   -> ?on_upsert_update:
-       (tx:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-        -> old_row:Sqlocaml_encoding.Row.t
-        -> new_row:Sqlocaml_encoding.Row.t
+       (tx:Granary_store.Store.rw Granary_store.Store.txn
+        -> old_row:Granary_encoding.Row.t
+        -> new_row:Granary_encoding.Row.t
         -> unit Lwt.t)
          option
-  -> Sqlocaml_store.Store.t
-  -> Sqlocaml_catalog.Catalog.t
+  -> Granary_store.Store.t
+  -> Granary_catalog.Catalog.t
   -> Plan.op
   -> int Lwt.t
 
@@ -132,21 +132,21 @@ val make_query_stats : unit -> query_stats
 
 (** #417 Phase 0: one row-level mutation captured by a change-capturing
     {!dirty_tables_acc}.  [rowid] is the row's int64 rowid; rows are the full
-    {!Sqlocaml_encoding.Row.t} as written/removed.  [Updated] carries both the
+    {!Granary_encoding.Row.t} as written/removed.  [Updated] carries both the
     pre-image ([old_row]) and post-image ([new_row]). *)
 type row_change =
   | Inserted of
       { rowid : int64
-      ; row : Sqlocaml_encoding.Row.t
+      ; row : Granary_encoding.Row.t
       }
   | Deleted of
       { rowid : int64
-      ; row : Sqlocaml_encoding.Row.t
+      ; row : Granary_encoding.Row.t
       }
   | Updated of
       { rowid : int64
-      ; old_row : Sqlocaml_encoding.Row.t
-      ; new_row : Sqlocaml_encoding.Row.t
+      ; old_row : Granary_encoding.Row.t
+      ; new_row : Granary_encoding.Row.t
       }
 
 (** #240: opaque accumulator for the set of user tables a write statement
@@ -170,7 +170,7 @@ val make_change_acc : unit -> dirty_tables_acc
     and independent of the {!query} stats context.  Schema-changing DDL
     ([ALTER]/[DROP]) is intentionally {b not} recorded, even when it rewrites
     rows (e.g. [ALTER TABLE … DROP COLUMN]): DDL invalidation is handled out of
-    band (see {!Sqlocaml_db.Db.dirty_tables}). *)
+    band (see {!Granary_db.Db.dirty_tables}). *)
 val with_dirty : dirty_tables_acc -> (unit -> 'a Lwt.t) -> 'a Lwt.t
 
 (** The accumulator installed by the nearest enclosing {!with_dirty}, if any.
@@ -200,29 +200,29 @@ val quote_ident : string -> string
     keys, and the [WITHOUT ROWID] clause. UNIQUE and composite/table-level
     PRIMARY KEY constraints are carried by their backing indexes
     ({!ddl_of_index}), not inline. *)
-val ddl_of_table : Sqlocaml_catalog.Catalog.table_meta -> string
+val ddl_of_table : Granary_catalog.Catalog.table_meta -> string
 
 (** #264: reconstruct a [CREATE [UNIQUE] INDEX] statement from index metadata. *)
-val ddl_of_index : Sqlocaml_catalog.Catalog.index_info -> string
+val ddl_of_index : Granary_catalog.Catalog.index_info -> string
 
 (** #264: reconstruct a [CREATE VIRTUAL TABLE .. USING fts5(..)] statement. *)
-val ddl_of_fts : Sqlocaml_catalog.Catalog.fts_table_meta -> string
+val ddl_of_fts : Granary_catalog.Catalog.fts_table_meta -> string
 
 (** #330: read an FTS5 table's stored content as [(rowid, column_texts)] pairs
     through [mode] (the dump's shared snapshot / explicit txn), so [Db.dump] can
     emit [INSERT INTO fts(rowid, ..)] statements that round-trip rowids exactly.
     Rowids are surfaced only here (out-of-band), not via any SQL projection. *)
 val read_fts_content_rows
-  :  Sqlocaml_store.Store.t
+  :  Granary_store.Store.t
   -> txn_mode
-  -> Sqlocaml_catalog.Catalog.fts_table_meta
+  -> Granary_catalog.Catalog.fts_table_meta
   -> (int64 * string list) list Lwt.t
 
-(** #264: render a {!Sqlocaml_encoding.Row.value} as a standalone SQL literal
+(** #264: render a {!Granary_encoding.Row.value} as a standalone SQL literal
     that re-reads to the identical value (text quoted, blob as [X'..'], float as
     the shortest round-tripping REAL literal, non-finite floats as
     [1e999]/[-1e999]/[NULL]). Used to serialize rows as [INSERT] statements. *)
-val sql_literal_of_value : Sqlocaml_encoding.Row.value -> string
+val sql_literal_of_value : Granary_encoding.Row.value -> string
 
 (** Execute read operations; returns a lazy stream of result rows.
     [params] are the positional parameter values for [?] placeholders.
@@ -238,12 +238,12 @@ val sql_literal_of_value : Sqlocaml_encoding.Row.value -> string
 val query
   :  ?mode:txn_mode
   -> ?clock:(unit -> float) option
-  -> ?params:Sqlocaml_encoding.Row.value array
+  -> ?params:Granary_encoding.Row.value array
   -> ?stats:query_stats
-  -> Sqlocaml_store.Store.t
-  -> Sqlocaml_catalog.Catalog.t
+  -> Granary_store.Store.t
+  -> Granary_catalog.Catalog.t
   -> Plan.op
-  -> Sqlocaml_encoding.Row.t Lwt_stream.t Lwt.t
+  -> Granary_encoding.Row.t Lwt_stream.t Lwt.t
 
 (** Evaluate a [Plan.expr] against a row.  Exposed primarily for testing
     the rich expression language directly without round-tripping through
@@ -251,7 +251,7 @@ val query
     raise [Failure]. *)
 val eval_expr
   :  (unit -> float) option
-  -> Sqlocaml_encoding.Row.value array
-  -> Sqlocaml_encoding.Row.t
+  -> Granary_encoding.Row.value array
+  -> Granary_encoding.Row.t
   -> Plan.expr
-  -> Sqlocaml_encoding.Row.value
+  -> Granary_encoding.Row.value

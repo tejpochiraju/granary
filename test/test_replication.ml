@@ -1,8 +1,8 @@
 (** Unit tests for the replication apply primitive. *)
 
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
-module Replication = Sqlocaml_replication.Replication
+module Wal = Granary_storage.Wal
+module Replication = Granary_replication.Replication
 
 (* ------------------------------------------------------------------ *)
 (* In-memory byte-addressable device (same pattern as test_wal.ml)      *)
@@ -87,13 +87,13 @@ let make_frame ~epoch ~frame_idx ~page_id ~is_commit ~page =
 (* ------------------------------------------------------------------ *)
 
 let minimal_pager ?(n_pages = 10L) () =
-  Sqlocaml_storage.Pager.create
+  Granary_storage.Pager.create
     ~read_page:(fun ~page_id:_ _ -> Lwt.return (Error "not needed"))
     ~write_page:(fun ~page_id:_ _ -> Lwt.return (Error "not needed"))
     ~sync:sync_ok
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
-    ~freelist:Sqlocaml_storage.Freelist.empty
+    ~freelist:Granary_storage.Freelist.empty
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -396,7 +396,7 @@ let test_apply_grows_device () =
      (match r with
       | Ok () ->
         Alcotest.(check int) "1 committed frame" 1 (Wal.committed_frames wal);
-        let new_pages = Sqlocaml_storage.Pager.n_pages pager in
+        let new_pages = Granary_storage.Pager.n_pages pager in
         Alcotest.(check bool) "device grew" true (new_pages >= 51L)
       | Error (`Apply_error msg) -> Alcotest.failf "apply_frames: %s" msg);
      Lwt.return_unit)

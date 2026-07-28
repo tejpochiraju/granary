@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module D = Sqlocaml.Db
+module D = Granary.Db
 
 let run f = Lwt_main.run (f ())
 

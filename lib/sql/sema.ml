@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Row = Sqlocaml_encoding.Row
-module Cat = Sqlocaml_catalog.Catalog
+module Row = Granary_encoding.Row
+module Cat = Granary_catalog.Catalog
 
 let sqlite_master_meta : Cat.table_meta =
   { Cat.name = "sqlite_master"
@@ -3510,10 +3510,10 @@ let pp_error fmt = function
   | Ambiguous_column col -> Format.fprintf fmt "ambiguous column: %s" col
   | Type_mismatch { expected; got } ->
     let ty_str = function
-      | Sqlocaml_encoding.Row.Integer -> "INTEGER"
-      | Sqlocaml_encoding.Row.Text -> "TEXT"
-      | Sqlocaml_encoding.Row.Real -> "REAL"
-      | Sqlocaml_encoding.Row.Blob -> "BLOB"
+      | Granary_encoding.Row.Integer -> "INTEGER"
+      | Granary_encoding.Row.Text -> "TEXT"
+      | Granary_encoding.Row.Real -> "REAL"
+      | Granary_encoding.Row.Blob -> "BLOB"
     in
     Format.fprintf fmt "type mismatch: expected %s, got %s" (ty_str expected) (ty_str got)
   | Arity_mismatch { expected; got } ->

@@ -1,4 +1,4 @@
-open Sqlocaml_encoding.Index_key
+open Granary_encoding.Index_key
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

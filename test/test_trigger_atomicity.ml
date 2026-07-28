@@ -8,8 +8,8 @@
             atomically together. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 let run = Lwt_main.run
 

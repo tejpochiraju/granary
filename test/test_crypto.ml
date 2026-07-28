@@ -1,4 +1,4 @@
-module C = Sqlocaml_storage.Crypto
+module C = Granary_storage.Crypto
 
 let key32 = String.make 32 'k'
 

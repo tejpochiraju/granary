@@ -58,7 +58,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-bench-${{ hashFiles('sqlocaml.opam') }}
+          key: opam-5.4-bench-${{ hashFiles('granary.opam') }}
           restore-keys: opam-5.4-bench-
 
       - name: Install opam packages
@@ -71,16 +71,16 @@ jobs:
         id: run
         env:
           RAW_LABEL: ${{ github.event.inputs.host_label }}
-          SQLOCAML_BENCH_ROWS: ${{ github.event.inputs.rows }}
-          SQLOCAML_BENCH_OPS: ${{ github.event.inputs.ops }}
-          SQLOCAML_BENCH_SCANS: ${{ github.event.inputs.scans }}
-          SQLOCAML_BENCH_COMMITS: ${{ github.event.inputs.commits }}
-          SQLOCAML_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
-          SQLOCAML_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
+          GRANARY_BENCH_ROWS: ${{ github.event.inputs.rows }}
+          GRANARY_BENCH_OPS: ${{ github.event.inputs.ops }}
+          GRANARY_BENCH_SCANS: ${{ github.event.inputs.scans }}
+          GRANARY_BENCH_COMMITS: ${{ github.event.inputs.commits }}
+          GRANARY_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
+          GRANARY_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
         run: |
           LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
           [[ -z "$LABEL" ]] && LABEL="bench-ci"
-          export SQLOCAML_BENCH_HOST="$LABEL"
+          export GRANARY_BENCH_HOST="$LABEL"
           echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
           mkdir -p bench/results
           opam exec -- dune exec test/bench_compare.exe 2>&1 \
@@ -105,7 +105,7 @@ jobs:
             echo "date=$(date -u +%FT%TZ)"
             echo "nproc=$(nproc)"
             echo "sqlite_version=$(sqlite3 --version | awk '{print $1}')"
-            echo "sqlocaml_sha=$(git rev-parse --short HEAD)"
+            echo "granary_sha=$(git rev-parse --short HEAD)"
             echo "rows=$ROWS"
             echo "ops=$OPS"
             echo "scans=$SCANS"
@@ -184,5 +184,5 @@ jobs:
             echo "No change to wiki page; nothing to publish"
             exit 0
           fi
-          git -C wiki commit -m "bench(#345): results for ${LABEL} (sqlocaml ${SHA}, run ${RUN})"
+          git -C wiki commit -m "bench(#345): results for ${LABEL} (granary ${SHA}, run ${RUN})"
           git -C wiki push origin HEAD:main

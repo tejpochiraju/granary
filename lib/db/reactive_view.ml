@@ -1,5 +1,5 @@
-module Row = Sqlocaml_encoding.Row
-module Ast = Sqlocaml_sql.Ast
+module Row = Granary_encoding.Row
+module Ast = Granary_sql.Ast
 
 type agg =
   | Count
@@ -192,11 +192,11 @@ module Agg_engine = struct
     let pp fmt _ = Format.fprintf fmt "<rv_output>"
   end
 
-  module ZIn = Sqlocaml_ivm.Zset.Make (Elt)
-  module ZOut = Sqlocaml_ivm.Zset.Make (Out_elt)
-  module DIn = Sqlocaml_ivm.Delta.Make (ZIn)
+  module ZIn = Granary_ivm.Zset.Make (Elt)
+  module ZOut = Granary_ivm.Zset.Make (Out_elt)
+  module DIn = Granary_ivm.Delta.Make (ZIn)
 
-  module Agg = Sqlocaml_ivm.Aggregate.Make (struct
+  module Agg = Granary_ivm.Aggregate.Make (struct
       module In = ZIn
       module Out = ZOut
 
@@ -213,9 +213,9 @@ module Agg_engine = struct
   let create () = Agg.create ()
 
   let event_of_change = function
-    | Ins i -> Sqlocaml_ivm.Delta.Insert i
-    | Del i -> Sqlocaml_ivm.Delta.Delete i
-    | Upd (o, n) -> Sqlocaml_ivm.Delta.Update (o, n)
+    | Ins i -> Granary_ivm.Delta.Insert i
+    | Del i -> Granary_ivm.Delta.Delete i
+    | Upd (o, n) -> Granary_ivm.Delta.Update (o, n)
   ;;
 
   let step st changes =

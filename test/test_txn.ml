@@ -1,9 +1,9 @@
 (** Tests for SQL-level BEGIN / COMMIT / ROLLBACK (Phase 3). *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 let run = Lwt_main.run
@@ -13,7 +13,7 @@ let db_counter = ref 0
 let fresh_file_db () =
   let n = !db_counter in
   incr db_counter;
-  let path = Printf.sprintf "/tmp/sqlocaml_txn_test_%04d.db" n in
+  let path = Printf.sprintf "/tmp/granary_txn_test_%04d.db" n in
   (try Unix.unlink path with
    | _ -> ());
   match run (Db.open_file ~path ()) with

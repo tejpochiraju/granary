@@ -25,17 +25,17 @@
     acquire on the reader path) while tolerating environmental jitter.
 
     Env vars (all optional):
-      SQLOCAML_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
-      SQLOCAML_BENCH_N_COMMITS       writer commits (default 30)
-      SQLOCAML_BENCH_N_READERS       parallel reader fibers (default 4)
-      SQLOCAML_BENCH_READ_OPS        cursor walks per reader (default 100)
-      SQLOCAML_BENCH_SEED_ROWS       initial tree size (default 200)
-      SQLOCAML_BENCH_MIN_SPEEDUP     pass/fail threshold (default 1.2)
+      GRANARY_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
+      GRANARY_BENCH_N_COMMITS       writer commits (default 30)
+      GRANARY_BENCH_N_READERS       parallel reader fibers (default 4)
+      GRANARY_BENCH_READ_OPS        cursor walks per reader (default 100)
+      GRANARY_BENCH_SEED_ROWS       initial tree size (default 200)
+      GRANARY_BENCH_MIN_SPEEDUP     pass/fail threshold (default 1.2)
 *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module UF = Sqlocaml_unix.Unix_file
+module S = Granary_store.Store
+module UF = Granary_unix.Unix_file
 
 let run = Lwt_main.run
 let bs = Bytes.of_string
@@ -312,7 +312,7 @@ let parallel_run st ~n_commits ~n_readers ~read_ops =
   Lwt.return (!writer_done, !reader_done)
 ;;
 
-let path = "/tmp/sqlocaml_bench_fsync_overlap.db"
+let path = "/tmp/granary_bench_fsync_overlap.db"
 
 type config_result =
   { wall : float
@@ -337,18 +337,18 @@ let run_config ~delay ~n_seed mode ~n_commits ~n_readers ~read_ops =
 ;;
 
 let test_fsync_overlap () =
-  let delay_ms = getenv_int "SQLOCAML_BENCH_FSYNC_DELAY_MS" 50 in
-  let n_commits = getenv_int "SQLOCAML_BENCH_N_COMMITS" 30 in
-  let n_readers = getenv_int "SQLOCAML_BENCH_N_READERS" 4 in
-  let read_ops = getenv_int "SQLOCAML_BENCH_READ_OPS" 100 in
-  let n_seed = getenv_int "SQLOCAML_BENCH_SEED_ROWS" 200 in
+  let delay_ms = getenv_int "GRANARY_BENCH_FSYNC_DELAY_MS" 50 in
+  let n_commits = getenv_int "GRANARY_BENCH_N_COMMITS" 30 in
+  let n_readers = getenv_int "GRANARY_BENCH_N_READERS" 4 in
+  let read_ops = getenv_int "GRANARY_BENCH_READ_OPS" 100 in
+  let n_seed = getenv_int "GRANARY_BENCH_SEED_ROWS" 200 in
   (* Set conservatively at 1.2.  Observed across 8 runs in the
-     sqlocaml-dev podman image at default parameters: min 1.38, mean
+     granary-dev podman image at default parameters: min 1.38, mean
      1.51, max 1.63.  A regression that reintroduces reader-on-writer-
      lock serialisation would collapse the speedup to ~1.0x (parallel
      ≈ baseline), so 1.2x gives clear separation while tolerating
      jitter. *)
-  let min_speedup = getenv_float "SQLOCAML_BENCH_MIN_SPEEDUP" 1.2 in
+  let min_speedup = getenv_float "GRANARY_BENCH_MIN_SPEEDUP" 1.2 in
   let delay = float_of_int delay_ms /. 1000.0 in
   (* Run baseline vs parallel under the currently-configured tid pair and
      assert the overlap win clears the floor.  Called once per config. *)

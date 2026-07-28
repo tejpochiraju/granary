@@ -1,14 +1,7 @@
 (library
- (name sqlocaml_unix)
- (public_name sqlocaml.unix)
- (libraries
-  lwt
-  lwt.unix
-  unix
-  cstruct
-  sqlocaml.store
-  sqlocaml.storage
-  sqlocaml)
+ (name granary_unix)
+ (public_name granary.unix)
+ (libraries lwt lwt.unix unix cstruct granary.store granary.storage granary)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

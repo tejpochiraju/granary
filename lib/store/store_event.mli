@@ -1,5 +1,5 @@
 (** Engine-internal events surfaced to an optional observer (the internals
-    monitor; #382).  Pure — depends on nothing in {!Sqlocaml_store.Store}, so
+    monitor; #382).  Pure — depends on nothing in {!Granary_store.Store}, so
     {!Store} can depend on it without a cycle.  Events are fire-and-forget; the
     library never blocks on an observer. *)
 

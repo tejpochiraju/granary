@@ -8,7 +8,7 @@
       see [rwlock.mli] for the rationale (snapshot isolation makes
       reader/writer concurrency safe at the data layer). *)
 
-module R = Sqlocaml_store.Rwlock
+module R = Granary_store.Rwlock
 open Lwt.Syntax
 
 let run = Lwt_main.run

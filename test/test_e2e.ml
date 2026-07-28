@@ -1,12 +1,12 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module Row = Sqlocaml_encoding.Row
+module Row = Granary_encoding.Row
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -224,7 +224,7 @@ let unknown_table () =
   let db = fresh_db () in
   let result = run (Db.query db "SELECT * FROM ghost") in
   match err_or_fail "unknown_table" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl) ->
+  | Db.Sema (Granary_sql.Sema.Unknown_table tbl) ->
     Alcotest.(check string) "table name is ghost" "ghost" tbl
   | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")"
 ;;
@@ -234,7 +234,7 @@ let unknown_column () =
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.query db "SELECT bogus FROM t") in
   match err_or_fail "unknown_column" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column ...)"
 ;;
 
@@ -243,7 +243,7 @@ let type_mismatch () =
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.execute db "INSERT INTO t (x) VALUES ('text')") in
   match err_or_fail "type_mismatch" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch ...)"
 ;;
 
@@ -252,7 +252,7 @@ let arity_mismatch () =
   exec db "CREATE TABLE t (a INTEGER, b INTEGER)";
   let result = run (Db.execute db "INSERT INTO t (a) VALUES (1, 2)") in
   match err_or_fail "arity_mismatch" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Arity_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Arity_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Arity_mismatch ...)"
 ;;
 
@@ -400,7 +400,7 @@ let already_exists_error () =
   exec db "CREATE TABLE t (x INTEGER)";
   let result = run (Db.execute db "CREATE TABLE t (y TEXT)") in
   match err_or_fail "already_exists" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
+  | Db.Sema (Granary_sql.Sema.Already_exists name) ->
     Alcotest.(check string) "table name is t" "t" name
   | _ -> Alcotest.fail "expected Sema(Already_exists \"t\")"
 ;;
@@ -502,7 +502,7 @@ let real_type_mismatch () =
   (* Inserting an integer literal into a REAL column should fail type check *)
   let result = run (Db.execute db "INSERT INTO t (x) VALUES ('text')") in
   match err_or_fail "real_type_mismatch" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
 ;;
 
@@ -528,7 +528,7 @@ let blob_type_mismatch () =
   exec db "CREATE TABLE t (data BLOB)";
   let result = run (Db.execute db "INSERT INTO t (data) VALUES ('text')") in
   match err_or_fail "blob_type_mismatch" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch) for text into blob col"
 ;;
 
@@ -570,7 +570,7 @@ let already_exists_real_blob () =
   exec db "CREATE TABLE t (f REAL, b BLOB)";
   let result = run (Db.execute db "CREATE TABLE t (x INTEGER)") in
   match err_or_fail "already_exists" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Already_exists name) ->
+  | Db.Sema (Granary_sql.Sema.Already_exists name) ->
     Alcotest.(check string) "table name is t" "t" name
   | _ -> Alcotest.fail "expected Sema(Already_exists)"
 ;;
@@ -1047,7 +1047,7 @@ let create_index_unknown_table () =
   let db = fresh_db () in
   let result = run (Db.execute db "CREATE INDEX idx ON ghost (x)") in
   match err_or_fail "create_index_unknown_table" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_table _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_table)"
 ;;
 
@@ -1056,7 +1056,7 @@ let create_index_unknown_column () =
   exec db "CREATE TABLE t (id INTEGER)";
   let result = run (Db.execute db "CREATE INDEX idx ON t (bogus)") in
   match err_or_fail "create_index_unknown_column" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
 ;;
 
@@ -1066,7 +1066,7 @@ let create_index_duplicate () =
   exec db "CREATE INDEX idx ON t (id)";
   let result = run (Db.execute db "CREATE INDEX idx ON t (id)") in
   match err_or_fail "create_index_duplicate" result with
-  | Db.Sema (Sqlocaml_sql.Sema.Already_exists _) -> ()
+  | Db.Sema (Granary_sql.Sema.Already_exists _) -> ()
   | _ -> Alcotest.fail "expected Sema(Already_exists)"
 ;;
 
@@ -1332,7 +1332,7 @@ let not_null_insert_null () =
   exec db "CREATE TABLE t (n INTEGER NOT NULL)";
   let result = run (Db.execute db "INSERT INTO t (n) VALUES (NULL)") in
   match result with
-  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
+  | Error (Db.Sema (Granary_sql.Sema.Not_null_violation "n")) -> ()
   | Error (Db.Runtime _) -> () (* also acceptable: runtime enforcement *)
   | Error e ->
     (match e with
@@ -1372,7 +1372,7 @@ let not_null_update_to_null () =
   exec db "INSERT INTO t (n) VALUES (5)";
   let result = run (Db.execute db "UPDATE t SET n = NULL") in
   match result with
-  | Error (Db.Sema (Sqlocaml_sql.Sema.Not_null_violation "n")) -> ()
+  | Error (Db.Sema (Granary_sql.Sema.Not_null_violation "n")) -> ()
   | Error (Db.Runtime _) -> () (* also acceptable *)
   | Ok () -> Alcotest.fail "expected Not_null_violation on UPDATE, got Ok"
   | Error e ->
@@ -1449,14 +1449,14 @@ let qcheck_default_applied =
 (** Helper: expect a Sema(Unknown_table) error. *)
 let expect_unknown_table label result =
   match err_or_fail label result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_table _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_table _) -> ()
   | _ -> Alcotest.failf "%s: expected Sema(Unknown_table)" label
 ;;
 
 (** Helper: expect a Sema(Unknown_index) error. *)
 let expect_unknown_index label result =
   match err_or_fail label result with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_index _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_index _) -> ()
   | _ -> Alcotest.failf "%s: expected Sema(Unknown_index)" label
 ;;
 
@@ -1602,7 +1602,7 @@ let open_file_invalid_path () =
 
 (** Tempfile helper that survives a single test. *)
 let with_tempfile f =
-  let path = Filename.temp_file "sqlocaml_gap_" ".db" in
+  let path = Filename.temp_file "granary_gap_" ".db" in
   (try Unix.unlink path with
    | Unix.Unix_error _ -> ());
   let result = f path in
@@ -3489,7 +3489,7 @@ let test_check_agg_rejected () =
 
 let test_check_persisted () =
   run
-    (let tmpfile = Filename.temp_file "sqlocaml_check_" ".db" in
+    (let tmpfile = Filename.temp_file "granary_check_" ".db" in
      Fun.protect
        ~finally:(fun () ->
          try Unix.unlink tmpfile with
@@ -7062,7 +7062,7 @@ let test_trigger_multiple_body_stmts () =
 ;;
 
 let test_trigger_persists_across_reopen () =
-  let path = Filename.temp_file "sqlocaml_test" ".db" in
+  let path = Filename.temp_file "granary_test" ".db" in
   Lwt_main.run
     ((* First session: create table, trigger, insert *)
      let* result1 = Db.open_file ~path () in
@@ -9824,7 +9824,7 @@ let test_sqlite_version_value () =
   let r = query_ok db "SELECT SQLITE_VERSION()" in
   Alcotest.(check row_testable)
     "sqlite_version literal"
-    [| Db.V_text "3.45.0-sqlocaml" |]
+    [| Db.V_text "3.45.0-granary" |]
     (List.nth r 0)
 ;;
 
@@ -9834,7 +9834,7 @@ let test_sqlite_version_in_expression () =
   let r = query_ok db "SELECT LENGTH(SQLITE_VERSION())" in
   Alcotest.(check row_testable)
     "sqlite_version length"
-    [| Db.V_int (Int64.of_int (String.length "3.45.0-sqlocaml")) |]
+    [| Db.V_int (Int64.of_int (String.length "3.45.0-granary")) |]
     (List.nth r 0)
 ;;
 
@@ -11176,7 +11176,7 @@ let test_phase35_deferred_parent_delete_with_child_delete () =
 *)
 let test_phase35_deferred_btree_backend () =
   Lwt_main.run
-    (let path = Filename.temp_file "sqlocaml_phase35" ".db" in
+    (let path = Filename.temp_file "granary_phase35" ".db" in
      (* [Filename.temp_file] creates the file; [Db.open_file] expects either
        absent or a previously initialised database, so delete the empty stub
        first. *)

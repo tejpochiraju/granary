@@ -10,10 +10,10 @@
 #   make check       — Run Clojure checker on generated history
 #   make test        — Full: generate history + run checker
 
-OCAML_HARNESS ?= sqlocaml_jepsen
-HISTORY      ?= /tmp/sqlocaml_jepsen_history.edn
-IMG_DEV      ?= sqlocaml-dev
-IMG_JEPSEN   ?= sqlocaml-jepsen
+OCAML_HARNESS ?= granary_jepsen
+HISTORY      ?= /tmp/granary_jepsen_history.edn
+IMG_DEV      ?= granary-dev
+IMG_JEPSEN   ?= granary-jepsen
 
 # ---------- OCaml build targets ----------
 
@@ -35,7 +35,7 @@ run-file: build
 	@echo "=== Running list-append workload (file) ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
-		--backend file --path /tmp/sqlocaml_jepsen.db --workers 4 --ops 100 --keys 10 \
+		--backend file --path /tmp/granary_jepsen.db --workers 4 --ops 100 --keys 10 \
 		--history $(HISTORY)
 
 .PHONY: run-wal
@@ -43,7 +43,7 @@ run-wal: build
 	@echo "=== Running list-append workload (WAL) ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
-		--backend wal --path /tmp/sqlocaml_jepsen.db --workers 4 --ops 100 --keys 10 \
+		--backend wal --path /tmp/granary_jepsen.db --workers 4 --ops 100 --keys 10 \
 		--history $(HISTORY)
 
 # ---------- New workloads ----------
@@ -54,15 +54,15 @@ run-bank: build
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 		--workload bank --backend mem --workers 4 --ops 100 --keys 5 \
-		--history /tmp/sqlocaml_jepsen_bank.edn
+		--history /tmp/granary_jepsen_bank.edn
 
 .PHONY: run-set
 run-set: build
 	@echo "=== Running set workload ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
-		--workload set --backend file --path /tmp/sqlocaml_jepsen_set.db \
-		--workers 4 --ops 50 --history /tmp/sqlocaml_jepsen_set.edn
+		--workload set --backend file --path /tmp/granary_jepsen_set.db \
+		--workers 4 --ops 50 --history /tmp/granary_jepsen_set.edn
 
 .PHONY: run-counter
 run-counter: build
@@ -70,7 +70,7 @@ run-counter: build
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 		--workload counter --backend mem --workers 4 --ops 200 --keys 5 \
-		--history /tmp/sqlocaml_jepsen_counter.edn
+		--history /tmp/granary_jepsen_counter.edn
 
 # ---------- Nemesis runs ----------
 
@@ -79,9 +79,9 @@ run-crash: build
 	@echo "=== Running set workload with crash-restart ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace \
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
-		--workload set --backend wal --path /tmp/sqlocaml_jepsen_crash.db \
+		--workload set --backend wal --path /tmp/granary_jepsen_crash.db \
 		--nemesis crash-restart --crash-after 30 --workers 2 --ops 60 \
-		--history /tmp/sqlocaml_jepsen_crash.edn
+		--history /tmp/granary_jepsen_crash.edn
 
 .PHONY: run-pause
 run-pause: build
@@ -90,7 +90,7 @@ run-pause: build
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 		--workload list-append --backend mem \
 		--nemesis pause --pause-after 40 --pause-dur 3.0 --workers 4 --ops 100 \
-		--history /tmp/sqlocaml_jepsen_pause.edn
+		--history /tmp/granary_jepsen_pause.edn
 
 .PHONY: run-lazyfs
 run-lazyfs: build
@@ -100,7 +100,7 @@ run-lazyfs: build
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 		--workload set --backend wal --path /tmp/lazyfs_mount/test.db \
 		--nemesis lazyfs --workers 2 --ops 40 \
-		--history /tmp/sqlocaml_jepsen_lazyfs.edn
+		--history /tmp/granary_jepsen_lazyfs.edn
 
 .PHONY: run-clock-skew
 run-clock-skew: build
@@ -111,7 +111,7 @@ run-clock-skew: build
 		$(IMG_DEV) opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 		--workload list-append --backend mem \
 		--nemesis clock-skew --workers 4 --ops 50 \
-		--history /tmp/sqlocaml_jepsen_clockskew.edn
+		--history /tmp/granary_jepsen_clockskew.edn
 
 .PHONY: negative
 negative: build
@@ -162,23 +162,23 @@ check-counter:
 
 check-neg-dirty:
 	@echo "=== negative: dirty_read (list-append) ==="
-	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_dirty_read.edn -w list-append
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/granary_negative_dirty_read.edn -w list-append
 
 check-neg-lost:
 	@echo "=== negative: lost_update (list-append) ==="
-	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_lost_update.edn -w list-append
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/granary_negative_lost_update.edn -w list-append
 
 check-neg-bank:
 	@echo "=== negative: bank_lost_transfer ==="
-	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_bank_lost_transfer.edn -w bank
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/granary_negative_bank_lost_transfer.edn -w bank
 
 check-neg-set:
 	@echo "=== negative: set_lost_element ==="
-	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_set_lost_element.edn -w set
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/granary_negative_set_lost_element.edn -w set
 
 check-neg-counter:
 	@echo "=== negative: counter_non_monotonic ==="
-	@$(JEPSEN_RUN) $(JEPSEN_HIST)/sqlocaml_negative_counter_non_monotonic.edn -w counter
+	@$(JEPSEN_RUN) $(JEPSEN_HIST)/granary_negative_counter_non_monotonic.edn -w counter
 
 # ---------- Full CI gate ----------
 
@@ -218,16 +218,16 @@ test: build run check
 test-negative: negative
 	@echo "=== Running Clojure checker on negative controls ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
-		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/sqlocaml_negative_dirty_read.edn -w list-append; \
+		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/granary_negative_dirty_read.edn -w list-append; \
 	echo "Exit code (should be 1 — anomaly detected): $?"
 
 .PHONY: test-negative-lost
 test-negative-lost: negative
 	@echo "=== Running Clojure checker on lost-update negative control ==="
 	podman run --rm -v $(PWD)/..:/workspace:z -w /workspace/jepsen/clojure \
-		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/sqlocaml_negative_lost_update.edn -w list-append; \
+		$(IMG_JEPSEN) clojure -M -m jepsen.check /tmp/granary_negative_lost_update.edn -w list-append; \
 	echo "Exit code (should be 1 — anomaly detected): $?"
 
 .PHONY: clean
 clean:
-	rm -f /tmp/sqlocaml_jepsen*.edn /tmp/sqlocaml_jepsen*.db /tmp/sqlocaml_jepsen*.db-wal
+	rm -f /tmp/granary_jepsen*.edn /tmp/granary_jepsen*.db /tmp/granary_jepsen*.db-wal

@@ -1,8 +1,8 @@
-# sqlocaml dev image. The ocaml/opam base tag is published multi-arch, so this
+# granary dev image. The ocaml/opam base tag is published multi-arch, so this
 # Containerfile builds unchanged on both linux/amd64 and linux/arm64 (#157):
 #
-#   podman build --platform=linux/amd64 -t sqlocaml-dev:amd64 -f Containerfile .
-#   podman build --platform=linux/arm64 -t sqlocaml-dev:arm64 -f Containerfile .
+#   podman build --platform=linux/amd64 -t granary-dev:amd64 -f Containerfile .
+#   podman build --platform=linux/arm64 -t granary-dev:arm64 -f Containerfile .
 #
 # Building/running a foreign arch on an x86 host needs the qemu binfmt handlers
 # (Debian/Ubuntu: `sudo apt-get install -y qemu-user-static binfmt-support`).

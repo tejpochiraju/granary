@@ -4,7 +4,7 @@
    on sqlite3 being in PATH — run manually with sqlite3 mounted into the dev
    container (see CLAUDE.md / test_sqlite_compare). *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let ( let* ) = Lwt.bind
 let sqlite3_available () = Sys.command "sqlite3 --version >/dev/null 2>&1" = 0
@@ -45,7 +45,7 @@ let test_real_dump_roundtrip () =
   if not (sqlite3_available ())
   then Printf.printf "[SKIP] sqlite3 not in PATH — #91 import integration\n%!"
   else (
-    let db_path = Filename.temp_file "sqlocaml91_" ".sqlite" in
+    let db_path = Filename.temp_file "granary91_" ".sqlite" in
     Fun.protect
       ~finally:(fun () ->
         try Sys.remove db_path with

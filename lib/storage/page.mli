@@ -1,4 +1,4 @@
-(** Page format codec for sqlocaml.
+(** Page format codec for granary.
 
     All B+-tree on-disk state lives in 4096-byte pages.  This module defines
     the page layout as Cstruct accessors and the types for each page kind.

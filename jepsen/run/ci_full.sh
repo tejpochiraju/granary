@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Full Jepsen #177 suite + pass/fail GATE, all inside the sqlocaml-jepsen image
+# Full Jepsen #177 suite + pass/fail GATE, all inside the granary-jepsen image
 # (OCaml harness + lazyfs + libfaketime + Clojure/Elle checker). Generates fresh
 # histories into /tmp (does NOT touch the committed reference run), checks each
 # against its expected verdict, and exits non-zero on any deviation.
 #
 #   podman run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 #     -v "$PWD":/workspace:z -w /workspace --entrypoint bash \
-#     sqlocaml-jepsen jepsen/run/ci_full.sh
+#     granary-jepsen jepsen/run/ci_full.sh
 set -u
 cd /workspace
 H=/tmp/jhist
@@ -56,7 +56,7 @@ LD_PRELOAD=$FT FAKETIME="+5d" "$EXE" --workload list-append --backend mem --neme
 
 echo "=== negative controls ==="
 opam exec -- dune exec jepsen/ocaml/negative_control.exe -- >/dev/null 2>&1
-cp /tmp/sqlocaml_negative_*.edn "$H"/ 2>/dev/null
+cp /tmp/granary_negative_*.edn "$H"/ 2>/dev/null
 
 echo "=== prepare checker (Clojure/Elle) ==="
 export HOME=/tmp/cljhome
@@ -68,10 +68,10 @@ clojure -P >/tmp/prep.log 2>&1 || { echo "clojure dep prep failed"; tail -12 /tm
 CHK() { clojure -J-Djava.awt.headless=true -M -m jepsen.check "$@" >/tmp/chk.out 2>&1; }
 wl() {
   case "$1" in
-    list_append_*|sqlocaml_negative_dirty_read|sqlocaml_negative_lost_update) echo list-append ;;
-    bank_*|sqlocaml_negative_bank_lost_transfer) echo bank ;;
-    set_*|sqlocaml_negative_set_lost_element) echo set ;;
-    counter_*|sqlocaml_negative_counter_non_monotonic) echo counter ;;
+    list_append_*|granary_negative_dirty_read|granary_negative_lost_update) echo list-append ;;
+    bank_*|granary_negative_bank_lost_transfer) echo bank ;;
+    set_*|granary_negative_set_lost_element) echo set ;;
+    counter_*|granary_negative_counter_non_monotonic) echo counter ;;
   esac
 }
 
@@ -102,9 +102,9 @@ done
 echo
 echo "=== GATE: negative controls (expect INVALID / caught) ==="
 for name in \
-  sqlocaml_negative_dirty_read sqlocaml_negative_lost_update \
-  sqlocaml_negative_bank_lost_transfer sqlocaml_negative_set_lost_element \
-  sqlocaml_negative_counter_non_monotonic; do
+  granary_negative_dirty_read granary_negative_lost_update \
+  granary_negative_bank_lost_transfer granary_negative_set_lost_element \
+  granary_negative_counter_non_monotonic; do
   CHK "$H/$name.edn" -w "$(wl "$name")"; rc=$?
   if [ $rc -eq 1 ]; then printf "  CAUGHT      %s\n" "$name"
   else printf "  FAIL        %s (expected INVALID/exit 1, got %d)\n" "$name" "$rc"; fails=$((fails + 1)); fi

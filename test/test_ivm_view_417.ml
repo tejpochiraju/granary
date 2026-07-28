@@ -1,11 +1,11 @@
 (** #417 Phase 3: closing the loop.  Lift the row-level delta feed (#419) into
-    Z-set deltas ({!Sqlocaml_ivm.Delta}) and drive the incremental operators
+    Z-set deltas ({!Granary_ivm.Delta}) and drive the incremental operators
     (#421) with them, so a materialized view is maintained from a transaction's
     changes instead of recomputed — and verify the maintained view tracks the
     authoritative database state across INSERT/UPDATE/DELETE. *)
 
-module Zset = Sqlocaml_ivm.Zset
-module Delta = Sqlocaml_ivm.Delta
+module Zset = Granary_ivm.Zset
+module Delta = Granary_ivm.Delta
 
 (* ---- The lift: row mutation events -> Z-set deltas ---- *)
 
@@ -61,7 +61,7 @@ let test_lift_events_sum () =
 
 (* ---- End-to-end: a maintained view tracks the authoritative DB state ---- *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -104,7 +104,7 @@ module ZGrp = Zset.Make (struct
 module DGrp = Delta.Make (ZGrp)
 module ZOut = Zset.Make (GAgg)
 
-module CountView = Sqlocaml_ivm.Aggregate.Make (struct
+module CountView = Granary_ivm.Aggregate.Make (struct
     module In = ZGrp
     module Out = ZOut
 
@@ -120,7 +120,7 @@ module CountView = Sqlocaml_ivm.Aggregate.Make (struct
 module ZGA = Zset.Make (GAgg)
 module DGA = Delta.Make (ZGA)
 
-module SumView = Sqlocaml_ivm.Aggregate.Make (struct
+module SumView = Granary_ivm.Aggregate.Make (struct
     module In = ZGA
     module Out = ZOut
 

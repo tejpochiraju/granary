@@ -1,6 +1,6 @@
-(** Tests for Sqlocaml_storage.Btree (CoW B+-tree). *)
+(** Tests for Granary_storage.Btree (CoW B+-tree). *)
 
-open Sqlocaml_storage
+open Granary_storage
 
 (* ------------------------------------------------------------------ *)
 (* Mock in-memory pager (same pattern as test_pager.ml)                 *)

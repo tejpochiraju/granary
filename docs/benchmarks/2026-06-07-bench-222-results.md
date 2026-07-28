@@ -125,8 +125,8 @@ under `full`) and `commit_n` (single-row txns):
 
 ```bash
 # matched the 2026-06-02 parameters for comparability (the script's bare defaults are larger):
-SQLOCAML_BENCH_ROWS=5000 SQLOCAML_BENCH_OPS=500 SQLOCAML_BENCH_SCANS=20 \
-  SQLOCAML_BENCH_COMMITS=50 SQLOCAML_BENCH_REPEATS=2 scripts/bench222.sh otp-prod-1
+GRANARY_BENCH_ROWS=5000 GRANARY_BENCH_OPS=500 GRANARY_BENCH_SCANS=20 \
+  GRANARY_BENCH_COMMITS=50 GRANARY_BENCH_REPEATS=2 scripts/bench222.sh otp-prod-1
 # → builds the bench image, runs locally, writes bench/results/<host>.csv
 ```
 

@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-${{ matrix.arch }}-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          key: opam-5.4-${{ matrix.arch }}-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
           restore-keys: opam-5.4-${{ matrix.arch }}-
 
       - name: Install opam packages
@@ -77,10 +77,10 @@ jobs:
         # run for smoke coverage but their wall-time thresholds are meaningless
         # under emulation, so disable them here (esp. on the arm64/qemu leg).
         env:
-          SQLOCAML_BENCH_MIN_SPEEDUP: "0"
-          SQLOCAML_BENCH_PARALLEL_MAX: "1000000"
-          SQLOCAML_BENCH_MAX_WRITER_S: "1000000"
-          SQLOCAML_BENCH_MAX_RATIO: "1000000"
+          GRANARY_BENCH_MIN_SPEEDUP: "0"
+          GRANARY_BENCH_PARALLEL_MAX: "1000000"
+          GRANARY_BENCH_MAX_WRITER_S: "1000000"
+          GRANARY_BENCH_MAX_RATIO: "1000000"
         run: opam exec -- dune runtest
 
       - name: Record runtime

@@ -1,15 +1,15 @@
-(** Unix-file convenience constructors for {!Sqlocaml_store.Store}.
+(** Unix-file convenience constructors for {!Granary_store.Store}.
     They build pager block-IO closures over a [Unix_file] (and a WAL sidecar)
     and hand them to the platform-agnostic [Store.open_block]/[open_block_wal],
     so the store core stays free of any [unix] dependency (#170). *)
 
 (** [file_history_sink ~path] (#266) is an append-only, fsync-on-append
-    {!Sqlocaml_store.History.sink} backed by the file at [path] (the
+    {!Granary_store.History.sink} backed by the file at [path] (the
     [<db>.aslog] sidecar).  A torn tail record is dropped on load. *)
-val file_history_sink : path:string -> Sqlocaml_store.History.sink
+val file_history_sink : path:string -> Granary_store.History.sink
 
 (** Open a B+-tree store over a Unix file at [path].  Creates and pre-sizes the
-    file if absent; otherwise reopens an existing sqlocaml database.
+    file if absent; otherwise reopens an existing granary database.
 
     [page_size] (default 4096) and [reserved_bytes_per_page] (default 0) set the
     page geometry when CREATING a fresh file (#95); both are fixed for the life
@@ -32,7 +32,7 @@ val open_file
   -> ?key:string
   -> path:string
   -> unit
-  -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
+  -> (Granary_store.Store.t, Granary_store.Store.error) result Lwt.t
 
 (** Open a WAL-mode store using [path] for the main DB and [path ^ "-wal"] for
     the WAL.  Crash recovery on the WAL runs automatically at open.  Geometry
@@ -53,7 +53,7 @@ val open_file_wal
   -> ?key:string
   -> path:string
   -> unit
-  -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
+  -> (Granary_store.Store.t, Granary_store.Store.error) result Lwt.t
 
 (** One-shot hot copy of [src] to a new file at [dest].
     Writes to a temporary file first, then atomically renames to [dest]
@@ -65,9 +65,9 @@ val open_file_wal
     pages through the snapshot WAL overlay, so recently committed
     but un-checkpointed data is included). *)
 val copy_to_file
-  :  Sqlocaml_store.Store.t
+  :  Granary_store.Store.t
   -> dest:string
-  -> (unit, Sqlocaml_store.Store.error) result Lwt.t
+  -> (unit, Granary_store.Store.error) result Lwt.t
 
 (** [rotate_key_file ~src_path ~old_key ~new_key ~dest] offline-rotates the
     encryption key of the database at [src_path] (opened with [old_key]),
@@ -85,4 +85,4 @@ val rotate_key_file
   -> old_key:string
   -> new_key:string
   -> dest:string
-  -> (unit, Sqlocaml_store.Store.error) result Lwt.t
+  -> (unit, Granary_store.Store.error) result Lwt.t

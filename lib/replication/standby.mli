@@ -28,15 +28,15 @@ type t
     successful apply batch with the standby's local
     [Wal.committed_frames] count.  The application typically uses it to
     advance the master's replication floor via
-    {!Sqlocaml_store.Store.update_replication_position}, so the master's
+    {!Granary_store.Store.update_replication_position}, so the master's
     checkpoint gate reflects the standby's true applied position.  The
     callback must not raise: in [start_following] it is caught by the
     loop's exception handler and degrades to an
     [`Apply_error]; in [rebase] it is not caught.  No-op when omitted. *)
 val create
-  :  store:Sqlocaml_store.Store.t
-  -> pager:Sqlocaml_storage.Pager.t
-  -> wal:Sqlocaml_storage.Wal.t
+  :  store:Granary_store.Store.t
+  -> pager:Granary_storage.Pager.t
+  -> wal:Granary_storage.Wal.t
   -> ?on_standby_ack:(int -> unit)
   -> unit
   -> t

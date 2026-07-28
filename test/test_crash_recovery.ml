@@ -10,19 +10,19 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module FI = Sqlocaml_unix.Fault_inject
+module FI = Granary_unix.Fault_inject
 
 let counter = ref 0
 
 let tmp_path () =
   incr counter;
   Printf.sprintf
-    "/tmp/sqlocaml_crash_%d_%d_%d.db"
+    "/tmp/granary_crash_%d_%d_%d.db"
     (Unix.getpid ())
     !counter
     (Random.int 1_000_000)

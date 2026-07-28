@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
-module C = Sqlocaml_storage.Crypto
+module Wal = Granary_storage.Wal
+module C = Granary_storage.Crypto
 
 let seed () = Mirage_crypto_rng_unix.use_default ()
 

@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -186,7 +186,7 @@ let update_unknown_table () =
   let db = fresh_db () in
   let result = run (Db.execute db "UPDATE ghost SET n = 1") in
   match result with
-  | Error (Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl)) ->
+  | Error (Db.Sema (Granary_sql.Sema.Unknown_table tbl)) ->
     Alcotest.(check string) "table name" "ghost" tbl
   | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")"
 ;;
@@ -196,7 +196,7 @@ let update_unknown_column () =
   exec db "CREATE TABLE t (n INTEGER)";
   let e = exec_err db "UPDATE t SET bad_col = 1" in
   match e with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
 ;;
 
@@ -205,7 +205,7 @@ let update_unknown_column_in_where () =
   exec db "CREATE TABLE t (n INTEGER)";
   let e = exec_err db "UPDATE t SET n = 1 WHERE bogus = 2" in
   match e with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
 ;;
 
@@ -214,7 +214,7 @@ let update_type_mismatch_int_text () =
   exec db "CREATE TABLE t (n INTEGER)";
   let e = exec_err db "UPDATE t SET n = 'text'" in
   match e with
-  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
 ;;
 
@@ -223,7 +223,7 @@ let update_type_mismatch_text_int () =
   exec db "CREATE TABLE t (s TEXT)";
   let e = exec_err db "UPDATE t SET s = 42" in
   match e with
-  | Db.Sema (Sqlocaml_sql.Sema.Type_mismatch _) -> ()
+  | Db.Sema (Granary_sql.Sema.Type_mismatch _) -> ()
   | _ -> Alcotest.fail "expected Sema(Type_mismatch)"
 ;;
 
@@ -533,12 +533,12 @@ let qcheck_update_count_matches =
 (* Group 8: Known limitations                                           *)
 (* ------------------------------------------------------------------ *)
 
-(* sqlocaml checks UNIQUE constraints against committed (pre-update) index
+(* granary checks UNIQUE constraints against committed (pre-update) index
    state before applying any mutations.  This means a single UPDATE that
    "swaps" two unique values across rows is rejected, even though the final
    state would be valid: when the check runs for the first row being updated
    (n=1 → n=-1), the committed index still contains -1 (owned by the second
-   row), so sqlocaml raises a UNIQUE violation.
+   row), so granary raises a UNIQUE violation.
 
    This is a known Phase 2 limitation: a correct implementation would defer
    the constraint check until all row mutations have been applied (or remove
@@ -553,7 +553,7 @@ let update_unique_swap_rejected () =
      let* _ = Db.execute db "INSERT INTO t (id, n) VALUES (2, -1)" in
      (* Attempt to negate all n values: row 1: 1 -> -1, row 2: -1 -> 1.
        Logically this is a pure swap and the final state would satisfy
-       UNIQUE(n), but sqlocaml rejects it because -1 already exists in the
+       UNIQUE(n), but granary rejects it because -1 already exists in the
        committed index when the pre-update check runs for row 1. *)
      let* result = Db.execute db "UPDATE t SET n = 0 - n" in
      (* Expect a UNIQUE violation Runtime error — not Ok. *)

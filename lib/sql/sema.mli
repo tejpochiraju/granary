@@ -35,7 +35,7 @@ type bound_expr =
   | BE_in of bound_expr * bound_expr list (** IN value list predicate. *)
   | BE_func of Ast.scalar_func * bound_expr list (** Scalar function call (Phase 5). *)
   | BE_param of int (** 0-indexed positional parameter (?). *)
-  | BE_match of Sqlocaml_catalog.Catalog.fts_table_meta * Fts_query.t
+  | BE_match of Granary_catalog.Catalog.fts_table_meta * Fts_query.t
   (** FTS MATCH expression: [table MATCH 'query']. *)
   | BE_subquery of Ast.stmt (** Scalar subquery: [(SELECT ...)] in expression position. *)
   | BE_exists of Ast.stmt (** EXISTS predicate: [EXISTS (SELECT ...)]. *)
@@ -93,7 +93,7 @@ type agg_proj_item =
     right table columns occupy [right_col_offset .. right_col_offset + n_right - 1]. *)
 type bound_join =
   { kind : Ast.join_kind
-  ; right_meta : Sqlocaml_catalog.Catalog.table_meta
+  ; right_meta : Granary_catalog.Catalog.table_meta
   ; on : bound_expr
   ; right_col_offset : int
     (** ordinal of the first right-table column in the combined row *)
@@ -111,13 +111,13 @@ type bound_stmt =
   | BS_no_op
   | BS_col_create_table of
       { name : string
-      ; columns : Sqlocaml_encoding.Row.column list
+      ; columns : Granary_encoding.Row.column list
       ; if_not_exists : bool
       }
   | BS_create_table of
       { name : string
-      ; columns : Sqlocaml_encoding.Row.column list
-      ; uniq_idxs : (string * string list * Sqlocaml_catalog.Catalog.idx_origin) list
+      ; columns : Granary_encoding.Row.column list
+      ; uniq_idxs : (string * string list * Granary_catalog.Catalog.idx_origin) list
         (** Auto-generated UNIQUE index specs: (index_name, [col_name; ...], origin).
             [origin] is [`Implicit_pk] for PRIMARY KEY constraints, [`Implicit_unique]
             for UNIQUE constraints.  Planner creates Op_create_index for each. *)
@@ -126,8 +126,8 @@ type bound_stmt =
           (string list
           * string
           * string list
-          * Sqlocaml_catalog.Catalog.fk_action
-          * Sqlocaml_catalog.Catalog.fk_action
+          * Granary_catalog.Catalog.fk_action
+          * Granary_catalog.Catalog.fk_action
           * bool)
             list
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
@@ -140,7 +140,7 @@ type bound_stmt =
             (single-column ascending INTEGER PK, rowid table). *)
       }
   | BS_insert of
-      { table_meta : Sqlocaml_catalog.Catalog.table_meta
+      { table_meta : Granary_catalog.Catalog.table_meta
       ; ordinals : int list (** column ordinals for the named cols *)
       ; values : bound_expr list list (* one sublist per VALUES row *)
       ; on_conflict : Ast.conflict_action option
@@ -148,14 +148,14 @@ type bound_stmt =
       ; upsert_update : (string list * (int * bound_expr) list) option
       }
   | BS_insert_select of
-      { table_meta : Sqlocaml_catalog.Catalog.table_meta
+      { table_meta : Granary_catalog.Catalog.table_meta
       ; ordinals : int list
       ; source : bound_stmt
       ; on_conflict : Ast.conflict_action option
       }
   | BS_select of
       { distinct : bool
-      ; table_meta : Sqlocaml_catalog.Catalog.table_meta
+      ; table_meta : Granary_catalog.Catalog.table_meta
       ; proj : int list
         (** column ordinals to project
                                             (refer to the combined row when [join] is set)
@@ -190,7 +190,7 @@ type bound_stmt =
       }
   | BS_create_index of
       { name : string
-      ; table_meta : Sqlocaml_catalog.Catalog.table_meta
+      ; table_meta : Granary_catalog.Catalog.table_meta
       ; col_sqls : string list (** col name (plain) or expr SQL (expression) *)
       ; col_expr_flags : bool list (** true = expression index *)
       ; where_expr : bound_expr option
@@ -199,7 +199,7 @@ type bound_stmt =
       ; if_not_exists : bool
       }
   | BS_update of
-      { table_meta : Sqlocaml_catalog.Catalog.table_meta
+      { table_meta : Granary_catalog.Catalog.table_meta
       ; assignments : (int * bound_expr) list (** [(col_ordinal, new_value_expr)] *)
       ; where : bound_expr option
       ; order : bound_order_key list
@@ -208,7 +208,7 @@ type bound_stmt =
       ; returning : bound_expr list
       }
   | BS_delete of
-      { table_meta : Sqlocaml_catalog.Catalog.table_meta
+      { table_meta : Granary_catalog.Catalog.table_meta
       ; where : bound_expr option
       ; order : bound_order_key list
       ; limit : int option
@@ -217,11 +217,11 @@ type bound_stmt =
       }
   | BS_drop_table of
       { name : string
-      ; table_meta : Sqlocaml_catalog.Catalog.table_meta
+      ; table_meta : Granary_catalog.Catalog.table_meta
       }
   | BS_drop_index of
       { name : string
-      ; idx_info : Sqlocaml_catalog.Catalog.index_info
+      ; idx_info : Granary_catalog.Catalog.index_info
       }
   | BS_seq_write of seq_write
   (** #312.1: a supported write against the synthesized [sqlite_sequence]
@@ -237,21 +237,21 @@ type bound_stmt =
       ; columns : string list
       }
   | BS_fts_insert of
-      { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta
+      { fts_meta : Granary_catalog.Catalog.fts_table_meta
       ; col_names : string list
       ; col_values : bound_expr list
       ; rowid_value : bound_expr option (** #330: explicit [rowid], if given *)
       }
   | BS_fts_delete of
-      { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta
+      { fts_meta : Granary_catalog.Catalog.fts_table_meta
       ; where : bound_expr option
       }
   | BS_fts_seq_scan of
-      { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta
+      { fts_meta : Granary_catalog.Catalog.fts_table_meta
       ; where : bound_expr option
       }
   | BS_fts_match_scan of
-      { fts_meta : Sqlocaml_catalog.Catalog.fts_table_meta
+      { fts_meta : Granary_catalog.Catalog.fts_table_meta
       ; query : Fts_query.t
       ; proj : int list
       ; include_rank : bool
@@ -260,7 +260,7 @@ type bound_stmt =
   | BS_pragma of { kind : Ast.pragma_kind }
   | BS_vacuum
   | BS_alter_table of
-      { table_meta : Sqlocaml_catalog.Catalog.table_meta
+      { table_meta : Granary_catalog.Catalog.table_meta
       ; action : Ast.alter_action
       }
   | BS_compound of
@@ -315,8 +315,8 @@ type error =
       }
   | Ambiguous_column of string (* column name appears in both joined tables *)
   | Type_mismatch of
-      { expected : Sqlocaml_encoding.Row.ty
-      ; got : Sqlocaml_encoding.Row.ty
+      { expected : Granary_encoding.Row.ty
+      ; got : Granary_encoding.Row.ty
       }
   | Arity_mismatch of
       { expected : int
@@ -335,7 +335,7 @@ val pp_error : Format.formatter -> error -> unit
     view definitions so references to views resolve. *)
 val bind
   :  ?views:(string, Ast.stmt) Hashtbl.t
-  -> Sqlocaml_catalog.Catalog.t
+  -> Granary_catalog.Catalog.t
   -> Ast.stmt
   -> (bound_stmt, error) result Lwt.t
 
@@ -343,7 +343,7 @@ val bind
     discovered in the statement (for [:name]/[@name] placeholders). *)
 val bind_returning_params
   :  ?views:(string, Ast.stmt) Hashtbl.t
-  -> Sqlocaml_catalog.Catalog.t
+  -> Granary_catalog.Catalog.t
   -> Ast.stmt
   -> (bound_stmt * (string * int) list, error) result Lwt.t
 

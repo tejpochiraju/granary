@@ -9,8 +9,8 @@
     - canonical / unambiguous (length-delimited, so reshuffling bytes across
       adjacent string fields cannot collide). *)
 
-module SF = Sqlocaml_encoding.Schema_fingerprint
-module Row = Sqlocaml_encoding.Row
+module SF = Granary_encoding.Schema_fingerprint
+module Row = Granary_encoding.Row
 
 let col
       ?(not_null = false)

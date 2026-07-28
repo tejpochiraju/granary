@@ -7,13 +7,13 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file = Sqlocaml_unix.Store.open_file
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file = Granary_unix.Store.open_file
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
-module Page = Sqlocaml_storage.Page
+module Page = Granary_storage.Page
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -22,7 +22,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_overflow_%04d.db" n
+  Printf.sprintf "/tmp/granary_overflow_%04d.db" n
 ;;
 
 let cleanup path =

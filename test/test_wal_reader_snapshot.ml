@@ -9,29 +9,29 @@
       successive queries, not within-snapshot stability.
 
     - [test_within_snapshot_stable_count] (added for #154) reaches
-      one layer down to [Sqlocaml_store.Store] and holds a single
+      one layer down to [Granary_store.Store] and holds a single
       [ro_begin] handle while a writer fiber commits new rows.  Every
       cursor walk on that handle must return the count captured at
       [ro_begin] time — this is the actual snapshot-isolation
       invariant the #149 plumbing delivers. *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 let run = Lwt_main.run
 let bs = Bytes.of_string
 
 let setup () =
-  let path = "/tmp/sqlocaml_phase38_wal_snap.db" in
+  let path = "/tmp/granary_phase38_wal_snap.db" in
   (try Unix.unlink path with
    | _ -> ());
   (try Unix.unlink (path ^ "-wal") with
@@ -126,7 +126,7 @@ let test_within_snapshot_stable_count () =
   let tid = 16 in
   let n_seed = 20 in
   let n_extra = 15 in
-  let path = "/tmp/sqlocaml_phase38_snap_stable.db" in
+  let path = "/tmp/granary_phase38_snap_stable.db" in
   (try Unix.unlink path with
    | _ -> ());
   (try Unix.unlink (path ^ "-wal") with

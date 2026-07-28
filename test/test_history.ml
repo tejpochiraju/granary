@@ -1,4 +1,4 @@
-module H = Sqlocaml_store.History
+module H = Granary_store.History
 
 let r txn_id timestamp root_page = { H.txn_id; timestamp; root_page }
 

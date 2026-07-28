@@ -1,5 +1,5 @@
 (** Mirage_block.S adapter.  Wraps any [Mirage_block.S] implementation
-    so it can be used as a sqlocaml block backend via [Store.open_block].
+    so it can be used as a granary block backend via [Store.open_block].
 
     Usage:
       module MB = Mirage_backend.Make(Block)   (* Block = mirage-block-unix *)

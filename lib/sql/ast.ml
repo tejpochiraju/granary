@@ -172,7 +172,7 @@ type join_kind =
   | Inner
   | Left
 
-type fk_action = Sqlocaml_catalog.Catalog.fk_action =
+type fk_action = Granary_catalog.Catalog.fk_action =
   | FA_no_action
   | FA_restrict
   | FA_cascade
@@ -186,7 +186,7 @@ type table_constraint =
       ; autoincrement : bool
         (** #312: AUTOINCREMENT appeared on a column inside the table-level
             PRIMARY KEY(...).  Only legal on a single-column INTEGER PK
-            (validated in {!Sqlocaml_sql.Sema}); composite is rejected. *)
+            (validated in {!Granary_sql.Sema}); composite is rejected. *)
       }
   | TC_foreign_key of
       { local_cols : string list
@@ -478,7 +478,7 @@ and column_def =
   ; autoincrement : bool
     (** [AUTOINCREMENT] on a column [PRIMARY KEY] (#299).  Only ever [true] for
         a single-column ascending INTEGER PRIMARY KEY on a rowid table; the
-        placement is validated in {!Sqlocaml_sql.Sema}. *)
+        placement is validated in {!Granary_sql.Sema}. *)
   ; pk_desc : bool
     (** #312: [PRIMARY KEY DESC] on this column.  SQLite treats an
         [INTEGER PRIMARY KEY DESC] as a NON-alias (hidden rowid + real index),

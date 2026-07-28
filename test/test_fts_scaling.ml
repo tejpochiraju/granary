@@ -20,10 +20,10 @@
 
     The ratio gate is a wall-clock measurement: on a shared, loaded CI runner a
     sub-millisecond 1k baseline is noise-dominated and the ratio flakes.  As with
-    the [bench_*] suites, CI neutralizes it via [SQLOCAML_BENCH_MAX_RATIO] (set
+    the [bench_*] suites, CI neutralizes it via [GRANARY_BENCH_MAX_RATIO] (set
     high) so the benches still run and print, without failing on load. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -36,9 +36,9 @@ let now () = Unix.gettimeofday ()
 
 (* Timing-ratio ceiling for the O(log n) gate.  Defaults to 2.0 — a wide margin
    vs GC/scheduler noise, well below the ~3x a re-introduced O(n) drain produces.
-   Raised via [SQLOCAML_BENCH_MAX_RATIO] to neutralize the gate on loaded CI. *)
+   Raised via [GRANARY_BENCH_MAX_RATIO] to neutralize the gate on loaded CI. *)
 let max_ratio =
-  match Sys.getenv_opt "SQLOCAML_BENCH_MAX_RATIO" with
+  match Sys.getenv_opt "GRANARY_BENCH_MAX_RATIO" with
   | Some v ->
     (try float_of_string v with
      | _ -> 2.0)
@@ -46,11 +46,11 @@ let max_ratio =
 ;;
 
 let with_db f =
-  let dir = Filename.temp_file "sqlocaml_fts_scaling" "" in
+  let dir = Filename.temp_file "granary_fts_scaling" "" in
   Sys.remove dir;
   Unix.mkdir dir 0o755;
   let path = Filename.concat dir "fts.db" in
-  let db = unwrap (run (Sqlocaml_unix.open_file_wal ~path ())) in
+  let db = unwrap (run (Granary_unix.open_file_wal ~path ())) in
   Fun.protect
     ~finally:(fun () ->
       (try run (Db.close db) with
@@ -167,7 +167,7 @@ let assert_flat label small large =
   (* 3x the surrounding index.  A full drain costs ~3x (validated); an O(log n)
      seek is ~flat.  Gate at < [max_ratio] (default 2.0): wide margin vs
      GC/scheduler noise, well below the ~3x a re-introduced drain produces;
-     neutralized on loaded CI via SQLOCAML_BENCH_MAX_RATIO. *)
+     neutralized on loaded CI via GRANARY_BENCH_MAX_RATIO. *)
   Alcotest.(check bool)
     (Printf.sprintf "%s: 3x index < %.1fx slower (got %.2fx)" label max_ratio ratio)
     true

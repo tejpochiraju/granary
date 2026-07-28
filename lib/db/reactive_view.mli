@@ -7,11 +7,11 @@
       must fall back to full re-computation, and records the base-table
       dependency set either way.
     - {!Agg_engine} is a generic, runtime-driven incremental aggregate over
-      rows (values arrays), built on [Sqlocaml_ivm].  The [Db] driver feeds it
+      rows (values arrays), built on [Granary_ivm].  The [Db] driver feeds it
       row-level changes and applies the returned output delta to the
       materialization table. *)
 
-module Row := Sqlocaml_encoding.Row
+module Row := Granary_encoding.Row
 
 (** The aggregate a delta-maintained view computes per group. *)
 type agg =
@@ -38,12 +38,12 @@ type classified =
 (** [classify select] inspects [select] and returns its maintenance
     classification.  Never fails: any shape the delta engine cannot handle is
     reported as {!Full}. *)
-val classify : Sqlocaml_sql.Ast.stmt -> classified
+val classify : Granary_sql.Ast.stmt -> classified
 
 (** [is_delta_maintainable select] is [true] when [classify] yields a {!Delta}
     kind — used to reject an explicit [REFRESH DELTA] on an unmaintainable
     shape at CREATE time. *)
-val is_delta_maintainable : Sqlocaml_sql.Ast.stmt -> bool
+val is_delta_maintainable : Granary_sql.Ast.stmt -> bool
 
 (** Generic incremental aggregate over value-array rows, driven at runtime. *)
 module Agg_engine : sig

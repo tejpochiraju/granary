@@ -1,4 +1,4 @@
-open Sqlocaml_sql
+open Granary_sql
 
 let tokenize s =
   let buf = Lexing.from_string s in

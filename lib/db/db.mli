@@ -1,4 +1,4 @@
-(** Public API for sqlocaml — pure-OCaml in-memory SQL engine (Phase 0). *)
+(** Public API for granary — pure-OCaml in-memory SQL engine (Phase 0). *)
 
 type t
 
@@ -6,18 +6,18 @@ type t
 val pp : Format.formatter -> t -> unit
 
 (** Re-export value type for convenience. *)
-type value = Sqlocaml_encoding.Row.value =
+type value = Granary_encoding.Row.value =
   | V_int of int64
   | V_text of string
   | V_null
   | V_real of float
   | V_blob of bytes
 
-type row = Sqlocaml_encoding.Row.t (* value array *)
+type row = Granary_encoding.Row.t (* value array *)
 
 type error =
   | Parse of string (** SQL syntax error *)
-  | Sema of Sqlocaml_sql.Sema.error (** name/type error *)
+  | Sema of Granary_sql.Sema.error (** name/type error *)
   | Runtime of string (** unexpected internal error *)
   | History_unavailable
   (** #266: an as-of read was requested on a database opened without
@@ -27,13 +27,13 @@ type error =
           {!history_pin}), so the snapshot is no longer available. *)
 
 (** #239: per-query cost/stats signal for an external cost-based cache,
-    re-exported from {!Sqlocaml_sql.Exec.query_stats}.  [rows_examined] is the
+    re-exported from {!Granary_sql.Exec.query_stats}.  [rows_examined] is the
     rows pulled from a base table/index scan (the work signal — a full scan
     behind a selective filter reads [rows_examined = N] returning one row);
     [rows_returned] is the result size once the stream is drained; [used_index]
     is the plan-time fact that the base access is an index/rowid/FTS seek rather
     than a full scan.  See {!query_with_stats} / {!iter_with_stats}. *)
-type query_stats = Sqlocaml_sql.Exec.query_stats =
+type query_stats = Granary_sql.Exec.query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int
   ; mutable used_index : bool
@@ -45,7 +45,7 @@ type query_stats = Sqlocaml_sql.Exec.query_stats =
 val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
 
 (** Open a SQL engine on any block device given as I/O callbacks.
-    Use with [Sqlocaml_mirage_block.Mirage_backend.Make(B)] to build
+    Use with [Granary_mirage_block.Mirage_backend.Make(B)] to build
     the callbacks from a [Mirage_block.S] device.  Pass [~n_pages:0L]
     for Mirage adapters; the adapter handles device-capacity bounds
     internally.  [~close] is called by [Db.close].
@@ -55,12 +55,12 @@ val open_in_memory : ?clock:(unit -> float) -> unit -> t Lwt.t
     before the catalog is loaded.
 
     This is the platform-agnostic entry point.  Unix file convenience
-    constructors ([open_file] / [open_file_wal]) live in the [sqlocaml.unix]
+    constructors ([open_file] / [open_file_wal]) live in the [granary.unix]
     driver library so this core carries no [unix] dependency (#170). *)
 val open_block
-  :  ?geom:Sqlocaml_storage.Geometry.t
+  :  ?geom:Granary_storage.Geometry.t
   -> ?clock:(unit -> float)
-  -> ?durability:Sqlocaml_store.Store.durability
+  -> ?durability:Granary_store.Store.durability
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -70,32 +70,32 @@ val open_block
   -> unit
   -> (t, error) result Lwt.t
 
-(** Wrap an already-open {!Sqlocaml_store.Store.t} as a database handle,
+(** Wrap an already-open {!Granary_store.Store.t} as a database handle,
     loading its catalog, views, and triggers.  [file_path] records the
     on-disk path for file-backed handles so VACUUM can rebuild in place;
     omit it for in-memory / arbitrary block devices.  [durability] sets the
     database-wide durability knob (full/batched/off) on the store before the
     catalog is loaded — use this to configure the store's fsync policy at
     open time without needing a raw store handle afterwards.  Used by the
-    [sqlocaml.unix] driver and by ATTACH. *)
+    [granary.unix] driver and by ATTACH. *)
 val of_store
   :  ?clock:(unit -> float)
-  -> ?durability:Sqlocaml_store.Store.durability
+  -> ?durability:Granary_store.Store.durability
   -> ?file_path:string
-  -> Sqlocaml_store.Store.t
+  -> Granary_store.Store.t
   -> t Lwt.t
 
 (** File operations the engine needs for ATTACH and VACUUM.  The core has no
-    OS/filesystem dependency (#170); a platform driver (e.g. [sqlocaml.unix])
+    OS/filesystem dependency (#170); a platform driver (e.g. [granary.unix])
     supplies these via {!set_file_provider}.  Without a provider, ATTACH and
     VACUUM fail with a clear error. *)
 type file_provider =
   { open_store :
-      ?geom:Sqlocaml_store.Store.Geometry.t
+      ?geom:Granary_store.Store.Geometry.t
       -> ?as_of_history:bool
       -> path:string
       -> unit
-      -> (Sqlocaml_store.Store.t, Sqlocaml_store.Store.error) result Lwt.t
+      -> (Granary_store.Store.t, Granary_store.Store.error) result Lwt.t
     (** [geom] (#176) is the geometry to CREATE a fresh file with — VACUUM
         passes the source's geometry so the rebuilt file keeps its page_size and
         reserved bytes.  Ignored when opening an existing file (its geometry is
@@ -122,11 +122,11 @@ val create_worker_handle : t -> t Lwt.t
 val wal_sync_count : t -> int
 
 (** Re-export of the internal-events type (#382). *)
-module Event = Sqlocaml_store.Store.Event
+module Event = Granary_store.Store.Event
 
 (** Register/clear the internals-monitor observer on this database's store.
     No-op for in-memory databases.  The callback should be cheap and
-    non-blocking (see {!Sqlocaml_store.Store.set_event_callback}). *)
+    non-blocking (see {!Granary_store.Store.set_event_callback}). *)
 val set_event_callback : t -> (Event.t -> unit) option -> unit
 
 (** [tree_of_table t name] is the storage tree id backing table [name] in the
@@ -138,21 +138,21 @@ val tree_of_table : t -> string -> int option
 
 (** [catalog t] is the active in-memory catalog backing [t], for read-only
     schema/type projection — column names, types, and NOT NULL constraints via
-    {!Sqlocaml_catalog.Catalog.list_tables} / {!Sqlocaml_catalog.Catalog.find_table}.
+    {!Granary_catalog.Catalog.list_tables} / {!Granary_catalog.Catalog.find_table}.
     The result reflects the schema at call time; the engine may swap its catalog
     on recovery, so treat the returned handle as a snapshot rather than caching
     it across a reopen. This is the {e live} handle: [Catalog.t] also exposes
     mutators ([drop_table], [add_column], …), so "do not mutate it — schema
     changes go through SQL DDL" is a caller contract, not enforced. See #433 for
     a possible opaque read-only projection should this grow more consumers. *)
-val catalog : t -> Sqlocaml_catalog.Catalog.t
+val catalog : t -> Granary_catalog.Catalog.t
 
 (** Rebuild the database file in place: copies every tree from the
     current file into a fresh sibling [path ^ ".vacuum-tmp"], then
     atomically renames it over the original.  This drops free-list
     pages and re-packs everything densely.
 
-    Only works on file-backed databases (opened via the [sqlocaml.unix]
+    Only works on file-backed databases (opened via the [granary.unix]
     driver); in-memory and arbitrary-block-device handles raise [Failure],
     as does any handle when no file provider is installed (see
     {!set_file_provider}).
@@ -180,7 +180,7 @@ val query : t -> string -> (row Lwt_stream.t, error) result Lwt.t
     ([rows_examined], [rows_returned], [used_index]) for an external cost-based
     cache.  The record's counters are populated as the returned stream is
     consumed — read them once it is fully drained.  See
-    {!Sqlocaml_sql.Exec.query_stats}. *)
+    {!Granary_sql.Exec.query_stats}. *)
 val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) result Lwt.t
 
 (** [query_as_of t target sql] (#266) runs a read-only [sql] query against the
@@ -198,7 +198,7 @@ val query_with_stats : t -> string -> (row Lwt_stream.t * query_stats, error) re
     consults exactly one store's history. *)
 val query_as_of
   :  t
-  -> Sqlocaml_store.History.target
+  -> Granary_store.History.target
   -> string
   -> (row Lwt_stream.t, error) result Lwt.t
 
@@ -223,7 +223,7 @@ val history_release : ?schema:string -> t -> unit
     (the [<path>.aslog] sidecar), oldest first.  Empty when as-of history is not
     enabled.
     @raise Invalid_argument if [schema] is neither ["main"] nor attached. *)
-val history_log : ?schema:string -> t -> Sqlocaml_store.History.record list Lwt.t
+val history_log : ?schema:string -> t -> Granary_store.History.record list Lwt.t
 
 (** #240: the set of user tables whose {e rows} a write statement actually
     mutated, including tables touched indirectly by triggers and FK cascades.
@@ -245,8 +245,8 @@ type dirty_tables = string list
 
 (** #417 Phase 0: one row-level mutation in the delta feed.  [rowid] is the row's
     int64 rowid; [row]/[old_row]/[new_row] are the full {!row}s involved.
-    Re-exported from {!Sqlocaml_sql.Exec.row_change}. *)
-type row_change = Sqlocaml_sql.Exec.row_change =
+    Re-exported from {!Granary_sql.Exec.row_change}. *)
+type row_change = Granary_sql.Exec.row_change =
   | Inserted of
       { rowid : int64
       ; row : row
@@ -425,7 +425,7 @@ val run_with_dirty : stmt -> params:value list -> (int * dirty_tables, error) re
 val iter : stmt -> params:value list -> (row Lwt_stream.t, error) result Lwt.t
 
 (** #239: like {!iter}, but also returns a per-query cost/stats record populated
-    as the returned stream is consumed.  See {!Sqlocaml_sql.Exec.query_stats}. *)
+    as the returned stream is consumed.  See {!Granary_sql.Exec.query_stats}. *)
 val iter_with_stats
   :  stmt
   -> params:value list

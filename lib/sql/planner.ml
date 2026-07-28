@@ -1,5 +1,5 @@
-module Cat = Sqlocaml_catalog.Catalog
-module Row = Sqlocaml_encoding.Row
+module Cat = Granary_catalog.Catalog
+module Row = Granary_encoding.Row
 
 (* Produces uppercase SQLite PRAGMA wire-format strings ("CASCADE", "NO ACTION", etc.)
    Distinct from Cat.fk_action_to_string which uses lowercase for internal serialization. *)

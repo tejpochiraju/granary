@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module UF = Sqlocaml_unix.Unix_file
+module UF = Granary_unix.Unix_file
 
 let page_size = 4096
 
@@ -21,7 +21,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_unix_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_unix_%04d.db" n
 ;;
 
 let cleanup path =

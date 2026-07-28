@@ -8,12 +8,12 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file = Sqlocaml_unix.Store.open_file
+  let open_file = Granary_unix.Store.open_file
 end
 
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -26,7 +26,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_store_btree_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_store_btree_%04d.db" n
 ;;
 
 let cleanup path =
@@ -61,7 +61,7 @@ let with_fresh_db ~f =
 ;;
 
 let tmp_block_file size_mb =
-  let path = Filename.temp_file "sqlocaml_ob_test" ".raw" in
+  let path = Filename.temp_file "granary_ob_test" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (size_mb * 1024 * 1024);
   Unix.close fd;
@@ -988,7 +988,7 @@ let test_btree_corrupt_propagation () =
        (* Overwrite pages 2 onwards with a fully-valid Header-kind page
        (CRC sealed) so read_common succeeds and Btree returns
        Tree_corrupt. *)
-       let module Pg = Sqlocaml_storage.Page in
+       let module Pg = Granary_storage.Page in
        let bogus = Cstruct.create Pg.page_size in
        Cstruct.memset bogus 0;
        Pg.write_common
@@ -1079,7 +1079,7 @@ let test_open_corrupt_headers_both () =
 (* ------------------------------------------------------------------ *)
 
 let test_freelist_survives_reopen () =
-  let path = Filename.temp_file "sqlocaml_fl_" ".db" in
+  let path = Filename.temp_file "granary_fl_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1112,7 +1112,7 @@ let test_freelist_survives_reopen () =
 ;;
 
 let test_freed_pages_reused_after_reopen () =
-  let path = Filename.temp_file "sqlocaml_reuse_" ".db" in
+  let path = Filename.temp_file "granary_reuse_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1159,7 +1159,7 @@ let test_freed_pages_reused_after_reopen () =
 (* ------------------------------------------------------------------ *)
 
 let test_rollback_restores_data () =
-  let path = Filename.temp_file "sqlocaml_rb_" ".db" in
+  let path = Filename.temp_file "granary_rb_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1183,7 +1183,7 @@ let test_rollback_restores_data () =
 ;;
 
 let test_rollback_freelist_not_corrupted () =
-  let path = Filename.temp_file "sqlocaml_rb2_" ".db" in
+  let path = Filename.temp_file "granary_rb2_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1213,7 +1213,7 @@ let test_rollback_freelist_not_corrupted () =
 ;;
 
 let test_rollback_then_commit_works () =
-  let path = Filename.temp_file "sqlocaml_rb3_" ".db" in
+  let path = Filename.temp_file "granary_rb3_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1237,7 +1237,7 @@ let test_rollback_then_commit_works () =
 ;;
 
 let test_rollback_new_key_absent () =
-  let path = Filename.temp_file "sqlocaml_rb4_" ".db" in
+  let path = Filename.temp_file "granary_rb4_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1263,7 +1263,7 @@ let test_rollback_new_key_absent () =
 (* ------------------------------------------------------------------ *)
 
 let test_ro_sees_committed_not_in_progress () =
-  let path = Filename.temp_file "sqlocaml_snap_" ".db" in
+  let path = Filename.temp_file "granary_snap_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1306,7 +1306,7 @@ let test_ro_sees_committed_not_in_progress () =
 let test_ro_after_rw_begin_safe () =
   (* Verify: opening an RO snapshot AFTER rw_begin does not corrupt reader's data.
      The critical ordering: rw_begin → ro_begin → put/commit → verify reader sees original. *)
-  let path = Filename.temp_file "sqlocaml_ro_after_rw_" ".db" in
+  let path = Filename.temp_file "granary_ro_after_rw_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1359,7 +1359,7 @@ let test_ro_after_rw_begin_safe () =
 ;;
 
 let test_active_reader_gates_freelist () =
-  let path = Filename.temp_file "sqlocaml_gate_" ".db" in
+  let path = Filename.temp_file "granary_gate_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1457,7 +1457,7 @@ let test_btree_block_error_propagation () =
        let* () = S.commit tx in
        let* () = S.close s in
        (* Truncate the file to just 2 pages, making it too short for the data *)
-       let page_size = Sqlocaml_storage.Page.page_size in
+       let page_size = Granary_storage.Page.page_size in
        let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
        let _ = Unix.ftruncate fd (2 * page_size) in
        Unix.close fd;
@@ -1489,7 +1489,7 @@ let test_btree_block_error_propagation () =
 (* ------------------------------------------------------------------ *)
 
 let test_freelist_read_error_path () =
-  let path = Filename.temp_file "sqlocaml_fl_err_" ".db" in
+  let path = Filename.temp_file "granary_fl_err_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1518,9 +1518,9 @@ let test_freelist_read_error_path () =
          point to a page beyond the end of the file, triggering Pager.read error. *)
            module
            Pg =
-           Sqlocaml_storage.Page
+           Granary_storage.Page
          in
-         let module Pager = Sqlocaml_storage.Pager in
+         let module Pager = Granary_storage.Pager in
          let fd = Unix.openfile path [ Unix.O_RDWR ] 0o644 in
          let st = Unix.fstat fd in
          let file_size = st.Unix.st_size in
@@ -1540,7 +1540,7 @@ let test_freelist_read_error_path () =
            Bytes.set_int64_be buf 32 out_of_bounds;
            (* Re-seal the CRC *)
            let cs = Cstruct.of_bytes buf in
-           Sqlocaml_storage.Page.seal cs;
+           Granary_storage.Page.seal cs;
            let resealed = Bytes.create Pg.page_size in
            Cstruct.blit_to_bytes cs 0 resealed 0 Pg.page_size;
            let _ = Unix.lseek fd offset Unix.SEEK_SET in
@@ -1563,7 +1563,7 @@ let test_freelist_read_error_path () =
 (* ------------------------------------------------------------------ *)
 
 let test_multiple_active_readers () =
-  let path = Filename.temp_file "sqlocaml_multi_ro_" ".db" in
+  let path = Filename.temp_file "granary_multi_ro_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1595,7 +1595,7 @@ let test_multiple_active_readers () =
 (* ------------------------------------------------------------------ *)
 
 let test_ro_cache_hit () =
-  let path = Filename.temp_file "sqlocaml_ro_cache_" ".db" in
+  let path = Filename.temp_file "granary_ro_cache_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1628,7 +1628,7 @@ let test_ro_cache_hit () =
 (* ------------------------------------------------------------------ *)
 
 let test_ro_refcount () =
-  let path = Filename.temp_file "sqlocaml_ro_refcount_" ".db" in
+  let path = Filename.temp_file "granary_ro_refcount_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with
@@ -1860,7 +1860,7 @@ let test_savepoint_then_commit_persists () =
    not grow n_pages by N*depth. The freelist guard relaxation allows freed
    pages to be reused within the same transaction. *)
 let test_same_txn_page_reuse_bounded () =
-  let path = Filename.temp_file "sqlocaml_reuse_" ".db" in
+  let path = Filename.temp_file "granary_reuse_" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Sys.remove path with

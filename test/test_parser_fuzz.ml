@@ -3,7 +3,7 @@
     Two QCheck properties guard against parser crashes:
 
     1. [no_crash_prop]    — feeds random ASCII-ish bytes through
-                            {!Sqlocaml.Db.execute}; any [Ok ()] or
+                            {!Granary.Db.execute}; any [Ok ()] or
                             [Error _] is accepted; an uncaught exception
                             is a property failure.
     2. [keyword_no_crash_prop] — same, but the generator biases toward
@@ -20,7 +20,7 @@
     properties on their own satisfy the acceptance criterion of #94. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (* Counters: 1000 random + 500 keyword-biased = 1500 inputs per run.
    That stays well under the 10s wall-clock budget on this machine; see

@@ -19,7 +19,7 @@
     identity and fails the test.  (The end-to-end speedup is a wall-clock
     benchmark concern; see the PR's point_lookup numbers.) *)
 
-open Sqlocaml_storage
+open Granary_storage
 
 (* In-memory mock block device (same pattern as test_write_alloc). *)
 type mock_block =

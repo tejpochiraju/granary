@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Run the nemeses that need special host privileges, from the HOST (not inside
 # a container): lazyfs needs --device /dev/fuse + --cap-add SYS_ADMIN; clock-skew
-# needs libfaketime via LD_PRELOAD.  Uses the sqlocaml-jepsen image (OCaml harness
+# needs libfaketime via LD_PRELOAD.  Uses the granary-jepsen image (OCaml harness
 # + lazyfs + libfaketime).  Run gen_177.sh / check_177.sh separately for the rest.
 #
 # Usage:  bash jepsen/run/run_nemeses_fuse.sh        # from the repo root
 set -eu
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-IMG="${IMG_JEPSEN:-sqlocaml-jepsen}"
+IMG="${IMG_JEPSEN:-granary-jepsen}"
 H=/workspace/jepsen/run/histories
 KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 FT=/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1

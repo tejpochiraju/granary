@@ -2,7 +2,7 @@
 
     Maintains:
     - A bounded FIFO cache of pages (read from BLOCK).  Capacity defaults to
-      [default_cache_capacity] and is overridable via [SQLOCAML_PAGE_CACHE].
+      [default_cache_capacity] and is overridable via [GRANARY_PAGE_CACHE].
     - A dirty table of pages modified since the last flush.
     - A pin table (#159): pages referenced by a live RO snapshot are pinned
       so the writer's CoW churn can't FIFO out a reader's working set.
@@ -11,13 +11,13 @@
     Dirty and pinned pages are never evicted from the cache; dirty pages are
     written to BLOCK only on [flush]. *)
 
-(* Default if [SQLOCAML_PAGE_CACHE] is unset/invalid.  Bumped from the
+(* Default if [GRANARY_PAGE_CACHE] is unset/invalid.  Bumped from the
    original 64 (#159): a bigger cache lets a reader's working set and a
    writer's CoW churn coexist without immediate eviction pressure. *)
 let default_cache_capacity = 1024
 
 let cache_capacity_from_env () =
-  match Sys.getenv_opt "SQLOCAML_PAGE_CACHE" with
+  match Sys.getenv_opt "GRANARY_PAGE_CACHE" with
   | Some s ->
     (match int_of_string_opt s with
      | Some n when n > 0 -> n

@@ -2,8 +2,8 @@
     (COUNT, SUM, AVG, MIN, MAX). *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 let run = Lwt_main.run
 let fresh_db () = run (Db.open_in_memory ())

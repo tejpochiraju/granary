@@ -19,7 +19,7 @@
 open Edn_history
 
 (** Module alias for the DB — all references are fully qualified. *)
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 type outcome =
   | Completed of txn_op list (* observed Read ops with results filled in *)

@@ -80,7 +80,7 @@ let decrypt_frame t ~page_id payload =
   | Some pt -> Ok (Cstruct.of_string pt)
 ;;
 
-let canary_adata = "sqlocaml-enc-v1"
+let canary_adata = "granary-enc-v1"
 
 let make_canary t ~nonce =
   let _, tag = GCM.authenticate_encrypt_tag ~key:t.key ~nonce ~adata:canary_adata "" in

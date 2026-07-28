@@ -1,4 +1,4 @@
-open Sqlocaml_sql.Datetime
+open Granary_sql.Datetime
 
 let check_ok msg expected actual =
   match actual with

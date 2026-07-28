@@ -1,6 +1,6 @@
 (** Tests for #382 — Store_event type + the Store on_event seam. *)
 
-module Ev = Sqlocaml_store.Store_event
+module Ev = Granary_store.Store_event
 
 let test_label_and_txn_id () =
   let c = Ev.Txn_commit { txn_id = 7L; frames = 3 } in
@@ -97,9 +97,9 @@ let test_tree_id_of () =
 ;;
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -108,7 +108,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_event_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_event_%04d.db" n
 ;;
 
 let cleanup path =
@@ -267,7 +267,7 @@ let test_checkpoint_then_read_emits_page_read () =
          (* Step 2: reopen with the non-WAL open_file so the pager has no WAL
             index.  Every read is a main-file lookup; cache is cold on open. *)
          let seen = ref [] in
-         let* st2 = Sqlocaml_unix.Store.open_file ~path () in
+         let* st2 = Granary_unix.Store.open_file ~path () in
          let st2 = Result.get_ok st2 in
          S.set_event_callback st2 (Some (fun ev -> seen := ev :: !seen));
          let* txn2 = S.rw_begin st2 in
@@ -368,7 +368,7 @@ let test_page_read_carries_tree () =
          let* () = S.checkpoint st in
          let* () = S.close st in
          (* reopen cold, non-WAL: every read is a main-file lookup *)
-         let* st2 = Sqlocaml_unix.Store.open_file ~path () in
+         let* st2 = Granary_unix.Store.open_file ~path () in
          let st2 = Result.get_ok st2 in
          let seen = collect st2 in
          let* txn2 = S.rw_begin st2 in

@@ -1,11 +1,11 @@
 open Lwt.Syntax
-module Cat = Sqlocaml_catalog.Catalog
-module S = Sqlocaml_store.Store
-module Row = Sqlocaml_encoding.Row
-module Sema = Sqlocaml_sql.Sema
-module Ast = Sqlocaml_sql.Ast
-module Plan = Sqlocaml_sql.Plan
-module Planner = Sqlocaml_sql.Planner
+module Cat = Granary_catalog.Catalog
+module S = Granary_store.Store
+module Row = Granary_encoding.Row
+module Sema = Granary_sql.Sema
+module Ast = Granary_sql.Ast
+module Plan = Granary_sql.Plan
+module Planner = Granary_sql.Planner
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

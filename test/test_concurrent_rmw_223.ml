@@ -14,10 +14,10 @@
     read-modify-write is atomic under the write lock. *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
-  let open_file = Sqlocaml_unix.open_file
+  let open_file_wal = Granary_unix.open_file_wal
+  let open_file = Granary_unix.open_file
 end
 
 let run = Lwt_main.run
@@ -78,7 +78,7 @@ let query_ints_lwt db sql =
 ;;
 
 (* Per-process temp path so parallel test runs don't collide (review nit). *)
-let tmp name = Printf.sprintf "/tmp/sqlocaml_rmw223_%s_%d.db" name (Unix.getpid ())
+let tmp name = Printf.sprintf "/tmp/granary_rmw223_%s_%d.db" name (Unix.getpid ())
 
 let unlink p =
   (try Unix.unlink p with

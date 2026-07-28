@@ -1,13 +1,13 @@
-(* Unix-file convenience constructors for {!Sqlocaml_store.Store}.  These build
+(* Unix-file convenience constructors for {!Granary_store.Store}.  These build
    the pager block-IO closures over a [Unix_file] (and a WAL sidecar fd) and
    hand them to the platform-agnostic [Store.open_block]/[open_block_wal], so
    the store core itself carries no [unix] dependency (#170). *)
 
 open Lwt.Syntax
-module Core = Sqlocaml_store.Store
-module History = Sqlocaml_store.History
-module Geometry = Sqlocaml_storage.Geometry
-module Header = Sqlocaml_storage.Header
+module Core = Granary_store.Store
+module History = Granary_store.History
+module Geometry = Granary_storage.Geometry
+module Header = Granary_storage.Header
 
 (* #95: resolve the geometry to open [file] with.  A fresh (zero-page) file uses
    the caller's [requested] geometry; an existing file's geometry is peeked from

@@ -1,5 +1,5 @@
 (library
- (name sqlocaml_ivm)
- (public_name sqlocaml.ivm)
+ (name granary_ivm)
+ (public_name granary.ivm)
  (instrumentation
   (backend bisect_ppx)))

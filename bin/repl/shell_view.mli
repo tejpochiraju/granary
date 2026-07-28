@@ -13,7 +13,7 @@ val input_var : t -> string Lwd.var
 val set_status : t -> string -> unit
 
 (** [set_result t ~headers ~rows] replaces the displayed result grid. *)
-val set_result : t -> headers:string list -> rows:Sqlocaml.Db.row list -> unit
+val set_result : t -> headers:string list -> rows:Granary.Db.row list -> unit
 
 (** [render t] is the reactive UI for the pane. *)
 val render : t -> Nottui.ui Lwd.t
@@ -22,7 +22,7 @@ val render : t -> Nottui.ui Lwd.t
     Exposed for testing. *)
 val column_widths_with_headers
   :  headers:string list
-  -> rows:Sqlocaml.Db.row list
+  -> rows:Granary.Db.row list
   -> int array
 
 (** Minimal pretty-printer (input + status summary) for debugging/logging. *)

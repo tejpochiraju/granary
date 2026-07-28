@@ -1,4 +1,4 @@
-# Jepsen checker container for sqlocaml
+# Jepsen checker container for granary
 #
 # *** MINIMAL IMAGE: Clojure-only checker (no OCaml, no lazyfs) ***
 # For the full OCaml harness + Java/Clojure + lazyfs image, see
@@ -6,9 +6,9 @@
 #
 # Provides Java 21 + Clojure CLI + Jepsen/Elle checker deps.
 #
-# Build:   podman build -t sqlocaml-jepsen -f jepsen/Containerfile.jepsen .
+# Build:   podman build -t granary-jepsen -f jepsen/Containerfile.jepsen .
 # Run:     podman run --rm -v $(pwd):/workspace:z -w /workspace/jepsen/clojure \
-#            sqlocaml-jepsen clojure -M -m jepsen.check <history.edn> -w list-append
+#            granary-jepsen clojure -M -m jepsen.check <history.edn> -w list-append
 
 # `--platform` pin: multi-arch base on a shared rootless podman store (#426). An
 # unpinned `FROM` can resolve to a foreign-arch image left in the store by the

@@ -1,7 +1,7 @@
 (** Bitmap helpers for null-mask encoding.
 
-    Used by {!Sqlocaml_columnar.Col} for columnar null bitmaps.  Intended to
-    also replace the inline bitmap logic in {!Sqlocaml_encoding.Row} once the
+    Used by {!Granary_columnar.Col} for columnar null bitmaps.  Intended to
+    also replace the inline bitmap logic in {!Granary_encoding.Row} once the
     API is adapted (see issue #372). *)
 
 module Bigarray = Bigarray

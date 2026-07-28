@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 let ok_or_fail = function
   | Ok x -> x
@@ -196,7 +196,7 @@ let test_fk_on_columnar_parent_rejected () =
 ;;
 
 let test_serialize_col_int () =
-  let module Col = Sqlocaml_columnar.Col in
+  let module Col = Granary_columnar.Col in
   let col = Col.create Row.Integer 4 in
   let col = Col.append_value col (Row.V_int 42L) in
   let col = Col.append_value col (Row.V_int (-1L)) in
@@ -212,7 +212,7 @@ let test_serialize_col_int () =
 ;;
 
 let test_serialize_col_real () =
-  let module Col = Sqlocaml_columnar.Col in
+  let module Col = Granary_columnar.Col in
   let col = Col.create Row.Real 4 in
   let col = Col.append_value col (Row.V_real 3.14) in
   let col = Col.append_value col Row.V_null in
@@ -228,7 +228,7 @@ let test_serialize_col_real () =
 ;;
 
 let test_serialize_col_text () =
-  let module Col = Sqlocaml_columnar.Col in
+  let module Col = Granary_columnar.Col in
   let col = Col.create Row.Text 4 in
   let col = Col.append_value col (Row.V_text "hello") in
   let col = Col.append_value col Row.V_null in
@@ -246,7 +246,7 @@ let test_serialize_col_text () =
 ;;
 
 let test_serialize_col_blob () =
-  let module Col = Sqlocaml_columnar.Col in
+  let module Col = Granary_columnar.Col in
   let col = Col.create Row.Blob 4 in
   let col = Col.append_value col (Row.V_blob (Bytes.of_string "\x00\x01\x02")) in
   let col = Col.append_value col Row.V_null in
@@ -288,7 +288,7 @@ let test_serialize_store_roundtrip () =
         }
     ]
   in
-  let module Col_store = Sqlocaml_columnar.Col_store in
+  let module Col_store = Granary_columnar.Col_store in
   let store = Col_store.create cols in
   Col_store.insert_rows
     store
@@ -303,9 +303,9 @@ let test_serialize_store_roundtrip () =
 ;;
 
 let test_persist_roundtrip () =
-  let module Col_store = Sqlocaml_columnar.Col_store in
-  let module Persist = Sqlocaml_columnar.Persist in
-  let module S = Sqlocaml_store.Store in
+  let module Col_store = Granary_columnar.Col_store in
+  let module Persist = Granary_columnar.Persist in
+  let module S = Granary_store.Store in
   let default = None in
   let check_sql = None in
   let generated_as = None in
@@ -376,8 +376,8 @@ let test_persist_roundtrip () =
 
 let test_persist_fresh_table_returns_none () =
   (* A tree_id with no persisted data should return None from Persist.load. *)
-  let module Persist = Sqlocaml_columnar.Persist in
-  let module S = Sqlocaml_store.Store in
+  let module Persist = Granary_columnar.Persist in
+  let module S = Granary_store.Store in
   let default = None in
   let check_sql = None in
   let generated_as = None in

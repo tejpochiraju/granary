@@ -2,7 +2,7 @@
 
 SQL test cases adapted from SQLite's own test suite (https://sqlite.org/src,
 files under `test/`). Each case has been transcribed to a plain `.sql` format
-so it can be replayed against sqlocaml without needing a TCL interpreter.
+so it can be replayed against granary without needing a TCL interpreter.
 
 ## File format
 
@@ -42,6 +42,6 @@ lines are ignored. Statements are terminated by `;` at end of line.
 | view.sql         | view.test (excerpts) | CREATE VIEW |
 | cte.sql          | with1.test (excerpts) | non-recursive CTE |
 
-Excerpts are minimal SQL fragments selected for behavior that sqlocaml claims
+Excerpts are minimal SQL fragments selected for behavior that granary claims
 to support. They are NOT verbatim copies — they have been simplified and
-re-expressed to match sqlocaml's accepted SQL surface.
+re-expressed to match granary's accepted SQL surface.

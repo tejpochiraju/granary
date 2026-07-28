@@ -15,10 +15,10 @@
     races. *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file = Granary_unix.open_file
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -252,7 +252,7 @@ let test_explicit_txn_isolation () =
     Exercises the snapshot-isolation path: each reader count must be
     monotonically non-decreasing across successive queries. *)
 let test_wal_backend_concurrent_readers_writer () =
-  let path = "/tmp/sqlocaml_phase38_wal_mfs.db" in
+  let path = "/tmp/granary_phase38_wal_mfs.db" in
   (try Unix.unlink path with
    | _ -> ());
   (try Unix.unlink (path ^ "-wal") with
@@ -303,7 +303,7 @@ let test_wal_backend_concurrent_readers_writer () =
     on the persistent backend.  Exercises the pager + WAL-less codepath
     under concurrency. *)
 let test_file_backend_concurrent () =
-  let path = "/tmp/sqlocaml_phase39_mfs.db" in
+  let path = "/tmp/granary_phase39_mfs.db" in
   (try Unix.unlink path with
    | _ -> ());
   let db =

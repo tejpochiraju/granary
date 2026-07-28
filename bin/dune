@@ -1,5 +1,5 @@
 (executables
- (names sqlocaml_cli sqlocaml_recover)
- (libraries sqlocaml sqlocaml.unix sqlocaml.recovery lwt lwt.unix)
+ (names granary_cli granary_recover)
+ (libraries granary granary.unix granary.recovery lwt lwt.unix)
  (preprocess
   (pps lwt_ppx)))

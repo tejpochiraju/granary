@@ -6,7 +6,7 @@
     ON CONFLICT variants on the PK, and FK references to an alias parent.  The
     broad SELECT/JOIN/aggregate parity is covered by [sqlite_compare]. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

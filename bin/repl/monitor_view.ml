@@ -1,6 +1,6 @@
 module W = Nottui_widgets
 module Ui = Nottui.Ui
-module Ev = Sqlocaml.Db.Event
+module Ev = Granary.Db.Event
 
 let attr_for ev =
   let open Notty.A in

@@ -1,8 +1,8 @@
 (** #215: offline key rotation tests. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module UnixStore = Sqlocaml_unix.Store
+module S = Granary_store.Store
+module UnixStore = Granary_unix.Store
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -11,7 +11,7 @@ let counter = ref 0
 let fresh_path tag =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_rekey_%04d_%s.db" n tag
+  Printf.sprintf "/tmp/granary_test_rekey_%04d_%s.db" n tag
 ;;
 
 let cleanup path =

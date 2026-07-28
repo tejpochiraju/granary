@@ -1,11 +1,11 @@
 (** Tests for the standby follower driver (#172). *)
 
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
-module Replication = Sqlocaml_replication.Replication
-module Standby = Sqlocaml_replication.Standby
-module Store = Sqlocaml_store.Store
-module Pager = Sqlocaml_storage.Pager
+module Wal = Granary_storage.Wal
+module Replication = Granary_replication.Replication
+module Standby = Granary_replication.Standby
+module Store = Granary_store.Store
+module Pager = Granary_storage.Pager
 
 (* ------------------------------------------------------------------ *)
 (* In-memory device (same as test_replication.ml)                      *)
@@ -115,7 +115,7 @@ let minimal_pager ?(n_pages = 10L) () =
     ~sync:sync_ok
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
-    ~freelist:Sqlocaml_storage.Freelist.empty
+    ~freelist:Granary_storage.Freelist.empty
 ;;
 
 (* A write-capable pager backed by an in-memory main device.  Needed for any
@@ -128,7 +128,7 @@ let writable_pager ?(n_pages = 16L) main_d () =
     ~sync:sync_ok
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
-    ~freelist:Sqlocaml_storage.Freelist.empty
+    ~freelist:Granary_storage.Freelist.empty
 ;;
 
 (* Read the first byte of a main-DB page directly off the device, so tests can
@@ -159,7 +159,7 @@ let sync_fail_pager ?(n_pages = 16L) main_d () =
     ~sync:(fun () -> Lwt.return (Error "injected sync failure"))
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
-    ~freelist:Sqlocaml_storage.Freelist.empty
+    ~freelist:Granary_storage.Freelist.empty
 ;;
 
 (* A WAL whose reads can be made to fail on demand (returns the toggle ref) —
@@ -221,7 +221,7 @@ let seed_one_frame wal =
 (* ------------------------------------------------------------------ *)
 
 let store_with_wal () =
-  let open Sqlocaml_store.Store in
+  let open Granary_store.Store in
   let main_d = mk_dev 65536 in
   let wal_d = mk_dev 65536 in
   let* r =

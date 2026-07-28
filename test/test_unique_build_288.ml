@@ -14,7 +14,7 @@
     partial index entries behind. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

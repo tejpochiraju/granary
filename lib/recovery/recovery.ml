@@ -19,9 +19,9 @@
     the tool falls back to raw-page catalog reconstruction from the
     redundant mirror (#174). *)
 
-module Page = Sqlocaml_storage.Page
-module Store = Sqlocaml_store.Store
-module Catalog = Sqlocaml_catalog.Catalog
+module Page = Granary_storage.Page
+module Store = Granary_store.Store
+module Catalog = Granary_catalog.Catalog
 open Lwt.Syntax
 
 (* ------------------------------------------------------------------ *)

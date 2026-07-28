@@ -3,7 +3,7 @@
     operators (Phase 2) compute over.  +1 = inserted, -1 = retracted; the delta
     feed (#419) lifts to a Z-set delta. *)
 
-module Z = Sqlocaml_ivm.Zset.Make (struct
+module Z = Granary_ivm.Zset.Make (struct
     type t = int
 
     let compare = Int.compare

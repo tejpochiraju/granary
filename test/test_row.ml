@@ -1,4 +1,4 @@
-open Sqlocaml_encoding
+open Granary_encoding
 
 (* ── Schemas ─────────────────────────────────────────────────────────── *)
 

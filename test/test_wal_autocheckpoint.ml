@@ -11,15 +11,15 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -28,7 +28,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_wal_autockpt_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_wal_autockpt_%04d.db" n
 ;;
 
 let cleanup path =
@@ -219,7 +219,7 @@ let test_writer_not_blocked_by_autocheckpoint () =
   (* After crossing threshold, the writer's commit must return promptly;
      checkpoint runs in the background.  Sanity check: 10 inserts past
      threshold complete in well under 1 second on a small DB. *)
-  let path = "/tmp/sqlocaml_phase38_actk_async.db" in
+  let path = "/tmp/granary_phase38_actk_async.db" in
   (try Unix.unlink path with
    | _ -> ());
   (try Unix.unlink (path ^ "-wal") with

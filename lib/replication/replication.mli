@@ -54,8 +54,8 @@ val verify_checksum : replicated_frame -> bool
     generation.  Epoch-aware apply (with re-anchor from a fresh
     base snapshot) is deferred to the standby-apply driver in #172. *)
 val apply_frames
-  :  wal:Sqlocaml_storage.Wal.t
-  -> pager:Sqlocaml_storage.Pager.t
+  :  wal:Granary_storage.Wal.t
+  -> pager:Granary_storage.Pager.t
   -> replicated_frame list
   -> (unit, [> `Apply_error of string ]) result Lwt.t
 
@@ -74,14 +74,14 @@ val cold_restore
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> wal_size_bytes:int64
-  -> pager:Sqlocaml_storage.Pager.t
+  -> pager:Granary_storage.Pager.t
   -> base_snapshot_path:string
   -> wal_frames:replicated_frame list Lwt_stream.t
   -> unit
   -> (unit, [> `Restore_error of string ]) result Lwt.t
 
 (** Incremental restore: chain a full base snapshot + ordered incremental
-    frame sets captured via {!Sqlocaml_store.Store.capture_frames_since}.
+    frame sets captured via {!Granary_store.Store.capture_frames_since}.
 
     The caller must have already loaded the base snapshot into [~pager]
     before calling this function — this module does not load snapshots;
@@ -100,16 +100,16 @@ val incremental_restore
   -> write_at:(offset:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
   -> wal_size_bytes:int64
-  -> pager:Sqlocaml_storage.Pager.t
-  -> incremental_sets:Sqlocaml_store.Store.backup_frame list list
+  -> pager:Granary_storage.Pager.t
+  -> incremental_sets:Granary_store.Store.backup_frame list list
   -> unit
   -> (int64 * int, [> `Restore_error of string ]) result Lwt.t
 
-(** Convert a {!Sqlocaml_store.Store.backup_frame} (as returned by
-    {!Sqlocaml_store.Store.capture_frames_since}) to a {!replicated_frame}
+(** Convert a {!Granary_store.Store.backup_frame} (as returned by
+    {!Granary_store.Store.capture_frames_since}) to a {!replicated_frame}
     for use with {!apply_frames}, {!apply_frames_epoch_aware}, or
     {!verify_checksum}. *)
-val backup_frame_to_replicated : Sqlocaml_store.Store.backup_frame -> replicated_frame
+val backup_frame_to_replicated : Granary_store.Store.backup_frame -> replicated_frame
 
 (** -------------------------------------------------------------------- *)
 
@@ -126,14 +126,14 @@ val no_reader_gate : target:int -> unit Lwt.t
 
     Migrates the latest version of every page in the WAL index to the
     main DB via [Pager.flush_one_to_main], syncs, then calls [Wal.reset]
-    (which bumps the WAL {!Sqlocaml_storage.Wal.epoch}).  This is the
+    (which bumps the WAL {!Granary_storage.Wal.epoch}).  This is the
     standby-side equivalent of the engine's inline checkpoint
-    ([Sqlocaml_store.Store.checkpoint]) and is the primitive used to
+    ([Granary_store.Store.checkpoint]) and is the primitive used to
     drain buffered committed frames to durable storage before the WAL is
     recycled — both on master-epoch transitions and on promotion. *)
 val checkpoint_wal_to_main
-  :  wal:Sqlocaml_storage.Wal.t
-  -> pager:Sqlocaml_storage.Pager.t
+  :  wal:Granary_storage.Wal.t
+  -> pager:Granary_storage.Pager.t
   -> reader_gate:(target:int -> unit Lwt.t)
   -> (unit, [> `Apply_error of string ]) result Lwt.t
 
@@ -158,8 +158,8 @@ val checkpoint_wal_to_main
     intervening checkpoint between epoch N and N+1 frames is always
     honored before the N+1 frames are appended. *)
 val apply_frames_epoch_aware
-  :  wal:Sqlocaml_storage.Wal.t
-  -> pager:Sqlocaml_storage.Pager.t
+  :  wal:Granary_storage.Wal.t
+  -> pager:Granary_storage.Pager.t
   -> last_epoch:int64
   -> last_idx:int
   -> reader_gate:(target:int -> unit Lwt.t)

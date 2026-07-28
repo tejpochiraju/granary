@@ -1,6 +1,6 @@
 (library
- (name sqlocaml_columnar)
- (public_name sqlocaml.columnar)
- (libraries sqlocaml.encoding sqlocaml.store bigarray)
+ (name granary_columnar)
+ (public_name granary.columnar)
+ (libraries granary.encoding granary.store bigarray)
  (instrumentation
   (backend bisect_ppx)))

@@ -1,9 +1,9 @@
 (** Tests for the Pager page-event seam (#384). *)
 
-open Sqlocaml_storage
+open Granary_storage
 
 (* Keep cache assertions deterministic across this exe. *)
-let () = Unix.putenv "SQLOCAML_PAGE_CACHE" "64"
+let () = Unix.putenv "GRANARY_PAGE_CACHE" "64"
 
 type mock_block =
   { store : (int64, Bytes.t) Hashtbl.t

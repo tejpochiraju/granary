@@ -1,6 +1,6 @@
-(** Page-level signal emitted by {!Sqlocaml_storage.Pager} for the internals
+(** Page-level signal emitted by {!Granary_storage.Pager} for the internals
     monitor (#384).  Storage-local on purpose: [Store_event] lives a layer up in
-    [sqlocaml.store], which depends on this library, so the pager cannot
+    [granary.store], which depends on this library, so the pager cannot
     reference it without creating a dependency cycle.  [Store.set_event_callback]
     translates these into [Store_event.t] variants.
 

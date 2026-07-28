@@ -1,6 +1,6 @@
 # Bench image for #222: adds in-process SQLite bindings to the dev toolchain.
-# Layering on sqlocaml-dev pins ONE libsqlite3 version across both hosts (fair).
-FROM localhost/sqlocaml-dev:latest
+# Layering on granary-dev pins ONE libsqlite3 version across both hosts (fair).
+FROM localhost/granary-dev:latest
 
 # apt needs root; the base image's default user is `opam`.
 # libsqlite3-dev: headers/lib the in-process bindings link against (the reference).

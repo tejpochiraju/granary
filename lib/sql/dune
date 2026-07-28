@@ -1,12 +1,12 @@
 (library
- (name sqlocaml_sql)
- (public_name sqlocaml.sql)
+ (name granary_sql)
+ (public_name granary.sql)
  (libraries
   lwt
-  sqlocaml.encoding
-  sqlocaml.store
-  sqlocaml.catalog
-  sqlocaml.columnar
+  granary.encoding
+  granary.store
+  granary.catalog
+  granary.columnar
   uutf
   uucp)
  (preprocess

@@ -1,8 +1,8 @@
 open Lwt.Syntax
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
 
 let tmp_file () =
-  let path = Filename.temp_file "sqlocaml_mb_test" ".raw" in
+  let path = Filename.temp_file "granary_mb_test" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (1024 * 1024);
   Unix.close fd;

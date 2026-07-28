@@ -1,8 +1,8 @@
-module S = Sqlocaml_store.Store
-module Row = Sqlocaml_encoding.Row
-module Varint = Sqlocaml_encoding.Varint
-module Schema_fingerprint = Sqlocaml_encoding.Schema_fingerprint
-module Rowid = Sqlocaml_encoding.Rowid
+module S = Granary_store.Store
+module Row = Granary_encoding.Row
+module Varint = Granary_encoding.Varint
+module Schema_fingerprint = Granary_encoding.Schema_fingerprint
+module Rowid = Granary_encoding.Rowid
 
 type fk_action =
   | FA_no_action
@@ -89,7 +89,7 @@ type storage =
       ; without_rowid : bool
       ; autoincrement : bool
       }
-  | Columnar of Sqlocaml_columnar.Col_store.t * S.tree_id
+  | Columnar of Granary_columnar.Col_store.t * S.tree_id
 
 type table_meta =
   { name : string
@@ -442,8 +442,8 @@ end = struct
       (fun name (m : table_meta) acc ->
          match m.storage with
          | Columnar (cs, _) ->
-           let encoded = Sqlocaml_columnar.Col_store.encode cs in
-           let was_dirty = Sqlocaml_columnar.Col_store.dirty cs in
+           let encoded = Granary_columnar.Col_store.encode cs in
+           let was_dirty = Granary_columnar.Col_store.dirty cs in
            (name, encoded, was_dirty) :: acc
          | _ -> acc)
       t.tables
@@ -481,8 +481,8 @@ end = struct
       (fun (name, encoded, was_dirty) ->
          match Hashtbl.find_opt t.tables name with
          | Some ({ storage = Columnar (_, tid); columns; _ } as m) ->
-           let cs = Sqlocaml_columnar.Col_store.decode columns encoded in
-           if was_dirty then Sqlocaml_columnar.Col_store.mark_dirty cs;
+           let cs = Granary_columnar.Col_store.decode columns encoded in
+           if was_dirty then Granary_columnar.Col_store.mark_dirty cs;
            Hashtbl.replace t.tables name { m with storage = Columnar (cs, tid) }
          | _ -> ())
       snapshots
@@ -648,7 +648,7 @@ let decode_table_storage bytes columns =
   | 1 ->
     let tid = Int64.to_int tid in
     let tid = if tid = 0 then -1 else tid in
-    Columnar (Sqlocaml_columnar.Col_store.create columns, tid)
+    Columnar (Granary_columnar.Col_store.create columns, tid)
   | _ ->
     Row { tree_id = Int64.to_int tid; next_rowid = next; without_rowid; autoincrement }
 ;;
@@ -1993,14 +1993,14 @@ let create_columnstore_table ?txn t ~name ~columns =
   match txn with
   | Some tx ->
     let%lwt tid = next_user_tid_tx tx in
-    let col_store = Sqlocaml_columnar.Col_store.create columns in
+    let col_store = Granary_columnar.Col_store.create columns in
     let%lwt m = write_rows col_store tid tx in
     Schema_cache.put_table t.sc ~name m;
     Lwt.return ()
   | None ->
     let%lwt tx = S.rw_begin t.store in
     let%lwt tid = next_user_tid_tx tx in
-    let col_store = Sqlocaml_columnar.Col_store.create columns in
+    let col_store = Granary_columnar.Col_store.create columns in
     let%lwt m = write_rows col_store tid tx in
     let%lwt () = S.commit tx in
     Schema_cache.put_table_durable t.sc ~name m;
@@ -2096,8 +2096,8 @@ let persist_dirty_columnar_stores t (tx : S.rw S.txn) =
     Lwt_list.filter_map_s
       (fun (m : table_meta) ->
          match m.storage with
-         | Columnar (cs, tid) when Sqlocaml_columnar.Col_store.dirty cs ->
-           let%lwt () = Sqlocaml_columnar.Persist.save tx tid cs in
+         | Columnar (cs, tid) when Granary_columnar.Col_store.dirty cs ->
+           let%lwt () = Granary_columnar.Persist.save tx tid cs in
            Lwt.return_some cs
          | _ -> Lwt.return_none)
       tables
@@ -2111,11 +2111,11 @@ let load_columnar_stores_with_txn t (tx : _ S.txn) =
     (fun (m : table_meta) ->
        match m.storage with
        | Columnar (_, tid) ->
-         let%lwt loaded = Sqlocaml_columnar.Persist.load tx tid m.columns in
+         let%lwt loaded = Granary_columnar.Persist.load tx tid m.columns in
          let cs =
            match loaded with
            | Some cs -> cs
-           | None -> Sqlocaml_columnar.Col_store.create m.columns
+           | None -> Granary_columnar.Col_store.create m.columns
          in
          let m' = { m with storage = Columnar (cs, tid) } in
          Schema_cache.put_table_durable t.sc ~name:m.name m';

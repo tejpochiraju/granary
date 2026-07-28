@@ -2,7 +2,7 @@
     plus pause/filter UI state held as [Lwd] vars so the view re-renders
     reactively (#382). *)
 
-module Event = Sqlocaml.Db.Event
+module Event = Granary.Db.Event
 
 type t
 

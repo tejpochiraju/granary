@@ -1,6 +1,6 @@
-module Row = Sqlocaml_encoding.Row
-module Null_bitmap = Sqlocaml_encoding.Null_bitmap
-module Varint = Sqlocaml_encoding.Varint
+module Row = Granary_encoding.Row
+module Null_bitmap = Granary_encoding.Null_bitmap
+module Varint = Granary_encoding.Varint
 
 type t =
   | Int_col of

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Generate all Jepsen #177 histories into jepsen/run/histories/.
-# Runs INSIDE the sqlocaml-dev container.
+# Runs INSIDE the granary-dev container.
 set -u
 cd /workspace
 H=jepsen/run/histories
@@ -44,7 +44,7 @@ run list_append_pause --workload list-append --backend mem --nemesis pause --pau
 # ---- Negative controls (should be INVALID) ----
 echo "### gen negative controls"
 opam exec -- dune exec jepsen/ocaml/negative_control.exe -- >/dev/null 2>&1
-cp /tmp/sqlocaml_negative_*.edn $H/ 2>/dev/null
+cp /tmp/granary_negative_*.edn $H/ 2>/dev/null
 
 echo
 echo "=== generated histories ==="

@@ -1,16 +1,16 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file = Sqlocaml_unix.Store.open_file
+  let open_file = Granary_unix.Store.open_file
 end
 
-module C = Sqlocaml_catalog.Catalog
-module Row = Sqlocaml_encoding.Row
-module Varint = Sqlocaml_encoding.Varint
-module SF = Sqlocaml_encoding.Schema_fingerprint
-module Rowid = Sqlocaml_encoding.Rowid
+module C = Granary_catalog.Catalog
+module Row = Granary_encoding.Row
+module Varint = Granary_encoding.Varint
+module SF = Granary_encoding.Schema_fingerprint
+module Rowid = Granary_encoding.Rowid
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -320,7 +320,7 @@ let test_blob_column_type () =
    column types are run through encode/decode (hitting the Real/Blob arms
    in type_of_tag). *)
 let test_mixed_column_types_roundtrip () =
-  let path = Printf.sprintf "/tmp/sqlocaml_test_catalog_mixed_%d.db" (Random.bits ()) in
+  let path = Printf.sprintf "/tmp/granary_test_catalog_mixed_%d.db" (Random.bits ()) in
   (try Unix.unlink path with
    | _ -> ());
   Fun.protect
@@ -834,7 +834,7 @@ let corrupt_default_tag () =
      in
      let bad_val =
        let buf = Buffer.create 16 in
-       let v = Sqlocaml_encoding.Varint.encode_uint64 in
+       let v = Granary_encoding.Varint.encode_uint64 in
        v buf 1L;
        (* type tag = INTEGER *)
        v buf 1L;
@@ -1128,9 +1128,9 @@ let corrupt_column_type_tag () =
      in
      let bad_val =
        let buf = Buffer.create 8 in
-       Sqlocaml_encoding.Varint.encode_uint64 buf 0L;
+       Granary_encoding.Varint.encode_uint64 buf 0L;
        (* tag=0, invalid *)
-       Sqlocaml_encoding.Varint.encode_uint64 buf 2L;
+       Granary_encoding.Varint.encode_uint64 buf 2L;
        (* name len *)
        Buffer.add_string buf "id";
        Buffer.to_bytes buf

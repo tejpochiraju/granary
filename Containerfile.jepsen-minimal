@@ -1,6 +1,6 @@
 # Minimal Jepsen image — layers Java + Clojure + Elle deps on top
-# of the sqlocaml-jepsen base (which has OCaml + lazyfs).
-FROM sqlocaml-jepsen
+# of the granary-jepsen base (which has OCaml + lazyfs).
+FROM granary-jepsen
 
 USER root
 

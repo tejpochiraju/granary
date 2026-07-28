@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let value_to_string = function
   | Db.V_null -> "NULL"
@@ -99,7 +99,7 @@ let read_stdin () =
 
 let () =
   (* Enable Unix file operations (ATTACH / VACUUM) for this process. *)
-  Sqlocaml_unix.install ();
+  Granary_unix.install ();
   let args = Array.to_list Sys.argv |> List.tl in
   let db_path, sql_source =
     match args with
@@ -117,7 +117,7 @@ let () =
        if db_path = ":memory:"
        then Db.open_in_memory ()
        else
-         let* result = Sqlocaml_unix.open_file ~path:db_path () in
+         let* result = Granary_unix.open_file ~path:db_path () in
          match result with
          | Ok db -> Lwt.return db
          | Error e ->

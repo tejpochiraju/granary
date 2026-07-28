@@ -1,13 +1,13 @@
 (lang dune 3.16)
-(name sqlocaml)
+(name granary)
 (using menhir 2.1)
 (generate_opam_files true)
 (version 0.0.1)
 (source
- (uri "git+ssh://git@git.iotready.com:2222/experiments/kosha.git"))
+ (uri "git+https://github.com/tejpochiraju/granary.git"))
 
 (package
- (name sqlocaml)
+ (name granary)
  (synopsis "Pure-OCaml SQL engine")
  (description "Pure-OCaml SQL engine targeting MirageOS unikernels.")
  (depends
@@ -24,11 +24,11 @@
   (alcotest-lwt :with-test)))
 
 (package
- (name sqlocaml_repl)
- (synopsis "TUI REPL for sqlocaml")
+ (name granary_repl)
+ (synopsis "TUI REPL for granary")
  (depends
   (ocaml (>= 5.4))
-  sqlocaml
+  granary
   (lwt (>= 5.7))
   (menhir (>= "20240715"))
   (lwd (>= 0.5))

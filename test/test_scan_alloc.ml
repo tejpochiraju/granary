@@ -24,10 +24,10 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file = Sqlocaml_unix.Store.open_file
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file = Granary_unix.Store.open_file
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -44,7 +44,7 @@ let ok_store : (S.t, S.error) result -> S.t = function
 ;;
 
 let with_store_gen ~open_db ~f =
-  let path = Filename.temp_file "sqlocaml_scan_alloc" ".db" in
+  let path = Filename.temp_file "granary_scan_alloc" ".db" in
   (try Unix.unlink path with
    | _ -> ());
   Lwt.finalize

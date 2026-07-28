@@ -6,7 +6,7 @@
     validation (page_size a 4096-multiple in [4096,65536]; reserved_bytes ≥ 0
     and small enough to leave a usable payload). *)
 
-module G = Sqlocaml_storage.Geometry
+module G = Granary_storage.Geometry
 
 let mk ?(reserved = 0) ps = G.create ~page_size:ps ~reserved_bytes_per_page:reserved
 

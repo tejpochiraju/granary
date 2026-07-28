@@ -3,19 +3,19 @@
 open Lwt.Syntax
 
 module DB = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
 (* ------------------------------------------------------------------ *)
 
 let tmp_file () =
-  let path = Filename.temp_file "sqlocaml_backend_test" ".raw" in
+  let path = Filename.temp_file "granary_backend_test" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (4 * 1024 * 1024);
   Unix.close fd;
@@ -126,7 +126,7 @@ let test_mem_backend () =
 ;;
 
 let test_unix_file_backend () =
-  let path = Filename.temp_file "sqlocaml_cf_unix" ".db" in
+  let path = Filename.temp_file "granary_cf_unix" ".db" in
   Fun.protect
     ~finally:(fun () ->
       try Unix.unlink path with
@@ -152,7 +152,7 @@ let test_mirage_backend () =
 
 let test_all_identical () =
   let mem_rows = Lwt_main.run (with_mem_db run_scenario) in
-  let file_path = Filename.temp_file "sqlocaml_all_unix" ".db" in
+  let file_path = Filename.temp_file "granary_all_unix" ".db" in
   let mb_path = tmp_file () in
   Fun.protect
     ~finally:(fun () ->

@@ -16,7 +16,7 @@
       - Recovery durability: elements survive crash/restart. *)
 
 open Edn_history
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (** Generate a set-add operation with a unique element value. *)
 let gen_add element = element

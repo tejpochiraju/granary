@@ -1,4 +1,4 @@
-open Sqlocaml_encoding.Rowid
+open Granary_encoding.Rowid
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

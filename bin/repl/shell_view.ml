@@ -5,7 +5,7 @@ type t =
   { input : string Lwd.var
   ; status : string Lwd.var
   ; headers : string list Lwd.var
-  ; rows : Sqlocaml.Db.row list Lwd.var
+  ; rows : Granary.Db.row list Lwd.var
   }
 
 let create () =
@@ -75,7 +75,7 @@ let render t =
         (pair (Lwd.get t.headers) (Lwd.get t.rows))
         ~f:(fun (headers, rows) ->
           W.vbox
-            ([ Lwd.return (W.string ~attr:Notty.A.(fg cyan) ("sqlocaml> " ^ input)) ]
+            ([ Lwd.return (W.string ~attr:Notty.A.(fg cyan) ("granary> " ^ input)) ]
              @ render_rows headers rows
              @ [ Lwd.return (W.string ~attr:Notty.A.(fg lightblack) status) ])))
 ;;

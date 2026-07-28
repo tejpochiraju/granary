@@ -16,20 +16,20 @@
     CI runner (these [`Slow] tests run concurrently with ~90 other suites and
     the IO-hammering [bench_*] jobs) GC/scheduler noise can exceed the headroom
     and flake.  As with the [bench_*] suites and [test_fts_scaling], CI
-    neutralizes the gates via the same env vars — [SQLOCAML_BENCH_MAX_RATIO]
-    (raised high) for the insert ceiling and [SQLOCAML_BENCH_MIN_SPEEDUP]
+    neutralizes the gates via the same env vars — [GRANARY_BENCH_MAX_RATIO]
+    (raised high) for the insert ceiling and [GRANARY_BENCH_MIN_SPEEDUP]
     (lowered to 0) for the lookup floor — so the suite still runs and prints
     without failing on load. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
 (* Insert second/first ratio ceiling.  Default 2.5 (generous headroom over the
-   ~2.0 a correct O(log n) insert shows); raised via [SQLOCAML_BENCH_MAX_RATIO]
+   ~2.0 a correct O(log n) insert shows); raised via [GRANARY_BENCH_MAX_RATIO]
    to neutralize the gate on loaded CI. *)
 let max_ratio =
-  match Sys.getenv_opt "SQLOCAML_BENCH_MAX_RATIO" with
+  match Sys.getenv_opt "GRANARY_BENCH_MAX_RATIO" with
   | Some v ->
     (try float_of_string v with
      | _ -> 2.5)
@@ -37,10 +37,10 @@ let max_ratio =
 ;;
 
 (* Point-lookup vs full-scan speedup floor.  Default 4.0 (the real ratio is
-   ~15-50x); lowered to 0 via [SQLOCAML_BENCH_MIN_SPEEDUP] to neutralize the
+   ~15-50x); lowered to 0 via [GRANARY_BENCH_MIN_SPEEDUP] to neutralize the
    gate on loaded CI. *)
 let min_speedup =
-  match Sys.getenv_opt "SQLOCAML_BENCH_MIN_SPEEDUP" with
+  match Sys.getenv_opt "GRANARY_BENCH_MIN_SPEEDUP" with
   | Some v ->
     (try float_of_string v with
      | _ -> 4.0)
@@ -53,11 +53,11 @@ let unwrap = function
 ;;
 
 let with_db f =
-  let dir = Filename.temp_file "sqlocaml_scaling" "" in
+  let dir = Filename.temp_file "granary_scaling" "" in
   Sys.remove dir;
   Unix.mkdir dir 0o755;
   let path = Filename.concat dir "scaling.db" in
-  let db = unwrap (run (Sqlocaml_unix.open_file_wal ~path ())) in
+  let db = unwrap (run (Granary_unix.open_file_wal ~path ())) in
   Fun.protect
     ~finally:(fun () ->
       (try run (Db.close db) with
@@ -167,7 +167,7 @@ let test_insert_not_quadratic () =
     (* O(n^2) would give a ratio ~3.0 (second half walks a table 1.5x larger on
        average and is twice as far along).  The O(log n) fix keeps it well under
        2.0; we assert < [max_ratio] (default 2.5) for generous headroom against
-       GC/scheduler noise, neutralized on loaded CI via SQLOCAML_BENCH_MAX_RATIO. *)
+       GC/scheduler noise, neutralized on loaded CI via GRANARY_BENCH_MAX_RATIO. *)
     Alcotest.(check bool)
       (Printf.sprintf "insert second/first ratio %.2f < %.1f" (second /. first) max_ratio)
       true
@@ -230,7 +230,7 @@ let test_point_lookup_fast () =
        collapses to ~1.  Require the seek to be at least [min_speedup]x cheaper
        (default 4.0) — the real ratio is ~15-50x, so this is a wide margin with
        no absolute threshold; neutralized on loaded CI via
-       SQLOCAML_BENCH_MIN_SPEEDUP. *)
+       GRANARY_BENCH_MIN_SPEEDUP. *)
     let scan_s = time_query db "SELECT COUNT(*), SUM(k) FROM t" ~reps:20 in
     let ratio = scan_s /. lookup_s in
     Printf.eprintf

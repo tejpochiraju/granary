@@ -1,5 +1,5 @@
-module U = Sqlocaml_unix.Store
-module H = Sqlocaml_store.History
+module U = Granary_unix.Store
+module H = Granary_store.History
 open Lwt.Syntax
 
 let with_temp f =

@@ -26,13 +26,13 @@
 open Lwt.Syntax
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
-module S = Sqlocaml_store.Store
-module UF = Sqlocaml_unix.Unix_file
+module S = Granary_store.Store
+module UF = Granary_unix.Unix_file
 
 let run = Lwt_main.run
 let counter = ref 0
@@ -40,7 +40,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_group_commit_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_group_commit_%04d.db" n
 ;;
 
 let cleanup path =

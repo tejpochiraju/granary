@@ -5,7 +5,7 @@
     against an OCaml model after each operation.
 
     The default iteration count is small (~500) so the test fits in CI;
-    set [SQLOCAML_SOAK_ITERS] to a larger number (e.g. 50_000) to run a
+    set [GRANARY_SOAK_ITERS] to a larger number (e.g. 50_000) to run a
     long soak locally.
 
     What this catches:
@@ -18,9 +18,9 @@
     randomized op we compare the model's contents to the db. *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 let run = Lwt_main.run
@@ -33,7 +33,7 @@ let env_int key default =
      | _ -> default)
 ;;
 
-let n_iters = env_int "SQLOCAML_SOAK_ITERS" 500
+let n_iters = env_int "GRANARY_SOAK_ITERS" 500
 let max_key = 200
 
 let exec_or_ignore db sql =
@@ -140,7 +140,7 @@ let test_soak_mem () =
 ;;
 
 let test_soak_file () =
-  let path = "/tmp/sqlocaml_phase39_soak.db" in
+  let path = "/tmp/granary_phase39_soak.db" in
   (try Unix.unlink path with
    | _ -> ());
   let db =

@@ -1,4 +1,4 @@
-open Sqlocaml_sql
+open Granary_sql
 
 let parse s =
   let lexbuf = Lexing.from_string s in

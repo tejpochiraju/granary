@@ -9,4 +9,4 @@
     no catalog (sequential scan with filtering).  This keeps unit tests
     that don't construct a full catalog compact. *)
 
-val plan : ?cat:Sqlocaml_catalog.Catalog.t -> Sema.bound_stmt -> Plan.op
+val plan : ?cat:Granary_catalog.Catalog.t -> Sema.bound_stmt -> Plan.op

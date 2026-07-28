@@ -15,7 +15,7 @@
     the restored database still enforces the constraint. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -51,9 +51,9 @@ let with_db f =
 ;;
 
 let with_file_db f =
-  let path = Filename.temp_file "sqlocaml_dump_264" ".db" in
+  let path = Filename.temp_file "granary_dump_264" ".db" in
   let db =
-    match run (Sqlocaml_unix.open_file ~path ()) with
+    match run (Granary_unix.open_file ~path ()) with
     | Ok db -> db
     | Error e -> Alcotest.failf "open_file: %a" Db.pp_error e
   in

@@ -8,12 +8,12 @@ second mechanical reviewer is high value.
 
 ## Running it
 
-merlint is baked into the `sqlocaml-dev` container image (see `Containerfile`).
+merlint is baked into the `granary-dev` container image (see `Containerfile`).
 It is git-only with no opam release, so the image pins a known-good commit.
 
 ```sh
 # inside the dev image (dune runs in podman, never on the host):
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev merlint --color=never
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev merlint --color=never
 ```
 
 Configuration lives in `.merlint` at the repo root. Command-line `--rules`

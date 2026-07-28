@@ -1,5 +1,5 @@
 (ns jepsen.check
-  "Offline checker runner for sqlocaml Jepsen histories.
+  "Offline checker runner for granary Jepsen histories.
 
    Reads an EDN-format history file produced by the OCaml harness
    and dispatches it to the appropriate Jepsen/Elle checker.
@@ -332,7 +332,7 @@
    ["-h" "--help"          "Show help"]])
 
 (defn usage [summary]
-  (println "sqlocaml Jepsen checker — offline history analysis")
+  (println "granary Jepsen checker — offline history analysis")
   (println)
   (println "Usage: clojure -M -m jepsen.check <history.edn> [options]")
   (println)

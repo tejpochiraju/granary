@@ -1,22 +1,22 @@
-# sqlocaml MirageOS build image (#403).
+# granary MirageOS build image (#403).
 #
-# Extends the sqlocaml-dev image with the `mirage` CLI (4.11.x) and the
+# Extends the granary-dev image with the `mirage` CLI (4.11.x) and the
 # Solo5/ocaml-solo5 build tooling, so the sample unikernel under mirage/ can be
 # assembled and built for the `unix` and `hvt` targets:
 #
-#   podman build -t sqlocaml-mirage -f Containerfile.mirage .
-#   podman run --rm -v "$(pwd):/workspace:z" -w /workspace/mirage sqlocaml-mirage \
+#   podman build -t granary-mirage -f Containerfile.mirage .
+#   podman run --rm -v "$(pwd):/workspace:z" -w /workspace/mirage granary-mirage \
 #     sh -c 'mirage configure -t unix && make depends && make build'
 #
 # For the aarch64 audit (#402), build from the arm64 dev base under emulation:
 #   podman build --platform=linux/arm64 \
-#     --build-arg BASE=localhost/sqlocaml-dev:arm64 \
-#     -t sqlocaml-mirage:arm64 -f Containerfile.mirage .
+#     --build-arg BASE=localhost/granary-dev:arm64 \
+#     -t granary-mirage:arm64 -f Containerfile.mirage .
 #
-# The mirage CLI is NOT in sqlocaml-dev (it pulls the mirage runtime + opam
+# The mirage CLI is NOT in granary-dev (it pulls the mirage runtime + opam
 # monorepo), which is why it lives in this dedicated image rather than bloating
 # the everyday dev/test/CI image. See mirage/README.md.
-ARG BASE=localhost/sqlocaml-dev:latest
+ARG BASE=localhost/granary-dev:latest
 FROM ${BASE}
 USER root
 # Solo5 / ocaml-solo5 build a tiny C runtime, so the host toolchain is needed

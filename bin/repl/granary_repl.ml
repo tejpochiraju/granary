@@ -1,4 +1,4 @@
-(** sqlocaml interactive TUI shell (#382).
+(** granary interactive TUI shell (#382).
 
     A single-root nottui application composing two panes:
     - SHELL (top): an editable input line, query results, and a status line
@@ -17,7 +17,7 @@
     views instead of printing to stdout. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 module W = Nottui_widgets
 module Ui = Nottui.Ui
 module Focus = Nottui.Focus
@@ -99,7 +99,7 @@ let dot_help () =
     ; ".import <path>              import a SQLite file (needs sqlite3 in PATH; \
        read-only on the source)"
     ; ".dump [path]                write the visible event log to a file (default \
-       sqlocaml-events.log)"
+       granary-events.log)"
     ; ".databases                  list attached databases"
     ; "Tab switches panes; Esc quits."
     ]
@@ -211,7 +211,7 @@ let dispatch_dot (d : Repl_command.dot) =
   | Open path -> dot_open path
   | Import path -> dot_import path
   | Dump path_opt ->
-    let path = Option.value path_opt ~default:"sqlocaml-events.log" in
+    let path = Option.value path_opt ~default:"granary-events.log" in
     (match Event_log.dump log path with
      | Ok n ->
        Shell_view.set_status shell (Printf.sprintf "dumped %d event(s) to %s" n path)
@@ -360,7 +360,7 @@ let root =
 (* ------------------------------------------------------------------ *)
 
 let main () =
-  Sqlocaml_unix.install ();
+  Granary_unix.install ();
   let path =
     match Array.to_list Sys.argv |> List.tl with
     | [] -> ":memory:"

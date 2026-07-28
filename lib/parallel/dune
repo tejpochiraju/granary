@@ -1,5 +1,5 @@
 (library
- (name sqlocaml_parallel)
- (public_name sqlocaml.parallel)
+ (name granary_parallel)
+ (public_name granary.parallel)
  (instrumentation
   (backend bisect_ppx)))

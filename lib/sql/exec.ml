@@ -1,10 +1,10 @@
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module Cat = Sqlocaml_catalog.Catalog
-module Row = Sqlocaml_encoding.Row
-module Rowid = Sqlocaml_encoding.Rowid
-module Index_key = Sqlocaml_encoding.Index_key
-module Varint = Sqlocaml_encoding.Varint
+module S = Granary_store.Store
+module Cat = Granary_catalog.Catalog
+module Row = Granary_encoding.Row
+module Rowid = Granary_encoding.Rowid
+module Index_key = Granary_encoding.Index_key
+module Varint = Granary_encoding.Varint
 
 (* #240: the set of user tables a write statement actually mutated, accumulated
    for an external read cache.  Like [query_stats] it rides Lwt
@@ -135,11 +135,11 @@ let dirty_changes ({ changes; _ } : dirty_tables_acc) : (string * row_change lis
 (* ------------------------------------------------------------------ *)
 
 (* #247: kill-switch for the cursor-level aggregate fast path.  Defaults on;
-   [SQLOCAML_AGG_FASTPATH=0] forces the general [stream_aggregate] path (a safety
+   [GRANARY_AGG_FASTPATH=0] forces the general [stream_aggregate] path (a safety
    valve, and the foil the Gc-gate regression test compares against).  Read
    per-call — an aggregate runs it once per query, never in a tight loop. *)
 let agg_fastpath_enabled () =
-  match Sys.getenv_opt "SQLOCAML_AGG_FASTPATH" with
+  match Sys.getenv_opt "GRANARY_AGG_FASTPATH" with
   | Some ("0" | "false" | "off") -> false
   | _ -> true
 ;;
@@ -1294,7 +1294,7 @@ let eval_misc_func (func : Ast.scalar_func) (args : Row.value list) : Row.value 
   | Ast.Fn_last_insert_rowid, _ -> Some Row.V_null
   | Ast.Fn_total_changes, [] -> Some (Row.V_int 0L)
   | Ast.Fn_total_changes, _ -> Some Row.V_null
-  | Ast.Fn_sqlite_version, [] -> Some (Row.V_text "3.45.0-sqlocaml")
+  | Ast.Fn_sqlite_version, [] -> Some (Row.V_text "3.45.0-granary")
   | Ast.Fn_sqlite_version, _ -> Some Row.V_null
   | _ -> None
 ;;
@@ -2442,14 +2442,14 @@ let release_txn ?cat tx owned =
         Cat.persist_dirty_columnar_stores c tx
     in
     let* () = S.commit tx in
-    List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
+    List.iter Granary_columnar.Col_store.mark_clean saved;
     Lwt.return_unit)
   else Lwt.return_unit
 ;;
 
 (** Extract the in-memory columnar store from a table_meta.  Asserts [Row]
     cannot happen at call sites guarded by [Cat.is_columnar]. *)
-let col_store_of_meta (m : Cat.table_meta) : Sqlocaml_columnar.Col_store.t =
+let col_store_of_meta (m : Cat.table_meta) : Granary_columnar.Col_store.t =
   match m.Cat.storage with
   | Cat.Columnar (cs, _) -> cs
   | Cat.Row _ -> assert false
@@ -6719,7 +6719,7 @@ let execute_with_count
                 row)
              values
          in
-         Sqlocaml_columnar.Col_store.insert_rows col_store (Array.of_list rows);
+         Granary_columnar.Col_store.insert_rows col_store (Array.of_list rows);
          let* () = release_txn ~cat tx owned in
          if values <> [] then mark_dirty table_meta.Cat.name;
          Lwt.return (List.length values))
@@ -6763,7 +6763,7 @@ let execute_with_count
     let* tx, owned = acquire_txn store mode in
     Lwt.catch
       (fun () ->
-         Sqlocaml_columnar.Col_store.insert_rows col_store batch;
+         Granary_columnar.Col_store.insert_rows col_store batch;
          let* () = release_txn ~cat tx owned in
          if Array.length batch > 0 then mark_dirty table_meta.Cat.name;
          Lwt.return (Array.length batch))
@@ -8356,7 +8356,7 @@ and stream_seq_scan clock params store mode (table_meta : Cat.table_meta) =
 
 and stream_col_seq_scan _clock _params _store _mode (table_meta : Cat.table_meta) =
   let col_store = col_store_of_meta table_meta in
-  let seq = Sqlocaml_columnar.Col_store.to_row_seq col_store in
+  let seq = Granary_columnar.Col_store.to_row_seq col_store in
   Lwt.return (Lwt_stream.of_list (List.of_seq seq))
 
 and stream_filter clock params store mode cat pred child =

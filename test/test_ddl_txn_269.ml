@@ -19,7 +19,7 @@
     per-job timeout (and a local [timeout 60]) turns that into a failure. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

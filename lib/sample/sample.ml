@@ -1,4 +1,4 @@
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (* Result-aware bind over an [(_, _) result Lwt.t]: short-circuits on the first
    [Error] so the workload reads as a flat sequence (keeps merlint nesting low). *)

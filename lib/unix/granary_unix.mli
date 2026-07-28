@@ -1,4 +1,4 @@
-(** Unix platform driver for sqlocaml (#170): file-backed database
+(** Unix platform driver for granary (#170): file-backed database
     constructors plus the file provider that powers ATTACH and VACUUM on the
     otherwise platform-agnostic core. *)
 
@@ -8,14 +8,14 @@ module Unix_file = Unix_file
 (** Fault-injecting wrapper around {!Unix_file} for crash-recovery tests. *)
 module Fault_inject = Fault_inject
 
-(** Unix-file convenience constructors for {!Sqlocaml_store.Store}. *)
+(** Unix-file convenience constructors for {!Granary_store.Store}. *)
 module Store = Store
 
 (** The Unix file provider, exposed for explicit installation. *)
-val provider : Sqlocaml.Db.file_provider
+val provider : Granary.Db.file_provider
 
 (** Install the process-wide file provider (see
-    {!Sqlocaml.Db.set_file_provider}) so ATTACH and VACUUM can touch the local
+    {!Granary.Db.set_file_provider}) so ATTACH and VACUUM can touch the local
     filesystem.  Idempotent; also called automatically by {!open_file} /
     {!open_file_wal}. *)
 val install : unit -> unit
@@ -29,12 +29,12 @@ val install : unit -> unit
     existing file (whose stored geometry is used).  Reopening with an explicit
     geometry that disagrees with the file is rejected.
 
-    [clock] is forwarded to {!Sqlocaml.Db.of_store} (used by datetime).  Note:
+    [clock] is forwarded to {!Granary.Db.of_store} (used by datetime).  Note:
     durability applies to WAL mode only; the non-WAL commit path syncs inline
     and ignores the sync mode, so {!open_file} takes no [durability] (#298).
 
     [as_of_history] (#266) defaults to [false]; set it to [true] to enable the
-    [<path>.aslog] as-of commit log, which lets {!Sqlocaml.Db.query_as_of} read
+    [<path>.aslog] as-of commit log, which lets {!Granary.Db.query_as_of} read
     the database as it existed at a past txn id / timestamp. *)
 val open_file
   :  ?page_size:int
@@ -43,19 +43,19 @@ val open_file
   -> ?as_of_history:bool
   -> path:string
   -> unit
-  -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
+  -> (Granary.Db.t, Granary.Db.error) result Lwt.t
 
 (** Open a persistent WAL-mode database ([path] for the main DB, [path ^ "-wal"]
     for the WAL), registering the file provider.  Crash recovery runs
     automatically at open.  Geometry arguments behave as in {!open_file} (#95).
-    [clock] and [durability] are forwarded to {!Sqlocaml.Db.of_store} (#298).
+    [clock] and [durability] are forwarded to {!Granary.Db.of_store} (#298).
     [as_of_history] (#266) defaults to [false] — see {!open_file}. *)
 val open_file_wal
   :  ?page_size:int
   -> ?reserved_bytes_per_page:int
   -> ?clock:(unit -> float)
-  -> ?durability:Sqlocaml_store.Store.durability
+  -> ?durability:Granary_store.Store.durability
   -> ?as_of_history:bool
   -> path:string
   -> unit
-  -> (Sqlocaml.Db.t, Sqlocaml.Db.error) result Lwt.t
+  -> (Granary.Db.t, Granary.Db.error) result Lwt.t

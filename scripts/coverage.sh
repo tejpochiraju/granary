@@ -6,7 +6,7 @@
 #   ./scripts/coverage.sh html        # summary + HTML in _coverage/
 #   ./scripts/coverage.sh ci          # fail if below COVERAGE_THRESHOLD (default 85%)
 #
-# Requires: sqlocaml-dev Podman image (built from Containerfile, includes bisect_ppx).
+# Requires: granary-dev Podman image (built from Containerfile, includes bisect_ppx).
 # Run from the repo root.
 
 set -euo pipefail
@@ -15,7 +15,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 THRESHOLD="${COVERAGE_THRESHOLD:-85}"
 MODE="${1:-summary}"
 
-PODMAN="podman run --rm -v ${REPO}:/workspace:Z -w /workspace sqlocaml-dev"
+PODMAN="podman run --rm -v ${REPO}:/workspace:Z -w /workspace granary-dev"
 
 echo "==> Building and running instrumented test suite..."
 $PODMAN bash -c "
@@ -26,7 +26,7 @@ $PODMAN bash -c "
 COVFILES=$($PODMAN bash -c "find _build -name '*.coverage' | tr '\n' ' '" 2>/dev/null)
 
 if [ -z "${COVFILES// }" ]; then
-  echo "ERROR: no coverage files generated. Is bisect_ppx installed in sqlocaml-dev?" >&2
+  echo "ERROR: no coverage files generated. Is bisect_ppx installed in granary-dev?" >&2
   exit 1
 fi
 

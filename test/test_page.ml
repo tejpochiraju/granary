@@ -1,6 +1,6 @@
-(** Tests for Sqlocaml_storage.Page *)
+(** Tests for Granary_storage.Page *)
 
-module P = Sqlocaml_storage.Page
+module P = Granary_storage.Page
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                             *)

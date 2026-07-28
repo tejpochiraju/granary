@@ -2,7 +2,7 @@
     blocking shell so both the terminal logic and the nottui views can share
     them (#382). *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (** Render one engine value as a display string (NULL/int/real/text/blob). *)
 val value_to_string : Db.value -> string

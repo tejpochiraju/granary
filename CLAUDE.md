@@ -1,4 +1,4 @@
-# sqlocaml — Agent Guide
+# granary — Agent Guide
 
 Pure-OCaml SQL engine targeting MirageOS. All implementation is in `lib/`; tests in `test/`; benchmarks in `bench/`.
 
@@ -32,13 +32,13 @@ Never call `dune` directly on the host. All OCaml build commands run inside the 
 
 ```sh
 # build
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev dune build
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune build
 
 # test
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev dune test
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune test
 
 # specific test
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev dune test test/test_foo.exe
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune test test/test_foo.exe
 ```
 
 From inside a worktree, substitute the worktree path for `$(pwd)`.
@@ -49,10 +49,10 @@ From inside a worktree, substitute the worktree path for `$(pwd)`.
 
 ```sh
 # check
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev ocamlformat --check lib/foo.ml
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev ocamlformat --check lib/foo.ml
 
 # fix (write to host via redirect)
-tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev \
+tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
   ocamlformat lib/foo.ml > "$tmp" && mv "$tmp" lib/foo.ml && chmod 644 lib/foo.ml
 ```
 
@@ -65,13 +65,13 @@ The CI **lint** job runs `dune build @fmt` (which checks dune-file formatting *a
 ```sh
 # dune-file formatting — @fmt can't run in a worktree (the worktree .git is a
 # file → "fatal: not a git repository"), so use the standalone formatter:
-tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev \
+tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
   dune format-dune-file path/to/dune > "$tmp" && mv "$tmp" path/to/dune && chmod 644 path/to/dune
 # verify a dune file is already formatted (expect no diff):
-diff <(podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev dune format-dune-file path/to/dune) path/to/dune
+diff <(podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune format-dune-file path/to/dune) path/to/dune
 
 # merlint — run from the workspace root; expect 0 issues for your files
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev merlint
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev merlint
 ```
 
 merlint enforces (among others): max nesting depth 4, every library module has a `.mli`, an abstract `type t` has a `pp`, and every public `val` in an `.mli` has a `(** … *)` doc comment (not `(* … *)`). It ignores the pre-existing `sqlite3 not found` build warning and still reports.
@@ -81,7 +81,7 @@ merlint enforces (among others): max nesting depth 4, every library module has a
 Use the manual binary loop, not `dune runtest --instrument-with=bisect_ppx` (requires RPC daemon):
 
 ```sh
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
   bisect-ppx-report html --output _coverage_report/ _build/default/test/*.coverage
 ```
 
@@ -91,7 +91,7 @@ When your work is ready:
 
 ```sh
 git push origin <branch-name>
-~/.local/bin/forgejo pr create experiments/kosha \
+~/.local/bin/forgejo pr create tej/granary \
   --title="feat(#NNN): short description" \
   --head=<branch-name> \
   --base=main \
@@ -110,17 +110,17 @@ EOF
 
 ### Filing issues
 
-"File an issue" means Forgejo (`experiments/kosha`), not GitHub or any third-party URL.
+"File an issue" means Forgejo (`tej/granary`), not GitHub or any third-party URL.
 
 ```sh
-~/.local/bin/forgejo issue create experiments/kosha --title="..." --body="..."
+~/.local/bin/forgejo issue create tej/granary --title="..." --body="..."
 ```
 
 ### Testing standards
 
 - Target 100% line coverage on every module.
 - Add QCheck property tests for every non-trivial function (see existing tests for patterns).
-- Tests that require real SQLite are gated by the `SQLOCAML_TEST_SQLITE` env var (see `test/compare_sqlite/`).
+- Tests that require real SQLite are gated by the `GRANARY_TEST_SQLITE` env var (see `test/compare_sqlite/`).
 
 ## Repository structure
 
@@ -135,16 +135,16 @@ bin/          — CLI entry point
 
 ## Forgejo CLI reference
 
-Binary: `~/.local/bin/forgejo`. Repo slug: `experiments/kosha`.
+Binary: `~/.local/bin/forgejo`. Repo slug: `tej/granary`.
 
 Common commands:
 
 ```sh
-forgejo issue list experiments/kosha
-forgejo issue view experiments/kosha <N>
-forgejo issue close experiments/kosha <N>
-forgejo pr list experiments/kosha
-forgejo pr view experiments/kosha <N>
-forgejo pr review experiments/kosha <N> --approve
-forgejo pr merge experiments/kosha <N> --method=squash
+forgejo issue list tej/granary
+forgejo issue view tej/granary <N>
+forgejo issue close tej/granary <N>
+forgejo pr list tej/granary
+forgejo pr view tej/granary <N>
+forgejo pr review tej/granary <N> --approve
+forgejo pr merge tej/granary <N> --method=squash
 ```

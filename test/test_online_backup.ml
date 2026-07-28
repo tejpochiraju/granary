@@ -3,10 +3,10 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 end
 
-module UnixStore = Sqlocaml_unix.Store
+module UnixStore = Granary_unix.Store
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -19,7 +19,7 @@ let counter = ref 0
 let fresh_path tag =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_backup_%04d_%s.db" n tag
+  Printf.sprintf "/tmp/granary_test_backup_%04d_%s.db" n tag
 ;;
 
 let cleanup path =

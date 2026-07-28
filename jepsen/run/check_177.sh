@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Check all #177 histories with the Clojure/Elle checkers.
-# Runs INSIDE the sqlocaml-jepsen-elle2 container.
+# Runs INSIDE the granary-jepsen-elle2 container.
 # The mounted project dir + opam $HOME are not writable by the runtime user,
 # so we copy the checker into /tmp and use a writable HOME for the dep cache.
 set -u
@@ -20,10 +20,10 @@ CHK() { clojure -J-Djava.awt.headless=true -M -m jepsen.check "$@" >/tmp/chk.out
 
 wl() {
   case "$1" in
-    list_append_*|sqlocaml_negative_dirty_read|sqlocaml_negative_lost_update) echo list-append ;;
-    bank_*|sqlocaml_negative_bank_lost_transfer) echo bank ;;
-    set_*|sqlocaml_negative_set_lost_element) echo set ;;
-    counter_*|sqlocaml_negative_counter_non_monotonic) echo counter ;;
+    list_append_*|granary_negative_dirty_read|granary_negative_lost_update) echo list-append ;;
+    bank_*|granary_negative_bank_lost_transfer) echo bank ;;
+    set_*|granary_negative_set_lost_element) echo set ;;
+    counter_*|granary_negative_counter_non_monotonic) echo counter ;;
     *) echo list-append ;;
   esac
 }
@@ -31,7 +31,7 @@ wl() {
 echo "============================================================"
 echo "  #177 JEPSEN CHECK - real histories (expect VALID, exit 0)"
 echo "============================================================"
-for f in $(ls "$H" | grep -v '^sqlocaml_negative_' | sort); do
+for f in $(ls "$H" | grep -v '^granary_negative_' | sort); do
   name="${f%.edn}"; w="$(wl "$name")"
   CHK "$H/$f" -w "$w"; rc=$?
   res=$(grep -m1 '^RESULT:' /tmp/chk.out | sed 's/RESULT: //')
@@ -54,7 +54,7 @@ echo
 echo "============================================================"
 echo "  #177 JEPSEN CHECK - negative controls (expect INVALID, exit 1)"
 echo "============================================================"
-for f in $(ls "$H" | grep '^sqlocaml_negative_' | sort); do
+for f in $(ls "$H" | grep '^granary_negative_' | sort); do
   name="${f%.edn}"; w="$(wl "$name")"
   CHK "$H/$f" -w "$w"; rc=$?
   res=$(grep -m1 '^RESULT:' /tmp/chk.out | sed 's/RESULT: //')

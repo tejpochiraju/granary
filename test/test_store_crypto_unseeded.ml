@@ -10,8 +10,8 @@
     fail cleanly rather than raise. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module Geometry = Sqlocaml_storage.Geometry
+module S = Granary_store.Store
+module Geometry = Granary_storage.Geometry
 
 let page_size = 4096
 

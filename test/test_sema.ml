@@ -1,9 +1,9 @@
 open Lwt.Syntax
-module C = Sqlocaml_catalog.Catalog
-module S = Sqlocaml_store.Store
-module Row = Sqlocaml_encoding.Row
-module Sema = Sqlocaml_sql.Sema
-module Ast = Sqlocaml_sql.Ast
+module C = Granary_catalog.Catalog
+module S = Granary_store.Store
+module Row = Granary_encoding.Row
+module Sema = Granary_sql.Sema
+module Ast = Granary_sql.Ast
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -983,7 +983,7 @@ let bind_create_index_duplicate () =
   (* First creation succeeds via catalog directly *)
   let _ =
     Lwt_main.run
-      (Sqlocaml_catalog.Catalog.create_index
+      (Granary_catalog.Catalog.create_index
          cat
          ~name:"idx"
          ~table:"users"
@@ -1467,7 +1467,7 @@ let bind_drop_index_basic () =
   let cat = two_col_cat () in
   let _ =
     Lwt_main.run
-      (Sqlocaml_catalog.Catalog.create_index
+      (Granary_catalog.Catalog.create_index
          cat
          ~name:"idx"
          ~table:"users"

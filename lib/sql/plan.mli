@@ -6,7 +6,7 @@
     resolved to integer ordinals.  Every type is exposed concretely because the
     planner constructs and the executor matches on the full structure. *)
 
-module Cat = Sqlocaml_catalog.Catalog
+module Cat = Granary_catalog.Catalog
 
 type binop =
   | Eq
@@ -76,15 +76,15 @@ type snippet_spec =
 type op =
   | Op_create_table of
       { name : string
-      ; columns : Sqlocaml_encoding.Row.column list
+      ; columns : Granary_encoding.Row.column list
       ; uniq_idxs : (string * string list * Cat.idx_origin) list
       ; if_not_exists : bool
       ; fk_constraints :
           (string list
           * string
           * string list
-          * Sqlocaml_catalog.Catalog.fk_action
-          * Sqlocaml_catalog.Catalog.fk_action
+          * Granary_catalog.Catalog.fk_action
+          * Granary_catalog.Catalog.fk_action
           * bool)
             list
         (** [(local_cols, parent_table, parent_cols, on_delete, on_update, deferrable)] *)
@@ -93,7 +93,7 @@ type op =
       }
   | Op_col_create_table of
       { name : string
-      ; columns : Sqlocaml_encoding.Row.column list
+      ; columns : Granary_encoding.Row.column list
       ; if_not_exists : bool
       }
   (** DDL: [CREATE TABLE name (...) USING COLUMNSTORE].
@@ -144,7 +144,7 @@ type op =
       ; where_expr : expr option
       ; where_sql : string option
       ; unique : bool
-      ; columns : Sqlocaml_encoding.Row.column list
+      ; columns : Granary_encoding.Row.column list
         (** columns of the target table — needed for row decoding
             during index population *)
       ; if_not_exists : bool
@@ -153,7 +153,7 @@ type op =
       { table_tree : int (** table's tree_id *)
       ; idx_tree : int (** index tree_id *)
       ; col_idx : int (** column ordinal for encoding *)
-      ; col_type : Sqlocaml_encoding.Row.ty
+      ; col_type : Granary_encoding.Row.ty
       ; lookup_val : expr (** value to look up *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
@@ -257,7 +257,7 @@ type op =
       ; include_rank : bool (** if true, append BM25 score as last projected column *)
       ; snippets : snippet_spec list
       }
-  | Op_pragma_rows of { rows : Sqlocaml_encoding.Row.t list }
+  | Op_pragma_rows of { rows : Granary_encoding.Row.t list }
   | Op_pragma_get_user_version
   (** Read user_version from sys_meta at exec time; returns one row [[V_int n]]. *)
   | Op_pragma_set_user_version of { version : int64 }

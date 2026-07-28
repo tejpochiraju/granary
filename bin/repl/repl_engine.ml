@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let value_to_string = function
   | Db.V_null -> "NULL"
@@ -211,7 +211,7 @@ let open_db ~path =
   then
     let* d = Db.open_in_memory () in
     Lwt.return (Ok d)
-  else Sqlocaml_unix.open_file ~path ()
+  else Granary_unix.open_file ~path ()
 ;;
 
 let column_widths rows =

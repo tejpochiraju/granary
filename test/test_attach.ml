@@ -1,6 +1,6 @@
 (** Phase 40 / #64 — multi-database ATTACH/DETACH tests.
 
-    Validates the sqlocaml flavour of multi-database support:
+    Validates the granary flavour of multi-database support:
     [ATTACH DATABASE 'path' AS schema], [DETACH DATABASE schema], and the
     [PRAGMA database_list] / [PRAGMA active_database] routing surface.
 
@@ -11,12 +11,12 @@
     - DETACH closes the sub-handle and forces [active_database] back to
       "main" when the detached schema was the active one. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (* ATTACH opens a file-backed sub-db, so the engine needs the Unix file
    provider (the parent here is in-memory, so opening it does not install
    it automatically). *)
-let () = Sqlocaml_unix.install ()
+let () = Granary_unix.install ()
 let run = Lwt_main.run
 
 let exec db sql =
@@ -58,7 +58,7 @@ let single_text db sql =
 ;;
 
 let scratch_file suffix =
-  let path = Printf.sprintf "/tmp/sqlocaml_phase40_%s_%d.db" suffix (Unix.getpid ()) in
+  let path = Printf.sprintf "/tmp/granary_phase40_%s_%d.db" suffix (Unix.getpid ()) in
   (try Unix.unlink path with
    | _ -> ());
   (try Unix.unlink (path ^ "-wal") with

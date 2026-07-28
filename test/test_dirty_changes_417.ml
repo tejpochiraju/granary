@@ -3,8 +3,8 @@
     carries the per-row deltas — inserted/deleted/updated rows with their rowids —
     that an incremental view-maintenance layer (DBSP-style) consumes. *)
 
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 let run = Lwt_main.run
 

@@ -3,7 +3,7 @@
     Rows are stored as per-column Bigarray arrays for cache-friendly scan
     performance. Text columns use dictionary encoding. *)
 
-module Row = Sqlocaml_encoding.Row
+module Row = Granary_encoding.Row
 
 type t
 

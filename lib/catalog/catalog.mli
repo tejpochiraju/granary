@@ -36,7 +36,7 @@ type pending_fk_kind =
     polymorphic in the transaction mode so it accepts either the active
     write txn (deferred path inside an explicit transaction) or an RO
     snapshot opened after auto-commit. *)
-type pending_fk_recheck = { recheck : 'm. 'm Sqlocaml_store.Store.txn -> bool Lwt.t }
+type pending_fk_recheck = { recheck : 'm. 'm Granary_store.Store.txn -> bool Lwt.t }
 
 (** A queued FK violation awaiting re-verification at commit. *)
 type pending_fk_check =
@@ -58,13 +58,13 @@ type pending_fk_check =
 
 type storage =
   | Row of
-      { tree_id : Sqlocaml_store.Store.tree_id
+      { tree_id : Granary_store.Store.tree_id
       ; next_rowid : int64
         (** Next rowid to auto-allocate.  [empty_next_rowid] = never seeded. *)
       ; without_rowid : bool (** WITHOUT ROWID — phase 37 #122. *)
       ; autoincrement : bool (** #299: sticky rowid high-water. *)
       }
-  | Columnar of Sqlocaml_columnar.Col_store.t * Sqlocaml_store.Store.tree_id
+  | Columnar of Granary_columnar.Col_store.t * Granary_store.Store.tree_id
   (** Columnar table: in-memory store plus the tree_id allocated for
       persistence.  The Col_store is empty on re-open after restart (M1
       behaviour); the tree_id is reserved for T2 block-region persistence. *)
@@ -72,19 +72,19 @@ type storage =
 type table_meta =
   { name : string
   ; storage : storage
-  ; columns : Sqlocaml_encoding.Row.column list
+  ; columns : Granary_encoding.Row.column list
   ; fk_constraints : fk_constraint list
   }
 
 (** Extract the Row payload.  Raises if [storage = Columnar]. *)
-val row_storage : table_meta -> Sqlocaml_store.Store.tree_id * int64 * bool * bool
+val row_storage : table_meta -> Granary_store.Store.tree_id * int64 * bool * bool
 (** Returns [(tree_id, next_rowid, without_rowid, autoincrement)]. *)
 
 val is_columnar : table_meta -> bool
 
 (** [tid_of_storage s] returns the tree_id for [Row] or [Columnar] storage.
     Columnar tables with a legacy dummy tree_id return -1. *)
-val tid_of_storage : storage -> Sqlocaml_store.Store.tree_id
+val tid_of_storage : storage -> Granary_store.Store.tree_id
 
 (** Sentinel [next_rowid] for a rowid/alias table that has never seeded its
     counter — conceptually [max = -inf].  Used to tell "never inserted" apart
@@ -97,7 +97,7 @@ val empty_next_rowid : int64
     For such tables the table tree is keyed by this column's value and no
     separate __pk index exists.  None for every other shape. *)
 val compute_rowid_alias_col
-  :  Sqlocaml_encoding.Row.column list
+  :  Granary_encoding.Row.column list
   -> without_rowid:bool
   -> int option
 
@@ -130,7 +130,7 @@ type index_info =
   ; idx_table : string
   ; idx_columns : string list (* col names for plain; expr SQL for expression indexes *)
   ; idx_unique : bool
-  ; idx_tree_id : Sqlocaml_store.Store.tree_id
+  ; idx_tree_id : Granary_store.Store.tree_id
   ; idx_expr_flags : bool list (* true = expression index column, false = plain column *)
   ; idx_where_sql : string option
   ; idx_origin : idx_origin
@@ -138,23 +138,23 @@ type index_info =
 
 type fts_table_meta =
   { fts_name : string
-  ; fts_content_tree : Sqlocaml_store.Store.tree_id
-  ; fts_index_tree : Sqlocaml_store.Store.tree_id
+  ; fts_content_tree : Granary_store.Store.tree_id
+  ; fts_index_tree : Granary_store.Store.tree_id
   ; fts_columns : string list
   }
 
 (** Open (or initialise) a catalog on the given store.
     Loads all existing table metadata and index metadata from the store. *)
-val open_ : Sqlocaml_store.Store.t -> t Lwt.t
+val open_ : Granary_store.Store.t -> t Lwt.t
 
 (** Read the user_version from the sys_meta tree inside an already-open
     transaction (RO or RW).  Returns 0 if not yet set. *)
-val read_user_version_tx : _ Sqlocaml_store.Store.txn -> int64 Lwt.t
+val read_user_version_tx : _ Granary_store.Store.txn -> int64 Lwt.t
 
 (** Write user_version to the sys_meta tree inside an already-open RW
     transaction.  Caller is responsible for the commit. *)
 val write_user_version_tx
-  :  Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  Granary_store.Store.rw Granary_store.Store.txn
   -> int64
   -> unit Lwt.t
 
@@ -167,13 +167,13 @@ val write_user_version_tx
     participate in an ambient [BEGIN … COMMIT] (no self-deadlock) and be undone
     by [rollback_schema_changes] on [ROLLBACK]. *)
 val create_table
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> name:string
-  -> columns:Sqlocaml_encoding.Row.column list
+  -> columns:Granary_encoding.Row.column list
   -> without_rowid:bool
   -> autoincrement:bool
-  -> Sqlocaml_store.Store.tree_id Lwt.t
+  -> Granary_store.Store.tree_id Lwt.t
 
 (** Find a table by name. Returns [None] if not found. *)
 val find_table : t -> name:string -> table_meta option Lwt.t
@@ -184,7 +184,7 @@ val find_table_cached : t -> name:string -> table_meta option
 
 (** Schema fingerprint (#174) of a table: a stable 64-bit hash of its shape
     (columns + WITHOUT ROWID), computed from the in-memory cache via
-    {!Sqlocaml_encoding.Schema_fingerprint}.  [None] if no such table.  Stable
+    {!Granary_encoding.Schema_fingerprint}.  [None] if no such table.  Stable
     across table renames; used for drift detection on open, the redundant
     catalog mirror, per-page fingerprint stamps, and replication schema
     matching (#92 / #172). *)
@@ -193,23 +193,23 @@ val table_fingerprint : t -> name:string -> int64 option
 (** [(tree_id, fingerprint)] for every persistent table currently in the
     catalog (ephemeral CTE entries are excluded).  Used to register per-tree
     page-header stamps with the store (#174). *)
-val fingerprints_by_tree_id : t -> (Sqlocaml_store.Store.tree_id * int64) list
+val fingerprints_by_tree_id : t -> (Granary_store.Store.tree_id * int64) list
 
 (** [(tree_id, fingerprint)] recorded in the redundant catalog mirror (#174).
     On a healthy database this agrees with {!fingerprints_by_tree_id}; a
     divergence indicates schema drift or corruption in one of the two copies. *)
-val mirror_fingerprints : t -> (Sqlocaml_store.Store.tree_id * int64) list Lwt.t
+val mirror_fingerprints : t -> (Granary_store.Store.tree_id * int64) list Lwt.t
 
 (** A disagreement between the primary catalog and the redundant mirror (#174). *)
 type schema_discrepancy =
   | Fingerprint_mismatch of
-      { tree_id : Sqlocaml_store.Store.tree_id
+      { tree_id : Granary_store.Store.tree_id
       ; primary : int64 (** fingerprint computed from the primary catalog *)
       ; mirror : int64 (** fingerprint recorded in the mirror *)
       }
-  | Missing_in_mirror of Sqlocaml_store.Store.tree_id
+  | Missing_in_mirror of Granary_store.Store.tree_id
   (** a table present in the primary catalog has no mirror entry *)
-  | Missing_in_primary of Sqlocaml_store.Store.tree_id
+  | Missing_in_primary of Granary_store.Store.tree_id
   (** the mirror records a table the primary catalog does not have *)
 
 (** Cross-check the primary catalog against the redundant mirror and report
@@ -230,19 +230,19 @@ val unregister_ephemeral : t -> name:string -> unit
 val list_tables : t -> table_meta list Lwt.t
 
 (** [persist_dirty_columnar_stores t tx] iterates all columnar tables in the
-    catalog and persists any whose {!Sqlocaml_columnar.Col_store.dirty} flag
+    catalog and persists any whose {!Granary_columnar.Col_store.dirty} flag
     is set, using the given write transaction.  Returns the list of stores
     that were persisted so callers can clear their dirty flags after commit. *)
 val persist_dirty_columnar_stores
   :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_columnar.Col_store.t list Lwt.t
+  -> Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_columnar.Col_store.t list Lwt.t
 
 (** [load_columnar_stores t store] iterates all columnar tables in the catalog
     and loads their data from [store] via a fresh RO transaction.  Used on DB
     open to restore persisted columnar data.  Tables with no persisted data
     are reset to empty. *)
-val load_columnar_stores : t -> Sqlocaml_store.Store.t -> unit Lwt.t
+val load_columnar_stores : t -> Granary_store.Store.t -> unit Lwt.t
 
 (** Allocate and return the next rowid for a table, incrementing the counter.
     Raises [Failure] if the table does not exist. *)
@@ -255,7 +255,7 @@ val next_rowid_in_txn
   :  ?defer_counter:bool
   -> t
   -> name:string
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> int64 Lwt.t
 
 (** #243 (T1): advance a table's autoincrement counter so the next allocation is
@@ -266,7 +266,7 @@ val bump_next_rowid_in_txn
   -> t
   -> name:string
   -> at_least:int64
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** #312.1: writable [sqlite_sequence] SET/INSERT.  Sets table [name]'s
@@ -278,7 +278,7 @@ val set_next_rowid_in_txn
   :  t
   -> name:string
   -> requested:int64
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** #312.1: writable [sqlite_sequence] DELETE.  Resets table [name]'s
@@ -289,7 +289,7 @@ val set_next_rowid_in_txn
 val reset_next_rowid_in_txn
   :  t
   -> name:string
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** #312.1: writable [sqlite_sequence] [DELETE] with no WHERE — reset every
@@ -297,7 +297,7 @@ val reset_next_rowid_in_txn
     Mutates through the held RW transaction (does NOT commit). *)
 val reset_all_next_rowid_in_txn
   :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** #409: note that [rowid] was deleted from plain rowid table [name].  When the
@@ -312,7 +312,7 @@ val note_rowid_deleted
   :  t
   -> name:string
   -> rowid:int64
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** #347: flush all dirty rowid counters into the B-tree under [tx].  Call once
@@ -321,7 +321,7 @@ val note_rowid_deleted
     [commit_schema_changes] reset is a no-op. *)
 val flush_dirty_counters_tx
   :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> unit Lwt.t
 
 (** Create a new index on a single column of an existing table.
@@ -339,7 +339,7 @@ val flush_dirty_counters_tx
     [?txn] (#269): run through this already-held explicit writer transaction
     instead of opening (and committing) a fresh one. *)
 val create_index
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> name:string
   -> table:string
@@ -376,7 +376,7 @@ val find_index_covering_cols
     The B+-tree pages for the table and its indexes are NOT reclaimed (Phase 3). *)
 val drop_table
   :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> name:string
   -> unit Lwt.t
 
@@ -384,7 +384,7 @@ val drop_table
     The B+-tree pages are NOT reclaimed (Phase 3). *)
 val drop_index
   :  t
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> name:string
   -> unit Lwt.t
 
@@ -396,10 +396,10 @@ val drop_index
     instead of opening a fresh one, and register a schema-cache undo so a
     [ROLLBACK] restores the prior table shape. *)
 val add_column
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> table_name:string
-  -> column:Sqlocaml_encoding.Row.column
+  -> column:Granary_encoding.Row.column
   -> (unit, string) result Lwt.t
 
 (** Rename a table.
@@ -409,7 +409,7 @@ val add_column
 
     [?txn] (#282): as for [add_column]. *)
 val rename_table
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> old_name:string
   -> new_name:string
@@ -421,7 +421,7 @@ val rename_table
 
     [?txn] (#282): as for [add_column]. *)
 val rename_column
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> table_name:string
   -> old_col:string
@@ -435,7 +435,7 @@ val rename_column
 
     [?txn] (#282): as for [add_column]. *)
 val drop_column
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> table_name:string
   -> col_name:string
@@ -445,10 +445,10 @@ val drop_column
     in the catalog (sys_tables + sys_columns), allocates no B-tree.
     Returns unit (no tree_id — columnar tables have no B-tree). *)
 val create_columnstore_table
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> name:string
-  -> columns:Sqlocaml_encoding.Row.column list
+  -> columns:Granary_encoding.Row.column list
   -> unit Lwt.t
 
 (** True if a table with [name] exists in the catalog. *)
@@ -470,7 +470,7 @@ val list_fts_tables : t -> fts_table_meta list
     [?txn] (#269): run the creation through this already-held explicit writer
     transaction instead of opening (and committing) a fresh one. *)
 val create_fts_table
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> name:string
   -> columns:string list
@@ -481,7 +481,7 @@ val create_fts_table
 val next_fts_rowid_in_txn
   :  t
   -> name:string
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> int64 Lwt.t
 
 (** #330: advance an FTS table's rowid high-water so the next auto-allocated
@@ -490,7 +490,7 @@ val next_fts_rowid_in_txn
 val ensure_fts_rowid_above_in_txn
   :  t
   -> name:string
-  -> Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  -> Granary_store.Store.rw Granary_store.Store.txn
   -> int64
   -> unit Lwt.t
 
@@ -499,7 +499,7 @@ val ensure_fts_rowid_above_in_txn
     [?txn] (#269): write through this already-held explicit writer transaction
     instead of opening (and committing) a fresh one. *)
 val save_fk_constraints
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
   -> t
   -> table_name:string
   -> fks:fk_constraint list
@@ -572,55 +572,55 @@ val mark_schema_txn_poisoned : t -> unit
 val schema_txn_poisoned : t -> bool
 
 (** Load all persisted view definitions. Returns [(view_name, create_view_sql)] pairs. *)
-val load_all_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+val load_all_views : Granary_store.Store.t -> (string * string) list Lwt.t
 
 (** #322/#323: load all view definitions through a caller-supplied snapshot,
     so [Db.dump] can read view DDL under its single shared RO snapshot and keep
     the schema section point-in-time consistent with the row data. *)
-val load_all_views_in_tx : _ Sqlocaml_store.Store.txn -> (string * string) list Lwt.t
+val load_all_views_in_tx : _ Granary_store.Store.txn -> (string * string) list Lwt.t
 
 (** Persist a view's SQL text to the sys_views B-tree.
 
     [?txn] (#269): write through this already-held explicit writer transaction
     instead of opening (and committing) a fresh one. *)
 val persist_view
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> sql:string
   -> unit Lwt.t
 
 (** Remove a view's SQL text from the sys_views B-tree.  [?txn] as above (#269). *)
 val remove_view
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> unit Lwt.t
 
 (** #427: load all reactive-view definitions as [(name, create_sql)] pairs. *)
-val load_all_reactive_views : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+val load_all_reactive_views : Granary_store.Store.t -> (string * string) list Lwt.t
 
 (** #427: persist a reactive view's [CREATE REACTIVE VIEW] SQL text.  [?txn] as
     for {!persist_view}. *)
 val persist_reactive_view
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> sql:string
   -> unit Lwt.t
 
 (** #427: remove a reactive view's SQL text.  [?txn] as above. *)
 val remove_reactive_view
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> unit Lwt.t
 
 (** Load all persisted trigger definitions. Returns [(trigger_name, create_trigger_sql)] pairs. *)
-val load_all_triggers : Sqlocaml_store.Store.t -> (string * string) list Lwt.t
+val load_all_triggers : Granary_store.Store.t -> (string * string) list Lwt.t
 
 (** #322/#323: trigger-DDL counterpart to {!load_all_views_in_tx}. *)
-val load_all_triggers_in_tx : _ Sqlocaml_store.Store.txn -> (string * string) list Lwt.t
+val load_all_triggers_in_tx : _ Granary_store.Store.txn -> (string * string) list Lwt.t
 
 (** Persist a trigger's CREATE TRIGGER SQL to the sys_triggers B-tree.
     Call this whenever CREATE TRIGGER is executed.
@@ -628,8 +628,8 @@ val load_all_triggers_in_tx : _ Sqlocaml_store.Store.txn -> (string * string) li
     [?txn] (#269): write through this already-held explicit writer transaction
     instead of opening (and committing) a fresh one. *)
 val persist_trigger
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> sql:string
   -> unit Lwt.t
@@ -637,8 +637,8 @@ val persist_trigger
 (** Remove a trigger's SQL from the sys_triggers B-tree.
     Call this whenever DROP TRIGGER is executed.  [?txn] as above (#269). *)
 val remove_trigger
-  :  ?txn:Sqlocaml_store.Store.rw Sqlocaml_store.Store.txn
-  -> Sqlocaml_store.Store.t
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> Granary_store.Store.t
   -> name:string
   -> unit Lwt.t
 
@@ -648,7 +648,7 @@ val get_fk_enforcement : t -> bool
 (** Set the FK enforcement flag (PRAGMA foreign_keys = 0/1). *)
 val set_fk_enforcement : t -> bool -> unit
 
-(** Get the current recursive-triggers flag (default true in sqlocaml — a
+(** Get the current recursive-triggers flag (default true in granary — a
     deliberate divergence from real SQLite which defaults OFF). When this
     flag is false, DML executed inside a trigger body does NOT fire further
     triggers. *)
@@ -680,4 +680,4 @@ val pending_fk_check_count : t -> int
 (** Underlying store handle. Exposed so subsystems (FK deferred rechecks)
     can open their own RO snapshots without threading the store through
     every function signature. *)
-val store : t -> Sqlocaml_store.Store.t
+val store : t -> Granary_store.Store.t

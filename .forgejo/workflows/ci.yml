@@ -28,7 +28,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          key: opam-5.4-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
           restore-keys: opam-5.4-
 
       - name: Install opam packages
@@ -50,13 +50,13 @@ jobs:
         # are unreliable on a shared, loaded CI runner and flake on any PR.
         # Neutralize the timing gates here so CI does not fail on load; the
         # benches still execute and print their measurements to the log.
-        # SQLOCAML_BENCH_MAX_RATIO also covers test_fts_scaling's O(log n) ratio
+        # GRANARY_BENCH_MAX_RATIO also covers test_fts_scaling's O(log n) ratio
         # gate (#262), whose sub-millisecond 1k baseline is noise-dominated here.
         env:
-          SQLOCAML_BENCH_MIN_SPEEDUP: "0"
-          SQLOCAML_BENCH_PARALLEL_MAX: "1000000"
-          SQLOCAML_BENCH_MAX_WRITER_S: "1000000"
-          SQLOCAML_BENCH_MAX_RATIO: "1000000"
+          GRANARY_BENCH_MIN_SPEEDUP: "0"
+          GRANARY_BENCH_PARALLEL_MAX: "1000000"
+          GRANARY_BENCH_MAX_WRITER_S: "1000000"
+          GRANARY_BENCH_MAX_RATIO: "1000000"
         run: opam exec -- dune runtest
 
       - name: Report test count
@@ -96,7 +96,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-lint-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          key: opam-5.4-lint-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
           restore-keys: opam-5.4-lint-
 
       - name: Install opam packages + merlint
@@ -127,7 +127,7 @@ jobs:
             | grep -v 'test/bench_compare.ml' \
             | grep -v 'test/test_sqlite_compare.ml' \
             | grep -v 'test/bench_perf_compare_sqlite3.ml' \
-            | grep -v 'bin/repl/sqlocaml_repl.ml' \
+            | grep -v 'bin/repl/granary_repl.ml' \
             | grep -v 'test/test_sqlite_import_91.ml' \
             || true)
           if [ -n "$violations" ]; then

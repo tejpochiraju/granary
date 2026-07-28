@@ -5,23 +5,23 @@ encrypted-WAL backend (`--backend enc-wal`, #84/#214/#215).
 
 | Script | Container | Purpose |
 |--------|-----------|---------|
-| `gen_177.sh` | `sqlocaml-dev` | Build the harness and generate every workload + crash/pause-nemesis history into `jepsen/run/histories/`, plus the 5 negative controls. |
-| `run_nemeses_fuse.sh` | `sqlocaml-jepsen` (host-side) | Run the privileged nemeses that `gen_177.sh` can't: **lazyfs** (un-fsynced write loss; needs `--device /dev/fuse --cap-add SYS_ADMIN`) on WAL + enc-WAL, and **clock-skew** (needs `libfaketime` via `LD_PRELOAD`). |
-| `check_177.sh` | `sqlocaml-jepsen-elle2` | Check every history (Clojure temporal + Elle SI), reporting VALID/INVALID and catching the negative controls. |
-| `detail_177.sh` | `sqlocaml-jepsen-elle2` | Dump full anomaly detail for the four counter/list-append histories that flag INVALID. |
-| `ci_full.sh` | `sqlocaml-jepsen` (one container, +FUSE) | Self-contained gen + nemeses + check with a pass/fail **gate** (expected verdict per history). Generates into `/tmp` (never touches the committed run). Driven by the nightly workflow `.forgejo/workflows/jepsen-nightly.yml`. |
+| `gen_177.sh` | `granary-dev` | Build the harness and generate every workload + crash/pause-nemesis history into `jepsen/run/histories/`, plus the 5 negative controls. |
+| `run_nemeses_fuse.sh` | `granary-jepsen` (host-side) | Run the privileged nemeses that `gen_177.sh` can't: **lazyfs** (un-fsynced write loss; needs `--device /dev/fuse --cap-add SYS_ADMIN`) on WAL + enc-WAL, and **clock-skew** (needs `libfaketime` via `LD_PRELOAD`). |
+| `check_177.sh` | `granary-jepsen-elle2` | Check every history (Clojure temporal + Elle SI), reporting VALID/INVALID and catching the negative controls. |
+| `detail_177.sh` | `granary-jepsen-elle2` | Dump full anomaly detail for the four counter/list-append histories that flag INVALID. |
+| `ci_full.sh` | `granary-jepsen` (one container, +FUSE) | Self-contained gen + nemeses + check with a pass/fail **gate** (expected verdict per history). Generates into `/tmp` (never touches the committed run). Driven by the nightly workflow `.forgejo/workflows/jepsen-nightly.yml`. |
 
-The `sqlocaml-jepsen` image (built from the root `Containerfile.jepsen`) carries
+The `granary-jepsen` image (built from the root `Containerfile.jepsen`) carries
 the OCaml harness, lazyfs (+ its `libpcache`), and `libfaketime`.
 
 ## Usage
 
 ```bash
 # from the repo root
-podman run --rm -v "$PWD":/workspace:z -w /workspace sqlocaml-dev \
+podman run --rm -v "$PWD":/workspace:z -w /workspace granary-dev \
   bash jepsen/run/gen_177.sh
 
-podman run --rm -v "$PWD":/workspace:z sqlocaml-jepsen-elle2 \
+podman run --rm -v "$PWD":/workspace:z granary-jepsen-elle2 \
   bash jepsen/run/check_177.sh
 ```
 

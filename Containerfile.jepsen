@@ -1,4 +1,4 @@
-# Jepsen test environment for sqlocaml
+# Jepsen test environment for granary
 #
 # *** MONOLITHIC IMAGE: OCaml harness + Java/Clojure checker + lazyfs ***
 # For a minimal Clojure-only checker image, see jepsen/Containerfile.jepsen.
@@ -10,7 +10,7 @@
 #   - faketime for clock skew nemesis (optional)
 #
 # Build:
-#   podman build -t sqlocaml-jepsen -f Containerfile.jepsen .
+#   podman build -t granary-jepsen -f Containerfile.jepsen .
 #
 # The `--platform=linux/amd64` pin on the FROM below is load-bearing (#424): the
 # self-hosted runner host shares its rootless podman image store across all
@@ -21,13 +21,13 @@
 # deterministic regardless of what the shared store was last left holding.
 #
 # Run the OCaml harness:
-#   podman run --rm -it sqlocaml-jepsen sqlocaml_jepsen --help
+#   podman run --rm -it granary-jepsen granary_jepsen --help
 #
 # Run the Clojure checker:
-#   podman run --rm -it sqlocaml-jepsen sh -c 'cd /workspace/jepsen/clojure && clojure -M -m jepsen.check <history.edn>'
+#   podman run --rm -it granary-jepsen sh -c 'cd /workspace/jepsen/clojure && clojure -M -m jepsen.check <history.edn>'
 #
 # Full workflow (in container):
-#   sqlocaml_jepsen --backend mem --workers 4 --ops 100 --history /tmp/history.edn
+#   granary_jepsen --backend mem --workers 4 --ops 100 --history /tmp/history.edn
 #   cd /workspace/jepsen/clojure && clojure -M -m jepsen.check /tmp/history.edn
 
 FROM --platform=linux/amd64 docker.io/ocaml/opam:ubuntu-24.04-ocaml-5.4
@@ -82,7 +82,7 @@ USER opam
 WORKDIR /workspace
 
 # ------------------------------------------------------------------
-# OCaml dependencies for sqlocaml
+# OCaml dependencies for granary
 # ------------------------------------------------------------------
 # mirage-crypto / mirage-crypto-rng power encryption at rest (#84); uutf/uucp
 # back the SQL text layer.  Kept in sync with .forgejo/workflows/ci.yml.

@@ -29,7 +29,7 @@
       validates correctness at scale. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+module S = Granary_store.Store
 
 let run = Lwt_main.run
 let key_of i = Bytes.of_string (Printf.sprintf "%012d" i)

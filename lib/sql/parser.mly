@@ -351,7 +351,7 @@ pragma_stmt:
            failwith (Printf.sprintf "PRAGMA wal_autocheckpoint: expected integer, got %s" value))
       | "synchronous" ->
         let lv = String.lowercase_ascii value in
-        (match Sqlocaml_store.Store.durability_of_string lv with
+        (match Granary_store.Store.durability_of_string lv with
          | Some _ -> Ast.S_pragma (Ast.Pragma_synchronous_set lv)
          | None ->
            failwith (Printf.sprintf

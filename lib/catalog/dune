@@ -1,7 +1,7 @@
 (library
- (name sqlocaml_catalog)
- (public_name sqlocaml.catalog)
- (libraries lwt sqlocaml.encoding sqlocaml.store sqlocaml.columnar)
+ (name granary_catalog)
+ (public_name granary.catalog)
+ (libraries lwt granary.encoding granary.store granary.columnar)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

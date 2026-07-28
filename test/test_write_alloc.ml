@@ -22,7 +22,7 @@
     The ceiling sits between the two so reintroducing either redundancy fails
     the test while genuine drift keeps wide headroom. *)
 
-open Sqlocaml_storage
+open Granary_storage
 
 (* In-memory mock block device (same pattern as test_btree). *)
 type mock_block =

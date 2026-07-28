@@ -2,12 +2,12 @@
     a past txn id, while a live [Db.query] sees the current state (#266). *)
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module H = Sqlocaml_store.History
+module H = Granary_store.History
 open Lwt.Syntax
 
 let run = Lwt_main.run
@@ -16,7 +16,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_db_as_of_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_db_as_of_%04d.db" n
 ;;
 
 let cleanup path =

@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
+module S = Granary_store.Store
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

@@ -63,7 +63,7 @@ jobs:
       # "Exec format error" on the amd64 host. The Containerfile FROM is pinned
       # too; this is belt-and-suspenders so the target platform is unambiguous.
       - name: Build Jepsen image (cached by podman layers across runs)
-        run: podman build --platform=linux/amd64 -t sqlocaml-jepsen -f Containerfile.jepsen .
+        run: podman build --platform=linux/amd64 -t granary-jepsen -f Containerfile.jepsen .
 
       # No -v bind mount: paths would resolve on the host (remote podman), and
       # the image already contains this checkout at /workspace via COPY.
@@ -71,7 +71,7 @@ jobs:
         run: |
           podman run --rm --device /dev/fuse --cap-add SYS_ADMIN \
             -w /workspace --entrypoint bash \
-            sqlocaml-jepsen jepsen/run/ci_full.sh
+            granary-jepsen jepsen/run/ci_full.sh
 
       # On any failure above, open a Forgejo issue so the nightly does not fail
       # silently. Deduped by title marker: if an open issue already exists for a

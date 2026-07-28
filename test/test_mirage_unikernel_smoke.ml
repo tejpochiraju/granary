@@ -1,23 +1,23 @@
 (** Host smoke test for the sample MirageOS unikernel wiring (#403).
 
-    Opens a {!Sqlocaml_store.Store} in WAL mode with the main DB on a real
-    [mirage-block-unix] device (wrapped by {!Sqlocaml_mirage_block.Mirage_backend})
-    and the shared in-memory {!Sqlocaml_sample.Mem_wal} WAL buffer — the exact
+    Opens a {!Granary_store.Store} in WAL mode with the main DB on a real
+    [mirage-block-unix] device (wrapped by {!Granary_mirage_block.Mirage_backend})
+    and the shared in-memory {!Granary_sample.Mem_wal} WAL buffer — the exact
     shape the sample unikernel uses — then runs the shared
-    {!Sqlocaml_sample.Sample.run_demo} workload and asserts the WAL fsync /
-    commit path fired. Runs in the plain [sqlocaml-dev] image (no mirage CLI /
+    {!Granary_sample.Sample.run_demo} workload and asserts the WAL fsync /
+    commit path fired. Runs in the plain [granary-dev] image (no mirage CLI /
     solo5 needed), so CI guards the Mirage_backend <-> Store wiring against
     bit-rot. *)
 
 open Lwt.Syntax
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
-module Store = Sqlocaml_store.Store
-module Db = Sqlocaml.Db
-module Mem_wal = Sqlocaml_sample.Mem_wal
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
+module Store = Granary_store.Store
+module Db = Granary.Db
+module Mem_wal = Granary_sample.Mem_wal
 
 (* A 4 MiB zero-filled file = 1024 pages of 4096 bytes; ample for the demo. *)
 let tmp_file () =
-  let path = Filename.temp_file "sqlocaml_uni_smoke" ".raw" in
+  let path = Filename.temp_file "granary_uni_smoke" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (4 * 1024 * 1024);
   Unix.close fd;
@@ -52,7 +52,7 @@ let test_smoke () =
           | Error e -> Alcotest.failf "open_block_wal: %a" Store.pp_error e
           | Ok store ->
             let* db = Db.of_store store in
-            let* r = Sqlocaml_sample.Sample.run_demo db in
+            let* r = Granary_sample.Sample.run_demo db in
             (match r with
              | Error e -> Alcotest.failf "run_demo: %a" Db.pp_error e
              | Ok n ->

@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Row = Sqlocaml_encoding.Row
-module S = Sqlocaml_store.Store
+module Row = Granary_encoding.Row
+module S = Granary_store.Store
 
 (** Well-known key under which columnar store data is persisted within the
     table's tree_id.  A single zero byte avoids collision with any real

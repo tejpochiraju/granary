@@ -39,17 +39,17 @@
     writer behind the reader's I/O sleeps and blow the wall bound.
 
     Env vars (all optional):
-      SQLOCAML_BENCH_READ_DELAY_MS  per-read injected sleep   (default 2)
-      SQLOCAML_BENCH_WAL_DELAY_MS   per-fsync injected sleep  (default 1)
-      SQLOCAML_BENCH_N_COMMITS      writer commits            (default 30)
-      SQLOCAML_BENCH_N_READS        reader cursor walks       (default 8)
-      SQLOCAML_BENCH_SEED_ROWS      initial tree size         (default 5000)
-      SQLOCAML_BENCH_MAX_WRITER_S   pass/fail upper bound (s) (default 3.0)
+      GRANARY_BENCH_READ_DELAY_MS  per-read injected sleep   (default 2)
+      GRANARY_BENCH_WAL_DELAY_MS   per-fsync injected sleep  (default 1)
+      GRANARY_BENCH_N_COMMITS      writer commits            (default 30)
+      GRANARY_BENCH_N_READS        reader cursor walks       (default 8)
+      GRANARY_BENCH_SEED_ROWS      initial tree size         (default 5000)
+      GRANARY_BENCH_MAX_WRITER_S   pass/fail upper bound (s) (default 3.0)
 *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module UF = Sqlocaml_unix.Unix_file
+module S = Granary_store.Store
+module UF = Granary_unix.Unix_file
 
 let run = Lwt_main.run
 let bs = Bytes.of_string
@@ -246,12 +246,12 @@ let walk_count : type a. a S.txn -> int Lwt.t =
 ;;
 
 let main () =
-  let read_delay = getenv_float "SQLOCAML_BENCH_READ_DELAY_MS" 2.0 /. 1000.0 in
-  let wal_delay = getenv_float "SQLOCAML_BENCH_WAL_DELAY_MS" 1.0 /. 1000.0 in
-  let n_commits = getenv_int "SQLOCAML_BENCH_N_COMMITS" 30 in
-  let n_reads = getenv_int "SQLOCAML_BENCH_N_READS" 8 in
-  let seed_rows = getenv_int "SQLOCAML_BENCH_SEED_ROWS" 5000 in
-  let max_writer_s = getenv_float "SQLOCAML_BENCH_MAX_WRITER_S" 3.0 in
+  let read_delay = getenv_float "GRANARY_BENCH_READ_DELAY_MS" 2.0 /. 1000.0 in
+  let wal_delay = getenv_float "GRANARY_BENCH_WAL_DELAY_MS" 1.0 /. 1000.0 in
+  let n_commits = getenv_int "GRANARY_BENCH_N_COMMITS" 30 in
+  let n_reads = getenv_int "GRANARY_BENCH_N_READS" 8 in
+  let seed_rows = getenv_int "GRANARY_BENCH_SEED_ROWS" 5000 in
+  let max_writer_s = getenv_float "GRANARY_BENCH_MAX_WRITER_S" 3.0 in
   let path = fresh_path () in
   let* () = seed_store ~path ~rows:seed_rows in
   (* Re-open with the slow callbacks engaged.  The Pager cache starts

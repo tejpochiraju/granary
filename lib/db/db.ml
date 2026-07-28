@@ -1,8 +1,8 @@
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module Cat = Sqlocaml_catalog.Catalog
-module Sql = Sqlocaml_sql
-module Row = Sqlocaml_encoding.Row
+module S = Granary_store.Store
+module Cat = Granary_catalog.Catalog
+module Sql = Granary_sql
+module Row = Granary_encoding.Row
 
 (* #427: reactive-view runtime state.  A view is either full-refresh (re-run the
    SELECT on each relevant commit) or delta-maintained through the IVM aggregate
@@ -49,7 +49,7 @@ type t =
   ; mutable trigger_depth : int (** recursion depth for nested trigger firing *)
   ; file_path : string option
     (** Set to the on-disk path for file-backed handles (opened via the
-        [sqlocaml.unix] driver or ATTACH).  VACUUM needs this to rebuild the
+        [granary.unix] driver or ATTACH).  VACUUM needs this to rebuild the
         file in place; [None] for in-memory / arbitrary block devices. *)
   ; attached : (string, t) Hashtbl.t
     (** Sub-handles registered via [ATTACH DATABASE 'path' AS schema]
@@ -198,7 +198,7 @@ let rv_absorb_changes t acc =
 let rv_clear_pending t = Hashtbl.reset t.rv_pending
 
 (* File operations the SQL engine needs for ATTACH and VACUUM, injected by a
-   platform driver (e.g. [sqlocaml.unix]) through [set_file_provider].  The
+   platform driver (e.g. [granary.unix]) through [set_file_provider].  The
    core itself carries no OS/filesystem dependency (#170); when no provider is
    installed, ATTACH and VACUUM fail with a clear error. *)
 type file_provider =
@@ -448,7 +448,7 @@ let vacuum t : unit Lwt.t =
       match !file_provider_ref with
       | None ->
         Lwt.fail_with
-          "VACUUM requires a file provider; link sqlocaml.unix and call \
+          "VACUUM requires a file provider; link granary.unix and call \
            Db.set_file_provider"
       | Some prov ->
         let tmp_path = path ^ ".vacuum-tmp" in
@@ -706,7 +706,7 @@ let commit_txn t =
              fails (disk-full, fsync error), the B-tree changes are discarded
              but the in-memory Col_store retains the rows, and dirty stays
              true so the next cycle retries. *)
-         List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
+         List.iter Granary_columnar.Col_store.mark_clean saved;
          (* #269: in-txn DDL's cache changes are now durable — drop the undo log. *)
          Cat.commit_schema_changes t.catalog;
          t.explicit_txn <- None;
@@ -787,7 +787,7 @@ let release_savepoint t name =
         (* Persist any dirty columnar stores before committing. *)
         let* saved = Cat.persist_dirty_columnar_stores t.catalog tx in
         let* () = S.commit tx in
-        List.iter Sqlocaml_columnar.Col_store.mark_clean saved;
+        List.iter Granary_columnar.Col_store.mark_clean saved;
         (* #269: finalize any in-txn DDL's cache changes on this auto-commit. *)
         Cat.commit_schema_changes t.catalog;
         t.explicit_txn <- None;
@@ -1523,7 +1523,7 @@ let execute_control_op top t sql op =
            Lwt.return
              (Error
                 (Runtime
-                   "ATTACH requires a file provider; link sqlocaml.unix and call \
+                   "ATTACH requires a file provider; link granary.unix and call \
                     Db.set_file_provider"))
          | Some prov ->
            let* result =
@@ -1966,7 +1966,7 @@ let history_log ?(schema = "main") t =
    [ref], wired into a [Lwt_stream.from] that ends the snapshot when the source
    yields [None] (drain) or raises (#164).  Errors before the stream is built end
    the snapshot eagerly. *)
-let query_as_of top (target : Sqlocaml_store.History.target) sql =
+let query_as_of top (target : Granary_store.History.target) sql =
   Lwt.catch
     (fun () ->
        (* #412: route FIRST, then open the historical snapshot on whichever store

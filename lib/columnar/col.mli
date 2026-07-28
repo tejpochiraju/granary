@@ -4,7 +4,7 @@
     columns use Bigarray for cache-friendly sequential scan; {!Text} columns
     use dictionary encoding; {!Blob} columns use OCaml [bytes] arrays. *)
 
-module Row = Sqlocaml_encoding.Row
+module Row = Granary_encoding.Row
 
 type t
 

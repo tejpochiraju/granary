@@ -1,7 +1,7 @@
 module E = Repl_engine
 module L = Event_log
-module Ev = Sqlocaml.Db.Event
-module Db = Sqlocaml.Db
+module Ev = Granary.Db.Event
+module Db = Granary.Db
 
 let mk_commit id = Ev.Txn_commit { txn_id = id; frames = 0 }
 
@@ -45,7 +45,7 @@ let test_dump () =
   let l = L.create ~capacity:10 in
   L.push l (mk_commit 1L);
   L.push l (mk_page ~txn:1 ~tree:16);
-  let path = Filename.temp_file "sqlocaml_dump" ".log" in
+  let path = Filename.temp_file "granary_dump" ".log" in
   (match L.dump l path with
    | Ok n -> Alcotest.(check int) "dumped 2 events" 2 n
    | Error e -> Alcotest.failf "dump failed: %s" e);
@@ -151,7 +151,7 @@ let test_has_terminator_line_comment () =
 ;;
 
 (* #389 follow-up (PR #394 review): [;] inside [...] / `...` quoted identifiers
-   must not split — both are valid sqlocaml identifier quotes (lexer.mll). *)
+   must not split — both are valid granary identifier quotes (lexer.mll). *)
 let test_split_bracket_identifier () =
   Alcotest.(check (list string))
     "semicolon inside a [..] quoted identifier is not a split"
@@ -279,7 +279,7 @@ let test_monitor_table_key () =
 let test_shell_renders () =
   let v = Shell_view.create () in
   Shell_view.set_status v "Open: :memory:";
-  Shell_view.set_result v ~headers:[ "x" ] ~rows:[ [| Sqlocaml.Db.V_int 1L |] ];
+  Shell_view.set_result v ~headers:[ "x" ] ~rows:[ [| Granary.Db.V_int 1L |] ];
   let root = Lwd.observe (Shell_view.render v) in
   let ui = Lwd.quick_sample root in
   Alcotest.(check bool) "renders" true (Nottui.Ui.layout_height ui >= 1)
@@ -289,7 +289,7 @@ let test_shell_header_width () =
   let w =
     Shell_view.column_widths_with_headers
       ~headers:[ "total_revenue" ]
-      ~rows:[ [| Sqlocaml.Db.V_int 42L |] ]
+      ~rows:[ [| Granary.Db.V_int 42L |] ]
   in
   Alcotest.(check int) "width covers header" (String.length "total_revenue") w.(0)
 ;;

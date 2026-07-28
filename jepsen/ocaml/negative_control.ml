@@ -208,7 +208,7 @@ let build_counter_non_monotonic () =
 let () =
   Random.self_init ();
   let write name entries =
-    let path = Printf.sprintf "/tmp/sqlocaml_negative_%s.edn" name in
+    let path = Printf.sprintf "/tmp/granary_negative_%s.edn" name in
     Edn_history.write_history path entries;
     Printf.printf
       "Wrote %d entries (%s negative control) to %s\n"

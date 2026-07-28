@@ -12,7 +12,7 @@
     is caught at the test gate rather than in production. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

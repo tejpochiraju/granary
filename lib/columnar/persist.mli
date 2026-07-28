@@ -1,13 +1,13 @@
 (** Persistence for columnar stores via the Store B-tree.
 
-    Each columnar table has an allocated {!Sqlocaml_store.Store.tree_id} (stored
-    in the catalog's {!Sqlocaml_catalog.Catalog.storage} variant).  The entire
+    Each columnar table has an allocated {!Granary_store.Store.tree_id} (stored
+    in the catalog's {!Granary_catalog.Catalog.storage} variant).  The entire
     in-memory {!Col_store.t} is serialised via {!Col_store.encode} and stored
     as a single value under a well-known key within that tree.  The B-tree
     overflow chain transparently handles values up to 1 GiB. *)
 
-module Row = Sqlocaml_encoding.Row
-module S = Sqlocaml_store.Store
+module Row = Granary_encoding.Row
+module S = Granary_store.Store
 
 (** [save tx tree_id store] serialises [store] and writes it to the B-tree
     at [tree_id] under a reserved key.  Must be called within a write

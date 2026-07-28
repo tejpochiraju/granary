@@ -1,6 +1,6 @@
 (** Tests for the WITHOUT ROWID table option added in phase 37 (#122).
 
-    In sqlocaml, WITHOUT ROWID requires a single INTEGER PRIMARY KEY column,
+    In granary, WITHOUT ROWID requires a single INTEGER PRIMARY KEY column,
     and that column's value is used as the rowid (no auto-allocation).
     More general WITHOUT ROWID semantics (composite or non-integer PKs) are
     deferred behind a clear sema error. *)
@@ -8,9 +8,9 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 let run = Lwt_main.run
@@ -19,7 +19,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_without_rowid_%04d.db" n
+  Printf.sprintf "/tmp/granary_without_rowid_%04d.db" n
 ;;
 
 let cleanup path =
@@ -53,11 +53,11 @@ let query db sql =
 ;;
 
 let value_to_string = function
-  | Sqlocaml_encoding.Row.V_int n -> Int64.to_string n
-  | Sqlocaml_encoding.Row.V_text s -> s
-  | Sqlocaml_encoding.Row.V_null -> "NULL"
-  | Sqlocaml_encoding.Row.V_real f -> Printf.sprintf "%g" f
-  | Sqlocaml_encoding.Row.V_blob b -> "BLOB(" ^ string_of_int (Bytes.length b) ^ ")"
+  | Granary_encoding.Row.V_int n -> Int64.to_string n
+  | Granary_encoding.Row.V_text s -> s
+  | Granary_encoding.Row.V_null -> "NULL"
+  | Granary_encoding.Row.V_real f -> Printf.sprintf "%g" f
+  | Granary_encoding.Row.V_blob b -> "BLOB(" ^ string_of_int (Bytes.length b) ^ ")"
 ;;
 
 let row_to_string row = String.concat "|" (List.map value_to_string (Array.to_list row))

@@ -1,10 +1,10 @@
 (test
  (name main)
  (libraries
-  sqlocaml
-  sqlocaml.encoding
-  sqlocaml.columnar
-  sqlocaml.store
+  granary
+  granary.encoding
+  granary.columnar
+  granary.store
   lwt
   lwt.unix
   unix))

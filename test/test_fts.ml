@@ -1,9 +1,9 @@
 open Lwt.Syntax
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 let run f = Lwt_main.run (f ())
@@ -64,7 +64,7 @@ let test_fts_persists_across_reopen () =
 ;;
 
 (* Tokenizer tests *)
-module Tok = Sqlocaml_sql.Fts_tokenizer
+module Tok = Granary_sql.Fts_tokenizer
 
 let test_tokenizer_basic () =
   let tokens = Tok.tokenize [ 0, "Hello World" ] in

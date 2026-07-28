@@ -1,14 +1,14 @@
-# Jepsen-style testing for sqlocaml
+# Jepsen-style testing for granary
 
 This directory contains a **Jepsen-style** concurrent workload and fault-injection
-test suite for sqlocaml, following the approach outlined in issue #177.
+test suite for granary, following the approach outlined in issue #177.
 
 ## Architecture (Option 2)
 
 Rather than running the full Jepsen distributed control plane, we use:
 
 1. **OCaml harness** (`ocaml/`) — runs N concurrent Lwt worker fibers against
-   a single in-memory or file-backed sqlocaml database, recording every
+   a single in-memory or file-backed granary database, recording every
    operation (`:invoke` / `:ok` / `:fail`) into a Jepsen-format EDN history file.
 
 2. **Clojure checker** (`clojure/`) — reads the EDN history offline and dispatches
@@ -23,8 +23,8 @@ Rather than running the full Jepsen distributed control plane, we use:
 ### Prerequisites
 
 - Podman
-- The `sqlocaml-dev` dev container (built from the project root Containerfile)
-- Or build the Jepsen full container: `podman build -t sqlocaml-jepsen -f Containerfile.jepsen ..`
+- The `granary-dev` dev container (built from the project root Containerfile)
+- Or build the Jepsen full container: `podman build -t granary-jepsen -f Containerfile.jepsen ..`
 
 ### Build the OCaml harness
 
@@ -65,8 +65,8 @@ Prove the checker catches violations:
 opam exec -- dune exec jepsen/ocaml/negative_control.exe --
 
 # Check that Elle detects them (should exit 1)
-clojure -M -m jepsen.check /tmp/sqlocaml_negative_dirty_read.edn -w list-append
-clojure -M -m jepsen.check /tmp/sqlocaml_negative_lost_update.edn -w list-append
+clojure -M -m jepsen.check /tmp/granary_negative_dirty_read.edn -w list-append
+clojure -M -m jepsen.check /tmp/granary_negative_lost_update.edn -w list-append
 ```
 
 ### Bank workload
@@ -141,12 +141,12 @@ opam exec -- dune exec jepsen/ocaml/harness.exe -- \
 | `--backend` | `mem` | Backend: `mem` \| `file` \| `wal` \| `enc-wal` |
 | `--workload` | `list-append` | Workload: `list-append` \| `bank` \| `set` \| `counter` |
 | `--nemesis` | `none` | Nemesis: `none` \| `crash-restart` \| `pause` \| `lazyfs` \| `clock-skew` |
-| `--path` | `/tmp/sqlocaml_jepsen.db` | DB file path (for file/wal/enc-wal) |
+| `--path` | `/tmp/granary_jepsen.db` | DB file path (for file/wal/enc-wal) |
 | `--key` | — | AES-256 key for `enc-wal` (32 raw bytes or 64 hex chars, #84) |
 | `--workers` | `4` | Number of concurrent worker fibers |
 | `--ops` | `100` | Operations per worker |
 | `--keys` | `10` | Number of distinct keys/accounts |
-| `--history` | `/tmp/sqlocaml_jepsen_history.edn` | Output EDN history path |
+| `--history` | `/tmp/granary_jepsen_history.edn` | Output EDN history path |
 | `--crash-after` | `50` | Ops per worker before crash (crash-restart) |
 | `--pause-after` | `30` | Ops per worker before pause (pause) |
 | `--pause-dur` | `2.0` | Pause duration in seconds (pause) |

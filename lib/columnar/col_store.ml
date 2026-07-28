@@ -1,5 +1,5 @@
-module Row = Sqlocaml_encoding.Row
-module Varint = Sqlocaml_encoding.Varint
+module Row = Granary_encoding.Row
+module Varint = Granary_encoding.Varint
 
 type t =
   { schema : Row.column list

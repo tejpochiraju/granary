@@ -1,4 +1,4 @@
-(* Unix platform driver for sqlocaml (#170): file-backed database constructors
+(* Unix platform driver for granary (#170): file-backed database constructors
    plus the file provider that powers ATTACH and VACUUM on the otherwise
    platform-agnostic core.  The core libraries (block/store/db) carry no [unix]
    dependency; this driver supplies the Unix-specific pieces. *)
@@ -12,16 +12,16 @@ module Store = Store
    the source database's geometry (#176) so the rebuilt file keeps its page_size
    and reserved bytes; opening an existing file (ATTACH, vacuum reopen) ignores
    it and peeks the header instead. *)
-let provider : Sqlocaml.Db.file_provider =
-  { Sqlocaml.Db.open_store =
+let provider : Granary.Db.file_provider =
+  { Granary.Db.open_store =
       (fun ?geom ?as_of_history ~path () ->
         match geom with
         | None -> Store.open_file ?as_of_history ~path ()
         | Some g ->
           Store.open_file
             ?as_of_history
-            ~page_size:g.Sqlocaml_storage.Geometry.page_size
-            ~reserved_bytes_per_page:g.Sqlocaml_storage.Geometry.reserved_bytes_per_page
+            ~page_size:g.Granary_storage.Geometry.page_size
+            ~reserved_bytes_per_page:g.Granary_storage.Geometry.reserved_bytes_per_page
             ~explicit_geometry:true
             ~path
             ())
@@ -33,14 +33,14 @@ let provider : Sqlocaml.Db.file_provider =
   }
 ;;
 
-let install () = Sqlocaml.Db.set_file_provider provider
+let install () = Granary.Db.set_file_provider provider
 
 let to_db ?clock ?durability ~path = function
   | Error e ->
     Lwt.return
-      (Error (Sqlocaml.Db.Runtime (Format.asprintf "%a" Sqlocaml_store.Store.pp_error e)))
+      (Error (Granary.Db.Runtime (Format.asprintf "%a" Granary_store.Store.pp_error e)))
   | Ok store ->
-    let* db = Sqlocaml.Db.of_store ?clock ?durability ~file_path:path store in
+    let* db = Granary.Db.of_store ?clock ?durability ~file_path:path store in
     Lwt.return (Ok db)
 ;;
 

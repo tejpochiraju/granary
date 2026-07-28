@@ -13,16 +13,16 @@
     - QCheck (10_000 trials): LEFT JOIN size ≥ INNER JOIN size *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Ast = Sqlocaml_sql.Ast
-module Sema = Sqlocaml_sql.Sema
-module Plan = Sqlocaml_sql.Plan
-module Planner = Sqlocaml_sql.Planner
-module Parser = Sqlocaml_sql.Parser
-module Lexer = Sqlocaml_sql.Lexer
-module Cat = Sqlocaml_catalog.Catalog
-module Row = Sqlocaml_encoding.Row
-module S = Sqlocaml_store.Store
+module Db = Granary.Db
+module Ast = Granary_sql.Ast
+module Sema = Granary_sql.Sema
+module Plan = Granary_sql.Plan
+module Planner = Granary_sql.Planner
+module Parser = Granary_sql.Parser
+module Lexer = Granary_sql.Lexer
+module Cat = Granary_catalog.Catalog
+module Row = Granary_encoding.Row
+module S = Granary_store.Store
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

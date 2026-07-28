@@ -1,8 +1,8 @@
-# .clinerules — sqlocaml (tej/sqlite_ocaml_port)
+# .clinerules — granary (tej/granary)
 
 ## Project
 
-sqlocaml is a pure-OCaml SQL engine — a concept port of SQLite targeting MirageOS
+granary is a pure-OCaml SQL engine — a concept port of SQLite targeting MirageOS
 unikernels. No C stubs, fresh on-disk format, single-writer/multi-reader MVCC with
 snapshot isolation. OCaml 5.4. Pre-release (0.0.1). **Entirely AI-authored**
 (disclosure level: `ai-generated`). See `README.md` and `ROADMAP.md`.
@@ -11,22 +11,22 @@ snapshot isolation. OCaml 5.4. Pre-release (0.0.1). **Entirely AI-authored**
 
 ## 1. Worktree discipline — ALWAYS
 
-**The repo root (`/home/tej/projects/sqlite_ocaml_port`) stays on `main` at all times.**
+**The repo root (`/home/tej/projects/granary`) stays on `main` at all times.**
 Never commit directly to `main`. Never work in the repo root.
 
 For every task:
 
 1. Create a feature branch and worktree **before touching any code**:
    ```
-   git worktree add ../sqlite_ocaml_port-<slug> -b feat/<slug>
+   git worktree add ../granary-<slug> -b feat/<slug>
    ```
-   All file edits and command execution happen inside `../sqlite_ocaml_port-<slug>/`.
+   All file edits and command execution happen inside `../granary-<slug>/`.
 
 2. When work is complete and tests are green, open a PR (see §5 Forgejo CLI).
 
 3. After the PR is merged, clean up:
    ```
-   git worktree remove ../sqlite_ocaml_port-<slug>
+   git worktree remove ../granary-<slug>
    git branch -d feat/<slug>
    ```
 
@@ -76,37 +76,37 @@ Rules:
 
 ## 4. Build / test / lint / format
 
-All dune commands run inside the **`sqlocaml-dev`** Podman image. Never run dune
+All dune commands run inside the **`granary-dev`** Podman image. Never run dune
 directly on the host. From inside the worktree directory:
 
 ```sh
 # Build
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev \
   opam exec -- dune build
 
 # Test
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev \
   opam exec -- dune runtest
 
 # Format check (ocamlformat 0.29.0, janestreet profile)
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev \
   opam exec -- dune build @fmt
 
 # Apply formatting
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev \
   opam exec -- dune fmt
 
 # Lint (merlint — must be zero findings)
-podman run --rm -v "$(pwd)":/workspace:Z -w /workspace sqlocaml-dev \
+podman run --rm -v "$(pwd)":/workspace:Z -w /workspace granary-dev \
   merlint --color=never
 
 # Coverage (threshold 85%)
 ./scripts/coverage.sh
 ```
 
-If the `sqlocaml-dev` image isn't built yet:
+If the `granary-dev` image isn't built yet:
 ```sh
-podman build -t sqlocaml-dev .
+podman build -t granary-dev .
 ```
 
 ---
@@ -118,7 +118,7 @@ podman build -t sqlocaml-dev .
 **PR analysis:** Post as **comments** (`forgejo issue comment`), not formal reviews — the coder and reviewer are the same user. Do not use the Forgejo review API.
 
 The `forgejo` CLI (`~/.local/bin/forgejo`) is authenticated against
-**https://git.iotready.com** as **tej (admin)**. Repo: `tej/sqlite_ocaml_port`.
+**https://git.iotready.com** as **tej (admin)**. Repo: `tej/granary`.
 
 **Critical gotcha:** `forgejo issue label …` and label/milestone subcommands
 **misroute to an org endpoint** and return `API error (404): GetOrgByName` for
@@ -127,27 +127,27 @@ passthrough:
 
 ```bash
 # List labels
-forgejo api GET /repos/tej/sqlite_ocaml_port/labels
+forgejo api GET /repos/tej/granary/labels
 
 # Create label
-forgejo api POST /repos/tej/sqlite_ocaml_port/labels \
+forgejo api POST /repos/tej/granary/labels \
   -f name="type:bug" -f color="#d73a4a" -f description="..."
 
 # Create milestone
-forgejo api POST /repos/tej/sqlite_ocaml_port/milestones \
+forgejo api POST /repos/tej/granary/milestones \
   -f title="M02" -f description="..."
 
 # Create issue (with milestone id + label ids — use --input for arrays/ints)
 echo '{"title":"...","body":"...","milestone":3,"labels":[1,4]}' \
-  | forgejo api POST /repos/tej/sqlite_ocaml_port/issues --input -
+  | forgejo api POST /repos/tej/granary/issues --input -
 
 # Read/list issues (native subcommands work fine)
-forgejo issue view tej/sqlite_ocaml_port <n>
-forgejo issue list tej/sqlite_ocaml_port
+forgejo issue view tej/granary <n>
+forgejo issue list tej/granary
 
 # Open PR
 echo '{"title":"feat: ...","body":"...","head":"feat/<slug>","base":"main"}' \
-  | forgejo api POST /repos/tej/sqlite_ocaml_port/pulls --input -
+  | forgejo api POST /repos/tej/granary/pulls --input -
 ```
 
 The REST API requires the CLI/token — plain `curl` returns 403 (private repo).
@@ -171,5 +171,5 @@ The REST API requires the CLI/token — plain `curl` returns 403 (private repo).
 ## 7. Issues & deferred work
 
 File deferred or discovered work as a Forgejo issue **immediately**. Never bury
-it in a code comment or `TODO`. Use `forgejo api POST /repos/tej/sqlite_ocaml_port/issues`
+it in a code comment or `TODO`. Use `forgejo api POST /repos/tej/granary/issues`
 with the right labels and milestone, then reference it (`#NNN`) where relevant.

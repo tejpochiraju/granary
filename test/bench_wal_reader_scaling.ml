@@ -6,15 +6,15 @@
     not regress vs sequential execution.
 
     Env vars:
-      SQLOCAML_BENCH_READERS  (default 8)
-      SQLOCAML_BENCH_PER      (default 200)
-      SQLOCAML_BENCH_PARALLEL_MAX (default 2.0)
+      GRANARY_BENCH_READERS  (default 8)
+      GRANARY_BENCH_PER      (default 200)
+      GRANARY_BENCH_PARALLEL_MAX (default 2.0)
 *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -29,7 +29,7 @@ let getenv_float k d =
   | _ -> d
 ;;
 
-let path = "/tmp/sqlocaml_phase38_bench.db"
+let path = "/tmp/granary_phase38_bench.db"
 
 let setup () =
   (try Unix.unlink path with
@@ -72,9 +72,9 @@ let bench db ~n_readers ~per =
 ;;
 
 let test_scaling () =
-  let n_readers = getenv_int "SQLOCAML_BENCH_READERS" 8 in
-  let per = getenv_int "SQLOCAML_BENCH_PER" 200 in
-  let parallel_max = getenv_float "SQLOCAML_BENCH_PARALLEL_MAX" 2.0 in
+  let n_readers = getenv_int "GRANARY_BENCH_READERS" 8 in
+  let per = getenv_int "GRANARY_BENCH_PER" 200 in
+  let parallel_max = getenv_float "GRANARY_BENCH_PARALLEL_MAX" 2.0 in
   let db = setup () in
   let t_serial = bench db ~n_readers:1 ~per:(n_readers * per) in
   let t_par = bench db ~n_readers ~per in

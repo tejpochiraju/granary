@@ -1,12 +1,12 @@
 (library
- (name sqlocaml_store)
- (public_name sqlocaml.store)
+ (name granary_store)
+ (public_name granary.store)
  (libraries
   cstruct
   lwt
-  sqlocaml.block
-  sqlocaml.encoding
-  sqlocaml.storage
+  granary.block
+  granary.encoding
+  granary.storage
   mirage-crypto
   mirage-crypto-rng)
  (preprocess

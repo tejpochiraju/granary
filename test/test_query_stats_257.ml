@@ -6,7 +6,7 @@
     an FTS scan behind a filter reads every content row; a correlated subquery
     re-scanned per outer row charges each inner read to the outer query. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -45,9 +45,9 @@ let stats_of db sql =
 
 let check_stats sql ~examined ~returned ~used_index (n, st) =
   Alcotest.(check int) (sql ^ " : rows_returned (len)") returned n;
-  Alcotest.(check int) (sql ^ " : rows_returned") returned st.Sqlocaml.Db.rows_returned;
-  Alcotest.(check int) (sql ^ " : rows_examined") examined st.Sqlocaml.Db.rows_examined;
-  Alcotest.(check bool) (sql ^ " : used_index") used_index st.Sqlocaml.Db.used_index
+  Alcotest.(check int) (sql ^ " : rows_returned") returned st.Granary.Db.rows_returned;
+  Alcotest.(check int) (sql ^ " : rows_examined") examined st.Granary.Db.rows_examined;
+  Alcotest.(check bool) (sql ^ " : used_index") used_index st.Granary.Db.used_index
 ;;
 
 (* Four-document FTS table; 'ocaml' appears in exactly two bodies. *)
@@ -115,11 +115,11 @@ let test_correlated_subquery_projection () =
       stats_of db "SELECT id, (SELECT sum(g) FROM inr WHERE g = o.id) AS s FROM o"
     in
     Alcotest.(check int) "corr proj rows" 3 n;
-    Alcotest.(check int) "corr proj rows_returned" 3 st.Sqlocaml.Db.rows_returned;
+    Alcotest.(check int) "corr proj rows_returned" 3 st.Granary.Db.rows_returned;
     Alcotest.(check int)
       "corr proj rows_examined (3 outer + 3*5 inner)"
       18
-      st.Sqlocaml.Db.rows_examined)
+      st.Granary.Db.rows_examined)
 ;;
 
 (* A correlated subquery in a WHERE predicate, same accounting: the inner scan
@@ -135,7 +135,7 @@ let test_correlated_subquery_filter () =
     Alcotest.(check int)
       "corr filter rows_examined (3 outer + 3*5 inner)"
       18
-      st.Sqlocaml.Db.rows_examined)
+      st.Granary.Db.rows_examined)
 ;;
 
 (* Before #257 the inner scan was invisible: prove the count is strictly greater
@@ -149,7 +149,7 @@ let test_correlated_charges_inner () =
     Alcotest.(check bool)
       "inner reads are charged (examined > 3 outer rows)"
       true
-      (st.Sqlocaml.Db.rows_examined > 3))
+      (st.Granary.Db.rows_examined > 3))
 ;;
 
 let () =

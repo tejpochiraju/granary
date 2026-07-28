@@ -36,7 +36,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-cov-${{ hashFiles('sqlocaml.opam') }}
+          key: opam-5.4-cov-${{ hashFiles('granary.opam') }}
           restore-keys: opam-5.4-cov-
 
       - name: Install opam packages (including bisect_ppx)

@@ -1,9 +1,9 @@
 (** Standby follower driver (#172) implementation. *)
 
 open Lwt.Syntax
-module Store = Sqlocaml_store.Store
-module Wal = Sqlocaml_storage.Wal
-module Pager = Sqlocaml_storage.Pager
+module Store = Granary_store.Store
+module Wal = Granary_storage.Wal
+module Pager = Granary_storage.Pager
 
 type follower_mode =
   | Following

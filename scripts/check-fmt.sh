@@ -20,9 +20,9 @@
 #   scripts/check-fmt.sh          # check; exit 1 (with diffs) on any deviation
 #   scripts/check-fmt.sh --fix    # rewrite the offending files in place
 #
-# Override the image with SQLOCAML_DEV_IMAGE if needed.
+# Override the image with GRANARY_DEV_IMAGE if needed.
 
-IMAGE="${SQLOCAML_DEV_IMAGE:-localhost/sqlocaml-dev:latest}"
+IMAGE="${GRANARY_DEV_IMAGE:-localhost/granary-dev:latest}"
 
 # ocamlformat lives only in the dev image. If it isn't already on PATH we are
 # on the host: re-exec this same script inside the container under `opam exec`

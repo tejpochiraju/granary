@@ -3,8 +3,8 @@
     Implementation of the apply primitive and cold restore. *)
 
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
-module Pager = Sqlocaml_storage.Pager
+module Wal = Granary_storage.Wal
+module Pager = Granary_storage.Pager
 
 type replicated_frame =
   { epoch : int64
@@ -288,10 +288,9 @@ let apply_frames_epoch_aware ~wal ~pager ~last_epoch ~last_idx ~reader_gate fram
 (* Incremental restore (#265)                                           *)
 (* ------------------------------------------------------------------ *)
 
-(** Convert a {!Sqlocaml_store.Store.backup_frame} to a
+(** Convert a {!Granary_store.Store.backup_frame} to a
     {!replicated_frame} for use with {!apply_frames_epoch_aware}. *)
-let backup_frame_to_replicated (bf : Sqlocaml_store.Store.backup_frame) : replicated_frame
-  =
+let backup_frame_to_replicated (bf : Granary_store.Store.backup_frame) : replicated_frame =
   { epoch = bf.epoch
   ; frame_idx = bf.frame_idx
   ; page_id = bf.page_id
@@ -309,7 +308,7 @@ let incremental_restore
       ~sync
       ~wal_size_bytes
       ~pager
-      ~(incremental_sets : Sqlocaml_store.Store.backup_frame list list)
+      ~(incremental_sets : Granary_store.Store.backup_frame list list)
       ()
   =
   let* wal_r = Wal.open_ ~read_at ~write_at ~sync ~size_bytes:wal_size_bytes () in
@@ -321,7 +320,7 @@ let incremental_restore
       List.find_map
         (function
           | [] -> None
-          | (f : Sqlocaml_store.Store.backup_frame) :: _ -> Some f.epoch)
+          | (f : Granary_store.Store.backup_frame) :: _ -> Some f.epoch)
         incremental_sets
       |> Option.value ~default:0L
     in

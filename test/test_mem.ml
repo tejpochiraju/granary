@@ -1,5 +1,5 @@
 open Lwt.Syntax
-module Mem = Sqlocaml_block.Mem
+module Mem = Granary_block.Mem
 
 (* Helper: check if [needle] appears anywhere in [haystack] *)
 let string_contains haystack needle =

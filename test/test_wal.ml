@@ -1,7 +1,7 @@
 (** Unit tests for the standalone WAL module. *)
 
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
+module Wal = Granary_storage.Wal
 
 (* ------------------------------------------------------------------ *)
 (* In-memory byte-addressable device                                    *)

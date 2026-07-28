@@ -1,4 +1,4 @@
-(** Jepsen-style concurrent workload harness for sqlocaml.
+(** Jepsen-style concurrent workload harness for granary.
 
     Usage: harness.exe [options]
 
@@ -13,10 +13,10 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file = Granary_unix.open_file
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 (* ----------------------------------------------------------------- *)
@@ -91,17 +91,17 @@ let open_db backend =
             (Format.asprintf "%a" Db.pp_error e)))
   | EncWAL { path; key } ->
     (* Encrypted-at-rest WAL backend (#84): open through the Store layer with a
-       32-byte AES-256 key, then wrap in a Db.t exactly as Sqlocaml_unix does. *)
-    Sqlocaml_unix.install ();
-    let* r = Sqlocaml_unix.Store.open_file_wal ~key ~path () in
+       32-byte AES-256 key, then wrap in a Db.t exactly as Granary_unix does. *)
+    Granary_unix.install ();
+    let* r = Granary_unix.Store.open_file_wal ~key ~path () in
     (match r with
-     | Ok store -> Sqlocaml.Db.of_store ~file_path:path store
+     | Ok store -> Granary.Db.of_store ~file_path:path store
      | Error e ->
        failwith
          (Printf.sprintf
             "open_file_wal(enc,%s) failed: %s"
             path
-            (Format.asprintf "%a" Sqlocaml_store.Store.pp_error e)))
+            (Format.asprintf "%a" Granary_store.Store.pp_error e)))
 ;;
 
 (* ----------------------------------------------------------------- *)
@@ -424,11 +424,11 @@ let () =
      must. Harmless for plaintext backends. *)
   Mirage_crypto_rng_unix.use_default ();
   let backend = ref "mem" in
-  let path = ref "/tmp/sqlocaml_jepsen.db" in
+  let path = ref "/tmp/granary_jepsen.db" in
   let n_workers = ref 4 in
   let ops_per_worker = ref 100 in
   let key_range = ref 10 in
-  let history_path = ref "/tmp/sqlocaml_jepsen_history.edn" in
+  let history_path = ref "/tmp/granary_jepsen_history.edn" in
   let workload_name = ref "list-append" in
   let nemesis_name = ref "none" in
   let crash_after = ref 50 in
@@ -472,7 +472,7 @@ let () =
     ; "--key", Arg.Set_string key, " AES-256 key for enc-wal (32 bytes or 64 hex)"
     ]
   in
-  Arg.parse (Arg.align args) (fun _ -> ()) "sqlocaml Jepsen harness";
+  Arg.parse (Arg.align args) (fun _ -> ()) "granary Jepsen harness";
   let backend_val =
     match !backend with
     | "mem" -> Mem

@@ -8,14 +8,14 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
-module Row = Sqlocaml_encoding.Row
-module Geometry = Sqlocaml_storage.Geometry
-module Header = Sqlocaml_storage.Header
+module Row = Granary_encoding.Row
+module Geometry = Granary_storage.Geometry
+module Header = Granary_storage.Header
 
 let run = Lwt_main.run
 
@@ -38,7 +38,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_vacuum_%04d.db" n
+  Printf.sprintf "/tmp/granary_vacuum_%04d.db" n
 ;;
 
 let cleanup path =

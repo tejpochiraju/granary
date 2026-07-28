@@ -1,4 +1,4 @@
-(** Tests for the sqlocaml TUI REPL binary.
+(** Tests for the granary TUI REPL binary.
 
     The REPL is a nottui-lwt TUI application that requires a real terminal
     for interactive rendering.  Full behavioural tests (piping SQL + reading
@@ -13,14 +13,14 @@
 
 let repl_path () =
   (* test_repl.exe lives in _build/default/test/  The REPL binary is at
-     _build/default/bin/repl/sqlocaml_repl.exe.  Resolve relative to our
+     _build/default/bin/repl/granary_repl.exe.  Resolve relative to our
      own exec path so we don't depend on cwd. *)
   let our_path = Sys.executable_name in
   let test_dir = Filename.dirname our_path in
   let build_root = Filename.dirname test_dir in
   Filename.concat
     (Filename.concat (Filename.concat build_root "bin") "repl")
-    "sqlocaml_repl.exe"
+    "granary_repl.exe"
 ;;
 
 let test_binary_exists () =
@@ -33,7 +33,7 @@ let test_bad_path_nonzero_exit () =
   let code =
     Sys.command
       (Printf.sprintf
-         "%s /nonexistent_sqlocaml_test_db </dev/null 2>/dev/null"
+         "%s /nonexistent_granary_test_db </dev/null 2>/dev/null"
          (Filename.quote bin))
   in
   Alcotest.(check bool) "non-existent db path exits nonzero" true (code <> 0)

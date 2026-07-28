@@ -11,7 +11,7 @@
       commits and nothing on no-op writes / DDL;
     - [REFRESH DELTA] on an unmaintainable shape is rejected at CREATE. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

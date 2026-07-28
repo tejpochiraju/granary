@@ -1,6 +1,6 @@
-(** Tests for Sqlocaml_storage.Freelist *)
+(** Tests for Granary_storage.Freelist *)
 
-module FL = Sqlocaml_storage.Freelist
+module FL = Granary_storage.Freelist
 
 (* ------------------------------------------------------------------ *)
 (* Unit tests                                                          *)

@@ -4,10 +4,10 @@
     reopen (read back from the header, no geometry passed by the caller). *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module Geometry = Sqlocaml_storage.Geometry
-module Header = Sqlocaml_storage.Header
-module Page = Sqlocaml_storage.Page
+module S = Granary_store.Store
+module Geometry = Granary_storage.Geometry
+module Header = Granary_storage.Header
+module Page = Granary_storage.Page
 
 let run = Lwt_main.run
 
@@ -151,7 +151,7 @@ let test_default_still_works () = roundtrip_at ~page_size:4096 ~n:1500 ~big_size
 (* Real Unix-file path: exercises the open-time peek + [Unix_file.set_page_size]
    + resize-at-16K glue, persistence across a true close/reopen, and the
    geometry-mismatch rejection. *)
-module USt = Sqlocaml_unix.Store
+module USt = Granary_unix.Store
 
 let open_or_fail what r =
   match r with
@@ -161,7 +161,7 @@ let open_or_fail what r =
 
 let test_unix_file_persistence () =
   run
-    (let path = Filename.temp_file "sqlocaml_geom_" ".db" in
+    (let path = Filename.temp_file "granary_geom_" ".db" in
      let n = 1000 in
      let big_size = 50000 in
      (* Create at 16K (explicit), populate, close. *)
@@ -195,7 +195,7 @@ let test_unix_file_persistence () =
    16K-sized frames written, recovered, and read back across a reopen. *)
 let test_unix_wal_persistence () =
   run
-    (let path = Filename.temp_file "sqlocaml_geomwal_" ".db" in
+    (let path = Filename.temp_file "granary_geomwal_" ".db" in
      let n = 800 in
      let big_size = 60000 in
      let* r = USt.open_file_wal ~page_size:16384 ~explicit_geometry:true ~path () in

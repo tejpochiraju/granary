@@ -16,7 +16,7 @@
       - Reads observe consistent snapshots. *)
 
 open Edn_history
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (** Generate a bank transfer transaction.
     Picks two distinct random accounts from [0, n_accounts) and an amount

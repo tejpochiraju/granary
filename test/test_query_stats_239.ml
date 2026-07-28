@@ -6,7 +6,7 @@
     filter reads [rows_examined = N] while returning one row.  These also pin
     the index-vs-scan signal and the count-star fast path. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -45,9 +45,9 @@ let stats_of db sql =
 
 let check_stats sql ~examined ~returned ~used_index (n, st) =
   Alcotest.(check int) (sql ^ " : rows_returned (len)") returned n;
-  Alcotest.(check int) (sql ^ " : rows_returned") returned st.Sqlocaml.Db.rows_returned;
-  Alcotest.(check int) (sql ^ " : rows_examined") examined st.Sqlocaml.Db.rows_examined;
-  Alcotest.(check bool) (sql ^ " : used_index") used_index st.Sqlocaml.Db.used_index
+  Alcotest.(check int) (sql ^ " : rows_returned") returned st.Granary.Db.rows_returned;
+  Alcotest.(check int) (sql ^ " : rows_examined") examined st.Granary.Db.rows_examined;
+  Alcotest.(check bool) (sql ^ " : used_index") used_index st.Granary.Db.used_index
 ;;
 
 (* A 10-row table with a UNIQUE-valued text column [v = 'row<i>']. *)
@@ -173,11 +173,11 @@ let test_join_counts_both_sides () =
     done;
     let n, st = stats_of db "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k" in
     Alcotest.(check int) "join rows (len)" 3 n;
-    Alcotest.(check int) "join rows_returned" 3 st.Sqlocaml.Db.rows_returned;
+    Alcotest.(check int) "join rows_returned" 3 st.Granary.Db.rows_returned;
     Alcotest.(check int)
       "join rows_examined (left scan + right rows)"
       6
-      st.Sqlocaml.Db.rows_examined)
+      st.Granary.Db.rows_examined)
 ;;
 
 let () =

@@ -76,12 +76,12 @@ type t =
 (* #246: default bound on the decrypted-frame cache.  One full WAL generation's
    worth of frames (the default auto-checkpoint threshold is 1000), so a hot
    working set that fits the un-checkpointed window never re-decrypts.
-   Configurable down via [SQLOCAML_WAL_FRAME_CACHE] for memory-tight unikernels
+   Configurable down via [GRANARY_WAL_FRAME_CACHE] for memory-tight unikernels
    (0 disables the cache entirely, restoring decrypt-on-every-read).  This is
    per-WAL RAM (~4 KB/frame plaintext) and stacks ON TOP of the pager's main
    page cache — size both together when budgeting a unikernel. *)
 let default_frame_cache_capacity =
-  match Sys.getenv_opt "SQLOCAML_WAL_FRAME_CACHE" with
+  match Sys.getenv_opt "GRANARY_WAL_FRAME_CACHE" with
   | Some s ->
     (match int_of_string_opt s with
      | Some n when n >= 0 -> n

@@ -1,4 +1,4 @@
-open Sqlocaml_parallel
+open Granary_parallel
 
 let test_run_returns_branch_value () =
   let r = Parallel.run ~parallel:(fun () -> 42) ~sequential:(fun () -> 42) in

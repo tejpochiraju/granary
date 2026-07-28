@@ -1,7 +1,7 @@
 (** End-to-end encryption-at-rest tests for the Unix file driver (#84).
 
     These are the real security validation for opt-in page encryption: they
-    drive the full Unix-file open paths ({!Sqlocaml_unix.Store.open_file} and
+    drive the full Unix-file open paths ({!Granary_unix.Store.open_file} and
     [open_file_wal]) with a [?key], round-trip data across reopen, exercise the
     three key/header error cases, recover an encrypted WAL after a crash (no
     checkpoint), and — critically — assert that a known plaintext canary value
@@ -9,8 +9,8 @@
     sidecar. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module UnixStore = Sqlocaml_unix.Store
+module S = Granary_store.Store
+module UnixStore = Granary_unix.Store
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -30,7 +30,7 @@ let counter = ref 0
    which the driver treats as fresh, but removing it is cleaner. *)
 let tmp_path () =
   incr counter;
-  let p = Printf.sprintf "/tmp/sqlocaml_enc_%d_%d.db" (Unix.getpid ()) !counter in
+  let p = Printf.sprintf "/tmp/granary_enc_%d_%d.db" (Unix.getpid ()) !counter in
   (try Sys.remove p with
    | _ -> ());
   p

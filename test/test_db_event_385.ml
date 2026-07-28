@@ -1,13 +1,13 @@
 (** Db.set_event_callback passthrough (#382). *)
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 module L = Event_log
-module Ev = Sqlocaml.Db.Event
+module Ev = Granary.Db.Event
 
 let run = Lwt_main.run
 let counter = ref 0
@@ -15,7 +15,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_dbevent_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_dbevent_%04d.db" n
 ;;
 
 let cleanup path =
@@ -124,7 +124,7 @@ let test_table_filter_resolution () =
 ;;
 
 let () =
-  Sqlocaml_unix.install ();
+  Granary_unix.install ();
   Alcotest.run
     "db_event"
     [ "passthrough", [ Alcotest.test_case "fires" `Quick test_passthrough_fires ]

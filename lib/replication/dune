@@ -1,7 +1,7 @@
 (library
- (name sqlocaml_replication)
- (public_name sqlocaml.replication)
- (libraries lwt cstruct sqlocaml.storage sqlocaml.store)
+ (name granary_replication)
+ (public_name granary.replication)
+ (libraries lwt cstruct granary.storage granary.store)
  (preprocess
   (pps lwt_ppx))
  (modules replication standby)

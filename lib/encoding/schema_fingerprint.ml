@@ -1,5 +1,5 @@
 (* FNV-1a 64-bit. Self-contained copy (the storage-layer WAL has its own, but
-   this module lives in [sqlocaml.encoding] which storage does not depend on,
+   this module lives in [granary.encoding] which storage does not depend on,
    so we keep an independent, tested copy here rather than introduce a
    dependency edge into the crash-recovery-critical WAL code). *)
 let fnv64_offset = 0xCBF29CE484222325L

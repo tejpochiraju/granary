@@ -1,6 +1,6 @@
 # Hotpath Profiling — sqlocaml (#222 follow-up)
 
-**Date:** 2026-06-02 · **sqlocaml:** `f5f6861` · **Host:** otp-infra-1 (HDD, 8 cores) · **Charts:** [wiki Profiling page](https://git.iotready.com/tej/sqlite_ocaml_port/wiki/Profiling)
+**Date:** 2026-06-02 · **sqlocaml:** `f5f6861` · **Host:** self-hosted runner (HDD, 8 cores) · **Charts:** wiki Profiling page, on the maintainer's private development instance
 
 Follow-up to the #222 benchmark: *where* does the slowness come from, toward the #231 "within 100× of SQLite" goal. Two methods — a **scaling measurement** (complexity) and a **`perf` CPU flamegraph** (hotspot).
 
@@ -50,8 +50,8 @@ Re-run scaling + `bench222.sh` after the fix; the per-op lines should flatten (p
 ## Reproduce
 ```bash
 # scaling
-for n in 1000 2000 4000; do SQLOCAML_BENCH_ROWS=$n SQLOCAML_BENCH_OPS=100 SQLOCAML_BENCH_SCANS=10 \
-  SQLOCAML_BENCH_COMMITS=10 SQLOCAML_BENCH_REPEATS=1 ./_build/default/test/bench_compare.exe 2>/dev/null \
+for n in 1000 2000 4000; do GRANARY_BENCH_ROWS=$n GRANARY_BENCH_OPS=100 GRANARY_BENCH_SCANS=10 \
+  GRANARY_BENCH_COMMITS=10 GRANARY_BENCH_REPEATS=1 ./_build/default/test/bench_compare.exe 2>/dev/null \
   | grep -E "sqlocaml,(point_lookup|scan_agg|insert_batch),plaintext"; done
 # flamegraph (host perf_event_paranoid=1)
 perf record -F 299 --call-graph dwarf -o perf.data -- ./_build/default/test/bench_compare.exe

@@ -24,7 +24,7 @@
     bound and the foil makes reintroducing a per-page list fail the test, and
     confirms the measurement actually distinguishes the two. *)
 
-module P = Sqlocaml_storage.Page
+module P = Granary_storage.Page
 
 let key_of i =
   let b = Bytes.create 8 in

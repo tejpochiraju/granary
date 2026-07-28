@@ -6,8 +6,8 @@
     holds ciphertext for pages >= 2. *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module Geometry = Sqlocaml_storage.Geometry
+module S = Granary_store.Store
+module Geometry = Granary_storage.Geometry
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run

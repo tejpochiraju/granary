@@ -16,11 +16,11 @@ NVMe numbers hide the fsync-ceiling story).
 ```sh
 DATA_DIR="$PWD/bench/data"; mkdir -p "$DATA_DIR"; chmod 777 "$PWD" "$DATA_DIR"
 podman run --rm \
-  -e SQLOCAML_BENCH_DURABILITY=sweep \
-  -e SQLOCAML_BENCH_HOST=otp-infra-1-hdd \
-  -e SQLOCAML_BENCH_ROWS=2000 -e SQLOCAML_BENCH_OPS=1000 \
-  -e SQLOCAML_BENCH_SCANS=10 -e SQLOCAML_BENCH_COMMITS=500 \
-  -e SQLOCAML_BENCH_REPEATS=3 -e SQLOCAML_BENCH_PAGE_CACHE=1024 \
+  -e GRANARY_BENCH_DURABILITY=sweep \
+  -e GRANARY_BENCH_HOST=otp-infra-1-hdd \
+  -e GRANARY_BENCH_ROWS=2000 -e GRANARY_BENCH_OPS=1000 \
+  -e GRANARY_BENCH_SCANS=10 -e GRANARY_BENCH_COMMITS=500 \
+  -e GRANARY_BENCH_REPEATS=3 -e GRANARY_BENCH_PAGE_CACHE=1024 \
   -e TMPDIR=/benchdata \
   -v "$PWD":/workspace:Z -w /workspace \
   -v "$DATA_DIR":/benchdata:Z \
@@ -28,9 +28,9 @@ podman run --rm \
   dune exec test/bench_compare.exe > bench/results/otp-infra-1-hdd-durability-sweep.csv
 ```
 
-`SQLOCAML_BENCH_DURABILITY` (added for #332) accepts `full` | `batched` | `off` |
+`GRANARY_BENCH_DURABILITY` (added for #332) accepts `full` | `batched` | `off` |
 `sweep`. `sweep` runs the sqlocaml engine once per mode in a single CSV;
-`batched` honours `SQLOCAML_BENCH_BATCH_N` (256) and `SQLOCAML_BENCH_BATCH_T_MS`
+`batched` honours `GRANARY_BENCH_BATCH_N` (256) and `GRANARY_BENCH_BATCH_T_MS`
 (100). The SQLite reference always runs `synchronous=FULL`. With no env var set,
 the harness behaves exactly as the original #222 run.
 

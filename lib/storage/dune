@@ -1,7 +1,7 @@
 (library
- (name sqlocaml_storage)
- (public_name sqlocaml.storage)
- (libraries cstruct lwt sqlocaml.block mirage-crypto mirage-crypto-rng)
+ (name granary_storage)
+ (public_name granary.storage)
+ (libraries cstruct lwt granary.block mirage-crypto mirage-crypto-rng)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

@@ -6,7 +6,7 @@
 
       dune exec test/bench_perf_compare_sqlite3.exe
 
-    Use SQLOCAML_BENCH_N to override the workload size (default 100). *)
+    Use GRANARY_BENCH_N to override the workload size (default 100). *)
 
 let env_int key default =
   match Sys.getenv_opt key with
@@ -16,7 +16,7 @@ let env_int key default =
      | _ -> default)
 ;;
 
-let n = env_int "SQLOCAML_BENCH_N" 100
+let n = env_int "GRANARY_BENCH_N" 100
 
 let throughput label ops dt =
   let rate = float_of_int ops /. dt in
@@ -24,7 +24,7 @@ let throughput label ops dt =
 ;;
 
 let () =
-  let path = "/tmp/sqlocaml_phase39_sqlite3_bench.db" in
+  let path = "/tmp/granary_phase39_sqlite3_bench.db" in
   (try Unix.unlink path with
    | _ -> ());
   let sqlite3 =
@@ -36,7 +36,7 @@ let () =
    | None -> Printf.eprintf "\n=== sqlite3 CLI not available — skipping baseline ===\n%!"
    | Some bin ->
      Printf.eprintf "\n=== sqlite3 baseline (subprocess), N=%d ===\n%!" n;
-     let script_path = "/tmp/sqlocaml_phase39_sqlite3_bench.sql" in
+     let script_path = "/tmp/granary_phase39_sqlite3_bench.sql" in
      let oc = open_out script_path in
      output_string oc "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER);\n";
      output_string oc "BEGIN;\n";

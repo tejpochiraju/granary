@@ -1,22 +1,22 @@
-(** #222 — cross-engine benchmark: sqlocaml vs reference C SQLite.
+(** #222 — cross-engine benchmark: granary vs reference C SQLite.
 
     Synchronous timing harness over a common {!ENGINE} interface.  Each workload
     is timed with wall-clock ([Unix.gettimeofday]) and CPU time ([Unix.times]:
     utime+stime); [cpu/wall] is the CPU-bound vs I/O-bound signal for #156.
 
     NOT a CI pass/fail gate — it is a measurement tool.  Correctness is guarded
-    by [SQLOCAML_BENCH_SMOKE=1] (cross-engine result equality on a tiny dataset).
+    by [GRANARY_BENCH_SMOKE=1] (cross-engine result equality on a tiny dataset).
 
     Output: CSV to stdout; human summary to stderr.  Tunables via env:
-      SQLOCAML_BENCH_ROWS    dataset rows         (default 10000)
-      SQLOCAML_BENCH_OPS     point-lookup ops     (default 5000)
-      SQLOCAML_BENCH_SCANS   scan/agg repeats     (default 50)
-      SQLOCAML_BENCH_COMMITS single-row txns      (default 200)
-      SQLOCAML_BENCH_REPEATS timed repeats        (default 5; best of N reported)
-      SQLOCAML_BENCH_PAGE_CACHE  page-cache pages (default 1024; mirrored to both engines)
-      SQLOCAML_BENCH_HOST    host label for CSV   (default from Unix.gethostname)
+      GRANARY_BENCH_ROWS    dataset rows         (default 10000)
+      GRANARY_BENCH_OPS     point-lookup ops     (default 5000)
+      GRANARY_BENCH_SCANS   scan/agg repeats     (default 50)
+      GRANARY_BENCH_COMMITS single-row txns      (default 200)
+      GRANARY_BENCH_REPEATS timed repeats        (default 5; best of N reported)
+      GRANARY_BENCH_PAGE_CACHE  page-cache pages (default 1024; mirrored to both engines)
+      GRANARY_BENCH_HOST    host label for CSV   (default from Unix.gethostname)
 
-    Each workload wraps its whole loop in ONE [Lwt_main.run] so sqlocaml's
+    Each workload wraps its whole loop in ONE [Lwt_main.run] so granary's
     numbers reflect engine cost, not per-op event-loop entry overhead (the C
     reference has no scheduler).  CPU time comes from [Unix.times], whose ~10ms
     tick quantization means very light workloads can read [cpu_s ≈ 0]; size the
@@ -32,53 +32,53 @@ let env_int key default =
   | None -> default
 ;;
 
-let rows_n = env_int "SQLOCAML_BENCH_ROWS" 10000
-let ops_n = env_int "SQLOCAML_BENCH_OPS" 5000
-let scans_n = env_int "SQLOCAML_BENCH_SCANS" 50
-let commits_n = env_int "SQLOCAML_BENCH_COMMITS" 200
-let repeats_n = env_int "SQLOCAML_BENCH_REPEATS" 5
-let page_cache = env_int "SQLOCAML_BENCH_PAGE_CACHE" 1024
+let rows_n = env_int "GRANARY_BENCH_ROWS" 10000
+let ops_n = env_int "GRANARY_BENCH_OPS" 5000
+let scans_n = env_int "GRANARY_BENCH_SCANS" 50
+let commits_n = env_int "GRANARY_BENCH_COMMITS" 200
+let repeats_n = env_int "GRANARY_BENCH_REPEATS" 5
+let page_cache = env_int "GRANARY_BENCH_PAGE_CACHE" 1024
 
 let host_label =
-  match Sys.getenv_opt "SQLOCAML_BENCH_HOST" with
+  match Sys.getenv_opt "GRANARY_BENCH_HOST" with
   | Some h when h <> "" -> h
   | _ ->
     (try Unix.gethostname () with
      | _ -> "unknown")
 ;;
 
-(* #332: per-deployment durability mode for the sqlocaml engine's WAL commits.
-   Selected by [SQLOCAML_BENCH_DURABILITY] (full|batched|off|sweep); the
+(* #332: per-deployment durability mode for the granary engine's WAL commits.
+   Selected by [GRANARY_BENCH_DURABILITY] (full|batched|off|sweep); the
    SQLite reference always runs synchronous=FULL.  Held in a ref so the sweep
    mode can re-open the same engine under each mode in turn.  The default
    ([None]) preserves the original #222 behaviour exactly (Full, untagged
    variants). *)
-let sqlocaml_durability = ref Sqlocaml_store.Store.Full
+let granary_durability = ref Granary_store.Store.Full
 
-let durability_label (d : Sqlocaml_store.Store.durability) =
+let durability_label (d : Granary_store.Store.durability) =
   match d with
-  | Sqlocaml_store.Store.Full -> "full"
-  | Sqlocaml_store.Store.Off -> "off"
-  | Sqlocaml_store.Store.Batched { commits; interval_ms } ->
+  | Granary_store.Store.Full -> "full"
+  | Granary_store.Store.Off -> "off"
+  | Granary_store.Store.Batched { commits; interval_ms } ->
     Printf.sprintf "batched-n%d-t%dms" commits interval_ms
 ;;
 
 let batched_from_env () =
-  Sqlocaml_store.Store.Batched
-    { commits = env_int "SQLOCAML_BENCH_BATCH_N" 256
-    ; interval_ms = env_int "SQLOCAML_BENCH_BATCH_T_MS" 100
+  Granary_store.Store.Batched
+    { commits = env_int "GRANARY_BENCH_BATCH_N" 256
+    ; interval_ms = env_int "GRANARY_BENCH_BATCH_T_MS" 100
     }
 ;;
 
-let parse_durability s : Sqlocaml_store.Store.durability =
+let parse_durability s : Granary_store.Store.durability =
   match String.lowercase_ascii s with
-  | "full" -> Sqlocaml_store.Store.Full
-  | "off" -> Sqlocaml_store.Store.Off
+  | "full" -> Granary_store.Store.Full
+  | "off" -> Granary_store.Store.Off
   | "batched" -> batched_from_env ()
   | other ->
     failwith
       (Printf.sprintf
-         "SQLOCAML_BENCH_DURABILITY: unknown mode %s (full|batched|off|sweep)"
+         "GRANARY_BENCH_DURABILITY: unknown mode %s (full|batched|off|sweep)"
          other)
 ;;
 
@@ -115,17 +115,17 @@ module type ENGINE = sig
   val close : t -> unit
 end
 
-(* ── sqlocaml engine ──────────────────────────────────────────────────────── *)
-module Sqlocaml : ENGINE = struct
-  open Sqlocaml
+(* ── granary engine ──────────────────────────────────────────────────────── *)
+module Granary : ENGINE = struct
+  open Granary
 
   type t = { db : Db.t }
 
-  let name = "sqlocaml"
+  let name = "granary"
 
   let unwrap = function
     | Ok v -> v
-    | Error e -> Alcotest.failf "sqlocaml: %a" Db.pp_error e
+    | Error e -> Alcotest.failf "granary: %a" Db.pp_error e
   ;;
 
   let open_db ~dir ~key =
@@ -142,19 +142,19 @@ module Sqlocaml : ENGINE = struct
       | None ->
         unwrap
           (run
-             (Sqlocaml_unix.open_file_wal
-                ~durability:!sqlocaml_durability
+             (Granary_unix.open_file_wal
+                ~durability:!granary_durability
                 ~clock:Unix.gettimeofday
                 ~path
                 ()))
       | Some k ->
-        (match run (Sqlocaml_unix.Store.open_file_wal ~key:k ~path ()) with
-         | Error _ -> Alcotest.fail "sqlocaml: encrypted open failed"
+        (match run (Granary_unix.Store.open_file_wal ~key:k ~path ()) with
+         | Error _ -> Alcotest.fail "granary: encrypted open failed"
          | Ok store ->
            run
              (Db.of_store
                 ~file_path:path
-                ~durability:!sqlocaml_durability
+                ~durability:!granary_durability
                 ~clock:Unix.gettimeofday
                 store))
     in
@@ -165,13 +165,13 @@ module Sqlocaml : ENGINE = struct
 
   (* Lwt-native exec, for wrapping a whole workload loop in ONE [Lwt_main.run]
      so the per-statement event-loop entry cost of [exec] does not inflate
-     sqlocaml's write-workload numbers against the scheduler-free C reference. *)
+     granary's write-workload numbers against the scheduler-free C reference. *)
   let exec_lwt db sql =
     let open Lwt.Syntax in
     let* r = Db.execute db sql in
     match r with
     | Ok () -> Lwt.return_unit
-    | Error e -> Alcotest.failf "sqlocaml: %a" Db.pp_error e
+    | Error e -> Alcotest.failf "granary: %a" Db.pp_error e
   ;;
 
   let seed t ~rows =
@@ -248,7 +248,7 @@ module Sqlocaml : ENGINE = struct
   ;;
 
   (* Prepare once, bind+run per row — same shape as the SQLite reference, so the
-     comparison isolates engine cost rather than sqlocaml's re-parse/re-plan. *)
+     comparison isolates engine cost rather than granary's re-parse/re-plan. *)
   let insert_sql = "INSERT INTO t (id, k, payload) VALUES (?, ?, ?)"
 
   let run_insert stmt ~id ~tag =
@@ -337,12 +337,12 @@ module Ref_sqlite : ENGINE = struct
      | _ -> ());
     let db = Sqlite3.db_open path in
     let t = { db } in
-    (* parity: same page size + cache page count as sqlocaml; WAL like sqlocaml. *)
+    (* parity: same page size + cache page count as granary; WAL like granary. *)
     exec t "PRAGMA page_size=4096";
     exec t (Printf.sprintf "PRAGMA cache_size=%d" page_cache);
     exec t "PRAGMA journal_mode=WAL";
     exec t "PRAGMA synchronous=FULL";
-    (* match sqlocaml's fsync-per-commit durability *)
+    (* match granary's fsync-per-commit durability *)
     t
   ;;
 
@@ -580,7 +580,7 @@ let run_engine (module E : ENGINE) ~variant ~key =
     E.close t)
 ;;
 
-(* ── cross-engine correctness smoke check (SQLOCAML_BENCH_SMOKE=1) ─────────── *)
+(* ── cross-engine correctness smoke check (GRANARY_BENCH_SMOKE=1) ─────────── *)
 let smoke () =
   let mk (module E : ENGINE) =
     let dir = Filename.temp_file "bench222smoke-" "" in
@@ -592,11 +592,11 @@ let smoke () =
     E.close t;
     E.name, fp
   in
-  let _, a = mk (module Sqlocaml) in
+  let _, a = mk (module Granary) in
   let _, b = mk (module Ref_sqlite) in
   if a <> b
   then (
-    Printf.eprintf "SMOKE FAIL: sqlocaml=[%s] sqlite=[%s]\n%!" a b;
+    Printf.eprintf "SMOKE FAIL: granary=[%s] sqlite=[%s]\n%!" a b;
     exit 1);
   let cols = String.split_on_char ',' csv_header in
   if List.length cols <> 10
@@ -614,41 +614,41 @@ let () =
   (* Seed the RNG: the encrypted-store open path derives nonces/keys from it
      and fails closed if no generator is installed. *)
   Mirage_crypto_rng_unix.use_default ();
-  (* pin sqlocaml page cache for parity (SQLite mirrored in Ref_sqlite, Task 3) *)
-  Unix.putenv "SQLOCAML_PAGE_CACHE" (string_of_int page_cache);
-  match Sys.getenv_opt "SQLOCAML_BENCH_SMOKE" with
+  (* pin granary page cache for parity (SQLite mirrored in Ref_sqlite, Task 3) *)
+  Unix.putenv "GRANARY_PAGE_CACHE" (string_of_int page_cache);
+  match Sys.getenv_opt "GRANARY_BENCH_SMOKE" with
   | Some ("1" | "true") -> smoke ()
   | _ ->
     (* Header + the SQLite reference baseline (always synchronous=FULL) are
-       common to every mode; only the sqlocaml variant list differs. *)
+       common to every mode; only the granary variant list differs. *)
     print_string (csv_header ^ "\n");
     run_engine (module Ref_sqlite) ~variant:"plaintext" ~key:None;
     (match
-       Option.map String.lowercase_ascii (Sys.getenv_opt "SQLOCAML_BENCH_DURABILITY")
+       Option.map String.lowercase_ascii (Sys.getenv_opt "GRANARY_BENCH_DURABILITY")
      with
      | None ->
-       (* Original #222 behaviour, unchanged: sqlocaml runs under Full. *)
-       run_engine (module Sqlocaml) ~variant:"plaintext" ~key:None;
-       run_engine (module Sqlocaml) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
+       (* Original #222 behaviour, unchanged: granary runs under Full. *)
+       run_engine (module Granary) ~variant:"plaintext" ~key:None;
+       run_engine (module Granary) ~variant:"encrypted" ~key:(Some (String.make 32 'K'))
      | Some "sweep" ->
        (* #332: one CSV comparing commit throughput across all three durability
           modes (plaintext only — the durability knob is orthogonal to
           encryption). *)
        List.iter
          (fun d ->
-            sqlocaml_durability := d;
+            granary_durability := d;
             run_engine
-              (module Sqlocaml)
+              (module Granary)
               ~variant:("plaintext/" ^ durability_label d)
               ~key:None)
-         [ Sqlocaml_store.Store.Full; batched_from_env (); Sqlocaml_store.Store.Off ]
+         [ Granary_store.Store.Full; batched_from_env (); Granary_store.Store.Off ]
      | Some mode ->
        (* A single explicit mode; variant tagged so the CSV is self-describing. *)
-       sqlocaml_durability := parse_durability mode;
-       let lbl = durability_label !sqlocaml_durability in
-       run_engine (module Sqlocaml) ~variant:("plaintext/" ^ lbl) ~key:None;
+       granary_durability := parse_durability mode;
+       let lbl = durability_label !granary_durability in
+       run_engine (module Granary) ~variant:("plaintext/" ^ lbl) ~key:None;
        run_engine
-         (module Sqlocaml)
+         (module Granary)
          ~variant:("encrypted/" ^ lbl)
          ~key:(Some (String.make 32 'K')))
 ;;

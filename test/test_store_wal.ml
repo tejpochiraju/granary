@@ -3,9 +3,9 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 let bs s = Bytes.of_string s
@@ -15,7 +15,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_store_wal_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_store_wal_%04d.db" n
 ;;
 
 let cleanup path =
@@ -280,10 +280,10 @@ let test_pragma_wal_checkpoint_via_sql () =
   (* Drive the engine end-to-end: open a WAL-backed Db, run SQL,
      issue PRAGMA wal_checkpoint, confirm data still readable, then
      reopen and confirm data was migrated to main. *)
-  let module Db = Sqlocaml.Db in
+  let module Db = Granary.Db in
   run
   @@ with_fresh ~f:(fun path ->
-    let* r = Sqlocaml_unix.open_file_wal ~path () in
+    let* r = Granary_unix.open_file_wal ~path () in
     let db =
       match r with
       | Ok db -> db

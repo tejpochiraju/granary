@@ -1,5 +1,5 @@
 let () =
   Alcotest.run
-    "sqlocaml"
+    "granary"
     [ "scaffold", [ Alcotest.test_case "compiles" `Quick (fun () -> ()) ] ]
 ;;

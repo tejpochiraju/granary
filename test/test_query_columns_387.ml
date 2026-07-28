@@ -4,7 +4,7 @@
     output column names — SELECT aliases and bare column names where known,
     [*] expanded to the table's columns, [col_N] placeholders otherwise. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

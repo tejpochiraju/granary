@@ -17,7 +17,7 @@
     — so this content model is automatically the right oracle for the
     #293/#303 counter-revert bug class without modelling the cache at all. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 

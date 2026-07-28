@@ -18,7 +18,7 @@
       - No lost increments under concurrency. *)
 
 open Edn_history
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (** Generate a counter increment for a random key in [0, key_range). *)
 let gen_incr key_range = Random.int key_range

@@ -7,7 +7,7 @@ name: Mirage unikernel
 # CLI + Solo5 toolchain — too heavy (opam-monorepo pull + a from-source duniverse
 # build) to gate every PR, so it runs weekly and on demand.
 #
-# `sqlocaml` is an unpublished local package; opam-monorepo vendors it from the
+# `granary` is an unpublished local package; opam-monorepo vendors it from the
 # local pin, which requires a real git checkout (actions/checkout provides one).
 
 on:
@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.opam
-          key: opam-5.4-mirage-${{ hashFiles('sqlocaml.opam', 'sqlocaml_repl.opam') }}
+          key: opam-5.4-mirage-${{ hashFiles('granary.opam', 'granary_repl.opam') }}
           restore-keys: opam-5.4-mirage-
 
       - name: Install engine deps + mirage CLI
@@ -47,7 +47,7 @@ jobs:
             uutf uucp mirage-crypto mirage-crypto-rng mirage.4.11.0
 
       - name: Pin the local engine (vendored by opam-monorepo, not installed)
-        run: opam pin add -yn sqlocaml .
+        run: opam pin add -yn granary .
 
       - name: mirage configure -t unix + build + run
         run: |
@@ -56,7 +56,7 @@ jobs:
           opam exec -- make depends
           opam exec -- make build
           rm -f disk && truncate -s 8M disk   # in-memory WAL: fresh disk per run
-          opam exec -- ./dist/sqlocaml-demo --logs='*:info'
+          opam exec -- ./dist/granary-demo --logs='*:info'
 
       - name: mirage configure -t hvt + build
         run: |
@@ -65,4 +65,4 @@ jobs:
           opam exec -- mirage configure -t hvt
           opam exec -- make depends
           opam exec -- make build
-          test -f dist/sqlocaml-demo.hvt && echo "hvt unikernel built OK"
+          test -f dist/granary-demo.hvt && echo "hvt unikernel built OK"

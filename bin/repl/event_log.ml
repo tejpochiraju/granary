@@ -1,4 +1,4 @@
-module Event = Sqlocaml.Db.Event
+module Event = Granary.Db.Event
 
 type filter =
   | No_filter

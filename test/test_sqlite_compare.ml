@@ -8,10 +8,10 @@
        -v /lib/x86_64-linux-gnu/libsqlite3.so.0:/lib/x86_64-linux-gnu/libsqlite3.so.0:ro \
        -v /lib/x86_64-linux-gnu/libreadline.so.8:/lib/x86_64-linux-gnu/libreadline.so.8:ro \
        -v /lib/x86_64-linux-gnu/libtinfo.so.6:/lib/x86_64-linux-gnu/libtinfo.so.6:ro \
-       -w /workspace sqlocaml-dev dune runtest
+       -w /workspace granary-dev dune runtest
 *)
 open Lwt.Syntax
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 (* ── availability check ────────────────────────────────────────── *)
 
@@ -21,7 +21,7 @@ let sqlite3_available () = Sys.command "sqlite3 --version >/dev/null 2>&1" = 0
 
 let fresh_db_path () =
   Printf.sprintf
-    "/tmp/sqlocaml_cmp_%d_%d.db"
+    "/tmp/granary_cmp_%d_%d.db"
     (Unix.getpid ())
     (Random.bits () land 0xFFFFFF)
 ;;
@@ -66,7 +66,7 @@ let sqlite3_run_query ~db_path query =
     lines
 ;;
 
-(* ── sqlocaml helpers ──────────────────────────────────────────── *)
+(* ── granary helpers ──────────────────────────────────────────── *)
 
 (* Format a value the same way sqlite3 outputs it with -nullvalue '__NULL__' *)
 let fmt_val = function
@@ -87,7 +87,7 @@ let fmt_val = function
   | Db.V_blob b -> Printf.sprintf "<blob:%d>" (Bytes.length b)
 ;;
 
-let sqlocaml_run setup query =
+let granary_run setup query =
   Lwt_main.run
     (let* db = Db.open_in_memory () in
      let* () =
@@ -97,13 +97,13 @@ let sqlocaml_run setup query =
             (match r with
              | Ok () -> ()
              | Error e ->
-               Alcotest.failf "sqlocaml setup error for %S: %a" sql Db.pp_error e);
+               Alcotest.failf "granary setup error for %S: %a" sql Db.pp_error e);
             Lwt.return_unit)
          setup
      in
      let* result = Db.query db query in
      match result with
-     | Error e -> Alcotest.failf "sqlocaml query error for %S: %a" query Db.pp_error e
+     | Error e -> Alcotest.failf "granary query error for %S: %a" query Db.pp_error e
      | Ok stream ->
        let* rows = Lwt_stream.to_list stream in
        Lwt.return (List.map (fun row -> Array.to_list (Array.map fmt_val row)) rows))
@@ -135,14 +135,14 @@ let run_case tc =
     (fun () ->
        sqlite3_run_setup ~db_path tc.setup;
        let sqlite_rows = sqlite3_run_query ~db_path tc.query in
-       let sqlocaml_rows = sqlocaml_run tc.setup tc.query in
+       let granary_rows = granary_run tc.setup tc.query in
        let sort rows = List.sort compare rows in
        let a = if tc.unordered then sort sqlite_rows else sqlite_rows in
-       let b = if tc.unordered then sort sqlocaml_rows else sqlocaml_rows in
+       let b = if tc.unordered then sort granary_rows else granary_rows in
        if a <> b
        then
          Alcotest.failf
-           "%s:\n\nSQLite:\n%s\n\nSqlocaml:\n%s"
+           "%s:\n\nSQLite:\n%s\n\nGranary:\n%s"
            tc.name
            (fmt_rows a)
            (fmt_rows b))
@@ -1613,12 +1613,12 @@ let phase9_fk_cases =
 ;;
 
 (* ── phase9_check error-comparison infrastructure ─────────────── *)
-(* These tests verify that BOTH sqlocaml and SQLite raise an error.  *)
+(* These tests verify that BOTH granary and SQLite raise an error.  *)
 (* We do not compare exact error messages.                           *)
 
-(** Run [setup] statements in sqlocaml; return true if the last one raises an
+(** Run [setup] statements in granary; return true if the last one raises an
     error (all preceding ones must succeed). *)
-let sqlocaml_last_setup_fails setup =
+let granary_last_setup_fails setup =
   Lwt_main.run
     (let* db = Db.open_in_memory () in
      let n = List.length setup in
@@ -1632,7 +1632,7 @@ let sqlocaml_last_setup_fails setup =
              | Ok () -> ()
              | Error e ->
                Alcotest.failf
-                 "sqlocaml unexpected setup error for %S: %a"
+                 "granary unexpected setup error for %S: %a"
                  sql
                  Db.pp_error
                  e);
@@ -1682,12 +1682,12 @@ let run_check_error_case ce =
       try Unix.unlink db_path with
       | _ -> ())
     (fun () ->
-       let sq_fails = sqlocaml_last_setup_fails ce.ce_setup in
+       let sq_fails = granary_last_setup_fails ce.ce_setup in
        let sl_fails = sqlite3_last_setup_fails ~db_path ce.ce_setup in
        if not sq_fails
        then
          Alcotest.failf
-           "%s: sqlocaml did not raise an error (expected CHECK violation)"
+           "%s: granary did not raise an error (expected CHECK violation)"
            ce.ce_name;
        if not sl_fails
        then
@@ -1701,12 +1701,12 @@ let make_check_error_test ce =
     if sqlite3_available ()
     then run_check_error_case ce
     else (
-      (* Without sqlite3, at least verify sqlocaml raises an error *)
-      let sq_fails = sqlocaml_last_setup_fails ce.ce_setup in
+      (* Without sqlite3, at least verify granary raises an error *)
+      let sq_fails = granary_last_setup_fails ce.ce_setup in
       if not sq_fails
       then
         Alcotest.failf
-          "%s: sqlocaml did not raise an error (expected CHECK violation)"
+          "%s: granary did not raise an error (expected CHECK violation)"
           ce.ce_name))
 ;;
 
@@ -2753,7 +2753,7 @@ let phase19_math_cases =
     ; query = "SELECT POWER(2.0, 3.0)"
     ; unordered = false
     }
-    (* TRUNCATE is a sqlocaml extension not present in SQLite, skipped from comparison *)
+    (* TRUNCATE is a granary extension not present in SQLite, skipped from comparison *)
   ]
 ;;
 
@@ -3282,7 +3282,7 @@ let phase24_limit_cases =
 
 let phase26_pragma_cases =
   [ (* NOTE: pragma_foreign_keys is intentionally excluded from SQLite comparison:
-     SQLite returns 0 by default (FK enforcement off), while sqlocaml always
+     SQLite returns 0 by default (FK enforcement off), while granary always
      returns 1 (FK enforcement always on). This difference is intentional. *)
     { name = "pragma_journal_mode"
     ; setup = []
@@ -3740,7 +3740,7 @@ let phase32_multi_col_fk_cases =
 let phase33_trigger_cases =
   [ (* Note: SQLite by default does NOT fire DELETE triggers on the rows
      displaced by an INSERT OR REPLACE conflict — that behaviour is gated
-     on [PRAGMA recursive_triggers = ON].  Sqlocaml always fires them,
+     on [PRAGMA recursive_triggers = ON].  Granary always fires them,
      which matches recursive_triggers=ON; that divergence is intentional
      and covered by the e2e test suite, so no comparison case is included
      here. *)
@@ -3776,11 +3776,11 @@ let phase33_new_fn_cases =
   [ (* Only the initial (zero) case is comparable: TOTAL_CHANGES is a
      per-connection counter, and the test harness opens a fresh sqlite3
      connection for the query phase — so SQLite always sees 0 here, while
-     sqlocaml runs setup + query in one in-memory connection. Cases that
+     granary runs setup + query in one in-memory connection. Cases that
      perform DML in setup are exercised in the e2e suite instead.
 
      SQLITE_VERSION is intentionally not compared: our value
-     ("3.45.0-sqlocaml") diverges from real sqlite3's build version. *)
+     ("3.45.0-granary") diverges from real sqlite3's build version. *)
     { name = "total_changes_initial"
     ; setup = [ "CREATE TABLE t (id INTEGER)" ]
     ; query = "SELECT TOTAL_CHANGES()"

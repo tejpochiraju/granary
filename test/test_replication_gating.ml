@@ -1,7 +1,7 @@
 (** Tests for replication reader gating in the Store. *)
 
 open Lwt.Syntax
-module Store = Sqlocaml_store.Store
+module Store = Granary_store.Store
 
 (* ------------------------------------------------------------------ *)
 (* Bounded yield helper: polls f up to max_pauses times, yielding each *)

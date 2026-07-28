@@ -1,9 +1,9 @@
 open Lwt.Syntax
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
+  let open_file = Granary_unix.open_file
 end
 
 (* ------------------------------------------------------------------ *)
@@ -97,7 +97,7 @@ let temp_counter = ref 0
 
 let fresh_temp_path () =
   incr temp_counter;
-  Printf.sprintf "/tmp/sqlocaml_conformance_%d_%d.db" (Unix.getpid ()) !temp_counter
+  Printf.sprintf "/tmp/granary_conformance_%d_%d.db" (Unix.getpid ()) !temp_counter
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -816,12 +816,12 @@ let unix_file_suite () =
 (* ------------------------------------------------------------------ *)
 (* Mirage backend opener                                                 *)
 (* ------------------------------------------------------------------ *)
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
 
 let fresh_mirage_path () =
   incr temp_counter;
   let path =
-    Printf.sprintf "/tmp/sqlocaml_conformance_mb_%d_%d.raw" (Unix.getpid ()) !temp_counter
+    Printf.sprintf "/tmp/granary_conformance_mb_%d_%d.raw" (Unix.getpid ()) !temp_counter
   in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (4 * 1024 * 1024);

@@ -8,14 +8,14 @@
       ephemeral use cases that exceed B+-tree leaf-cell size limits.
     - [open_block ~...] — CoW B+-tree over any BLOCK device, given as I/O
       callbacks. Persistent across reopen. Keys ≤ 512 bytes, values ≤ 1024
-      bytes. Unix-file convenience constructors live in the [sqlocaml.unix]
+      bytes. Unix-file convenience constructors live in the [granary.unix]
       driver library so this core stays platform-agnostic (#170). *)
 
 type t
 
 (** Page geometry (#95), re-exported so callers can name {!Geometry.t} without
-    depending on [sqlocaml.storage] directly. *)
-module Geometry = Sqlocaml_storage.Geometry
+    depending on [granary.storage] directly. *)
+module Geometry = Granary_storage.Geometry
 
 (** Pretty-print the store's backend kind (Mem or Btree). *)
 val pp : Format.formatter -> t -> unit
@@ -73,7 +73,7 @@ val create : unit -> t
     devices); when [false] it returns [Header_error] instead, so an
     existing-but-corrupt file is not silently clobbered.
 
-    [geom] (#95, default {!Sqlocaml_storage.Geometry.default}) is the geometry
+    [geom] (#95, default {!Granary_storage.Geometry.default}) is the geometry
     used when CREATING a fresh device.  For an existing device the geometry is
     discovered by peeking page 0, and [geom] is ignored.  The block backend's
     own page size must already match (see [Unix_file.set_page_size]).
@@ -95,7 +95,7 @@ val open_block
   -> ?history:History.sink
   -> ?now:(unit -> int64)
   -> ?key:string
-  -> ?geom:Sqlocaml_storage.Geometry.t
+  -> ?geom:Granary_storage.Geometry.t
   -> init_if_corrupt:bool
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
@@ -126,7 +126,7 @@ val open_block_wal
   -> ?history:History.sink
   -> ?now:(unit -> int64)
   -> ?key:string
-  -> ?geom:Sqlocaml_storage.Geometry.t
+  -> ?geom:Granary_storage.Geometry.t
   -> read_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> write_page:(page_id:int64 -> Cstruct.t -> (unit, string) result Lwt.t)
   -> sync:(unit -> (unit, string) result Lwt.t)
@@ -551,7 +551,7 @@ val set_replication_gate_max_yields : t -> int -> unit
 
     The {!checksum} field covers the decrypted page payload (transport
     integrity for the backup frame), matching the same scheme used by
-    {!Sqlocaml_replication.replicated_frame}.  For unencrypted WALs the
+    {!Granary_replication.replicated_frame}.  For unencrypted WALs the
     plaintext equals the on-disk page; for encrypted WALs the checksum
     guards against corruption of the decrypted content during transport
     or storage, not the on-disk ciphertext. *)

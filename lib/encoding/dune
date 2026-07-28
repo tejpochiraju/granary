@@ -1,5 +1,5 @@
 (library
- (name sqlocaml_encoding)
- (public_name sqlocaml.encoding)
+ (name granary_encoding)
+ (public_name granary.encoding)
  (instrumentation
   (backend bisect_ppx)))

@@ -1,7 +1,7 @@
 (library
- (name sqlocaml_recovery)
- (public_name sqlocaml.recovery)
- (libraries sqlocaml.storage sqlocaml.store sqlocaml.catalog cstruct lwt)
+ (name granary_recovery)
+ (public_name granary.recovery)
+ (libraries granary.storage granary.store granary.catalog cstruct lwt)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

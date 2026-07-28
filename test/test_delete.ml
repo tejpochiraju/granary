@@ -1,6 +1,6 @@
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)
@@ -152,7 +152,7 @@ let delete_unknown_table () =
   let db = fresh_db () in
   let result = run (Db.execute db "DELETE FROM ghost") in
   match result with
-  | Error (Db.Sema (Sqlocaml_sql.Sema.Unknown_table tbl)) ->
+  | Error (Db.Sema (Granary_sql.Sema.Unknown_table tbl)) ->
     Alcotest.(check string) "table name" "ghost" tbl
   | _ -> Alcotest.fail "expected Sema(Unknown_table \"ghost\")"
 ;;
@@ -162,7 +162,7 @@ let delete_unknown_column_in_where () =
   exec db "CREATE TABLE t (n INTEGER)";
   let e = exec_err db "DELETE FROM t WHERE bad_col = 1" in
   match e with
-  | Db.Sema (Sqlocaml_sql.Sema.Unknown_column _) -> ()
+  | Db.Sema (Granary_sql.Sema.Unknown_column _) -> ()
   | _ -> Alcotest.fail "expected Sema(Unknown_column)"
 ;;
 

@@ -1,4 +1,4 @@
-# sqlocaml
+# granary
 
 A pure-OCaml SQL engine — a concept port of SQLite targeting [MirageOS](https://mirage.io/)
 unikernels. No C stubs, a fresh on-disk file format, single-writer / multi-reader MVCC with
@@ -21,7 +21,7 @@ plaintext, exactly as before (encryption is **off by default**).
 
 ```ocaml
 let key = (* 32 raw bytes from your secrets manager / boot config *) in
-Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
+Granary_unix.Store.open_file ~key ~path:"app.db" ()
 ```
 
 - **Fixed at creation.** Whether a database is encrypted is a per-file property
@@ -44,7 +44,7 @@ Sqlocaml_unix.Store.open_file ~key ~path:"app.db" ()
 
 ## Durability modes (`PRAGMA synchronous`)
 
-sqlocaml supports a per-deployment durability setting analogous to SQLite's `synchronous`, gating
+granary supports a per-deployment durability setting analogous to SQLite's `synchronous`, gating
 only the WAL group-commit fsync. CoW shadow-paging, snapshot isolation, rollback, and crash
 recovery are unaffected — only *when* commits are fsynced changes.
 
@@ -59,7 +59,7 @@ recovery are unaffected — only *when* commits are fsynced changes.
 - `PRAGMA synchronous = full | batched | off`
 - `PRAGMA wal_batch_commits = N` (default 256) — the batched commit-count threshold
 - `PRAGMA wal_batch_interval_ms = T` (default 100) — the batched time threshold (milliseconds)
-- Open-option: `Db.open_block ?durability:(Sqlocaml_store.Store.Batched { commits; interval_ms })` (also `Full` / `Off`)
+- Open-option: `Db.open_block ?durability:(Granary_store.Store.Batched { commits; interval_ms })` (also `Full` / `Off`)
 - The getters (`PRAGMA synchronous`, `PRAGMA wal_batch_commits`, `PRAGMA wal_batch_interval_ms`) read the current values back.
 
 > **Caveat — `batched` and `off` trade safety for speed.**
@@ -98,10 +98,10 @@ record per commit (txn id, wall-clock ms, root page):
 
 ```ocaml
 (* plain-file open *)
-let* db = Sqlocaml_unix.open_file ~as_of_history:true ~path:"app.db" () in
+let* db = Granary_unix.open_file ~as_of_history:true ~path:"app.db" () in
 
 (* WAL open *)
-let* db = Sqlocaml_unix.open_file_wal ~as_of_history:true ~path:"app.db" () in
+let* db = Granary_unix.open_file_wal ~as_of_history:true ~path:"app.db" () in
 ```
 
 For the lower-level `Store.open_block` / `Store.open_block_wal`, supply a
@@ -189,12 +189,12 @@ multi-arch, so the same `Containerfile` builds on either host.
 
 ```sh
 # native build (host architecture)
-podman build -t sqlocaml-dev -f Containerfile .
+podman build -t granary-dev -f Containerfile .
 
 # explicit per-arch builds — these build natively on a matching host and under
 # qemu-user-static emulation on a foreign host (e.g. arm64 on an x86 box):
-podman build --platform=linux/amd64 -t sqlocaml-dev:amd64 -f Containerfile .
-podman build --platform=linux/arm64 -t sqlocaml-dev:arm64 -f Containerfile .
+podman build --platform=linux/amd64 -t granary-dev:amd64 -f Containerfile .
+podman build --platform=linux/arm64 -t granary-dev:arm64 -f Containerfile .
 ```
 
 To build or run a foreign-architecture image on an x86 host, register the qemu
@@ -208,7 +208,7 @@ Then build and test exactly as on the host architecture:
 
 ```sh
 podman run --rm --platform=linux/arm64 -v "$(pwd):/workspace:z" -w /workspace \
-  sqlocaml-dev:arm64 dune runtest
+  granary-dev:arm64 dune runtest
 ```
 
 > **`_build/` is architecture-specific.** dune artefacts under `_build/` are not
@@ -220,7 +220,7 @@ podman run --rm --platform=linux/arm64 -v "$(pwd):/workspace:z" -w /workspace \
 A minimal, in-tree sample unikernel under [`mirage/`](mirage/) runs the engine
 over a `Mirage_block` device in WAL mode (the amd64 baseline for the aarch64
 audit, #403). It builds and runs on the `unix` target and builds for the `hvt`
-(Solo5) target. The `mirage` CLI is not in `sqlocaml-dev`; see
+(Solo5) target. The `mirage` CLI is not in `granary-dev`; see
 [`mirage/README.md`](mirage/README.md) for the dedicated build image
 ([`Containerfile.mirage`](Containerfile.mirage)) and the build/run commands.
 
@@ -230,13 +230,13 @@ In-process benchmarks against reference C **SQLite 3.45.1** (same dataset, prepa
 both sides, WAL, fsync-per-commit, matched page cache), separating the CPU term from the I/O term
 via `cpu/wall` per run. Full method and tables:
 [docs/benchmarks/2026-06-07-bench-222-results.md](docs/benchmarks/2026-06-07-bench-222-results.md)
-(also on the [wiki](https://git.iotready.com/experiments/kosha/wiki/Benchmarks)).
+(also on the project wiki, on the maintainer's private development instance).
 
 **Current NVMe baseline** (`1a73da0`, after #228 PK B-tree seek, #229 O(n) bulk insert, and the
-T4/T5 read-path work) — sqlocaml is now within single-digit multiples of C SQLite on most
+T4/T5 read-path work) — granary is now within single-digit multiples of C SQLite on most
 workloads:
 
-| workload (NVMe, plaintext) | sqlocaml vs SQLite | bound |
+| workload (NVMe, plaintext) | granary vs SQLite | bound |
 |----------------------------|--------------------|-------|
 | point lookup `WHERE pk=?`  | ~3.7× slower | CPU |
 | range scan / aggregate     | ~8.3× slower | CPU |
@@ -259,7 +259,7 @@ Writes are barely affected.
 workloads are within the #231 "10× of SQLite" goal**; the read-side multicore epic (#156) remains
 gated on closing the batch-insert constant factor first.
 
-> **Honest, early numbers.** sqlocaml is a young pure-OCaml engine; these are a snapshot on a
+> **Honest, early numbers.** granary is a young pure-OCaml engine; these are a snapshot on a
 > production NVMe host under live load, at a small (cache-resident) dataset, and are expected to
 > keep moving as the write path is optimized.
 
@@ -271,7 +271,7 @@ the results doc).
 **This codebase is entirely AI-written.** Per the
 [avsm/ocaml-ai-disclosure](https://github.com/avsm/ocaml-ai-disclosure) proposal — which aligns
 its vocabulary with the [W3C AI Content Disclosure](https://github.com/w3c-cg/ai-content-disclosure/)
-levels (`none` / `ai-assisted` / `ai-generated` / `autonomous`) — sqlocaml's disclosure level is:
+levels (`none` / `ai-assisted` / `ai-generated` / `autonomous`) — granary's disclosure level is:
 
 ```
 ai-generated

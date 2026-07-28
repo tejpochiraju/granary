@@ -3,7 +3,7 @@
     cache is completeness under FK cascades and triggers: a write to one table
     that silently mutates another (inside the engine) reports BOTH. *)
 
-module Db = Sqlocaml.Db
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -117,7 +117,7 @@ let test_run_with_dirty () =
         (run
            (Db.run_with_dirty
               st
-              ~params:[ Sqlocaml_encoding.Row.V_int 1L; Sqlocaml_encoding.Row.V_text "a" ]))
+              ~params:[ Granary_encoding.Row.V_int 1L; Granary_encoding.Row.V_text "a" ]))
     in
     Alcotest.(check int) "one row" 1 n;
     Alcotest.(check (list string)) "run dirtied users" [ "users" ] tables)

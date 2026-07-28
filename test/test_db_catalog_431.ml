@@ -4,23 +4,23 @@
     the catalog a [Db.t] already holds, so it needs an accessor to reach it. *)
 
 open Lwt.Syntax
-module Row = Sqlocaml_encoding.Row
-module Catalog = Sqlocaml_catalog.Catalog
+module Row = Granary_encoding.Row
+module Catalog = Granary_catalog.Catalog
 
 let run = Lwt_main.run
 
 let test_catalog_sees_created_table () =
   run
-    (let* db = Sqlocaml.Db.open_in_memory () in
+    (let* db = Granary.Db.open_in_memory () in
      let* r =
-       Sqlocaml.Db.execute
+       Granary.Db.execute
          db
          "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL)"
      in
      (match r with
       | Ok () -> ()
-      | Error e -> Alcotest.failf "create table: %a" Sqlocaml.Db.pp_error e);
-     let* tables = Catalog.list_tables (Sqlocaml.Db.catalog db) in
+      | Error e -> Alcotest.failf "create table: %a" Granary.Db.pp_error e);
+     let* tables = Catalog.list_tables (Granary.Db.catalog db) in
      let users =
        List.find_opt (fun (m : Catalog.table_meta) -> m.name = "users") tables
      in

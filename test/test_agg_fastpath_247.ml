@@ -1,13 +1,13 @@
 (** #247: the cursor-level aggregate fast path must be byte-identical to the
     general [stream_aggregate] path, and must allocate strictly less.  We use the
-    [SQLOCAML_AGG_FASTPATH] kill-switch as a live foil: each query is run with the
+    [GRANARY_AGG_FASTPATH] kill-switch as a live foil: each query is run with the
     fast path ON and forced OFF, and the result rows must match exactly.  A Gc
     gate then proves the fast path allocates materially less than the general
     path on the same query. *)
 
 open Lwt.Syntax
-module U = Sqlocaml_unix
-module Db = Sqlocaml.Db
+module U = Granary_unix
+module Db = Granary.Db
 
 let run = Lwt_main.run
 
@@ -16,7 +16,7 @@ let unwrap = function
   | Error _ -> Alcotest.fail "db error"
 ;;
 
-let set_fastpath on = Unix.putenv "SQLOCAML_AGG_FASTPATH" (if on then "1" else "0")
+let set_fastpath on = Unix.putenv "GRANARY_AGG_FASTPATH" (if on then "1" else "0")
 
 let vstr = function
   | Db.V_int i -> Printf.sprintf "i:%Ld" i

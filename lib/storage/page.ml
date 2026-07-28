@@ -86,7 +86,7 @@ let write_common buf c =
 (* CRC32 table using native OCaml int (63-bit on 64-bit platforms) to avoid
    the per-operation heap allocation that OCaml's Int32 boxing incurs.  Every
    value fits in a 32-bit unsigned range so 63-bit int is a safe superset.
-   Requires 64-bit platform — correct for all sqlocaml/MirageOS targets. *)
+   Requires 64-bit platform — correct for all granary/MirageOS targets. *)
 let crc32_table : int array =
   let table = Array.make 256 0 in
   for i = 0 to 255 do

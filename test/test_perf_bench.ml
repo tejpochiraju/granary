@@ -5,7 +5,7 @@
     are printed to stderr — the test only fails on correctness errors,
     never on a slow measurement, so CI stability is preserved.
 
-    Use [SQLOCAML_BENCH_N] to override the workload size (default 1000).
+    Use [GRANARY_BENCH_N] to override the workload size (default 1000).
 
     What is measured:
     - bulk INSERT (1 commit)
@@ -20,10 +20,10 @@
     than encoding them in the test exit status. *)
 
 module Db = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file = Sqlocaml_unix.open_file
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file = Granary_unix.open_file
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -37,8 +37,8 @@ let env_int key default =
 ;;
 
 (* Default kept small (100) so the bench fits in default CI budgets.
-   Override [SQLOCAML_BENCH_N=10000] for serious measurements. *)
-let n = env_int "SQLOCAML_BENCH_N" 100
+   Override [GRANARY_BENCH_N=10000] for serious measurements. *)
+let n = env_int "GRANARY_BENCH_N" 100
 
 let exec db sql =
   match run (Db.execute db sql) with
@@ -158,15 +158,15 @@ let run_suite ~label db =
 ;;
 
 let test_bench_mem () =
-  Printf.eprintf "\n=== sqlocaml in-memory backend, N=%d ===\n%!" n;
+  Printf.eprintf "\n=== granary in-memory backend, N=%d ===\n%!" n;
   let db = run (Db.open_in_memory ()) in
   run_suite ~label:"mem" db;
   run (Db.close db)
 ;;
 
 let test_bench_file () =
-  Printf.eprintf "\n=== sqlocaml file backend, N=%d ===\n%!" n;
-  let path = "/tmp/sqlocaml_phase39_bench.db" in
+  Printf.eprintf "\n=== granary file backend, N=%d ===\n%!" n;
+  let path = "/tmp/granary_phase39_bench.db" in
   (try Unix.unlink path with
    | _ -> ());
   let db =
@@ -181,8 +181,8 @@ let test_bench_file () =
 ;;
 
 let test_bench_wal () =
-  Printf.eprintf "\n=== sqlocaml WAL backend, N=%d ===\n%!" n;
-  let path = "/tmp/sqlocaml_phase39_bench_wal.db" in
+  Printf.eprintf "\n=== granary WAL backend, N=%d ===\n%!" n;
+  let path = "/tmp/granary_phase39_bench_wal.db" in
   let wal = path ^ "-wal" in
   (try Unix.unlink path with
    | _ -> ());

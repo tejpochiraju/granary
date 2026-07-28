@@ -6,11 +6,11 @@
     direct invocation of [Exec.eval_expr] where useful. *)
 
 open Lwt.Syntax
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
-module Ast = Sqlocaml_sql.Ast
-module Plan = Sqlocaml_sql.Plan
-module Exec = Sqlocaml_sql.Exec
+module Db = Granary.Db
+module Row = Granary_encoding.Row
+module Ast = Granary_sql.Ast
+module Plan = Granary_sql.Plan
+module Exec = Granary_sql.Exec
 
 (* ------------------------------------------------------------------ *)
 (* Helpers                                                              *)

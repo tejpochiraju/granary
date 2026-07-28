@@ -7,13 +7,13 @@
     master's replication floor through {!Store.update_replication_position}. *)
 
 open Lwt.Syntax
-module Wal = Sqlocaml_storage.Wal
-module Replication = Sqlocaml_replication.Replication
-module Standby = Sqlocaml_replication.Standby
-module Store = Sqlocaml_store.Store
-module Pager = Sqlocaml_storage.Pager
-module Db = Sqlocaml.Db
-module Row = Sqlocaml_encoding.Row
+module Wal = Granary_storage.Wal
+module Replication = Granary_replication.Replication
+module Standby = Granary_replication.Standby
+module Store = Granary_store.Store
+module Pager = Granary_storage.Pager
+module Db = Granary.Db
+module Row = Granary_encoding.Row
 
 (* ------------------------------------------------------------------ *)
 (* In-memory device helpers (same pattern as test_standby.ml)          *)
@@ -101,7 +101,7 @@ let writable_pager ?(n_pages = 16L) main_d () =
     ~sync:sync_ok
     ~resize:(fun ~n_pages:_ -> Lwt.return (Ok ()))
     ~n_pages
-    ~freelist:Sqlocaml_storage.Freelist.empty
+    ~freelist:Granary_storage.Freelist.empty
 ;;
 
 (* ------------------------------------------------------------------ *)

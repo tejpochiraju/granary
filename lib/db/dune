@@ -1,13 +1,13 @@
 (library
- (name sqlocaml)
- (public_name sqlocaml)
+ (name granary)
+ (public_name granary)
  (libraries
   lwt
-  sqlocaml.store
-  sqlocaml.catalog
-  sqlocaml.sql
-  sqlocaml.encoding
-  sqlocaml.ivm)
+  granary.store
+  granary.catalog
+  granary.sql
+  granary.encoding
+  granary.ivm)
  (preprocess
   (pps lwt_ppx))
  (instrumentation

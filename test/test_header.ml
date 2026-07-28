@@ -1,6 +1,6 @@
-(** Tests for Sqlocaml_storage.Header *)
+(** Tests for Granary_storage.Header *)
 
-open Sqlocaml_storage
+open Granary_storage
 
 (* ------------------------------------------------------------------ *)
 (* Mock BLOCK backend (same style as test_pager.ml)                    *)

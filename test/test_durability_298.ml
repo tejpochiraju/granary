@@ -3,15 +3,15 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
 module D = struct
-  include Sqlocaml.Db
+  include Granary.Db
 
-  let open_file_wal = Sqlocaml_unix.open_file_wal
+  let open_file_wal = Granary_unix.open_file_wal
 end
 
 let run = Lwt_main.run
@@ -20,7 +20,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_test_dura_298_%04d.db" n
+  Printf.sprintf "/tmp/granary_test_dura_298_%04d.db" n
 ;;
 
 let cleanup path =
@@ -348,7 +348,7 @@ let test_of_store_durability_option () =
     let* st = open_st path in
     let* db =
       D.of_store
-        ~durability:(Sqlocaml_store.Store.Batched { commits = 8; interval_ms = 20 })
+        ~durability:(Granary_store.Store.Batched { commits = 8; interval_ms = 20 })
         st
     in
     let* v = query1_text db "PRAGMA synchronous" in

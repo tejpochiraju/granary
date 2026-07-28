@@ -9,12 +9,12 @@
 open Lwt.Syntax
 
 module S = struct
-  include Sqlocaml_store.Store
+  include Granary_store.Store
 
-  let open_file_wal = Sqlocaml_unix.Store.open_file_wal
+  let open_file_wal = Granary_unix.Store.open_file_wal
 end
 
-module Wal = Sqlocaml_storage.Wal
+module Wal = Granary_storage.Wal
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -23,7 +23,7 @@ let counter = ref 0
 let fresh_path () =
   let n = !counter in
   incr counter;
-  Printf.sprintf "/tmp/sqlocaml_wal_fault_%04d.db" n
+  Printf.sprintf "/tmp/granary_wal_fault_%04d.db" n
 ;;
 
 let cleanup path =

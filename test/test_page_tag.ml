@@ -7,8 +7,8 @@
     trees (system trees, freelist) carry 0. *)
 
 open Lwt.Syntax
-open Sqlocaml_storage
-module S = Sqlocaml_store.Store
+open Granary_storage
+module S = Granary_store.Store
 
 let run = Lwt_main.run
 

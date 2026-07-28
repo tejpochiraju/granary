@@ -6,7 +6,7 @@
        — a concurrent reader still sees pre-write content. *)
 
 open Lwt.Syntax
-module Pager = Sqlocaml_storage.Pager
+module Pager = Granary_storage.Pager
 
 let mkdev n_pages =
   let bytes = Bytes.make (n_pages * 4096) '\x00' in
@@ -90,7 +90,7 @@ let test_snapshot_reads_isolated_from_newer_frames () =
          ~sync
          ~resize
          ~n_pages:4L
-         ~freelist:Sqlocaml_storage.Freelist.empty
+         ~freelist:Granary_storage.Freelist.empty
      in
      let stub = { frames = [||]; committed = 0 } in
      Pager.set_wal pager (Some (make_stub_callbacks stub));
@@ -125,7 +125,7 @@ let test_writer_dirty_invisible_to_concurrent_readers () =
          ~sync
          ~resize
          ~n_pages:4L
-         ~freelist:Sqlocaml_storage.Freelist.empty
+         ~freelist:Granary_storage.Freelist.empty
      in
      let stub = { frames = [||]; committed = 0 } in
      Pager.set_wal pager (Some (make_stub_callbacks stub));
@@ -153,7 +153,7 @@ let test_main_cache_invalidated_after_clear_dirty () =
          ~sync
          ~resize
          ~n_pages:4L
-         ~freelist:Sqlocaml_storage.Freelist.empty
+         ~freelist:Granary_storage.Freelist.empty
      in
      let* _ = write_page ~page_id:3L (with_byte 0x30) in
      let* r1 = Pager.read pager 3L in

@@ -5,7 +5,7 @@
     recomputing the operator over the summed inputs.  That is what makes a view
     maintainable from the delta feed (#419) rather than recomputed from scratch. *)
 
-module Zset = Sqlocaml_ivm.Zset
+module Zset = Granary_ivm.Zset
 
 (* (id, attr) tuples for the two join inputs; (attr, attr) for the output. *)
 module IntStr = struct
@@ -26,7 +26,7 @@ module ZL = Zset.Make (IntStr)
 module ZR = Zset.Make (IntStr)
 module ZO = Zset.Make (StrStr)
 
-module J = Sqlocaml_ivm.Join.Make (struct
+module J = Granary_ivm.Join.Make (struct
     module Left = ZL
     module Right = ZR
     module Out = ZO
@@ -153,7 +153,7 @@ module ZIc = Zset.Make (Str)
 (* SUM input: (group, value) rows. *)
 module ZIs = Zset.Make (SInt)
 
-module Cnt = Sqlocaml_ivm.Aggregate.Make (struct
+module Cnt = Granary_ivm.Aggregate.Make (struct
     module In = ZIc
     module Out = ZG
 
@@ -165,7 +165,7 @@ module Cnt = Sqlocaml_ivm.Aggregate.Make (struct
     let result g c = g, c
   end)
 
-module Sm = Sqlocaml_ivm.Aggregate.Make (struct
+module Sm = Granary_ivm.Aggregate.Make (struct
     module In = ZIs
     module Out = ZG
 

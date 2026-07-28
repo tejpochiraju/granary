@@ -5,9 +5,9 @@
     the latest). *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module H = Sqlocaml_store.History
-module MB = Sqlocaml_mirage_block.Mirage_backend.Make (Block)
+module S = Granary_store.Store
+module H = Granary_store.History
+module MB = Granary_mirage_block.Mirage_backend.Make (Block)
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run
@@ -34,7 +34,7 @@ let monotonic () =
 ;;
 
 let tmp_block_file () =
-  let path = Filename.temp_file "sqlocaml_as_of_test" ".raw" in
+  let path = Filename.temp_file "granary_as_of_test" ".raw" in
   let fd = Unix.openfile path [ Unix.O_RDWR; Unix.O_CREAT ] 0o644 in
   Unix.ftruncate fd (4 * 1024 * 1024);
   Unix.close fd;

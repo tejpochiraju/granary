@@ -9,8 +9,8 @@
     the main file must not disturb a pinned historical read). *)
 
 open Lwt.Syntax
-module S = Sqlocaml_store.Store
-module H = Sqlocaml_store.History
+module S = Granary_store.Store
+module H = Granary_store.History
 
 let bs s = Bytes.of_string s
 let run = Lwt_main.run

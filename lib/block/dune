@@ -1,14 +1,14 @@
 (library
- (name sqlocaml_block)
- (public_name sqlocaml.block)
+ (name granary_block)
+ (public_name granary.block)
  (modules block mem)
  (libraries lwt cstruct)
  (instrumentation
   (backend bisect_ppx)))
 
 (library
- (name sqlocaml_mirage_block)
- (public_name sqlocaml.mirage_block)
+ (name granary_mirage_block)
+ (public_name granary.mirage_block)
  (modules mirage_backend)
  (libraries mirage-block lwt cstruct)
  (instrumentation

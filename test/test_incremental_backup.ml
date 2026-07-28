@@ -1,10 +1,10 @@
 (** Tests for #265 — incremental backup (WAL-frame based). *)
 
 open Lwt.Syntax
-module Store = Sqlocaml_store.Store
-module Replication = Sqlocaml_replication.Replication
-module Pager = Sqlocaml_storage.Pager
-module Freelist = Sqlocaml_storage.Freelist
+module Store = Granary_store.Store
+module Replication = Granary_replication.Replication
+module Pager = Granary_storage.Pager
+module Freelist = Granary_storage.Freelist
 
 (* ------------------------------------------------------------------ *)
 (* In-memory device helpers                                           *)
