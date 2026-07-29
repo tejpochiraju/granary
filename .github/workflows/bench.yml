@@ -41,6 +41,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPAMROOT: /home/opam/.opam
+    defaults:
+      run:
+        # The container's default run: shell resolves to POSIX sh (dash), not
+        # bash, so the label-sanitization steps below (bash parameter-expansion
+        # pattern substitution, [[ ]] tests) need this explicit override.
+        shell: bash
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
       options: --user root
