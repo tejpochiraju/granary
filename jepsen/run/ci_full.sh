@@ -47,12 +47,27 @@ echo "=== nemeses (FUSE / faketime) ==="
 LD_PRELOAD=$FT FAKETIME="+5d" "$EXE" --workload list-append --backend mem --nemesis clock-skew \
   --workers 4 --ops 50 --history "$H/list_append_clockskew.edn" >/dev/null 2>&1 \
   || { echo "clock-skew gen failed"; exit 1; }
-"$EXE" --workload set --backend wal --path /tmp/lazyfs_mount/test.db --nemesis lazyfs \
-  --workers 2 --ops 40 --history "$H/set_wal_lazyfs.edn" >/tmp/lz1.log 2>&1 \
-  || { echo "lazyfs wal failed"; tail -8 /tmp/lz1.log; exit 1; }
-"$EXE" --workload set --backend enc-wal --key $KEY --path /tmp/lazyfs_mount_enc/test.db --nemesis lazyfs \
-  --workers 2 --ops 40 --history "$H/set_encwal_lazyfs.edn" >/tmp/lz2.log 2>&1 \
-  || { echo "lazyfs enc-wal failed"; tail -8 /tmp/lz2.log; exit 1; }
+
+# FUSE mounts hang indefinitely inside GitHub-hosted Actions runners' Docker
+# layer (verified: --device /dev/fuse --cap-add SYS_ADMIN passed, still hangs
+# forever on the lazyfs mount) — a documented platform limitation distinct
+# from our self-hosted rootless-podman setup, where lazyfs is verified
+# working. Skip lazyfs there; keep full coverage everywhere else. Checked via
+# RUNNER_ENVIRONMENT (github-hosted | self-hosted), NOT GITHUB_ACTIONS, since
+# Forgejo Actions also sets GITHUB_ACTIONS=true for compatibility and would
+# wrongly skip real coverage on the source-of-truth CI too.
+if [ "${RUNNER_ENVIRONMENT:-}" = "github-hosted" ]; then
+  echo "skipping lazyfs nemesis: RUNNER_ENVIRONMENT=github-hosted (FUSE mounts hang there, see #451)"
+  SKIP_LAZYFS=1
+else
+  SKIP_LAZYFS=0
+  "$EXE" --workload set --backend wal --path /tmp/lazyfs_mount/test.db --nemesis lazyfs \
+    --workers 2 --ops 40 --history "$H/set_wal_lazyfs.edn" >/tmp/lz1.log 2>&1 \
+    || { echo "lazyfs wal failed"; tail -8 /tmp/lz1.log; exit 1; }
+  "$EXE" --workload set --backend enc-wal --key $KEY --path /tmp/lazyfs_mount_enc/test.db --nemesis lazyfs \
+    --workers 2 --ops 40 --history "$H/set_encwal_lazyfs.edn" >/tmp/lz2.log 2>&1 \
+    || { echo "lazyfs enc-wal failed"; tail -8 /tmp/lz2.log; exit 1; }
+fi
 
 echo "=== negative controls ==="
 opam exec -- dune exec jepsen/ocaml/negative_control.exe -- >/dev/null 2>&1
@@ -79,11 +94,14 @@ fails=0
 echo
 echo "=== GATE: real workloads (expect VALID) ==="
 # Every workload/backend/nemesis history must be VALID under its checker.
-for name in \
-  bank_mem bank_wal bank_encwal \
-  set_file set_wal set_encwal set_wal_crash set_encwal_crash set_wal_lazyfs set_encwal_lazyfs \
+gate_names="bank_mem bank_wal bank_encwal \
+  set_file set_wal set_encwal set_wal_crash set_encwal_crash \
   counter_mem counter_wal counter_encwal \
-  list_append_mem list_append_file list_append_pause list_append_clockskew; do
+  list_append_mem list_append_file list_append_pause list_append_clockskew"
+if [ "$SKIP_LAZYFS" -eq 0 ]; then
+  gate_names="$gate_names set_wal_lazyfs set_encwal_lazyfs"
+fi
+for name in $gate_names; do
   CHK "$H/$name.edn" -w "$(wl "$name")"; rc=$?
   if [ $rc -eq 0 ]; then printf "  VALID       %s\n" "$name"
   else printf "  FAIL        %s (expected VALID, exit %d)\n" "$name" "$rc"; fails=$((fails + 1)); fi
