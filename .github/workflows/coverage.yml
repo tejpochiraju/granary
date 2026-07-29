@@ -27,7 +27,9 @@ jobs:
           sudo apt-get install -y -q nodejs
 
       - name: Fix ownership of runner temp dirs (actions/checkout needs write access; container's default user is non-root opam)
-        run: sudo chown -R "$(id -u):$(id -g)" /__w/_temp /github/home 2>/dev/null || true
+        run: |
+          sudo mkdir -p /__w/_temp/_runner_file_commands
+          sudo chown -R "$(id -u):$(id -g)" /__w/_temp/_runner_file_commands
 
       - uses: actions/checkout@v4
 
