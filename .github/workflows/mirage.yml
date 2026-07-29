@@ -31,7 +31,7 @@ jobs:
       - name: Fix ownership of runner temp dirs (actions/checkout needs write access; container's default user is non-root opam)
         run: |
           sudo mkdir -p /__w/_temp/_runner_file_commands
-          sudo chown -R "$(id -u):$(id -g)" /__w/_temp/_runner_file_commands
+          sudo chmod -R 777 /__w/_temp
 
       - uses: actions/checkout@v4
 
