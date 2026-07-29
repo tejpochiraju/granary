@@ -34,7 +34,7 @@ jobs:
       - name: Run full #177 suite + gate
         run: |
           docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
-            -w /workspace --entrypoint bash \
+            -e RUNNER_ENVIRONMENT -w /workspace --entrypoint bash \
             granary-jepsen jepsen/run/ci_full.sh
 
       # On any failure above, open a GitHub issue so the nightly does not fail
