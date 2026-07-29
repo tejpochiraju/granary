@@ -1,0 +1,67 @@
+name: Jepsen nightly (#177)
+
+# Full single-node Jepsen suite (all workloads × mem/file/wal/enc-wal, plus the
+# crash-restart / process-pause / lazyfs / clock-skew nemeses) and the Elle/Clojure
+# checkers, gated by jepsen/run/ci_full.sh. Heavy (~8-10 min once the image layers
+# are cached; the first run builds the lazyfs + Clojure + harness image, ~20 min),
+# so it runs nightly rather than per-PR. The OCaml lost-update regression
+# (test_concurrent_rmw_223) already runs per-PR inside `dune runtest`.
+#
+# Unlike the Forgejo version, this runs on a real ubuntu-latest VM (not a
+# constrained host-mode container), so standard checkout + Docker work directly:
+# no plain-git workaround, no remote-podman-socket path caveats.
+
+on:
+  schedule:
+    # 03:00 UTC daily (08:30 IST).
+    - cron: "0 3 * * *"
+  # Allow ad-hoc manual runs (so the suite can be triggered on demand to test).
+  workflow_dispatch: {}
+
+concurrency:
+  group: jepsen-nightly
+  cancel-in-progress: false
+
+jobs:
+  jepsen-full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Jepsen image
+        run: docker build --platform=linux/amd64 -t granary-jepsen -f Containerfile.jepsen .
+
+      - name: Run full #177 suite + gate
+        run: |
+          docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
+            -w /workspace --entrypoint bash \
+            granary-jepsen jepsen/run/ci_full.sh
+
+      # On any failure above, open a GitHub issue so the nightly does not fail
+      # silently. Deduped by title marker: if an open issue already exists for a
+      # previous failing nightly, comment on it instead of opening a duplicate
+      # (the scheduled job runs unattended every night).
+      - name: File issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MARKER: "Jepsen nightly failed"
+        run: |
+          set -eu
+          body="The Jepsen nightly suite (#177) failed.
+
+          - Run: ${RUN_URL}
+          - Commit: ${GITHUB_SHA}
+          - Ref: ${GITHUB_REF}
+
+          See the workflow logs for the failing workload/nemesis and the Elle checker output."
+
+          number=$(gh issue list --state open --search "${MARKER} in:title" --json number --jq '.[0].number' || true)
+          if [ -n "${number:-}" ]; then
+            echo "Open failure issue #${number} exists; adding a comment."
+            gh issue comment "${number}" --body "Failed again on run ${RUN_URL} (commit ${GITHUB_SHA})."
+          else
+            echo "No open failure issue; opening one."
+            gh issue create --title "${MARKER} (run ${{ github.run_number }})" --body "${body}"
+          fi

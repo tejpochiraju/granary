@@ -1,0 +1,191 @@
+name: Benchmark (#345)
+
+on:
+  workflow_dispatch:
+    inputs:
+      host_label:
+        description: "Label for the result CSV/meta (default github-actions-ci). NOTE: shared cloud runner, numbers not comparable to the NVMe reference host."
+        required: false
+        default: github-actions-ci
+      rows:
+        description: Dataset rows (default 100000)
+        required: false
+        default: "100000"
+      ops:
+        description: Point-lookup ops (default 20000)
+        required: false
+        default: "20000"
+      scans:
+        description: Scan/agg repeats (default 50)
+        required: false
+        default: "50"
+      commits:
+        description: Single-row txns (default 500)
+        required: false
+        default: "500"
+      repeats:
+        description: Timed repeats (default 5)
+        required: false
+        default: "5"
+      page_cache:
+        description: Page-cache pages (default 1024)
+        required: false
+        default: "1024"
+
+concurrency:
+  group: bench
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    env:
+      OPAMROOT: /home/opam/.opam
+    container:
+      image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
+
+    steps:
+      - name: Install Node.js (needed by actions/checkout)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q nodejs
+
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev sqlite3
+
+      - name: Cache opam packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.opam
+          key: opam-5.4-bench-${{ hashFiles('granary.opam') }}
+          restore-keys: opam-5.4-bench-
+
+      - name: Install opam packages
+        run: |
+          opam install -y lwt cstruct menhir alcotest lwt_ppx \
+            mirage-block mirage-block-unix uutf uucp \
+            mirage-crypto mirage-crypto-rng sqlite3
+
+      - name: Run benchmark
+        id: run
+        env:
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
+          GRANARY_BENCH_ROWS: ${{ github.event.inputs.rows }}
+          GRANARY_BENCH_OPS: ${{ github.event.inputs.ops }}
+          GRANARY_BENCH_SCANS: ${{ github.event.inputs.scans }}
+          GRANARY_BENCH_COMMITS: ${{ github.event.inputs.commits }}
+          GRANARY_BENCH_REPEATS: ${{ github.event.inputs.repeats }}
+          GRANARY_BENCH_PAGE_CACHE: ${{ github.event.inputs.page_cache }}
+        run: |
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="github-actions-ci"
+          export GRANARY_BENCH_HOST="$LABEL"
+          echo "label=${LABEL}" >> "$GITHUB_OUTPUT"
+          mkdir -p bench/results
+          opam exec -- dune exec test/bench_compare.exe 2>&1 \
+            > "bench/results/${LABEL}.csv"
+          echo "bench/results/${LABEL}.csv:"
+          cat "bench/results/${LABEL}.csv"
+
+      - name: Generate metadata
+        env:
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
+          ROWS: ${{ github.event.inputs.rows }}
+          OPS: ${{ github.event.inputs.ops }}
+          SCANS: ${{ github.event.inputs.scans }}
+          COMMITS: ${{ github.event.inputs.commits }}
+          REPEATS: ${{ github.event.inputs.repeats }}
+          PAGE_CACHE: ${{ github.event.inputs.page_cache }}
+        run: |
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="github-actions-ci"
+          {
+            echo "host=$LABEL"
+            echo "date=$(date -u +%FT%TZ)"
+            echo "nproc=$(nproc)"
+            echo "sqlite_version=$(sqlite3 --version | awk '{print $1}')"
+            echo "granary_sha=$(git rev-parse --short HEAD)"
+            echo "rows=$ROWS"
+            echo "ops=$OPS"
+            echo "scans=$SCANS"
+            echo "commits=$COMMITS"
+            echo "repeats=$REPEATS"
+            echo "page_cache=$PAGE_CACHE"
+            echo "storage=overlay-fs (ci-container /tmp)"
+            DISK=$(lsblk -d -o NAME,ROTA,MODEL --noheadings 2>/dev/null | tr -s ' ' | head -3)
+            echo "disk=${DISK:-unavailable}"
+          } > "bench/results/${LABEL}.meta"
+          cat "bench/results/${LABEL}.meta"
+
+      # main is branch-protected, so we can't push results into the code repo.
+      # Publish them to the wiki instead (a separate, unprotected git repo).
+      # Each host/label gets its own "CI-Benchmark-Results-<label>" page holding
+      # the latest run's metadata + rendered table; the curated "Benchmarks" page
+      # is never touched.
+      - name: Publish results to wiki
+        env:
+          RAW_LABEL: ${{ github.event.inputs.host_label }}
+          # Dedicated PAT (classic, repo scope) stored as the WIKI_PAT secret:
+          # the auto GITHUB_TOKEN lacks the scope to push to the wiki repo.
+          TOKEN: ${{ secrets.WIKI_PAT }}
+          RUN: ${{ github.run_number }}
+          SERVER_URL: ${{ github.server_url }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          LABEL="${RAW_LABEL//[^a-zA-Z0-9_-]/}"
+          [[ -z "$LABEL" ]] && LABEL="github-actions-ci"
+          CSV="bench/results/${LABEL}.csv"
+          META="bench/results/${LABEL}.meta"
+          if [[ ! -s "$CSV" ]]; then
+            echo "No results CSV at ${CSV}; nothing to publish"
+            exit 0
+          fi
+
+          HOST="$(echo "${SERVER_URL}" | sed 's|https://||')"
+          git clone "https://x-access-token:${TOKEN}@${HOST}/${REPOSITORY}.wiki.git" wiki
+          git -C wiki config user.name "bench-bot"
+          git -C wiki config user.email "bench-bot@users.noreply.github.com"
+
+          PAGE="wiki/CI-Benchmark-Results-${LABEL}.md"
+          SHA="$(git rev-parse --short HEAD)"
+          {
+            echo "# CI Benchmark Results — \`${LABEL}\`"
+            echo
+            echo "_Automatically updated by the Benchmark (#345) workflow (run ${RUN}). Latest run only — history is in the wiki git log. The curated analysis (real NVMe reference hardware) lives on the [[Benchmarks]] page — these numbers are from a shared, variable-performance GitHub-hosted cloud runner and are NOT directly comparable to that page's figures. Useful only as a relative smoke check that nothing has regressed drastically._"
+            echo
+            echo "## Run metadata"
+            echo
+            echo "| key | value |"
+            echo "| --- | --- |"
+            # Split each line on the first "=" only. Lines without "=" are
+            # continuations of the previous value (e.g. multi-line "disk=") and
+            # are folded in with "; " so they don't break the markdown table.
+            awk '
+              /^[A-Za-z_][A-Za-z0-9_]*=/ {
+                if (have) printf "| %s | %s |\n", k, v
+                eq = index($0, "="); k = substr($0, 1, eq - 1); v = substr($0, eq + 1); have = 1; next
+              }
+              { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") v = v "; " $0 }
+              END { if (have) printf "| %s | %s |\n", k, v }
+            ' "$META"
+            echo
+            echo "## Results (ops/sec; \`bench_compare\` raw output)"
+            echo
+            awk -F, '
+              { row=$0; gsub(/,/, " | ", row); print "| " row " |" }
+              NR==1 { sep="|"; for (i=0;i<NF;i++) sep=sep" --- |"; print sep }
+            ' "$CSV"
+          } > "$PAGE"
+
+          git -C wiki add "$(basename "$PAGE")"
+          if git -C wiki diff --cached --quiet; then
+            echo "No change to wiki page; nothing to publish"
+            exit 0
+          fi
+          git -C wiki commit -m "bench(#345): results for ${LABEL} (granary ${SHA}, run ${RUN})"
+          git -C wiki push origin HEAD:main
