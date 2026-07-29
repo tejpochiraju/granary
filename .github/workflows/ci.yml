@@ -78,15 +78,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPAMROOT: /home/opam/.opam
-    env:
-      OPAMROOT: /home/opam/.opam
     # Enforcing (#173): the curated merlint set is at zero, so findings now
     # block the build. History: adopted warn-first in #153, ratcheted to zero
     # via #167/#168/#173, flipped to blocking once #171 (ocamlformat) cleared
     # the last finding (E500).
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
-      options: --user root
       options: --user root
 
     steps:
