@@ -52,8 +52,9 @@ jobs:
           GRANARY_BENCH_MAX_WRITER_S: "1000000"
           GRANARY_BENCH_MAX_RATIO: "1000000"
         run: |
-          docker run --rm --platform=linux/${{ matrix.arch }} \
+          docker run --rm --platform=linux/${{ matrix.arch }} --user root \
             -v "$PWD":/workspace -w /workspace \
+            -e HOME=/home/opam -e OPAMROOT=/home/opam/.opam \
             -e GRANARY_BENCH_MIN_SPEEDUP -e GRANARY_BENCH_PARALLEL_MAX \
             -e GRANARY_BENCH_MAX_WRITER_S -e GRANARY_BENCH_MAX_RATIO \
             ocaml/opam:ubuntu-24.04-ocaml-5.4 bash -c '
