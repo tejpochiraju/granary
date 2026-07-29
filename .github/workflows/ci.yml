@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
@@ -79,6 +80,7 @@ jobs:
     # the last finding (E500).
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
