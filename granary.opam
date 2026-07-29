@@ -3,6 +3,11 @@ opam-version: "2.0"
 version: "0.0.1"
 synopsis: "Pure-OCaml SQL engine"
 description: "Pure-OCaml SQL engine targeting MirageOS unikernels."
+maintainer: ["Tej Pochiraju <foss@tej.sh>"]
+authors: ["Tej Pochiraju <foss@tej.sh>"]
+license: "Apache-2.0"
+homepage: "https://github.com/tejpochiraju/granary"
+bug-reports: "https://github.com/tejpochiraju/granary/issues"
 depends: [
   "dune" {>= "3.16"}
   "ocaml" {>= "5.4"}

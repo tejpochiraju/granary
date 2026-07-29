@@ -10,6 +10,11 @@
  (name granary)
  (synopsis "Pure-OCaml SQL engine")
  (description "Pure-OCaml SQL engine targeting MirageOS unikernels.")
+ (maintainers "Tej Pochiraju <foss@tej.sh>")
+ (authors "Tej Pochiraju <foss@tej.sh>")
+ (license "Apache-2.0")
+ (homepage "https://github.com/tejpochiraju/granary")
+ (bug_reports "https://github.com/tejpochiraju/granary/issues")
  (depends
   (ocaml (>= 5.4))
   (lwt (>= 5.7))
@@ -26,6 +31,11 @@
 (package
  (name granary_repl)
  (synopsis "TUI REPL for granary")
+ (maintainers "Tej Pochiraju <foss@tej.sh>")
+ (authors "Tej Pochiraju <foss@tej.sh>")
+ (license "Apache-2.0")
+ (homepage "https://github.com/tejpochiraju/granary")
+ (bug_reports "https://github.com/tejpochiraju/granary/issues")
  (depends
   (ocaml (>= 5.4))
   granary
