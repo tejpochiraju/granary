@@ -30,10 +30,14 @@ let test_binary_exists () =
 
 let test_bad_path_nonzero_exit () =
   let bin = repl_path () in
+  (* A path under a non-existent parent directory fails with ENOENT
+     regardless of the running user's privileges (unlike a path directly at
+     filesystem root, which root — but not a regular user — can create). *)
   let code =
     Sys.command
       (Printf.sprintf
-         "%s /nonexistent_granary_test_db </dev/null 2>/dev/null"
+         "%s /nonexistent_granary_test_dir_xyz/nonexistent_granary_test_db </dev/null \
+          2>/dev/null"
          (Filename.quote bin))
   in
   Alcotest.(check bool) "non-existent db path exits nonzero" true (code <> 0)

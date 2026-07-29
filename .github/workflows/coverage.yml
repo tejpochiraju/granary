@@ -17,19 +17,17 @@ env:
 jobs:
   coverage:
     runs-on: ubuntu-latest
+    env:
+      OPAMROOT: /home/opam/.opam
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nodejs
-
-      - name: Fix ownership of runner temp dirs (actions/checkout needs write access; container's default user is non-root opam)
-        run: |
-          sudo mkdir -p /__w/_temp/_runner_file_commands
-          sudo chmod -R 777 /__w/_temp
 
       - uses: actions/checkout@v4
 

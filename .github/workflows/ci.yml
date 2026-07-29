@@ -9,19 +9,17 @@ on:
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    env:
+      OPAMROOT: /home/opam/.opam
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
+      options: --user root
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nodejs
-
-      - name: Fix ownership of runner temp dirs (actions/checkout needs write access; container's default user is non-root opam)
-        run: |
-          sudo mkdir -p /__w/_temp/_runner_file_commands
-          sudo chmod -R 777 /__w/_temp
 
       - uses: actions/checkout@v4
 
@@ -80,6 +78,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OPAMROOT: /home/opam/.opam
+    env:
+      OPAMROOT: /home/opam/.opam
     # Enforcing (#173): the curated merlint set is at zero, so findings now
     # block the build. History: adopted warn-first in #153, ratcheted to zero
     # via #167/#168/#173, flipped to blocking once #171 (ocamlformat) cleared
@@ -87,17 +87,13 @@ jobs:
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
       options: --user root
+      options: --user root
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q nodejs
-
-      - name: Fix ownership of runner temp dirs (actions/checkout needs write access; container's default user is non-root opam)
-        run: |
-          sudo mkdir -p /__w/_temp/_runner_file_commands
-          sudo chmod -R 777 /__w/_temp
 
       - uses: actions/checkout@v4
 
