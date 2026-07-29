@@ -2,7 +2,7 @@
 (name granary)
 (using menhir 2.1)
 (generate_opam_files true)
-(version 0.0.2)
+(version 0.0.3)
 (source
  (uri "git+https://github.com/tejpochiraju/granary.git"))
 
@@ -20,15 +20,13 @@
   (lwt (>= 5.7))
   (cstruct (>= 6.2))
   (menhir (>= 20240715))
-  (alcotest :with-test)
-  (qcheck-alcotest :with-test)
   (mirage-block (>= "3.0.0"))
   (mirage-block-unix (>= "2.14.0"))
   (mirage-crypto (>= "1.2.0"))
   (mirage-crypto-rng (>= "1.2.0"))
-  (alcotest-lwt :with-test)
   (lwt_ppx :build)
-  uucp))
+  uucp
+  uutf))
 
 (package
  (name granary_repl)
