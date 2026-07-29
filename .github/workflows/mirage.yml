@@ -22,6 +22,8 @@ jobs:
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
       options: --user root
+      env:
+        HOME: /home/opam
 
     steps:
       - name: Install Node.js (needed by actions/checkout)
