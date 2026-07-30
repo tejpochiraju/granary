@@ -203,4 +203,8 @@ jobs:
             exit 0
           fi
           git -C wiki commit -m "bench(#345): results for ${LABEL} (granary ${SHA}, run ${RUN})"
-          git -C wiki push origin HEAD:main
+          # Push back to whatever branch the clone checked out (the wiki's
+          # served default): master on GitHub, main on Forgejo. Hardcoding
+          # either one publishes to a branch the other forge never renders —
+          # the run then "succeeds" while the results stay invisible (#459).
+          git -C wiki push origin HEAD
