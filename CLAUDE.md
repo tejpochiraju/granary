@@ -78,12 +78,30 @@ merlint enforces (among others): max nesting depth 4, every library module has a
 
 ### Coverage
 
-Use the manual binary loop, not `dune runtest --instrument-with=bisect_ppx` (requires RPC daemon):
+`dune runtest --instrument-with bisect_ppx` works (verified on 5.4). Two
+prerequisites, both of which the `coverage.yml` workflow also applies:
+
+- `bisect_ppx` must be pinned to the unmerged upstream PR that supports the
+  OCaml 5.2+ AST — the released 2.8.3 caps `ppxlib < 0.36`, which is
+  incompatible with the `lwt_ppx 6.1` / `ppxlib 0.38` this project needs (#166).
+- The `bench_*` timing gates must be neutralized; instrumentation slows
+  everything enough that they fail near-deterministically.
 
 ```sh
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
-  bisect-ppx-report html --output _coverage_report/ _build/default/test/*.coverage
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace \
+  -e GRANARY_BENCH_MIN_SPEEDUP=0 -e GRANARY_BENCH_PARALLEL_MAX=1000000 \
+  -e GRANARY_BENCH_MAX_WRITER_S=1000000 -e GRANARY_BENCH_MAX_RATIO=1000000 \
+  granary-dev bash -c '
+    opam pin add -y -k git bisect_ppx \
+      "https://github.com/patricoferris/bisect_ppx.git#7061d643ff492b0045796357ee6917ded21fb1f0"
+    dune runtest --instrument-with bisect_ppx
+    bisect-ppx-report html -o _coverage_report/ $(find _build -name "*.coverage")
+  '
 ```
+
+Handwritten coverage (excluding the generated parser/lexer) is ~80%; CI gates
+tags at 75%. Note the CI image ships **mawk** and has neither `python3` nor
+`bc` — keep report post-processing to portable awk.
 
 ### Opening a PR
 
