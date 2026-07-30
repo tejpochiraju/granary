@@ -15,6 +15,7 @@
       reports an unknown view instead of silently attaching to nothing. *)
 
 module Db = Granary.Db
+module Cat = Granary_catalog.Catalog
 
 let run = Lwt_main.run
 
@@ -213,6 +214,24 @@ let test_callbacks () =
    neither can be fooled by a catalog-derived heuristic (a user table literally
    named [_rv_<x>], or an [_rv_] table whose view failed to re-load). *)
 
+(* pid + a monotonic counter: deterministic and collision-free, unlike drawing
+   from the global [Random] state the QCheck runner also seeds. *)
+let tmp_counter = ref 0
+
+let tmp_path () =
+  incr tmp_counter;
+  Printf.sprintf "/tmp/granary_rv437_%d_%d.db" (Unix.getpid ()) !tmp_counter
+;;
+
+(* Prints the actual error on failure, unlike comparing against [= Ok ()]. *)
+let register_result =
+  Alcotest.testable
+    (fun fmt -> function
+       | Ok () -> Format.pp_print_string fmt "Ok ()"
+       | Error (`Unknown_view n) -> Format.fprintf fmt "Error (`Unknown_view %S)" n)
+    ( = )
+;;
+
 let test_reactive_view_names () =
   with_db (fun db ->
     Alcotest.(check (list string)) "no views on a fresh db" [] (Db.reactive_view_names db);
@@ -259,32 +278,31 @@ let test_register_reports_unknown_view () =
     exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
     exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
     let cb _ = Lwt.return_unit in
-    Alcotest.(check bool)
+    Alcotest.check
+      register_result
       "registering against a live view succeeds"
-      true
-      (Db.register_view_callback db ~view_name:"cnt" cb = Ok ());
-    Alcotest.(check bool)
+      (Ok ())
+      (Db.register_view_callback db ~view_name:"cnt" cb);
+    Alcotest.check
+      register_result
       "a typo'd view name is reported, not silently dropped"
-      true
-      (Db.register_view_callback db ~view_name:"cnnt" cb = Error (`Unknown_view "cnnt"));
-    Alcotest.(check bool)
+      (Error (`Unknown_view "cnnt"))
+      (Db.register_view_callback db ~view_name:"cnnt" cb);
+    Alcotest.check
+      register_result
       "a plain table name is reported too"
-      true
-      (Db.register_view_callback db ~view_name:"t" cb = Error (`Unknown_view "t")))
+      (Error (`Unknown_view "t"))
+      (Db.register_view_callback db ~view_name:"t" cb))
 ;;
 
 (* The registry is rebuilt from the catalog on open: names must survive a
    reopen, otherwise a hook wired at startup attaches to nothing. *)
 let test_names_survive_reopen () =
-  let path =
-    Printf.sprintf "/tmp/granary_rv437_%d_%d.db" (Unix.getpid ()) (Random.int 1_000_000)
-  in
+  let path = tmp_path () in
+  (* [open_file] is non-WAL: one file, no sidecars. *)
   let cleanup () =
-    List.iter
-      (fun s ->
-         try Sys.remove (path ^ s) with
-         | _ -> ())
-      [ "" ]
+    try Sys.remove path with
+    | _ -> ()
   in
   cleanup ();
   Fun.protect ~finally:cleanup (fun () ->
@@ -304,10 +322,65 @@ let test_names_survive_reopen () =
            [ "cnt" ]
            (Db.reactive_view_names db);
          let cb _ = Lwt.return_unit in
-         Alcotest.(check bool)
+         Alcotest.check
+           register_result
            "and a callback attaches to it"
-           true
-           (Db.register_view_callback db ~view_name:"cnt" cb = Ok ())))
+           (Ok ())
+           (Db.register_view_callback db ~view_name:"cnt" cb)))
+;;
+
+(* The motivating "dead hook reported healthy" state (#437 comment): a persisted
+   definition that [rv_load] cannot restore leaves the [_rv_<name>] table in the
+   catalog with *no* registry entry.  Any catalog-derived probe reports the view
+   live; the registry accessor — and [register_view_callback] — must not.  Both
+   skip branches are covered: SQL that fails to parse, and SQL that parses to a
+   different statement. *)
+let test_unloadable_view_is_not_live stored_sql () =
+  let path = tmp_path () in
+  let cleanup () =
+    try Sys.remove path with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    run (Db.close db);
+    (* Corrupt the stored definition behind the engine's back, leaving _rv_cnt
+       in place — what a downgrade or a definition the parser no longer accepts
+       would produce. *)
+    (match run (Granary_unix.Store.open_file ~path ()) with
+     | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
+     | Ok store ->
+       run (Cat.persist_reactive_view store ~name:"cnt" ~sql:stored_sql);
+       run (Granary_store.Store.close store));
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close db) with
+        | _ -> ())
+      (fun () ->
+         (* the materialisation table is still there — this is exactly what
+            makes the _rv_ probe report a healthy view *)
+         Alcotest.(check (list (pair string int)))
+           "_rv_cnt survived the corruption"
+           [ "a", 1 ]
+           (mv db "cnt");
+         Alcotest.(check (list string))
+           "…but the view is not live"
+           []
+           (Db.reactive_view_names db);
+         Alcotest.(check bool)
+           "…and is_reactive_view says so"
+           false
+           (Db.is_reactive_view db "cnt");
+         Alcotest.check
+           register_result
+           "…and registering reports it unknown rather than attaching nothing"
+           (Error (`Unknown_view "cnt"))
+           (Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit))))
 ;;
 
 (* ---- regression (review #428): full-refresh must not collapse duplicate
@@ -462,6 +535,14 @@ let () =
             `Quick
             test_register_reports_unknown_view
         ; Alcotest.test_case "names survive reopen" `Quick test_names_survive_reopen
+        ; Alcotest.test_case
+            "unparseable stored SQL is not live"
+            `Quick
+            (test_unloadable_view_is_not_live "NOT SQL AT ALL")
+        ; Alcotest.test_case
+            "non-reactive-view stored SQL is not live"
+            `Quick
+            (test_unloadable_view_is_not_live "SELECT 1")
         ] )
     ; "property", [ QCheck_alcotest.to_alcotest prop_views_track ]
     ]

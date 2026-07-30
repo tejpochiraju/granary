@@ -318,7 +318,15 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
     [view_name] is not a live reactive view, so a caller wiring hooks from
     config can tell a typo from a successful registration.  Validity is decided
     at the instant of registration; prefer this over pre-checking with
-    {!is_reactive_view}. *)
+    {!is_reactive_view}.
+
+    The error is a closed polymorphic variant rather than the module-wide
+    {!error} deliberately: this is the only failure this function has, and it is
+    not a SQL error.  Widening {!error} would add a case that no other function
+    returning [(_, error) result] can ever produce, and would force every
+    existing exhaustive match to handle it.  A caller chaining against [error]
+    maps it explicitly, e.g.
+    [Result.map_error (fun (`Unknown_view v) -> Runtime ("unknown view " ^ v))]. *)
 val register_view_callback
   :  t
   -> view_name:string
