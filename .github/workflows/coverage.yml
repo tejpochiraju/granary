@@ -45,7 +45,9 @@ jobs:
 
       - name: Install system deps
         run: |
-          sudo apt-get install -y -q pkg-config libgmp-dev
+          # libsqlite3-dev is required by the sqlite3 opam package (used by
+          # the comparison benches that `dune runtest` builds). Matches ci.yml.
+          sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev
 
       - name: Cache opam packages
         uses: actions/cache@v4
@@ -56,8 +58,15 @@ jobs:
 
       - name: Install opam packages (including bisect_ppx)
         run: |
+          # Keep in sync with ci.yml — this job runs the same `dune runtest`,
+          # so it needs the same dependency closure. (ocamlformat omitted:
+          # coverage doesn't run `dune build @fmt`.) The dev container has
+          # everything installed globally, so a missing entry here only ever
+          # shows up in CI. See #462.
           opam install -y lwt cstruct menhir alcotest qcheck-alcotest lwt_ppx \
-            mirage-block mirage-block-unix uutf uucp
+            mirage-block mirage-block-unix uutf uucp \
+            mirage-crypto mirage-crypto-rng alcotest-lwt sqlite3 \
+            nottui nottui-lwt lwd
           # bisect_ppx: see the header. Released 2.8.3 caps ppxlib < 0.36 and
           # upstream master doesn't build on the 5.2+ AST; this is the head of
           # the unmerged PR that fixes both. Pinned by commit so it can't shift.
