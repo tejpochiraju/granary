@@ -312,13 +312,29 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
     [view_name]'s materialisation.  [cb] receives the native {!row_change} diffs
     applied to [_rv_<view_name>] (Deleted/Inserted pairs; a changed aggregate row
     is a delete of the old plus an insert of the new).  Commits that leave the
-    view unchanged — and DDL — fire nothing.  A no-op if [view_name] is not a
-    reactive view. *)
+    view unchanged — and DDL — fire nothing.
+
+    #437: returns [Error (`Unknown_view view_name)] — attaching nothing — when
+    [view_name] is not a live reactive view, so a caller wiring hooks from
+    config can tell a typo from a successful registration.  Validity is decided
+    at the instant of registration; prefer this over pre-checking with
+    {!is_reactive_view}. *)
 val register_view_callback
   :  t
   -> view_name:string
   -> (row_change list -> unit Lwt.t)
-  -> unit
+  -> (unit, [ `Unknown_view of string ]) result
+
+(** #437: the names of the live reactive views, sorted.  Read from the in-memory
+    registry, so — unlike probing the catalog for [_rv_<name>] — a user table
+    named [_rv_<x>] does not make [x] look live, and neither does a persisted
+    view whose stored SQL failed to re-parse at open (which leaves its [_rv_]
+    table behind and logs a warning). *)
+val reactive_view_names : t -> string list
+
+(** #437: whether [name] is a live reactive view, i.e. is in
+    {!reactive_view_names}. *)
+val is_reactive_view : t -> string -> bool
 
 (** #387: the projected output column names for a row-returning [sql], without
     executing it.  Parses and binds [sql] against the current schema and returns
