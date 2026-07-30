@@ -3238,7 +3238,21 @@ let rv_load top =
                        | Ok engine -> register (RV_delta { group_ord; measure; engine })
                        | Error _ -> register RV_full))
                  | Rv.Full -> register RV_full)
-              | _ -> Lwt.return_unit)
+              (* #437: a view we cannot re-load leaves its [_rv_<name>] table in
+                 the catalog with no registry entry.  Say so — silently skipping
+                 it makes {!register_view_callback} report [`Unknown_view] with
+                 no clue why. *)
+              | Ok _ ->
+                Printf.eprintf
+                  "warning: skipping non-reactive-view SQL for reactive view '%s'\n%!"
+                  name;
+                Lwt.return_unit
+              | Error e ->
+                Printf.eprintf
+                  "warning: failed to parse reactive view SQL for '%s': %s\n%!"
+                  name
+                  (Format.asprintf "%a" pp_error e);
+                Lwt.return_unit)
            pairs
        in
        (* Reconcile each persisted materialisation against recomputed state.  For
@@ -3255,10 +3269,24 @@ let rv_load top =
        Lwt.return_unit)
 ;;
 
+(* #437: accessors over the in-memory registry.  A caller wiring hooks from
+   config needs to tell a live view from a typo, and the registry — not the
+   [_rv_<name>] catalog naming convention — is the authority: an [_rv_] table
+   can exist without a registry entry (a user table of that name, or a view
+   whose stored SQL failed to re-load above). *)
+let reactive_view_names top =
+  Hashtbl.fold (fun name _ acc -> name :: acc) top.reactive_views []
+  |> List.sort String.compare
+;;
+
+let is_reactive_view top name = Hashtbl.mem top.reactive_views name
+
 let register_view_callback top ~view_name cb =
   match Hashtbl.find_opt top.reactive_views view_name with
-  | Some e -> e.rv_callbacks <- e.rv_callbacks @ [ cb ]
-  | None -> ()
+  | Some e ->
+    e.rv_callbacks <- e.rv_callbacks @ [ cb ];
+    Ok ()
+  | None -> Error (`Unknown_view view_name)
 ;;
 
 let () =
