@@ -45,33 +45,44 @@ From inside a worktree, substitute the worktree path for `$(pwd)`.
 
 ### Formatting
 
-`dune build @fmt` has git interaction issues in worktrees. Use ocamlformat directly and redirect to host:
+**Use `scripts/check-fmt.sh` — it is the canonical local equivalent of CI's `dune build @fmt` gate.** It self-wraps podman (no manual `podman run`), runs the pinned ocamlformat over every `.ml`/`.mli` in `lib/ test/ bin/ bench/`, prints a unified diff for each deviation, and exits non-zero. Run it from the repo or worktree root:
 
 ```sh
-# check
-podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev ocamlformat --check lib/foo.ml
-
-# fix (write to host via redirect)
-tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
-  ocamlformat lib/foo.ml > "$tmp" && mv "$tmp" lib/foo.ml && chmod 644 lib/foo.ml
+sh scripts/check-fmt.sh          # check; exits 1 and prints diffs on any deviation
+sh scripts/check-fmt.sh --fix    # rewrite the offending files in place
 ```
+
+Read its final summary line, not just the exit code:
+
+- `✓ … parity with CI's @fmt gate` — OCaml sources **and** dune files verified.
+- `◐ … Dune files UNVERIFIED` — OCaml sources are clean but the dune-file check was skipped (see below). Exits 0; **not** full parity with CI.
+
+Why not the raw tools:
+
+- `dune build @fmt` is the real gate and works in the **main checkout**, but inside a **worktree** it aborts with `fatal: not a git repository` (the worktree's `.git` is a file pointing outside the container mount). It only consults git when it has a change to *promote*, so in a worktree it passes silently while everything is clean and fails only once a file deviates — success there proves nothing.
+- `ocamlformat --check` reports a mismatch through the **exit code only**, printing nothing at all. Testing its captured output for emptiness reports every file as falsely clean. This trap sank five PRs (#213, #253, #277, #287, #308) before the script existed.
+- **`dune format-dune-file` is NOT equivalent to `@fmt` for dune files** — verified 2026-07-30: on `dune-project` it wants 47 lines changed (blank lines between stanzas, dependency constraints rewrapped) that `@fmt` accepts as-is. Do not use it to "fix" dune files; it also makes the `diff`-expects-nothing check a false failure.
+- A hand-rolled `podman run … ocamlformat --inplace` **fails silently**: under rootless podman the image's default `opam` user maps to an unrelated subuid, so every checkout file looks root-owned and `--inplace` exits 2 without writing. The script passes `--user 0` (host user → container root), which writes correctly and preserves `tej:tej` ownership. If you must invoke a container by hand and need it to *write* into the checkout, pass `--user 0` too.
 
 The pre-commit hook runs format checks automatically on staged `.ml`/`.mli` files.
 
 ### Before pushing: dune-file formatting + merlint
 
-The CI **lint** job runs `dune build @fmt` (which checks dune-file formatting *and* ocamlformat) and `merlint`. Formatting only your `.ml`/`.mli` with ocamlformat is **not** enough — CI will still fail on unformatted `dune` files or merlint findings. Run both locally before pushing:
+The CI **lint** job runs `dune build @fmt` (dune-file formatting *and* ocamlformat) plus `merlint`. Formatting only your `.ml`/`.mli` is **not** enough — CI still fails on unformatted `dune` files or merlint findings.
 
 ```sh
-# dune-file formatting — @fmt can't run in a worktree (the worktree .git is a
-# file → "fatal: not a git repository"), so use the standalone formatter:
-tmp=$(mktemp) && podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev \
-  dune format-dune-file path/to/dune > "$tmp" && mv "$tmp" path/to/dune && chmod 644 path/to/dune
-# verify a dune file is already formatted (expect no diff):
-diff <(podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune format-dune-file path/to/dune) path/to/dune
+# formatting (both .ml/.mli and dune files) — see above
+sh scripts/check-fmt.sh
 
 # merlint — run from the workspace root; expect 0 issues for your files
 podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev merlint
+```
+
+**If you touched a `dune` or `dune-project` file while working in a worktree**, `check-fmt.sh` will report `◐ … Dune files UNVERIFIED`. To actually verify them before pushing, run the real gate in the main checkout (it needs no worktree state — the dune files are what matter):
+
+```sh
+cd /home/tej/projects/sqlite_ocaml_port   # the main checkout, not a worktree
+podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune build @fmt
 ```
 
 merlint enforces (among others): max nesting depth 4, every library module has a `.mli`, an abstract `type t` has a `pp`, and every public `val` in an `.mli` has a `(** … *)` doc comment (not `(* … *)`). It ignores the pre-existing `sqlite3 not found` build warning and still reports.

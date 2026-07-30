@@ -28,8 +28,17 @@ IMAGE="${GRANARY_DEV_IMAGE:-localhost/granary-dev:latest}"
 # on the host: re-exec this same script inside the container under `opam exec`
 # (which puts the pinned ocamlformat on PATH). The inner run finds ocamlformat
 # and proceeds, so there is no re-exec loop.
+#
+# --user 0 is REQUIRED for --fix, and helps in check mode too. Under rootless
+# podman the host user maps to container root, while the image's default `opam`
+# user maps to an unrelated subuid — so as `opam` every checkout file looks
+# root-owned and `ocamlformat --inplace` dies with "Permission denied" (exit 2).
+# As container root, writes land as the host user and ownership is preserved.
+# A _build that @fmt creates fresh under this flag is owned by the host user
+# rather than a subuid, so it can be deleted without `podman unshare` (an
+# existing _build keeps whatever owner it was created with).
 if ! command -v ocamlformat >/dev/null 2>&1; then
-  exec podman run --rm -v "$PWD":/work -w /work "$IMAGE" \
+  exec podman run --rm --user 0 -v "$PWD":/work -w /work "$IMAGE" \
     sh -c "opam exec -- sh scripts/check-fmt.sh $*"
 fi
 
@@ -50,7 +59,15 @@ count=0
 for f in $files; do
   count=$((count + 1))
   if [ "$mode" = "fix" ]; then
-    ocamlformat --inplace "$f"
+    # Never ignore this exit code: a failed --inplace (e.g. an unwritable file)
+    # would otherwise leave the file untouched while the summary below claims
+    # everything was reformatted — the exact silent-false-clean this script
+    # exists to prevent.
+    if ! ocamlformat --inplace "$f" 2>/tmp/_fmt.err; then
+      echo "✗ could not rewrite: $f"
+      tail -3 /tmp/_fmt.err
+      status=1
+    fi
     continue
   fi
   if ! ocamlformat "$f" >/tmp/_fmt.out 2>/tmp/_fmt.err; then
@@ -74,11 +91,19 @@ done
 # link points outside the build mount), so skip gracefully there — CI is the
 # backstop. Only run when the ocamlformat pass above is clean, to avoid
 # double-reporting any .ml/.mli issues @fmt would also flag.
+#
+# NOTE on the worktree abort: @fmt only consults git when it has a change to
+# *promote*, so in a worktree it succeeds silently while everything is clean and
+# fails with "fatal: not a git repository" the moment a dune file deviates.
+# Success there therefore does NOT prove the dune files are clean — hence
+# dune_checked, which keeps the summary from claiming a parity it did not verify.
+dune_checked=0
 if [ "$status" -eq 0 ]; then
   if [ "$mode" = "fix" ]; then
     dune build @fmt --auto-promote >/tmp/_fmt_dune.out 2>&1 || true
+    dune_checked=1
   elif fmt_out=$(dune build @fmt 2>&1); then
-    : # dune files (and .ml/.mli) are clean per the real gate
+    dune_checked=1 # dune files (and .ml/.mli) are clean per the real gate
   else
     case "$fmt_out" in
       *"not a git repository"* | *fatal:*)
@@ -93,11 +118,16 @@ if [ "$status" -eq 0 ]; then
 fi
 
 echo
-if [ "$mode" = "fix" ]; then
-  echo "Reformatted in place across $count OCaml sources + dune files (ocamlformat $(ocamlformat --version) + dune build @fmt)."
-elif [ "$status" -eq 0 ]; then
-  echo "✓ All $count OCaml sources + dune files match the formatter (ocamlformat $(ocamlformat --version) + dune build @fmt) — parity with CI's @fmt gate."
-else
+if [ "$status" -ne 0 ]; then
   echo "Formatting check FAILED. Run 'scripts/check-fmt.sh --fix' to fix; this matches CI's 'dune build @fmt' gate."
+elif [ "$dune_checked" -eq 0 ]; then
+  # Deliberately not a ✓: the OCaml sources are clean but the dune files were
+  # never checked, so this is NOT parity with CI's gate.
+  echo "◐ $count OCaml sources match the formatter (ocamlformat $(ocamlformat --version))."
+  echo "  Dune files UNVERIFIED (see warning above) — not full parity with CI's @fmt gate."
+elif [ "$mode" = "fix" ]; then
+  echo "Reformatted in place across $count OCaml sources + dune files (ocamlformat $(ocamlformat --version) + dune build @fmt)."
+else
+  echo "✓ All $count OCaml sources + dune files match the formatter (ocamlformat $(ocamlformat --version) + dune build @fmt) — parity with CI's @fmt gate."
 fi
 exit "$status"
