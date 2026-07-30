@@ -59,6 +59,15 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      - name: Configure git safe.directory
+        # Running as root (needed for actions/checkout, see #447/#448) but the
+        # checkout is owned by the runner's host uid — git's dubious-ownership
+        # safety check (CVE-2022-24765 mitigation) refuses to operate here
+        # otherwise. actions/checkout applies this for its own checkout
+        # (--local scope only); later steps' own git invocations (metadata
+        # generation, wiki publish) need it applied globally.
+        run: git config --global --add safe.directory '*'
+
       - name: Install system deps
         run: |
           sudo apt-get install -y -q pkg-config libgmp-dev libsqlite3-dev sqlite3
