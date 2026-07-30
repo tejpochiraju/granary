@@ -123,7 +123,14 @@ jobs:
           opam exec -- bisect-ppx-report html -o _coverage $COVFILES
 
       - name: Upload HTML report as artifact
-        uses: actions/upload-artifact@v4
+        # v3, not v4, on Forgejo (#464). upload-artifact@v4 bundles
+        # @actions/artifact v2, which requires github.com's newer artifact
+        # service and hard-errors against anything it detects as GHES:
+        #   GHESNotSupportedError: ... not currently supported on GHES.
+        # That's a client-side refusal, not a Forgejo gap — Forgejo does
+        # implement the older artifact API that v3 uses. The GitHub copy of
+        # this workflow stays on v4, where v3 is deprecated.
+        uses: actions/upload-artifact@v3
         with:
           name: coverage-report
           path: _coverage/
