@@ -24,11 +24,17 @@
     invariant is broken (e.g. someone reintroduces a writer-lock
     acquire on the reader path) while tolerating environmental jitter.
 
+    Because that ceiling is [1 + T_readers / T_writer], the reader
+    workload is {b calibrated} at startup rather than fixed: see
+    [calibrate_read_ops].  Setting GRANARY_BENCH_READ_OPS pins it
+    instead and skips calibration.
+
     Env vars (all optional):
       GRANARY_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
       GRANARY_BENCH_N_COMMITS       writer commits (default 30)
       GRANARY_BENCH_N_READERS       parallel reader fibers (default 4)
-      GRANARY_BENCH_READ_OPS        cursor walks per reader (default 100)
+      GRANARY_BENCH_READ_OPS        cursor walks per reader (default: calibrated)
+      GRANARY_BENCH_READER_RATIO    target T_readers / T_writer (default 0.6)
       GRANARY_BENCH_SEED_ROWS       initial tree size (default 200)
       GRANARY_BENCH_MIN_SPEEDUP     pass/fail threshold (default 1.2)
 *)
@@ -336,12 +342,62 @@ let run_config ~delay ~n_seed mode ~n_commits ~n_readers ~read_ops =
      Lwt.return { wall = t1 -. t0; writer_phase = w; reader_phase = r })
 ;;
 
+(* Time the baseline reader phase alone — [n_readers] fibers joined, no
+   writer, no fsync delay.  Used by [calibrate_read_ops]. *)
+let probe_reader_phase ~n_seed ~n_readers ~read_ops =
+  cleanup path;
+  run
+    (let* st = open_slow_wal ~path ~delay:0.0 in
+     let* () = seed st n_seed in
+     let t0 = Unix.gettimeofday () in
+     let readers = List.init n_readers (fun _ -> reader_workload st ~read_ops) in
+     let* () = Lwt.join readers in
+     let t1 = Unix.gettimeofday () in
+     let* () = S.close st in
+     Lwt.return (t1 -. t0))
+;;
+
+(* Reader-workload calibration (#468).
+
+   The metric is baseline / parallel = (T_w + T_r) / max (T_w, T_r), so when
+   readers are the shorter phase its arithmetic ceiling is 1 + T_r / T_w — the
+   floor is only reachable if T_r is a real fraction of T_w.  A fixed
+   READ_OPS pins T_r in absolute terms, and once the read path got ~40x
+   faster (#228 / #229 seek_ge, cursor_next, frame cache) T_r collapsed to
+   ~0.04s against a 1.5s writer: a 1.02x ceiling, i.e. the 1.2x gate failed
+   on hosts with fast reads *while overlap was in fact perfect*.
+
+   So size the reader workload against the writer instead of hard-coding it.
+   Two probes give the marginal per-op cost of the reader phase on this host
+   (the difference cancels the fixed cold-cache cost of the first walk), and
+   READ_OPS is chosen so T_r lands near [ratio] x T_w.  The floor then
+   measures overlap quality rather than host read speed. *)
+let calibrate_read_ops ~n_seed ~n_readers ~target_secs =
+  let probe = 1000 in
+  let t1 = probe_reader_phase ~n_seed ~n_readers ~read_ops:probe in
+  let t2 = probe_reader_phase ~n_seed ~n_readers ~read_ops:(2 * probe) in
+  let marginal = (t2 -. t1) /. float_of_int probe in
+  (* Fall back to the average cost if the two probes were swamped by jitter. *)
+  let per_op = if marginal > 0.0 then marginal else t2 /. float_of_int (2 * probe) in
+  if per_op <= 0.0
+  then probe
+  else (
+    let want = int_of_float (target_secs /. per_op) in
+    (* Clamped so a pathologically slow host can't make the bench run for
+       minutes, and a pathologically fast one still does real work. *)
+    max probe (min 200_000 want))
+;;
+
 let test_fsync_overlap () =
   let delay_ms = getenv_int "GRANARY_BENCH_FSYNC_DELAY_MS" 50 in
   let n_commits = getenv_int "GRANARY_BENCH_N_COMMITS" 30 in
   let n_readers = getenv_int "GRANARY_BENCH_N_READERS" 4 in
-  let read_ops = getenv_int "GRANARY_BENCH_READ_OPS" 100 in
   let n_seed = getenv_int "GRANARY_BENCH_SEED_ROWS" 200 in
+  (* Target reader phase as a fraction of the writer phase.  0.6 puts the
+     expected speedup at ~1.6x — matching the 1.38-1.63x historically
+     observed in this image — which leaves ample room above the 1.2x
+     floor. *)
+  let reader_ratio = getenv_float "GRANARY_BENCH_READER_RATIO" 0.6 in
   (* Set conservatively at 1.2.  Observed across 8 runs in the
      granary-dev podman image at default parameters: min 1.38, mean
      1.51, max 1.63.  A regression that reintroduces reader-on-writer-
@@ -350,6 +406,18 @@ let test_fsync_overlap () =
      jitter. *)
   let min_speedup = getenv_float "GRANARY_BENCH_MIN_SPEEDUP" 1.2 in
   let delay = float_of_int delay_ms /. 1000.0 in
+  (* Each commit parks the writer for [delay], so this is the writer phase
+     to within scheduling and B-tree overhead. *)
+  let writer_secs = float_of_int n_commits *. delay in
+  (* An unparseable override falls through to calibration rather than to a
+     hard-coded count — a fixed count is exactly what #468 was. *)
+  let read_ops, read_ops_src =
+    match Option.bind (Sys.getenv_opt "GRANARY_BENCH_READ_OPS") int_of_string_opt with
+    | Some n -> n, "env"
+    | None ->
+      ( calibrate_read_ops ~n_seed ~n_readers ~target_secs:(writer_secs *. reader_ratio)
+      , "calibrated" )
+  in
   (* Run baseline vs parallel under the currently-configured tid pair and
      assert the overlap win clears the floor.  Called once per config. *)
   let measure label =
@@ -357,7 +425,7 @@ let test_fsync_overlap () =
     let par = run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops in
     let speedup = base.wall /. par.wall in
     Printf.printf
-      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d seed=%d\n\
+      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d (%s) seed=%d\n\
       \  baseline=%.3fs (writer=%.3fs, readers=%.3fs) parallel=%.3fs (writer_done=%.3fs \
        reader_done=%.3fs) speedup=%.2fx (min %.2fx)\n\
        %!"
@@ -366,6 +434,7 @@ let test_fsync_overlap () =
       n_commits
       n_readers
       read_ops
+      read_ops_src
       n_seed
       base.wall
       base.writer_phase
