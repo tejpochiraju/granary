@@ -338,6 +338,10 @@ type bound_stmt =
       ; refresh : Ast.refresh_mode
       }
   | BS_drop_view of { name : string }
+  | BS_drop_reactive_view of
+      { name : string
+      ; if_exists : bool
+      }
   | BS_create_trigger of
       { name : string
       ; timing : Ast.trigger_timing
@@ -3868,6 +3872,8 @@ let rec bind_internal ?(views = Hashtbl.create 0) ~named_params ~param_counter c
         | Error e -> Lwt.return (Error e)
         | Ok _ -> Lwt.return (Ok (BS_create_reactive_view { name; query; refresh }))))
   | Ast.S_drop_view { name; if_exists = _ } -> Lwt.return (Ok (BS_drop_view { name }))
+  | Ast.S_drop_reactive_view { name; if_exists } ->
+    Lwt.return (Ok (BS_drop_reactive_view { name; if_exists }))
   | Ast.S_create_trigger { name; timing; event; table; when_; body } ->
     (match reject_reserved_name name with
      | Error e -> Lwt.return (Error e)

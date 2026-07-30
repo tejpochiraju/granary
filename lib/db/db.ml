@@ -167,6 +167,12 @@ let rv_flush_hook : (t -> (unit, error) result Lwt.t) ref =
   ref (fun _ -> Lwt.return (Ok ()))
 ;;
 
+(* #469: forward hook for [DROP REACTIVE VIEW]; populated at the bottom of the
+   file alongside the other reactive-view hooks. *)
+let rv_drop_hook : (t -> name:string -> if_exists:bool -> (unit, error) result Lwt.t) ref =
+  ref (fun _ ~name:_ ~if_exists:_ -> Lwt.return (Ok ()))
+;;
+
 (* Is [tbl] a base table of some registered reactive view? *)
 let rv_is_base_table t tbl =
   Hashtbl.fold
@@ -1496,6 +1502,35 @@ let staged_schema_change t ~apply ~undo ~persist =
     Lwt.return_unit
 ;;
 
+(* Double-quote an identifier, escaping embedded quotes.  Defined here, well
+   above the rest of the [rv_] helpers, because the DROP guards in
+   {!execute_control_op} below need it to render the "use DROP REACTIVE VIEW
+   <name>" hint for a name that cannot be written bare. *)
+let rv_quote id = "\"" ^ String.concat "\"\"" (String.split_on_char '"' id) ^ "\""
+
+(* #469: render [id] the way a caller must type it in SQL: bare when it lexes
+   as a plain identifier, double-quoted otherwise.  Keeps the common hint
+   readable ([DROP REACTIVE VIEW cnt]) while staying copy-pasteable for a name
+   with spaces or punctuation.  Bare keywords are deliberately not quoted: the
+   grammar's [any_ident] accepts them in this position anyway. *)
+let rv_sql_name id =
+  let plain c =
+    (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c = '_'
+  in
+  if id <> "" && (not (id.[0] >= '0' && id.[0] <= '9')) && String.for_all plain id
+  then id
+  else rv_quote id
+;;
+
+(* #469: is [tbl] the materialisation [_rv_<name>] of a *registered* reactive
+   view?  A user table that merely starts with [_rv_] is not — the registry, not
+   the naming convention, is the authority (same rule as {!is_reactive_view}). *)
+let rv_owned_table top tbl =
+  String.length tbl > 4
+  && String.sub tbl 0 4 = "_rv_"
+  && Hashtbl.mem top.reactive_views (String.sub tbl 4 (String.length tbl - 4))
+;;
+
 (* Handle non-DML control / DDL ops (txn control, ATTACH/DETACH, schema
    switch, CREATE/DROP VIEW/TRIGGER, VACUUM).  Returns [Some result] for ops
    it owns and [None] for DML / catch-all ops the caller routes to
@@ -1570,6 +1605,21 @@ let execute_control_op top t sql op =
   | Sql.Plan.Op_active_database_get ->
     (* No rows produced via execute; use [query]/[Db.query] to read. *)
     Some (Lwt.return (Ok ()))
+  | Sql.Plan.Op_drop_table { table_meta; _ }
+    when t == top && (not top.rv_refreshing) && rv_owned_table top table_meta.Cat.name ->
+    (* #469: the driver's own teardown/re-type drops run with [rv_refreshing]
+       set and pass straight through. *)
+    let tbl = table_meta.Cat.name in
+    let view = String.sub tbl 4 (String.length tbl - 4) in
+    Some
+      (Lwt.return
+         (Error
+            (Runtime
+               (Printf.sprintf
+                  "table '%s' is an internal reactive-view materialisation; use DROP \
+                   REACTIVE VIEW %s"
+                  tbl
+                  (rv_sql_name view)))))
   | Sql.Plan.Op_create_view { name; query } ->
     (* #269: participates in an ambient explicit txn (rolls back atomically);
        autocommits otherwise. *)
@@ -1590,6 +1640,44 @@ let execute_control_op top t sql op =
     (* #427: classify, materialise [_rv_<name>], build any delta engine, and
        persist the definition.  Reactive views live on the top-level handle. *)
     Some (!rv_create_hook top ~sql ~name query refresh)
+  | Sql.Plan.Op_drop_reactive_view { name; if_exists } when t == top ->
+    (* #469: deregister, drop [_rv_<name>], and forget the persisted
+       definition.  Like CREATE, this is immediate rather than staged. *)
+    Some (!rv_drop_hook top ~name ~if_exists)
+  | Sql.Plan.Op_drop_reactive_view { name; _ } ->
+    (* #469 review: reactive views live on [top] only, but [rv_drop]'s internal
+       [DROP TABLE IF EXISTS _rv_<name>] re-enters [compile_routed], which
+       routes by [top.active_schema].  Under [PRAGMA active_database = aux] it
+       would therefore aim at [aux] and silently no-op, removing the registry
+       entry and main's catalog row while leaving main's [_rv_<name>] table
+       behind — after which re-CREATEing the view fails with "table already
+       exists".  Falling through to [top] would be just as surprising (the
+       statement would silently ignore the active schema), so refuse and say
+       what to do instead.  Fires under IF EXISTS too: the statement is
+       misrouted regardless of whether the view exists. *)
+    Some
+      (Lwt.return
+         (Error
+            (Runtime
+               (Printf.sprintf
+                  "DROP REACTIVE VIEW %s: reactive views exist only in the main schema; \
+                   run this with PRAGMA active_database = main"
+                  (rv_sql_name name)))))
+  | Sql.Plan.Op_drop_view { name } when t == top && Hashtbl.mem top.reactive_views name ->
+    (* #469: DROP VIEW only knows about [t.views]; on a reactive view it would
+       succeed while removing nothing.  Fires even under IF EXISTS — the object
+       exists, the statement is the wrong one.  Reactive views live on the
+       top-level handle only, so [t == top] keeps this from misfiring on a
+       DROP VIEW routed to an ATTACHed sub-handle (see the [Op_drop_table]
+       guard above). *)
+    Some
+      (Lwt.return
+         (Error
+            (Runtime
+               (Printf.sprintf
+                  "'%s' is a reactive view; use DROP REACTIVE VIEW %s"
+                  name
+                  (rv_sql_name name)))))
   | Sql.Plan.Op_drop_view { name } ->
     Some
       (let prev = Hashtbl.find_opt t.views name in
@@ -2634,8 +2722,8 @@ module Rv = Reactive_view
 
 let rv_table_name name = "_rv_" ^ name
 
-(* Double-quote an identifier, escaping embedded quotes. *)
-let rv_quote id = "\"" ^ String.concat "\"\"" (String.split_on_char '"' id) ^ "\""
+(* [rv_quote] / [rv_sql_name] are defined further up, next to [rv_owned_table],
+   because {!execute_control_op}'s DROP guards need them. *)
 
 let rv_ty_sql = function
   | Row.Integer -> "INTEGER"
@@ -3188,6 +3276,143 @@ let rv_create top ~sql ~name query refresh =
            Lwt.return_unit))
 ;;
 
+(* #469: erase a reactive view's persistent state: catalog row first, then the
+   [_rv_<name>] materialisation.
+
+   The order matters, and it is *not* the one the design spec §2 wrote down —
+   the spec's stated rationale ("a crash part-way must not leave something that
+   resurrects or breaks the db") is what this order actually achieves, so the
+   order is what changed, not the goal.  These are two separate autocommit
+   transactions ([Cat.remove_reactive_view] always takes its own writer txn, and
+   [execute] autocommits), so there is a real window between them.  With the
+   table dropped first, a crash in that window reopens with a catalog row and no
+   table: [rv_load] re-registers the view, [rv_refresh_one ~resync:true] runs
+   [SELECT * FROM _rv_<name>] and fails.  That failure is swallowed at open, but
+   [drive_reactive] propagates it thereafter, so *every* user write to the base
+   table fails — the view does not merely resurrect, it bricks the write path.
+
+   Removing the catalog row first inverts the failure: the window leaves an
+   orphan [_rv_<name>] table with no catalog row and no registry entry.  That is
+   inert (nothing consults it) and droppable with a plain [DROP TABLE], since
+   the internal-table guard keys off the registry, not the name.  It also
+   mirrors [rv_create], which registers registry+catalog last and so fails
+   toward an orphan table too. *)
+let rv_erase_persistent top ~name =
+  let* () = Cat.remove_reactive_view top.store ~name in
+  execute top (Printf.sprintf "DROP TABLE IF EXISTS %s" (rv_quote (rv_table_name name)))
+;;
+
+(* #469 review: the registry is the authority for *live* views, but #437
+   deliberately leaves a view whose stored SQL fails to re-parse OUT of the
+   registry while keeping its catalog row and [_rv_] table.  Consulting only the
+   registry would answer "no such reactive view" for such a view forever, so its
+   catalog row could never be removed through SQL and every open would keep
+   warning.  Fall back to the catalog before erroring, so [DROP REACTIVE VIEW]
+   really is the single removal path. *)
+let rv_drop_unloadable top ~name ~if_exists =
+  let* pairs = Cat.load_all_reactive_views top.store in
+  if List.mem_assoc name pairs
+  then rv_erase_persistent top ~name
+  else if if_exists
+  then Lwt.return (Ok ())
+  else Lwt.return (Error (Runtime (Printf.sprintf "no such reactive view: %s" name)))
+;;
+
+(* #469: retire a reactive view — erase its persistent state via
+   [rv_erase_persistent] (see there for the ordering argument), then deregister
+   it.  Runs with [rv_refreshing] set so the internal [DROP TABLE] is not
+   rejected by the internal-table guard in [execute_control_op].
+
+   #477 review: the persistent work happens FIRST and the in-memory mutations
+   (registry removal, [rv_pending] pruning) only on [Ok], so a failed drop
+   cannot half-succeed.  Failure mode: on error nothing in memory changed and
+   the view stays live — still maintained on base-table writes, still holding
+   its callbacks, still in [reactive_view_names] — so the caller's error is the
+   truth and a retry is meaningful.  The persistent state may be partially
+   erased (catalog row gone, [_rv_] table left), which is exactly the state the
+   crash-window reasoning above already covers: an inert orphan table.  Note
+   that a catalog failure *raises* rather than returning [Error] (#476), so the
+   persistent work is wrapped in [Lwt.catch].
+
+   That in-memory survival is only process-scoped, though: if the failure landed
+   after [Cat.remove_reactive_view] succeeded, the catalog row is already gone
+   while the registry entry lives on, so the view keeps consuming base-table
+   deltas and writing into [_rv_<name>] for the rest of this process — and then
+   vanishes at the next open, because [rv_load] has no catalog row left to
+   rebuild it from.  An errored drop therefore still becomes an effective drop
+   across a restart; the error means "retry now", not "nothing happened".
+
+   #477 re-review: both branches below go through one [Lwt.catch] so
+   [DROP REACTIVE VIEW] has a single calling convention — it returns [Error] for
+   a store/catalog fault whether or not the view is live.  The unloadable branch
+   needs the cover just as much: [rv_drop_unloadable] raises from
+   [Cat.load_all_reactive_views] as well as from [rv_erase_persistent].  The
+   [Lwt.catch] stays INSIDE the [Lwt.finalize] so [rv_refreshing] is restored on
+   every path. *)
+let rv_drop top ~name ~if_exists =
+  (* #473: [Cat.remove_reactive_view] below always writes through its own
+     fresh writer transaction ([borrow_or_autocommit ?txn:None] ->
+     [S.rw_begin]).  Unlike the sibling table/view DDL path
+     ([staged_schema_change] at ~line 1490), it does not thread
+     [top.explicit_txn] through, so running it while an explicit transaction
+     already holds the store's single-writer lock self-deadlocks
+     unconditionally.  Threading [?txn] is the real fix but would make
+     reactive-view DDL transactional, which is a deliberate design decision
+     we are not overturning here (see #473) — so reject up front, before any
+     state is mutated, rather than hang. *)
+  if top.explicit_txn <> None
+  then
+    Lwt.return
+      (Error
+         (Runtime
+            "DROP REACTIVE VIEW is not supported inside an explicit transaction (see \
+             #473); run it in autocommit"))
+  else (
+    (* Live in the registry?  Decided once, up front: it selects the erase
+       strategy and, below, whether there is any in-memory state to drop. *)
+    let live = Hashtbl.mem top.reactive_views name in
+    top.rv_refreshing <- true;
+    let* r =
+      Lwt.finalize
+        (fun () ->
+           Lwt.catch
+             (fun () ->
+                if live
+                then rv_erase_persistent top ~name
+                else rv_drop_unloadable top ~name ~if_exists)
+             (function
+               (* Deliberately narrower than the [Op_vacuum] arm above, which
+                  converts every exception: cancellation and the two resource
+                  exhaustions are not drop failures, and turning [Lwt.Canceled]
+                  into an [Error] would report a spurious failed drop. *)
+               | (Lwt.Canceled | Stack_overflow | Out_of_memory) as e -> Lwt.fail e
+               | Failure msg -> Lwt.return (Error (Runtime msg))
+               | e -> Lwt.return (Error (Runtime (Printexc.to_string e)))))
+        (fun () ->
+           top.rv_refreshing <- false;
+           Lwt.return_unit)
+    in
+    match r with
+    | Error _ as e -> Lwt.return e
+    | Ok () when not live -> Lwt.return (Ok ())
+    | Ok () ->
+      Hashtbl.remove top.reactive_views name;
+      (* Forget pending base-table deltas no remaining view depends on.
+         Currently dead code: in autocommit [rv_flush_inner]'s finalizer empties
+         [rv_pending] after every statement, so it can only ever accumulate
+         inside an explicit transaction — which [rv_drop] rejects outright
+         above.  Kept because it becomes live the moment #473 threads [?txn]
+         through and lets this run under an explicit [BEGIN]. *)
+      let stale =
+        Hashtbl.fold
+          (fun tbl _ acc -> if rv_is_base_table top tbl then acc else tbl :: acc)
+          top.rv_pending
+          []
+      in
+      List.iter (Hashtbl.remove top.rv_pending) stale;
+      Lwt.return (Ok ()))
+;;
+
 (* Rebuild the in-memory registry on open: re-parse each stored definition and
    restore delta-engine state from the current base contents.  Then reconcile
    each [_rv_<name>] table against the freshly-computed materialisation: a crash
@@ -3291,6 +3516,7 @@ let register_view_callback top ~view_name cb =
 
 let () =
   rv_create_hook := rv_create;
+  rv_drop_hook := rv_drop;
   (rv_flush_hook := fun top -> rv_flush top);
   rv_load_hook := rv_load
 ;;

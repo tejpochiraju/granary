@@ -425,6 +425,14 @@ and stmt =
       { name : string
       ; if_exists : bool
       }
+  | S_drop_reactive_view of
+      { name : string
+      ; if_exists : bool
+      }
+  (** [DROP REACTIVE VIEW [IF EXISTS] name] (#469).  Retires a reactive view:
+        deregisters it, drops its [_rv_<name>] materialisation, and removes its
+        persisted definition.  Distinct from {!S_drop_view}, which only knows
+        about plain SQL views. *)
   | S_create_trigger of
       { name : string
       ; timing : trigger_timing

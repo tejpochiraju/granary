@@ -5776,6 +5776,7 @@ let op_name = function
   | Plan.Op_create_view { name; _ } -> "CreateView(" ^ name ^ ")"
   | Plan.Op_create_reactive_view { name; _ } -> "CreateReactiveView(" ^ name ^ ")"
   | Plan.Op_drop_view { name } -> "DropView(" ^ name ^ ")"
+  | Plan.Op_drop_reactive_view { name; _ } -> "DropReactiveView(" ^ name ^ ")"
   | Plan.Op_create_trigger { name; _ } -> "CreateTrigger(" ^ name ^ ")"
   | Plan.Op_drop_trigger { name } -> "DropTrigger(" ^ name ^ ")"
   | Plan.Op_pragma_rows _ -> "Pragma"
@@ -6974,6 +6975,7 @@ let execute_with_count
   | Plan.Op_create_view _
   | Plan.Op_create_reactive_view _
   | Plan.Op_drop_view _
+  | Plan.Op_drop_reactive_view _
   | Plan.Op_create_trigger _
   | Plan.Op_drop_trigger _
   | Plan.Op_no_op -> Lwt.return 0
@@ -9855,6 +9857,7 @@ and stream_explain clock params store mode cat analyze inner =
         | Plan.Op_create_view _
         | Plan.Op_create_reactive_view _
         | Plan.Op_drop_view _
+        | Plan.Op_drop_reactive_view _
         | Plan.Op_create_trigger _
         | Plan.Op_drop_trigger _
         | Plan.Op_pragma_set_user_version _
@@ -10145,6 +10148,7 @@ and to_stream
   | Plan.Op_create_view _
   | Plan.Op_create_reactive_view _
   | Plan.Op_drop_view _
+  | Plan.Op_drop_reactive_view _
   | Plan.Op_create_trigger _
   | Plan.Op_drop_trigger _
   | Plan.Op_begin

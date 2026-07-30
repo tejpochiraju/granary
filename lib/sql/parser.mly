@@ -277,6 +277,7 @@ stmt:
   | s = create_reactive_view { s }
   | s = create_view       { s }
   | s = drop_view         { s }
+  | s = drop_reactive_view { s }
   | s = create_trigger    { s }
   | s = drop_trigger      { s }
   | s = create_table      { s }
@@ -450,6 +451,12 @@ drop_view:
     { Ast.S_drop_view { name; if_exists = false } }
   | DROP VIEW IF EXISTS name = any_ident
     { Ast.S_drop_view { name; if_exists = true } }
+
+drop_reactive_view:
+  | DROP REACTIVE VIEW name = any_ident
+    { Ast.S_drop_reactive_view { name; if_exists = false } }
+  | DROP REACTIVE VIEW IF EXISTS name = any_ident
+    { Ast.S_drop_reactive_view { name; if_exists = true } }
 
 create_trigger:
   | CREATE TRIGGER name = any_ident

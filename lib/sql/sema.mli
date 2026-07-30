@@ -288,6 +288,10 @@ type bound_stmt =
       ; refresh : Ast.refresh_mode
       }
   | BS_drop_view of { name : string }
+  | BS_drop_reactive_view of
+      { name : string
+      ; if_exists : bool
+      }
   | BS_create_trigger of
       { name : string
       ; timing : Ast.trigger_timing

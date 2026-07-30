@@ -326,7 +326,11 @@ val execute_with_changes : t -> string -> (table_changes, error) result Lwt.t
     returning [(_, error) result] can ever produce, and would force every
     existing exhaustive match to handle it.  A caller chaining against [error]
     maps it explicitly, e.g.
-    [Result.map_error (fun (`Unknown_view v) -> Runtime ("unknown view " ^ v))]. *)
+    [Result.map_error (fun (`Unknown_view v) -> Runtime ("unknown view " ^ v))].
+
+    Callbacks are held by the registry entry, so [DROP REACTIVE VIEW] discards
+    them: a callback registered against a dropped view stops firing, and
+    re-registering reports [`Unknown_view]. *)
 val register_view_callback
   :  t
   -> view_name:string
@@ -337,7 +341,31 @@ val register_view_callback
     registry, so — unlike probing the catalog for [_rv_<name>] — a user table
     named [_rv_<x>] does not make [x] look live, and neither does a persisted
     view whose stored SQL failed to re-parse at open (which leaves its [_rv_]
-    table behind and logs a warning). *)
+    table behind and logs a warning).
+
+    #469: a view leaves this list when [DROP REACTIVE VIEW name] retires it —
+    the only supported removal path.  The two statements a caller would most
+    plausibly reach for instead are rejected rather than silently half-working:
+    [DROP TABLE _rv_<name>] and [DROP VIEW <name>] on a live reactive view both
+    error and point at [DROP REACTIVE VIEW].  Both guards key off the registry,
+    so they protect *live* views only: for a persisted view whose stored SQL
+    failed to re-parse at open (and which is therefore absent from the
+    registry) neither fires — [DROP TABLE _rv_<name>] succeeds and
+    [DROP VIEW <name>] still no-ops — but [DROP REACTIVE VIEW] recovers such a
+    view regardless, erasing its catalog row and tolerating an already-missing
+    [_rv_] table.  That is not a guarantee that the registry can never drift
+    from the catalog — by design (see the spec's
+    non-goals) nothing yet stops [ALTER TABLE _rv_<name> RENAME TO …] or
+    [DROP TABLE <base_table>] from desynchronising them.
+    Reactive-view DDL is immediate rather than transactional: a
+    [ROLLBACK] after a drop does not bring the view back.  #473: inside an
+    explicit transaction, [DROP REACTIVE VIEW] is rejected outright (not
+    staged, not executed early) — it returns an error rather than
+    participating in the transaction at all, so there is nothing for
+    [ROLLBACK] or [COMMIT] to interact with; run it in autocommit.
+    [CREATE REACTIVE VIEW] inside an explicit transaction is *not* similarly
+    guarded and currently hangs — it is not "symmetric" with the drop case;
+    see #473, which also tracks that gap. *)
 val reactive_view_names : t -> string list
 
 (** #437: whether [name] is a live reactive view, i.e. is in

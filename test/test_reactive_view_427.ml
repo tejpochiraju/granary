@@ -45,6 +45,14 @@ let exec_err db sql =
   | Error e -> Some (Format.asprintf "%a" Db.pp_error e)
 ;;
 
+(* #469: substring search — error strings are part of the contract. *)
+let contains ~needle haystack =
+  let nl = String.length needle
+  and hl = String.length haystack in
+  let rec go i = i + nl <= hl && (String.sub haystack i nl = needle || go (i + 1)) in
+  go 0
+;;
+
 (* (group, value) rows read from a two-column relation, sorted. *)
 let rows2 db sql : (string * int) list =
   let stream = unwrap (run (Db.query db sql)) in
@@ -58,6 +66,16 @@ let rows2 db sql : (string * int) list =
 ;;
 
 let mv db name = rows2 db (Printf.sprintf "SELECT * FROM _rv_%s" name)
+
+(* #469: does the materialisation [_rv_<name>] still exist as a table?  Tells
+   "the drop happened" apart from "the drop was aimed at another schema". *)
+let rv_table_exists db name =
+  match run (Db.query db (Printf.sprintf "SELECT * FROM _rv_%s" name)) with
+  | Ok stream ->
+    ignore (run (Lwt_stream.to_list stream));
+    true
+  | Error _ -> false
+;;
 
 (* single-column text rows, sorted, duplicates preserved (multiset). *)
 let rows1 db sql : string list =
@@ -295,6 +313,380 @@ let test_register_reports_unknown_view () =
       (Db.register_view_callback db ~view_name:"t" cb))
 ;;
 
+(* #469: DROP REACTIVE VIEW is the supported removal path. *)
+let test_drop_removes_view () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    Alcotest.(check bool) "live before the drop" true (Db.is_reactive_view db "cnt");
+    exec db "DROP REACTIVE VIEW cnt";
+    Alcotest.(check bool) "not live after" false (Db.is_reactive_view db "cnt");
+    Alcotest.(check (list string)) "not listed after" [] (Db.reactive_view_names db);
+    (* the materialisation is gone: selecting from it is now an error *)
+    Alcotest.(check bool)
+      "_rv_cnt no longer exists"
+      true
+      (Option.is_some (exec_err db "SELECT * FROM _rv_cnt"));
+    (* a full-refresh view (MIN is not delta-maintainable) drops the same way *)
+    exec db "CREATE REACTIVE VIEW lo AS SELECT grp, MIN(amt) FROM t GROUP BY grp";
+    Alcotest.(check (list string))
+      "the full-refresh view is live"
+      [ "lo" ]
+      (Db.reactive_view_names db);
+    exec db "DROP REACTIVE VIEW lo";
+    Alcotest.(check (list string)) "and drops too" [] (Db.reactive_view_names db);
+    (* REACTIVE remains usable as an ordinary identifier *)
+    exec db "CREATE TABLE reactive (reactive TEXT)";
+    exec db "DROP TABLE reactive")
+;;
+
+let test_drop_stops_callbacks () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    let fired = ref 0 in
+    (match
+       Db.register_view_callback db ~view_name:"cnt" (fun _ ->
+         incr fired;
+         Lwt.return_unit)
+     with
+     | Ok () -> ()
+     | Error (`Unknown_view n) -> Alcotest.failf "expected %S to be a live view" n);
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    Alcotest.(check int) "callback fires while live" 1 !fired;
+    exec db "DROP REACTIVE VIEW cnt";
+    exec db "INSERT INTO t VALUES (2, 'b', 20)";
+    Alcotest.(check int) "callback is silent after the drop" 1 !fired;
+    Alcotest.check
+      register_result
+      "re-registering reports the view as unknown"
+      (Error (`Unknown_view "cnt"))
+      (Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit)))
+;;
+
+let test_drop_if_exists () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    (match exec_err db "DROP REACTIVE VIEW nosuch" with
+     | None -> Alcotest.fail "dropping a missing reactive view must error"
+     | Some msg ->
+       Alcotest.(check bool) "error names the view" true (contains ~needle:"nosuch" msg));
+    exec db "DROP REACTIVE VIEW IF EXISTS nosuch";
+    (* IF EXISTS on a live view still drops it *)
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "DROP REACTIVE VIEW IF EXISTS cnt";
+    Alcotest.(check (list string)) "dropped" [] (Db.reactive_view_names db))
+;;
+
+(* A dropped view must not come back on reopen, and must not leave the delta
+   engine or the old materialisation behind for a same-named successor. *)
+let test_drop_is_durable_and_recreatable () =
+  let path = tmp_path () in
+  let cleanup () =
+    try Sys.remove path with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW v AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    exec db "INSERT INTO t VALUES (2, 'a', 5)";
+    exec db "DROP REACTIVE VIEW v";
+    run (Db.close db);
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close db) with
+        | _ -> ())
+      (fun () ->
+         Alcotest.(check (list string))
+           "the drop survived the reopen"
+           []
+           (Db.reactive_view_names db);
+         (* re-create the same name with a *different* aggregate: no stale
+            registry, catalog row, or _rv_ table may leak through *)
+         exec db "CREATE REACTIVE VIEW v AS SELECT grp, SUM(amt) FROM t GROUP BY grp";
+         Alcotest.(check (list (pair string int)))
+           "re-created view materialises the new query"
+           [ "a", 15 ]
+           (mv db "v");
+         exec db "INSERT INTO t VALUES (3, 'a', 1)";
+         Alcotest.(check (list (pair string int)))
+           "and is maintained"
+           [ "a", 16 ]
+           (mv db "v")))
+;;
+
+(* #469: the materialisation is internal — dropping it directly would leave the
+   registry claiming a view with no _rv_ table.  A user table that merely starts
+   with [_rv_] and has no registry entry stays droppable. *)
+let test_rv_table_drop_rejected () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    (match exec_err db "DROP TABLE _rv_cnt" with
+     | None -> Alcotest.fail "dropping an internal _rv_ table must be rejected"
+     | Some msg ->
+       Alcotest.(check bool)
+         "error points at DROP REACTIVE VIEW"
+         true
+         (contains ~needle:"DROP REACTIVE VIEW cnt" msg));
+    Alcotest.(check bool) "the view is untouched" true (Db.is_reactive_view db "cnt");
+    (* the view still works *)
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    Alcotest.(check (list (pair string int))) "still maintained" [ "a", 1 ] (mv db "cnt");
+    (* a plain user table with an _rv_ prefix and no registry entry still drops *)
+    exec db "CREATE TABLE _rv_ghost (a TEXT)";
+    exec db "DROP TABLE _rv_ghost";
+    (* and after a proper drop, the name is droppable as an ordinary table *)
+    exec db "DROP REACTIVE VIEW cnt";
+    exec db "CREATE TABLE _rv_cnt (a TEXT)";
+    exec db "DROP TABLE _rv_cnt")
+;;
+
+(* #469: DROP VIEW used to silently succeed as a no-op on a reactive view —
+   reactive views live in their own registry, not in [t.views]. *)
+let test_drop_view_on_reactive_view_errors () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    (match exec_err db "DROP VIEW cnt" with
+     | None -> Alcotest.fail "DROP VIEW on a reactive view must not silently succeed"
+     | Some msg ->
+       Alcotest.(check bool)
+         "error points at DROP REACTIVE VIEW"
+         true
+         (contains ~needle:"DROP REACTIVE VIEW cnt" msg));
+    Alcotest.(check bool) "the view is untouched" true (Db.is_reactive_view db "cnt");
+    (* IF EXISTS does not excuse it: the object exists, the statement is wrong *)
+    Alcotest.(check bool)
+      "IF EXISTS still errors"
+      true
+      (Option.is_some (exec_err db "DROP VIEW IF EXISTS cnt"));
+    (* plain views are unaffected *)
+    exec db "CREATE VIEW plain AS SELECT grp FROM t";
+    exec db "DROP VIEW plain")
+;;
+
+(* #469/#473: reactive-view DDL is immediate, not staged (symmetric with
+   CREATE REACTIVE VIEW), and is unsupported inside an explicit transaction
+   at all.
+
+   [rv_drop] (lib/db/db.ml) writes the registry removal through
+   [Cat.remove_reactive_view top.store ~name] without threading the ambient
+   [t.explicit_txn] as [?txn] — unlike the sibling [staged_schema_change]
+   path used by [Op_create_view]/[Op_drop_view]. Because that write always
+   acquires its own fresh writer transaction ([borrow_or_autocommit
+   ?txn:None] -> [S.rw_begin] -> [Rwlock.acquire_write t.lock]), running it
+   while an explicit [BEGIN] already holds that same single-writer lock
+   would self-deadlock unconditionally (confirmed empirically: two prior
+   runs killed at 120s/280s, both parked at 0% CPU). Threading [?txn] is the
+   real fix but would make reactive-view DDL transactional, overturning a
+   deliberate design decision (#269 makes that area delicate), so instead
+   [rv_drop] rejects the statement outright — before mutating any state —
+   whenever [top.explicit_txn] is not [None]. This test pins that rejection:
+   the error surfaces immediately (not a hang), mentions the transaction,
+   leaves the view live, and the same drop succeeds once back in
+   autocommit. Because the failure mode is now a returned [Error] rather
+   than a lock wait, a regression here fails an assertion instead of
+   blocking the suite. Tracked as #473 (real fix: thread [?txn] through). *)
+let test_drop_is_not_rolled_back () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "BEGIN";
+    (match exec_err db "DROP REACTIVE VIEW cnt" with
+     | None -> Alcotest.fail "DROP REACTIVE VIEW inside BEGIN must not silently succeed"
+     | Some msg ->
+       Alcotest.(check bool)
+         "error mentions the transaction"
+         true
+         (contains ~needle:"transaction" msg));
+    Alcotest.(check bool)
+      "the view is still live inside the (still open) transaction"
+      true
+      (Db.is_reactive_view db "cnt");
+    (* IF EXISTS does not excuse it: the statement is unsupported here
+       regardless of whether the view exists (mirrors DROP VIEW's guard). *)
+    Alcotest.(check bool)
+      "IF EXISTS is rejected too, inside a transaction"
+      true
+      (Option.is_some (exec_err db "DROP REACTIVE VIEW IF EXISTS cnt"));
+    Alcotest.(check bool)
+      "the view is still live after the IF EXISTS attempt"
+      true
+      (Db.is_reactive_view db "cnt");
+    exec db "ROLLBACK";
+    Alcotest.(check bool)
+      "the view is still live after ROLLBACK"
+      true
+      (Db.is_reactive_view db "cnt");
+    (* the same drop now succeeds in autocommit *)
+    exec db "DROP REACTIVE VIEW cnt";
+    Alcotest.(check (list string))
+      "autocommit drop is immediate"
+      []
+      (Db.reactive_view_names db))
+;;
+
+(* #469 review finding: reactive views live only on the top-level handle, so
+   the guard must not fire for drops routed to an ATTACHed sub-handle — an
+   ordinary, unrelated table there that happens to share the [_rv_<name>]
+   naming convention with a *main*-schema view must stay droppable. *)
+let test_rv_guard_does_not_cross_attach () =
+  let () = Granary_unix.install () in
+  let aux = tmp_path () in
+  let cleanup () =
+    try Sys.remove aux with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    with_db (fun db ->
+      exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+      exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+      exec db "INSERT INTO t VALUES (1, 'a', 10)";
+      exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux);
+      exec db "PRAGMA active_database = aux";
+      (* an ordinary table in [aux] that happens to share the main-schema
+         view's materialisation name — no registry entry ties it to [cnt]. *)
+      exec db "CREATE TABLE _rv_cnt (a TEXT)";
+      exec db "DROP TABLE _rv_cnt";
+      exec db "PRAGMA active_database = main";
+      Alcotest.(check bool)
+        "the main view is untouched"
+        true
+        (Db.is_reactive_view db "cnt");
+      (* #469 review: without this, the test would still pass if the aux-side
+         drop had reached through to main's materialisation — the registry
+         entry alone does not prove the table survived. *)
+      Alcotest.(check (list (pair string int)))
+        "main's _rv_cnt survived, contents intact"
+        [ "a", 1 ]
+        (mv db "cnt");
+      exec db "DETACH DATABASE aux"))
+;;
+
+(* #469 review: [rv_drop] removes the registry entry and main's catalog row
+   directly, but its internal [DROP TABLE IF EXISTS _rv_<name>] re-enters
+   [compile_routed], which routes by [active_schema].  Under [active_database =
+   aux] that drop would be aimed at [aux] and silently no-op, orphaning main's
+   [_rv_cnt] and making a later re-CREATE fail with "table already exists".
+   The statement is therefore refused outright off the top-level handle. *)
+let test_drop_reactive_view_rejected_off_main () =
+  let () = Granary_unix.install () in
+  let aux = tmp_path () in
+  let cleanup () =
+    try Sys.remove aux with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    with_db (fun db ->
+      exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+      exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+      exec db "INSERT INTO t VALUES (1, 'a', 10)";
+      exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux);
+      exec db "PRAGMA active_database = aux";
+      (match exec_err db "DROP REACTIVE VIEW cnt" with
+       | None -> Alcotest.fail "DROP REACTIVE VIEW off the main schema must be rejected"
+       | Some msg ->
+         Alcotest.(check bool)
+           "error says to run it against main"
+           true
+           (contains ~needle:"active_database = main" msg));
+      (* IF EXISTS does not excuse a misrouted statement either. *)
+      Alcotest.(check bool)
+        "IF EXISTS is rejected off main too"
+        true
+        (Option.is_some (exec_err db "DROP REACTIVE VIEW IF EXISTS cnt"));
+      exec db "PRAGMA active_database = main";
+      Alcotest.(check bool) "the view is still live" true (Db.is_reactive_view db "cnt");
+      Alcotest.(check (list (pair string int)))
+        "and its materialisation is intact"
+        [ "a", 1 ]
+        (mv db "cnt");
+      (* the drop works once routed at main, and the name is re-creatable —
+         which it would not be had a stray _rv_cnt been left behind *)
+      exec db "DROP REACTIVE VIEW cnt";
+      Alcotest.(check bool) "_rv_cnt is gone" false (rv_table_exists db "cnt");
+      exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+      Alcotest.(check (list (pair string int)))
+        "re-created cleanly"
+        [ "a", 1 ]
+        (mv db "cnt");
+      exec db "DETACH DATABASE aux"))
+;;
+
+(* #469 review: two views over one base table.  Dropping one must deregister
+   exactly that view and leave the other maintained — this is the invariant the
+   registry / [rv_pending] manipulation in [rv_drop] exists to protect. *)
+let test_drop_one_of_two_views_on_same_base () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "CREATE REACTIVE VIEW sm AS SELECT grp, SUM(amt) FROM t GROUP BY grp";
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    exec db "DROP REACTIVE VIEW cnt";
+    Alcotest.(check (list string))
+      "only [sm] remains live"
+      [ "sm" ]
+      (Db.reactive_view_names db);
+    Alcotest.(check bool) "_rv_cnt is gone" false (rv_table_exists db "cnt");
+    (* the survivor keeps tracking the shared base table across every op kind *)
+    exec db "INSERT INTO t VALUES (2, 'a', 5)";
+    Alcotest.(check (list (pair string int))) "insert tracked" [ "a", 15 ] (mv db "sm");
+    exec db "UPDATE t SET amt = 1 WHERE id = 1";
+    Alcotest.(check (list (pair string int))) "update tracked" [ "a", 6 ] (mv db "sm");
+    exec db "INSERT INTO t VALUES (3, 'b', 4)";
+    exec db "DELETE FROM t WHERE id = 2";
+    Alcotest.(check (list (pair string int)))
+      "delete tracked"
+      [ "a", 1; "b", 4 ]
+      (mv db "sm");
+    Alcotest.(check (list (pair string int)))
+      "survivor = authoritative"
+      (rows2 db "SELECT grp, SUM(amt) FROM t GROUP BY grp")
+      (mv db "sm"))
+;;
+
+(* #469 review finding: the [t == top] guard on the new [Op_drop_view] arm
+   had no direct regression test — [test_rv_guard_does_not_cross_attach]
+   only exercises the [Op_drop_table] arm.  A plain view sharing the
+   reactive view's name, but living in an ATTACHed schema, must stay
+   droppable via ordinary DROP VIEW: the guard must consult [top]'s
+   registry only when the drop is actually routed to [top]. *)
+let test_drop_view_guard_does_not_cross_attach () =
+  let () = Granary_unix.install () in
+  let aux = tmp_path () in
+  let cleanup () =
+    try Sys.remove aux with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    with_db (fun db ->
+      exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+      exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+      exec db (Printf.sprintf "ATTACH DATABASE '%s' AS aux" aux);
+      exec db "PRAGMA active_database = aux";
+      (* an ordinary plain view in [aux] that happens to share the
+         main-schema reactive view's name — no registry entry ties it to
+         [cnt] on [top]. *)
+      exec db "CREATE TABLE u (a TEXT)";
+      exec db "CREATE VIEW cnt AS SELECT a FROM u";
+      exec db "DROP VIEW cnt";
+      exec db "PRAGMA active_database = main";
+      Alcotest.(check bool)
+        "the main reactive view is untouched"
+        true
+        (Db.is_reactive_view db "cnt");
+      exec db "DETACH DATABASE aux"))
+;;
+
 (* The registry is rebuilt from the catalog on open: names must survive a
    reopen, otherwise a hook wired at startup attaches to nothing. *)
 let test_names_survive_reopen () =
@@ -381,6 +773,85 @@ let test_unloadable_view_is_not_live stored_sql () =
            "…and registering reports it unknown rather than attaching nothing"
            (Error (`Unknown_view "cnt"))
            (Db.register_view_callback db ~view_name:"cnt" (fun _ -> Lwt.return_unit))))
+;;
+
+(* #469 review: a view left out of the registry by #437 (stored SQL that no
+   longer re-parses) still owns a catalog row and an [_rv_] table.  If
+   [rv_drop] consulted only the registry it would answer "no such reactive
+   view" forever, so that row could never be removed through SQL and every open
+   would keep warning.  [DROP REACTIVE VIEW] must fall back to the catalog and
+   clean it up, and the reopen after must be quiet. *)
+let test_drop_removes_unloadable_view () =
+  let path = tmp_path () in
+  let cleanup () =
+    try Sys.remove path with
+    | _ -> ()
+  in
+  cleanup ();
+  Fun.protect ~finally:cleanup (fun () ->
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, grp TEXT, amt INTEGER)";
+    exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+    exec db "INSERT INTO t VALUES (1, 'a', 10)";
+    run (Db.close db);
+    (* corrupt the stored definition behind the engine's back, exactly as
+       [test_unloadable_view_is_not_live] does *)
+    (match run (Granary_unix.Store.open_file ~path ()) with
+     | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
+     | Ok store ->
+       run (Cat.persist_reactive_view store ~name:"cnt" ~sql:"NOT SQL AT ALL");
+       run (Granary_store.Store.close store));
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    Alcotest.(check (list string))
+      "precondition: not live, so the registry alone cannot drop it"
+      []
+      (Db.reactive_view_names db);
+    Alcotest.(check bool)
+      "precondition: _rv_cnt is still there"
+      true
+      (rv_table_exists db "cnt");
+    exec db "DROP REACTIVE VIEW cnt";
+    Alcotest.(check bool) "the orphan _rv_cnt is gone" false (rv_table_exists db "cnt");
+    run (Db.close db);
+    (* the catalog row is gone too: the reopen finds nothing to warn about and
+       nothing to skip *)
+    (match run (Granary_unix.Store.open_file ~path ()) with
+     | Error e -> Alcotest.failf "store open: %a" Granary_store.Store.pp_error e
+     | Ok store ->
+       let pairs = run (Cat.load_all_reactive_views store) in
+       Alcotest.(check (list string))
+         "no reactive-view catalog rows remain"
+         []
+         (List.map fst pairs);
+       run (Granary_store.Store.close store));
+    let db = unwrap (run (Granary_unix.open_file ~path ())) in
+    Fun.protect
+      ~finally:(fun () ->
+        try run (Db.close db) with
+        | _ -> ())
+      (fun () ->
+         Alcotest.(check (list string)) "reopen is quiet" [] (Db.reactive_view_names db);
+         (* and the name is fully reusable *)
+         exec db "CREATE REACTIVE VIEW cnt AS SELECT grp, COUNT(*) FROM t GROUP BY grp";
+         Alcotest.(check (list (pair string int)))
+           "re-created over the surviving base data"
+           [ "a", 1 ]
+           (mv db "cnt")))
+;;
+
+(* #469 review: with no registry entry *and* no catalog row, the drop must
+   still error (and IF EXISTS must still be silent) — the catalog fallback
+   above must not turn an unknown name into a success. *)
+let test_drop_unknown_view_still_errors () =
+  with_db (fun db ->
+    (match exec_err db "DROP REACTIVE VIEW nope" with
+     | None -> Alcotest.fail "dropping an unknown reactive view must error"
+     | Some msg ->
+       Alcotest.(check bool)
+         "error names the view"
+         true
+         (contains ~needle:"no such reactive view: nope" msg));
+    exec db "DROP REACTIVE VIEW IF EXISTS nope")
 ;;
 
 (* ---- regression (review #428): full-refresh must not collapse duplicate
@@ -543,6 +1014,45 @@ let () =
             "non-reactive-view stored SQL is not live"
             `Quick
             (test_unloadable_view_is_not_live "SELECT 1")
+        ] )
+    ; ( "drop"
+      , [ Alcotest.test_case "drop removes the view" `Quick test_drop_removes_view
+        ; Alcotest.test_case "drop stops callbacks" `Quick test_drop_stops_callbacks
+        ; Alcotest.test_case "if exists" `Quick test_drop_if_exists
+        ; Alcotest.test_case
+            "drop is durable and re-creatable"
+            `Quick
+            test_drop_is_durable_and_recreatable
+        ; Alcotest.test_case "_rv_ table drop rejected" `Quick test_rv_table_drop_rejected
+        ; Alcotest.test_case
+            "DROP VIEW on a reactive view errors"
+            `Quick
+            test_drop_view_on_reactive_view_errors
+        ; Alcotest.test_case "drop is not rolled back" `Quick test_drop_is_not_rolled_back
+        ; Alcotest.test_case
+            "_rv_ guard does not cross attach"
+            `Quick
+            test_rv_guard_does_not_cross_attach
+        ; Alcotest.test_case
+            "DROP VIEW guard does not cross attach"
+            `Quick
+            test_drop_view_guard_does_not_cross_attach
+        ; Alcotest.test_case
+            "DROP REACTIVE VIEW rejected off main"
+            `Quick
+            test_drop_reactive_view_rejected_off_main
+        ; Alcotest.test_case
+            "one of two views on the same base"
+            `Quick
+            test_drop_one_of_two_views_on_same_base
+        ; Alcotest.test_case
+            "drop cleans up an unloadable view"
+            `Quick
+            test_drop_removes_unloadable_view
+        ; Alcotest.test_case
+            "unknown view still errors"
+            `Quick
+            test_drop_unknown_view_still_errors
         ] )
     ; "property", [ QCheck_alcotest.to_alcotest prop_views_track ]
     ]

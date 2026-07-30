@@ -409,6 +409,10 @@ and stmt =
       { name : string
       ; if_exists : bool
       }
+  | S_drop_reactive_view of
+      { name : string
+      ; if_exists : bool
+      }
   | S_create_trigger of
       { name : string
       ; timing : trigger_timing

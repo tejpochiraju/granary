@@ -1000,6 +1000,8 @@ let rec plan ?cat = function
   | Sema.BS_create_reactive_view { name; query; refresh } ->
     Plan.Op_create_reactive_view { name; query; refresh }
   | Sema.BS_drop_view { name } -> Plan.Op_drop_view { name }
+  | Sema.BS_drop_reactive_view { name; if_exists } ->
+    Plan.Op_drop_reactive_view { name; if_exists }
   | Sema.BS_create_trigger { name; timing; event; table; when_; body } ->
     Plan.Op_create_trigger { name; timing; event; table; when_; body }
   | Sema.BS_drop_trigger { name } -> Plan.Op_drop_trigger { name }

@@ -333,6 +333,10 @@ type op =
       ; refresh : Ast.refresh_mode
       }
   | Op_drop_view of { name : string }
+  | Op_drop_reactive_view of
+      { name : string
+      ; if_exists : bool
+      }
   | Op_create_trigger of
       { name : string
       ; timing : Ast.trigger_timing
