@@ -1,0 +1,7 @@
+; TPC-derived benchmark support library (#482).  Deliberately free of any
+; `sqlite3` dependency: the cross-check engine lives in the executable, so this
+; library builds and its tests run even where `sqlite3` is absent.
+
+(library
+ (name granary_tpc)
+ (libraries granary granary.store granary.unix lwt lwt.unix unix))

@@ -250,6 +250,10 @@ That is a large improvement over the [2026-06-02 pre-fix baseline](docs/benchmar
 *complexity* bugs are gone; the only large remaining gap is **batch insert (~44×)**, a
 constant-factor copy-on-write write-amplification cost (#230 / #231).
 
+A TPC-H-derived OLAP benchmark (7 of 22 queries verified against reference SQLite at SF 0.01,
+the rest rewritten-pending or not yet expressible) lives in
+[docs/benchmarks/BENCHMARKS-TPCH.md](docs/benchmarks/BENCHMARKS-TPCH.md).
+
 AES-256-GCM encryption-at-rest now adds only **~20% (or within noise)** to cache-resident reads —
 the frame-cache (T4) caches decrypted pages, down from the ~2× (≈ +100%) of the pre-fix run.
 Writes are barely affected.

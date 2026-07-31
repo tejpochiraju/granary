@@ -31,5 +31,13 @@ RUN opam pin add -y -k git merlint "https://github.com/samoht/merlint.git#d55488
  && opam install -y merlint
 # ocamlformat (#171): exact pin — the .ocamlformat `version` field must equal this.
 RUN opam install -y ocamlformat.0.29.0
+# Reference C SQLite (#482): every CI workflow installs libsqlite3-dev + the
+# sqlite3 opam library, but the dev image did not — so `dune build` failed on
+# bench_compare locally and the TPC-H answer cross-check could not run at all.
+# Appended as its own layer to keep the opam layers above cache-valid.
+USER root
+RUN apt-get update && apt-get install -y libsqlite3-dev sqlite3
+USER opam
+RUN opam install -y sqlite3
 WORKDIR /workspace
 ENTRYPOINT ["opam", "exec", "--"]

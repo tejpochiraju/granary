@@ -24,3 +24,6 @@ mirage/*
 !mirage/config.ml
 !mirage/unikernel.ml
 !mirage/README.md
+
+# Subagent-driven-development scratch workspace (per-plan ledger, briefs, reports)
+.superpowers/
