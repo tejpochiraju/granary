@@ -87,6 +87,16 @@ podman run --rm -v "$(pwd):/workspace:z" -w /workspace granary-dev dune build @f
 
 merlint enforces (among others): max nesting depth 4, every library module has a `.mli`, an abstract `type t` has a `pp`, and every public `val` in an `.mli` has a `(** … *)` doc comment (not `(* … *)`). It ignores the pre-existing `sqlite3 not found` build warning and still reports.
 
+### Dead-code analysis
+
+`dead_code_analyzer` is in the dev image and is **advisory, not a CI gate**.
+Run it before a release or when pruning, and always after `dune build @check` —
+a plain `dune build` emits one test `.cmt`, which makes the whole public API
+look dead (185 findings instead of 56). Note that ~19 findings are `pp`
+functions that merlint *requires*; the two linters collide there. Full
+instructions, the current baseline, and the OCaml 5.4 fork pin are in
+`docs/DEAD_CODE.md`.
+
 ### Coverage
 
 `dune runtest --instrument-with bisect_ppx` works (verified on 5.4). Two

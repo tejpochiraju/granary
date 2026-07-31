@@ -41,5 +41,10 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 USER opam
 RUN opam install -y sqlite3
+# dead_code_analyzer (#160): advisory, not a CI gate. See docs/DEAD_CODE.md.
+# Upstream caps itself at `ocaml < 5.4` and has no 5.4 branch, so this pins our
+# fork carrying the 21-line 5.4 port. Drop the fork once upstream ships 5.4.
+RUN opam pin add -y -k git dead_code_analyzer "https://github.com/tejpochiraju/dead_code_analyzer.git#ae94d2f83e2ba9dcedcc96bf0bff568021b41aca" \
+ && opam install -y dead_code_analyzer
 WORKDIR /workspace
 ENTRYPOINT ["opam", "exec", "--"]
