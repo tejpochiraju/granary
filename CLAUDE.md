@@ -120,7 +120,7 @@ When your work is ready:
 
 ```sh
 git push origin <branch-name>
-~/.local/bin/forgejo pr create tej/granary \
+~/.local/bin/forgejo pr create IoTReadyNext/granary \
   --title="feat(#NNN): short description" \
   --head=<branch-name> \
   --base=main \
@@ -139,10 +139,10 @@ EOF
 
 ### Filing issues
 
-"File an issue" means Forgejo (`tej/granary`), not GitHub or any third-party URL.
+"File an issue" means Forgejo (`IoTReadyNext/granary`), not GitHub or any third-party URL.
 
 ```sh
-~/.local/bin/forgejo issue create tej/granary --title="..." --body="..."
+~/.local/bin/forgejo issue create IoTReadyNext/granary --title="..." --body="..."
 ```
 
 ### Testing standards
@@ -164,16 +164,16 @@ bin/          — CLI entry point
 
 ## Forgejo CLI reference
 
-Binary: `~/.local/bin/forgejo`. Repo slug: `tej/granary`.
+Binary: `~/.local/bin/forgejo`. Repo slug: `IoTReadyNext/granary`.
 
 Common commands:
 
 ```sh
-forgejo issue list tej/granary
-forgejo issue view tej/granary <N>
-forgejo issue close tej/granary <N>
-forgejo pr list tej/granary
-forgejo pr view tej/granary <N>
-forgejo pr review tej/granary <N> --approve
-forgejo pr merge tej/granary <N> --method=squash
+forgejo issue list IoTReadyNext/granary
+forgejo issue view IoTReadyNext/granary <N>
+forgejo issue close IoTReadyNext/granary <N>
+forgejo pr list IoTReadyNext/granary
+forgejo pr view IoTReadyNext/granary <N>
+forgejo pr review IoTReadyNext/granary <N> --approve
+forgejo pr merge IoTReadyNext/granary <N> --method=squash
 ```
