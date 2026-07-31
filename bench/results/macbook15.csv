@@ -1,0 +1,16 @@
+host,engine,workload,variant,rows,ops,wall_s,cpu_s,cpu_wall_ratio,ops_per_s
+macbook15,sqlite,point_lookup,plaintext,100000,20000,0.057516,0.057194,0.994,347728.7
+macbook15,sqlite,scan_agg,plaintext,100000,50,0.240685,0.239480,0.995,207.7
+macbook15,sqlite,insert_one,plaintext,20000,20000,82.064179,8.615020,0.105,243.7
+macbook15,sqlite,insert_batch,plaintext,100000,100000,0.140461,0.114093,0.812,711941.6
+macbook15,sqlite,commit_n,plaintext,500,500,1.940222,0.206058,0.106,257.7
+macbook15,granary,point_lookup,plaintext,100000,20000,0.224968,0.223324,0.993,88901.5
+macbook15,granary,scan_agg,plaintext,100000,50,2.930678,3.016358,1.029,17.1
+macbook15,granary,insert_one,plaintext,20000,20000,104.149404,27.049036,0.260,192.0
+macbook15,granary,insert_batch,plaintext,100000,100000,0.469162,0.438228,0.934,213146.0
+macbook15,granary,commit_n,plaintext,500,500,2.673772,0.700080,0.262,187.0
+macbook15,granary,point_lookup,encrypted,100000,20000,0.308276,0.305965,0.993,64876.9
+macbook15,granary,scan_agg,encrypted,100000,50,3.487953,3.546966,1.017,14.3
+macbook15,granary,insert_one,encrypted,20000,20000,108.998615,32.826569,0.301,183.5
+macbook15,granary,insert_batch,encrypted,100000,100000,0.488527,0.458397,0.938,204697.0
+macbook15,granary,commit_n,encrypted,500,500,2.685037,0.853116,0.318,186.2
