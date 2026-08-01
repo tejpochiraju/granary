@@ -671,6 +671,23 @@
   mirage-crypto-rng
   mirage-crypto-rng.unix))
 
+; #481 — scan-path cost probe (granary only, no `sqlite3` dependency).  An
+; `executable`, not a `test`: it seeds 100k rows and times 20 repeats, which is
+; far too slow to run under `dune test`.  Being non-optional keeps it
+; type-checked by every `dune build`.
+
+(executable
+ (name bench_scan_probe)
+ (modules bench_scan_probe)
+ (libraries
+  granary
+  granary.store
+  granary.unix
+  lwt.unix
+  unix
+  mirage-crypto-rng
+  mirage-crypto-rng.unix))
+
 (test
  (name test_incremental_backup)
  (modules test_incremental_backup)

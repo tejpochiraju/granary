@@ -1,0 +1,11 @@
+host=macbook15-small
+date=2026-07-31T16:40:44Z
+nproc=8
+cpu=Intel Core i7-4870HQ @ 2.50GHz (4c/8t, Haswell)
+disk=sda      0 APPLE SSD SM0256F;sdb      0 SD Card Reader;
+fs=btrfs on /dev/sda3 (bind-mounted $REPO/bench/data -> /benchdata)
+sqlite_version=3.45.1
+granary_sha=89c52d9
+durability=none
+rows=5000 ops=500 scans=20 commits=50 repeats=2 page_cache=1024
+note=Fedora Atomic host; benchmark run via rootless podman from a fedora-toolbox container.
