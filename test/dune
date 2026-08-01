@@ -246,7 +246,14 @@
 (test
  (name test_composite_seek_508)
  (modules test_composite_seek_508)
- (libraries granary alcotest qcheck-core qcheck-alcotest lwt.unix))
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
 
 (test
  (name test_mirage_backend)

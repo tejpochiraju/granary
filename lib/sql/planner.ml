@@ -325,12 +325,48 @@ let residual_filter ~consumed all_conjuncts child =
     Plan.Op_filter { pred; child }
 ;;
 
-(* Choose the base access path for a single table.  The WHERE clause is split on
+(* Choose an access path for [where] over a single table.  The clause is split on
    its top-level [AND] spine (#508); equality conjuncts of the form
    [col = literal|?] can pin either the rowid alias (a single table seek) or the
-   leading columns of an index (an encoded-prefix seek).  Whatever the access
-   path does not consume stays behind as a residual filter; with no usable path
-   at all, a filtered seq scan.  With joins, always a seq scan. *)
+   leading columns of an index (an encoded-prefix seek).  Returns the chosen path
+   together with the conjunct positions it consumed — everything else must still
+   be evaluated by the caller. *)
+let choose_access_path cat (table_meta : Cat.table_meta) conjuncts_list =
+  let eqs =
+    conjuncts_list
+    |> List.mapi (fun pos c ->
+      Option.map (fun (col_idx, v) -> pos, col_idx, v) (recognise_eq_col_lit c))
+    |> List.filter_map Fun.id
+  in
+  let alias_eq =
+    List.find_opt
+      (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
+      eqs
+  in
+  match alias_eq with
+  | Some (pos, _, lit_expr) ->
+    (* #243 (T1): the alias column IS the table key — a single rowid seek, no
+       index. *)
+    Some (Plan.Seek_rowid (plan_expr lit_expr), [ pos ])
+  | None ->
+    if eqs = []
+    then None
+    else (
+      match find_index_for_eqs cat table_meta eqs with
+      | None -> None
+      | Some (idx, prefix, consumed) ->
+        let keys =
+          List.map
+            (fun (col_idx, v) ->
+               col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
+            prefix
+        in
+        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys }, consumed))
+;;
+
+(* The base access path for a SELECT over a single table: the chosen seek as a
+   plan op, with the unconsumed conjuncts left behind as a residual filter; a
+   filtered seq scan when nothing is seekable.  With joins, always a seq scan. *)
 let plan_base cat ~table_meta ~where ~has_joins =
   if has_joins
   then make_scan table_meta
@@ -339,51 +375,29 @@ let plan_base cat ~table_meta ~where ~has_joins =
     | None -> make_scan table_meta
     | Some e ->
       let cs = conjuncts e in
-      let eqs =
-        cs
-        |> List.mapi (fun pos c ->
-          Option.map (fun (col_idx, v) -> pos, col_idx, v) (recognise_eq_col_lit c))
-        |> List.filter_map Fun.id
-      in
       let fallback () =
         Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta }
       in
-      let alias_eq =
-        List.find_opt
-          (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
-          eqs
-      in
-      (match alias_eq with
-       | Some (pos, _, lit_expr) ->
-         (* #243 (T1): the alias column IS the table key — a single rowid seek,
-            no index. *)
+      (match choose_access_path cat table_meta cs with
+       | None -> fallback ()
+       | Some (Plan.Seek_rowid lookup_val, consumed) ->
+         residual_filter ~consumed cs (Plan.Op_rowid_lookup { table_meta; lookup_val })
+       | Some (Plan.Seek_index { idx_tree; keys }, consumed) ->
+         let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
          residual_filter
-           ~consumed:[ pos ]
+           ~consumed
            cs
-           (Plan.Op_rowid_lookup { table_meta; lookup_val = plan_expr lit_expr })
-       | None ->
-         if eqs = []
-         then fallback ()
-         else (
-           match find_index_for_eqs cat table_meta eqs with
-           | None -> fallback ()
-           | Some (idx, prefix, consumed) ->
-             let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-             let keys =
-               List.map
-                 (fun (col_idx, v) ->
-                    col_idx, (List.nth table_meta.columns col_idx).Row.ty, plan_expr v)
-                 prefix
-             in
-             residual_filter
-               ~consumed
-               cs
-               (Plan.Op_index_lookup
-                  { table_tree = tree_id_pl
-                  ; idx_tree = idx.Cat.idx_tree_id
-                  ; keys
-                  ; table_meta
-                  }))))
+           (Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; table_meta })))
+;;
+
+(* #508: the narrowing path for a DML WHERE clause.  Unlike [plan_base] this
+   discards which conjuncts were consumed — the write path always re-evaluates
+   the whole predicate on every candidate row, so the seek is a pure
+   restriction of what gets read. *)
+let plan_dml_seek cat ~table_meta ~where =
+  match cat, where with
+  | Some c, Some e -> Option.map fst (choose_access_path c table_meta (conjuncts e))
+  | _ -> None
 ;;
 
 (* Build ORDER BY sort keys, substituting window slots into the key
@@ -736,6 +750,7 @@ let plan_update cat ~table_meta ~assignments ~where ~order ~limit ~offset ~retur
     { table_meta
     ; assignments = List.map (fun (i, e) -> i, plan_expr e) assignments
     ; where = Option.map plan_expr where
+    ; seek = plan_dml_seek cat ~table_meta ~where
     ; order = plan_order_keys order
     ; limit
     ; offset
@@ -748,6 +763,7 @@ let plan_delete cat ~table_meta ~where ~order ~limit ~offset ~returning =
   Plan.Op_delete
     { table_meta
     ; where = Option.map plan_expr where
+    ; seek = plan_dml_seek cat ~table_meta ~where
     ; order = plan_order_keys order
     ; limit
     ; offset

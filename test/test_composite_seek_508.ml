@@ -20,6 +20,8 @@ let unwrap = function
   | Error e -> Alcotest.failf "db error: %a" Db.pp_error e
 ;;
 
+let unwrap_open r = Lwt.map unwrap r
+
 let with_db f =
   let db = run (Db.open_in_memory ()) in
   Fun.protect
@@ -231,6 +233,119 @@ let text_composite_key_seeks () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* UPDATE / DELETE access paths                                         *)
+(* ------------------------------------------------------------------ *)
+
+(* [query_with_stats] covers reads only, so the write path is measured by its
+   physical I/O: count the page/WAL reads a statement provokes, over a
+   file-backed DB big enough that a full drain must touch many pages. *)
+let with_file_db f =
+  let dir = Filename.temp_file "t508-" "" in
+  Sys.remove dir;
+  Unix.mkdir dir 0o755;
+  let path = Filename.concat dir "db" in
+  let db = run (unwrap_open (Granary_unix.open_file_wal ~path ())) in
+  Fun.protect
+    ~finally:(fun () ->
+      run (Db.close db);
+      List.iter
+        (fun s ->
+           try Sys.remove (path ^ s) with
+           | _ -> ())
+        [ ""; "-wal" ];
+      try Unix.rmdir dir with
+      | _ -> ())
+    (fun () -> f db)
+;;
+
+(* Run [sql], returning how many page/WAL reads it caused. *)
+let reads_during db sql =
+  let n = ref 0 in
+  Db.set_event_callback
+    db
+    (Some
+       (function
+         | Db.Event.Page_read _ | Db.Event.Wal_read _ -> incr n
+         | _ -> ()));
+  exec db sql;
+  Db.set_event_callback db None;
+  !n
+;;
+
+let q_at db ~w ~i =
+  match rows_of db (Printf.sprintf "SELECT q FROM stock WHERE w = %d AND i = %d" w i) with
+  | [ [| Db.V_int n |] ] -> Int64.to_int n
+  | _ -> Alcotest.failf "expected exactly one q at (%d,%d)" w i
+;;
+
+(* #508's write half: the UPDATE's WHERE clause must narrow through the index
+   rather than draining the table.  The [+ 0] foil is the same UPDATE the
+   planner cannot seek, run against the same data — it both calibrates the
+   comparison and proves the measurement is live (a cache that served
+   everything would leave the foil near zero too). *)
+let update_by_full_key_seeks () =
+  with_file_db (fun db ->
+    seed_stock db ~n_w:1 ~n_i:20000;
+    let scan_reads =
+      reads_during db "UPDATE stock SET q = q + 1 WHERE w + 0 = 1 AND i + 0 = 10000"
+    in
+    let seek_reads =
+      reads_during db "UPDATE stock SET q = q + 1 WHERE w = 1 AND i = 10000"
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "foil actually reads pages (got %d)" scan_reads)
+      true
+      (scan_reads > 100);
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "seek reads far fewer pages (seek %d vs scan %d)"
+         seek_reads
+         scan_reads)
+      true
+      (seek_reads * 5 < scan_reads);
+    (* Both UPDATEs hit exactly the one row, and no other. *)
+    Alcotest.(check int) "target updated twice" 11002 (q_at db ~w:1 ~i:10000);
+    Alcotest.(check int) "neighbour untouched" 10999 (q_at db ~w:1 ~i:9999))
+;;
+
+let delete_by_full_key_seeks () =
+  with_file_db (fun db ->
+    seed_stock db ~n_w:1 ~n_i:20000;
+    let seek_reads = reads_during db "DELETE FROM stock WHERE w = 1 AND i = 10000" in
+    let scan_reads =
+      reads_during db "DELETE FROM stock WHERE w + 0 = 1 AND i + 0 = 9999"
+    in
+    Alcotest.(check bool)
+      (Printf.sprintf "foil actually reads pages (got %d)" scan_reads)
+      true
+      (scan_reads > 100);
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "seek reads far fewer pages (seek %d vs scan %d)"
+         seek_reads
+         scan_reads)
+      true
+      (seek_reads * 5 < scan_reads);
+    Alcotest.(check int)
+      "exactly the two rows are gone"
+      19998
+      (match rows_of db "SELECT COUNT(*) FROM stock" with
+       | [ [| Db.V_int n |] ] -> Int64.to_int n
+       | _ -> Alcotest.fail "count shape"))
+;;
+
+(* A residual conjunct must still gate the write: seeking to the row does not
+   license updating it when a non-key predicate rejects it. *)
+let update_residual_conjunct_still_gates () =
+  with_db (fun db ->
+    seed_stock db ~n_w:2 ~n_i:100;
+    exec db "UPDATE stock SET q = 0 WHERE w = 1 AND i = 50 AND q = 999999";
+    Alcotest.(check int) "rejected by residual" 1050 (q_at db ~w:1 ~i:50);
+    exec db "UPDATE stock SET q = 0 WHERE w = 1 AND i = 50 AND q = 1050";
+    Alcotest.(check int) "accepted by residual" 0 (q_at db ~w:1 ~i:50))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Correctness property: seek path == unoptimizable foil                *)
 (* ------------------------------------------------------------------ *)
 
@@ -286,6 +401,14 @@ let () =
             `Quick
             three_column_index_prefix_seeks
         ; Alcotest.test_case "text composite key seeks" `Quick text_composite_key_seeks
+        ] )
+    ; ( "write"
+      , [ Alcotest.test_case "UPDATE by full key seeks" `Quick update_by_full_key_seeks
+        ; Alcotest.test_case "DELETE by full key seeks" `Quick delete_by_full_key_seeks
+        ; Alcotest.test_case
+            "UPDATE residual conjunct still gates"
+            `Quick
+            update_residual_conjunct_still_gates
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_seek_matches_scan ]
     ]

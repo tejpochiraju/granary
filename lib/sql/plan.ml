@@ -69,6 +69,13 @@ type snippet_spec =
   ; n_tokens : int
   }
 
+type seek =
+  | Seek_rowid of expr
+  | Seek_index of
+      { idx_tree : int
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+      }
+
 type op =
   | Op_create_table of
       { name : string
@@ -160,6 +167,7 @@ type op =
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option
@@ -169,6 +177,7 @@ type op =
   | Op_delete of
       { table_meta : Cat.table_meta
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option

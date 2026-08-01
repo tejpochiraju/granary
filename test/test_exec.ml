@@ -2427,6 +2427,7 @@ let exec_update_no_match_returns_zero () =
             ; assignments = [ 1, Plan.P_lit (Ast.L_text "z") ]
             ; where =
                 Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)))
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2467,6 +2468,7 @@ let exec_update_match_returns_count () =
             { table_meta = m
             ; assignments = [ 1, Plan.P_lit (Ast.L_text "updated") ]
             ; where = None
+            ; seek = None
             ; (* update all *)
               order = []
             ; limit = None
@@ -2507,6 +2509,7 @@ let exec_update_raises_in_query () =
                 { table_meta = m
                 ; assignments = [ 1, Plan.P_lit (Ast.L_text "x") ]
                 ; where = None
+                ; seek = None
                 ; order = []
                 ; limit = None
                 ; offset = None
@@ -2551,6 +2554,7 @@ let exec_delete_no_match_returns_zero () =
             { table_meta = m
             ; where =
                 Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)))
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2591,6 +2595,7 @@ let exec_delete_all_returns_count () =
          (Plan.Op_delete
             { table_meta = m
             ; where = None
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2629,6 +2634,7 @@ let exec_delete_raises_in_query () =
              (Plan.Op_delete
                 { table_meta = m
                 ; where = None
+                ; seek = None
                 ; order = []
                 ; limit = None
                 ; offset = None
