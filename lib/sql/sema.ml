@@ -1222,21 +1222,48 @@ let auto_unique_indexes ~name ~constraints ~columns ~rowid_alias_col_name =
   tbl_uniq_idxs @ col_pk_idxs
 ;;
 
-(* Mark row columns named by a table-level PRIMARY KEY (col) as primary_key. *)
-let mark_table_pk constraints row_cols =
+(* #530: mark EVERY column named by a table-level PRIMARY KEY as primary_key,
+   on the AST column definitions — i.e. BEFORE [column_of_def] derives
+   [not_null = c.not_null || c.primary_key] from them.
+
+   Two defects lived here.  The marking used to be applied to [column_of_def]'s
+   OUTPUT, so its [primary_key = true] could never reach that [||] and the
+   table-constraint spelling of a key accepted the NULL that the identical
+   column-constraint spelling rejected.  And it matched [pk_cols = [ pk_col ]]
+   only, so no column of a composite [PRIMARY KEY (w, o)] was marked at all —
+   which is why such a table reported no PRIMARY KEY to every consumer of the
+   flag, [validate_without_rowid] and the #520 cost model included.
+
+   Feeding the marked defs to [column_of_def] is what makes a table-level PK
+   imply NOT NULL.  The caller keeps the UNMARKED [columns] for every other
+   consumer: [auto_unique_indexes] would otherwise emit a second, per-column
+   [__pk_*] index alongside the table-level one it already builds. *)
+let mark_table_pk constraints (columns : Ast.column_def list) =
   List.fold_left
     (fun cols c ->
        match c with
-       | Ast.TC_primary_key { pk_cols = [ pk_col ]; _ } ->
+       | Ast.TC_primary_key { pk_cols; _ } ->
          List.map
-           (fun (col : Row.column) ->
-              if String.equal col.name pk_col
+           (fun (col : Ast.column_def) ->
+              if List.exists (String.equal col.name) pk_cols
               then { col with primary_key = true }
               else col)
            cols
        | _ -> cols)
-    row_cols
+    columns
     constraints
+;;
+
+(* The table's single PRIMARY KEY column, for the consumers that can only handle
+   one: a FOREIGN KEY that names no parent column infers it.  #530 made every
+   column of a composite key carry [primary_key], so "the PK column" has to be
+   asked for as an exactly-one question — [List.find_opt] would silently infer a
+   single-column reference to the FIRST column of a composite key, where before
+   the parent simply reported no PK. *)
+let sole_pk_column (cols : Row.column list) =
+  match List.filter (fun (c : Row.column) -> c.primary_key) cols with
+  | [ pk ] -> Some pk
+  | [] | _ :: _ :: _ -> None
 ;;
 
 (* Collect FK constraints from column-level REFERENCES and table-level FOREIGN
@@ -1269,11 +1296,7 @@ let extract_fk_constraints cat ~columns ~constraints =
                            cd.Ast.name
                            parent_table))
                  else (
-                   match
-                     List.find_opt
-                       (fun (c : Row.column) -> c.primary_key)
-                       parent_meta.Cat.columns
-                   with
+                   match sole_pk_column parent_meta.Cat.columns with
                    | None ->
                      Error
                        (Unsupported
@@ -1489,7 +1512,10 @@ let bind_create
                      else c)
                   columns
             in
-            let row_cols = mark_table_pk constraints (List.map column_of_def columns) in
+            (* #530: mark the table-level PK on the column DEFS, so
+          [column_of_def] can derive NOT NULL from it.  [columns] itself stays
+          unmarked — see [mark_table_pk]. *)
+            let row_cols = List.map column_of_def (mark_table_pk constraints columns) in
             (* #243 (T1): an INTEGER PRIMARY KEY rowid alias gets NO separate __pk
           index — the table tree is keyed by it and enforces uniqueness. *)
             let rowid_alias_col_name =
@@ -3421,11 +3447,7 @@ let bind_add_column cat ~(table_meta : Cat.table_meta) ~action (col_def : Ast.co
          let actual_parent_col =
            if parent_col = ""
            then (
-             match
-               List.find_opt
-                 (fun (c : Row.column) -> c.primary_key)
-                 parent_meta.Cat.columns
-             with
+             match sole_pk_column parent_meta.Cat.columns with
              | None -> None
              | Some pk -> Some pk.Row.name)
            else if

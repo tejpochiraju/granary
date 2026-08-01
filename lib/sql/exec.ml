@@ -355,13 +355,26 @@ let format_pk_suffix ~autoinc_idx i (col : Row.column) buf =
   if Some i = autoinc_idx then Buffer.add_string buf " AUTOINCREMENT"
 ;;
 
-let format_column ~autoinc_idx i (col : Row.column) =
+(* #530: a composite PRIMARY KEY now marks every one of its columns, so the
+   inline [PRIMARY KEY] suffix has to be suppressed for it — emitting it per
+   column would render [PRIMARY KEY (k, j)] as two separate single-column keys,
+   which is a different table.  The table-level form is not emitted instead
+   because [Row.column] records no key ORDINAL: reconstructing
+   [PRIMARY KEY (...)] from storage order would silently reorder the key.  So a
+   composite PK stays absent from the rendered DDL and continues to round-trip
+   through [Db.dump] as the plain [CREATE UNIQUE INDEX] documented there — the
+   pre-existing, intentional downgrade, unchanged by this issue. *)
+let inline_pk_column_count (cols : Row.column list) =
+  List.length (List.filter (fun (c : Row.column) -> c.Row.primary_key) cols)
+;;
+
+let format_column ~autoinc_idx ~pk_count i (col : Row.column) =
   let buf = Buffer.create 64 in
   Buffer.add_string buf (quote_ident col.Row.name);
   Buffer.add_char buf ' ';
   Buffer.add_string buf (sql_of_row_type col.Row.ty);
   if col.Row.not_null then Buffer.add_string buf " NOT NULL";
-  if col.Row.primary_key then format_pk_suffix ~autoinc_idx i col buf;
+  if col.Row.primary_key && pk_count = 1 then format_pk_suffix ~autoinc_idx i col buf;
   (match col.Row.default with
    | None -> ()
    | Some dv ->
@@ -394,7 +407,8 @@ let ddl_of_table (meta : Cat.table_meta) =
     then Cat.compute_rowid_alias_col meta.Cat.columns ~without_rowid
     else None
   in
-  let col_parts = List.mapi (format_column ~autoinc_idx) meta.Cat.columns in
+  let pk_count = inline_pk_column_count meta.Cat.columns in
+  let col_parts = List.mapi (format_column ~autoinc_idx ~pk_count) meta.Cat.columns in
   let fk_parts =
     List.map
       (fun (fk : Cat.fk_constraint) ->

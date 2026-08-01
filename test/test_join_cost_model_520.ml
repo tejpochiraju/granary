@@ -234,14 +234,16 @@ let large_driving_side_still_probes_a_much_larger_right_table () =
    keep the probe however large the driving table is — this is the #508/#516
    shape the whole series is about.
 
-   It needs its own case because [Sema.mark_table_pk] only marks a table-level
-   PRIMARY KEY that names ONE column, so both columns of [PRIMARY KEY (w, o)]
-   carry [primary_key = false] and [not_null = false]. Review of PR #526 caught
-   the estimator's NOT NULL guard silently failing here: 201 rows examined (a
-   hash join, one scan of stock) to serve one row, where the probe reads 2. The
-   second spelling declares the columns NOT NULL explicitly; both must agree,
-   which is what says the estimate follows the seek's shape and not an
-   incidental column flag. *)
+   It needs its own case because of how close it came to being lost. Review of
+   PR #526 caught the estimator's NOT NULL guard silently failing here — 201
+   rows examined (a hash join, one scan of stock) to serve one row, where the
+   probe reads 2 — because [Sema.mark_table_pk] then marked only a table-level
+   PRIMARY KEY naming ONE column, leaving both columns of [PRIMARY KEY (w, o)]
+   with [primary_key = false] and [not_null = false]. #526 shipped an exemption
+   for the PK index; #530 fixed the marking itself and removed it, so this case
+   now passes the guard on the columns' own flags. The second spelling declares
+   the columns NOT NULL explicitly; both must agree, which is what says the
+   estimate follows the seek's shape and not an incidental column flag. *)
 let composite_pk_point_lookup_keeps_the_probe () =
   let check ~label ~cols =
     with_db (fun db ->

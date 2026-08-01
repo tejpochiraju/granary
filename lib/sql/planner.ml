@@ -653,15 +653,14 @@ let table_rows_estimate (meta : Cat.table_meta) =
     which keeps the estimate from answering 1 in the direction this module's
     bias argues against.
 
-    {b The implicit PRIMARY KEY index is exempt from it.}  [Sema.mark_table_pk]
-    marks only a table-level [PRIMARY KEY] naming a SINGLE column, so both
-    columns of [PRIMARY KEY (w, o)] carry [primary_key = false] and hence
-    [not_null = false] — and the composite-PK point lookup is precisely the
-    #508/#516 shape this whole series exists for.  Without the exemption a seek
-    that reaches exactly one row was estimated at the table's high-water mark
-    and lost its probe: review of PR #526 measured 201 rows examined against 2.
-    The PK index is the table's identity, so its full-key seek is the one-row
-    class whether or not the columns happen to be marked.
+    #526 had to exempt the implicit PRIMARY KEY index from that check, because
+    [Sema.mark_table_pk] marked only a table-level [PRIMARY KEY] naming a SINGLE
+    column: both columns of [PRIMARY KEY (w, o)] carried [primary_key = false]
+    and hence [not_null = false], so the composite-PK point lookup — precisely
+    the #508/#516 shape this series exists for — fell out of the one-row class
+    and lost its probe (201 rows examined against 2). #530 fixed the marking at
+    its source, every PK column is NOT NULL, and the exemption is gone: the PK
+    index now satisfies [all_not_null] on its own merits.
 
     The residual exposure on a [`User] or [`Implicit_unique] index is smaller
     than it looks, because a key is only ever pinned by [col = value] and that
@@ -680,7 +679,7 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
     i.Cat.idx_tree_id = idx_tree
     && i.Cat.idx_unique
     && List.length i.Cat.idx_columns = List.length keys
-    && (all_not_null || i.Cat.idx_origin = `Implicit_pk))
+    && all_not_null)
 ;;
 
 (** #520: estimate how many rows [op] produces, statically.
