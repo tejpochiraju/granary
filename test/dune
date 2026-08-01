@@ -803,3 +803,17 @@
  (optional)
  (modules bench_tpch)
  (libraries granary_tpc sqlite3 unix))
+
+; #513: join must not discard the driving table's access path.
+
+(test
+ (name test_join_pushdown_513)
+ (modules test_join_pushdown_513)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))

@@ -364,30 +364,59 @@ let choose_access_path cat (table_meta : Cat.table_meta) conjuncts_list =
         Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys }, consumed))
 ;;
 
-(* The base access path for a SELECT over a single table: the chosen seek as a
-   plan op, with the unconsumed conjuncts left behind as a residual filter; a
-   filtered seq scan when nothing is seekable.  With joins, always a seq scan. *)
+(* Realise a chosen seek as the base-table plan op it reads through. *)
+let seek_op (table_meta : Cat.table_meta) = function
+  | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val }
+  | Plan.Seek_index { idx_tree; keys } ->
+    let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
+    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; table_meta }
+;;
+
+(* #513: the conjuncts of a joined query that speak only about the driving
+   table.  Column ordinals in a bound WHERE clause address the {i combined} row,
+   whose leading [n_base] slots are the driving table's own columns, so anything
+   at or beyond that boundary belongs to a joined table and cannot pin the base
+   table's index.  The value side of a recognised equality is a literal or a
+   bound parameter — never a column — so a surviving conjunct references no
+   joined table at all. *)
+let base_only_conjuncts ~n_base cs =
+  List.filter
+    (fun c ->
+       match recognise_eq_col_lit c with
+       | Some (col_idx, _) -> col_idx < n_base
+       | None -> false)
+    cs
+;;
+
+(* The base access path for a SELECT: the chosen seek as a plan op, with the
+   unconsumed conjuncts left behind as a residual filter; a filtered seq scan
+   when nothing is seekable.
+
+   #513: a join no longer forfeits the access path.  It does change what the
+   seek is allowed to assume — [chain_joins] applies the whole WHERE clause to
+   the joined row, so here the seek narrows what the driving table reads and
+   nothing more.  That is why the joined case drops the residual filter (the
+   post-join filter already covers every conjunct, including the consumed ones)
+   and why it plans only from [base_only_conjuncts]: it is a pure restriction of
+   the base input, exactly like the #508 DML seek. *)
 let plan_base cat ~table_meta ~where ~has_joins =
-  if has_joins
-  then make_scan table_meta
-  else (
-    match where with
-    | None -> make_scan table_meta
-    | Some e ->
-      let cs = conjuncts e in
+  match where with
+  | None -> make_scan table_meta
+  | Some e ->
+    let cs = conjuncts e in
+    if has_joins
+    then (
+      let n_base = List.length table_meta.Cat.columns in
+      match choose_access_path cat table_meta (base_only_conjuncts ~n_base cs) with
+      | None -> make_scan table_meta
+      | Some (seek, _consumed) -> seek_op table_meta seek)
+    else (
       let fallback () =
         Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta }
       in
-      (match choose_access_path cat table_meta cs with
-       | None -> fallback ()
-       | Some (Plan.Seek_rowid lookup_val, consumed) ->
-         residual_filter ~consumed cs (Plan.Op_rowid_lookup { table_meta; lookup_val })
-       | Some (Plan.Seek_index { idx_tree; keys }, consumed) ->
-         let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-         residual_filter
-           ~consumed
-           cs
-           (Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; table_meta })))
+      match choose_access_path cat table_meta cs with
+      | None -> fallback ()
+      | Some (seek, consumed) -> residual_filter ~consumed cs (seek_op table_meta seek))
 ;;
 
 (* #508: the narrowing path for a DML WHERE clause.  Unlike [plan_base] this
