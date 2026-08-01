@@ -804,6 +804,34 @@
  (modules bench_tpch)
  (libraries granary_tpc sqlite3 unix))
 
+; #517: range bound after an access path's equality prefix.
+
+(test
+ (name test_range_bound_517)
+ (modules test_range_bound_517)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #516: nested-loop join probe over a multi-column index.
+
+(test
+ (name test_nlj_composite_probe_516)
+ (modules test_nlj_composite_probe_516)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #513: join must not discard the driving table's access path.
 
 (test

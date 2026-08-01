@@ -87,6 +87,42 @@ let recognise_eq_col_lit = function
   | _ -> None
 ;;
 
+(** #517: recognise an inequality [col <op> v] (or [v <op> col]) against a
+    literal or bound parameter, at the top level of the WHERE clause.  Returns
+    the column, which end of the range the predicate constrains, and the value.
+
+    Strictness is deliberately dropped: the caller uses this only to narrow the
+    span an index seek scans, never to decide whether a row qualifies, so
+    treating [>] as [>=] can cost one extra key and can never lose a row.  A
+    literal NULL is not matched, for the same reason [col = NULL] is not: the
+    comparison is never true, and the filter path already handles it. *)
+let recognise_ineq_col_lit = function
+  | Sema.BE_binop (op, Sema.BE_col i, (Sema.BE_lit l as e)) ->
+    (match l, op with
+     | Ast.L_null, _ -> None
+     | _, (Sema.Ge | Sema.Gt) -> Some (i, `Lo, e)
+     | _, (Sema.Le | Sema.Lt) -> Some (i, `Hi, e)
+     | _, _ -> None)
+  | Sema.BE_binop (op, (Sema.BE_lit l as e), Sema.BE_col i) ->
+    (* [v > col] constrains the column's UPPER end, not its lower one. *)
+    (match l, op with
+     | Ast.L_null, _ -> None
+     | _, (Sema.Ge | Sema.Gt) -> Some (i, `Hi, e)
+     | _, (Sema.Le | Sema.Lt) -> Some (i, `Lo, e)
+     | _, _ -> None)
+  | Sema.BE_binop (op, Sema.BE_col i, (Sema.BE_param _ as e)) ->
+    (match op with
+     | Sema.Ge | Sema.Gt -> Some (i, `Lo, e)
+     | Sema.Le | Sema.Lt -> Some (i, `Hi, e)
+     | _ -> None)
+  | Sema.BE_binop (op, (Sema.BE_param _ as e), Sema.BE_col i) ->
+    (match op with
+     | Sema.Ge | Sema.Gt -> Some (i, `Hi, e)
+     | Sema.Le | Sema.Lt -> Some (i, `Lo, e)
+     | _ -> None)
+  | _ -> None
+;;
+
 (* An index is usable for equality lookup only if all its columns are plain
    (not expressions) and it is not partial: a row absent from a partial index
    may still satisfy the query's WHERE clause, and the optimizer cannot match
@@ -100,20 +136,80 @@ let index_is_seekable (i : Cat.index_info) =
   is_plain_cols && i.Cat.idx_where_sql = None
 ;;
 
-(** If the catalog has a single-column index on [(table, col_idx)], return the
-    matching [index_info].  Used by the JOIN planner, whose nested-loop probe
-    keys on exactly one column.  Otherwise [None]. *)
-let find_index_on_col cat (meta : Cat.table_meta) col_idx =
-  let col_name = (List.nth meta.columns col_idx).Row.name in
-  let candidates = Cat.indexes_for_table cat ~table:meta.name in
-  List.find_opt
-    (fun (i : Cat.index_info) ->
-       index_is_seekable i
-       &&
-       match i.Cat.idx_columns with
-       | [ col ] -> col = col_name
-       | _ -> false (* an NLJ probe pins one column, so only a 1-col index fits *))
-    candidates
+(** The ordinal of [name] in [meta]'s column list, if it has one. *)
+let col_ordinal (meta : Cat.table_meta) name =
+  let rec go n = function
+    | [] -> None
+    | (c : Row.column) :: rest ->
+      if String.equal c.Row.name name then Some n else go (n + 1) rest
+  in
+  go 0 meta.Cat.columns
+;;
+
+(** #516: build a nested-loop probe key for one candidate index of the join's
+    right table, or [None] if the index cannot serve as a probe.
+
+    The index's columns are walked in order and each is pinned either by the
+    join column — whose value comes from the left row, and is preferred when a
+    column could be pinned both ways — or by a WHERE equality on the right
+    table, which contributes a constant.  The walk stops at the first column
+    pinned by neither, so the key always covers a leading prefix.
+
+    A key that pins no left-row value is rejected: every left row would read the
+    same range, which is a constant restriction rather than a join probe, and
+    the ON predicate would go unenforced by the probe. *)
+let probe_key_for_index (right_meta : Cat.table_meta) ~join_col ~left_col ~right_eqs idx =
+  let rec walk acc drives = function
+    | [] -> acc, drives
+    | name :: rest ->
+      (match col_ordinal right_meta name with
+       | None -> acc, drives
+       | Some ord when ord = join_col ->
+         walk (Plan.Probe_from_left left_col :: acc) true rest
+       | Some ord ->
+         (match List.assoc_opt ord right_eqs with
+          | Some e -> walk (Plan.Probe_const (plan_expr e) :: acc) drives rest
+          | None -> acc, drives))
+  in
+  if not (index_is_seekable idx)
+  then None
+  else (
+    match walk [] false idx.Cat.idx_columns with
+    | _, false -> None
+    | parts, true -> Some (List.rev parts))
+;;
+
+(** #516: the WHERE equalities that pin a column of the join's {i right} table.
+    Column ordinals in a bound WHERE clause address the combined row, so the
+    right table's own columns are the [n_right_cols] slots at [right_offset];
+    the result re-bases them to right-table ordinals. *)
+let right_table_eqs ~right_offset ~n_right_cols cs =
+  List.filter_map
+    (fun c ->
+       match recognise_eq_col_lit c with
+       | Some (col_idx, e)
+         when col_idx >= right_offset && col_idx < right_offset + n_right_cols ->
+         Some (col_idx - right_offset, e)
+       | Some _ | None -> None)
+    cs
+;;
+
+(** Pick the candidate index of [right_meta] whose probe key covers the most
+    columns. *)
+let best_probe cat (right_meta : Cat.table_meta) ~join_col ~left_col ~right_eqs =
+  Cat.indexes_for_table cat ~table:right_meta.Cat.name
+  |> List.filter_map (fun (i : Cat.index_info) ->
+    Option.map
+      (fun parts -> i, parts)
+      (probe_key_for_index right_meta ~join_col ~left_col ~right_eqs i))
+  |> function
+  | [] -> None
+  | c :: rest ->
+    Some
+      (List.fold_left
+         (fun (bi, bp) (i, p) -> if List.length p > List.length bp then i, p else bi, bp)
+         c
+         rest)
 ;;
 
 (** Flatten the top-level [AND] spine of a WHERE clause into its conjuncts.
@@ -173,6 +269,45 @@ let find_index_for_eqs cat (meta : Cat.table_meta) eqs =
        None
 ;;
 
+(** #517: only fixed-width index-key encodings can carry a range bound.  See
+    {!Plan.range}. *)
+let bounded_type = function
+  | Row.Integer | Row.Real -> true
+  | Row.Text | Row.Blob -> false
+;;
+
+(** #517: find a range over the index column immediately following the
+    equality-covered prefix.  [n_eq] is how many leading index columns the
+    equalities pinned, so the bounded column is the index's [n_eq]th.
+
+    The conjuncts are NOT marked consumed: the range narrows the scanned span
+    and the predicate is still evaluated on every row, which is what makes an
+    inclusive-only bound sound. *)
+let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts_list =
+  match List.nth_opt i.Cat.idx_columns n_eq with
+  | None -> None
+  | Some idx_col ->
+    (match col_ordinal meta idx_col with
+     | None -> None
+     | Some ord ->
+       let ty = (List.nth meta.Cat.columns ord).Row.ty in
+       if not (bounded_type ty)
+       then None
+       else (
+         let pick which =
+           List.find_map
+             (fun c ->
+                match recognise_ineq_col_lit c with
+                | Some (col_idx, w, e) when col_idx = ord && w = which ->
+                  Some (plan_expr e)
+                | Some _ | None -> None)
+             conjuncts_list
+         in
+         match pick `Lo, pick `Hi with
+         | None, None -> None
+         | r_lo, r_hi -> Some { Plan.r_ty = ty; r_lo; r_hi }))
+;;
+
 (** Detect [BE_col a = BE_col b] equality at the top level. *)
 let recognise_eq_col_col = function
   | Sema.BE_binop (Sema.Eq, Sema.BE_col a, Sema.BE_col b) -> Some (a, b)
@@ -193,11 +328,21 @@ let make_scan (meta : Cat.table_meta) : Plan.op =
 ;;
 
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
-    either Op_nested_loop_join (when the right join column has an index)
-    or Op_hash_join (otherwise).  If the ON predicate is not a simple
-    equality between a left and a right column, fall back to a hash
-    cartesian product wrapped in an Op_filter. *)
-let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Plan.op =
+    either Op_nested_loop_join (when the right table has an index the join can
+    probe) or Op_hash_join (otherwise).  If the ON predicate is not a simple
+    equality between a left and a right column, fall back to a hash cartesian
+    product wrapped in an Op_filter.
+
+    #516: [where_conjuncts] are the top-level [AND] conjuncts of the query's
+    WHERE clause.  Equalities among them that pin a right-table column can
+    complete a multi-column probe key whose remaining column is the join column
+    — the TPC-C shape, where [stock] is keyed on [(s_w_id, s_i_id)], joined on
+    [s_i_id], and [s_w_id] is fixed by the WHERE clause.  This is only sound
+    because the caller still applies the whole WHERE clause to the joined row;
+    see {!Plan.probe_part}. *)
+let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_left
+  : Plan.op
+  =
   let join_kind =
     match bj.kind with
     | Ast.Inner -> `Inner
@@ -205,16 +350,15 @@ let plan_join cat (bj : Sema.bound_join) (left_op : Plan.op) (n_left : int) : Pl
   in
   let right_offset = bj.right_col_offset in
   let n_right_cols = List.length bj.right_meta.Cat.columns in
+  let right_eqs = right_table_eqs ~right_offset ~n_right_cols where_conjuncts in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
-    let idx_opt = find_index_on_col cat bj.right_meta right_col in
-    match idx_opt with
-    | Some idx ->
+    match best_probe cat bj.right_meta ~join_col:right_col ~left_col ~right_eqs with
+    | Some (idx, probe) ->
       Plan.Op_nested_loop_join
         { left = left_op
         ; right_meta = bj.right_meta
         ; idx_tree = idx.Cat.idx_tree_id
-        ; right_col_idx = right_col
-        ; left_col_idx = left_col
+        ; probe
         ; join_kind
         ; right_col_offset = right_offset
         ; n_right_cols
@@ -361,15 +505,18 @@ let choose_access_path cat (table_meta : Cat.table_meta) conjuncts_list =
                col_idx, (List.nth table_meta.Cat.columns col_idx).Row.ty, plan_expr v)
             prefix
         in
-        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys }, consumed))
+        let range =
+          range_for_index table_meta idx ~n_eq:(List.length prefix) conjuncts_list
+        in
+        Some (Plan.Seek_index { idx_tree = idx.Cat.idx_tree_id; keys; range }, consumed))
 ;;
 
 (* Realise a chosen seek as the base-table plan op it reads through. *)
 let seek_op (table_meta : Cat.table_meta) = function
   | Plan.Seek_rowid lookup_val -> Plan.Op_rowid_lookup { table_meta; lookup_val }
-  | Plan.Seek_index { idx_tree; keys } ->
+  | Plan.Seek_index { idx_tree; keys; range } ->
     let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; table_meta }
+    Plan.Op_index_lookup { table_tree = tree_id_pl; idx_tree; keys; range; table_meta }
 ;;
 
 (* #513: the conjuncts of a joined query that speak only about the driving
@@ -384,7 +531,12 @@ let base_only_conjuncts ~n_base cs =
     (fun c ->
        match recognise_eq_col_lit c with
        | Some (col_idx, _) -> col_idx < n_base
-       | None -> false)
+       | None ->
+         (* #517: inequalities are kept too — they cannot pin the prefix, but
+            they can bound the column after it. *)
+         (match recognise_ineq_col_lit c with
+          | Some (col_idx, _, _) -> col_idx < n_base
+          | None -> false))
     cs
 ;;
 
@@ -562,10 +714,15 @@ let finalize_select ~distinct ~limit ~offset sorted =
 (* Catalog path: chain joins left-to-right via plan_join, then apply WHERE to
    the combined row (single-table WHERE is already folded into [base]). *)
 let chain_joins cat ~(table_meta : Cat.table_meta) ~base ~joins ~where =
+  let where_conjuncts =
+    match where with
+    | None -> []
+    | Some e -> conjuncts e
+  in
   let after_joins, _ =
     List.fold_left
       (fun (op, n_left) (bj : Sema.bound_join) ->
-         let joined = plan_join cat bj op n_left in
+         let joined = plan_join cat ~where_conjuncts bj op n_left in
          joined, n_left + List.length bj.Sema.right_meta.Cat.columns)
       (base, List.length table_meta.Cat.columns)
       joins

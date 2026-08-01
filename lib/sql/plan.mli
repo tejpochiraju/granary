@@ -73,6 +73,28 @@ type snippet_spec =
   ; n_tokens : int
   }
 
+(** #517: a range restriction on the index column immediately after a seek's
+    equality-covered prefix — the [range] of an [equality* \[range\]] access
+    path.
+
+    Both ends are treated as {b inclusive} regardless of whether the SQL wrote
+    [>] or [>=].  That is deliberate: the bound is only ever a narrowing, never
+    a substitute for the predicate, which the plan still evaluates on every row
+    the seek produces.  Treating a strict bound as inclusive can only widen the
+    span scanned by one key, and keeps the encoding free of off-by-one
+    reasoning.
+
+    Only [Integer] and [Real] columns are bounded, because their index-key
+    encoding is a fixed 9 bytes and order-preserving, so the stop condition is a
+    plain byte comparison at a known offset.  Text and blob encodings are
+    variable-length, which would make that comparison depend on where the next
+    column's bytes begin; those fall back to an unbounded prefix scan. *)
+type range =
+  { r_ty : Granary_encoding.Row.ty (** the bounded column's type *)
+  ; r_lo : expr option (** lower end, inclusive *)
+  ; r_hi : expr option (** upper end, inclusive *)
+  }
+
 (** #508: a narrowing access path for a DML statement's WHERE clause.  It only
     restricts the candidate rows the write path considers — the full WHERE
     predicate is still evaluated on every candidate — so a seek can never change
@@ -83,7 +105,26 @@ type seek =
       { idx_tree : int
       ; keys : (int * Granary_encoding.Row.ty * expr) list
         (** leading index columns pinned by equality, in index-column order *)
+      ; range : range option
+        (** #517: an optional range over the index column right after [keys] *)
       }
+
+(** #516: one component of a nested-loop join's index probe key.
+
+    The probe key is built in index-column order from two sources: the join
+    column, whose value differs per left row, and equality conjuncts of the
+    WHERE clause that pin other columns of the same index to a constant.  A
+    right table keyed on [(a, b)] and joined on [b] is only seekable because
+    [a = ?] in the WHERE clause supplies the leading column.
+
+    {b The constant parts narrow the probe and nothing else.}  They are taken
+    only from the top-level [AND] spine of the WHERE clause, which the planner
+    still applies in full to the joined row, so a constant can never change
+    which joined rows survive — only how many right rows are read to find
+    them. *)
+type probe_part =
+  | Probe_from_left of int (** take the value from this column ordinal of the LEFT row *)
+  | Probe_const of expr (** a constant pinned by a WHERE equality on the right table *)
 
 type op =
   | Op_create_table of
@@ -171,6 +212,10 @@ type op =
             yields one element per covered leading column, and the seek matches
             that encoded prefix.  Conjuncts not consumed here are left to a
             residual [Op_filter] above. *)
+      ; range : range option
+        (** #517: an optional range over the index column immediately after
+            [keys], narrowing the span the seek scans.  See {!range} — it never
+            replaces the predicate. *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
   | Op_rowid_lookup of
@@ -211,8 +256,11 @@ type op =
       { left : op (** left input (any op stream) *)
       ; right_meta : Cat.table_meta (** right table for row decode *)
       ; idx_tree : int (** right-side index tree id *)
-      ; right_col_idx : int (** join col ordinal IN RIGHT TABLE *)
-      ; left_col_idx : int (** join col ordinal in the LEFT row *)
+      ; probe : probe_part list
+        (** the probe key, in index-column order, covering a leading prefix of
+            [idx_tree]'s columns.  Always contains at least one
+            {!Probe_from_left}, or the join would not be driven by the left
+            input at all. *)
       ; join_kind : [ `Inner | `Left ]
       ; right_col_offset : int (** = n_left_cols *)
       ; n_right_cols : int

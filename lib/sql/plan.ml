@@ -69,12 +69,28 @@ type snippet_spec =
   ; n_tokens : int
   }
 
+(* #517: a range over the index column right after a seek's equality prefix.
+   Both ends are inclusive by construction; see plan.mli for why that is safe
+   and why only fixed-width column types are bounded. *)
+type range =
+  { r_ty : Granary_encoding.Row.ty
+  ; r_lo : expr option
+  ; r_hi : expr option
+  }
+
 type seek =
   | Seek_rowid of expr
   | Seek_index of
       { idx_tree : int
       ; keys : (int * Granary_encoding.Row.ty * expr) list
+      ; range : range option
       }
+
+(* #516: one component of a nested-loop join's index probe key.  See plan.mli
+   for why the constant parts are a pure narrowing. *)
+type probe_part =
+  | Probe_from_left of int
+  | Probe_const of expr
 
 type op =
   | Op_create_table of
@@ -156,6 +172,7 @@ type op =
       ; keys : (int * Granary_encoding.Row.ty * expr) list
         (** leading index columns pinned by equality, in INDEX column order:
             [(column ordinal, column type, value expression)] *)
+      ; range : range option (** #517: range over the column after [keys] *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
   | Op_rowid_lookup of
@@ -193,8 +210,7 @@ type op =
       { left : op (** left input (any op stream) *)
       ; right_meta : Cat.table_meta (** right table for row decode *)
       ; idx_tree : int (** right-side index tree id *)
-      ; right_col_idx : int (** join col ordinal IN RIGHT TABLE *)
-      ; left_col_idx : int (** join col ordinal in the LEFT row *)
+      ; probe : probe_part list (** probe key, in index-column order *)
       ; join_kind : [ `Inner | `Left ]
       ; right_col_offset : int (** = n_left_cols *)
       ; n_right_cols : int
