@@ -9,7 +9,8 @@
     The assertions are machine-independent: each times the *same* query against
     two index sizes (1x and 3x) and requires the per-op cost to stay roughly
     flat.  A query that drains the whole index grows ~linearly with size; an
-    O(log n) seek does not.  Two paths are covered:
+    O(log n) seek does not.  The ratio is a BEST-OF-N over interleaved trials
+    (#529) — see {!test_fts_queries_flat}.  Two paths are covered:
       - exact term ([fts_posting_list]) via [MATCH 'unique<k>'] (one match);
       - prefix ([fts_prefix_posting_list]) via [MATCH 'zebra*'] over a FIXED
         small set of zebra docs present in both tables (so the match count is
@@ -21,7 +22,12 @@
     The ratio gate is a wall-clock measurement: on a shared, loaded CI runner a
     sub-millisecond 1k baseline is noise-dominated and the ratio flakes.  As with
     the [bench_*] suites, CI neutralizes it via [GRANARY_BENCH_MAX_RATIO] (set
-    high) so the benches still run and print, without failing on load. *)
+    high) so the benches still run and print, without failing on load.
+
+    #529: a single measurement flaked under a parallel [dune test] (observed up
+    to 10.5x with no code change).  Three mitigations, in order of importance:
+    best-of-N over interleaved trials, longer timing loops (250 reps, so the
+    timed region is tens of ms rather than ~1.6 ms), and a 2.5x default gate. *)
 
 module Db = Granary.Db
 
@@ -34,15 +40,17 @@ let unwrap = function
 
 let now () = Unix.gettimeofday ()
 
-(* Timing-ratio ceiling for the O(log n) gate.  Defaults to 2.0 — a wide margin
-   vs GC/scheduler noise, well below the ~3x a re-introduced O(n) drain produces.
-   Raised via [GRANARY_BENCH_MAX_RATIO] to neutralize the gate on loaded CI. *)
+(* Timing-ratio ceiling for the O(log n) gate, applied to the best-of-N ratio.
+   Defaults to 2.5 — a wide margin over the ~1.4x a healthy best-of-N shows,
+   still below the ~3x a re-introduced O(n) drain produces.  Raised via
+   [GRANARY_BENCH_MAX_RATIO] to neutralize the gate on loaded CI (the same knob
+   the [bench_*] suites and [test_insert_scaling] use). *)
 let max_ratio =
   match Sys.getenv_opt "GRANARY_BENCH_MAX_RATIO" with
   | Some v ->
     (try float_of_string v with
-     | _ -> 2.0)
-  | None -> 2.0
+     | _ -> 2.5)
+  | None -> 2.5
 ;;
 
 let with_db f =
@@ -94,9 +102,8 @@ let mean_per_op f ~reps =
 
 (* Build an FTS index: [n_zebra] fixed zebra docs (matched by the prefix query)
    plus [docs] padding docs each with a shared term [alpha] and a unique term
-   [unique<i>].  Returns (term_query_per_op, prefix_query_per_op) in seconds,
-   asserting correctness of both. *)
-let build_and_time db ~docs =
+   [unique<i>].  Asserts the correctness of all three query shapes. *)
+let build db ~docs =
   run (exec_lwt db "CREATE VIRTUAL TABLE docs USING FTS5(body)");
   run
     (let open Lwt.Syntax in
@@ -133,11 +140,16 @@ let build_and_time db ~docs =
   let all = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'alpha'" in
   Alcotest.(check int) "shared term matches all padding docs" docs (List.length all);
   let zs = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'zebra*'" in
-  Alcotest.(check int) "prefix matches the fixed zebra set" n_zebra (List.length zs);
-  (* Speed: exact-term path (one match, varying term) and prefix path (fixed
-     match set). *)
+  Alcotest.(check int) "prefix matches the fixed zebra set" n_zebra (List.length zs)
+;;
+
+(* One timing sample of both query paths against an already-built index:
+   the exact-term path (one match, varying term) and the prefix path (fixed
+   match set).  Returns (term_per_op, prefix_per_op) in seconds. *)
+let time_once db ~docs ~reps =
+  Gc.full_major ();
   let term_per_op =
-    mean_per_op ~reps:100 (fun i ->
+    mean_per_op ~reps (fun i ->
       let k = i * 2654435761 mod docs in
       let rows =
         query_rowids
@@ -147,8 +159,9 @@ let build_and_time db ~docs =
       if List.length rows <> 1
       then Alcotest.failf "rare term unique%d matched %d docs" k (List.length rows))
   in
+  Gc.full_major ();
   let prefix_per_op =
-    mean_per_op ~reps:100 (fun _ ->
+    mean_per_op ~reps (fun _ ->
       let rows = query_rowids db "SELECT body FROM docs WHERE docs MATCH 'zebra*'" in
       if List.length rows <> n_zebra
       then Alcotest.failf "prefix zebra* matched %d docs" (List.length rows))
@@ -156,18 +169,11 @@ let build_and_time db ~docs =
   term_per_op, prefix_per_op
 ;;
 
-let assert_flat label small large =
-  let ratio = large /. small in
-  Printf.eprintf
-    "FTS-SCALING: %s 1k=%.3f ms/op  3k=%.3f ms/op  ratio=%.2f\n%!"
-    label
-    (small *. 1000.)
-    (large *. 1000.)
-    ratio;
+let assert_flat label ratio =
   (* 3x the surrounding index.  A full drain costs ~3x (validated); an O(log n)
-     seek is ~flat.  Gate at < [max_ratio] (default 2.0): wide margin vs
-     GC/scheduler noise, well below the ~3x a re-introduced drain produces;
-     neutralized on loaded CI via GRANARY_BENCH_MAX_RATIO. *)
+     seek is ~flat.  Gate at < [max_ratio] (default 2.5): wide margin over the
+     ~1.4x a healthy best-of-N shows, still under the ~3x a re-introduced drain
+     produces; neutralized on loaded CI via GRANARY_BENCH_MAX_RATIO. *)
   Alcotest.(check bool)
     (Printf.sprintf "%s: 3x index < %.1fx slower (got %.2fx)" label max_ratio ratio)
     true
@@ -175,10 +181,52 @@ let assert_flat label small large =
 ;;
 
 let test_fts_queries_flat () =
-  let term_s, prefix_s = with_db (fun db -> build_and_time db ~docs:1000) in
-  let term_l, prefix_l = with_db (fun db -> build_and_time db ~docs:3000) in
-  assert_flat "exact-term query" term_s term_l;
-  assert_flat "prefix query" prefix_s prefix_l
+  (* Both indexes are held open at once and the two sizes are timed back to back
+     inside every trial, so a load spike that inflates one size inflates its
+     partner too.  The verdict is the BEST (minimum) ratio over [trials]: noise
+     only ever adds time, so the minimum is the closest estimate of the true
+     cost ratio, and a single co-scheduled outlier can no longer decide the
+     outcome (#529). *)
+  let trials = 5 in
+  let reps = 250 in
+  with_db (fun small ->
+    with_db (fun large ->
+      build small ~docs:1000;
+      build large ~docs:3000;
+      (* Discarded warm-up: first-touch page-cache and Lwt/parser allocation
+         costs land here rather than in trial 1. *)
+      ignore (time_once small ~docs:1000 ~reps:20 : float * float);
+      ignore (time_once large ~docs:3000 ~reps:20 : float * float);
+      let best_term = ref infinity
+      and best_prefix = ref infinity in
+      for t = 1 to trials do
+        let term_s, prefix_s = time_once small ~docs:1000 ~reps in
+        let term_l, prefix_l = time_once large ~docs:3000 ~reps in
+        let term_ratio = term_l /. term_s
+        and prefix_ratio = prefix_l /. prefix_s in
+        Printf.eprintf
+          "FTS-SCALING: trial %d/%d  term 1k=%.3f 3k=%.3f ratio=%.2f | prefix 1k=%.3f \
+           3k=%.3f ratio=%.2f  (ms/op)\n\
+           %!"
+          t
+          trials
+          (term_s *. 1000.)
+          (term_l *. 1000.)
+          term_ratio
+          (prefix_s *. 1000.)
+          (prefix_l *. 1000.)
+          prefix_ratio;
+        if term_ratio < !best_term then best_term := term_ratio;
+        if prefix_ratio < !best_prefix then best_prefix := prefix_ratio
+      done;
+      Printf.eprintf
+        "FTS-SCALING: best-of-%d  term ratio=%.2f  prefix ratio=%.2f  (gate %.2f)\n%!"
+        trials
+        !best_term
+        !best_prefix
+        max_ratio;
+      assert_flat "exact-term query" !best_term;
+      assert_flat "prefix query" !best_prefix))
 ;;
 
 let () =
