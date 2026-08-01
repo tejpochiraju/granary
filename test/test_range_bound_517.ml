@@ -594,8 +594,245 @@ let real_range_narrows () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* #523: the tightest same-end conjunct wins                            *)
+(* ------------------------------------------------------------------ *)
+
+(* Two conjuncts constrain the SAME end. Taking the first one leaves the
+   narrowing the second one offers on the floor: [o >= 150] must beat the
+   [BETWEEN]'s [100]. *)
+let tightest_lower_bound_wins () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 150"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND 200 AND o + 0 >= 150"
+        (* 150..200 inclusive. *)
+      ~expect_examined:51)
+;;
+
+(* The mirror: the tighter of two upper bounds. *)
+let tightest_upper_bound_wins () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o <= 150"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND 200 AND o + 0 <= 150"
+      ~expect_examined:51)
+;;
+
+(* Pre-existing to #519: a plain pair of same-end inequalities has the same
+   defect, in either order — the fold must not depend on the tighter one coming
+   last. *)
+let repeated_inequalities_fold () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o >= 100 AND o >= 150 AND o <= 200"
+      ~foil:
+        "SELECT v FROM t WHERE w = 2 AND o + 0 >= 100 AND o + 0 >= 150 AND o + 0 <= 200"
+      ~expect_examined:51;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o >= 150 AND o >= 100 AND o <= 200"
+      ~foil:
+        "SELECT v FROM t WHERE w = 2 AND o + 0 >= 150 AND o + 0 >= 100 AND o + 0 <= 200"
+      ~expect_examined:51;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o >= 150 AND o <= 250 AND o <= 200"
+      ~foil:
+        "SELECT v FROM t WHERE w = 2 AND o + 0 >= 150 AND o + 0 <= 250 AND o + 0 <= 200"
+      ~expect_examined:51)
+;;
+
+(* Folded bounds that contradict each other: the window is empty, and the seek
+   must discover that without walking the group. *)
+let contradictory_folded_bounds_read_nothing () =
+  with_db (fun db ->
+    seed db;
+    let sql = "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 250" in
+    Alcotest.(check (list (list string))) "no rows" [] (rows_of db sql);
+    let n = examined db sql in
+    Alcotest.(check bool)
+      (Printf.sprintf "and did not scan to find out (%d examined)" n)
+      true
+      (n <= 1))
+;;
+
+(* Same shape as {!stats_of}, for a prepared statement with bound parameters. *)
+let stats_of_params db sql params =
+  unwrap
+    (run
+       (let open Lwt.Syntax in
+        let* st = Db.prepare db sql in
+        match st with
+        | Error e -> Lwt.return (Error e)
+        | Ok st ->
+          let* r = Db.iter_with_stats st ~params in
+          (match r with
+           | Error e -> Lwt.return (Error e)
+           | Ok (stream, stats) ->
+             let* rows = Lwt_stream.to_list stream in
+             Lwt.return (Ok (rows, stats)))))
+;;
+
+let rows_of_params db sql params =
+  let rows, _ = stats_of_params db sql params in
+  List.sort compare (List.map (fun r -> Array.to_list (Array.map render r)) rows)
+;;
+
+let examined_params db sql params =
+  let _, st = stats_of_params db sql params in
+  st.Granary.Db.rows_examined
+;;
+
+(* A bound parameter's value is unknown at plan time, so it cannot take part in
+   the fold. It must still be used when it is the only candidate for its end —
+   the fold must not quietly prefer "no bound" to "a bound I cannot order". *)
+let parameter_bound_alone_still_narrows () =
+  with_db (fun db ->
+    seed db;
+    let sql = "SELECT v FROM t WHERE w = 2 AND o >= ?" in
+    Alcotest.(check int) "rows" 20 (List.length (rows_of_params db sql [ Db.V_int 281L ]));
+    Alcotest.(check int) "examined" 20 (examined_params db sql [ Db.V_int 281L ]))
+;;
+
+(* A mix of one orderable literal and one parameter on the same end: whichever
+   the planner keeps, the rows must be right, because the predicate still runs
+   on every row the seek yields. *)
+let mixed_literal_and_parameter_bound_is_sound () =
+  with_db (fun db ->
+    seed db;
+    let bounded = "SELECT v FROM t WHERE w = 2 AND o >= ? AND o >= 150 AND o <= 200" in
+    let foil =
+      "SELECT v FROM t WHERE w = 2 AND o + 0 >= ? AND o + 0 >= 150 AND o + 0 <= 200"
+    in
+    List.iter
+      (fun p ->
+         Alcotest.(check (list (list string)))
+           (Printf.sprintf "param %Ld: agrees with the unoptimizable foil" p)
+           (rows_of_params db foil [ Db.V_int p ])
+           (rows_of_params db bounded [ Db.V_int p ]))
+      [ 100L; 180L; 250L ])
+;;
+
+(* A same-end candidate whose literal type differs from the column's cannot be
+   ordered against one that matches, and at run time it would not bound the
+   seek at all. Keeping the orderable one is a narrowing; either way the rows
+   must not move. (Cross-type comparison semantics are #522's business — the
+   foil is compared against, not a hand-written expectation.) *)
+let cross_type_same_end_bound_is_sound () =
+  with_db (fun db ->
+    seed db;
+    Alcotest.(check (list (list string)))
+      "real literal alongside an integer one, on an integer column"
+      (rows_of
+         db
+         "SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND 200 AND o + 0 >= 150.5")
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 150.5");
+    Alcotest.(check (list (list string)))
+      "text literal alongside an integer one"
+      (rows_of
+         db
+         "SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND 200 AND o + 0 >= 'x'")
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 'x'"))
+;;
+
+(* A cross-type literal can never bound the seek — {!Granary_sql.Exec}'s
+   [range_seek_bounds] refuses to encode a value whose type is not the column's
+   and leaves that end unbounded. So it must not shut out a candidate that CAN
+   bound it just by being written first: both spellings must read the same.
+
+   This is what {!cross_type_same_end_bound_is_sound} cannot catch — a pure
+   narrowing never moves the rows, so pinning rows alone passes in either
+   order. *)
+let cross_type_bound_does_not_block_a_usable_one () =
+  with_db (fun db ->
+    seed db;
+    let both_orders ~first ~second ~expect_examined =
+      List.iter
+        (fun sql ->
+           let n = examined db sql in
+           Alcotest.(check int) (Printf.sprintf "%s : examined" sql) expect_examined n)
+        [ Printf.sprintf "SELECT v FROM t WHERE w = 2 AND %s AND %s" first second
+        ; Printf.sprintf "SELECT v FROM t WHERE w = 2 AND %s AND %s" second first
+        ]
+    in
+    (* 100..200 inclusive, whichever side of the useless conjunct it is on. *)
+    both_orders ~first:"o >= 'x'" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101;
+    both_orders ~first:"o >= 150.5" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101)
+;;
+
+(* The fold applies to reals too, whose ordering is the other one it has to get
+   right. *)
+let tightest_real_bound_wins () =
+  with_db (fun db ->
+    exec db "CREATE TABLE r (w INTEGER, x REAL, v INTEGER, PRIMARY KEY (w, x))";
+    exec db "BEGIN";
+    for i = 1 to 200 do
+      exec db (Printf.sprintf "INSERT INTO r VALUES (1, %f, %d)" (float_of_int i /. 4.) i)
+    done;
+    exec db "COMMIT";
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x BETWEEN 2.5 AND 10.0 AND x >= 5.0"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 BETWEEN 2.5 AND 10.0 AND x + 0 >= 5.0"
+        (* 5.0 .. 10.0 in steps of 0.25, both ends inclusive. *)
+      ~expect_examined:21)
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Property                                                             *)
 (* ------------------------------------------------------------------ *)
+
+(* #523: four same-end constraints at once — whatever the fold keeps, the rows
+   must equal the unoptimizable foil's.  Both ends get two INDEPENDENT
+   candidates: the lower end [a] (from the [BETWEEN]) against [b], the upper end
+   [c] against [d].  With the same value on both upper candidates the two would
+   always compare equal and a [>=]/[<=] slip in the fold's [`Hi] arm would go
+   unseen under random input. *)
+let prop_folded_bounds_match_foil =
+  QCheck.Test.make
+    ~count:200
+    ~name:"folded same-end bounds agree with unoptimizable foil"
+    QCheck.(
+      quad
+        (int_range 1 3)
+        (int_range (-2) 14)
+        (int_range (-2) 14)
+        (pair (int_range (-2) 14) (int_range (-2) 14)))
+    (fun (w, a, b, (c, d)) ->
+       with_db (fun db ->
+         exec db "CREATE TABLE t (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+         exec db "BEGIN";
+         for wi = 1 to 3 do
+           for o = 1 to 12 do
+             exec
+               db
+               (Printf.sprintf "INSERT INTO t VALUES (%d, %d, %d)" wi o ((wi * 100) + o))
+           done
+         done;
+         exec db "COMMIT";
+         let q col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = %d AND %s BETWEEN %d AND %d AND %s >= %d AND \
+                 %s <= %d"
+                w
+                col
+                a
+                c
+                col
+                b
+                col
+                d)
+         in
+         q "o" = q "o + 0"))
+;;
 
 let prop_range_matches_foil =
   QCheck.Test.make
@@ -735,6 +972,17 @@ let () =
             between_under_a_join_narrows
         ; Alcotest.test_case "DML range narrows" `Quick dml_range_narrows
         ; Alcotest.test_case "real range narrows" `Quick real_range_narrows
+        ; Alcotest.test_case "tightest lower bound wins" `Quick tightest_lower_bound_wins
+        ; Alcotest.test_case "tightest upper bound wins" `Quick tightest_upper_bound_wins
+        ; Alcotest.test_case
+            "repeated inequalities fold"
+            `Quick
+            repeated_inequalities_fold
+        ; Alcotest.test_case "tightest real bound wins" `Quick tightest_real_bound_wins
+        ; Alcotest.test_case
+            "parameter bound alone still narrows"
+            `Quick
+            parameter_bound_alone_still_narrows
         ] )
     ; ( "correctness"
       , [ Alcotest.test_case
@@ -777,6 +1025,22 @@ let () =
             "NULLs in a column after the ranged one"
             `Quick
             nulls_in_a_column_after_the_ranged_one
+        ; Alcotest.test_case
+            "contradictory folded bounds read nothing"
+            `Quick
+            contradictory_folded_bounds_read_nothing
+        ; Alcotest.test_case
+            "mixed literal and parameter bound is sound"
+            `Quick
+            mixed_literal_and_parameter_bound_is_sound
+        ; Alcotest.test_case
+            "cross-type same-end bound is sound"
+            `Quick
+            cross_type_same_end_bound_is_sound
+        ; Alcotest.test_case
+            "cross-type bound does not block a usable one"
+            `Quick
+            cross_type_bound_does_not_block_a_usable_one
         ] )
     ; ( "property"
       , List.map
@@ -784,6 +1048,7 @@ let () =
           [ prop_range_matches_foil
           ; prop_between_matches_foil
           ; prop_cross_type_between_matches_inequalities
+          ; prop_folded_bounds_match_foil
           ] )
     ]
 ;;
