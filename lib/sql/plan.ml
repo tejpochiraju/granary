@@ -146,9 +146,9 @@ type op =
   | Op_index_lookup of
       { table_tree : int (** table's tree_id *)
       ; idx_tree : int (** index tree_id *)
-      ; col_idx : int (** column ordinal for encoding *)
-      ; col_type : Granary_encoding.Row.ty
-      ; lookup_val : expr (** value to look up *)
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+        (** leading index columns pinned by equality, in INDEX column order:
+            [(column ordinal, column type, value expression)] *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
   | Op_rowid_lookup of

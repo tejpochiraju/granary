@@ -87,32 +87,90 @@ let recognise_eq_col_lit = function
   | _ -> None
 ;;
 
+(* An index is usable for equality lookup only if all its columns are plain
+   (not expressions) and it is not partial: a row absent from a partial index
+   may still satisfy the query's WHERE clause, and the optimizer cannot match
+   query predicates against expression-index keys. *)
+let index_is_seekable (i : Cat.index_info) =
+  let is_plain_cols =
+    match i.Cat.idx_expr_flags with
+    | [] -> true (* old format: no flags = all plain *)
+    | flags -> not (List.exists Fun.id flags)
+  in
+  is_plain_cols && i.Cat.idx_where_sql = None
+;;
+
 (** If the catalog has a single-column index on [(table, col_idx)], return the
-    matching [index_info].  Multi-column indexes are not used for lookup
-    optimization (deferred).  Otherwise [None]. *)
+    matching [index_info].  Used by the JOIN planner, whose nested-loop probe
+    keys on exactly one column.  Otherwise [None]. *)
 let find_index_on_col cat (meta : Cat.table_meta) col_idx =
   let col_name = (List.nth meta.columns col_idx).Row.name in
   let candidates = Cat.indexes_for_table cat ~table:meta.name in
   List.find_opt
     (fun (i : Cat.index_info) ->
-       (* Partial indexes (with WHERE clause) are not safe to use for general
-       query optimization: a row absent from the index may still satisfy
-       the query's WHERE clause, so we must always fall back to a full scan.
-       Expression indexes are also excluded from Op_index_lookup optimization:
-       the optimizer cannot trivially match query predicates to expression index keys. *)
-       let is_plain_cols =
-         match i.Cat.idx_expr_flags with
-         | [] -> true (* old format: no flags = all plain *)
-         | flags -> not (List.exists Fun.id flags)
-         (* no expression columns *)
-       in
-       is_plain_cols
-       && i.Cat.idx_where_sql = None
+       index_is_seekable i
        &&
        match i.Cat.idx_columns with
        | [ col ] -> col = col_name
-       | _ -> false (* multi-column indexes not used for lookup optimization *))
+       | _ -> false (* an NLJ probe pins one column, so only a 1-col index fits *))
     candidates
+;;
+
+(** Flatten the top-level [AND] spine of a WHERE clause into its conjuncts.
+    [OR] and everything else are opaque leaves. *)
+let rec conjuncts (e : Sema.bound_expr) =
+  match e with
+  | Sema.BE_binop (Sema.And, a, b) -> conjuncts a @ conjuncts b
+  | e -> [ e ]
+;;
+
+(** #508: match [eqs] — the recognised [(conjunct position, col ordinal, value)]
+    equalities of the WHERE clause — against one index, longest seekable prefix
+    first.  Returns the covered leading columns in INDEX order together with the
+    conjunct positions they consumed, or [None] if the index's first column is
+    not pinned.
+
+    Position (not column ordinal) identifies a consumed conjunct, so a repeated
+    column — [w = 1 AND w = 2] — consumes only the conjunct it actually seeks
+    with and leaves the other to the residual filter. *)
+let prefix_for_index (meta : Cat.table_meta) (i : Cat.index_info) eqs =
+  let col_ordinal name =
+    let rec go k = function
+      | [] -> None
+      | (c : Row.column) :: rest ->
+        if String.equal c.Row.name name then Some k else go (k + 1) rest
+    in
+    go 0 meta.Cat.columns
+  in
+  let rec go acc used = function
+    | [] -> List.rev acc, used
+    | idx_col :: rest ->
+      (match col_ordinal idx_col with
+       | None -> List.rev acc, used
+       | Some ord ->
+         (match
+            List.find_opt (fun (pos, c, _) -> c = ord && not (List.mem pos used)) eqs
+          with
+          | None -> List.rev acc, used
+          | Some (pos, _, v) -> go ((ord, v) :: acc) (pos :: used) rest))
+  in
+  match go [] [] i.Cat.idx_columns with
+  | [], _ -> None
+  | prefix, used -> Some (prefix, used)
+;;
+
+(** Pick the index giving the longest equality-covered leading prefix. *)
+let find_index_for_eqs cat (meta : Cat.table_meta) eqs =
+  Cat.indexes_for_table cat ~table:meta.Cat.name
+  |> List.filter index_is_seekable
+  |> List.filter_map (fun i ->
+    Option.map (fun (prefix, used) -> i, prefix, used) (prefix_for_index meta i eqs))
+  |> List.fold_left
+       (fun best ((_, prefix, _) as cand) ->
+          match best with
+          | Some (_, bp, _) when List.length bp >= List.length prefix -> best
+          | _ -> Some cand)
+       None
 ;;
 
 (** Detect [BE_col a = BE_col b] equality at the top level. *)
@@ -254,9 +312,25 @@ let rec substitute_window_slots ~n_input_cols (e : Plan.expr) : Plan.expr =
   | e' -> e'
 ;;
 
-(* Choose the base access path for a single table: an index lookup when the
-   WHERE clause is [col = literal] and an index covers the column, else a seq
-   scan (optionally wrapped in a filter).  With joins, always a seq scan. *)
+(* Wrap [child] in a filter for the conjuncts an access path did not consume. *)
+let residual_filter ~consumed all_conjuncts child =
+  let left =
+    List.filteri (fun pos _ -> not (List.mem pos consumed)) all_conjuncts
+    |> List.map plan_expr
+  in
+  match left with
+  | [] -> child
+  | p :: rest ->
+    let pred = List.fold_left (fun a b -> Plan.P_binop (Plan.And, a, b)) p rest in
+    Plan.Op_filter { pred; child }
+;;
+
+(* Choose the base access path for a single table.  The WHERE clause is split on
+   its top-level [AND] spine (#508); equality conjuncts of the form
+   [col = literal|?] can pin either the rowid alias (a single table seek) or the
+   leading columns of an index (an encoded-prefix seek).  Whatever the access
+   path does not consume stays behind as a residual filter; with no usable path
+   at all, a filtered seq scan.  With joins, always a seq scan. *)
 let plan_base cat ~table_meta ~where ~has_joins =
   if has_joins
   then make_scan table_meta
@@ -264,26 +338,52 @@ let plan_base cat ~table_meta ~where ~has_joins =
     match where with
     | None -> make_scan table_meta
     | Some e ->
-      (match recognise_eq_col_lit e with
-       | Some (col_idx, lit_expr) when Cat.rowid_alias_col table_meta = Some col_idx ->
+      let cs = conjuncts e in
+      let eqs =
+        cs
+        |> List.mapi (fun pos c ->
+          Option.map (fun (col_idx, v) -> pos, col_idx, v) (recognise_eq_col_lit c))
+        |> List.filter_map Fun.id
+      in
+      let fallback () =
+        Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta }
+      in
+      let alias_eq =
+        List.find_opt
+          (fun (_, col_idx, _) -> Cat.rowid_alias_col table_meta = Some col_idx)
+          eqs
+      in
+      (match alias_eq with
+       | Some (pos, _, lit_expr) ->
          (* #243 (T1): the alias column IS the table key — a single rowid seek,
             no index. *)
-         Plan.Op_rowid_lookup { table_meta; lookup_val = plan_expr lit_expr }
-       | Some (col_idx, lit_expr) ->
-         (match find_index_on_col cat table_meta col_idx with
-          | Some idx ->
-            let col_type = (List.nth table_meta.columns col_idx).Row.ty in
-            let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
-            Plan.Op_index_lookup
-              { table_tree = tree_id_pl
-              ; idx_tree = idx.idx_tree_id
-              ; col_idx
-              ; col_type
-              ; lookup_val = plan_expr lit_expr
-              ; table_meta
-              }
-          | None -> Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta })
-       | None -> Plan.Op_filter { pred = plan_expr e; child = make_scan table_meta }))
+         residual_filter
+           ~consumed:[ pos ]
+           cs
+           (Plan.Op_rowid_lookup { table_meta; lookup_val = plan_expr lit_expr })
+       | None ->
+         if eqs = []
+         then fallback ()
+         else (
+           match find_index_for_eqs cat table_meta eqs with
+           | None -> fallback ()
+           | Some (idx, prefix, consumed) ->
+             let tree_id_pl, _, _, _ = Cat.row_storage table_meta in
+             let keys =
+               List.map
+                 (fun (col_idx, v) ->
+                    col_idx, (List.nth table_meta.columns col_idx).Row.ty, plan_expr v)
+                 prefix
+             in
+             residual_filter
+               ~consumed
+               cs
+               (Plan.Op_index_lookup
+                  { table_tree = tree_id_pl
+                  ; idx_tree = idx.Cat.idx_tree_id
+                  ; keys
+                  ; table_meta
+                  }))))
 ;;
 
 (* Build ORDER BY sort keys, substituting window slots into the key

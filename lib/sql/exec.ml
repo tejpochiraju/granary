@@ -8459,29 +8459,31 @@ and stream_index_lookup
       mode
       table_tree
       idx_tree
-      col_type
-      lookup_val
+      (keys : (int * Row.ty * Plan.expr) list)
       (table_meta : Cat.table_meta)
   =
   let s_opt = Lwt.get query_stats_key in
-  let v = eval_expr clock params [||] lookup_val in
-  (* [WHERE col = NULL] never matches (SQL three-valued logic).  A bound
-     parameter may be NULL at run time (#228: [col = ?] is now index-eligible);
-     return no rows rather than seeking the index's NULL entries. *)
-  match v with
-  | Row.V_null -> Lwt.return (Lwt_stream.of_list [])
-  | _ ->
-    let lookup_v =
-      match v, col_type with
-      | Row.V_null, _ -> Index_key.IK_null
-      | Row.V_int n, Row.Integer -> Index_key.IK_int n
-      | Row.V_text s, Row.Text -> Index_key.IK_text s
-      | Row.V_real f, Row.Real -> Index_key.IK_real f
-      | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
-      | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *)
+  let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+  (* [WHERE col = NULL] never matches (SQL three-valued logic), and one NULL
+     anywhere in the key kills the whole conjunction.  A bound parameter may be
+     NULL at run time (#228: [col = ?] is index-eligible); return no rows rather
+     than seeking the index's NULL entries. *)
+  if List.exists (fun (v, _) -> v = Row.V_null) vs
+  then Lwt.return (Lwt_stream.of_list [])
+  else (
+    let lookup_vs =
+      List.map
+        (fun (v, ty) ->
+           match v, ty with
+           | Row.V_null, _ -> Index_key.IK_null
+           | Row.V_int n, Row.Integer -> Index_key.IK_int n
+           | Row.V_text s, Row.Text -> Index_key.IK_text s
+           | Row.V_real f, Row.Real -> Index_key.IK_real f
+           | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
+           | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *))
+        vs
     in
-    let prefix = Index_key.encode_value lookup_v in
-    let plen = Bytes.length prefix in
+    let prefix, plen = encode_index_key_prefix lookup_vs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     (* #262: read through the active txn so an index lookup sees rows the open
        transaction has inserted/updated but not yet committed. *)
@@ -8538,7 +8540,7 @@ and stream_index_lookup
                let%lwt () = finish () in
                Lwt.fail exn))
     in
-    Lwt.return stream
+    Lwt.return stream)
 
 (* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
    the table key, so this is a single O(log n) table-tree seek, no index and no
@@ -9933,18 +9935,8 @@ and to_stream
               Hashtbl.replace seen k ();
               true))
          inner)
-  | Plan.Op_index_lookup
-      { table_tree; idx_tree; col_idx = _; col_type; lookup_val; table_meta } ->
-    stream_index_lookup
-      clock
-      params
-      store
-      mode
-      table_tree
-      idx_tree
-      col_type
-      lookup_val
-      table_meta
+  | Plan.Op_index_lookup { table_tree; idx_tree; keys; table_meta } ->
+    stream_index_lookup clock params store mode table_tree idx_tree keys table_meta
   | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
