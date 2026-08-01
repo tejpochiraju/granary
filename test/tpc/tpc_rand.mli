@@ -36,3 +36,19 @@ val pick : t -> string array -> string
 (** [phone r ~nation] builds the spec's 15-character phone number
     ["CC-AAA-BBB-CCCC"], where the country code is [nation + 10]. *)
 val phone : t -> nation:int -> string
+
+(** [nurand t ~a ~x ~y ~c] is the TPC-C non-uniform random distribution
+    [(((random(0,a) lor random(x,y)) + c) mod (y - x + 1)) + x], always within
+    [\[x, y\]].  The skew it produces is what makes the benchmark contend; a
+    uniform draw would not.  [c] is the spec's per-run constant, taken as a
+    parameter so that a seed pins the whole workload.  Requires [x <= y],
+    [a >= 0], and [c >= 0] — a negative [c] would make OCaml's [mod] return a
+    negative remainder, pushing the result below [x]; raises
+    [Invalid_argument] if any precondition is violated. *)
+val nurand : t -> a:int -> x:int -> y:int -> c:int -> int
+
+(** [last_name n] is the spec's customer surname for [n] in [\[0, 999\]]: the
+    concatenation of three syllables drawn from a fixed ten-element table,
+    running from ["BARBARBAR"] to ["EINGEINGEING"].  Pure — it draws no
+    randomness.  Raises [Invalid_argument] outside [\[0, 999\]]. *)
+val last_name : int -> string

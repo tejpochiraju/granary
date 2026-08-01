@@ -89,22 +89,12 @@ let indexes =
   ]
 ;;
 
+(* The escaping and whole-valued-REAL rules live in [Tpc_value.literal]; this
+   only maps TPC-H's value type onto the shared one. *)
 let literal = function
-  | Tpch_gen.VInt i -> string_of_int i
-  | Tpch_gen.VReal f ->
-    (* granary types a literal by its text: "100" is an INTEGER literal and a
-       REAL column rejects it under strict column typing, so a whole-valued
-       REAL has to keep a fractional part. *)
-    let s = Printf.sprintf "%.17g" f in
-    if String.exists (fun c -> c = '.' || c = 'e' || c = 'E') s then s else s ^ ".0"
-  | Tpch_gen.VText s ->
-    let buf = Buffer.create (String.length s + 2) in
-    Buffer.add_char buf '\'';
-    String.iter
-      (fun c -> if c = '\'' then Buffer.add_string buf "''" else Buffer.add_char buf c)
-      s;
-    Buffer.add_char buf '\'';
-    Buffer.contents buf
+  | Tpch_gen.VInt i -> Tpc_value.literal (Tpc_value.VInt i)
+  | Tpch_gen.VReal f -> Tpc_value.literal (Tpc_value.VReal f)
+  | Tpch_gen.VText s -> Tpc_value.literal (Tpc_value.VText s)
 ;;
 
 module Load (E : Bench_report.ENGINE) = struct

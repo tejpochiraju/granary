@@ -733,6 +733,39 @@
  (modules test_tpch_smoke)
  (libraries granary_tpc alcotest unix))
 
+(test
+ (name test_tpcc_gen)
+ (modules test_tpcc_gen)
+ (libraries granary_tpc alcotest qcheck-core qcheck-alcotest))
+
+(test
+ (name test_tpcc_schema)
+ (modules test_tpcc_schema)
+ (libraries granary_tpc alcotest unix))
+
+(test
+ (name test_tpcc_check)
+ (modules test_tpcc_check)
+ (libraries granary_tpc alcotest))
+
+(test
+ (name test_tpcc_txn)
+ (modules test_tpcc_txn)
+ (libraries granary_tpc lwt lwt.unix alcotest qcheck-core qcheck-alcotest))
+
+(test
+ (name test_tpcc_load)
+ (modules test_tpcc_load)
+ (libraries granary_tpc alcotest unix))
+
+; TPC-C profile smoke run (#500).  The expensive case is gated behind
+; GRANARY_TPCC_SMOKE; see the header comment in test_tpcc_smoke.ml.
+
+(test
+ (name test_tpcc_smoke)
+ (modules test_tpcc_smoke)
+ (libraries granary_tpc alcotest lwt lwt.unix unix))
+
 ; TPC-H-derived benchmark (#482).  `(optional)` for the same reason as
 ; bench_compare: builds where `sqlite3` is absent skip it rather than fail.
 

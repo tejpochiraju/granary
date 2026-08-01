@@ -78,3 +78,39 @@ let phone t ~nation =
     (int_between t ~lo:100 ~hi:999)
     (int_between t ~lo:1000 ~hi:9999)
 ;;
+
+(* TPC-C's non-uniform key distribution:
+     NURand(A, x, y) = (((random(0,A) | random(x,y)) + C) mod (y - x + 1)) + x
+   The bitwise-or is what creates the skew — it drives bits high, so the
+   masked-and-wrapped result clusters, and clustering is what makes the
+   benchmark contend.  The spec picks C once per run at random; taking it as a
+   parameter keeps a seed sufficient to pin the whole workload.
+
+   The two draws are bound in explicit statements, random(0,a) first, rather
+   than written inline as operands of [lor].  Both draws mutate the LCG state,
+   and OCaml does not specify evaluation order for the operands of an infix
+   operator — inlined, which stream value plays random(0,a) and which plays
+   random(x,y) would be toolchain-dependent, silently breaking the seed's
+   cross-platform reproducibility contract.  This is the same hazard
+   [a_string] avoids above by using an explicit loop instead of
+   [String.init]. *)
+let nurand t ~a ~x ~y ~c =
+  if x > y then invalid_arg "Tpc_rand.nurand: x > y";
+  if a < 0 then invalid_arg "Tpc_rand.nurand: a < 0";
+  if c < 0 then invalid_arg "Tpc_rand.nurand: c < 0";
+  let span = y - x + 1 in
+  let r_a = int_between t ~lo:0 ~hi:a in
+  let r_xy = int_between t ~lo:x ~hi:y in
+  (((r_a lor r_xy) + c) mod span) + x
+;;
+
+let last_name_syllables =
+  [| "BAR"; "OUGHT"; "ABLE"; "PRI"; "PRES"; "ESE"; "ANTI"; "CALLY"; "ATION"; "EING" |]
+;;
+
+let last_name n =
+  if n < 0 || n > 999 then invalid_arg "Tpc_rand.last_name: n out of [0,999]";
+  last_name_syllables.(n / 100)
+  ^ last_name_syllables.(n / 10 mod 10)
+  ^ last_name_syllables.(n mod 10)
+;;

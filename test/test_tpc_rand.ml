@@ -224,6 +224,119 @@ let test_requires_a_63_bit_int () =
     (Sys.int_size >= 63)
 ;;
 
+let test_nurand_within_range () =
+  let r = seeded () in
+  for _ = 1 to 10_000 do
+    let v = Granary_tpc.Tpc_rand.nurand r ~a:1023 ~x:1 ~y:3000 ~c:17 in
+    Alcotest.(check bool) "within [1,3000]" true (v >= 1 && v <= 3000)
+  done
+;;
+
+let test_nurand_singleton_range () =
+  let r = seeded () in
+  Alcotest.(check int)
+    "x = y yields x"
+    5
+    (Granary_tpc.Tpc_rand.nurand r ~a:255 ~x:5 ~y:5 ~c:3)
+;;
+
+let test_nurand_is_skewed () =
+  (* The whole point of NURand: it must NOT be uniform, and it must be *this*
+     skew, not just "skewed somehow" — a one-sided ">" bar is satisfied by
+     several wrong implementations. Exhaustive enumeration over all 1024 *
+     3000 (a, random(x,y)) pairs for a:1023, x:1, y:3000, c:0 gives exactly
+     36.4591% landing in [1,1000] (1,120,024 / 3,072,000). A uniform draw
+     gives 33.33%; a buggy [lxor]-for-[lor] variant gives 35.53%
+     (1,091,616 / 3,072,000, enumerated the same way) and would pass a
+     one-sided "> 35%" bar; [land] instead of [lor] gives 99.97%
+     (3,071,104 / 3,072,000) and would pass too. Anchoring on a tight
+     two-sided band around the true 36.4591%
+     rejects all three. n = 200_000 for headroom: at that n the sampling
+     stderr for a true share of 0.364591 is about 0.0011, so the band
+     [0.358, 0.371] (+-0.0065, ~6 sigma) comfortably contains the true value
+     while excluding uniform, lxor, and land by wide margins. *)
+  let r = seeded () in
+  let n = 200_000 in
+  let low = ref 0 in
+  for _ = 1 to n do
+    if Granary_tpc.Tpc_rand.nurand r ~a:1023 ~x:1 ~y:3000 ~c:0 <= 1000 then incr low
+  done;
+  let share = float_of_int !low /. float_of_int n in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "skewed toward low keys at the enumerated rate (%d/%d = %.5f)"
+       !low
+       n
+       share)
+    true
+    (share >= 0.358 && share <= 0.371)
+;;
+
+let test_nurand_x_gt_y_raises () =
+  let r = seeded () in
+  Alcotest.check_raises
+    "x > y raises Invalid_argument"
+    (Invalid_argument "Tpc_rand.nurand: x > y")
+    (fun () -> ignore (Granary_tpc.Tpc_rand.nurand r ~a:1023 ~x:8 ~y:3 ~c:0))
+;;
+
+let test_last_name_endpoints () =
+  Alcotest.(check string) "0" "BARBARBAR" (Granary_tpc.Tpc_rand.last_name 0);
+  Alcotest.(check string) "999" "EINGEINGEING" (Granary_tpc.Tpc_rand.last_name 999);
+  (* Pins the 15-character maximum (all three digits pick a 5-char syllable),
+     so the [9,15] bound on qcheck_last_name_alphabet cannot silently rot. *)
+  Alcotest.(check string) "111" "OUGHTOUGHTOUGHT" (Granary_tpc.Tpc_rand.last_name 111)
+;;
+
+let test_last_name_distinct () =
+  let names = List.init 1000 Granary_tpc.Tpc_rand.last_name in
+  let uniq = List.sort_uniq String.compare names in
+  Alcotest.(check int) "1000 distinct names" 1000 (List.length uniq)
+;;
+
+let test_last_name_out_of_range () =
+  Alcotest.check_raises
+    "negative"
+    (Invalid_argument "Tpc_rand.last_name: n out of [0,999]")
+    (fun () -> ignore (Granary_tpc.Tpc_rand.last_name (-1)));
+  Alcotest.check_raises
+    "too large"
+    (Invalid_argument "Tpc_rand.last_name: n out of [0,999]")
+    (fun () -> ignore (Granary_tpc.Tpc_rand.last_name 1000))
+;;
+
+let qcheck_nurand_in_range =
+  QCheck.Test.make
+    ~name:"nurand stays within [x,y] for arbitrary seeds and bounds"
+    ~count:2000
+    QCheck.(
+      tup5 int (int_range 0 4095) (int_range 0 5000) (int_range 0 5000) (int_range 0 8191))
+    (fun (seed, a, p, q, c) ->
+       let x = min p q
+       and y = max p q in
+       let r = Granary_tpc.Tpc_rand.create ~seed in
+       (* [c] is drawn from its own non-negative [int_range], not derived from
+          [seed] via [abs] — [abs min_int] is still negative, which would feed
+          [nurand] a [c] it now rejects. *)
+       let v = Granary_tpc.Tpc_rand.nurand r ~a ~x ~y ~c in
+       v >= x && v <= y)
+;;
+
+let qcheck_last_name_alphabet =
+  QCheck.Test.make
+    ~name:"last_name is a concatenation of three syllables"
+    ~count:1000
+    QCheck.(int_range 0 999)
+    (fun n ->
+       let s = Granary_tpc.Tpc_rand.last_name n in
+       (* Syllable lengths run 3-5 ("BAR".."OUGHT"/"CALLY"/"ATION"), so three
+          concatenated syllables span [9,15], not [9,12] - e.g. n=77 gives
+          "BAR" ^ "CALLY" ^ "CALLY" = 13 chars. *)
+       String.for_all (fun c -> c >= 'A' && c <= 'Z') s
+       && String.length s >= 9
+       && String.length s <= 15)
+;;
+
 let () =
   Alcotest.run
     "tpc_rand"
@@ -268,9 +381,25 @@ let () =
         ; Alcotest.test_case "reaches all elements" `Quick test_pick_reaches_all_elements
         ; Alcotest.test_case "empty array raises" `Quick test_pick_empty_array_raises
         ] )
+    ; ( "nurand"
+      , [ Alcotest.test_case "within range" `Quick test_nurand_within_range
+        ; Alcotest.test_case "singleton range" `Quick test_nurand_singleton_range
+        ; Alcotest.test_case "is skewed" `Quick test_nurand_is_skewed
+        ; Alcotest.test_case "x > y raises" `Quick test_nurand_x_gt_y_raises
+        ] )
+    ; ( "last_name"
+      , [ Alcotest.test_case "endpoints" `Quick test_last_name_endpoints
+        ; Alcotest.test_case "1000 distinct" `Quick test_last_name_distinct
+        ; Alcotest.test_case "out of range raises" `Quick test_last_name_out_of_range
+        ] )
     ; ( "properties"
       , List.map
           QCheck_alcotest.to_alcotest
-          [ prop_int_between_respects_bounds; prop_a_string_length; prop_determinism ] )
+          [ prop_int_between_respects_bounds
+          ; prop_a_string_length
+          ; prop_determinism
+          ; qcheck_nurand_in_range
+          ; qcheck_last_name_alphabet
+          ] )
     ]
 ;;
