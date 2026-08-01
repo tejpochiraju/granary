@@ -18,17 +18,35 @@
       writer is parked inside [wal_sync].  Wall time approaches
       [max(T_writer, T_readers)].
 
-    Reports speedup = baseline / parallel.  Theoretical ceiling for
-    perfect overlap with balanced reader/writer durations is 2x.  We
-    assert a modest 1.2x floor so the test fails if the overlap
-    invariant is broken (e.g. someone reintroduces a writer-lock
-    acquire on the reader path) while tolerating environmental jitter.
+    Two gates, in order of robustness (#468):
+
+    - {b Primary — the overlap invariant.}  In the parallel run, readers
+      must finish no later than the writer ([reader_done <= writer_done]).
+      Serialised readers cannot start until the writer is done, so they
+      necessarily finish after it; overlapping readers finish inside its
+      window.  Both terms scale with host speed, so this holds on any
+      hardware and needs no assumption about the reader/writer balance.
+    - {b Secondary — the wall-clock win}, speedup = baseline / parallel,
+      floor 1.2x.  Ceiling for perfect overlap with balanced durations is
+      2x.  This one assumes [parallel ~ max (T_writer, T_readers)], which
+      needs CPU headroom; where the host has none it is reported
+      INCONCLUSIVE instead of failing (the invariant still applies).
+
+    Because the secondary ceiling is [1 + T_readers / T_writer], the reader
+    workload is {b calibrated} at startup rather than fixed: see
+    [calibrate_read_ops].  Setting GRANARY_BENCH_READ_OPS pins it
+    instead and skips calibration.
+
+    The premise is a writer parked in fsync for a measurable time, so
+    DELAY_MS x N_COMMITS should stay well above a second (default 1.5s);
+    at a few tens of ms, fixed per-run overhead dominates both walls.
 
     Env vars (all optional):
       GRANARY_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
       GRANARY_BENCH_N_COMMITS       writer commits (default 30)
       GRANARY_BENCH_N_READERS       parallel reader fibers (default 4)
-      GRANARY_BENCH_READ_OPS        cursor walks per reader (default 100)
+      GRANARY_BENCH_READ_OPS        cursor walks per reader (default: calibrated)
+      GRANARY_BENCH_READER_RATIO    target T_readers / T_writer (default 0.45)
       GRANARY_BENCH_SEED_ROWS       initial tree size (default 200)
       GRANARY_BENCH_MIN_SPEEDUP     pass/fail threshold (default 1.2)
 *)
@@ -336,12 +354,140 @@ let run_config ~delay ~n_seed mode ~n_commits ~n_readers ~read_ops =
      Lwt.return { wall = t1 -. t0; writer_phase = w; reader_phase = r })
 ;;
 
+(* Ops per probe run.  A probe size only — deliberately NOT reused as a
+   floor on the calibrated workload: on a slow host a 1000-op floor would
+   override calibration and push T_r past T_w, which is #468 mirrored. *)
+let probe_ops = 1000
+
+(* Time the baseline reader phase alone — [n_readers] fibers joined, no
+   writer, no fsync delay.  Used by [calibrate_read_ops]. *)
+let probe_reader_phase ~n_seed ~n_readers ~read_ops =
+  cleanup path;
+  run
+    (let* st = open_slow_wal ~path ~delay:0.0 in
+     let* () = seed st n_seed in
+     let t0 = Unix.gettimeofday () in
+     let readers = List.init n_readers (fun _ -> reader_workload st ~read_ops) in
+     let* () = Lwt.join readers in
+     let t1 = Unix.gettimeofday () in
+     let* () = S.close st in
+     Lwt.return (t1 -. t0))
+;;
+
+(* Reader-workload calibration (#468).
+
+   The metric is baseline / parallel = (T_w + T_r) / max (T_w, T_r), so when
+   readers are the shorter phase its arithmetic ceiling is 1 + T_r / T_w — the
+   floor is only reachable if T_r is a real fraction of T_w.  A fixed
+   READ_OPS pins T_r in absolute terms, and once the read path got ~40x
+   faster (#228 / #229 seek_ge, cursor_next, frame cache) T_r collapsed to
+   ~0.04s against a 1.5s writer: a 1.02x ceiling, i.e. the 1.2x gate failed
+   on hosts with fast reads *while overlap was in fact perfect*.
+
+   So size the reader workload against the writer instead of hard-coding it.
+   Two probes give the marginal per-op cost of the reader phase on this host
+   (the difference cancels the fixed cold-cache cost of the first walk), and
+   READ_OPS is chosen so T_r lands near [ratio] x T_w.  The floor then
+   measures overlap quality rather than host read speed.
+
+   Err LOW, deliberately.  Two effects punish T_r near T_w:
+   - the metric is not monotonic in T_r.  Past T_r = T_w the expression
+     becomes 1 + T_w / T_r and the speedup falls again; and
+   - readers are slower under contention than the probes (which run with no
+     writer on an idle scheduler), so actual T_r overshoots target by ~1.5x
+     and, once readers set the parallel wall, that inflation lands directly
+     on the denominator.  A cold run measured 1.27x this way.
+   Hence the low default ratio and the hard writer-relative cap below: T_r is
+   kept clear of T_w so the writer always bounds the parallel wall. *)
+let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
+  (* Timing noise is one-sided — a probe can be delayed, never hurried — so
+     take the fastest of [probe_reps] repeats rather than a single shot.
+     Single-shot probes drifted read_ops by up to 1.5x run to run, which
+     showed up directly as speedup spread (1.25x on the unlucky draw). *)
+  let probe_reps = 3 in
+  let best ~read_ops =
+    let times =
+      List.init probe_reps (fun _ -> probe_reader_phase ~n_seed ~n_readers ~read_ops)
+    in
+    List.fold_left min infinity times
+  in
+  let t1 = best ~read_ops:probe_ops in
+  let t2 = best ~read_ops:(2 * probe_ops) in
+  let marginal = (t2 -. t1) /. float_of_int probe_ops in
+  (* Fall back to the average cost if the two probes were swamped by jitter. *)
+  let per_op = if marginal > 0.0 then marginal else t2 /. float_of_int (2 * probe_ops) in
+  (* Unreachable unless the clock runs backwards — [t2] is a positive
+     duration — so this branch is defence only and will not be covered. *)
+  if per_op <= 0.0
+  then probe_ops
+  else (
+    let ops_for secs = int_of_float (secs /. per_op) in
+    let want = ops_for (writer_secs *. ratio) in
+    (* Upper clamps: predicted T_r stays at most 0.75 x T_w (see above), and
+       200k ops keeps a pathologically slow host from running for minutes.
+       Lower clamp is 1, not [probe_ops]: a probe size is not a workload
+       floor, and forcing one on a slow host recreates #468 with the
+       inequality flipped. *)
+    max 1 (min (min 200_000 (ops_for (writer_secs *. 0.75))) want))
+;;
+
+(* The two gates for one config.  See the header for why there are two. *)
+let assert_gates ~label ~base ~par ~speedup ~min_speedup =
+  (* Primary gate: the overlap invariant itself, asserted directly and
+     host-independently.  If readers were serialised behind the writer they
+     could not start until it finished, so [reader_done] would necessarily
+     exceed [writer_done] by the whole reader phase (measured: 1.5x).
+     Overlapping readers finish inside the writer's window (measured: 0.37-0.48,
+     and unchanged by host speed, since both terms scale together).  Unlike the
+     speedup ratio this needs no assumption about T_r / T_w. *)
+  let overlap_ratio = par.reader_phase /. par.writer_phase in
+  Alcotest.(check bool)
+    (Printf.sprintf
+       "[%s] readers finish inside the writer window: reader_done/writer_done %.2f <= \
+        1.15"
+       label
+       overlap_ratio)
+    true
+    (overlap_ratio <= 1.15);
+  (* Secondary gate: the wall-clock win.  This one DOES assume parallel ~
+     max (T_w, T_r), which needs enough CPU headroom for the readers' work to
+     fit inside the writer's fsync sleeps.  On a starved host the writer's own
+     phase inflates (measured: 1.61s -> 2.23s at 0.15 CPU) and the ratio
+     collapses below the floor with overlap perfectly intact — so report that
+     inconclusive rather than failing.  A serialisation regression does NOT
+     inflate the writer's phase, and the invariant above catches it
+     unconditionally. *)
+  let writer_inflation = par.writer_phase /. base.writer_phase in
+  if writer_inflation > 1.25
+  then
+    Printf.printf
+      "  INCONCLUSIVE [%s]: writer phase inflated %.2fx under load (no CPU headroom to \
+       overlap); speedup floor not asserted\n\
+       %!"
+      label
+      writer_inflation
+  else
+    Alcotest.(check bool)
+      (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label speedup min_speedup)
+      true
+      (speedup >= min_speedup)
+;;
+
 let test_fsync_overlap () =
   let delay_ms = getenv_int "GRANARY_BENCH_FSYNC_DELAY_MS" 50 in
   let n_commits = getenv_int "GRANARY_BENCH_N_COMMITS" 30 in
   let n_readers = getenv_int "GRANARY_BENCH_N_READERS" 4 in
-  let read_ops = getenv_int "GRANARY_BENCH_READ_OPS" 100 in
   let n_seed = getenv_int "GRANARY_BENCH_SEED_ROWS" 200 in
+  (* Target reader phase as a fraction of the writer phase.  Contention makes
+     the real T_r overshoot this somewhat, so 0.45 lands the effective ratio
+     near 0.5 and the expected speedup near 1.5x — well over the 1.2x floor
+     while keeping T_r clear of T_w (see [calibrate_read_ops]).  A
+     non-positive or unparseable value means "unset". *)
+  let reader_ratio =
+    let default = 0.45 in
+    let r = getenv_float "GRANARY_BENCH_READER_RATIO" default in
+    if r > 0.0 then r else default
+  in
   (* Set conservatively at 1.2.  Observed across 8 runs in the
      granary-dev podman image at default parameters: min 1.38, mean
      1.51, max 1.63.  A regression that reintroduces reader-on-writer-
@@ -350,14 +496,32 @@ let test_fsync_overlap () =
      jitter. *)
   let min_speedup = getenv_float "GRANARY_BENCH_MIN_SPEEDUP" 1.2 in
   let delay = float_of_int delay_ms /. 1000.0 in
+  (* Each commit parks the writer for [delay], so this is the writer phase
+     to within scheduling and B-tree overhead. *)
+  let writer_secs = float_of_int n_commits *. delay in
+  (* An unparseable override falls through to calibration rather than to a
+     hard-coded count — a fixed count is exactly what #468 was.  A
+     non-positive [min_speedup] means the gate is neutralized (coverage and
+     bench-disabled CI runs do this), so don't burn the probes on a number
+     nothing asserts on. *)
+  let read_ops, read_ops_src =
+    match Option.bind (Sys.getenv_opt "GRANARY_BENCH_READ_OPS") int_of_string_opt with
+    | Some n -> n, "env"
+    | None when min_speedup <= 0.0 -> probe_ops, "gate-off"
+    | None ->
+      calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio:reader_ratio, "calibrated"
+  in
   (* Run baseline vs parallel under the currently-configured tid pair and
-     assert the overlap win clears the floor.  Called once per config. *)
+     assert the overlap win clears the floor.  Called once per config.  Both
+     configs deliberately share one calibration: per-op cost differs between
+     them (shared-tid pays writer CoW eviction), and holding read_ops fixed
+     is what makes the two speedups comparable. *)
   let measure label =
     let base = run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops in
     let par = run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops in
     let speedup = base.wall /. par.wall in
     Printf.printf
-      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d seed=%d\n\
+      "fsync-overlap bench [%s]: delay=%dms commits=%d readers=%d read_ops=%d (%s) seed=%d\n\
       \  baseline=%.3fs (writer=%.3fs, readers=%.3fs) parallel=%.3fs (writer_done=%.3fs \
        reader_done=%.3fs) speedup=%.2fx (min %.2fx)\n\
        %!"
@@ -366,6 +530,7 @@ let test_fsync_overlap () =
       n_commits
       n_readers
       read_ops
+      read_ops_src
       n_seed
       base.wall
       base.writer_phase
@@ -376,10 +541,18 @@ let test_fsync_overlap () =
       speedup
       min_speedup;
     cleanup path;
-    Alcotest.(check bool)
-      (Printf.sprintf "[%s] speedup %.2fx >= %.2fx" label speedup min_speedup)
-      true
-      (speedup >= min_speedup)
+    (* GRANARY_BENCH_MIN_SPEEDUP=0 is the documented way to neutralize this
+       bench (coverage runs use it — instrumentation slows everything enough to
+       make timing gates near-deterministic failures).  Honour it for BOTH
+       gates: the workload is left uncalibrated in that mode, so an
+       instrumented reader phase can legitimately outlast the writer. *)
+    if min_speedup <= 0.0
+    then
+      Printf.printf
+        "  [%s] gates neutralized (GRANARY_BENCH_MIN_SPEEDUP=%.2f)\n%!"
+        label
+        min_speedup
+    else assert_gates ~label ~base ~par ~speedup ~min_speedup
   in
   (* Config A: shared tree (reader and writer on the SAME tree).  This is
      the #159 regression case — every writer commit CoW-paths the reader's
