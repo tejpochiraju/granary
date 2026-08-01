@@ -87,39 +87,48 @@ let recognise_eq_col_lit = function
   | _ -> None
 ;;
 
-(** #517: recognise an inequality [col <op> v] (or [v <op> col]) against a
-    literal or bound parameter, at the top level of the WHERE clause.  Returns
-    the column, which end of the range the predicate constrains, and the value.
+(** A value a range end can be built from: a non-NULL literal, or a bound
+    parameter.  A literal NULL is not one, for the same reason [col = NULL] is
+    not matched: the comparison is never true, and the filter path already
+    handles it. *)
+let range_value = function
+  | Sema.BE_lit Ast.L_null -> None
+  | Sema.BE_lit _ as e -> Some e
+  | Sema.BE_param _ as e -> Some e
+  | _ -> None
+;;
+
+(** #517: recognise a predicate that constrains one or both ends of a column's
+    range — an inequality [col <op> v] (or [v <op> col]), or [col BETWEEN lo AND
+    hi] (#519) — at the top level of the WHERE clause.  Returns the column and
+    the value for each end it constrains.
 
     Strictness is deliberately dropped: the caller uses this only to narrow the
     span an index seek scans, never to decide whether a row qualifies, so
-    treating [>] as [>=] can cost one extra key and can never lose a row.  A
-    literal NULL is not matched, for the same reason [col = NULL] is not: the
-    comparison is never true, and the filter path already handles it. *)
-let recognise_ineq_col_lit = function
-  | Sema.BE_binop (op, Sema.BE_col i, (Sema.BE_lit l as e)) ->
-    (match l, op with
-     | Ast.L_null, _ -> None
-     | _, (Sema.Ge | Sema.Gt) -> Some (i, `Lo, e)
-     | _, (Sema.Le | Sema.Lt) -> Some (i, `Hi, e)
-     | _, _ -> None)
-  | Sema.BE_binop (op, (Sema.BE_lit l as e), Sema.BE_col i) ->
+    treating [>] as [>=] can cost one extra key and can never lose a row.  For
+    the same reason a [BETWEEN] whose ends are not both recognisable still
+    contributes the end that is — narrowing one side is sound on its own.
+
+    [NOT BETWEEN] parses as a negation wrapping [BE_between], so it does not
+    reach this function's [BE_between] case and constrains nothing. *)
+let recognise_range_col_lit = function
+  | Sema.BE_between (Sema.BE_col i, lo, hi) ->
+    (match range_value lo, range_value hi with
+     | None, None -> None
+     | lo, hi -> Some (i, lo, hi))
+  | Sema.BE_binop (op, Sema.BE_col i, e) ->
+    (match range_value e, op with
+     | None, _ -> None
+     | Some v, (Sema.Ge | Sema.Gt) -> Some (i, Some v, None)
+     | Some v, (Sema.Le | Sema.Lt) -> Some (i, None, Some v)
+     | Some _, _ -> None)
+  | Sema.BE_binop (op, e, Sema.BE_col i) ->
     (* [v > col] constrains the column's UPPER end, not its lower one. *)
-    (match l, op with
-     | Ast.L_null, _ -> None
-     | _, (Sema.Ge | Sema.Gt) -> Some (i, `Hi, e)
-     | _, (Sema.Le | Sema.Lt) -> Some (i, `Lo, e)
-     | _, _ -> None)
-  | Sema.BE_binop (op, Sema.BE_col i, (Sema.BE_param _ as e)) ->
-    (match op with
-     | Sema.Ge | Sema.Gt -> Some (i, `Lo, e)
-     | Sema.Le | Sema.Lt -> Some (i, `Hi, e)
-     | _ -> None)
-  | Sema.BE_binop (op, (Sema.BE_param _ as e), Sema.BE_col i) ->
-    (match op with
-     | Sema.Ge | Sema.Gt -> Some (i, `Hi, e)
-     | Sema.Le | Sema.Lt -> Some (i, `Lo, e)
-     | _ -> None)
+    (match range_value e, op with
+     | None, _ -> None
+     | Some v, (Sema.Ge | Sema.Gt) -> Some (i, None, Some v)
+     | Some v, (Sema.Le | Sema.Lt) -> Some (i, Some v, None)
+     | Some _, _ -> None)
   | _ -> None
 ;;
 
@@ -297,9 +306,13 @@ let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts
          let pick which =
            List.find_map
              (fun c ->
-                match recognise_ineq_col_lit c with
-                | Some (col_idx, w, e) when col_idx = ord && w = which ->
-                  Some (plan_expr e)
+                match recognise_range_col_lit c with
+                | Some (col_idx, lo, hi) when col_idx = ord ->
+                  Option.map
+                    plan_expr
+                    (match which with
+                     | `Lo -> lo
+                     | `Hi -> hi)
                 | Some _ | None -> None)
              conjuncts_list
          in
@@ -523,18 +536,20 @@ let seek_op (table_meta : Cat.table_meta) = function
    table.  Column ordinals in a bound WHERE clause address the {i combined} row,
    whose leading [n_base] slots are the driving table's own columns, so anything
    at or beyond that boundary belongs to a joined table and cannot pin the base
-   table's index.  The value side of a recognised equality is a literal or a
-   bound parameter — never a column — so a surviving conjunct references no
-   joined table at all. *)
+   table's index.  Only the recognised parts of a surviving conjunct are ever
+   read — its subject column, checked here, and value sides that are literals or
+   bound parameters, never columns.  A #519 [BETWEEN] whose other end mentions a
+   joined column therefore survives with that end simply unrecognised, and
+   contributes only the end that is a value. *)
 let base_only_conjuncts ~n_base cs =
   List.filter
     (fun c ->
        match recognise_eq_col_lit c with
        | Some (col_idx, _) -> col_idx < n_base
        | None ->
-         (* #517: inequalities are kept too — they cannot pin the prefix, but
-            they can bound the column after it. *)
-         (match recognise_ineq_col_lit c with
+         (* #517: inequalities (and #519's BETWEEN) are kept too — they cannot
+            pin the prefix, but they can bound the column after it. *)
+         (match recognise_range_col_lit c with
           | Some (col_idx, _, _) -> col_idx < n_base
           | None -> false))
     cs
