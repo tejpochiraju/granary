@@ -26,6 +26,18 @@ Worktrees live in `.worktrees/` which is gitignored. After the branch is created
 chmod 777 .worktrees/<short-name>
 ```
 
+**Never use `git stash` — `refs/stash` is shared across every worktree in the repo.** It is not per-worktree. Several agents routinely work in sibling worktrees at once, and a `stash push` in one followed by a `stash pop` in another hands the second agent the *first* one's changes and silently empties its tree. This happened on 2026-08-01 between the #527 and #514 agents: uncommitted `lib/sql/exec.ml` work crossed between worktrees in both directions, and both agents spent time on recovery instead of the task.
+
+To measure before/after numbers, use any of these instead:
+
+```sh
+cp lib/sql/exec.ml /tmp/exec.ml.good     # then restore with cp
+git diff > /tmp/wip.patch                # then git checkout -- <files>, re-apply later
+git commit                               # a WIP checkpoint on your own branch, then git checkout HEAD~1 -- lib/
+```
+
+Commit early on your own branch regardless. An uncommitted tree is the only thing at risk.
+
 ### Building and testing
 
 Never call `dune` directly on the host. All OCaml build commands run inside the dev container:
@@ -159,7 +171,8 @@ EOF
 
 - Target 100% line coverage on every module.
 - Add QCheck property tests for every non-trivial function (see existing tests for patterns).
-- Tests that require real SQLite are gated by the `GRANARY_TEST_SQLITE` env var (see `test/compare_sqlite/`).
+- Tests that require real SQLite live in `test/test_sqlite_compare.ml` (~4k lines) and skip gracefully when `sqlite3` is not in `PATH` — its header comment has the exact `podman run` invocation that mounts the host `sqlite3` and its libs into the container. **There is no `test/compare_sqlite/` directory**; that path was in this file for a while and sent agents looking for a harness they concluded did not exist. The separate `GRANARY_TEST_SQLITE` env var gates only the slow TPC-C smoke run in `test/test_tpcc_smoke.ml`.
+- Granary is **inspired by** SQLite, not a port of it. When pinning a behaviour that differs from SQLite, record the divergence deliberately rather than assuming parity is the goal — e.g. every PRIMARY KEY column implies NOT NULL here, where SQLite enforces that only for `INTEGER PRIMARY KEY` (#530).
 
 ## Repository structure
 
