@@ -294,6 +294,79 @@ let text_range_is_correct_without_a_bound () =
       (rows_of db "SELECT name FROM s WHERE w = 1 AND name > 'aa' AND name <= 'b'"))
 ;;
 
+(* NULLs IN the ranged column — the entries for which the stop test's comparison
+   window runs past the column boundary, because a NULL encodes to one byte
+   rather than the bounded types' nine.  What keeps that sound is the ordering
+   of the encoding's type tags: [0x00] for NULL sorts below [0x01] for integer,
+   so a misaligned window always compares low, the walk is never cut short, and
+   the NULL entries sort to the front of the group anyway.
+
+   This case exists because that is the input the justification turns on.  It
+   pins both halves — the rows still match the unoptimizable foil, AND the
+   narrowing is still live rather than silently disabled. *)
+let nulls_in_the_ranged_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE n (w INTEGER, o INTEGER, v INTEGER)";
+    exec db "CREATE INDEX idx_n ON n (w, o)";
+    exec db "BEGIN";
+    for w = 1 to 3 do
+      for i = 1 to 5 do
+        exec db (Printf.sprintf "INSERT INTO n VALUES (%d, NULL, %d)" w (-i))
+      done;
+      for o = 1 to 20 do
+        exec db (Printf.sprintf "INSERT INTO n VALUES (%d, %d, %d)" w o ((w * 100) + o))
+      done
+    done;
+    exec db "COMMIT";
+    let check ~bounded ~foil ~expect_examined =
+      Alcotest.(check (list (list string)))
+        (bounded ^ " : rows")
+        (rows_of db foil)
+        (rows_of db bounded);
+      Alcotest.(check int) (bounded ^ " : examined") expect_examined (examined db bounded)
+    in
+    (* Upper bound only: the five NULL entries sort first and are walked before
+       the bound engages, so they are examined and then rejected. *)
+    check
+      ~bounded:"SELECT v FROM n WHERE w = 2 AND o <= 5"
+      ~foil:"SELECT v FROM n WHERE w = 2 AND o + 0 <= 5"
+      ~expect_examined:10;
+    (* Lower bound only: the start key skips past the NULLs entirely. *)
+    check
+      ~bounded:"SELECT v FROM n WHERE w = 2 AND o >= 15"
+      ~foil:"SELECT v FROM n WHERE w = 2 AND o + 0 >= 15"
+      ~expect_examined:6;
+    check
+      ~bounded:"SELECT v FROM n WHERE w = 2 AND o >= 5 AND o <= 9"
+      ~foil:"SELECT v FROM n WHERE w = 2 AND o + 0 >= 5 AND o + 0 <= 9"
+      ~expect_examined:5;
+    (* And the whole group, had nothing narrowed: 5 NULLs + 20 rows. *)
+    Alcotest.(check int)
+      "the foil really does read the whole group"
+      25
+      (examined db "SELECT v FROM n WHERE w = 2 AND o + 0 <= 5"))
+;;
+
+(* A NULL in a trailing index column, after the ranged one: [start] appends the
+   minimum rowid straight after the lower bound rather than the remaining
+   columns, so a key must never sort before it.  Every trailing byte is at least
+   [0x00], so none can. *)
+let nulls_in_a_column_after_the_ranged_one () =
+  with_db (fun db ->
+    exec db "CREATE TABLE m (w INTEGER, o INTEGER, k INTEGER, v INTEGER)";
+    exec db "CREATE INDEX idx_m ON m (w, o, k)";
+    exec db "BEGIN";
+    for o = 1 to 20 do
+      exec db (Printf.sprintf "INSERT INTO m VALUES (1, %d, NULL, %d)" o o);
+      exec db (Printf.sprintf "INSERT INTO m VALUES (1, %d, %d, %d)" o o (100 + o))
+    done;
+    exec db "COMMIT";
+    Alcotest.(check (list (list string)))
+      "rows agree with the unoptimizable foil"
+      (rows_of db "SELECT v FROM m WHERE w = 1 AND o + 0 >= 5 AND o + 0 <= 7")
+      (rows_of db "SELECT v FROM m WHERE w = 1 AND o >= 5 AND o <= 7"))
+;;
+
 (* An inequality on a column that is NOT the one after the equality prefix must
    not be mistaken for a bound on it. *)
 let inequality_on_another_column_is_not_a_bound () =
@@ -404,6 +477,14 @@ let () =
             "NULL bound matches nothing"
             `Quick
             null_bound_matches_nothing
+        ; Alcotest.test_case
+            "NULLs in the ranged column"
+            `Quick
+            nulls_in_the_ranged_column
+        ; Alcotest.test_case
+            "NULLs in a column after the ranged one"
+            `Quick
+            nulls_in_a_column_after_the_ranged_one
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_range_matches_foil ]
     ]

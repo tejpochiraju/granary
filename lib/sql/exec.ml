@@ -2675,25 +2675,35 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
     through the statement's predicate, so an inclusive reading of a strict bound
     costs at most one extra key and can never drop a row.
 
-    [Plan.range] admits only fixed-width column types, so the bounded column
-    occupies exactly [Index_key.fixed_width] bytes at offset [plen] of every key
-    under [prefix] — which is what makes the stop test a plain byte comparison
-    at a known offset.  Byte order is the column order, because the encoding is
-    order-preserving by construction. *)
-let range_ty = function
-  | None -> Row.Integer (* unreachable: only called with [Some] *)
-  | Some { Plan.r_ty; _ } -> r_ty
-;;
+    The stop test compares a fixed-width window at offset [plen], which needs
+    care: {b the bounded column is NOT always that width}.  [Plan.range] admits
+    only [Integer] and [Real], whose encodings are 9 bytes — but
+    {!Granary_encoding.Index_key.encode_value} emits a {i single} [0x00] byte
+    for a NULL, and for a NaN real, which it encodes as NULL.  On such an entry
+    the window runs past the column boundary into the bytes that follow.
 
+    That is still sound, and this is the load-bearing reason — not the width.
+    The NULL/NaN tag [0x00] sorts below both the integer tag [0x01] and the real
+    tag [0x02], so a misaligned window always compares {i low}: [past_end] never
+    fires early on one, and those entries sort to the front of the prefix group
+    anyway, ahead of anything the bound could exclude.  A future change to the
+    tag ordering, not to the widths, is what would break this.
+
+    The mirror case is a NaN {i bound}, which encodes to that same one byte and
+    so makes [past_end] fire on the very first key: the seek returns nothing,
+    which is the right answer because no comparison against NaN is ever true.
+
+    Byte order is column order throughout, because the encoding is
+    order-preserving by construction. *)
 let range_seek_bounds clock params ~prefix ~plen (range : Plan.range option) =
-  let encode_end e =
-    match index_lookup_values [ eval_expr clock params [||] e, range_ty range ] with
-    | Some [ iv ] -> Some (Index_key.encode_value iv)
-    | Some _ | None -> None (* NULL or type mismatch: leave that end unbounded *)
-  in
   match range with
   | None -> Bytes.cat prefix (Rowid.encode Int64.min_int), fun _ -> false
-  | Some { Plan.r_lo; r_hi; _ } ->
+  | Some { Plan.r_ty; r_lo; r_hi } ->
+    let encode_end e =
+      match index_lookup_values [ eval_expr clock params [||] e, r_ty ] with
+      | Some [ iv ] -> Some (Index_key.encode_value iv)
+      | Some _ | None -> None (* NULL or type mismatch: leave that end unbounded *)
+    in
     let start =
       match Option.bind r_lo encode_end with
       | None -> Bytes.cat prefix (Rowid.encode Int64.min_int)

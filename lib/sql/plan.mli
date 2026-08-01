@@ -85,10 +85,16 @@ type snippet_spec =
     reasoning.
 
     Only [Integer] and [Real] columns are bounded, because their index-key
-    encoding is a fixed 9 bytes and order-preserving, so the stop condition is a
-    plain byte comparison at a known offset.  Text and blob encodings are
+    encoding is 9 bytes wide and order-preserving, so the stop condition can be
+    a byte comparison at a known offset.  Text and blob encodings are
     variable-length, which would make that comparison depend on where the next
-    column's bytes begin; those fall back to an unbounded prefix scan. *)
+    column's bytes begin; those fall back to an unbounded prefix scan.
+
+    Note that width is {i not} what makes the stop test sound — a NULL (or a
+    NaN real) in the bounded column encodes to a single byte, so the comparison
+    window runs past the column boundary on those entries.  See
+    {!Exec.range_seek_bounds} for why that is still correct: it turns on the
+    ordering of the encoding's type tags, not on their widths. *)
 type range =
   { r_ty : Granary_encoding.Row.ty (** the bounded column's type *)
   ; r_lo : expr option (** lower end, inclusive *)
