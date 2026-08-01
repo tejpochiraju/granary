@@ -507,7 +507,7 @@ let null_between_bound_matches_nothing () =
 let cross_type_between_agrees_with_inequalities () =
   with_db (fun db ->
     seed db;
-    let check name ~between ~pair ~expect =
+    let check name ~between ~pair ~expect ~expect_examined =
       Alcotest.(check (list (list string)))
         (name ^ " : BETWEEN vs the inequality pair")
         (rows_of db pair)
@@ -515,32 +515,41 @@ let cross_type_between_agrees_with_inequalities () =
       Alcotest.(check int)
         (name ^ " : rows returned")
         expect
-        (List.length (rows_of db between))
+        (List.length (rows_of db between));
+      (* #527: how much of the 300-row group the seek had to read. *)
+      Alcotest.(check int) (name ^ " : examined") expect_examined (examined db between)
     in
-    (* Text ends against an integer column: no row compares in range. *)
+    (* Text ends against an integer column: no row compares in range, and there
+       is nothing to promote a text bound into, so the whole group is read. *)
     check
       "text ends"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN '100' AND '119'"
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= '100' AND o <= '119'"
-      ~expect:0;
-    (* Real ends against an integer column: the two promote, 101..119 match. *)
+      ~expect:0
+      ~expect_examined:300;
+    (* Real ends against an integer column: the two promote, 101..119 match —
+       and since #527 the seek reads exactly those 19 keys. *)
     check
       "real ends"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119.5"
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100.5 AND o <= 119.5"
-      ~expect:19;
+      ~expect:19
+      ~expect_examined:19;
     (* One end the column's type, the other not: the mismatched end alone must
-       still be able to reject a row. *)
+       still be able to reject a row.  Only the integer end bounds the seek, so
+       the walk runs to the end of the group. *)
     check
       "one text end"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND '119'"
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100 AND o <= '119'"
-      ~expect:0;
+      ~expect:0
+      ~expect_examined:201;
     check
       "one real end"
       ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119"
       ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100.5 AND o <= 119"
-      ~expect:19;
+      ~expect:19
+      ~expect_examined:19;
     (* The foil takes no seek path at all, so agreeing with it says the answer
        comes from the predicate rather than from a lucky bound. *)
     Alcotest.(check (list (list string)))
@@ -741,10 +750,14 @@ let cross_type_same_end_bound_is_sound () =
       (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 'x'"))
 ;;
 
-(* A cross-type literal can never bound the seek — {!Granary_sql.Exec}'s
-   [range_seek_bounds] refuses to encode a value whose type is not the column's
-   and leaves that end unbounded. So it must not shut out a candidate that CAN
-   bound it just by being written first: both spellings must read the same.
+(* A text literal can never bound the seek on an integer column — there is
+   nothing sound for {!Granary_sql.Exec}'s [range_bound_key] to turn it into, so
+   it leaves that end unbounded. It must not shut out a candidate that CAN bound
+   the seek just by being written first: both spellings must read the same.
+
+   A cross-type NUMERIC literal is the other case, and since #527 it is not
+   useless at all: the fold orders it against the integer candidate and the
+   tighter one wins, in either written order.
 
    This is what {!cross_type_same_end_bound_is_sound} cannot catch — a pure
    narrowing never moves the rows, so pinning rows alone passes in either
@@ -763,7 +776,9 @@ let cross_type_bound_does_not_block_a_usable_one () =
     in
     (* 100..200 inclusive, whichever side of the useless conjunct it is on. *)
     both_orders ~first:"o >= 'x'" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101;
-    both_orders ~first:"o >= 150.5" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101)
+    (* #527: [150.5] is the tighter lower bound and now wins outright — ceil to
+       151, so 151..200. Order must not change that. *)
+    both_orders ~first:"o >= 150.5" ~second:"o BETWEEN 100 AND 200" ~expect_examined:50)
 ;;
 
 (* The fold applies to reals too, whose ordering is the other one it has to get
@@ -782,6 +797,202 @@ let tightest_real_bound_wins () =
       ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 BETWEEN 2.5 AND 10.0 AND x + 0 >= 5.0"
         (* 5.0 .. 10.0 in steps of 0.25, both ends inclusive. *)
       ~expect_examined:21)
+;;
+
+(* ------------------------------------------------------------------ *)
+(* #527: a cross-type numeric bound is promoted by rounding OUTWARD      *)
+(* ------------------------------------------------------------------ *)
+
+(* A real bound on an INTEGER column used to be declined outright, so the whole
+   equality prefix was scanned.  Promoting it to the enclosing integer is exact
+   for an integer column — [o >= 280.5] is [o >= 281] and [o <= 20.5] is
+   [o <= 20] — so the [expect_examined] numbers below are the tight ones.
+
+   The direction is the whole point and is invisible in the rows: rounding a
+   lower bound DOWN (or an upper bound UP) is still sound and returns the same
+   rows, just one key wider, so only the exact examined counts pin it.  Rounding
+   the other way — inward — would drop rows, which the foil comparison catches. *)
+let real_bound_narrows_an_integer_column () =
+  with_db (fun db ->
+    seed db;
+    (* ceil 280.5 = 281: 281..300. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o >= 280.5"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 >= 280.5"
+      ~expect_examined:20;
+    (* floor 20.5 = 20: 1..20. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o <= 20.5"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 <= 20.5"
+      ~expect_examined:20;
+    (* Both ends at once — the issue's repro shape. 101..119. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119.5"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100.5 AND 119.5"
+      ~expect_examined:19;
+    (* A real that is already an integer must NOT be rounded away: [o >= 280.0]
+       is [o >= 280], not [o >= 281], and its row 280 must come back. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o >= 280.0"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 >= 280.0"
+      ~expect_examined:21;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o <= 20.0"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 <= 20.0"
+      ~expect_examined:20;
+    (* A strict real bound is still read inclusively, so an exactly-integral one
+       costs the endpoint key that the predicate then rejects. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o > 280.0"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 > 280.0"
+      ~expect_examined:21)
+;;
+
+(* The mirror direction: an integer bound on a REAL column. Every integer here
+   is exactly representable, so both ends land on the value itself. *)
+let integer_bound_narrows_a_real_column () =
+  with_db (fun db ->
+    exec db "CREATE TABLE r (w INTEGER, x REAL, v INTEGER, PRIMARY KEY (w, x))";
+    exec db "BEGIN";
+    for i = 1 to 200 do
+      exec db (Printf.sprintf "INSERT INTO r VALUES (1, %f, %d)" (float_of_int i /. 4.) i)
+    done;
+    exec db "COMMIT";
+    (* 49.0 .. 50.0 in steps of 0.25. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x >= 49"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 >= 49"
+      ~expect_examined:5;
+    (* 0.25 .. 1.0. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x <= 1"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 <= 1"
+      ~expect_examined:4;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x BETWEEN 49 AND 50"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 BETWEEN 49 AND 50"
+      ~expect_examined:5;
+    (* The int64 extremes, where [Int64.to_float] is no longer exact and the
+       promotion has to step the float back outward. Neither may produce a bound
+       that excludes a row it should admit: [x <= max_int] admits all 200. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x <= 9223372036854775807"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 <= 9223372036854775807"
+      ~expect_examined:200;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x >= -9223372036854775808"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 >= -9223372036854775808"
+      ~expect_examined:200;
+    (* And the empty directions: no row is anywhere near either extreme. *)
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x >= 9223372036854775807"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 >= 9223372036854775807"
+      ~expect_examined:0;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM r WHERE w = 1 AND x <= -9223372036854775808"
+      ~foil:"SELECT v FROM r WHERE w = 1 AND x + 0 <= -9223372036854775808"
+      ~expect_examined:0)
+;;
+
+(* NaN and the infinities cannot be spelled as literals, so they arrive as bound
+   parameters. None of them may produce a wrong key.
+
+   NaN gets exactly the treatment a same-type NaN bound already gets: it encodes
+   to the single [0x00] NULL/NaN byte, which sorts below every other key. That
+   agrees with the residual predicate, whose [Float.compare] also orders NaN
+   below every number — so a NaN LOWER bound admits every row and a NaN UPPER
+   bound stops the walk on the first key. The expectations below are the foil's,
+   not SQLite's: SQLite has no NaN at all (it stores one as NULL, which would
+   make both ends match nothing), and that divergence is the comparison stack's
+   business, not the seek's. *)
+let nan_and_infinite_bounds_are_sound () =
+  with_db (fun db ->
+    seed db;
+    let check name ~sql ~foil ~params ~expect_rows ~expect_examined =
+      Alcotest.(check (list (list string)))
+        (name ^ " : agrees with the unoptimizable foil")
+        (rows_of_params db foil params)
+        (rows_of_params db sql params);
+      Alcotest.(check int)
+        (name ^ " : rows returned")
+        expect_rows
+        (List.length (rows_of_params db sql params));
+      Alcotest.(check int)
+        (name ^ " : examined")
+        expect_examined
+        (examined_params db sql params)
+    in
+    let lo = "SELECT v FROM t WHERE w = 2 AND o >= ?"
+    and lo_foil = "SELECT v FROM t WHERE w = 2 AND o + 0 >= ?"
+    and hi = "SELECT v FROM t WHERE w = 2 AND o <= ?"
+    and hi_foil = "SELECT v FROM t WHERE w = 2 AND o + 0 <= ?" in
+    check
+      "NaN lower bound"
+      ~sql:lo
+      ~foil:lo_foil
+      ~params:[ Db.V_real Float.nan ]
+      ~expect_rows:300
+      ~expect_examined:300;
+    check
+      "NaN upper bound"
+      ~sql:hi
+      ~foil:hi_foil
+      ~params:[ Db.V_real Float.nan ]
+      ~expect_rows:0
+      ~expect_examined:0;
+    (* An infinity has no integer to round to, so the end is left unbounded —
+       never overflowed into a key that would drop rows. *)
+    check
+      "+inf upper bound admits every row"
+      ~sql:hi
+      ~foil:hi_foil
+      ~params:[ Db.V_real Float.infinity ]
+      ~expect_rows:300
+      ~expect_examined:300;
+    check
+      "-inf lower bound admits every row"
+      ~sql:lo
+      ~foil:lo_foil
+      ~params:[ Db.V_real Float.neg_infinity ]
+      ~expect_rows:300
+      ~expect_examined:300;
+    check
+      "+inf lower bound admits none"
+      ~sql:lo
+      ~foil:lo_foil
+      ~params:[ Db.V_real Float.infinity ]
+      ~expect_rows:0
+      ~expect_examined:300;
+    (* Out of int64 range: declining is the only safe answer.  The two
+       admit-everything cases are the load-bearing ones — an overflowed key
+       would silently drop all 300 rows. *)
+    check
+      "huge upper bound admits every row"
+      ~sql:hi
+      ~foil:hi_foil
+      ~params:[ Db.V_real 1e30 ]
+      ~expect_rows:300
+      ~expect_examined:300;
+    check
+      "huge negative lower bound admits every row"
+      ~sql:lo
+      ~foil:lo_foil
+      ~params:[ Db.V_real (-1e30) ]
+      ~expect_rows:300
+      ~expect_examined:300)
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -942,6 +1153,54 @@ let prop_cross_type_between_matches_inequalities =
          between "o" = pair "o" && between "o" = between "o + 0"))
 ;;
 
+(* #527: a promoted cross-type bound must return exactly what the unoptimizable
+   [o + 0] foil does.  Ends are drawn in halves so both the rounding case (a
+   [.5] end, where the direction matters) and the exact case (a [.0] end, which
+   must not be rounded away) come up, and each spelling — the inequality pair
+   and the [BETWEEN] — is checked against its own foil. *)
+let prop_cross_type_range_bound_matches_foil =
+  QCheck.Test.make
+    ~count:200
+    ~name:"promoted cross-type range bound agrees with unoptimizable foil"
+    QCheck.(triple (int_range 1 3) (int_range (-4) 28) (int_range (-4) 28))
+    (fun (w, lo2, hi2) ->
+       let lo = Printf.sprintf "%.1f" (float_of_int lo2 /. 2.)
+       and hi = Printf.sprintf "%.1f" (float_of_int hi2 /. 2.) in
+       with_db (fun db ->
+         exec db "CREATE TABLE t (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+         exec db "BEGIN";
+         for wi = 1 to 3 do
+           for o = 1 to 12 do
+             exec
+               db
+               (Printf.sprintf "INSERT INTO t VALUES (%d, %d, %d)" wi o ((wi * 100) + o))
+           done
+         done;
+         exec db "COMMIT";
+         let pair col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = %d AND %s > %s AND %s <= %s"
+                w
+                col
+                lo
+                col
+                hi)
+         in
+         let between col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = %d AND %s BETWEEN %s AND %s"
+                w
+                col
+                lo
+                hi)
+         in
+         pair "o" = pair "o + 0" && between "o" = between "o + 0"))
+;;
+
 let () =
   Alcotest.run
     "range_bound_517"
@@ -983,6 +1242,14 @@ let () =
             "parameter bound alone still narrows"
             `Quick
             parameter_bound_alone_still_narrows
+        ; Alcotest.test_case
+            "real bound narrows an integer column"
+            `Quick
+            real_bound_narrows_an_integer_column
+        ; Alcotest.test_case
+            "integer bound narrows a real column"
+            `Quick
+            integer_bound_narrows_a_real_column
         ] )
     ; ( "correctness"
       , [ Alcotest.test_case
@@ -1041,6 +1308,10 @@ let () =
             "cross-type bound does not block a usable one"
             `Quick
             cross_type_bound_does_not_block_a_usable_one
+        ; Alcotest.test_case
+            "NaN and infinite bounds are sound"
+            `Quick
+            nan_and_infinite_bounds_are_sound
         ] )
     ; ( "property"
       , List.map
@@ -1049,6 +1320,7 @@ let () =
           ; prop_between_matches_foil
           ; prop_cross_type_between_matches_inequalities
           ; prop_folded_bounds_match_foil
+          ; prop_cross_type_range_bound_matches_foil
           ] )
     ]
 ;;

@@ -287,25 +287,38 @@ let bounded_type = function
 
 (** #523: what a candidate bound is worth to a same-end fold.
 
-    - [`Orderable] — a literal of exactly the bounded column's type.  Two of
-      them can be compared here, and the winner is one
-      {!Granary_sql.Exec.range_seek_bounds} will actually encode.
+    - [`Orderable] — a numeric literal on a numeric column.  Two of them can be
+      compared here, and the winner is one
+      {!Granary_sql.Exec.range_seek_bounds} will actually encode.  #527: this
+      includes a literal of the {i other} numeric type, which that function
+      promotes across the int/real boundary by rounding outward.
     - [`Unknown] — a bound parameter, whose value is not known until run time.
       It may well be the tighter one, so a fold must keep it rather than
       discard it for a literal it cannot compare it against.
-    - [`Useless] — a literal of some other type.  Knowable, but it can never
-      bound anything: [range_seek_bounds] refuses to encode a value whose type
-      is not the column's and leaves that end unbounded.  A fold should drop it
-      in favour of any other candidate.
+    - [`Useless] — a literal that can never bound anything, because
+      [range_seek_bounds] has nothing sound to turn it into and leaves that end
+      unbounded: a text or blob literal on a numeric column, or an infinity on
+      an integer one.  A fold should drop it in favour of any other candidate.
 
     A NaN is deliberately [`Unknown] rather than [`Orderable]: it encodes as
     NULL, whose behaviour as a bound is a special case of its own (see
-    [range_seek_bounds]), and no comparison against it is ever true.  Keeping it
-    out of the ordering leaves that case exactly as it was. *)
+    [range_seek_bounds]).  Keeping it out of the ordering leaves that case
+    exactly as it was.
+
+    An out-of-int64-range real on an integer column is [`Orderable] even though
+    [range_bound_key] declines it — misclassifying it costs at most a narrowing
+    the fold would otherwise have kept, never a row, since every candidate is
+    individually a sound bound and the predicate runs on every yielded row. *)
 let classify_range_bound (ty : Row.ty) = function
-  | Sema.BE_lit (Ast.L_int _) when ty = Row.Integer -> `Orderable
+  | Sema.BE_lit (Ast.L_int _) when ty = Row.Integer || ty = Row.Real -> `Orderable
   | Sema.BE_lit (Ast.L_real f) when ty = Row.Real ->
     if Float.is_nan f then `Unknown else `Orderable
+  | Sema.BE_lit (Ast.L_real f) when ty = Row.Integer ->
+    if Float.is_nan f
+    then `Unknown
+    else if Float.is_finite f
+    then `Orderable
+    else `Useless
   | Sema.BE_lit _ -> `Useless
   | _ -> `Unknown
 ;;
@@ -314,11 +327,16 @@ let classify_range_bound (ty : Row.ty) = function
     same total order {!Granary_sql.Exec.compare_values} applies in the residual
     predicate and {!Granary_encoding.Index_key.encode_value} encodes, so the
     fold can never pick a bound the predicate and the key order disagree
-    about. *)
+    about.  #527: a mixed int/real pair is ordered by the same int-to-float
+    promotion the residual comparison uses. *)
 let compare_range_bounds a b =
   match a, b with
   | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) -> Some (Int64.compare x y)
   | Sema.BE_lit (Ast.L_real x), Sema.BE_lit (Ast.L_real y) -> Some (Float.compare x y)
+  | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_real y) ->
+    Some (Float.compare (Int64.to_float x) y)
+  | Sema.BE_lit (Ast.L_real x), Sema.BE_lit (Ast.L_int y) ->
+    Some (Float.compare x (Int64.to_float y))
   | _, _ -> None
 ;;
 
