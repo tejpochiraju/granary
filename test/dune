@@ -255,6 +255,21 @@
   lwt.unix
   unix))
 
+; #514: the DML seek path's candidate drain must be memory-bounded.
+
+(test
+ (name test_bounded_drain_514)
+ (modules test_bounded_drain_514)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 (test
  (name test_mirage_backend)
  (modules test_mirage_backend)

@@ -189,6 +189,27 @@ val dirty_elements : dirty_tables_acc -> string list
     ({!make_dirty_acc}). *)
 val dirty_changes : dirty_tables_acc -> (string * row_change list) list
 
+(** #514: what the DML (UPDATE/DELETE) index-seek path did with its candidate
+    rowids.  [dss_candidates] is how many index entries the seek accepted and
+    [dss_fetched] how many of those rowids were looked up in the table tree;
+    [dss_peak_buffered] is the high-water mark of the difference — candidates
+    walked but not yet fetched.  That backlog is the memory #514 is about: it
+    stays at 1 while the drain streams, and would equal the whole match count if
+    the drain ever went back to materialising every candidate first. *)
+type dml_seek_stats =
+  { mutable dss_candidates : int
+  ; mutable dss_fetched : int
+  ; mutable dss_peak_buffered : int
+  }
+
+(** A zeroed {!dml_seek_stats}. *)
+val make_dml_seek_stats : unit -> dml_seek_stats
+
+(** [with_dml_seek_stats st f] runs [f] with [st] collecting the DML seek
+    counters (see {!dml_seek_stats}).  Purely observational; installing no
+    accumulator costs one key lookup per drain and nothing per row. *)
+val with_dml_seek_stats : dml_seek_stats -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+
 (** #264: quote a SQL identifier with double-quotes when it is not a plain
     [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
     otherwise. *)

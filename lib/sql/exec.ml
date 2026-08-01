@@ -53,6 +53,50 @@ let make_change_acc () : dirty_tables_acc =
 
 let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
 
+(* #514: instrumentation for the DML seek path's candidate buffering.  The point
+   of the issue is a memory bound, which no functional result exposes — so the
+   drain reports its candidate BACKLOG: how many rowids the index walk had
+   produced but the row fetch had not yet consumed, at its worst moment.  An
+   eager "walk the whole range into a list, then fetch" drain drives that to the
+   match count; a streaming one holds it at one.  Rides Lwt
+   sequence-associated storage like [query_stats]/[dirty_tables_acc], so a caller
+   that installs no accumulator pays one predicted branch per candidate and the
+   DML path needs no extra parameter. *)
+type dml_seek_stats =
+  { mutable dss_candidates : int
+  ; mutable dss_fetched : int
+  ; mutable dss_peak_buffered : int
+  }
+
+let make_dml_seek_stats () =
+  { dss_candidates = 0; dss_fetched = 0; dss_peak_buffered = 0 }
+;;
+
+let dml_seek_stats_key : dml_seek_stats Lwt.key = Lwt.new_key ()
+let with_dml_seek_stats st f = Lwt.with_value dml_seek_stats_key (Some st) f
+
+(* Record that the index walk produced one more candidate rowid, updating the
+   high-water mark of walked-but-not-yet-fetched candidates.  Takes the
+   already-resolved accumulator rather than reading the Lwt key itself: the DML
+   drain resolves it once per statement, exactly as the read path does with
+   [query_stats] (see [incr_examined]), so the seek #512 made hot pays no
+   per-row key lookup. *)
+let note_seek_candidate (st_opt : dml_seek_stats option) =
+  match st_opt with
+  | None -> ()
+  | Some st ->
+    st.dss_candidates <- st.dss_candidates + 1;
+    let backlog = st.dss_candidates - st.dss_fetched in
+    if backlog > st.dss_peak_buffered then st.dss_peak_buffered <- backlog
+;;
+
+(* Record that one candidate's row was looked up in the table tree. *)
+let note_seek_fetched (st_opt : dml_seek_stats option) =
+  match st_opt with
+  | None -> ()
+  | Some st -> st.dss_fetched <- st.dss_fetched + 1
+;;
+
 (* Reserved-prefix internal tables — the synthesized [sqlite_…] objects
    (sqlite_master / sqlite_sequence) — are never reported: an external cache only
    invalidates user tables.  [sqlite_] is the SOLE prefix [sema] forbids to user
@@ -4890,49 +4934,94 @@ let cascade_apply_set_default
       child_col_idxs
 ;;
 
-(* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
-   under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-(* #508: candidate rowids for a DML [seek].  [None] means "no narrowing
-   available" — the caller scans.  The seek is only a restriction: the caller
-   still evaluates the full WHERE predicate on every candidate, so a
-   wrong-but-superset answer here can cost time but cannot change results.
+(* Hand one candidate rowid to [fetch], counting it. *)
+let emit_candidate ~stats ~(fetch : int64 -> unit Lwt.t) rowid =
+  note_seek_candidate stats;
+  fetch rowid
+;;
 
-   Returned in ASCENDING ROWID order, which is the order a full table-tree scan
-   drains in.  An index seek naturally yields index-key order, and for a prefix
-   spanning several distinct full keys the two differ — which would silently
-   change which n rows an [UPDATE/DELETE ... LIMIT n] without ORDER BY hits.
-   Sorting keeps the seek a pure restriction of the scan, drain order included. *)
-let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option Lwt.t =
+(* Walk the index range an equality [keys] prefix (plus optional [range]) covers,
+   handing each candidate rowid to [fetch] as it is decoded (#514).  Nothing is
+   accumulated here: the walk holds one rowid at a time, so candidate memory does
+   not grow with the number of matched rows.
+
+   The cursor stays open ACROSS the fetches, which is safe for exactly the reason
+   the read path's [stream_index_lookup] does the same: [fetch] only reads (a
+   [Store.get] on the table tree, then the statement's predicate), and every
+   physical mutation of this statement happens after
+   [drain_matching_rows_in_tx] has returned and this cursor is closed.  That
+   ordering is load-bearing, not incidental — deleting rows or moving their index
+   keys while this cursor walks the same index would revisit rows whose new key
+   sorts later in the range and skip their neighbours.  Streaming the CANDIDATES
+   is safe; streaming the mutations would not be. *)
+let seek_index_candidates
+      tx
+      clock
+      params
+      ~idx_tree
+      ~keys
+      ~range
+      ~(stats : dml_seek_stats option)
+      ~(fetch : int64 -> unit Lwt.t)
+  : unit Lwt.t
+  =
+  let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+  match index_lookup_values vs with
+  | None -> Lwt.return_unit (* NULL or type mismatch: matches nothing *)
+  | Some ivs ->
+    let prefix, plen = encode_index_key_prefix ivs in
+    let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
+    let in_range ikey =
+      Bytes.length ikey >= plen + 8
+      && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+      && not (past_end ikey)
+    in
+    let* cur = S.seek_ge tx idx_tree start in
+    let rec walk () =
+      let* next = S.seek_next cur in
+      match next with
+      | Some (ikey, _) when in_range ikey ->
+        let* () = emit_candidate ~stats ~fetch (decode_index_key_rowid ikey) in
+        walk ()
+      | _ -> Lwt.return_unit
+    in
+    (* [fetch] evaluates the statement's WHERE predicate, which can raise; close
+       the cursor on that path too (the eager-list version closed it before any
+       predicate ran). *)
+    Lwt.finalize walk (fun () ->
+      S.seek_close cur;
+      Lwt.return_unit)
+;;
+
+(* #508: candidate rowids for a DML [seek], streamed to [fetch] one at a time
+   (#514).  The seek is only a restriction: the caller still evaluates the full
+   WHERE predicate on every candidate, so a wrong-but-superset answer here can
+   cost time but cannot change results.
+
+   Candidates arrive in INDEX-KEY order, which for a prefix spanning several
+   distinct full keys is not rowid order.  The caller must therefore sort its
+   accumulated matches by rowid — the order a full table-tree scan drains in —
+   or an [UPDATE/DELETE ... LIMIT n] without [ORDER BY] would silently hit a
+   different n rows than the scan it replaced. *)
+let seek_candidates tx clock params (seek : Plan.seek) ~stats ~fetch : unit Lwt.t =
   match seek with
   | Plan.Seek_rowid e ->
     (match eval_expr clock params [||] e with
-     | Row.V_int n -> Lwt.return (Some [ n ])
-     | _ -> Lwt.return (Some []) (* NULL or non-integer matches no rowid *))
+     | Row.V_int n -> emit_candidate ~stats ~fetch n
+     | _ -> Lwt.return_unit (* NULL or non-integer matches no rowid *))
   | Plan.Seek_index { idx_tree; keys; range } ->
-    let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
-    (match index_lookup_values vs with
-     | None -> Lwt.return (Some []) (* NULL or type mismatch: matches nothing *)
-     | Some ivs ->
-       let prefix, plen = encode_index_key_prefix ivs in
-       let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
-       let* cur = S.seek_ge tx idx_tree start in
-       let rec collect acc =
-         let* next = S.seek_next cur in
-         match next with
-         | Some (ikey, _)
-           when Bytes.length ikey >= plen + 8
-                && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-                && not (past_end ikey) -> collect (decode_index_key_rowid ikey :: acc)
-         | _ ->
-           S.seek_close cur;
-           Lwt.return acc
-       in
-       let* rowids = collect [] in
-       Lwt.return (Some (List.sort Int64.compare rowids)))
+    seek_index_candidates tx clock params ~idx_tree ~keys ~range ~stats ~fetch
 ;;
 
 (* Drain matching rows from the given txn (RO or RW).  With a [seek], only the
-   candidate rows it names are read; [where] is applied either way. *)
+   candidate rows it names are read; [where] is applied either way.
+
+   Every match is materialised BEFORE the caller mutates anything, and that is
+   deliberate: the callers consume the list several times over (length, FK
+   pre-check, triggers, then the write loop), and mutating rows while a cursor
+   still walks the table or an index it lives in would revisit or skip rows.
+   #514 streams the seek's CANDIDATES into this list rather than materialising
+   them separately first; it does not — and must not — stream the mutations. *)
 let drain_matching_rows_in_tx
       ~(seek : Plan.seek option)
       tx
@@ -4948,25 +5037,28 @@ let drain_matching_rows_in_tx
     | None -> true
     | Some pred -> value_truthy (eval_expr clock params row pred)
   in
-  let* narrowed =
-    match seek with
-    | None -> Lwt.return None
-    | Some s -> seek_candidate_rowids tx clock params s
-  in
-  match narrowed with
-  | Some rowids ->
-    let* matches =
-      Lwt_list.filter_map_s
-        (fun rowid ->
-           let* v = S.get tx tree_id (Rowid.encode rowid) in
-           match v with
-           | None -> Lwt.return_none
-           | Some vbytes ->
-             let row = decode_with_virtual clock params table_meta vbytes in
-             Lwt.return (if keep row then Some (rowid, row) else None))
-        rowids
+  match seek with
+  | Some s ->
+    (* #514: matches accumulate here as the seek walk produces candidates, so no
+       intermediate rowid list exists at all — the only structure whose size
+       grows with the statement is the match list the callers need in full
+       anyway (they take its length, pre-check FKs over it, fire triggers, then
+       mutate). *)
+    let stats = Lwt.get dml_seek_stats_key in
+    let acc = ref [] in
+    let fetch_one rowid =
+      note_seek_fetched stats;
+      let* v = S.get tx tree_id (Rowid.encode rowid) in
+      match v with
+      | None -> Lwt.return_unit
+      | Some vbytes ->
+        let row = decode_with_virtual clock params table_meta vbytes in
+        if keep row then acc := (rowid, row) :: !acc;
+        Lwt.return_unit
     in
-    Lwt.return matches
+    let* () = seek_candidates tx clock params s ~stats ~fetch:fetch_one in
+    (* Ascending rowid = the order a scan drains in; see [seek_candidates]. *)
+    Lwt.return (List.sort (fun (a, _) (b, _) -> Int64.compare a b) !acc)
   | None ->
     let* cur = S.cursor_open tx tree_id in
     let _sr = S.cursor_first cur in
