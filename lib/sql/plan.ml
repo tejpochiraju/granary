@@ -69,6 +69,13 @@ type snippet_spec =
   ; n_tokens : int
   }
 
+type seek =
+  | Seek_rowid of expr
+  | Seek_index of
+      { idx_tree : int
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+      }
+
 type op =
   | Op_create_table of
       { name : string
@@ -146,9 +153,9 @@ type op =
   | Op_index_lookup of
       { table_tree : int (** table's tree_id *)
       ; idx_tree : int (** index tree_id *)
-      ; col_idx : int (** column ordinal for encoding *)
-      ; col_type : Granary_encoding.Row.ty
-      ; lookup_val : expr (** value to look up *)
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+        (** leading index columns pinned by equality, in INDEX column order:
+            [(column ordinal, column type, value expression)] *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
   | Op_rowid_lookup of
@@ -160,6 +167,7 @@ type op =
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option
@@ -169,6 +177,7 @@ type op =
   | Op_delete of
       { table_meta : Cat.table_meta
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option

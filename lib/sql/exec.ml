@@ -2639,6 +2639,33 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
   buf, total
 ;;
 
+(** #508: map evaluated equality values to the index-key values that seek them.
+    [None] means "matches nothing" and the caller must return no rows without
+    seeking — which is the honest encoding of both cases that reach it:
+
+    - a NULL value, because [WHERE col = NULL] never matches (three-valued
+      logic); a bound parameter may only turn out NULL at run time (#228).
+    - a value whose type does not match the column's, which no stored key can
+      equal.  Note this must NOT become an [IK_null] prefix: that is a real seek
+      key selecting the index's NULL entries, not an empty result.
+
+    The read ([stream_index_lookup]) and write ([seek_candidate_rowids]) paths
+    share this so they can never disagree about which rows a key matches. *)
+let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list option =
+  let rec go acc = function
+    | [] -> Some (List.rev acc)
+    | (v, ty) :: rest ->
+      (match v, ty with
+       | Row.V_int n, Row.Integer -> go (Index_key.IK_int n :: acc) rest
+       | Row.V_text s, Row.Text -> go (Index_key.IK_text s :: acc) rest
+       | Row.V_real f, Row.Real -> go (Index_key.IK_real f :: acc) rest
+       | Row.V_blob b, Row.Blob -> go (Index_key.IK_blob b :: acc) rest
+       | Row.V_null, _ -> None (* [col = NULL] never matches *)
+       | _, _ -> None (* type mismatch: no stored key can equal this *))
+  in
+  go [] vs
+;;
+
 (** Decode the rowid from the trailing 8 bytes of an index key. *)
 let decode_index_key_rowid (ikey : bytes) : int64 =
   let n = Bytes.length ikey in
@@ -4811,8 +4838,48 @@ let cascade_apply_set_default
 
 (* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
    under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-(* Drain matching rows from the given txn (RO or RW). *)
+(* #508: candidate rowids for a DML [seek].  [None] means "no narrowing
+   available" — the caller scans.  The seek is only a restriction: the caller
+   still evaluates the full WHERE predicate on every candidate, so a
+   wrong-but-superset answer here can cost time but cannot change results.
+
+   Returned in ASCENDING ROWID order, which is the order a full table-tree scan
+   drains in.  An index seek naturally yields index-key order, and for a prefix
+   spanning several distinct full keys the two differ — which would silently
+   change which n rows an [UPDATE/DELETE ... LIMIT n] without ORDER BY hits.
+   Sorting keeps the seek a pure restriction of the scan, drain order included. *)
+let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option Lwt.t =
+  match seek with
+  | Plan.Seek_rowid e ->
+    (match eval_expr clock params [||] e with
+     | Row.V_int n -> Lwt.return (Some [ n ])
+     | _ -> Lwt.return (Some []) (* NULL or non-integer matches no rowid *))
+  | Plan.Seek_index { idx_tree; keys } ->
+    let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+    (match index_lookup_values vs with
+     | None -> Lwt.return (Some []) (* NULL or type mismatch: matches nothing *)
+     | Some ivs ->
+       let prefix, plen = encode_index_key_prefix ivs in
+       let* cur = S.seek_ge tx idx_tree (Bytes.cat prefix (Rowid.encode Int64.min_int)) in
+       let rec collect acc =
+         let* next = S.seek_next cur in
+         match next with
+         | Some (ikey, _)
+           when Bytes.length ikey >= plen + 8
+                && Bytes.equal (Bytes.sub ikey 0 plen) prefix ->
+           collect (decode_index_key_rowid ikey :: acc)
+         | _ ->
+           S.seek_close cur;
+           Lwt.return acc
+       in
+       let* rowids = collect [] in
+       Lwt.return (Some (List.sort Int64.compare rowids)))
+;;
+
+(* Drain matching rows from the given txn (RO or RW).  With a [seek], only the
+   candidate rows it names are read; [where] is applied either way. *)
 let drain_matching_rows_in_tx
+      ~(seek : Plan.seek option)
       tx
       (table_meta : Cat.table_meta)
       ~clock
@@ -4820,31 +4887,47 @@ let drain_matching_rows_in_tx
       ~(where : Plan.expr option)
   : (int64 * Row.t) list Lwt.t
   =
-  let* cur =
-    S.cursor_open
-      tx
-      (let x, _, _, _ = Cat.row_storage table_meta in
-       x)
+  let tree_id, _, _, _ = Cat.row_storage table_meta in
+  let keep row =
+    match where with
+    | None -> true
+    | Some pred -> value_truthy (eval_expr clock params row pred)
   in
-  let _sr = S.cursor_first cur in
-  let buf = ref [] in
-  let rec drain () =
-    match S.cursor_next cur with
-    | None -> ()
-    | Some (kbytes, vbytes) ->
-      let rowid = Rowid.decode kbytes in
-      let row = decode_with_virtual clock params table_meta vbytes in
-      let keep =
-        match where with
-        | None -> true
-        | Some pred -> value_truthy (eval_expr clock params row pred)
-      in
-      if keep then buf := (rowid, row) :: !buf;
-      drain ()
+  let* narrowed =
+    match seek with
+    | None -> Lwt.return None
+    | Some s -> seek_candidate_rowids tx clock params s
   in
-  drain ();
-  S.cursor_close cur;
-  Lwt.return (List.rev !buf)
+  match narrowed with
+  | Some rowids ->
+    let* matches =
+      Lwt_list.filter_map_s
+        (fun rowid ->
+           let* v = S.get tx tree_id (Rowid.encode rowid) in
+           match v with
+           | None -> Lwt.return_none
+           | Some vbytes ->
+             let row = decode_with_virtual clock params table_meta vbytes in
+             Lwt.return (if keep row then Some (rowid, row) else None))
+        rowids
+    in
+    Lwt.return matches
+  | None ->
+    let* cur = S.cursor_open tx tree_id in
+    let _sr = S.cursor_first cur in
+    let buf = ref [] in
+    let rec drain () =
+      match S.cursor_next cur with
+      | None -> ()
+      | Some (kbytes, vbytes) ->
+        let rowid = Rowid.decode kbytes in
+        let row = decode_with_virtual clock params table_meta vbytes in
+        if keep row then buf := (rowid, row) :: !buf;
+        drain ()
+    in
+    drain ();
+    S.cursor_close cur;
+    Lwt.return (List.rev !buf)
 ;;
 
 (* Apply ORDER BY, then OFFSET, then LIMIT to a drained (rowid,row) list. *)
@@ -5277,6 +5360,7 @@ let execute_update
       ~(table_meta : Cat.table_meta)
       ~(assignments : (int * Plan.expr) list)
       ~(where : Plan.expr option)
+      ~(seek : Plan.seek option)
       ~(order : (Plan.expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list)
       ~(limit : int option)
       ~(offset : int option)
@@ -5292,7 +5376,9 @@ let execute_update
   let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-       let* matches = drain_matching_rows_in_tx tx table_meta ~clock ~params ~where in
+       let* matches =
+         drain_matching_rows_in_tx ~seek tx table_meta ~clock ~params ~where
+       in
        let matches =
          apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
        in
@@ -5608,6 +5694,7 @@ let execute_delete
       (cat : Cat.t)
       ~(table_meta : Cat.table_meta)
       ~(where : Plan.expr option)
+      ~(seek : Plan.seek option)
       ~(order : (Plan.expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list)
       ~(limit : int option)
       ~(offset : int option)
@@ -5622,7 +5709,9 @@ let execute_delete
   let* tx, owned = acquire_txn store mode in
   Lwt.catch
     (fun () ->
-       let* matches = drain_matching_rows_in_tx tx table_meta ~clock ~params ~where in
+       let* matches =
+         drain_matching_rows_in_tx ~seek tx table_meta ~clock ~params ~where
+       in
        let matches =
          apply_order_offset_limit ~clock ~params ~order ~offset ~limit matches
        in
@@ -6153,6 +6242,7 @@ let execute_update_op
       ~table_meta
       ~assignments
       ~where
+      ~seek
       ~order
       ~limit
       ~offset
@@ -6182,6 +6272,7 @@ let execute_update_op
     ~table_meta
     ~assignments
     ~where
+    ~seek
     ~order
     ~limit
     ~offset
@@ -6199,6 +6290,7 @@ let execute_delete_op
       ~after_hook
       ~table_meta
       ~where
+      ~seek
       ~order
       ~limit
       ~offset
@@ -6225,6 +6317,7 @@ let execute_delete_op
     cat
     ~table_meta
     ~where
+    ~seek
     ~order
     ~limit
     ~offset
@@ -6815,7 +6908,16 @@ let execute_with_count
       ~columns
       ~if_not_exists
   | Plan.Op_update
-      { table_meta; assignments; where; order; limit; offset; indexes; returning = _ } ->
+      { table_meta
+      ; assignments
+      ; where
+      ; seek
+      ; order
+      ; limit
+      ; offset
+      ; indexes
+      ; returning = _
+      } ->
     if Cat.is_columnar table_meta
     then
       Lwt.fail_with
@@ -6834,11 +6936,13 @@ let execute_with_count
         ~table_meta
         ~assignments
         ~where
+        ~seek
         ~order
         ~limit
         ~offset
         ~indexes
-  | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning = _ } ->
+  | Plan.Op_delete
+      { table_meta; where; seek; order; limit; offset; indexes; returning = _ } ->
     if Cat.is_columnar table_meta
     then
       Lwt.fail_with
@@ -6856,6 +6960,7 @@ let execute_with_count
         ~after_hook
         ~table_meta
         ~where
+        ~seek
         ~order
         ~limit
         ~offset
@@ -8459,29 +8564,17 @@ and stream_index_lookup
       mode
       table_tree
       idx_tree
-      col_type
-      lookup_val
+      (keys : (int * Row.ty * Plan.expr) list)
       (table_meta : Cat.table_meta)
   =
   let s_opt = Lwt.get query_stats_key in
-  let v = eval_expr clock params [||] lookup_val in
-  (* [WHERE col = NULL] never matches (SQL three-valued logic).  A bound
-     parameter may be NULL at run time (#228: [col = ?] is now index-eligible);
-     return no rows rather than seeking the index's NULL entries. *)
-  match v with
-  | Row.V_null -> Lwt.return (Lwt_stream.of_list [])
-  | _ ->
-    let lookup_v =
-      match v, col_type with
-      | Row.V_null, _ -> Index_key.IK_null
-      | Row.V_int n, Row.Integer -> Index_key.IK_int n
-      | Row.V_text s, Row.Text -> Index_key.IK_text s
-      | Row.V_real f, Row.Real -> Index_key.IK_real f
-      | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
-      | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *)
-    in
-    let prefix = Index_key.encode_value lookup_v in
-    let plen = Bytes.length prefix in
+  let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+  (* A NULL or type-mismatched value anywhere in the key kills the whole
+     conjunction; return no rows rather than seeking the index's NULL entries. *)
+  match index_lookup_values vs with
+  | None -> Lwt.return (Lwt_stream.of_list [])
+  | Some lookup_vs ->
+    let prefix, plen = encode_index_key_prefix lookup_vs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     (* #262: read through the active txn so an index lookup sees rows the open
        transaction has inserted/updated but not yet committed. *)
@@ -8542,9 +8635,8 @@ and stream_index_lookup
 
 (* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
    the table key, so this is a single O(log n) table-tree seek, no index and no
-   second fetch.  A NULL or non-integer probe matches nothing, mirroring the
-   old __pk Op_index_lookup path (which mapped a type-mismatched value to
-   IK_null ⇒ empty), so behavior is unchanged. *)
+   second fetch.  A NULL or non-integer probe matches nothing, as it does on the
+   index path (see [index_lookup_values]). *)
 and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
@@ -9661,6 +9753,7 @@ and stream_update_returning
       (table_meta : Cat.table_meta)
       assignments
       where
+      seek
       order
       limit
       offset
@@ -9692,6 +9785,7 @@ and stream_update_returning
       ~table_meta
       ~assignments
       ~where
+      ~seek
       ~order
       ~limit
       ~offset
@@ -9707,6 +9801,7 @@ and stream_delete_returning
       cat
       (table_meta : Cat.table_meta)
       where
+      seek
       order
       limit
       offset
@@ -9734,6 +9829,7 @@ and stream_delete_returning
       c
       ~table_meta
       ~where
+      ~seek
       ~order
       ~limit
       ~offset
@@ -9933,18 +10029,8 @@ and to_stream
               Hashtbl.replace seen k ();
               true))
          inner)
-  | Plan.Op_index_lookup
-      { table_tree; idx_tree; col_idx = _; col_type; lookup_val; table_meta } ->
-    stream_index_lookup
-      clock
-      params
-      store
-      mode
-      table_tree
-      idx_tree
-      col_type
-      lookup_val
-      table_meta
+  | Plan.Op_index_lookup { table_tree; idx_tree; keys; table_meta } ->
+    stream_index_lookup clock params store mode table_tree idx_tree keys table_meta
   | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
@@ -10078,7 +10164,7 @@ and to_stream
     when returning <> [] && Cat.is_columnar table_meta ->
     Lwt.fail_with "RETURNING is not supported on columnar tables"
   | Plan.Op_update
-      { table_meta; assignments; where; order; limit; offset; indexes; returning }
+      { table_meta; assignments; where; seek; order; limit; offset; indexes; returning }
     when returning <> [] ->
     stream_update_returning
       clock
@@ -10089,6 +10175,7 @@ and to_stream
       table_meta
       assignments
       where
+      seek
       order
       limit
       offset
@@ -10097,7 +10184,7 @@ and to_stream
   | Plan.Op_delete { table_meta; returning; _ }
     when returning <> [] && Cat.is_columnar table_meta ->
     Lwt.fail_with "RETURNING is not supported on columnar tables"
-  | Plan.Op_delete { table_meta; where; order; limit; offset; indexes; returning }
+  | Plan.Op_delete { table_meta; where; seek; order; limit; offset; indexes; returning }
     when returning <> [] ->
     stream_delete_returning
       clock
@@ -10107,6 +10194,7 @@ and to_stream
       cat
       table_meta
       where
+      seek
       order
       limit
       offset

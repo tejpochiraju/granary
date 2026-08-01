@@ -1704,9 +1704,7 @@ let query_index_lookup_basic () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Integer
-         ; lookup_val = Plan.P_lit (Ast.L_int 2L)
+         ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 2L) ]
          ; table_meta = m
          }
      in
@@ -1769,9 +1767,7 @@ let query_index_lookup_type_mismatch () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Integer
-         ; lookup_val = Plan.P_lit (Ast.L_text "not-an-int")
+         ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_text "not-an-int") ]
          ; table_meta = m
          }
      in
@@ -1834,9 +1830,7 @@ let query_index_lookup_multiple_matches () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Integer
-         ; lookup_val = Plan.P_lit (Ast.L_int 7L)
+         ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 7L) ]
          ; table_meta = m
          }
      in
@@ -1895,9 +1889,7 @@ let query_index_lookup_text () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 1
-         ; col_type = Row.Text
-         ; lookup_val = Plan.P_lit (Ast.L_text "alice")
+         ; keys = [ 1, Row.Text, Plan.P_lit (Ast.L_text "alice") ]
          ; table_meta = m
          }
      in
@@ -1966,9 +1958,7 @@ let query_index_lookup_real () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Real
-         ; lookup_val = Plan.P_lit (Ast.L_real 2.5)
+         ; keys = [ 0, Row.Real, Plan.P_lit (Ast.L_real 2.5) ]
          ; table_meta = m
          }
      in
@@ -2037,9 +2027,7 @@ let query_index_lookup_blob () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Blob
-         ; lookup_val = Plan.P_lit (Ast.L_blob (Bytes.of_string "BBBB"))
+         ; keys = [ 0, Row.Blob, Plan.P_lit (Ast.L_blob (Bytes.of_string "BBBB")) ]
          ; table_meta = m
          }
      in
@@ -2097,9 +2085,7 @@ let query_index_lookup_null () =
              (let x_id, _, _, _ = Cat.row_storage m in
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
-         ; col_idx = 0
-         ; col_type = Row.Integer
-         ; lookup_val = Plan.P_lit Ast.L_null
+         ; keys = [ 0, Row.Integer, Plan.P_lit Ast.L_null ]
          ; table_meta = m
          }
      in
@@ -2441,6 +2427,7 @@ let exec_update_no_match_returns_zero () =
             ; assignments = [ 1, Plan.P_lit (Ast.L_text "z") ]
             ; where =
                 Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)))
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2481,6 +2468,7 @@ let exec_update_match_returns_count () =
             { table_meta = m
             ; assignments = [ 1, Plan.P_lit (Ast.L_text "updated") ]
             ; where = None
+            ; seek = None
             ; (* update all *)
               order = []
             ; limit = None
@@ -2521,6 +2509,7 @@ let exec_update_raises_in_query () =
                 { table_meta = m
                 ; assignments = [ 1, Plan.P_lit (Ast.L_text "x") ]
                 ; where = None
+                ; seek = None
                 ; order = []
                 ; limit = None
                 ; offset = None
@@ -2565,6 +2554,7 @@ let exec_delete_no_match_returns_zero () =
             { table_meta = m
             ; where =
                 Some (Plan.P_binop (Plan.Eq, Plan.P_col 0, Plan.P_lit (Ast.L_int 99L)))
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2605,6 +2595,7 @@ let exec_delete_all_returns_count () =
          (Plan.Op_delete
             { table_meta = m
             ; where = None
+            ; seek = None
             ; order = []
             ; limit = None
             ; offset = None
@@ -2643,6 +2634,7 @@ let exec_delete_raises_in_query () =
              (Plan.Op_delete
                 { table_meta = m
                 ; where = None
+                ; seek = None
                 ; order = []
                 ; limit = None
                 ; offset = None

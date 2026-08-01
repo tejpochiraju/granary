@@ -73,6 +73,18 @@ type snippet_spec =
   ; n_tokens : int
   }
 
+(** #508: a narrowing access path for a DML statement's WHERE clause.  It only
+    restricts the candidate rows the write path considers — the full WHERE
+    predicate is still evaluated on every candidate — so a seek can never change
+    which rows a statement affects, only how many are read to find them. *)
+type seek =
+  | Seek_rowid of expr (** the INTEGER PRIMARY KEY rowid alias is pinned *)
+  | Seek_index of
+      { idx_tree : int
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+        (** leading index columns pinned by equality, in index-column order *)
+      }
+
 type op =
   | Op_create_table of
       { name : string
@@ -152,9 +164,13 @@ type op =
   | Op_index_lookup of
       { table_tree : int (** table's tree_id *)
       ; idx_tree : int (** index tree_id *)
-      ; col_idx : int (** column ordinal for encoding *)
-      ; col_type : Granary_encoding.Row.ty
-      ; lookup_val : expr (** value to look up *)
+      ; keys : (int * Granary_encoding.Row.ty * expr) list
+        (** #508: the leading index columns pinned by equality, in INDEX column
+            order — [(column ordinal, column type, value expression)].  A
+            single-column index yields a one-element list; a composite index
+            yields one element per covered leading column, and the seek matches
+            that encoded prefix.  Conjuncts not consumed here are left to a
+            residual [Op_filter] above. *)
       ; table_meta : Cat.table_meta (** for row decoding *)
       }
   | Op_rowid_lookup of
@@ -169,6 +185,7 @@ type op =
       { table_meta : Cat.table_meta
       ; assignments : (int * expr) list (** [(col_ordinal, new_value_expr)] *)
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option
@@ -178,6 +195,7 @@ type op =
   | Op_delete of
       { table_meta : Cat.table_meta
       ; where : expr option
+      ; seek : seek option (** #508: optional index/rowid narrowing for [where] *)
       ; order : (expr * [ `Asc | `Desc ] * [ `Nulls_first | `Nulls_last ]) list
       ; limit : int option
       ; offset : int option
