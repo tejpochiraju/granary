@@ -285,13 +285,44 @@ let bounded_type = function
   | Row.Text | Row.Blob -> false
 ;;
 
+(** #523: order two candidate bounds for the {i same} end of a column's range,
+    or [None] when they cannot be ordered at plan time.
+
+    Only a literal of exactly the bounded column's type is orderable.  A bound
+    parameter's value is unknown until run time; a literal of another type is
+    knowable but useless, since {!Granary_sql.Exec.range_seek_bounds} refuses to
+    encode a value whose type does not match the column and leaves that end
+    unbounded.  Either way there is no plan-time answer to "which is tighter",
+    so the caller keeps the candidate it already had.
+
+    A NaN bound is deliberately not orderable: it encodes as NULL, whose
+    behaviour as a bound is a special case of its own (see
+    {!Granary_sql.Exec.range_seek_bounds}), and no comparison against it is ever
+    true.  Leaving it out of the fold keeps that case exactly as it was. *)
+let compare_range_bounds (ty : Row.ty) a b =
+  match ty, a, b with
+  | Row.Integer, Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) ->
+    Some (Int64.compare x y)
+  | Row.Real, Sema.BE_lit (Ast.L_real x), Sema.BE_lit (Ast.L_real y)
+    when not (Float.is_nan x || Float.is_nan y) -> Some (Float.compare x y)
+  | _, _, _ -> None
+;;
+
 (** #517: find a range over the index column immediately following the
     equality-covered prefix.  [n_eq] is how many leading index columns the
     equalities pinned, so the bounded column is the index's [n_eq]th.
 
     The conjuncts are NOT marked consumed: the range narrows the scanned span
     and the predicate is still evaluated on every row, which is what makes an
-    inclusive-only bound sound. *)
+    inclusive-only bound sound.
+
+    #523: several conjuncts may constrain the same end — [o BETWEEN 100 AND 200
+    AND o >= 150], or a plain [o >= 100 AND o >= 150].  Each is individually
+    sound, and since every result row satisfies all of them, so is the
+    {i extremum}: the greatest lower bound and the least upper bound.  Taking
+    the first match instead left the tighter one unused.  The fold keeps the
+    earlier candidate whenever {!compare_range_bounds} cannot order the pair, so
+    an end whose only candidate is a bound parameter still bounds the seek. *)
 let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts_list =
   match List.nth_opt i.Cat.idx_columns n_eq with
   | None -> None
@@ -303,18 +334,29 @@ let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts
        if not (bounded_type ty)
        then None
        else (
+         let end_of which c =
+           match recognise_range_col_lit c with
+           | Some (col_idx, lo, hi) when col_idx = ord ->
+             (match which with
+              | `Lo -> lo
+              | `Hi -> hi)
+           | Some _ | None -> None
+         in
+         (* Keep whichever of [best] and [cand] constrains the end more. *)
+         let tighter which best cand =
+           match compare_range_bounds ty best cand, which with
+           | None, _ -> best
+           | Some n, `Lo -> if n >= 0 then best else cand
+           | Some n, `Hi -> if n <= 0 then best else cand
+         in
+         let fold which best c =
+           match end_of which c, best with
+           | None, _ -> best
+           | Some cand, None -> Some cand
+           | Some cand, Some best -> Some (tighter which best cand)
+         in
          let pick which =
-           List.find_map
-             (fun c ->
-                match recognise_range_col_lit c with
-                | Some (col_idx, lo, hi) when col_idx = ord ->
-                  Option.map
-                    plan_expr
-                    (match which with
-                     | `Lo -> lo
-                     | `Hi -> hi)
-                | Some _ | None -> None)
-             conjuncts_list
+           Option.map plan_expr (List.fold_left (fold which) None conjuncts_list)
          in
          match pick `Lo, pick `Hi with
          | None, None -> None
