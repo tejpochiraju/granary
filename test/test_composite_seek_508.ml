@@ -345,6 +345,122 @@ let update_residual_conjunct_still_gates () =
     Alcotest.(check int) "accepted by residual" 0 (q_at db ~w:1 ~i:50))
 ;;
 
+(* Every other write case keys on the implicit __pk.  A user-declared secondary
+   composite index must drive the DML seek just the same — the planner picks by
+   covered prefix, not by index origin. *)
+let dml_seeks_through_a_secondary_index () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, v INTEGER)";
+    exec db "CREATE INDEX idx_ab ON t (a, b)";
+    exec db "BEGIN";
+    for i = 1 to 60 do
+      exec
+        db
+        (Printf.sprintf
+           "INSERT INTO t VALUES (%d, %d, 'b%d', %d)"
+           i
+           (i mod 6)
+           (i mod 4)
+           i)
+    done;
+    exec db "COMMIT";
+    let by_ab sql = List.length (rows_of db sql) in
+    (* Baseline through the unseekable foil, so the seek has something to agree
+       with rather than only agreeing with itself. *)
+    Alcotest.(check int)
+      "SELECT agrees with foil"
+      (by_ab "SELECT v FROM t WHERE a + 0 = 3 AND b = 'b1'")
+      (by_ab "SELECT v FROM t WHERE a = 3 AND b = 'b1'");
+    exec db "UPDATE t SET v = -1 WHERE a = 3 AND b = 'b1'";
+    Alcotest.(check int)
+      "UPDATE hit exactly the foil's rows"
+      (by_ab "SELECT v FROM t WHERE a + 0 = 3 AND b = 'b1'")
+      (by_ab "SELECT v FROM t WHERE v = -1");
+    exec db "DELETE FROM t WHERE a = 3 AND b = 'b1'";
+    Alcotest.(check int)
+      "DELETE removed them all"
+      0
+      (by_ab "SELECT v FROM t WHERE v = -1"))
+;;
+
+(* [seek_candidate_rowids] fetches rows with [S.get tx tree_id (Rowid.encode
+   rowid)], which assumes the table tree is rowid-keyed.  WITHOUT ROWID is where
+   that assumption is most likely to break, so pin it there.
+
+   Note the shape: granary's WITHOUT ROWID requires exactly one INTEGER PRIMARY
+   KEY column (sema.ml:1348), so a composite PK is rejected outright — the
+   composite seek has to come from a secondary index on such a table. *)
+let without_rowid_table_seeks () =
+  with_db (fun db ->
+    exec
+      db
+      "CREATE TABLE wr (id INTEGER PRIMARY KEY, k INTEGER, n INTEGER, v INTEGER) WITHOUT \
+       ROWID";
+    exec db "CREATE INDEX idx_kn ON wr (k, n)";
+    exec db "BEGIN";
+    for k = 1 to 4 do
+      for n = 1 to 25 do
+        exec
+          db
+          (Printf.sprintf
+             "INSERT INTO wr VALUES (%d, %d, %d, %d)"
+             (((k - 1) * 25) + n)
+             k
+             n
+             ((k * 100) + n))
+      done
+    done;
+    exec db "COMMIT";
+    let one sql =
+      match rows_of db sql with
+      | [ [| Db.V_int x |] ] -> Int64.to_int x
+      | rows -> Alcotest.failf "expected one int row, got %d" (List.length rows)
+    in
+    Alcotest.(check int) "SELECT" 313 (one "SELECT v FROM wr WHERE k = 3 AND n = 13");
+    exec db "UPDATE wr SET v = 0 WHERE k = 3 AND n = 13";
+    Alcotest.(check int) "UPDATE" 0 (one "SELECT v FROM wr WHERE k = 3 AND n = 13");
+    Alcotest.(check int)
+      "neighbour untouched"
+      312
+      (one "SELECT v FROM wr WHERE k = 3 AND n = 12");
+    exec db "DELETE FROM wr WHERE k = 3 AND n = 13";
+    Alcotest.(check int) "DELETE removed exactly one" 99 (one "SELECT COUNT(*) FROM wr");
+    (* And the rowid-alias seek on the same table, which is the other path
+       through [Rowid.encode] on a WITHOUT ROWID tree. *)
+    exec db "UPDATE wr SET v = -5 WHERE id = 7 AND k = 1";
+    Alcotest.(check int)
+      "alias seek with residual"
+      (-5)
+      (one "SELECT v FROM wr WHERE id = 7"))
+;;
+
+(* #512 review: an index seek yields index-key order, a table scan yields rowid
+   order.  For a prefix spanning several full keys those differ, so an unordered
+   [UPDATE ... LIMIT n] would otherwise hit a different n rows than the scan
+   would.  [seek_candidate_rowids] sorts by rowid to keep them identical. *)
+let limit_without_order_matches_scan_order () =
+  with_db (fun db ->
+    exec db "CREATE TABLE t (w INTEGER, i INTEGER, v INTEGER, PRIMARY KEY (w, i))";
+    exec db "BEGIN";
+    (* Insert with i descending, so rowid order and index-key order disagree. *)
+    for i = 10 downto 1 do
+      exec db (Printf.sprintf "INSERT INTO t VALUES (1, %d, 0)" i)
+    done;
+    exec db "COMMIT";
+    exec db "UPDATE t SET v = 1 WHERE w = 1 LIMIT 3";
+    (* The scan path would take the first three rows in rowid order: i = 10, 9, 8. *)
+    Alcotest.(check (list int))
+      "same three rows a scan would have taken"
+      [ 8; 9; 10 ]
+      (List.sort
+         compare
+         (List.map
+            (function
+              | [| Db.V_int n |] -> Int64.to_int n
+              | _ -> Alcotest.fail "shape")
+            (rows_of db "SELECT i FROM t WHERE v = 1"))))
+;;
+
 (* ------------------------------------------------------------------ *)
 (* Correctness property: seek path == unoptimizable foil                *)
 (* ------------------------------------------------------------------ *)
@@ -409,6 +525,15 @@ let () =
             "UPDATE residual conjunct still gates"
             `Quick
             update_residual_conjunct_still_gates
+        ; Alcotest.test_case
+            "DML seeks through a secondary index"
+            `Quick
+            dml_seeks_through_a_secondary_index
+        ; Alcotest.test_case "WITHOUT ROWID table seeks" `Quick without_rowid_table_seeks
+        ; Alcotest.test_case
+            "LIMIT without ORDER BY matches scan order"
+            `Quick
+            limit_without_order_matches_scan_order
         ] )
     ; "property", List.map QCheck_alcotest.to_alcotest [ prop_seek_matches_scan ]
     ]

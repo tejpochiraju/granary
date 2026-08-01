@@ -2639,6 +2639,33 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
   buf, total
 ;;
 
+(** #508: map evaluated equality values to the index-key values that seek them.
+    [None] means "matches nothing" and the caller must return no rows without
+    seeking — which is the honest encoding of both cases that reach it:
+
+    - a NULL value, because [WHERE col = NULL] never matches (three-valued
+      logic); a bound parameter may only turn out NULL at run time (#228).
+    - a value whose type does not match the column's, which no stored key can
+      equal.  Note this must NOT become an [IK_null] prefix: that is a real seek
+      key selecting the index's NULL entries, not an empty result.
+
+    The read ([stream_index_lookup]) and write ([seek_candidate_rowids]) paths
+    share this so they can never disagree about which rows a key matches. *)
+let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list option =
+  let rec go acc = function
+    | [] -> Some (List.rev acc)
+    | (v, ty) :: rest ->
+      (match v, ty with
+       | Row.V_int n, Row.Integer -> go (Index_key.IK_int n :: acc) rest
+       | Row.V_text s, Row.Text -> go (Index_key.IK_text s :: acc) rest
+       | Row.V_real f, Row.Real -> go (Index_key.IK_real f :: acc) rest
+       | Row.V_blob b, Row.Blob -> go (Index_key.IK_blob b :: acc) rest
+       | Row.V_null, _ -> None (* [col = NULL] never matches *)
+       | _, _ -> None (* type mismatch: no stored key can equal this *))
+  in
+  go [] vs
+;;
+
 (** Decode the rowid from the trailing 8 bytes of an index key. *)
 let decode_index_key_rowid (ikey : bytes) : int64 =
   let n = Bytes.length ikey in
@@ -4811,10 +4838,16 @@ let cascade_apply_set_default
 
 (* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
    under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-(* #508: candidate rowids for a DML [seek], in ascending key order.  [None] means
-   "no narrowing available" — the caller scans.  The seek is only a restriction:
-   the caller still evaluates the full WHERE predicate on every candidate, so a
-   wrong-but-superset answer here can cost time but cannot change results. *)
+(* #508: candidate rowids for a DML [seek].  [None] means "no narrowing
+   available" — the caller scans.  The seek is only a restriction: the caller
+   still evaluates the full WHERE predicate on every candidate, so a
+   wrong-but-superset answer here can cost time but cannot change results.
+
+   Returned in ASCENDING ROWID order, which is the order a full table-tree scan
+   drains in.  An index seek naturally yields index-key order, and for a prefix
+   spanning several distinct full keys the two differ — which would silently
+   change which n rows an [UPDATE/DELETE ... LIMIT n] without ORDER BY hits.
+   Sorting keeps the seek a pure restriction of the scan, drain order included. *)
 let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option Lwt.t =
   match seek with
   | Plan.Seek_rowid e ->
@@ -4823,34 +4856,24 @@ let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option
      | _ -> Lwt.return (Some []) (* NULL or non-integer matches no rowid *))
   | Plan.Seek_index { idx_tree; keys } ->
     let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
-    if List.exists (fun (v, _) -> v = Row.V_null) vs
-    then Lwt.return (Some []) (* [col = NULL] never matches *)
-    else (
-      let ivs =
-        List.map
-          (fun (v, ty) ->
-             match v, ty with
-             | Row.V_int n, Row.Integer -> Index_key.IK_int n
-             | Row.V_text s, Row.Text -> Index_key.IK_text s
-             | Row.V_real f, Row.Real -> Index_key.IK_real f
-             | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
-             | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *))
-          vs
-      in
-      let prefix, plen = encode_index_key_prefix ivs in
-      let* cur = S.seek_ge tx idx_tree (Bytes.cat prefix (Rowid.encode Int64.min_int)) in
-      let rec collect acc =
-        let* next = S.seek_next cur in
-        match next with
-        | Some (ikey, _)
-          when Bytes.length ikey >= plen + 8 && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-          -> collect (decode_index_key_rowid ikey :: acc)
-        | _ ->
-          S.seek_close cur;
-          Lwt.return (List.rev acc)
-      in
-      let* rowids = collect [] in
-      Lwt.return (Some rowids))
+    (match index_lookup_values vs with
+     | None -> Lwt.return (Some []) (* NULL or type mismatch: matches nothing *)
+     | Some ivs ->
+       let prefix, plen = encode_index_key_prefix ivs in
+       let* cur = S.seek_ge tx idx_tree (Bytes.cat prefix (Rowid.encode Int64.min_int)) in
+       let rec collect acc =
+         let* next = S.seek_next cur in
+         match next with
+         | Some (ikey, _)
+           when Bytes.length ikey >= plen + 8
+                && Bytes.equal (Bytes.sub ikey 0 plen) prefix ->
+           collect (decode_index_key_rowid ikey :: acc)
+         | _ ->
+           S.seek_close cur;
+           Lwt.return acc
+       in
+       let* rowids = collect [] in
+       Lwt.return (Some (List.sort Int64.compare rowids)))
 ;;
 
 (* Drain matching rows from the given txn (RO or RW).  With a [seek], only the
@@ -8546,25 +8569,11 @@ and stream_index_lookup
   =
   let s_opt = Lwt.get query_stats_key in
   let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
-  (* [WHERE col = NULL] never matches (SQL three-valued logic), and one NULL
-     anywhere in the key kills the whole conjunction.  A bound parameter may be
-     NULL at run time (#228: [col = ?] is index-eligible); return no rows rather
-     than seeking the index's NULL entries. *)
-  if List.exists (fun (v, _) -> v = Row.V_null) vs
-  then Lwt.return (Lwt_stream.of_list [])
-  else (
-    let lookup_vs =
-      List.map
-        (fun (v, ty) ->
-           match v, ty with
-           | Row.V_null, _ -> Index_key.IK_null
-           | Row.V_int n, Row.Integer -> Index_key.IK_int n
-           | Row.V_text s, Row.Text -> Index_key.IK_text s
-           | Row.V_real f, Row.Real -> Index_key.IK_real f
-           | Row.V_blob b, Row.Blob -> Index_key.IK_blob b
-           | _, _ -> Index_key.IK_null (* type mismatch: nothing matches *))
-        vs
-    in
+  (* A NULL or type-mismatched value anywhere in the key kills the whole
+     conjunction; return no rows rather than seeking the index's NULL entries. *)
+  match index_lookup_values vs with
+  | None -> Lwt.return (Lwt_stream.of_list [])
+  | Some lookup_vs ->
     let prefix, plen = encode_index_key_prefix lookup_vs in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     (* #262: read through the active txn so an index lookup sees rows the open
@@ -8622,13 +8631,12 @@ and stream_index_lookup
                let%lwt () = finish () in
                Lwt.fail exn))
     in
-    Lwt.return stream)
+    Lwt.return stream
 
 (* #243 (T1): point lookup on an INTEGER PRIMARY KEY rowid alias — the column IS
    the table key, so this is a single O(log n) table-tree seek, no index and no
-   second fetch.  A NULL or non-integer probe matches nothing, mirroring the
-   old __pk Op_index_lookup path (which mapped a type-mismatched value to
-   IK_null ⇒ empty), so behavior is unchanged. *)
+   second fetch.  A NULL or non-integer probe matches nothing, as it does on the
+   index path (see [index_lookup_values]). *)
 and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.table_meta) =
   let s_opt = Lwt.get query_stats_key in
   let v = eval_expr clock params [||] lookup_val in
