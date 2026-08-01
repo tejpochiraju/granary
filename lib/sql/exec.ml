@@ -1375,16 +1375,16 @@ let rec eval_expr
      | Row.V_int n -> Row.V_int (Int64.lognot n)
      | Row.V_null -> Row.V_null
      | _ -> Row.V_null)
+  (* #522: [x BETWEEN lo AND hi] is evaluated as literally [x >= lo AND x <= hi]
+     — same operators, same three-valued AND — so the two spellings cannot
+     disagree. Comparing through [compare_values] instead used to answer 0 for
+     any cross-type pair, which made both ends true at once and the whole
+     predicate true for every row. [x] is still evaluated once. *)
   | Plan.P_between (x, lo, hi) ->
     let vx = eval_expr clock params row x in
     let vlo = eval_expr clock params row lo in
     let vhi = eval_expr clock params row hi in
-    (match vx, vlo, vhi with
-     | Row.V_null, _, _ | _, Row.V_null, _ | _, _, Row.V_null -> Row.V_null
-     | _ ->
-       let ge_lo = compare_values vx vlo >= 0 in
-       let le_hi = compare_values vx vhi <= 0 in
-       Row.V_int (if ge_lo && le_hi then 1L else 0L))
+    eval_binop Plan.And (eval_binop Plan.Ge vx vlo) (eval_binop Plan.Le vx vhi)
   | Plan.P_in (x, vals) -> eval_in clock params row x vals
   | Plan.P_is_null e ->
     (match eval_expr clock params row e with
