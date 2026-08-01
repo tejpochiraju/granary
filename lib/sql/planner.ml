@@ -119,15 +119,15 @@ let recognise_range_col_lit = function
   | Sema.BE_binop (op, Sema.BE_col i, e) ->
     (match range_value e, op with
      | None, _ -> None
-     | Some _, (Sema.Ge | Sema.Gt) -> Some (i, Some e, None)
-     | Some _, (Sema.Le | Sema.Lt) -> Some (i, None, Some e)
+     | Some v, (Sema.Ge | Sema.Gt) -> Some (i, Some v, None)
+     | Some v, (Sema.Le | Sema.Lt) -> Some (i, None, Some v)
      | Some _, _ -> None)
   | Sema.BE_binop (op, e, Sema.BE_col i) ->
     (* [v > col] constrains the column's UPPER end, not its lower one. *)
     (match range_value e, op with
      | None, _ -> None
-     | Some _, (Sema.Ge | Sema.Gt) -> Some (i, None, Some e)
-     | Some _, (Sema.Le | Sema.Lt) -> Some (i, Some e, None)
+     | Some v, (Sema.Ge | Sema.Gt) -> Some (i, None, Some v)
+     | Some v, (Sema.Le | Sema.Lt) -> Some (i, Some v, None)
      | Some _, _ -> None)
   | _ -> None
 ;;

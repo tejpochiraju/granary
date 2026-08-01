@@ -147,6 +147,49 @@ let half_recognisable_between_narrows () =
       ~expect_examined:20)
 ;;
 
+(* An unrecognisable end does not block a separate conjunct from supplying it:
+   the [BETWEEN] gives the lower end, the recogniser falls through on its upper
+   one, and the inequality completes the pair. *)
+let between_and_inequality_compose () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND v AND o <= 119"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND v AND o + 0 <= 119"
+      ~expect_examined:20)
+;;
+
+(* #513's lesson: the joined access path plans from [base_only_conjuncts], and a
+   [BETWEEN] end may name a joined column there.  Only the recognised end
+   becomes a bound; the post-join filter still evaluates the whole predicate, so
+   the rows must match the unoptimizable foil while the read narrows. *)
+let between_under_a_join_narrows () =
+  with_db (fun db ->
+    seed db;
+    exec db "CREATE TABLE j (k INTEGER, lim INTEGER)";
+    exec db "INSERT INTO j VALUES (1, 119)";
+    let bounded =
+      "SELECT t.v FROM t JOIN j ON j.k = 1 WHERE t.w = 2 AND t.o BETWEEN 100 AND j.lim"
+    in
+    let foil =
+      "SELECT t.v FROM t JOIN j ON j.k = 1 WHERE t.w = 2 AND t.o + 0 BETWEEN 100 AND \
+       j.lim"
+    in
+    Alcotest.(check (list (list string)))
+      "bounded and unoptimizable foil agree"
+      (rows_of db foil)
+      (rows_of db bounded);
+    Alcotest.(check int) "20 rows" 20 (List.length (rows_of db bounded));
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "the joined seek narrowed (%d examined vs the foil's %d)"
+         (examined db bounded)
+         (examined db foil))
+      true
+      (examined db bounded < examined db foil))
+;;
+
 (* A lower bound alone still moves the start key; the walk then runs to the end
    of the equality prefix's span. *)
 let lower_bound_only_narrows () =
@@ -556,6 +599,14 @@ let () =
             "half-recognisable BETWEEN narrows"
             `Quick
             half_recognisable_between_narrows
+        ; Alcotest.test_case
+            "BETWEEN and inequality compose"
+            `Quick
+            between_and_inequality_compose
+        ; Alcotest.test_case
+            "BETWEEN under a join narrows"
+            `Quick
+            between_under_a_join_narrows
         ; Alcotest.test_case "DML range narrows" `Quick dml_range_narrows
         ; Alcotest.test_case "real range narrows" `Quick real_range_narrows
         ] )
