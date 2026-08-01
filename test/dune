@@ -832,6 +832,20 @@
   lwt.unix
   unix))
 
+; #520: static driving-side cardinality estimate for the join strategy choice.
+
+(test
+ (name test_join_cost_model_520)
+ (modules test_join_cost_model_520)
+ (libraries
+  granary
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #513: join must not discard the driving table's access path.
 
 (test

@@ -408,6 +408,197 @@ let make_scan (meta : Cat.table_meta) : Plan.op =
   | Cat.Row _ -> Plan.Op_seq_scan { table_meta = meta }
 ;;
 
+(* ------------------------------------------------------------------ *)
+(* #520: a crude static cardinality estimate for the join's driving side *)
+(* ------------------------------------------------------------------ *)
+
+(** #520: "we have no idea" — the estimate for any shape whose output cannot be
+    bounded from the plan alone.  Deliberately larger than any threshold, so an
+    unknown driving side always falls on the hash-join side of the choice. *)
+let unbounded_rows = max_int
+
+(** #520: the driving-side row count below which a nested-loop probe is taken
+    unconditionally, without consulting the right table at all.
+
+    Measured on the #500 W=1 TPC-C population, the StockLevel query
+    ([order_line INNER JOIN stock], where [stock] holds 100,000 rows):
+
+    {v
+      driving side   nested-loop probe          hash join
+      30,240 rows    60,480 examined   2757 ms   130,240 examined   1240 ms
+          12 rows        24 examined    0.5 ms   100,012 examined    945 ms
+    v}
+
+    Note that rows examined FALL while wall-clock RISES: a B-tree seek costs far
+    more than a hash-table lookup, so ~30,000 probes lose to a single
+    100,000-row scan, while 12 probes beat it by ~2000x.  {b Rows examined is
+    not the cost model.}
+
+    {b The floor is slack, not a win condition.}  It is tempting to read it as
+    "a handful of seeks cannot lose to a scan of anything", and that is wrong:
+    1000 seeks is not a handful and it does lose to a small right table.
+    Measured with the floor set to 0 — D = 1000 against R = 200 costs 2.65 ms
+    probing and 2.10 ms hashing, against R = 20 it is 2.52 ms and 1.73 ms.  So
+    the floor knowingly accepts up to ~1.5x in that corner.
+
+    It buys two things that are worth more than that corner.  First, it absorbs
+    {!range_seek_rows}' deliberate optimism: with the floor at 0 the only test
+    that fails is the range-bounded StockLevel shape, whose nominal 100 loses
+    the ratio against a 200-row right table even though the real window is 21
+    rows.  The floor is the slack that covers a made-up number.  Second, it is
+    the only thing that can fire when R is not knowable at all — a WITHOUT ROWID
+    or columnar right table estimates as {!unbounded_rows}, the ratio can never
+    hold, and without the floor such a join could never take a probe.
+
+    Those two jobs want different numbers (100 keeps every test green but
+    strands the unknowable-R case), so 1000 is a single compromise between them
+    — and it stays an order of magnitude above the largest measured win,
+    StockLevel's post-#517 230-row driving side.  {b Do not "tune" it as though
+    it were a break-even point; it is not one.} *)
+let nlj_min_driving_rows = 1000
+
+(** #520: how many right-table rows a single probe is worth.
+
+    The floor above is not enough on its own, because the trade-off is a {b
+    ratio}, not an absolute cut: a probe costs D seeks and a hash join costs
+    D + R reads, so the same D is the wrong answer against a small R and the
+    right one against a large one.  Review of PR #526 measured exactly that —
+    1,200 driving rows against TPC-C's 100,000-row [stock] took 153.7 ms as a
+    hash join and 4.3 ms as a probe, a 36x regression from a rule that looked at
+    D alone.
+
+    The measurements above put a probe at ~91 µs and a hashed right-table row at
+    ~9.5 µs, so break-even is around [R / 9.6].  8 is the round number just
+    below that, i.e. very slightly biased towards the probe at break-even, where
+    by construction the two plans cost about the same and the bias cannot matter
+    much either way.  It is a {b heuristic, not a calibrated model}: this engine
+    has no ANALYZE, no stored table statistics and no selectivity estimates, so
+    there is nothing to calibrate against, and both figures come from one
+    workload on one machine.
+
+    Checked against every measured point: 30,240 driving rows against R =
+    100,000 gives a cut of 12,500 and takes the hash join, matching the
+    measurement; 230 and 12 are under the floor and probe; 1,200 against R =
+    100,000 probes, which is the regression this constant fixes. *)
+let nlj_probe_cost_ratio = 8
+
+let range_seek_rows = 100
+
+(** #520: how many rows [meta]'s table can hold, from the only real number the
+    catalog carries: a rowid table's [next_rowid] high-water mark, which is
+    [max(rowid) + 1] over everything ever inserted.
+
+    That makes it an upper bound on the live row count for the ordinary case
+    (auto-allocated, non-negative rowids) and an over-estimate after deletes —
+    over-estimating biases the choice towards the hash join, which is the safer
+    direction: choosing hash wrongly costs a bounded multiple of the right
+    table's size, while choosing nested-loop wrongly grows without limit in the
+    driving side.  An explicitly inserted negative rowid would break the bound; that is
+    accepted, since the consequence is only a strategy choice.
+
+    WITHOUT ROWID and columnar tables carry no such counter and are unbounded. *)
+let table_rows_estimate (meta : Cat.table_meta) =
+  match meta.Cat.storage with
+  | Cat.Columnar _ -> unbounded_rows
+  | Cat.Row { without_rowid = true; _ } -> unbounded_rows
+  | Cat.Row { next_rowid; _ } when Int64.equal next_rowid Cat.empty_next_rowid -> 0
+  | Cat.Row { next_rowid; _ } ->
+    if Int64.compare next_rowid (Int64.of_int unbounded_rows) >= 0
+    then unbounded_rows
+    else max 0 (Int64.to_int next_rowid - 1)
+;;
+
+(** #520: does [idx_tree] belong to a UNIQUE index of [meta] whose every column
+    is pinned by [keys]?  Such a seek reaches at most one row.
+
+    A UNIQUE index permits any number of NULLs, so a full-key seek whose key
+    includes one can reach many index entries — hence the [not_null] check,
+    which keeps the estimate from answering 1 in the direction this module's
+    bias argues against.
+
+    {b The implicit PRIMARY KEY index is exempt from it.}  [Sema.mark_table_pk]
+    marks only a table-level [PRIMARY KEY] naming a SINGLE column, so both
+    columns of [PRIMARY KEY (w, o)] carry [primary_key = false] and hence
+    [not_null = false] — and the composite-PK point lookup is precisely the
+    #508/#516 shape this whole series exists for.  Without the exemption a seek
+    that reaches exactly one row was estimated at the table's high-water mark
+    and lost its probe: review of PR #526 measured 201 rows examined against 2.
+    The PK index is the table's identity, so its full-key seek is the one-row
+    class whether or not the columns happen to be marked.
+
+    The residual exposure on a [`User] or [`Implicit_unique] index is smaller
+    than it looks, because a key is only ever pinned by [col = value] and that
+    comparison is never true for NULL: a seek whose key is NULL returns no rows
+    at all, so the under-estimate can only mis-cost a query that was going to be
+    empty.  The check is kept there anyway — it is free, and "empty result" is
+    not the same as "cheap". *)
+let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
+  let all_not_null =
+    List.for_all
+      (fun (col_idx, _, _) -> (List.nth meta.Cat.columns col_idx).Row.not_null)
+      keys
+  in
+  Cat.indexes_for_table cat ~table:meta.Cat.name
+  |> List.exists (fun (i : Cat.index_info) ->
+    i.Cat.idx_tree_id = idx_tree
+    && i.Cat.idx_unique
+    && List.length i.Cat.idx_columns = List.length keys
+    && (all_not_null || i.Cat.idx_origin = `Implicit_pk))
+;;
+
+(** #520: estimate how many rows [op] produces, statically.
+
+    Only the three shapes a driving side can actually take are classified.
+    [chain_joins] hands {!plan_join} either the base access path — which
+    [plan_base] builds as a bare scan or seek when the query has joins, never
+    wrapped in a filter — or a previous join, so nothing else reaches here.
+    Every other op answers {!unbounded_rows} rather than adding an arm no test
+    can reach: an [Op_aggregate] with no GROUP BY is exactly one row and an
+    [Op_limit] is capped by its limit, both of which would be easy to classify
+    and neither of which can occur below a join today.
+
+    A join's output is {!unbounded_rows} for a different reason — without
+    selectivity estimates its fan-out is genuinely unknown, and the asymmetry of
+    the two errors (see {!table_rows_estimate}) says to answer "large" when in
+    doubt.  The practical effect is that only the first join of a chain can take
+    a probe. *)
+let estimate_rows cat (op : Plan.op) =
+  match op with
+  | Plan.Op_rowid_lookup _ -> 1
+  | Plan.Op_index_lookup { idx_tree; keys; range; table_meta; _ } ->
+    let seek =
+      if seek_is_unique_point cat table_meta ~idx_tree ~keys
+      then 1
+      else if Option.is_some range
+      then range_seek_rows
+      else unbounded_rows
+    in
+    min seek (table_rows_estimate table_meta)
+  | Plan.Op_seq_scan { table_meta } -> table_rows_estimate table_meta
+  | _ -> unbounded_rows
+;;
+
+(** #520: is a nested-loop probe worth it, given [driving_rows] estimated left
+    rows and a right table of [right_rows]?
+
+    A probe costs one seek per driving row; the hash join it replaces costs one
+    read per right-table row, plus the same driving rows either way.  So below
+    {!nlj_min_driving_rows} the probe always wins, and above it the comparison
+    is against the right table's size scaled by {!nlj_probe_cost_ratio}.
+
+    The ratio is written as a division rather than [driving_rows * ratio >
+    right_rows] because [driving_rows] can be {!unbounded_rows} = [max_int],
+    which that multiplication would overflow into a negative number and silently
+    invert the test.  An unbounded estimate on {i either} side also fails the
+    comparison outright, so "we have no idea how big this is" lands on the hash
+    join, which is the bounded-loss choice. *)
+let probe_is_worth_it ~driving_rows ~right_rows =
+  driving_rows <= nlj_min_driving_rows
+  || (driving_rows < unbounded_rows
+      && right_rows < unbounded_rows
+      && driving_rows <= right_rows / nlj_probe_cost_ratio)
+;;
+
 (** Plan a JOIN.  [left_op] produces left-table rows; we wrap it with
     either Op_nested_loop_join (when the right table has an index the join can
     probe) or Op_hash_join (otherwise).  If the ON predicate is not a simple
@@ -420,7 +611,15 @@ let make_scan (meta : Cat.table_meta) : Plan.op =
     — the TPC-C shape, where [stock] is keyed on [(s_w_id, s_i_id)], joined on
     [s_i_id], and [s_w_id] is fixed by the WHERE clause.  This is only sound
     because the caller still applies the whole WHERE clause to the joined row;
-    see {!Plan.probe_part}. *)
+    see {!Plan.probe_part}.
+
+    #520: having a probe is not on its own a reason to use one.  A probe costs a
+    B-tree seek per driving row where a hash join costs one scan of the right
+    table, so the choice turns on how many driving rows there are — see
+    {!probe_is_worth_it} for the rule, {!nlj_probe_cost_ratio} for the
+    measurements behind it, and {!estimate_rows} for the static estimate that
+    stands in for statistics this engine does not keep.
+    Both strategies return the same rows; this is only ever a cost decision. *)
 let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_left
   : Plan.op
   =
@@ -432,8 +631,18 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
   let right_offset = bj.right_col_offset in
   let n_right_cols = List.length bj.right_meta.Cat.columns in
   let right_eqs = right_table_eqs ~right_offset ~n_right_cols where_conjuncts in
+  (* #520: neither side of the cost comparison depends on which strategy is
+     chosen or on which column the ON predicate resolves to — compute both once,
+     outside the match. *)
+  let driving_rows = estimate_rows cat left_op in
+  let right_rows = table_rows_estimate bj.right_meta in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
-    match best_probe cat bj.right_meta ~join_col:right_col ~left_col ~right_eqs with
+    let probe =
+      if probe_is_worth_it ~driving_rows ~right_rows
+      then best_probe cat bj.right_meta ~join_col:right_col ~left_col ~right_eqs
+      else None
+    in
+    match probe with
     | Some (idx, probe) ->
       Plan.Op_nested_loop_join
         { left = left_op
