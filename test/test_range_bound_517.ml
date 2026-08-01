@@ -120,6 +120,33 @@ let two_sided_range_narrows () =
       ~expect_examined:21)
 ;;
 
+(* #519: [BETWEEN] is its own AST node, not a pair of comparisons, so it has to
+   be recognised in its own right or the whole equality group is scanned. Both
+   its ends are inclusive, so — unlike the strict cases above — the examined
+   count is exactly the number of rows returned. *)
+let between_narrows () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 119"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100 AND 119"
+      ~expect_examined:20)
+;;
+
+(* One end a literal, the other an expression the planner cannot evaluate at
+   plan time: the recognisable end must still bound its side rather than the
+   pair being rejected wholesale. *)
+let half_recognisable_between_narrows () =
+  with_db (fun db ->
+    seed db;
+    check_narrows
+      db
+      ~bounded:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 281 AND v"
+      ~foil:"SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 281 AND v"
+      ~expect_examined:20)
+;;
+
 (* A lower bound alone still moves the start key; the walk then runs to the end
    of the equality prefix's span. *)
 let lower_bound_only_narrows () =
@@ -398,6 +425,35 @@ let null_bound_matches_nothing () =
       (rows_of db "SELECT v FROM t WHERE w = 2 AND o >= NULL"))
 ;;
 
+(* #519: [NOT BETWEEN] parses as a negated [BETWEEN], so the conjunct is a
+   [NOT] node and must not be read as a bound on the column — doing so would
+   seek to the span the query excludes. *)
+let not_between_is_not_a_bound () =
+  with_db (fun db ->
+    seed db;
+    let sql = "SELECT v FROM t WHERE w = 2 AND o NOT BETWEEN 100 AND 119" in
+    Alcotest.(check (list (list string)))
+      "same as the unoptimizable foil"
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o + 0 NOT BETWEEN 100 AND 119")
+      (rows_of db sql);
+    Alcotest.(check int) "280 of the group's 300 rows" 280 (List.length (rows_of db sql)))
+;;
+
+(* A NULL end of a [BETWEEN] leaves that end unbounded, exactly as a NULL
+   inequality operand does; the predicate then rejects every row. *)
+let null_between_bound_matches_nothing () =
+  with_db (fun db ->
+    seed db;
+    Alcotest.(check (list (list string)))
+      "NULL lower end"
+      []
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN NULL AND 119");
+    Alcotest.(check (list (list string)))
+      "NULL upper end"
+      []
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND NULL"))
+;;
+
 (* Reals are bounded too — the other fixed-width encoding. *)
 let real_range_narrows () =
   with_db (fun db ->
@@ -450,6 +506,36 @@ let prop_range_matches_foil =
          q "o" = q "o + 0"))
 ;;
 
+let prop_between_matches_foil =
+  QCheck.Test.make
+    ~count:200
+    ~name:"bounded BETWEEN seek agrees with unoptimizable foil"
+    QCheck.(triple (int_range 1 3) (int_range (-2) 14) (int_range (-2) 14))
+    (fun (w, lo, hi) ->
+       with_db (fun db ->
+         exec db "CREATE TABLE t (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+         exec db "BEGIN";
+         for wi = 1 to 3 do
+           for o = 1 to 12 do
+             exec
+               db
+               (Printf.sprintf "INSERT INTO t VALUES (%d, %d, %d)" wi o ((wi * 100) + o))
+           done
+         done;
+         exec db "COMMIT";
+         let q col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = %d AND %s BETWEEN %d AND %d"
+                w
+                col
+                lo
+                hi)
+         in
+         q "o" = q "o + 0"))
+;;
+
 let () =
   Alcotest.run
     "range_bound_517"
@@ -465,6 +551,11 @@ let () =
             "empty window reads nothing"
             `Quick
             empty_window_reads_nothing
+        ; Alcotest.test_case "BETWEEN narrows" `Quick between_narrows
+        ; Alcotest.test_case
+            "half-recognisable BETWEEN narrows"
+            `Quick
+            half_recognisable_between_narrows
         ; Alcotest.test_case "DML range narrows" `Quick dml_range_narrows
         ; Alcotest.test_case "real range narrows" `Quick real_range_narrows
         ] )
@@ -486,6 +577,14 @@ let () =
             `Quick
             null_bound_matches_nothing
         ; Alcotest.test_case
+            "NOT BETWEEN is not a bound"
+            `Quick
+            not_between_is_not_a_bound
+        ; Alcotest.test_case
+            "NULL BETWEEN bound matches nothing"
+            `Quick
+            null_between_bound_matches_nothing
+        ; Alcotest.test_case
             "NULLs in the ranged column"
             `Quick
             nulls_in_the_ranged_column
@@ -494,6 +593,9 @@ let () =
             `Quick
             nulls_in_a_column_after_the_ranged_one
         ] )
-    ; "property", List.map QCheck_alcotest.to_alcotest [ prop_range_matches_foil ]
+    ; ( "property"
+      , List.map
+          QCheck_alcotest.to_alcotest
+          [ prop_range_matches_foil; prop_between_matches_foil ] )
     ]
 ;;
