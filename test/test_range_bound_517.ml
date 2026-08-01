@@ -497,6 +497,85 @@ let null_between_bound_matches_nothing () =
       (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND NULL"))
 ;;
 
+(* #522: a [BETWEEN] end need not share the column's type. Evaluated through
+   [compare_values] alone — which answers 0 for any cross-type pair — such an
+   end compared equal in BOTH directions, so the predicate was true for every
+   row while the equivalent inequalities were right all along. Each case pins
+   the [BETWEEN] against both other spellings of the same test: the inequality
+   pair it must equal, and the unoptimizable foil that takes no seek path, so
+   neither the evaluator nor the seek can drift on its own. *)
+let cross_type_between_agrees_with_inequalities () =
+  with_db (fun db ->
+    seed db;
+    let check name ~between ~pair ~expect =
+      Alcotest.(check (list (list string)))
+        (name ^ " : BETWEEN vs the inequality pair")
+        (rows_of db pair)
+        (rows_of db between);
+      Alcotest.(check int)
+        (name ^ " : rows returned")
+        expect
+        (List.length (rows_of db between))
+    in
+    (* Text ends against an integer column: no row compares in range. *)
+    check
+      "text ends"
+      ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN '100' AND '119'"
+      ~pair:"SELECT v FROM t WHERE w = 2 AND o >= '100' AND o <= '119'"
+      ~expect:0;
+    (* Real ends against an integer column: the two promote, 101..119 match. *)
+    check
+      "real ends"
+      ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119.5"
+      ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100.5 AND o <= 119.5"
+      ~expect:19;
+    (* One end the column's type, the other not: the mismatched end alone must
+       still be able to reject a row. *)
+    check
+      "one text end"
+      ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND '119'"
+      ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100 AND o <= '119'"
+      ~expect:0;
+    check
+      "one real end"
+      ~between:"SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119"
+      ~pair:"SELECT v FROM t WHERE w = 2 AND o >= 100.5 AND o <= 119"
+      ~expect:19;
+    (* The foil takes no seek path at all, so agreeing with it says the answer
+       comes from the predicate rather than from a lucky bound. *)
+    Alcotest.(check (list (list string)))
+      "the unoptimizable foil agrees too"
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o + 0 BETWEEN 100.5 AND 119.5")
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100.5 AND 119.5"))
+;;
+
+(* #522, the other half of desugaring to a conjunction: a NULL end makes only
+   ITS side unknown, not the whole predicate. [o BETWEEN 500 AND NULL] is false
+   — not unknown — for every row here, because the lower end already answered
+   false and [false AND unknown] is false. Returning unknown instead was
+   invisible under a bare [WHERE] (both reject the row) but observable under
+   [NOT], where unknown still rejects and false admits. *)
+let null_end_of_between_is_three_valued () =
+  with_db (fun db ->
+    seed db;
+    Alcotest.(check int)
+      "NOT (o BETWEEN 500 AND NULL): the lower end is decisively false, so all 300 rows \
+       come back"
+      300
+      (List.length
+         (rows_of db "SELECT v FROM t WHERE w = 2 AND NOT (o BETWEEN 500 AND NULL)"));
+    Alcotest.(check (list (list string)))
+      "and it agrees with the inequality pair it desugars to"
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND NOT (o >= 500 AND o <= NULL)")
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND NOT (o BETWEEN 500 AND NULL)");
+    (* Where neither end is decisive the result really is unknown, and [NOT] of
+       unknown is unknown — so this one returns nothing. *)
+    Alcotest.(check (list (list string)))
+      "NOT (o BETWEEN 1 AND NULL) is unknown, which rejects"
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND NOT (o >= 1 AND o <= NULL)")
+      (rows_of db "SELECT v FROM t WHERE w = 2 AND NOT (o BETWEEN 1 AND NULL)"))
+;;
+
 (* Reals are bounded too — the other fixed-width encoding. *)
 let real_range_narrows () =
   with_db (fun db ->
@@ -579,6 +658,53 @@ let prop_between_matches_foil =
          q "o" = q "o + 0"))
 ;;
 
+(* #522: whatever the ends' types, [x BETWEEN a AND b] must be exactly
+   [x >= a AND x <= b]. The generator spells each end as an integer, a real or
+   a text literal independently, so most draws are cross-type. *)
+let spell_literal which n =
+  match which with
+  | 0 -> string_of_int n
+  | 1 -> Printf.sprintf "%d.5" n
+  | _ -> Printf.sprintf "'%d'" n
+;;
+
+let prop_cross_type_between_matches_inequalities =
+  QCheck.Test.make
+    ~count:200
+    ~name:"cross-type BETWEEN agrees with the inequality pair"
+    QCheck.(quad (int_range 0 2) (int_range 0 2) (int_range (-2) 14) (int_range (-2) 14))
+    (fun (lo_kind, hi_kind, lo_n, hi_n) ->
+       let lo = spell_literal lo_kind lo_n
+       and hi = spell_literal hi_kind hi_n in
+       with_db (fun db ->
+         exec db "CREATE TABLE t (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
+         exec db "BEGIN";
+         for o = 1 to 12 do
+           exec db (Printf.sprintf "INSERT INTO t VALUES (1, %d, %d)" o (100 + o))
+         done;
+         exec db "COMMIT";
+         let between col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = 1 AND %s BETWEEN %s AND %s"
+                col
+                lo
+                hi)
+         in
+         let pair col =
+           rows_of
+             db
+             (Printf.sprintf
+                "SELECT v FROM t WHERE w = 1 AND %s >= %s AND %s <= %s"
+                col
+                lo
+                col
+                hi)
+         in
+         between "o" = pair "o" && between "o" = between "o + 0"))
+;;
+
 let () =
   Alcotest.run
     "range_bound_517"
@@ -636,6 +762,14 @@ let () =
             `Quick
             null_between_bound_matches_nothing
         ; Alcotest.test_case
+            "cross-type BETWEEN agrees with inequalities"
+            `Quick
+            cross_type_between_agrees_with_inequalities
+        ; Alcotest.test_case
+            "NULL end of BETWEEN is three-valued"
+            `Quick
+            null_end_of_between_is_three_valued
+        ; Alcotest.test_case
             "NULLs in the ranged column"
             `Quick
             nulls_in_the_ranged_column
@@ -647,6 +781,9 @@ let () =
     ; ( "property"
       , List.map
           QCheck_alcotest.to_alcotest
-          [ prop_range_matches_foil; prop_between_matches_foil ] )
+          [ prop_range_matches_foil
+          ; prop_between_matches_foil
+          ; prop_cross_type_between_matches_inequalities
+          ] )
     ]
 ;;
