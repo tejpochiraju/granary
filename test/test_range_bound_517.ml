@@ -361,10 +361,18 @@ let nulls_in_a_column_after_the_ranged_one () =
       exec db (Printf.sprintf "INSERT INTO m VALUES (1, %d, %d, %d)" o o (100 + o))
     done;
     exec db "COMMIT";
+    let bounded = "SELECT v FROM m WHERE w = 1 AND o >= 5 AND o <= 7" in
+    let foil = "SELECT v FROM m WHERE w = 1 AND o + 0 >= 5 AND o + 0 <= 7" in
     Alcotest.(check (list (list string)))
       "rows agree with the unoptimizable foil"
-      (rows_of db "SELECT v FROM m WHERE w = 1 AND o + 0 >= 5 AND o + 0 <= 7")
-      (rows_of db "SELECT v FROM m WHERE w = 1 AND o >= 5 AND o <= 7"))
+      (rows_of db foil)
+      (rows_of db bounded);
+    (* Without this the case would be vacuous: a pure narrowing cannot change
+       the rows, so the check above passes whether or not a bound was built —
+       and with no bound there is no lower bound in the start key, which is the
+       one code path this case exists to cover. *)
+    Alcotest.(check int) "the foil reads the whole group" 40 (examined db foil);
+    Alcotest.(check int) "the start key skips to the bound" 6 (examined db bounded))
 ;;
 
 (* An inequality on a column that is NOT the one after the equality prefix must

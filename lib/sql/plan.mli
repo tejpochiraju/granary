@@ -92,9 +92,12 @@ type snippet_spec =
 
     Note that width is {i not} what makes the stop test sound — a NULL (or a
     NaN real) in the bounded column encodes to a single byte, so the comparison
-    window runs past the column boundary on those entries.  See
-    {!Exec.range_seek_bounds} for why that is still correct: it turns on the
-    ordering of the encoding's type tags, not on their widths. *)
+    window runs past the column boundary on those entries.  It is still correct,
+    for a reason that turns on the ordering of the encoding's type tags rather
+    than their widths; the argument is written out at [range_seek_bounds] in
+    exec.ml.  (Named in prose, not as an odoc reference: that function is
+    internal to [Exec] and not in its signature, and [Exec] depends on [Plan]
+    rather than the other way round.) *)
 type range =
   { r_ty : Granary_encoding.Row.ty (** the bounded column's type *)
   ; r_lo : expr option (** lower end, inclusive *)
