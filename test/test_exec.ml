@@ -1705,6 +1705,7 @@ let query_index_lookup_basic () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 2L) ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -1768,6 +1769,7 @@ let query_index_lookup_type_mismatch () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_text "not-an-int") ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -1831,6 +1833,7 @@ let query_index_lookup_multiple_matches () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Integer, Plan.P_lit (Ast.L_int 7L) ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -1890,6 +1893,7 @@ let query_index_lookup_text () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 1, Row.Text, Plan.P_lit (Ast.L_text "alice") ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -1959,6 +1963,7 @@ let query_index_lookup_real () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Real, Plan.P_lit (Ast.L_real 2.5) ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -2028,6 +2033,7 @@ let query_index_lookup_blob () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Blob, Plan.P_lit (Ast.L_blob (Bytes.of_string "BBBB")) ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -2086,6 +2092,7 @@ let query_index_lookup_null () =
               x_id)
          ; idx_tree = idx.Cat.idx_tree_id
          ; keys = [ 0, Row.Integer, Plan.P_lit Ast.L_null ]
+         ; range = None
          ; table_meta = m
          }
      in
@@ -3543,8 +3550,7 @@ let query_nlj_raises_in_execute () =
                 { left = Plan.Op_seq_scan { table_meta = m }
                 ; right_meta = m
                 ; idx_tree = 99
-                ; right_col_idx = 0
-                ; left_col_idx = 0
+                ; probe = [ Plan.Probe_from_left 0 ]
                 ; join_kind = `Inner
                 ; right_col_offset = 2
                 ; n_right_cols = 2

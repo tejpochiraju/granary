@@ -2666,6 +2666,60 @@ let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list 
   go [] vs
 ;;
 
+(** #517: the seek start key and stop test implied by an equality [prefix] and
+    an optional [range] over the column right after it.
+
+    Both are pure narrowings of the prefix scan.  The start key positions the
+    cursor no later than the first qualifying entry, and the stop test ends the
+    walk no earlier than the last one; every row the walk yields is still put
+    through the statement's predicate, so an inclusive reading of a strict bound
+    costs at most one extra key and can never drop a row.
+
+    The stop test compares a fixed-width window at offset [plen], which needs
+    care: {b the bounded column is NOT always that width}.  [Plan.range] admits
+    only [Integer] and [Real], whose encodings are 9 bytes — but
+    {!Granary_encoding.Index_key.encode_value} emits a {i single} [0x00] byte
+    for a NULL, and for a NaN real, which it encodes as NULL.  On such an entry
+    the window runs past the column boundary into the bytes that follow.
+
+    That is still sound, and this is the load-bearing reason — not the width.
+    The NULL/NaN tag [0x00] sorts below both the integer tag [0x01] and the real
+    tag [0x02], so a misaligned window always compares {i low}: [past_end] never
+    fires early on one, and those entries sort to the front of the prefix group
+    anyway, ahead of anything the bound could exclude.  A future change to the
+    tag ordering, not to the widths, is what would break this.
+
+    The mirror case is a NaN {i bound}, which encodes to that same one byte and
+    so makes [past_end] fire on the very first key: the seek returns nothing,
+    which is the right answer because no comparison against NaN is ever true.
+
+    Byte order is column order throughout, because the encoding is
+    order-preserving by construction. *)
+let range_seek_bounds clock params ~prefix ~plen (range : Plan.range option) =
+  match range with
+  | None -> Bytes.cat prefix (Rowid.encode Int64.min_int), fun _ -> false
+  | Some { Plan.r_ty; r_lo; r_hi } ->
+    let encode_end e =
+      match index_lookup_values [ eval_expr clock params [||] e, r_ty ] with
+      | Some [ iv ] -> Some (Index_key.encode_value iv)
+      | Some _ | None -> None (* NULL or type mismatch: leave that end unbounded *)
+    in
+    let start =
+      match Option.bind r_lo encode_end with
+      | None -> Bytes.cat prefix (Rowid.encode Int64.min_int)
+      | Some lo -> Bytes.cat (Bytes.cat prefix lo) (Rowid.encode Int64.min_int)
+    in
+    let past_end =
+      match Option.bind r_hi encode_end with
+      | None -> fun _ -> false
+      | Some hi ->
+        let w = Bytes.length hi in
+        fun ikey ->
+          Bytes.length ikey >= plen + w && Bytes.compare (Bytes.sub ikey plen w) hi > 0
+    in
+    start, past_end
+;;
+
 (** Decode the rowid from the trailing 8 bytes of an index key. *)
 let decode_index_key_rowid (ikey : bytes) : int64 =
   let n = Bytes.length ikey in
@@ -4854,20 +4908,21 @@ let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option
     (match eval_expr clock params [||] e with
      | Row.V_int n -> Lwt.return (Some [ n ])
      | _ -> Lwt.return (Some []) (* NULL or non-integer matches no rowid *))
-  | Plan.Seek_index { idx_tree; keys } ->
+  | Plan.Seek_index { idx_tree; keys; range } ->
     let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
     (match index_lookup_values vs with
      | None -> Lwt.return (Some []) (* NULL or type mismatch: matches nothing *)
      | Some ivs ->
        let prefix, plen = encode_index_key_prefix ivs in
-       let* cur = S.seek_ge tx idx_tree (Bytes.cat prefix (Rowid.encode Int64.min_int)) in
+       let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
+       let* cur = S.seek_ge tx idx_tree start in
        let rec collect acc =
          let* next = S.seek_next cur in
          match next with
          | Some (ikey, _)
            when Bytes.length ikey >= plen + 8
-                && Bytes.equal (Bytes.sub ikey 0 plen) prefix ->
-           collect (decode_index_key_rowid ikey :: acc)
+                && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                && not (past_end ikey) -> collect (decode_index_key_rowid ikey :: acc)
          | _ ->
            S.seek_close cur;
            Lwt.return acc
@@ -8565,6 +8620,7 @@ and stream_index_lookup
       table_tree
       idx_tree
       (keys : (int * Row.ty * Plan.expr) list)
+      (range : Plan.range option)
       (table_meta : Cat.table_meta)
   =
   let s_opt = Lwt.get query_stats_key in
@@ -8575,7 +8631,9 @@ and stream_index_lookup
   | None -> Lwt.return (Lwt_stream.of_list [])
   | Some lookup_vs ->
     let prefix, plen = encode_index_key_prefix lookup_vs in
-    let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
+    (* #517: the range (if any) moves the start key forward and stops the walk
+       early; it never changes which rows qualify. *)
+    let seek_key, past_end = range_seek_bounds clock params ~prefix ~plen range in
     (* #262: read through the active txn so an index lookup sees rows the open
        transaction has inserted/updated but not yet committed. *)
     let* rh = rh_begin store mode in
@@ -8609,6 +8667,7 @@ and stream_index_lookup
                    if
                      Bytes.length ikey >= plen + 8
                      && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+                     && not (past_end ikey)
                    then (
                      let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
                      let rowid = Rowid.decode rowid_bytes in
@@ -8658,6 +8717,26 @@ and stream_rowid_lookup clock params store mode lookup_val (table_meta : Cat.tab
 
 (* Probe the right index for one left row [lrow], appending matched (or a
    null-padded row for LEFT JOIN) combinations to [out]. *)
+(* #516: evaluate a probe key against one left row.  [None] means the key
+   matches nothing — a NULL component can never equal a stored key under
+   three-valued logic — and the caller null-extends or drops the row without
+   seeking, exactly as the single-column probe did for a NULL join key. *)
+and nlj_probe_values clock params lrow (probe : Plan.probe_part list)
+  : Row.value list option
+  =
+  let rec go acc = function
+    | [] -> Some (List.rev acc)
+    | Plan.Probe_from_left i :: rest ->
+      (match lrow.(i) with
+       | Row.V_null -> None
+       | v -> go (v :: acc) rest)
+    | Plan.Probe_const e :: rest ->
+      (match eval_expr clock params [||] e with
+       | Row.V_null -> None
+       | v -> go (v :: acc) rest)
+  in
+  go [] probe
+
 and nlj_probe_left
       clock
       params
@@ -8665,23 +8744,22 @@ and nlj_probe_left
       rh
       (right_meta : Cat.table_meta)
       idx_tree
-      left_col_idx
+      (probe : Plan.probe_part list)
       join_kind
       n_right_cols
       out
       lrow
   : unit Lwt.t
   =
-  let lkey = lrow.(left_col_idx) in
-  if lkey = Row.V_null
-  then (
+  match nlj_probe_values clock params lrow probe with
+  | None ->
     if join_kind = `Left
     then out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out;
-    Lwt.return_unit)
-  else (
-    let ik_value = row_value_to_index_value lkey in
-    let prefix = Index_key.encode_value ik_value in
-    let plen = Bytes.length prefix in
+    Lwt.return_unit
+  | Some key_values ->
+    let prefix, plen =
+      encode_index_key_prefix (List.map row_value_to_index_value key_values)
+    in
     let seek_key = Bytes.cat prefix (Rowid.encode Int64.min_int) in
     (* O(log n) native seek per probe — avoids draining the whole index per
        left row, which made indexed nested-loop joins O(n^2) (#228/#229). *)
@@ -8714,7 +8792,7 @@ and nlj_probe_left
      | `Left when not !found ->
        out := Array.append lrow (Array.make n_right_cols Row.V_null) :: !out
      | _ -> ());
-    Lwt.return_unit)
+    Lwt.return_unit
 
 and stream_nested_loop_join
       clock
@@ -8725,7 +8803,7 @@ and stream_nested_loop_join
       left
       (right_meta : Cat.table_meta)
       idx_tree
-      left_col_idx
+      (probe : Plan.probe_part list)
       join_kind
       n_right_cols
   =
@@ -8748,7 +8826,7 @@ and stream_nested_loop_join
          rh
          right_meta
          idx_tree
-         left_col_idx
+         probe
          join_kind
          n_right_cols
          out)
@@ -10029,20 +10107,13 @@ and to_stream
               Hashtbl.replace seen k ();
               true))
          inner)
-  | Plan.Op_index_lookup { table_tree; idx_tree; keys; table_meta } ->
-    stream_index_lookup clock params store mode table_tree idx_tree keys table_meta
+  | Plan.Op_index_lookup { table_tree; idx_tree; keys; range; table_meta } ->
+    stream_index_lookup clock params store mode table_tree idx_tree keys range table_meta
   | Plan.Op_rowid_lookup { table_meta; lookup_val } ->
     stream_rowid_lookup clock params store mode lookup_val table_meta
   | Plan.Op_nested_loop_join
-      { left
-      ; right_meta
-      ; idx_tree
-      ; right_col_idx = _
-      ; left_col_idx
-      ; join_kind
-      ; right_col_offset = _
-      ; n_right_cols
-      } ->
+      { left; right_meta; idx_tree; probe; join_kind; right_col_offset = _; n_right_cols }
+    ->
     stream_nested_loop_join
       clock
       params
@@ -10052,7 +10123,7 @@ and to_stream
       left
       right_meta
       idx_tree
-      left_col_idx
+      probe
       join_kind
       n_right_cols
   | Plan.Op_hash_join
