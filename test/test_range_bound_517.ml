@@ -655,10 +655,11 @@ let contradictory_folded_bounds_read_nothing () =
     seed db;
     let sql = "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 250" in
     Alcotest.(check (list (list string))) "no rows" [] (rows_of db sql);
+    let n = examined db sql in
     Alcotest.(check bool)
-      (Printf.sprintf "and did not scan to find out (%d examined)" (examined db sql))
+      (Printf.sprintf "and did not scan to find out (%d examined)" n)
       true
-      (examined db sql <= 1))
+      (n <= 1))
 ;;
 
 (* Same shape as {!stats_of}, for a prepared statement with bound parameters. *)
@@ -740,6 +741,31 @@ let cross_type_same_end_bound_is_sound () =
       (rows_of db "SELECT v FROM t WHERE w = 2 AND o BETWEEN 100 AND 200 AND o >= 'x'"))
 ;;
 
+(* A cross-type literal can never bound the seek — {!Granary_sql.Exec}'s
+   [range_seek_bounds] refuses to encode a value whose type is not the column's
+   and leaves that end unbounded. So it must not shut out a candidate that CAN
+   bound it just by being written first: both spellings must read the same.
+
+   This is what {!cross_type_same_end_bound_is_sound} cannot catch — a pure
+   narrowing never moves the rows, so pinning rows alone passes in either
+   order. *)
+let cross_type_bound_does_not_block_a_usable_one () =
+  with_db (fun db ->
+    seed db;
+    let both_orders ~first ~second ~expect_examined =
+      List.iter
+        (fun sql ->
+           let n = examined db sql in
+           Alcotest.(check int) (Printf.sprintf "%s : examined" sql) expect_examined n)
+        [ Printf.sprintf "SELECT v FROM t WHERE w = 2 AND %s AND %s" first second
+        ; Printf.sprintf "SELECT v FROM t WHERE w = 2 AND %s AND %s" second first
+        ]
+    in
+    (* 100..200 inclusive, whichever side of the useless conjunct it is on. *)
+    both_orders ~first:"o >= 'x'" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101;
+    both_orders ~first:"o >= 150.5" ~second:"o BETWEEN 100 AND 200" ~expect_examined:101)
+;;
+
 (* The fold applies to reals too, whose ordering is the other one it has to get
    right. *)
 let tightest_real_bound_wins () =
@@ -762,15 +788,23 @@ let tightest_real_bound_wins () =
 (* Property                                                             *)
 (* ------------------------------------------------------------------ *)
 
-(* #523: three same-end constraints at once — whatever the fold keeps, the rows
-   must equal the unoptimizable foil's. *)
+(* #523: four same-end constraints at once — whatever the fold keeps, the rows
+   must equal the unoptimizable foil's.  Both ends get two INDEPENDENT
+   candidates: the lower end [a] (from the [BETWEEN]) against [b], the upper end
+   [c] against [d].  With the same value on both upper candidates the two would
+   always compare equal and a [>=]/[<=] slip in the fold's [`Hi] arm would go
+   unseen under random input. *)
 let prop_folded_bounds_match_foil =
   QCheck.Test.make
     ~count:200
     ~name:"folded same-end bounds agree with unoptimizable foil"
     QCheck.(
-      quad (int_range 1 3) (int_range (-2) 14) (int_range (-2) 14) (int_range (-2) 14))
-    (fun (w, a, b, c) ->
+      quad
+        (int_range 1 3)
+        (int_range (-2) 14)
+        (int_range (-2) 14)
+        (pair (int_range (-2) 14) (int_range (-2) 14)))
+    (fun (w, a, b, (c, d)) ->
        with_db (fun db ->
          exec db "CREATE TABLE t (w INTEGER, o INTEGER, v INTEGER, PRIMARY KEY (w, o))";
          exec db "BEGIN";
@@ -795,7 +829,7 @@ let prop_folded_bounds_match_foil =
                 col
                 b
                 col
-                c)
+                d)
          in
          q "o" = q "o + 0"))
 ;;
@@ -1003,6 +1037,10 @@ let () =
             "cross-type same-end bound is sound"
             `Quick
             cross_type_same_end_bound_is_sound
+        ; Alcotest.test_case
+            "cross-type bound does not block a usable one"
+            `Quick
+            cross_type_bound_does_not_block_a_usable_one
         ] )
     ; ( "property"
       , List.map

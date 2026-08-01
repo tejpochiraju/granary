@@ -285,27 +285,60 @@ let bounded_type = function
   | Row.Text | Row.Blob -> false
 ;;
 
-(** #523: order two candidate bounds for the {i same} end of a column's range,
-    or [None] when they cannot be ordered at plan time.
+(** #523: what a candidate bound is worth to a same-end fold.
 
-    Only a literal of exactly the bounded column's type is orderable.  A bound
-    parameter's value is unknown until run time; a literal of another type is
-    knowable but useless, since {!Granary_sql.Exec.range_seek_bounds} refuses to
-    encode a value whose type does not match the column and leaves that end
-    unbounded.  Either way there is no plan-time answer to "which is tighter",
-    so the caller keeps the candidate it already had.
+    - [`Orderable] — a literal of exactly the bounded column's type.  Two of
+      them can be compared here, and the winner is one
+      {!Granary_sql.Exec.range_seek_bounds} will actually encode.
+    - [`Unknown] — a bound parameter, whose value is not known until run time.
+      It may well be the tighter one, so a fold must keep it rather than
+      discard it for a literal it cannot compare it against.
+    - [`Useless] — a literal of some other type.  Knowable, but it can never
+      bound anything: [range_seek_bounds] refuses to encode a value whose type
+      is not the column's and leaves that end unbounded.  A fold should drop it
+      in favour of any other candidate.
 
-    A NaN bound is deliberately not orderable: it encodes as NULL, whose
-    behaviour as a bound is a special case of its own (see
-    {!Granary_sql.Exec.range_seek_bounds}), and no comparison against it is ever
-    true.  Leaving it out of the fold keeps that case exactly as it was. *)
-let compare_range_bounds (ty : Row.ty) a b =
-  match ty, a, b with
-  | Row.Integer, Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) ->
-    Some (Int64.compare x y)
-  | Row.Real, Sema.BE_lit (Ast.L_real x), Sema.BE_lit (Ast.L_real y)
-    when not (Float.is_nan x || Float.is_nan y) -> Some (Float.compare x y)
-  | _, _, _ -> None
+    A NaN is deliberately [`Unknown] rather than [`Orderable]: it encodes as
+    NULL, whose behaviour as a bound is a special case of its own (see
+    [range_seek_bounds]), and no comparison against it is ever true.  Keeping it
+    out of the ordering leaves that case exactly as it was. *)
+let classify_range_bound (ty : Row.ty) = function
+  | Sema.BE_lit (Ast.L_int _) when ty = Row.Integer -> `Orderable
+  | Sema.BE_lit (Ast.L_real f) when ty = Row.Real ->
+    if Float.is_nan f then `Unknown else `Orderable
+  | Sema.BE_lit _ -> `Useless
+  | _ -> `Unknown
+;;
+
+(** Order two [`Orderable] bounds for the same column.  [Float.compare] is the
+    same total order {!Granary_sql.Exec.compare_values} applies in the residual
+    predicate and {!Granary_encoding.Index_key.encode_value} encodes, so the
+    fold can never pick a bound the predicate and the key order disagree
+    about. *)
+let compare_range_bounds a b =
+  match a, b with
+  | Sema.BE_lit (Ast.L_int x), Sema.BE_lit (Ast.L_int y) -> Some (Int64.compare x y)
+  | Sema.BE_lit (Ast.L_real x), Sema.BE_lit (Ast.L_real y) -> Some (Float.compare x y)
+  | _, _ -> None
+;;
+
+(** #523: keep whichever of [best] and [cand] constrains [which] end more.  A
+    [`Useless] candidate loses to anything else; otherwise only two
+    [`Orderable]s can be separated, and every other pairing keeps the incumbent.
+
+    Keeping the incumbent when a parameter is involved makes the result depend
+    on the order the conjuncts were written, which is deliberate: with no
+    plan-time value there is nothing better to go on, and either choice is a
+    sound narrowing because the predicate still runs on every row. *)
+let tighter_bound ty which best cand =
+  match classify_range_bound ty best, classify_range_bound ty cand with
+  | `Useless, (`Orderable | `Unknown) -> cand
+  | `Orderable, `Orderable ->
+    (match compare_range_bounds best cand, which with
+     | None, _ -> best
+     | Some n, `Lo -> if n >= 0 then best else cand
+     | Some n, `Hi -> if n <= 0 then best else cand)
+  | (`Orderable | `Unknown | `Useless), (`Orderable | `Unknown | `Useless) -> best
 ;;
 
 (** #517: find a range over the index column immediately following the
@@ -320,8 +353,8 @@ let compare_range_bounds (ty : Row.ty) a b =
     AND o >= 150], or a plain [o >= 100 AND o >= 150].  Each is individually
     sound, and since every result row satisfies all of them, so is the
     {i extremum}: the greatest lower bound and the least upper bound.  Taking
-    the first match instead left the tighter one unused.  The fold keeps the
-    earlier candidate whenever {!compare_range_bounds} cannot order the pair, so
+    the first match instead left the tighter one unused.  See
+    {!tighter_bound} for what happens when two candidates cannot be ordered —
     an end whose only candidate is a bound parameter still bounds the seek. *)
 let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts_list =
   match List.nth_opt i.Cat.idx_columns n_eq with
@@ -342,18 +375,11 @@ let range_for_index (meta : Cat.table_meta) (i : Cat.index_info) ~n_eq conjuncts
               | `Hi -> hi)
            | Some _ | None -> None
          in
-         (* Keep whichever of [best] and [cand] constrains the end more. *)
-         let tighter which best cand =
-           match compare_range_bounds ty best cand, which with
-           | None, _ -> best
-           | Some n, `Lo -> if n >= 0 then best else cand
-           | Some n, `Hi -> if n <= 0 then best else cand
-         in
          let fold which best c =
            match end_of which c, best with
            | None, _ -> best
            | Some cand, None -> Some cand
-           | Some cand, Some best -> Some (tighter which best cand)
+           | Some cand, Some best -> Some (tighter_bound ty which best cand)
          in
          let pick which =
            Option.map plan_expr (List.fold_left (fold which) None conjuncts_list)
