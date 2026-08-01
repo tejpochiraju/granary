@@ -724,6 +724,11 @@
  (libraries granary_tpc alcotest))
 
 (test
+ (name test_tpch_check)
+ (modules test_tpch_check)
+ (libraries granary_tpc alcotest))
+
+(test
  (name test_tpch_smoke)
  (modules test_tpch_smoke)
  (libraries granary_tpc alcotest unix))

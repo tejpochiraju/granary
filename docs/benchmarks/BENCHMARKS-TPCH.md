@@ -22,9 +22,16 @@ nothing here may be reported as a TPC benchmark result.
   primitives, text-pool grammar (§4.2.2.1) and column domains, but its output is
   not byte-identical to `dbgen`'s.
 - **Money is `REAL`, not `DECIMAL`.** Neither engine has DECIMAL. Aggregates are
-  therefore compared with a relative epsilon rather than exactly.
+  therefore compared with a relative epsilon rather than exactly. That numeric
+  fallback applies only when at least one side is rendered as a float, so two
+  TEXT values the engines wrote differently (`'07'` vs `'7'`) stay a
+  disagreement rather than being absorbed as arithmetic noise.
 - **Substitution parameters are fixed** at the spec's validation values instead
   of randomized, so runs are comparable and the cross-check has a stable target.
+- **Engine order is fixed.** granary always loads and runs first, SQLite second,
+  over the same directory, so the second engine meets a page cache the first one
+  warmed. Best-of-`GRANARY_TPCH_REPEATS` mitigates it but the asymmetry is
+  systematic, not noise.
 - **Some queries are rewritten** to fit granary's SQL dialect. Every rewrite is
   recorded in the `verdict` column and its rationale lives beside the query in
   `test/tpc/tpch_queries.ml`. Queries granary cannot express at all are
@@ -259,19 +266,23 @@ host,engine,sf,query,verdict,wall_s,cpu_s,cpu_wall_ratio,rows_out,cross_check
 | `engine` | `granary` or `sqlite`. Two rows per query, one per engine. |
 | `sf` | Scale factor the row was measured at. |
 | `query` | TPC-H query number, 1–22. |
-| `verdict` | `native`, `rewritten`, `rewritten-not-yet-running`, `skipped`, or `error: <exception>` when the engine rejected the query. An error does not abort the run. `rewritten-not-yet-running` means the SQL *has* been transformed — it is not spec text — but granary does not yet produce the right answer for it. |
+| `verdict` | `native`, `rewritten`, `rewritten-not-yet-running`, `skipped`, or `error: <exception>` when the engine rejected the query. An error does not abort the run, but on a query the catalogue asserts runs it makes the run exit non-zero (#502). `rewritten-not-yet-running` means the SQL *has* been transformed — it is not spec text — but granary does not yet produce the right answer for it. |
 | `wall_s` | Best wall-clock seconds across `GRANARY_TPCH_REPEATS`. `0` when the query did not run. |
 | `cpu_s` | User + system CPU seconds of that same best run. |
 | `cpu_wall_ratio` | `cpu_s / wall_s`. Near 1.0 means CPU-bound; well under 1.0 means the query waited on I/O. |
 | `rows_out` | Rows returned; empty when the query did not run. |
-| `cross_check` | `ok`, `ok-both-empty`, `MISMATCH`, or `skipped`. Identical on both of a query's two rows — it is a property of the pair. |
+| `cross_check` | `ok`, `ok-both-empty`, `MISMATCH`, `error`, or `skipped`. Identical on both of a query's two rows — it is a property of the pair. |
 
 `ok-both-empty` means the two engines agreed on **zero rows**. It is reported
 separately from `ok` because it is not evidence of correctness — see the section
-above. `skipped` means the comparison could not be made: the query is `Skipped`,
-or one of the engines errored. `MISMATCH` also prints the first disagreement to
-stderr and makes the process exit non-zero. Timing is reported and never gated,
-but a wrong answer is a real failure.
+above.
+
+`skipped` means no comparison was attempted because the query's verdict is
+`Skipped`. `error` means a query the catalogue asserts *runs* produced no rows
+because an engine rejected it — a regression, not a deliberate omission, and it
+is deliberately not the same token (#502). Both `MISMATCH` and `error` print a
+line to stderr and make the process exit non-zero. Timing is reported and never
+gated, but a wrong answer — or a query that stops running — is a real failure.
 
 Because Q2 and Q20 return wrong answers today (#492), a full run **exits 1**.
 That is deliberate: the harness reports what the engine actually does.

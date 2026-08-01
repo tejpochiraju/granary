@@ -36,7 +36,9 @@ RUN opam install -y ocamlformat.0.29.0
 # bench_compare locally and the TPC-H answer cross-check could not run at all.
 # Appended as its own layer to keep the opam layers above cache-valid.
 USER root
-RUN apt-get update && apt-get install -y libsqlite3-dev sqlite3
+RUN apt-get update \
+ && apt-get install -y libsqlite3-dev sqlite3 \
+ && rm -rf /var/lib/apt/lists/*
 USER opam
 RUN opam install -y sqlite3
 WORKDIR /workspace

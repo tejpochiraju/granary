@@ -11,6 +11,7 @@
 module BR = Granary_tpc.Bench_report
 module G = Granary_tpc.Tpch_gen
 module Q = Granary_tpc.Tpch_queries
+module Check = Granary_tpc.Tpch_check
 module Granary_engine = Granary_tpc.Granary_engine
 
 (* ── reference C SQLite (in-process bindings) ─────────────────────────────────
@@ -45,8 +46,8 @@ module Ref_sqlite : BR.ENGINE = struct
   ;;
 
   (* Rendered exactly as Granary_engine renders, so equal values compare equal as
-     text and the float fallback in [field_eq] only has to absorb arithmetic
-     noise. *)
+     text and the float fallback in [Tpch_check.field_eq] only has to absorb
+     arithmetic noise. *)
   let render = function
     | Sqlite3.Data.INT i -> Int64.to_string i
     | Sqlite3.Data.FLOAT f -> Printf.sprintf "%.17g" f
@@ -76,106 +77,6 @@ module Ref_sqlite : BR.ENGINE = struct
 
   let close t = if not (Sqlite3.db_close t.db) then failwith "sqlite3: db_close failed"
 end
-
-(* ── answer comparison ────────────────────────────────────────────────────── *)
-
-let field_eq a b =
-  if a = b
-  then true
-  else (
-    match float_of_string_opt a, float_of_string_opt b with
-    | Some fa, Some fb -> BR.real_eq fa fb
-    | _ -> false)
-;;
-
-let row_eq ra rb = List.length ra = List.length rb && List.for_all2 field_eq ra rb
-
-(* Q2, Q3, Q10, Q18 and Q21 truncate with LIMIT under an ORDER BY that is not a
-   total order — Q10 ties on revenue alone, Q18 on (o_totalprice, o_orderdate).
-   Two engines may legitimately order tied rows differently, so for these the
-   comparison is on the multiset of rows rather than the sequence.  Every other
-   query keeps sequence comparison, where a wrong row order IS a defect.
-
-   Residual limit, stated rather than hidden: if the tie spans the LIMIT cut, the
-   engines may return genuinely different rows and this still reports MISMATCH.
-   That is the correct default — it is indistinguishable from a real disagreement
-   without re-deriving the query's tie-break semantics. *)
-let tie_prone = [ 2; 3; 10; 18; 21 ]
-
-let rec take_matching ra acc = function
-  | [] -> None
-  | rb :: tl ->
-    if row_eq ra rb
-    then Some (List.rev_append acc tl)
-    else take_matching ra (rb :: acc) tl
-;;
-
-(* Greedy multiset match; result is the rows of [a] with no partner in [b]. *)
-let multiset_unmatched a b =
-  let remaining = ref b in
-  let step acc ra =
-    match take_matching ra [] !remaining with
-    | Some rest ->
-      remaining := rest;
-      acc
-    | None -> ra :: acc
-  in
-  List.rev (List.fold_left step [] a)
-;;
-
-let rec first_seq_diff i a b =
-  match a, b with
-  | [], [] -> None
-  | ra :: ta, rb :: tb ->
-    if row_eq ra rb then first_seq_diff (i + 1) ta tb else Some (i, Some ra, Some rb)
-  | ra :: _, [] -> Some (i, Some ra, None)
-  | [], rb :: _ -> Some (i, None, Some rb)
-;;
-
-(* [None] when the answers agree; [Some report] describing the first
-   disagreement otherwise. *)
-let compare_rows ~unordered granary_rows sqlite_rows =
-  let show r =
-    match r with
-    | None -> "<missing>"
-    | Some row -> String.concat " | " row
-  in
-  let counts =
-    Printf.sprintf
-      "granary %d rows, sqlite %d rows"
-      (List.length granary_rows)
-      (List.length sqlite_rows)
-  in
-  if unordered
-  then (
-    let only_g = multiset_unmatched granary_rows sqlite_rows in
-    let only_s = multiset_unmatched sqlite_rows granary_rows in
-    match only_g, only_s with
-    | [], [] when List.length granary_rows = List.length sqlite_rows -> None
-    | g, s ->
-      Some
-        (Printf.sprintf
-           "%s; unmatched (multiset compare): granary-only %s / sqlite-only %s"
-           counts
-           (show (List.nth_opt g 0))
-           (show (List.nth_opt s 0))))
-  else (
-    match first_seq_diff 0 granary_rows sqlite_rows with
-    | None -> None
-    | Some (i, g, s) ->
-      Some
-        (Printf.sprintf "%s; row %d: granary %s / sqlite %s" counts i (show g) (show s)))
-;;
-
-(* ── setup views ──────────────────────────────────────────────────────────── *)
-
-(* A query's [setup] creates views (Q15's revenue0) on a database that outlives
-   the query — reloading the dataset per query is not affordable.  The spec's
-   trailing DROP VIEW was omitted on the assumption that the harness discards the
-   database between queries; that assumption does not hold, so the harness drops
-   the view itself: before setup, so setup is re-runnable across repeats and
-   engines, and after the query, so no view leaks into a later one. *)
-let setup_views q = List.filter_map Q.view_name_of_setup q.Q.setup
 
 (* ── disk-space guard ─────────────────────────────────────────────────────── *)
 
@@ -237,11 +138,8 @@ module Runner (E : BR.ENGINE) = struct
     | None -> invalid_arg "repeats must be >= 1"
   ;;
 
-  let drop_views e q =
-    List.iter
-      (fun v -> E.exec e (Printf.sprintf "DROP VIEW IF EXISTS %s" v))
-      (setup_views q)
-  ;;
+  (* Runs both before setup and after the query — see {!Q.drop_setup_sql}. *)
+  let drop_views e q = List.iter (E.exec e) (Q.drop_setup_sql q)
 
   let one e ~repeats q =
     match q.Q.verdict with
@@ -363,20 +261,25 @@ let make_tmp_dir () =
   dir
 ;;
 
-(* Two empty answers compare equal, and that agreement carries no information:
-   at SF 0.001 Q2 and Q20 read "ok" for two rounds of review and were wrong at
-   SF 0.01.  So an all-empty agreement gets its own token — the false-pass class
-   is then visible in the artifact instead of depending on a reader noticing. *)
+(* The classification itself lives in [Tpch_check], where it is unit-tested;
+   this reports it. *)
 let cross_check_of q g s =
-  match g.rows, s.rows with
-  | Some gr, Some sr ->
-    let unordered = List.mem q.Q.number tie_prone in
-    (match compare_rows ~unordered gr sr with
-     | None -> if gr = [] && sr = [] then "ok-both-empty" else "ok"
-     | Some report ->
-       Printf.eprintf "MISMATCH Q%d: %s\n%!" q.Q.number report;
-       "MISMATCH")
-  | _ -> "skipped"
+  let runnable =
+    match q.Q.verdict with
+    | Q.Skipped _ -> false
+    | Q.Native | Q.Rewritten _ | Q.Rewritten_pending _ -> true
+  in
+  let outcome =
+    Check.classify ~number:q.Q.number ~runnable ~granary:g.rows ~sqlite:s.rows
+  in
+  (match outcome with
+   | Check.Mismatch report -> Printf.eprintf "MISMATCH Q%d: %s\n%!" q.Q.number report
+   | Check.Errored ->
+     (* [verdict] carries the exception text; this line makes the failure
+        visible without reading the CSV. *)
+     Printf.eprintf "ERROR Q%d: granary %s / sqlite %s\n%!" q.Q.number g.verdict s.verdict
+   | Check.Agree | Check.Agree_both_empty | Check.Skipped -> ());
+  outcome
 ;;
 
 let () =
@@ -402,19 +305,23 @@ let () =
   let g_out = Granary_runner.run ~dir ~gen ~queries ~repeats in
   let s_out = Sqlite_runner.run ~dir ~gen ~queries ~repeats in
   print_endline (BR.Csv.header columns);
-  let mismatches = ref 0 in
+  let failures = ref 0 in
   let report q g s =
-    let cross_check = cross_check_of q g s in
-    if cross_check = "MISMATCH" then incr mismatches;
+    let outcome = cross_check_of q g s in
+    if Check.is_failure outcome then incr failures;
+    let cross_check = Check.label outcome in
     emit ~host ~sf ~engine:"granary" g ~cross_check;
     emit ~host ~sf ~engine:"sqlite" s ~cross_check
   in
   List.iteri (fun i g -> report (List.nth queries i) g (List.nth s_out i)) g_out;
-  if !mismatches > 0
+  if !failures > 0
   then (
+    (* A query the catalogue asserts runs and that errors is a failure too:
+       rendering it as `skipped` made a regression indistinguishable from one of
+       the 12 deliberate skips, and still exited 0 (#502). *)
     Printf.eprintf
-      "%d quer%s disagreed with SQLite\n%!"
-      !mismatches
-      (if !mismatches = 1 then "y" else "ies");
+      "%d quer%s disagreed with SQLite or failed to run\n%!"
+      !failures
+      (if !failures = 1 then "y" else "ies");
     exit 1)
 ;;

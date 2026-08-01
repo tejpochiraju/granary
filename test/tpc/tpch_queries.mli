@@ -46,9 +46,14 @@ val find : int -> query option
     comma-free so they need no CSV quoting. *)
 val verdict_label : verdict -> string
 
-(** [view_name_of_setup stmt] is the name of the view created by [stmt] when
-    [stmt] is a [CREATE VIEW name ...] statement (with or without an explicit
-    column list), or [None] otherwise. Used to drop a query's setup views
-    before and after it runs, since the harness does not discard the database
-    between queries. *)
-val view_name_of_setup : string -> string option
+(** [drop_setup_sql q] is one [DROP VIEW IF EXISTS] statement per view created
+    by [q]'s {!field-setup} — Q15's [revenue0] is the only one today.
+
+    The harness does not discard the database between queries, because
+    reloading the dataset per query is not affordable, and the spec's trailing
+    DROP VIEW was omitted on the assumption that it does. So every caller runs
+    these statements twice: before setup, making setup re-runnable across
+    repeats and engines, and after the query, so no view leaks into a later
+    one. Both the benchmark runner and the smoke test call this rather than
+    reimplementing the drop. *)
+val drop_setup_sql : query -> string list

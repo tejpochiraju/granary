@@ -5,6 +5,20 @@
 
 type t = { mutable state : int }
 
+(* The 48-bit state and the [1 lsl 48] mask below need a 63-bit [int].  On a
+   32-bit target the mask wraps and the same seed would produce a different
+   dataset, silently voiding the reproducibility contract this module exists
+   for — so refuse to load instead (#504). *)
+let () =
+  if Sys.int_size < 63
+  then
+    failwith
+      (Printf.sprintf
+         "Tpc_rand: needs a 63-bit int for its 48-bit LCG state; this platform's int is \
+          %d bits"
+         Sys.int_size)
+;;
+
 let modulus = 1 lsl 48
 let multiplier = 0x5DEECE66D
 let increment = 0xB

@@ -213,10 +213,23 @@ let prop_determinism =
        draw a = draw b)
 ;;
 
+(* #504.3: the generator's state is 48 bits wide and is masked with
+   [1 lsl 48], so "a seed pins the dataset" holds only where [int] is 63-bit.
+   On a 32-bit target the mask silently wraps; the module refuses to load there
+   rather than emit a different dataset under the same seed. *)
+let test_requires_a_63_bit_int () =
+  Alcotest.(check bool)
+    "the platform int is wide enough for the 48-bit LCG state"
+    true
+    (Sys.int_size >= 63)
+;;
+
 let () =
   Alcotest.run
     "tpc_rand"
-    [ ( "int_between"
+    [ ( "platform"
+      , [ Alcotest.test_case "63-bit int required" `Quick test_requires_a_63_bit_int ] )
+    ; ( "int_between"
       , [ Alcotest.test_case "in range" `Quick test_int_between_in_range
         ; Alcotest.test_case "reaches both ends" `Quick test_int_between_hits_both_ends
         ; Alcotest.test_case "singleton range" `Quick test_int_between_singleton

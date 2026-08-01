@@ -128,11 +128,19 @@ jobs:
           # gated integration test drives it — neither uses the Sqlite3 OCaml
           # module, so the engine takes on no real-SQLite dependency.  The
           # `Sqlite3.` guard below still applies to these files.
+          #
+          # test/bench_tpch.ml (#482) is a designated comparison file in the
+          # same sense as bench_compare.ml: it is the TPC-H answer cross-check
+          # against reference C SQLite, and it is `(optional)` in test/dune, so
+          # a checkout without sqlite3 does not build it and the engine takes on
+          # no real-SQLite dependency.  It was added by #501 without being
+          # allowlisted here, which left this job failing on main (#505).
           violations=$(grep -rnE '"sqlite3[ "]' lib/ bin/ containers/ test/ \
             --include='*.ml' 2>/dev/null \
             | grep -v 'test/bench_compare.ml' \
             | grep -v 'test/test_sqlite_compare.ml' \
             | grep -v 'test/bench_perf_compare_sqlite3.ml' \
+            | grep -v 'test/bench_tpch.ml' \
             | grep -v 'bin/repl/granary_repl.ml' \
             | grep -v 'test/test_sqlite_import_91.ml' \
             || true)
@@ -144,9 +152,10 @@ jobs:
           violations=$(grep -rn 'Sqlite3\.' lib/ bin/ containers/ test/ \
             --include='*.ml' 2>/dev/null \
             | grep -v 'test/bench_compare.ml' \
+            | grep -v 'test/bench_tpch.ml' \
             || true)
           if [ -n "$violations" ]; then
-            echo "FAIL: Sqlite3 module used outside test/bench_compare.ml:"
+            echo "FAIL: Sqlite3 module used outside the gated comparison benchmarks:"
             echo "$violations"
             exit 1
           fi

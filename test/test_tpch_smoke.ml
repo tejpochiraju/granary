@@ -5,10 +5,10 @@ module Q = Granary_tpc.Tpch_queries
 module Granary_engine = Granary_tpc.Granary_engine
 module Load = Granary_tpc.Tpch_schema.Load (Granary_engine)
 
+(* [Filename.temp_dir] creates the directory itself, with no create-then-replace
+   window of the [temp_file]/[unlink]/[mkdir] sequence it replaced. *)
 let with_tmp_dir f =
-  let dir = Filename.temp_file "tpch-smoke" "" in
-  Unix.unlink dir;
-  Unix.mkdir dir 0o755;
+  let dir = Filename.temp_dir "tpch-smoke" "" in
   Fun.protect
     ~finally:(fun () ->
       ignore (Sys.command (Printf.sprintf "rm -rf %s" (Filename.quote dir))))
@@ -54,20 +54,9 @@ let check_well_formed q rows =
       rows
 ;;
 
-(* A query's [setup] creates views (Q15's revenue0) on a database that outlives
-   the query, because reloading the data per query is not affordable.  The spec's
-   trailing DROP VIEW was omitted on the assumption that the database is
-   discarded between queries; that assumption does not hold here, so the harness
-   drops the view itself — before setup, making setup re-runnable, and after the
-   query, so no view leaks into a later one. *)
-let drop_setup_views exec q =
-  List.iter
-    (fun stmt ->
-       match Q.view_name_of_setup stmt with
-       | Some v -> exec (Printf.sprintf "DROP VIEW IF EXISTS %s" v)
-       | None -> ())
-    q.Q.setup
-;;
+(* Runs both before setup and after the query — see {!Q.drop_setup_sql}, which
+   is where the rationale lives and where the runner gets its drops too. *)
+let drop_setup_views exec q = List.iter exec (Q.drop_setup_sql q)
 
 (* Unconditional since Task 8b: the verdicts in Tpch_queries are established by
    measurement, so every [Native] or [Rewritten] query must actually run. *)

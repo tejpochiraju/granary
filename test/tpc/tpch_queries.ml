@@ -14,7 +14,7 @@
      spec itself defines Q15 as three statements of which only the middle one is
      the measured query.  The trailing DROP VIEW is omitted from [sql]; the
      database is NOT discarded between queries, so the harness drops the view
-     itself — see {!view_name_of_setup} below for the mechanism and why it runs
+     itself — see {!drop_setup_sql} below for the mechanism and why it runs
      both before setup and after the query.
 
    Task 8a then applied four *mechanical, meaning-preserving* rewrites, each
@@ -844,14 +844,20 @@ let verdict_label = function
    spec's trailing DROP VIEW was omitted on the assumption that the database is
    discarded between queries; that assumption does not hold, so the harness
    drops the view itself: before setup, so setup is re-runnable across repeats
-   and engines, and after the query, so no view leaks into a later one. *)
+   and engines, and after the query, so no view leaks into a later one.
+
+   This is the single place that rationale is written down, and {!drop_setup_sql}
+   below is the single implementation of the drop — both the benchmark runner and
+   the smoke test call it.  The rationale was previously copied into three files
+   and the logic written twice, which is exactly how the stale header comment at
+   the top of this file went stale (#503). *)
 let view_name_of_setup stmt =
   let words =
     String.split_on_char
       ' '
       (String.map
          (function
-           | '\n' | '\t' -> ' '
+           | '\n' | '\r' | '\t' -> ' '
            | c -> c)
          stmt)
     |> List.filter (fun w -> w <> "")
@@ -865,4 +871,11 @@ let view_name_of_setup stmt =
     | [] -> None
   in
   scan words
+;;
+
+let drop_setup_sql q =
+  List.filter_map
+    (fun stmt ->
+       Option.map (Printf.sprintf "DROP VIEW IF EXISTS %s") (view_name_of_setup stmt))
+    q.setup
 ;;
