@@ -255,6 +255,24 @@
   lwt.unix
   unix))
 
+; #514: what the DML seek path does with its candidate rowids, and — the half
+; that a measurement settled — what order it reads the matching rows in. The
+; drain is NOT memory-bounded (the module name predates that finding); see the
+; module docstring.
+
+(test
+ (name test_bounded_drain_514)
+ (modules test_bounded_drain_514)
+ (libraries
+  granary
+  granary.sql
+  granary.unix
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 (test
  (name test_mirage_backend)
  (modules test_mirage_backend)

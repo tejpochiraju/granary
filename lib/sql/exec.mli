@@ -189,6 +189,46 @@ val dirty_elements : dirty_tables_acc -> string list
     ({!make_dirty_acc}). *)
 val dirty_changes : dirty_tables_acc -> (string * row_change list) list
 
+(** #514: what the DML (UPDATE/DELETE) index-seek path did with its candidate
+    rowids.  [dss_candidates] is how many index entries the seek accepted and
+    [dss_fetched] how many of those rowids were looked up in the table tree;
+    [dss_peak_buffered] is the high-water mark of the difference — candidates
+    walked but not yet fetched.
+
+    That backlog is a {e shape} assertion, not a memory bound.  It equals the
+    match count by design: the drain sorts every candidate into rowid order
+    before fetching any row, because fetching them in index-key order costs up
+    to a page read per row on a table larger than the pager cache.  A drop to 1
+    therefore signals a fetch-as-you-walk regression, not an improvement.  The
+    statement's peak memory is dominated by the match list (a decoded row each),
+    which is O(affected rows) by design and not what these counters measure.
+
+    So in the current shape [dss_peak_buffered] is redundant: no fetch happens
+    until the walk ends, the backlog is monotone, and the peak is always exactly
+    [dss_candidates].  It is kept anyway, because that redundancy IS the
+    assertion — it is the only counter that distinguishes "buffered everything,
+    then fetched" from "buffered and fetched in step", and those two have the
+    same [(dss_candidates, dss_fetched)] pair and a 20x page-read gap.  The day
+    it stops equalling [dss_candidates] is the day the drain changed shape.
+
+    All three are cumulative over the enclosing {!with_dml_seek_stats} scope,
+    not per statement: an FK [CASCADE] delete or a trigger firing nested DML
+    re-enters the drain and adds to the same record, so the counts are a sum
+    across every seeked drain in the scope, over any number of tables. *)
+type dml_seek_stats =
+  { mutable dss_candidates : int
+  ; mutable dss_fetched : int
+  ; mutable dss_peak_buffered : int
+  }
+
+(** A zeroed {!dml_seek_stats}. *)
+val make_dml_seek_stats : unit -> dml_seek_stats
+
+(** [with_dml_seek_stats st f] runs [f] with [st] collecting the DML seek
+    counters (see {!dml_seek_stats}).  Purely observational; installing no
+    accumulator costs one key lookup per drain and nothing per row. *)
+val with_dml_seek_stats : dml_seek_stats -> (unit -> 'a Lwt.t) -> 'a Lwt.t
+
 (** #264: quote a SQL identifier with double-quotes when it is not a plain
     [[A-Za-z_][A-Za-z0-9_]*] word (embedded quotes doubled); returned verbatim
     otherwise. *)

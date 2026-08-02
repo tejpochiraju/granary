@@ -383,7 +383,7 @@ let dml_seeks_through_a_secondary_index () =
       (by_ab "SELECT v FROM t WHERE v = -1"))
 ;;
 
-(* [seek_candidate_rowids] fetches rows with [S.get tx tree_id (Rowid.encode
+(* The DML seek's drain fetches rows with [S.get tx tree_id (Rowid.encode
    rowid)], which assumes the table tree is rowid-keyed.  WITHOUT ROWID is where
    that assumption is most likely to break, so pin it there.
 
@@ -437,7 +437,7 @@ let without_rowid_table_seeks () =
 (* #512 review: an index seek yields index-key order, a table scan yields rowid
    order.  For a prefix spanning several full keys those differ, so an unordered
    [UPDATE ... LIMIT n] would otherwise hit a different n rows than the scan
-   would.  [seek_candidate_rowids] sorts by rowid to keep them identical. *)
+   would.  The drain sorts its candidates by rowid to keep them identical. *)
 let limit_without_order_matches_scan_order () =
   with_db (fun db ->
     exec db "CREATE TABLE t (w INTEGER, i INTEGER, v INTEGER, PRIMARY KEY (w, i))";

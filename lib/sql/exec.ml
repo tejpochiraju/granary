@@ -53,6 +53,53 @@ let make_change_acc () : dirty_tables_acc =
 
 let dirty_tables_key : dirty_tables_acc Lwt.key = Lwt.new_key ()
 
+(* #514: instrumentation for the DML seek path.  [dss_candidates]/[dss_fetched]
+   make the seek's shape observable without timing it — a full-key seek that
+   walks one entry and reads one row has not degraded into a scan, whatever the
+   clock says (#512).  [dss_peak_buffered] is the candidate BACKLOG: rowids the
+   index walk had produced but the row fetch had not yet consumed, at its worst
+   moment.  It equals the match count, because the drain deliberately sorts all
+   candidates before fetching any (see [rowid_buf]); it is a shape assertion
+   against a fetch-as-you-walk regression, which would drive it to one and cost
+   a page read per row on disk.  Rides Lwt
+   sequence-associated storage like [query_stats]/[dirty_tables_acc], so a caller
+   that installs no accumulator pays one predicted branch per candidate and the
+   DML path needs no extra parameter. *)
+type dml_seek_stats =
+  { mutable dss_candidates : int
+  ; mutable dss_fetched : int
+  ; mutable dss_peak_buffered : int
+  }
+
+let make_dml_seek_stats () =
+  { dss_candidates = 0; dss_fetched = 0; dss_peak_buffered = 0 }
+;;
+
+let dml_seek_stats_key : dml_seek_stats Lwt.key = Lwt.new_key ()
+let with_dml_seek_stats st f = Lwt.with_value dml_seek_stats_key (Some st) f
+
+(* Record that the index walk produced one more candidate rowid, updating the
+   high-water mark of walked-but-not-yet-fetched candidates.  Takes the
+   already-resolved accumulator rather than reading the Lwt key itself: the DML
+   drain resolves it once per statement, exactly as the read path does with
+   [query_stats] (see [incr_examined]), so the seek #512 made hot pays no
+   per-row key lookup. *)
+let note_seek_candidate (st_opt : dml_seek_stats option) =
+  match st_opt with
+  | None -> ()
+  | Some st ->
+    st.dss_candidates <- st.dss_candidates + 1;
+    let backlog = st.dss_candidates - st.dss_fetched in
+    if backlog > st.dss_peak_buffered then st.dss_peak_buffered <- backlog
+;;
+
+(* Record that one candidate's row was looked up in the table tree. *)
+let note_seek_fetched (st_opt : dml_seek_stats option) =
+  match st_opt with
+  | None -> ()
+  | Some st -> st.dss_fetched <- st.dss_fetched + 1
+;;
+
 (* Reserved-prefix internal tables — the synthesized [sqlite_…] objects
    (sqlite_master / sqlite_sequence) — are never reported: an external cache only
    invalidates user tables.  [sqlite_] is the SOLE prefix [sema] forbids to user
@@ -2649,7 +2696,7 @@ let encode_index_key_prefix (ivs : Index_key.value list) : bytes * int =
       equal.  Note this must NOT become an [IK_null] prefix: that is a real seek
       key selecting the index's NULL entries, not an empty result.
 
-    The read ([stream_index_lookup]) and write ([seek_candidate_rowids]) paths
+    The read ([stream_index_lookup]) and write ([seek_index_candidates]) paths
     share this so they can never disagree about which rows a key matches. *)
 let index_lookup_values (vs : (Row.value * Row.ty) list) : Index_key.value list option =
   let rec go acc = function
@@ -2833,6 +2880,19 @@ let range_seek_bounds clock params ~prefix ~plen (range : Plan.range option) =
           Bytes.length ikey >= plen + w && Bytes.compare (Bytes.sub ikey plen w) hi > 0
     in
     start, past_end
+;;
+
+(** Does [ikey] still belong to the range [range_seek_bounds] described?  It must
+    carry a trailing rowid, still match the equality [prefix], and not have run
+    past the range's high end.
+
+    Shared by the read ([stream_index_lookup]) and write
+    ([seek_index_candidates]) paths for the same reason {!index_lookup_values}
+    is: the two must never disagree about which index entries a seek covers. *)
+let index_key_in_range ~prefix ~plen ~past_end ikey =
+  Bytes.length ikey >= plen + 8
+  && Bytes.equal (Bytes.sub ikey 0 plen) prefix
+  && not (past_end ikey)
 ;;
 
 (** Decode the rowid from the trailing 8 bytes of an index key. *)
@@ -5005,49 +5065,217 @@ let cascade_apply_set_default
       child_col_idxs
 ;;
 
-(* Drain all rows of [table_meta] satisfying [where] into a (rowid,row) list
-   under an RO snapshot, so subsequent writes don't invalidate the cursor. *)
-(* #508: candidate rowids for a DML [seek].  [None] means "no narrowing
-   available" — the caller scans.  The seek is only a restriction: the caller
-   still evaluates the full WHERE predicate on every candidate, so a
-   wrong-but-superset answer here can cost time but cannot change results.
+(* Hand one candidate rowid to [emit], counting it. *)
+let emit_candidate ~stats ~(emit : int64 -> unit Lwt.t) rowid =
+  note_seek_candidate stats;
+  emit rowid
+;;
 
-   Returned in ASCENDING ROWID order, which is the order a full table-tree scan
-   drains in.  An index seek naturally yields index-key order, and for a prefix
-   spanning several distinct full keys the two differ — which would silently
-   change which n rows an [UPDATE/DELETE ... LIMIT n] without ORDER BY hits.
-   Sorting keeps the seek a pure restriction of the scan, drain order included. *)
-let seek_candidate_rowids tx clock params (seek : Plan.seek) : int64 list option Lwt.t =
+(* Walk the index range an equality [keys] prefix (plus optional [range]) covers,
+   handing each candidate rowid to [emit] as it is decoded.  Nothing is
+   accumulated here; what the caller does with the rowids is its business.
+
+   [emit] runs with this index cursor OPEN, so it must not mutate the tree being
+   walked: deleting rows or moving their index keys mid-walk would revisit rows
+   whose new key sorts later in the range and skip their neighbours.  The one
+   caller ([drain_matching_rows_in_tx]) only appends to a buffer, and every
+   physical mutation of the statement happens after the drain has returned and
+   this cursor is closed — table reads included, since the candidates are sorted
+   into rowid order before any row is fetched. *)
+let seek_index_candidates
+      tx
+      clock
+      params
+      ~idx_tree
+      ~keys
+      ~range
+      ~(stats : dml_seek_stats option)
+      ~(emit : int64 -> unit Lwt.t)
+  : unit Lwt.t
+  =
+  let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
+  match index_lookup_values vs with
+  | None -> Lwt.return_unit (* NULL or type mismatch: matches nothing *)
+  | Some ivs ->
+    let prefix, plen = encode_index_key_prefix ivs in
+    let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
+    let* cur = S.seek_ge tx idx_tree start in
+    let rec walk () =
+      let* next = S.seek_next cur in
+      match next with
+      | Some (ikey, _) when index_key_in_range ~prefix ~plen ~past_end ikey ->
+        let* () = emit_candidate ~stats ~emit (decode_index_key_rowid ikey) in
+        walk ()
+      | _ -> Lwt.return_unit
+    in
+    (* [S.seek_next] and [emit] can both raise; close the cursor on that path
+       too.  [Store.seek_close] is a no-op for the B-tree cursor today, so this
+       leaks nothing either way — it is here so that stops being true safely. *)
+    Lwt.finalize walk (fun () ->
+      S.seek_close cur;
+      Lwt.return_unit)
+;;
+
+(* #508: candidate rowids for a DML [seek], handed to [emit] as they are
+   decoded.  The seek is only a restriction: the caller still evaluates the full
+   WHERE predicate on every candidate, so a wrong-but-superset answer here can
+   cost time but cannot change results.
+
+   Candidates arrive in INDEX-KEY order, which for a prefix spanning several
+   distinct full keys is not rowid order.  The caller must therefore sort its
+   accumulated matches by rowid — the order a full table-tree scan drains in —
+   or an [UPDATE/DELETE ... LIMIT n] without [ORDER BY] would silently hit a
+   different n rows than the scan it replaced. *)
+let seek_candidates tx clock params (seek : Plan.seek) ~stats ~emit : unit Lwt.t =
   match seek with
   | Plan.Seek_rowid e ->
     (match eval_expr clock params [||] e with
-     | Row.V_int n -> Lwt.return (Some [ n ])
-     | _ -> Lwt.return (Some []) (* NULL or non-integer matches no rowid *))
+     | Row.V_int n -> emit_candidate ~stats ~emit n
+     | _ -> Lwt.return_unit (* NULL or non-integer matches no rowid *))
   | Plan.Seek_index { idx_tree; keys; range } ->
-    let vs = List.map (fun (_, ty, e) -> eval_expr clock params [||] e, ty) keys in
-    (match index_lookup_values vs with
-     | None -> Lwt.return (Some []) (* NULL or type mismatch: matches nothing *)
-     | Some ivs ->
-       let prefix, plen = encode_index_key_prefix ivs in
-       let start, past_end = range_seek_bounds clock params ~prefix ~plen range in
-       let* cur = S.seek_ge tx idx_tree start in
-       let rec collect acc =
-         let* next = S.seek_next cur in
-         match next with
-         | Some (ikey, _)
-           when Bytes.length ikey >= plen + 8
-                && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-                && not (past_end ikey) -> collect (decode_index_key_rowid ikey :: acc)
-         | _ ->
-           S.seek_close cur;
-           Lwt.return acc
-       in
-       let* rowids = collect [] in
-       Lwt.return (Some (List.sort Int64.compare rowids)))
+    seek_index_candidates tx clock params ~idx_tree ~keys ~range ~stats ~emit
+;;
+
+(* #514: a growable, flat buffer of candidate rowids.  THE measurement table
+   for this PR lives here; the mli and the tests point at it rather than
+   restating it.
+
+   The DML seek must hand the table tree its [get]s in ASCENDING ROWID order,
+   which means collecting every candidate the index walk produces before
+   fetching the first row.  That is not an oversight, it is the measured
+   choice.  Fetching each rowid the instant the walk decodes it needs no buffer
+   at all, but delivers the gets in INDEX-KEY order; for an index whose order is
+   uncorrelated with rowid that is random access against the table, and since
+   the pager cache is a bounded FIFO ([Pager.default_cache_capacity]) a table
+   larger than the cache then re-reads a page per row.  Measured on a
+   file-backed DB with [GRANARY_PAGE_CACHE=64] and index order deliberately
+   scrambled against rowid order, one prefix DELETE:
+
+     rows    sorted-then-fetch    fetch-as-you-walk
+     20 000              957                21 685   (22.7x)
+
+   [test_bounded_drain_514]'s [prefix_delete_reads_each_table_page_about_once]
+   is that exact run, and its threshold (4 000) is the only copy of these
+   numbers with teeth.  A 60 000-row run measured 2 365 against 67 648, but
+   nothing asserts it, so it is recorded here and nowhere else.
+
+   Chunking (buffer K, sort, fetch, repeat) does not escape that either: it
+   holds locality only while K stays comparable to the match count, degrading
+   back toward the right-hand column as the count grows past K (measured on the
+   60 000-row case at K = 16 384: 4 375 reads, 1.85x; on the 20 000-row case at
+   K = 1 024: 5 150, 5.4x).  A bound that costs a page read per row exactly when
+   it starts to bind is not a bound worth having.
+
+   So the buffer stays whole and its per-candidate cost is cut instead.  The
+   representation is a [Bigarray.Array1] of [int64], grown by doubling, rather
+   than the [int64 list] this replaced or the [int64 array] the first pass at it
+   used.  Note that an [int64 array] is NOT flat: OCaml unboxes only [float
+   array], so it stores a pointer per slot to a 24-byte custom block — 32 bytes
+   a rowid, and a [caml_modify] write barrier on every push.  A [Bigarray]
+   stores the 8 bytes themselves, off-heap, in one block the major GC never
+   scans element-wise.  Resident set after buffering 1M candidates, each
+   representation in a fresh process, [Gc.compact]ed:
+
+     int64 list      49.3 MB     cons (3 words) + box (3 words)
+     int64 array     34.2 MB     8-byte slot + 24-byte box
+     Bigarray         8.3 MB     8-byte slot
+
+   Peak matters more than steady state here, because doubling means up to [2N]
+   slots are live when the buffer is largest.  The [int64 array] version also
+   compacted with [Array.sub] before sorting, so [2N] slots, [N] boxes and an
+   [N]-slot copy overlapped; the heapsort below is in place over the filled
+   prefix, so nothing is copied and the peak is just the two buffers a doubling
+   straddles.  For 1M candidates: ~48 MB against ~13 MB.
+
+   The price is that [Array.sort] does not apply to a [Bigarray], so the sort is
+   hand-rolled ([rowid_buf_sort]).  Heapsort, because it is in place, has no
+   recursion depth to blow on an adversarial input, and needs no scratch — the
+   three properties this buffer exists for.  It is pinned end to end by a
+   QCheck property in [test_bounded_drain_514] that runs a seeked
+   [DELETE .. LIMIT k] over a random rowid permutation against a scan foil:
+   LIMIT takes a prefix of the drain, so it reads out the sort.
+
+   All of this is a constant factor, not a bound: the match list the callers
+   need in full is a decoded row per match and remains the larger term.  Capping
+   THAT means streaming the mutations, which the callers' shape forbids (see
+   [drain_matching_rows_in_tx]). *)
+type rowid_buf =
+  { mutable ids : (int64, Bigarray.int64_elt, Bigarray.c_layout) Bigarray.Array1.t
+  ; mutable len : int
+  }
+
+let rowid_buf_alloc n = Bigarray.Array1.create Bigarray.Int64 Bigarray.c_layout n
+let rowid_buf_create () = { ids = rowid_buf_alloc 0; len = 0 }
+
+let rowid_buf_push b rowid =
+  let cap = Bigarray.Array1.dim b.ids in
+  if b.len = cap
+  then (
+    let bigger = rowid_buf_alloc (if cap = 0 then 16 else 2 * cap) in
+    Bigarray.Array1.blit b.ids (Bigarray.Array1.sub bigger 0 b.len);
+    b.ids <- bigger);
+  Bigarray.Array1.set b.ids b.len rowid;
+  b.len <- b.len + 1
+;;
+
+let rowid_buf_swap a i j =
+  let t = Bigarray.Array1.get a i in
+  Bigarray.Array1.set a i (Bigarray.Array1.get a j);
+  Bigarray.Array1.set a j t
+;;
+
+(* Sift [root] down a max-heap occupying [0, limit) of [a]. *)
+let rec rowid_buf_sift a root limit =
+  let l = (2 * root) + 1 in
+  let r = l + 1 in
+  if l < limit
+  then (
+    let child =
+      if
+        r < limit && Int64.compare (Bigarray.Array1.get a r) (Bigarray.Array1.get a l) > 0
+      then r
+      else l
+    in
+    if Int64.compare (Bigarray.Array1.get a child) (Bigarray.Array1.get a root) > 0
+    then (
+      rowid_buf_swap a root child;
+      rowid_buf_sift a child limit))
+;;
+
+(* Ascending rowid, in place, over just the filled prefix — no scratch array, so
+   the buffer's peak is its capacity and nothing more (see [rowid_buf]). *)
+let rowid_buf_sort b =
+  let a = b.ids in
+  let n = b.len in
+  for i = (n / 2) - 1 downto 0 do
+    rowid_buf_sift a i n
+  done;
+  for last = n - 1 downto 1 do
+    rowid_buf_swap a 0 last;
+    rowid_buf_sift a 0 last
+  done
+;;
+
+(* Sequential Lwt iteration over the filled prefix, without going through a
+   list (which would re-spend the allocation the buffer exists to avoid). *)
+let rowid_buf_iter_s f b =
+  let rec go i =
+    if i >= b.len
+    then Lwt.return_unit
+    else Lwt.bind (f (Bigarray.Array1.get b.ids i)) (fun () -> go (i + 1))
+  in
+  go 0
 ;;
 
 (* Drain matching rows from the given txn (RO or RW).  With a [seek], only the
-   candidate rows it names are read; [where] is applied either way. *)
+   candidate rows it names are read; [where] is applied either way.
+
+   Every match is materialised BEFORE the caller mutates anything, and that is
+   deliberate: the callers consume the list several times over (length, FK
+   pre-check, triggers, then the write loop), and mutating rows while a cursor
+   still walks the table or an index it lives in would revisit or skip rows.
+   #514 shrinks the seek's candidate buffer from an [int64 list] to a packed
+   [rowid_buf]; it does not — and must not — stream the mutations. *)
 let drain_matching_rows_in_tx
       ~(seek : Plan.seek option)
       tx
@@ -5063,25 +5291,35 @@ let drain_matching_rows_in_tx
     | None -> true
     | Some pred -> value_truthy (eval_expr clock params row pred)
   in
-  let* narrowed =
-    match seek with
-    | None -> Lwt.return None
-    | Some s -> seek_candidate_rowids tx clock params s
-  in
-  match narrowed with
-  | Some rowids ->
-    let* matches =
-      Lwt_list.filter_map_s
-        (fun rowid ->
-           let* v = S.get tx tree_id (Rowid.encode rowid) in
-           match v with
-           | None -> Lwt.return_none
-           | Some vbytes ->
-             let row = decode_with_virtual clock params table_meta vbytes in
-             Lwt.return (if keep row then Some (rowid, row) else None))
-        rowids
+  match seek with
+  | Some s ->
+    (* Candidates land in a [rowid_buf] and are fetched in ascending rowid
+       order: the order a full table scan drains in, which keeps the table-tree
+       reads sequential (see [rowid_buf] for the page-read measurement that
+       forces this) and keeps an unordered [UPDATE/DELETE ... LIMIT n] hitting
+       the same rows the scan it replaced would (#512 review).  Because the
+       fetches already run in that order, [acc] only needs reversing. *)
+    let stats = Lwt.get dml_seek_stats_key in
+    let acc = ref [] in
+    let fetch_one rowid =
+      note_seek_fetched stats;
+      let* v = S.get tx tree_id (Rowid.encode rowid) in
+      match v with
+      | None -> Lwt.return_unit
+      | Some vbytes ->
+        let row = decode_with_virtual clock params table_meta vbytes in
+        if keep row then acc := (rowid, row) :: !acc;
+        Lwt.return_unit
     in
-    Lwt.return matches
+    let cands = rowid_buf_create () in
+    let* () =
+      seek_candidates tx clock params s ~stats ~emit:(fun rowid ->
+        rowid_buf_push cands rowid;
+        Lwt.return_unit)
+    in
+    rowid_buf_sort cands;
+    let* () = rowid_buf_iter_s fetch_one cands in
+    Lwt.return (List.rev !acc)
   | None ->
     let* cur = S.cursor_open tx tree_id in
     let _sr = S.cursor_first cur in
@@ -8779,10 +9017,7 @@ and stream_index_lookup
                    let%lwt () = finish () in
                    Lwt.return_none
                  | Some (ikey, _ival) ->
-                   if
-                     Bytes.length ikey >= plen + 8
-                     && Bytes.equal (Bytes.sub ikey 0 plen) prefix
-                     && not (past_end ikey)
+                   if index_key_in_range ~prefix ~plen ~past_end ikey
                    then (
                      let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
                      let rowid = Rowid.decode rowid_bytes in
