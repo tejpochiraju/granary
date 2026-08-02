@@ -111,6 +111,7 @@ type trigger_meta =
 type query_stats = Sql.Exec.query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int
+  ; mutable index_entries : int
   ; mutable used_index : bool
   }
 

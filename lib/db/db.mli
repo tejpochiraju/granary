@@ -32,10 +32,14 @@ type error =
     behind a selective filter reads [rows_examined = N] returning one row);
     [rows_returned] is the result size once the stream is drained; [used_index]
     is the plan-time fact that the base access is an index/rowid/FTS seek rather
-    than a full scan.  See {!query_with_stats} / {!iter_with_stats}. *)
+    than a full scan.  [index_entries] (#546) is the number of index entries an
+    index lookup walked — the work an index seek adds over the scan it replaces,
+    which [rows_examined] cannot show because it counts only the table rows both
+    plans end up reading.  See {!query_with_stats} / {!iter_with_stats}. *)
 type query_stats = Granary_sql.Exec.query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int
+  ; mutable index_entries : int
   ; mutable used_index : bool
   }
 

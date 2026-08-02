@@ -120,10 +120,17 @@ val execute_with_count
     lookups (incl. nested-loop-join right-side probes), the count fast path,
     both inputs of a hash join, FTS scans (content rows in a plain scan, matched
     index rows in a MATCH query), and rows read inside scalar/correlated
-    subqueries (#257). *)
+    subqueries (#257).
+
+    #546: [index_entries] is the number of INDEX entries an index lookup walked.
+    [rows_examined] counts only the table rows fetched afterwards, one [rh_get]
+    per entry, so it charges an index seek and the sequential scan it replaced
+    the same amount for reading the same rows and hides the per-entry tree
+    descent entirely.  Everything other than an index lookup leaves it at 0. *)
 type query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int
+  ; mutable index_entries : int
   ; mutable used_index : bool
   }
 

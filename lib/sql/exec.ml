@@ -6472,14 +6472,26 @@ let explain_plan op =
    examined=1_000_000, returned=1); [rows_returned] is the size of the result
    stream once drained; [used_index] is the plan-time fact that the base access
    is an index/rowid seek rather than a full scan.  Mirage-pure — plain counters
-   the executor already has, no clock/Unix dependency. *)
+   the executor already has, no clock/Unix dependency.
+
+   #546: [index_entries] counts the INDEX entries an index lookup walked, which
+   [rows_examined] does not — it counts only the table rows the walk then
+   fetched.  The two differ by exactly the work an index seek adds over the
+   ordered leaf walk it replaces: [stream_index_lookup] does one [rh_get] on the
+   table tree per entry, so an unselective seek can pay N tree descents to
+   examine the same N rows a scan would have read sequentially, and no counter
+   could tell the two plans apart.  Entries skipped by a range's [past_end] stop
+   are not counted: the walk ends at the first one. *)
 type query_stats =
   { mutable rows_examined : int
   ; mutable rows_returned : int
+  ; mutable index_entries : int
   ; mutable used_index : bool
   }
 
-let make_query_stats () = { rows_examined = 0; rows_returned = 0; used_index = false }
+let make_query_stats () =
+  { rows_examined = 0; rows_returned = 0; index_entries = 0; used_index = false }
+;;
 
 (* The active query's stats record, propagated to the base scanners via Lwt
    sequence-associated storage rather than threaded through the ~50 mutually
@@ -6521,6 +6533,14 @@ let with_pull_context ~stats ~mode f =
 let incr_examined (s_opt : query_stats option) =
   match s_opt with
   | Some s -> s.rows_examined <- s.rows_examined + 1
+  | None -> ()
+;;
+
+(* #546: same discipline as [incr_examined], for the index entries an index
+   lookup walks. *)
+let incr_index_entries (s_opt : query_stats option) =
+  match s_opt with
+  | Some s -> s.index_entries <- s.index_entries + 1
   | None -> ()
 ;;
 
@@ -9158,6 +9178,11 @@ and stream_index_lookup
                  | Some (ikey, _ival) ->
                    if index_key_in_range ~prefix ~plen ~past_end ikey
                    then (
+                     (* #546: counted here, before the [rh_get] — an entry whose
+                        table row has since gone is still an entry walked, and
+                        this is the count that says what the seek cost over the
+                        scan it replaced. *)
+                     incr_index_entries s_opt;
                      let rowid_bytes = Bytes.sub ikey (Bytes.length ikey - 8) 8 in
                      let rowid = Rowid.decode rowid_bytes in
                      let table_key = Rowid.encode rowid in
