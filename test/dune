@@ -909,3 +909,33 @@
   qcheck-alcotest
   lwt.unix
   unix))
+
+; #507: an aggregated projection may be an arbitrary expression over aggregates.
+
+(test
+ (name test_agg_expr_507)
+ (modules test_agg_expr_507)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #547: UPSERT's DO UPDATE SET must refuse a literal NULL in a NOT NULL column.
+
+(test
+ (name test_upsert_not_null_547)
+ (modules test_upsert_not_null_547)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))

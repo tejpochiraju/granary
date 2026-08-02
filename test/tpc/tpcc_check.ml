@@ -56,12 +56,12 @@ type outcome =
    perturbing a value AND by deleting a whole group — and require Violated.
    They are what caught both holes, and they will catch them again.
 
-   (#507 is a separate, unrelated reason conditions 3 and 4 cannot be one
-   query: granary's aggregation planner rejects any GROUP BY projection item
-   that is not a bare grouped column, a bare aggregate call, or a window
-   function, so `MAX(x) - MIN(x)` and a subquery beside an aggregate are both
-   rejected outright. Even once #507 is fixed, the client-side join must
-   stay — it is what closes hole 2.) *)
+   (#507 used to be a separate, unrelated reason conditions 3 and 4 could not
+   be one query: the aggregation planner rejected any GROUP BY projection item
+   that was not a bare grouped column, a bare aggregate call, or a window
+   function. `MAX(x) - MIN(x) + 1 = COUNT-star` is now accepted, so that reason
+   is gone — and the client-side join still stays, because it is what closes
+   hole 2. A subquery beside an aggregate in the projection remains rejected.) *)
 
 module Key_map = Map.Make (struct
     type t = string list

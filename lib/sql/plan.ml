@@ -398,6 +398,9 @@ and proj_item =
   | PI_group_col of int (** project the i-th GROUP BY column (index into group_cols) *)
   | PI_agg_slot of int (** project the k-th aggregate result *)
   | PI_window_slot of int (** project the j-th post-aggregate window function result *)
+  | PI_expr of expr
+  (** #507: evaluate an expression over the aggregate output row
+          [group_cols @ aggs @ window_results] *)
 
 and agg_spec =
   { func : Ast.agg_func

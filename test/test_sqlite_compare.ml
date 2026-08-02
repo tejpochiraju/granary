@@ -4019,6 +4019,178 @@ let phase35_snippet_parity_cases =
   ]
 ;;
 
+(* #507: an aggregated projection item may be any scalar expression over the
+   aggregates.  SQLite has always accepted these, so it is the oracle for what
+   the answers must be — including the NULL-propagating empty-table case, where
+   arithmetic over MAX/MIN of no rows is NULL rather than 0. *)
+let agg_expr_507_cases =
+  [ { name = "agg_expr_max_minus_min"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, MAX(x) - MIN(x) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_tpcc_condition_3"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, MAX(x) - MIN(x) + 1 = COUNT(*) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_no_group_by"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT MAX(x) - MIN(x) FROM t"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_count_arith_no_group_by"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT COUNT(*) * 2 FROM t"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_empty_table"
+    ; setup = [ "CREATE TABLE t (a INTEGER, x INTEGER)" ]
+    ; query = "SELECT MAX(x) - MIN(x) FROM t"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_grouped_col_in_expr"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, a * 100 + COUNT(*) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_function_over_aggs"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, ABS(MIN(x) - MAX(x)) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_case_over_agg"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, CASE WHEN COUNT(*) < 3 THEN 1 ELSE 0 END FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_between_over_agg"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, MAX(x) BETWEEN 1 AND 20 FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_sum_ratio"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, SUM(x) - COUNT(*) * MIN(x) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_with_having"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (1, 12)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ; "INSERT INTO t VALUES (2, 30)"
+        ]
+    ; query = "SELECT a, MAX(x) - MIN(x) FROM t GROUP BY a HAVING MAX(x) - MIN(x) > 10"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_null_group"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, NULL)"
+        ; "INSERT INTO t VALUES (1, 4)"
+        ; "INSERT INTO t VALUES (2, NULL)"
+        ]
+    ; query = "SELECT a, MAX(x) - MIN(x) FROM t GROUP BY a"
+    ; unordered = true
+    }
+  ; { name = "agg_expr_real_division"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ]
+    ; query = "SELECT SUM(x) / 7.0 FROM t"
+    ; unordered = false
+    }
+  ; { name = "agg_expr_percentage"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (1, 14)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ]
+    ; query = "SELECT 100.0 * SUM(x) / COUNT(*) FROM t"
+    ; unordered = false
+    }
+  ; { name = "agg_expr_literal_beside_aggregate"
+    ; setup =
+        [ "CREATE TABLE t (a INTEGER, x INTEGER)"
+        ; "INSERT INTO t VALUES (1, 10)"
+        ; "INSERT INTO t VALUES (2, 5)"
+        ]
+    ; query = "SELECT 'C', MAX(x) FROM t"
+    ; unordered = false
+    }
+  ]
+;;
+
 (* ── runner ────────────────────────────────────────────────────── *)
 
 let () =
@@ -4077,5 +4249,6 @@ let () =
     ; "phase35_fk_deferrable", List.map make_test phase35_fk_deferrable_cases
     ; "phase35_virtual_index", List.map make_test phase35_virtual_index_cases
     ; "phase35_snippet_parity", List.map make_test phase35_snippet_parity_cases
+    ; "agg_expr_507", List.map make_test agg_expr_507_cases
     ]
 ;;
