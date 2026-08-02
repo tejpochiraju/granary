@@ -478,11 +478,20 @@ let access_path_for_eqs cat (table_meta : Cat.table_meta) ~eqs ~range_conjuncts 
     address the combined row, so their ordinals would have to be re-based into
     right-table space before {!range_for_index} could read them, which the
     equality path gets for free from {!right_table_eqs} and a range does not.
-    That is a missed narrowing, never an unsound one.
+    That is a missed narrowing, never an unsound one — tracked as #532.
+
+    The seek is taken unconditionally whenever a prefix is pinned, because there
+    is no selectivity estimate to consult.  Where the prefix selects nearly the
+    whole table this trades one ordered leaf walk for an index traversal plus a
+    random row fetch per entry, which in-memory measurement cannot see — #546.
 
     Synthesized right tables — CTEs, [sqlite_master], [sqlite_sequence], marked
     by a negative [tree_id] — and columnar tables have no B-tree to seek and are
-    left to {!make_scan}. *)
+    left to {!make_scan}.  For a CTE the guard is load-bearing, not defensive:
+    {!access_path_for_eqs} reaches the catalog {i by name}, so a CTE that
+    shadows a real table would otherwise pick up that table's indexes and plan
+    an [Op_index_lookup] against a tree it has nothing to do with — a wrong
+    answer, pinned by [cte_shadowing_a_real_table_still_scans]. *)
 let build_side cat (right_meta : Cat.table_meta) ~right_eqs =
   let seekable =
     match right_meta.Cat.storage with
@@ -537,8 +546,13 @@ let unbounded_rows = max_int
     the ratio against a 200-row right table even though the real window is 21
     rows.  The floor is the slack that covers a made-up number.  Second, it is
     the only thing that can fire when R is not knowable at all — a WITHOUT ROWID
-    or columnar right table estimates as {!unbounded_rows}, the ratio can never
-    hold, and without the floor such a join could never take a probe.
+    or columnar right table usually estimates as {!unbounded_rows}, the ratio
+    can never hold, and without the floor such a join could never take a probe.
+    (#528 put one crack in that "never": a WITHOUT ROWID right table whose whole
+    unique key is pinned by the WHERE clause now seeks to a provable single row,
+    so {!estimate_rows} answers 1 rather than {!unbounded_rows} and the ratio
+    can hold after all.  A columnar right table has no seek and is still
+    unknowable.)
 
     Those two jobs want different numbers (100 keeps every test green but
     strands the unknowable-R case), so 1000 is a single compromise between them
@@ -638,10 +652,22 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
 
 (** #520: estimate how many rows [op] produces, statically.
 
-    Only the three shapes a driving side can actually take are classified.
+    Two callers reach here, and they see different shapes.
+
+    As the {i driving}-side estimate, only three shapes are possible:
     [chain_joins] hands {!plan_join} either the base access path — which
     [plan_base] builds as a bare scan or seek when the query has joins, never
-    wrapped in a filter — or a previous join, so nothing else reaches here.
+    wrapped in a filter — or a previous join.
+
+    #528 added the second caller: the {i build}-side estimate, whose op comes
+    from {!build_side}.  That adds the synthesized and columnar scans
+    {!make_scan} can produce — [Op_cte_scan], [Op_sqlite_master],
+    [Op_sqlite_sequence], [Op_col_seq_scan] — all of which fall to the
+    [unbounded_rows] arm.  That is the same answer {!table_rows_estimate} gives
+    for a columnar table, and a pessimistic one for the three synthesized
+    shapes; it is inert either way, because {!best_probe} finds no index on any
+    of them, so the strategy lands on the hash join whatever [right_rows] says.
+
     Every other op answers {!unbounded_rows} rather than adding an arm no test
     can reach: an [Op_aggregate] with no GROUP BY is exactly one row and an
     [Op_limit] is capped by its limit, both of which would be easy to classify
@@ -730,10 +756,17 @@ let plan_join cat ~where_conjuncts (bj : Sema.bound_join) (left_op : Plan.op) n_
      outside the match. *)
   let driving_rows = estimate_rows cat left_op in
   (* #528: R in the cost comparison is what the hash join would actually read,
-     which is now the seeked subset rather than the whole table.  {!estimate_rows}
-     answers [table_rows_estimate] for the [make_scan] case, so this is the same
-     number as before wherever the build side is not narrowed, and a smaller one
-     — biased towards the hash join, as the issue predicted — wherever it is. *)
+     so it is estimated from the (possibly narrowed) build-side op rather than
+     from the whole table.
+
+     Be precise about how much that moves: it shrinks ONLY where the seek is
+     provably a point.  {!estimate_rows} answers [table_rows_estimate] for the
+     [Op_seq_scan] case, and for an [Op_index_lookup] it answers
+     [unbounded_rows] — hence [table_rows_estimate] after the [min] — unless
+     {!seek_is_unique_point} holds or the seek carries a range, and
+     {!build_side} passes no range (#532).  So R is unchanged for every partial
+     prefix pin, and collapses to 1 for a full-unique-key or rowid-alias pin.
+     There is no selectivity estimate here; do not read this as one. *)
   let right_rows = estimate_rows cat right_op in
   let mk_with_left_col_right_col left_col right_col : Plan.op =
     let probe =

@@ -162,6 +162,36 @@ let build_side_seeks_the_pinned_prefix () =
       (examined db seek_sql))
 ;;
 
+(* The headline number this issue is named after, given a home in the repo.
+
+   PR #531 measured #520's shape — 30,000 driving rows against 100,000 stock
+   rows spread over four warehouses — at 130,000 examined before and 55,000
+   after. That figure lived only in the PR body: the largest committed case was
+   1,200 x 2,000, and [test_tpcc_txn.ml] makes no [rows_examined] assertion on
+   StockLevel, so nothing would have caught a regression of it.
+
+   This is that shape at one tenth scale, which preserves the arithmetic exactly
+   (3,000 + 10,000 = 13,000 examined before, 3,000 + 2,500 = 5,500 after) while
+   keeping the seeding inside a unit test's budget. The ratio still sends it to
+   the hash join: 3,000 driving rows against a right table of 10,000 fails
+   [3000 <= 10000/8]. *)
+let headline_520_shape_halves_rows_examined () =
+  with_db (fun db ->
+    seed db ~n_line:3_000 ~n_w:4 ~n_per_w:2_500 ();
+    Alcotest.(check int)
+      "before: the driving side plus every warehouse's stock"
+      13_000
+      (examined
+         db
+         "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1");
+    Alcotest.(check int)
+      "after: the driving side plus warehouse 1 only"
+      5_500
+      (examined
+         db
+         "SELECT qty FROM line INNER JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"))
+;;
+
 (* A WHERE equality on the right table's rowid alias is a single table seek, not
    an index seek — the #243 path, reached through the same chooser. *)
 let build_side_seeks_a_rowid_alias () =
@@ -220,11 +250,161 @@ let general_on_predicate_build_side_seeks () =
     let seek = "SELECT qty FROM line INNER JOIN stock ON si > i_id WHERE sw = 1" in
     let foil = "SELECT qty FROM line INNER JOIN stock ON si > i_id WHERE sw + 0 = 1" in
     same_rows db ~label:"cartesian build side agrees with its scan" ~seek ~foil;
+    (* Bound once: these are cartesian products, and the Alcotest label must not
+       cost a second execution of each. *)
+    let n_seek = examined db seek
+    and n_foil = examined db foil in
     Alcotest.(check bool)
-      (Printf.sprintf
-         "examined %d is below a full scan of stock (%d)"
-         (examined db seek)
-         (examined db foil))
+      (Printf.sprintf "examined %d is below a full scan of stock (%d)" n_seek n_foil)
+      true
+      (n_seek < n_foil))
+;;
+
+(* The general-ON path crossed with LEFT — the combination this PR newly widened,
+   and the one place the argument needs two filters rather than one.
+
+   The cartesian hash join null-extends unmatched left rows, then
+   [Op_filter (plan_expr bj.on)] runs ABOVE it (planner.ml), so an ON predicate
+   that is true of a null-extended row — [si IS NULL] — would emit rows that the
+   narrowing makes strictly more numerous. What kills them is the SECOND filter:
+   [chain_joins] wraps the whole chain in the WHERE clause, whose [sw = 1] is
+   NULL on a null-extended row. Both spellings must agree with their foils. *)
+let general_on_predicate_left_join_agrees () =
+  with_db (fun db ->
+    exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+    exec
+      db
+      "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER, PRIMARY KEY (sw, si))";
+    exec db "BEGIN";
+    for o = 1 to 20 do
+      (* Row 20 matches nothing under either ON predicate, so the cartesian join
+         has a genuine null-extension candidate to offer the filters. *)
+      let i_id = if o = 20 then 90_000 else o mod 10 in
+      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o i_id)
+    done;
+    for w = 1 to 4 do
+      for si = 1 to 20 do
+        exec
+          db
+          (Printf.sprintf "INSERT INTO stock VALUES (%d, %d, %d)" w si ((w * 1000) + si))
+      done
+    done;
+    exec db "COMMIT";
+    let q on pred =
+      Printf.sprintf "SELECT o, qty FROM line LEFT JOIN stock ON %s WHERE %s" on pred
+    in
+    List.iter
+      (fun on ->
+         let seek = q on "sw = 1"
+         and foil = q on "sw + 0 = 1" in
+         same_rows
+           db
+           ~label:(Printf.sprintf "LEFT + general ON %S agrees with its scan" on)
+           ~seek
+           ~foil;
+         let n_seek = examined db seek
+         and n_foil = examined db foil in
+         Alcotest.(check bool)
+           (Printf.sprintf "ON %S: examined %d < foil %d" on n_seek n_foil)
+           true
+           (n_seek < n_foil))
+      (* [si > i_id] is the ordinary general ON; [si IS NULL] is the one that is
+         true of a null-extended row, so it is the case the ON-filter alone
+         cannot handle. *)
+      [ "si > i_id"; "si IS NULL" ])
+;;
+
+(* ------------------------------------------------------------------ *)
+(* The [tree_id >= 0] guard, which is load-bearing and not defensive     *)
+(* ------------------------------------------------------------------ *)
+
+(* [access_path_for_eqs] reaches the catalog BY NAME
+   ([Cat.indexes_for_table cat ~table:right_meta.name]). A CTE gets a
+   synthesized [table_meta] carrying the CTE's own name and [tree_id = -1], so a
+   CTE that shadows a real table would pick up that table's indexes and plan an
+   [Op_index_lookup] against a B-tree the CTE has nothing to do with.
+
+   That is a WRONG ANSWER, not a missed optimisation: deleting the guard (making
+   the [Cat.Row] arm [true]) turns this query's 240 rows into 0 while the foil
+   still returns 240. Verified by hand on this branch; this case is what stops
+   it rotting. *)
+let cte_shadowing_a_real_table_still_scans () =
+  with_db (fun db ->
+    (* [i_mod:5] puts [i_id] in 1..5, so exactly a fifth of the driving rows
+       carry the CTE's [si = 3]. *)
+    seed db ~i_mod:5 ();
+    let cte = "WITH stock AS (SELECT 1 AS sw, 3 AS si, 999 AS qty) " in
+    let seek =
+      cte ^ "SELECT qty FROM line JOIN stock ON si = i_id WHERE w = 1 AND sw = 1"
+    in
+    let foil =
+      cte ^ "SELECT qty FROM line JOIN stock ON si = i_id WHERE w = 1 AND sw + 0 = 1"
+    in
+    let expected = List.init (n_line / 5) (fun _ -> [ "999" ]) in
+    Alcotest.(check (list (list string)))
+      "the CTE's own single row, once per matching driving row"
+      expected
+      (rows_of db seek);
+    same_rows db ~label:"shadowing CTE agrees with its unoptimizable foil" ~seek ~foil)
+;;
+
+(* The [Cat.Columnar] arm of the same guard. Unlike the CTE arm this one is
+   genuinely defensive — a columnar table has no rowid alias and no indexes, so
+   [access_path_for_eqs] would answer [None] and fall back to [make_scan]
+   anyway. It is still the only thing keeping [Cat.row_storage], which raises on
+   a columnar [table_meta], off the path if the chooser ever grows an arm that
+   reaches it. *)
+let columnar_right_table_still_scans () =
+  with_db (fun db ->
+    exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
+    exec db "CREATE TABLE cs (sw INTEGER, si INTEGER, qty INTEGER) USING COLUMNSTORE";
+    exec db "BEGIN";
+    for o = 1 to n_line do
+      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o ((o mod 8) + 1))
+    done;
+    for w = 1 to 2 do
+      for si = 1 to 8 do
+        exec
+          db
+          (Printf.sprintf "INSERT INTO cs VALUES (%d, %d, %d)" w si ((w * 100) + si))
+      done
+    done;
+    exec db "COMMIT";
+    let seek = "SELECT qty FROM line INNER JOIN cs ON si = i_id WHERE w = 1 AND sw = 1" in
+    let foil =
+      "SELECT qty FROM line INNER JOIN cs ON si = i_id WHERE w = 1 AND sw + 0 = 1"
+    in
+    same_rows db ~label:"columnar right table agrees with its foil" ~seek ~foil;
+    Alcotest.(check int)
+      "and every driving row found its warehouse-1 match"
+      n_line
+      (List.length (rows_of db seek)))
+;;
+
+(* Every other narrowing case joins one table, so [right_col_offset] is the
+   driving table's width. Here [stock] is the SECOND join, and [right_table_eqs]
+   must re-base [sw]'s combined-row ordinal across both preceding tables. A
+   wrong offset would seek the wrong column and the foil would disagree. *)
+let build_side_seeks_as_the_second_join_in_a_chain () =
+  with_db (fun db ->
+    seed db ~n_per_w:20 ~i_mod:20 ();
+    exec db "CREATE TABLE ord (ow INTEGER PRIMARY KEY, tag INTEGER)";
+    exec db "INSERT INTO ord VALUES (1, 7)";
+    let q pred =
+      Printf.sprintf
+        "SELECT qty, tag FROM line INNER JOIN ord ON ow = w INNER JOIN stock ON si = \
+         i_id WHERE w = 1 AND %s"
+        pred
+    in
+    let seek = q "sw = 1"
+    and foil = q "sw + 0 = 1" in
+    same_rows db ~label:"chained build side agrees with its scan" ~seek ~foil;
+    Alcotest.(check int)
+      "one joined row per driving row"
+      n_line
+      (List.length (rows_of db seek));
+    Alcotest.(check bool)
+      "and the narrowing fired across the offset"
       true
       (examined db seek < examined db foil))
 ;;
@@ -329,8 +509,19 @@ let left_join_with_a_narrowing_constant () =
       (List.exists (fun r -> List.nth r 1 = "2777") (rows_of db seek)))
 ;;
 
-(* A LEFT JOIN whose driving row has a NULL join key still null-extends, whatever
-   the build side reads. *)
+(* A LEFT JOIN whose driving row has a NULL join key still null-extends.
+
+   Note what this does and does not cover. With no WHERE clause [right_eqs] is
+   [[]] and the build side is [make_scan] — so the first half is a regression
+   guard on the UNNARROWED path, and passes identically on main. The second half
+   adds the narrowing conjunct, which is what makes it coverage of #528: NULL
+   join keys and a seeked build side at the same time.
+
+   A narrowed LEFT JOIN can never emit a null-extended output row, and that is
+   structural rather than an accident of this population — the narrowing
+   conjunct is by construction in the post-join filter, and it is NULL on a
+   null-extended row. So the second half asserts agreement with the foil (both
+   drop them) rather than the presence of NULLs. *)
 let left_join_null_key_null_extends () =
   with_db (fun db ->
     exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
@@ -339,16 +530,44 @@ let left_join_null_key_null_extends () =
       "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER, PRIMARY KEY (sw, si))";
     exec db "BEGIN";
     for o = 1 to n_line do
-      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, NULL)" o)
+      (* A third of the driving rows have a NULL join key; the rest match in
+         warehouse 1, warehouse 2 only, or nowhere. *)
+      let v =
+        match o mod 4 with
+        | 0 -> "NULL"
+        | 1 -> string_of_int ((o mod 8) + 1)
+        | 2 -> "777"
+        | _ -> string_of_int (90_000 + o)
+      in
+      exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %s)" o v)
     done;
-    exec db "INSERT INTO stock VALUES (1, 8, 80)";
+    for w = 1 to 2 do
+      for si = 1 to 8 do
+        exec
+          db
+          (Printf.sprintf "INSERT INTO stock VALUES (%d, %d, %d)" w si ((w * 100) + si))
+      done
+    done;
+    exec db "INSERT INTO stock VALUES (2, 777, 2777)";
     exec db "COMMIT";
+    (* Unnarrowed: no WHERE clause, so the build side is a plain scan. *)
     let rows = rows_of db "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id" in
-    Alcotest.(check int) "every NULL-keyed row survives" n_line (List.length rows);
+    let null_extended = List.filter (fun r -> List.nth r 1 = "NULL") rows in
+    (* The NULL-keyed quarter plus the matches-nothing quarter. *)
+    Alcotest.(check int)
+      "every unmatchable driving row survives, null-extended"
+      (n_line / 2)
+      (List.length null_extended);
+    (* Narrowed: the same NULL keys, now against a seeked build side. *)
+    let seek = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw = 1" in
+    let foil = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw + 0 = 1" in
+    same_rows db ~label:"NULL keys against a seeked build side" ~seek ~foil;
+    let n_seek = examined db seek
+    and n_foil = examined db foil in
     Alcotest.(check bool)
-      "null-extended"
+      (Printf.sprintf "the narrowing fired: examined %d < foil %d" n_seek n_foil)
       true
-      (List.for_all (fun r -> List.nth r 1 = "NULL") rows))
+      (n_seek < n_foil))
 ;;
 
 (* A pinned prefix that matches nothing must yield no rows, not the index's NULL
@@ -405,14 +624,28 @@ let or_does_not_narrow_the_build_side () =
 (* Whatever the pinned warehouse and whatever the driving-side range, the
    narrowed build side returns exactly the row set of the unoptimizable foil.
    The driving side is deliberately kept above #520's 1000-row floor, because
-   below it the planner takes a probe and the build side never runs at all. *)
+   below it the planner takes a probe and the build side never runs at all.
+
+   NON-VACUITY. The generators used to draw [sw] from 0..3 and [i_hi] from 0..12
+   against a [stock] holding only [sw] in {1,2} and [si] in 1..8, so a draw of
+   [sw = 0] or [i_hi = 0] compared two empty row sets and proved nothing. This
+   repo has shipped silently-vacuous property tests before (#485). The ranges
+   are now inside the population — [i_hi >= 2] matters, because [i_id] is
+   [o mod 10] and [i_id < 1] selects only the [i_id = 0] rows, which join
+   nothing — and each case asserts a non-empty result as well as agreement.
+
+   The [left] flag makes the soundness argument executable rather than adding
+   LEFT-JOIN output coverage: because the narrowing conjunct is always in the
+   WHERE clause, a narrowed LEFT JOIN can never emit a null-extended row. That
+   is structural, not an accident of these generators — see
+   [left_join_null_key_null_extends]. *)
 let n_line_prop = 1050
 
 let prop_build_seek_matches_foil =
   QCheck.Test.make
     ~count:20
     ~name:"hash-join build-side seek agrees with unoptimizable foil"
-    QCheck.(triple (int_range 0 3) (int_range 0 12) bool)
+    QCheck.(triple (int_range 1 2) (int_range 2 12) bool)
     (fun (sw, i_hi, left) ->
        with_db (fun db ->
          exec
@@ -439,16 +672,17 @@ let prop_build_seek_matches_foil =
          done;
          exec db "COMMIT";
          let kind = if left then "LEFT" else "INNER" in
-         let q pred =
-           rows_of
-             db
-             (Printf.sprintf
-                "SELECT o, qty FROM line %s JOIN stock ON si = i_id WHERE %s"
-                kind
-                pred)
+         let sql pred =
+           Printf.sprintf
+             "SELECT o, qty FROM line %s JOIN stock ON si = i_id WHERE %s"
+             kind
+             pred
          in
-         q (Printf.sprintf "sw = %d AND i_id < %d" sw i_hi)
-         = q (Printf.sprintf "sw + 0 = %d AND i_id < %d" sw i_hi)))
+         let seek = sql (Printf.sprintf "sw = %d AND i_id < %d" sw i_hi)
+         and foil = sql (Printf.sprintf "sw + 0 = %d AND i_id < %d" sw i_hi) in
+         let rows = rows_of db seek in
+         (* Non-vacuity, checked per case rather than argued from the ranges. *)
+         rows <> [] && examined db seek < examined db foil && rows = rows_of db foil))
 ;;
 
 let () =
@@ -475,6 +709,28 @@ let () =
             "general ON predicate build side seeks"
             `Quick
             general_on_predicate_build_side_seeks
+        ; Alcotest.test_case
+            "general ON predicate LEFT JOIN agrees"
+            `Quick
+            general_on_predicate_left_join_agrees
+        ; Alcotest.test_case
+            "#520's headline shape halves rows examined"
+            `Quick
+            headline_520_shape_halves_rows_examined
+        ; Alcotest.test_case
+            "build side seeks as the second join in a chain"
+            `Quick
+            build_side_seeks_as_the_second_join_in_a_chain
+        ] )
+    ; ( "unseekable right tables"
+      , [ Alcotest.test_case
+            "CTE shadowing a real table still scans"
+            `Quick
+            cte_shadowing_a_real_table_still_scans
+        ; Alcotest.test_case
+            "columnar right table still scans"
+            `Quick
+            columnar_right_table_still_scans
         ] )
     ; ( "cost model"
       , [ Alcotest.test_case
