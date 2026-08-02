@@ -244,19 +244,29 @@ let supplier_comment t r ~index =
   | Some marker -> splice_marker base marker
 ;;
 
+(* Every draw below is bound to its own [let], in the order it is meant to
+   happen, and the row array is built only from already-bound values.  Two draws
+   written as elements of one array — as the rows here were until #509 — are
+   evaluated in a toolchain-dependent order, and each draw advances the LCG, so
+   the seed no longer pinned the dataset across compilers.  Same discipline as
+   Tpcc_gen's, and the same hazard Tpc_rand.phone had. *)
 let gen_supplier t ~f =
   let r = rand_for t ~table:"supplier" in
   let n = n_supplier t in
   for i = 0 to n - 1 do
     let nation = Tpc_rand.int_between r ~lo:0 ~hi:24 in
+    let address = Tpc_rand.a_string r ~lo:10 ~hi:40 in
+    let phone = Tpc_rand.phone r ~nation in
+    let acctbal = Tpc_rand.float_between r ~lo:(-999.99) ~hi:9999.99 ~decimals:2 in
+    let comment = supplier_comment t r ~index:i in
     f
       [| VInt i
        ; VText (Printf.sprintf "Supplier#%09d" i)
-       ; VText (Tpc_rand.a_string r ~lo:10 ~hi:40)
+       ; VText address
        ; VInt nation
-       ; VText (Tpc_rand.phone r ~nation)
-       ; VReal (Tpc_rand.float_between r ~lo:(-999.99) ~hi:9999.99 ~decimals:2)
-       ; VText (supplier_comment t r ~index:i)
+       ; VText phone
+       ; VReal acctbal
+       ; VText comment
       |]
   done
 ;;
@@ -398,25 +408,27 @@ let gen_part t ~f =
     let mfgr = Tpc_rand.int_between r ~lo:1 ~hi:5 in
     let brand = Tpc_rand.int_between r ~lo:1 ~hi:5 in
     let name = part_name r in
-    let ptype =
-      String.concat
-        " "
-        [ Tpc_rand.pick r type_syllable_1
-        ; Tpc_rand.pick r type_syllable_2
-        ; Tpc_rand.pick r type_syllable_3
-        ]
-    in
-    let container = Tpc_rand.pick r container_1 ^ " " ^ Tpc_rand.pick r container_2 in
+    (* The three type syllables were elements of one list and the two container
+       words operands of one [^]; both are unspecified-order positions (#509). *)
+    let syl_1 = Tpc_rand.pick r type_syllable_1 in
+    let syl_2 = Tpc_rand.pick r type_syllable_2 in
+    let syl_3 = Tpc_rand.pick r type_syllable_3 in
+    let ptype = String.concat " " [ syl_1; syl_2; syl_3 ] in
+    let cont_1 = Tpc_rand.pick r container_1 in
+    let cont_2 = Tpc_rand.pick r container_2 in
+    let container = String.concat " " [ cont_1; cont_2 ] in
+    let size = Tpc_rand.int_between r ~lo:1 ~hi:50 in
+    let comment = Tpch_text.substring ~pool:t.pool r ~lo:5 ~hi:22 in
     f
       [| VInt i
        ; VText name
        ; VText (Printf.sprintf "Manufacturer#%d" mfgr)
        ; VText (Printf.sprintf "Brand#%d%d" mfgr brand)
        ; VText ptype
-       ; VInt (Tpc_rand.int_between r ~lo:1 ~hi:50)
+       ; VInt size
        ; VText container
        ; VReal (retail_price i)
-       ; VText (Tpch_text.substring ~pool:t.pool r ~lo:5 ~hi:22)
+       ; VText comment
       |]
   done
 ;;
@@ -447,12 +459,15 @@ let gen_partsupp t ~f =
   let suppliers = n_supplier t in
   for i = 0 to n - 1 do
     for j = 0 to 3 do
+      let availqty = Tpc_rand.int_between r ~lo:1 ~hi:9_999 in
+      let supplycost = Tpc_rand.float_between r ~lo:1.00 ~hi:1_000.00 ~decimals:2 in
+      let comment = Tpch_text.substring ~pool:t.pool r ~lo:49 ~hi:198 in
       f
         [| VInt i
          ; VInt (ps_suppkey ~partkey:i ~index:j ~suppliers)
-         ; VInt (Tpc_rand.int_between r ~lo:1 ~hi:9_999)
-         ; VReal (Tpc_rand.float_between r ~lo:1.00 ~hi:1_000.00 ~decimals:2)
-         ; VText (Tpch_text.substring ~pool:t.pool r ~lo:49 ~hi:198)
+         ; VInt availqty
+         ; VReal supplycost
+         ; VText comment
         |]
     done
   done
@@ -467,15 +482,20 @@ let gen_customer t ~f =
   let n = n_customer t in
   for i = 0 to n - 1 do
     let nation = Tpc_rand.int_between r ~lo:0 ~hi:24 in
+    let address = Tpc_rand.a_string r ~lo:10 ~hi:40 in
+    let phone = Tpc_rand.phone r ~nation in
+    let acctbal = Tpc_rand.float_between r ~lo:(-999.99) ~hi:9999.99 ~decimals:2 in
+    let segment = Tpc_rand.pick r segments in
+    let comment = Tpch_text.substring ~pool:t.pool r ~lo:29 ~hi:116 in
     f
       [| VInt i
        ; VText (Printf.sprintf "Customer#%09d" i)
-       ; VText (Tpc_rand.a_string r ~lo:10 ~hi:40)
+       ; VText address
        ; VInt nation
-       ; VText (Tpc_rand.phone r ~nation)
-       ; VReal (Tpc_rand.float_between r ~lo:(-999.99) ~hi:9999.99 ~decimals:2)
-       ; VText (Tpc_rand.pick r segments)
-       ; VText (Tpch_text.substring ~pool:t.pool r ~lo:29 ~hi:116)
+       ; VText phone
+       ; VReal acctbal
+       ; VText segment
+       ; VText comment
       |]
   done
 ;;
@@ -536,14 +556,22 @@ let order_custkey r ~customers =
     (3 * (j / 2)) + 1 + (j mod 2))
 ;;
 
+(* A record's fields are an unspecified-order position exactly as a call's
+   arguments are, so the five draws below are bound first and the record built
+   from names only (#509). *)
 let gen_order_core t r ~key =
   let clerks = Stdlib.max 1 (scaled t 1_000) in
+  let custkey = order_custkey r ~customers:(n_customer t) in
+  let orderdate = Tpc_rand.int_between r ~lo:date_lo ~hi:(date_hi - max_line_offset) in
+  let priority = Tpc_rand.pick r priorities in
+  let clerk = Tpc_rand.int_between r ~lo:1 ~hi:clerks in
+  let comment = Tpch_text.substring ~pool:t.pool r ~lo:19 ~hi:78 in
   { o_orderkey = key
-  ; o_custkey = order_custkey r ~customers:(n_customer t)
-  ; o_orderdate = Tpc_rand.int_between r ~lo:date_lo ~hi:(date_hi - max_line_offset)
-  ; o_orderpriority = Tpc_rand.pick r priorities
-  ; o_clerk = Printf.sprintf "Clerk#%09d" (Tpc_rand.int_between r ~lo:1 ~hi:clerks)
-  ; o_comment = Tpch_text.substring ~pool:t.pool r ~lo:19 ~hi:78
+  ; o_custkey = custkey
+  ; o_orderdate = orderdate
+  ; o_orderpriority = priority
+  ; o_clerk = Printf.sprintf "Clerk#%09d" clerk
+  ; o_comment = comment
   }
 ;;
 
@@ -559,6 +587,9 @@ let gen_line t r ~orderdate ~lineno =
   let returnflag =
     if receiptdate <= current_date then Tpc_rand.pick r return_flags else "N"
   in
+  let shipinstruct = Tpc_rand.pick r ship_instructs in
+  let shipmode = Tpc_rand.pick r ship_modes in
+  let comment = Tpch_text.substring ~pool:t.pool r ~lo:10 ~hi:43 in
   { l_partkey = partkey
   ; l_suppkey = ps_suppkey ~partkey ~index:which ~suppliers:(n_supplier t)
   ; l_linenumber = lineno
@@ -571,9 +602,9 @@ let gen_line t r ~orderdate ~lineno =
   ; l_shipdate = shipdate
   ; l_commitdate = commitdate
   ; l_receiptdate = receiptdate
-  ; l_shipinstruct = Tpc_rand.pick r ship_instructs
-  ; l_shipmode = Tpc_rand.pick r ship_modes
-  ; l_comment = Tpch_text.substring ~pool:t.pool r ~lo:10 ~hi:43
+  ; l_shipinstruct = shipinstruct
+  ; l_shipmode = shipmode
+  ; l_comment = comment
   }
 ;;
 

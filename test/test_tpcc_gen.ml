@@ -323,6 +323,79 @@ let prop_rows_match_columns_and_counts =
          Granary_tpc.Tpcc_gen.tables)
 ;;
 
+(* --- #509: the reproducibility contract, pinned ----------------------- *)
+
+(* A seed must pin the dataset across compilers, flambda settings and OCaml
+   versions. This digest is what enforces it: a change means the generated data
+   changed, either deliberately — recompute it and say so — or because some
+   expression went back to drawing twice in a position OCaml leaves unordered,
+   which is the #509 bug. Floats go in by their exact bit pattern so the pin
+   cannot be loosened by a printing difference.
+
+   The item and stock tables are excluded only because they are 100,000 rows
+   each and fixed by the spec regardless of warehouse count; every table whose
+   generator this change touched is covered. *)
+let dataset_digest ~seed =
+  let g = Granary_tpc.Tpcc_gen.create ~seed ~warehouses:1 in
+  let buf = Buffer.create 4096 in
+  let add = function
+    | V.VInt i -> Buffer.add_string buf (string_of_int i)
+    | V.VReal f -> Buffer.add_string buf (Int64.to_string (Int64.bits_of_float f))
+    | V.VText s -> Buffer.add_string buf s
+    | V.VNull -> Buffer.add_string buf "NULL"
+  in
+  List.iter
+    (fun table ->
+       Buffer.add_string buf table;
+       Granary_tpc.Tpcc_gen.iter_rows g ~table ~f:(fun row ->
+         Array.iter
+           (fun v ->
+              add v;
+              Buffer.add_char buf '\001')
+           row);
+       Buffer.add_char buf '\002')
+    [ "warehouse"
+    ; "district"
+    ; "customer"
+    ; "history"
+    ; "orders"
+    ; "new_order"
+    ; "order_line"
+    ];
+  Digest.to_hex (Digest.string (Buffer.contents buf))
+;;
+
+let test_dataset_digest_is_pinned () =
+  Alcotest.(check string)
+    "seed 42, W=1 dataset digest"
+    "72b3401c41eca4ece2bada3be4a6ea17"
+    (dataset_digest ~seed:42)
+;;
+
+let test_dataset_digest_depends_on_seed () =
+  Alcotest.(check bool)
+    "a different seed gives a different dataset"
+    false
+    (String.equal (dataset_digest ~seed:42) (dataset_digest ~seed:43))
+;;
+
+(* Clause 4.3.2.2 specifies c_phone as n_string(16,16) — sixteen digits. It was
+   generated with the 64-symbol alphanumeric a_string until #509. *)
+let test_c_phone_is_sixteen_digits () =
+  let g = Granary_tpc.Tpcc_gen.create ~seed:42 ~warehouses:1 in
+  let seen = ref 0 in
+  let bad = ref 0 in
+  Granary_tpc.Tpcc_gen.iter_rows g ~table:"customer" ~f:(fun row ->
+    incr seen;
+    match row.(11) with
+    | V.VText s ->
+      if not (String.length s = 16 && String.for_all (fun c -> c >= '0' && c <= '9') s)
+      then incr bad
+    | _ -> incr bad);
+  Alcotest.(check int) "every c_phone is 16 digits" 0 !bad;
+  Alcotest.(check int) "and every customer was inspected" 30_000 !seen
+;;
+
 let () =
   Alcotest.run
     "tpcc_gen"
@@ -386,6 +459,17 @@ let () =
             "o_c_id is a permutation"
             `Quick
             test_customer_ids_are_a_permutation
+        ] )
+    ; ( "reproducibility 509"
+      , [ Alcotest.test_case "dataset digest pinned" `Quick test_dataset_digest_is_pinned
+        ; Alcotest.test_case
+            "depends on the seed"
+            `Quick
+            test_dataset_digest_depends_on_seed
+        ; Alcotest.test_case
+            "c_phone is n_string(16,16)"
+            `Quick
+            test_c_phone_is_sixteen_digits
         ] )
     ; "properties", [ QCheck_alcotest.to_alcotest prop_rows_match_columns_and_counts ]
     ]

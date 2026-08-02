@@ -217,72 +217,91 @@ let terminators = [| "."; ";"; ":"; "?"; "!"; "--" |]
    handful of sentence forms.  Kept to four forms and one level of nesting so
    the module stays within merlint's nesting limit. *)
 
+(* Every phrase below binds each draw to its own [let], in the order the words
+   are meant to be produced, and only then concatenates.  Two draws written as
+   operands of [^] — as these were until #509 — are evaluated in a
+   toolchain-dependent order, and each draw advances the LCG, so the pool of
+   comment text a seed produced varied by compiler and flambda setting.  Since
+   every TPC-H *_comment column is a substring of this pool, that voided the
+   reproducibility contract for a large part of the dataset.  [join] exists so
+   the sequencing is expressed once instead of at each of the twelve sites. *)
+let join parts = String.concat "" parts
+
 let noun_phrase r =
   match Tpc_rand.int_between r ~lo:0 ~hi:3 with
   | 0 -> Tpc_rand.pick r nouns
-  | 1 -> Tpc_rand.pick r adjectives ^ " " ^ Tpc_rand.pick r nouns
+  | 1 ->
+    let adj = Tpc_rand.pick r adjectives in
+    let noun = Tpc_rand.pick r nouns in
+    join [ adj; " "; noun ]
   | 2 ->
-    Tpc_rand.pick r adjectives
-    ^ ", "
-    ^ Tpc_rand.pick r adjectives
-    ^ " "
-    ^ Tpc_rand.pick r nouns
+    let adj1 = Tpc_rand.pick r adjectives in
+    let adj2 = Tpc_rand.pick r adjectives in
+    let noun = Tpc_rand.pick r nouns in
+    join [ adj1; ", "; adj2; " "; noun ]
   | _ ->
-    Tpc_rand.pick r adverbs
-    ^ " "
-    ^ Tpc_rand.pick r adjectives
-    ^ " "
-    ^ Tpc_rand.pick r nouns
+    let adv = Tpc_rand.pick r adverbs in
+    let adj = Tpc_rand.pick r adjectives in
+    let noun = Tpc_rand.pick r nouns in
+    join [ adv; " "; adj; " "; noun ]
 ;;
 
 let verb_phrase r =
   match Tpc_rand.int_between r ~lo:0 ~hi:3 with
   | 0 -> Tpc_rand.pick r verbs
-  | 1 -> Tpc_rand.pick r adverbs ^ " " ^ Tpc_rand.pick r verbs
-  | 2 -> Tpc_rand.pick r verbs ^ " " ^ Tpc_rand.pick r adverbs
+  | 1 ->
+    let adv = Tpc_rand.pick r adverbs in
+    let verb = Tpc_rand.pick r verbs in
+    join [ adv; " "; verb ]
+  | 2 ->
+    let verb = Tpc_rand.pick r verbs in
+    let adv = Tpc_rand.pick r adverbs in
+    join [ verb; " "; adv ]
   | _ ->
-    Tpc_rand.pick r adverbs ^ " " ^ Tpc_rand.pick r verbs ^ " " ^ Tpc_rand.pick r adverbs
+    let adv1 = Tpc_rand.pick r adverbs in
+    let verb = Tpc_rand.pick r verbs in
+    let adv2 = Tpc_rand.pick r adverbs in
+    join [ adv1; " "; verb; " "; adv2 ]
 ;;
 
-let prepositional_phrase r = Tpc_rand.pick r prepositions ^ " the " ^ noun_phrase r
+let prepositional_phrase r =
+  let prep = Tpc_rand.pick r prepositions in
+  let noun = noun_phrase r in
+  join [ prep; " the "; noun ]
+;;
 
 let sentence r =
   match Tpc_rand.int_between r ~lo:0 ~hi:4 with
-  | 0 -> noun_phrase r ^ " " ^ verb_phrase r ^ " " ^ Tpc_rand.pick r terminators
+  | 0 ->
+    let np = noun_phrase r in
+    let vp = verb_phrase r in
+    let term = Tpc_rand.pick r terminators in
+    join [ np; " "; vp; " "; term ]
   | 1 ->
-    noun_phrase r
-    ^ " "
-    ^ verb_phrase r
-    ^ " "
-    ^ prepositional_phrase r
-    ^ " "
-    ^ Tpc_rand.pick r terminators
+    let np = noun_phrase r in
+    let vp = verb_phrase r in
+    let pp = prepositional_phrase r in
+    let term = Tpc_rand.pick r terminators in
+    join [ np; " "; vp; " "; pp; " "; term ]
   | 2 ->
-    noun_phrase r
-    ^ " "
-    ^ verb_phrase r
-    ^ " "
-    ^ noun_phrase r
-    ^ " "
-    ^ Tpc_rand.pick r terminators
+    let np1 = noun_phrase r in
+    let vp = verb_phrase r in
+    let np2 = noun_phrase r in
+    let term = Tpc_rand.pick r terminators in
+    join [ np1; " "; vp; " "; np2; " "; term ]
   | 3 ->
-    prepositional_phrase r
-    ^ " "
-    ^ noun_phrase r
-    ^ " "
-    ^ verb_phrase r
-    ^ " "
-    ^ Tpc_rand.pick r terminators
+    let pp = prepositional_phrase r in
+    let np = noun_phrase r in
+    let vp = verb_phrase r in
+    let term = Tpc_rand.pick r terminators in
+    join [ pp; " "; np; " "; vp; " "; term ]
   | _ ->
-    prepositional_phrase r
-    ^ " "
-    ^ noun_phrase r
-    ^ " "
-    ^ verb_phrase r
-    ^ " "
-    ^ prepositional_phrase r
-    ^ " "
-    ^ Tpc_rand.pick r terminators
+    let pp1 = prepositional_phrase r in
+    let np = noun_phrase r in
+    let vp = verb_phrase r in
+    let pp2 = prepositional_phrase r in
+    let term = Tpc_rand.pick r terminators in
+    join [ pp1; " "; np; " "; vp; " "; pp2; " "; term ]
 ;;
 
 let pool r ~size =

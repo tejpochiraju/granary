@@ -47,6 +47,7 @@ let float_between t ~lo ~hi ~decimals =
 ;;
 
 let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789, "
+let digits = "0123456789"
 
 (* Built with an explicit left-to-right loop rather than [String.init].  The
    character function draws from the LCG, so the string's value depends on the
@@ -54,15 +55,18 @@ let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789, 
    order" on the toolchain this project pins, but making the order local rather
    than inherited from a stdlib guarantee keeps the reproducibility contract
    readable and immune to that documentation changing. *)
-let a_string t ~lo ~hi =
+let string_from t ~symbols ~lo ~hi =
   let n = int_between t ~lo ~hi in
-  let last = String.length alphabet - 1 in
+  let last = String.length symbols - 1 in
   let b = Bytes.create n in
   for i = 0 to n - 1 do
-    Bytes.unsafe_set b i alphabet.[int_between t ~lo:0 ~hi:last]
+    Bytes.unsafe_set b i symbols.[int_between t ~lo:0 ~hi:last]
   done;
   Bytes.unsafe_to_string b
 ;;
+
+let a_string t ~lo ~hi = string_from t ~symbols:alphabet ~lo ~hi
+let n_string t ~lo ~hi = string_from t ~symbols:digits ~lo ~hi
 
 let pick t choices =
   let n = Array.length choices in
@@ -70,13 +74,18 @@ let pick t choices =
   choices.(int_between t ~lo:0 ~hi:(n - 1))
 ;;
 
+(* Each draw is bound to its own [let], in the order the fields appear, rather
+   than written inline as arguments of [Printf.sprintf].  OCaml does not specify
+   the evaluation order of a function's arguments, and every draw advances the
+   LCG, so inlined it was toolchain-dependent which draw landed in which field —
+   the same seed produced different s_phone and c_phone values under a different
+   compiler or flambda setting, silently voiding this module's reproducibility
+   contract (#509).  Same hazard as [a_string] above and [nurand] below. *)
 let phone t ~nation =
-  Printf.sprintf
-    "%02d-%03d-%03d-%04d"
-    (nation + 10)
-    (int_between t ~lo:100 ~hi:999)
-    (int_between t ~lo:100 ~hi:999)
-    (int_between t ~lo:1000 ~hi:9999)
+  let area = int_between t ~lo:100 ~hi:999 in
+  let exchange = int_between t ~lo:100 ~hi:999 in
+  let line = int_between t ~lo:1000 ~hi:9999 in
+  Printf.sprintf "%02d-%03d-%03d-%04d" (nation + 10) area exchange line
 ;;
 
 (* TPC-C's non-uniform key distribution:

@@ -274,6 +274,20 @@ let gen_new_order_line r ~warehouses ~w_id ~constants =
   { ol_i_id = i_id; ol_supply_w_id = supply_w_id; ol_quantity = quantity }
 ;;
 
+(* Explicit recursion rather than [List.init].  Each line consumes draws from
+   [r], so the list's contents depend on the order the elements are built in.
+   [List.init] is documented "evaluated left to right" on the toolchain this
+   project pins, but stating the order here keeps the reproducibility contract
+   local rather than inherited from a stdlib guarantee (#509) — the same choice
+   Tpch_gen.build_lines and Tpc_rand.a_string make. *)
+let rec build_lines r ~warehouses ~w_id ~constants ~remaining acc =
+  if remaining <= 0
+  then List.rev acc
+  else (
+    let line = gen_new_order_line r ~warehouses ~w_id ~constants in
+    build_lines r ~warehouses ~w_id ~constants ~remaining:(remaining - 1) (line :: acc))
+;;
+
 let invalidate_last lines =
   match List.rev lines with
   | [] -> lines
@@ -287,9 +301,7 @@ let gen_new_order r ~warehouses ~constants =
     Tpc_rand.nurand r ~a:1023 ~x:1 ~y:customers_per_district ~c:constants.nurand_c_id
   in
   let ol_cnt = Tpc_rand.int_between r ~lo:5 ~hi:15 in
-  let lines =
-    List.init ol_cnt (fun _ -> gen_new_order_line r ~warehouses ~w_id ~constants)
-  in
+  let lines = build_lines r ~warehouses ~w_id ~constants ~remaining:ol_cnt [] in
   let rollback_roll = Tpc_rand.int_between r ~lo:1 ~hi:100 in
   let rollback = rollback_roll = 1 in
   let lines = if rollback then invalidate_last lines else lines in

@@ -29,6 +29,12 @@ val float_between : t -> lo:float -> hi:float -> decimals:int -> float
     alphabet (letters, digits, comma, space). *)
 val a_string : t -> lo:int -> hi:int -> string
 
+(** [n_string r ~lo ~hi] is the spec's random numeric string (TPC-C
+    [n_string(lo, hi)]): a length uniform in [\[lo, hi\]], each character drawn
+    uniformly from the ten decimal digits. Distinct from {!a_string}, whose
+    64-symbol alphabet includes letters, a comma and a space. *)
+val n_string : t -> lo:int -> hi:int -> string
+
 (** [pick r choices] selects one element uniformly.  Raises
     [Invalid_argument] on an empty array. *)
 val pick : t -> string array -> string
