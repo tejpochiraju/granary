@@ -1,26 +1,37 @@
-(** #514 (second half): the DML index-seek path must not materialise every
-    candidate rowid before fetching any of them.
+(** #514 (second half): what the DML index-seek path does with its candidate
+    rowids, and — the part that took a measurement to settle — what order it
+    reads the matching rows in.
 
-    [Exec.seek_candidate_rowids] used to walk the whole index range into an
-    [int64 list], sort it, and only then let [drain_matching_rows_in_tx] fetch
-    rows — so peak memory was proportional to the match count, and a
-    [DELETE FROM t WHERE tenant = 1] over a large table held the entire
-    candidate set at once.  The walk now hands each rowid to the fetch as it is
-    decoded, holding one at a time, and the drain sorts its accumulated matches
-    by rowid (which the DML path relies on to keep an unordered
-    [UPDATE/DELETE … LIMIT n] hitting the same rows a scan would).
+    The seek walks an index range and then reads each candidate out of the table
+    tree.  Those two trees are ordered differently, so the drain has to choose:
+    read each row the instant the index walk names it (no candidate buffer, but
+    index-key order against the table), or buffer every candidate, sort by
+    rowid, and read them in table order.
 
-    The memory assertion rides {!Granary_sql.Exec.dml_seek_stats}, whose
-    [dss_peak_buffered] is the high-water mark of candidates walked but not yet
-    fetched: it must stay at 1 however many rows the statement affects, which is
-    the same thing as saying rows are fetched interleaved with the seek rather
-    than all after it.  Correctness is the bigger half of this file:
-    mutation-during-iteration cases (including an UPDATE of the very column
-    being seeked on), rollback, and QCheck properties against an unoptimizable
-    foil predicate.
+    It buffers.  Reading in index-key order is random access against the table
+    for any index uncorrelated with rowid, and the pager cache is a bounded FIFO
+    ({!Granary_storage.Pager}), so a table larger than the cache re-reads a page
+    per row.  Measured here by {!prefix_delete_reads_each_table_page_about_once}:
+    on disk, with the cache squeezed and index order scrambled against rowid
+    order, sorting first reads ~1 page per 20 rows where fetching as it walks
+    reads more than 1 page {e per row}.  What #514 actually bought is a cheaper
+    buffer — an [int64 array] rather than an [int64 list], 32 live bytes per
+    candidate instead of 48 — not a bound.  The bound would be streaming the
+    mutations, which the callers' shape forbids, and the {e other} half of #514,
+    the selectivity guard, is not addressed here either.
 
-    The selectivity guard — the {e other} half of #514 — is deliberately not
-    addressed here and #514 stays open for it. *)
+    {!Granary_sql.Exec.dml_seek_stats} makes the shape observable:
+    [dss_peak_buffered] equals the match count precisely because the drain sorts
+    before it fetches, so a drop to 1 is the regression, not the goal.
+
+    Correctness is the bigger half of this file.  Buffering the candidates means
+    the index cursor is closed before any row is read and long before anything
+    is written, but the drain order still has to match what a table scan would
+    produce (an unordered [DELETE … LIMIT n] depends on it), and an UPDATE that
+    moves the very keys being walked must still visit each row exactly once.
+    Those cases run on both backends: in memory, and — since [Store.seek_ge] on
+    [Mem] snapshots an immutable map while on [Btree] it holds live page ids —
+    against a real file-backed B-tree too. *)
 
 module Db = Granary.Db
 module Exec = Granary_sql.Exec
@@ -45,6 +56,64 @@ let exec db sql =
   match run (Db.execute db sql) with
   | Ok () -> ()
   | Error e -> Alcotest.failf "exec %S: %a" sql Db.pp_error e
+;;
+
+(* The Mem backend cannot see half of what this file reasons about: its
+   [seek_ge] snapshots an immutable map, so the cursor is isolated from the tree
+   by construction and there are no pages to read.  The B-tree cursor holds live
+   page ids and a cached leaf.  Cases that care run on both. *)
+let with_file_db ?page_cache f =
+  let dir = Filename.temp_file "t514-" "" in
+  Sys.remove dir;
+  Unix.mkdir dir 0o755;
+  let path = Filename.concat dir "db" in
+  let restore =
+    match page_cache with
+    | None -> fun () -> ()
+    | Some n ->
+      let prev = Sys.getenv_opt "GRANARY_PAGE_CACHE" in
+      Unix.putenv "GRANARY_PAGE_CACHE" (string_of_int n);
+      fun () ->
+        (match prev with
+         | Some v -> Unix.putenv "GRANARY_PAGE_CACHE" v
+         | None -> Unix.putenv "GRANARY_PAGE_CACHE" "");
+        ()
+  in
+  let db =
+    match run (Granary_unix.open_file_wal ~path ()) with
+    | Ok db -> db
+    | Error e ->
+      restore ();
+      Alcotest.failf "open_file_wal: %a" Db.pp_error e
+  in
+  Fun.protect
+    ~finally:(fun () ->
+      restore ();
+      (try run (Db.close db) with
+       | _ -> ());
+      List.iter
+        (fun sfx ->
+           try Sys.remove (path ^ sfx) with
+           | _ -> ())
+        [ ""; "-wal" ];
+      try Unix.rmdir dir with
+      | _ -> ())
+    (fun () -> f db)
+;;
+
+(* Physical I/O of one statement: the write path has no [rows_examined], so page
+   reads are how its access pattern is observed (the #508 trick). *)
+let reads_during db sql =
+  let n = ref 0 in
+  Db.set_event_callback
+    db
+    (Some
+       (function
+         | Db.Event.Page_read _ | Db.Event.Wal_read _ -> incr n
+         | _ -> ()));
+  exec db sql;
+  Db.set_event_callback db None;
+  !n
 ;;
 
 (* Run [sql] with the DML seek counters installed. *)
@@ -98,24 +167,31 @@ let seed db ~n_w ~n_i =
 ;;
 
 (* ------------------------------------------------------------------ *)
-(* The memory bound                                                     *)
+(* Candidate handling: what the seek walks, buffers, and reads          *)
 (* ------------------------------------------------------------------ *)
 
-(* RED before the fix: the seek buffered all 3000 candidates before fetching
-   any, so [dss_peak_buffered] was 3000 rather than 1. *)
+(* Enough matches that a per-row regression is unmistakable in the counters. *)
 let many = 3000
 
 (* A large-but-not-round row count for the correctness cases below, chosen well
    above any plausible internal batch so a batching regression shows up. *)
 let large = 1224
 
-let delete_streams_candidates () =
-  with_db (fun db ->
+(* Every index entry in the prefix is walked, every one of them is read, and
+   none is read before the walk finishes — [dss_peak_buffered = many] is the
+   sort-then-fetch shape.  It dropping to 1 would mean the drain had gone back
+   to fetching in index-key order; see
+   [prefix_delete_reads_each_table_page_about_once] for what that costs. *)
+let delete_seek_buffers_then_fetches ~open_db () =
+  open_db (fun db ->
     seed db ~n_w:2 ~n_i:many;
     let st = exec_stats db "DELETE FROM t WHERE w = 1" in
     Alcotest.(check int) "candidates walked" many st.Exec.dss_candidates;
     Alcotest.(check int) "rows fetched" many st.Exec.dss_fetched;
-    Alcotest.(check int) "peak candidate backlog" 1 st.Exec.dss_peak_buffered;
+    Alcotest.(check int)
+      "all candidates buffered before any fetch"
+      many
+      st.Exec.dss_peak_buffered;
     Alcotest.(check int)
       "deleted all of w = 1"
       0
@@ -126,12 +202,15 @@ let delete_streams_candidates () =
       (one_int db "SELECT COUNT(*) FROM t WHERE w = 2"))
 ;;
 
-let update_streams_candidates () =
-  with_db (fun db ->
+let update_seek_buffers_then_fetches ~open_db () =
+  open_db (fun db ->
     seed db ~n_w:2 ~n_i:many;
     let st = exec_stats db "UPDATE t SET v = 0 WHERE w = 2" in
     Alcotest.(check int) "candidates walked" many st.Exec.dss_candidates;
-    Alcotest.(check int) "peak candidate backlog" 1 st.Exec.dss_peak_buffered;
+    Alcotest.(check int)
+      "all candidates buffered before any fetch"
+      many
+      st.Exec.dss_peak_buffered;
     Alcotest.(check int)
       "all of w = 2 updated"
       many
@@ -154,14 +233,29 @@ let single_row_match_buffers_one () =
     Alcotest.(check int) "99 rows left" 99 (one_int db "SELECT COUNT(*) FROM t"))
 ;;
 
-let zero_row_match_buffers_none () =
-  with_db (fun db ->
-    seed db ~n_w:2 ~n_i:50;
-    let st = exec_stats db "DELETE FROM t WHERE w = 1 AND i = 999" in
+(* A seek that matches nothing walks nothing.  Zeroed counters alone would not
+   say that — a statement the planner sent to the scan branch reports 0/0/0 too
+   — so this runs on disk and pins the access path physically: the no-match
+   seek must touch far fewer pages than the same statement spelled so the
+   planner cannot use the index. *)
+let zero_row_match_walks_nothing () =
+  with_file_db (fun db ->
+    seed db ~n_w:2 ~n_i:2000;
+    let st = exec_stats db "DELETE FROM t WHERE w = 1 AND i = 99999" in
     Alcotest.(check int) "no candidates" 0 st.Exec.dss_candidates;
     Alcotest.(check int) "no fetches" 0 st.Exec.dss_fetched;
     Alcotest.(check int) "nothing buffered" 0 st.Exec.dss_peak_buffered;
-    Alcotest.(check int) "100 rows left" 100 (one_int db "SELECT COUNT(*) FROM t");
+    Alcotest.(check int) "4000 rows left" 4000 (one_int db "SELECT COUNT(*) FROM t");
+    let seek_reads = reads_during db "DELETE FROM t WHERE w = 1 AND i = 99998" in
+    let scan_reads = reads_during db "DELETE FROM t WHERE w + 0 = 1 AND i + 0 = 99998" in
+    Alcotest.(check bool)
+      (Printf.sprintf "foil really scans (got %d reads)" scan_reads)
+      true
+      (scan_reads > 50);
+    Alcotest.(check bool)
+      (Printf.sprintf "seek beats the scan (%d vs %d reads)" seek_reads scan_reads)
+      true
+      (seek_reads * 4 < scan_reads);
     (* Same for a prefix that matches no index entry at all. *)
     let st = exec_stats db "UPDATE t SET v = 1 WHERE w = 77" in
     Alcotest.(check int) "no candidates" 0 st.Exec.dss_candidates;
@@ -169,6 +263,103 @@ let zero_row_match_buffers_none () =
       "nothing updated"
       0
       (one_int db "SELECT COUNT(*) FROM t WHERE v = 1"))
+;;
+
+(* ------------------------------------------------------------------ *)
+(* Why the candidates are sorted before any row is read                 *)
+(* ------------------------------------------------------------------ *)
+
+(* [i] is a pseudo-random permutation rather than a descending run: reverse
+   order is still sequential against the table tree and hides the effect
+   entirely.  [7919] is coprime to [n], so [j -> j * 7919 mod n] is a
+   permutation of [0, n).  Rows go in batched — the layout is identical to
+   one-INSERT-per-row (rowid order is insertion order), but seeding 60 000 rows
+   takes ~4s instead of minutes. *)
+let seed_scrambled db ~n_w ~n =
+  exec db "CREATE TABLE t (w INTEGER, i INTEGER, v INTEGER, PRIMARY KEY (w, i))";
+  exec db "BEGIN";
+  let buf = Buffer.create 8192 in
+  for w = 1 to n_w do
+    let j = ref 0 in
+    while !j < n do
+      Buffer.clear buf;
+      Buffer.add_string buf "INSERT INTO t VALUES ";
+      let stop = min n (!j + 200) in
+      let first = ref true in
+      while !j < stop do
+        let i = (!j * 7919 mod n) + 1 in
+        if not !first then Buffer.add_char buf ',';
+        first := false;
+        Buffer.add_string buf (Printf.sprintf "(%d,%d,%d)" w i ((w * 100000) + i));
+        incr j
+      done;
+      exec db (Buffer.contents buf)
+    done
+  done;
+  exec db "COMMIT"
+;;
+
+(* The measurement that decides the drain's design (#514 review).
+
+   A wide prefix DELETE on disk, over a table far larger than the page cache,
+   with index-key order scrambled against rowid order.  The drain sorts its
+   candidates into rowid order before reading any row, so the table tree is
+   walked ascending and each leaf is read about once.  Reading them in the order
+   the index walk produces them instead is random access against the table, and
+   the pager cache is a bounded FIFO, so it costs about a page read per row.
+
+   Measured both ways on this exact workload (20 000 matching rows, 64-page
+   cache): 957 reads sorted against 21 685 unsorted, a 22.7x amplification.  The
+   bound below sits an order of magnitude above the first and well below the
+   second.
+
+   Two things about the shape are load-bearing and easy to get wrong: the
+   scramble (a descending [i] is still sequential, and measures ~1 000 reads
+   whichever way the drain fetches), and the size.  At 6 000 rows per prefix
+   both orders measure the same — the pages the DELETE dirties are pinned in
+   cache and the working set never turns over — so a smaller, faster version of
+   this test would pass against a drain that had regressed completely.
+
+   The [+ 0] foil calibrates: the same DELETE spelled so the planner cannot
+   seek, showing the measurement is live rather than served from cache. *)
+let prefix_delete_reads_each_table_page_about_once () =
+  let n = 20_000 in
+  with_file_db ~page_cache:64 (fun db ->
+    seed_scrambled db ~n_w:3 ~n;
+    let st = Exec.make_dml_seek_stats () in
+    let seek_reads = ref 0 in
+    Db.set_event_callback
+      db
+      (Some
+         (function
+           | Db.Event.Page_read _ | Db.Event.Wal_read _ -> incr seek_reads
+           | _ -> ()));
+    (match
+       run
+         (Exec.with_dml_seek_stats st (fun () ->
+            Db.execute db "DELETE FROM t WHERE w = 1"))
+     with
+     | Ok () -> ()
+     | Error e -> Alcotest.failf "seeked DELETE: %a" Db.pp_error e);
+    Db.set_event_callback db None;
+    Alcotest.(check int) "the whole prefix was walked" n st.Exec.dss_candidates;
+    Alcotest.(check int) "every candidate row was read" n st.Exec.dss_fetched;
+    Alcotest.(check int)
+      "and the prefix is gone"
+      (2 * n)
+      (one_int db "SELECT COUNT(*) FROM t");
+    let foil_reads = reads_during db "DELETE FROM t WHERE w + 0 = 2" in
+    Alcotest.(check bool)
+      (Printf.sprintf "measurement is live (foil read %d pages)" foil_reads)
+      true
+      (foil_reads > 100);
+    Alcotest.(check bool)
+      (Printf.sprintf
+         "rowid-ordered fetch reads ~a page per leaf, not per row (%d reads for %d rows)"
+         !seek_reads
+         n)
+      true
+      (!seek_reads < 4000))
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -184,8 +375,8 @@ let zero_row_match_buffers_none () =
    prefix range and strictly after the old one — precisely the shape that
    revisits a row.  Each row must be updated exactly once, so the final [i]
    values are the originals plus the offset, with no doubles. *)
-let update_seeked_column_visits_each_row_once () =
-  with_db (fun db ->
+let update_seeked_column_visits_each_row_once ~open_db () =
+  open_db (fun db ->
     let n = 40 in
     seed db ~n_w:2 ~n_i:n;
     exec db (Printf.sprintf "UPDATE t SET i = i + %d WHERE w = 1" n);
@@ -377,29 +568,43 @@ let prop_seeked_update_matches_foil =
 let () =
   Alcotest.run
     "bounded_drain_514"
-    [ ( "memory bound"
+    [ ( "candidate handling"
       , [ Alcotest.test_case
-            "DELETE streams its candidates"
+            "DELETE buffers its candidates, then fetches"
             `Quick
-            delete_streams_candidates
+            (delete_seek_buffers_then_fetches ~open_db:with_db)
         ; Alcotest.test_case
-            "UPDATE streams its candidates"
+            "UPDATE buffers its candidates, then fetches"
             `Quick
-            update_streams_candidates
+            (update_seek_buffers_then_fetches ~open_db:with_db)
+        ; Alcotest.test_case
+            "DELETE buffers its candidates, then fetches (file-backed)"
+            `Quick
+            (delete_seek_buffers_then_fetches ~open_db:(fun f -> with_file_db f))
         ; Alcotest.test_case
             "single-row match buffers one"
             `Quick
             single_row_match_buffers_one
         ; Alcotest.test_case
-            "zero-row match buffers none"
+            "zero-row match walks nothing"
             `Quick
-            zero_row_match_buffers_none
+            zero_row_match_walks_nothing
+        ] )
+    ; ( "drain order"
+      , [ Alcotest.test_case
+            "a prefix DELETE reads each table page about once"
+            `Quick
+            prefix_delete_reads_each_table_page_about_once
         ] )
     ; ( "mutation during iteration"
       , [ Alcotest.test_case
             "UPDATE of the seeked column visits each row once"
             `Quick
-            update_seeked_column_visits_each_row_once
+            (update_seeked_column_visits_each_row_once ~open_db:with_db)
+        ; Alcotest.test_case
+            "UPDATE of the seeked column visits each row once (file-backed)"
+            `Quick
+            (update_seeked_column_visits_each_row_once ~open_db:(fun f -> with_file_db f))
         ; Alcotest.test_case
             "UPDATE moving the seeked column backwards"
             `Quick

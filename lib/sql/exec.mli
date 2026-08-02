@@ -193,9 +193,20 @@ val dirty_changes : dirty_tables_acc -> (string * row_change list) list
     rowids.  [dss_candidates] is how many index entries the seek accepted and
     [dss_fetched] how many of those rowids were looked up in the table tree;
     [dss_peak_buffered] is the high-water mark of the difference — candidates
-    walked but not yet fetched.  That backlog is the memory #514 is about: it
-    stays at 1 while the drain streams, and would equal the whole match count if
-    the drain ever went back to materialising every candidate first. *)
+    walked but not yet fetched.
+
+    That backlog is a {e shape} assertion, not a memory bound.  It equals the
+    match count by design: the drain sorts every candidate into rowid order
+    before fetching any row, because fetching them in index-key order costs up
+    to a page read per row on a table larger than the pager cache.  A drop to 1
+    therefore signals a fetch-as-you-walk regression, not an improvement.  The
+    statement's peak memory is dominated by the match list (a decoded row each),
+    which is O(affected rows) by design and not what these counters measure.
+
+    All three are cumulative over the enclosing {!with_dml_seek_stats} scope,
+    not per statement: an FK [CASCADE] delete or a trigger firing nested DML
+    re-enters the drain and adds to the same record, so the counts are a sum
+    across every seeked drain in the scope, over any number of tables. *)
 type dml_seek_stats =
   { mutable dss_candidates : int
   ; mutable dss_fetched : int
