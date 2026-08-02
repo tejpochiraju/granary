@@ -129,18 +129,25 @@ jobs:
           # module, so the engine takes on no real-SQLite dependency.  The
           # `Sqlite3.` guard below still applies to these files.
           #
-          # test/bench_tpch.ml (#482) is a designated comparison file in the
-          # same sense as bench_compare.ml: it is the TPC-H answer cross-check
-          # against reference C SQLite, and it is `(optional)` in test/dune, so
-          # a checkout without sqlite3 does not build it and the engine takes on
-          # no real-SQLite dependency.  It was added by #501 without being
-          # allowlisted here, which left this job failing on main (#505).
+          # test/bench_tpch.ml (#482) and test/bench_tpcc.ml (#500) are
+          # designated comparison files in the same sense as bench_compare.ml:
+          # each is the reference-C-SQLite cross-check for its TPC-derived
+          # harness — answers for TPC-H, transaction throughput for TPC-C — and
+          # each is `(optional)` in test/dune, so a checkout without sqlite3
+          # does not build it and the engine takes on no real-SQLite
+          # dependency.  BOTH greps below must allowlist a file like these:
+          # they use the `"sqlite3 ..."` error-string form AND the `Sqlite3.`
+          # module.  bench_tpch.ml was added by #501 without being allowlisted,
+          # which left this job failing on main (#505); bench_tpcc.ml repeated
+          # it verbatim in #500.  Adding a comparison file means adding it in
+          # four places here (two greps x two workflow files).
           violations=$(grep -rnE '"sqlite3[ "]' lib/ bin/ containers/ test/ \
             --include='*.ml' 2>/dev/null \
             | grep -v 'test/bench_compare.ml' \
             | grep -v 'test/test_sqlite_compare.ml' \
             | grep -v 'test/bench_perf_compare_sqlite3.ml' \
             | grep -v 'test/bench_tpch.ml' \
+            | grep -v 'test/bench_tpcc.ml' \
             | grep -v 'bin/repl/granary_repl.ml' \
             | grep -v 'test/test_sqlite_import_91.ml' \
             || true)
@@ -153,6 +160,7 @@ jobs:
             --include='*.ml' 2>/dev/null \
             | grep -v 'test/bench_compare.ml' \
             | grep -v 'test/bench_tpch.ml' \
+            | grep -v 'test/bench_tpcc.ml' \
             || true)
           if [ -n "$violations" ]; then
             echo "FAIL: Sqlite3 module used outside the gated comparison benchmarks:"
