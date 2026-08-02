@@ -2732,35 +2732,264 @@ let rekey_table_columns tx ~old_name ~new_name ~n_cols =
   loop 0
 ;;
 
-(* [~txn] (#282): [Some] when the surrounding rename is borrowing an ambient
-   explicit transaction; the entry is committed (and the cache undo registered)
-   only on the borrowed path, otherwise the autocommit caller commits its own
-   writer txn.  The sys_indexes scan runs THROUGH [tx] (read-your-own-writes) so
-   an index created earlier in the same transaction is remapped too, not just
-   pre-txn indexes. *)
-let finish_rename t tx ~txn ~old_name ~new_name ~meta =
-  (* Re-write sys_indexes entries that reference old_name, reading through the
-     active txn so uncommitted in-txn index entries are also caught. *)
+(* ------------------------------------------------------------------ *)
+(* #553: remapping the stored references to a renamed column/table      *)
+(* ------------------------------------------------------------------ *)
+
+(* Every sys_indexes entry naming [table], as (storage key, decoded info).
+
+   The scan runs THROUGH [tx] (read-your-own-writes) so an index created earlier
+   in the same transaction is seen too, not just pre-txn indexes. *)
+let indexes_of_table_tx tx ~table =
   let%lwt cur = S.cursor_open tx sys_indexes_tid in
   let _sr = S.cursor_first cur in
-  let idx_updates = ref [] in
-  let rec scan_idxs () =
+  let acc = ref [] in
+  let rec scan () =
     match S.cursor_next cur with
     | None -> ()
     | Some (k, v) ->
       let info = decode_index_value v in
-      if String.equal info.idx_table old_name
-      then idx_updates := (k, info) :: !idx_updates;
-      scan_idxs ()
+      if String.equal info.idx_table table then acc := (k, info) :: !acc;
+      scan ()
   in
-  scan_idxs ();
+  scan ();
   S.cursor_close cur;
+  Lwt.return (List.rev !acc)
+;;
+
+let is_ident_start c =
+  (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c = '_' || Char.code c >= 128
+;;
+
+let is_ident_char c = is_ident_start c || (c >= '0' && c <= '9') || c = '$'
+
+(* Copy the string literal starting at [i] (which is its opening quote) into
+   [buf] verbatim, doubled quotes included; returns the index just past it. *)
+let copy_sql_string sql buf i =
+  let n = String.length sql in
+  let q = sql.[i] in
+  Buffer.add_char buf q;
+  let rec go k =
+    if k >= n
+    then k
+    else if sql.[k] <> q
+    then (
+      Buffer.add_char buf sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = q
+    then (
+      Buffer.add_char buf q;
+      Buffer.add_char buf q;
+      go (k + 2))
+    else (
+      Buffer.add_char buf q;
+      k + 1)
+  in
+  go (i + 1)
+;;
+
+(* A delimited identifier ("x" or `x`) starting at [i]: renamed when its body
+   matches, re-emitted with the same delimiter either way. *)
+let copy_quoted_ident sql buf i ~old_name ~new_name =
+  let n = String.length sql in
+  let q = sql.[i] in
+  let body = Buffer.create 16 in
+  let rec go k =
+    if k >= n
+    then None
+    else if sql.[k] <> q
+    then (
+      Buffer.add_char body sql.[k];
+      go (k + 1))
+    else if k + 1 < n && sql.[k + 1] = q
+    then (
+      Buffer.add_char body q;
+      go (k + 2))
+    else Some (k + 1)
+  in
+  match go (i + 1) with
+  | None ->
+    (* Unterminated — not something we can safely reinterpret; copy verbatim. *)
+    Buffer.add_char buf q;
+    i + 1
+  | Some stop ->
+    let text = Buffer.contents body in
+    let text = if String.equal text old_name then new_name else text in
+    Buffer.add_char buf q;
+    String.iter
+      (fun c ->
+         if c = q then Buffer.add_char buf q;
+         Buffer.add_char buf c)
+      text;
+    Buffer.add_char buf q;
+    stop
+;;
+
+(* A bare word starting at [i].  It is a column reference — and so renameable —
+   unless the character that follows says otherwise: '(' makes it a function
+   name, '\'' makes it a literal prefix ([x'6a'] is a BLOB, not a column), and
+   '.' makes it a qualifier (a table, not a column). *)
+let copy_bare_ident sql buf i ~old_name ~new_name =
+  let n = String.length sql in
+  let rec stop k = if k < n && is_ident_char sql.[k] then stop (k + 1) else k in
+  let j = stop i in
+  let word = String.sub sql i (j - i) in
+  let is_column_ref =
+    j >= n
+    ||
+    match sql.[j] with
+    | '(' | '\'' | '.' -> false
+    | _ -> true
+  in
+  Buffer.add_string
+    buf
+    (if is_column_ref && String.equal word old_name then new_name else word);
+  j
+;;
+
+(* #553: rename every reference to the identifier [old_name] inside stored SQL
+   text — a CHECK or GENERATED expression, a partial index's WHERE clause, an
+   expression index's column SQL.
+
+   Lexical rather than parse-and-reprint, for two reasons.  The catalog sits
+   BELOW the parser in the dependency graph ([granary.sql] depends on
+   [granary.catalog], not the reverse), so no AST is reachable from here; and a
+   reprint would rewrite text the user wrote and we have no business touching —
+   [Ast.expr_to_sql] raises outright on a BLOB literal.  A token scan preserves
+   every byte it does not rename.
+
+   Matching is case-sensitive, as every other column lookup in this module is
+   ([rename_column], [drop_column] and [clear_pk_flags] all use [String.equal]). *)
+let rewrite_ident_in_sql ~old_name ~new_name sql =
+  if String.equal old_name new_name
+  then sql
+  else (
+    let n = String.length sql in
+    let buf = Buffer.create (n + 16) in
+    let rec go i =
+      if i >= n
+      then ()
+      else (
+        let c = sql.[i] in
+        if c = '\''
+        then go (copy_sql_string sql buf i)
+        else if c = '"' || c = '`'
+        then go (copy_quoted_ident sql buf i ~old_name ~new_name)
+        else if is_ident_start c
+        then go (copy_bare_ident sql buf i ~old_name ~new_name)
+        else (
+          Buffer.add_char buf c;
+          go (i + 1)))
+    in
+    go 0;
+    Buffer.contents buf)
+;;
+
+(* An index with [old_col] renamed to [new_col]: a plain column matches by name,
+   an expression column and the partial WHERE by the lexical rewrite above. *)
+let rename_col_in_index ~old_col ~new_col (info : index_info) =
+  let rw = rewrite_ident_in_sql ~old_name:old_col ~new_name:new_col in
+  let cols =
+    List.map2
+      (fun col is_expr ->
+         if is_expr then rw col else if String.equal col old_col then new_col else col)
+      info.idx_columns
+      info.idx_expr_flags
+  in
+  { info with idx_columns = cols; idx_where_sql = Option.map rw info.idx_where_sql }
+;;
+
+(* A stored column record with [old_col] renamed: its own name, plus any CHECK
+   or GENERATED expression — which may name ANY column of the table, so this
+   runs over every column, not only the renamed one. *)
+let rename_col_in_column ~old_col ~new_col (c : Row.column) =
+  let rw = rewrite_ident_in_sql ~old_name:old_col ~new_name:new_col in
+  { c with
+    Row.name = (if String.equal c.Row.name old_col then new_col else c.Row.name)
+  ; check_sql = Option.map rw c.Row.check_sql
+  ; generated_as = Option.map (fun (e, stored) -> rw e, stored) c.Row.generated_as
+  }
+;;
+
+(* A foreign key with [old_col] renamed on [table]: the local side when the FK
+   belongs to [table], the parent side when it points AT [table] (which includes
+   a self-reference, where both sides move). *)
+let rename_col_in_fk ~owner ~table ~old_col ~new_col (fk : fk_constraint) =
+  let sub cols = List.map (fun c -> if String.equal c old_col then new_col else c) cols in
+  { fk with
+    fk_local_cols =
+      (if String.equal owner table then sub fk.fk_local_cols else fk.fk_local_cols)
+  ; fk_parent_cols =
+      (if String.equal fk.fk_parent_table table
+       then sub fk.fk_parent_cols
+       else fk.fk_parent_cols)
+  }
+;;
+
+(* Write [fks] to the primary FK record for [table] inside [tx].  Mirrors
+   [save_fk_constraints]'s storage decision (delete when empty) without its
+   mirror write, which the callers here fold into their own [put_mirror_tx]. *)
+let put_fks_tx tx ~table ~fks =
+  let key = fk_meta_key table in
+  if fks = []
+  then S.del tx sys_meta_tid key
+  else S.put tx sys_meta_tid key (encode_fks fks)
+;;
+
+(* Every table whose FK constraints mention [table] as a PARENT, excluding
+   [table] itself (its own record is rewritten by the caller in one piece). *)
+let child_tables_of t ~table =
+  Schema_cache.fold_tables
+    (fun name (m : table_meta) acc ->
+       if String.equal name table
+       then acc
+       else if
+         List.exists (fun fk -> String.equal fk.fk_parent_table table) m.fk_constraints
+       then m :: acc
+       else acc)
+    t.sc
+    []
+;;
+
+(* [~txn] (#282): [Some] when the surrounding rename is borrowing an ambient
+   explicit transaction; the entry is committed (and the cache undo registered)
+   only on the borrowed path, otherwise the autocommit caller commits its own
+   writer txn. *)
+let finish_rename t tx ~txn ~old_name ~new_name ~meta =
+  (* Re-write sys_indexes entries that reference old_name. *)
+  let%lwt idx_updates = indexes_of_table_tx tx ~table:old_name in
   let%lwt () =
     Lwt_list.iter_s
       (fun (k, (info : index_info)) ->
          let new_info = { info with idx_table = new_name } in
          S.put tx sys_indexes_tid k (encode_index_value new_info))
-      !idx_updates
+      idx_updates
+  in
+  (* #553: the primary FK record is keyed by the table name, so it has to move
+     with it — otherwise the constraints load as absent on the next open and the
+     renamed table silently stops enforcing them.  Children pointing AT the old
+     name are re-pointed in the same txn. *)
+  let%lwt () = put_fks_tx tx ~table:old_name ~fks:[] in
+  let%lwt () = put_fks_tx tx ~table:new_name ~fks:meta.fk_constraints in
+  let children = child_tables_of t ~table:old_name in
+  let repoint (m : table_meta) =
+    { m with
+      fk_constraints =
+        List.map
+          (fun fk ->
+             if String.equal fk.fk_parent_table old_name
+             then { fk with fk_parent_table = new_name }
+             else fk)
+          m.fk_constraints
+    }
+  in
+  let children = List.map repoint children in
+  let%lwt () =
+    Lwt_list.iter_s
+      (fun (m : table_meta) ->
+         let%lwt () = put_fks_tx tx ~table:m.name ~fks:m.fk_constraints in
+         put_mirror_tx tx m)
+      children
   in
   (* Refresh the mirror entry (keyed by the unchanged tree_id) with the new
      name; the schema shape — hence the fingerprint — is unchanged. *)
@@ -2786,14 +3015,20 @@ let finish_rename t tx ~txn ~old_name ~new_name ~meta =
      Schema_cache.put_table t.sc ~name:new_name { meta with name = new_name };
      List.iter
        (fun (k, v) -> Schema_cache.put_index t.sc ~name:k { v with idx_table = new_name })
-       to_update
+       to_update;
+     List.iter
+       (fun (m : table_meta) -> Schema_cache.put_table t.sc ~name:m.name m)
+       children
    | None ->
      Schema_cache.remove_table_durable t.sc ~name:old_name;
      Schema_cache.put_table_durable t.sc ~name:new_name { meta with name = new_name };
      List.iter
        (fun (k, v) ->
           Schema_cache.put_index_durable t.sc ~name:k { v with idx_table = new_name })
-       to_update);
+       to_update;
+     List.iter
+       (fun (m : table_meta) -> Schema_cache.put_table_durable t.sc ~name:m.name m)
+       children);
   Lwt.return (Ok ())
 ;;
 
@@ -2831,11 +3066,87 @@ let rename_table ?txn t ~old_name ~new_name =
            Lwt.return (Error msg)))
 ;;
 
+(* Rewrite every _sys_columns record of [table_name] that the rename touches:
+   the renamed column's own name, plus any CHECK or GENERATED expression naming
+   it — those live on whichever column DECLARED them, not on the one they
+   reference, so all of them are examined.
+
+   Records that come out byte-identical are left alone rather than re-written.
+   That is not just an optimisation: a legacy record decodes into defaults its
+   stored bytes never carried (#533), so re-encoding an untouched column would
+   silently upgrade the on-disk encoding of a file an older build still reads. *)
+let rewrite_columns_tx tx ~table_name ~columns ~old_col ~new_col =
+  Lwt_list.iteri_s
+    (fun j _ ->
+       let k = column_key table_name j in
+       match%lwt S.get tx sys_columns_tid k with
+       | None -> Lwt.return_unit
+       | Some b ->
+         let c = decode_column b in
+         let c' = rename_col_in_column ~old_col ~new_col c in
+         if c' = c then Lwt.return_unit else S.put tx sys_columns_tid k (encode_column c'))
+    columns
+;;
+
+(* Foreign keys of OTHER tables that point at [table_name].[old_col]; only those
+   that actually change are returned, each already rewritten. *)
+let rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col =
+  let children =
+    List.filter_map
+      (fun (m : table_meta) ->
+         let fks =
+           List.map
+             (rename_col_in_fk ~owner:m.name ~table:table_name ~old_col ~new_col)
+             m.fk_constraints
+         in
+         if fks = m.fk_constraints then None else Some { m with fk_constraints = fks })
+      (child_tables_of t ~table:table_name)
+  in
+  let%lwt () =
+    Lwt_list.iter_s
+      (fun (m : table_meta) ->
+         let%lwt () = put_fks_tx tx ~table:m.name ~fks:m.fk_constraints in
+         put_mirror_tx tx m)
+      children
+  in
+  Lwt.return children
+;;
+
+(* Indexes of [table_name] that name [old_col], each already rewritten and
+   written back through [tx]. *)
+let rewrite_indexes_tx tx ~table_name ~old_col ~new_col =
+  let%lwt idxs = indexes_of_table_tx tx ~table:table_name in
+  let changed =
+    List.filter_map
+      (fun (k, info) ->
+         let info' = rename_col_in_index ~old_col ~new_col info in
+         if info' = info then None else Some (k, info'))
+      idxs
+  in
+  let%lwt () =
+    Lwt_list.iter_s
+      (fun (k, info) -> S.put tx sys_indexes_tid k (encode_index_value info))
+      changed
+  in
+  Lwt.return (List.map snd changed)
+;;
+
 (* [?txn] (#282): mirrors [add_column].  Renaming a column changes the schema
    fingerprint (it is computed over column names), so the undo restores both the
    prior [table_meta] and its tree-tag stamp.  The corrupt-catalog error path no
    longer rolls a borrowed txn back — it surfaces an Error and leaves teardown to
-   the caller. *)
+   the caller.
+
+   #553: a column name is recorded in five more places than its _sys_columns
+   record — an index's [idx_columns], a partial index's [idx_where_sql], a CHECK
+   expression, a GENERATED expression, and both sides of a FOREIGN KEY (this
+   table's [fk_local_cols], any other table's [fk_parent_cols]).  All of them are
+   remapped HERE, in the caller's transaction and under the same schema-cache
+   undo, so the rename is atomic in exactly the way the column rewrite already
+   was.  Leaving any of them behind leaves the catalog naming a column the table
+   does not have; for the implicit PRIMARY KEY index that is a dump which will
+   not restore, because since #533 the DDL renderer reads that index as the
+   record of the table's key. *)
 let rename_column ?txn t ~table_name ~old_col ~new_col =
   match Schema_cache.find_table t.sc table_name with
   | None -> Lwt.return (Error (Printf.sprintf "table not found: %s" table_name))
@@ -2845,33 +3156,52 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
      | Some i ->
        let col_k = column_key table_name i in
        let body tx =
-         let%lwt bytes_opt = S.get tx sys_columns_tid col_k in
-         match bytes_opt with
+         match%lwt S.get tx sys_columns_tid col_k with
          | None -> Lwt.return (Error "column entry missing from catalog")
-         | Some old_bytes ->
-           let old_col_rec = decode_column old_bytes in
-           let new_col_rec = { old_col_rec with Row.name = new_col } in
-           let%lwt () = S.put tx sys_columns_tid col_k (encode_column new_col_rec) in
-           let new_columns =
-             List.mapi
-               (fun j c -> if j = i then { c with Row.name = new_col } else c)
-               meta.columns
+         | Some _ ->
+           let%lwt () =
+             rewrite_columns_tx tx ~table_name ~columns:meta.columns ~old_col ~new_col
            in
-           let new_meta = { meta with columns = new_columns } in
+           let new_meta =
+             { meta with
+               columns = List.map (rename_col_in_column ~old_col ~new_col) meta.columns
+             ; fk_constraints =
+                 List.map
+                   (rename_col_in_fk
+                      ~owner:table_name
+                      ~table:table_name
+                      ~old_col
+                      ~new_col)
+                   meta.fk_constraints
+             }
+           in
+           let%lwt () =
+             if new_meta.fk_constraints = meta.fk_constraints
+             then Lwt.return_unit
+             else put_fks_tx tx ~table:table_name ~fks:new_meta.fk_constraints
+           in
            let%lwt () = put_mirror_tx tx new_meta in
-           Lwt.return (Ok new_meta)
+           let%lwt children = rewrite_child_fks_tx t tx ~table_name ~old_col ~new_col in
+           let%lwt indexes = rewrite_indexes_tx tx ~table_name ~old_col ~new_col in
+           Lwt.return (Ok (new_meta, indexes, children))
        in
-       let finalize new_meta =
-         match txn with
-         | Some _ -> Schema_cache.put_table t.sc ~name:table_name new_meta
-         | None -> Schema_cache.put_table_durable t.sc ~name:table_name new_meta
+       let finalize (new_meta, indexes, children) =
+         let put_table, put_index =
+           match txn with
+           | Some _ -> Schema_cache.put_table t.sc, Schema_cache.put_index t.sc
+           | None ->
+             Schema_cache.put_table_durable t.sc, Schema_cache.put_index_durable t.sc
+         in
+         put_table ~name:table_name new_meta;
+         List.iter (fun (idx : index_info) -> put_index ~name:idx.idx_name idx) indexes;
+         List.iter (fun (m : table_meta) -> put_table ~name:m.name m) children
        in
        (match txn with
         | Some tx ->
           (match%lwt body tx with
            | Error msg -> Lwt.return (Error msg)
-           | Ok new_meta ->
-             finalize new_meta;
+           | Ok result ->
+             finalize result;
              Lwt.return (Ok ()))
         | None ->
           let%lwt tx = S.rw_begin t.store in
@@ -2879,9 +3209,9 @@ let rename_column ?txn t ~table_name ~old_col ~new_col =
            | Error msg ->
              let%lwt () = S.rollback tx in
              Lwt.return (Error msg)
-           | Ok new_meta ->
+           | Ok result ->
              let%lwt () = S.commit tx in
-             finalize new_meta;
+             finalize result;
              Lwt.return (Ok ()))))
 ;;
 

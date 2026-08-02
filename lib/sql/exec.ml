@@ -7237,7 +7237,13 @@ let execute_alter_table store (cat : Cat.t) ~mode ~(table_meta : Cat.table_meta)
       in
       (match result with
        | Error msg -> Lwt.fail_with msg
-       | Ok () -> Lwt.return 0)
+       | Ok () ->
+         (* #553: the rename rewrites the CHECK / GENERATED expression SQL of
+            this table, and those caches are keyed by that SQL text — a stale
+            entry would keep a compiled expression resolved against the old
+            column list.  Same reasoning as [alter_drop_column]. *)
+         clear_table_expr_caches table_meta.Cat.name;
+         Lwt.return 0)
     | Ast.AA_drop_column col_name -> alter_drop_column tx cat ~table_meta col_name)
 ;;
 
