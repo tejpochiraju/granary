@@ -26,17 +26,20 @@ Worktrees live in `.worktrees/` which is gitignored. After the branch is created
 chmod 777 .worktrees/<short-name>
 ```
 
-**Never use `git stash` — `refs/stash` is shared across every worktree in the repo.** It is not per-worktree. Several agents routinely work in sibling worktrees at once, and a `stash push` in one followed by a `stash pop` in another hands the second agent the *first* one's changes and silently empties its tree. This happened on 2026-08-01 between the #527 and #514 agents: uncommitted `lib/sql/exec.ml` work crossed between worktrees in both directions, and both agents spent time on recovery instead of the task.
+**Never use `git stash`.** `refs/stash` is one repo-wide stack, not per-worktree, and several agents work in sibling worktrees at once — a `pop` in one worktree can apply another's changes and silently empty its tree (2026-08-01, #527 and #514).
 
-To measure before/after numbers, use any of these instead:
+To measure before/after numbers, use one of these instead:
 
 ```sh
-cp lib/sql/exec.ml /tmp/exec.ml.good     # then restore with cp
-git diff > /tmp/wip.patch                # then git checkout -- <files>, re-apply later
-git commit                               # a WIP checkpoint on your own branch, then git checkout HEAD~1 -- lib/
+cp lib/sql/exec.ml <scratchpad>/exec.ml.good  # restore with cp; use your session scratchpad
+git add -N .                                  # so new files are seen
+git diff HEAD > <scratchpad>/wip.patch        # staged + unstaged; git checkout -- . then git apply later
+git commit -m wip                             # WIP checkpoint on your own branch:
+                                              #   git checkout HEAD~1 -- lib/   (old code)
+                                              #   git checkout HEAD  -- lib/    (back to WIP)
 ```
 
-Commit early on your own branch regardless. An uncommitted tree is the only thing at risk.
+Plain `git diff` captures neither staged nor untracked changes — use `git diff HEAD` after `git add -N`. `git checkout HEAD~1 -- lib/` also will not delete files that exist only in the WIP commit; remove those by hand. Commit early on your own branch regardless: an uncommitted tree is the only thing at risk.
 
 ### Building and testing
 
@@ -171,8 +174,9 @@ EOF
 
 - Target 100% line coverage on every module.
 - Add QCheck property tests for every non-trivial function (see existing tests for patterns).
-- Tests that require real SQLite live in `test/test_sqlite_compare.ml` (~4k lines) and skip gracefully when `sqlite3` is not in `PATH` — its header comment has the exact `podman run` invocation that mounts the host `sqlite3` and its libs into the container. **There is no `test/compare_sqlite/` directory**; that path was in this file for a while and sent agents looking for a harness they concluded did not exist. The separate `GRANARY_TEST_SQLITE` env var gates only the slow TPC-C smoke run in `test/test_tpcc_smoke.ml`.
-- Granary is **inspired by** SQLite, not a port of it. When pinning a behaviour that differs from SQLite, record the divergence deliberately rather than assuming parity is the goal — e.g. every PRIMARY KEY column implies NOT NULL here, where SQLite enforces that only for `INTEGER PRIMARY KEY` (#530).
+- Tests that require real SQLite live in `test/test_sqlite_compare.ml`; they skip gracefully via `sqlite3_available ()` (`:18`) when `sqlite3` is not in `PATH`, and its header comment has the exact `podman run` invocation that mounts the host `sqlite3` and its libs into the container. **There is no `test/compare_sqlite/` directory** — that path was in this file for a while and sent agents looking for a harness they concluded did not exist.
+- Nothing in the tree reads `GRANARY_TEST_SQLITE`; it is a phantom invented by the same stale sentence. The SQLite comparison tests gate on `sqlite3` in `PATH`; the slow TPC-C smoke run gates on `GRANARY_TPCC_SMOKE` (`test/test_tpcc_smoke.ml:238`).
+- Granary is **inspired by** SQLite, not a port of it. When pinning a behaviour that differs from SQLite, record the divergence deliberately rather than assuming parity is the goal — e.g. the decided direction for #530 is that every PRIMARY KEY column implies NOT NULL (PR #533, not yet merged), where SQLite leaves PK columns nullable on *rowid* tables (its legacy behaviour; it does enforce PK NOT NULL on `WITHOUT ROWID` tables, which this engine also supports).
 
 ## Repository structure
 
