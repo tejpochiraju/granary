@@ -665,8 +665,11 @@ let seek_is_unique_point cat (meta : Cat.table_meta) ~idx_tree ~keys =
     [Op_sqlite_sequence], [Op_col_seq_scan] — all of which fall to the
     [unbounded_rows] arm.  That is the same answer {!table_rows_estimate} gives
     for a columnar table, and a pessimistic one for the three synthesized
-    shapes; it is inert either way, because {!best_probe} finds no index on any
-    of them, so the strategy lands on the hash join whatever [right_rows] says.
+    shapes; it is inert wherever {!best_probe} finds no index on them, since the
+    strategy then lands on the hash join whatever [right_rows] says.  A CTE that
+    shadows a real table is the exception: {!best_probe} reaches the catalog by
+    name and carries no [tree_id] guard of its own — it is unguarded here, #551
+    — so it can find the shadowed table's indexes.
 
     Every other op answers {!unbounded_rows} rather than adding an arm no test
     can reach: an [Op_aggregate] with no GROUP BY is exactly one row and an

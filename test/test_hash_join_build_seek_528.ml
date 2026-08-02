@@ -250,6 +250,10 @@ let general_on_predicate_build_side_seeks () =
     let seek = "SELECT qty FROM line INNER JOIN stock ON si > i_id WHERE sw = 1" in
     let foil = "SELECT qty FROM line INNER JOIN stock ON si > i_id WHERE sw + 0 = 1" in
     same_rows db ~label:"cartesian build side agrees with its scan" ~seek ~foil;
+    Alcotest.(check bool)
+      "and the agreement is not between two empty lists"
+      true
+      (rows_of db seek <> []);
     (* Bound once: these are cartesian products, and the Alcotest label must not
        cost a second execution of each. *)
     let n_seek = examined db seek
@@ -263,12 +267,26 @@ let general_on_predicate_build_side_seeks () =
 (* The general-ON path crossed with LEFT — the combination this PR newly widened,
    and the one place the argument needs two filters rather than one.
 
-   The cartesian hash join null-extends unmatched left rows, then
-   [Op_filter (plan_expr bj.on)] runs ABOVE it (planner.ml), so an ON predicate
-   that is true of a null-extended row — [si IS NULL] — would emit rows that the
-   narrowing makes strictly more numerous. What kills them is the SECOND filter:
-   [chain_joins] wraps the whole chain in the WHERE clause, whose [sw = 1] is
-   NULL on a null-extended row. Both spellings must agree with their foils. *)
+   [Op_filter (plan_expr bj.on)] runs ABOVE the cartesian join (planner.ml), so
+   an ON predicate that is true of a null-extended row — [si IS NULL] — would
+   emit rows the narrowing could make strictly more numerous. Two things stop
+   that. The first is [chain_joins], which wraps the whole chain in the WHERE
+   clause, whose [sw = 1] is NULL on a null-extended row. The second is the
+   executor itself, and it is a bug: the cartesian arm of [stream_hash_join]
+   (exec.ml) sets [any := true] for EVERY right row, so it null-extends only
+   when the build side is entirely empty — never for an individual unmatched
+   left row. So [si IS NULL] currently returns nothing at all, from either
+   spelling: that half of this case is a [] = [] comparison, pinned to #552, and
+   only its [examined seek < foil] assertion bites. It is kept because when #552
+   is fixed this is the case that will start producing rows, and the agreement
+   check is already sitting on it.
+
+   For the same reason the [o = 20] driving row is not a null-extension
+   candidate under either predicate — the cartesian join pairs it with every
+   stock row regardless — it only widens the set of rows the filters must
+   reject.
+
+   Both spellings must agree with their foils. *)
 let general_on_predicate_left_join_agrees () =
   with_db (fun db ->
     exec db "CREATE TABLE line (w INTEGER, o INTEGER, i_id INTEGER, PRIMARY KEY (w, o))";
@@ -277,8 +295,8 @@ let general_on_predicate_left_join_agrees () =
       "CREATE TABLE stock (sw INTEGER, si INTEGER, qty INTEGER, PRIMARY KEY (sw, si))";
     exec db "BEGIN";
     for o = 1 to 20 do
-      (* Row 20 matches nothing under either ON predicate, so the cartesian join
-         has a genuine null-extension candidate to offer the filters. *)
+      (* Row 20 matches nothing under either ON predicate, so the ON filter has
+         a driving row whose every cartesian pairing it must reject. *)
       let i_id = if o = 20 then 90_000 else o mod 10 in
       exec db (Printf.sprintf "INSERT INTO line VALUES (1, %d, %d)" o i_id)
     done;
@@ -294,7 +312,7 @@ let general_on_predicate_left_join_agrees () =
       Printf.sprintf "SELECT o, qty FROM line LEFT JOIN stock ON %s WHERE %s" on pred
     in
     List.iter
-      (fun on ->
+      (fun (on, nonempty) ->
          let seek = q on "sw = 1"
          and foil = q on "sw + 0 = 1" in
          same_rows
@@ -302,6 +320,13 @@ let general_on_predicate_left_join_agrees () =
            ~label:(Printf.sprintf "LEFT + general ON %S agrees with its scan" on)
            ~seek
            ~foil;
+         (* Non-vacuity, stated per case: [si IS NULL] is the one that yields
+            nothing today, and it does so because of #552 rather than because
+            the narrowing swallowed rows. *)
+         Alcotest.(check bool)
+           (Printf.sprintf "ON %S: rows are%s empty" on (if nonempty then " not" else ""))
+           nonempty
+           (rows_of db seek <> []);
          let n_seek = examined db seek
          and n_foil = examined db foil in
          Alcotest.(check bool)
@@ -310,8 +335,8 @@ let general_on_predicate_left_join_agrees () =
            (n_seek < n_foil))
       (* [si > i_id] is the ordinary general ON; [si IS NULL] is the one that is
          true of a null-extended row, so it is the case the ON-filter alone
-         cannot handle. *)
-      [ "si > i_id"; "si IS NULL" ])
+         cannot handle — and the one #552 currently empties. *)
+      [ "si > i_id", true; "si IS NULL", false ])
 ;;
 
 (* ------------------------------------------------------------------ *)
@@ -414,12 +439,16 @@ let build_side_seeks_as_the_second_join_in_a_chain () =
 (* ------------------------------------------------------------------ *)
 
 (* #526 compares D seeks against D + R reads, with R the right table's size. Now
-   that the build side can seek, R is the size of the SEEKED SUBSET, and the
-   estimate has to say so or the comparison is against a table the plan never
-   reads.
+   that the build side can seek, R must not be costed at a table the plan never
+   reads — but the estimate only moves where the seek is PROVABLY A POINT.
+   [estimate_rows] answers [unbounded_rows] for an [Op_index_lookup] unless the
+   seek is a unique point or carries a range, and the build side passes no range
+   (#532), so every partial prefix pin still costs the whole table. There is no
+   selectivity estimation here.
 
-   Here the WHERE clause pins stock's whole primary key, so the build side reads
-   exactly one row. Costing R at the table's 20,000-row high-water mark makes
+   A full primary-key pin is that point case. Here the WHERE clause pins stock's
+   whole primary key, so the build side reads exactly one row and the estimate
+   says 1. Costing R at the table's 20,000-row high-water mark makes
    1,200 driving rows look cheap enough to probe (1200 <= 20000/8) — 1,200 B-tree
    seeks in place of one seek and 1,200 hash lookups. Costing it at the seek's
    actual reach picks the hash join. *)
@@ -497,11 +526,14 @@ let left_join_with_a_narrowing_constant () =
     let seek = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw = 1" in
     let foil = "SELECT o, qty FROM line LEFT JOIN stock ON si = i_id WHERE sw + 0 = 1" in
     same_rows db ~label:"narrowed LEFT JOIN build side agrees with its scan" ~seek ~foil;
+    (* Bound once each: the label must not cost a second execution. *)
+    let n_seek = examined db seek
+    and n_foil = examined db foil in
     (* Not vacuous: the narrowing really fired. *)
     Alcotest.(check bool)
-      (Printf.sprintf "examined %d < foil %d" (examined db seek) (examined db foil))
+      (Printf.sprintf "examined %d < foil %d" n_seek n_foil)
       true
-      (examined db seek < examined db foil);
+      (n_seek < n_foil);
     (* And it really did suppress matches: warehouse 2's 777 rows are gone. *)
     Alcotest.(check bool)
       "no warehouse-2 quantity survives"
