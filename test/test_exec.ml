@@ -2929,6 +2929,7 @@ let query_hash_join_inner () =
                ; right = Plan.Op_seq_scan { table_meta = om }
                ; left_key = 0
                ; right_key = 0
+               ; on_pred = None
                ; join_kind = `Inner
                ; right_col_offset = n_left
                ; n_right_cols = n_right
@@ -2990,6 +2991,7 @@ let query_hash_join_left () =
          ; right = Plan.Op_seq_scan { table_meta = om }
          ; left_key = 0
          ; right_key = 0
+         ; on_pred = None
          ; join_kind = `Left
          ; right_col_offset = n_left
          ; n_right_cols = n_right
@@ -3062,6 +3064,7 @@ let query_hash_join_cartesian () =
          ; right = Plan.Op_seq_scan { table_meta = om }
          ; left_key = -1
          ; right_key = -1
+         ; on_pred = None
          ; join_kind = `Inner
          ; right_col_offset = n_left
          ; n_right_cols = n_right
@@ -3124,6 +3127,7 @@ let query_hash_join_null_key_excluded () =
          ; right = Plan.Op_seq_scan { table_meta = rm }
          ; left_key = 0
          ; right_key = 0
+         ; on_pred = None
          ; join_kind = `Inner
          ; right_col_offset = n_left
          ; n_right_cols = n_right
@@ -3590,6 +3594,7 @@ let query_hash_join_raises_in_execute () =
                 ; right = Plan.Op_seq_scan { table_meta = m }
                 ; left_key = 0
                 ; right_key = 0
+                ; on_pred = None
                 ; join_kind = `Inner
                 ; right_col_offset = 2
                 ; n_right_cols = 2
