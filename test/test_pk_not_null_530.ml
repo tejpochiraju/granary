@@ -462,6 +462,149 @@ let alter_add_plain_column_still_works () =
 ;;
 
 (* ------------------------------------------------------------------ *)
+(* ALTER TABLE on a composite-PK member (#533 A/B)                      *)
+(* ------------------------------------------------------------------ *)
+
+(* Replay [script] into a fresh database and hand it back, failing loudly on the
+   first statement that does not apply.  Unlike [restore], the point here is
+   that the dump of a table whose key is no longer enforced must still restore
+   EVERY ROW — a dump that renders a constraint the live rows already violate
+   loses data, which is strictly worse than losing the constraint. *)
+let restore_all_rows script ~table ~expect_rows =
+  let dst = run (Db.open_in_memory ()) in
+  List.iteri
+    (fun i stmt ->
+       let s = String.trim stmt in
+       if s <> ""
+       then (
+         match run (Db.execute dst s) with
+         | Ok () -> ()
+         | Error e ->
+           Alcotest.failf
+             "restore statement %d (%S) failed: %a\nfull dump:\n%s"
+             i
+             s
+             Db.pp_error
+             e
+             script))
+    (String.split_on_char ';' script);
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Db.close dst) with
+      | _ -> ())
+    (fun () ->
+       Alcotest.(check int)
+         "all rows restored"
+         expect_rows
+         (count dst (Printf.sprintf "SELECT * FROM %s" table)))
+;;
+
+(* A. [DROP COLUMN] on a member of a composite PRIMARY KEY drops the backing
+   `Implicit_pk index, so the key stops being enforced — but the surviving
+   members kept [primary_key], which since #530 is what the DDL renderer reads.
+   The dump then claimed a key the live table does not enforce and its rows
+   already violate, and the restore failed on the second row. *)
+let drop_composite_pk_member_unmarks_the_survivors () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+    exec db "INSERT INTO c VALUES ('a', 'b', 1)";
+    exec db "ALTER TABLE c DROP COLUMN j";
+    (* The duplicate is accepted, because nothing enforces [k] any more. *)
+    exec db "INSERT INTO c VALUES ('a', 9)";
+    Alcotest.(check string)
+      "no PRIMARY KEY the table cannot enforce"
+      "CREATE TABLE c (k TEXT NOT NULL, v INTEGER)"
+      (ddl_of db "c");
+    Alcotest.(check (list (triple string string string)))
+      "pk flag cleared, not_null kept"
+      [ "k", "1", "0"; "v", "0", "0" ]
+      (table_info_flags db "c"))
+;;
+
+(* [not_null] is deliberately kept: the live table still rejects NULL in [k], so
+   the rendered NOT NULL is faithful.  Clearing it would drop a constraint the
+   engine is still enforcing. *)
+let drop_composite_pk_member_keeps_not_null_enforced () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+    exec db "ALTER TABLE c DROP COLUMN j";
+    rejects_null db ~col:"k" "INSERT INTO c VALUES (NULL, 1)")
+;;
+
+let drop_composite_pk_member_dump_restores_every_row () =
+  let src = run (Db.open_in_memory ()) in
+  exec src "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+  exec src "INSERT INTO c VALUES ('a', 'b', 1)";
+  exec src "ALTER TABLE c DROP COLUMN j";
+  exec src "INSERT INTO c VALUES ('a', 9)";
+  let script = dump_of src in
+  run (Db.close src);
+  restore_all_rows script ~table:"c" ~expect_rows:2
+;;
+
+(* An untouched composite key must be unaffected by the unmarking — only the
+   members of the index actually dropped lose the flag. *)
+let drop_plain_column_leaves_the_key_alone () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+    exec db "INSERT INTO c VALUES ('a', 'b', 1)";
+    exec db "ALTER TABLE c DROP COLUMN v";
+    Alcotest.(check string)
+      "key intact"
+      "CREATE TABLE c (k TEXT NOT NULL, j TEXT NOT NULL, PRIMARY KEY (k, j))"
+      (ddl_of db "c");
+    match run (Db.execute db "INSERT INTO c VALUES ('a', 'b')") with
+    | Error _ -> ()
+    | Ok () -> Alcotest.fail "surviving composite key stopped enforcing")
+;;
+
+(* B. [RENAME COLUMN] does not update [idx_columns], so the implicit PK index
+   outlives the name it was built on.  Trusting a stale index rendered
+   [PRIMARY KEY (k, j)] inside the CREATE TABLE for a table with no [j] — so the
+   TABLE failed to restore and took all its rows with it, where before only the
+   CREATE INDEX failed.  A stale key now falls back to emitting no key at all.
+
+   The underlying catalog corruption is #553; this pins the blast radius. *)
+let rename_composite_pk_member_still_renders_valid_ddl () =
+  with_db (fun db ->
+    exec db "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+    exec db "INSERT INTO c VALUES ('a', 'b', 1)";
+    exec db "ALTER TABLE c RENAME COLUMN j TO jj";
+    Alcotest.(check string)
+      "no key naming a column that does not exist, and no spurious inline key"
+      "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER)"
+      (ddl_of db "c"))
+;;
+
+let rename_composite_pk_member_dump_keeps_the_rows () =
+  let src = run (Db.open_in_memory ()) in
+  exec src "CREATE TABLE c (k TEXT, j TEXT, v INTEGER, PRIMARY KEY (k, j))";
+  exec src "INSERT INTO c VALUES ('a', 'b', 1)";
+  exec src "INSERT INTO c VALUES ('a', 'c', 2)";
+  exec src "ALTER TABLE c RENAME COLUMN j TO jj";
+  let script = dump_of src in
+  run (Db.close src);
+  (* The stale CREATE UNIQUE INDEX still fails — that is the pre-existing bug,
+     unchanged.  What must hold is that the table and both rows survive it. *)
+  let dst = run (Db.open_in_memory ()) in
+  List.iter
+    (fun stmt ->
+       let s = String.trim stmt in
+       if s <> "" then ignore (run (Db.execute dst s)))
+    (String.split_on_char ';' script);
+  Fun.protect
+    ~finally:(fun () ->
+      try run (Db.close dst) with
+      | _ -> ())
+    (fun () ->
+       Alcotest.(check int) "both rows restored" 2 (count dst "SELECT * FROM c");
+       Alcotest.(check string)
+         "table restored with the renamed column"
+         "CREATE TABLE c (k TEXT NOT NULL, jj TEXT NOT NULL, v INTEGER)"
+         (ddl_of dst "c"))
+;;
+
+(* ------------------------------------------------------------------ *)
 (* Pre-existing databases (#533 / #542)                                 *)
 (* ------------------------------------------------------------------ *)
 
@@ -780,6 +923,32 @@ let () =
             "plain column still works"
             `Quick
             alter_add_plain_column_still_works
+        ] )
+    ; ( "ALTER TABLE on a composite-PK member"
+      , [ Alcotest.test_case
+            "DROP COLUMN unmarks the surviving members"
+            `Quick
+            drop_composite_pk_member_unmarks_the_survivors
+        ; Alcotest.test_case
+            "DROP COLUMN keeps NOT NULL enforced"
+            `Quick
+            drop_composite_pk_member_keeps_not_null_enforced
+        ; Alcotest.test_case
+            "DROP COLUMN dump restores every row"
+            `Quick
+            drop_composite_pk_member_dump_restores_every_row
+        ; Alcotest.test_case
+            "DROP COLUMN of a non-key column leaves the key alone"
+            `Quick
+            drop_plain_column_leaves_the_key_alone
+        ; Alcotest.test_case
+            "RENAME COLUMN still renders valid DDL"
+            `Quick
+            rename_composite_pk_member_still_renders_valid_ddl
+        ; Alcotest.test_case
+            "RENAME COLUMN dump keeps the rows"
+            `Quick
+            rename_composite_pk_member_dump_keeps_the_rows
         ] )
     ; ( "pre-existing databases"
       , [ Alcotest.test_case

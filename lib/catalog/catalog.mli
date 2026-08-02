@@ -428,6 +428,23 @@ val rename_column
   -> new_col:string
   -> (unit, string) result Lwt.t
 
+(** [clear_pk_flags ?txn t ~table_name ~cols] clears [primary_key] on every
+    column of [table_name] named in [cols], in the catalog and on disk.
+
+    #533: the inverse of the [open_] re-derivation, for when the `Implicit_pk
+    index that justified the flag is dropped ([ALTER TABLE ... DROP COLUMN] on a
+    member of a composite PRIMARY KEY).  Without it the surviving members keep a
+    [PRIMARY KEY] the table no longer enforces, and [Db.dump] renders a key the
+    live rows already violate.  [not_null] is left alone on purpose — it is the
+    conservative half of a bit #530 made ambiguous.  A no-op when no listed
+    column is marked. *)
+val clear_pk_flags
+  :  ?txn:Granary_store.Store.rw Granary_store.Store.txn
+  -> t
+  -> table_name:string
+  -> cols:string list
+  -> (unit, string) result Lwt.t
+
 (** Remove a column from an existing table.
     Re-keys all column entries with ordinal > drop_idx (shift down by 1).
     Does NOT migrate existing row data — caller (the executor) is responsible.
