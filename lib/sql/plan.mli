@@ -351,6 +351,13 @@ type op =
   (** Write user_version to sys_meta; DDL-like, returns 0 rows. *)
   | Op_pragma_integrity_check
   (** Scan all table + index B-trees; return [["ok"]] or list of error strings. *)
+  | Op_pragma_not_null_check
+  (** #563: scan every row table for stored NULLs in a column the loaded schema
+      declares NOT NULL; one row [[table; column; count]] per offending pair,
+      none when the database is clean.  Read-only. *)
+  | Op_pragma_not_null_repair
+  (** #563: DELETE the rows [Op_pragma_not_null_check] reports; one row
+      [[table; column; deleted]] per pair actually repaired. *)
   | Op_pragma_get_fk
   (** Read fk_enforcement flag from catalog; returns one row [[V_int 0|1]]. *)
   | Op_pragma_set_fk of { on : bool }

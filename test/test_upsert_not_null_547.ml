@@ -11,11 +11,11 @@
 
     The two tests that matter are the two spellings of the write — an ordinary
     NOT NULL column and a PRIMARY KEY column — each checked to be rejected *and*
-    to have left the pre-existing row untouched. Enforcement is literal-only in
-    both binders, so [SET c = (SELECT NULL)] still gets through; that is a known
-    hole recorded in [Planner.seek_is_unique_point]'s doc comment, and it is
-    pinned below so a later fix notices this test rather than the other way
-    round. *)
+    to have left the pre-existing row untouched. Enforcement in the two binders
+    is still literal-only, deliberately: #567 added the runtime half at encode
+    time, so [SET c = (SELECT NULL)] is now refused there instead of getting
+    through. The last test below pins that, and reports the runtime message
+    rather than the binder's. *)
 
 open Lwt.Syntax
 module Db = Granary.Db
@@ -160,15 +160,18 @@ let upsert_still_updates_normally () =
       (texts db "SELECT * FROM a"))
 ;;
 
-(* Known hole, pinned deliberately, and pinned as it actually behaves rather
-   than as one would like it to.  Enforcement is literal-only, so a NULL that
-   arrives via a subquery is not seen by either binder.  UPDATE happens to
-   escape it anyway — for an unrelated reason, subqueries are not supported in
-   UPDATE SET at all — while the upsert path evaluates the subquery and stores
-   the NULL.  #547 asked only for parity on the literal; this stays open.  If
-   this test starts failing, the hole has been closed: delete the test and the
-   note in [Planner.seek_is_unique_point]. *)
-let subquery_null_is_a_known_hole () =
+(* This was the hole #547 left open and pinned as it then behaved: enforcement
+   was literal-only in both binders, so a NULL arriving via a subquery was seen
+   by neither and the upsert path stored it.  #567 closed it by enforcing NOT
+   NULL at encode time, where the row values are finally known — so the write
+   is now refused whatever spelling of NULL produced it.  The binder rejection
+   is still the earlier and better-located error for the literal, which is why
+   the literal cases above still report [Not_null violation: j] while this one
+   reports the runtime [NOT NULL constraint failed: a.j].
+
+   UPDATE escapes for its own unrelated reason: subqueries are not supported in
+   UPDATE SET at all. *)
+let subquery_null_is_caught_at_encode_time () =
   with_db (fun db ->
     seed db;
     (match run (Db.execute db "UPDATE a SET j = (SELECT NULL)") with
@@ -186,11 +189,16 @@ let subquery_null_is_a_known_hole () =
             "INSERT INTO a VALUES ('x','z',2) ON CONFLICT (k) DO UPDATE SET j = (SELECT \
              NULL)")
      with
-     | Ok () -> ()
-     | Error e -> Alcotest.failf "upsert with a subquery: %a" Db.pp_error e);
+     | Ok () -> Alcotest.fail "upsert with a subquery NULL was accepted (#567)"
+     | Error e ->
+       let msg = Format.asprintf "%a" Db.pp_error e in
+       Alcotest.(check bool)
+         (Printf.sprintf "refused at encode time (%S)" msg)
+         true
+         (contains_sub ~needle:"NOT NULL constraint failed: a.j" msg));
     Alcotest.(check (list string))
-      "the non-literal NULL still lands — the known hole"
-      [ "x|<null>|1" ]
+      "and the row is untouched"
+      [ "x|y|1" ]
       (texts db "SELECT * FROM a"))
 ;;
 
@@ -214,7 +222,10 @@ let () =
         ] )
     ; ( "unchanged"
       , [ Alcotest.test_case "normal upserts" `Quick upsert_still_updates_normally
-        ; Alcotest.test_case "subquery NULL hole" `Quick subquery_null_is_a_known_hole
+        ; Alcotest.test_case
+            "subquery NULL closed by #567"
+            `Quick
+            subquery_null_is_caught_at_encode_time
         ] )
     ]
 ;;

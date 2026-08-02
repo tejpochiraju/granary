@@ -1057,6 +1057,40 @@
   lwt.unix
   unix))
 
+; #567: NOT NULL must be enforced where the row values are known (encode time),
+; and #563 adds PRAGMA not_null_check / not_null_repair for files that already
+; violate one.
+
+(test
+ (name test_not_null_567)
+ (modules test_not_null_567)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  granary.catalog
+  granary.store
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
+; #568: the SUM/AVG non-numeric argument check must not depend on spelling.
+
+(test
+ (name test_agg_numeric_568)
+ (modules test_agg_numeric_568)
+ (libraries
+  granary
+  granary.unix
+  granary.encoding
+  alcotest
+  qcheck-core
+  qcheck-alcotest
+  lwt.unix
+  unix))
+
 ; #572: identifier quoting in stored SQL text (CHECK / GENERATED / partial and
 ; expression indexes).  Depends on lexer.mll so the reserved-word list in
 ; Ast can be checked against the lexer's own table.

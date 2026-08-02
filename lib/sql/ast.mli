@@ -478,6 +478,14 @@ and pragma_kind =
   | Pragma_user_version_set of int64 (* PRAGMA user_version = N → write *)
   | Pragma_journal_mode (* PRAGMA journal_mode  → "delete" *)
   | Pragma_integrity_check (* PRAGMA integrity_check → errors or "ok" *)
+  | Pragma_not_null_check
+    (* #563: PRAGMA not_null_check — report stored rows that hold NULL in a
+       column the loaded schema declares NOT NULL.  One row per offending
+       (table, column) with a count; read-only. *)
+  | Pragma_not_null_repair
+    (* #563: PRAGMA not_null_repair — DELETE those rows.  Deliberately a
+       separate statement from the report: it is destructive, and for a legacy
+       PRIMARY KEY column the NULL row may be the one worth inspecting. *)
   | Pragma_wal_checkpoint (* PRAGMA wal_checkpoint — migrate WAL → main *)
   | Pragma_wal_autocheckpoint (* PRAGMA wal_autocheckpoint — read threshold *)
   | Pragma_wal_autocheckpoint_set of int64

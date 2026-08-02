@@ -2181,6 +2181,67 @@ let eval_check_constraints
       table_meta.columns)
 ;;
 
+(* #567: a column whose stored cell is allowed to be [V_null] even though the
+   schema says NOT NULL.  VIRTUAL generated columns are stored as NULL and
+   recomputed on read ([decode_with_virtual]), so their stored cell says
+   nothing about the value the schema declares. *)
+let not_null_exempt_col (col : Row.column) : bool =
+  match col.Row.generated_as with
+  | Some (_, false) -> true (* VIRTUAL: not materialised in the stored row *)
+  | _ -> false
+;;
+
+(* #567: the runtime half of NOT NULL enforcement.  [Sema] rejects a *literal*
+   NULL assigned to a NOT NULL column, but a bound parameter, a NULL-valued
+   expression ([v = NULL + 1]), a DEFAULT, a subquery or an FK cascade all
+   reach the encoder untouched, and there was no check there — so the write
+   succeeded and left a row the table's own rendered DDL refuses to restore
+   (#548 makes [Db.dump] refuse the whole script over it).  Since #530/#533
+   every PRIMARY KEY column carries [not_null = true], so a PK is reachable
+   the same way.
+
+   This runs where the row values are finally known, at the four places a row
+   assembled from user input is committed to storage.  Enumerated, because
+   "before every [Row.encode]" is not the right rule and stating it that way
+   sent this fix past the columnstore once already:
+
+   - [execute_insert_write] — INSERT, after [insert_rowid] has written the
+     rowid-alias value back into the row;
+   - [write_row_rekeyed] — UPDATE, UPSERT DO UPDATE and ON UPDATE CASCADE all
+     funnel through it;
+   - the two columnstore [Op_insert] / [Op_insert_select] arms, which hand the
+     row array straight to [Col_store.insert_rows] and never encode at all.
+
+   The third [Row.encode] in this module, in the ALTER TABLE DROP COLUMN
+   rewrite, is deliberately NOT a site: it re-encodes an already-stored row
+   with one column removed, so it can only preserve or reduce the set of NULLs
+   in the columns that survive.
+
+   The static binder checks stay as the earlier, better-located error.
+
+   The message matches SQLite's ("NOT NULL constraint failed: t.c") and the
+   wording already used by [eval_check_constraints] / the UNIQUE paths; it
+   surfaces to callers as [Db.Runtime]. *)
+let enforce_not_null (table_meta : Cat.table_meta) (row : Row.t) : unit =
+  let n = Array.length row in
+  List.iteri
+    (fun i (col : Row.column) ->
+       let violated =
+         col.Row.not_null
+         && (not (not_null_exempt_col col))
+         && i < n
+         && row.(i) = Row.V_null
+       in
+       if violated
+       then
+         failwith
+           (Printf.sprintf
+              "NOT NULL constraint failed: %s.%s"
+              table_meta.Cat.name
+              col.Row.name))
+    table_meta.Cat.columns
+;;
+
 (* ------------------------------------------------------------------ *)
 (* FTS inverted-index helpers                                           *)
 (* ------------------------------------------------------------------ *)
@@ -3644,6 +3705,11 @@ let write_row_rekeyed
           (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
   in
   let schema = table_meta.Cat.columns in
+  (* #567: every single-row UPDATE path (UPDATE, UPSERT DO UPDATE, ON UPDATE
+     CASCADE / SET NULL / SET DEFAULT) funnels through here, so this is the one
+     place the new row's NULLs have to be checked.  Raises before any index or
+     row write. *)
+  enforce_not_null table_meta new_row;
   let old_row_for_idx = with_computed_virtuals clock params table_meta old_row in
   let new_row_for_idx = with_computed_virtuals clock params table_meta new_row in
   let* () =
@@ -3788,7 +3854,11 @@ let execute_insert_write
        B-tree deletes have been made, so [S.rollback] is safe. *)
     let* () = if owned then S.rollback tx else Lwt.return_unit in
     Lwt.return false
-  else
+  else (
+    (* #567: the rowid-alias column has just been written back by
+       [insert_rowid], so by now the row is exactly what will be encoded —
+       check it before any REPLACE deletes or index writes happen. *)
+    enforce_not_null table_meta row;
     let* displaced_rows =
       delete_replace_conflicts
         tx
@@ -3940,7 +4010,7 @@ let execute_insert_write
            ~on_upsert_update
        | _ ->
          Lwt.fail_with
-           (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name))
+           (Printf.sprintf "UNIQUE constraint failed: %s.%s" table_meta.Cat.name col_name)))
 ;;
 
 (* Build the row to insert: use [prebuilt_row] if given, else evaluate each
@@ -6375,6 +6445,8 @@ let op_name = function
   | Plan.Op_pragma_set_user_version { version } ->
     Printf.sprintf "Pragma(set_user_version=%Ld)" version
   | Plan.Op_pragma_integrity_check -> "Pragma(integrity_check)"
+  | Plan.Op_pragma_not_null_check -> "Pragma(not_null_check)"
+  | Plan.Op_pragma_not_null_repair -> "Pragma(not_null_repair)"
   | Plan.Op_pragma_get_fk -> "Pragma(get_foreign_keys)"
   | Plan.Op_pragma_set_fk { on } -> Printf.sprintf "Pragma(set_foreign_keys=%b)" on
   | Plan.Op_pragma_get_recursive_triggers -> "Pragma(get_recursive_triggers)"
@@ -7378,6 +7450,13 @@ let execute_with_count
                   (fun ord expr -> row.(ord) <- eval_expr clock params [||] expr)
                   ordinals
                   vals;
+                (* #567: a columnstore INSERT never reaches [Row.encode] — it
+                   hands the row array straight to [Col_store.insert_rows] — so
+                   it needs the same check the row-store path gets before its
+                   encode.  Without it the bound-parameter spelling the issue
+                   calls out as the one that matters in practice wrote NULL
+                   into a NOT NULL column here. *)
+                enforce_not_null table_meta row;
                 row)
              values
          in
@@ -7419,6 +7498,10 @@ let execute_with_count
            (fun src_row ->
               let dest = Array.make n_cols Row.V_null in
               List.iteri (fun i ord -> dest.(ord) <- src_row.(i)) ordinals;
+              (* #567: same as the columnar VALUES path above — no encode, so
+                 the check has to be here.  Raised before the txn is acquired,
+                 so nothing has been written when it fires. *)
+              enforce_not_null table_meta dest;
               dest)
            src_rows)
     in
@@ -7662,6 +7745,8 @@ let execute_with_count
   | Plan.Op_window _
   | Plan.Op_pragma_get_user_version
   | Plan.Op_pragma_integrity_check
+  | Plan.Op_pragma_not_null_check
+  | Plan.Op_pragma_not_null_repair
   | Plan.Op_pragma_get_fk
   | Plan.Op_pragma_get_recursive_triggers
   | Plan.Op_pragma_get_defer_fk
@@ -10151,6 +10236,217 @@ and stream_pragma_integrity_check store cat =
   in
   Lwt.return (Lwt_stream.of_list rows)
 
+(* #563: the (ordinal, name) of every column whose loaded schema declares NOT
+   NULL and whose stored cell therefore has to hold a value.  VIRTUAL
+   generated columns are excluded for exactly the reason [enforce_not_null]
+   exempts them: they are stored as NULL and recomputed on read. *)
+and not_null_scan_cols (meta : Cat.table_meta) : (int * string) list =
+  meta.Cat.columns
+  |> List.mapi (fun i (c : Row.column) -> i, c)
+  |> List.filter_map (fun (i, (c : Row.column)) ->
+    if c.Row.not_null && not (not_null_exempt_col c) then Some (i, c.Row.name) else None)
+
+(* #563: a columnstore table's rows never enter a B-tree, so they are scanned
+   through [Col_store.to_row_seq] instead of a cursor.  There are no rowids to
+   hand back — the store exposes no delete — so the victim list is empty and
+   only the count is reported.  [not_null_repair] refuses such a table rather
+   than reporting a repair it did not perform. *)
+and not_null_scan_columnar (meta : Cat.table_meta) (cols : (int * string) list) =
+  let cs = col_store_of_meta meta in
+  let counts = List.map (fun (i, name) -> i, name, ref 0) cols in
+  Seq.iter
+    (fun (row : Row.t) ->
+       List.iter
+         (fun (i, _, n) -> if i < Array.length row && row.(i) = Row.V_null then incr n)
+         counts)
+    (Granary_columnar.Col_store.to_row_seq cs);
+  List.filter_map
+    (fun (_i, name, n) -> if !n = 0 then None else Some (name, !n, []))
+    counts
+
+(* #563: scan one table for stored NULLs in a declared-NOT NULL column.
+   Returns one entry per VIOLATING column: its name, how many rows violate it,
+   and — for a row-store table — those rows with their rowids, which is what
+   the repair deletes.  Columns with no violation are dropped, so an empty
+   result means the table honours its own schema. *)
+and not_null_scan_table
+  : type m. m S.txn -> Cat.table_meta -> (string * int * (int64 * Row.t) list) list Lwt.t
+  =
+  fun tx meta ->
+  let cols = not_null_scan_cols meta in
+  if cols = []
+  then Lwt.return []
+  else (
+    match meta.Cat.storage with
+    | Cat.Columnar _ -> Lwt.return (not_null_scan_columnar meta cols)
+    | Cat.Row { tree_id; _ } ->
+      let buckets = List.map (fun (i, name) -> i, name, ref []) cols in
+      let* cur = S.cursor_open tx tree_id in
+      let _sr = S.cursor_first cur in
+      let note row rowid (i, _, bucket) =
+        if i < Array.length row && row.(i) = Row.V_null
+        then bucket := (rowid, row) :: !bucket
+      in
+      let rec go () =
+        match S.cursor_next cur with
+        | None -> ()
+        | Some (k, v) ->
+          let row = Row.decode meta.Cat.columns v in
+          List.iter (note row (Rowid.decode k)) buckets;
+          go ()
+      in
+      go ();
+      S.cursor_close cur;
+      Lwt.return
+        (List.filter_map
+           (fun (_i, name, bucket) ->
+              match List.rev !bucket with
+              | [] -> None
+              | l -> Some (name, List.length l, l))
+           buckets))
+
+(* #563: the report row shape shared by check and repair — (table, column, n).
+   [n] is the number of offending rows for [not_null_check] and the number of
+   offending rows actually DELETED for [not_null_repair]; on a row-store table
+   the two coincide, and where they cannot (a columnstore, which has no delete)
+   the difference is precisely what the operator has to see. *)
+and not_null_report_rows (meta : Cat.table_meta) ~counted found =
+  List.map
+    (fun (name, n, _) ->
+       [| Row.V_text meta.Cat.name
+        ; Row.V_text name
+        ; Row.V_int (Int64.of_int (counted n))
+       |])
+    found
+
+(* #563 report mode: [PRAGMA not_null_check].  One row per offending (table,
+   column) with the number of stored rows that hold NULL there, so an operator
+   sees the whole scope before touching anything.  A clean database returns no
+   rows.  Strictly read-only — the destructive half is [not_null_repair].
+
+   [mode] is honoured rather than always taking a fresh RO snapshot: inside an
+   explicit transaction the report must see that transaction's own writes, or
+   [BEGIN; PRAGMA not_null_repair; PRAGMA not_null_check] would contradict a
+   plain SELECT in the same transaction and tell the operator the repair
+   failed (read-your-own-writes, #262). *)
+and stream_pragma_not_null_check store mode cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_pragma_not_null_check requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  let body : type m. m S.txn -> Row.t Lwt_stream.t Lwt.t =
+    fun tx ->
+    let* per_table =
+      Lwt_list.map_s
+        (fun (meta : Cat.table_meta) ->
+           let* found = not_null_scan_table tx meta in
+           Lwt.return (not_null_report_rows meta ~counted:Fun.id found))
+        tables
+    in
+    Lwt.return (Lwt_stream.of_list (List.concat per_table))
+  in
+  match mode with
+  | In_txn tx -> body tx
+  | In_ro_txn tx -> body tx
+  | Auto -> S.with_ro store body
+
+(* #563 repair mode: [PRAGMA not_null_repair] DELETEs the rows the report
+   names, through the ordinary delete path so index entries and ON DELETE
+   cascades are honoured.  Reports the same (table, column, count) shape as the
+   check; a row violating two NOT NULL columns is counted under both but
+   deleted once, so the counts are per-column violations, not a total. *)
+and stream_pragma_not_null_repair store mode cat =
+  let cat_val =
+    match cat with
+    | None -> failwith "Exec.to_stream: Op_pragma_not_null_repair requires catalog"
+    | Some c -> c
+  in
+  let* tables = Cat.list_tables cat_val in
+  (* Reuse the ambient write txn when there is one: opening our own would block
+     on the write lock the caller already holds. *)
+  let* tx, owned = acquire_txn store mode in
+  Lwt.catch
+    (fun () ->
+       let* scans =
+         Lwt_list.map_s
+           (fun (meta : Cat.table_meta) ->
+              let* found = not_null_scan_table tx meta in
+              Lwt.return (meta, found))
+           tables
+       in
+       let* per_table =
+         Lwt_list.map_s
+           (fun (meta, found) -> repair_not_null_table tx cat_val meta found)
+           scans
+       in
+       let* () = release_txn ~cat:cat_val tx owned in
+       Lwt.return (Lwt_stream.of_list (List.concat per_table)))
+    (fun exn ->
+       let* () = if owned then S.rollback tx else Lwt.return_unit in
+       Lwt.fail exn)
+
+(* #563: delete one table's NOT NULL violators, returning its report rows.
+
+   A columnstore is append-only — [Col_store] exposes no delete — so its rows
+   cannot be repaired.  It reports [0] deleted rather than raising: the raise
+   escapes [Db.query] uncaught (it happens inside the returned promise, past
+   the [exception Failure] guard in [Db.query_impl]), which would make an
+   unrepairable table crash the caller instead of informing it.
+
+   {b The count-0 row is a standalone signal, not a cross-reference.}  A table
+   with nothing to fix produces NO row at all (the [found = []] branch below),
+   so a row whose count is 0 is emitted in exactly one situation: findings that
+   could not be deleted.  "Nothing to fix" and "cannot fix" are therefore
+   distinguishable from the repair output alone — empty versus a 0-count row —
+   and [PRAGMA not_null_check] then gives the size of what was left behind.
+   Both cases are pinned in [test_not_null_567.ml] ("clean table works" and
+   "report sees a columnstore violation").
+
+   {b Known residual (#588).}  A 0-count row is still weaker than a
+   statement-level error naming the table, which is what this ought to be and
+   what a caller can act on without knowing the convention.  That error is not
+   expressible from this path at all, for the reason above; #588 tracks fixing
+   the [Db.query_impl] guard, and closing it should turn this branch back into
+   a raise. *)
+and repair_not_null_table tx (cat_val : Cat.t) (meta : Cat.table_meta) found =
+  if found = []
+  then Lwt.return []
+  else if Cat.is_columnar meta
+  then Lwt.return (not_null_report_rows meta ~counted:(fun _ -> 0) found)
+  else (
+    let indexes = Cat.indexes_for_table cat_val ~table:meta.Cat.name in
+    let* child_refs =
+      if Cat.get_fk_enforcement cat_val
+      then build_child_refs cat_val ~parent_table_name:meta.Cat.name
+      else Lwt.return []
+    in
+    let victims =
+      List.concat_map (fun (_name, _n, rows) -> rows) found
+      |> List.sort_uniq (fun (a, _) (b, _) -> Int64.compare a b)
+    in
+    let* () =
+      Lwt_list.iter_s
+        (fun ((rowid, row) as m) ->
+           let* () =
+             apply_delete_row
+               tx
+               cat_val
+               meta
+               ~clock:None
+               ~params:[||]
+               ~child_refs
+               ~indexes
+               m
+           in
+           record_change meta.Cat.name (Deleted { rowid; row });
+           Lwt.return_unit)
+        victims
+    in
+    mark_dirty meta.Cat.name;
+    Lwt.return (not_null_report_rows meta ~counted:Fun.id found))
+
 and stream_sqlite_master store cat =
   let cat_val =
     match cat with
@@ -10777,6 +11073,8 @@ and to_stream
     in
     Lwt.return (Lwt_stream.of_list [ [| Row.V_int (if v then 1L else 0L) |] ])
   | Plan.Op_pragma_integrity_check -> stream_pragma_integrity_check store cat
+  | Plan.Op_pragma_not_null_check -> stream_pragma_not_null_check store mode cat
+  | Plan.Op_pragma_not_null_repair -> stream_pragma_not_null_repair store mode cat
   | Plan.Op_sqlite_master -> stream_sqlite_master store cat
   | Plan.Op_sqlite_sequence -> stream_sqlite_sequence cat
   | Plan.Op_union { all; left; right } ->

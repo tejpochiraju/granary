@@ -400,6 +400,9 @@ pragma_stmt:
       | "user_version"    -> Ast.S_pragma Ast.Pragma_user_version
       | "journal_mode"    -> Ast.S_pragma Ast.Pragma_journal_mode
       | "integrity_check" -> Ast.S_pragma Ast.Pragma_integrity_check
+      (* #563: report/repair for rows that violate a declared NOT NULL. *)
+      | "not_null_check"  -> Ast.S_pragma Ast.Pragma_not_null_check
+      | "not_null_repair" -> Ast.S_pragma Ast.Pragma_not_null_repair
       | "wal_checkpoint"  -> Ast.S_pragma Ast.Pragma_wal_checkpoint
       | "wal_autocheckpoint" -> Ast.S_pragma Ast.Pragma_wal_autocheckpoint
       | "synchronous"           -> Ast.S_pragma Ast.Pragma_synchronous

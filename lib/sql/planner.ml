@@ -850,9 +850,11 @@ let table_rows_estimate (meta : Cat.table_meta) =
     flags are all false — reaches the one-row class too, instead of silently
     reverting the #513 StockLevel win on every pre-existing database.
 
-    {b [not_null] is a declaration, not an invariant.} Enforcement is bind-time
-    and literal-only, so [INSERT INTO t SELECT ...] can still land a NULL in a
-    column declared NOT NULL — including a PRIMARY KEY column. The estimate
+    {b [not_null] is a declaration, not an invariant.} #567 added encode-time
+    enforcement, so no write this engine performs can land a NULL in a column
+    declared NOT NULL any more — but a file written before #530 can already
+    hold one, and #533's re-derivation is what makes its schema claim
+    otherwise ([PRAGMA not_null_check] reports those rows, #563). The estimate
     survives that for the same reason the check is coarse in the first place:
     see below.
 
@@ -1796,6 +1798,8 @@ let plan_pragma_rows cat kind =
   | Ast.Pragma_user_version
   | Ast.Pragma_user_version_set _
   | Ast.Pragma_integrity_check
+  | Ast.Pragma_not_null_check
+  | Ast.Pragma_not_null_repair
   | Ast.Pragma_foreign_keys
   | Ast.Pragma_foreign_keys_set _
   | Ast.Pragma_recursive_triggers
@@ -1822,6 +1826,9 @@ let plan_pragma cat kind =
   | Ast.Pragma_user_version -> Plan.Op_pragma_get_user_version
   | Ast.Pragma_user_version_set v -> Plan.Op_pragma_set_user_version { version = v }
   | Ast.Pragma_integrity_check -> Plan.Op_pragma_integrity_check
+  (* #563 *)
+  | Ast.Pragma_not_null_check -> Plan.Op_pragma_not_null_check
+  | Ast.Pragma_not_null_repair -> Plan.Op_pragma_not_null_repair
   | Ast.Pragma_foreign_keys -> Plan.Op_pragma_get_fk
   | Ast.Pragma_foreign_keys_set on -> Plan.Op_pragma_set_fk { on }
   | Ast.Pragma_recursive_triggers -> Plan.Op_pragma_get_recursive_triggers

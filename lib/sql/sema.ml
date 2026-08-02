@@ -894,7 +894,48 @@ type col_resolver =
      may differ from resolve_unqual in HAVING contexts. *)
     resolve_agg_arg : string -> (int, error) result
   ; resolve_agg_arg_qual : string -> string -> (int, error) result
+  ; (* #568: declared type of the input-row column an aggregate argument
+       resolved to, so [agg_col_ord] can type-check SUM/AVG wherever it is
+       called from.  [None] when the ordinal is out of range. *)
+    agg_arg_col_ty : int -> Row.ty option
   }
+
+(** #568: build the [agg_arg_col_ty] lookup for a FROM list.  The ordinals
+    [resolve_agg_arg] hands back index the concatenated input-row columns of
+    every table in the FROM list, so the type lookup must concatenate the same
+    way. *)
+let agg_arg_col_ty_of_tables
+      ~(tables : (Cat.table_meta * int * string option) list)
+      (i : int)
+  : Row.ty option
+  =
+  let cols = List.concat_map (fun (tm, _, _) -> tm.Cat.columns) tables in
+  Option.map (fun (c : Row.column) -> c.Row.ty) (List.nth_opt cols i)
+;;
+
+(* #568: SUM/AVG over a TEXT or BLOB column is rejected at bind time.  This
+   used to live only in [project_agg] (the binder for a *bare* aggregate
+   projection item), so wrapping the same aggregate in any expression —
+   [SUM(s) + 0], or any HAVING — routed it through [agg_col_ord] instead and
+   the check simply did not run; the error then arrived only at runtime, and
+   only if a row actually reached the accumulator (an empty group succeeded).
+   Granary's strict column typing is a deliberate divergence from SQLite, so a
+   check a pair of parentheses can turn off is worse than no check: it now
+   lives on the single ordinal-resolution path every binder shares. *)
+let agg_numeric_check
+      ~(col_ty : int -> Row.ty option)
+      (func : Ast.agg_func)
+      (co : int option)
+  : (unit, error) result
+  =
+  match func, co with
+  | (Ast.Agg_sum | Ast.Agg_avg), Some i ->
+    (match col_ty i with
+     | None -> Ok () (* ordinal out of range: leave it to the caller's own error *)
+     | Some (Row.Integer | Row.Real) -> Ok ()
+     | Some t -> Error (Type_mismatch { expected = Row.Real; got = t }))
+  | _ -> Ok ()
+;;
 
 (** Resolve the column ordinal of an aggregate-function argument (the input-row
     column the aggregate consumes).  [None] is the COUNT-star case. *)
@@ -904,21 +945,29 @@ let agg_col_ord
       (arg_opt : Ast.expr option)
   : (int option, error) result
   =
-  match arg_opt with
-  | None ->
-    (* COUNT-star — only legal here for Agg_count *)
-    (match func with
-     | Ast.Agg_count -> Ok None
-     | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
-  | Some (Ast.E_col name) ->
-    (match resolver.resolve_agg_arg name with
+  let ord =
+    match arg_opt with
+    | None ->
+      (* COUNT-star — only legal here for Agg_count *)
+      (match func with
+       | Ast.Agg_count -> Ok None
+       | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
+    | Some (Ast.E_col name) ->
+      (match resolver.resolve_agg_arg name with
+       | Error e -> Error e
+       | Ok i -> Ok (Some i))
+    | Some (Ast.E_tbl_col (t, c)) ->
+      (match resolver.resolve_agg_arg_qual t c with
+       | Error e -> Error e
+       | Ok i -> Ok (Some i))
+    | Some _ -> Error (Unsupported "aggregate argument must be a column reference")
+  in
+  match ord with
+  | Error e -> Error e
+  | Ok co ->
+    (match agg_numeric_check ~col_ty:resolver.agg_arg_col_ty func co with
      | Error e -> Error e
-     | Ok i -> Ok (Some i))
-  | Some (Ast.E_tbl_col (t, c)) ->
-    (match resolver.resolve_agg_arg_qual t c with
-     | Error e -> Error e
-     | Ok i -> Ok (Some i))
-  | Some _ -> Error (Unsupported "aggregate argument must be a column reference")
+     | Ok () -> Ok co)
 ;;
 
 (** Bind expression, collecting aggregates.  Aggregates become
@@ -2536,8 +2585,25 @@ let project_window
           Ok (AP_window_slot slot)))
 ;;
 
-(* Bind an aggregate call in an aggregated projection (with SUM/AVG numeric
-   type check), registering it via [add_agg] and returning AP_agg_slot. *)
+(* #568: the resolver an aggregate's *arguments* see.  Inside an aggregate any
+   table column is legal (that is what the aggregate consumes), so the
+   unqualified/qualified resolvers are the plain FROM-list lookups; callers
+   that restrict bare column refs (a GROUP BY projection, HAVING) override the
+   first two and keep these. *)
+let agg_arg_resolver ~(tables : (Cat.table_meta * int * string option) list) ~meta =
+  { resolve_unqual = select_proj_lookup ~tables ~meta
+  ; resolve_qual = select_qual_lookup ~tables
+  ; resolve_agg_arg = select_proj_lookup ~tables ~meta
+  ; resolve_agg_arg_qual = select_qual_lookup ~tables
+  ; agg_arg_col_ty = agg_arg_col_ty_of_tables ~tables
+  }
+;;
+
+(* Bind an aggregate call in an aggregated projection, registering it via
+   [add_agg] and returning AP_agg_slot.  #568: the SUM/AVG numeric type check
+   used to be inlined here; it now lives in [agg_col_ord], which this path and
+   every expression-over-aggregate path share, so both spellings of the same
+   aggregate are checked identically. *)
 let project_agg
       ~(tables : (Cat.table_meta * int * string option) list)
       ~meta
@@ -2546,43 +2612,11 @@ let project_agg
       arg_opt
   : (agg_proj_item, error) result
   =
-  (* SUM/AVG type check. *)
-  let validate_numeric col_ord =
-    let cols = List.concat_map (fun (tm, _, _) -> tm.Cat.columns) tables in
-    let col = List.nth cols col_ord in
-    match col.Row.ty with
-    | Row.Integer | Row.Real -> Ok ()
-    | _ -> Error (Type_mismatch { expected = Row.Real; got = col.ty })
-  in
-  let col_ord_result : (int option, error) result =
-    match arg_opt with
-    | None ->
-      (match func with
-       | Ast.Agg_count -> Ok None
-       | _ -> Error (Unsupported "non-COUNT aggregate requires an argument"))
-    | Some (Ast.E_col name) ->
-      (match (select_proj_lookup ~tables ~meta) name with
-       | Error e -> Error e
-       | Ok i -> Ok (Some i))
-    | Some (Ast.E_tbl_col (t, c)) ->
-      (match (select_qual_lookup ~tables) t c with
-       | Error e -> Error e
-       | Ok i -> Ok (Some i))
-    | Some _ -> Error (Unsupported "aggregate argument must be a column reference")
-  in
-  match col_ord_result with
+  match agg_col_ord ~resolver:(agg_arg_resolver ~tables ~meta) func arg_opt with
   | Error e -> Error e
   | Ok co ->
-    let type_check =
-      match func, co with
-      | (Ast.Agg_sum | Ast.Agg_avg), Some i -> validate_numeric i
-      | _ -> Ok ()
-    in
-    (match type_check with
-     | Error e -> Error e
-     | Ok () ->
-       let slot = add_agg { func; col_ord = co } in
-       Ok (AP_agg_slot slot))
+    let slot = add_agg { func; col_ord = co } in
+    Ok (AP_agg_slot slot)
 ;;
 
 (* #507: bind an aggregated projection item that is neither a bare grouped
@@ -2633,6 +2667,7 @@ let project_agg_expr
          in HAVING — that is what the aggregate consumes. *)
       resolve_agg_arg = select_proj_lookup ~tables ~meta
     ; resolve_agg_arg_qual = select_qual_lookup ~tables
+    ; agg_arg_col_ty = agg_arg_col_ty_of_tables ~tables
     }
   in
   let on_window func args window =
@@ -2866,6 +2901,7 @@ let bind_select_having
         ; (* Inside aggregate args in HAVING, any table column is allowed *)
           resolve_agg_arg = select_proj_lookup ~tables ~meta
         ; resolve_agg_arg_qual = select_qual_lookup ~tables
+        ; agg_arg_col_ty = agg_arg_col_ty_of_tables ~tables
         }
       in
       (* Append HAVING aggregates AFTER the projection
