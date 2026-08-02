@@ -9,7 +9,8 @@
     [dune runtest] sets [GRANARY_BENCH_PARALLEL_MAX=1000000], which neutralizes
     the bound (ci.yml, coverage.yml, cross-arch.yml, in both [.forgejo/] and
     [.github/]).  The one job that runs it with the bound live is the nightly
-    [.forgejo/workflows/bench-nightly.yml] (mirrored to [.github/]), which sets
+    [.forgejo/workflows/bench-nightly.yml] (its [.github/] mirror is
+    manual-only), which sets
     no [GRANARY_BENCH_*] neutralizer and runs [dune runtest --force -j 1] on a
     self-hosted runner.  It reports rather than blocking PRs.  Outside that
     nightly this bound is armed only for a developer running the suite locally

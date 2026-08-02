@@ -21,28 +21,44 @@ name: Timing gates nightly (#549)
 # never fail a PR. On failure it files/updates an issue (same dedup pattern as
 # jepsen-nightly.yml).
 #
-# CAVEAT specific to this mirror: GitHub's `ubuntu-latest` is a shared 2-core
-# hosted VM with noisy neighbours, which is a considerably worse place to
-# assert a wall-clock ceiling than the self-hosted runner the Forgejo copy
-# uses. Treat a red run here as weaker evidence than a red run on Forgejo, and
-# triage against the load line printed below. The Forgejo copy is the
-# authoritative one; this mirror exists because the repo keeps the two
-# workflow directories in sync.
+# THIS MIRROR IS MANUAL-ONLY — `workflow_dispatch`, deliberately NO `schedule`.
+# The Forgejo copy is the authoritative armed nightly; this one exists because
+# the repo keeps the two workflow directories in sync, and directory parity is
+# satisfied by the file existing, not by an identical trigger.
+#
+# The reason is the whole point of #549. GitHub's `ubuntu-latest` is a shared
+# 2-core hosted VM with noisy neighbours — the worst place in the repo to
+# assert `overlap <= 1.15` and `speedup >= 1.2`. Scheduled nightly, it would
+# auto-file a recurring public issue that nobody acts on, and because the dedup
+# is by title marker it would become one long noise thread. Training people to
+# ignore that marker is exactly the disease #549 was filed about, not its cure.
+# So: run it here on demand (e.g. to reproduce something on hosted hardware),
+# and read a red result as weak evidence — triage against the load line the job
+# prints. Do not add a `schedule:` block without solving the noise problem.
 
 on:
-  schedule:
-    # 03:30 UTC daily (09:00 IST) — after the Jepsen nightly's 03:00 slot.
-    - cron: "30 3 * * *"
-  # Allow ad-hoc manual runs (so the suite can be triggered on demand).
+  # Deliberately manual-only — see the header. No `schedule:`.
   workflow_dispatch: {}
 
+# A scheduled/dispatched workflow's default GITHUB_TOKEN is read-only under the
+# now-common repo default, so the failure step below could not file anything
+# without this.
+permissions:
+  contents: read
+  issues: write
+
 concurrency:
-  group: bench-nightly
+  # Shared with jepsen-nightly so the two heavy nightlies can never overlap.
+  group: nightly
   cancel-in-progress: false
 
 jobs:
   armed-timing-gates:
     runs-on: ubuntu-latest
+    # A serial `--force -j 1` run of ~130 executables, plus up to TRIALS
+    # retries in the timing gates, has a long tail. Bound it so a wedged run
+    # cannot hold the slot indefinitely.
+    timeout-minutes: 120
     env:
       OPAMROOT: /home/opam/.opam
     container:
@@ -104,41 +120,51 @@ jobs:
         # in #529 and the 1.70 overlap ratio in #538.
         run: opam exec -- dune runtest --force -j 1
 
-      # On any failure above, open a GitHub issue so the nightly does not fail
+      # On any failure above, open a GitHub issue so the run does not fail
       # silently. Deduped by title marker: if an open issue already exists for a
-      # previous failing nightly, comment on it instead of opening a duplicate
-      # (the scheduled job runs unattended every night).
+      # previous failing run, comment on it instead of opening a duplicate.
+      #
+      # curl, NOT `gh`. The `gh` CLI ships in the HOSTED RUNNER IMAGE, not in
+      # this job's `container:` (ocaml/opam:ubuntu-24.04 has no gh). A `gh`
+      # call here would die with "gh: command not found" on top of the
+      # already-failed job and report nothing — reintroducing, in the mirror,
+      # exactly the silent-failure mode this workflow exists to remove.
+      # jepsen-nightly.yml's GitHub copy gets away with `gh` only because that
+      # job has no `container:` and so runs on the host. The REST calls below
+      # mirror the Forgejo copy's shape; only the host and the search syntax
+      # differ. `curl` IS present in the opam image (opam itself needs it).
       - name: File issue on failure
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.api_url }}/repos/${{ github.repository }}
+          SEARCH: ${{ github.api_url }}/search/issues
+          REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           MARKER: "Armed timing gates nightly failed"
         run: |
           set -eu
-          body="The armed timing-gate nightly (#549) failed.
-
-          This job is the only automated one that runs the timing/scaling gates
-          with their ceilings live, so a failure here is either a real
-          performance regression or runner noise that the gate's best-of-N
-          statistic did not absorb.
-
-          - Run: ${RUN_URL}
-          - Commit: ${GITHUB_SHA}
-          - Ref: ${GITHUB_REF}
-
-          See the workflow logs for the failing gate and its printed
-          measurements (each gate prints its per-trial numbers and its
-          best-of-N verdict), plus the recorded load average.
-
-          Do NOT fix this by adding GRANARY_BENCH_* neutralizers to this
-          workflow — that would put the gate back on the honour system (#549)."
-
-          number=$(gh issue list --state open --search "${MARKER} in:title" --json number --jq '.[0].number' || true)
-          if [ -n "${number:-}" ]; then
+          # Single-line with \n escapes, so no YAML block indentation leaks
+          # into the rendered issue body.
+          body="The armed timing-gate run (#549) failed.\n\nThis job runs the timing/scaling gates with their ceilings live, so a failure is either a real performance regression or runner noise that the gate's best-of-N statistic did not absorb. NOTE: this is the GitHub mirror on a shared 2-core hosted VM — weak evidence compared with the Forgejo nightly on the self-hosted runner. Check the load line printed before the timed run.\n\n- Run: ${RUN_URL}\n- Commit: ${GITHUB_SHA}\n- Ref: ${GITHUB_REF}\n\nSee the workflow logs for the failing gate and its printed measurements (each gate prints its per-trial numbers and its best-of-N verdict).\n\nDo NOT fix this by adding GRANARY_BENCH_* neutralizers to this workflow — that would put the gate back on the honour system (#549)."
+          existing=$(curl -sS \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            --get "${SEARCH}" \
+            --data-urlencode "q=repo:${REPO} is:issue is:open in:title ${MARKER}")
+          number=$(printf '%s' "${existing}" | grep -o "\"number\":[0-9]*" | head -n1 | grep -o "[0-9]*" || true)
+          if [ -n "${number}" ]; then
             echo "Open failure issue #${number} exists; adding a comment."
-            gh issue comment "${number}" --body "Failed again on run ${RUN_URL} (commit ${GITHUB_SHA})."
+            curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"body\": \"Failed again on run ${RUN_URL} (commit ${GITHUB_SHA}).\"}" \
+              "${API}/issues/${number}/comments" >/dev/null
           else
             echo "No open failure issue; opening one."
-            gh issue create --title "${MARKER} (run ${{ github.run_number }})" --body "${body}"
+            curl -sSf -X POST \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -d "{\"title\": \"${MARKER} (run ${{ github.run_number }})\", \"body\": \"${body}\"}" \
+              "${API}/issues" >/dev/null
           fi

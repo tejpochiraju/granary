@@ -54,29 +54,36 @@
     average 13: [calibrate_read_ops] chose read_ops=22639 targeting
     T_r = 0.45 x T_w = 0.68 s, and the measured reader phase came out 4.4-6.4 s
     against a 1.5 s writer — a 6-9x overshoot, so ALL THREE trials failed
-    identically at overlap 2.04.  The calibration probes run with no writer and
-    take the MINIMUM of three, i.e. the most optimistic per-op cost available;
-    if they happen to land in an idle window while the measurement then runs
-    under load, the workload is oversized and every subsequent trial inherits
-    it.  Erring low on per-op cost errs HIGH on the workload, which is the one
-    direction [calibrate_read_ops] documents as unsafe.
+    identically at overlap 2.04.  The calibration probes run with no writer,
+    and they used to take the MINIMUM of three, i.e. the most optimistic per-op
+    cost available; if they land in an idle window while the measurement then
+    runs under load, the workload is oversized and every subsequent trial
+    inherits it.  Erring low on per-op cost errs HIGH on the workload, which is
+    the one direction [calibrate_read_ops] documents as unsafe.
 
-    So the second half of the fix closes the loop: a trial whose readers
-    overran the writer window rescales read_ops by the observed overshoot and
-    restarts the statistic (durations from different workloads are not
-    comparable).  That is measurement feedback rather than a better guess, and
-    it converges in one step because T_r is ~linear in read_ops.  See
-    [measure].
+    So the fix has two parts, in order of importance:
+    - {b at the source}: [calibrate_read_ops] now reduces its probes with the
+      MEDIAN rather than the minimum, which tracks the load actually present
+      and discards the lucky idle probe that causes blowouts.  A divisor is not
+      a verdict — see the comment there for why min is right in [measure] and
+      wrong in calibration.
+    - {b as a safety net}: a trial whose readers overran the writer window
+      resizes read_ops by the observed overshoot and restarts the statistic
+      (durations from different workloads are not comparable).  Bounded, and
+      the bounds are load-bearing — see [measure].  It is run-wide rather than
+      per-config, so both configs keep sharing one calibration.
 
     {b Where these gates actually run armed.}  Every automated job that
     invokes [dune runtest] sets [GRANARY_BENCH_MIN_SPEEDUP=0], which
     neutralizes both gates (see the [min_speedup <= 0.0] branch in [measure]).
-    The one job that runs them ARMED is the nightly
-    [.forgejo/workflows/bench-nightly.yml] (mirrored to [.github/]), which
-    deliberately sets no [GRANARY_BENCH_*] neutralizer and runs [dune runtest
-    -j 1] on an otherwise-idle self-hosted runner.  It reports (files/updates
-    an issue) rather than blocking PRs.  Outside that nightly this gate is
-    armed only for a developer running the suite locally (#549).
+    The one scheduled job that runs them ARMED is
+    [.forgejo/workflows/bench-nightly.yml], which deliberately sets no
+    [GRANARY_BENCH_*] neutralizer and runs [dune runtest --force -j 1] on the
+    self-hosted runner.  It reports (files/updates an issue) rather than
+    blocking PRs.  Its [.github/] mirror is manual-only ([workflow_dispatch],
+    no [schedule]) on purpose: a shared 2-core hosted VM is no place to assert
+    a wall-clock ceiling nightly.  Outside that nightly this gate is armed only
+    for a developer running the suite locally (#549).
 
     Env vars (all optional):
       GRANARY_BENCH_FSYNC_DELAY_MS  injected per-fsync sleep (default 50)
@@ -451,19 +458,40 @@ let probe_reader_phase ~n_seed ~n_readers ~read_ops =
    Hence the low default ratio and the hard writer-relative cap below: T_r is
    kept clear of T_w so the writer always bounds the parallel wall. *)
 let calibrate_read_ops ~n_seed ~n_readers ~writer_secs ~ratio =
-  (* Timing noise is one-sided — a probe can be delayed, never hurried — so
-     take the fastest of [probe_reps] repeats rather than a single shot.
-     Single-shot probes drifted read_ops by up to 1.5x run to run, which
-     showed up directly as speedup spread (1.25x on the unlucky draw). *)
+  (* Probes are repeated because single-shot ones drifted read_ops by up to
+     1.5x run to run, which showed up directly as speedup spread (1.25x on the
+     unlucky draw).  The reduction is the MEDIAN, not the minimum (#538 review).
+
+     The minimum is the right statistic when you want the unperturbed cost of
+     an operation — that is why [measure] uses it on the trial durations, where
+     noise can only ever ADD time.  It is the wrong statistic here, because
+     this number is not a verdict, it is a divisor: [read_ops] is chosen as
+     [target_seconds / per_op], so a per-op estimate that is too LOW makes the
+     workload too BIG.  That is the direction this function's own header calls
+     unsafe, and it is what broke #538: a min-of-three that happened to land in
+     an idle window while the measurement then ran under load chose 22639 ops
+     for a 0.68 s target and produced a 4.4-6.4 s reader phase, failing all
+     three trials identically at overlap 2.04.
+
+     The median tracks the load the box is actually under, so it errs the
+     documented-safe way (slightly oversized per_op -> slightly undersized
+     workload) and it discards the one lucky idle probe that causes the large
+     blowouts.  It costs nothing extra: the probes were already being repeated,
+     only the fold changed. *)
   let probe_reps = 3 in
-  let best ~read_ops =
-    let times =
-      List.init probe_reps (fun _ -> probe_reader_phase ~n_seed ~n_readers ~read_ops)
-    in
-    List.fold_left min infinity times
+  let median = function
+    | [] -> infinity
+    | l ->
+      let a = Array.of_list l in
+      Array.sort compare a;
+      a.(Array.length a / 2)
   in
-  let t1 = best ~read_ops:probe_ops in
-  let t2 = best ~read_ops:(2 * probe_ops) in
+  let typical ~read_ops =
+    median
+      (List.init probe_reps (fun _ -> probe_reader_phase ~n_seed ~n_readers ~read_ops))
+  in
+  let t1 = typical ~read_ops:probe_ops in
+  let t2 = typical ~read_ops:(2 * probe_ops) in
   let marginal = (t2 -. t1) /. float_of_int probe_ops in
   (* Fall back to the average cost if the two probes were swamped by jitter. *)
   let per_op = if marginal > 0.0 then marginal else t2 /. float_of_int (2 * probe_ops) in
@@ -620,7 +648,9 @@ let test_fsync_overlap () =
      assert the overlap win clears the floor.  Called once per config.  Both
      configs deliberately share one calibration: per-op cost differs between
      them (shared-tid pays writer CoW eviction), and holding read_ops fixed
-     is what makes the two speedups comparable. *)
+     is what makes the two speedups comparable.  A resize (see [measure])
+     preserves that invariant by being run-wide rather than per-config: it
+     changes the shared number, it does not give each config its own. *)
   let trial label t ~read_ops ~read_ops_src =
     let base = run_config ~delay ~n_seed `Baseline ~n_commits ~n_readers ~read_ops in
     let par = run_config ~delay ~n_seed `Parallel ~n_commits ~n_readers ~read_ops in
@@ -673,8 +703,9 @@ let test_fsync_overlap () =
      unbounded loop would walk a REAL serialisation regression down to passing:
      serialised readers show ratio 1 + T_r/T_w, and driving T_r towards zero
      drives that towards 1.0, which is under the 1.15 gate.  Two bounds keep
-     that out of reach — at most ONE resize per config, and a trigger chosen so
-     that the resize is safe by construction rather than by a fudge factor:
+     that out of reach — at most ONE resize per RUN (not per config; see
+     below), and a trigger chosen so that the resize is safe by construction
+     rather than by a fudge factor:
 
      Under the serialised model the observed ratio is [1 + r] with
      [r = T_r / T_w], so scaling the workload by [f] leaves [1 + f * (obs - 1)].
@@ -690,23 +721,50 @@ let test_fsync_overlap () =
      bought the same safety but could not correct a large blowout (a forced
      8.5x overshoot resized to the clamp and still failed).  With the trigger
      doing the work, an arbitrarily oversized calibration is corrected in one
-     step and a serialised one still fails. *)
+     step and a serialised one still fails.
+
+     {b The resize is a safety net, not the primary fix, and it does not cover
+     everything.}  The trigger cannot be lowered — 1.667 is exactly where the
+     derivation stops holding — so a calibration blowout landing in
+     [(1.15, 1.667]] (roughly a 2.5-3.7x oversize) fails the gate and gets no
+     resize, and retrying cannot help because a bad calibration is
+     deterministic across trials.  That band is uncovered here BY CONSTRUCTION,
+     which is why the real fix for #538 is at the source: see the median in
+     [calibrate_read_ops], which removes the lucky-idle-probe mode that
+     produced the blowouts in the first place.  The resize only has to catch
+     what survives that.  The residual band is tracked in #569, which also
+     records the two candidate ways to close it properly. *)
   let overlap_target = 0.5 in
   let resize_trigger = 1.7 in
+  (* The resized workload is RUN-scoped, not [measure]-scoped (#538 review).
+     The calibration site above states that both configs deliberately share one
+     calibration, because holding read_ops fixed is what makes their two
+     speedups comparable.  A resize that lived inside [measure] would silently
+     break that: config A would run at the resized count and config B at the
+     original one, and the two printed speedups would no longer be comparable
+     while still looking as though they were.  So the resize updates these
+     refs, config B inherits it, and [resized] is a single run-wide budget —
+     which is also the stricter reading of the "at most one resize" bound,
+     since it prevents two shrinks compounding across configs. *)
+  let cur_read_ops = ref read_ops in
+  let cur_read_ops_src = ref read_ops_src in
+  let resized = ref false in
   let measure label =
     (* Neutralized runs take exactly one trial: nothing is asserted, so extra
        trials would only burn time. *)
     let budget = if min_speedup <= 0.0 then 1 else trials in
-    let rec loop t ~read_ops ~read_ops_src ~resized acc =
+    let rec loop t acc =
+      let read_ops = !cur_read_ops
+      and read_ops_src = !cur_read_ops_src in
       let base, par = trial label t ~read_ops ~read_ops_src in
       let acc = agg_add acc ~base ~par in
       let observed = par.reader_phase /. par.writer_phase in
       if t >= budget || gates_pass acc ~min_speedup
       then t, acc
-      else if resized || observed <= resize_trigger
-      then loop (t + 1) ~read_ops ~read_ops_src ~resized acc
+      else if !resized || observed <= resize_trigger
+      then loop (t + 1) acc
       else (
-        (* Oversized workload rather than bad luck — shrink it once, floored,
+        (* Oversized workload rather than bad luck — shrink it once, run-wide,
            and restart the statistic.  See the header for why the bounds
            matter. *)
         let scaled =
@@ -714,16 +772,20 @@ let test_fsync_overlap () =
         in
         Printf.printf
           "  [%s] readers overran the writer window (%.2f > %.2f); calibration was \
-           oversized — resizing read_ops %d -> %d and restarting the statistic\n\
+           oversized — resizing read_ops %d -> %d for the rest of the run and restarting \
+           the statistic\n\
            %!"
           label
           observed
           resize_trigger
           read_ops
           scaled;
-        loop (t + 1) ~read_ops:scaled ~read_ops_src:"resized" ~resized:true agg_empty)
+        cur_read_ops := scaled;
+        cur_read_ops_src := "resized";
+        resized := true;
+        loop (t + 1) agg_empty)
     in
-    let n_trials, a = loop 1 ~read_ops ~read_ops_src ~resized:false agg_empty in
+    let n_trials, a = loop 1 agg_empty in
     Printf.printf
       "  [%s] best-of-%d (min per phase): baseline=%.3fs parallel=%.3fs \
        writer_done=%.3fs reader_done=%.3fs overlap=%.2f (gate %.2f) speedup=%.2fx (gate \

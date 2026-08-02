@@ -33,7 +33,8 @@
     {b Where this gate actually runs armed.}  Not in ci.yml, coverage.yml or
     cross-arch.yml — all six of those workflows (Forgejo and GitHub) neutralize
     it.  The one automated job that runs it with the ceiling live is the nightly
-    [.forgejo/workflows/bench-nightly.yml] (mirrored to [.github/]): [dune
+    [.forgejo/workflows/bench-nightly.yml] (its [.github/] mirror is
+    manual-only): [dune
     runtest --force -j 1] on a self-hosted runner with no [GRANARY_BENCH_*]
     neutralizer set, raising [GRANARY_BENCH_TRIALS] instead.  It reports rather
     than blocking PRs.  Outside that nightly this gate is armed only for a

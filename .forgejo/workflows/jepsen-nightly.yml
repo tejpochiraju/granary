@@ -30,7 +30,11 @@ on:
   workflow_dispatch: {}
 
 concurrency:
-  group: jepsen-nightly
+  # Shared with bench-nightly.yml (#549) so the two heavy nightlies queue
+  # rather than overlap. The armed timing-gate nightly asserts wall-clock
+  # ceilings, so it must not run alongside this suite; renamed from
+  # `jepsen-nightly` to a shared group for that reason.
+  group: nightly
   cancel-in-progress: false
 
 jobs:

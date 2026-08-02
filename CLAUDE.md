@@ -85,14 +85,22 @@ O(n²) bulk insert, a lost reader/writer overlap:
 
 **Where they run armed.** `ci.yml`, `coverage.yml` and `cross-arch.yml` — all
 six files, Forgejo and GitHub — neutralize every one of them, because those
-jobs share a loaded runner with every other PR. The single automated job that
-runs them with their ceilings live is the nightly
-`.forgejo/workflows/bench-nightly.yml` (mirrored to `.github/`): `dune runtest
---force -j 1`, no `GRANARY_BENCH_*` neutralizer, reporting via an auto-filed
-issue rather than blocking PRs (#549). Do not "fix" a red nightly by adding a
-neutralizer to that workflow — that is the honour system #549 removed. Anywhere
-else, these gates are armed only when *you* run the suite locally and read the
-result.
+jobs share a loaded runner with every other PR. The single *scheduled* job that
+runs them with their ceilings live is `.forgejo/workflows/bench-nightly.yml`:
+`dune runtest --force -j 1`, no `GRANARY_BENCH_*` neutralizer, on the
+self-hosted runner, reporting via an auto-filed issue rather than blocking PRs
+(#549). It shares the `nightly` concurrency group with `jepsen-nightly.yml` so
+the two heavy nightlies queue instead of perturbing each other's timings.
+
+The `.github/` mirror of that file is **manual-only** (`workflow_dispatch`, no
+`schedule`) and that is deliberate: GitHub's `ubuntu-latest` is a shared 2-core
+VM, so a scheduled armed run there would auto-file a recurring public issue
+nobody acts on and train everyone to ignore the marker — #549's disease, not
+its cure. Treat a red run there as weak evidence.
+
+Do not "fix" a red nightly by adding a neutralizer to that workflow — that is
+the honour system #549 removed. Anywhere else, these gates are armed only when
+*you* run the suite locally and read the result.
 
 **Tuning knobs, not gates.** `GRANARY_BENCH_TRIALS` (best-of-N draws;
 `test_fts_scaling` default 9, `bench_wal_fsync_overlap` default 3) and

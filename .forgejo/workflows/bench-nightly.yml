@@ -17,8 +17,14 @@ name: Timing gates nightly (#549)
 #   - `dune runtest -j 1`, so the suite does not contend with itself;
 #   - GRANARY_BENCH_TRIALS raised, so each gate's best-of-N statistic has more
 #     draws to find an unperturbed one.
-# `concurrency` keeps two of these from overlapping, and the 03:30 UTC slot is
-# 30 minutes after the Jepsen nightly's 03:00 so the two do not share the box.
+#
+# This is the one job in the repo whose verdict is a function of machine load,
+# so runner exclusivity is NOT left to clock arithmetic. It shares the
+# `nightly` concurrency group with jepsen-nightly.yml, which queues rather than
+# overlaps; the 04:30 slot is then just extra margin. (An earlier draft used
+# 03:30 with its own group, relying on the Jepsen nightly's "~8-10 min cached"
+# — but that job's own header says a cold podman store makes it ~20 min for the
+# lazyfs/Clojure image build, which can exceed a 30-minute gap.)
 #
 # REPORTING, NOT BLOCKING. It does not run on push or pull_request, so it can
 # never fail a PR. On failure it files/updates a Forgejo issue (same dedup
@@ -39,18 +45,27 @@ name: Timing gates nightly (#549)
 
 on:
   schedule:
-    # 03:30 UTC daily (09:00 IST) — after the Jepsen nightly's 03:00 slot.
-    - cron: "30 3 * * *"
+    # 04:30 UTC daily (10:00 IST) — well clear of the Jepsen nightly's 03:00,
+    # though the shared concurrency group below is what actually enforces it.
+    - cron: "30 4 * * *"
   # Allow ad-hoc manual runs (so the suite can be triggered on demand).
   workflow_dispatch: {}
 
 concurrency:
-  group: bench-nightly
+  # Shared with jepsen-nightly.yml: the two heavy nightlies queue rather than
+  # compete for the self-hosted runner. A timing gate that ran alongside the
+  # Jepsen suite would be measuring the wrong thing.
+  group: nightly
   cancel-in-progress: false
 
 jobs:
   armed-timing-gates:
     runs-on: self-hosted
+    # A serial `--force -j 1` run of ~130 executables, plus up to TRIALS
+    # retries in the timing gates, has a long tail. Without a ceiling a wedged
+    # run would hold the self-hosted runner and every later night would queue
+    # behind it (cancel-in-progress is deliberately false).
+    timeout-minutes: 120
     container:
       image: ocaml/opam:ubuntu-24.04-ocaml-5.4
 
